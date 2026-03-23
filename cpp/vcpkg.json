@@ -1,0 +1,42 @@
+{
+  "$schema": "https://raw.githubusercontent.com/microsoft/vcpkg-tool/main/docs/vcpkg.schema.json",
+  "name": "xop-trader",
+  "version-semver": "0.1.0",
+  "description": "CHIA DEX market-making bot — XOPTrader C++ engine",
+  "license": "UNLICENSED",
+  "supports": "!uwp",
+  "dependencies": [
+    {
+      "name": "boost-asio",
+      "version>=": "1.84.0"
+    },
+    {
+      "name": "boost-beast",
+      "version>=": "1.84.0"
+    },
+    {
+      "name": "boost-program-options",
+      "version>=": "1.84.0"
+    },
+    {
+      "name": "boost-json",
+      "version>=": "1.84.0"
+    },
+    "curl",
+    "openssl",
+    "nlohmann-json",
+    "spdlog",
+    "yaml-cpp",
+    "sqlite3",
+    {
+      "name": "prometheus-cpp",
+      "default-features": true,
+      "features": [
+        "pull",
+        "push"
+      ]
+    }
+  ],
+  "builtin-baseline": "2024.09.30",
+  "overrides": []
+}

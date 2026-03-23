@@ -1,0 +1,169 @@
+# =============================================================================
+# CMakeLists.txt — Root build for XOPTrader CHIA DEX market-making engine
+# =============================================================================
+#
+# Build:
+#   cmake -B build -S . -DCMAKE_TOOLCHAIN_FILE=$VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake
+#   cmake --build build --config Release
+#
+# Prerequisites:
+#   vcpkg with manifest mode (vcpkg.json in this directory).
+#   A C++20 compiler with coroutine support (MSVC 19.29+, GCC 11+, Clang 14+).
+#
+# ISO/IEC 27001:2022 — no secrets or credentials are embedded in the build.
+# ISO/IEC 5055       — static analysis targets provided (clang-tidy, cppcheck).
+# =============================================================================
+
+cmake_minimum_required(VERSION 3.24)
+
+# ---------- vcpkg manifest mode auto-detection ----------------------------
+# If the user forgot -DCMAKE_TOOLCHAIN_FILE, try the VCPKG_ROOT env variable.
+if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
+    set(CMAKE_TOOLCHAIN_FILE
+        "$ENV{VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake"
+        CACHE STRING "vcpkg toolchain file")
+    message(STATUS "Auto-detected vcpkg toolchain: ${CMAKE_TOOLCHAIN_FILE}")
+endif()
+
+project(xop_trader
+    VERSION   0.1.0
+    LANGUAGES CXX
+    DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
+)
+
+# ==========================================================================
+# Global compiler settings
+# ==========================================================================
+set(CMAKE_CXX_STANDARD          20)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS        OFF)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)  # For clang-tidy / LSP
+
+# ---------- Coroutine support ---------------------------------------------
+# C++20 coroutines require explicit opt-in on some compilers.
+if(MSVC)
+    # MSVC 19.29+ : /await:strict for standards-conformant coroutines.
+    add_compile_options(/await:strict)
+    # Silence harmless warnings that flood Boost.Asio headers.
+    add_compile_definitions(_WIN32_WINNT=0x0A00)  # Target Windows 10+
+    add_compile_definitions(_SILENCE_CXX17_ALLOCATOR_VOID_DEPRECATION_WARNING)
+elseif(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    add_compile_options(-fcoroutines)
+    # GCC 11-12 need this; GCC 13+ enables coroutines with -std=c++20 alone,
+    # but the flag is harmless even when redundant.
+elseif(CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    # Clang 14+ supports coroutines under -std=c++20 without extra flags.
+    # Apple Clang may lag; add -fcoroutines-ts if needed.
+endif()
+
+# ---------- Hardening flags (ISO/IEC 5055 — CWE mitigation) ---------------
+if(NOT MSVC)
+    add_compile_options(
+        -Wall -Wextra -Wpedantic -Werror=return-type
+        -fstack-protector-strong
+        -D_FORTIFY_SOURCE=2
+    )
+    add_link_options(-Wl,-z,relro -Wl,-z,now)
+else()
+    add_compile_options(/W4 /sdl /GS /guard:cf)
+    add_link_options(/guard:cf)
+endif()
+
+# ==========================================================================
+# Options
+# ==========================================================================
+option(XOP_BUILD_TESTS      "Build unit and integration tests"    ON)
+option(XOP_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds" OFF)
+
+if(XOP_ENABLE_SANITIZERS AND NOT MSVC)
+    add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
+    add_link_options(-fsanitize=address,undefined)
+endif()
+
+# ==========================================================================
+# Dependencies (vcpkg + FetchContent fallback)
+# ==========================================================================
+include(cmake/dependencies.cmake)
+
+# ==========================================================================
+# Core library — everything except main(), so tests can link against it.
+# ==========================================================================
+add_library(xop_core STATIC
+    # -- Core infrastructure ---------------------------------------------------
+    src/config.cpp
+    src/state.cpp
+
+    # -- Strategy layer --------------------------------------------------------
+    src/strategy/spread.cpp
+    src/strategy/avellaneda.cpp
+    src/strategy/glft.cpp
+
+    # -- Risk layer ------------------------------------------------------------
+    src/risk/inventory.cpp
+    src/risk/limits.cpp
+
+    # -- RPC / networking ------------------------------------------------------
+    src/rpc/chia_rpc.cpp
+
+    # -- Data layer (volatility estimator) -------------------------------------
+    src/data/volatility.cpp
+
+    # -- Future subsystem sources (uncomment as implemented) -------------------
+    # src/execution/offer_manager.cpp
+    # src/execution/coin_manager.cpp
+    # src/data/market_data.cpp
+    # src/data/adverse_selection.cpp
+    # src/rpc/dexie_client.cpp
+    # src/monitoring/prometheus.cpp
+)
+
+target_include_directories(xop_core
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<INSTALL_INTERFACE:include>
+)
+
+target_link_libraries(xop_core PUBLIC xop_deps)
+
+# ==========================================================================
+# Executable
+# ==========================================================================
+add_executable(xop_trader src/main.cpp)
+target_link_libraries(xop_trader PRIVATE xop_core)
+
+# ==========================================================================
+# Tests (Google Test or Catch2 — to be wired in Phase 2)
+# ==========================================================================
+if(XOP_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
+
+# ==========================================================================
+# Install rules
+# ==========================================================================
+include(GNUInstallDirs)
+install(TARGETS xop_trader RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# ==========================================================================
+# Static analysis targets (optional convenience)
+# ==========================================================================
+find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+if(CLANG_TIDY_EXE)
+    set_target_properties(xop_core PROPERTIES
+        CXX_CLANG_TIDY "${CLANG_TIDY_EXE};-checks=-*,bugprone-*,cppcoreguidelines-*,performance-*,readability-*"
+    )
+endif()
+
+find_program(CPPCHECK_EXE NAMES cppcheck)
+if(CPPCHECK_EXE)
+    add_custom_target(cppcheck
+        COMMAND ${CPPCHECK_EXE}
+            --enable=all
+            --std=c++20
+            --suppress=missingInclude
+            --project=${CMAKE_BINARY_DIR}/compile_commands.json
+        COMMENT "Running cppcheck static analysis"
+        VERBATIM
+    )
+endif()
