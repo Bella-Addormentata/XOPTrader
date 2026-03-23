@@ -697,7 +697,7 @@ s_competition = max(s_floor_bps, best_competing_bps + epsilon_bps)
 ```yaml
 market_data:
   enable_competitor_tracking: true
-  min_competitor_offer_size_xch: 1.0
+  min_competitor_offer_size: 1000000000000  # 1 XCH in mojos
   competitor_alert_threshold_bps: 50.0
 
 spread_optimizer:

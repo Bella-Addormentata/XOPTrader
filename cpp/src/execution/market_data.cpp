@@ -689,14 +689,31 @@ void MarketDataFeed::ingest_competing_offers(
         filtered.push_back(offer);
     }
 
+    // Capture count and emptiness before move.
+    const auto ingested_count = filtered.size();
+    const bool is_empty = (ingested_count == 0);
+
     // Store the filtered list under lock.
     {
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
     }
 
+    // Update competitor metrics based on the newly ingested offers.
+    if (is_empty) {
+        // No competing offers remain: remove stale metrics so the competitor
+        // effectively disappears from downstream views.
+        std::unique_lock lock(mtx_competitor_metrics_);
+        competitor_metrics_.erase(pair_name);
+    } else {
+        // Non-empty offer set: recompute metrics.
+        // Note: compute_competitor_metrics() acquires its own locks internally,
+        // so we don't hold any lock here (no nested lock risk).
+        compute_competitor_metrics(pair_name);
+    }
+
     spdlog::debug("MarketDataFeed: ingested {} competing offers for pair={}",
-                  filtered.size(), pair_name);
+                  ingested_count, pair_name);
 }
 
 // -------------------------------------------------------------------------
@@ -713,16 +730,14 @@ void MarketDataFeed::ingest_competing_offers(
 // -------------------------------------------------------------------------
 
 std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
-    const std::string& pair_name,
-    double             mid_price)
+    const std::string& pair_name)
 {
     if (!config_.enable_competitor_tracking) {
         return std::nullopt;
     }
 
-    if (mid_price <= 0.0) {
-        return std::nullopt;  // Cannot compute spreads without valid mid-price.
-    }
+    // Read mid-price internally; if unavailable, we can still compute depth counts.
+    const double mid_price = get_mid_price(pair_name);
 
     // Read competing offers under shared lock.
     std::vector<CompetingOffer> offers;
@@ -763,22 +778,29 @@ std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
     }
 
     // Compute spreads in basis points relative to mid-price.
-    const double best_competing_bid_bps =
-        (best_competing_bid > 0.0)
-            ? ((mid_price - best_competing_bid) / mid_price) * 10'000.0
-            : 0.0;
-
-    const double best_competing_ask_bps =
-        (best_competing_ask > 0.0)
-            ? ((best_competing_ask - mid_price) / mid_price) * 10'000.0
-            : 0.0;
-
-    // Compute tightest competing spread: the two-sided spread from best bid/ask.
-    // This is what we feed into SpreadOptimizer as best_competing_bps.
+    // Guard against zero/invalid mid-price: BPS math requires valid mid-price,
+    // but depth counts are always available.
+    double best_competing_bid_bps = 0.0;
+    double best_competing_ask_bps = 0.0;
     double best_competing_spread_bps = 0.0;
-    if (best_competing_bid > 0.0 && best_competing_ask > 0.0) {
-        const double spread = (best_competing_ask - best_competing_bid) / mid_price;
-        best_competing_spread_bps = spread * 10'000.0;
+
+    if (mid_price > 0.0) {
+        best_competing_bid_bps =
+            (best_competing_bid > 0.0)
+                ? ((mid_price - best_competing_bid) / mid_price) * 10'000.0
+                : 0.0;
+
+        best_competing_ask_bps =
+            (best_competing_ask > 0.0)
+                ? ((best_competing_ask - mid_price) / mid_price) * 10'000.0
+                : 0.0;
+
+        // Compute tightest competing spread: the two-sided spread from best bid/ask.
+        // This is what we feed into SpreadOptimizer as best_competing_bps.
+        if (best_competing_bid > 0.0 && best_competing_ask > 0.0) {
+            const double spread = (best_competing_ask - best_competing_bid) / mid_price;
+            best_competing_spread_bps = spread * 10'000.0;
+        }
     }
 
     // Check if this is a new competitor (first time seeing any competing offers).

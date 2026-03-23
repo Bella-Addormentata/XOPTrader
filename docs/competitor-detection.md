@@ -310,7 +310,7 @@ METRIC(xop_competitor_detections_total, Counter)
 
 ## Testing Strategy
 
-### Unit Tests (`tests/test_competitor_detection.cpp`)
+### Unit Tests (`cpp/tests/test_competitor_detection.cpp`)
 
 Key test cases:
 1. **No competitors**: `get_best_competing_spread_bps()` returns 0.0
@@ -380,8 +380,8 @@ offer_manager:
 - [ ] Create Grafana dashboard panel
 - [ ] Add Telegram alert rule for tight competitor spreads
 
-### Phase 4: Testing (Recommended)
-- [ ] Write unit tests for `compute_competitor_metrics()`
+### Phase 4: Testing (Recommended – expanded coverage beyond Phase 1)
+- [ ] Add additional unit tests for `compute_competitor_metrics()` (beyond initial coverage added in Phase 1)
 - [ ] Create integration test scenarios
 - [ ] Run backtests with simulated competitor activity
 
@@ -399,10 +399,10 @@ offer_manager:
 - **Total memory**: < 1 KB per pair (trivial)
 
 ### Lock Contention
-- **Three new mutexes**: `mtx_competitors_`, `mtx_competitor_metrics_`
+- **New synchronization primitives**: Two new `std::shared_mutex` members (`mtx_competitors_`, `mtx_competitor_metrics_`)
 - **Access pattern**: Writer-heavy (engine writes each block, strategies read)
 - **Mitigation**: Used `std::shared_mutex` for concurrent reads
-- **No deadlock risk**: No method acquires more than one mutex
+- **No deadlock risk**: No method acquires more than one lock
 
 ## Security and Privacy
 
