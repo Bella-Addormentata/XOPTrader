@@ -400,11 +400,10 @@ private:
                               double              price);
 
     /// Compute CompetitorMetrics from the tracked competing offers for a pair.
-    /// Filters out stale offers, computes best spreads, depth counts.
+    /// Computes best spreads, depth counts, and detects new competitors.
     /// Returns std::nullopt if competitor tracking is disabled.
     std::optional<CompetitorMetrics> compute_competitor_metrics(
-        const std::string& pair_name,
-        double             mid_price);
+        const std::string& pair_name);
 
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
