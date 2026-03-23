@@ -1,0 +1,332 @@
+// spread.hpp -- Four-component spread optimization engine for XOPTrader CHIA
+//               DEX market-making bot.
+//
+// Implements the spread model described in CHIA_MARKET_MAKER_STRATEGY.md S6:
+//
+//     spread = s_adverse + s_inventory + s_cost + s_competition
+//
+// Each component is calibrated to CHIA-specific parameters (52-second blocks,
+// ~$2K daily DEX volume, 5% daily volatility, PIN range 0.10-0.25).
+//
+// An optional Thompson Sampling module learns profitable spread levels from
+// live fill outcomes using Beta-distribution posteriors over a discrete grid.
+//
+// Compliant with:
+//   ISO/IEC 27001:2022  (no secrets in spread data, audit-friendly outputs)
+//   ISO/IEC 5055        (bounds-checked arithmetic, no UB on edge cases)
+//   ISO/IEC 25000       (clear naming, fully documented public interface)
+//   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
+
+#ifndef XOP_STRATEGY_SPREAD_HPP
+#define XOP_STRATEGY_SPREAD_HPP
+
+#include <cstdint>
+#include <array>
+#include <optional>
+#include <random>
+#include <vector>
+
+namespace xop {
+
+// ---------------------------------------------------------------------------
+// Venue -- DEX platform identifier for fee lookups.
+// ---------------------------------------------------------------------------
+enum class Venue : std::uint8_t {
+    Dexie      = 0,   // 0% fee on regular offers
+    TibetSwap  = 1,   // 0.7% fee
+    Hashgreen  = 2,   // 0.9% fee
+    OfferBin   = 3,   // 0% (bulletin board)
+    Splash     = 4    // 0% (P2P protocol)
+};
+
+/// Return the aggregator fee as a decimal fraction for a given venue.
+/// E.g. Dexie -> 0.0, TibetSwap -> 0.007, Hashgreen -> 0.009.
+double venue_fee_fraction(Venue v) noexcept;
+
+// ---------------------------------------------------------------------------
+// VolatilityRegime -- qualitative regime label used by the dynamic multiplier.
+// ---------------------------------------------------------------------------
+enum class VolatilityRegime : std::uint8_t {
+    Low    = 0,   // sigma < 0.7 * sigma_7d_avg  -> tighten 30%
+    Normal = 1,   // within 0.7-1.3x of rolling average
+    High   = 2    // sigma > 1.3 * sigma_7d_avg  -> widen 80%
+};
+
+// ---------------------------------------------------------------------------
+// SpreadResult -- fully decomposed output of compute_spread().
+//
+// All spread values are in basis points (bps). 1 bps = 0.01%.
+// half_spread = total_spread_bps / 2, representing the distance from
+// mid-price to a single side's quote.
+// ---------------------------------------------------------------------------
+struct SpreadResult {
+    double total_spread_bps;   // Final spread after all adjustments.
+    double half_spread;        // total_spread_bps / 2.
+
+    // Individual components (pre-multiplier, in bps).
+    double s_adverse;          // Adverse selection component.
+    double s_inventory;        // Inventory risk component.
+    double s_cost;             // Transaction cost component.
+    double s_competition;      // Competitive floor / improvement component.
+
+    // Multiplier applied to the raw sum of components.
+    double regime_multiplier;  // 1.0 = neutral; <1 tightened; >1 widened.
+};
+
+// ---------------------------------------------------------------------------
+// ThompsonSamplerConfig -- parameters that control the optional Thompson
+//                          Sampling spread-learning module.
+// ---------------------------------------------------------------------------
+struct ThompsonSamplerConfig {
+    /// Discrete spread levels (bps) to explore.
+    /// Default grid: {30, 40, 50, 60, 80, 100}.
+    std::vector<double> grid_bps{30.0, 40.0, 50.0, 60.0, 80.0, 100.0};
+
+    /// Prior alpha (successes) for each grid level.
+    /// Initialised to 1.0 (uniform Beta(1,1) prior) if left empty.
+    std::vector<double> prior_alpha;
+
+    /// Prior beta (failures) for each grid level.
+    /// Initialised to 1.0 if left empty.
+    std::vector<double> prior_beta;
+
+    /// Enable / disable Thompson Sampling.  When disabled,
+    /// compute_spread() uses the deterministic model exclusively.
+    bool enabled{false};
+};
+
+// ---------------------------------------------------------------------------
+// SpreadConfig -- tuning knobs for the four-component model and its dynamic
+//                 adjustments.  Defaults reflect CHIA conditions as of
+//                 March 2026 (Section 6 of the strategy document).
+// ---------------------------------------------------------------------------
+struct SpreadConfig {
+    // --- Adverse selection ---
+    /// Risk-aversion coefficient (gamma).  Shared with Avellaneda-Stoikov.
+    double gamma{0.01};
+
+    /// Default PIN (Probability of Informed Trading) when the Bayesian
+    /// estimator has not yet converged.  Typical range 0.10-0.25.
+    double default_pin{0.15};
+
+    /// Default expected time-to-fill in seconds.  Calibrated from dexie
+    /// historical fill data (strategy doc: ~2 hours at current volume).
+    double default_expected_fill_seconds{7200.0};
+
+    // --- Inventory ---
+    /// Time horizon (tau) in seconds for inventory cost calculation.
+    /// Represents the trader's planning horizon.
+    double tau_seconds{3600.0};
+
+    // --- Cost ---
+    /// Blockchain settlement fee in XCH.  Typically 0.0001 XCH.
+    double blockchain_fee_xch{0.0001};
+
+    /// Default trade size in XCH for cost-per-trade calculation.
+    double default_trade_size_xch{10.0};
+
+    // --- Competition ---
+    /// Minimum profitable spread floor in bps.  Strategy doc: 35-60 bps.
+    double s_floor_bps{40.0};
+
+    /// Minimum improvement over best competing spread (epsilon), in bps.
+    double epsilon_bps{2.0};
+
+    // --- Dynamic adjustment multipliers ---
+    double high_vol_multiplier{1.80};     // Widen 80% under high volatility.
+    double low_vol_multiplier{0.70};      // Tighten 30% under low volatility.
+    double weekend_multiplier{1.175};     // Widen 17.5% on weekends (midpoint of 15-20%).
+    double overlap_hours_multiplier{0.90};// Tighten 10% during US+EU overlap.
+    double inventory_skew_threshold{0.60};// Fraction of q_max beyond which
+                                          //   asymmetric widening kicks in.
+    double inventory_overweight_multiplier{1.30}; // Applied to overweight side.
+
+    // --- Thompson Sampling ---
+    ThompsonSamplerConfig thompson;
+};
+
+// ---------------------------------------------------------------------------
+// ThompsonSampler -- maintains Beta posteriors over a discrete spread grid,
+//                    samples from them to select an exploration spread, and
+//                    updates posteriors on fill outcomes.
+//
+// Usage:
+//   1. Call sample() to draw a spread level from the posteriors.
+//   2. Quote at or near that level.
+//   3. On fill, call record_outcome(level_index, profitable).
+//
+// Thread safety: NOT thread-safe.  The caller (SpreadOptimizer) serialises
+// access via its own compute_spread / record_fill API.
+// ---------------------------------------------------------------------------
+class ThompsonSampler {
+public:
+    /// Construct from configuration.  Validates and normalises priors.
+    explicit ThompsonSampler(const ThompsonSamplerConfig& cfg);
+
+    /// Sample from the Beta posteriors and return the index of the spread
+    /// level with the highest sampled probability of profitability.
+    /// Returns the grid index (into grid_bps).
+    std::size_t sample();
+
+    /// Return the spread value (bps) corresponding to a grid index.
+    double spread_at(std::size_t index) const;
+
+    /// Record the outcome of a fill at a given grid level.
+    /// @param index   Grid level that was active when the fill occurred.
+    /// @param profit  True if the fill was profitable (spread captured);
+    ///                false if adverse selection was detected.
+    void record_outcome(std::size_t index, bool profit);
+
+    /// Return the posterior mean for a given grid level:
+    ///   alpha / (alpha + beta).
+    double posterior_mean(std::size_t index) const;
+
+    /// Number of levels in the grid.
+    std::size_t grid_size() const noexcept;
+
+    /// Read-only access to the current grid (bps values).
+    const std::vector<double>& grid() const noexcept;
+
+    /// Read-only access to the current alpha (success) counts.
+    const std::vector<double>& alphas() const noexcept;
+
+    /// Read-only access to the current beta (failure) counts.
+    const std::vector<double>& betas() const noexcept;
+
+private:
+    std::vector<double> grid_bps_;   // Discrete spread levels.
+    std::vector<double> alpha_;      // Beta posterior alpha per level.
+    std::vector<double> beta_;       // Beta posterior beta per level.
+    std::mt19937        rng_;        // Mersenne Twister PRNG.
+};
+
+// ---------------------------------------------------------------------------
+// SpreadOptimizer -- the primary class that computes the four-component
+//                    spread and applies dynamic adjustments.
+//
+// Typical usage (per block heartbeat):
+//
+//     SpreadOptimizer optimizer(config);
+//     auto result = optimizer.compute_spread(
+//         mid_price_xch, sigma_daily, inventory_q, q_max,
+//         pin, venue_fee, best_competing_bps,
+//         hour_utc, day_of_week);
+//
+// The optimizer is stateful only when Thompson Sampling is enabled;
+// otherwise every call to compute_spread() is a pure function of its inputs.
+// ---------------------------------------------------------------------------
+class SpreadOptimizer {
+public:
+    /// Construct with the given spread configuration.
+    explicit SpreadOptimizer(const SpreadConfig& cfg);
+
+    // -----------------------------------------------------------------------
+    // Primary interface
+    // -----------------------------------------------------------------------
+
+    /// Compute the optimal spread given current market conditions.
+    ///
+    /// @param mid_price_xch     Current mid-price in XCH (e.g. 2.75).
+    /// @param sigma_daily       Annualised or daily volatility as a decimal
+    ///                          fraction (e.g. 0.05 for 5% daily vol).
+    ///                          Interpretation: daily standard deviation of
+    ///                          returns.
+    /// @param inventory_q       Current inventory in base-asset units.
+    ///                          Positive = long, negative = short.
+    /// @param q_max             Maximum tolerated absolute inventory.
+    /// @param pin               Probability of Informed Trading [0,1].
+    ///                          Pass <= 0 to use the configured default.
+    /// @param venue             DEX venue for fee lookup.
+    /// @param best_competing_bps Best observed competing spread (bps).
+    ///                          Pass <= 0 if no competition data available.
+    /// @param hour_utc          Current hour of day in UTC [0, 23].
+    /// @param day_of_week       ISO day-of-week: 1=Monday .. 7=Sunday.
+    ///
+    /// @return Fully decomposed SpreadResult.
+    SpreadResult compute_spread(
+        double mid_price_xch,
+        double sigma_daily,
+        double inventory_q,
+        double q_max,
+        double pin,
+        Venue  venue,
+        double best_competing_bps,
+        int    hour_utc,
+        int    day_of_week) const;
+
+    // -----------------------------------------------------------------------
+    // Thompson Sampling interaction (only meaningful when enabled)
+    // -----------------------------------------------------------------------
+
+    /// Record a fill outcome for the Thompson Sampling module.
+    /// No-op if Thompson Sampling is disabled.
+    /// @param profitable  True if the fill captured positive spread PnL.
+    void record_fill(bool profitable);
+
+    /// Sample a spread level from the Thompson posteriors.
+    /// Returns std::nullopt if Thompson Sampling is disabled.
+    std::optional<double> thompson_sample();
+
+    /// Read-only access to the Thompson Sampler (nullopt if disabled).
+    const ThompsonSampler* sampler() const noexcept;
+
+    // -----------------------------------------------------------------------
+    // Component accessors (for diagnostics / unit testing)
+    // -----------------------------------------------------------------------
+
+    /// Adverse selection: gamma * sigma * sqrt(E[T_fill]) * PIN, in bps.
+    static double calc_adverse_selection_bps(
+        double gamma,
+        double sigma_daily,
+        double expected_fill_seconds,
+        double pin);
+
+    /// Inventory risk: gamma * sigma^2 * tau * |q| / q_max, in bps.
+    static double calc_inventory_bps(
+        double gamma,
+        double sigma_daily,
+        double tau_seconds,
+        double inventory_q,
+        double q_max);
+
+    /// Transaction cost: (blockchain_fee + venue_fee) / trade_size, in bps.
+    static double calc_cost_bps(
+        double blockchain_fee_xch,
+        double venue_fee_fraction,
+        double trade_size_xch);
+
+    /// Competition: max(s_floor, best_competing + epsilon), in bps.
+    static double calc_competition_bps(
+        double s_floor_bps,
+        double best_competing_bps,
+        double epsilon_bps);
+
+    /// Regime multiplier: product of volatility, weekend, and overlap factors.
+    static double calc_regime_multiplier(
+        VolatilityRegime regime,
+        int hour_utc,
+        int day_of_week,
+        double high_vol_mult,
+        double low_vol_mult,
+        double weekend_mult,
+        double overlap_mult);
+
+    // -----------------------------------------------------------------------
+    // Configuration access
+    // -----------------------------------------------------------------------
+
+    /// Return a const reference to the active configuration.
+    const SpreadConfig& config() const noexcept;
+
+private:
+    SpreadConfig                        cfg_;
+    mutable std::optional<ThompsonSampler> sampler_;
+
+    /// Index of the most recently sampled Thompson grid level.
+    /// Used to attribute fill outcomes to the correct grid bucket.
+    mutable std::optional<std::size_t>  last_thompson_index_;
+};
+
+}  // namespace xop
+
+#endif  // XOP_STRATEGY_SPREAD_HPP

@@ -1,0 +1,395 @@
+// market_data.hpp -- Multi-source market data aggregation for XOPTrader CHIA
+//                    DEX market-making bot.
+//
+// Aggregates price data from three source tiers into unified MarketSnapshot
+// objects consumed by the strategy and risk layers:
+//
+//   1. Dexie API  (primary)  -- order book best bid/ask, recent trades, 24h vol
+//   2. Chia Full Node        -- block height, mempool activity
+//   3. CEX reference (future)-- mid price from OKX / Gate.io for arb detection
+//
+// Aggregation priority:
+//   - Primary mid: dexie best_bid/ask -> mid = (bid + ask) / 2
+//   - Fallback:    if no quotes, use last trade price from dexie
+//   - Blended:     if CEX reference available, weighted mid =
+//                    0.7 * dex_mid + 0.3 * cex_mid
+//                  (CEX is 1000x more liquid; 30% weight anchors the DEX mid
+//                   toward the globally discovered price)
+//
+// Staleness:
+//   Data older than kStaleThreshold (5 minutes) is marked stale.  The strategy
+//   layer should widen spreads or pause quoting when it observes stale data.
+//
+// Price history:
+//   A circular buffer of (block_height, price) tuples per pair feeds the
+//   volatility estimator and regime detector.  Default capacity is 1000 blocks
+//   (~14.4 hours at 52 s/block).
+//
+// Arbitrage signals:
+//   When dexie mid diverges from CEX mid beyond a configurable threshold, an
+//   ArbitrageSignal is emitted for the strategy layer to act on.
+//
+// Thread safety:
+//   MarketSnapshot updates and per-pair state are guarded by std::shared_mutex.
+//   Price history has its own shared_mutex for concurrent reads by volatility
+//   and regime estimators.  No method acquires more than one mutex, so deadlock
+//   is impossible by construction.
+//
+// Compliant with:
+//   ISO/IEC 27001:2022 -- no secrets handled; API endpoints from config only
+//   ISO/IEC 5055       -- no raw pointers, RAII locking, bounds-checked buffers
+//   ISO/IEC 25000      -- documented interfaces, single-responsibility
+//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+
+#ifndef XOP_EXECUTION_MARKET_DATA_HPP
+#define XOP_EXECUTION_MARKET_DATA_HPP
+
+#include "xop/types.hpp"
+#include "xop/config.hpp"
+#include "xop/state.hpp"
+
+#include <chrono>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <optional>
+#include <shared_mutex>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+namespace xop {
+
+// ---------------------------------------------------------------------------
+// Constants
+// ---------------------------------------------------------------------------
+
+/// Data older than this threshold is considered stale and should not be
+/// trusted for quote computation.  5 minutes was chosen because the CHIA
+/// block time is ~52 seconds; missing ~6 consecutive blocks strongly
+/// suggests a connectivity problem or an idle market.
+inline constexpr auto kStaleThreshold = std::chrono::minutes{5};
+
+/// Default capacity for the per-pair price history circular buffer.
+/// 1000 blocks * 52 s/block = 52,000 s = ~14.4 hours of history.
+/// Sufficient for the Yang-Zhang volatility estimator (200-block window)
+/// and the variance-ratio regime detector (100-block window) with ample
+/// look-back margin.
+inline constexpr std::size_t kDefaultPriceHistoryCapacity = 1000;
+
+/// Weight assigned to the DEX mid-price when blending with CEX reference.
+/// The remaining (1 - kDexWeight) goes to CEX.  CEX carries 30% because
+/// its volume is ~1000x larger (Section 10 of strategy doc: $2.4M/day CEX
+/// vs ~$2K/day DEX), so its price discovery is far more authoritative.
+inline constexpr double kDexWeight = 0.70;
+
+/// Weight assigned to the CEX mid-price when blending.
+inline constexpr double kCexWeight = 1.0 - kDexWeight;  // 0.30
+
+// ---------------------------------------------------------------------------
+// ArbitrageDirection -- which venue is cheaper.
+// ---------------------------------------------------------------------------
+
+enum class ArbitrageDirection : std::uint8_t {
+    DexCheap = 0,  // DEX price < CEX price -- buy on DEX, sell on CEX
+    CexCheap = 1   // CEX price < DEX price -- buy on CEX, sell on DEX
+};
+
+/// Human-readable label for logging.
+inline const char* to_string(ArbitrageDirection d) noexcept {
+    return d == ArbitrageDirection::DexCheap ? "DexCheap" : "CexCheap";
+}
+
+// ---------------------------------------------------------------------------
+// ArbitrageSignal -- emitted when DEX-CEX price divergence exceeds threshold.
+//
+// The strategy layer uses this to decide whether to post aggressive offers
+// that capture the convergence (Section 10: CEX-DEX Arbitrage).
+// ---------------------------------------------------------------------------
+
+struct ArbitrageSignal {
+    std::string        pair_name;       // Trading pair, e.g. "XCH/wUSDC"
+    double             dex_price;       // DEX mid-price (quote per base)
+    double             cex_price;       // CEX mid-price (quote per base)
+    double             divergence_bps;  // abs(dex - cex) / cex * 10000
+    ArbitrageDirection direction;       // Which venue is cheaper
+    Timestamp          detected_at;     // Wall-clock detection time
+};
+
+// ---------------------------------------------------------------------------
+// PriceHistoryEntry -- one (block_height, price) observation stored in the
+// per-pair circular buffer.
+// ---------------------------------------------------------------------------
+
+struct PriceHistoryEntry {
+    BlockHeight block_height;  // Block at which this price was observed
+    double      price;         // Mid-price in quote-per-base (double for math)
+};
+
+// ---------------------------------------------------------------------------
+// MarketDataConfig -- tuning parameters for the aggregation layer.
+// ---------------------------------------------------------------------------
+
+struct MarketDataConfig {
+    /// Maximum entries in the per-pair price history circular buffer.
+    std::size_t price_history_capacity{kDefaultPriceHistoryCapacity};
+
+    /// Divergence threshold (basis points) above which an ArbitrageSignal
+    /// is emitted.  50 bps is the lower end of the expected edge per
+    /// Section 10 ("expected edge: 50-200 bps per arbitrage cycle").
+    double arb_threshold_bps{50.0};
+
+    /// Staleness threshold.  Data older than this is flagged as stale.
+    std::chrono::minutes stale_threshold{5};
+};
+
+// ---------------------------------------------------------------------------
+// PairState -- internal per-pair aggregation state.
+//
+// Not exposed directly; callers read MarketSnapshot via the State object or
+// use the typed accessor methods on MarketDataFeed.
+// ---------------------------------------------------------------------------
+
+struct PairState {
+    std::string pair_name;        // e.g. "XCH/wUSDC"
+
+    // --- Dexie data ---
+    double      dex_best_bid{0.0};  // Best bid from dexie order book
+    double      dex_best_ask{0.0};  // Best ask from dexie order book
+    double      dex_last_trade{0.0};// Most recent trade price on dexie
+    double      volume_24h{0.0};    // Rolling 24-hour volume (base asset units)
+    Timestamp   dex_updated_at{};   // When dexie data was last refreshed
+
+    // --- CEX reference ---
+    double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
+    Timestamp   cex_updated_at{};   // When CEX data was last refreshed
+
+    // --- Block height context ---
+    BlockHeight last_block{0};      // Most recent block height observed
+
+    // --- Computed fields ---
+    double      mid_price{0.0};     // Aggregated mid (dex + optional cex blend)
+    double      spread_bps{0.0};    // Current spread in basis points
+    bool        is_stale{true};     // True if data is older than stale_threshold
+
+    explicit PairState(const std::string& name = "") : pair_name(name) {}
+};
+
+// ---------------------------------------------------------------------------
+// ArbitrageCallback -- signature for the callback invoked when an arbitrage
+// signal is detected.  The strategy layer registers its handler at startup.
+// ---------------------------------------------------------------------------
+
+using ArbitrageCallback = std::function<void(const ArbitrageSignal&)>;
+
+// ---------------------------------------------------------------------------
+// MarketDataFeed -- the primary market data aggregation class.
+//
+// Lifecycle:
+//   1. Construct with config, a reference to the shared State, and an
+//      optional ArbitrageCallback.
+//   2. Call refresh(enabled_pairs) once per block from the engine heartbeat.
+//      This is a non-blocking operation that updates internal state.
+//   3. Read aggregated data via get_mid_price, get_spread_bps, etc.
+//
+// Thread safety:
+//   Safe for concurrent reads from multiple strategy threads while a single
+//   writer thread calls refresh().  No method acquires more than one mutex.
+// ---------------------------------------------------------------------------
+
+class MarketDataFeed {
+public:
+    // -- Construction -------------------------------------------------------
+
+    /// Construct with configuration, a shared State reference (for writing
+    /// MarketSnapshot objects), and an optional arbitrage signal callback.
+    ///
+    /// @param cfg       Aggregation configuration (thresholds, capacities).
+    /// @param state     Shared mutable state — refresh() writes snapshots here.
+    /// @param arb_cb    Optional callback invoked when an arb signal fires.
+    explicit MarketDataFeed(const MarketDataConfig& cfg,
+                            State&                  state,
+                            ArbitrageCallback       arb_cb = nullptr);
+
+    // Non-copyable, movable.
+    MarketDataFeed(const MarketDataFeed&)            = delete;
+    MarketDataFeed& operator=(const MarketDataFeed&) = delete;
+    MarketDataFeed(MarketDataFeed&&)                 noexcept;
+    MarketDataFeed& operator=(MarketDataFeed&&)      noexcept;
+
+    ~MarketDataFeed();
+
+    // -- Primary interface --------------------------------------------------
+
+    /// Refresh market data for every pair in @p enabled_pairs.
+    ///
+    /// For each pair, this method:
+    ///   1. Ingests dexie order book data (best bid/ask, last trade, volume).
+    ///   2. Ingests the current block height from the full node.
+    ///   3. Ingests any available CEX reference prices.
+    ///   4. Computes the aggregated mid-price using the blending rules.
+    ///   5. Detects staleness.
+    ///   6. Detects arbitrage signals and invokes the callback if armed.
+    ///   7. Appends the observation to the price history circular buffer.
+    ///   8. Writes the resulting MarketSnapshot into the shared State.
+    ///
+    /// This method is intended to be called once per block (~52 s) from the
+    /// engine heartbeat.  It does NOT perform HTTP I/O itself; the caller
+    /// must supply pre-fetched data via the ingest_* methods, or override
+    /// the protected fetch hooks for testing.
+    ///
+    /// @param enabled_pairs  List of pair names to refresh (e.g. "XCH/wUSDC").
+    void refresh(const std::vector<std::string>& enabled_pairs);
+
+    // -- Data ingestion (called before refresh, or by async fetch layer) ----
+
+    /// Ingest dexie order book data for a pair.
+    ///
+    /// @param pair_name  Trading pair identifier.
+    /// @param best_bid   Best bid price (quote per base), or 0 if no bids.
+    /// @param best_ask   Best ask price (quote per base), or 0 if no asks.
+    /// @param last_trade Last trade price (quote per base), or 0 if none.
+    /// @param vol_24h    Rolling 24-hour volume in base asset units.
+    void ingest_dexie(const std::string& pair_name,
+                      double             best_bid,
+                      double             best_ask,
+                      double             last_trade,
+                      double             vol_24h);
+
+    /// Ingest the current block height from the Chia full node.
+    ///
+    /// @param block_height  Peak block height from get_blockchain_state().
+    void ingest_block_height(BlockHeight block_height);
+
+    /// Ingest a CEX reference mid-price for a pair.
+    ///
+    /// @param pair_name  Trading pair identifier (must match dexie pair name).
+    /// @param cex_mid    CEX mid-price (quote per base).
+    void ingest_cex_reference(const std::string& pair_name,
+                              double             cex_mid);
+
+    // -- Typed accessors (thread-safe reads) --------------------------------
+
+    /// Best available mid-price for a pair.
+    /// Returns 0.0 if the pair is unknown or has no data.
+    double get_mid_price(const std::string& pair_name) const;
+
+    /// Current spread in basis points for a pair.
+    /// Returns 0.0 if the pair is unknown or has no quotes.
+    double get_spread_bps(const std::string& pair_name) const;
+
+    /// Rolling 24-hour volume in base asset units.
+    /// Returns 0.0 if the pair is unknown.
+    double get_volume_24h(const std::string& pair_name) const;
+
+    /// CEX reference mid-price for a pair, if available.
+    /// Returns std::nullopt if no CEX data has been ingested for this pair,
+    /// or if the CEX data is stale.
+    std::optional<double> get_cex_reference(const std::string& pair_name) const;
+
+    /// Whether the data for a pair is considered stale.
+    /// Returns true if the pair is unknown.
+    bool is_stale(const std::string& pair_name) const;
+
+    /// Retrieve the latest block height ingested from the full node.
+    BlockHeight current_block_height() const;
+
+    // -- Price history access (concurrent reads via shared_mutex) -----------
+
+    /// Read the price history for a pair.
+    /// Returns an empty vector if the pair has no history.
+    /// The returned entries are ordered oldest-to-newest.
+    std::vector<PriceHistoryEntry> get_price_history(
+        const std::string& pair_name) const;
+
+    /// Number of entries currently stored for a pair's price history.
+    /// Returns 0 if the pair is unknown.
+    std::size_t price_history_size(const std::string& pair_name) const;
+
+    // -- Arbitrage signal access -------------------------------------------
+
+    /// Retrieve the most recent arbitrage signal for a pair, if any.
+    /// Returns std::nullopt if no signal has been emitted or if the pair
+    /// is unknown.
+    std::optional<ArbitrageSignal> get_latest_arb_signal(
+        const std::string& pair_name) const;
+
+    // -- Configuration access -----------------------------------------------
+
+    /// Read-only access to the active configuration.
+    const MarketDataConfig& config() const noexcept;
+
+    /// Update the arbitrage threshold at runtime (e.g. from ML tuner).
+    void set_arb_threshold_bps(double threshold_bps);
+
+    /// Replace the arbitrage callback (e.g. when strategy layer reconnects).
+    void set_arb_callback(ArbitrageCallback cb);
+
+private:
+    // -- Internal helpers ---------------------------------------------------
+
+    /// Compute the aggregated mid-price for a pair using the blending rules.
+    ///   1. If dexie has valid bid/ask: dex_mid = (bid + ask) / 2
+    ///   2. If dexie has no quotes but has a last trade: dex_mid = last_trade
+    ///   3. If CEX reference is available: mid = kDexWeight*dex + kCexWeight*cex
+    ///   4. Otherwise: mid = dex_mid
+    /// Returns 0.0 if no price data is available at all.
+    static double compute_mid(const PairState& ps);
+
+    /// Compute the spread in basis points from best_bid and best_ask.
+    /// Returns 0.0 if either side is zero (no two-sided market).
+    static double compute_spread_bps(double best_bid, double best_ask);
+
+    /// Detect staleness by comparing the data timestamp to now().
+    /// Returns true if (now - ts) > stale_threshold, or if ts is epoch-zero
+    /// (never updated).
+    bool detect_stale(Timestamp ts) const;
+
+    /// Check for arbitrage divergence and fire the callback if threshold
+    /// is exceeded.  Updates the per-pair latest_arb_signal.
+    void check_arbitrage(PairState& ps);
+
+    /// Append a price observation to the per-pair circular buffer, evicting
+    /// the oldest entry if capacity is reached.
+    void append_price_history(const std::string& pair_name,
+                              BlockHeight         block,
+                              double              price);
+
+    /// Build a MarketSnapshot from internal PairState and write it to the
+    /// shared State object.
+    void publish_snapshot(const PairState& ps);
+
+    /// Look up or create a PairState.  Caller must hold mtx_pairs_ exclusively.
+    PairState& get_or_create_pair(const std::string& pair_name);
+
+    // -- Data members -------------------------------------------------------
+
+    /// Configuration (thresholds, capacities).
+    MarketDataConfig config_;
+
+    /// Reference to the shared global state.  refresh() writes MarketSnapshot
+    /// objects here so that strategy and risk layers can read them.
+    State& state_;
+
+    /// Callback invoked when an arbitrage signal fires.  May be null.
+    ArbitrageCallback arb_callback_;
+
+    /// Per-pair aggregation state.  Guarded by mtx_pairs_.
+    mutable std::shared_mutex                          mtx_pairs_;
+    std::unordered_map<std::string, PairState>         pairs_;
+
+    /// Per-pair price history circular buffers.  Guarded by mtx_history_.
+    mutable std::shared_mutex                          mtx_history_;
+    std::unordered_map<std::string, std::deque<PriceHistoryEntry>> history_;
+
+    /// Per-pair latest arbitrage signal.  Guarded by mtx_arb_.
+    mutable std::shared_mutex                          mtx_arb_;
+    std::unordered_map<std::string, ArbitrageSignal>   latest_arb_;
+
+    /// Latest block height from the full node.  Atomic for lock-free reads.
+    std::atomic<BlockHeight> block_height_{0};
+};
+
+}  // namespace xop
+
+#endif  // XOP_EXECUTION_MARKET_DATA_HPP
