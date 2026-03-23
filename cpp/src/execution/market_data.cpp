@@ -78,6 +78,14 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
         std::unique_lock lock(other.mtx_arb_);
         latest_arb_ = std::move(other.latest_arb_);
     }
+    {
+        std::unique_lock lock(other.mtx_competitors_);
+        competing_offers_ = std::move(other.competing_offers_);
+    }
+    {
+        std::unique_lock lock(other.mtx_competitor_metrics_);
+        competitor_metrics_ = std::move(other.competitor_metrics_);
+    }
 }
 
 MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
@@ -105,6 +113,16 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
         std::unique_lock lock_dst(mtx_arb_);
         std::unique_lock lock_src(other.mtx_arb_);
         latest_arb_ = std::move(other.latest_arb_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_competitors_);
+        std::unique_lock lock_src(other.mtx_competitors_);
+        competing_offers_ = std::move(other.competing_offers_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_competitor_metrics_);
+        std::unique_lock lock_src(other.mtx_competitor_metrics_);
+        competitor_metrics_ = std::move(other.competitor_metrics_);
     }
 
     return *this;
@@ -631,6 +649,244 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     // Write to shared State (thread-safe; State::update_market acquires
     // its own internal mutex).
     state_.update_market(snap);
+}
+
+// =========================================================================
+// Competitor tracking methods
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// ingest_competing_offers -- parse and store individual competing offers
+//
+// Called from the engine after fetching the full order book from dexie.
+// Filters out own offers, tracks competing offers, and detects new competitors.
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::ingest_competing_offers(
+    const std::string&                 pair_name,
+    const std::vector<CompetingOffer>& competing_offers,
+    const std::unordered_set<std::string>& own_offer_ids)
+{
+    if (!config_.enable_competitor_tracking) {
+        return;  // Feature disabled; no-op.
+    }
+
+    // Filter out own offers and offers below minimum size threshold.
+    std::vector<CompetingOffer> filtered;
+    filtered.reserve(competing_offers.size());
+
+    for (const auto& offer : competing_offers) {
+        // Skip our own offers.
+        if (own_offer_ids.count(offer.offer_id) > 0) {
+            continue;
+        }
+
+        // Skip dust offers (not from serious market makers).
+        if (offer.size < config_.min_competitor_offer_size) {
+            continue;
+        }
+
+        filtered.push_back(offer);
+    }
+
+    // Capture count and emptiness before move.
+    const auto ingested_count = filtered.size();
+    const bool is_empty = (ingested_count == 0);
+
+    // Store the filtered list under lock.
+    {
+        std::unique_lock lock(mtx_competitors_);
+        competing_offers_[pair_name] = std::move(filtered);
+    }
+
+    // Update competitor metrics based on the newly ingested offers.
+    if (is_empty) {
+        // No competing offers remain: remove stale metrics so the competitor
+        // effectively disappears from downstream views.
+        std::unique_lock lock(mtx_competitor_metrics_);
+        competitor_metrics_.erase(pair_name);
+    } else {
+        // Non-empty offer set: recompute metrics.
+        // Note: compute_competitor_metrics() acquires its own locks internally,
+        // so we don't hold any lock here (no nested lock risk).
+        compute_competitor_metrics(pair_name);
+    }
+
+    spdlog::debug("MarketDataFeed: ingested {} competing offers for pair={}",
+                  ingested_count, pair_name);
+}
+
+// -------------------------------------------------------------------------
+// compute_competitor_metrics -- analyze competing offers and compute metrics
+//
+// Computes:
+//   - Best competing bid/ask spreads vs mid-price
+//   - Tightest competing two-sided spread
+//   - Depth counts (number of offers per side)
+//   - Detection of new competitors
+//
+// Returns std::nullopt if competitor tracking is disabled or no competing
+// offers exist for this pair.
+// -------------------------------------------------------------------------
+
+std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
+    const std::string& pair_name)
+{
+    if (!config_.enable_competitor_tracking) {
+        return std::nullopt;
+    }
+
+    // Read mid-price internally; if unavailable, we can still compute depth counts.
+    const double mid_price = get_mid_price(pair_name);
+
+    // Read competing offers under shared lock.
+    std::vector<CompetingOffer> offers;
+    {
+        std::shared_lock lock(mtx_competitors_);
+        auto it = competing_offers_.find(pair_name);
+        if (it == competing_offers_.end() || it->second.empty()) {
+            return std::nullopt;  // No competing offers.
+        }
+        offers = it->second;
+    }
+
+    // Separate bids and asks.
+    std::vector<double> bid_prices;
+    std::vector<double> ask_prices;
+
+    for (const auto& offer : offers) {
+        // Convert mojos to double for spread calculation.
+        const double price = static_cast<double>(offer.price) / static_cast<double>(kMojosPerXch);
+
+        if (offer.side == Side::Bid) {
+            bid_prices.push_back(price);
+        } else {
+            ask_prices.push_back(price);
+        }
+    }
+
+    // Compute best competing bid (highest price) and best competing ask (lowest price).
+    double best_competing_bid = 0.0;
+    double best_competing_ask = 0.0;
+
+    if (!bid_prices.empty()) {
+        best_competing_bid = *std::max_element(bid_prices.begin(), bid_prices.end());
+    }
+
+    if (!ask_prices.empty()) {
+        best_competing_ask = *std::min_element(ask_prices.begin(), ask_prices.end());
+    }
+
+    // Compute spreads in basis points relative to mid-price.
+    // Guard against zero/invalid mid-price: BPS math requires valid mid-price,
+    // but depth counts are always available.
+    double best_competing_bid_bps = 0.0;
+    double best_competing_ask_bps = 0.0;
+    double best_competing_spread_bps = 0.0;
+
+    if (mid_price > 0.0) {
+        best_competing_bid_bps =
+            (best_competing_bid > 0.0)
+                ? ((mid_price - best_competing_bid) / mid_price) * 10'000.0
+                : 0.0;
+
+        best_competing_ask_bps =
+            (best_competing_ask > 0.0)
+                ? ((best_competing_ask - mid_price) / mid_price) * 10'000.0
+                : 0.0;
+
+        // Compute tightest competing spread: the two-sided spread from best bid/ask.
+        // This is what we feed into SpreadOptimizer as best_competing_bps.
+        if (best_competing_bid > 0.0 && best_competing_ask > 0.0) {
+            const double spread = (best_competing_ask - best_competing_bid) / mid_price;
+            best_competing_spread_bps = spread * 10'000.0;
+        }
+    }
+
+    // Check if this is a new competitor (first time seeing any competing offers).
+    bool new_competitor_detected = false;
+    {
+        std::shared_lock lock(mtx_competitor_metrics_);
+        auto it = competitor_metrics_.find(pair_name);
+        if (it == competitor_metrics_.end() || it->second.num_competing_offers == 0) {
+            new_competitor_detected = true;
+        }
+    }
+
+    // Assemble metrics.
+    CompetitorMetrics metrics;
+    metrics.pair_name                 = pair_name;
+    metrics.num_competing_offers      = offers.size();
+    metrics.best_competing_bid_bps    = best_competing_bid_bps;
+    metrics.best_competing_ask_bps    = best_competing_ask_bps;
+    metrics.best_competing_spread_bps = best_competing_spread_bps;
+    metrics.competing_depth_bids      = bid_prices.size();
+    metrics.competing_depth_asks      = ask_prices.size();
+    metrics.new_competitor_detected   = new_competitor_detected;
+    metrics.last_updated              = std::chrono::system_clock::now();
+
+    // Store under lock.
+    {
+        std::unique_lock lock(mtx_competitor_metrics_);
+        competitor_metrics_[pair_name] = metrics;
+    }
+
+    // Log warning if tight competing spread detected.
+    if (best_competing_spread_bps > 0.0 &&
+        best_competing_spread_bps < config_.competitor_alert_threshold_bps) {
+        spdlog::warn("MarketDataFeed: tight competitor detected on pair={}, "
+                     "competing_spread={:.1f}bps (threshold={:.1f}bps)",
+                     pair_name, best_competing_spread_bps,
+                     config_.competitor_alert_threshold_bps);
+    }
+
+    if (new_competitor_detected) {
+        spdlog::info("MarketDataFeed: new competitor(s) detected on pair={}, "
+                     "num_offers={}, best_spread={:.1f}bps",
+                     pair_name, metrics.num_competing_offers,
+                     best_competing_spread_bps);
+    }
+
+    return metrics;
+}
+
+// -------------------------------------------------------------------------
+// Public accessor methods for competitor metrics
+// -------------------------------------------------------------------------
+
+std::optional<CompetitorMetrics> MarketDataFeed::get_competitor_metrics(
+    const std::string& pair_name) const
+{
+    if (!config_.enable_competitor_tracking) {
+        return std::nullopt;
+    }
+
+    std::shared_lock lock(mtx_competitor_metrics_);
+    auto it = competitor_metrics_.find(pair_name);
+    if (it == competitor_metrics_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+double MarketDataFeed::get_best_competing_spread_bps(
+    const std::string& pair_name) const
+{
+    auto metrics = get_competitor_metrics(pair_name);
+    if (!metrics.has_value()) {
+        return 0.0;
+    }
+    return metrics->best_competing_spread_bps;
+}
+
+std::size_t MarketDataFeed::get_num_competing_offers(
+    const std::string& pair_name) const
+{
+    auto metrics = get_competitor_metrics(pair_name);
+    if (!metrics.has_value()) {
+        return 0;
+    }
+    return metrics->num_competing_offers;
 }
 
 // -------------------------------------------------------------------------
