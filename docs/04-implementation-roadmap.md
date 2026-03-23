@@ -108,41 +108,42 @@ chia show -s
 - [ ] Wallet synced and receiving testnet XCH
 - [ ] Verify wallet RPC is accessible:
   ```bash
-  curl --insecure \
+  curl --cacert ~/.chia/testnet11/config/ssl/ca/chia_ca.crt \
     --cert ~/.chia/testnet11/config/ssl/wallet/private_wallet.crt \
     --key ~/.chia/testnet11/config/ssl/wallet/private_wallet.key \
     -d '{}' https://localhost:9256/get_wallets
   ```
+  > **Note**: Add `--insecure` only as a last resort for local troubleshooting. Never use it when connecting to a remote host.
 
 #### Milestone 1.2: Repository Structure
-Create the initial project structure:
+The repository uses a C++20 architecture. The current structure is:
 ```
 XOPTrader/
-├── xoptrader/
-│   ├── __init__.py
-│   ├── config.py           # Configuration management
-│   ├── wallet.py           # Chia wallet RPC client
-│   ├── dexie.py            # Dexie API client
-│   ├── tibetswap.py        # TibetSwap API client
-│   ├── oracle.py           # Price oracle
-│   ├── offers.py           # Offer lifecycle manager
-│   ├── inventory.py        # Inventory manager
-│   ├── strategy.py         # Strategy engine
-│   └── bot.py              # Main bot orchestrator
-├── tests/
-│   ├── test_wallet.py
-│   ├── test_dexie.py
-│   ├── test_oracle.py
-│   └── test_strategy.py
+├── cpp/
+│   ├── CMakeLists.txt
+│   ├── vcpkg.json                      # C++ dependencies
+│   ├── include/xop/
+│   │   ├── engine.hpp                  # Main per-block engine loop
+│   │   ├── config.hpp                  # YAML config validation
+│   │   ├── types.hpp                   # Shared types
+│   │   ├── state.hpp                   # Global bot state
+│   │   ├── database.hpp                # SQLite audit trail
+│   │   ├── backtest.hpp                # Backtesting framework
+│   │   ├── rpc/                        # Chia RPC + Dexie API clients
+│   │   ├── strategy/                   # A-S, GLFT, spread optimizer, regime
+│   │   ├── execution/                  # Offer manager, coin manager, market data
+│   │   ├── risk/                       # Inventory, limits, hedging
+│   │   ├── data/                       # Volatility (Yang-Zhang), adverse selection
+│   │   └── monitoring/                 # Metrics, PnL, alerts
+│   ├── src/                            # Corresponding .cpp implementations
+│   └── tests/                          # Unit tests (71 tests)
 ├── docs/
 │   ├── 01-chia-ecosystem-overview.md
 │   ├── 02-market-making-strategies.md
 │   ├── 03-technical-architecture.md
-│   └── 04-implementation-roadmap.md  (this file)
-├── config.example.toml     # Example configuration
-├── requirements.txt
-├── requirements-dev.txt
-├── Makefile
+│   └── 04-implementation-roadmap.md    (this file)
+├── config.example.yaml                 # Annotated example configuration
+├── CHIA_MARKET_MAKER_STRATEGY.md       # Full deep-research strategy document
 └── README.md
 ```
 
@@ -190,45 +191,21 @@ Implement and test the Dexie API client:
 **Test**: Insert and retrieve offers, verify state transitions.
 
 #### Milestone 2.3: Configuration System
-```toml
-# config.example.toml
-
-[general]
-network = "testnet11"        # "mainnet" or "testnet11"
-log_level = "INFO"
-dry_run = true               # Set to false for live trading
-
-[wallet]
-fingerprint = 0              # Set your wallet fingerprint
-rpc_host = "localhost"
-rpc_port = 9256
-
-[strategy]
-name = "basic_spread"        # Strategy to use
-base_spread_pct = 1.0        # Base spread percentage
-max_inventory_xch = 10.0     # Max XCH in play
-max_offer_count = 10         # Max concurrent offers
-offer_expiry_blocks = 100    # ~87 minutes
-
-[pairs]
-[[pairs.pair]]
-base = "XCH"
-quote = "USDS"
-quote_asset_id = "6d95dae356e32a71db5ddcb42224754a02524c615c5fc35f568c2af04774e589"
-lot_size_xch = 0.5           # XCH per offer
-enabled = true
-
-[price_sources]
-okx = true
-mexc = true
-tibetswap = true
-
-[alerts]
-telegram_bot_token = ""      # Optional: Telegram bot for alerts
-telegram_chat_id = ""
+The project uses YAML configuration. Copy the example and fill in your values:
+```bash
+cp config.example.yaml config.yaml
+# Edit config.yaml with your wallet fingerprint, SSL paths, trading pairs, etc.
 ```
 
-**Deliverable of Phase 1**: Bot can connect to Chia wallet, fetch prices, and read/write from database. `dry_run = true` mode shows what offers *would* be created without submitting them.
+Key sections in `config.yaml`:
+- `chia`: Full node + wallet RPC endpoints and SSL certificate paths
+- `pairs`: List of trading pairs to market-make (base/quote asset IDs, enabled flag)
+- `strategy`: Avellaneda-Stoikov/GLFT parameters (gamma, kappa, tier spreads)
+- `risk`: Inventory limits, Kelly fraction, per-pair capital caps
+- `volatility`: Yang-Zhang lookback window and weighting
+- `monitoring`: Prometheus port, Telegram bot token and chat ID for alerts
+
+Refer to `config.example.yaml` for all available options with inline annotations.
 
 ---
 

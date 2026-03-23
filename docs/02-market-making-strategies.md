@@ -28,7 +28,7 @@ A market maker provides liquidity to a market by simultaneously quoting buy (bid
 | Aspect | CEX Market Making | DEX (Chia Offers) Market Making |
 |--------|------------------|---------------------------------|
 | Order placement | API calls, near-instant | Create/submit offer files |
-| Order cancellation | API call (fast) | Let offer expire or cancel (on-chain cost is zero for offer files) |
+| Order cancellation | API call (fast) | Let offer expire/not repost (off-chain, no fee) or cancel via on-chain spend (may incur a blockchain fee) |
 | Partial fills | Common | Not supported (all-or-nothing) |
 | Price discovery | Real-time order book | Must query external price feeds |
 | Transparency | Order book visible | Offers visible on Dexie |
