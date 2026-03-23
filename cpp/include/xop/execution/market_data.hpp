@@ -56,6 +56,7 @@
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace xop {
@@ -141,6 +142,20 @@ struct MarketDataConfig {
 
     /// Staleness threshold.  Data older than this is flagged as stale.
     std::chrono::minutes stale_threshold{5};
+
+    /// Enable competitor detection and tracking from order book data.
+    /// When enabled, MarketDataFeed will parse individual offers and
+    /// compute best_competing_bps metrics.
+    bool enable_competitor_tracking{true};
+
+    /// Minimum offer size (in mojos) to be considered a competitor offer.
+    /// Filters out dust offers that aren't from serious market makers.
+    /// Default: 1 XCH = 1e12 mojos.
+    Mojo min_competitor_offer_size{1'000'000'000'000LL};
+
+    /// Alert threshold: if competing spread < this value (bps), fire an alert.
+    /// Indicates a serious competitor with tight spreads has appeared.
+    double competitor_alert_threshold_bps{50.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -256,6 +271,18 @@ public:
                       double             last_trade,
                       double             vol_24h);
 
+    /// Ingest individual offers from the dexie order book for competitor tracking.
+    /// This is called in addition to ingest_dexie() when competitor tracking
+    /// is enabled, and processes the full order book (not just best bid/ask).
+    ///
+    /// @param pair_name     Trading pair identifier.
+    /// @param competing_offers Vector of competing offers parsed from API response.
+    /// @param own_offer_ids Set of our own offer IDs to exclude from competitor analysis.
+    void ingest_competing_offers(
+        const std::string&                 pair_name,
+        const std::vector<CompetingOffer>& competing_offers,
+        const std::unordered_set<std::string>& own_offer_ids);
+
     /// Ingest the current block height from the Chia full node.
     ///
     /// @param block_height  Peak block height from get_blockchain_state().
@@ -306,7 +333,24 @@ public:
     /// Returns 0 if the pair is unknown.
     std::size_t price_history_size(const std::string& pair_name) const;
 
-    // -- Arbitrage signal access -------------------------------------------
+    // -- Competitor metrics access ------------------------------------------
+
+    /// Retrieve the latest competitor metrics for a pair.
+    /// Returns std::nullopt if competitor tracking is disabled or if no
+    /// competitors have been detected for this pair.
+    std::optional<CompetitorMetrics> get_competitor_metrics(
+        const std::string& pair_name) const;
+
+    /// Best competing spread (tightest non-own spread) in basis points.
+    /// This is the value fed into SpreadOptimizer::compute_spread() as
+    /// best_competing_bps.  Returns 0.0 if no competitors detected.
+    double get_best_competing_spread_bps(const std::string& pair_name) const;
+
+    /// Total number of competing offers (both sides) for a pair.
+    /// Returns 0 if competitor tracking is disabled or no competitors exist.
+    std::size_t get_num_competing_offers(const std::string& pair_name) const;
+
+    // -- Arbitrage signal access --------------------------------------------
 
     /// Retrieve the most recent arbitrage signal for a pair, if any.
     /// Returns std::nullopt if no signal has been emitted or if the pair
@@ -355,6 +399,12 @@ private:
                               BlockHeight         block,
                               double              price);
 
+    /// Compute CompetitorMetrics from the tracked competing offers for a pair.
+    /// Computes best spreads, depth counts, and detects new competitors.
+    /// Returns std::nullopt if competitor tracking is disabled.
+    std::optional<CompetitorMetrics> compute_competitor_metrics(
+        const std::string& pair_name);
+
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
     void publish_snapshot(const PairState& ps);
@@ -385,6 +435,14 @@ private:
     /// Per-pair latest arbitrage signal.  Guarded by mtx_arb_.
     mutable std::shared_mutex                          mtx_arb_;
     std::unordered_map<std::string, ArbitrageSignal>   latest_arb_;
+
+    /// Per-pair competing offers tracked from order book.  Guarded by mtx_competitors_.
+    mutable std::shared_mutex                          mtx_competitors_;
+    std::unordered_map<std::string, std::vector<CompetingOffer>> competing_offers_;
+
+    /// Per-pair latest competitor metrics.  Guarded by mtx_competitor_metrics_.
+    mutable std::shared_mutex                          mtx_competitor_metrics_;
+    std::unordered_map<std::string, CompetitorMetrics> competitor_metrics_;
 
     /// Latest block height from the full node.  Atomic for lock-free reads.
     std::atomic<BlockHeight> block_height_{0};

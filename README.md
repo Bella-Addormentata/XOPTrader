@@ -657,6 +657,70 @@ Key sections to configure before first run:
 
 ---
 
+## Competitor Detection and Response
+
+XOPTrader includes comprehensive competitor detection capabilities to adapt when other market makers appear on CHIA DEX exchanges.
+
+### System Architecture
+
+**New Types** (`types.hpp`):
+- `CompetingOffer` — Individual offers from other market participants
+- `CompetitorMetrics` — Aggregated statistics per trading pair
+
+**MarketDataFeed Extensions** (`market_data.hpp/cpp`):
+- `ingest_competing_offers()` — Parse individual offers from order book
+- `compute_competitor_metrics()` — Analyze competing spreads and depth
+- `get_best_competing_spread_bps()` — Feed into spread optimizer
+
+**Key Features:**
+- **Own-offer filtering**: Excludes our offers via offer ID matching
+- **Dust filtering**: Ignores offers below minimum size (1 XCH default)
+- **Best spread tracking**: Computes tightest competing two-sided spread
+- **Alert system**: Logs warnings when tight competitors detected
+- **Spread floor protection**: Never goes below profitable minimum (40 bps)
+
+### Strategic Response
+
+When competitors appear, the spread optimizer automatically adapts via the competition component:
+
+```
+s_competition = max(s_floor_bps, best_competing_bps + epsilon_bps)
+```
+
+**Behavior:**
+- **No competitors**: Falls back to 40 bps floor
+- **Wide competitors** (200 bps): We maintain tight spreads (202 bps)
+- **Tight competitors** (45 bps): We improve by epsilon (47 bps)
+- **Extremely tight**: Floor protection prevents race-to-zero (40 bps minimum)
+
+**Configuration** (`config.yaml`):
+```yaml
+market_data:
+  enable_competitor_tracking: true
+  min_competitor_offer_size: 1000000000000  # 1 XCH in mojos
+  competitor_alert_threshold_bps: 50.0
+
+spread_optimizer:
+  s_floor_bps: 40.0       # Minimum profitable spread
+  epsilon_bps: 2.0        # Price improvement over competitor
+```
+
+### Implementation Status
+
+| Component | Status |
+|-----------|--------|
+| Infrastructure (types, MarketDataFeed) | ✅ Complete |
+| Competitor detection logic | ✅ Complete |
+| Unit tests (10 test cases) | ✅ Complete |
+| Documentation | ✅ Complete |
+| Engine integration | ⚠️ Requires implementation |
+| Prometheus metrics | ⚠️ Recommended |
+| Telegram alerts | ⚠️ Recommended |
+
+**For full implementation details**, see [`docs/competitor-detection.md`](docs/competitor-detection.md).
+
+---
+
 ## Development
 
 ### Running Tests
@@ -669,12 +733,13 @@ ctest --output-on-failure
 ./xop_tests
 ```
 
-71 unit tests covering:
+81 unit tests covering:
 - **Avellaneda-Stoikov math** (14 tests) — reservation price, half-spread, tau rollover, fill intensity, GLFT skew
 - **Spread optimizer** (19 tests) — all 4 components, regime multipliers, Thompson sampling convergence
 - **Inventory/risk** (19 tests) — cost basis arithmetic, sell-at-loss rejection, Kelly sizing, limit thresholds
 - **Volatility** (9 tests) — Yang-Zhang on synthetic data, annualization roundtrip, VR regime classification
 - **Regime detection** (10 tests) — synthetic OU/trending processes, hysteresis, Z-significance
+- **Competitor detection** (10 tests) — offer filtering, spread calculation, depth counts, new competitor alerts
 
 ### Code Quality
 
@@ -706,7 +771,8 @@ The codebase follows:
 - [x] SQLite audit trail
 - [x] Prometheus metrics
 - [x] Backtesting framework
-- [x] 71 unit tests
+- [x] Competitor detection infrastructure
+- [x] 81 unit tests
 
 ### Phase 2: Live Deployment
 - [ ] Deploy with minimal capital ($1K) on mainnet
