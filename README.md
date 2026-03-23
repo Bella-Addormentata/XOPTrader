@@ -753,11 +753,30 @@ This is a **greenfield opportunity** — no professional market makers exist on 
 
 ## Research Documentation
 
-In-depth research and planning documents covering the ecosystem, strategies, architecture options, and implementation roadmap:
+In-depth research and planning documents covering the ecosystem, strategies, architecture options, and implementation roadmap. See [docs/README.md](docs/README.md) for the full documentation index.
+
+### Architecture & Implementation Reference (this PR)
 
 | Document | Description |
 |----------|-------------|
 | [docs/01-chia-ecosystem-overview.md](docs/01-chia-ecosystem-overview.md) | Chia fundamentals, Chialisp, CATs, Offers protocol, DEX landscape (Dexie, TibetSwap), market opportunities and risks |
 | [docs/02-market-making-strategies.md](docs/02-market-making-strategies.md) | Strategy options: basic spread, grid trading, Avellaneda-Stoikov model, AMM LP, arbitrage; pricing, inventory, and risk management |
 | [docs/03-technical-architecture.md](docs/03-technical-architecture.md) | System design, component breakdown, technology stack options, Chia wallet RPC integration, deployment, and security |
-| [docs/04-implementation-roadmap.md](docs/04-implementation-roadmap.md) | Phased build plan, prerequisites, capital requirements, testing strategy, and launch checklist |
+| [docs/04-implementation-roadmap.md](docs/04-implementation-roadmap.md) | Phased build plan aligned to C++20 layout, capital requirements, testing strategy, and launch checklist |
+
+### Comprehensive Research Series (from PR #3)
+
+| Document | Description |
+|----------|-------------|
+| [docs/01-chia-market-maker-overview.md](docs/01-chia-market-maker-overview.md) | Chia introduction, offer system, market making fundamentals, and strategic considerations |
+| [docs/02-dex-platforms-analysis.md](docs/02-dex-platforms-analysis.md) | Detailed analysis of TibetSwap, Dexie, OfferBin, and platform selection guide |
+| [docs/03-market-making-strategies.md](docs/03-market-making-strategies.md) | Nine market making strategies from beginner ($100) to professional ($100K+) capital levels |
+| [docs/04-technical-implementation.md](docs/04-technical-implementation.md) | Step-by-step Python bot implementation with code examples, wallet RPC, and deployment |
+| [docs/05-risk-management-operations.md](docs/05-risk-management-operations.md) | Comprehensive risk management framework, circuit breakers, and operational procedures |
+| [docs/06-implementation-roadmap.md](docs/06-implementation-roadmap.md) | Phased roadmap from beginner to professional market maker across 6 capital phases |
+
+### Concise Research Brief (from PR #4)
+
+| Document | Description |
+|----------|-------------|
+| [docs/chia-market-maker.md](docs/chia-market-maker.md) | Concise research brief: DEX landscape, four market-making models, risk controls, architecture playbook |
