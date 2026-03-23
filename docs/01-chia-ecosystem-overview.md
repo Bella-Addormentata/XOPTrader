@@ -28,7 +28,7 @@ Chia uses a novel consensus mechanism called **Proof of Space and Time (PoST)**,
 - **Pre-farm**: 21 million XCH pre-farmed at genesis
 - **All-time High**: ~$1,934 (May 2021)
 - **2024 Range**: ~$21 – $60 USD
-- **2025 Estimates**: $3 – $8 USD range (per multiple analyst forecasts)
+- **Current Price** (as of March 2026): ~$2.70 – $2.88 USD (see [CoinGecko](https://www.coingecko.com/en/coins/chia) or [CoinMarketCap](https://coinmarketcap.com/currencies/chia-network/) for live data)
 
 ### Coinset Model vs. Account Model
 Unlike Ethereum's account-based model, Chia uses a **coinset (UTXO-like) model**:
@@ -195,9 +195,8 @@ WSS    /v1/stream          - Real-time offer stream
 | Platform | Type | Description |
 |----------|------|-------------|
 | SpaceScan | Explorer | Blockchain explorer with offer visibility |
-| HashGreen | DEX | P2P offer exchange (less active) |
+| Hashgreen | DEX / AMM | P2P offer exchange and early AMM (less active) |
 | MintGarden | NFT DEX | NFT-focused marketplace using offers |
-| Hashgreen | AMM | Early Chia AMM (less adopted) |
 
 ---
 

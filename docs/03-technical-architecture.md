@@ -147,10 +147,12 @@ class OfferManager:
 
     async def create_offer(self, params: OfferParams) -> Offer:
         """Create an offer via Chia wallet RPC."""
+        # create_offer_for_ids keys are wallet IDs (int), not asset IDs (str).
+        # Use wallet_id=1 for XCH; for CATs, look up the wallet ID from the wallet list.
         result = await self.wallet_rpc.create_offer_for_ids({
             "offer": {
-                params.offered_asset_id: -params.offered_amount,
-                params.requested_asset_id: params.requested_amount,
+                params.offered_wallet_id: -params.offered_amount,
+                params.requested_wallet_id: params.requested_amount,
             },
             "fee": params.blockchain_fee,
             "max_height": params.expiry_block_height,
@@ -202,16 +204,18 @@ class InventoryManager:
 
     async def get_inventory(self, pair: TradingPair) -> Inventory:
         """Get current inventory for a trading pair."""
-        base_coins = await self.wallet_rpc.get_spendable_coins(pair.base_asset_id)
-        quote_coins = await self.wallet_rpc.get_spendable_coins(pair.quote_asset_id)
+        # get_spendable_coins takes a wallet_id (int), not an asset_id (str).
+        # Use pair.base_wallet_id / pair.quote_wallet_id resolved via get_wallet_id_for_asset().
+        base_coins = await self.wallet_rpc.get_spendable_coins(pair.base_wallet_id)
+        quote_coins = await self.wallet_rpc.get_spendable_coins(pair.quote_wallet_id)
         locked = await self.get_locked_coins()  # Coins in open offers
         
         available_base = sum(c.amount for c in base_coins if c.name not in locked)
         available_quote = sum(c.amount for c in quote_coins if c.name not in locked)
         
         return Inventory(
-            base_asset=pair.base_asset_id,
-            quote_asset=pair.quote_asset_id,
+            base_asset=pair.base_wallet_id,
+            quote_asset=pair.quote_wallet_id,
             base_amount=available_base,
             quote_amount=available_quote,
         )
@@ -373,12 +377,14 @@ chia wallet show
 # Find wallet RPC certificate paths
 ls ~/.chia/mainnet/config/ssl/wallet/
 
-# Test RPC connection
-curl --insecure --cert ~/.chia/mainnet/config/ssl/wallet/private_wallet.crt \
+# Test RPC connection (using Chia's CA cert for proper TLS verification)
+curl --cacert ~/.chia/mainnet/config/ssl/ca/chia_ca.crt \
+     --cert ~/.chia/mainnet/config/ssl/wallet/private_wallet.crt \
      --key ~/.chia/mainnet/config/ssl/wallet/private_wallet.key \
      -H "Content-Type: application/json" \
      -d '{}' \
      https://localhost:9256/get_wallets
+# Note: add --insecure only as a last resort for local debugging, never against remote hosts.
 ```
 
 ### Asset ID Management
