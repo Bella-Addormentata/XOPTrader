@@ -126,6 +126,38 @@ struct PendingOffer {
     Timestamp    created_at_ts;    // wall-clock creation time
 };
 
+// ---------------------------------------------------------------------------
+// CompetingOffer -- an offer on the order book from another market participant.
+//                   Tracked to compute best_competing_bps for spread optimizer.
+// ---------------------------------------------------------------------------
+
+struct CompetingOffer {
+    std::string  offer_id;         // unique offer identifier (from dexie API)
+    std::string  pair_name;        // trading pair
+    Side         side;             // bid or ask
+    Mojo         price;            // offer price (mojos)
+    Mojo         size;             // offered quantity (mojos)
+    BlockHeight  first_seen_block; // block at which we first observed this offer
+    BlockHeight  last_seen_block;  // most recent block where offer was present
+    Timestamp    last_seen_ts;     // wall-clock time of last observation
+};
+
+// ---------------------------------------------------------------------------
+// CompetitorMetrics -- aggregated statistics about competing market makers.
+// ---------------------------------------------------------------------------
+
+struct CompetitorMetrics {
+    std::string  pair_name;              // trading pair
+    std::size_t  num_competing_offers;   // total count of non-own offers
+    double       best_competing_bid_bps; // best competing bid spread vs mid (bps)
+    double       best_competing_ask_bps; // best competing ask spread vs mid (bps)
+    double       best_competing_spread_bps; // tightest competing spread (bps)
+    std::size_t  competing_depth_bids;   // number of competing bid offers
+    std::size_t  competing_depth_asks;   // number of competing ask offers
+    bool         new_competitor_detected; // true if first competitor seen this block
+    Timestamp    last_updated;           // wall-clock time of last metric update
+};
+
 }  // namespace xop
 
 #endif  // XOP_TYPES_HPP
