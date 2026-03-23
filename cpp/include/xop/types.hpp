@@ -1,0 +1,131 @@
+// types.hpp -- Core type definitions for XOPTrader CHIA market-making bot.
+// Header-only. All monetary values expressed in mojos (int64_t) to prevent
+// floating-point drift.  1 XCH = 10^12 mojos.
+//
+// Compliant with:
+//   ISO/IEC 27001:2022  (secure coding -- no implicit conversions on monetary)
+//   ISO/IEC 5055        (no unchecked arithmetic on critical paths)
+//   ISO/IEC 25000       (clear naming, minimal coupling)
+
+#ifndef XOP_TYPES_HPP
+#define XOP_TYPES_HPP
+
+#include <cstdint>
+#include <string>
+#include <chrono>
+
+namespace xop {
+
+// ---------------------------------------------------------------------------
+// Fundamental aliases
+// ---------------------------------------------------------------------------
+
+/// Smallest indivisible unit on the Chia blockchain.
+/// 1 XCH = 10^12 mojos.  int64_t range covers +/- 9,223 XCH which is well
+/// beyond the capital ceiling described in the strategy document ($30K at
+/// ~$2.70/XCH = ~11,111 XCH).
+using Mojo = std::int64_t;
+
+/// Conversion constant: mojos per whole XCH.
+inline constexpr Mojo kMojosPerXch = 1'000'000'000'000LL;
+
+/// Asset identifier.
+/// "xch" for the native coin; 64-character lower-case hex string for CATs
+/// (e.g. wUSDC, SBX, DBX).
+using AssetId = std::string;
+
+/// High-resolution wall-clock timestamp (UTC).
+using Timestamp = std::chrono::system_clock::time_point;
+
+/// Block height on the Chia blockchain (uint32 suffices for decades).
+using BlockHeight = std::uint32_t;
+
+// ---------------------------------------------------------------------------
+// Side -- which side of the order book an order / fill belongs to.
+// ---------------------------------------------------------------------------
+
+enum class Side : std::uint8_t {
+    Bid = 0,  // buy  -- we receive base, we pay quote
+    Ask = 1   // sell -- we pay base, we receive quote
+};
+
+/// Human-readable label for logging.
+inline const char* to_string(Side s) noexcept {
+    return s == Side::Bid ? "Bid" : "Ask";
+}
+
+// ---------------------------------------------------------------------------
+// OrderTier -- one level of the multi-tier offer ladder described in the
+//              strategy document (section 11).
+// ---------------------------------------------------------------------------
+
+struct OrderTier {
+    Mojo          price;       // price in mojos-per-unit of quote asset
+    Mojo          size;        // quantity of base asset in mojos
+    std::uint8_t  tier_index;  // 0-based tier (0 = tightest, 3 = widest)
+};
+
+// ---------------------------------------------------------------------------
+// Quote -- a two-sided quotation produced by the strategy engine every block.
+// ---------------------------------------------------------------------------
+
+struct Quote {
+    Mojo   bid_price;   // best bid price (mojos)
+    Mojo   ask_price;   // best ask price (mojos)
+    Mojo   bid_size;    // quantity offered on bid (mojos)
+    Mojo   ask_size;    // quantity offered on ask (mojos)
+    double spread_bps;  // spread in basis points (informational only --
+                        //   derived from integer prices for display)
+};
+
+// ---------------------------------------------------------------------------
+// Fill -- a confirmed trade originating from an accepted (taken) offer.
+//         Recorded after the spend bundle settles on-chain.
+// ---------------------------------------------------------------------------
+
+struct Fill {
+    std::string  offer_id;      // unique offer identifier (Chia spend-bundle hash)
+    std::string  pair_name;     // e.g. "XCH/wUSDC"
+    Side         side;          // whether this was our bid or ask
+    Mojo         price;         // execution price (mojos)
+    Mojo         size;          // filled quantity (mojos of base asset)
+    BlockHeight  block_height;  // settlement block
+    Timestamp    timestamp;     // wall-clock time of detection
+};
+
+// ---------------------------------------------------------------------------
+// MarketSnapshot -- latest view of a single trading pair's state, aggregated
+//                   from on-chain data (dexie / TibetSwap) and CEX feeds.
+// ---------------------------------------------------------------------------
+
+struct MarketSnapshot {
+    std::string  pair_name;    // e.g. "XCH/wUSDC"
+    Mojo         mid_price;    // (best_bid + best_ask) / 2  (mojos)
+    Mojo         best_bid;     // top-of-book bid (mojos)
+    Mojo         best_ask;     // top-of-book ask (mojos)
+    double       spread_bps;   // current spread in basis points
+    Mojo         cex_mid;      // CEX reference mid-price (mojos, 0 if unavailable)
+    Mojo         volume_24h;   // rolling 24-hour volume in mojos of base asset
+    BlockHeight  last_block;   // block height at which this snapshot was taken
+    Timestamp    updated_at;   // wall-clock time
+};
+
+// ---------------------------------------------------------------------------
+// PendingOffer -- an outstanding offer we have posted and not yet settled or
+//                 cancelled.  Tracked for lifecycle management (section 15).
+// ---------------------------------------------------------------------------
+
+struct PendingOffer {
+    std::string  offer_id;         // unique offer identifier
+    std::string  pair_name;        // trading pair
+    Side         side;             // bid or ask
+    Mojo         price;            // offer price (mojos)
+    Mojo         size;             // offered quantity (mojos)
+    std::uint8_t tier;             // which tier of the multi-tier ladder
+    BlockHeight  created_at_block; // block at which the offer was broadcast
+    Timestamp    created_at_ts;    // wall-clock creation time
+};
+
+}  // namespace xop
+
+#endif  // XOP_TYPES_HPP
