@@ -150,7 +150,7 @@ These supplementary documents cover the C++20 engine architecture and system des
 | [competitor-detection.md](./competitor-detection.md) | Competitor-offer tracking, best-spread computation, adaptive spread response |
 | [whale-trader-response.md](./whale-trader-response.md) | Whale-trade detection, adverse-selection risks, spread-widening guard, configuration reference |
 | [advanced-trading-methods.md](./advanced-trading-methods.md) | VPIN flow-toxicity estimation, OFI order-flow imbalance, asymmetric spread widening — scholarly references |
-| [trading-strategies.md](./trading-strategies.md) | Complete strategy catalog: 12 implemented, 5 considered, 15 future strategies — pros/cons, scholarly references, TODO list |
+| [trading-strategies.md](./trading-strategies.md) | Complete strategy catalog: 12 implemented, 5 considered, 21 future strategies — pros/cons, scholarly references, implementation priority ranking, Chia-specific advantages, and guidance on deliberate loss-taking and inventory balance |
 
 ---
 
