@@ -112,11 +112,13 @@ new mid — they get filled immediately at a loss.
 filled, the price falls further, then other market makers' bids get hit, driving
 the price down further still.
 
-**Mitigation**: The `whale_max_spread_multiplier = 3.0` default means that even
-a single large whale event raises our spread to 3× normal (e.g. 120 bps instead
-of 40 bps), making it extremely expensive for a cascading seller to continue
-filling our bids.  Combined with inventory skew from the GLFT/Avellaneda
-strategies, this significantly reduces tail-loss exposure.
+**Mitigation**: The `whale_max_spread_multiplier = 3.0` default means that when
+the whale window fills up, our spread reaches 3× normal (e.g. 120 bps instead
+of 40 bps).  A **single** event only widens spreads to 1.2× (48 bps), but the
+multiplier climbs linearly as events accumulate in the window, making it
+progressively expensive for a cascading seller to continue filling our bids.
+Combined with inventory skew from the GLFT/Avellaneda strategies, this
+significantly reduces tail-loss exposure.
 
 ---
 
@@ -128,8 +130,8 @@ trigger the guard unnecessarily, reducing profitability.
 
 **Mitigation**: The linear interpolation formula (`spread_multiplier = 1.0 +
 fraction × (max − 1.0)`) means that a **single** whale event at `whale_window_blocks =
-10` only produces a multiplier of 1.1 (10 % widening), not the full 3×.  Three
-events over 10 blocks give 1.3×.  Only a sustained barrage of whale trades
+10` only produces a multiplier of 1.2 (20 % widening), not the full 3×.  Three
+events over 10 blocks give 1.6×.  Only a sustained barrage of whale trades
 within the window maxes out the guard.  Operators can tune `whale_trade_threshold`
 upward on liquid pairs to reduce false positives.
 
@@ -191,14 +193,27 @@ for operators who wish to build on it.
 
 ## Configuration Reference
 
-All parameters live in `MarketDataConfig` (in `cpp/include/xop/execution/market_data.hpp`):
+These parameters are defined as defaults on `MarketDataConfig` (in
+`cpp/include/xop/execution/market_data.hpp`) and are **not yet exposed in
+`config.example.yaml`**.  Operators who want to change them today must do so at
+construction time (by populating a `MarketDataConfig` before handing it to
+`MarketDataFeed`) or at runtime via the provided setter methods:
 
-```yaml
-# config.example.yaml
-whale_trade_threshold:      50000000000000  # 50 XCH in mojos (50 * 10^12)
-whale_volume_fraction:      0.05            # 5 % of 24-hour volume
-whale_window_blocks:        10              # ~520 s at 52 s/block
-whale_max_spread_multiplier: 3.0            # 3× spread at maximum activity
+```cpp
+// Construction-time (set before creating MarketDataFeed)
+MarketDataConfig cfg;
+cfg.whale_trade_threshold      = 100LL * kMojosPerXch; // 100 XCH
+cfg.whale_volume_fraction      = 0.03;                 // 3 %
+cfg.whale_window_blocks        = 20;                   // ~17 min
+cfg.whale_max_spread_multiplier = 4.0;                 // 4× at full window
+
+auto feed = MarketDataFeed(cfg, state);
+
+// Runtime (after construction, e.g. from operator console)
+feed.set_whale_trade_threshold(100LL * kMojosPerXch);
+feed.set_whale_volume_fraction(0.03);
+feed.set_whale_window_blocks(20);
+feed.set_whale_max_spread_multiplier(4.0);
 ```
 
 | Parameter | Type | Default | Description |

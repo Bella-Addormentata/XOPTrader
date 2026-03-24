@@ -426,6 +426,24 @@ public:
     /// Replace the arbitrage callback (e.g. when strategy layer reconnects).
     void set_arb_callback(ArbitrageCallback cb);
 
+    // -- Whale configuration setters (runtime-tunable) ----------------------
+
+    /// Update the absolute whale-trade size threshold.
+    /// @param threshold  Minimum trade size in mojos; must be > 0.
+    void set_whale_trade_threshold(Mojo threshold);
+
+    /// Update the volume-fraction whale threshold.
+    /// @param fraction  Minimum fraction of 24h volume (0 < fraction <= 1).
+    void set_whale_volume_fraction(double fraction);
+
+    /// Update the rolling window length.
+    /// @param blocks  Window size in blocks; must be >= 1.
+    void set_whale_window_blocks(std::size_t blocks);
+
+    /// Update the maximum spread multiplier.
+    /// @param multiplier  Must be >= 1.0.
+    void set_whale_max_spread_multiplier(double multiplier);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
