@@ -190,6 +190,15 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     drift_analyzer_ = std::make_unique<InventoryDriftAnalyzer>(
         DriftConfig{});
 
+    // -- Pair config lookup map -----------------------------------------------
+    // Build the O(1) pair_config_map_ from config_.pairs so that every step
+    // can resolve a pair name to its PairConfig without a linear scan.
+    // ISO/IEC 5055: pointers remain valid because config_ is an immutable
+    // value member and its pairs vector is never reallocated after construction.
+    for (const auto& pc : config_.pairs) {
+        pair_config_map_[pc.name] = &pc;
+    }
+
     state_->set_status(BotStatus::Initializing);
 
     spdlog::info("[Engine] All subsystems initialized successfully");
@@ -528,9 +537,9 @@ void Engine::step_update_market_state(BlockHeight block_height)
                 co.offer_id         = orec.id;
                 co.pair_name        = pair.name;
                 // Determine side from the offered/requested arrays:
-                // if offered contains the base asset, this is an ask.
+                // if offered contains the pair's base asset, this is an ask.
                 co.side             = (!orec.offered.empty() &&
-                                       orec.offered[0].id == "xch")
+                                       orec.offered[0].id == pair.base_asset_id)
                                       ? Side::Ask : Side::Bid;
                 co.price            = static_cast<Mojo>(
                     orec.price * static_cast<double>(kMojosPerXch));
@@ -602,23 +611,19 @@ void Engine::step_process_fills(BlockHeight block_height)
         tr.fee_mojos       = 0;  // Fee extraction from wallet response (Phase 2).
         tr.block_height    = fill.block_height;
 
-        // Issue 8 fix: look up the pair config to obtain the correct quote
-        // asset ID for bid fills (previously passed empty string, yielding
-        // a zeroed default record).
+        // Look up pair config for this fill's pair (O(1) map lookup).
         // ISO/IEC 5055: validated lookup before use.
-        const PairConfig* fill_pair_cfg = nullptr;
-        for (const auto& pc : config_.pairs) {
-            if (pc.name == fill.pair_name) { fill_pair_cfg = &pc; break; }
-        }
+        const PairConfig* fill_pair_cfg = find_pair_config(fill.pair_name);
 
         // Retrieve cost basis from the inventory tracker for PnL calculation.
-        // For asks (sells), use the base asset ("xch"); for bids (buys),
-        // use the actual quote asset from the pair configuration.
+        // For asks (sells), use the pair's base asset; for bids (buys),
+        // use the pair's quote asset.
         auto asset_rec = inventory_->get_record(
             (fill.side == Side::Ask)
-                ? AssetId{"xch"}
+                ? AssetId{fill_pair_cfg ? fill_pair_cfg->base_asset_id
+                                        : std::string{}}
                 : AssetId{fill_pair_cfg ? fill_pair_cfg->quote_asset_id
-                                        : std::string{"xch"}});
+                                        : std::string{}});
         tr.cost_basis_mojos   = asset_rec.weighted_avg_cost_basis;
         tr.realized_pnl_mojos = (fill.side == Side::Ask)
             ? (fill.price - asset_rec.weighted_avg_cost_basis) * fill.size
@@ -629,13 +634,15 @@ void Engine::step_process_fills(BlockHeight block_height)
         // Record the offer as filled in the offer log.
         db_->update_offer_status(fill.offer_id, "filled", fill.block_height);
 
-        // Update the inventory tracker.
+        // Update the inventory tracker using the pair's actual base asset.
         auto now = std::chrono::system_clock::now();
+        const std::string& fill_base =
+            fill_pair_cfg ? fill_pair_cfg->base_asset_id : fill.pair_name;
         if (fill.side == Side::Bid) {
-            inventory_->record_buy("xch", fill.size, fill.price,
+            inventory_->record_buy(fill_base, fill.size, fill.price,
                                    fill.block_height, now);
         } else {
-            inventory_->record_sell("xch", fill.size, fill.price,
+            inventory_->record_sell(fill_base, fill.size, fill.price,
                                     fill.block_height, now);
         }
 
@@ -716,8 +723,24 @@ void Engine::step_update_analytics(BlockHeight block_height)
 void Engine::step_compute_quotes(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
+        // -- Staleness gate: suppress quoting when market data is stale ------
+        // If the market data feed has not received a fresh update within the
+        // staleness threshold (5 minutes), skip quote generation for this
+        // pair.  Quoting on stale prices risks adverse selection against us.
+        // ISO/IEC 5055: defensive gate prevents acting on unreliable data.
+        if (market_data_->is_stale(pair_name)) {
+            spdlog::warn("[Engine] Step 4: {} market data is stale -- "
+                         "skipping quote generation", pair_name);
+            pcs.quote_valid = false;
+            continue;
+        }
+
         double mid = market_data_->get_mid_price(pair_name);
         if (mid <= 0.0) continue;
+
+        // Resolve pair config for this pair (O(1) map lookup).
+        const PairConfig* pair_cfg = find_pair_config(pair_name);
+        if (!pair_cfg) continue;
 
         // Look up the volatility estimate for this pair.
         double sigma = 0.0;
@@ -726,12 +749,12 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             sigma = vol_it->second->get_sigma_annual();
         }
 
-        // Compute inventory (signed net position in base asset).
+        // Compute inventory (signed net position in the pair's base asset).
         double q = static_cast<double>(
-            inventory_->net_inventory(AssetId{"xch"}));
+            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}));
 
         // Set cost basis on the strategy for the never-sell-at-loss constraint.
-        auto rec = inventory_->get_record(AssetId{"xch"});
+        auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
         double cost_basis = static_cast<double>(rec.weighted_avg_cost_basis);
         strategy_->set_cost_basis(
             cost_basis, config_.strategy.min_profit_margin_bps);
@@ -764,14 +787,19 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         double mid = market_data_->get_mid_price(pair_name);
         if (mid <= 0.0) continue;
 
+        // Resolve pair config once per iteration (O(1) map lookup).
+        const PairConfig* pair_cfg = find_pair_config(pair_name);
+        if (!pair_cfg) continue;
+
         double sigma = 0.0;
         auto vol_it = vol_estimators_.find(pair_name);
         if (vol_it != vol_estimators_.end() && vol_it->second->is_ready()) {
             sigma = vol_it->second->get_sigma_annual();
         }
 
-        // Inventory for spread sizing.
-        double q = static_cast<double>(inventory_->net_inventory(AssetId{"xch"}));
+        // Inventory for spread sizing -- use the pair's actual base asset.
+        double q = static_cast<double>(
+            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}));
         double q_max = config_.strategy.q_max;
 
         // PIN estimate.
@@ -840,8 +868,18 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         if (order_book_tactician_) {
             BookState book_state;
             book_state.mid_price = market_data_->get_mid_price(pair_name);
-            book_state.best_bid = 0.0;  // Populated from market data
-            book_state.best_ask = 0.0;
+
+            // Populate best_bid / best_ask from the market data feed's
+            // dexie order book.  The spread in bps divided by 20000 gives
+            // the half-spread as a fraction of mid, producing synthetic
+            // best-bid/ask that reflect the actual top-of-book levels.
+            // ISO/IEC 5055: verified non-zero mid before division.
+            {
+                const double feed_spread_bps = market_data_->get_spread_bps(pair_name);
+                const double half_frac = feed_spread_bps / 20000.0;
+                book_state.best_bid = book_state.mid_price * (1.0 - half_frac);
+                book_state.best_ask = book_state.mid_price * (1.0 + half_frac);
+            }
             book_state.our_spread_bps = pcs.spread_result.total_spread_bps;
             book_state.best_competing_bps = market_data_->get_best_competing_spread_bps(pair_name);
             auto comp_metrics = market_data_->get_competitor_metrics(pair_name);
@@ -850,13 +888,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             book_state.vpin = market_data_->get_vpin(pair_name);
             book_state.normalized_ofi = market_data_->get_normalized_ofi(pair_name);
 
-            // Use the 3-arg inventory_ratio with the first enabled pair's asset IDs
+            // Use the 3-arg inventory_ratio with this pair's asset IDs
             // and current mid-price as the ratio reference.
+            // pair_cfg was resolved at the top of this loop iteration.
             Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
-            const PairConfig* pair_cfg = nullptr;
-            for (const auto& pc : config_.pairs) {
-                if (pc.name == pair_name) { pair_cfg = &pc; break; }
-            }
             book_state.inventory_ratio = pair_cfg
                 ? std::abs(inventory_->inventory_ratio(
                       AssetId{pair_cfg->base_asset_id},
@@ -886,18 +921,26 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 void Engine::step_apply_risk_limits(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
-        // Find the pair config for base/quote asset IDs.
-        const PairConfig* pair_cfg = nullptr;
-        for (const auto& pc : config_.pairs) {
-            if (pc.name == pair_name) { pair_cfg = &pc; break; }
-        }
+        // Find the pair config for base/quote asset IDs (O(1) map lookup).
+        const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
 
-        // Build a Quote from the strategy output, applying the spread
-        // optimizer's half-spread to the mid.  Asymmetric multipliers from
-        // whale detection (§1.11) decompose the spread into per-side widths
-        // so the informed side absorbs more of the widening.
+        // Build a Quote from the strategy output.  The strategy's raw
+        // bid_price and ask_price already include the A-S reservation
+        // price skew (r = S - q * gamma * sigma^2 * tau), which shifts
+        // the quote center away from the market mid to incentivise
+        // inventory rebalancing.  Using the raw market mid here would
+        // discard that skew and produce symmetric quotes regardless of
+        // inventory, defeating the A-S / GLFT models.
+        //
+        // We use the strategy's reservation mid (midpoint of the raw
+        // quote) as the center and apply the spread optimizer's
+        // half-spread around it.  The asymmetric multipliers from whale
+        // detection further decompose the spread per-side.
+        // ISO/IEC 25000: preserves the mathematical intent of the strategy.
         double mid = market_data_->get_mid_price(pair_name);
+        double reservation_mid = (pcs.raw_quote.bid_price
+                                + pcs.raw_quote.ask_price) / 2.0;
         double half_spread = pcs.spread_result.half_spread / 10000.0 * mid;
 
         // Apply per-side asymmetric widening from whale/OFI analysis.
@@ -907,9 +950,9 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 
         Quote quote;
         quote.bid_price  = static_cast<Mojo>(
-            (mid - bid_half) * static_cast<double>(kMojosPerXch));
+            (reservation_mid - bid_half) * static_cast<double>(kMojosPerXch));
         quote.ask_price  = static_cast<Mojo>(
-            (mid + ask_half) * static_cast<double>(kMojosPerXch));
+            (reservation_mid + ask_half) * static_cast<double>(kMojosPerXch));
         quote.bid_size   = static_cast<Mojo>(
             pcs.raw_quote.bid_size * static_cast<double>(kMojosPerXch));
         quote.ask_size   = static_cast<Mojo>(
@@ -917,22 +960,78 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         quote.spread_bps = pcs.spread_result.total_spread_bps;
 
         // Enforce never-sell-at-loss on the ask price.
-        auto rec = inventory_->get_record(AssetId{"xch"});
+        // Use the pair's base asset (not hardcoded "xch") for cost-basis lookup.
+        auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
         quote = pre_trade_->enforce_no_loss(
             quote, rec.weighted_avg_cost_basis, /*enable=*/true);
 
         // -- Consult strategic loss manager for rebalancing decisions ------
+        // The loss manager evaluates whether taking a deliberate loss to
+        // rebalance inventory is rational given current market conditions.
+        // It is disabled by default (enabled=false) so this block is a
+        // no-op unless the operator explicitly enables strategic loss
+        // analysis.  The never-sell-at-loss constraint is always the
+        // default; this pathway may relax it only when all five EV
+        // scenarios indicate that rebalancing yields positive expected
+        // value.
+        // ISO/IEC 27001:2022: advisory-only; no secrets; audit-logged.
         if (loss_manager_ && loss_manager_->config().enabled) {
-            // Only consult if inventory is significantly imbalanced
             Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
             double inv_ratio = std::abs(inventory_->inventory_ratio(
                 AssetId{pair_cfg->base_asset_id},
                 AssetId{pair_cfg->quote_asset_id},
                 mid_mojos));
+
+            // Only consult the loss manager when inventory is significantly
+            // imbalanced (> 60% one-sided).  Below that threshold the
+            // normal skew mechanism suffices.
             if (inv_ratio > 0.60) {
-                // Loss manager may recommend accepting a loss for rebalancing
-                spdlog::debug("[step6] {} inv_ratio={:.2f} — consulting loss manager",
-                    pair_name, inv_ratio);
+                // Build the price map for the loss manager.
+                std::unordered_map<AssetId, Mojo> price_map;
+                price_map[pair_cfg->base_asset_id] = mid_mojos;
+
+                // Build market parameters from live analytics.
+                MarketParams mkt_params{};
+                {
+                    auto vol_it = vol_estimators_.find(pair_name);
+                    mkt_params.sigma = (vol_it != vol_estimators_.end()
+                                        && vol_it->second->is_ready())
+                        ? vol_it->second->get_sigma_block()
+                        : 0.0;
+                }
+                mkt_params.fill_rate_per_block = 0.03;  // conservative estimate
+                mkt_params.spread_bps = pcs.spread_result.half_spread;
+                mkt_params.vpin = market_data_->get_vpin(pair_name);
+                mkt_params.variance_ratio = strategy_
+                    ? strategy_->current_regime().variance_ratio
+                    : 1.0;
+                mkt_params.current_block = block_height;
+
+                auto decision = loss_manager_->should_rebalance_at_loss(
+                    AssetId{pair_cfg->base_asset_id},
+                    mid_mojos,
+                    loss_manager_->config().target_inventory_ratio,
+                    *inventory_,
+                    price_map,
+                    mkt_params);
+
+                if (decision.should_take_loss) {
+                    // The loss manager recommends relaxing the no-loss
+                    // constraint for this cycle to rebalance inventory.
+                    // Re-apply enforce_no_loss with the constraint disabled
+                    // so the ask price is not floored above cost basis.
+                    spdlog::info("[step6] {} Loss manager recommends "
+                        "rebalancing: rationale='{}', loss={:.1f}bps, "
+                        "breakeven={:.0f} blocks",
+                        pair_name, decision.rationale,
+                        decision.loss_bps, decision.blocks_to_breakeven);
+                    quote = pre_trade_->enforce_no_loss(
+                        quote, rec.weighted_avg_cost_basis, /*enable=*/false);
+                } else {
+                    spdlog::debug("[step6] {} Loss manager: hold (inv_ratio="
+                        "{:.2f}, rationale='{}')",
+                        pair_name, inv_ratio, decision.rationale);
+                }
             }
         }
 
@@ -975,12 +1074,9 @@ void Engine::step_generate_ladder(BlockHeight block_height)
             sigma = vol_it->second->get_sigma_annual();
         }
 
-        // Inventory ratio for skew.
+        // Inventory ratio for skew (O(1) pair config lookup).
         double inv_ratio = 0.5;
-        const PairConfig* pair_cfg = nullptr;
-        for (const auto& pc : config_.pairs) {
-            if (pc.name == pair_name) { pair_cfg = &pc; break; }
-        }
+        const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (pair_cfg) {
             inv_ratio = inventory_->inventory_ratio(
                 AssetId{pair_cfg->base_asset_id},
@@ -1029,11 +1125,8 @@ void Engine::step_manage_offers(BlockHeight block_height)
         // xop::TierQuote from types.hpp.  No conversion needed.
         const auto& exec_tiers = pcs.ladder;
 
-        // Find the PairConfig for this pair.
-        const PairConfig* pair_cfg = nullptr;
-        for (const auto& pc : config_.pairs) {
-            if (pc.name == pair_name) { pair_cfg = &pc; break; }
-        }
+        // Find the PairConfig for this pair (O(1) map lookup).
+        const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
 
         // Post the new offers.

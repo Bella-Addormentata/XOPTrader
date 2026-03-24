@@ -827,8 +827,12 @@ MonteCarloResult BacktestEngine::run_monte_carlo(
         // Generate a synthetic price path using GBM.
         const auto prices = generate_price_path(blocks_.size(), s0, sigma, rng);
 
-        // Build synthetic blocks from the price path.
-        const auto syn_blocks = build_synthetic_blocks(prices, historical_fill_rate_);
+        // Build synthetic blocks from the price path.  Each path gets a
+        // unique flow seed (base_seed + path_index) so Monte Carlo paths
+        // explore diverse order-flow scenarios.
+        const auto flow_seed = static_cast<unsigned>(seed + path_idx);
+        const auto syn_blocks = build_synthetic_blocks(
+            prices, historical_fill_rate_, flow_seed);
 
         // Create a fresh strategy instance.
         auto strategy = strategy_factory(params);
@@ -1088,8 +1092,24 @@ OptimizationResult BacktestEngine::walk_forward_optimize(
     // Track which parameter sets get accepted across windows.
     std::unordered_map<std::size_t, std::uint32_t> param_accept_counts;
 
+    // Compute fixed train and test block counts that remain constant across
+    // all walk-forward folds.  The test portion equals advance_blocks (the
+    // distance the window slides each iteration), and the train portion is
+    // derived from train_pct so that train / (train + test) = train_pct.
+    //
+    // Previously window_end was always set to total_blocks, which caused
+    // later windows to have progressively larger test sets and invalidated
+    // the walk-forward cross-validation.
+    const std::size_t test_blocks = static_cast<std::size_t>(advance_blocks);
+    const std::size_t train_blocks =
+        static_cast<std::size_t>(
+            static_cast<double>(test_blocks) * train_pct / (1.0 - train_pct));
+    const std::size_t fixed_window_size = train_blocks + test_blocks;
+
     while (window_start + min_window < total_blocks) {
-        const std::size_t window_end = total_blocks;
+        // Cap the window so it does not exceed the available data.
+        const std::size_t window_end =
+            std::min(window_start + fixed_window_size, total_blocks);
         const std::size_t window_size = window_end - window_start;
 
         const std::size_t train_end = window_start +
@@ -1705,14 +1725,18 @@ std::vector<double> BacktestEngine::generate_price_path(
 
 std::vector<BlockData> BacktestEngine::build_synthetic_blocks(
     const std::vector<double>& prices,
-    double                     historical_fill_rate) const
+    double                     historical_fill_rate,
+    unsigned                   flow_seed) const
 {
     std::vector<BlockData> syn;
     syn.reserve(prices.size());
 
-    // Use a separate RNG for order flow (seeded from the block index for
-    // determinism without requiring the caller to pass a second RNG).
-    std::mt19937 flow_rng(12345u);
+    // Each Monte Carlo path must use a unique order-flow seed so that flow
+    // patterns vary across paths.  A fixed seed (e.g. 12345u) would make
+    // every path share identical flow, defeating Monte Carlo diversity.
+    // Callers pass base_seed + path_index; the default 0 is acceptable for
+    // non-MC use (single deterministic backtest).
+    std::mt19937 flow_rng(flow_seed);
     std::uniform_real_distribution<double> uniform(0.0, 1.0);
 
     for (std::size_t i = 0; i < prices.size(); ++i) {

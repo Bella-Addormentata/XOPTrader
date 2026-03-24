@@ -16,8 +16,8 @@
 #include "xop/risk/limits.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <stdexcept>
 #include <cstddef>
 #include <limits>
 #include <numeric>
@@ -44,14 +44,18 @@ const char* to_string(EmergencyRule r) noexcept {
 // ---------------------------------------------------------------------------
 
 PreTradeCheck::PreTradeCheck(const RiskConfig&     cfg,
-                             const StrategyConfig& strat_cfg) noexcept
+                             const StrategyConfig& strat_cfg)
     : risk_cfg_(cfg)
     , strat_cfg_(strat_cfg)
     , margin_fraction_(strat_cfg.min_profit_margin_bps / 10'000.0)
 {
-    // Sanity: margin_fraction_ should be a small positive number (e.g. 0.0035
-    // for 35 bps).  A negative or enormous value would indicate a config bug.
-    assert(margin_fraction_ >= 0.0 && margin_fraction_ < 1.0);
+    // Validate: margin_fraction_ should be a small positive number (e.g. 0.0035
+    // for 35 bps).  A negative or enormous value indicates a config error.
+    // ISO/IEC 5055: throw instead of assert (stripped in Release builds).
+    if (!(margin_fraction_ >= 0.0 && margin_fraction_ < 1.0)) {
+        throw std::invalid_argument(
+            "RiskConfig: min_profit_margin_bps yields margin_fraction outside [0, 1)");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -158,19 +162,35 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 
     // Base overweight?
     if (base_conc >= risk_cfg_.hard_limit_pct) {
-        // Pull bids -- do not accumulate more base.
+        // Hard limit breach: pull bids entirely -- do not accumulate more base.
         quote.bid_size = 0;
     } else if (base_conc >= risk_cfg_.soft_limit_pct) {
-        // Backstop: also pull bids at soft limit.
-        quote.bid_size = 0;
+        // Soft limit: apply graduated proportional reduction instead of
+        // zeroing.  Linearly interpolate from full size at soft_limit to
+        // zero at hard_limit, so the transition is smooth rather than a
+        // cliff that behaves identically to the hard limit.
+        // ISO/IEC 5055: clamped to [0.0, 1.0] to guard against config
+        // where soft_pct == hard_pct (division by zero yields 0.0 via clamp).
+        const double reduction = std::clamp(
+            (base_conc - risk_cfg_.soft_limit_pct)
+                / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
+            0.0, 1.0);
+        quote.bid_size = static_cast<Mojo>(
+            static_cast<double>(quote.bid_size) * (1.0 - reduction));
     }
 
     // Quote overweight?
     if (quote_conc >= risk_cfg_.hard_limit_pct) {
-        // Pull asks -- do not sell more base (we already have too little).
+        // Hard limit breach: pull asks entirely -- do not sell more base.
         quote.ask_size = 0;
     } else if (quote_conc >= risk_cfg_.soft_limit_pct) {
-        quote.ask_size = 0;
+        // Soft limit: graduated proportional reduction (mirror of bid logic).
+        const double reduction = std::clamp(
+            (quote_conc - risk_cfg_.soft_limit_pct)
+                / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
+            0.0, 1.0);
+        quote.ask_size = static_cast<Mojo>(
+            static_cast<double>(quote.ask_size) * (1.0 - reduction));
     }
 
     // ---- 2. Single-CAT cap (12% of total portfolio) ----------------------

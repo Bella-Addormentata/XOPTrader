@@ -571,9 +571,13 @@ private:
 
     /// Build synthetic BlockData from a generated price path.
     /// Injects synthetic order flow calibrated from historical fill rates.
+    /// @param flow_seed  Per-path seed for the order-flow RNG; each Monte
+    ///                   Carlo path should pass a unique seed so that flow
+    ///                   patterns vary across paths.
     std::vector<BlockData> build_synthetic_blocks(
         const std::vector<double>& prices,
-        double historical_fill_rate) const;
+        double historical_fill_rate,
+        unsigned flow_seed = 0u) const;
 
     // -- Data storage -------------------------------------------------------
 

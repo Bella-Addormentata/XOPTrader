@@ -162,7 +162,8 @@ class StrategyPortfolio {
 public:
     /// Construct with a fully populated configuration.
     /// Initialises all eight components with uniform weight = 1/8.
-    explicit StrategyPortfolio(const PortfolioConfig& cfg) noexcept;
+    /// @throws std::invalid_argument if any config invariant is violated.
+    explicit StrategyPortfolio(const PortfolioConfig& cfg);
 
     // -- PnL attribution -------------------------------------------------------
 

@@ -2,26 +2,24 @@
 // main.cpp -- Entry point for XOPTrader CHIA DEX market-making engine.
 // =============================================================================
 //
-// Initialization order (strict — later steps depend on earlier ones):
-//   1. Parse CLI arguments    (--config, --dry-run, --verbose)
-//   2. Initialize structured logging (spdlog — must precede any log calls)
-//   3. Load and validate YAML configuration via xop::load_config()
-//   4. Create boost::asio::io_context (drives all async I/O)
-//   5. Construct xop::State (thread-safe global runtime state)
-//   6. Construct Engine      (owns all trading subsystems)
-//   7. Install signal handlers (SIGINT, SIGTERM) via asio::signal_set
-//   8. Spawn Engine::run() coroutine and enter the event loop
+// Initialization order (strict -- later steps depend on earlier ones):
+//   1. Initialize libcurl globally  (curl_global_init, once per process)
+//   2. Parse CLI arguments           (--config, --dry-run, --verbose)
+//   3. Initialize structured logging (spdlog -- must precede any log calls)
+//   4. Load and validate YAML config via xop::load_config()
+//   5. Construct xop::Engine(config, dry_run) -- owns io_context, all subsystems
+//   6. Install signal handlers       (SIGINT, SIGTERM via std::signal)
+//   7. Call engine.run()             (blocks until shutdown completes)
 //
 // Shutdown sequence (on signal or unrecoverable error):
-//   1. Signal handler fires -> Engine::request_shutdown()
-//   2. Engine breaks out of the heartbeat loop
-//   3. Engine cancels all outstanding CHIA offers via Wallet RPC
-//   4. Engine coroutine completes -> completion handler calls io_context.stop()
-//   5. Worker threads join (jthread RAII), logging flushes, objects destruct
+//   1. Signal handler fires -> engine->shutdown()
+//   2. Engine cancels all outstanding CHIA offers via Wallet RPC
+//   3. Engine stops its internal io_context, run() returns
+//   4. curl_global_cleanup(), spdlog::shutdown(), process exits
 //
-// A second signal (double Ctrl-C) force-stops the io_context immediately,
-// bypassing the graceful offer-cancellation path.  This is the escape hatch
-// if the wallet RPC is unreachable during shutdown.
+// A second signal (double Ctrl-C) calls std::_Exit() to force-terminate
+// immediately, bypassing the graceful offer-cancellation path.  This is the
+// escape hatch if the wallet RPC is unreachable during shutdown.
 //
 // Security (ISO/IEC 27001:2022):
 //   - No hardcoded secrets.  SSL cert paths and tokens are loaded from YAML.
@@ -29,237 +27,70 @@
 //
 // Secure coding (ISO/IEC 5055):
 //   - Stack protector and control-flow guard enabled via CMake.
-//   - No raw owning pointers; RAII throughout (unique_ptr, jthread).
+//   - No raw owning pointers; RAII throughout.
 //   - All external input (CLI, YAML) validated before use.
+//   - curl_global_init called exactly once at process start (not per-client).
 // =============================================================================
 
-#include <xop/config.hpp>
-#include <xop/state.hpp>
-#include <xop/types.hpp>
+#include "xop/engine.hpp"
+#include "xop/config.hpp"
 
 #include <atomic>
-#include <chrono>
+#include <csignal>
 #include <cstdlib>
-#include <exception>
 #include <filesystem>
 #include <iostream>
-#include <memory>
 #include <optional>
 #include <string>
-#include <thread>
-#include <vector>
-
-// Boost
-#include <boost/asio.hpp>
-#include <boost/asio/co_spawn.hpp>
-#include <boost/asio/detached.hpp>
-#include <boost/asio/signal_set.hpp>
-#include <boost/asio/steady_timer.hpp>
-#include <boost/program_options.hpp>
 
 // Third-party
+#include <boost/program_options.hpp>
+#include <curl/curl.h>
 #include <spdlog/spdlog.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <spdlog/sinks/rotating_file_sink.h>
 
-namespace asio = boost::asio;
-namespace po   = boost::program_options;
-namespace fs   = std::filesystem;
+namespace po = boost::program_options;
+namespace fs = std::filesystem;
 
 // =============================================================================
-// Engine — Central orchestrator (stub).
+// Global engine pointer for signal handler access.
 //
-// The full implementation lives in engine.cpp (future).  This inline stub
-// provides enough structure for main.cpp to compile, link, and run the
-// heartbeat loop while subsystems are developed incrementally.
-//
-// Subsystems (constructed in dependency order, torn down in reverse):
-//   1. MarketDataFeed   — CEX + DEX price aggregation
-//   2. VolatilityModel  — Yang-Zhang hybrid estimator
-//   3. OfferManager     — CHIA Wallet RPC: create / cancel / monitor offers
-//   4. StrategyEngine   — Avellaneda-Stoikov / GLFT quote computation
-//   5. RiskManager      — inventory limits, never-sell-at-loss enforcement
-//   6. CostBasisTracker — FIFO per-asset cost accounting (via xop::State)
-//   7. MetricsExporter  — Prometheus pull endpoint
-//
-// The Engine exposes a single coroutine entry point run() that implements
-// the per-block heartbeat loop described in Section 13 of the strategy doc.
+// std::signal handlers must have C linkage and access only signal-safe state.
+// We store a raw pointer to the Engine (which outlives the signal handler
+// registration) and an atomic counter to implement two-phase shutdown:
+//   First signal  -> engine->shutdown() (graceful)
+//   Second signal -> std::_Exit()       (force-kill escape hatch)
 // =============================================================================
 
-class Engine {
-public:
-    /// Construct the Engine.  All subsystem constructors run here (fail-fast).
-    ///
-    /// @param io       io_context that drives all async operations.
-    /// @param config   Validated application configuration.
-    /// @param state    Shared mutable runtime state (positions, offers, markets).
-    /// @param dry_run  If true, compute quotes but never submit on-chain offers.
-    explicit Engine(asio::io_context&  io,
-                    xop::AppConfig     config,
-                    xop::State&        state,
-                    bool               dry_run)
-        : io_context_{io}
-        , config_{std::move(config)}
-        , state_{state}
-        , dry_run_{dry_run}
-        , shutdown_requested_{false}
-    {
-        state_.set_status(xop::BotStatus::Initializing);
+/// Global engine pointer set before entering the main loop.
+/// The Engine's shutdown() method is safe to call from a signal context
+/// because it only sets an atomic flag and posts work to the io_context.
+static std::atomic<xop::Engine*> g_engine_ptr{nullptr};
 
-        // TODO: construct subsystems in dependency order:
-        //   1. MarketDataFeed  (needs config_.chia, config_.dexie)
-        //   2. VolatilityModel (needs config_.volatility)
-        //   3. OfferManager    (needs config_.chia for wallet RPC + io_context)
-        //   4. StrategyEngine  (needs config_.strategy)
-        //   5. RiskManager     (needs config_.risk, state_)
-        //   6. MetricsExporter (needs config_.monitoring.prometheus_port)
+/// Count of signals received.  Second signal triggers immediate exit.
+static std::atomic<int> g_signal_count{0};
 
-        spdlog::info("Engine constructed (dry_run={}, pairs={})",
-                     dry_run_, config_.pairs.size());
+/// Signal handler for SIGINT / SIGTERM.  Async-signal-safe: only touches
+/// atomics and calls std::_Exit (which is async-signal-safe per POSIX).
+static void signal_handler(int signum) {
+    const int count = g_signal_count.fetch_add(1, std::memory_order_relaxed) + 1;
+
+    if (count >= 2) {
+        // Second signal: force-kill.  Wallet RPC may be unreachable;
+        // this is the escape hatch documented in the header comment.
+        std::_Exit(EXIT_FAILURE);
     }
 
-    /// Request a graceful shutdown.  Thread-safe (called from signal handler
-    /// context via asio::post, but the atomic itself is safe from any thread).
-    void request_shutdown() noexcept {
-        bool expected = false;
-        if (shutdown_requested_.compare_exchange_strong(expected, true)) {
-            spdlog::info("Shutdown requested — will cancel all outstanding offers");
-            state_.set_status(xop::BotStatus::ShuttingDown);
-
-            // Post teardown work onto the io_context so it runs on the event-
-            // loop thread, avoiding data races with running coroutines.
-            asio::post(io_context_, [this]() { initiate_teardown(); });
-        }
+    // First signal: request graceful shutdown via the Engine.
+    xop::Engine* engine = g_engine_ptr.load(std::memory_order_acquire);
+    if (engine != nullptr) {
+        engine->shutdown();
     }
 
-    /// True once request_shutdown() has been called at least once.
-    [[nodiscard]] bool is_shutdown_requested() const noexcept {
-        return shutdown_requested_.load(std::memory_order_acquire);
-    }
-
-    /// Main coroutine — the per-block heartbeat loop (Section 13).
-    /// Spawned onto io_context via co_spawn() from main().
-    asio::awaitable<void> run() {
-        state_.set_status(xop::BotStatus::Running);
-        spdlog::info("Engine::run() — entering per-block heartbeat loop");
-
-        // Steady timer paces the heartbeat at one CHIA block interval (~52 s).
-        // The timer is cancellable: initiate_teardown() cancels it to break
-        // the loop promptly rather than waiting up to 52 seconds.
-        asio::steady_timer heartbeat{io_context_};
-
-        // CHIA block time is approximately 52 seconds (Section 5 of strategy).
-        constexpr auto kBlockInterval = std::chrono::seconds{52};
-
-        while (!is_shutdown_requested()) {
-            try {
-                // ----- Per-block heartbeat (Section 13 of strategy doc) ------
-                //
-                // The nine steps executed every block:
-                //
-                //  1. Update market state (prices from CEX + DEX feeds)
-                //  2. Process any fills detected since last heartbeat
-                //  3. Recompute volatility, PIN, regime estimates
-                //  4. Compute optimal quotes (Avellaneda-Stoikov / GLFT)
-                //  5. Apply never-sell-at-loss constraint:
-                //       ask = max(optimal_ask, cost_basis + min_profit_margin)
-                //  6. Apply Half-Kelly position size limits
-                //  7. Cancel stale offers (TTL expired), post new ones
-                //  8. Update PnL attribution (spread / inventory / fees)
-                //  9. Export metrics to Prometheus
-                //
-                // Each step will be implemented as a subsystem coroutine call
-                // once the respective module is built.
-
-                spdlog::debug("Heartbeat tick — awaiting next block interval");
-
-                heartbeat.expires_after(kBlockInterval);
-                co_await heartbeat.async_wait(asio::use_awaitable);
-            } catch (const boost::system::system_error& e) {
-                // timer.cancel() during shutdown raises operation_aborted.
-                if (e.code() == asio::error::operation_aborted) {
-                    spdlog::info("Heartbeat timer cancelled — exiting run loop");
-                    break;
-                }
-                spdlog::error("Heartbeat error: {}", e.what());
-            }
-        }
-
-        // Graceful teardown: cancel all CHIA offers before returning.
-        // This is the critical safety step — we must not leave orphaned offers
-        // on the network after the bot shuts down, or a counterparty could take
-        // them at stale prices.
-        co_await cancel_all_offers();
-
-        state_.set_status(xop::BotStatus::Stopped);
-        spdlog::info("Engine::run() — exited cleanly");
-    }
-
-private:
-    /// Cancel every outstanding offer via Chia Wallet RPC (cancel_offers).
-    ///
-    /// In dry-run mode this is a no-op because no offers were ever submitted.
-    /// In live mode, each cancellation spends a locked coin (secure cancel)
-    /// and requires ~52 seconds to confirm on-chain.  We fire all cancellations
-    /// in parallel and await their collective completion.
-    asio::awaitable<void> cancel_all_offers() {
-        const auto offers = state_.get_all_offers();
-
-        if (offers.empty()) {
-            spdlog::info("No outstanding offers to cancel");
-            co_return;
-        }
-
-        if (dry_run_) {
-            spdlog::info("Dry-run mode — skipping cancellation of {} offer(s)",
-                         offers.size());
-            co_return;
-        }
-
-        spdlog::info("Cancelling {} outstanding offer(s)...", offers.size());
-
-        // TODO: for each offer in `offers`:
-        //   co_await wallet_rpc_->cancel_offer(offer.offer_id, fee, secure=true);
-        //   state_.remove_offer(offer.offer_id);
-        //
-        // Cancellations should be dispatched concurrently (co_spawn per offer)
-        // with a timeout guard — if the wallet is unreachable we must not hang
-        // forever.  The second-signal force-kill path in main() is the backstop.
-
-        for (const auto& offer : offers) {
-            spdlog::info("  Would cancel offer id={} pair={} side={} price={}",
-                         offer.offer_id, offer.pair_name,
-                         xop::to_string(offer.side), offer.price);
-            state_.remove_offer(offer.offer_id);
-        }
-
-        spdlog::info("All offers cancelled (or removal recorded)");
-        co_return;
-    }
-
-    /// Post-shutdown subsystem cleanup dispatched onto the event loop.
-    /// Called via asio::post() from request_shutdown().
-    void initiate_teardown() {
-        spdlog::info("Tearing down subsystems in reverse construction order...");
-        // TODO: stop subsystems in reverse order:
-        //   7. MetricsExporter.stop()
-        //   6. (CostBasisTracker — no explicit stop; state persists in DB)
-        //   5. RiskManager.stop()
-        //   4. StrategyEngine.stop()
-        //   3. OfferManager.stop()   — cancel_all_offers() handles the heavy lifting
-        //   2. VolatilityModel.stop()
-        //   1. MarketDataFeed.stop()
-        //
-        // The io_context::stop() call happens in the co_spawn completion handler
-        // in main(), not here, to ensure cancel_all_offers() runs to completion.
-    }
-
-    asio::io_context&  io_context_;         ///< Borrowed reference; owned by main().
-    xop::AppConfig     config_;             ///< Immutable after construction.
-    xop::State&        state_;              ///< Shared mutable runtime state.
-    bool               dry_run_;            ///< If true, never submit real offers.
-    std::atomic<bool>  shutdown_requested_; ///< Signal-safe shutdown flag.
-};
+    // Suppress unused-parameter warning for signal number.
+    (void)signum;
+}
 
 // =============================================================================
 // CLI argument parsing
@@ -352,21 +183,39 @@ static void init_logging(bool verbose) {
 
 int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
-    // 1. Parse command-line arguments
+    // 1. Initialize libcurl globally (ISO/IEC 5055: resource init once).
+    //
+    //    curl_global_init() is NOT thread-safe.  It must be called exactly
+    //    once, before any threads are spawned or any curl handles created.
+    //    The Engine's RPC clients (ChiaFullNodeRPC, ChiaWalletRPC,
+    //    DexieClient) all use libcurl internally; calling this here
+    //    ensures the library is ready before any subsystem construction.
+    // ------------------------------------------------------------------
+    const CURLcode curl_rc = curl_global_init(CURL_GLOBAL_DEFAULT);
+    if (curl_rc != CURLE_OK) {
+        std::cerr << "Fatal: curl_global_init failed: "
+                  << curl_easy_strerror(curl_rc) << "\n";
+        return EXIT_FAILURE;
+    }
+
+    // ------------------------------------------------------------------
+    // 2. Parse command-line arguments
     // ------------------------------------------------------------------
     const auto cli_opt = parse_cli(argc, argv);
     if (!cli_opt.has_value()) {
+        curl_global_cleanup();
         return EXIT_SUCCESS;  // --help was requested.
     }
     const auto& cli = cli_opt.value();
 
     // ------------------------------------------------------------------
-    // 2. Initialize structured logging (must precede any spdlog calls)
+    // 3. Initialize structured logging (must precede any spdlog calls)
     // ------------------------------------------------------------------
     try {
         init_logging(cli.verbose);
     } catch (const spdlog::spdlog_ex& e) {
         std::cerr << "Fatal: logging init failed: " << e.what() << "\n";
+        curl_global_cleanup();
         return EXIT_FAILURE;
     }
 
@@ -376,7 +225,7 @@ int main(int argc, char* argv[]) {
     }
 
     // ------------------------------------------------------------------
-    // 3. Load and validate YAML configuration (xop::load_config)
+    // 4. Load and validate YAML configuration (xop::load_config)
     //
     //    Uses the fully-validated loader from config.cpp that maps every
     //    YAML field into typed AppConfig structs with domain checks.
@@ -387,6 +236,8 @@ int main(int argc, char* argv[]) {
         app_config = xop::load_config(cli.config_path);
     } catch (const xop::ConfigError& e) {
         spdlog::critical("Configuration error: {}", e.what());
+        spdlog::shutdown();
+        curl_global_cleanup();
         return EXIT_FAILURE;
     }
 
@@ -401,120 +252,91 @@ int main(int argc, char* argv[]) {
                  app_config.chia.full_node_port);
 
     // ------------------------------------------------------------------
-    // 4. Create the boost::asio io_context
+    // 5. Construct the Engine (owns io_context, State, all subsystems).
     //
-    //    Concurrency hint: one thread per core up to 4.  More threads add
-    //    overhead without benefit — the bot is I/O-bound (52-second block
-    //    intervals, sparse HTTP RPCs) not CPU-bound.
+    //    xop::Engine takes (const AppConfig&, bool dry_run) and internally
+    //    constructs the io_context, State, Database, RPC clients, strategy
+    //    layer, risk layer, and monitoring layer in dependency order.
+    //    The constructor validates the full configuration and fails fast
+    //    if any subsystem cannot initialise.
     // ------------------------------------------------------------------
-    const auto hw_threads = std::max(1u, std::thread::hardware_concurrency());
-    const auto io_threads = std::min(hw_threads, 4u);
-    asio::io_context io_context{static_cast<int>(io_threads)};
-
-    spdlog::info("io_context created with concurrency_hint={}", io_threads);
-
-    // ------------------------------------------------------------------
-    // 5. Construct global State (thread-safe runtime data store)
-    // ------------------------------------------------------------------
-    xop::State state;
-
-    // ------------------------------------------------------------------
-    // 6. Construct the Engine
-    // ------------------------------------------------------------------
-    auto engine = std::make_unique<Engine>(
-        io_context, std::move(app_config), state, cli.dry_run);
-
-    // ------------------------------------------------------------------
-    // 7. Install signal handlers (SIGINT, SIGTERM) via asio::signal_set
-    //
-    //    This is cross-platform: on Windows, asio::signal_set correctly
-    //    handles console Ctrl+C.  SIGTERM is best-effort on Windows
-    //    (only delivered by explicit TerminateProcess or taskkill).
-    //
-    //    Two-phase protocol:
-    //      First signal  -> graceful shutdown (cancel offers, drain work)
-    //      Second signal -> force io_context.stop() (escape hatch)
-    // ------------------------------------------------------------------
-    asio::signal_set signals(io_context, SIGINT, SIGTERM);
-
-    // Raw pointer is safe: engine outlives the signal handler because
-    // engine is destroyed only after io_context.run() returns below.
-    Engine* engine_ptr = engine.get();
-
-    signals.async_wait([engine_ptr, &io_context, &signals](
-            const boost::system::error_code& ec, int signal_number) {
-        if (ec) {
-            return;  // Handler cancelled during normal shutdown.
-        }
-        spdlog::warn("Caught signal {} -- initiating graceful shutdown",
-                     signal_number);
-
-        // Phase 1: request graceful shutdown (cancel offers, drain work).
-        engine_ptr->request_shutdown();
-
-        // Re-arm for a second signal: force-kill escape hatch.
-        signals.async_wait([&io_context](
-                const boost::system::error_code& ec2, int sig2) {
-            if (ec2) return;
-            spdlog::critical(
-                "Second signal ({}) received -- forcing immediate exit", sig2);
-            io_context.stop();
-        });
-    });
-
-    // ------------------------------------------------------------------
-    // 8. Spawn the Engine coroutine and run the event loop
-    //
-    //    co_spawn launches Engine::run() as an asio coroutine.  When it
-    //    completes (after cancel_all_offers finishes), the completion
-    //    handler stops the io_context so all threads' run() calls return.
-    // ------------------------------------------------------------------
-    asio::co_spawn(io_context, engine->run(),
-        [&io_context](std::exception_ptr eptr) {
-            if (eptr) {
-                try {
-                    std::rethrow_exception(eptr);
-                } catch (const std::exception& e) {
-                    spdlog::critical(
-                        "Engine coroutine terminated with exception: {}",
-                        e.what());
-                }
-            }
-            // Engine exited — all offers cancelled.  Stop the event loop.
-            io_context.stop();
-        });
-
-    // Launch worker threads.  The main thread also participates as a
-    // worker, blocking on io_context.run() until stop() is called.
-    std::vector<std::jthread> workers;
-    workers.reserve(io_threads - 1);
-    for (unsigned i = 1; i < io_threads; ++i) {
-        workers.emplace_back([&io_context, i]() {
-            spdlog::debug("Worker thread {} started", i);
-            io_context.run();
-            spdlog::debug("Worker thread {} exited", i);
-        });
+    std::unique_ptr<xop::Engine> engine;
+    try {
+        engine = std::make_unique<xop::Engine>(app_config, cli.dry_run);
+    } catch (const std::exception& e) {
+        spdlog::critical("Engine construction failed: {}", e.what());
+        spdlog::shutdown();
+        curl_global_cleanup();
+        return EXIT_FAILURE;
     }
 
-    spdlog::info("Event loop running on {} thread(s) -- ready to trade",
-                 io_threads);
-    io_context.run();  // Main thread blocks here.
+    // ------------------------------------------------------------------
+    // 6. Install signal handlers (SIGINT, SIGTERM) via std::signal.
+    //
+    //    The xop::Engine owns its own io_context, so we cannot use
+    //    asio::signal_set from outside.  std::signal is portable and
+    //    sufficient: the handler calls engine->shutdown() (which posts
+    //    work to the internal io_context via an atomic flag).
+    //
+    //    Two-phase protocol:
+    //      First signal  -> engine->shutdown() (graceful, cancels offers)
+    //      Second signal -> std::_Exit()       (force-kill escape hatch)
+    //
+    //    On Windows, SIGINT maps to Ctrl+C and SIGTERM is best-effort
+    //    (delivered only by explicit TerminateProcess / taskkill).
+    // ------------------------------------------------------------------
+    g_engine_ptr.store(engine.get(), std::memory_order_release);
+
+    std::signal(SIGINT,  signal_handler);
+#ifdef SIGTERM
+    std::signal(SIGTERM, signal_handler);
+#endif
 
     // ------------------------------------------------------------------
-    // 9. Cleanup — deterministic, RAII-driven.
+    // 7. Enter the main loop.
+    //
+    //    engine->run() opens all RPC connections, starts the Prometheus
+    //    exporter, begins the 5-second block-height polling timer, and
+    //    blocks on ioc_.run() until shutdown() is called.  All 13 steps
+    //    of the per-block heartbeat cycle execute within this call.
+    // ------------------------------------------------------------------
+    try {
+        spdlog::info("Entering main loop -- ready to trade");
+        engine->run();
+    } catch (const std::exception& e) {
+        spdlog::critical("Engine terminated with unhandled exception: {}",
+                         e.what());
+    }
+
+    // ------------------------------------------------------------------
+    // 8. Cleanup -- deterministic, RAII-driven.
     //
     //    Destruction order (reverse of construction):
-    //      - jthread workers join automatically (RAII destructor)
-    //      - unique_ptr<Engine> destroys the engine and all subsystems
-    //      - State destructor releases mutex-guarded maps
-    //      - io_context destructor cleans up residual handlers
-    //      - spdlog::shutdown() flushes all sinks
+    //      - Deregister signal handler (prevent use-after-free)
+    //      - Engine destructor: calls shutdown() if still running,
+    //        destroys all subsystems in reverse construction order,
+    //        stops internal io_context
+    //      - curl_global_cleanup(): release libcurl global state
+    //      - spdlog::shutdown(): flush all sinks
     //
     //    This mirrors the construction order and satisfies the invariant
     //    that no destroyed object is referenced by a still-alive one.
     // ------------------------------------------------------------------
+
+    // Deregister the signal handler before destroying the engine to
+    // prevent a signal from calling shutdown() on a dangling pointer.
+    g_engine_ptr.store(nullptr, std::memory_order_release);
+    std::signal(SIGINT,  SIG_DFL);
+#ifdef SIGTERM
+    std::signal(SIGTERM, SIG_DFL);
+#endif
+
+    // Engine destructor handles subsystem teardown.
+    engine.reset();
+
     spdlog::info("XOPTrader shutdown complete");
     spdlog::shutdown();
+    curl_global_cleanup();
 
     return EXIT_SUCCESS;
 }

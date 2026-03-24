@@ -14,8 +14,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <stdexcept>
 #include <limits>
 #include <numeric>
 
@@ -44,18 +44,34 @@ const char* to_string(StrategyComponent c) noexcept
 // Construction
 // ===========================================================================
 
-StrategyPortfolio::StrategyPortfolio(const PortfolioConfig& cfg) noexcept
+StrategyPortfolio::StrategyPortfolio(const PortfolioConfig& cfg)
     : cfg_(cfg)
 {
-    // Sanity-check config invariants.  These are programming errors, not user
-    // input, so we assert rather than throw.
-    assert(cfg_.beta_intensity >= 0.0     && "beta must be non-negative");
-    assert(cfg_.min_weight >= 0.0         && "min_weight must be non-negative");
-    assert(cfg_.max_weight <= 1.0         && "max_weight must be <= 1.0");
-    assert(cfg_.min_weight < cfg_.max_weight && "min_weight must be < max_weight");
-    assert(cfg_.switching_cost_bps >= 0.0 && "switching cost must be non-negative");
-    assert(cfg_.crowding_threshold > 0.0  && "crowding threshold must be positive");
-    assert(cfg_.crowding_threshold <= 1.0 && "crowding threshold must be <= 1.0");
+    // Validate config invariants.  These parameters come from the config layer
+    // and may contain user-supplied values, so throw on invalid input rather
+    // than assert (which is stripped in Release builds).
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.beta_intensity >= 0.0)) {
+        throw std::invalid_argument("PortfolioConfig: beta_intensity must be non-negative");
+    }
+    if (!(cfg_.min_weight >= 0.0)) {
+        throw std::invalid_argument("PortfolioConfig: min_weight must be non-negative");
+    }
+    if (!(cfg_.max_weight <= 1.0)) {
+        throw std::invalid_argument("PortfolioConfig: max_weight must be <= 1.0");
+    }
+    if (!(cfg_.min_weight < cfg_.max_weight)) {
+        throw std::invalid_argument("PortfolioConfig: min_weight must be < max_weight");
+    }
+    if (!(cfg_.switching_cost_bps >= 0.0)) {
+        throw std::invalid_argument("PortfolioConfig: switching_cost_bps must be non-negative");
+    }
+    if (!(cfg_.crowding_threshold > 0.0)) {
+        throw std::invalid_argument("PortfolioConfig: crowding_threshold must be positive");
+    }
+    if (!(cfg_.crowding_threshold <= 1.0)) {
+        throw std::invalid_argument("PortfolioConfig: crowding_threshold must be <= 1.0");
+    }
 
     // Enumerate every defined component and initialise with uniform weight.
     static constexpr StrategyComponent kAllComponents[] = {
@@ -97,9 +113,16 @@ void StrategyPortfolio::record_pnl(StrategyComponent component,
                                     double adverse_selection_bps,
                                     BlockHeight block)
 {
-    // Find or create the component state.  Components should already be
-    // initialised by the constructor, but defensive creation is harmless.
-    auto& state = components_[component];
+    // Look up the component state.  All valid components are initialised in
+    // the constructor; unknown components must be rejected to prevent
+    // operator[] from default-constructing a spurious entry in the map.
+    auto it = components_.find(component);
+    if (it == components_.end()) {
+        spdlog::warn("[StrategyPortfolio] Unknown component {}, ignoring PnL record",
+                     static_cast<int>(component));
+        return;
+    }
+    auto& state = it->second;
 
     // Build and store the PnL record.
     StrategyPnLRecord record{};

@@ -15,8 +15,8 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <stdexcept>
 #include <numeric>
 
 namespace xop {
@@ -29,22 +29,48 @@ ChiaEdgeOptimizer::ChiaEdgeOptimizer(const ChiaEdgeConfig& cfg)
     : cfg_(cfg)
     , min_margin_bps_(cfg.min_margin_bps)
 {
-    // Validate critical parameters.  These are programming errors (not user
-    // input), so we assert rather than throw.
-    assert(cfg_.gamma > 0.0              && "gamma must be strictly positive");
-    assert(cfg_.kappa > 0.0              && "kappa must be strictly positive");
-    assert(cfg_.q_max > 0.0              && "q_max must be strictly positive");
-    assert(cfg_.horizon_blocks > 0       && "horizon must be at least 1 block");
-    assert(cfg_.block_time_seconds > 0.0 && "block time must be positive");
-    assert(cfg_.reference_spread_bps > 0.0 && "reference spread must be positive");
-    assert(cfg_.spread_floor_bps >= 0.0  && "spread floor must be non-negative");
+    // Validate critical parameters.  Config values may come from user files or
+    // command-line flags, so throw on invalid input rather than assert (which
+    // is stripped in Release builds).
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.gamma > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: gamma must be strictly positive");
+    }
+    if (!(cfg_.kappa > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: kappa must be strictly positive");
+    }
+    if (!(cfg_.q_max > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: q_max must be strictly positive");
+    }
+    if (!(cfg_.horizon_blocks > 0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: horizon_blocks must be at least 1");
+    }
+    if (!(cfg_.block_time_seconds > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: block_time_seconds must be positive");
+    }
+    if (!(cfg_.reference_spread_bps > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: reference_spread_bps must be positive");
+    }
+    if (!(cfg_.spread_floor_bps >= 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: spread_floor_bps must be non-negative");
+    }
 
-    // Validate edge factor floor bounds.
-    assert(cfg_.atomic_mult_floor > 0.0     && cfg_.atomic_mult_floor <= 1.0);
-    assert(cfg_.cancel_mult_floor > 0.0     && cfg_.cancel_mult_floor <= 1.0);
-    assert(cfg_.utxo_mult_floor > 0.0       && cfg_.utxo_mult_floor <= 1.0);
-    assert(cfg_.block_time_mult_floor > 0.0 && cfg_.block_time_mult_floor <= 1.0);
-    assert(cfg_.mempool_mult_floor > 0.0    && cfg_.mempool_mult_floor <= 1.0);
+    // Validate edge factor floor bounds: each must be in (0.0, 1.0].
+    if (!(cfg_.atomic_mult_floor > 0.0 && cfg_.atomic_mult_floor <= 1.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: atomic_mult_floor must be in (0, 1]");
+    }
+    if (!(cfg_.cancel_mult_floor > 0.0 && cfg_.cancel_mult_floor <= 1.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: cancel_mult_floor must be in (0, 1]");
+    }
+    if (!(cfg_.utxo_mult_floor > 0.0 && cfg_.utxo_mult_floor <= 1.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: utxo_mult_floor must be in (0, 1]");
+    }
+    if (!(cfg_.block_time_mult_floor > 0.0 && cfg_.block_time_mult_floor <= 1.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: block_time_mult_floor must be in (0, 1]");
+    }
+    if (!(cfg_.mempool_mult_floor > 0.0 && cfg_.mempool_mult_floor <= 1.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: mempool_mult_floor must be in (0, 1]");
+    }
 
     spdlog::info("[ChiaEdgeOptimizer] Initialised with composite edge = {:.4f} "
                  "(atomic={:.3f}, cancel={:.3f}, utxo={:.3f}, "

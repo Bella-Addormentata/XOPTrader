@@ -314,6 +314,7 @@ DriftReport InventoryDriftAnalyzer::analyze_drift(
 DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
     MarketCondition condition,
     double          trend_pct_day,
+    double          current_ratio,
     uint32_t        num_paths,
     uint32_t        max_blocks,
     uint64_t        seed) const
@@ -357,6 +358,17 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
         cfg_.block_time_seconds / (2.0 * kSecondsPerYear);
     const double as_force = cfg_.gamma * sigma_blk * sigma_blk * tau_avg;
 
+    // Convert the current inventory ratio to an XCH deviation from balanced.
+    // q_initial = (current_ratio - 0.5) * total_value / xch_price.
+    // This ensures the simulation starts from the actual position rather than
+    // assuming a balanced (q = 0) portfolio.
+    const double clamped_ratio = std::clamp(current_ratio, 0.0, 1.0);
+    const double q_initial =
+        (cfg_.xch_price_usd > 0.0)
+            ? (clamped_ratio - 0.5) * cfg_.total_portfolio_value_usd
+              / cfg_.xch_price_usd
+            : 0.0;
+
     // Storage for first-passage times across all paths.
     std::vector<double> soft_times(num_paths,
                                    static_cast<double>(max_blocks));
@@ -368,7 +380,7 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
     double sum_final_ratio_sq = 0.0;
 
     for (uint32_t p = 0; p < num_paths; ++p) {
-        double q = 0.0;  // Inventory deviation from balanced (in XCH).
+        double q = q_initial;  // Start from the actual inventory deviation.
         bool hit_soft = false;
         bool hit_hard = false;
 

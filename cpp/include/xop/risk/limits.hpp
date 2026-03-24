@@ -98,8 +98,9 @@ class PreTradeCheck {
 public:
     /// Construct with an immutable reference to the risk configuration.
     /// The RiskConfig must outlive this object (typically AppConfig lifetime).
+    /// @throws std::invalid_argument if config yields invalid margin fraction.
     explicit PreTradeCheck(const RiskConfig& cfg,
-                           const StrategyConfig& strat_cfg) noexcept;
+                           const StrategyConfig& strat_cfg);
 
     // -- Core rule: NEVER SELL AT A LOSS ------------------------------------
 

@@ -279,6 +279,15 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                                    double             best_ask,
                                    double             last_trade,
                                    double             vol_24h) {
+    // Reject crossed-book data: bid >= ask produces nonsensical mid-prices.
+    // Both sides must be positive (non-zero) for the check to apply; a zero
+    // price indicates the side was absent from the book.
+    if (best_bid > 0.0 && best_ask > 0.0 && best_bid >= best_ask) {
+        spdlog::warn("[MarketData] Crossed book for {}: bid={} >= ask={}",
+                     pair_name, best_bid, best_ask);
+        return;  // Discard this snapshot entirely.
+    }
+
     std::unique_lock lock(mtx_pairs_);
     PairState& ps = get_or_create_pair(pair_name);
 
@@ -1644,14 +1653,19 @@ void MarketDataFeed::recompute_ofi(const std::string& pair_name)
         cumulative += (delta_bid - delta_ask);
     }
 
-    // Normalise OFI to [-1, 1] using a rolling max-absolute-value approach.
-    // We use the maximum possible single-step imbalance (sum of bid+ask sizes
-    // across all observations) as the normalisation factor.
-    double max_abs = 0.0;
+    // Normalise OFI to [-1, 1] using the average per-snapshot imbalance
+    // capacity within the current sliding window.  We compute the mean of
+    // (bid_size + ask_size) across all snapshots, then multiply by the number
+    // of delta steps (snaps.size() - 1).  This keeps the denominator
+    // proportional to the window length rather than growing without bound as
+    // more snapshots accumulate (which would drive normalised OFI to zero).
+    double sum_sizes = 0.0;
     for (const auto& s : snaps) {
-        max_abs += (s.bid_size + s.ask_size);
+        sum_sizes += (s.bid_size + s.ask_size);
     }
-    max_abs = std::max(max_abs, 1e-12);  // guard against division by zero
+    const double avg_size = sum_sizes / static_cast<double>(snaps.size());
+    const double max_abs  = std::max(
+        avg_size * static_cast<double>(snaps.size() - 1), 1e-12);
 
     const double norm_ofi = std::clamp(cumulative / max_abs, -1.0, 1.0);
 
