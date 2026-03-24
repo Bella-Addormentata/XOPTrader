@@ -16,7 +16,7 @@
 //   ISO/IEC 27001:2022  -- parameterised queries, append-only audit log
 //   ISO/IEC 5055        -- no unchecked casts, RAII resource management
 //   ISO/IEC 25000       -- clear error handling, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- portable C++17, defined behaviour throughout
+//   ISO/IEC JTC 1/SC 22 -- portable C++20, defined behaviour throughout
 
 #include "xop/monitoring/pnl.hpp"
 

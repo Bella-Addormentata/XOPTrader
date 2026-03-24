@@ -509,13 +509,18 @@ class DatabaseService(QObject):
         return True
 
     def stop(self) -> None:
-        """Close the database and shut down the worker thread."""
+        """Close the database and shut down the worker thread.
+
+        Safe to call even if the service was never started -- the thread
+        quit/wait is skipped when the thread is not running.
+        """
         _log.info("Stopping DatabaseService.")
         self._refresh_timer.stop()
-        self._trigger_close.emit()
-        self._thread.quit()
-        if not self._thread.wait(5_000):
-            _log.warning("DatabaseService worker thread did not exit in time.")
+        if self._thread.isRunning():
+            self._trigger_close.emit()
+            self._thread.quit()
+            if not self._thread.wait(5_000):
+                _log.warning("DatabaseService worker thread did not exit in time.")
 
     # ===================================================================
     # Public query API (non-blocking, results via signals)

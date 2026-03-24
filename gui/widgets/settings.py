@@ -548,7 +548,7 @@ class SettingsWidget(QWidget):
         as_form.setSpacing(8)
 
         self._gamma = QDoubleSpinBox()
-        self._gamma.setRange(0.001, 1.0)
+        self._gamma.setRange(0.0, 10.0)
         self._gamma.setSingleStep(0.001)
         self._gamma.setDecimals(4)
         self._gamma.setToolTip(
@@ -1465,8 +1465,13 @@ class SettingsWidget(QWidget):
         remove_btn.setObjectName("dangerButton")
         remove_btn.setFixedHeight(24)
         remove_btn.setToolTip("Remove this trading pair")
+        # Resolve the button's current row at click time rather than
+        # capturing a row index at insert time.  Captured indices go
+        # stale when earlier rows are deleted.
         remove_btn.clicked.connect(
-            lambda _checked, r=row: self._on_remove_pair(r)
+            lambda _checked, btn=remove_btn: self._on_remove_pair(
+                self._pairs_table.indexAt(btn.pos()).row()
+            )
         )
         actions_layout.addWidget(remove_btn)
         self._pairs_table.setCellWidget(row, 4, actions)

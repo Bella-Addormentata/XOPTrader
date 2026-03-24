@@ -631,6 +631,10 @@ class DashboardWidget(QWidget):
     ) -> None:
         """Update the Current Block card.
 
+        When *height* is 0 or *last_block_ts* is 0 the block chain
+        state is unknown; the card shows placeholder text instead of
+        computing a nonsensical age from epoch zero.
+
         Parameters
         ----------
         height:
@@ -638,6 +642,12 @@ class DashboardWidget(QWidget):
         last_block_ts:
             Unix timestamp of the most recent block.
         """
+        # Guard: unknown block state produces placeholder display.
+        if height == 0 or last_block_ts == 0.0:
+            self._block_height_label.setText("Block: --")
+            self._block_age_label.setText("-- ago")
+            return
+
         self._block_height_label.setText(f"{height:,}")
         age_s = time.time() - last_block_ts
         if age_s < 60:

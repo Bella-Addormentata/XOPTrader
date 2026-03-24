@@ -543,6 +543,83 @@ class OrderBookWidget(QWidget):
         if self._combo_pair.findText(pair_name) < 0:
             self._combo_pair.addItem(pair_name)
 
+    def update_market_data(self, data: dict) -> None:
+        """Accept a market-data dict from the bridge and update the book.
+
+        The bridge emits a flat dict keyed by pair name, e.g.::
+
+            {
+                "XCH/USDS": {
+                    "best_bid": 12345,
+                    "best_ask": 12346,
+                    "mid_price": 12345,
+                    "spread_bps": 5.0,
+                    ...
+                },
+                ...
+            }
+
+        This method looks up the currently selected pair, extracts its
+        sub-dict, builds an :class:`OrderBookSnapshot` with whatever
+        fields are available, and forwards it to :meth:`update_book`.
+
+        Parameters
+        ----------
+        data:
+            Per-pair market data dict from the engine bridge.
+        """
+        if not data:
+            return
+
+        # Determine which pair is currently active in the selector.
+        current_pair: str = self._combo_pair.currentText()
+        if not current_pair:
+            return
+
+        pair_data: dict = data.get(current_pair, {})
+        if not pair_data:
+            return
+
+        # Build an OrderBookSnapshot from the available fields.
+        # The bridge provides integer mojo values for prices and
+        # float basis-point values for the spread.
+        mid_price = int(pair_data.get("mid_price", 0))
+        spread_bps = float(pair_data.get("spread_bps", 0.0))
+
+        # Reconstruct bid/ask levels if the bridge supplies them.
+        bids: list[OrderBookLevel] = []
+        asks: list[OrderBookLevel] = []
+
+        for raw_lvl in pair_data.get("bids", []):
+            bids.append(OrderBookLevel(
+                price_mojos=int(raw_lvl.get("price_mojos", 0)),
+                size_mojos=int(raw_lvl.get("size_mojos", 0)),
+                cumulative_mojos=int(raw_lvl.get("cumulative_mojos", 0)),
+                is_own=bool(raw_lvl.get("is_own", False)),
+                own_size_mojos=int(raw_lvl.get("own_size_mojos", 0)),
+                tier=int(raw_lvl.get("tier", -1)),
+            ))
+
+        for raw_lvl in pair_data.get("asks", []):
+            asks.append(OrderBookLevel(
+                price_mojos=int(raw_lvl.get("price_mojos", 0)),
+                size_mojos=int(raw_lvl.get("size_mojos", 0)),
+                cumulative_mojos=int(raw_lvl.get("cumulative_mojos", 0)),
+                is_own=bool(raw_lvl.get("is_own", False)),
+                own_size_mojos=int(raw_lvl.get("own_size_mojos", 0)),
+                tier=int(raw_lvl.get("tier", -1)),
+            ))
+
+        snapshot = OrderBookSnapshot(
+            pair_name=current_pair,
+            mid_price_mojos=mid_price,
+            spread_bps=spread_bps,
+            bids=bids,
+            asks=asks,
+            timestamp=float(pair_data.get("timestamp", 0.0)),
+        )
+        self.update_book(snapshot)
+
     # -----------------------------------------------------------------
     # Internal: slot handlers
     # -----------------------------------------------------------------
@@ -569,8 +646,13 @@ class OrderBookWidget(QWidget):
 
     @Slot(int)
     def _on_highlight_toggled(self, state: int) -> None:
-        """Toggle visibility of the own-order overlay."""
-        self._show_own = state == Qt.CheckState.Checked.value
+        """Toggle visibility of the own-order overlay.
+
+        Uses ``isChecked()`` instead of comparing the raw *state*
+        parameter to avoid int-vs-enum mismatches across PySide6
+        versions (ISO/IEC 5055 -- defensive type handling).
+        """
+        self._show_own = self._chk_highlight.isChecked()
         # Immediately toggle the chart overlay visibility.
         self._own_bars.setVisible(self._show_own)
         # Re-render the table to add/remove My Size column content.
@@ -924,7 +1006,7 @@ class OrderBookWidget(QWidget):
             for lvl in bids + asks:
                 if lvl.is_own and lvl.own_size_mojos > 0:
                     own_prices.append(mojos_to_xch_float(lvl.price_mojos))
-                    own_heights.append(mojos_to_xch_float(lvl.cumulative_mojos))
+                    own_heights.append(mojos_to_xch_float(lvl.own_size_mojos))
 
         self._own_bars.setOpts(
             x=np.array(own_prices, dtype=np.float64) if own_prices else np.array([]),

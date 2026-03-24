@@ -682,12 +682,22 @@ class ChartWidget(QWidget):
             PriceTick(block=block_height, timestamp=timestamp,
                       mid=mid, bid=bid, ask=ask)
         )
-        # Maintain the O(1) block-to-timestamp lookup table (bounded).
-        self._block_ts_map[(self._current_pair, block_height)] = timestamp
-        if len(self._block_ts_map) > _MAX_DATA_POINTS * 2:
-            # Evict oldest entries to prevent unbounded growth.
-            excess = len(self._block_ts_map) - _MAX_DATA_POINTS
-            for key in list(self._block_ts_map)[:excess]:
+        # Maintain the O(1) block-to-timestamp lookup table.
+        # Eviction is per-pair to prevent unbounded growth when many
+        # pairs each accumulate entries independently.
+        pair = self._current_pair
+        self._block_ts_map[(pair, block_height)] = timestamp
+
+        # Count entries belonging to the current pair and evict the
+        # oldest (lowest block numbers) when the limit is exceeded.
+        pair_keys = [
+            k for k in self._block_ts_map if k[0] == pair
+        ]
+        if len(pair_keys) > _MAX_DATA_POINTS:
+            # Sort by block height (second tuple element) ascending.
+            pair_keys.sort(key=lambda k: k[1])
+            excess = len(pair_keys) - _MAX_DATA_POINTS
+            for key in pair_keys[:excess]:
                 del self._block_ts_map[key]
         self._dirty = True
 
