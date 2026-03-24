@@ -1331,18 +1331,18 @@ double MarketDataFeed::get_vpin(const std::string& pair_name) const
 // OFI aggregates signed volume changes at the best bid/ask.  For each pair
 // of consecutive snapshots (t-1, t):
 //
-//   delta_bid = { +bid_size_t   if bid_t > bid_{t-1}
-//               { -(bid_size_{t-1}) if bid_t < bid_{t-1}
-//               { bid_size_t - bid_size_{t-1}  otherwise
+//   delta_bid (e^B): { +bid_size_t        if bid_t > bid_{t-1}  (bid improved)
+//                    { -(bid_size_{t-1})  if bid_t < bid_{t-1}  (bid weakened)
+//                    { bid_size_t - bid_size_{t-1}   otherwise  (size change)
 //
-//   delta_ask = { -(ask_size_t) if ask_t < ask_{t-1}
-//               { +ask_size_{t-1}   if ask_t > ask_{t-1}
-//               { ask_size_{t-1} - ask_size_t  otherwise
+//   delta_ask (e^A): { +ask_size_t        if ask_t < ask_{t-1}  (ask improved)
+//                    { -(ask_size_{t-1})  if ask_t > ask_{t-1}  (ask weakened)
+//                    { ask_size_t - ask_size_{t-1}   otherwise  (size change)
 //
-//   OFI_t = delta_bid - delta_ask   (note the sign flip on ask)
+//   OFI_t = delta_bid - delta_ask
 //
-// Positive OFI → buy pressure (bids strengthening / asks retreating).
-// Negative OFI → sell pressure.
+// Positive OFI → buy pressure (bids strengthening faster than asks).
+// Negative OFI → sell pressure (asks strengthening faster than bids).
 // =========================================================================
 
 void MarketDataFeed::ingest_book_snapshot_for_ofi(
@@ -1393,14 +1393,17 @@ void MarketDataFeed::recompute_ofi(const std::string& pair_name)
             delta_bid = curr.bid_size - prev.bid_size;
         }
 
-        // Ask-side delta (note: ask improvement is a DECREASE in ask price).
+        // Ask-side event (e^A) per Cont et al.:
+        //   ask improves (price decreases) → e^A = +ask_size_t
+        //   ask weakens  (price increases) → e^A = -ask_size_{t-1}
+        //   ask unchanged                  → e^A = ask_size_t - ask_size_{t-1}
         double delta_ask = 0.0;
         if (curr.best_ask < prev.best_ask) {
-            delta_ask = -curr.ask_size;
+            delta_ask = curr.ask_size;
         } else if (curr.best_ask > prev.best_ask) {
-            delta_ask = prev.ask_size;
+            delta_ask = -prev.ask_size;
         } else {
-            delta_ask = prev.ask_size - curr.ask_size;
+            delta_ask = curr.ask_size - prev.ask_size;
         }
 
         // OFI = delta_bid - delta_ask (sign: positive = buy pressure).
@@ -1430,9 +1433,9 @@ void MarketDataFeed::recompute_ofi(const std::string& pair_name)
         else db = curr.bid_size - prev.bid_size;
 
         double da = 0.0;
-        if (curr.best_ask < prev.best_ask) da = -curr.ask_size;
-        else if (curr.best_ask > prev.best_ask) da = prev.ask_size;
-        else da = prev.ask_size - curr.ask_size;
+        if (curr.best_ask < prev.best_ask) da = curr.ask_size;
+        else if (curr.best_ask > prev.best_ask) da = -prev.ask_size;
+        else da = curr.ask_size - prev.ask_size;
 
         latest_ofi = db - da;
     }

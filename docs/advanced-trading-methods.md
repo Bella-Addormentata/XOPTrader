@@ -85,19 +85,19 @@ a large trade confirms — enabling preemptive spread widening.
 
 For each pair of consecutive order-book snapshots *(t−1, t)*:
 
-**Bid-side delta** (`δ_bid`):
+**Bid-side delta** (`e^B`):
 
-- If `bid_t > bid_{t−1}`: a new, higher bid arrived → `δ_bid = +bid_size_t`
-- If `bid_t < bid_{t−1}`: the best bid was taken → `δ_bid = −bid_size_{t−1}`
-- If `bid_t == bid_{t−1}`: price unchanged → `δ_bid = bid_size_t − bid_size_{t−1}`
+- If `bid_t > bid_{t−1}`: a new, higher bid arrived (bid improved) → `e^B = +bid_size_t`
+- If `bid_t < bid_{t−1}`: the best bid was taken (bid weakened) → `e^B = −bid_size_{t−1}`
+- If `bid_t == bid_{t−1}`: price unchanged → `e^B = bid_size_t − bid_size_{t−1}`
 
-**Ask-side delta** (`δ_ask`):
+**Ask-side delta** (`e^A`):
 
-- If `ask_t < ask_{t−1}`: a new, lower ask arrived → `δ_ask = −ask_size_t`
-- If `ask_t > ask_{t−1}`: the best ask was taken → `δ_ask = +ask_size_{t−1}`
-- If `ask_t == ask_{t−1}`: price unchanged → `δ_ask = ask_size_{t−1} − ask_size_t`
+- If `ask_t < ask_{t−1}`: a new, lower ask arrived (ask improved) → `e^A = +ask_size_t`
+- If `ask_t > ask_{t−1}`: the best ask was taken (ask weakened) → `e^A = −ask_size_{t−1}`
+- If `ask_t == ask_{t−1}`: price unchanged → `e^A = ask_size_t − ask_size_{t−1}`
 
-**OFI** = `δ_bid − δ_ask`
+**OFI** = `e^B − e^A`
 
 Positive OFI → buy pressure (bids strengthening, asks retreating).
 Negative OFI → sell pressure (asks strengthening, bids retreating).
