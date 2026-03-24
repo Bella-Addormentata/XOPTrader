@@ -92,29 +92,44 @@ add_library(xop_core STATIC
     # -- Core infrastructure ---------------------------------------------------
     src/config.cpp
     src/state.cpp
+    src/database.cpp
+    src/engine.cpp
+    src/backtest.cpp
 
     # -- Strategy layer --------------------------------------------------------
     src/strategy/spread.cpp
     src/strategy/avellaneda.cpp
     src/strategy/glft.cpp
+    src/strategy/regime.cpp
+    src/strategy/liquidity.cpp
+    src/strategy/arbitrage.cpp
+    src/strategy/new_strategies.cpp
+    src/strategy/chia_edge.cpp
 
     # -- Risk layer ------------------------------------------------------------
     src/risk/inventory.cpp
     src/risk/limits.cpp
+    src/risk/hedging.cpp
+    src/risk/loss_manager.cpp
+    src/risk/drift_analyzer.cpp
+
+    # -- Execution layer -------------------------------------------------------
+    src/execution/offer_manager.cpp
+    src/execution/coin_manager.cpp
+    src/execution/market_data.cpp
 
     # -- RPC / networking ------------------------------------------------------
     src/rpc/chia_rpc.cpp
+    src/rpc/dexie_client.cpp
 
-    # -- Data layer (volatility estimator) -------------------------------------
+    # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp
+    src/data/adverse_selection.cpp
 
-    # -- Future subsystem sources (uncomment as implemented) -------------------
-    # src/execution/offer_manager.cpp
-    # src/execution/coin_manager.cpp
-    # src/data/market_data.cpp
-    # src/data/adverse_selection.cpp
-    # src/rpc/dexie_client.cpp
-    # src/monitoring/prometheus.cpp
+    # -- Monitoring ------------------------------------------------------------
+    src/monitoring/pnl.cpp
+    src/monitoring/metrics.cpp
+    src/monitoring/alerts.cpp
 )
 
 target_include_directories(xop_core
