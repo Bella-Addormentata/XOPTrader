@@ -2021,6 +2021,26 @@ takers, multiple spread levels coexist profitably.
 | **TTL + block-cadence timing** | Quote at moments when competitor coverage is thin, rather than when the book is already full | Future (§3.17, §3.18) |
 | **Minimum spread floor** | Never quote below a configurable minimum spread (e.g., spread_min_bps = 50–100 for typical CAT pairs, lower for high-volume pairs like XCH/USDS) regardless of competitive pressure — this is the circuit breaker against Bertrand races | Config parameter (spread_min_bps) |
 
+#### Other order-book interaction strategies
+
+Gap-filling should be the **default** XOPTrader behavior on Chia DEX, but it
+is not the only valid way to interact with the order book.  The broader
+microstructure literature suggests a small menu of recurring tactics:
+
+| Tactic | When to use it | Why it works |
+|--------|----------------|--------------|
+| **Join the inside queue** | Low toxicity, thin queue ahead, stable regime | Maximizes fill probability while still earning maker spread; appropriate when the best bid/ask is not overcrowded (Parlour, 1998 [ref 43]; Rosu, 2009 [ref 44]) |
+| **Improve by one price increment** | Queue at best price is too deep but the spread is still wide enough to justify stepping in front | Buys queue priority at the cost of some spread; best used selectively and with small size so you do not trigger a price-improvement race (Foucault, Kadan & Kandel, 2005 [ref 38]; Lu & Abergel, 2018 [ref 46]) |
+| **Step back / fade one tier** | VPIN or OFI rises, competitor crowding increases, or the inside spread becomes too tight | Preserves capital and avoids adverse selection; this is the anti-feedback-loop move when the inside quote is no longer attractive (Cartea, Jaimungal & Penalva, 2015 [ref 10]; Bouchaud, 2010 [ref 45]) |
+| **Layer multiple tiers** | Uncertain short-term direction but desire for continuous presence | Captures both fast taker flow near mid and slower flow farther out; reduces all-or-nothing dependence on one quote level (§1.4; Foucault, Kadan & Kandel, 2005 [ref 38]) |
+| **Asymmetric sizing** | Inventory is imbalanced but full rebalancing is unnecessary | Keep both sides quoted, but post larger size on the side that reduces inventory and smaller size on the side that increases it (Avellaneda & Stoikov, 2008 [ref 6]; Guéant, Lehalle & Fernandez-Tapia, 2013 [ref 19]) |
+| **Hybrid maker-taker rebalancing** | Extreme imbalance, stale book, or urgent risk reduction | Stay passive most of the time, but cross the spread deliberately for a small amount when the expected future spread income from restoring balance exceeds the immediate loss (§5.1, §5.2; Guilbaud & Pham, 2013 [ref 21]) |
+
+The key is to treat these as **state-dependent tactics**, not permanent
+identities.  A healthy market maker may spend part of the day joining the
+inside, part of the day stepping back, and part of the day filling gaps in
+the second or third tier.
+
 #### What about running multiple XOPTrader instances ourselves?
 
 If _you_ control multiple instances (e.g., for scaling or redundancy), the
@@ -2056,6 +2076,33 @@ XOPTrader or not), the expected equilibrium is:
   [ref 37] finding applies: successful market makers survive competition
   by running diversified strategy portfolios, not by winning a single
   spread-tightening contest.
+
+#### Scholarly guidance on avoiding feedback loops
+
+Yes — there is meaningful scholarly support for the idea that market makers
+should avoid blindly matching each other and should instead differentiate,
+back off, or relocate when the book becomes crowded:
+
+- **Farmer & Joshi (2002) [ref 42]** is the most directly relevant paper in
+  this document.  It shows that strategies which are profitable in isolation
+  can become unprofitable once crowded by similar agents.  The implication is
+  to monitor crowding and rotate away from saturated quote locations.
+- **Bouchaud (2010) [ref 45]** frames many market instabilities as endogenous
+  feedback loops between order flow, liquidity, and price impact.  The
+  practical lesson is to avoid pro-cyclical quote chasing and avoid reacting
+  mechanically to every competitor move.
+- **Parlour (1998) [ref 43]** and **Rosu (2009) [ref 44]** model how the
+  state of the order book affects whether traders place aggressive or passive
+  orders.  Their core message is that quote placement should depend on queue
+  state and book shape, not just on an abstract fair-value estimate.
+- **Lu & Abergel (2018) [ref 46]** is especially useful for XOPTrader's
+  practical design because it studies order-book-aware market making tactics
+  such as joining, improving, and stepping back — exactly the tactical menu
+  needed to avoid self-defeating feedback dynamics.
+- **Menkveld (2013) [ref 37]** suggests that robust market makers survive by
+  operating as diversified, adaptive agents rather than by defending one
+  static quoting style.  In our context, that means gap-filling should be the
+  baseline strategy, but not the only one.
 
 **Key takeaway:** Don't try to know or control what other market makers
 are doing.  Instead, (1) use the A-S/GLFT model to find _your_ optimal
@@ -2190,3 +2237,11 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 41. Brock, W. A. & Hommes, C. H. (1998). "Heterogeneous beliefs and routes to chaos in a simple asset pricing model." *Journal of Economic Dynamics and Control*, 22(8–9), 1235–1274.
 
 42. Farmer, J. D. & Joshi, S. (2002). "The price dynamics of common trading strategies." *Journal of Economic Behavior & Organization*, 49(2), 149–171.
+
+43. Parlour, C. A. (1998). "Price dynamics in limit order markets." *Review of Financial Studies*, 11(4), 789–816.
+
+44. Rosu, I. (2009). "A dynamic model of the limit order book." *Review of Financial Studies*, 22(11), 4601–4641.
+
+45. Bouchaud, J.-P. (2010). "The endogenous dynamics of markets: price impact, feedback loops and instabilities." *arXiv:1009.2928*.
+
+46. Lu, X. & Abergel, F. (2018). "Order-book modelling and market making strategies." *FINEC Working Paper 2018-028*.
