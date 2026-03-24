@@ -409,6 +409,49 @@ void MarketDataFeed::set_arb_callback(ArbitrageCallback cb) {
     spdlog::debug("Arbitrage callback updated");
 }
 
+void MarketDataFeed::set_whale_trade_threshold(Mojo threshold) {
+    if (threshold <= 0) {
+        spdlog::warn("set_whale_trade_threshold: invalid threshold={}, ignoring",
+                     threshold);
+        return;
+    }
+    config_.whale_trade_threshold = threshold;
+    spdlog::info("Whale trade threshold updated to {} mojos ({:.2f} XCH)",
+                 threshold,
+                 static_cast<double>(threshold) / static_cast<double>(kMojosPerXch));
+}
+
+void MarketDataFeed::set_whale_volume_fraction(double fraction) {
+    if (fraction <= 0.0 || fraction > 1.0) {
+        spdlog::warn("set_whale_volume_fraction: invalid fraction={:.4f}, ignoring",
+                     fraction);
+        return;
+    }
+    config_.whale_volume_fraction = fraction;
+    spdlog::info("Whale volume fraction updated to {:.4f} ({:.1f}%)",
+                 fraction, fraction * 100.0);
+}
+
+void MarketDataFeed::set_whale_window_blocks(std::size_t blocks) {
+    if (blocks == 0) {
+        spdlog::warn("set_whale_window_blocks: window must be >= 1, ignoring");
+        return;
+    }
+    config_.whale_window_blocks = blocks;
+    spdlog::info("Whale window updated to {} blocks (~{:.0f}s at 52s/block)",
+                 blocks, static_cast<double>(blocks) * 52.0);
+}
+
+void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
+    if (multiplier < 1.0) {
+        spdlog::warn("set_whale_max_spread_multiplier: multiplier={:.2f} < 1.0, ignoring",
+                     multiplier);
+        return;
+    }
+    config_.whale_max_spread_multiplier = multiplier;
+    spdlog::info("Whale max spread multiplier updated to {:.2f}x", multiplier);
+}
+
 // =========================================================================
 //  Internal helpers
 // =========================================================================
@@ -1058,10 +1101,14 @@ double MarketDataFeed::compute_whale_spread_multiplier(
         return 1.0;
     }
 
+    // Ensure we never divide by zero: treat a zero window size as 1 block.
+    const double window_blocks = std::max(
+        1.0,
+        static_cast<double>(config_.whale_window_blocks));
+
     // Clamp at the window size so we don't extrapolate beyond max.
     const double fraction = std::min(
-        static_cast<double>(events_in_window) /
-            static_cast<double>(config_.whale_window_blocks),
+        static_cast<double>(events_in_window) / window_blocks,
         1.0);
 
     // Linear interpolation: 1.0 + fraction * (max - 1.0)
@@ -1087,9 +1134,12 @@ std::optional<WhaleMetrics> MarketDataFeed::get_whale_metrics(
     }
 
     const WhaleMetrics& wm = it->second;
-    // Use addition rather than subtraction to avoid unsigned underflow when
-    // current_block is less than last_event_block (e.g. during replay or tests).
-    if (current_block >= wm.last_event_block + static_cast<BlockHeight>(config_.whale_window_blocks))
+    // Compute the expiry comparison in uint64_t to avoid uint32 overflow when
+    // last_event_block is near UINT32_MAX or when whale_window_blocks is large.
+    const auto current64 = static_cast<std::uint64_t>(current_block);
+    const auto last64    = static_cast<std::uint64_t>(wm.last_event_block);
+    const auto window64  = static_cast<std::uint64_t>(config_.whale_window_blocks);
+    if (current64 >= last64 + window64)
     {
         // Window has expired; behave as if no whale is present.
         return std::nullopt;
