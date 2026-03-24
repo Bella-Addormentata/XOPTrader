@@ -156,6 +156,29 @@ struct MarketDataConfig {
     /// Alert threshold: if competing spread < this value (bps), fire an alert.
     /// Indicates a serious competitor with tight spreads has appeared.
     double competitor_alert_threshold_bps{50.0};
+
+    // -- Whale detection configuration --------------------------------------
+
+    /// Minimum trade size (in mojos) to be classified as a whale trade.
+    /// Default: 50 XCH.  Trades at or above this size trigger adverse-selection
+    /// guards (spread widening, size reduction).
+    Mojo whale_trade_threshold{50LL * 1'000'000'000'000LL};
+
+    /// Minimum fraction of rolling 24-hour volume that makes a trade a whale
+    /// trade regardless of absolute size.  This catches whales on illiquid pairs
+    /// where 50 XCH may still be a large fraction of daily turnover.
+    /// Default: 0.05 = 5 % of 24-hour volume.
+    double whale_volume_fraction{0.05};
+
+    /// Number of blocks over which whale events are counted for the activity
+    /// window.  Default: 10 blocks (~520 s at 52 s/block).
+    std::size_t whale_window_blocks{10};
+
+    /// Maximum spread multiplier applied when whale activity is at its most
+    /// intense.  The actual multiplier is linearly interpolated between 1.0
+    /// (no whale activity) and this value (maximum whale activity in window).
+    /// Default: 3.0  (triple the normal spread when the whale window is full).
+    double whale_max_spread_multiplier{3.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -358,6 +381,40 @@ public:
     std::optional<ArbitrageSignal> get_latest_arb_signal(
         const std::string& pair_name) const;
 
+    // -- Whale detection ----------------------------------------------------
+
+    /// Record an individual trade and update whale-activity metrics.
+    ///
+    /// Called by the engine each time a fill is confirmed on the DEX (or when
+    /// the order book snapshots reveal a large trade vs. the previous block).
+    /// A trade is classified as a "whale trade" when its size meets either
+    /// the absolute threshold (whale_trade_threshold) or the fractional-volume
+    /// threshold (whale_volume_fraction × vol_24h).
+    ///
+    /// @param pair_name     Trading pair identifier.
+    /// @param side          Direction of the trade (Bid = taker bought, Ask = taker sold).
+    /// @param size          Trade size in mojos (base asset).
+    /// @param block_height  Block at which the trade occurred.
+    void ingest_trade(const std::string& pair_name,
+                      Side               side,
+                      Mojo               size,
+                      BlockHeight        block_height);
+
+    /// Retrieve the latest whale metrics for a pair.
+    /// Returns std::nullopt if no trades have been ingested for this pair or if
+    /// no whale events have occurred within the tracking window.
+    std::optional<WhaleMetrics> get_whale_metrics(
+        const std::string& pair_name) const;
+
+    /// Whether whale activity is currently detected for a pair.
+    /// Returns false if the pair is unknown or the tracking window is empty.
+    bool is_whale_active(const std::string& pair_name) const;
+
+    /// Recommended spread multiplier based on current whale activity.
+    /// Returns 1.0 when no whale activity is detected (no spread widening).
+    /// Returns up to whale_max_spread_multiplier when the whale window is full.
+    double get_whale_spread_multiplier(const std::string& pair_name) const;
+
     // -- Configuration access -----------------------------------------------
 
     /// Read-only access to the active configuration.
@@ -405,6 +462,18 @@ private:
     std::optional<CompetitorMetrics> compute_competitor_metrics(
         const std::string& pair_name);
 
+    /// Classify a trade as a whale event and, if so, append it to the per-pair
+    /// event deque and recompute WhaleMetrics.  Called from ingest_trade().
+    void detect_and_update_whale(const std::string& pair_name,
+                                 Side               side,
+                                 Mojo               size,
+                                 BlockHeight        block_height);
+
+    /// Compute the spread multiplier from the count of whale events in the
+    /// rolling window.  Linear interpolation: 0 events → 1.0; window_blocks
+    /// events → whale_max_spread_multiplier.
+    double compute_whale_spread_multiplier(std::size_t events_in_window) const;
+
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
     void publish_snapshot(const PairState& ps);
@@ -443,6 +512,15 @@ private:
     /// Per-pair latest competitor metrics.  Guarded by mtx_competitor_metrics_.
     mutable std::shared_mutex                          mtx_competitor_metrics_;
     std::unordered_map<std::string, CompetitorMetrics> competitor_metrics_;
+
+    /// Per-pair whale trade event deques (ordered oldest-to-newest by block).
+    /// Guarded by mtx_whale_events_.
+    mutable std::shared_mutex                              mtx_whale_events_;
+    std::unordered_map<std::string, std::deque<WhaleTradeEvent>> whale_events_;
+
+    /// Per-pair latest whale metrics.  Guarded by mtx_whale_metrics_.
+    mutable std::shared_mutex                          mtx_whale_metrics_;
+    std::unordered_map<std::string, WhaleMetrics>      whale_metrics_;
 
     /// Latest block height from the full node.  Atomic for lock-free reads.
     std::atomic<BlockHeight> block_height_{0};
