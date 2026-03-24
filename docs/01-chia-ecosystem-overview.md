@@ -162,7 +162,7 @@ WSS    /v1/stream          - Real-time offer stream
 
 ### 5.2 TibetSwap (v2.tibetswap.io)
 
-**TibetSwap** is Chia's leading Automated Market Maker (AMM), modeled after Uniswap V1.
+**TibetSwap** is Chia's leading Automated Market Maker (AMM), modeled after Uniswap V2.
 
 **Architecture:**
 - Constant product AMM: `x * y = k` invariant
