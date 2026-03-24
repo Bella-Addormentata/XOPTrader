@@ -64,6 +64,11 @@ except ImportError:
     SettingsWidget = None  # type: ignore[assignment,misc]
 
 try:
+    from gui.widgets.order_book import OrderBookWidget
+except ImportError:
+    OrderBookWidget = None  # type: ignore[assignment,misc]
+
+try:
     from gui.widgets.trade_log import TradeLogWidget
 except ImportError:
     TradeLogWidget = None  # type: ignore[assignment,misc]
@@ -171,6 +176,7 @@ class MainWindow(QMainWindow):
         self._dashboard: Optional[QWidget] = None
         self._chart: Optional[QWidget] = None
         self._order_panel: Optional[QWidget] = None
+        self._order_book: Optional[QWidget] = None
         self._settings_widget: Optional[QWidget] = None
         self._trade_log: Optional[QWidget] = None
         self._bot_log: Optional[QWidget] = None
@@ -227,6 +233,14 @@ class MainWindow(QMainWindow):
             db.offers_loaded.connect(self._tab_order_panel.update_offers)
         if self._trade_log is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._trade_log.load_trades)
+
+        # -- Order book data signals ---------------------------------------
+        if self._order_book is not None:
+            if hasattr(db, "offers_loaded"):
+                db.offers_loaded.connect(self._on_offers_for_order_book)
+            # Feed aggregated market data snapshots to the order book widget
+            # on every bridge refresh tick.
+            bridge.data_updated.connect(self._on_bridge_data_for_order_book)
 
         # -- Widget -> bridge command signals ------------------------------
         if self._order_panel is not None:
@@ -357,6 +371,9 @@ class MainWindow(QMainWindow):
     def _on_view_orders(self, pair_name: str) -> None:
         """Switch to orders page filtered for the given pair.
 
+        Also updates the order book widget's active pair when available
+        so the depth view stays synchronised with the selected pair.
+
         Parameters
         ----------
         pair_name : str
@@ -364,6 +381,9 @@ class MainWindow(QMainWindow):
         """
         self._stacked.setCurrentIndex(2)
         self._sidebar.select_page(2)
+        # Keep the order book widget in sync with the selected pair.
+        if self._order_book is not None and hasattr(self._order_book, "set_pair"):
+            self._order_book.set_pair(pair_name)
 
     def _on_bot_error(self, msg: str) -> None:
         """Handle error detected in bot log.
@@ -374,6 +394,42 @@ class MainWindow(QMainWindow):
             Error message from bot log.
         """
         self._status_bar.showMessage(f"ERROR: {msg[:100]}", 10000)
+
+    def _on_offers_for_order_book(self, offers: list) -> None:
+        """Forward active offers to the order book widget as own-order highlights.
+
+        Only pending offers are forwarded so the depth visualisation can
+        mark the bot's resting orders on the book.
+
+        Parameters
+        ----------
+        offers : list
+            List of offer dicts from the database service.
+        """
+        if self._order_book is None or not hasattr(self._order_book, "set_own_orders"):
+            return
+        # Filter to pending offers only
+        own = [o for o in offers if o.get("status") == "pending"]
+        self._order_book.set_own_orders(own)
+
+    def _on_bridge_data_for_order_book(self, data: dict) -> None:
+        """Forward market data from the bridge refresh to the order book.
+
+        Extracts the ``order_book`` and ``market_data`` sections from the
+        aggregated data snapshot and passes them to the widget.
+
+        Parameters
+        ----------
+        data : dict
+            Aggregated bridge data snapshot.
+        """
+        if self._order_book is None:
+            return
+        # Prefer the dedicated order_book key if present, fall back to
+        # market_data for backward compatibility.
+        ob_data = data.get("order_book", data.get("market_data", {}))
+        if hasattr(self._order_book, "update_market_data"):
+            self._order_book.update_market_data(ob_data)
 
     # ===================================================================== #
     #  Menu bar                                                              #
@@ -453,7 +509,7 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("S&ettings")
 
         act_open_settings = QAction("&Open Settings Panel", self)
-        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(3))
+        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(4))
         settings_menu.addAction(act_open_settings)
 
         # -- Help menu ------------------------------------------------------
@@ -642,6 +698,8 @@ class MainWindow(QMainWindow):
         self._stacked.addWidget(self._chart)
         self._order_panel = self._create_page_widget(OrderPanel, "Orders")
         self._stacked.addWidget(self._order_panel)
+        self._order_book = self._create_page_widget(OrderBookWidget, "Order Book")
+        self._stacked.addWidget(self._order_book)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
         self._stacked.addWidget(self._settings_widget)
         self._splitter.addWidget(self._stacked)
@@ -751,12 +809,13 @@ class MainWindow(QMainWindow):
         Ctrl+1  -- Dashboard page
         Ctrl+2  -- Charts page
         Ctrl+3  -- Orders page
-        Ctrl+4  -- Settings page
+        Ctrl+4  -- Order Book page
+        Ctrl+5  -- Settings page
         F11     -- Toggle full screen
         Ctrl+B  -- Toggle sidebar
         """
-        # Page switching: Ctrl+1 through Ctrl+4
-        for index in range(4):
+        # Page switching: Ctrl+1 through Ctrl+5
+        for index in range(5):
             action = QAction(self)
             action.setShortcut(QKeySequence(f"Ctrl+{index + 1}"))
             action.triggered.connect(

@@ -273,12 +273,24 @@ class EngineBridge(QObject):
             if pair_name:
                 market_data[pair_name] = self._metrics_svc.get_market_data(pair_name)
 
+        # Build per-pair order book data from the latest market-data
+        # snapshots.  This provides the depth information that the
+        # OrderBookWidget uses to render bid/ask levels.
+        order_book: dict[str, dict[str, float]] = {
+            pair_name: self._metrics_svc.get_market_data(pair_name)
+            for pair_name in (
+                p.get("name", "") for p in pairs if p.get("name")
+            )
+            if pair_name
+        }
+
         data: dict[str, Any] = {
             "pnl": self._metrics_svc.get_pnl(),
             "health": self._metrics_svc.get_health(),
             "offers": self._metrics_svc.get_offers_summary(),
             "risk": self._metrics_svc.get_risk(),
             "market_data": market_data,
+            "order_book": order_book,
             "trade_summary": self._last_data.get("trade_summary", {}),
             "config": self._config_svc.get_full_config(),
             "bot_status": self._bot_status,

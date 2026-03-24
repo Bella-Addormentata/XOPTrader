@@ -50,6 +50,7 @@ _NAV_ITEMS: Final[list[tuple[str, str]]] = [
     ("Dashboard", "\u25EB"),   # ◫
     ("Charts", "\u25F0"),      # ◰
     ("Orders", "\u2630"),      # ☰
+    ("Order Book", "\u2593"),  # ▓
     ("Settings", "\u2699"),    # ⚙
 ]
 
@@ -279,7 +280,7 @@ class Sidebar(QWidget):
         Parameters
         ----------
         index : int
-            Zero-based page index (0 = Dashboard .. 3 = Settings).
+            Zero-based page index (0 = Dashboard .. 4 = Settings).
         """
         if 0 <= index < len(self._buttons):
             self._on_button_clicked(index)
