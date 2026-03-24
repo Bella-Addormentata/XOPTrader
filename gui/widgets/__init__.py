@@ -9,6 +9,7 @@ Public API:
     MetricCard      -- individual KPI tile with sparkline.
     ChartWidget     -- real-time price / PnL / volume chart.
     OrderPanel      -- active-offers management table.
+    OrderBookWidget -- depth-of-book visualisation with own-order highlights.
     TradeLogWidget  -- historical trade viewer with CSV export.
     BotLogWidget    -- live structured log viewer.
 """
@@ -23,12 +24,17 @@ from gui.widgets.status_bar import StatusBar
 from gui.widgets.settings import SettingsWidget
 from gui.widgets.trade_log import TradeLogWidget
 
+from gui.widgets.order_book import OrderBookWidget, OrderBookLevel, OrderBookSnapshot
+
 __all__: list[str] = [
     "BotLogWidget",
     "ChartWidget",
     "DashboardWidget",
     "MainWindow",
     "MetricCard",
+    "OrderBookLevel",
+    "OrderBookSnapshot",
+    "OrderBookWidget",
     "OrderPanel",
     "SettingsWidget",
     "Sidebar",
