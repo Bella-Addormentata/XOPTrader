@@ -8,6 +8,7 @@
 
 ## Table of Contents
 
+0. [Goals and Objectives](#0-goals-and-objectives)
 1. [Implemented Strategies](#1-implemented-strategies)
    - [1.1 Avellaneda-Stoikov Optimal Market Making](#11-avellaneda-stoikov-optimal-market-making)
    - [1.2 GLFT Running-Inventory-Penalty Model](#12-glft-running-inventory-penalty-model)
@@ -43,8 +44,95 @@
    - [3.13 Impermanent Loss Hedging for AMM LP Positions](#313-impermanent-loss-hedging-for-amm-lp-positions)
    - [3.14 Batch Auction Strategies (Frequent Batch Auctions)](#314-batch-auction-strategies-frequent-batch-auctions)
    - [3.15 Market Microstructure Invariance](#315-market-microstructure-invariance)
-4. [Strategy Interaction Matrix](#4-strategy-interaction-matrix)
-5. [References](#5-references)
+   - [3.16 Strategic Loss-Taking for Inventory Rebalancing](#316-strategic-loss-taking-for-inventory-rebalancing)
+   - [3.17 Offer Time-to-Live (TTL) Optimization](#317-offer-time-to-live-ttl-optimization)
+   - [3.18 Chia Block-Cadence Synchronization](#318-chia-block-cadence-synchronization)
+   - [3.19 CAT Ecosystem Correlation Trading](#319-cat-ecosystem-correlation-trading)
+   - [3.20 Chialisp Programmable Offer Conditions](#320-chialisp-programmable-offer-conditions)
+   - [3.21 Blockchain Transparency Competitor Intelligence](#321-blockchain-transparency-competitor-intelligence)
+4. [Chia-Specific Competitive Advantages](#4-chia-specific-competitive-advantages)
+5. [On Deliberate Loss-Taking and Inventory Balance](#5-on-deliberate-loss-taking-and-inventory-balance)
+6. [Implementation Priority Ranking](#6-implementation-priority-ranking)
+7. [Key Strategy Trade-offs](#7-key-strategy-trade-offs)
+   - [7.10 Coexisting With Unknown Market Makers](#710-coexisting-with-unknown-market-makers)
+8. [Strategy Interaction Matrix](#8-strategy-interaction-matrix)
+9. [References](#9-references)
+
+---
+
+## 0. Goals and Objectives
+
+This section defines *what we are trying to achieve* with XOPTrader and *how
+we measure success*.  Every strategy decision — which to implement, in what
+order, and when to accept a loss — should be evaluated against these goals.
+
+### 0.1 Primary Goal
+
+**Maximize risk-adjusted spread income over time on Chia DEX.**
+
+This is a *flow* goal, not a directional one.  XOPTrader is a market maker,
+not a speculator.  Success is measured by cumulative spread captured per unit
+of capital at risk, not by the direction of any single trade.
+
+The core model:
+```
+Risk-adjusted PnL = Σ(spread captured per fill) − Σ(adverse selection losses)
+                  − Σ(inventory drift losses) − Σ(operational costs)
+```
+
+### 0.2 Secondary Goals
+
+| Goal | Why It Matters |
+|------|---------------|
+| **Maintain two-sided quoting** | Single-sided quoting earns zero spread on the missing side and exposes the other side to 100% adverse selection |
+| **Preserve capital during stress** | A market maker who loses their capital base cannot quote; survival is prerequisite to profitability |
+| **Minimize adverse selection** | Informed counterparties systematically extract value; detecting and avoiding them is essential |
+| **Exploit Chia-specific edges** | The unique features of Chia DEX (§4) give structural advantages that centralized-market strategies miss |
+| **Operate continuously and reliably** | Uptime = quoting time = income; every offline minute is missed opportunity and potential stale-quote risk |
+
+### 0.3 Success Metrics
+
+The following KPIs define a "healthy" deployment:
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| **Fill Rate** | >30% of posted offers filled | Too low → spreads are too wide; too high → spreads are too narrow |
+| **Inventory Imbalance** | \|q / q_max\| < 0.6 at all times | 0.60–0.75: intensify skew; >0.75: trigger deliberate rebalancing (§5) |
+| **Realized Spread** | >50% of quoted spread | Measures adverse selection leakage |
+| **Uptime** | >99% of blocks | Per-block heartbeat enables this; see block-cadence sync §3.18 |
+| **Drawdown** | <10% of deployed capital / month | Circuit breaker if exceeded |
+| **Capital Efficiency** | >60% of capital generating fills within 24 h | Idle capital is wasted risk capacity |
+
+### 0.4 Implementation Milestones
+
+The strategies are not intended to be deployed all at once.  The following
+phased milestones provide a concrete road map from the current state to a
+fully optimized deployment.  Each milestone is self-contained and improves
+PnL incrementally.
+
+| Milestone | Strategies to Add | Expected Impact |
+|-----------|------------------|-----------------|
+| **M1 — Operational Hardening** | §3.18 Block-cadence sync, §3.17 TTL optimization | Eliminates cancel/fill races; reduces stale-quote losses |
+| **M2 — Inventory Discipline** | §3.16 Strategic loss-taking, §3.5 Dynamic position limits | Prevents inventory exhaustion; keeps two-sided quoting alive |
+| **M3 — Volatility Awareness** | §3.2 GARCH volatility forecasting | Feeds better σ into A-S/GLFT; spread sizing tracks real-time risk |
+| **M4 — CEX Signal Integration** | §3.3 Lead-lag CEX feeds, §3.11 Oracle anchoring | Reduces adverse selection from CEX-to-DEX price discovery lag |
+| **M5 — Competitor Intelligence** | §3.21 Blockchain transparency intel | Shifts competitor response from reactive to predictive |
+| **M6 — Portfolio Expansion** | §3.19 CAT correlation trading, §3.8 Multi-asset quoting | Diversifies income; reduces single-pair concentration risk |
+| **M7 — Advanced Risk** | §3.1 CEX inventory hedging, §3.13 IL hedging | Eliminates residual directional risk; enables tighter spreads |
+
+### 0.5 What We Have Not Implemented Yet (And Why)
+
+The 21 strategies in §3 are all documented but not yet in code.  The most
+impactful ones to implement *next* are identified in the priority ranking (§6).
+The "Always Defer" category (end of §6) represents strategies where the
+expected value under Chia's specific constraints is insufficient to justify
+the engineering cost at this stage.
+
+A strategy being "not implemented" is not a failure — it is a deliberate
+choice to apply engineering resources where the marginal PnL improvement is
+highest.  The catalog exists so that future contributors can find the right
+strategy when conditions change (e.g., a richer CAT ecosystem makes §3.8
+more valuable; Chialisp tooling maturing makes §3.20 practical).
 
 ---
 
@@ -969,7 +1057,1064 @@ from cross-sectional market data.
 
 ---
 
-## 4. Strategy Interaction Matrix
+### 3.16 Strategic Loss-Taking for Inventory Rebalancing
+
+| Priority | **High** |
+|----------|----------|
+| **Effort** | Low |
+
+**Description.**
+Accept a below-reservation-price fill (or post an intentionally under-priced
+offer) when one inventory side becomes dangerously skewed.  Taking a small,
+controlled loss now prevents a much larger loss from holding a lopsided book
+into a sustained directional move.
+
+The rebalancing trigger is an inventory ratio threshold:
+
+```
+imbalance_ratio = |q| / q_max
+
+if imbalance_ratio > threshold_rebalance:
+    post one-shot offer at mid ± δ_rebalance   // δ_rebalance < normal half-spread
+    accept fill at a known loss to restore q toward zero
+```
+
+Typical values: `threshold_rebalance = 0.75`, `δ_rebalance ≈ 0.5 × normal_spread`.
+
+**When taking a deliberate loss is rational:**
+
+| Situation | Rationale |
+|-----------|-----------|
+| Inventory at 75 %+ of limit | Prevents quoting only one side and missing all flow |
+| Directional signal detected (OFI / VPIN spike) | Lock in a small loss before the market moves further against the skew |
+| Time-sensitive capital release | Free the stuck position to redeploy into a higher-return opportunity |
+| Tax-loss harvesting window | Crystallise a tax loss at end of fiscal period, immediately re-enter |
+| Offer-book deadlock | Both sides have stale offers; cancel and post fresh at a tighter loss |
+
+**Pros:**
+- Keeps both bid and ask quoted simultaneously — the fundamental requirement of market making.
+- Small, planned loss is less damaging than accumulating an unhedged directional position.
+- Pairs naturally with GLFT/A-S inventory penalty: when the model says widen, also consider just rebalancing.
+- Tax-efficient if timed to fiscal periods.
+
+**Cons:**
+- Explicit PnL hit per rebalancing event; must be tracked and minimized.
+- Predictable rebalancing behaviour can be exploited by observers watching the on-chain book.
+- Sizing the rebalancing offer (how far below mid) requires calibration.
+- Too-frequent rebalancing turns the strategy into a taker strategy rather than a maker strategy.
+
+---
+
+### 3.17 Offer Time-to-Live (TTL) Optimization
+
+| Priority | **Medium** |
+|----------|------------|
+| **Effort** | Low |
+
+**Description.**
+Unlike traditional limit orders, Chia offers have **no native expiry**.  A
+signed offer file posted on Dexie remains valid until cancelled via an on-chain
+transaction.  This is both an advantage and a risk:
+
+- **Advantage:** An offer can be broadcast to many venues simultaneously; the
+  first taker fills it, all other copies become automatically invalid (the coin
+  is already spent).
+- **Risk:** A stale offer posted during a low-volatility period may be sniped
+  by an arbitrageur when price moves while our bot is offline.
+
+TTL optimization decides the offer's *intended* lifetime and schedules an
+on-chain cancellation if no fill occurs.  The cost is one cancellation
+transaction per expired offer, so TTL must be balanced against fee cost.
+
+```
+optimal_ttl = f(spread, volatility, fill_rate, cancellation_fee_cost)
+
+if volatility_high:
+    ttl = 2–3 blocks    // refresh aggressively to avoid adverse selection
+else:
+    ttl = 10–20 blocks  // reduce cancellation cost
+```
+
+**Pros:**
+- Dramatically reduces stale-quote adverse selection on Chia.
+- Chia-specific: CEX and Ethereum DEX offer native order expiry; this is a
+  unique operational concern and opportunity on Chia.
+- Short TTL in high-vol regimes combined with wide spreads covers both sides
+  of the risk.
+
+**Cons:**
+- Every cancellation is an on-chain transaction (small cost and 52-second latency).
+- No native TTL means our bot must be reliably online to cancel.
+- Race condition: cancellation and fill may land in the same block.
+
+---
+
+### 3.18 Chia Block-Cadence Synchronization
+
+| Priority | **Medium** |
+|----------|------------|
+| **Effort** | Low |
+
+**Description.**
+Chia produces blocks every ~52 seconds on average.  All state changes
+(fills, cancellations, new offers) take effect at block boundaries.  Using
+wall-clock timers for strategy refresh introduces a random phase offset against
+block finality.
+
+Block-cadence synchronization subscribes to the Chia node's `new_peak`
+websocket event and fires strategy evaluation only on confirmed new peaks.
+This eliminates the class of race conditions where a refresh transaction
+lands in the same block as a fill transaction on the same coin.
+
+**Benefits over wall-clock timers:**
+| Clock Type | Risk |
+|------------|------|
+| Wall-clock | Refresh lands mid-block; cancel/fill conflict possible |
+| Block-cadence | Refresh fires after finality; state is deterministic |
+
+Chia's per-block heartbeat is already the architectural basis of XOPTrader's
+`boost::asio` loop (see `cpp/src/execution/market_data.cpp`); this strategy
+codifies the best-practice configuration of that loop.
+
+**Pros:**
+- Eliminates cancel/fill race conditions inherent to wall-clock polling.
+- Natural cadence for all strategy signals (VPIN buckets, OFI snapshots,
+  regime re-evaluation all align to block boundaries).
+- Reduces unnecessary CPU wake-ups (52-second sleep vs. 1-second polling).
+- Unique to Chia: Ethereum and Solana have sub-second block times where this
+  distinction matters less.
+
+**Cons:**
+- 52-second minimum reaction latency; cannot respond faster than one block.
+- Empty blocks (no transactions) still fire the `new_peak` event — need to
+  handle gracefully.
+- Block times are not perfectly regular; `new_peak` can arrive early or late.
+
+---
+
+### 3.19 CAT Ecosystem Correlation Trading
+
+| Priority | **Medium** |
+|----------|------------|
+| **Effort** | Medium |
+| **Reference** | Engle & Granger (1987) [32]. |
+
+**Description.**
+The Chia CAT ecosystem contains 50+ tokens.  Many are correlated with XCH
+(which underlies all blockchain operations) and with each other through
+shared liquidity providers and market conditions.  Exploiting these correlations
+enables:
+
+1. **Cross-CAT leading indicators** — if a heavily-traded CAT moves first,
+   use that signal to anticipate XCH or other CAT moves.
+2. **Statistical arbitrage** — identify cointegrated pairs; trade the spread
+   when it deviates from long-run equilibrium.
+3. **Hedged CAT market making** — when accumulating a risky CAT through
+   market making, hedge the resulting exposure using correlated XCH positions.
+
+```
+// Pair score for stat-arb
+z_score = (price_A / price_B - mean_ratio) / std_ratio
+
+if z_score > 2.0:
+    sell A, buy B   // ratio too high
+if z_score < -2.0:
+    buy A, sell B   // ratio too low
+```
+
+**Chia-specific advantage:** The entire CAT order book is publicly visible
+on-chain.  Cross-asset correlation data can be computed directly from
+blockchain history without relying on a third-party exchange API.
+
+**Pros:**
+- Diversifies income across the Chia ecosystem rather than depending on
+  a single pair.
+- Statistical arbitrage is genuinely market-neutral when the hedge is live.
+- Cointegration-based signals have lower false-positive rates than simple
+  price-level correlations.
+- Unique data source: full on-chain offer history with no API rate limits.
+
+**Cons:**
+- Correlation structure is unstable in crypto markets.
+- Thin CAT markets amplify mean-reversion noise; signal-to-noise ratio is low.
+- Requires multi-asset position tracking, increasing operational complexity.
+- Transaction costs on Chia are low but non-zero; tight correlations may not
+  be profitable after costs.
+
+---
+
+### 3.20 Chialisp Programmable Offer Conditions
+
+| Priority | **Low (research stage)** |
+|----------|--------------------------|
+| **Effort** | High |
+
+**Description.**
+Chialisp is a Turing-complete on-chain programming language native to Chia.
+Every coin's spending conditions are expressed as a Chialisp puzzle.  Advanced
+market makers could embed strategic conditions directly into offer puzzles:
+
+| Condition Type | Description |
+|----------------|-------------|
+| **Time-lock expiry** | Offer invalid after block N — native TTL without a cancel transaction |
+| **Rate limiting** | Offer fillable at most once per N blocks |
+| **Conditional pricing** | Fill price adjusts based on an on-chain oracle coin's state |
+| **Batch-fill guard** | Reject fills that would move inventory past a limit |
+| **Atomic multi-leg** | Single puzzle that fills two correlated offers simultaneously or neither |
+
+This approach eliminates the cancel-transaction cost for TTL optimization
+(§3.17) and enables strategies with no equivalent on any other DEX platform.
+
+**Pros:**
+- Unique competitive moat — no other DEX ecosystem offers native
+  programmable offer conditions.
+- Time-lock expiry removes cancel cost and cancel/fill race condition entirely.
+- Conditional pricing could enable fully trustless dynamic spreads.
+- Atomic multi-leg is impossible on offer-based DEXs without Chialisp.
+
+**Cons:**
+- Requires deep Chialisp expertise and significant engineering effort.
+- Complex puzzles increase the smart-contract security audit burden.
+- Tooling for Chialisp development and testing is less mature than Solidity.
+- Counterparties (takers) must be able to introspect and trust the puzzle,
+  which may limit adoption on public offer boards.
+
+---
+
+### 3.21 Blockchain Transparency Competitor Intelligence
+
+| Priority | **Medium** |
+|----------|------------|
+| **Effort** | Medium |
+
+**Description.**
+Chia's fully public blockchain means every offer ever posted, filled, or
+cancelled is permanently on-chain.  Unlike opaque CEX order books where
+only the current snapshot is visible, XOPTrader can reconstruct the complete
+historical action of every competitor:
+
+- When do competitors refresh their offers? (Identify their refresh cadence)
+- What spread levels do they target? (Map their pricing strategy)
+- Do they widen spreads during whale events? (Detect if they have whale detection)
+- Which price levels do they abandon first during volatile periods?
+- Do they cluster their offers at round-number prices? (Exploit round-number bias)
+
+Building a competitor behavior model enables *predictive* rather than
+*reactive* competitor response — going beyond the current reactive
+`CompetitorDetection` module (§1.7).
+
+```
+// Competitor behavior model update per block
+for each competitor offer (offer_coin_id):
+    if offer_cancelled and not filled:
+        record(competitor_id, cancel_block, price, spread)
+    if offer_filled:
+        record(competitor_id, fill_block, price, spread, fill_direction)
+
+// Predict next competitor action
+if competitor_avg_ttl = 5 blocks and current_ttl = 4:
+    expect competitor refresh next block
+    → tighten spread temporarily to capture flow before their refresh
+```
+
+**Pros:**
+- Chia-specific advantage — this level of competitor transparency is
+  unavailable on CEX or Ethereum DEX (private order history, API rate limits).
+- Enables "first mover" positioning ahead of predictable competitor refreshes.
+- Historical competitor data requires no third-party API — pure on-chain.
+- Directly extends the existing CompetitorDetection infrastructure.
+
+**Cons:**
+- Competitors can also analyze our behavior — arms-race dynamics.
+- Privacy-preserving competitors can randomize timing and amounts to
+  defeat behavioral fingerprinting.
+- Requires blockchain indexing infrastructure to process offer history at scale.
+- Model accuracy degrades when competitors change strategies.
+
+---
+
+## 4. Chia-Specific Competitive Advantages
+
+This section catalogues the structural features of the Chia DEX environment
+that XOPTrader can uniquely exploit.  Understanding these advantages informs
+which strategies to prioritize (§6) and how to design them.
+
+### 4.1 Offer File Portability — "Post Once, Fill Anywhere"
+
+A Chia offer file is a signed, self-contained cryptographic artifact.  The
+**same file** can be submitted to Dexie, OfferBin, Splash, a community Discord,
+or a direct counterparty simultaneously.  Capital is **not fragmented** across
+venues — the underlying coin is locked once and is filled by whoever takes the
+offer first.  All other copies become invalid automatically.
+
+**Market-making implication:** A single offer effectively has the liquidity
+aggregated across all distribution channels.  A traditional DEX or CEX maker
+must split capital across venues or use a smart-order-router.  On Chia, the
+offer file *is* the smart-order-router.
+
+**Exploit:** Maximize distribution of offer files to reach the widest
+possible audience and improve fill rates without multiplying capital
+requirements or increasing inventory risk.
+
+---
+
+### 4.2 Deterministic 52-Second Block Cadence
+
+Chia produces one block approximately every 52 seconds (configurable via
+the `SUB_SLOT_ITERS` constant).  Unlike Ethereum's variable block times
+or Solana's sub-second blocks, Chia's cadence is predictable and slow enough
+for a market maker to reason about within one block window.
+
+**Market-making implication:** The block cadence is a natural heartbeat for
+all strategy signals (VPIN bucket completion, OFI snapshot, regime re-evaluation).
+Synchronizing to `new_peak` events (§3.18) eliminates an entire class of
+race conditions.
+
+---
+
+### 4.3 No Gas Wars — Flat, Minimal Fees
+
+Chia's transaction fees are small (currently fractions of a mojo) and are
+not subject to EIP-1559-style gas auctions.  There is no "fee market" where
+participants bid against each other for block inclusion.
+
+**Market-making implication:**
+- Cancellation is cheap — TTL optimization (§3.17) is economical.
+- Aggressive rebalancing (§3.16) has negligible transaction overhead.
+- Cancel/replace cycles can be frequent without eroding PnL.
+
+On Ethereum, each cancel and replace costs real gas; makers must hold offers
+longer to amortize fees, creating "sticky" quotes.  XOPTrader faces no
+such constraint.
+
+---
+
+### 4.4 Atomic Trustless Settlement — No Counterparty Risk
+
+Chia offers are trustless atomic swaps.  Either the exact amounts specified
+in the offer change hands atomically, or nothing happens.  There is no:
+
+- Settlement failure risk
+- Partial fill risk (a taker takes only part of the offer)
+- Counterparty default risk
+- Custodial intermediary
+
+**Market-making implication:** The maker can quote aggressively and at tight
+spreads without worrying about settlement risk.  The spread need not include
+a "counterparty risk premium" that traditional OTC market makers charge.
+All risk-adjusted spread components (§1.3) can focus purely on market risk
+and adverse selection, not counterparty risk.
+
+---
+
+### 4.5 Full UTXO Transparency — Complete Competitor Visibility
+
+Every Chia offer is an on-chain UTXO.  The full history of all offers
+(created, filled, cancelled) is publicly readable by any full node without
+any API key, rate limit, or data subscription.
+
+**Market-making implication:** The foundation for Blockchain Transparency
+Competitor Intelligence (§3.21).  XOPTrader can build a complete,
+real-time view of every competitor's offer book, fill history, and
+pricing strategy — a data advantage unavailable on any CEX or
+privacy-preserving DEX.
+
+---
+
+### 4.6 CAT Ecosystem Depth — 50+ Tokens With Variable Liquidity
+
+The Chia CAT ecosystem comprises 50+ tokens ranging from well-known
+(Stably USDS, wBTC, wETH) to niche community tokens.  Liquidity varies
+enormously across pairs.
+
+**Market-making implication:**
+- **Illiquid pairs** offer wider natural spreads — higher per-trade
+  profit at the cost of lower fill rates.
+- **Liquid pairs** (XCH/USDC) offer tight spreads but high fill rates
+  and volume.
+- A diversified multi-pair strategy (§3.8) can allocate capital across
+  the liquidity spectrum to optimize the risk/return trade-off.
+- CAT Correlation Trading (§3.19) exploits the structural ties between
+  XCH and tokens whose value is partly denominated in XCH.
+
+---
+
+### 4.7 No MEV (Miner/Maximal Extractable Value)
+
+Chia's proof-of-space-and-time consensus does not allow farmers (Chia's
+equivalent of miners) to freely reorder or insert transactions within a
+block.  The coin-spending puzzle model and the farming reward structure
+prevent the front-running MEV strategies common on Ethereum (sandwich
+attacks, JIT liquidity attacks).
+
+**Market-making implication:**
+- Our offers cannot be sandwiched by a farmer who sees our cancel in
+  the mempool.
+- There is no "dark pool" advantage for well-connected nodes.
+- The competitive playing field is closer to flat: execution quality
+  depends on strategy and speed, not miner bribery.
+
+---
+
+### 4.8 Peer-to-Peer Offer Distribution
+
+Offer files can be shared via any communication channel: email, Discord,
+Telegram, a website, or a QR code.  They require no platform intermediary
+and cannot be censored at the chain level.
+
+**Market-making implication:** Direct large counterparty relationships are
+possible.  A market maker could run a private OTC desk for institutional
+buyers, offering bespoke pricing without listing on any public DEX.
+
+---
+
+## 5. On Deliberate Loss-Taking and Inventory Balance
+
+This section addresses two questions raised in the issue: *Is it ever a
+good strategy to take a loss on a position in order to achieve a different
+goal?* and *Would holding too long make the balances uneven?*
+
+### 5.1 When Is It Rational to Take a Deliberate Loss?
+
+**Yes — taking a deliberate loss is often the correct strategic choice.**
+The key insight is that market making is a *flow* business, not a *directional*
+business.  The goal is to maximize total spread income over time, not to win
+any individual trade.  A deliberate loss that restores the conditions for
+profitable quoting has positive expected value.
+
+#### Scenario 1: Inventory Rebalancing (Most Common)
+
+When one side of the book is exhausted, the maker can only quote in one
+direction.  A single-sided market maker earns zero spread on the missing side
+and bears the full adverse-selection risk of the side that remains.
+
+```
+Example:
+Starting state:  50 XCH + $2,500 USDC   (balanced)
+After bull run:   2 XCH + $5,400 USDC   (all sells filled; no XCH to sell)
+
+Options:
+A) Wait: quote only buy offers; earn zero sell-side spread; risk continued
+         price rise making the buy quotes progressively deeper out-of-money.
+B) Rebalance: buy 25 XCH at market (slightly above mid); incur ~0.3% loss
+              vs. mid; restore book; resume two-sided quoting immediately.
+
+Expected value of B > Expected value of A when:
+   spread_income_restored × expected_fill_rate × time_horizon
+   > rebalancing_loss_amount
+```
+
+The A-S and GLFT models already model this mathematically: both produce a
+*reservation price* skewed away from the excess-inventory side to encourage
+natural rebalancing.  Strategic loss-taking is the manual equivalent when
+natural rebalancing is too slow.
+
+#### Scenario 2: Avoiding Larger Adverse-Selection Losses
+
+When VPIN or OFI signals a sustained directional move, holding a large
+inventory position on the wrong side will generate a series of fills at
+progressively worse prices.  Closing out early at a known small loss
+is superior to absorbing the full adverse move.
+
+```
+VPIN = 0.85 (highly toxic flow)
+OFI  = +0.7 (strong buy pressure)
+Our inventory: -30 XCH (short XCH — we've been selling into a rising market)
+
+If we continue quoting:
+   Expected loss = 30 XCH × expected_price_move × P(continued_rise)
+
+If we close now at mid + δ (paying up to exit):
+   Known loss = δ × 30 XCH
+
+When VPIN = 0.85 and price_move > δ is likely: close now.
+```
+
+#### Scenario 3: Opportunity Cost Arbitrage
+
+Capital locked in a stale, idle position earns nothing.  If a better
+opportunity exists (new pair launch with wide spreads, temporary market
+dislocation), exiting the stale position at a small loss to redeploy
+capital can be net positive.
+
+#### Scenario 4: Tax-Loss Harvesting
+
+In jurisdictions where capital gains tax applies, crystallising an
+unrealised loss before year-end and immediately re-entering provides a
+tax benefit that may exceed the transaction cost of the exit and re-entry.
+The *economic* position is unchanged (same inventory before and after)
+but the *tax* position is improved.
+
+---
+
+### 5.2 Does Holding Too Long Make Balances Uneven?
+
+**Yes — this is one of the most important practical risks in market making.**
+
+#### The Inventory Drift Problem
+
+In a market making system with symmetric spreads:
+
+- Each fill moves inventory by ±1 unit.
+- In a random walk, expected inventory after T fills is 0, but the
+  *standard deviation* grows as √T.
+- In a trending market, every fill is on the same side: inventory
+  drifts linearly (not just as √T).
+
+After N one-sided fills without rebalancing:
+```
+Bull market:  q ≈ −N  (sold N units; little XCH remains to sell)
+Bear market:  q ≈ +N  (bought N units; little USDC remains to buy)
+```
+
+The maker eventually reaches a position where:
+1. **One offer type cannot be posted** — insufficient inventory.
+2. **The remaining quotes face 100 % adverse selection** — only
+   informed traders who know the direction will take them.
+3. **The spread captured on past fills is lost** to the subsequent
+   adverse move on the accumulated position.
+
+#### The Compounding Risk
+
+Holding too long not only creates imbalance but *accelerates* the problem:
+
+| Time | State | Risk |
+|------|-------|------|
+| T=0  | Balanced book | Normal quoting, two-sided |
+| T=10 | Moderate imbalance (q = 0.6 × q_max) | A-S/GLFT naturally widens quotes |
+| T=20 | Heavy imbalance (q = 0.9 × q_max) | Can only quote one side at wide spread |
+| T=30 | Exhausted (q = q_max) | Zero quoting ability; full directional risk |
+
+At T=30 the maker has transformed from a market maker into an involuntary
+directional speculator — the worst possible outcome.
+
+#### The Rebalancing Policy
+
+The practical remedy is a tiered rebalancing policy:
+
+| Imbalance Ratio | Action |
+|-----------------|--------|
+| 0 – 0.50 | Normal quoting; A-S/GLFT natural skew handles it |
+| 0.50 – 0.75 | Intensify skew; post more aggressive one-sided offers |
+| 0.75 – 0.90 | Active rebalancing: post a deliberate loss offer (§3.16) |
+| > 0.90 | Emergency rebalancing: cancel all offers; market-buy/sell to target |
+
+This policy ensures the maker never reaches the "involuntary speculator"
+state while keeping deliberate losses small and infrequent.
+
+---
+
+## 6. Implementation Priority Ranking
+
+The following table ranks all strategies — implemented (§1), considered (§2),
+and future (§3) — in order of recommended implementation priority.  Priority
+reflects expected value per unit of engineering effort in the context of
+Chia's specific DEX environment.
+
+### Tier 1 — Implement Soon (High Value, Low–Medium Effort)
+
+| Rank | Strategy | Effort | Key Benefit |
+|------|----------|--------|-------------|
+| 1 | 3.18 Block-Cadence Synchronization | Low | Eliminates cancel/fill race conditions; operationally critical |
+| 2 | 3.17 Offer TTL Optimization | Low | Reduces stale-quote adverse selection; Chia-specific edge |
+| 3 | 3.16 Strategic Loss-Taking for Inventory Rebalancing | Low | Prevents inventory exhaustion; enables sustained two-sided quoting |
+| 4 | 3.2 Volatility Forecasting (GARCH) | Medium | Directly improves A-S/GLFT spread sizing; well-understood model |
+| 5 | 3.3 Lead-Lag CEX Signals | Medium | "Free" alpha; directly reduces adverse selection from CEX-to-DEX price discovery lag |
+
+### Tier 2 — Implement Next (Medium Value, Medium Effort)
+
+| Rank | Strategy | Effort | Key Benefit |
+|------|----------|--------|-------------|
+| 6 | 3.11 Oracle-Based Fair-Value Anchoring | Low | Prevents DEX book manipulation; improves mid-price accuracy on thin pairs |
+| 7 | 3.21 Blockchain Transparency Competitor Intelligence | Medium | Predictive competitor modeling; extends existing CompetitorDetection infrastructure |
+| 8 | 3.5 Dynamic Position Limits (VaR/CVaR) | Medium | Risk-adaptive inventory limits; integrates naturally with volatility forecasting |
+| 9 | 3.19 CAT Ecosystem Correlation Trading | Medium | Unique Chia data advantage; diversified income across token ecosystem |
+| 10 | 2.3 Cartea-Jaimungal Alpha Signal | Medium | Formalises OFI into explicit next-price predictor; builds on existing OFI infrastructure |
+
+### Tier 3 — Consider After Tier 1–2 (Medium–High Value, Higher Effort)
+
+| Rank | Strategy | Effort | Key Benefit |
+|------|----------|--------|-------------|
+| 11 | 3.7 Latency Arbitrage Defense | Medium | Prevents stale-quote sniping; pairs well with TTL optimization and CEX feeds |
+| 12 | 3.1 Inventory-Aware CEX Hedging | High | Eliminates directional inventory risk; enables tighter spreads |
+| 13 | 3.8 Multi-Asset Joint Quoting | High | Cross-pair risk awareness; better capital utilization |
+| 14 | 3.13 IL Hedging for AMM LP | High | Enables fee-earning LP participation without full IL exposure |
+| 15 | 2.4 Kyle Lambda | Medium | Principled trade-impact model; improves large-trade spread sizing |
+
+### Tier 4 — Defer (Lower Priority or Speculative)
+
+| Rank | Strategy | Effort | Reason to Defer |
+|------|----------|--------|-----------------|
+| 16 | 3.6 Toxic Flow ML | High | VPIN already covers this; labelled training data scarce on Chia DEX |
+| 17 | 3.12 Spoofing Detection | Medium | Limited manipulation risk on transparent Chia blockchain |
+| 18 | 3.4 Maker-Taker Fee Optimization | Low | Minimal fee differentiation in current Chia ecosystem |
+| 19 | 3.15 Market Microstructure Invariance | Medium | Uncertain benefit; Chia microstructure differs from equities |
+| 20 | 3.20 Chialisp Programmable Offer Conditions | High | High-value long-term but requires deep Chialisp expertise |
+
+### Always Defer / Likely Won't Implement
+
+| Strategy | Reason |
+|----------|--------|
+| 2.1 Bayesian PIN | VPIN was designed as a real-time PIN proxy; PIN adds complexity without proportionate benefit |
+| 2.2 Predatory Trading Defense | Whale detection + asymmetric widening provides adequate partial defense |
+| 2.5 Guilbaud-Pham SOC | HJB PDE numerically intensive; complexity/benefit ratio poor on thin Chia DEX |
+| 3.9 Reinforcement Learning | Requires Chia DEX simulator that does not yet exist; sample efficiency very poor |
+| 3.10 Cross-Chain Bridge Arbitrage | Bridge settlement risk and latency too high; bridge exploits are common |
+| 3.14 Batch Auction Strategies | Chia DEX does not use batch auctions; purely speculative |
+
+---
+
+## 7. Key Strategy Trade-offs
+
+Every market making decision involves genuine tension between competing
+objectives.  This section catalogues the major trade-offs so that strategy
+choices can be made consciously rather than by default.
+
+> **Scholarly foundation:** The trade-offs below are not merely practical
+> observations — they arise from fundamental results in market microstructure.
+> Garman (1976) first formalized the dealer's inventory-versus-bankruptcy
+> trade-off; Ho & Stoll (1981) [ref 23] extended it to return uncertainty;
+> Foucault, Kadan & Kandel (2005) [ref 38] proved that the maker-vs-taker
+> choice is itself an equilibrium outcome of queue priority and patience.
+> The strategy-switching question — *when* to move between strategies — is
+> addressed in §7.9 below.
+
+### 7.1 Spread Width vs. Fill Rate
+
+The most fundamental tension in market making.  Amihud & Mendelson (1986)
+[ref 3] showed that wider spreads reduce adverse selection but also reduce
+trading volume; the optimal spread balances these forces.
+
+| Spread Choice | Fill Rate | Revenue per Fill | Adverse Selection | Inventory Velocity |
+|---------------|-----------|-----------------|-------------------|-------------------|
+| Narrow (1–2%) | High | Low | High | Fast (frequent rebalancing) |
+| Medium (3–5%) | Moderate | Medium | Moderate | Balanced |
+| Wide (5–10%)  | Low | High | Low | Slow (infrequent rebalancing) |
+
+**Chia-specific nuance:** On thin DEX markets, extremely narrow spreads
+attract informed flow disproportionately (no retail "noise" traders to
+balance it).  Wider-than-CEX spreads are often *correct* on Chia, not
+a sign of poor calibration.
+
+**Optimization tool:** Thompson Sampling (§1.12) automates this exploration
+rather than requiring a manual static choice.
+
+---
+
+### 7.2 Inventory Risk vs. Capital Efficiency
+
+Garman (1976) [ref 35] proved that a dealer who ignores inventory will
+eventually go bankrupt with probability 1.  The question is *how much*
+inventory risk to tolerate — Avellaneda & Stoikov (2008) [ref 6] and
+Guéant et al. (2013) [ref 19] both parameterize this as a risk-aversion
+coefficient γ that trades off expected profit against inventory variance.
+
+| Choice | Inventory Risk | Capital Efficiency | Scenario |
+|--------|---------------|-------------------|----------|
+| Large position limits (high q_max) | High | High | More capital deployed, bigger directional exposure |
+| Small position limits (low q_max) | Low | Low | Less capital at risk, but spreads must be wider to compensate |
+| Dynamic limits (VaR/CVaR, §3.5) | Adaptive | High in calm, Low in stress | Best of both but requires calibration |
+
+**Key insight:** Inventory risk is not symmetric.  A long position in XCH
+during a bear market compounds losses; a short position during a bull market
+does the same.  GLFT's linear skew (§1.2) and the rebalancing policy (§5.2)
+together address this asymmetry.
+
+---
+
+### 7.3 Strategy Complexity vs. Robustness
+
+López de Prado (2018) [ref 39] devotes an entire chapter to the "backtest
+overfitting" problem — complex strategies that look brilliant in-sample but
+fail out-of-sample.  The Adaptive Markets Hypothesis (Lo, 2004 [ref 36])
+argues that strategy fitness is *environment-dependent*: what works in one
+regime may fail in the next, so robustness across regimes matters more than
+peak performance within one.
+
+| Complexity | Advantages | Disadvantages |
+|------------|-----------|---------------|
+| Simple (fixed spread, manual rebalancing) | Easy to debug; predictable behavior | Leaves PnL on the table; no adaptation |
+| Moderate (A-S/GLFT + regime detection) | Good adaptation to conditions | Parameter sensitivity; requires calibration |
+| High (ML-based, multi-asset, RL) | Potentially highest PnL | Overfitting; failure modes are hard to anticipate |
+
+**Recommendation:** Prefer moderate-complexity strategies with well-understood
+failure modes over high-complexity strategies with opaque behavior.  On a
+thin, slow DEX like Chia, marginal signal improvements from additional
+complexity are small relative to the debugging and operational cost.
+
+This is why the priority ranking (§6) places block-cadence sync and TTL
+optimization — operational correctness improvements — above ML-based
+toxic flow classification.
+
+---
+
+### 7.4 Passive (Maker) vs. Active (Taker) Behavior
+
+Foucault, Kadan & Kandel (2005) [ref 38] model this as an equilibrium: patient
+traders post limit orders (maker), impatient traders cross the spread (taker).
+The optimal mix depends on queue priority, time horizon, and urgency.  In Chia's
+offer-file model, "maker" has zero explicit cost; "taker" costs the full spread.
+
+| Behavior | Cost | Benefit | When Appropriate |
+|----------|------|---------|-----------------|
+| Pure maker (only post offers) | Zero taker fees; earn spread | May never fill on illiquid pairs | Normal quoting |
+| Hybrid (post maker, take for rebalancing) | Taker fee + cross spread to exit | Reliable inventory management | When imbalance > 0.75 (§5.2) |
+| Pure taker (always take existing offers) | Always pays spread | Instant execution | Never — defeats the purpose of market making |
+
+**Key rule:** Never pay the spread for routine operations.  Taker behavior
+is only justified for *emergency rebalancing* when the cost of holding the
+imbalance exceeds the cost of crossing the spread.
+
+---
+
+### 7.5 Reactive vs. Predictive Quoting
+
+Lehalle & Laruelle (2018) [ref 40] distinguish three quoting regimes:
+*passive* (react to fills), *informed* (react to signals), and *predictive*
+(lead the market using cross-venue information).  Each step up in
+sophistication reduces lag but increases false-signal risk.
+
+| Approach | Lag | False Signal Risk | Implementation Complexity |
+|----------|-----|------------------|--------------------------|
+| Reactive (respond after fills) | 1–2 blocks | Low | Low |
+| Signal-driven (VPIN, OFI, whale) | 0–1 blocks | Medium | Medium |
+| Predictive (lead-lag CEX, competitor model) | −1 to +1 blocks | High | High |
+
+**Chia context:** The 52-second block time makes "predictive" quoting based
+on CEX feeds (§3.3) especially valuable — there is a natural 10–60 second
+window where CEX prices have moved but Chia DEX offers have not yet updated.
+Lead-lag signals (§3.3) exploit this window directly.
+
+---
+
+### 7.6 DEX-Only vs. Cross-Venue Operation
+
+| Scope | Capital Required | Hedging Ability | Operational Complexity |
+|-------|-----------------|-----------------|----------------------|
+| Chia DEX only | Low | None (directional inventory risk) | Low |
+| Chia DEX + CEX inventory hedge | 2× | Full delta neutrality | High |
+| Multi-DEX (Dexie + TibetSwap) | Medium | Partial (IL vs. offer risk) | Medium |
+
+**Trade-off:** CEX hedging (§3.1) would enable the tightest possible spreads
+since inventory risk is eliminated.  However, it requires capital on the CEX,
+a CEX API integration, and careful management of the basis between CEX and
+DEX prices.  The benefit is clear; the cost is operational complexity and
+counter-party risk on the CEX side.
+
+---
+
+### 7.7 Short-Term PnL vs. Long-Term Market Presence
+
+Menkveld (2013) [ref 37] shows that modern market makers who provide *continuous*
+liquidity earn a structural informational advantage over intermittent ones —
+taker flow preferentially routes to reliable quoters.  Withdrawing during
+stress sacrifices this advantage permanently.
+
+| Priority | Short-Term PnL | Long-Term Presence |
+|----------|---------------|-------------------|
+| **Extractive quoting** | Widen spreads aggressively, withdraw on volatility | Reduces fill frequency over time; other makers capture flow |
+| **Supportive quoting** | Maintain competitive spreads through volatility | Lower short-term margin; stronger market position, higher fill share |
+
+**Strategic consideration:** On Chia DEX, where the ecosystem is small and
+the number of professional market makers is low, being a *reliable*, consistent
+liquidity provider builds taker trust and repeat business.  Predatory widening
+drives takers to AMM pools (TibetSwap), permanently reducing the offer-based
+flow available to us.
+
+The right balance is: use volatility signals (VPIN, OFI, regime) to widen
+*proportionately* — not to withdraw entirely — during stress.
+
+---
+
+### 7.8 On-Chain Transparency: Advantage vs. Liability
+
+Chia's full blockchain transparency (§4.5) cuts both ways:
+
+| As an Advantage | As a Liability |
+|-----------------|----------------|
+| Full competitor history readable (§3.21) | Our own offer history is equally readable |
+| Whale accumulation visible before it fully impacts price | Predictable rebalancing behaviour can be front-run |
+| No hidden order flow; what you see is all there is | No dark pool or private OTC to conceal large moves |
+
+**Mitigation:** Randomize rebalancing timing and amounts (within bounds) to
+defeat behavioral fingerprinting.  Never rebalance at a fixed inventory ratio
+with a fixed offer size — vary both by ±20% stochastically.
+
+---
+
+### 7.9 Strategy Switching: When and How to Change Strategies
+
+A market maker should not run a single static strategy forever.  Market
+conditions change, and the *optimal* strategy shifts with them.  Several
+scholarly frameworks address this directly:
+
+**Brock & Hommes (1998) [ref 41] — Performance-Based Strategy Switching.**
+The foundational model of *adaptive belief systems*: agents track the recent
+profitability of competing strategies and switch toward whichever performed
+best (net of switching costs).  The key parameter is the *intensity of choice*
+β — how aggressively agents abandon underperforming strategies.  Too high β
+causes destabilizing herding; too low β leaves you stuck in a bad strategy.
+
+*Application to XOPTrader:* We already have the building blocks — regime
+detection (§1.5) identifies the current market state, and Thompson Sampling
+(§1.12) explores spread parameters.  The Brock-Hommes insight suggests we
+should extend this to *strategy-level* switching: track realized PnL
+attribution per strategy component and increase weight on components that
+are currently profitable, with a dampening factor to avoid oscillation.
+
+**Lo (2004) [ref 36] — The Adaptive Markets Hypothesis (AMH).**
+Argues that market efficiency varies over time as the population of
+strategies in use evolves.  Strategies that are profitable attract imitators,
+which erodes their edge; strategies that fail are abandoned, which restores
+their edge later.  The implication: no strategy should be permanently ruled
+out or permanently relied upon.
+
+*Application:* The "Always Defer" category in §6 should be revisited
+periodically.  If Chia DEX volume grows 10×, strategies like multi-asset
+quoting (§3.8) and ML-based toxic flow classification (§3.6) become viable
+because the signal-to-noise ratio improves with volume.
+
+**Farmer & Joshi (2002) [ref 42] — Strategy Interaction Dynamics.**
+Simulates what happens when multiple trading strategies coexist.  Key finding:
+strategies that are profitable in isolation may become unprofitable when others
+adopt them (crowding), and the *composition* of the strategy population matters
+as much as individual strategy quality.
+
+*Application:* On Chia DEX, where the competitor population is small and
+observable (§3.21, §4.5), we can directly estimate strategy crowding.  If
+blockchain analysis (§3.21) reveals that competitors have adopted A-S-style
+inventory skewing, our edge from that approach shrinks — and the priority
+ranking (§6) should shift toward less-crowded strategies.
+
+**Menkveld (2013) [ref 37] — The Modern Market Maker as Multi-Strategy Agent.**
+Documents that successful high-frequency market makers run *portfolios* of
+strategies simultaneously, with dynamic capital allocation across them —
+not sequential switching between monolithic strategies.  The allocation
+shifts in real time based on current market conditions.
+
+*Application:* Rather than switching *from* A-S *to* GLFT, run both with
+dynamically weighted blending.  The regime detector (§1.5) can control the
+blend: more A-S weight in mean-reverting regimes (where inventory mean-reverts
+naturally), more GLFT weight in trending regimes (where inventory penalty
+matters more).
+
+**Practical Strategy-Switching Policy for XOPTrader:**
+
+| Signal | Action | Scholarly Basis |
+|--------|--------|-----------------|
+| Regime detector signals shift from mean-reverting → trending | Increase GLFT weight, intensify inventory skew, widen spreads | Hamilton (1989) [ref 22], Brock & Hommes (1998) [ref 41] |
+| VPIN rises above 0.7 | Activate asymmetric widening (§1.11), consider pausing quoting on informed side | Easley et al. (2012) [ref 14] |
+| Realized spread < 30% of quoted for 24h | Widen spreads; the current width is being adversely selected through | Amihud & Mendelson (1986) [ref 3] |
+| Competitor analysis shows crowding on A-S-style quoting | Shift toward TTL optimization (§3.17) and block-cadence sync (§3.18) — operational edges that can't be crowded | Farmer & Joshi (2002) [ref 42] |
+| CEX lead-lag signal consistently predicts DEX price moves | Activate predictive quoting mode (§3.3) | De Jong & Nijman (1997) [ref 12], Lo (2004) [ref 36] |
+| Monthly PnL attribution shows one strategy dominating | *Reduce* its allocation slightly — check for overfitting to recent conditions | López de Prado (2018) [ref 39] |
+
+---
+
+### 7.10 Coexisting With Unknown Market Makers
+
+**Assumptions we must live with:**
+
+1. We never know how many other market makers are active in a given pair.
+2. We never know what software they run — it could be XOPTrader, a custom
+   bot, a manual trader, or an AMM pool.
+3. We cannot coordinate with them.  There is no shared state, no signaling
+   channel, no way to negotiate who quotes where.
+
+Under these constraints the question is not "how do we avoid competing"
+but **"how do we find a profitable niche and stay in it while others do
+the same thing?"**
+
+#### Why feedback loops can arise — and the natural limits that contain them
+
+A feedback loop occurs when two market makers with similar strategies
+repeatedly fill each other's rebalancing offers: A accumulates inventory,
+skews quotes to offload, B takes the other side (and vice versa), and both
+pay transaction fees without earning spread income from real takers.
+
+In theory this is a Bertrand competition problem (Bertrand, 1883) —
+identical dealers in an undifferentiated product compress spreads to
+marginal cost.  Farmer & Joshi (2002) [ref 42] confirmed computationally
+that identical strategies crowding the same market destroy their own edge.
+
+**In practice, however, several forces limit the damage:**
+
+- **Capital constraints differ.**  Every operator has different wallet
+  balances, risk tolerance, and rebalancing thresholds.  Even identical
+  software with identical parameters will diverge after the first asymmetric
+  fill because each instance's inventory — and therefore its quote skew —
+  becomes unique.
+- **Timing jitter.**  Each instance observes the blockchain at different
+  moments, processes data at different speeds, and posts offers at different
+  points in the ~52-second block cycle.  This natural desynchronization
+  means "identical" quotes are rarely truly simultaneous.
+- **Taker demand absorbs symmetry.**  Real takers (non-market-makers)
+  choose the best-priced offer for their desired direction — a buyer takes
+  the lowest ask, a seller takes the highest bid.  As long as genuine taker
+  flow exists, two market makers don't exclusively trade with each other —
+  they share the taker flow.  The feedback loop only becomes dominant in
+  markets with near-zero organic taker volume.
+- **Inventory limits are self-correcting.**  If an instance accumulates too
+  much one-sided inventory through feedback trading, it will hit its position
+  limit (§3.5) or its rebalancing threshold (§5.2) and pull quotes.  This
+  breaks the loop automatically.
+
+The real risk is not an infinite loop — it's **compressed spreads and
+reduced per-trade profit** when another maker is active.  That's normal
+competitive dynamics, not a bug.
+
+#### The core strategy: find and fill the gaps
+
+Rather than trying to outcompete other market makers at the same price
+levels, XOPTrader should **seek out the parts of the order book where
+nobody else is quoting** — or where existing quotes are stale, wide, or
+thin.  This is the gap-filling approach, and it is the natural equilibrium
+for multiple independent market makers:
+
+**1. Quote where the book is empty.**
+Use competitor detection (§1.7) to observe the existing offer landscape.
+If other makers are quoting tight at the inside spread, don't race them —
+instead place offers at the **second and third tiers** (§1.4) where there
+is no liquidity.  These wider-spread offers fill less frequently but earn
+more per fill and face no competition.
+
+**2. Quote when others are absent.**
+Block-cadence synchronization (§3.18) and TTL optimization (§3.17) let
+XOPTrader maintain fresh offers across block boundaries.  Many competitors
+leave stale offers or pull quotes during volatile blocks.  Being present
+when others are absent is a structural edge.
+
+**3. Quote the pairs others ignore.**
+The CAT ecosystem (§4.6) has 50+ tokens.  Most market makers concentrate on
+XCH/USDS and XCH/wBTC.  Illiquid pairs like niche CATs have wider natural
+spreads and fewer competitors — higher profit per trade, lower feedback risk.
+
+**4. Let the A-S/GLFT model find equilibrium naturally.**
+The Avellaneda-Stoikov (§1.1) and GLFT (§1.2) models already solve this
+problem mathematically: the optimal quote depends on _our_ inventory,
+_our_ risk aversion (γ), and _our_ time horizon.  Two instances with
+different inventories and γ values will naturally quote at different prices
+even without explicit coordination.  **The key parameter is γ** — it
+controls how aggressively we quote.  A higher γ means wider spreads and
+less competition with other makers; a lower γ means tighter spreads and
+more fills but more exposure to crowding.
+
+**5. Don't chase competitors — differentiate from them.**
+The competitor detection module (§1.7) alerts when someone else is quoting
+tighter.  The temptation is to match their spread.  **Resist this unless
+your model independently supports the tighter price.**  If another maker is
+willing to quote at 50 bps and your model says 80 bps is correct for your
+risk level, stay at 80 bps.  They'll absorb the toxic flow at 50 bps; you'll
+pick up the rest at a more profitable width.  This is the Foucault, Kadan &
+Kandel (2005) [ref 38] insight: in a market with both patient and impatient
+takers, multiple spread levels coexist profitably.
+
+#### Avoiding feedback loops without coordination
+
+| Mechanism | How it prevents feedback | Already implemented? |
+|-----------|------------------------|---------------------|
+| **Inventory-driven quote skew** (A-S/GLFT) | Each instance's quotes diverge as inventory diverges after first asymmetric fill | ✅ Yes (§1.1, §1.2) |
+| **Position limits** | Hard caps prevent runaway inventory accumulation | Future (§3.5) |
+| **Rebalancing thresholds** (§5.2) | Instance pulls one-sided quotes when imbalance exceeds 0.75, breaking the cycle | Documented policy |
+| **Competitor detection** (§1.7) | Detects when another maker is active; shifts to non-overlapping tiers instead of undercutting | ✅ Yes |
+| **Fill-rate monitoring** | If fill rate drops below the normal-conditions target of 30% (§0.3), the market is likely crowded — widen spreads or rotate to less competitive pairs | ✅ Yes (Thompson sampling §1.12 tracks this) |
+| **TTL + block-cadence timing** | Quote at moments when competitor coverage is thin, rather than when the book is already full | Future (§3.17, §3.18) |
+| **Minimum spread floor** | Never quote below a configurable minimum spread (e.g., spread_min_bps = 50–100 for typical CAT pairs, lower for high-volume pairs like XCH/USDS) regardless of competitive pressure — this is the circuit breaker against Bertrand races | Config parameter (spread_min_bps) |
+
+#### Other order-book interaction strategies
+
+Gap-filling should be the **default** XOPTrader behavior on Chia DEX, but it
+is not the only valid way to interact with the order book.  The broader
+microstructure literature suggests a small menu of recurring tactics:
+
+| Tactic | When to use it | Why it works |
+|--------|----------------|--------------|
+| **Join the inside queue** | Low toxicity, thin queue ahead, stable regime | Maximizes fill probability while still earning maker spread; appropriate when the best bid/ask is not overcrowded (Parlour, 1998 [ref 43]; Rosu, 2009 [ref 44]) |
+| **Improve by one price increment** | Queue at best price is too deep but the spread is still wide enough to justify stepping in front | Buys queue priority at the cost of some spread; best used selectively and with small size so you do not trigger a price-improvement race (Foucault, Kadan & Kandel, 2005 [ref 38]; Lu & Abergel, 2018 [ref 46]) |
+| **Step back / fade one tier** | VPIN or OFI rises, competitor crowding increases, or the inside spread becomes too tight | Preserves capital and avoids adverse selection; this is the anti-feedback-loop move when the inside quote is no longer attractive (Cartea, Jaimungal & Penalva, 2015 [ref 10]; Bouchaud, 2010 [ref 45]) |
+| **Layer multiple tiers** | Uncertain short-term direction but desire for continuous presence | Captures both fast taker flow near mid and slower flow farther out; reduces all-or-nothing dependence on one quote level (§1.4; Foucault, Kadan & Kandel, 2005 [ref 38]) |
+| **Asymmetric sizing** | Inventory is imbalanced but full rebalancing is unnecessary | Keep both sides quoted, but post larger size on the side that reduces inventory and smaller size on the side that increases it (Avellaneda & Stoikov, 2008 [ref 6]; Guéant, Lehalle & Fernandez-Tapia, 2013 [ref 19]) |
+| **Hybrid maker-taker rebalancing** | Extreme imbalance, stale book, or urgent risk reduction | Stay passive most of the time, but cross the spread deliberately for a small amount when the expected future spread income from restoring balance exceeds the immediate loss (§5.1, §5.2; Guilbaud & Pham, 2013 [ref 21]) |
+
+The key is to treat these as **state-dependent tactics**, not permanent
+identities.  A healthy market maker may spend part of the day joining the
+inside, part of the day stepping back, and part of the day filling gaps in
+the second or third tier.
+
+#### What about running multiple XOPTrader instances ourselves?
+
+If _you_ control multiple instances (e.g., for scaling or redundancy), the
+same principles apply but you can add explicit coordination:
+
+- **Pair partitioning:** each instance trades non-overlapping pairs.
+  No overlap = no self-competition.
+- **Tier partitioning:** Instance A quotes tier 1 (tight, small), Instance B
+  quotes tier 2 (wide, large) on the same pair.
+- **Self-detection:** tag offers with an instance identifier so competitor
+  detection ignores own-family offers.
+- **Shared state:** for advanced multi-machine setups, share inventory
+  position via a common database so instances quote collaboratively.
+
+But the gap-filling and A-S equilibrium strategies above work regardless —
+even against your own other instances.
+
+#### The equilibrium outcome
+
+In a market with multiple independent market makers (whether running
+XOPTrader or not), the expected equilibrium is:
+
+- **Spread compression** toward the level supported by actual taker
+  flow and adverse selection risk — this is healthy competition that
+  benefits takers.
+- **Natural specialization** — makers with lower costs or higher risk
+  tolerance capture the tight-spread, high-frequency segment; others
+  migrate to wider spreads, less liquid pairs, or different timing
+  windows.  This is the Lo (2004) [ref 36] Adaptive Markets prediction:
+  strategies find niches rather than all converging on the same point.
+- **Reduced per-trade profit but not zero profit** — as long as organic
+  taker flow exists, spread income remains positive.  The Menkveld (2013)
+  [ref 37] finding applies: successful market makers survive competition
+  by running diversified strategy portfolios, not by winning a single
+  spread-tightening contest.
+
+#### Scholarly guidance on avoiding feedback loops
+
+Yes — there is meaningful scholarly support for the idea that market makers
+should avoid blindly matching each other and should instead differentiate,
+back off, or relocate when the book becomes crowded:
+
+- **Farmer & Joshi (2002) [ref 42]** is the most directly relevant paper in
+  this document.  It shows that strategies which are profitable in isolation
+  can become unprofitable once crowded by similar agents.  The implication is
+  to monitor crowding and rotate away from saturated quote locations.
+- **Bouchaud (2010) [ref 45]** frames many market instabilities as endogenous
+  feedback loops between order flow, liquidity, and price impact.  The
+  practical lesson is to avoid pro-cyclical quote chasing and avoid reacting
+  mechanically to every competitor move.
+- **Parlour (1998) [ref 43]** and **Rosu (2009) [ref 44]** model how the
+  state of the order book affects whether traders place aggressive or passive
+  orders.  Their core message is that quote placement should depend on queue
+  state and book shape, not just on an abstract fair-value estimate.
+- **Lu & Abergel (2018) [ref 46]** is especially useful for XOPTrader's
+  practical design because it studies order-book-aware market making tactics
+  such as joining, improving, and stepping back — exactly the tactical menu
+  needed to avoid self-defeating feedback dynamics.
+- **Menkveld (2013) [ref 37]** suggests that robust market makers survive by
+  operating as diversified, adaptive agents rather than by defending one
+  static quoting style.  In our context, that means gap-filling should be the
+  baseline strategy, but not the only one.
+
+**Key takeaway:** Don't try to know or control what other market makers
+are doing.  Instead, (1) use the A-S/GLFT model to find _your_ optimal
+price given _your_ inventory and risk, (2) fill the gaps in the order
+book where others aren't quoting, (3) enforce a minimum spread floor to
+prevent Bertrand races, and (4) monitor fill rates to detect crowding
+early and rotate to less competitive opportunities.  The math finds
+equilibrium; the gap-filling strategy avoids head-on collisions.
+
+---
+
+## 8. Strategy Interaction Matrix
 
 How the implemented strategies compose and interact:
 
@@ -1007,7 +2152,7 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 
 ---
 
-## 5. References
+## 9. References
 
 1. Agrawal, S. & Goyal, N. (2012). "Analysis of Thompson sampling for the multi-armed bandit problem." *COLT 2012*.
 
@@ -1070,3 +2215,33 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 30. Stoll, H. R. (1978). "The supply of dealer services in securities markets." *Journal of Finance*, 33(4), 1133–1151.
 
 31. Thompson, W. R. (1933). "On the likelihood that one unknown probability exceeds another." *Biometrika*, 25(3/4), 285–294.
+
+32. Engle, R. F. & Granger, C. W. J. (1987). "Co-integration and error correction: representation, estimation, and testing." *Econometrica*, 55(2), 251–276.
+
+33. Engle, R. F. (2002). "Dynamic conditional correlation: A simple class of multivariate generalized autoregressive conditional heteroskedasticity models." *Journal of Business & Economic Statistics*, 20(3), 339–350.
+
+34. Madhavan, A. (2000). "Market microstructure: A survey." *Journal of Financial Markets*, 3(3), 205–258.
+
+35. Garman, M. B. (1976). "Market microstructure." *Journal of Financial Economics*, 3(3), 257–275.
+
+36. Lo, A. W. (2004). "The Adaptive Markets Hypothesis." *Journal of Portfolio Management*, 30(5), 15–29.
+
+37. Menkveld, A. J. (2013). "High frequency trading and the new market makers." *Journal of Financial Markets*, 16(4), 712–740.
+
+38. Foucault, T., Kadan, O. & Kandel, E. (2005). "Limit order book as a market for liquidity." *Review of Financial Studies*, 18(4), 1171–1217.
+
+39. López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley. (Ch. 11–12: backtesting pitfalls; Ch. 16–17: strategy selection and bet sizing.)
+
+40. Lehalle, C.-A. & Laruelle, S. (2018). *Market Microstructure in Practice* (2nd ed.). World Scientific.
+
+41. Brock, W. A. & Hommes, C. H. (1998). "Heterogeneous beliefs and routes to chaos in a simple asset pricing model." *Journal of Economic Dynamics and Control*, 22(8–9), 1235–1274.
+
+42. Farmer, J. D. & Joshi, S. (2002). "The price dynamics of common trading strategies." *Journal of Economic Behavior & Organization*, 49(2), 149–171.
+
+43. Parlour, C. A. (1998). "Price dynamics in limit order markets." *Review of Financial Studies*, 11(4), 789–816.
+
+44. Rosu, I. (2009). "A dynamic model of the limit order book." *Review of Financial Studies*, 22(11), 4601–4641.
+
+45. Bouchaud, J.-P. (2010). "The endogenous dynamics of markets: price impact, feedback loops and instabilities." *arXiv:1009.2928*.
+
+46. Lu, X. & Abergel, F. (2018). "Order-book modelling and market making strategies." *FINEC Working Paper 2018-028*.
