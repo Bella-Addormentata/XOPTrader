@@ -255,6 +255,24 @@ private:
     /// Close all RPC/API connections.
     void close_connections();
 
+    // -- Pair config lookup ---------------------------------------------------
+
+    /// O(1) lookup map from pair name to the corresponding PairConfig entry
+    /// in config_.pairs.  Built once during construction; eliminates the
+    /// repeated O(N) linear scans that previously appeared in steps 2, 5,
+    /// 6, 7, and 8.
+    /// ISO/IEC 5055: deterministic lookup, no raw pointer ownership.
+    std::unordered_map<std::string, const PairConfig*> pair_config_map_;
+
+    /// Return a pointer to the PairConfig for @p pair_name, or nullptr if
+    /// no matching pair is configured.
+    [[nodiscard]] const PairConfig* find_pair_config(
+        const std::string& pair_name) const
+    {
+        auto it = pair_config_map_.find(pair_name);
+        return (it != pair_config_map_.end()) ? it->second : nullptr;
+    }
+
     // -- Configuration -------------------------------------------------------
 
     /// Immutable copy of the application configuration.

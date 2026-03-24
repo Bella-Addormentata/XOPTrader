@@ -10,8 +10,8 @@
 #include <xop/strategy/avellaneda.hpp>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
+#include <stdexcept>
 #include <numeric>
 
 namespace xop {
@@ -24,14 +24,28 @@ AvellanedaStoikov::AvellanedaStoikov(const AvellanedaConfig& cfg)
     : cfg_(cfg)
     , min_margin_bps_(cfg.min_margin_bps)
 {
-    // Sanity checks on critical parameters.  These are programming errors
-    // (not user input), so we assert rather than throw.
-    assert(cfg_.gamma > 0.0       && "gamma must be strictly positive");
-    assert(cfg_.kappa > 0.0       && "kappa must be strictly positive");
-    assert(cfg_.A > 0.0           && "fill intensity A must be strictly positive");
-    assert(cfg_.q_max > 0.0       && "q_max must be strictly positive");
-    assert(cfg_.horizon_blocks > 0 && "horizon must be at least 1 block");
-    assert(cfg_.block_time_seconds > 0.0 && "block time must be positive");
+    // Validate critical parameters.  Config values may come from user files
+    // or command-line flags, so throw on invalid input rather than assert
+    // (which is stripped in Release builds).
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.gamma > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: gamma must be strictly positive");
+    }
+    if (!(cfg_.kappa > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: kappa must be strictly positive");
+    }
+    if (!(cfg_.A > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: fill intensity A must be strictly positive");
+    }
+    if (!(cfg_.q_max > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: q_max must be strictly positive");
+    }
+    if (!(cfg_.horizon_blocks > 0)) {
+        throw std::invalid_argument("AvellanedaConfig: horizon_blocks must be at least 1");
+    }
+    if (!(cfg_.block_time_seconds > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: block_time_seconds must be positive");
+    }
 }
 
 // ===========================================================================

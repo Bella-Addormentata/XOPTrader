@@ -465,15 +465,19 @@ public:
 
     /// Run Monte Carlo simulation of inventory evolution.
     ///
-    /// @param condition      Market regime to simulate.
-    /// @param trend_pct_day  Daily trend magnitude (for trending regimes).
-    /// @param num_paths      Number of simulation paths.
-    /// @param max_blocks     Maximum blocks to simulate per path.
-    /// @param seed           RNG seed (0 = use random device).
+    /// @param condition       Market regime to simulate.
+    /// @param trend_pct_day   Daily trend magnitude (for trending regimes).
+    /// @param current_ratio   Current inventory ratio in [0,1]; 0.5 = balanced.
+    ///                        The simulation starts from this position rather
+    ///                        than assuming a balanced portfolio.
+    /// @param num_paths       Number of simulation paths.
+    /// @param max_blocks      Maximum blocks to simulate per path.
+    /// @param seed            RNG seed (0 = use random device).
     ///
     /// @return DriftSimulationResult  Statistical summary of the simulation.
     DriftSimulationResult simulate_drift(MarketCondition condition,
                                          double          trend_pct_day,
+                                         double          current_ratio = 0.5,
                                          uint32_t        num_paths = 10000,
                                          uint32_t        max_blocks = 50000,
                                          uint64_t        seed = 0) const;

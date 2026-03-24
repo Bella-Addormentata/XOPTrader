@@ -181,12 +181,14 @@ void VolatilityEstimator::recompute_yang_zhang()
         return;
     }
 
-    // Number of paired observations (we skip the first candle for overnight).
-    const auto n = static_cast<double>(n_candles - 1);
-
     // ------------------------------------------------------------------
     // Step 1: Compute log-return series
     // ------------------------------------------------------------------
+    //
+    // n_valid tracks the number of observation pairs that pass the
+    // zero/negative price guard.  Using n_valid (not the raw n_candles - 1)
+    // as the denominator ensures the variance estimate is unbiased when
+    // degenerate candles are skipped.
 
     // o_i = ln(O_i / C_{i-1})  -- overnight return
     // c_i = ln(C_i / O_i)      -- close-to-open (intraday) return
@@ -197,17 +199,20 @@ void VolatilityEstimator::recompute_yang_zhang()
     double sum_o2 = 0.0;   // sum of squared overnight returns
     double sum_c2 = 0.0;   // sum of squared close-to-open returns
     double sum_rs = 0.0;   // sum of Rogers-Satchell terms
+    std::size_t n_valid = 0;  // count of pairs with valid (positive) prices
 
     for (std::size_t i = 1; i < n_candles; ++i) {
         const Candle& prev = candles_[i - 1];
         const Candle& curr = candles_[i];
 
         // Guard against zero or negative prices (would produce NaN/inf).
-        // In degenerate cases, skip this observation.
+        // In degenerate cases, skip this observation entirely.
         if (prev.close <= 0.0 || curr.open <= 0.0 ||
             curr.close <= 0.0 || curr.high <= 0.0 || curr.low <= 0.0) {
             continue;
         }
+
+        ++n_valid;
 
         // Overnight return: open of this candle vs close of previous candle.
         const double o_i = std::log(curr.open / prev.close);
@@ -229,6 +234,17 @@ void VolatilityEstimator::recompute_yang_zhang()
         const double log_lo = std::log(curr.low  / curr.open);
         sum_rs += log_hc * log_ho + log_lc * log_lo;
     }
+
+    // If all observations were skipped (degenerate data), bail out.
+    if (n_valid < 2) {
+        sigma_block_ = 0.0;
+        sigma_annual_ = 0.0;
+        return;
+    }
+
+    // Use n_valid (not n_candles - 1) as the denominator so the variance
+    // estimate accounts for skipped zero/negative-price observations.
+    const auto n = static_cast<double>(n_valid);
 
     // ------------------------------------------------------------------
     // Step 2: Compute the three variance components
@@ -348,58 +364,83 @@ void VolatilityEstimator::recompute_variance_ratio()
     // ------------------------------------------------------------------
     //
     // r1[i] = ln(C_{start+i+1} / C_{start+i}),  i = 0, ..., (window-2)
+    //
+    // n1_valid tracks the count of non-degenerate observations so the
+    // variance denominator is correct when zero/negative prices are skipped.
 
-    const std::size_t n1 = cfg_.vr_window - 1;  // count of 1-period returns
     double sum_r1  = 0.0;
     double sum_r1_sq = 0.0;
+    std::size_t n1_valid = 0;
 
-    for (std::size_t i = 0; i < n1; ++i) {
-        const double c_prev = candles_[start + i].close;
-        const double c_curr = candles_[start + i + 1].close;
+    {
+        const std::size_t n1_total = cfg_.vr_window - 1;
+        for (std::size_t i = 0; i < n1_total; ++i) {
+            const double c_prev = candles_[start + i].close;
+            const double c_curr = candles_[start + i + 1].close;
 
-        if (c_prev <= 0.0 || c_curr <= 0.0) {
-            continue;  // skip degenerate prices
+            if (c_prev <= 0.0 || c_curr <= 0.0) {
+                continue;  // skip degenerate prices
+            }
+
+            const double r = std::log(c_curr / c_prev);
+            sum_r1    += r;
+            sum_r1_sq += r * r;
+            ++n1_valid;
         }
-
-        const double r = std::log(c_curr / c_prev);
-        sum_r1    += r;
-        sum_r1_sq += r * r;
     }
 
-    const double mean_r1 = sum_r1 / static_cast<double>(n1);
+    // Need at least 2 valid returns for a meaningful variance.
+    if (n1_valid < 2) {
+        variance_ratio_ = 1.0;
+        return;
+    }
 
-    // Var(1-period) = (1/n1) * sum(r1^2) - mean^2
-    const double var_1 = (sum_r1_sq / static_cast<double>(n1))
-                       - (mean_r1 * mean_r1);
+    const double dn1    = static_cast<double>(n1_valid);
+    const double mean_r1 = sum_r1 / dn1;
+
+    // Var(1-period) = (1/n1_valid) * sum(r1^2) - mean^2
+    const double var_1 = (sum_r1_sq / dn1) - (mean_r1 * mean_r1);
 
     // ------------------------------------------------------------------
     // Step 2: Compute q-period log-returns over the window
     // ------------------------------------------------------------------
     //
     // rq[j] = ln(C_{start+j+q} / C_{start+j}),  j = 0, ..., (window-1-q)
+    //
+    // nq_valid tracks valid observations analogously to n1_valid.
 
-    const std::size_t nq = cfg_.vr_window - q;  // count of q-period returns
     double sum_rq  = 0.0;
     double sum_rq_sq = 0.0;
+    std::size_t nq_valid = 0;
 
-    for (std::size_t j = 0; j < nq; ++j) {
-        const double c_prev = candles_[start + j].close;
-        const double c_curr = candles_[start + j + q].close;
+    {
+        const std::size_t nq_total = cfg_.vr_window - q;
+        for (std::size_t j = 0; j < nq_total; ++j) {
+            const double c_prev = candles_[start + j].close;
+            const double c_curr = candles_[start + j + q].close;
 
-        if (c_prev <= 0.0 || c_curr <= 0.0) {
-            continue;
+            if (c_prev <= 0.0 || c_curr <= 0.0) {
+                continue;
+            }
+
+            const double r = std::log(c_curr / c_prev);
+            sum_rq    += r;
+            sum_rq_sq += r * r;
+            ++nq_valid;
         }
-
-        const double r = std::log(c_curr / c_prev);
-        sum_rq    += r;
-        sum_rq_sq += r * r;
     }
 
-    const double mean_rq = sum_rq / static_cast<double>(nq);
+    // Need at least 2 valid q-period returns for a meaningful variance.
+    if (nq_valid < 2) {
+        variance_ratio_ = 1.0;
+        return;
+    }
 
-    // Var(q-period) = (1/nq) * sum(rq^2) - mean_rq^2
-    const double var_q = (sum_rq_sq / static_cast<double>(nq))
-                       - (mean_rq * mean_rq);
+    const double dnq    = static_cast<double>(nq_valid);
+    const double mean_rq = sum_rq / dnq;
+
+    // Var(q-period) = (1/nq_valid) * sum(rq^2) - mean_rq^2
+    const double var_q = (sum_rq_sq / dnq) - (mean_rq * mean_rq);
 
     // ------------------------------------------------------------------
     // Step 3: Compute VR(q)
