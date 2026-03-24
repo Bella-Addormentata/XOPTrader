@@ -1669,9 +1669,20 @@ Every market making decision involves genuine tension between competing
 objectives.  This section catalogues the major trade-offs so that strategy
 choices can be made consciously rather than by default.
 
+> **Scholarly foundation:** The trade-offs below are not merely practical
+> observations — they arise from fundamental results in market microstructure.
+> Garman (1976) first formalized the dealer's inventory-versus-bankruptcy
+> trade-off; Ho & Stoll (1981) [ref 23] extended it to return uncertainty;
+> Foucault, Kadan & Kandel (2005) [ref 38] proved that the maker-vs-taker
+> choice is itself an equilibrium outcome of queue priority and patience.
+> The strategy-switching question — *when* to move between strategies — is
+> addressed in §7.9 below.
+
 ### 7.1 Spread Width vs. Fill Rate
 
-The most fundamental tension in market making:
+The most fundamental tension in market making.  Amihud & Mendelson (1986)
+[ref 3] showed that wider spreads reduce adverse selection but also reduce
+trading volume; the optimal spread balances these forces.
 
 | Spread Choice | Fill Rate | Revenue per Fill | Adverse Selection | Inventory Velocity |
 |---------------|-----------|-----------------|-------------------|-------------------|
@@ -1691,6 +1702,12 @@ rather than requiring a manual static choice.
 
 ### 7.2 Inventory Risk vs. Capital Efficiency
 
+Garman (1976) [ref 35] proved that a dealer who ignores inventory will
+eventually go bankrupt with probability 1.  The question is *how much*
+inventory risk to tolerate — Avellaneda & Stoikov (2008) [ref 6] and
+Guéant et al. (2013) [ref 19] both parameterize this as a risk-aversion
+coefficient γ that trades off expected profit against inventory variance.
+
 | Choice | Inventory Risk | Capital Efficiency | Scenario |
 |--------|---------------|-------------------|----------|
 | Large position limits (high q_max) | High | High | More capital deployed, bigger directional exposure |
@@ -1705,6 +1722,13 @@ together address this asymmetry.
 ---
 
 ### 7.3 Strategy Complexity vs. Robustness
+
+López de Prado (2018) [ref 39] devotes an entire chapter to the "backtest
+overfitting" problem — complex strategies that look brilliant in-sample but
+fail out-of-sample.  The Adaptive Markets Hypothesis (Lo, 2004 [ref 36])
+argues that strategy fitness is *environment-dependent*: what works in one
+regime may fail in the next, so robustness across regimes matters more than
+peak performance within one.
 
 | Complexity | Advantages | Disadvantages |
 |------------|-----------|---------------|
@@ -1725,6 +1749,11 @@ toxic flow classification.
 
 ### 7.4 Passive (Maker) vs. Active (Taker) Behavior
 
+Foucault, Kadan & Kandel (2005) [ref 38] model this as an equilibrium: patient
+traders post limit orders (maker), impatient traders cross the spread (taker).
+The optimal mix depends on queue priority, time horizon, and urgency.  In Chia's
+offer-file model, "maker" has zero explicit cost; "taker" costs the full spread.
+
 | Behavior | Cost | Benefit | When Appropriate |
 |----------|------|---------|-----------------|
 | Pure maker (only post offers) | Zero taker fees; earn spread | May never fill on illiquid pairs | Normal quoting |
@@ -1738,6 +1767,11 @@ imbalance exceeds the cost of crossing the spread.
 ---
 
 ### 7.5 Reactive vs. Predictive Quoting
+
+Lehalle & Laruelle (2018) [ref 40] distinguish three quoting regimes:
+*passive* (react to fills), *informed* (react to signals), and *predictive*
+(lead the market using cross-venue information).  Each step up in
+sophistication reduces lag but increases false-signal risk.
 
 | Approach | Lag | False Signal Risk | Implementation Complexity |
 |----------|-----|------------------|--------------------------|
@@ -1770,6 +1804,11 @@ counter-party risk on the CEX side.
 
 ### 7.7 Short-Term PnL vs. Long-Term Market Presence
 
+Menkveld (2013) [ref 37] shows that modern market makers who provide *continuous*
+liquidity earn a structural informational advantage over intermittent ones —
+taker flow preferentially routes to reliable quoters.  Withdrawing during
+stress sacrifices this advantage permanently.
+
 | Priority | Short-Term PnL | Long-Term Presence |
 |----------|---------------|-------------------|
 | **Extractive quoting** | Widen spreads aggressively, withdraw on volatility | Reduces fill frequency over time; other makers capture flow |
@@ -1799,6 +1838,75 @@ Chia's full blockchain transparency (§4.5) cuts both ways:
 **Mitigation:** Randomize rebalancing timing and amounts (within bounds) to
 defeat behavioral fingerprinting.  Never rebalance at a fixed inventory ratio
 with a fixed offer size — vary both by ±20% stochastically.
+
+---
+
+### 7.9 Strategy Switching: When and How to Change Strategies
+
+A market maker should not run a single static strategy forever.  Market
+conditions change, and the *optimal* strategy shifts with them.  Several
+scholarly frameworks address this directly:
+
+**Brock & Hommes (1998) [ref 41] — Performance-Based Strategy Switching.**
+The foundational model of *adaptive belief systems*: agents track the recent
+profitability of competing strategies and switch toward whichever performed
+best (net of switching costs).  The key parameter is the *intensity of choice*
+β — how aggressively agents abandon underperforming strategies.  Too high β
+causes destabilizing herding; too low β leaves you stuck in a bad strategy.
+
+*Application to XOPTrader:* We already have the building blocks — regime
+detection (§1.5) identifies the current market state, and Thompson Sampling
+(§1.12) explores spread parameters.  The Brock-Hommes insight suggests we
+should extend this to *strategy-level* switching: track realized PnL
+attribution per strategy component and increase weight on components that
+are currently profitable, with a dampening factor to avoid oscillation.
+
+**Lo (2004) [ref 36] — The Adaptive Markets Hypothesis (AMH).**
+Argues that market efficiency varies over time as the population of
+strategies in use evolves.  Strategies that are profitable attract imitators,
+which erodes their edge; strategies that fail are abandoned, which restores
+their edge later.  The implication: no strategy should be permanently ruled
+out or permanently relied upon.
+
+*Application:* The "Always Defer" category in §6 should be revisited
+periodically.  If Chia DEX volume grows 10×, strategies like multi-asset
+quoting (§3.8) and ML-based toxic flow classification (§3.6) become viable
+because the signal-to-noise ratio improves with volume.
+
+**Farmer & Joshi (2002) [ref 42] — Strategy Interaction Dynamics.**
+Simulates what happens when multiple trading strategies coexist.  Key finding:
+strategies that are profitable in isolation may become unprofitable when others
+adopt them (crowding), and the *composition* of the strategy population matters
+as much as individual strategy quality.
+
+*Application:* On Chia DEX, where the competitor population is small and
+observable (§3.21, §4.5), we can directly estimate strategy crowding.  If
+blockchain analysis (§3.21) reveals that competitors have adopted A-S-style
+inventory skewing, our edge from that approach shrinks — and the priority
+ranking (§6) should shift toward less-crowded strategies.
+
+**Menkveld (2013) [ref 37] — The Modern Market Maker as Multi-Strategy Agent.**
+Documents that successful high-frequency market makers run *portfolios* of
+strategies simultaneously, with dynamic capital allocation across them —
+not sequential switching between monolithic strategies.  The allocation
+shifts in real time based on current market conditions.
+
+*Application:* Rather than switching *from* A-S *to* GLFT, run both with
+dynamically weighted blending.  The regime detector (§1.5) can control the
+blend: more A-S weight in mean-reverting regimes (where inventory mean-reverts
+naturally), more GLFT weight in trending regimes (where inventory penalty
+matters more).
+
+**Practical Strategy-Switching Policy for XOPTrader:**
+
+| Signal | Action | Scholarly Basis |
+|--------|--------|-----------------|
+| Regime detector signals shift from mean-reverting → trending | Increase GLFT weight, intensify inventory skew, widen spreads | Hamilton (1989) [ref 22], Brock & Hommes (1998) [ref 41] |
+| VPIN rises above 0.7 | Activate asymmetric widening (§1.11), consider pausing quoting on informed side | Easley et al. (2012) [ref 14] |
+| Realized spread < 30% of quoted for 24h | Widen spreads; the current width is being adversely selected through | Amihud & Mendelson (1986) [ref 3] |
+| Competitor analysis shows crowding on A-S-style quoting | Shift toward TTL optimization (§3.17) and block-cadence sync (§3.18) — operational edges that can't be crowded | Farmer & Joshi (2002) [ref 42] |
+| CEX lead-lag signal consistently predicts DEX price moves | Activate predictive quoting mode (§3.3) | De Jong & Nijman (1997) [ref 12], Lo (2004) [ref 36] |
+| Monthly PnL attribution shows one strategy dominating | *Reduce* its allocation slightly — check for overfitting to recent conditions | López de Prado (2018) [ref 39] |
 
 ---
 
@@ -1909,3 +2017,19 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 33. Engle, R. F. (2002). "Dynamic conditional correlation: A simple class of multivariate generalized autoregressive conditional heteroskedasticity models." *Journal of Business & Economic Statistics*, 20(3), 339–350.
 
 34. Madhavan, A. (2000). "Market microstructure: A survey." *Journal of Financial Markets*, 3(3), 205–258.
+
+35. Garman, M. B. (1976). "Market microstructure." *Journal of Financial Economics*, 3(3), 257–275.
+
+36. Lo, A. W. (2004). "The Adaptive Markets Hypothesis." *Journal of Portfolio Management*, 30(5), 15–29.
+
+37. Menkveld, A. J. (2013). "High frequency trading and the new market makers." *Journal of Financial Markets*, 16(4), 712–740.
+
+38. Foucault, T., Kadan, O. & Kandel, E. (2005). "Limit order book as a market for liquidity." *Review of Financial Studies*, 18(4), 1171–1217.
+
+39. López de Prado, M. (2018). *Advances in Financial Machine Learning*. Wiley. (Ch. 11–12: backtesting pitfalls; Ch. 16–17: strategy selection and bet sizing.)
+
+40. Lehalle, C.-A. & Laruelle, S. (2018). *Market Microstructure in Practice* (2nd ed.). World Scientific.
+
+41. Brock, W. A. & Hommes, C. H. (1998). "Heterogeneous beliefs and routes to chaos in a simple asset pricing model." *Journal of Economic Dynamics and Control*, 22(8–9), 1235–1274.
+
+42. Farmer, J. D. & Joshi, S. (2002). "The price dynamics of common trading strategies." *Journal of Economic Behavior & Organization*, 49(2), 149–171.
