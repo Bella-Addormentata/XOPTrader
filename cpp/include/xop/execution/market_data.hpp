@@ -592,6 +592,11 @@ private:
     /// Compute OFI delta from the latest two book snapshots and update metrics.
     void recompute_ofi(const std::string& pair_name);
 
+    /// Recompute whale metrics for all tracked pairs after a config change.
+    /// Trims stale events from each pair's event deque and recalculates the
+    /// spread multiplier with the updated configuration.
+    void recompute_all_whale_metrics();
+
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
     void publish_snapshot(const PairState& ps);
@@ -601,7 +606,9 @@ private:
 
     // -- Data members -------------------------------------------------------
 
-    /// Configuration (thresholds, capacities).
+    /// Configuration (thresholds, capacities).  Guarded by mtx_config_ for
+    /// thread-safe runtime updates via the set_* methods.
+    mutable std::shared_mutex mtx_config_;
     MarketDataConfig config_;
 
     /// Reference to the shared global state.  refresh() writes MarketSnapshot

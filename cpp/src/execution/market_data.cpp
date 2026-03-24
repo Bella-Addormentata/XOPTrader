@@ -391,6 +391,10 @@ std::optional<ArbitrageSignal> MarketDataFeed::get_latest_arb_signal(
 // =========================================================================
 
 const MarketDataConfig& MarketDataFeed::config() const noexcept {
+    // Note: mtx_config_ is not acquired here to preserve the noexcept contract.
+    // Callers should ensure no concurrent config mutation (i.e. call setters
+    // from the same thread that owns the feed, or accept benign tearing on
+    // double fields).
     return config_;
 }
 
@@ -400,7 +404,10 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
                      threshold_bps);
         return;
     }
-    config_.arb_threshold_bps = threshold_bps;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.arb_threshold_bps = threshold_bps;
+    }
     spdlog::info("Arbitrage threshold updated to {:.1f} bps", threshold_bps);
 }
 
@@ -415,10 +422,14 @@ void MarketDataFeed::set_whale_trade_threshold(Mojo threshold) {
                      threshold);
         return;
     }
-    config_.whale_trade_threshold = threshold;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_trade_threshold = threshold;
+    }
     spdlog::info("Whale trade threshold updated to {} mojos ({:.2f} XCH)",
                  threshold,
                  static_cast<double>(threshold) / static_cast<double>(kMojosPerXch));
+    recompute_all_whale_metrics();
 }
 
 void MarketDataFeed::set_whale_volume_fraction(double fraction) {
@@ -427,9 +438,13 @@ void MarketDataFeed::set_whale_volume_fraction(double fraction) {
                      fraction);
         return;
     }
-    config_.whale_volume_fraction = fraction;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_volume_fraction = fraction;
+    }
     spdlog::info("Whale volume fraction updated to {:.4f} ({:.1f}%)",
                  fraction, fraction * 100.0);
+    recompute_all_whale_metrics();
 }
 
 void MarketDataFeed::set_whale_window_blocks(std::size_t blocks) {
@@ -437,9 +452,13 @@ void MarketDataFeed::set_whale_window_blocks(std::size_t blocks) {
         spdlog::warn("set_whale_window_blocks: window must be >= 1, ignoring");
         return;
     }
-    config_.whale_window_blocks = blocks;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_window_blocks = blocks;
+    }
     spdlog::info("Whale window updated to {} blocks (~{:.0f}s at 52s/block)",
                  blocks, static_cast<double>(blocks) * 52.0);
+    recompute_all_whale_metrics();
 }
 
 void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
@@ -448,8 +467,12 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
                      multiplier);
         return;
     }
-    config_.whale_max_spread_multiplier = multiplier;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_max_spread_multiplier = multiplier;
+    }
     spdlog::info("Whale max spread multiplier updated to {:.2f}x", multiplier);
+    recompute_all_whale_metrics();
 }
 
 // =========================================================================
@@ -1028,12 +1051,22 @@ void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
         deq.push_back(evt);
 
         // Evict events older than whale_window_blocks.
+        // Use uint64_t for the subtraction to avoid narrowing config_.whale_window_blocks
+        // (a size_t) to BlockHeight (uint32_t), which would silently truncate values
+        // above UINT32_MAX.
+        const std::uint64_t window_blocks =
+            static_cast<std::uint64_t>(config_.whale_window_blocks);
         while (!deq.empty() &&
-               block_height >= deq.front().block_height &&
-               (block_height - deq.front().block_height) >=
-                   static_cast<BlockHeight>(config_.whale_window_blocks))
+               block_height >= deq.front().block_height)
         {
-            deq.pop_front();
+            const std::uint64_t age =
+                static_cast<std::uint64_t>(block_height) -
+                static_cast<std::uint64_t>(deq.front().block_height);
+            if (age >= window_blocks) {
+                deq.pop_front();
+            } else {
+                break;
+            }
         }
     }
 
@@ -1164,6 +1197,95 @@ double MarketDataFeed::get_whale_spread_multiplier(
 }
 
 // -------------------------------------------------------------------------
+// recompute_all_whale_metrics -- re-evaluate after config change
+//
+// Called by the runtime setters to ensure cached whale metrics reflect the
+// new configuration immediately (e.g. a changed window size or multiplier).
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::recompute_all_whale_metrics()
+{
+    const BlockHeight current_block =
+        block_height_.load(std::memory_order_relaxed);
+
+    // Collect pair names with whale events.
+    std::vector<std::string> pair_names;
+    {
+        std::shared_lock lock(mtx_whale_events_);
+        pair_names.reserve(whale_events_.size());
+        for (const auto& [name, _] : whale_events_) {
+            pair_names.push_back(name);
+        }
+    }
+
+    for (const auto& pair_name : pair_names) {
+        // Trim events under the new window.
+        {
+            std::unique_lock lock(mtx_whale_events_);
+            auto it = whale_events_.find(pair_name);
+            if (it == whale_events_.end()) {
+                continue;
+            }
+            auto& deq = it->second;
+            const std::uint64_t window_blocks =
+                static_cast<std::uint64_t>(config_.whale_window_blocks);
+            while (!deq.empty() && current_block >= deq.front().block_height) {
+                const std::uint64_t age =
+                    static_cast<std::uint64_t>(current_block) -
+                    static_cast<std::uint64_t>(deq.front().block_height);
+                if (age >= window_blocks) {
+                    deq.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Snapshot surviving events.
+        std::vector<WhaleTradeEvent> events_snapshot;
+        {
+            std::shared_lock lock(mtx_whale_events_);
+            auto it = whale_events_.find(pair_name);
+            if (it != whale_events_.end()) {
+                events_snapshot.assign(it->second.begin(), it->second.end());
+            }
+        }
+
+        if (events_snapshot.empty()) {
+            // Clear metrics if no events survive the new window.
+            std::unique_lock lock(mtx_whale_metrics_);
+            whale_metrics_.erase(pair_name);
+            continue;
+        }
+
+        Mojo largest = 0;
+        for (const auto& e : events_snapshot) {
+            if (e.size > largest) {
+                largest = e.size;
+            }
+        }
+
+        const std::size_t n = events_snapshot.size();
+        const double multiplier = compute_whale_spread_multiplier(n);
+
+        WhaleMetrics wm;
+        wm.pair_name          = pair_name;
+        wm.events_in_window   = n;
+        wm.largest_trade_size = largest;
+        wm.spread_multiplier  = multiplier;
+        wm.dominant_side      = events_snapshot.back().side;
+        wm.is_active          = true;
+        wm.last_event_block   = events_snapshot.back().block_height;
+        wm.last_updated       = std::chrono::system_clock::now();
+
+        {
+            std::unique_lock lock(mtx_whale_metrics_);
+            whale_metrics_[pair_name] = wm;
+        }
+    }
+}
+
+// -------------------------------------------------------------------------
 // get_or_create_pair -- lazy initialization of PairState
 //
 // Caller MUST hold mtx_pairs_ exclusively.
@@ -1201,7 +1323,14 @@ void MarketDataFeed::ingest_trade_for_vpin(const std::string& pair_name,
         return;
     }
 
-    const double bucket_size = std::max(1e-12, config_.vpin_bucket_size);
+    const double bucket_size = config_.vpin_bucket_size;
+    if (bucket_size <= 0.0) {
+        spdlog::warn(
+            "VPIN disabled for pair '{}' due to non-positive bucket size: {}",
+            pair_name,
+            bucket_size);
+        return;
+    }
 
     {
         std::unique_lock lock(mtx_vpin_);
@@ -1272,7 +1401,10 @@ void MarketDataFeed::recompute_vpin(const std::string& pair_name)
         return;
     }
 
-    const double bucket_size = std::max(1e-12, config_.vpin_bucket_size);
+    const double bucket_size = config_.vpin_bucket_size;
+    if (bucket_size <= 0.0) {
+        return;  // VPIN disabled — warning was already logged in ingest_trade_for_vpin.
+    }
 
     // VPIN = (1/N) * SUM |buy_i - sell_i| / bucket_size
     double sum_abs_imbalance = 0.0;
@@ -1475,8 +1607,9 @@ double MarketDataFeed::get_normalized_ofi(const std::string& pair_name) const
 // Asymmetric spread widening
 //
 // Uses the whale detector's dominant_side to skew the spread multiplier.
-// Total widening is preserved: bid_mult * ask_mult ≈ symmetric_mult^2,
-// but the risk-bearing side gets a larger share of the spread.
+// The average widening is preserved: (bid_mult + ask_mult) / 2 = symmetric_mult,
+// but the risk-bearing side gets a larger share of the spread (and bid_mult *
+// ask_mult < symmetric_mult^2 whenever asymmetric_skew_factor α > 0).
 //
 // The asymmetric_skew_factor (α ∈ [0,1]) controls the split:
 //   α = 0.0 → symmetric (same multiplier on both sides)

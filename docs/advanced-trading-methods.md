@@ -210,10 +210,12 @@ ofi = feed.get_normalized_ofi(pair);
 ofi_mult = 1.0 + abs(ofi) * ofi_sensitivity;
 
 // Layer 4: Asymmetric skewing (new — applied per-side).
+// NOTE: asym already incorporates the whale symmetric multiplier, so do NOT
+// multiply by whale_mult separately — that would double-count whale widening.
 asym = feed.get_asymmetric_spread_multipliers(pair);
 
-final_bid_spread = base_spread_bps * whale_mult * vpin_mult * ofi_mult * asym.bid_multiplier;
-final_ask_spread = base_spread_bps * whale_mult * vpin_mult * ofi_mult * asym.ask_multiplier;
+final_bid_spread = base_spread_bps * vpin_mult * ofi_mult * asym.bid_multiplier;
+final_ask_spread = base_spread_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 ```
 
 ### Suggested Defaults for Chia
@@ -259,7 +261,8 @@ ordering convention:
 mtx_pairs_ → ... → mtx_whale_metrics_ → mtx_vpin_ → mtx_vpin_metrics_ → mtx_ofi_ → mtx_ofi_metrics_
 ```
 
-Each public method acquires at most one mutex.
+Public methods (and their helpers) may acquire multiple mutexes, but they always
+do so in this global order; no method acquires locks in a conflicting order.
 
 ### Unit Tests
 

@@ -316,8 +316,13 @@ pairs_ → arb_/history_/competitors_ → competitor_metrics_
                                     → whale_events_ → whale_metrics_
 ```
 
-No method acquires more than two mutexes in sequence (whale_events_ then
-whale_metrics_, both released before return), so deadlock is impossible.
+All methods that take multiple locks follow this global order. Some call paths
+(for example, `ingest_trade()` calling `get_volume_24h()` and then updating
+whale events/metrics) acquire up to three different mutexes sequentially
+(`mtx_pairs_`, then `mtx_whale_events_`, then `mtx_whale_metrics_`), but at
+most two are held simultaneously, and locks are released in reverse acquisition
+order. Under these constraints and the strict lock ordering above, deadlock
+from these mutexes is avoided.
 
 ### Unit Tests (`cpp/tests/test_whale_detection.cpp`)
 
