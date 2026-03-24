@@ -174,11 +174,12 @@ class Sidebar(QWidget):
         self._build_ui()
         self._apply_stylesheet()
 
-        # Select the first page by default and notify listeners so that
-        # the stacked widget shows the correct initial page.
+        # Select the first page by default.  The page_changed signal is
+        # NOT emitted here because the signal is typically not yet connected
+        # at construction time.  Callers should rely on QStackedWidget
+        # defaulting to index 0, or call select_page(0) after connecting.
         if self._buttons:
             self._buttons[0].set_active(True)
-            self.page_changed.emit(0)
 
     # -- Qt property for animated width -------------------------------------
 
