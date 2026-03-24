@@ -201,9 +201,12 @@ class _MetricsWorker(QObject):
         super().__init__(parent)
         self._url: str = _DEFAULT_URL
 
+    @Slot(str)
     def set_url(self, url: str) -> None:
-        """Update the scrape URL.  Called from the main thread before
-        the worker thread processes the next tick.
+        """Update the scrape URL.
+
+        Thread-safe: designed to be called via a queued signal from the
+        main thread so the mutation occurs on the worker thread.
 
         Parameters
         ----------
@@ -275,8 +278,9 @@ class MetricsService(QObject):
     connection_lost = Signal()
     connection_restored = Signal()
 
-    # -- Internal trigger signal (queued connection to worker thread) --------
+    # -- Internal trigger signals (queued connections to worker thread) -------
     _trigger_fetch = Signal()
+    _trigger_set_url = Signal(str)
 
     def __init__(
         self,
@@ -313,16 +317,19 @@ class MetricsService(QObject):
         self._worker.result_ready.connect(self._on_result)
         self._worker.request_failed.connect(self._on_failure)
 
-        # Queued connection: emit _trigger_fetch to invoke fetch() on the
-        # worker thread rather than blocking the GUI thread directly.
+        # Queued connections: emit trigger signals to invoke worker slots
+        # on the worker thread rather than blocking the GUI thread.
         self._trigger_fetch.connect(self._worker.fetch)
+        self._trigger_set_url.connect(self._worker.set_url)
 
         # -- Poll timer (fires on the main thread) --------------------------
         self._timer: QTimer = QTimer(self)
         self._timer.setTimerType(self._timer.TimerType.CoarseTimer)
         self._timer.timeout.connect(self._request_fetch)
 
-        self._worker.set_url(self._url)
+        # Dispatch the initial URL to the worker via queued signal so
+        # it is set on the worker thread (thread-safe).
+        self._trigger_set_url.emit(self._url)
 
         _log.info(
             "MetricsService created: url=%s, interval=%d ms",
@@ -346,13 +353,18 @@ class MetricsService(QObject):
         self._request_fetch()
 
     def stop(self) -> None:
-        """Stop polling and cleanly shut down the worker thread."""
+        """Stop polling and cleanly shut down the worker thread.
+
+        Safe to call even if the service was never started -- the thread
+        quit/wait is skipped when the thread is not running.
+        """
         _log.info("Stopping MetricsService.")
         self._timer.stop()
-        self._thread.quit()
-        # Wait up to 5 seconds for the thread to finish.
-        if not self._thread.wait(5_000):
-            _log.warning("MetricsService worker thread did not exit in time.")
+        if self._thread.isRunning():
+            self._thread.quit()
+            # Wait up to 5 seconds for the thread to finish.
+            if not self._thread.wait(5_000):
+                _log.warning("MetricsService worker thread did not exit in time.")
 
     # ===================================================================
     # Convenience getters (main-thread, non-blocking)
@@ -506,6 +518,8 @@ class MetricsService(QObject):
 
         This is the public API for changing the metrics URL; callers
         should use this instead of accessing the worker directly.
+        The URL is dispatched to the worker via a queued signal so the
+        mutation occurs on the worker thread (no cross-thread data race).
 
         Parameters
         ----------
@@ -513,7 +527,7 @@ class MetricsService(QObject):
             Full URL including path (e.g. ``http://host:9090/metrics``).
         """
         self._url = url
-        self._worker.set_url(url)
+        self._trigger_set_url.emit(url)
 
     @Slot()
     def _request_fetch(self) -> None:

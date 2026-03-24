@@ -29,7 +29,6 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSplitter,
     QStackedWidget,
-    QStatusBar,
     QTabWidget,
     QToolBar,
     QVBoxLayout,
@@ -82,6 +81,7 @@ except ImportError:
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
 from gui.theme import COLORS as _C
+from gui.utils import mojos_to_xch_float
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
 LIGHT_GREEN: Final[str] = _C.LIGHT_GREEN
@@ -298,12 +298,21 @@ class MainWindow(QMainWindow):
 
         # Dashboard update -- translate bridge dict to card-keyed format.
         if self._dashboard is not None and hasattr(self._dashboard, "update_metrics"):
+            # Convert PnL values from raw mojos (int) to XCH (float) so
+            # that MetricCard's {:+,.2f} formatter shows human-readable
+            # amounts rather than 12-digit mojo integers.
+            total_xch = mojos_to_xch_float(int(pnl.get("total", 0)))
+            realized_xch = mojos_to_xch_float(int(pnl.get("realized", 0)))
+            unrealized_xch = mojos_to_xch_float(int(pnl.get("unrealized", 0)))
+            spread_xch = mojos_to_xch_float(int(pnl.get("spread", 0)))
+            inventory_xch = mojos_to_xch_float(int(pnl.get("inventory", 0)))
+
             card_data = {
-                "Total PnL": {"value": pnl.get("total", 0), "spark": pnl.get("total", 0)},
-                "Realized PnL": {"value": pnl.get("realized", 0), "spark": pnl.get("realized", 0)},
-                "Unrealized PnL": {"value": pnl.get("unrealized", 0), "spark": pnl.get("unrealized", 0)},
-                "Spread PnL": {"value": pnl.get("spread", 0), "spark": pnl.get("spread", 0)},
-                "Inventory PnL": {"value": pnl.get("inventory", 0), "spark": pnl.get("inventory", 0)},
+                "Total PnL": {"value": total_xch, "spark": total_xch},
+                "Realized PnL": {"value": realized_xch, "spark": realized_xch},
+                "Unrealized PnL": {"value": unrealized_xch, "spark": unrealized_xch},
+                "Spread PnL": {"value": spread_xch, "spark": spread_xch},
+                "Inventory PnL": {"value": inventory_xch, "spark": inventory_xch},
                 "24h Fill Count": {
                     "value": data.get("offers", {}).get("filled", 0),
                     "spark": data.get("offers", {}).get("filled", 0),
@@ -972,7 +981,7 @@ class MainWindow(QMainWindow):
 
     def _on_toggle_statusbar(self) -> None:
         """Toggle visibility of the status bar."""
-        bar: QStatusBar = self.statusBar()
+        bar: StatusBar = self.statusBar()  # type: ignore[assignment]
         bar.setVisible(not bar.isVisible())
 
     def _on_toggle_fullscreen(self) -> None:
