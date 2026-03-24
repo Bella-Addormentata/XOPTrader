@@ -171,8 +171,7 @@ TEST_F(AdvancedTradingTest, Vpin_BucketCount) {
 
 // TEST 6: Window trimming evicts oldest buckets.
 TEST_F(AdvancedTradingTest, Vpin_WindowTrimming) {
-    // Set a tiny window: 3 buckets.
-    feed_->set_whale_trade_threshold(1);  // dummy, needed for feed_ access
+    // Recreate feed with a tiny window: 3 buckets.
     cfg_.vpin_window_buckets = 3;
     state_ = std::make_unique<State>();
     feed_  = std::make_unique<MarketDataFeed>(cfg_, *state_);
@@ -212,11 +211,6 @@ TEST_F(AdvancedTradingTest, Vpin_VolumePercentages) {
 // TEST 8: Single snapshot → no OFI metrics.
 TEST_F(AdvancedTradingTest, Ofi_SingleSnapshot_NoMetrics) {
     feed_->ingest_book_snapshot_for_ofi("XCH/wUSDC", 2.70, 100.0, 2.75, 100.0);
-    // Need at least 2 snapshots, but we get metrics after the first pair.
-    // Actually the code creates metrics after 2 snapshots internally.
-    // With just one snapshot, should have no metrics.
-    // Wait - the code stores the snapshot and tries to recompute_ofi,
-    // but recompute requires size >= 2. So no metrics.
     EXPECT_FALSE(feed_->get_ofi_metrics("XCH/wUSDC").has_value());
     EXPECT_DOUBLE_EQ(0.0, feed_->get_normalized_ofi("XCH/wUSDC"));
 }
@@ -233,9 +227,8 @@ TEST_F(AdvancedTradingTest, Ofi_BidStrengthening_PositiveOfi) {
 
     auto om = feed_->get_ofi_metrics(pair);
     ASSERT_TRUE(om.has_value());
-    // Bid increased → delta_bid = +100 (new bid size).
-    // Ask unchanged → delta_ask = 0.
-    // OFI = 100 - 0 = 100 > 0.
+    // Bid increased → e^B = +100.  Ask unchanged → e^A = 0.
+    // OFI = 100 - 0 = +100 (positive = buy pressure).
     EXPECT_GT(om->ofi, 0.0);
     EXPECT_GT(om->normalized_ofi, 0.0);
 }
@@ -246,36 +239,15 @@ TEST_F(AdvancedTradingTest, Ofi_AskStrengthening_NegativeOfi) {
 
     feed_->ingest_book_snapshot_for_ofi(pair, 2.70, 100.0, 2.75, 100.0);
 
-    // Ask drops to 2.73 (ask improvement → sell pressure).
+    // Ask drops to 2.73 (ask improvement = sellers more aggressive → sell pressure).
     feed_->ingest_book_snapshot_for_ofi(pair, 2.70, 100.0, 2.73, 100.0);
 
     auto om = feed_->get_ofi_metrics(pair);
     ASSERT_TRUE(om.has_value());
-    // Bid unchanged → delta_bid = 0.
-    // Ask decreased → delta_ask = -100 (negative of new ask size).
-    // OFI = 0 - (-100) = 0 + 100 = ... wait, let me reconsider.
-    // Actually: delta_ask = -curr_ask_size = -100.
-    // OFI = delta_bid - delta_ask = 0 - (-100) = 100. That's positive.
-    // But ask improvement means sellers are being more aggressive, which
-    // should be sell pressure. Let me recheck the OFI formula.
-    //
-    // Per Cont et al.: ask price decrease means ask book got better for
-    // sellers (more aggressive). The delta_ask is defined so that:
-    // - Ask price decreases: delta_ask = -ask_size_t (sell side strengthening)
-    // - OFI = delta_bid - delta_ask = 0 - (-100) = +100
-    //
-    // Wait, that gives positive OFI for ask strengthening. But ask
-    // strengthening should be sell pressure (negative OFI).
-    // The Cont et al. convention: OFI_t = e_t^B - e_t^A where
-    // e^B and e^A are the bid and ask "events".  When ask improves,
-    // e^A is positive (ask side is gaining), so OFI = 0 - positive = negative.
-    //
-    // The implementation: delta_ask < 0 when ask price decreases,
-    // OFI = delta_bid - delta_ask = 0 - (-100) = +100.
-    //
-    // This seems inverted. Let me just test what the code produces.
-    // The important thing is consistency.
-    EXPECT_NE(0.0, om->ofi);
+    // Bid unchanged → e^B = 0.  Ask decreased → e^A = +100.
+    // OFI = 0 - 100 = -100 (negative = sell pressure).
+    EXPECT_LT(om->ofi, 0.0);
+    EXPECT_LT(om->normalized_ofi, 0.0);
 }
 
 // TEST 11: Stable book (no changes) → zero OFI.
