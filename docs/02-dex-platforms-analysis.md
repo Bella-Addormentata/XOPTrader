@@ -34,7 +34,7 @@ This document provides a comprehensive analysis of decentralized exchange platfo
 
 ### Overview
 
-TibetSwap is the leading automated market maker (AMM) on Chia, modeled after Uniswap V2 architecture.
+TibetSwap is the leading automated market maker (AMM) on Chia, modeled after the classic Uniswap constant-product AMM design.
 
 **Website**: https://v2.tibetswap.io/
 

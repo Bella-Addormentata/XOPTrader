@@ -416,23 +416,28 @@ def get_wallet_id_for_asset(asset_id: str | None) -> int:
 ### Offer File Structure Reference
 ```python
 # Offer creation parameters (wallet RPC)
+# Resolve asset IDs to wallet IDs first (see get_wallet_id_for_asset above)
+USDS_ASSET_ID = ASSET_IDS["USDS"]
+xch_wallet_id = get_wallet_id_for_asset(ASSET_IDS["XCH"])     # Typically 1
+usds_wallet_id = get_wallet_id_for_asset(USDS_ASSET_ID)
+
 offer_request = {
     "offer": {
         # Positive = requesting, Negative = offering
         # XCH amount in mojos (1 XCH = 1e12 mojos)
         # CAT amount in CAT mojos (depends on token precision)
-        None: -100_000_000_000,          # Offer 0.1 XCH
-        USDS_ASSET_ID: 10_000_000,       # Request 10 USDS (6 decimals)
+        xch_wallet_id: -100_000_000_000,   # Offer 0.1 XCH
+        usds_wallet_id: 10_000_000,        # Request 10 USDS (6 decimals)
     },
-    "fee": 0,                             # Chia network fee in mojos
-    "validate_only": False,               # Set True to validate without creating
-    "driver_dict": {},                    # NFT metadata (empty for fungible assets)
-    "min_coin_amount": 0,                 # Minimum coin size to use
-    "max_coin_amount": None,              # Maximum coin size to use
-    "coin_announcements": [],             # Additional announcement assertions
-    "puzzle_announcements": [],           # Additional puzzle announcement assertions
-    "solver": None,                       # Custom solver for complex offers
-    "reuse_puzhash": False,              # Whether to reuse puzzle hash for change
+    "fee": 0,                              # Chia network fee in mojos
+    "validate_only": False,                # Set True to validate without creating
+    "driver_dict": {},                     # NFT metadata (empty for fungible assets)
+    "min_coin_amount": 0,                  # Minimum coin size to use
+    "max_coin_amount": None,               # Maximum coin size to use
+    "coin_announcements": [],              # Additional announcement assertions
+    "puzzle_announcements": [],            # Additional puzzle announcement assertions
+    "solver": None,                        # Custom solver for complex offers
+    "reuse_puzhash": False,                # Whether to reuse puzzle hash for change
 }
 ```
 
@@ -649,14 +654,15 @@ chia show -s
 # Clone and install XOPTrader
 git clone https://github.com/dorkmo/XOPTrader.git
 cd XOPTrader
-pip install -r requirements.txt
+# Install dependencies as described in README.md
+# (C++20 engine: see cpp/ build instructions; Python deps: pip install chia-blockchain)
 
 # Configure environment
-cp config.example.toml config.toml
-# Edit config.toml with wallet fingerprint, trading pairs, etc.
+cp config.example.yaml config.yaml
+# Edit config.yaml with wallet fingerprint, trading pairs, etc.
 
-# Run with systemd
-sudo cp deploy/xoptrader.service /etc/systemd/system/
+# Run with systemd (after creating /etc/systemd/system/xoptrader.service)
+sudo systemctl daemon-reload
 sudo systemctl enable xoptrader
 sudo systemctl start xoptrader
 ```

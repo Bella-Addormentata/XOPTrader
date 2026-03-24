@@ -710,11 +710,13 @@ sudo journalctl -u chia-market-maker -f
 
 ### Docker Deployment
 
+> **Note**: The Dockerfile below is illustrative pseudocode showing the general structure. Adapt it to your actual project layout (e.g., replace `requirements.txt` with your real dependency file and `bot.py` with your actual entrypoint).
+
 ```dockerfile
-# Dockerfile
+# Dockerfile (illustrative — adapt to your project layout)
 FROM python:3.10-slim
 
-# Install dependencies
+# Install system dependencies
 RUN apt-get update && apt-get install -y \
     git \
     build-essential \
@@ -727,10 +729,10 @@ RUN pip install chia-blockchain
 WORKDIR /app
 COPY . /app
 
-# Install Python dependencies
-RUN pip install -r requirements.txt
+# Install Python dependencies (replace with your actual dependency file)
+# RUN pip install -r requirements.txt
 
-# Run bot
+# Run bot (replace with your actual entrypoint)
 CMD ["python", "bot.py"]
 ```
 
