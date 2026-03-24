@@ -32,7 +32,7 @@
 //   ISO/IEC 27001:2022 -- secret classification, audit logging
 //   ISO/IEC 5055       -- no raw pointers, RAII locking, bounds checks
 //   ISO/IEC 25000      -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #ifndef XOP_MONITORING_ALERTS_HPP
 #define XOP_MONITORING_ALERTS_HPP
@@ -148,10 +148,14 @@ struct BotState {
 };
 
 // ---------------------------------------------------------------------------
-// DailySummary -- data for the daily summary alert.
+// AlertDailySummary -- data for the daily summary alert.
+//
+// Distinct from xop::DailySummary (in pnl.hpp), which is the PnL tracker's
+// end-of-day aggregation.  This struct carries the alert-specific fields
+// needed by the Telegram daily summary message.
 // ---------------------------------------------------------------------------
 
-struct DailySummary {
+struct AlertDailySummary {
     Mojo   total_pnl;           // Net PnL for the day.
     Mojo   realized_pnl;        // Realized component.
     Mojo   unrealized_pnl;      // Unrealized component.
@@ -211,7 +215,7 @@ public:
 
     /// Send a pre-formatted daily summary.
     /// Bypasses rate limiting (it is itself a once-per-day event).
-    void send_daily_summary(const DailySummary& summary);
+    void send_daily_summary(const AlertDailySummary& summary);
 
     /// Flush all queued INFO-tier messages as a single batched Telegram
     /// message.  Should be called once per hour by the main loop.

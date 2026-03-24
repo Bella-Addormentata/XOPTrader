@@ -29,7 +29,7 @@
 //   ISO/IEC 27001:2022  (no secrets, audit-friendly rebalance logging)
 //   ISO/IEC 5055        (bounds-checked vectors, no UB on edge inputs)
 //   ISO/IEC 25000       (clear naming, documented invariants)
-//   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
+//   ISO/IEC JTC 1/SC 22 (standard-conforming C++20)
 
 #ifndef XOP_STRATEGY_LIQUIDITY_HPP
 #define XOP_STRATEGY_LIQUIDITY_HPP
@@ -43,52 +43,21 @@
 
 namespace xop {
 
-// ---------------------------------------------------------------------------
-// TierQuote -- a single level of the multi-tier offer ladder.
-//
-// Represents one offer on one side (bid or ask) at a specific distance from
-// mid-price.  The execution layer maps each TierQuote to a create_offer_for_ids
-// wallet RPC call, pre-splitting coins to match the size field.
-// ---------------------------------------------------------------------------
-
-struct TierQuote {
-    int        tier;        // 0-based tier index (0 = tightest, N-1 = widest).
-    Side       side;        // Bid (buy) or Ask (sell).
-    std::int64_t price;     // Offer price in mojos.
-    std::int64_t size;      // Offer quantity in mojos of the relevant asset.
-    double     spread_bps;  // Distance from mid-price in basis points
-                            //   (informational, for logging and metrics).
-};
-
-// ---------------------------------------------------------------------------
-// RebalanceReason -- enumeration of conditions that trigger a full tier
-//                    recalculation and offer refresh.
-//
-// Multiple reasons may be active simultaneously; should_rebalance() returns
-// the highest-priority one.  The engine logs the reason for every rebalance
-// cycle to support post-hoc analysis and parameter tuning.
-// ---------------------------------------------------------------------------
-
-enum class RebalanceReason : std::uint8_t {
-    None             = 0,  // No rebalance needed.
-    PriceDeviation   = 1,  // Mid-price moved > threshold since last rebalance.
-    InventorySkew    = 2,  // Inventory ratio crossed the 60% threshold.
-    OfferStale       = 3,  // Outstanding offers exceed TTL in blocks.
-    VolumeSpike      = 4,  // Recent volume > 3x rolling average.
-    VolatilitySpike  = 5   // Current sigma > 2x 7-day average sigma.
-};
+// TierQuote and RebalanceReason are defined in <xop/types.hpp> (unified).
+// Both the strategy and execution layers share the same definitions.
 
 /// Human-readable label for logging and Prometheus metric labels.
 inline const char* to_string(RebalanceReason r) noexcept {
     switch (r) {
-        case RebalanceReason::None:            return "None";
-        case RebalanceReason::PriceDeviation:  return "PriceDeviation";
-        case RebalanceReason::InventorySkew:   return "InventorySkew";
-        case RebalanceReason::OfferStale:      return "OfferStale";
-        case RebalanceReason::VolumeSpike:     return "VolumeSpike";
-        case RebalanceReason::VolatilitySpike: return "VolatilitySpike";
+        case RebalanceReason::None:           return "None";
+        case RebalanceReason::PriceMove:      return "PriceMove";
+        case RebalanceReason::InventorySkew:  return "InventorySkew";
+        case RebalanceReason::TTLExpired:     return "TTLExpired";
+        case RebalanceReason::RegimeChange:   return "RegimeChange";
+        case RebalanceReason::CompetitorMove: return "CompetitorMove";
+        case RebalanceReason::ForcedRefresh:  return "ForcedRefresh";
+        default:                              return "Unknown";
     }
-    return "Unknown";
 }
 
 // ---------------------------------------------------------------------------

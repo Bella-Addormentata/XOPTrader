@@ -23,7 +23,7 @@
 //   ISO/IEC 27001:2022 -- controlled mutable state, audit-ready accessors
 //   ISO/IEC 5055       -- no raw pointer ownership, RAII locking, bounds checks
 //   ISO/IEC 25000      -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #ifndef XOP_RISK_INVENTORY_HPP
 #define XOP_RISK_INVENTORY_HPP

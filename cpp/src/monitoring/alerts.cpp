@@ -257,7 +257,7 @@ void AlertManager::send_alert(AlertTier tier, const std::string& message)
     post_telegram(prefix + message);
 }
 
-void AlertManager::send_daily_summary(const DailySummary& summary)
+void AlertManager::send_daily_summary(const AlertDailySummary& summary)
 {
     // Build a human-readable summary message.
     // Monetary values are shown in XCH (mojos / 10^12) for readability.

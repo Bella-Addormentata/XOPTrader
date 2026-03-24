@@ -26,7 +26,7 @@
 //   ISO/IEC 27001:2022 -- append-only audit trail, parameterised queries
 //   ISO/IEC 5055       -- RAII resource management, prepared statements
 //   ISO/IEC 25000      -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #ifndef XOP_DATABASE_HPP
 #define XOP_DATABASE_HPP

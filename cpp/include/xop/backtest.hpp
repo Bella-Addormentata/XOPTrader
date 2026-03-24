@@ -27,13 +27,13 @@
 // Optional GPU acceleration:
 //   - Controlled at compile time by the XOP_ENABLE_CUDA preprocessor flag.
 //   - When enabled, Monte Carlo paths run on the GPU via CUDA kernels.
-//   - When disabled, all code compiles as standard C++17 with no CUDA deps.
+//   - When disabled, all code compiles as standard C++20 with no CUDA deps.
 //
 // Compliant with:
 //   ISO/IEC 27001:2022  -- no secrets; historical data only
 //   ISO/IEC 5055        -- no raw pointers; bounds-checked containers
 //   ISO/IEC 25000       -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard-conforming C++17 (CUDA extension optional)
+//   ISO/IEC JTC 1/SC 22 -- standard-conforming C++20 (CUDA extension optional)
 
 #ifndef XOP_BACKTEST_HPP
 #define XOP_BACKTEST_HPP

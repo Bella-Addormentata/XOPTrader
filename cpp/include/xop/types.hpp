@@ -276,6 +276,62 @@ struct AsymmetricMultipliers {
     double ask_multiplier{1.0};   // spread widening factor for ask side
 };
 
+// ---------------------------------------------------------------------------
+// TierQuote -- a single level of the multi-tier offer ladder.
+//
+// Represents one offer on one side (bid or ask) at a specific distance from
+// mid-price.  The execution layer maps each TierQuote to a create_offer_for_ids
+// wallet RPC call, pre-splitting coins to match the size field.
+//
+// Unified definition: consumed by both the strategy layer (LiquidityEngine)
+// and the execution layer (OfferManager).
+// ---------------------------------------------------------------------------
+
+struct TierQuote {
+    std::uint8_t tier_index;   // 0-based tier (0 = tightest, N-1 = widest).
+    Side         side;         // Bid (buy) or Ask (sell).
+    Mojo         price;        // Offer price in mojos.
+    Mojo         size;         // Offer quantity in mojos of the relevant asset.
+    double       spread_bps;   // Distance from mid-price in basis points
+                               //   (informational, for logging and metrics).
+};
+
+// ---------------------------------------------------------------------------
+// RebalanceReason -- bitmask-capable enumeration of conditions that trigger
+//                    a full tier recalculation and offer refresh.
+//
+// Multiple reasons may be active simultaneously; use the bitwise operators
+// to combine and test flags.  The engine logs the reason(s) for every
+// rebalance cycle to support post-hoc analysis and parameter tuning.
+// ---------------------------------------------------------------------------
+
+enum class RebalanceReason : std::uint8_t {
+    None           = 0,
+    PriceMove      = 1 << 0,
+    InventorySkew  = 1 << 1,
+    TTLExpired     = 1 << 2,
+    RegimeChange   = 1 << 3,
+    CompetitorMove = 1 << 4,
+    ForcedRefresh  = 1 << 5
+};
+
+/// Bitwise OR for combining rebalance reason flags.
+inline RebalanceReason operator|(RebalanceReason a, RebalanceReason b) {
+    return static_cast<RebalanceReason>(
+        static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+}
+
+/// Bitwise AND for testing rebalance reason flags.
+inline RebalanceReason operator&(RebalanceReason a, RebalanceReason b) {
+    return static_cast<RebalanceReason>(
+        static_cast<std::uint8_t>(a) & static_cast<std::uint8_t>(b));
+}
+
+/// Convenience predicate: returns true if @p flag is set in @p composite.
+inline bool has_reason(RebalanceReason composite, RebalanceReason flag) {
+    return (composite & flag) != RebalanceReason::None;
+}
+
 }  // namespace xop
 
 #endif  // XOP_TYPES_HPP

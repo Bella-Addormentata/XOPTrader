@@ -244,7 +244,7 @@ void MetricsExporter::register_metrics()
 //  Dashboard 1: Real-Time PnL
 // ===================================================================
 
-void MetricsExporter::update_pnl(const PnlSummary& summary)
+void MetricsExporter::update_pnl(const MetricsPnlSnapshot& summary)
 {
     if (!running_) {
         return;

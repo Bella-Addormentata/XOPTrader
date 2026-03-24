@@ -63,51 +63,15 @@ namespace xop::execution {
 namespace asio = boost::asio;
 using json = nlohmann::json;
 
-// ---------------------------------------------------------------------------
-// RebalanceTrigger -- reason codes for why the offer ladder was refreshed.
-// Encoded as a bitmask so that multiple triggers can fire simultaneously.
-// ---------------------------------------------------------------------------
+// TierQuote and RebalanceReason are defined in <xop/types.hpp> (unified).
+// The execution layer uses xop::TierQuote and xop::RebalanceReason directly.
+using xop::TierQuote;
+using xop::RebalanceReason;
 
-enum class RebalanceTrigger : std::uint8_t {
-    None           = 0x00,
-    PriceDeviation = 0x01,  ///< Mid moved >2% from last rebalance price.
-    InventorySkew  = 0x02,  ///< Inventory skew >60% one-sided.
-    TimeDecay      = 0x04,  ///< Offers stale >1 hour (~69 blocks).
-    VolumeSpike    = 0x08,  ///< Recent volume >3x rolling average.
-    VolatilitySpike= 0x10   ///< Current vol >2x 7-day average.
-};
-
-/// Bitwise OR for combining trigger flags.
-inline RebalanceTrigger operator|(RebalanceTrigger a,
-                                  RebalanceTrigger b) noexcept {
-    return static_cast<RebalanceTrigger>(
-        static_cast<std::uint8_t>(a) | static_cast<std::uint8_t>(b));
+/// Convenience predicate: returns true if at least one rebalance flag is set.
+inline bool any_trigger(RebalanceReason r) noexcept {
+    return static_cast<std::uint8_t>(r) != 0;
 }
-
-/// Bitwise AND for testing trigger flags.
-inline RebalanceTrigger operator&(RebalanceTrigger a,
-                                  RebalanceTrigger b) noexcept {
-    return static_cast<RebalanceTrigger>(
-        static_cast<std::uint8_t>(a) & static_cast<std::uint8_t>(b));
-}
-
-/// Convenience predicate: returns true if at least one flag is set.
-inline bool any_trigger(RebalanceTrigger t) noexcept {
-    return static_cast<std::uint8_t>(t) != 0;
-}
-
-// ---------------------------------------------------------------------------
-// TierQuote -- a single tier of the multi-tier offer ladder, before it
-//              becomes a PendingOffer on-chain.  Internal working structure.
-// ---------------------------------------------------------------------------
-
-struct TierQuote {
-    Side         side;         ///< Bid or Ask.
-    std::uint8_t tier_index;   ///< 0 = tightest, num_tiers-1 = widest.
-    Mojo         price;        ///< Offer price in mojos of quote per base.
-    Mojo         size;         ///< Quantity in mojos of base asset.
-    double       spread_bps;   ///< Distance from mid in basis points.
-};
 
 // ---------------------------------------------------------------------------
 // RebalanceSnapshot -- context captured at the moment of last rebalance,
@@ -250,9 +214,9 @@ public:
      * @param current_block Current block height.
      * @param current_vol   Current annualised volatility (dimensionless).
      * @param current_volume Recent volume (mojos over a window).
-     * @return Bitmask of RebalanceTrigger flags.
+     * @return Bitmask of RebalanceReason flags.
      */
-    RebalanceTrigger evaluate_rebalance(
+    RebalanceReason evaluate_rebalance(
         const std::string& pair_name,
         Mojo               current_mid,
         BlockHeight        current_block,

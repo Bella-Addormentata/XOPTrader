@@ -30,9 +30,11 @@
 #include <spdlog/spdlog.h>
 
 #include <chrono>
+#include <cmath>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <unordered_set>
 
 namespace xop {
 
@@ -455,6 +457,76 @@ void Engine::step_update_market_state(BlockHeight block_height)
                 ticker->price_sell,
                 ticker->price_last,
                 ticker->volume_xch_daily);
+
+            // Feed OFI (Order Flow Imbalance) with best bid/ask from the
+            // dexie ticker snapshot.  The ticker provides best-level prices;
+            // daily volume serves as a top-of-book depth proxy.
+            // ISO/IEC 5055: guard against zero/negative prices.
+            if (ticker->price_buy > 0.0 && ticker->price_sell > 0.0) {
+                market_data_->ingest_book_snapshot_for_ofi(
+                    pair.name,
+                    ticker->price_buy,
+                    ticker->volume_xch_daily,   // bid-side depth proxy
+                    ticker->price_sell,
+                    ticker->volume_xch_daily);  // ask-side depth proxy
+            }
+        }
+
+        // Feed competing-offer tracker with the full active order book
+        // from dexie.  Own offer IDs are collected from the shared State
+        // so the competitor detector can filter them out.
+        // ISO/IEC 27001:2022: no secret data exposed in offers.
+        try {
+            auto offers_page = dexie_->get_offers(
+                pair.name,
+                /*offered=*/   {},
+                /*requested=*/ {},
+                /*page=*/      1,
+                /*page_size=*/ 100,
+                /*sort=*/      "price_asc",
+                /*compact=*/   true,
+                /*status=*/    0);  // status 0 = active offers
+
+            // Build CompetingOffer vector from dexie OfferRecord data.
+            std::vector<CompetingOffer> comp_offers;
+            comp_offers.reserve(offers_page.offers.size());
+            for (const auto& orec : offers_page.offers) {
+                CompetingOffer co;
+                co.offer_id         = orec.id;
+                co.pair_name        = pair.name;
+                // Determine side from the offered/requested arrays:
+                // if offered contains the base asset, this is an ask.
+                co.side             = (!orec.offered.empty() &&
+                                       orec.offered[0].id == "xch")
+                                      ? Side::Ask : Side::Bid;
+                co.price            = static_cast<Mojo>(
+                    orec.price * static_cast<double>(kMojosPerXch));
+                co.size             = 0;
+                if (!orec.offered.empty()) {
+                    co.size = static_cast<Mojo>(
+                        orec.offered[0].amount *
+                        static_cast<double>(kMojosPerXch));
+                }
+                co.first_seen_block = block_height;
+                co.last_seen_block  = block_height;
+                co.last_seen_ts     = std::chrono::system_clock::now();
+                comp_offers.push_back(co);
+            }
+
+            // Collect own offer IDs from shared State for exclusion.
+            std::unordered_set<std::string> own_ids;
+            auto pending = state_->get_all_offers();
+            for (const auto& po : pending) {
+                own_ids.insert(po.offer_id);
+            }
+
+            market_data_->ingest_competing_offers(
+                pair.name, comp_offers, own_ids);
+        } catch (const std::exception& ex) {
+            // Transient dexie errors should not abort the cycle.
+            // ISO/IEC 5055: checked error handling with logging.
+            spdlog::warn("[Engine] Step 1: competing-offer fetch failed "
+                         "for {}: {}", pair.name, ex.what());
         }
 
         // CEX reference ingestion would go here (Phase 2: OKX/Gate.io).
@@ -497,10 +569,23 @@ void Engine::step_process_fills(BlockHeight block_height)
         tr.fee_mojos       = 0;  // Fee extraction from wallet response (Phase 2).
         tr.block_height    = fill.block_height;
 
+        // Issue 8 fix: look up the pair config to obtain the correct quote
+        // asset ID for bid fills (previously passed empty string, yielding
+        // a zeroed default record).
+        // ISO/IEC 5055: validated lookup before use.
+        const PairConfig* fill_pair_cfg = nullptr;
+        for (const auto& pc : config_.pairs) {
+            if (pc.name == fill.pair_name) { fill_pair_cfg = &pc; break; }
+        }
+
         // Retrieve cost basis from the inventory tracker for PnL calculation.
-        // For bids (buys), no realized PnL; for asks (sells), compute PnL.
+        // For asks (sells), use the base asset ("xch"); for bids (buys),
+        // use the actual quote asset from the pair configuration.
         auto asset_rec = inventory_->get_record(
-            (fill.side == Side::Ask) ? "xch" : "");
+            (fill.side == Side::Ask)
+                ? AssetId{"xch"}
+                : AssetId{fill_pair_cfg ? fill_pair_cfg->quote_asset_id
+                                        : std::string{"xch"}});
         tr.cost_basis_mojos   = asset_rec.weighted_avg_cost_basis;
         tr.realized_pnl_mojos = (fill.side == Side::Ask)
             ? (fill.price - asset_rec.weighted_avg_cost_basis) * fill.size
@@ -523,6 +608,22 @@ void Engine::step_process_fills(BlockHeight block_height)
 
         // Feed the PnL tracker.
         pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos);
+
+        // Feed the whale detector with each fill so that large trades
+        // trigger spread widening via WhaleMetrics.
+        // ISO/IEC 25000: connects the fully-implemented whale subsystem
+        // to the engine heartbeat.
+        market_data_->ingest_trade(
+            fill.pair_name, fill.side, fill.size, fill.block_height);
+
+        // Feed VPIN (Volume-Synchronized Probability of Informed Trading)
+        // with each fill's volume.  VPIN accumulates volume bars to detect
+        // flow toxicity; without this feed the VPIN signal was always zero.
+        // ISO/IEC 5055: convert mojos to base-asset units for VPIN.
+        const double fill_volume =
+            static_cast<double>(fill.size) / static_cast<double>(kMojosPerXch);
+        market_data_->ingest_trade_for_vpin(
+            fill.pair_name, fill.side, fill_volume);
 
         spdlog::info("[Engine] Fill: {} {} {} @ {} (block {})",
                      fill.pair_name,
@@ -632,21 +733,51 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             pin = pin_it->second->get_pin();
         }
 
-        // Compute the four-component spread.
+        // Fetch actual best-competing spread from the competitor tracker
+        // instead of the previous hardcoded 0.0.  Returns 0.0 if no
+        // competitors are tracked (feature disabled or no offers).
+        // ISO/IEC 25000: connects the competitor-detection subsystem output.
+        double best_competing_bps =
+            market_data_->get_best_competing_spread_bps(pair_name);
+
+        // Compute the four-component spread using live competitor data.
         pcs.spread_result = spread_opt_->compute_spread(
             mid, sigma, q, q_max, pin,
-            Venue::Dexie, /*best_competing_bps=*/0.0,
+            Venue::Dexie, best_competing_bps,
             hour_utc, day_of_week);
 
+        // ---------------------------------------------------------------
+        // Apply whale / VPIN / OFI post-multipliers to the base spread.
+        //
+        // These signals widen the spread when informed-flow risk is elevated:
+        //   whale_mult : direct spread multiplier from whale detector (>=1.0)
+        //   vpin_mult  : up to 50% widening at max toxicity (VPIN=1.0)
+        //   ofi_mult   : up to 30% widening at max order-flow imbalance
+        //
+        // ISO/IEC 27001:2022: no secret data; all signals are market-derived.
+        // ISO/IEC 5055: multipliers are clamped via their source methods.
+        // ---------------------------------------------------------------
+        double whale_mult = market_data_->get_whale_spread_multiplier(pair_name);
+        double vpin       = market_data_->get_vpin(pair_name);
+        double vpin_mult  = 1.0 + vpin * 0.5;   // linear scale [1.0, 1.5]
+        double ofi        = std::abs(market_data_->get_normalized_ofi(pair_name));
+        double ofi_mult   = 1.0 + ofi * 0.3;    // linear scale [1.0, 1.3]
+
+        pcs.spread_result.total_spread_bps *= whale_mult * vpin_mult * ofi_mult;
+        pcs.spread_result.half_spread =
+            pcs.spread_result.total_spread_bps / 2.0;
+
         spdlog::debug("[Engine] Step 5: {} spread={:.1f}bps (adverse={:.1f} inv={:.1f} "
-                      "cost={:.1f} comp={:.1f} mult={:.2f})",
+                      "cost={:.1f} comp={:.1f} mult={:.2f} "
+                      "whale={:.2f} vpin={:.3f} ofi={:.3f})",
                       pair_name,
                       pcs.spread_result.total_spread_bps,
                       pcs.spread_result.s_adverse,
                       pcs.spread_result.s_inventory,
                       pcs.spread_result.s_cost,
                       pcs.spread_result.s_competition,
-                      pcs.spread_result.regime_multiplier);
+                      pcs.spread_result.regime_multiplier,
+                      whale_mult, vpin, ofi);
     }
 }
 
@@ -771,20 +902,9 @@ void Engine::step_manage_offers(BlockHeight block_height)
                          cancelled, pair_name);
         }
 
-        // Convert the LiquidityEngine's TierQuote to execution::TierQuote.
-        // The two structs have identical semantics but live in different
-        // namespaces; build the execution-layer vector.
-        std::vector<execution::TierQuote> exec_tiers;
-        exec_tiers.reserve(pcs.ladder.size());
-        for (const auto& tq : pcs.ladder) {
-            execution::TierQuote etq;
-            etq.side       = tq.side;
-            etq.tier_index = static_cast<std::uint8_t>(tq.tier);
-            etq.price      = tq.price;
-            etq.size       = tq.size;
-            etq.spread_bps = tq.spread_bps;
-            exec_tiers.push_back(etq);
-        }
+        // Both the strategy and execution layers now use the unified
+        // xop::TierQuote from types.hpp.  No conversion needed.
+        const auto& exec_tiers = pcs.ladder;
 
         // Find the PairConfig for this pair.
         const PairConfig* pair_cfg = nullptr;
@@ -956,7 +1076,7 @@ void Engine::step_export_metrics(BlockHeight block_height)
 
     // Dashboard 1: PnL
     auto total = pnl_->get_total_pnl();
-    PnlSummary ps;
+    MetricsPnlSnapshot ps;
     ps.total      = total.total_pnl;
     ps.realized   = total.spread_pnl;  // spread PnL = realized
     ps.unrealized = total.inventory_pnl;
