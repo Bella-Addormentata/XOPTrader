@@ -250,24 +250,29 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 // ---------------------------------------------------------------------------
 // check_flash_crash -- circuit breaker for sudden price drops.
 //
-// Algorithm:
-//   Scan the price window for a peak followed by a trough where the
-//   fractional drop exceeds the threshold.  The peak must precede the
-//   trough chronologically (we care about a DROP, not a recovery).
+// Algorithm (rolling max-drawdown):
+//   Scan the price window chronologically, maintaining a running maximum.
+//   At each point, compute the drawdown from the running max.  If any
+//   drawdown exceeds the threshold, a crash is detected.
 //
-//   Specifically:
-//     1. Find the index and value of the global maximum in the window.
-//     2. In the sub-window [max_index+1 .. end), find the global minimum.
-//     3. If (max - min) / max >= threshold, return true (crash detected).
+//   This correctly detects:
+//     - Early crashes followed by recovery to new highs (the previous
+//       global-max algorithm missed these because the later peak dominated).
+//     - Multiple successive crashes within one window.
+//     - V-shaped recoveries (crash still flagged).
+//     - Monotonically rising prices (no crash).
+//     - Flat markets (no crash).
 //
-//   This correctly handles monotonically rising prices (no crash),
-//   V-shaped recoveries (crash still flagged), and flat markets (no crash).
+//   The running-max approach is O(N) in time and O(1) in auxiliary space,
+//   matching the previous implementation's complexity while providing
+//   strictly superior detection coverage.
 //
 //   Edge cases:
 //     - Empty or single-element history: no crash.
-//     - Max is the last element: no subsequent trough possible, no crash.
-//     - Zero max price: degenerate, treated as no crash to avoid division
-//       by zero.
+//     - All prices zero or negative: degenerate, treated as no crash.
+//     - Running max is the last element: drawdown is 0.0, no false positive.
+//
+// ISO/IEC 5055: division guarded against zero denominator; no UB.
 // ---------------------------------------------------------------------------
 
 bool PreTradeCheck::check_flash_crash(const std::vector<Mojo>& price_history,
@@ -277,30 +282,33 @@ bool PreTradeCheck::check_flash_crash(const std::vector<Mojo>& price_history,
         return false;  // not enough data to detect a crash
     }
 
-    // Step 1 -- locate the global maximum.
-    auto max_it = std::max_element(price_history.cbegin(), price_history.cend());
-    const Mojo max_price = *max_it;
+    // Track the running maximum as we scan chronologically.
+    Mojo running_max = price_history[0];
 
-    if (max_price <= 0) {
-        return false;  // degenerate data
+    for (std::size_t i = 1; i < price_history.size(); ++i) {
+        // Update running max with the current price.
+        if (price_history[i] > running_max) {
+            running_max = price_history[i];
+        }
+
+        // Guard: skip drawdown computation when running_max is non-positive
+        // to avoid division by zero on degenerate data.
+        if (running_max <= 0) {
+            continue;
+        }
+
+        // Compute fractional drawdown from the running maximum.
+        // Use double for the division only (operands are exact integers).
+        const double drawdown =
+            static_cast<double>(running_max - price_history[i])
+            / static_cast<double>(running_max);
+
+        if (drawdown >= threshold) {
+            return true;  // Flash crash detected.
+        }
     }
 
-    // Step 2 -- locate the minimum in the sub-window after the peak.
-    const auto after_peak = std::next(max_it);
-    if (after_peak == price_history.cend()) {
-        return false;  // peak is the last element -- no subsequent drop
-    }
-
-    auto min_it = std::min_element(after_peak, price_history.cend());
-    const Mojo min_price = *min_it;
-
-    // Step 3 -- compute fractional drop.
-    // drop = (max - min) / max
-    // Use double for the division only (the operands are exact integers).
-    const double drop = static_cast<double>(max_price - min_price)
-                      / static_cast<double>(max_price);
-
-    return drop >= threshold;
+    return false;
 }
 
 // ---------------------------------------------------------------------------

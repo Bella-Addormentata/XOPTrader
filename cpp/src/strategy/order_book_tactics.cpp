@@ -179,10 +179,17 @@ const OrderBookTacticsConfig& OrderBookTactician::config() const noexcept
 BookTactic OrderBookTactician::select_tactic(const BookState& state) const
 {
     // --- Priority 1: Extreme inventory imbalance ---------------------------
-    // When inventory ratio exceeds the rebalance threshold, the position is
-    // dangerously one-sided.  Hybrid rebalancing crosses the spread to
+    // When inventory imbalance exceeds the rebalance threshold, the position
+    // is dangerously one-sided.  Hybrid rebalancing crosses the spread to
     // restore balance, accepting taker fees as the cost of risk reduction.
-    if (state.inventory_ratio > cfg_.hybrid_rebalance_threshold) {
+    //
+    // inventory_ratio is in [0, 1] centered at 0.5.  Convert to signed
+    // imbalance [-0.5, +0.5] where positive = long base, negative = short
+    // base, then use the absolute value for symmetric threshold comparison.
+    const double imbalance = state.inventory_ratio - 0.5;
+    const double abs_imbalance = std::abs(imbalance);
+
+    if (abs_imbalance > cfg_.hybrid_rebalance_threshold) {
         return BookTactic::HybridRebalance;
     }
 
@@ -202,10 +209,11 @@ BookTactic OrderBookTactician::select_tactic(const BookState& state) const
     }
 
     // --- Priority 3: Inventory skew + OFI confirmation ---------------------
-    // When inventory is moderately skewed (ratio > 0.4) AND the order flow
-    // imbalance exceeds the asymmetry threshold, use asymmetric sizing to
-    // passively rebalance by quoting larger on the inventory-reducing side.
-    if (state.inventory_ratio > 0.4 &&
+    // When inventory is moderately skewed AND the order flow imbalance
+    // exceeds the asymmetry threshold, use asymmetric sizing to passively
+    // rebalance by quoting larger on the inventory-reducing side.
+    // Use abs_imbalance (deviation from 0.5) for symmetric skew detection.
+    if (abs_imbalance > 0.1 &&
         std::abs(state.normalized_ofi) > cfg_.ofi_asymmetry_threshold) {
         return BookTactic::AsymmetricSize;
     }
@@ -426,9 +434,11 @@ OrderBookTactician::eval_asymmetric(const BookState& state) const
     }
 
     // Confidence scales with the strength of the OFI signal and
-    // the severity of the inventory imbalance.
+    // the severity of the inventory imbalance (deviation from 0.5).
+    // Use abs(imbalance) / 0.5 to normalise to [0, 1] range.
     const double ofi_strength = std::abs(state.normalized_ofi);
-    const double inv_strength = state.inventory_ratio;
+    const double inv_imbalance = std::abs(state.inventory_ratio - 0.5);
+    const double inv_strength = inv_imbalance / 0.5;
     const double confidence = std::clamp(
         0.5 * ofi_strength + 0.5 * inv_strength, 0.3, 0.95);
 
@@ -491,9 +501,12 @@ OrderBookTactician::eval_hybrid_rebalance(const BookState& state) const
 
     // Widen the spread to offset taker costs incurred by crossing.
     // The widening is proportional to the inventory imbalance severity.
+    // Use abs(imbalance) so that both long and short extremes are measured
+    // symmetrically against the threshold.
+    const double imb = std::abs(state.inventory_ratio - 0.5);
     const double severity = std::clamp(
-        (state.inventory_ratio - cfg_.hybrid_rebalance_threshold)
-        / (1.0 - cfg_.hybrid_rebalance_threshold),
+        (imb - cfg_.hybrid_rebalance_threshold)
+        / (0.5 - cfg_.hybrid_rebalance_threshold),
         0.0, 1.0);
     const double widen_bps = cfg_.step_back_widening_bps * (1.0 + severity);
 

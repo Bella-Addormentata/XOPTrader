@@ -98,6 +98,12 @@ struct StrategyConfig {
     uint32_t num_tiers{4};                  // Tier count per side.
     std::vector<double> tier_spacing_bps;   // Length == num_tiers.
     std::vector<double> tier_size_pct;      // Length == num_tiers, sum ~= 1.0.
+
+    /// Global cap on half-spread (bps) after all compounding multipliers.
+    /// Prevents the multiplicative chain (regime * whale * VPIN * OFI * tactic)
+    /// from producing effective market withdrawal.
+    /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
+    double   max_half_spread_bps{250.0};
 };
 
 // ---------------------------------------------------------------------------

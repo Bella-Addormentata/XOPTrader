@@ -364,10 +364,15 @@ double InventoryTracker::compute_kelly_size(double spread_bps,
                                             double sigma,
                                             double tau) const
 {
-    // Validate inputs: sigma and tau must be strictly positive to avoid
-    // division by zero or nonsensical results.
-    if (sigma <= 0.0 || tau <= 0.0) {
-        return 0.0;
+    // Validate inputs: sigma and tau must be meaningfully positive to avoid
+    // division by zero or near-zero denominators.  VolatilityEstimator may
+    // return 0.0 during cold start (< min_candles); subnormal/near-zero
+    // values are equally hazardous.  The epsilon 1e-10 is chosen to reject
+    // any estimate that lacks statistical significance while remaining well
+    // below realistic volatility floors (~1e-4 for even the calmest markets).
+    // ISO/IEC 5055: guard against division by zero and numerical instability.
+    if (sigma < 1e-10 || tau < 1e-10) {
+        return 0.0;  // No data = no sizing
     }
 
     // Convert spread from basis points to a fraction.

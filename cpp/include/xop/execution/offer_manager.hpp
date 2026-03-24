@@ -352,6 +352,12 @@ private:
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;
 
+    /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
+    /// constructor from AppConfig::pairs so that evaluate_rebalance()
+    /// can resolve base/quote asset IDs without an external parameter.
+    /// ISO/IEC 5055: deterministic lookup, value-copy avoids dangling refs.
+    std::unordered_map<std::string, PairConfig> pair_config_map_;
+
     // -- Configuration constants derived from strategy params ----------------
 
     /// Price deviation threshold for rebalance trigger (fraction, e.g. 0.02).

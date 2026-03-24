@@ -154,12 +154,16 @@ public:
 
     // -- Flash-crash circuit breaker ----------------------------------------
 
-    /// Detect whether a flash crash has occurred in the recent price history.
+    /// Detect whether a flash crash has occurred in the recent price history
+    /// using a rolling max-drawdown algorithm.
     ///
     /// Algorithm:
-    ///   1. Find the maximum price in the window.
-    ///   2. Find the minimum price that occurs AFTER that maximum.
-    ///   3. If (max - min) / max >= threshold, a crash is detected.
+    ///   Scan chronologically, maintaining a running maximum price.  At each
+    ///   point, compute the drawdown from the running max.  If any drawdown
+    ///   exceeds the threshold, a crash is detected.
+    ///
+    /// This detects early crashes even if the price later recovers to a new
+    /// high (the previous global-max anchor missed those cases).
     ///
     /// The window should contain the last N block-level mid-prices (caller
     /// decides N; strategy doc says 100+ stable blocks for recovery).

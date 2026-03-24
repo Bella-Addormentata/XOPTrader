@@ -72,6 +72,14 @@ StrategyPortfolio::StrategyPortfolio(const PortfolioConfig& cfg)
     if (!(cfg_.crowding_threshold <= 1.0)) {
         throw std::invalid_argument("PortfolioConfig: crowding_threshold must be <= 1.0");
     }
+    if (!(cfg_.crowding_decay_factor > 0.0 && cfg_.crowding_decay_factor < 1.0)) {
+        throw std::invalid_argument(
+            "PortfolioConfig: crowding_decay_factor must be in (0.0, 1.0)");
+    }
+    if (cfg_.crowding_cooldown_blocks == 0) {
+        throw std::invalid_argument(
+            "PortfolioConfig: crowding_cooldown_blocks must be > 0");
+    }
 
     // Enumerate every defined component and initialise with uniform weight.
     static constexpr StrategyComponent kAllComponents[] = {
@@ -392,12 +400,53 @@ void StrategyPortfolio::compute_intensity_scores(MarketRegime regime)
     // while the PnL history provides the data-driven update.  The switching
     // cost penalises rapid reallocation, damping oscillation.
     //
+    // Crowding integration (Farmer & Joshi 2002):
+    //   When a component is detected as crowded, its intensity is reduced by
+    //   a geometric decay factor (default 0.90 = 10% per evaluation) rather
+    //   than the original binary halving that caused a death spiral.  If the
+    //   component reaches min_weight and stays there for crowding_cooldown_blocks
+    //   consecutive blocks, the crowding flag is cleared to allow re-evaluation.
+    //   This prevents permanent strategy extinction per Lo (2004).
+    //
     // Numerical guard: cap the exponent argument to avoid overflow in exp().
     // On IEEE 754 double, exp(709) ~ 8.2e307 which is near DBL_MAX.
     // We cap at 500.0 which gives exp(500) ~ 1.4e217 -- large but safe.
     static constexpr double kMaxExponentArg = 500.0;
 
+    // Tolerance for "at min_weight" comparison.  Accounts for floating-point
+    // drift from normalization arithmetic.
+    static constexpr double kMinWeightTolerance = 1e-6;
+
     for (auto& [comp, state] : components_) {
+        // --- Crowding cooldown recovery ---
+        // Track how long this component has been sitting at or near min_weight.
+        // After crowding_cooldown_blocks consecutive blocks at the floor, clear
+        // the crowding flag so the component can compete fairly again.
+        // ISO/IEC 25000: prevents permanent strategy extinction (Lo 2004).
+        if (state.weight <= cfg_.min_weight + kMinWeightTolerance) {
+            ++state.blocks_at_min_weight;
+        } else {
+            state.blocks_at_min_weight = 0;
+        }
+
+        if (state.crowding_flagged &&
+            state.blocks_at_min_weight >= cfg_.crowding_cooldown_blocks)
+        {
+            spdlog::info("StrategyPortfolio -- {} crowding cooldown expired "
+                         "after {} blocks at min_weight; clearing flag",
+                         to_string(comp), state.blocks_at_min_weight);
+            state.crowding_flagged     = false;
+            state.blocks_at_min_weight = 0;
+        }
+
+        // --- Crowding detection ---
+        // Re-evaluate crowding status on each call.  is_crowded() returns true
+        // only when the component has meaningful weight (> min_weight) and its
+        // fill rate has declined past the threshold.
+        if (is_crowded(comp)) {
+            state.crowding_flagged = true;
+        }
+
         // Net PnL: realised profit minus adverse-selection cost.
         const double net_pnl = state.trailing_pnl_bps - state.trailing_adverse_bps;
 
@@ -419,7 +468,22 @@ void StrategyPortfolio::compute_intensity_scores(MarketRegime regime)
         // The prior must be strictly positive to prevent permanent extinction
         // of a component.  We floor it at a small epsilon.
         const double safe_base = std::max(base_w, 1e-8);
-        state.intensity_score = safe_base * std::exp(exponent);
+        double intensity = safe_base * std::exp(exponent);
+
+        // Apply geometric crowding decay instead of binary halving.
+        // The decay factor (default 0.90) reduces the intensity by 10% per
+        // evaluation, converging gradually rather than collapsing in 3-4 steps.
+        // This avoids the death spiral where reduced weight -> fewer fills ->
+        // still crowded -> halved again -> permanent extinction at min_weight.
+        if (state.crowding_flagged) {
+            intensity *= cfg_.crowding_decay_factor;
+            spdlog::debug("StrategyPortfolio -- {} intensity reduced by crowding "
+                          "decay ({:.2f}x), blocks_at_min={}",
+                          to_string(comp), cfg_.crowding_decay_factor,
+                          state.blocks_at_min_weight);
+        }
+
+        state.intensity_score = intensity;
     }
 }
 
@@ -591,6 +655,23 @@ void StrategyPortfolio::clamp_weights()
     // ISO/IEC 5055: defensive re-enforcement of invariant after arithmetic.
     for (auto& [comp, state] : components_) {
         state.weight = std::clamp(state.weight, cfg_.min_weight, cfg_.max_weight);
+    }
+
+    // Second normalization pass: the post-normalization clamp above can break
+    // the simplex constraint (sum == 1.0) by pushing weights inward from both
+    // bounds.  Without this pass, the portfolio operates on a weight vector
+    // that does not sum to 1.0, causing the blended quote to under- or
+    // over-allocate capital.
+    // ISO/IEC 5055: re-establish the simplex invariant after every mutation.
+    double final_sum = 0.0;
+    for (const auto& [comp, state] : components_) {
+        final_sum += state.weight;
+    }
+    if (final_sum > 0.0) {
+        const double inv_final = 1.0 / final_sum;
+        for (auto& [comp, state] : components_) {
+            state.weight *= inv_final;
+        }
     }
 }
 
