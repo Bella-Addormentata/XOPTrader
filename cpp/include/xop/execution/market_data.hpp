@@ -179,6 +179,32 @@ struct MarketDataConfig {
     /// (no whale activity) and this value (maximum whale activity in window).
     /// Default: 3.0  (triple the normal spread when the whale window is full).
     double whale_max_spread_multiplier{3.0};
+
+    // -- VPIN configuration -------------------------------------------------
+
+    /// Volume per VPIN bucket, in base-asset units (e.g. XCH).
+    /// Trades are accumulated until this threshold is reached, completing a bar.
+    /// Reference: Easley, López de Prado & O'Hara (2012).
+    /// Default: 10.0 XCH per bucket.
+    double vpin_bucket_size{10.0};
+
+    /// Number of completed buckets in the rolling VPIN window.
+    /// VPIN is computed as the mean absolute imbalance over the most recent
+    /// N completed buckets.  Default: 50 buckets.
+    std::size_t vpin_window_buckets{50};
+
+    // -- OFI configuration --------------------------------------------------
+
+    /// Number of order-book snapshots to retain for OFI computation.
+    /// Default: 20 observations.
+    std::size_t ofi_window_size{20};
+
+    // -- Asymmetric spread configuration ------------------------------------
+
+    /// Asymmetry factor controlling how much the spread is skewed toward the
+    /// informed side during whale activity.  0.0 = symmetric, 1.0 = fully
+    /// asymmetric (all widening on the informed side).  Default: 0.5.
+    double asymmetric_skew_factor{0.5};
 };
 
 // ---------------------------------------------------------------------------
@@ -415,6 +441,73 @@ public:
     /// Returns up to whale_max_spread_multiplier when the whale window is full.
     double get_whale_spread_multiplier(const std::string& pair_name) const;
 
+    // -- VPIN (flow toxicity) -----------------------------------------------
+
+    /// Ingest a classified trade for VPIN computation.
+    ///
+    /// Unlike ingest_trade() (which only records whale-sized trades), this
+    /// method feeds every observed trade into the VPIN volume-bar pipeline.
+    /// Call this for ALL trades, not just whales.
+    ///
+    /// @param pair_name     Trading pair identifier.
+    /// @param side          Direction of the trade (Bid = taker bought).
+    /// @param volume        Trade volume in base-asset units (e.g. XCH).
+    void ingest_trade_for_vpin(const std::string& pair_name,
+                               Side               side,
+                               double             volume);
+
+    /// Retrieve the current VPIN (flow-toxicity) metrics for a pair.
+    /// Returns std::nullopt if insufficient buckets have been completed.
+    std::optional<VpinMetrics> get_vpin_metrics(
+        const std::string& pair_name) const;
+
+    /// Current VPIN value for a pair, in [0, 1].
+    /// Returns 0.0 if no VPIN data is available (safe default: no toxicity).
+    double get_vpin(const std::string& pair_name) const;
+
+    // -- OFI (order flow imbalance) -----------------------------------------
+
+    /// Ingest an order-book snapshot for OFI computation.
+    ///
+    /// The OFI delta is computed from changes between consecutive snapshots
+    /// at the best bid/ask levels.  Call this once per block after
+    /// ingest_dexie().
+    ///
+    /// @param pair_name  Trading pair identifier.
+    /// @param best_bid   Best bid price.
+    /// @param bid_size   Total size at best bid.
+    /// @param best_ask   Best ask price.
+    /// @param ask_size   Total size at best ask.
+    void ingest_book_snapshot_for_ofi(const std::string& pair_name,
+                                      double             best_bid,
+                                      double             bid_size,
+                                      double             best_ask,
+                                      double             ask_size);
+
+    /// Retrieve the current OFI metrics for a pair.
+    /// Returns std::nullopt if fewer than 2 snapshots have been ingested.
+    std::optional<OfiMetrics> get_ofi_metrics(
+        const std::string& pair_name) const;
+
+    /// Normalised OFI value for a pair, in [-1, 1].
+    /// Positive = buy pressure, negative = sell pressure.
+    /// Returns 0.0 if no OFI data is available.
+    double get_normalized_ofi(const std::string& pair_name) const;
+
+    // -- Asymmetric spread widening -----------------------------------------
+
+    /// Compute per-side spread multipliers that skew widening toward the
+    /// informed (toxic) side.
+    ///
+    /// When a whale buys aggressively (dominant_side = Bid), the ask side
+    /// carries higher adverse-selection risk.  This method raises the ask
+    /// multiplier and lowers the bid multiplier, preserving the total
+    /// widening but distributing it asymmetrically.
+    ///
+    /// Returns {1.0, 1.0} when no whale activity is detected.
+    AsymmetricMultipliers get_asymmetric_spread_multipliers(
+        const std::string& pair_name) const;
+
     // -- Configuration access -----------------------------------------------
 
     /// Read-only access to the active configuration.
@@ -492,6 +585,13 @@ private:
     /// events → whale_max_spread_multiplier.
     double compute_whale_spread_multiplier(std::size_t events_in_window) const;
 
+    /// Compute VPIN from the completed volume bars for a pair.
+    /// VPIN = (1/N) * SUM(|buy_vol_i - sell_vol_i|) / bucket_size
+    void recompute_vpin(const std::string& pair_name);
+
+    /// Compute OFI delta from the latest two book snapshots and update metrics.
+    void recompute_ofi(const std::string& pair_name);
+
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
     void publish_snapshot(const PairState& ps);
@@ -539,6 +639,34 @@ private:
     /// Per-pair latest whale metrics.  Guarded by mtx_whale_metrics_.
     mutable std::shared_mutex                          mtx_whale_metrics_;
     std::unordered_map<std::string, WhaleMetrics>      whale_metrics_;
+
+    /// Per-pair VPIN volume-bar state.  Guarded by mtx_vpin_.
+    /// Each pair tracks a current (incomplete) bucket and a deque of completed
+    /// buckets.  When the current bucket fills, it is pushed to the deque.
+    struct VpinState {
+        VpinBucket                current_bucket;   // in-progress bar
+        std::deque<VpinBucket>    completed;        // completed bars (newest last)
+    };
+    mutable std::shared_mutex                          mtx_vpin_;
+    std::unordered_map<std::string, VpinState>         vpin_state_;
+
+    /// Per-pair latest VPIN metrics.  Guarded by mtx_vpin_metrics_.
+    mutable std::shared_mutex                          mtx_vpin_metrics_;
+    std::unordered_map<std::string, VpinMetrics>       vpin_metrics_;
+
+    /// Per-pair OFI book-snapshot history.  Guarded by mtx_ofi_.
+    struct BookSnapshot {
+        double best_bid{0.0};
+        double bid_size{0.0};
+        double best_ask{0.0};
+        double ask_size{0.0};
+    };
+    mutable std::shared_mutex                          mtx_ofi_;
+    std::unordered_map<std::string, std::deque<BookSnapshot>> ofi_snapshots_;
+
+    /// Per-pair latest OFI metrics.  Guarded by mtx_ofi_metrics_.
+    mutable std::shared_mutex                          mtx_ofi_metrics_;
+    std::unordered_map<std::string, OfiMetrics>        ofi_metrics_;
 
     /// Latest block height from the full node.  Atomic for lock-free reads.
     std::atomic<BlockHeight> block_height_{0};
