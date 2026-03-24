@@ -378,6 +378,18 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                           + std::to_string(tier_sum));
     }
 
+    // Optional: global half-spread cap (bps).  Defaults to 250 bps if absent.
+    // Prevents compounding multipliers from producing effective market withdrawal.
+    if (node["max_half_spread_bps"] && node["max_half_spread_bps"].IsDefined()
+        && !node["max_half_spread_bps"].IsNull()) {
+        cfg.max_half_spread_bps = node["max_half_spread_bps"].as<double>();
+        if (cfg.max_half_spread_bps <= 0.0) {
+            throw ConfigError(sec + ".max_half_spread_bps must be > 0; got "
+                              + std::to_string(cfg.max_half_spread_bps));
+        }
+    }
+    // else: default from StrategyConfig{} is used (250.0 bps).
+
     return cfg;
 }
 
@@ -514,7 +526,8 @@ void log_config_summary(const AppConfig& cfg)
         if (i > 0) out << ", ";
         out << cfg.strategy.tier_size_pct[i];
     }
-    out << "]\n";
+    out << "]\n"
+        << "  max_hs_cap = " << cfg.strategy.max_half_spread_bps << " bps\n";
 
     // Risk -- all fields are tuning parameters.
     out << "[risk]\n"

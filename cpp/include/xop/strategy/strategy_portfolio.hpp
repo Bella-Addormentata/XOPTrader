@@ -129,6 +129,21 @@ struct PortfolioConfig {
     // component is flagged as crowded.
     double crowding_threshold{0.30};
 
+    // Crowding cooldown: number of consecutive blocks a component must spend
+    // at or near min_weight before the crowding flag is cleared and the
+    // component is allowed to re-enter fair evaluation.  500 blocks at ~52s
+    // each equals approximately 7.2 hours -- long enough for the competitive
+    // landscape to shift, short enough to recover within a trading day.
+    // ISO/IEC 25000: prevents permanent strategy extinction (Lo 2004).
+    std::size_t crowding_cooldown_blocks{500};
+
+    // Crowding decay factor applied per evaluation instead of binary halving.
+    // Geometric decay 0.90 means the weight is reduced by 10% each time
+    // crowding is detected, converging gradually rather than collapsing to
+    // min_weight in 3-4 iterations (as 0.5 would).
+    // Farmer & Joshi (2002): gradual withdrawal is more stable than binary.
+    double crowding_decay_factor{0.90};
+
     // -- Regime-dependent base (prior) weights ---------------------------------
     // These weights are used as priors before PnL-driven adjustment.
     // MeanReverting regime -> heavier A-S, lighter GLFT.
@@ -254,6 +269,13 @@ private:
         std::size_t historical_fill_count{0};// Lifetime fill count (for crowding baseline).
         std::size_t historical_windows{0};   // Number of complete lookback windows observed.
         std::deque<StrategyPnLRecord> pnl_history; // Per-fill records within lookback.
+
+        // Crowding recovery state.
+        // Tracks consecutive blocks at or near min_weight so that the
+        // crowding flag can be cleared after a cooldown period, preventing
+        // permanent strategy extinction (Lo 2004 Adaptive Markets Hypothesis).
+        bool        crowding_flagged{false};    // Currently flagged as crowded.
+        std::size_t blocks_at_min_weight{0};    // Consecutive blocks at min_weight.
     };
 
     // -- Brock-Hommes intensity-of-choice computation --------------------------

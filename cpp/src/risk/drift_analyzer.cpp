@@ -403,10 +403,16 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
             // Apply mean-reversion force (model-dependent).
             // For MeanReverting: use GLFT theta (full OU reversion).
             // For other regimes: use A-S reversion force.
+            //
+            // Use the exact OU discrete solution instead of explicit Euler
+            // (q -= theta * q) to avoid sign oscillation when theta > 1.0.
+            // Exact solution: q(t+1) = q(t) * exp(-theta) + noise.
+            // The noise term was already added above; here we apply only the
+            // deterministic decay factor, which is unconditionally stable.
             if (condition == MarketCondition::MeanReverting) {
-                q -= theta * q;
+                q *= std::exp(-theta);
             } else {
-                q -= as_force * q;
+                q *= std::exp(-as_force);
             }
 
             const double abs_q = std::abs(q);
@@ -997,7 +1003,8 @@ std::string InventoryDriftAnalyzer::action_detail_text(
             break;
 
         case RecommendedAction::IncreaseSkew:
-            oss << "Anomalous drift detected. Consider increasing phi or gamma "
+            oss << "Drift approaching soft limit (~" << blocks_to_soft
+                << " blocks). Consider increasing phi or gamma "
                 << "to accelerate inventory reversion. Current ratio="
                 << current_ratio << ".";
             break;

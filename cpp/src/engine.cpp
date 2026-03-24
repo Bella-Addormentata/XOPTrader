@@ -966,6 +966,30 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             spdlog::debug("[step5] {} tactic={} spread_adj={:.1f}bps bid_size_f={:.2f} ask_size_f={:.2f}",
                 pair_name, rec.reason, adj.spread_bps, adj.bid_size_factor, adj.ask_size_factor);
         }
+
+        // ---------------------------------------------------------------
+        // Global spread cap: prevent compounding multipliers from causing
+        // effective market withdrawal.
+        //
+        // The multiplicative chain (regime * whale * VPIN * OFI * tactic *
+        // chia_edge) can compound to ~14x base spread in worst case.
+        // Cap half_spread to max_half_spread_bps (default 250 bps =
+        // 500 bps round-trip = 5%).
+        //
+        // ISO/IEC 5055: bounded output prevents unbounded spread growth.
+        // ISO/IEC 25000: configurable via strategy.max_half_spread_bps.
+        // ---------------------------------------------------------------
+        const double max_hs = config_.strategy.max_half_spread_bps;
+        if (pcs.spread_result.half_spread > max_hs) {
+            spdlog::warn("[step5] {} spread capped: {:.1f}bps -> {:.1f}bps "
+                         "(half_spread exceeded max {}bps)",
+                         pair_name,
+                         pcs.spread_result.total_spread_bps,
+                         max_hs * 2.0,
+                         max_hs);
+            pcs.spread_result.half_spread      = max_hs;
+            pcs.spread_result.total_spread_bps = max_hs * 2.0;
+        }
     }
 }
 

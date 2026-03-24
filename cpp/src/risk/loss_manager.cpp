@@ -640,7 +640,12 @@ LossDecision StrategicLossManager::should_rebalance_at_loss(
     //                + carrying_cost * min_spread_recovery_blocks
     //
     //   ev_no_action = adverse_selection_ev_hold
-    //                - carrying_cost * min_spread_recovery_blocks
+    //
+    // Carrying cost appears ONLY in ev_rebalance (as a benefit of freeing
+    // locked capital).  Including it as a penalty in ev_no_action would
+    // double-count the same economic factor, artificially inflating the
+    // attractiveness of rebalancing.  The adverse selection EV already
+    // captures the downside of holding through toxic flow.
     //
     // The horizon for carrying cost accumulation is the configured
     // min_spread_recovery_blocks window.
@@ -651,8 +656,7 @@ LossDecision StrategicLossManager::should_rebalance_at_loss(
                      + tax_benefit
                      + d.carrying_cost_per_block * horizon;
 
-    d.ev_no_action = adverse_selection_ev_hold
-                     - d.carrying_cost_per_block * horizon;
+    d.ev_no_action = adverse_selection_ev_hold;
 
     // -----------------------------------------------------------------------
     // 11. Decision: rebalance if EV(rebalance) > EV(no_action).

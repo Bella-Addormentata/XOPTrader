@@ -66,9 +66,18 @@ OfferManager::OfferManager(asio::io_context&                    ioc,
             "tier_size_pct length must equal num_tiers");
     }
 
-    logger_->info("OfferManager initialised: {} tiers, TTL {} blocks",
+    // Build pair config lookup so evaluate_rebalance() can resolve
+    // base/quote asset IDs from a pair name without external help.
+    // ISO/IEC 5055: deterministic O(1) lookup, value-copy for safety.
+    for (const auto& pc : config.pairs) {
+        pair_config_map_.emplace(pc.name, pc);
+    }
+
+    logger_->info("OfferManager initialised: {} tiers, TTL {} blocks, "
+                  "{} pairs",
                   strategy_cfg_.num_tiers,
-                  strategy_cfg_.offer_ttl_blocks);
+                  strategy_cfg_.offer_ttl_blocks,
+                  pair_config_map_.size());
 }
 
 // ---------------------------------------------------------------------------
@@ -427,9 +436,19 @@ RebalanceReason OfferManager::evaluate_rebalance(
     }
 
     // Trigger 2: Inventory skew > 60%.
-    // Read inventory skew from state (the pair_name is used as the base
-    // asset_id for the position lookup -- the engine maps pair -> asset).
-    double skew = state_->inventory_skew(pair_name, pair_name);
+    // Resolve the pair's base and quote asset IDs from the pair config map
+    // so that inventory_skew() receives the correct position keys.
+    // ISO/IEC 5055: previous code passed pair_name for both arguments,
+    // which produced a degenerate skew of 0 (same numerator and denominator).
+    double skew = 0.0;
+    auto pair_it = pair_config_map_.find(pair_name);
+    if (pair_it != pair_config_map_.end()) {
+        const auto& pc = pair_it->second;
+        skew = state_->inventory_skew(pc.base_asset_id, pc.quote_asset_id);
+    } else {
+        logger_->warn("evaluate_rebalance: no pair config for '{}' -- "
+                       "skew defaults to 0.0", pair_name);
+    }
     if (std::abs(skew) > kInventorySkewThreshold) {
         result = result | RebalanceReason::InventorySkew;
         logger_->debug("Rebalance trigger: inventory skew {:.2f} for {}",
@@ -498,15 +517,21 @@ std::vector<TierQuote> OfferManager::build_tier_ladder(
         : 0;
 
     // Inventory skew adjusts relative sizing between bid and ask sides.
-    // Positive skew = long base -> reduce ask size, increase bid size.
-    // Negative skew = short base -> increase ask size, reduce bid size.
+    // Positive skew = long base -> DECREASE bid size (buy less),
+    //                               INCREASE ask size (sell more to reduce).
+    // Negative skew = short base -> INCREASE bid size (buy more to rebuild),
+    //                                DECREASE ask size (sell less).
+    // This is the standard market-making inventory-reduction convention:
+    // lean against the accumulated position to revert toward neutral.
     // Clamped to [-1, +1] for safety.
     const double clamped_skew = std::clamp(inv_skew, -1.0, 1.0);
 
-    // Skew multiplier: at skew=+1, bid gets 1.5x, ask gets 0.5x.
-    // At skew=0, both get 1.0x (symmetric).
-    const double bid_size_mult = 1.0 + 0.5 * clamped_skew;
-    const double ask_size_mult = 1.0 - 0.5 * clamped_skew;
+    // Skew multiplier: at skew=+1 (long base), bid gets 0.5x (buy less),
+    // ask gets 1.5x (sell more).  At skew=0, both get 1.0x (symmetric).
+    // ISO/IEC 5055: signs inverted relative to original code which
+    // incorrectly reinforced the existing position instead of reducing it.
+    const double bid_size_mult = 1.0 - 0.5 * clamped_skew;
+    const double ask_size_mult = 1.0 + 0.5 * clamped_skew;
 
     for (std::uint32_t i = 0; i < strategy_cfg_.num_tiers; ++i) {
         const double spacing_frac =

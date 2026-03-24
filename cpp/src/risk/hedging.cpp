@@ -86,15 +86,16 @@ double HedgingManager::compute_skew_adjustment(double inventory_q,
 //   If every buy is matched by a sell: net = 0, NHE = 1.0 (perfect).
 //   If all fills are buys: net = total, NHE = 0.0 (worst case).
 //
-// Edge case: total_volume == 0 means no fills occurred.  Returning 0.0
-// rather than 1.0 is intentional: zero volume means zero hedging is
-// happening, which is the alarm the caller needs.
+// Edge case: total_volume == 0 means no fills occurred.  Zero volume
+// implies zero risk exposure, which is trivially perfectly hedged.
+// Returning 1.0 prevents false "below target" alerts during idle periods
+// when no trading has taken place and no hedging action is needed.
 
 double HedgingManager::compute_nhe(double net_inventory_change,
                                    double total_volume) noexcept
 {
     if (total_volume <= 0.0) {
-        return 0.0;  // no volume -- no natural hedging is occurring
+        return 1.0;  // no volume -- zero risk -- trivially perfect hedge
     }
 
     const double ratio = std::abs(net_inventory_change) / total_volume;

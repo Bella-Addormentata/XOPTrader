@@ -980,12 +980,14 @@ double MempoolSentinelStrategy::mempool_spread_multiplier() const
 
 double MempoolSentinelStrategy::mempool_skew_adjustment() const
 {
-    // skew = -phi_mempool * sign(F_pending) * I_pending
+    // skew = phi_mempool * sign(F_pending) * I_pending
     // Clamped to [-skew_max, +skew_max].
     //
-    // The negative sign ensures correct directional response:
+    // Positive sign ensures correct directional response:
     //   F > 0 (buying pressure) => positive skew => quotes shift UP
+    //     (ask widens / less eager to sell, bid tightens / more eager to buy)
     //   F < 0 (selling pressure) => negative skew => quotes shift DOWN
+    //     (ask tightens / more eager to sell, bid widens / less eager to buy)
     const double F = pending_net_flow();
     if (std::abs(F) < 1e-12) {
         return 0.0;  // No pending flow; no skew adjustment.
@@ -993,7 +995,7 @@ double MempoolSentinelStrategy::mempool_skew_adjustment() const
 
     const double I      = pending_flow_intensity();
     const double sign_F = (F > 0.0) ? 1.0 : -1.0;
-    const double raw_skew = -cfg_.phi_mempool * sign_F * I;
+    const double raw_skew = cfg_.phi_mempool * sign_F * I;
 
     return std::clamp(raw_skew, -cfg_.skew_max, cfg_.skew_max);
 }
