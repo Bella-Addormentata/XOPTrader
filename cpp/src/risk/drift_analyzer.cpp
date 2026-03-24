@@ -9,9 +9,8 @@
 //   - All monetary values are in XCH (double), not mojos, because the drift
 //     models operate in continuous-valued space.  Conversion to/from mojos
 //     happens at the call site in the risk manager.
-//   - Monte Carlo simulation uses a 64-bit Xoshiro256** PRNG for speed and
-//     statistical quality.  The PRNG state is local to each simulation call
-//     and does not affect thread safety.
+//   - Monte Carlo simulation uses std::mt19937_64 PRNG.  The PRNG state is
+//     local to each simulation call and does not affect thread safety.
 //   - The normal_cdf() helper uses the Abramowitz-Stegun approximation which
 //     is accurate to < 7.5e-8 -- adequate for risk calculations.
 //
@@ -21,17 +20,14 @@
 //   ISO/IEC 25000      -- single-responsibility methods, documented formulas
 //   ISO/IEC JTC 1/SC 22 -- C++20, no undefined behaviour
 
-#include "xop/risk/drift_analyzer.hpp"
+#include <xop/risk/drift_analyzer.hpp>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
-#include <cstring>
-#include <limits>
+#include <mutex>
 #include <numeric>
 #include <random>
-#include <sstream>
-#include <stdexcept>
 
 namespace xop {
 
@@ -67,7 +63,12 @@ const char* to_string(RecommendedAction a) noexcept {
 
 InventoryDriftAnalyzer::InventoryDriftAnalyzer(const DriftConfig& cfg)
     : cfg_{cfg}
-{}
+{
+    spdlog::info("InventoryDriftAnalyzer constructed: lambda={:.4f} "
+                 "delta_q={:.1f} V_total={:.0f} XCH_price={:.2f}",
+                 cfg_.fill_rate_per_block, cfg_.avg_fill_size_xch,
+                 cfg_.total_portfolio_value_usd, cfg_.xch_price_usd);
+}
 
 InventoryDriftAnalyzer::InventoryDriftAnalyzer(
     const RiskConfig& risk_cfg,
@@ -77,12 +78,20 @@ InventoryDriftAnalyzer::InventoryDriftAnalyzer(
     double xch_price_usd)
     : cfg_{}
 {
-    cfg_.soft_limit_pct           = risk_cfg.soft_limit_pct;
-    cfg_.hard_limit_pct           = risk_cfg.hard_limit_pct;
-    cfg_.fill_rate_per_block      = fill_rate_per_block;
-    cfg_.avg_fill_size_xch        = avg_fill_size_xch;
+    // Extract risk thresholds from the RiskConfig.
+    cfg_.soft_limit_pct            = risk_cfg.soft_limit_pct;
+    cfg_.hard_limit_pct            = risk_cfg.hard_limit_pct;
+
+    // Store caller-supplied market microstructure parameters.
+    cfg_.fill_rate_per_block       = fill_rate_per_block;
+    cfg_.avg_fill_size_xch         = avg_fill_size_xch;
     cfg_.total_portfolio_value_usd = total_value_usd;
-    cfg_.xch_price_usd            = xch_price_usd;
+    cfg_.xch_price_usd             = xch_price_usd;
+
+    spdlog::info("InventoryDriftAnalyzer constructed from RiskConfig: "
+                 "soft={:.2f} hard={:.2f} lambda={:.4f} delta_q={:.1f}",
+                 cfg_.soft_limit_pct, cfg_.hard_limit_pct,
+                 cfg_.fill_rate_per_block, cfg_.avg_fill_size_xch);
 }
 
 // ===========================================================================
@@ -95,18 +104,15 @@ void InventoryDriftAnalyzer::record_observation(double ratio,
     // Clamp ratio to [0, 1] for robustness against rounding artifacts.
     ratio = std::clamp(ratio, 0.0, 1.0);
 
+    // Exclusive lock -- modifying the observation deque.
     std::unique_lock lock(mtx_);
 
     observations_.push_back({ratio, block_height});
 
-    // Evict old observations beyond the rolling window.
-    // Window is defined in blocks; remove entries that are older than
-    // (current_block - drift_window_blocks).
-    if (block_height > cfg_.drift_window_blocks) {
-        const BlockHeight cutoff = block_height - cfg_.drift_window_blocks;
-        while (!observations_.empty() && observations_.front().block < cutoff) {
-            observations_.pop_front();
-        }
+    // Trim the deque to the configured rolling window size.
+    while (observations_.size() >
+           static_cast<std::size_t>(cfg_.drift_window_blocks)) {
+        observations_.pop_front();
     }
 }
 
@@ -733,80 +739,44 @@ double InventoryDriftAnalyzer::ratio_to_xch_deviation(
     double target_ratio,
     double current_ratio) const
 {
-    // The inventory ratio r = base_value / (base_value + quote_value).
-    // The deviation in XCH needed to move r from current to target is:
+    // Compute the XCH deviation needed to move from the current inventory
+    // imbalance to the target ratio's imbalance.
     //
-    //   delta_xch = |target_ratio - current_ratio| * V_total / price
+    // deviation = |target_ratio - 0.5| * V_total / xch_price
+    //           - |current_ratio - 0.5| * V_total / xch_price
     //
-    // where V_total is the total portfolio value and price is XCH price.
-    //
-    // However, we must handle the TWO-SIDED nature: the limit can be breached
-    // by going EITHER above (r > soft_limit) or below (r < 1 - soft_limit).
-    // We return the distance to the NEAREST limit.
+    // This measures the ADDITIONAL imbalance (in XCH) required to reach the
+    // target ratio, starting from the current ratio.  Positive values indicate
+    // the target has not yet been reached.
 
     if (cfg_.xch_price_usd <= 0.0) {
-        return std::numeric_limits<double>::infinity();
-    }
-
-    const double V_xch = cfg_.total_portfolio_value_usd / cfg_.xch_price_usd;
-
-    // Distance upward to target_ratio.
-    const double dist_up   = (target_ratio - current_ratio) * V_xch;
-    // Distance downward to (1 - target_ratio).
-    const double dist_down = (current_ratio - (1.0 - target_ratio)) * V_xch;
-
-    // Take the minimum POSITIVE distance (nearest breach direction).
-    double nearest = std::numeric_limits<double>::infinity();
-    if (dist_up > 0.0) {
-        nearest = std::min(nearest, dist_up);
-    }
-    if (dist_down > 0.0) {
-        nearest = std::min(nearest, dist_down);
-    }
-
-    // If current ratio already exceeds the limit, distance is 0.
-    if (current_ratio >= target_ratio ||
-        current_ratio <= (1.0 - target_ratio)) {
         return 0.0;
     }
 
-    // If neither direction is breachable (limit is very wide), use the
-    // minimum of the absolute distances.
-    if (nearest == std::numeric_limits<double>::infinity()) {
-        nearest = std::min(std::abs(dist_up), std::abs(dist_down));
-    }
+    const double scale = cfg_.total_portfolio_value_usd / cfg_.xch_price_usd;
+    const double target_dev  = std::abs(target_ratio  - 0.5) * scale;
+    const double current_dev = std::abs(current_ratio - 0.5) * scale;
 
-    return std::max(nearest, 0.0);
+    return std::max(0.0, target_dev - current_dev);
 }
 
 double InventoryDriftAnalyzer::random_walk_first_passage(double L_xch) const
 {
-    // E[T_breach] = L^2 / (delta_q^2 * lambda)
+    // E[T_breach] = L^2 / (delta_q^2 * lambda)         (equation 7)
     //
-    // This is the expected first-passage time for a symmetric random walk
-    // starting at 0 to reach +/- L, where each step has size delta_q and
-    // steps occur at rate lambda per block.
-    //
-    // Derivation: the walk has variance delta_q^2 per step, so after n steps
-    // the variance is n * delta_q^2.  We want n such that sqrt(n) * delta_q = L,
-    // giving n = L^2 / delta_q^2.  Since steps occur at rate lambda per block,
-    // the expected time is n / lambda = L^2 / (delta_q^2 * lambda).
-    //
-    // Note: this is the EXPECTED value.  The actual distribution is heavy-tailed
-    // (the walk can wander back and forth many times before hitting L).
+    // Expected first-passage time (in blocks) for a symmetric random walk
+    // with step variance delta_q^2 and rate lambda fills/block to reach
+    // distance L from the origin.
 
-    if (L_xch <= 0.0) {
+    const double dq  = cfg_.avg_fill_size_xch;
+    const double lam = cfg_.fill_rate_per_block;
+    const double denom = dq * dq * lam;
+
+    if (denom <= 0.0 || L_xch <= 0.0) {
         return 0.0;
     }
 
-    const double dq = cfg_.avg_fill_size_xch;
-    const double lam = cfg_.fill_rate_per_block;
-
-    if (dq <= 0.0 || lam <= 0.0) {
-        return std::numeric_limits<double>::infinity();
-    }
-
-    return (L_xch * L_xch) / (dq * dq * lam);
+    return (L_xch * L_xch) / denom;
 }
 
 double InventoryDriftAnalyzer::trending_first_passage(
@@ -873,21 +843,13 @@ double InventoryDriftAnalyzer::mean_revert_first_passage(
     //
     //   dq = -theta * q * dt + sigma_noise * dW
     //
-    // The expected first-passage time to reach level L starting from 0 is
-    // not available in simple closed form.  We use the Kramers escape-rate
-    // approximation for a potential well:
+    // Approximate first-passage time for L >> sigma_steady:
     //
-    //   E[T] ~ (pi / theta) * exp(L^2 / (2 * sigma_ss^2))
+    //   E[T] = (1 / theta) * ln(L / sigma_steady)
     //
-    // This is valid when L >> sigma_ss (the barrier is in the tail of the
-    // steady-state distribution).  For L ~ sigma_ss, the passage time is
-    // on the order of 1/theta.
-    //
-    // For practical purposes:
-    //   - If L < sigma_ss: the process frequently visits L, so E[T] ~ 1/theta.
-    //   - If L > 2*sigma_ss: Kramers formula gives an exponentially long time.
-    //   - If L > 4*sigma_ss: breach is effectively impossible in any
-    //     operational timeframe.
+    // When L is not much larger than sigma_steady, the barrier is within
+    // the normal fluctuation range and breach is rapid.  We floor at
+    // 1 block to avoid returning zero or negative.
 
     if (L_xch <= 0.0) {
         return 0.0;
@@ -900,21 +862,12 @@ double InventoryDriftAnalyzer::mean_revert_first_passage(
 
     const double ratio = L_xch / sigma_steady;
 
-    if (ratio < 1.0) {
-        // Barrier is within the steady-state fluctuation range.
-        // Expected time is approximately one reversion cycle.
-        return 1.0 / theta;
+    if (ratio <= 1.0) {
+        // Barrier is within steady-state fluctuations; breach is imminent.
+        return 1.0;
     }
 
-    if (ratio > 10.0) {
-        // Barrier is so far in the tail that breach is effectively impossible.
-        // Cap at a very large value to avoid overflow in exp().
-        return 1e12;
-    }
-
-    // Kramers escape rate approximation.
-    const double exponent = 0.5 * ratio * ratio;
-    return (M_PI / theta) * std::exp(exponent);
+    return (1.0 / theta) * std::log(ratio);
 }
 
 double InventoryDriftAnalyzer::trending_drift_rate(double trend_pct_day) const
@@ -941,20 +894,22 @@ double InventoryDriftAnalyzer::trending_drift_rate(double trend_pct_day) const
 double InventoryDriftAnalyzer::as_steady_state_sigma(double sigma_annual) const
 {
     // A-S steady-state variance (equation 11 in header):
-    //   Var[q]_AS ~ delta_q^2 * lambda / (2 * gamma * sigma^2 * tau_avg)
+    //   Var[q]_AS ~ delta_q^2 * lambda / (2 * gamma * sigma_block^2 * tau_avg)
     //
-    // where tau_avg = (horizon_blocks * block_time) / 2 (average tau over
-    // the rolling horizon -- tau starts at horizon_blocks * block_time and
-    // linearly decreases to 0, then resets).
+    // where:
+    //   sigma_block = per-block volatility (converted from annual)
+    //   tau_avg     = horizon * block_time / 2
+    //              = as_horizon_blocks * 52 / 2  (seconds, average remaining time)
     //
-    // sigma is per-block volatility (not annual), so we convert.
+    // tau starts at horizon_blocks * block_time and linearly decreases to 0,
+    // then resets.  The average over the horizon is half the total.
 
     const double sigma_blk = per_block_sigma(sigma_annual);
     const double tau_avg   = static_cast<double>(cfg_.as_horizon_blocks)
                            * cfg_.block_time_seconds / 2.0;
 
     if (cfg_.gamma <= 0.0 || sigma_blk <= 0.0 || tau_avg <= 0.0) {
-        return std::numeric_limits<double>::infinity();
+        return 0.0;
     }
 
     const double dq  = cfg_.avg_fill_size_xch;
@@ -969,23 +924,23 @@ double InventoryDriftAnalyzer::as_steady_state_sigma(double sigma_annual) const
 double InventoryDriftAnalyzer::glft_steady_state_sigma() const
 {
     // GLFT steady-state variance (equation 13 in header):
-    //   Var[q]_GLFT = delta_q^2 * lambda / (2 * theta)
+    //   Var[q]_GLFT = q_max / (2 * phi * kappa)
     //
-    // where theta = phi * lambda * kappa * delta_q / q_max
-    //             (effective Ornstein-Uhlenbeck reversion rate).
+    // This is derived from the OU process with theta = phi*lambda*kappa*dq/q_max
+    // and noise variance delta_q^2 * lambda:
+    //   Var[q] = noise_var / (2 * theta) = (dq^2 * lambda) / (2 * theta)
+    //          = (dq^2 * lambda * q_max) / (2 * phi * lambda * kappa * dq)
+    //          = q_max / (2 * phi * kappa)
+    //
+    // The simplified form is independent of fill rate and fill size.
 
-    const double theta = glft_theta();
+    const double denom = 2.0 * cfg_.phi * cfg_.kappa;
 
-    if (theta <= 0.0) {
-        return std::numeric_limits<double>::infinity();
+    if (denom <= 0.0) {
+        return 0.0;
     }
 
-    const double dq  = cfg_.avg_fill_size_xch;
-    const double lam = cfg_.fill_rate_per_block;
-
-    const double var_q = (dq * dq * lam) / (2.0 * theta);
-
-    return std::sqrt(var_q);
+    return std::sqrt(cfg_.q_max / denom);
 }
 
 double InventoryDriftAnalyzer::glft_theta() const
@@ -998,24 +953,14 @@ double InventoryDriftAnalyzer::glft_theta() const
     //
     //   theta = phi * lambda * kappa * delta_q / q_max
     //
-    // Derivation:
-    //   The skew shifts the effective half-spread on the "inventory-reducing"
-    //   side by -phi * q / q_max and on the "inventory-increasing" side by
-    //   +phi * q / q_max.  The change in fill rate is:
-    //     d(lambda)/d(delta) = -kappa * lambda
-    //   So the net fill rate toward zero changes by:
-    //     d(lambda_net) = 2 * kappa * lambda * phi * q / q_max
-    //   The net reversion in inventory per block is:
-    //     d(q)/d(block) = -delta_q * d(lambda_net) = -theta * q
-    //   where theta = 2 * kappa * lambda * phi * delta_q / q_max.
-    //
-    //   (The factor of 2 accounts for both sides being shifted.)
+    // This drives the OU dynamics:  dq = -theta * q * dt + delta_q * dW
+    // producing a steady-state variance of delta_q^2 * lambda / (2 * theta).
 
     if (cfg_.q_max <= 0.0) {
         return 0.0;
     }
 
-    return 2.0 * cfg_.kappa * cfg_.fill_rate_per_block * cfg_.phi
+    return cfg_.phi * cfg_.fill_rate_per_block * cfg_.kappa
          * cfg_.avg_fill_size_xch / cfg_.q_max;
 }
 
