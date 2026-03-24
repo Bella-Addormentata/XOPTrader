@@ -25,7 +25,7 @@
 //   ISO/IEC 27001:2022 -- controlled mutable state, defensive input validation
 //   ISO/IEC 5055       -- no raw pointer ownership, RAII locking, bounds checks
 //   ISO/IEC 25000      -- single-responsibility methods, documented edge cases
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #include "xop/risk/inventory.hpp"
 
