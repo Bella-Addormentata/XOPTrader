@@ -8,6 +8,7 @@
 
 ## Table of Contents
 
+0. [Goals and Objectives](#0-goals-and-objectives)
 1. [Implemented Strategies](#1-implemented-strategies)
    - [1.1 Avellaneda-Stoikov Optimal Market Making](#11-avellaneda-stoikov-optimal-market-making)
    - [1.2 GLFT Running-Inventory-Penalty Model](#12-glft-running-inventory-penalty-model)
@@ -52,8 +53,85 @@
 4. [Chia-Specific Competitive Advantages](#4-chia-specific-competitive-advantages)
 5. [On Deliberate Loss-Taking and Inventory Balance](#5-on-deliberate-loss-taking-and-inventory-balance)
 6. [Implementation Priority Ranking](#6-implementation-priority-ranking)
-7. [Strategy Interaction Matrix](#7-strategy-interaction-matrix)
-8. [References](#8-references)
+7. [Key Strategy Trade-offs](#7-key-strategy-trade-offs)
+8. [Strategy Interaction Matrix](#8-strategy-interaction-matrix)
+9. [References](#9-references)
+
+---
+
+## 0. Goals and Objectives
+
+This section defines *what we are trying to achieve* with XOPTrader and *how
+we measure success*.  Every strategy decision — which to implement, in what
+order, and when to accept a loss — should be evaluated against these goals.
+
+### 0.1 Primary Goal
+
+**Maximize risk-adjusted spread income over time on Chia DEX.**
+
+This is a *flow* goal, not a directional one.  XOPTrader is a market maker,
+not a speculator.  Success is measured by cumulative spread captured per unit
+of capital at risk, not by the direction of any single trade.
+
+The core model:
+```
+Risk-adjusted PnL = Σ(spread captured per fill) − Σ(adverse selection losses)
+                  − Σ(inventory drift losses) − Σ(operational costs)
+```
+
+### 0.2 Secondary Goals
+
+| Goal | Why It Matters |
+|------|---------------|
+| **Maintain two-sided quoting** | Single-sided quoting earns zero spread on the missing side and exposes the other side to 100% adverse selection |
+| **Preserve capital during stress** | A market maker who loses their capital base cannot quote; survival is prerequisite to profitability |
+| **Minimize adverse selection** | Informed counterparties systematically extract value; detecting and avoiding them is essential |
+| **Exploit Chia-specific edges** | The unique features of Chia DEX (§4) give structural advantages that centralized-market strategies miss |
+| **Operate continuously and reliably** | Uptime = quoting time = income; every offline minute is missed opportunity and potential stale-quote risk |
+
+### 0.3 Success Metrics
+
+The following KPIs define a "healthy" deployment:
+
+| Metric | Target | Notes |
+|--------|--------|-------|
+| **Fill Rate** | >30% of posted offers filled | Too low → spreads are too wide; too high → spreads are too narrow |
+| **Inventory Imbalance** | \|q / q_max\| < 0.6 at all times | 0.60–0.75: intensify skew; >0.75: trigger deliberate rebalancing (§5) |
+| **Realized Spread** | >50% of quoted spread | Measures adverse selection leakage |
+| **Uptime** | >99% of blocks | Per-block heartbeat enables this; see block-cadence sync §3.18 |
+| **Drawdown** | <10% of deployed capital / month | Circuit breaker if exceeded |
+| **Capital Efficiency** | >60% of capital generating fills within 24 h | Idle capital is wasted risk capacity |
+
+### 0.4 Implementation Milestones
+
+The strategies are not intended to be deployed all at once.  The following
+phased milestones provide a concrete road map from the current state to a
+fully optimized deployment.  Each milestone is self-contained and improves
+PnL incrementally.
+
+| Milestone | Strategies to Add | Expected Impact |
+|-----------|------------------|-----------------|
+| **M1 — Operational Hardening** | §3.18 Block-cadence sync, §3.17 TTL optimization | Eliminates cancel/fill races; reduces stale-quote losses |
+| **M2 — Inventory Discipline** | §3.16 Strategic loss-taking, §3.5 Dynamic position limits | Prevents inventory exhaustion; keeps two-sided quoting alive |
+| **M3 — Volatility Awareness** | §3.2 GARCH volatility forecasting | Feeds better σ into A-S/GLFT; spread sizing tracks real-time risk |
+| **M4 — CEX Signal Integration** | §3.3 Lead-lag CEX feeds, §3.11 Oracle anchoring | Reduces adverse selection from CEX-to-DEX price discovery lag |
+| **M5 — Competitor Intelligence** | §3.21 Blockchain transparency intel | Shifts competitor response from reactive to predictive |
+| **M6 — Portfolio Expansion** | §3.19 CAT correlation trading, §3.8 Multi-asset quoting | Diversifies income; reduces single-pair concentration risk |
+| **M7 — Advanced Risk** | §3.1 CEX inventory hedging, §3.13 IL hedging | Eliminates residual directional risk; enables tighter spreads |
+
+### 0.5 What We Have Not Implemented Yet (And Why)
+
+The 21 strategies in §3 are all documented but not yet in code.  The most
+impactful ones to implement *next* are identified in the priority ranking (§6).
+The "Always Defer" category (end of §6) represents strategies where the
+expected value under Chia's specific constraints is insufficient to justify
+the engineering cost at this stage.
+
+A strategy being "not implemented" is not a failure — it is a deliberate
+choice to apply engineering resources where the marginal PnL improvement is
+highest.  The catalog exists so that future contributors can find the right
+strategy when conditions change (e.g., a richer CAT ecosystem makes §3.8
+more valuable; Chialisp tooling maturing makes §3.20 practical).
 
 ---
 
@@ -1585,7 +1663,146 @@ Chia's specific DEX environment.
 
 ---
 
-## 7. Strategy Interaction Matrix
+## 7. Key Strategy Trade-offs
+
+Every market making decision involves genuine tension between competing
+objectives.  This section catalogues the major trade-offs so that strategy
+choices can be made consciously rather than by default.
+
+### 7.1 Spread Width vs. Fill Rate
+
+The most fundamental tension in market making:
+
+| Spread Choice | Fill Rate | Revenue per Fill | Adverse Selection | Inventory Velocity |
+|---------------|-----------|-----------------|-------------------|-------------------|
+| Narrow (1–2%) | High | Low | High | Fast (frequent rebalancing) |
+| Medium (3–5%) | Moderate | Medium | Moderate | Balanced |
+| Wide (5–10%)  | Low | High | Low | Slow (infrequent rebalancing) |
+
+**Chia-specific nuance:** On thin DEX markets, extremely narrow spreads
+attract informed flow disproportionately (no retail "noise" traders to
+balance it).  Wider-than-CEX spreads are often *correct* on Chia, not
+a sign of poor calibration.
+
+**Optimization tool:** Thompson Sampling (§1.12) automates this exploration
+rather than requiring a manual static choice.
+
+---
+
+### 7.2 Inventory Risk vs. Capital Efficiency
+
+| Choice | Inventory Risk | Capital Efficiency | Scenario |
+|--------|---------------|-------------------|----------|
+| Large position limits (high q_max) | High | High | More capital deployed, bigger directional exposure |
+| Small position limits (low q_max) | Low | Low | Less capital at risk, but spreads must be wider to compensate |
+| Dynamic limits (VaR/CVaR, §3.5) | Adaptive | High in calm, Low in stress | Best of both but requires calibration |
+
+**Key insight:** Inventory risk is not symmetric.  A long position in XCH
+during a bear market compounds losses; a short position during a bull market
+does the same.  GLFT's linear skew (§1.2) and the rebalancing policy (§5.2)
+together address this asymmetry.
+
+---
+
+### 7.3 Strategy Complexity vs. Robustness
+
+| Complexity | Advantages | Disadvantages |
+|------------|-----------|---------------|
+| Simple (fixed spread, manual rebalancing) | Easy to debug; predictable behavior | Leaves PnL on the table; no adaptation |
+| Moderate (A-S/GLFT + regime detection) | Good adaptation to conditions | Parameter sensitivity; requires calibration |
+| High (ML-based, multi-asset, RL) | Potentially highest PnL | Overfitting; failure modes are hard to anticipate |
+
+**Recommendation:** Prefer moderate-complexity strategies with well-understood
+failure modes over high-complexity strategies with opaque behavior.  On a
+thin, slow DEX like Chia, marginal signal improvements from additional
+complexity are small relative to the debugging and operational cost.
+
+This is why the priority ranking (§6) places block-cadence sync and TTL
+optimization — operational correctness improvements — above ML-based
+toxic flow classification.
+
+---
+
+### 7.4 Passive (Maker) vs. Active (Taker) Behavior
+
+| Behavior | Cost | Benefit | When Appropriate |
+|----------|------|---------|-----------------|
+| Pure maker (only post offers) | Zero taker fees; earn spread | May never fill on illiquid pairs | Normal quoting |
+| Hybrid (post maker, take for rebalancing) | Taker fee + cross spread to exit | Reliable inventory management | When imbalance > 0.75 (§5.2) |
+| Pure taker (always take existing offers) | Always pays spread | Instant execution | Never — defeats the purpose of market making |
+
+**Key rule:** Never pay the spread for routine operations.  Taker behavior
+is only justified for *emergency rebalancing* when the cost of holding the
+imbalance exceeds the cost of crossing the spread.
+
+---
+
+### 7.5 Reactive vs. Predictive Quoting
+
+| Approach | Lag | False Signal Risk | Implementation Complexity |
+|----------|-----|------------------|--------------------------|
+| Reactive (respond after fills) | 1–2 blocks | Low | Low |
+| Signal-driven (VPIN, OFI, whale) | 0–1 blocks | Medium | Medium |
+| Predictive (lead-lag CEX, competitor model) | −1 to +1 blocks | High | High |
+
+**Chia context:** The 52-second block time makes "predictive" quoting based
+on CEX feeds (§3.3) especially valuable — there is a natural 10–60 second
+window where CEX prices have moved but Chia DEX offers have not yet updated.
+Lead-lag signals (§3.3) exploit this window directly.
+
+---
+
+### 7.6 DEX-Only vs. Cross-Venue Operation
+
+| Scope | Capital Required | Hedging Ability | Operational Complexity |
+|-------|-----------------|-----------------|----------------------|
+| Chia DEX only | Low | None (directional inventory risk) | Low |
+| Chia DEX + CEX inventory hedge | 2× | Full delta neutrality | High |
+| Multi-DEX (Dexie + TibetSwap) | Medium | Partial (IL vs. offer risk) | Medium |
+
+**Trade-off:** CEX hedging (§3.1) would enable the tightest possible spreads
+since inventory risk is eliminated.  However, it requires capital on the CEX,
+a CEX API integration, and careful management of the basis between CEX and
+DEX prices.  The benefit is clear; the cost is operational complexity and
+counter-party risk on the CEX side.
+
+---
+
+### 7.7 Short-Term PnL vs. Long-Term Market Presence
+
+| Priority | Short-Term PnL | Long-Term Presence |
+|----------|---------------|-------------------|
+| **Extractive quoting** | Widen spreads aggressively, withdraw on volatility | Reduces fill frequency over time; other makers capture flow |
+| **Supportive quoting** | Maintain competitive spreads through volatility | Lower short-term margin; stronger market position, higher fill share |
+
+**Strategic consideration:** On Chia DEX, where the ecosystem is small and
+the number of professional market makers is low, being a *reliable*, consistent
+liquidity provider builds taker trust and repeat business.  Predatory widening
+drives takers to AMM pools (TibetSwap), permanently reducing the offer-based
+flow available to us.
+
+The right balance is: use volatility signals (VPIN, OFI, regime) to widen
+*proportionately* — not to withdraw entirely — during stress.
+
+---
+
+### 7.8 On-Chain Transparency: Advantage vs. Liability
+
+Chia's full blockchain transparency (§4.5) cuts both ways:
+
+| As an Advantage | As a Liability |
+|-----------------|----------------|
+| Full competitor history readable (§3.21) | Our own offer history is equally readable |
+| Whale accumulation visible before it fully impacts price | Predictable rebalancing behaviour can be front-run |
+| No hidden order flow; what you see is all there is | No dark pool or private OTC to conceal large moves |
+
+**Mitigation:** Randomize rebalancing timing and amounts (within bounds) to
+defeat behavioral fingerprinting.  Never rebalance at a fixed inventory ratio
+with a fixed offer size — vary both by ±20% stochastically.
+
+---
+
+## 8. Strategy Interaction Matrix
 
 How the implemented strategies compose and interact:
 
@@ -1623,7 +1840,7 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 
 ---
 
-## 8. References
+## 9. References
 
 1. Agrawal, S. & Goyal, N. (2012). "Analysis of Thompson sampling for the multi-armed bandit problem." *COLT 2012*.
 
