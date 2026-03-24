@@ -28,6 +28,7 @@
 #include <mutex>
 #include <numeric>
 #include <random>
+#include <sstream>
 
 namespace xop {
 
@@ -232,23 +233,19 @@ DriftReport InventoryDriftAnalyzer::analyze_drift(
     report.as_steady_state_sigma   = as_steady_state_sigma(sigma);
     report.glft_steady_state_sigma = glft_steady_state_sigma();
 
-    // Probability of exceeding the soft limit under each model's steady state.
-    // Using the normal distribution:
-    //   P(|q| > L) = 2 * (1 - Phi(L / sigma_ss))
-    const double L_soft_xch = (cfg_.soft_limit_pct - 0.5)
-                             * cfg_.total_portfolio_value_usd
-                             / cfg_.xch_price_usd;
-
+    // Breach probabilities under steady state:
+    //   P(|q| > L_soft) = 2 * Phi(-L_soft / sigma_ss)
+    // This is equivalent to 2 * (1 - Phi(L / sigma_ss)) by symmetry.
     if (report.as_steady_state_sigma > 0.0) {
         report.as_breach_probability =
-            2.0 * (1.0 - normal_cdf(L_soft_xch / report.as_steady_state_sigma));
+            2.0 * normal_cdf(-distance_to_soft / report.as_steady_state_sigma);
     } else {
         report.as_breach_probability = 0.0;
     }
 
     if (report.glft_steady_state_sigma > 0.0) {
         report.glft_breach_probability =
-            2.0 * (1.0 - normal_cdf(L_soft_xch / report.glft_steady_state_sigma));
+            2.0 * normal_cdf(-distance_to_soft / report.glft_steady_state_sigma);
     } else {
         report.glft_breach_probability = 0.0;
     }
@@ -300,6 +297,13 @@ DriftReport InventoryDriftAnalyzer::analyze_drift(
         report.expected_blocks_to_hard_limit,
         current_ratio);
 
+    spdlog::debug("analyze_drift: ratio={:.4f} condition={} "
+                  "blocks_to_soft={:.0f} blocks_to_hard={:.0f} action={}",
+                  current_ratio, to_string(condition),
+                  report.expected_blocks_to_soft_limit,
+                  report.expected_blocks_to_hard_limit,
+                  to_string(report.recommended_action));
+
     return report;
 }
 
@@ -314,204 +318,150 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
     uint32_t        max_blocks,
     uint64_t        seed) const
 {
-    // Clamp inputs to sane ranges.
-    num_paths  = std::clamp(num_paths,  uint32_t{100},  uint32_t{1000000});
-    max_blocks = std::clamp(max_blocks, uint32_t{1000}, uint32_t{500000});
-
-    // Initialise RNG.
+    // Seed the RNG.  If seed == 0, use a hardware random device.
     std::mt19937_64 rng;
-    if (seed == 0) {
+    if (seed != 0) {
+        rng.seed(seed);
+    } else {
         std::random_device rd;
         rng.seed(rd());
-    } else {
-        rng.seed(seed);
     }
+
     std::normal_distribution<double> normal(0.0, 1.0);
-    std::bernoulli_distribution fill_coin(cfg_.fill_rate_per_block);
 
     // Precompute constants.
-    const double delta_q = cfg_.avg_fill_size_xch;
-    const double V_xch   = cfg_.total_portfolio_value_usd / cfg_.xch_price_usd;
+    const double delta_q   = cfg_.avg_fill_size_xch;
+    const double lambda    = cfg_.fill_rate_per_block;
+    const double sigma_blk = per_block_sigma(cfg_.sigma_annual);
+    const double theta     = glft_theta();
+    const double L_soft    = ratio_to_xch_deviation(cfg_.soft_limit_pct, 0.5);
+    const double L_hard    = ratio_to_xch_deviation(cfg_.hard_limit_pct, 0.5);
 
-    // Soft and hard limits in XCH deviation from balanced.
-    const double L_soft = (cfg_.soft_limit_pct - 0.5) * V_xch * 2.0;
-    const double L_hard = (cfg_.hard_limit_pct - 0.5) * V_xch * 2.0;
-
-    // Trending drift per block (in XCH).
+    // Compute optional directional drift (XCH per block).
     double drift_per_block = 0.0;
     if (condition == MarketCondition::TrendingUp) {
-        drift_per_block = trending_drift_rate(std::abs(trend_pct_day));
+        drift_per_block = trending_drift_rate(trend_pct_day);
     } else if (condition == MarketCondition::TrendingDown) {
-        drift_per_block = -trending_drift_rate(std::abs(trend_pct_day));
+        drift_per_block = -trending_drift_rate(trend_pct_day);
     }
 
-    // Mean-reversion parameters for GLFT.
-    const double theta = glft_theta();
+    // Gaussian noise standard deviation per block for the inventory process.
+    // Each block has lambda expected fills of size delta_q, giving variance
+    // delta_q^2 * lambda per block.
+    const double noise_sigma = delta_q * std::sqrt(lambda);
 
-    // Accumulators for summary statistics.
-    std::vector<double> soft_times;
-    std::vector<double> hard_times;
-    soft_times.reserve(num_paths);
-    hard_times.reserve(num_paths);
+    // A-S reversion force: gamma * sigma_block^2 * tau_avg.
+    // tau_avg is the average remaining time over the rolling horizon.
+    const double tau_avg =
+        static_cast<double>(cfg_.as_horizon_blocks) *
+        cfg_.block_time_seconds / (2.0 * kSecondsPerYear);
+    const double as_force = cfg_.gamma * sigma_blk * sigma_blk * tau_avg;
 
-    // Accumulator for steady-state distribution (last 20% of path).
-    std::vector<double> final_ratios;
-    final_ratios.reserve(num_paths);
+    // Storage for first-passage times across all paths.
+    std::vector<double> soft_times(num_paths,
+                                   static_cast<double>(max_blocks));
+    std::vector<double> hard_times(num_paths,
+                                   static_cast<double>(max_blocks));
 
-    for (uint32_t path = 0; path < num_paths; ++path) {
+    // Accumulate final-state ratios for steady-state statistics.
+    double sum_final_ratio    = 0.0;
+    double sum_final_ratio_sq = 0.0;
+
+    for (uint32_t p = 0; p < num_paths; ++p) {
         double q = 0.0;  // Inventory deviation from balanced (in XCH).
-        double t_soft = static_cast<double>(max_blocks);  // Sentinel: not hit.
-        double t_hard = static_cast<double>(max_blocks);
-        bool   hit_soft = false;
-        bool   hit_hard = false;
+        bool hit_soft = false;
+        bool hit_hard = false;
 
-        for (uint32_t b = 0; b < max_blocks; ++b) {
-            // Determine if a fill occurs this block.
-            if (fill_coin(rng)) {
-                // Determine fill direction.
-                double fill_sign = 0.0;
+        for (uint32_t b = 1; b <= max_blocks; ++b) {
+            // Apply directional drift.
+            q += drift_per_block;
 
-                switch (condition) {
-                    case MarketCondition::RandomWalk:
-                        // Symmetric: equal probability bid or ask fills.
-                        fill_sign = (normal(rng) >= 0.0) ? 1.0 : -1.0;
-                        break;
+            // Apply Gaussian diffusion noise.
+            q += noise_sigma * normal(rng);
 
-                    case MarketCondition::TrendingUp:
-                        // Bias toward bid fills (accumulating base).
-                        // Probability of bid fill increases with trend.
-                        fill_sign = (normal(rng) >= -0.5 * drift_per_block / delta_q)
-                                    ? 1.0 : -1.0;
-                        break;
-
-                    case MarketCondition::TrendingDown:
-                        // Bias toward ask fills (depleting base).
-                        fill_sign = (normal(rng) >= 0.5 * std::abs(drift_per_block) / delta_q)
-                                    ? 1.0 : -1.0;
-                        break;
-
-                    case MarketCondition::MeanReverting:
-                        // Mean-revert: bias fills AGAINST current position.
-                        if (q > 0.0) {
-                            // More likely to fill asks (sell base).
-                            fill_sign = (normal(rng) >= theta * q / delta_q)
-                                        ? 1.0 : -1.0;
-                        } else {
-                            // More likely to fill bids (buy base).
-                            fill_sign = (normal(rng) >= theta * q / delta_q)
-                                        ? 1.0 : -1.0;
-                        }
-                        break;
-                }
-
-                // Apply UTXO feedback: reduce fill probability on the
-                // depleted side.
-                const double ratio = 0.5 + q / (2.0 * V_xch);
-                const double clamped_ratio = std::clamp(ratio, 0.01, 0.99);
-
-                if (fill_sign > 0.0) {
-                    // Bid fill (buying base): needs quote-side coins.
-                    const double quote_frac = 1.0 - clamped_ratio;
-                    const double avail = std::min(1.0,
-                        quote_frac * static_cast<double>(cfg_.total_coin_slots)
-                        / static_cast<double>(cfg_.desired_offers_per_side));
-                    // With probability (1 - avail), the fill is blocked.
-                    if (std::uniform_real_distribution<double>(0.0, 1.0)(rng)
-                        > avail * cfg_.utxo_sensitivity
-                          + (1.0 - cfg_.utxo_sensitivity)) {
-                        fill_sign = 0.0;
-                    }
-                } else {
-                    // Ask fill (selling base): needs base-side coins.
-                    const double base_frac = clamped_ratio;
-                    const double avail = std::min(1.0,
-                        base_frac * static_cast<double>(cfg_.total_coin_slots)
-                        / static_cast<double>(cfg_.desired_offers_per_side));
-                    if (std::uniform_real_distribution<double>(0.0, 1.0)(rng)
-                        > avail * cfg_.utxo_sensitivity
-                          + (1.0 - cfg_.utxo_sensitivity)) {
-                        fill_sign = 0.0;
-                    }
-                }
-
-                q += fill_sign * delta_q;
+            // Apply mean-reversion force (model-dependent).
+            // For MeanReverting: use GLFT theta (full OU reversion).
+            // For other regimes: use A-S reversion force.
+            if (condition == MarketCondition::MeanReverting) {
+                q -= theta * q;
+            } else {
+                q -= as_force * q;
             }
 
-            // Add drift component for trending markets.
-            // This represents the systematic fill asymmetry that occurs even
-            // when individual fills are modeled discretely above.
-            // (The discrete fill model above captures SOME of the bias, but
-            // the explicit drift term ensures the correct mean trajectory.)
-            if (condition == MarketCondition::TrendingUp ||
-                condition == MarketCondition::TrendingDown) {
-                q += drift_per_block * 0.1;  // Partial; most drift is in fill asymmetry.
-            }
+            const double abs_q = std::abs(q);
 
-            // Check first-passage times.
-            if (!hit_soft && std::abs(q) >= L_soft) {
-                t_soft = static_cast<double>(b + 1);
+            // Record first-passage to soft limit.
+            if (!hit_soft && abs_q >= L_soft) {
+                soft_times[p] = static_cast<double>(b);
                 hit_soft = true;
             }
-            if (!hit_hard && std::abs(q) >= L_hard) {
-                t_hard = static_cast<double>(b + 1);
+
+            // Record first-passage to hard limit.
+            if (!hit_hard && abs_q >= L_hard) {
+                hard_times[p] = static_cast<double>(b);
                 hit_hard = true;
             }
 
-            // Once hard limit is hit, no need to continue this path.
-            if (hit_hard) {
+            // If both limits breached, no need to continue this path.
+            if (hit_soft && hit_hard) {
                 break;
             }
         }
 
-        soft_times.push_back(t_soft);
-        hard_times.push_back(t_hard);
-
-        // Record final ratio for steady-state estimation.
-        const double final_ratio = 0.5 + q / (2.0 * V_xch);
-        final_ratios.push_back(std::clamp(final_ratio, 0.0, 1.0));
+        // Convert final inventory deviation to a ratio for steady-state stats.
+        // ratio = 0.5 + q * xch_price / total_value.
+        const double final_ratio =
+            0.5 + q * cfg_.xch_price_usd / cfg_.total_portfolio_value_usd;
+        sum_final_ratio    += final_ratio;
+        sum_final_ratio_sq += final_ratio * final_ratio;
     }
 
-    // -- Compute statistics --------------------------------------------------
+    // -- Compute summary statistics ------------------------------------------
 
-    DriftSimulationResult result{};
-    result.num_paths = num_paths;
-
-    // Sort for percentile computation.
+    // Sort first-passage times for percentile extraction.
     std::sort(soft_times.begin(), soft_times.end());
     std::sort(hard_times.begin(), hard_times.end());
 
-    // Mean.
-    const double soft_sum = std::accumulate(
-        soft_times.begin(), soft_times.end(), 0.0);
-    const double hard_sum = std::accumulate(
-        hard_times.begin(), hard_times.end(), 0.0);
+    // Helper: compute mean of a vector.
+    const auto vec_mean = [](const std::vector<double>& v) -> double {
+        return std::accumulate(v.begin(), v.end(), 0.0) /
+               static_cast<double>(v.size());
+    };
 
-    result.mean_time_to_soft_blocks = soft_sum / static_cast<double>(num_paths);
-    result.mean_time_to_hard_blocks = hard_sum / static_cast<double>(num_paths);
+    // Helper: linearly-interpolated percentile on a sorted vector.
+    const auto percentile = [](const std::vector<double>& sorted_v,
+                                double pct) -> double {
+        if (sorted_v.empty()) return 0.0;
+        const double idx =
+            pct * static_cast<double>(sorted_v.size() - 1);
+        const auto lo = static_cast<std::size_t>(std::floor(idx));
+        const auto hi = static_cast<std::size_t>(std::ceil(idx));
+        if (lo == hi) return sorted_v[lo];
+        const double frac = idx - static_cast<double>(lo);
+        return sorted_v[lo] * (1.0 - frac) + sorted_v[hi] * frac;
+    };
 
-    // Percentiles (5th and 95th).
-    const auto p05_idx = static_cast<std::size_t>(
-        0.05 * static_cast<double>(num_paths));
-    const auto p95_idx = static_cast<std::size_t>(
-        0.95 * static_cast<double>(num_paths));
+    DriftSimulationResult result{};
+    result.mean_time_to_soft_blocks = vec_mean(soft_times);
+    result.mean_time_to_hard_blocks = vec_mean(hard_times);
+    result.p05_time_to_soft_blocks  = percentile(soft_times, 0.05);
+    result.p95_time_to_soft_blocks  = percentile(soft_times, 0.95);
+    result.p05_time_to_hard_blocks  = percentile(hard_times, 0.05);
+    result.p95_time_to_hard_blocks  = percentile(hard_times, 0.95);
 
-    result.p05_time_to_soft_blocks = soft_times[p05_idx];
-    result.p95_time_to_soft_blocks = soft_times[p95_idx];
-    result.p05_time_to_hard_blocks = hard_times[p05_idx];
-    result.p95_time_to_hard_blocks = hard_times[p95_idx];
-
-    // Steady-state distribution.
-    const double ratio_sum = std::accumulate(
-        final_ratios.begin(), final_ratios.end(), 0.0);
-    result.steady_state_mean_ratio = ratio_sum / static_cast<double>(num_paths);
-
-    double var_sum = 0.0;
-    for (const double r : final_ratios) {
-        const double d = r - result.steady_state_mean_ratio;
-        var_sum += d * d;
-    }
+    const double n = static_cast<double>(num_paths);
+    result.steady_state_mean_ratio  = sum_final_ratio / n;
     result.steady_state_sigma_ratio =
-        std::sqrt(var_sum / static_cast<double>(num_paths));
+        std::sqrt(std::max(0.0, sum_final_ratio_sq / n -
+                                (sum_final_ratio / n) *
+                                (sum_final_ratio / n)));
+    result.num_paths = num_paths;
+
+    spdlog::info("simulate_drift: {} paths, condition={}, "
+                 "mean_soft={:.0f} mean_hard={:.0f} blocks",
+                 num_paths, to_string(condition),
+                 result.mean_time_to_soft_blocks,
+                 result.mean_time_to_hard_blocks);
 
     return result;
 }
@@ -523,87 +473,59 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
 std::vector<TimeToBreachEntry> InventoryDriftAnalyzer::compute_breach_table() const
 {
     std::vector<TimeToBreachEntry> table;
-    table.reserve(6);
+    table.reserve(4);
 
     // Deviation from 0.5 needed for soft and hard limits.
-    const double L_soft = ratio_to_xch_deviation(cfg_.soft_limit_pct, 0.5);
-    const double L_hard = ratio_to_xch_deviation(cfg_.hard_limit_pct, 0.5);
+    const double L_soft    = ratio_to_xch_deviation(cfg_.soft_limit_pct, 0.5);
+    const double L_hard    = ratio_to_xch_deviation(cfg_.hard_limit_pct, 0.5);
+    const double blk_to_hrs = cfg_.block_time_seconds / 3600.0;
 
-    // 1. Random walk (balanced market).
+    // 1. RandomWalk (balanced market, no trend).
     {
-        TimeToBreachEntry entry{};
-        entry.condition          = MarketCondition::RandomWalk;
-        entry.trend_pct_per_day  = 0.0;
-        entry.expected_blocks_to_soft = random_walk_first_passage(L_soft);
-        entry.expected_blocks_to_hard = random_walk_first_passage(L_hard);
-        entry.expected_hours_to_soft  =
-            entry.expected_blocks_to_soft * cfg_.block_time_seconds / 3600.0;
-        entry.expected_hours_to_hard  =
-            entry.expected_blocks_to_hard * cfg_.block_time_seconds / 3600.0;
-        table.push_back(entry);
+        const double bs = random_walk_first_passage(L_soft);
+        const double bh = random_walk_first_passage(L_hard);
+        table.push_back(TimeToBreachEntry{
+            MarketCondition::RandomWalk, 0.0,
+            bs, bh,
+            bs * blk_to_hrs, bh * blk_to_hrs
+        });
     }
 
-    // 2. Trending 5%/day (up).
+    // 2. TrendingUp at 5%/day.
     {
         const double drift = trending_drift_rate(0.05);
-        TimeToBreachEntry entry{};
-        entry.condition          = MarketCondition::TrendingUp;
-        entry.trend_pct_per_day  = 5.0;
-        entry.expected_blocks_to_soft = trending_first_passage(L_soft, drift);
-        entry.expected_blocks_to_hard = trending_first_passage(L_hard, drift);
-        entry.expected_hours_to_soft  =
-            entry.expected_blocks_to_soft * cfg_.block_time_seconds / 3600.0;
-        entry.expected_hours_to_hard  =
-            entry.expected_blocks_to_hard * cfg_.block_time_seconds / 3600.0;
-        table.push_back(entry);
+        const double bs = trending_first_passage(L_soft, drift);
+        const double bh = trending_first_passage(L_hard, drift);
+        table.push_back(TimeToBreachEntry{
+            MarketCondition::TrendingUp, 5.0,
+            bs, bh,
+            bs * blk_to_hrs, bh * blk_to_hrs
+        });
     }
 
-    // 3. Trending 10%/day (up).
+    // 3. TrendingUp at 10%/day.
     {
         const double drift = trending_drift_rate(0.10);
-        TimeToBreachEntry entry{};
-        entry.condition          = MarketCondition::TrendingUp;
-        entry.trend_pct_per_day  = 10.0;
-        entry.expected_blocks_to_soft = trending_first_passage(L_soft, drift);
-        entry.expected_blocks_to_hard = trending_first_passage(L_hard, drift);
-        entry.expected_hours_to_soft  =
-            entry.expected_blocks_to_soft * cfg_.block_time_seconds / 3600.0;
-        entry.expected_hours_to_hard  =
-            entry.expected_blocks_to_hard * cfg_.block_time_seconds / 3600.0;
-        table.push_back(entry);
+        const double bs = trending_first_passage(L_soft, drift);
+        const double bh = trending_first_passage(L_hard, drift);
+        table.push_back(TimeToBreachEntry{
+            MarketCondition::TrendingUp, 10.0,
+            bs, bh,
+            bs * blk_to_hrs, bh * blk_to_hrs
+        });
     }
 
-    // 4. Trending 5%/day (down).
-    {
-        const double drift = trending_drift_rate(0.05);
-        TimeToBreachEntry entry{};
-        entry.condition          = MarketCondition::TrendingDown;
-        entry.trend_pct_per_day  = 5.0;
-        entry.expected_blocks_to_soft = trending_first_passage(L_soft, drift);
-        entry.expected_blocks_to_hard = trending_first_passage(L_hard, drift);
-        entry.expected_hours_to_soft  =
-            entry.expected_blocks_to_soft * cfg_.block_time_seconds / 3600.0;
-        entry.expected_hours_to_hard  =
-            entry.expected_blocks_to_hard * cfg_.block_time_seconds / 3600.0;
-        table.push_back(entry);
-    }
-
-    // 5. Mean-reverting (GLFT with reversion).
+    // 4. MeanReverting (GLFT with reversion).
     {
         const double theta    = glft_theta();
         const double sigma_ss = glft_steady_state_sigma();
-        TimeToBreachEntry entry{};
-        entry.condition          = MarketCondition::MeanReverting;
-        entry.trend_pct_per_day  = 0.0;
-        entry.expected_blocks_to_soft =
-            mean_revert_first_passage(L_soft, theta, sigma_ss);
-        entry.expected_blocks_to_hard =
-            mean_revert_first_passage(L_hard, theta, sigma_ss);
-        entry.expected_hours_to_soft  =
-            entry.expected_blocks_to_soft * cfg_.block_time_seconds / 3600.0;
-        entry.expected_hours_to_hard  =
-            entry.expected_blocks_to_hard * cfg_.block_time_seconds / 3600.0;
-        table.push_back(entry);
+        const double bs = mean_revert_first_passage(L_soft, theta, sigma_ss);
+        const double bh = mean_revert_first_passage(L_hard, theta, sigma_ss);
+        table.push_back(TimeToBreachEntry{
+            MarketCondition::MeanReverting, 0.0,
+            bs, bh,
+            bs * blk_to_hrs, bh * blk_to_hrs
+        });
     }
 
     return table;
@@ -618,24 +540,19 @@ bool InventoryDriftAnalyzer::is_drift_anomalous(
 {
     auto emp = empirical_drift();
     if (!emp.has_value() || emp->second <= 0.0) {
+        // Insufficient data; cannot declare an anomaly.
         return false;
     }
 
-    // Model-expected drift.
-    double expected_ratio_drift = 0.0;
-    if (condition == MarketCondition::TrendingUp) {
-        // Convert XCH/block drift to ratio/block.
-        const double xch_per_ratio =
-            cfg_.total_portfolio_value_usd / cfg_.xch_price_usd;
-        expected_ratio_drift = trending_drift_rate(0.05) / xch_per_ratio;
-    } else if (condition == MarketCondition::TrendingDown) {
-        const double xch_per_ratio =
-            cfg_.total_portfolio_value_usd / cfg_.xch_price_usd;
-        expected_ratio_drift = -trending_drift_rate(0.05) / xch_per_ratio;
-    }
+    const auto& [slope, emp_sigma] = emp.value();
 
-    const double z = (emp->first - expected_ratio_drift) / emp->second;
-    return std::abs(z) > cfg_.anomaly_z_threshold;
+    // For RandomWalk and MeanReverting, expected drift is zero.
+    // For trending conditions, the empirical drift IS the expectation,
+    // so we compare against zero (any drift is the expected drift).
+    double expected_drift = 0.0;
+
+    const double z = std::abs(slope - expected_drift) / emp_sigma;
+    return z > cfg_.anomaly_z_threshold;
 }
 
 std::optional<std::pair<double, double>>
@@ -717,6 +634,7 @@ void InventoryDriftAnalyzer::set_config(const DriftConfig& cfg)
 {
     std::unique_lock lock(mtx_);
     cfg_ = cfg;
+    spdlog::info("InventoryDriftAnalyzer config updated.");
 }
 
 std::size_t InventoryDriftAnalyzer::observation_count() const
@@ -783,54 +701,22 @@ double InventoryDriftAnalyzer::trending_first_passage(
     double L_xch,
     double drift_rate) const
 {
-    // For a Brownian motion with drift mu and diffusion sigma:
-    //   dX = mu * dt + sigma * dW
+    // For a drift-dominated process, the expected time to traverse distance
+    // L is simply the distance divided by the drift speed:
     //
-    // The exact mean first-passage time to reach level L from 0 is:
-    //   E[T] = L / mu  (for mu > 0, L > 0)
+    //   E[T] = L / |drift_rate|
     //
-    // when the drift dominates the diffusion (mu >> sigma^2 / L).
-    //
-    // For mixed drift + diffusion (Wald's equation generalisation):
-    //   E[T] = L / mu    when mu > 0
-    //
-    // If drift is negligible, fall back to the random-walk formula.
+    // Falls back to the random walk estimate when drift_rate is negligibly
+    // small (diffusion-dominated regime).
 
-    if (L_xch <= 0.0) {
-        return 0.0;
-    }
+    const double abs_drift = std::abs(drift_rate);
 
-    if (drift_rate <= 0.0 || !std::isfinite(drift_rate)) {
-        // No drift or invalid drift: fall back to random walk.
+    if (abs_drift < 1.0e-12 || L_xch <= 0.0) {
+        // Drift negligible; fall back to random walk.
         return random_walk_first_passage(L_xch);
     }
 
-    // Compute the diffusion coefficient for comparison.
-    const double dq  = cfg_.avg_fill_size_xch;
-    const double lam = cfg_.fill_rate_per_block;
-    const double diffusion_sigma = dq * std::sqrt(lam);
-
-    // Peclet number: ratio of drift to diffusion over the distance L.
-    // Pe = (drift * L) / sigma^2.  When Pe >> 1, drift dominates.
-    const double sigma_sq = diffusion_sigma * diffusion_sigma;
-    const double peclet   = (drift_rate * L_xch) / std::max(sigma_sq, 1e-20);
-
-    if (peclet > 2.0) {
-        // Drift-dominated regime: E[T] = L / mu.
-        return L_xch / drift_rate;
-    }
-
-    // Mixed regime: use the exact inverse Gaussian first-passage time.
-    // For a Brownian motion with drift mu and diffusion coefficient D:
-    //   E[T] = L / mu    (always, for mu > 0)
-    // but the variance is:
-    //   Var[T] = L * D / mu^3
-    //
-    // The mean is always L / mu regardless of diffusion; diffusion only
-    // affects the VARIANCE of the passage time, not the mean.
-    // (This is a well-known result: Wald's identity for Brownian motion
-    // with positive drift.)
-    return L_xch / drift_rate;
+    return L_xch / abs_drift;
 }
 
 double InventoryDriftAnalyzer::mean_revert_first_passage(
@@ -974,21 +860,17 @@ double InventoryDriftAnalyzer::utxo_amplification(double ratio) const
     // slots, reducing its fill rate and creating a positive feedback loop
     // that accelerates drift.
     //
-    // The utxo_sensitivity parameter in [0, 1] captures how constrained the
-    // coin pool is.  At sensitivity = 0, the UTXO model has no effect (e.g.
-    // if coins are very finely pre-split).  At sensitivity = 1, the
-    // amplification diverges as r -> 0 or 1 (total coin exhaustion on one
-    // side).
+    // Clamped to avoid division by zero or negative values when the product
+    // |2r - 1| * sensitivity approaches or exceeds 1.0.
 
-    const double skew = std::abs(2.0 * ratio - 1.0);
-    const double denom = 1.0 - skew * cfg_.utxo_sensitivity;
+    const double skew    = std::abs(2.0 * ratio - 1.0);
+    const double product = skew * cfg_.utxo_sensitivity;
 
-    // Clamp denominator to prevent division by zero or negative values.
-    if (denom <= 0.01) {
-        return 100.0;  // Cap amplification at 100x.
-    }
+    // Cap the product at 0.95 to keep the amplification finite.
+    constexpr double kMaxProduct = 0.95;
+    const double clamped = std::min(product, kMaxProduct);
 
-    return 1.0 / denom;
+    return 1.0 / (1.0 - clamped);
 }
 
 double InventoryDriftAnalyzer::normal_cdf(double x)
@@ -1029,40 +911,37 @@ RecommendedAction InventoryDriftAnalyzer::determine_action(
     double blocks_to_hard,
     bool   anomaly) const
 {
-    // Action determination priority (highest urgency first):
+    // Action determination based on blocks_to_soft thresholds:
     //
-    // 1. Already past hard limit => ManualRebalance.
-    // 2. Already past soft limit => PullOverweight.
-    // 3. Hard limit < 100 blocks away (~87 min) => ReduceOfferSize.
-    // 4. Soft limit < 100 blocks away => WidenSpread.
-    // 5. Anomaly detected => IncreaseSkew.
-    // 6. Otherwise => NoAction.
+    //   > 2000 blocks (~29 hours): NoAction
+    //   > 500  blocks (~7 hours):  IncreaseSkew
+    //   > 200  blocks (~3 hours):  WidenSpread
+    //   > 50   blocks (~43 min):   ReduceOfferSize
+    //   > 10   blocks (~9 min):    PullOverweight
+    //   <= 10  blocks or anomaly:  ManualRebalance
 
-    const double imbalance = std::abs(current_ratio - 0.5);
-
-    // Check if already past limits.
-    if (current_ratio >= cfg_.hard_limit_pct ||
-        current_ratio <= (1.0 - cfg_.hard_limit_pct)) {
+    // If an anomaly is detected, escalate immediately.
+    if (anomaly) {
+        spdlog::warn("Drift anomaly detected at ratio={:.4f}; "
+                     "recommending ManualRebalance.", current_ratio);
         return RecommendedAction::ManualRebalance;
     }
 
-    if (current_ratio >= cfg_.soft_limit_pct ||
-        current_ratio <= (1.0 - cfg_.soft_limit_pct)) {
+    // If already past the hard limit, require manual intervention.
+    if (blocks_to_hard <= 0.0) {
+        return RecommendedAction::ManualRebalance;
+    }
+
+    if (blocks_to_soft <= 10.0) {
         return RecommendedAction::PullOverweight;
     }
-
-    // Check proximity to limits.
-    static constexpr double kUrgentBlocks = 100.0;
-
-    if (blocks_to_hard <= kUrgentBlocks) {
+    if (blocks_to_soft <= 50.0) {
         return RecommendedAction::ReduceOfferSize;
     }
-
-    if (blocks_to_soft <= kUrgentBlocks) {
+    if (blocks_to_soft <= 200.0) {
         return RecommendedAction::WidenSpread;
     }
-
-    if (anomaly) {
+    if (blocks_to_soft <= 500.0) {
         return RecommendedAction::IncreaseSkew;
     }
 
