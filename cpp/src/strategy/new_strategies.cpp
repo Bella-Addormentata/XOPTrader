@@ -297,16 +297,15 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute per-block sigma and tau in years for the A-S model.
+    // Step 1: Compute tau in years for the A-S model.
     //
-    //   sigma_block = sigma_annual * sqrt(52.0 / kSecondsPerYear)
-    //   tau         = remaining_blocks * 52.0 / kSecondsPerYear
+    //   tau = remaining_blocks * block_time_seconds / kSecondsPerYear
     //
-    // This convention scales volatility to the 52-second block interval
-    // and expresses the remaining horizon as a fraction of a year.
+    // sigma is already annualized; tau is in years from rolling_tau_years().
+    // sigma_annual^2 * tau_years = variance in years (dimensionally correct).
+    // ISO/IEC 5055: correct dimensional analysis -- no per-block conversion
+    // that would produce sigma_block^2 * tau_years ~6 orders too small.
     // -----------------------------------------------------------------
-    const double sigma_blk = annual_to_per_block_vol(
-        sigma, cfg_.block_time_seconds, kSecondsPerYear);
     const double tau = rolling_tau_years(
         block_height, cfg_.horizon_blocks,
         cfg_.block_time_seconds, kSecondsPerYear);
@@ -314,14 +313,14 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     // -----------------------------------------------------------------
     // Step 2: Compute A-S reservation price and half-spread.
     //
-    //   r     = mid - q * gamma * sigma_block^2 * tau
+    //   r     = mid - q * gamma * sigma_annual^2 * tau_years
     //   delta = (1/kappa) * ln(1 + kappa/gamma)
-    //         + 0.5 * gamma * sigma_block^2 * tau
+    //         + 0.5 * gamma * sigma_annual^2 * tau_years
     // -----------------------------------------------------------------
     const double r     = as_reservation_price(mid, q, cfg_.gamma,
-                                              sigma_blk, tau);
+                                              sigma, tau);
     const double delta = as_half_spread(cfg_.gamma, cfg_.kappa,
-                                        sigma_blk, tau);
+                                        sigma, tau);
 
     // -----------------------------------------------------------------
     // Step 3: Apply regime multiplier to the half-spread.
@@ -532,10 +531,13 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute per-block sigma and tau in years.
+    // Step 1: Compute tau in years.
+    //
+    // sigma is already annualized; tau is in years from rolling_tau_years().
+    // sigma_annual^2 * tau_years = variance in years (dimensionally correct).
+    // ISO/IEC 5055: correct dimensional analysis -- no per-block conversion
+    // that would produce sigma_block^2 * tau_years ~6 orders too small.
     // -----------------------------------------------------------------
-    const double sigma_blk = annual_to_per_block_vol(
-        sigma, cfg_.target_block_time, kSecondsPerYear);
     const double tau = rolling_tau_years(
         block_height, cfg_.horizon_blocks,
         cfg_.target_block_time, kSecondsPerYear);
@@ -550,12 +552,12 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     const double kappa_adj = adjusted_kappa();
 
     const double r = as_reservation_price(mid, q, cfg_.gamma,
-                                          sigma_blk, tau);
+                                          sigma, tau);
 
     // Half-spread uses the cadence-adjusted kappa, not the base kappa.
     const double delta = (1.0 / kappa_adj)
                          * std::log(1.0 + kappa_adj / cfg_.gamma)
-                         + 0.5 * cfg_.gamma * sigma_blk * sigma_blk * tau;
+                         + 0.5 * cfg_.gamma * sigma * sigma * tau;
 
     // -----------------------------------------------------------------
     // Step 3: Apply regime multiplier.
@@ -782,10 +784,13 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute per-block sigma and tau in years.
+    // Step 1: Compute tau in years.
+    //
+    // sigma is already annualized; tau is in years from rolling_tau_years().
+    // sigma_annual^2 * tau_years = variance in years (dimensionally correct).
+    // ISO/IEC 5055: correct dimensional analysis -- no per-block conversion
+    // that would produce sigma_block^2 * tau_years ~6 orders too small.
     // -----------------------------------------------------------------
-    const double sigma_blk = annual_to_per_block_vol(
-        sigma, cfg_.block_time_seconds, kSecondsPerYear);
     const double tau = rolling_tau_years(
         block_height, cfg_.horizon_blocks,
         cfg_.block_time_seconds, kSecondsPerYear);
@@ -794,9 +799,9 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
     // Step 2: Compute A-S reservation price and half-spread.
     // -----------------------------------------------------------------
     const double r     = as_reservation_price(mid, q, cfg_.gamma,
-                                              sigma_blk, tau);
+                                              sigma, tau);
     const double delta = as_half_spread(cfg_.gamma, cfg_.kappa,
-                                        sigma_blk, tau);
+                                        sigma, tau);
 
     // -----------------------------------------------------------------
     // Step 3: Apply regime multiplier.

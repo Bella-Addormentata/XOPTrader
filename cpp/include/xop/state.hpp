@@ -48,7 +48,9 @@ struct Position {
     /// Record an inflow of `qty` mojos purchased at `unit_price` mojos-of-quote
     /// per mojo-of-base.  Updates balance, total_cost, and recomputes the
     /// weighted-average cost_basis.
-    void add(Mojo qty, Mojo unit_price);
+    /// Returns false (and leaves state unchanged) on overflow or invalid input.
+    /// ISO/IEC 5055 -- CWE-190: callers must check the return value.
+    [[nodiscard]] bool add(Mojo qty, Mojo unit_price);
 
     /// Record an outflow of `qty` mojos sold.  Reduces balance and total_cost
     /// proportionally, preserving cost_basis (weighted-average drawdown).

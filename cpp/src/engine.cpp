@@ -40,6 +40,10 @@ namespace xop {
 
 namespace asio = boost::asio;
 
+// [H9] Fallback XCH/USD rate when CEX feed is unavailable (Phase 2).
+// ISO/IEC 5055: no magic numbers in financial calculations.
+static constexpr double kFallbackXchUsdRate = 2.70;
+
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -615,18 +619,34 @@ void Engine::step_process_fills(BlockHeight block_height)
         // ISO/IEC 5055: validated lookup before use.
         const PairConfig* fill_pair_cfg = find_pair_config(fill.pair_name);
 
+        // [H3] Guard against fills for unconfigured pairs.
+        // ISO/IEC 5055: null-pointer dereference prevention.
+        if (!fill_pair_cfg) {
+            spdlog::error("[Engine] Fill for unconfigured pair '{}' -- skipping",
+                          fill.pair_name);
+            continue;
+        }
+
         // Retrieve cost basis from the inventory tracker for PnL calculation.
         // For asks (sells), use the pair's base asset; for bids (buys),
         // use the pair's quote asset.
         auto asset_rec = inventory_->get_record(
             (fill.side == Side::Ask)
-                ? AssetId{fill_pair_cfg ? fill_pair_cfg->base_asset_id
-                                        : std::string{}}
-                : AssetId{fill_pair_cfg ? fill_pair_cfg->quote_asset_id
-                                        : std::string{}});
+                ? AssetId{fill_pair_cfg->base_asset_id}
+                : AssetId{fill_pair_cfg->quote_asset_id});
         tr.cost_basis_mojos   = asset_rec.weighted_avg_cost_basis;
+        // [C2] PnL unit normalization -- prevent mojos-squared overflow.
+        // Price is in "mojos per XCH" (i.e. mojos_quote per kMojosPerXch
+        // mojos_base).  To obtain PnL in quote mojos:
+        //   pnl = (sell_price - cost_basis) * size / kMojosPerXch
+        // We use double intermediates to avoid int64 overflow on the
+        // multiply (two 1e12-scale values can exceed 2^63).
+        // ISO/IEC 5055: explicit unit normalization for financial calc.
         tr.realized_pnl_mojos = (fill.side == Side::Ask)
-            ? (fill.price - asset_rec.weighted_avg_cost_basis) * fill.size
+            ? static_cast<Mojo>(
+                  static_cast<double>(fill.price - asset_rec.weighted_avg_cost_basis)
+                  * static_cast<double>(fill.size)
+                  / static_cast<double>(kMojosPerXch))
             : 0;
 
         db_->insert_trade(tr);
@@ -636,8 +656,8 @@ void Engine::step_process_fills(BlockHeight block_height)
 
         // Update the inventory tracker using the pair's actual base asset.
         auto now = std::chrono::system_clock::now();
-        const std::string& fill_base =
-            fill_pair_cfg ? fill_pair_cfg->base_asset_id : fill.pair_name;
+        // [H3] fill_pair_cfg is guaranteed non-null (guarded above).
+        const std::string& fill_base = fill_pair_cfg->base_asset_id;
         if (fill.side == Side::Bid) {
             inventory_->record_buy(fill_base, fill.size, fill.price,
                                    fill.block_height, now);
@@ -710,7 +730,11 @@ void Engine::step_update_analytics(BlockHeight block_height)
         // PIN estimator updates happen after fills (in step 2, once we
         // have subsequent price data).  Here we just record the latest
         // regime for logging.
-        auto& vol_est = *vol_estimators_[pair.name];
+        // [H5] Use the vol_it iterator from find() above instead of
+        // operator[] which inserts a nullptr on missing keys.
+        // ISO/IEC 5055: prevent default-insertion in associative container.
+        if (vol_it == vol_estimators_.end()) continue;
+        auto& vol_est = *vol_it->second;
         auto regime = vol_est.get_regime();
 
         spdlog::debug("[Engine] Step 3: {} sigma_block={:.6f} regime={}",
@@ -736,7 +760,13 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         }
 
         double mid = market_data_->get_mid_price(pair_name);
-        if (mid <= 0.0) continue;
+        // [M1] Invalidate quote when mid-price is non-positive, so
+        // downstream steps do not act on a stale quote_valid flag.
+        // ISO/IEC 5055: defensive guard on financial input data.
+        if (mid <= 0.0) {
+            pcs.quote_valid = false;
+            continue;
+        }
 
         // Resolve pair config for this pair (O(1) map lookup).
         const PairConfig* pair_cfg = find_pair_config(pair_name);
@@ -784,6 +814,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
     int day_of_week = (utc_tm.tm_wday == 0) ? 7 : utc_tm.tm_wday; // ISO: Mon=1..Sun=7
 
     for (auto& [pair_name, pcs] : cycle_) {
+        // [H1] Skip pairs whose quote was invalidated in step 4.
+        // ISO/IEC 5055: guard prevents operating on invalid state.
+        if (!pcs.quote_valid) continue;
+
         double mid = market_data_->get_mid_price(pair_name);
         if (mid <= 0.0) continue;
 
@@ -921,6 +955,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 void Engine::step_apply_risk_limits(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
+        // [H2] Skip pairs whose quote was invalidated in prior steps.
+        // ISO/IEC 5055: guard prevents operating on invalid state.
+        if (!pcs.quote_valid) continue;
+
         // Find the pair config for base/quote asset IDs (O(1) map lookup).
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
@@ -1000,7 +1038,10 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                         : 0.0;
                 }
                 mkt_params.fill_rate_per_block = 0.03;  // conservative estimate
-                mkt_params.spread_bps = pcs.spread_result.half_spread;
+                // [C4] Full spread in bps for EV revenue estimation.
+                // ISO/IEC 5055: half_spread was incorrect; loss manager
+                // needs the total spread to estimate capture revenue.
+                mkt_params.spread_bps = pcs.spread_result.total_spread_bps;
                 mkt_params.vpin = market_data_->get_vpin(pair_name);
                 mkt_params.variance_ratio = strategy_
                     ? strategy_->current_regime().variance_ratio
@@ -1240,8 +1281,10 @@ void Engine::step_update_pnl(BlockHeight block_height)
             auto rec = inventory_->get_record(AssetId{asset});
             return rec.weighted_avg_cost_basis;
         },
-        // XCH/USD rate (Phase 2: fetch from CEX; default placeholder).
-        2.70);
+        // [H9] XCH/USD rate -- use named constant instead of magic number.
+        // TODO: fetch from CEX feed (Phase 2).
+        // ISO/IEC 5055: no magic numbers in financial calculations.
+        kFallbackXchUsdRate);
 
     // Persist a snapshot for each enabled pair.
     std::vector<DbSnapshot> batch;
@@ -1381,7 +1424,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // PnL state.
     auto total = pnl_->get_total_pnl();
     bs.total_pnl = total.total_pnl;
-    bs.peak_pnl  = total.total_pnl;  // Phase 2: track high-water mark.
+    // [H6] Track the PnL high-water mark across cycles for drawdown alerts.
+    // ISO/IEC 5055: monotonically non-decreasing peak prevents false
+    // drawdown resets when total_pnl oscillates.
+    peak_pnl_hwm_ = std::max(peak_pnl_hwm_, total.total_pnl);
+    bs.peak_pnl  = peak_pnl_hwm_;
 
     // Inventory exposure.
     bs.max_inventory_ratio = 0.5;  // Phase 2: compute max across all pairs.

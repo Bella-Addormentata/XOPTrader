@@ -127,6 +127,10 @@ DriftReport InventoryDriftAnalyzer::analyze_drift(
     MarketCondition condition,
     double          trend_pct_day) const
 {
+    // ISO/IEC 5055 -- CWE-362: acquire shared lock to protect cfg_ reads
+    // from concurrent set_config() writes.
+    std::shared_lock lock(mtx_);
+
     DriftReport report{};
 
     // -- Current state -------------------------------------------------------
@@ -165,7 +169,8 @@ DriftReport InventoryDriftAnalyzer::analyze_drift(
     }
 
     // Use empirical drift if available; fall back to model.
-    auto emp = empirical_drift();
+    // Call the unlocked variant since we already hold mtx_ (shared lock).
+    auto emp = empirical_drift_unlocked();
     if (emp.has_value()) {
         // Convert ratio-space drift to XCH-space:
         //   d(ratio)/d(block) * V_total / price = XCH/block.
@@ -319,6 +324,10 @@ DriftSimulationResult InventoryDriftAnalyzer::simulate_drift(
     uint32_t        max_blocks,
     uint64_t        seed) const
 {
+    // ISO/IEC 5055 -- CWE-362: acquire shared lock to protect cfg_ reads
+    // from concurrent set_config() writes.
+    std::shared_lock lock(mtx_);
+
     // Seed the RNG.  If seed == 0, use a hardware random device.
     std::mt19937_64 rng;
     if (seed != 0) {
@@ -571,7 +580,13 @@ std::optional<std::pair<double, double>>
 InventoryDriftAnalyzer::empirical_drift() const
 {
     std::shared_lock lock(mtx_);
+    return empirical_drift_unlocked();
+}
 
+// ISO/IEC 5055 -- CWE-362: lock-free helper; caller must already hold mtx_.
+std::optional<std::pair<double, double>>
+InventoryDriftAnalyzer::empirical_drift_unlocked() const
+{
     // Need at least 10 observations for a meaningful linear regression.
     if (observations_.size() < 10) {
         return std::nullopt;

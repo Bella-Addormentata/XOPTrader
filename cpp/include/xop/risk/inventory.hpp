@@ -31,6 +31,7 @@
 #include "xop/types.hpp"
 #include "xop/config.hpp"
 
+#include <atomic>
 #include <cstdint>
 #include <shared_mutex>
 #include <string>
@@ -330,7 +331,10 @@ private:
     double single_cat_cap_pct_;
     double kelly_fraction_;
     double max_capital_per_pair_pct_;
-    bool   no_loss_constraint_;
+    // ISO/IEC 5055: atomic to prevent data races -- this flag is read by
+    // record_sell() / min_ask_price() (under mtx_records_) and written by
+    // set_no_loss_constraint() without holding that mutex.
+    std::atomic<bool> no_loss_constraint_;
 };
 
 }  // namespace xop

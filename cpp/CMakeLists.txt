@@ -59,13 +59,21 @@ endif()
 # ---------- Hardening flags (ISO/IEC 5055 — CWE mitigation) ---------------
 if(NOT MSVC)
     add_compile_options(
+        # ISO/IEC 5055 -- additional warnings for financial code correctness:
+        # -Wshadow: detect accidental variable shadowing (CWE-710)
+        # -Wformat-security / -Wformat=2: catch format-string vulnerabilities (CWE-134)
+        # -Wdouble-promotion: flag implicit float-to-double promotions in arithmetic
         -Wall -Wextra -Wpedantic -Werror=return-type
+        -Wshadow -Wformat-security -Wformat=2 -Wdouble-promotion
         -fstack-protector-strong
-        -D_FORTIFY_SOURCE=2
+        # ISO/IEC 5055 -- _FORTIFY_SOURCE requires optimisation (-O1+); applying
+        # it in Debug (-O0) builds causes compiler warnings or has no effect.
+        $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
     )
     add_link_options(-Wl,-z,relro -Wl,-z,now)
 else()
-    add_compile_options(/W4 /sdl /GS /guard:cf)
+    # ISO/IEC 5055 -- /WX promotes warnings to errors, enforcing clean builds.
+    add_compile_options(/W4 /WX /sdl /GS /guard:cf)
     add_link_options(/guard:cf)
 endif()
 
@@ -147,6 +155,13 @@ target_link_libraries(xop_core PUBLIC xop_deps)
 # ==========================================================================
 add_executable(xop_trader src/main.cpp)
 target_link_libraries(xop_trader PRIVATE xop_core)
+
+# ISO/IEC 5055 -- PIE (Position-Independent Executable) enables full ASLR,
+# mitigating CWE-119 class memory-corruption exploits at runtime.
+if(NOT MSVC)
+    target_compile_options(xop_trader PRIVATE -fPIE)
+    target_link_options(xop_trader PRIVATE -pie)
+endif()
 
 # ==========================================================================
 # Tests (Google Test or Catch2 — to be wired in Phase 2)

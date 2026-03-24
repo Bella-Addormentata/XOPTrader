@@ -227,6 +227,7 @@ public:
 
     /// Insert a single trade record into the SQLite trade_log table.
     /// Uses a parameterised prepared statement to prevent SQL injection.
+    /// Thread-safe: acquires mtx_ internally.
     void insert_trade(const TradeRecord& record);
 
     /// Query trades for a specific pair within a time range.
@@ -300,6 +301,10 @@ private:
     /// Build a PnLSummary from a PairPnL accumulator.
     [[nodiscard]] PnLSummary build_summary(const PairPnL& ppnl,
                                             double xch_usd) const;
+
+    /// Lock-free insert helper; caller must already hold mtx_.
+    /// ISO/IEC 5055 -- CWE-362: separated to avoid deadlock with record_fill.
+    void insert_trade_unlocked(const TradeRecord& record);
 
     /// Finalise and null-out a prepared statement, ignoring errors.
     static void finalize_stmt(sqlite3_stmt*& stmt) noexcept;

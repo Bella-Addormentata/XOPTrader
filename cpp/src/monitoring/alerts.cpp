@@ -174,24 +174,30 @@ bool AlertManager::is_enabled() const noexcept
 //  Rate Limiting
 // ===================================================================
 
-bool AlertManager::check_rate_limit(AlertTier tier)
+// ISO/IEC 5055: rate limiting is keyed by AlertRule, not AlertTier, so that
+// each of the 14 alert rules has its own independent cooldown.  The previous
+// per-tier design allowed a single rapid-firing rule (e.g. SpreadWidening)
+// to suppress all other WARNING-tier rules sharing the same cooldown bucket.
+bool AlertManager::check_rate_limit(AlertRule rule)
 {
+    const AlertTier tier = tier_for_rule(rule);
+
     // INFO tier is handled by batch buffering, not per-message rate limiting.
     if (tier == AlertTier::INFO) {
         return true;
     }
 
-    const auto key = static_cast<std::uint8_t>(tier);
+    const auto key = static_cast<std::uint8_t>(rule);
     const auto now = Clock::now();
 
-    // Determine the cooldown for this tier.
+    // Determine the cooldown from the rule's tier.
     const auto cooldown = (tier == AlertTier::CRITICAL)
         ? cooldown_critical_
         : cooldown_warning_;
 
     auto it = last_sent_.find(key);
     if (it == last_sent_.end()) {
-        // First alert of this tier -- always permit.
+        // First alert for this rule -- always permit.
         last_sent_[key] = now;
         return true;
     }
@@ -206,7 +212,7 @@ bool AlertManager::check_rate_limit(AlertTier tier)
 
     // Rate-limited: log at debug for audit trail but do not send.
     spdlog::debug("AlertManager: {} alert rate-limited ({}/{} seconds elapsed)",
-                  to_string(tier), elapsed.count(), cooldown.count());
+                  to_string(rule), elapsed.count(), cooldown.count());
     return false;
 }
 
@@ -237,8 +243,53 @@ void AlertManager::send_alert(AlertTier tier, const std::string& message)
         return;
     }
 
-    // CRITICAL / WARNING: check per-tier rate limit.
-    if (!check_rate_limit(tier)) {
+    // NOTE: This tier-based overload is kept for backward compatibility
+    // (e.g. direct INFO sends).  For rule-based dispatch with per-rule
+    // rate limiting, use send_alert(AlertRule, message) instead.
+
+    if (!enabled_) {
+        return;
+    }
+
+    // Format the Telegram message with a tier prefix and label.
+    std::string prefix;
+    switch (tier) {
+        case AlertTier::CRITICAL: prefix = "[CRITICAL] "; break;
+        case AlertTier::WARNING:  prefix = "[WARNING] ";  break;
+        default:                  prefix = "[INFO] ";     break;
+    }
+
+    post_telegram(prefix + message);
+}
+
+// ISO/IEC 5055: per-rule alert dispatch with independent cooldowns.
+void AlertManager::send_alert(AlertRule rule, const std::string& message)
+{
+    const AlertTier tier = tier_for_rule(rule);
+
+    std::lock_guard lock(mtx_);
+
+    // Always log the alert locally regardless of Telegram delivery.
+    switch (tier) {
+        case AlertTier::CRITICAL:
+            spdlog::error("[ALERT:CRITICAL] {}", message);
+            break;
+        case AlertTier::WARNING:
+            spdlog::warn("[ALERT:WARNING] {}", message);
+            break;
+        case AlertTier::INFO:
+            spdlog::info("[ALERT:INFO] {}", message);
+            break;
+    }
+
+    // INFO tier: accumulate into the batch buffer for hourly flush.
+    if (tier == AlertTier::INFO) {
+        info_batch_.push_back(message);
+        return;
+    }
+
+    // CRITICAL / WARNING: check per-rule rate limit.
+    if (!check_rate_limit(rule)) {
         return;
     }
 
@@ -246,7 +297,7 @@ void AlertManager::send_alert(AlertTier tier, const std::string& message)
         return;
     }
 
-    // Format the Telegram message with a tier prefix emoji and label.
+    // Format the Telegram message with a tier prefix and label.
     std::string prefix;
     switch (tier) {
         case AlertTier::CRITICAL: prefix = "[CRITICAL] "; break;
@@ -480,7 +531,7 @@ void AlertManager::check_node_desync(const BotState& state)
         state.network_block_height - state.current_block_height);
 
     if (blocks_behind > threshold) {
-        send_alert(AlertTier::CRITICAL,
+        send_alert(AlertRule::NodeDesync,
             fmt::format("Node desync: {} blocks behind network tip (height {} vs {})",
                         static_cast<int>(blocks_behind),
                         state.current_block_height,
@@ -492,7 +543,7 @@ void AlertManager::check_node_desync(const BotState& state)
 void AlertManager::check_wallet_unreachable(const BotState& state)
 {
     if (!state.wallet_connected) {
-        send_alert(AlertTier::CRITICAL,
+        send_alert(AlertRule::WalletUnreachable,
                    "Wallet RPC unreachable -- cannot create or cancel offers");
     }
 }
@@ -501,7 +552,7 @@ void AlertManager::check_wallet_unreachable(const BotState& state)
 void AlertManager::check_exposure_breach(const BotState& state)
 {
     if (state.max_inventory_ratio > state.hard_limit_pct) {
-        send_alert(AlertTier::CRITICAL,
+        send_alert(AlertRule::ExposureBreach,
             fmt::format("Exposure breach: inventory ratio {:.1f}% exceeds "
                         "hard limit {:.1f}%",
                         state.max_inventory_ratio * 100.0,
@@ -525,7 +576,7 @@ void AlertManager::check_flash_crash(const BotState& state)
             / static_cast<double>(pair.recent_high);
 
         if (drop_pct >= threshold) {
-            send_alert(AlertTier::CRITICAL,
+            send_alert(AlertRule::FlashCrash,
                 fmt::format("Flash crash on {}: {:.1f}% drop (high={}, mid={})",
                             pair.pair_name,
                             drop_pct * 100.0,
@@ -549,7 +600,7 @@ void AlertManager::check_fill_rate_drop(const BotState& state)
     const double ratio = state.fill_rate_per_hour / state.avg_fill_rate_24h;
 
     if (ratio < threshold) {
-        send_alert(AlertTier::WARNING,
+        send_alert(AlertRule::FillRateDrop,
             fmt::format("Fill rate drop: {:.2f}/hr vs {:.2f}/hr 24h avg "
                         "({:.0f}% of normal)",
                         state.fill_rate_per_hour,
@@ -572,7 +623,7 @@ void AlertManager::check_spread_widening(const BotState& state)
         const double ratio = pair.current_spread_bps / pair.normal_spread_bps;
 
         if (ratio > threshold) {
-            send_alert(AlertTier::WARNING,
+            send_alert(AlertRule::SpreadWidening,
                 fmt::format("Spread widening on {}: {:.1f} bps "
                             "({:.1f}x normal {:.1f} bps)",
                             pair.pair_name,
@@ -592,7 +643,7 @@ void AlertManager::check_underwater_positions(const BotState& state)
         }
 
         if (asset.cost_basis > asset.market_price && asset.market_price > 0) {
-            send_alert(AlertTier::WARNING,
+            send_alert(AlertRule::UnderwaterPosition,
                 fmt::format("Underwater position: {} (cost={}, market={})",
                             asset.asset_id,
                             asset.cost_basis,
@@ -615,7 +666,7 @@ void AlertManager::check_concentration_breach(const BotState& state)
         }
 
         if (asset.portfolio_pct > threshold) {
-            send_alert(AlertTier::WARNING,
+            send_alert(AlertRule::ConcentrationBreach,
                 fmt::format("Concentration breach: {} at {:.1f}% of portfolio "
                             "(cap {:.1f}%)",
                             asset.asset_id,
@@ -639,7 +690,7 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
                           / static_cast<double>(state.peak_pnl);
 
     if (drawdown > threshold) {
-        send_alert(AlertTier::WARNING,
+        send_alert(AlertRule::PnlDrawdown,
             fmt::format("PnL drawdown: {:.1f}% from peak (threshold {:.1f}%)",
                         drawdown * 100.0,
                         threshold * 100.0));
@@ -653,7 +704,7 @@ void AlertManager::check_offer_creation_fail(const BotState& state)
         static_cast<std::uint8_t>(AlertRule::OfferCreationFail));
 
     if (static_cast<double>(state.consecutive_offer_failures) >= threshold) {
-        send_alert(AlertTier::WARNING,
+        send_alert(AlertRule::OfferCreationFail,
             fmt::format("Offer creation failing: {} consecutive failures",
                         state.consecutive_offer_failures));
     }

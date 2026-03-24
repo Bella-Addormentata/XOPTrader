@@ -234,8 +234,11 @@ namespace xop {
 // Construction
 // ===========================================================================
 
+// ISO/IEC 5055: removed noexcept -- the body calls spdlog, which may throw
+// (e.g. std::bad_alloc during string formatting or logger creation).
+// A noexcept function that emits an unhandled exception calls std::terminate.
 StrategicLossManager::StrategicLossManager(
-    const LossManagerConfig& cfg) noexcept
+    const LossManagerConfig& cfg)
     : cfg_{cfg}
 {
     // Validate configuration invariants.
@@ -520,12 +523,14 @@ LossDecision StrategicLossManager::should_rebalance_at_loss(
     // -----------------------------------------------------------------------
     double current_ratio = 0.5;   // Default: balanced.
 
-    // Locate a quote-side asset from the price map.
+    // Pick the quote asset deterministically (sorted by name) to ensure
+    // consistent behavior across runs.  Non-deterministic iteration of
+    // unordered_map would produce unstable inventory ratio readings.
+    // ISO/IEC 5055 -- CWE-330: deterministic asset selection for reproducibility.
     AssetId quote_id;
     for (const auto& [aid, aprice] : price_map) {
-        if (aid != asset_id) {
+        if (aid != asset_id && (quote_id.empty() || aid < quote_id)) {
             quote_id = aid;
-            break;
         }
     }
 

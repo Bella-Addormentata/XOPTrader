@@ -72,6 +72,11 @@ ChiaEdgeOptimizer::ChiaEdgeOptimizer(const ChiaEdgeConfig& cfg)
         throw std::invalid_argument("ChiaEdgeConfig: mempool_mult_floor must be in (0, 1]");
     }
 
+    // Initialize regime to sane defaults so the first compute_quotes() call
+    // before any update_price() produces reasonable spreads (not zero).
+    // ISO/IEC 5055: defensive initialization of derived state.
+    regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+
     spdlog::info("[ChiaEdgeOptimizer] Initialised with composite edge = {:.4f} "
                  "(atomic={:.3f}, cancel={:.3f}, utxo={:.3f}, "
                  "block_time={:.3f}, mempool={:.3f})",
