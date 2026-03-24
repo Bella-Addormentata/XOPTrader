@@ -158,6 +158,53 @@ struct CompetitorMetrics {
     Timestamp    last_updated;           // wall-clock time of last metric update
 };
 
+// ---------------------------------------------------------------------------
+// WhaleTradeEvent -- a single large trade detected on the DEX that exceeds the
+//                    whale-size threshold.  Whale trades create adverse-selection
+//                    risk: the whale likely has an informational edge, so our
+//                    quoted inventory on the opposite side may rapidly lose value.
+// ---------------------------------------------------------------------------
+
+struct WhaleTradeEvent {
+    std::string  pair_name;        // trading pair, e.g. "XCH/wUSDC"
+    Side         side;             // direction the whale traded (Bid = whale bought,
+                                   //   Ask = whale sold)
+    Mojo         size;             // trade size in mojos (base asset)
+    double       size_pct_vol;     // size as a fraction of 24-hour volume (0-1)
+    BlockHeight  block_height;     // block at which the trade was detected
+    Timestamp    detected_at;      // wall-clock time of detection
+};
+
+// ---------------------------------------------------------------------------
+// WhaleMetrics -- aggregated whale-activity statistics for a single trading pair.
+//
+// The strategy layer queries this to decide whether to widen spreads, reduce
+// offer sizes, or pause quoting entirely until the market stabilises.
+//
+// Risks a whale creates:
+//   1. Adverse selection: whale has superior information; our resting orders on
+//      the opposite side are at risk of being taken at a loss.
+//   2. Inventory imbalance: repeated fills on one side skew position dangerously.
+//   3. Price impact: large trades can gap the mid-price, leaving our quotes stale.
+//   4. Liquidation cascade: a whale sell can crater the price, wiping out all bids.
+//
+// Response encoded in spread_multiplier:
+//   - 1.0: normal (no whale activity).
+//   - 1.0 – whale_max_spread_multiplier: linearly scaled to number and size of
+//     recent whale events in the tracking window.
+// ---------------------------------------------------------------------------
+
+struct WhaleMetrics {
+    std::string  pair_name;             // trading pair
+    std::size_t  events_in_window;      // whale trade events in the recent window
+    Mojo         largest_trade_size;    // largest single whale trade seen in window
+    double       spread_multiplier;     // recommended spread widening factor (>= 1.0)
+    Side         dominant_side;         // direction of the most-recent whale event
+    bool         is_active;             // true if at least one event in window
+    BlockHeight  last_event_block;      // block of the most recent whale event
+    Timestamp    last_updated;          // wall-clock time of last computation
+};
+
 }  // namespace xop
 
 #endif  // XOP_TYPES_HPP

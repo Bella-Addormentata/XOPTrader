@@ -86,6 +86,14 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
         std::unique_lock lock(other.mtx_competitor_metrics_);
         competitor_metrics_ = std::move(other.competitor_metrics_);
     }
+    {
+        std::unique_lock lock(other.mtx_whale_events_);
+        whale_events_ = std::move(other.whale_events_);
+    }
+    {
+        std::unique_lock lock(other.mtx_whale_metrics_);
+        whale_metrics_ = std::move(other.whale_metrics_);
+    }
 }
 
 MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
@@ -123,6 +131,16 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
         std::unique_lock lock_dst(mtx_competitor_metrics_);
         std::unique_lock lock_src(other.mtx_competitor_metrics_);
         competitor_metrics_ = std::move(other.competitor_metrics_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_whale_events_);
+        std::unique_lock lock_src(other.mtx_whale_events_);
+        whale_events_ = std::move(other.whale_events_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_whale_metrics_);
+        std::unique_lock lock_src(other.mtx_whale_metrics_);
+        whale_metrics_ = std::move(other.whale_metrics_);
     }
 
     return *this;
@@ -887,6 +905,212 @@ std::size_t MarketDataFeed::get_num_competing_offers(
         return 0;
     }
     return metrics->num_competing_offers;
+}
+
+// =========================================================================
+// Whale detection methods
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// ingest_trade -- record an individual trade and update whale-activity metrics
+//
+// Classifies the trade as a whale event when its size meets either:
+//   (a) the absolute threshold (whale_trade_threshold), or
+//   (b) the fractional-volume threshold (whale_volume_fraction × vol_24h).
+//
+// Non-whale trades are silently discarded.  Whale trades are appended to a
+// per-pair deque and WhaleMetrics is recomputed.
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::ingest_trade(const std::string& pair_name,
+                                  Side               side,
+                                  Mojo               size,
+                                  BlockHeight        block_height)
+{
+    if (size <= 0) {
+        return;  // Guard against degenerate input.
+    }
+
+    // Fetch current 24h volume to evaluate the fractional-volume criterion.
+    const double vol_24h = get_volume_24h(pair_name);  // base-asset units (double)
+
+    // Convert size to base-asset units for the fractional comparison.
+    const double size_units =
+        static_cast<double>(size) / static_cast<double>(kMojosPerXch);
+
+    // Compute size as a fraction of 24h volume (guard against zero volume).
+    const double size_pct_vol =
+        (vol_24h > 0.0) ? (size_units / vol_24h) : 0.0;
+
+    // Determine whether this qualifies as a whale trade.
+    const bool absolute_threshold_met = (size >= config_.whale_trade_threshold);
+    const bool volume_fraction_met =
+        (vol_24h > 0.0) && (size_pct_vol >= config_.whale_volume_fraction);
+
+    if (!absolute_threshold_met && !volume_fraction_met) {
+        return;  // Not a whale trade; ignore.
+    }
+
+    // Record the whale event.
+    detect_and_update_whale(pair_name, side, size, block_height);
+}
+
+// -------------------------------------------------------------------------
+// detect_and_update_whale -- append a confirmed whale event and recompute metrics
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
+                                             Side               side,
+                                             Mojo               size,
+                                             BlockHeight        block_height)
+{
+    const double vol_24h = get_volume_24h(pair_name);
+    const double size_units =
+        static_cast<double>(size) / static_cast<double>(kMojosPerXch);
+    const double size_pct_vol =
+        (vol_24h > 0.0) ? (size_units / vol_24h) : 0.0;
+
+    WhaleTradeEvent evt;
+    evt.pair_name    = pair_name;
+    evt.side         = side;
+    evt.size         = size;
+    evt.size_pct_vol = size_pct_vol;
+    evt.block_height = block_height;
+    evt.detected_at  = std::chrono::system_clock::now();
+
+    // Append event and evict stale events outside the rolling window.
+    {
+        std::unique_lock lock(mtx_whale_events_);
+        auto& deq = whale_events_[pair_name];
+        deq.push_back(evt);
+
+        // Evict events older than whale_window_blocks.
+        while (!deq.empty() &&
+               block_height >= deq.front().block_height &&
+               (block_height - deq.front().block_height) >=
+                   static_cast<BlockHeight>(config_.whale_window_blocks))
+        {
+            deq.pop_front();
+        }
+    }
+
+    // Recompute metrics under shared read of the event deque.
+    std::vector<WhaleTradeEvent> events_snapshot;
+    {
+        std::shared_lock lock(mtx_whale_events_);
+        auto it = whale_events_.find(pair_name);
+        if (it != whale_events_.end()) {
+            events_snapshot.assign(it->second.begin(), it->second.end());
+        }
+    }
+
+    if (events_snapshot.empty()) {
+        return;
+    }
+
+    // Find largest trade in window.
+    Mojo largest = 0;
+    for (const auto& e : events_snapshot) {
+        if (e.size > largest) {
+            largest = e.size;
+        }
+    }
+
+    const std::size_t n = events_snapshot.size();
+    const double multiplier = compute_whale_spread_multiplier(n);
+
+    WhaleMetrics wm;
+    wm.pair_name          = pair_name;
+    wm.events_in_window   = n;
+    wm.largest_trade_size = largest;
+    wm.spread_multiplier  = multiplier;
+    wm.dominant_side      = events_snapshot.back().side;
+    wm.is_active          = true;
+    wm.last_event_block   = events_snapshot.back().block_height;
+    wm.last_updated       = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_whale_metrics_);
+        whale_metrics_[pair_name] = wm;
+    }
+
+    spdlog::warn("MarketDataFeed: whale trade detected on pair={}, "
+                 "side={}, size_xch={:.2f}, events_in_window={}, "
+                 "spread_multiplier={:.2f}x",
+                 pair_name,
+                 to_string(side),
+                 static_cast<double>(size) / static_cast<double>(kMojosPerXch),
+                 n,
+                 multiplier);
+}
+
+// -------------------------------------------------------------------------
+// compute_whale_spread_multiplier -- linear interpolation over event count
+//
+// 0 events → 1.0 (no widening)
+// >= whale_window_blocks events → whale_max_spread_multiplier
+// -------------------------------------------------------------------------
+
+double MarketDataFeed::compute_whale_spread_multiplier(
+    std::size_t events_in_window) const
+{
+    if (events_in_window == 0) {
+        return 1.0;
+    }
+
+    // Clamp at the window size so we don't extrapolate beyond max.
+    const double fraction = std::min(
+        static_cast<double>(events_in_window) /
+            static_cast<double>(config_.whale_window_blocks),
+        1.0);
+
+    // Linear interpolation: 1.0 + fraction * (max - 1.0)
+    return 1.0 + fraction * (config_.whale_max_spread_multiplier - 1.0);
+}
+
+// -------------------------------------------------------------------------
+// Public accessor methods for whale metrics
+// -------------------------------------------------------------------------
+
+std::optional<WhaleMetrics> MarketDataFeed::get_whale_metrics(
+    const std::string& pair_name) const
+{
+    // Expire stale whale metrics: if the most recent event is older than the
+    // tracking window, the whale has left and we return nullopt.
+    const BlockHeight current_block =
+        block_height_.load(std::memory_order_relaxed);
+
+    std::shared_lock lock(mtx_whale_metrics_);
+    auto it = whale_metrics_.find(pair_name);
+    if (it == whale_metrics_.end()) {
+        return std::nullopt;
+    }
+
+    const WhaleMetrics& wm = it->second;
+    // Use addition rather than subtraction to avoid unsigned underflow when
+    // current_block is less than last_event_block (e.g. during replay or tests).
+    if (current_block >= wm.last_event_block + static_cast<BlockHeight>(config_.whale_window_blocks))
+    {
+        // Window has expired; behave as if no whale is present.
+        return std::nullopt;
+    }
+
+    return wm;
+}
+
+bool MarketDataFeed::is_whale_active(const std::string& pair_name) const
+{
+    return get_whale_metrics(pair_name).has_value();
+}
+
+double MarketDataFeed::get_whale_spread_multiplier(
+    const std::string& pair_name) const
+{
+    auto wm = get_whale_metrics(pair_name);
+    if (!wm.has_value()) {
+        return 1.0;
+    }
+    return wm->spread_multiplier;
 }
 
 // -------------------------------------------------------------------------
