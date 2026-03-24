@@ -303,6 +303,15 @@ void PnLTracker::init_database()
 
 void PnLTracker::insert_trade(const TradeRecord& record)
 {
+    // ISO/IEC 5055 -- CWE-362: protect SQLite prepared-statement access from
+    // concurrent callers.  Callers that already hold mtx_ (e.g. record_fill)
+    // must use insert_trade_unlocked() to avoid deadlock.
+    std::lock_guard<std::mutex> lock(mtx_);
+    insert_trade_unlocked(record);
+}
+
+void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
+{
     if (!db_ || !stmt_insert_) {
         throw std::runtime_error(
             "PnLTracker::insert_trade: database not initialised");
@@ -326,7 +335,9 @@ void PnLTracker::insert_trade(const TradeRecord& record)
     sqlite3_bind_int64(stmt_insert_, 7, record.fee_mojos);
     sqlite3_bind_int64(stmt_insert_, 8, record.cost_basis_mojos);
     sqlite3_bind_int64(stmt_insert_, 9, record.realized_pnl_mojos);
-    sqlite3_bind_int(stmt_insert_,  10, static_cast<int>(record.block_height));
+    // ISO/IEC 5055 -- CWE-681: use int64 to avoid truncation of BlockHeight
+    // (uint32_t can exceed INT_MAX when high bit is set).
+    sqlite3_bind_int64(stmt_insert_, 10, static_cast<int64_t>(record.block_height));
     sqlite3_bind_text(stmt_insert_, 11, record.offer_hash.c_str(), -1, SQLITE_TRANSIENT);
 
     const int rc = sqlite3_step(stmt_insert_);
@@ -372,7 +383,8 @@ TradeRecord read_row(sqlite3_stmt* stmt)
     rec.fee_mojos          = sqlite3_column_int64(stmt, 6);
     rec.cost_basis_mojos   = sqlite3_column_int64(stmt, 7);
     rec.realized_pnl_mojos = sqlite3_column_int64(stmt, 8);
-    rec.block_height       = static_cast<BlockHeight>(sqlite3_column_int(stmt, 9));
+    // ISO/IEC 5055 -- CWE-681: use int64 to avoid truncation of BlockHeight.
+    rec.block_height       = static_cast<BlockHeight>(sqlite3_column_int64(stmt, 9));
 
     const char* hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
     rec.offer_hash = hash ? hash : "";
@@ -508,11 +520,14 @@ void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis)
     record.block_height       = fill.block_height;
     record.offer_hash         = fill.offer_id;  // Offer ID is the spend-bundle hash.
 
-    insert_trade(record);
+    // ISO/IEC 5055 -- CWE-362: acquire the lock once for the entire
+    // insert + in-memory update sequence, ensuring atomicity and avoiding
+    // deadlock from nested lock_guard acquisitions.
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    insert_trade_unlocked(record);
 
     // -- Step 3: Update in-memory PnL accumulators -----------------------
-
-    std::lock_guard<std::mutex> lock(mtx_);
 
     auto& ppnl = pair_pnl_[fill.pair_name];
 

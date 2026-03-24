@@ -289,13 +289,19 @@ std::vector<DbTradeRecord> Database::query_trades(
     }
 
     // Step through result rows.
+    // ISO/IEC 5055 -- CWE-476: null-guard all sqlite3_column_text results
+    // to prevent undefined behaviour when columns contain SQL NULL.
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         DbTradeRecord rec;
         // Column indices match the SELECT column order.
-        rec.timestamp          = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
-        rec.trade_id           = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
-        rec.pair_name          = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
-        rec.side               = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        const char* p0 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        rec.timestamp          = p0 ? p0 : "";
+        const char* p1 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 1));
+        rec.trade_id           = p1 ? p1 : "";
+        const char* p2 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 2));
+        rec.pair_name          = p2 ? p2 : "";
+        const char* p3 = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
+        rec.side               = p3 ? p3 : "";
         rec.price_mojos        = sqlite3_column_int64(stmt, 4);
         rec.size_mojos         = sqlite3_column_int64(stmt, 5);
         rec.fee_mojos          = sqlite3_column_int64(stmt, 6);
@@ -419,7 +425,9 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
     if (rc == SQLITE_ROW) {
         DbSnapshot s;
         s.block_height    = static_cast<BlockHeight>(sqlite3_column_int64(stmt_last_snapshot_, 0));
-        s.pair_name       = reinterpret_cast<const char*>(sqlite3_column_text(stmt_last_snapshot_, 1));
+        // ISO/IEC 5055 -- CWE-476: null-guard sqlite3_column_text result.
+        const char* pn = reinterpret_cast<const char*>(sqlite3_column_text(stmt_last_snapshot_, 1));
+        s.pair_name       = pn ? pn : "";
         s.mid_price_mojos = sqlite3_column_int64(stmt_last_snapshot_, 2);
         s.spread_bps      = sqlite3_column_double(stmt_last_snapshot_, 3);
         s.inventory_ratio = sqlite3_column_double(stmt_last_snapshot_, 4);

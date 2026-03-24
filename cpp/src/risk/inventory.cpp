@@ -209,7 +209,8 @@ bool InventoryTracker::record_sell(const AssetId& asset_id,
     // Never-sell-at-loss enforcement.
     // Compare sell_price against weighted_avg_cost_basis.  If the sell would
     // realise a loss and the constraint is active, reject the trade.
-    if (no_loss_constraint_ && rec.total_quantity > 0) {
+    // ISO/IEC 5055: atomic load for thread-safe flag access.
+    if (no_loss_constraint_.load(std::memory_order_acquire) && rec.total_quantity > 0) {
         if (sell_price < rec.weighted_avg_cost_basis) {
             return false;
         }
@@ -412,24 +413,62 @@ RiskStatus InventoryTracker::get_risk_status(
     Mojo           current_price,
     const std::unordered_map<AssetId, Mojo>& price_map) const
 {
+    // ISO/IEC 5055: acquire mtx_records_ once and compute all risk checks
+    // inline.  The previous implementation called is_underwater() and
+    // portfolio_concentration(), each of which acquired the same shared lock,
+    // creating a nested-shared-lock hazard on non-recursive shared_mutex
+    // implementations.
+    std::shared_lock lock(mtx_records_);
+
     // Priority 1 (highest severity): Underwater.
-    // If cost basis exceeds market price, the position is underwater and we
-    // must not sell below cost.
-    if (is_underwater(asset_id, current_price)) {
-        return RiskStatus::Underwater;
+    // Inline the logic from is_underwater() to avoid re-acquiring mtx_records_.
+    {
+        const AssetRecord* rec = find_record_locked(asset_id);
+        if (rec && rec->total_quantity != 0 &&
+            rec->weighted_avg_cost_basis > current_price) {
+            return RiskStatus::Underwater;
+        }
     }
 
-    // Priority 2: Hard limit.
-    // If portfolio concentration exceeds the hard limit, pull quotes on the
-    // overweight side.
-    const double concentration = portfolio_concentration(asset_id, price_map);
+    // Priority 2 & 3: Portfolio concentration (soft / hard limits).
+    // Inline the logic from portfolio_concentration() to avoid re-acquiring
+    // mtx_records_.
+    double concentration = 0.0;
+    {
+        double asset_value = 0.0;
+        double total_value = 0.0;
+
+        for (const auto& [id, rec] : records_) {
+            if (rec.total_quantity == 0) {
+                continue;
+            }
+
+            Mojo price = 0;
+            auto pit = price_map.find(id);
+            if (pit != price_map.end()) {
+                price = pit->second;
+            } else {
+                price = rec.weighted_avg_cost_basis;
+            }
+
+            const double value = static_cast<double>(rec.total_quantity)
+                               * static_cast<double>(price);
+            total_value += value;
+
+            if (id == asset_id) {
+                asset_value = value;
+            }
+        }
+
+        if (total_value > 0.0) {
+            concentration = asset_value / total_value;
+        }
+    }
 
     if (concentration >= hard_limit_pct_) {
         return RiskStatus::HardLimit;
     }
 
-    // Priority 3: Soft limit.
-    // If concentration exceeds the soft limit, begin aggressive skewing.
     if (concentration >= soft_limit_pct_) {
         return RiskStatus::SoftLimit;
     }
@@ -555,17 +594,20 @@ std::vector<AssetRecord> InventoryTracker::get_all_records() const
 
 bool InventoryTracker::no_loss_constraint_enabled() const noexcept
 {
-    return no_loss_constraint_;
+    // ISO/IEC 5055: explicit atomic load for thread-safe flag access.
+    return no_loss_constraint_.load(std::memory_order_acquire);
 }
 
 void InventoryTracker::set_no_loss_constraint(bool enabled) noexcept
 {
-    no_loss_constraint_ = enabled;
+    // ISO/IEC 5055: explicit atomic store for thread-safe flag update.
+    no_loss_constraint_.store(enabled, std::memory_order_release);
 }
 
 Mojo InventoryTracker::min_ask_price(const AssetId& asset_id) const
 {
-    if (!no_loss_constraint_) {
+    // ISO/IEC 5055: atomic load for thread-safe flag access.
+    if (!no_loss_constraint_.load(std::memory_order_acquire)) {
         return 0;
     }
 

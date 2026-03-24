@@ -154,12 +154,10 @@ void DexieClient::open() {
         return; // Idempotent.
     }
 
-    // Global curl init is ref-counted and safe to call multiple times.
-    const CURLcode rc = curl_global_init(CURL_GLOBAL_DEFAULT);
-    if (rc != CURLE_OK) {
-        throw DexieError(std::string("curl_global_init failed: ") +
-                         curl_easy_strerror(rc));
-    }
+    // curl_global_init() is called once at process startup in main.cpp.
+    // It must NOT be called here -- it is not thread-safe and would race
+    // with Chia RPC's curl usage.
+    // ISO/IEC 5055: single initialization point for global resources.
 
     // Create the multi-handle that acts as the connection pool.
     CURLM* raw_multi = curl_multi_init();

@@ -194,7 +194,8 @@ public:
 
     /// Construct with a validated configuration.  The config is copied and
     /// stored immutably.
-    explicit StrategicLossManager(const LossManagerConfig& cfg) noexcept;
+    /// ISO/IEC 5055: not noexcept -- body calls spdlog which may throw.
+    explicit StrategicLossManager(const LossManagerConfig& cfg);
 
     // -- Primary interface --------------------------------------------------
 

@@ -255,7 +255,18 @@ private:
     /// Close all RPC/API connections.
     void close_connections();
 
+    // -- Configuration -------------------------------------------------------
+
+    /// Immutable copy of the application configuration.
+    AppConfig config_;
+
+    /// Dry-run mode flag.
+    bool dry_run_;
+
     // -- Pair config lookup ---------------------------------------------------
+    // [M11] Declared after config_ so that C++ member initialization order
+    // is correct (pair_config_map_ depends on config_.pairs pointers).
+    // ISO/IEC JTC 1/SC 22: member init order matches declaration order.
 
     /// O(1) lookup map from pair name to the corresponding PairConfig entry
     /// in config_.pairs.  Built once during construction; eliminates the
@@ -272,14 +283,6 @@ private:
         auto it = pair_config_map_.find(pair_name);
         return (it != pair_config_map_.end()) ? it->second : nullptr;
     }
-
-    // -- Configuration -------------------------------------------------------
-
-    /// Immutable copy of the application configuration.
-    AppConfig config_;
-
-    /// Dry-run mode flag.
-    bool dry_run_;
 
     // -- Boost.Asio event loop -----------------------------------------------
 
@@ -404,17 +407,25 @@ private:
 
     /// Per-pair working storage for the current cycle's quotes.
     /// Populated by step_compute_quotes, consumed through steps 5-8.
+    // [M10] Value-initialize all aggregate members to prevent
+    // undefined reads on first access within a cycle.
+    // ISO/IEC 5055: deterministic initial state for all fields.
     struct PairCycleState {
-        std::string   pair_name;       ///< Pair being processed.
-        QuoteResult   raw_quote;       ///< Output of strategy.
-        SpreadResult  spread_result;   ///< Output of spread optimizer.
-        Quote         risk_quote;      ///< After risk filter.
-        bool          quote_valid{false}; ///< False if risk killed both sides.
-        std::vector<TierQuote> ladder; ///< Multi-tier expansion.
+        std::string   pair_name;            ///< Pair being processed.
+        QuoteResult   raw_quote{};          ///< Output of strategy.
+        SpreadResult  spread_result{};      ///< Output of spread optimizer.
+        Quote         risk_quote{};         ///< After risk filter.
+        bool          quote_valid{false};   ///< False if risk killed both sides.
+        std::vector<TierQuote> ladder;      ///< Multi-tier expansion.
     };
 
     /// Per-pair cycle state for the current block.
     std::unordered_map<std::string, PairCycleState> cycle_;
+
+    // [H6] PnL high-water mark for drawdown detection in step 13 alerts.
+    // Monotonically non-decreasing; updated each cycle in step_check_alerts.
+    // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.
+    Mojo peak_pnl_hwm_{0};
 };
 
 }  // namespace xop

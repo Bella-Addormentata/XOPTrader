@@ -213,6 +213,12 @@ public:
     /// (but logged at debug level for audit).
     void send_alert(AlertTier tier, const std::string& message);
 
+    /// ISO/IEC 5055: per-rule overload for rate-limited dispatch.
+    /// Each AlertRule has its own independent cooldown, preventing one
+    /// rapid-firing rule from suppressing alerts for other rules in the
+    /// same tier.
+    void send_alert(AlertRule rule, const std::string& message);
+
     /// Send a pre-formatted daily summary.
     /// Bypasses rate limiting (it is itself a once-per-day event).
     void send_daily_summary(const AlertDailySummary& summary);
@@ -250,9 +256,10 @@ private:
 
     // -- Rate limiting -------------------------------------------------------
 
-    /// Return true if enough time has elapsed since the last alert of this
-    /// tier to permit sending.  Updates the timestamp if permitted.
-    bool check_rate_limit(AlertTier tier);
+    /// Return true if enough time has elapsed since the last alert for this
+    /// rule to permit sending.  Updates the timestamp if permitted.
+    /// ISO/IEC 5055: keyed by AlertRule for per-rule independent cooldowns.
+    bool check_rate_limit(AlertRule rule);
 
     // -- Rule evaluation helpers (one per rule) ------------------------------
 

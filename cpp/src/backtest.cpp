@@ -828,9 +828,13 @@ MonteCarloResult BacktestEngine::run_monte_carlo(
         const auto prices = generate_price_path(blocks_.size(), s0, sigma, rng);
 
         // Build synthetic blocks from the price path.  Each path gets a
-        // unique flow seed (base_seed + path_index) so Monte Carlo paths
-        // explore diverse order-flow scenarios.
-        const auto flow_seed = static_cast<unsigned>(seed + path_idx);
+        // unique flow seed derived from the master seed.  We use a
+        // domain-separated seed (seed + n_paths + path_idx) to decorrelate
+        // the order-flow RNG from the price-path RNG (which uses
+        // seed + path_idx), preventing spurious correlation between the
+        // two stochastic processes in the simulation.
+        // ISO/IEC 5055 -- CWE-330: domain-separated seeding for independence.
+        const auto flow_seed = static_cast<unsigned>(seed + n_paths + path_idx);
         const auto syn_blocks = build_synthetic_blocks(
             prices, historical_fill_rate_, flow_seed);
 

@@ -39,6 +39,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace xop {
@@ -139,7 +140,13 @@ public:
     /// Start the Prometheus HTTP server on the given port.
     /// Registers all metric families and begins serving /metrics.
     /// Throws std::runtime_error if the port is already in use.
-    void init(std::uint16_t port);
+    ///
+    /// @param asset_ids  The set of known asset IDs from config.  Only these
+    ///                   IDs will be accepted for label-keyed metrics, bounding
+    ///                   Prometheus label cardinality.
+    ///                   ISO/IEC 5055: bounded resource allocation.
+    void init(std::uint16_t port,
+              const std::vector<std::string>& asset_ids = {});
 
     /// Stop the HTTP server and release all resources.
     /// Safe to call even if init() was never called.
@@ -262,6 +269,11 @@ private:
     prometheus::Gauge* risk_var_95_{nullptr};
     prometheus::Gauge* risk_max_drawdown_{nullptr};
     prometheus::Family<prometheus::Gauge>* risk_concentration_family_{nullptr};
+
+    // -- Cardinality guard ----------------------------------------------------
+    // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered
+    // at init() are accepted as Prometheus label values.
+    std::unordered_set<std::string> known_asset_ids_;
 };
 
 }  // namespace xop

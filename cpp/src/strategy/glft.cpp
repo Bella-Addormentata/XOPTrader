@@ -49,6 +49,11 @@ GlftStrategy::GlftStrategy(const GlftConfig& cfg)
     if (!(cfg_.block_time_seconds > 0.0)) {
         throw std::invalid_argument("GlftConfig: block_time_seconds must be positive");
     }
+
+    // Initialize regime to sane defaults so the first compute_quotes() call
+    // before any update_price() produces reasonable spreads (not zero).
+    // ISO/IEC 5055: defensive initialization of derived state.
+    regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
 }
 
 // ===========================================================================

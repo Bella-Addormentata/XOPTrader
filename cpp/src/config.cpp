@@ -20,8 +20,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <iostream>
+#include <limits>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -123,29 +125,35 @@ uint16_t read_port(const YAML::Node& parent,
 }
 
 // Read a required unsigned 32-bit integer >= 1.
+// ISO/IEC 5055 -- CWE-681: parse as int64_t to prevent truncation of values
+// exceeding INT_MAX when targeting uint32_t.
 uint32_t read_uint32_positive(const YAML::Node& parent,
                               const std::string& key,
                               const std::string& section)
 {
     require_scalar(parent, key, section);
-    int value = parent[key].as<int>();
-    if (value < 1) {
-        throw ConfigError(section + "." + key + " must be >= 1; got "
-                          + std::to_string(value));
+    int64_t value = parent[key].as<int64_t>();
+    if (value < 1 || value > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw ConfigError(section + "." + key + " must be in [1, "
+                          + std::to_string(std::numeric_limits<uint32_t>::max())
+                          + "]; got " + std::to_string(value));
     }
     return static_cast<uint32_t>(value);
 }
 
 // Read a required unsigned 32-bit integer >= 0.
+// ISO/IEC 5055 -- CWE-681: parse as int64_t to prevent truncation of values
+// exceeding INT_MAX when targeting uint32_t.
 uint32_t read_uint32(const YAML::Node& parent,
                      const std::string& key,
                      const std::string& section)
 {
     require_scalar(parent, key, section);
-    int value = parent[key].as<int>();
-    if (value < 0) {
-        throw ConfigError(section + "." + key + " must be >= 0; got "
-                          + std::to_string(value));
+    int64_t value = parent[key].as<int64_t>();
+    if (value < 0 || value > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+        throw ConfigError(section + "." + key + " must be in [0, "
+                          + std::to_string(std::numeric_limits<uint32_t>::max())
+                          + "]; got " + std::to_string(value));
     }
     return static_cast<uint32_t>(value);
 }

@@ -584,6 +584,14 @@ void StrategyPortfolio::clamp_weights()
             state.weight *= inv_total;
         }
     }
+
+    // Post-normalization clamp: ensure min/max bounds still hold after
+    // the final division.  Without this, weights can drift below min_weight
+    // or above max_weight due to floating-point renormalization.
+    // ISO/IEC 5055: defensive re-enforcement of invariant after arithmetic.
+    for (auto& [comp, state] : components_) {
+        state.weight = std::clamp(state.weight, cfg_.min_weight, cfg_.max_weight);
+    }
 }
 
 // ===========================================================================

@@ -359,14 +359,20 @@ double SpreadOptimizer::calc_competition_bps(
     double best_competing_bps,
     double epsilon_bps)
 {
-    // When no competition data exists, fall back to the profitable floor.
+    // When no competition data is available, return 0 -- the final spread
+    // floor (total_spread_bps = max(total_spread_bps, s_floor_bps)) handles
+    // the minimum.  Returning s_floor_bps here would double-count the floor
+    // because it gets added to the other components and THEN the floor is
+    // re-applied on the total.
+    // ISO/IEC 5055: prevent double-counting of the spread floor that would
+    // inflate quoted spreads beyond intended minimums.
     if (best_competing_bps <= 0.0) {
-        return s_floor_bps;
+        return 0.0;
     }
 
-    // The competitive spread must at least match the floor; when competition
-    // is present, we improve upon their spread by epsilon.
-    return std::max(s_floor_bps, best_competing_bps + epsilon_bps);
+    // When competition data is present, improve upon the best competing
+    // spread by epsilon.  The final floor on total_spread_bps still applies.
+    return best_competing_bps + epsilon_bps;
 }
 
 // ---------------------------------------------------------------------------

@@ -50,7 +50,8 @@ MetricsExporter::~MetricsExporter()
 //  Lifecycle
 // ===================================================================
 
-void MetricsExporter::init(std::uint16_t port)
+void MetricsExporter::init(std::uint16_t port,
+                           const std::vector<std::string>& asset_ids)
 {
     if (running_) {
         spdlog::warn("MetricsExporter::init called while already running; ignoring");
@@ -59,6 +60,13 @@ void MetricsExporter::init(std::uint16_t port)
 
     spdlog::info("MetricsExporter: starting Prometheus HTTP server on port {}",
                  port);
+
+    // ISO/IEC 5055: populate the known-asset set from config to bound
+    // Prometheus label cardinality.
+    known_asset_ids_.clear();
+    known_asset_ids_.insert(asset_ids.begin(), asset_ids.end());
+    spdlog::info("MetricsExporter: {} known asset IDs registered for cardinality guard",
+                 known_asset_ids_.size());
 
     // Create the shared registry that holds all metric families.
     registry_ = std::make_shared<prometheus::Registry>();
@@ -272,6 +280,15 @@ void MetricsExporter::update_inventory(
 
     // Per-asset gauges: balance, cost basis, underwater flag.
     for (const auto& pos : positions) {
+        // ISO/IEC 5055: reject unknown asset IDs to prevent unbounded
+        // Prometheus label cardinality.
+        if (!known_asset_ids_.empty() &&
+            known_asset_ids_.find(pos.asset_id) == known_asset_ids_.end()) {
+            spdlog::warn("[Metrics] Unknown asset_id '{}' -- skipping inventory metric",
+                         pos.asset_id);
+            continue;
+        }
+
         inv_balance_family_
             ->Add({{"asset_id", pos.asset_id}})
             .Set(static_cast<double>(pos.balance));
@@ -402,6 +419,15 @@ void MetricsExporter::update_risk(
     risk_max_drawdown_->Set(risk.max_drawdown);
 
     for (const auto& c : concentrations) {
+        // ISO/IEC 5055: reject unknown asset IDs to prevent unbounded
+        // Prometheus label cardinality.
+        if (!known_asset_ids_.empty() &&
+            known_asset_ids_.find(c.asset_id) == known_asset_ids_.end()) {
+            spdlog::warn("[Metrics] Unknown asset_id '{}' -- skipping risk metric",
+                         c.asset_id);
+            continue;
+        }
+
         risk_concentration_family_
             ->Add({{"asset_id", c.asset_id}})
             .Set(c.concentration);

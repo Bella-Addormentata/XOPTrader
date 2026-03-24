@@ -56,6 +56,15 @@ PreTradeCheck::PreTradeCheck(const RiskConfig&     cfg,
         throw std::invalid_argument(
             "RiskConfig: min_profit_margin_bps yields margin_fraction outside [0, 1)");
     }
+
+    // ISO/IEC 5055: validate that soft_limit_pct does not exceed
+    // hard_limit_pct.  A reversed ordering would cause the graduated
+    // reduction logic in apply_limits() to divide by zero or produce
+    // nonsensical skew factors.
+    if (risk_cfg_.soft_limit_pct > risk_cfg_.hard_limit_pct) {
+        throw std::invalid_argument(
+            "RiskConfig: soft_limit_pct must be <= hard_limit_pct");
+    }
 }
 
 // ---------------------------------------------------------------------------

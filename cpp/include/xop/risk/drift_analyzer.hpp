@@ -600,6 +600,10 @@ private:
                                           double blocks_to_hard,
                                           double current_ratio);
 
+    /// Lock-free implementation of empirical_drift(); caller must hold mtx_.
+    /// ISO/IEC 5055 -- CWE-362: separated to avoid re-entrant shared-lock UB.
+    std::optional<std::pair<double, double>> empirical_drift_unlocked() const;
+
     // -- Observation history -------------------------------------------------
 
     struct Observation {

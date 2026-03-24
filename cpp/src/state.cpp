@@ -184,7 +184,9 @@ Position::Position(const AssetId& id)
     , total_cost{0}
 {}
 
-void Position::add(Mojo qty, Mojo unit_price)
+// ISO/IEC 5055 -- CWE-190: return false on overflow instead of silently
+// dropping the addition, so callers can detect and handle the failure.
+[[nodiscard]] bool Position::add(Mojo qty, Mojo unit_price)
 {
     // Weighted-average cost basis update.
     //
@@ -199,7 +201,7 @@ void Position::add(Mojo qty, Mojo unit_price)
     if (qty <= 0) {
         spdlog::warn("Position::add called with non-positive qty={} for asset={}",
                       qty, asset_id);
-        return;
+        return false;
     }
 
     // Guard against overflow: qty * unit_price could exceed int64 range if
@@ -214,16 +216,18 @@ void Position::add(Mojo qty, Mojo unit_price)
 
     const Mojo new_balance = balance + qty;
 
-    // Clamp to int64 range -- should never trigger in practice.
+    // Reject on overflow -- callers must check the return value.
     if (exceeds_int64(wide_total) || new_balance <= 0) {
-        spdlog::error("Position::add overflow for asset={} qty={} price={}",
+        spdlog::error("[Position] Overflow in cost basis -- addition rejected "
+                      "for asset={} qty={} price={}",
                        asset_id, qty, unit_price);
-        return;
+        return false;
     }
 
     total_cost = static_cast<Mojo>(wide_total.lo);
     balance    = new_balance;
     cost_basis = (balance > 0) ? (total_cost / balance) : 0;
+    return true;
 }
 
 bool Position::remove(Mojo qty)
@@ -302,7 +306,12 @@ void State::record_buy(const AssetId& asset_id, Mojo qty, Mojo unit_price)
     std::unique_lock lock(mtx_positions_);
 
     auto [it, inserted] = positions_.try_emplace(asset_id, asset_id);
-    it->second.add(qty, unit_price);
+    // ISO/IEC 5055 -- CWE-190: propagate overflow detection to caller's log.
+    if (!it->second.add(qty, unit_price)) {
+        spdlog::error("record_buy: Position::add failed (overflow) "
+                      "asset={} qty={} price={}", asset_id, qty, unit_price);
+        return;
+    }
 
     spdlog::info("record_buy  asset={} qty={} price={} -> balance={} basis={}",
                   asset_id, qty, unit_price,

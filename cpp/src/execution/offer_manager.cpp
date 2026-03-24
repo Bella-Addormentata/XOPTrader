@@ -347,11 +347,23 @@ asio::awaitable<void> OfferManager::cancel_all()
         co_return;
     }
 
+    // ISO/IEC 5055: track which offers were successfully cancelled.
+    // Only clear offers whose cancellation succeeded.
+    // Failed cancellations remain tracked for retry on next heartbeat.
+    std::vector<std::string> cancelled_ids;
+    cancelled_ids.reserve(all_offers.size());
+
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
+    bool bulk_ok = false;
     try {
         constexpr std::uint64_t kCancelFee = 100'000'000ULL;
         co_await wallet_->cancel_offers(kCancelFee, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
+        bulk_ok = true;
+        // Bulk success: all offers are considered cancelled.
+        for (const auto& po : all_offers) {
+            cancelled_ids.push_back(po.offer_id);
+        }
     } catch (const rpc::ChiaRPCError& e) {
         // Bulk cancel failed -- fall back to individual cancellation.
         logger_->warn("Bulk cancel_offers failed: {} -- falling back to "
@@ -363,20 +375,23 @@ asio::awaitable<void> OfferManager::cancel_all()
                 co_await wallet_->cancel_offer(
                     po.offer_id, kCancelFee, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
+                cancelled_ids.push_back(po.offer_id);
             } catch (const rpc::ChiaRPCError& inner_e) {
                 logger_->error("Failed to cancel offer {}: {}",
                                po.offer_id.substr(0, 12), inner_e.what());
+                // Do NOT add to cancelled_ids -- keep tracked for retry.
             }
         }
     }
 
-    // Clear all pending offers from state regardless of individual results.
-    // Any that were already taken will have been confirmed by now.
-    for (const auto& po : all_offers) {
-        state_->remove_offer(po.offer_id);
+    // Remove only the offers whose cancellation succeeded from state.
+    // Failed cancellations remain tracked for retry on the next heartbeat.
+    for (const auto& id : cancelled_ids) {
+        state_->remove_offer(id);
     }
 
-    logger_->info("cancel_all: {} offers processed", all_offers.size());
+    logger_->info("cancel_all: {}/{} offers cancelled successfully",
+                  cancelled_ids.size(), all_offers.size());
 }
 
 // ---------------------------------------------------------------------------
