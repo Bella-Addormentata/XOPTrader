@@ -1177,4 +1177,343 @@ PairState& MarketDataFeed::get_or_create_pair(const std::string& pair_name) {
     return it->second;
 }
 
+// =========================================================================
+// VPIN — Volume-Synchronized Probability of Informed Trading
+//
+// Reference: Easley, López de Prado & O'Hara (2012). "Flow Toxicity and
+// Liquidity in a High-frequency World."
+//
+// Trades are accumulated into volume bars (buckets) of fixed size.  When a
+// bucket fills the buy/sell imbalance is frozen.  VPIN is the rolling mean
+// of absolute imbalances over the last N completed buckets, divided by the
+// bucket size:
+//
+//   VPIN = (1/N) * SUM_i |buy_vol_i - sell_vol_i| / bucket_size
+//
+// This yields a continuous toxicity signal in [0, 1].
+// =========================================================================
+
+void MarketDataFeed::ingest_trade_for_vpin(const std::string& pair_name,
+                                           Side               side,
+                                           double             volume)
+{
+    if (volume <= 0.0) {
+        return;
+    }
+
+    const double bucket_size = std::max(1e-12, config_.vpin_bucket_size);
+
+    {
+        std::unique_lock lock(mtx_vpin_);
+        auto& vs = vpin_state_[pair_name];
+
+        double remaining = volume;
+        while (remaining > 0.0) {
+            // How much capacity is left in the current bucket?
+            const double current_total =
+                vs.current_bucket.buy_volume + vs.current_bucket.sell_volume;
+            const double capacity = bucket_size - current_total;
+
+            if (capacity <= 0.0) {
+                // Current bucket is already full — push and start fresh.
+                vs.current_bucket.complete = true;
+                vs.completed.push_back(vs.current_bucket);
+                vs.current_bucket = VpinBucket{};
+
+                // Trim to window size.
+                while (vs.completed.size() > config_.vpin_window_buckets) {
+                    vs.completed.pop_front();
+                }
+                continue;
+            }
+
+            const double fill = std::min(remaining, capacity);
+            if (side == Side::Bid) {
+                vs.current_bucket.buy_volume += fill;
+            } else {
+                vs.current_bucket.sell_volume += fill;
+            }
+            remaining -= fill;
+
+            // Check if bucket is now complete.
+            const double new_total =
+                vs.current_bucket.buy_volume + vs.current_bucket.sell_volume;
+            if (new_total >= bucket_size - 1e-12) {
+                vs.current_bucket.complete = true;
+                vs.completed.push_back(vs.current_bucket);
+                vs.current_bucket = VpinBucket{};
+
+                // Trim to window size.
+                while (vs.completed.size() > config_.vpin_window_buckets) {
+                    vs.completed.pop_front();
+                }
+            }
+        }
+    }
+
+    recompute_vpin(pair_name);
+}
+
+void MarketDataFeed::recompute_vpin(const std::string& pair_name)
+{
+    // Read completed buckets under shared lock.
+    std::vector<VpinBucket> buckets;
+    {
+        std::shared_lock lock(mtx_vpin_);
+        auto it = vpin_state_.find(pair_name);
+        if (it == vpin_state_.end()) {
+            return;
+        }
+        buckets.assign(it->second.completed.begin(),
+                       it->second.completed.end());
+    }
+
+    if (buckets.empty()) {
+        return;
+    }
+
+    const double bucket_size = std::max(1e-12, config_.vpin_bucket_size);
+
+    // VPIN = (1/N) * SUM |buy_i - sell_i| / bucket_size
+    double sum_abs_imbalance = 0.0;
+    double total_buy  = 0.0;
+    double total_sell = 0.0;
+    for (const auto& b : buckets) {
+        sum_abs_imbalance += std::abs(b.buy_volume - b.sell_volume);
+        total_buy  += b.buy_volume;
+        total_sell += b.sell_volume;
+    }
+
+    const double n = static_cast<double>(buckets.size());
+    const double vpin = (sum_abs_imbalance / n) / bucket_size;
+
+    const double total = total_buy + total_sell;
+    const double buy_pct  = (total > 0.0) ? (total_buy / total)  : 0.5;
+    const double sell_pct = (total > 0.0) ? (total_sell / total) : 0.5;
+
+    VpinMetrics vm;
+    vm.pair_name        = pair_name;
+    vm.vpin             = std::min(vpin, 1.0);  // clamp to [0, 1]
+    vm.complete_buckets = buckets.size();
+    vm.buy_volume_pct   = buy_pct;
+    vm.sell_volume_pct  = sell_pct;
+    vm.last_updated     = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_vpin_metrics_);
+        vpin_metrics_[pair_name] = vm;
+    }
+}
+
+std::optional<VpinMetrics> MarketDataFeed::get_vpin_metrics(
+    const std::string& pair_name) const
+{
+    std::shared_lock lock(mtx_vpin_metrics_);
+    auto it = vpin_metrics_.find(pair_name);
+    if (it == vpin_metrics_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+double MarketDataFeed::get_vpin(const std::string& pair_name) const
+{
+    auto vm = get_vpin_metrics(pair_name);
+    return vm.has_value() ? vm->vpin : 0.0;
+}
+
+// =========================================================================
+// OFI — Order Flow Imbalance
+//
+// Reference: Cont, Kukanov & Stoikov (2014). "The Price Impact of Order
+// Book Events."
+//
+// OFI aggregates signed volume changes at the best bid/ask.  For each pair
+// of consecutive snapshots (t-1, t):
+//
+//   delta_bid = { +bid_size_t   if bid_t > bid_{t-1}
+//               { -(bid_size_{t-1}) if bid_t < bid_{t-1}
+//               { bid_size_t - bid_size_{t-1}  otherwise
+//
+//   delta_ask = { -(ask_size_t) if ask_t < ask_{t-1}
+//               { +ask_size_{t-1}   if ask_t > ask_{t-1}
+//               { ask_size_{t-1} - ask_size_t  otherwise
+//
+//   OFI_t = delta_bid - delta_ask   (note the sign flip on ask)
+//
+// Positive OFI → buy pressure (bids strengthening / asks retreating).
+// Negative OFI → sell pressure.
+// =========================================================================
+
+void MarketDataFeed::ingest_book_snapshot_for_ofi(
+    const std::string& pair_name,
+    double             best_bid,
+    double             bid_size,
+    double             best_ask,
+    double             ask_size)
+{
+    {
+        std::unique_lock lock(mtx_ofi_);
+        auto& snaps = ofi_snapshots_[pair_name];
+        snaps.push_back(BookSnapshot{best_bid, bid_size, best_ask, ask_size});
+
+        // Keep window + 1 (need at least 2 for a delta).
+        while (snaps.size() > config_.ofi_window_size + 1) {
+            snaps.pop_front();
+        }
+    }
+
+    recompute_ofi(pair_name);
+}
+
+void MarketDataFeed::recompute_ofi(const std::string& pair_name)
+{
+    std::vector<BookSnapshot> snaps;
+    {
+        std::shared_lock lock(mtx_ofi_);
+        auto it = ofi_snapshots_.find(pair_name);
+        if (it == ofi_snapshots_.end() || it->second.size() < 2) {
+            return;
+        }
+        snaps.assign(it->second.begin(), it->second.end());
+    }
+
+    double cumulative = 0.0;
+    for (std::size_t i = 1; i < snaps.size(); ++i) {
+        const auto& prev = snaps[i - 1];
+        const auto& curr = snaps[i];
+
+        // Bid-side delta.
+        double delta_bid = 0.0;
+        if (curr.best_bid > prev.best_bid) {
+            delta_bid = curr.bid_size;
+        } else if (curr.best_bid < prev.best_bid) {
+            delta_bid = -prev.bid_size;
+        } else {
+            delta_bid = curr.bid_size - prev.bid_size;
+        }
+
+        // Ask-side delta (note: ask improvement is a DECREASE in ask price).
+        double delta_ask = 0.0;
+        if (curr.best_ask < prev.best_ask) {
+            delta_ask = -curr.ask_size;
+        } else if (curr.best_ask > prev.best_ask) {
+            delta_ask = prev.ask_size;
+        } else {
+            delta_ask = prev.ask_size - curr.ask_size;
+        }
+
+        // OFI = delta_bid - delta_ask (sign: positive = buy pressure).
+        cumulative += (delta_bid - delta_ask);
+    }
+
+    // Normalise OFI to [-1, 1] using a rolling max-absolute-value approach.
+    // We use the maximum possible single-step imbalance (sum of bid+ask sizes
+    // across all observations) as the normalisation factor.
+    double max_abs = 0.0;
+    for (const auto& s : snaps) {
+        max_abs += (s.bid_size + s.ask_size);
+    }
+    max_abs = std::max(max_abs, 1e-12);  // guard against division by zero
+
+    const double norm_ofi = std::clamp(cumulative / max_abs, -1.0, 1.0);
+
+    // Latest single-step OFI for the "current" reading.
+    double latest_ofi = 0.0;
+    if (snaps.size() >= 2) {
+        const auto& prev = snaps[snaps.size() - 2];
+        const auto& curr = snaps[snaps.size() - 1];
+
+        double db = 0.0;
+        if (curr.best_bid > prev.best_bid) db = curr.bid_size;
+        else if (curr.best_bid < prev.best_bid) db = -prev.bid_size;
+        else db = curr.bid_size - prev.bid_size;
+
+        double da = 0.0;
+        if (curr.best_ask < prev.best_ask) da = -curr.ask_size;
+        else if (curr.best_ask > prev.best_ask) da = prev.ask_size;
+        else da = prev.ask_size - curr.ask_size;
+
+        latest_ofi = db - da;
+    }
+
+    OfiMetrics om;
+    om.pair_name      = pair_name;
+    om.ofi            = latest_ofi;
+    om.normalized_ofi = norm_ofi;
+    om.cumulative_ofi = cumulative;
+    om.observations   = snaps.size();
+    om.last_updated   = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_ofi_metrics_);
+        ofi_metrics_[pair_name] = om;
+    }
+}
+
+std::optional<OfiMetrics> MarketDataFeed::get_ofi_metrics(
+    const std::string& pair_name) const
+{
+    std::shared_lock lock(mtx_ofi_metrics_);
+    auto it = ofi_metrics_.find(pair_name);
+    if (it == ofi_metrics_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+double MarketDataFeed::get_normalized_ofi(const std::string& pair_name) const
+{
+    auto om = get_ofi_metrics(pair_name);
+    return om.has_value() ? om->normalized_ofi : 0.0;
+}
+
+// =========================================================================
+// Asymmetric spread widening
+//
+// Uses the whale detector's dominant_side to skew the spread multiplier.
+// Total widening is preserved: bid_mult * ask_mult ≈ symmetric_mult^2,
+// but the risk-bearing side gets a larger share of the spread.
+//
+// The asymmetric_skew_factor (α ∈ [0,1]) controls the split:
+//   α = 0.0 → symmetric (same multiplier on both sides)
+//   α = 1.0 → fully asymmetric (all extra widening on informed side)
+//
+// For whale buying (dominant_side = Bid, i.e. taker bought from us):
+//   ask_mult = 1 + (m - 1) * (1 + α)    (widen ask: we're selling into a bid)
+//   bid_mult = 1 + (m - 1) * (1 - α)    (tighten bid: we want to buy cheap)
+//
+// The average of the two multipliers equals the original symmetric one.
+// =========================================================================
+
+AsymmetricMultipliers MarketDataFeed::get_asymmetric_spread_multipliers(
+    const std::string& pair_name) const
+{
+    auto wm = get_whale_metrics(pair_name);
+    if (!wm.has_value() || wm->spread_multiplier <= 1.0 + 1e-9) {
+        return AsymmetricMultipliers{1.0, 1.0};
+    }
+
+    const double m = wm->spread_multiplier;     // symmetric multiplier
+    const double excess = m - 1.0;               // extra widening above 1.0
+    const double alpha = std::clamp(config_.asymmetric_skew_factor, 0.0, 1.0);
+
+    // high_side gets (1 + α) share, low_side gets (1 - α) share.
+    const double high_mult = 1.0 + excess * (1.0 + alpha);
+    const double low_mult  = 1.0 + excess * (1.0 - alpha);
+
+    AsymmetricMultipliers am;
+    if (wm->dominant_side == Side::Bid) {
+        // Whale is buying → widen ask (adverse-selection risk on our ask).
+        am.ask_multiplier = high_mult;
+        am.bid_multiplier = low_mult;
+    } else {
+        // Whale is selling → widen bid (adverse-selection risk on our bid).
+        am.bid_multiplier = high_mult;
+        am.ask_multiplier = low_mult;
+    }
+
+    return am;
+}
+
 }  // namespace xop

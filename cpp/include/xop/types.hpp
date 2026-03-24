@@ -205,6 +205,77 @@ struct WhaleMetrics {
     Timestamp    last_updated;          // wall-clock time of last computation
 };
 
+// ---------------------------------------------------------------------------
+// VpinBucket -- a single volume-synchronised bucket for the VPIN estimator.
+//
+// Reference: Easley, López de Prado & O'Hara (2012). "Flow Toxicity and
+// Liquidity in a High-frequency World."  The Review of Financial Studies,
+// 25(5), 1457–1493.
+//
+// VPIN partitions incoming volume into fixed-size "volume bars".  Within each
+// bar the buy/sell imbalance is measured.  VPIN is the rolling mean of
+// absolute imbalances over the most recent N bars, divided by the bar size.
+// ---------------------------------------------------------------------------
+
+struct VpinBucket {
+    double buy_volume{0.0};    // buyer-initiated volume accumulated in this bar
+    double sell_volume{0.0};   // seller-initiated volume accumulated in this bar
+    bool   complete{false};    // true once total volume >= bucket_size
+};
+
+// ---------------------------------------------------------------------------
+// VpinMetrics -- aggregated VPIN statistics for a single trading pair.
+//
+// The strategy layer reads VPIN ∈ [0, 1] as a continuous "flow toxicity"
+// signal.  Values near 0 indicate balanced, uninformed flow; values near 1
+// indicate heavily one-sided, likely informed flow.
+// ---------------------------------------------------------------------------
+
+struct VpinMetrics {
+    std::string  pair_name;             // trading pair
+    double       vpin;                  // VPIN estimate in [0, 1]
+    std::size_t  complete_buckets;      // number of completed bars in the window
+    double       buy_volume_pct;        // fraction of recent volume that is buys
+    double       sell_volume_pct;       // fraction of recent volume that is sells
+    Timestamp    last_updated;          // wall-clock time of last computation
+};
+
+// ---------------------------------------------------------------------------
+// OfiMetrics -- Order Flow Imbalance metrics for a single trading pair.
+//
+// Reference: Cont, Kukanov & Stoikov (2014). "The Price Impact of Order Book
+// Events."  Journal of Financial Econometrics, 12(1), 47–88.
+//
+// OFI aggregates signed changes at the best bid/ask into a single predictor
+// of short-term price moves.  A persistently positive OFI signals buying
+// pressure (price likely to rise); persistently negative signals selling
+// pressure (price likely to fall).
+// ---------------------------------------------------------------------------
+
+struct OfiMetrics {
+    std::string  pair_name;             // trading pair
+    double       ofi;                   // raw OFI value (positive = buy pressure)
+    double       normalized_ofi;        // OFI normalised to [-1, 1] range
+    double       cumulative_ofi;        // cumulative OFI over the rolling window
+    std::size_t  observations;          // number of book-change observations
+    Timestamp    last_updated;          // wall-clock time of last computation
+};
+
+// ---------------------------------------------------------------------------
+// AsymmetricMultipliers -- per-side spread multipliers derived from whale
+// activity and order-flow direction.
+//
+// When a whale buys aggressively (dominant_side = Bid), the ask side faces
+// higher adverse-selection risk, so the ask multiplier is raised while the
+// bid multiplier is reduced (we still want to buy cheaply).  Vice versa for
+// whale sells.
+// ---------------------------------------------------------------------------
+
+struct AsymmetricMultipliers {
+    double bid_multiplier{1.0};   // spread widening factor for bid side
+    double ask_multiplier{1.0};   // spread widening factor for ask side
+};
+
 }  // namespace xop
 
 #endif  // XOP_TYPES_HPP
