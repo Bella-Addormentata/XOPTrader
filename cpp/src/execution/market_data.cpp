@@ -94,6 +94,27 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
         std::unique_lock lock(other.mtx_whale_metrics_);
         whale_metrics_ = std::move(other.whale_metrics_);
     }
+    // Transfer VPIN volume-bar state (per-pair current bucket + completed bars).
+    // ISO/IEC 5055: each map moved under its own mutex to prevent data races.
+    {
+        std::unique_lock lock(other.mtx_vpin_);
+        vpin_state_ = std::move(other.vpin_state_);
+    }
+    // Transfer cached VPIN metrics (per-pair latest VPIN value).
+    {
+        std::unique_lock lock(other.mtx_vpin_metrics_);
+        vpin_metrics_ = std::move(other.vpin_metrics_);
+    }
+    // Transfer OFI book-snapshot history (per-pair deque of snapshots).
+    {
+        std::unique_lock lock(other.mtx_ofi_);
+        ofi_snapshots_ = std::move(other.ofi_snapshots_);
+    }
+    // Transfer cached OFI metrics (per-pair latest normalized OFI).
+    {
+        std::unique_lock lock(other.mtx_ofi_metrics_);
+        ofi_metrics_ = std::move(other.ofi_metrics_);
+    }
 }
 
 MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
@@ -141,6 +162,31 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
         std::unique_lock lock_dst(mtx_whale_metrics_);
         std::unique_lock lock_src(other.mtx_whale_metrics_);
         whale_metrics_ = std::move(other.whale_metrics_);
+    }
+    // Transfer VPIN volume-bar state under paired locks.
+    // ISO/IEC 5055: consistent lock ordering (dst then src) prevents deadlock.
+    {
+        std::unique_lock lock_dst(mtx_vpin_);
+        std::unique_lock lock_src(other.mtx_vpin_);
+        vpin_state_ = std::move(other.vpin_state_);
+    }
+    // Transfer cached VPIN metrics.
+    {
+        std::unique_lock lock_dst(mtx_vpin_metrics_);
+        std::unique_lock lock_src(other.mtx_vpin_metrics_);
+        vpin_metrics_ = std::move(other.vpin_metrics_);
+    }
+    // Transfer OFI book-snapshot history.
+    {
+        std::unique_lock lock_dst(mtx_ofi_);
+        std::unique_lock lock_src(other.mtx_ofi_);
+        ofi_snapshots_ = std::move(other.ofi_snapshots_);
+    }
+    // Transfer cached OFI metrics.
+    {
+        std::unique_lock lock_dst(mtx_ofi_metrics_);
+        std::unique_lock lock_src(other.mtx_ofi_metrics_);
+        ofi_metrics_ = std::move(other.ofi_metrics_);
     }
 
     return *this;

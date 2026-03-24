@@ -29,7 +29,7 @@
 //   ISO/IEC 27001:2022 -- secrets are never logged; audit trail via Database
 //   ISO/IEC 5055       -- no raw owning pointers; RAII via unique_ptr
 //   ISO/IEC 25000      -- documented lifecycle, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17 coroutines via Boost.Asio
+//   ISO/IEC JTC 1/SC 22 -- standard C++20 coroutines via Boost.Asio
 
 #ifndef XOP_ENGINE_HPP
 #define XOP_ENGINE_HPP

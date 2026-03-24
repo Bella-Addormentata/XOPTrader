@@ -29,7 +29,7 @@
 //   ISO/IEC 27001:2022  (no secrets; pure numerical computation)
 //   ISO/IEC 5055        (no raw pointers; bounds-checked containers)
 //   ISO/IEC 25000       (comprehensive mathematical documentation)
-//   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
+//   ISO/IEC JTC 1/SC 22 (standard-conforming C++20)
 
 #ifndef XOP_DATA_VOLATILITY_HPP
 #define XOP_DATA_VOLATILITY_HPP

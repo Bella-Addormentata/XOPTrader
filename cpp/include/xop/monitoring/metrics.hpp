@@ -22,7 +22,7 @@
 //   ISO/IEC 27001:2022 -- no secrets exposed on the metrics endpoint
 //   ISO/IEC 5055       -- no raw pointers, RAII ownership of server/registry
 //   ISO/IEC 25000      -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #ifndef XOP_MONITORING_METRICS_HPP
 #define XOP_MONITORING_METRICS_HPP
@@ -44,12 +44,15 @@
 namespace xop {
 
 // ---------------------------------------------------------------------------
-// PnlSummary -- snapshot of PnL components for update_pnl().
+// MetricsPnlSnapshot -- snapshot of PnL components for update_pnl().
+//
+// Named distinctly from xop::PnLSummary (in pnl.hpp) because this struct
+// is specific to the Prometheus exporter's five-gauge dashboard.
 //
 // All values are in mojos.  Matches the five gauges in Dashboard 1.
 // ---------------------------------------------------------------------------
 
-struct PnlSummary {
+struct MetricsPnlSnapshot {
     Mojo total;       // Total PnL (realized + unrealized).
     Mojo realized;    // Realised PnL from closed positions.
     Mojo unrealized;  // Mark-to-market PnL on open positions.
@@ -149,7 +152,7 @@ public:
 
     /// Push a PnL snapshot.  All five gauge values are set atomically
     /// (from the caller's perspective -- each Set is individually atomic).
-    void update_pnl(const PnlSummary& summary);
+    void update_pnl(const MetricsPnlSnapshot& summary);
 
     // -- Dashboard 2: Inventory ----------------------------------------------
 

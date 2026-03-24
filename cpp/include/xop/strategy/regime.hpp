@@ -54,7 +54,7 @@
 //   ISO/IEC 27001:2022  (no secrets; pure numerical computation)
 //   ISO/IEC 5055        (no raw pointers; bounds-checked containers)
 //   ISO/IEC 25000       (comprehensive formulae documentation; clear naming)
-//   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
+//   ISO/IEC JTC 1/SC 22 (standard-conforming C++20)
 
 #ifndef XOP_STRATEGY_REGIME_HPP
 #define XOP_STRATEGY_REGIME_HPP

@@ -15,7 +15,7 @@
 //   ISO/IEC 27001:2022  (no secrets in spread data, audit-friendly outputs)
 //   ISO/IEC 5055        (bounds-checked arithmetic, no UB on edge cases)
 //   ISO/IEC 25000       (clear naming, fully documented public interface)
-//   ISO/IEC JTC 1/SC 22 (standard-conforming C++17)
+//   ISO/IEC JTC 1/SC 22 (standard-conforming C++20)
 
 #ifndef XOP_STRATEGY_SPREAD_HPP
 #define XOP_STRATEGY_SPREAD_HPP

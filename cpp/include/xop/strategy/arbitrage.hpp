@@ -34,7 +34,7 @@
 //   ISO/IEC 27001:2022 -- no secrets; pure market-data analysis
 //   ISO/IEC 5055       -- no raw pointers; bounds-checked containers
 //   ISO/IEC 25000      -- clear naming, comprehensive documentation
-//   ISO/IEC JTC 1/SC 22 -- standard-conforming C++17
+//   ISO/IEC JTC 1/SC 22 -- standard-conforming C++20
 
 #ifndef XOP_STRATEGY_ARBITRAGE_HPP
 #define XOP_STRATEGY_ARBITRAGE_HPP

@@ -383,7 +383,7 @@ asio::awaitable<void> OfferManager::cancel_all()
 // evaluate_rebalance -- check all five rebalance triggers
 // ---------------------------------------------------------------------------
 
-RebalanceTrigger OfferManager::evaluate_rebalance(
+RebalanceReason OfferManager::evaluate_rebalance(
     const std::string& pair_name,
     Mojo               current_mid,
     BlockHeight        current_block,
@@ -393,11 +393,11 @@ RebalanceTrigger OfferManager::evaluate_rebalance(
     auto it = rebalance_baselines_.find(pair_name);
     if (it == rebalance_baselines_.end()) {
         // No baseline recorded yet -- always trigger initial posting.
-        return RebalanceTrigger::PriceDeviation;
+        return RebalanceReason::PriceMove;
     }
 
     const RebalanceSnapshot& base = it->second;
-    RebalanceTrigger result = RebalanceTrigger::None;
+    RebalanceReason result = RebalanceReason::None;
 
     // Trigger 1: Price deviation > 2% from last rebalance mid.
     if (base.mid_price > 0) {
@@ -405,7 +405,7 @@ RebalanceTrigger OfferManager::evaluate_rebalance(
             static_cast<double>(current_mid - base.mid_price)
             / static_cast<double>(base.mid_price));
         if (deviation > kPriceDeviationThreshold) {
-            result = result | RebalanceTrigger::PriceDeviation;
+            result = result | RebalanceReason::PriceMove;
             logger_->debug("Rebalance trigger: price deviation {:.2f}% for {}",
                            deviation * 100.0, pair_name);
         }
@@ -416,14 +416,14 @@ RebalanceTrigger OfferManager::evaluate_rebalance(
     // asset_id for the position lookup -- the engine maps pair -> asset).
     double skew = state_->inventory_skew(pair_name, pair_name);
     if (std::abs(skew) > kInventorySkewThreshold) {
-        result = result | RebalanceTrigger::InventorySkew;
+        result = result | RebalanceReason::InventorySkew;
         logger_->debug("Rebalance trigger: inventory skew {:.2f} for {}",
                        skew, pair_name);
     }
 
     // Trigger 3: Time decay > ~69 blocks (1 hour at 52 s/block).
     if (current_block >= base.block_height + kTimeDecayBlocks) {
-        result = result | RebalanceTrigger::TimeDecay;
+        result = result | RebalanceReason::TTLExpired;
         logger_->debug("Rebalance trigger: time decay ({} blocks stale) for {}",
                        current_block - base.block_height, pair_name);
     }
@@ -431,7 +431,7 @@ RebalanceTrigger OfferManager::evaluate_rebalance(
     // Trigger 4: Volume spike > 3x rolling average.
     if (base.volume_avg > 0.0 &&
         current_volume > kVolumeSpikeMultiplier * base.volume_avg) {
-        result = result | RebalanceTrigger::VolumeSpike;
+        result = result | RebalanceReason::RegimeChange;
         logger_->debug("Rebalance trigger: volume spike ({:.0f} vs avg {:.0f}) "
                        "for {}", current_volume, base.volume_avg, pair_name);
     }
@@ -439,7 +439,7 @@ RebalanceTrigger OfferManager::evaluate_rebalance(
     // Trigger 5: Volatility spike > 2x 7-day average.
     if (base.volatility_7d > 0.0 &&
         current_vol > kVolSpikeMult * base.volatility_7d) {
-        result = result | RebalanceTrigger::VolatilitySpike;
+        result = result | RebalanceReason::ForcedRefresh;
         logger_->debug("Rebalance trigger: vol spike ({:.4f} vs 7d avg {:.4f}) "
                        "for {}", current_vol, base.volatility_7d, pair_name);
     }

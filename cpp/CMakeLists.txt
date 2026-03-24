@@ -105,6 +105,8 @@ add_library(xop_core STATIC
     src/strategy/arbitrage.cpp
     src/strategy/new_strategies.cpp
     src/strategy/chia_edge.cpp
+    src/strategy/order_book_tactics.cpp
+    src/strategy/strategy_portfolio.cpp
 
     # -- Risk layer ------------------------------------------------------------
     src/risk/inventory.cpp

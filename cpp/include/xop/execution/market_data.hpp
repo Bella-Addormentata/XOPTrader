@@ -39,7 +39,7 @@
 //   ISO/IEC 27001:2022 -- no secrets handled; API endpoints from config only
 //   ISO/IEC 5055       -- no raw pointers, RAII locking, bounds-checked buffers
 //   ISO/IEC 25000      -- documented interfaces, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #ifndef XOP_EXECUTION_MARKET_DATA_HPP
 #define XOP_EXECUTION_MARKET_DATA_HPP

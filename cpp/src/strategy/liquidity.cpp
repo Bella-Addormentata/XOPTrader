@@ -178,7 +178,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
 
         if (bid_price > 0 && bid_size > 0) {
             TierQuote tq;
-            tq.tier       = static_cast<int>(i);
+            tq.tier_index = static_cast<std::uint8_t>(i);
             tq.side       = Side::Bid;
             tq.price      = bid_price;
             tq.size       = bid_size;
@@ -202,7 +202,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
 
         if (ask_price > 0 && ask_size > 0) {
             TierQuote tq;
-            tq.tier       = static_cast<int>(i);
+            tq.tier_index = static_cast<std::uint8_t>(i);
             tq.side       = Side::Ask;
             tq.price      = ask_price;
             tq.size       = ask_size;
@@ -220,7 +220,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
                 // Bid (0) before Ask (1).
                 return static_cast<int>(a.side) < static_cast<int>(b.side);
             }
-            return a.tier < b.tier;
+            return a.tier_index < b.tier_index;
         });
 
     return ladder;
@@ -394,7 +394,7 @@ bool LiquidityEngine::should_rebalance(
 
     // If we have never rebalanced, always trigger (bootstrap).
     if (last_rebalance_block_ == 0) {
-        last_reason_ = RebalanceReason::PriceDeviation;
+        last_reason_ = RebalanceReason::PriceMove;
         return true;
     }
 
@@ -408,7 +408,7 @@ bool LiquidityEngine::should_rebalance(
             / static_cast<double>(last_rebalance_price_);
 
         if (price_change > cfg_.price_deviation_threshold) {
-            last_reason_ = RebalanceReason::PriceDeviation;
+            last_reason_ = RebalanceReason::PriceMove;
             return true;
         }
     }
@@ -438,7 +438,7 @@ bool LiquidityEngine::should_rebalance(
         const auto blocks_elapsed =
             current_block - last_rebalance_block_;
         if (blocks_elapsed >= cfg_.offer_ttl_blocks) {
-            last_reason_ = RebalanceReason::OfferStale;
+            last_reason_ = RebalanceReason::TTLExpired;
             return true;
         }
     }
@@ -451,7 +451,7 @@ bool LiquidityEngine::should_rebalance(
         const double vol_ratio =
             static_cast<double>(current_vol) / static_cast<double>(avg_vol);
         if (vol_ratio > cfg_.volume_spike_factor) {
-            last_reason_ = RebalanceReason::VolumeSpike;
+            last_reason_ = RebalanceReason::RegimeChange;
             return true;
         }
     }
@@ -463,7 +463,7 @@ bool LiquidityEngine::should_rebalance(
     if (avg_sigma > 0.0 && current_sigma > 0.0) {
         const double sigma_ratio = current_sigma / avg_sigma;
         if (sigma_ratio > cfg_.volatility_spike_factor) {
-            last_reason_ = RebalanceReason::VolatilitySpike;
+            last_reason_ = RebalanceReason::ForcedRefresh;
             return true;
         }
     }
