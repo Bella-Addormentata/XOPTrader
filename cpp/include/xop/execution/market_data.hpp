@@ -582,8 +582,14 @@ private:
 
     /// Compute the spread multiplier from the count of whale events in the
     /// rolling window.  Linear interpolation: 0 events → 1.0; window_blocks
-    /// events → whale_max_spread_multiplier.
-    double compute_whale_spread_multiplier(std::size_t events_in_window) const;
+    /// events → max_multiplier.
+    /// @param events_in_window  Number of whale events in the rolling window.
+    /// @param window_blocks     Config snapshot of whale_window_blocks.
+    /// @param max_multiplier    Config snapshot of whale_max_spread_multiplier.
+    static double compute_whale_spread_multiplier(
+        std::size_t events_in_window,
+        std::size_t window_blocks,
+        double      max_multiplier);
 
     /// Compute VPIN from the completed volume bars for a pair.
     /// VPIN = (1/N) * SUM(|buy_vol_i - sell_vol_i|) / bucket_size
