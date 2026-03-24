@@ -156,6 +156,55 @@ struct MarketDataConfig {
     /// Alert threshold: if competing spread < this value (bps), fire an alert.
     /// Indicates a serious competitor with tight spreads has appeared.
     double competitor_alert_threshold_bps{50.0};
+
+    // -- Whale detection configuration --------------------------------------
+
+    /// Minimum trade size (in mojos) to be classified as a whale trade.
+    /// Default: 50 XCH.  Trades at or above this size trigger adverse-selection
+    /// guards (spread widening, size reduction).
+    Mojo whale_trade_threshold{50LL * 1'000'000'000'000LL};
+
+    /// Minimum fraction of rolling 24-hour volume that makes a trade a whale
+    /// trade regardless of absolute size.  This catches whales on illiquid pairs
+    /// where 50 XCH may still be a large fraction of daily turnover.
+    /// Default: 0.05 = 5 % of 24-hour volume.
+    double whale_volume_fraction{0.05};
+
+    /// Number of blocks over which whale events are counted for the activity
+    /// window.  Default: 10 blocks (~520 s at 52 s/block).
+    std::size_t whale_window_blocks{10};
+
+    /// Maximum spread multiplier applied when whale activity is at its most
+    /// intense.  The actual multiplier is linearly interpolated between 1.0
+    /// (no whale activity) and this value (maximum whale activity in window).
+    /// Default: 3.0  (triple the normal spread when the whale window is full).
+    double whale_max_spread_multiplier{3.0};
+
+    // -- VPIN configuration -------------------------------------------------
+
+    /// Volume per VPIN bucket, in base-asset units (e.g. XCH).
+    /// Trades are accumulated until this threshold is reached, completing a bar.
+    /// Reference: Easley, López de Prado & O'Hara (2012).
+    /// Default: 10.0 XCH per bucket.
+    double vpin_bucket_size{10.0};
+
+    /// Number of completed buckets in the rolling VPIN window.
+    /// VPIN is computed as the mean absolute imbalance over the most recent
+    /// N completed buckets.  Default: 50 buckets.
+    std::size_t vpin_window_buckets{50};
+
+    // -- OFI configuration --------------------------------------------------
+
+    /// Number of order-book snapshots to retain for OFI computation.
+    /// Default: 20 observations.
+    std::size_t ofi_window_size{20};
+
+    // -- Asymmetric spread configuration ------------------------------------
+
+    /// Asymmetry factor controlling how much the spread is skewed toward the
+    /// informed side during whale activity.  0.0 = symmetric, 1.0 = fully
+    /// asymmetric (all widening on the informed side).  Default: 0.5.
+    double asymmetric_skew_factor{0.5};
 };
 
 // ---------------------------------------------------------------------------
@@ -358,6 +407,107 @@ public:
     std::optional<ArbitrageSignal> get_latest_arb_signal(
         const std::string& pair_name) const;
 
+    // -- Whale detection ----------------------------------------------------
+
+    /// Record an individual trade and update whale-activity metrics.
+    ///
+    /// Called by the engine each time a fill is confirmed on the DEX (or when
+    /// the order book snapshots reveal a large trade vs. the previous block).
+    /// A trade is classified as a "whale trade" when its size meets either
+    /// the absolute threshold (whale_trade_threshold) or the fractional-volume
+    /// threshold (whale_volume_fraction × vol_24h).
+    ///
+    /// @param pair_name     Trading pair identifier.
+    /// @param side          Direction of the trade (Bid = taker bought, Ask = taker sold).
+    /// @param size          Trade size in mojos (base asset).
+    /// @param block_height  Block at which the trade occurred.
+    void ingest_trade(const std::string& pair_name,
+                      Side               side,
+                      Mojo               size,
+                      BlockHeight        block_height);
+
+    /// Retrieve the latest whale metrics for a pair.
+    /// Returns std::nullopt if no trades have been ingested for this pair or if
+    /// no whale events have occurred within the tracking window.
+    std::optional<WhaleMetrics> get_whale_metrics(
+        const std::string& pair_name) const;
+
+    /// Whether whale activity is currently detected for a pair.
+    /// Returns false if the pair is unknown or the tracking window is empty.
+    bool is_whale_active(const std::string& pair_name) const;
+
+    /// Recommended spread multiplier based on current whale activity.
+    /// Returns 1.0 when no whale activity is detected (no spread widening).
+    /// Returns up to whale_max_spread_multiplier when the whale window is full.
+    double get_whale_spread_multiplier(const std::string& pair_name) const;
+
+    // -- VPIN (flow toxicity) -----------------------------------------------
+
+    /// Ingest a classified trade for VPIN computation.
+    ///
+    /// Unlike ingest_trade() (which only records whale-sized trades), this
+    /// method feeds every observed trade into the VPIN volume-bar pipeline.
+    /// Call this for ALL trades, not just whales.
+    ///
+    /// @param pair_name     Trading pair identifier.
+    /// @param side          Direction of the trade (Bid = taker bought).
+    /// @param volume        Trade volume in base-asset units (e.g. XCH).
+    void ingest_trade_for_vpin(const std::string& pair_name,
+                               Side               side,
+                               double             volume);
+
+    /// Retrieve the current VPIN (flow-toxicity) metrics for a pair.
+    /// Returns std::nullopt if insufficient buckets have been completed.
+    std::optional<VpinMetrics> get_vpin_metrics(
+        const std::string& pair_name) const;
+
+    /// Current VPIN value for a pair, in [0, 1].
+    /// Returns 0.0 if no VPIN data is available (safe default: no toxicity).
+    double get_vpin(const std::string& pair_name) const;
+
+    // -- OFI (order flow imbalance) -----------------------------------------
+
+    /// Ingest an order-book snapshot for OFI computation.
+    ///
+    /// The OFI delta is computed from changes between consecutive snapshots
+    /// at the best bid/ask levels.  Call this once per block after
+    /// ingest_dexie().
+    ///
+    /// @param pair_name  Trading pair identifier.
+    /// @param best_bid   Best bid price.
+    /// @param bid_size   Total size at best bid.
+    /// @param best_ask   Best ask price.
+    /// @param ask_size   Total size at best ask.
+    void ingest_book_snapshot_for_ofi(const std::string& pair_name,
+                                      double             best_bid,
+                                      double             bid_size,
+                                      double             best_ask,
+                                      double             ask_size);
+
+    /// Retrieve the current OFI metrics for a pair.
+    /// Returns std::nullopt if fewer than 2 snapshots have been ingested.
+    std::optional<OfiMetrics> get_ofi_metrics(
+        const std::string& pair_name) const;
+
+    /// Normalised OFI value for a pair, in [-1, 1].
+    /// Positive = buy pressure, negative = sell pressure.
+    /// Returns 0.0 if no OFI data is available.
+    double get_normalized_ofi(const std::string& pair_name) const;
+
+    // -- Asymmetric spread widening -----------------------------------------
+
+    /// Compute per-side spread multipliers that skew widening toward the
+    /// informed (toxic) side.
+    ///
+    /// When a whale buys aggressively (dominant_side = Bid), the ask side
+    /// carries higher adverse-selection risk.  This method raises the ask
+    /// multiplier and lowers the bid multiplier, preserving the total
+    /// widening but distributing it asymmetrically.
+    ///
+    /// Returns {1.0, 1.0} when no whale activity is detected.
+    AsymmetricMultipliers get_asymmetric_spread_multipliers(
+        const std::string& pair_name) const;
+
     // -- Configuration access -----------------------------------------------
 
     /// Read-only access to the active configuration.
@@ -368,6 +518,24 @@ public:
 
     /// Replace the arbitrage callback (e.g. when strategy layer reconnects).
     void set_arb_callback(ArbitrageCallback cb);
+
+    // -- Whale configuration setters (runtime-tunable) ----------------------
+
+    /// Update the absolute whale-trade size threshold.
+    /// @param threshold  Minimum trade size in mojos; must be > 0.
+    void set_whale_trade_threshold(Mojo threshold);
+
+    /// Update the volume-fraction whale threshold.
+    /// @param fraction  Minimum fraction of 24h volume (0 < fraction <= 1).
+    void set_whale_volume_fraction(double fraction);
+
+    /// Update the rolling window length.
+    /// @param blocks  Window size in blocks; must be >= 1.
+    void set_whale_window_blocks(std::size_t blocks);
+
+    /// Update the maximum spread multiplier.
+    /// @param multiplier  Must be >= 1.0.
+    void set_whale_max_spread_multiplier(double multiplier);
 
 private:
     // -- Internal helpers ---------------------------------------------------
@@ -405,6 +573,36 @@ private:
     std::optional<CompetitorMetrics> compute_competitor_metrics(
         const std::string& pair_name);
 
+    /// Classify a trade as a whale event and, if so, append it to the per-pair
+    /// event deque and recompute WhaleMetrics.  Called from ingest_trade().
+    void detect_and_update_whale(const std::string& pair_name,
+                                 Side               side,
+                                 Mojo               size,
+                                 BlockHeight        block_height);
+
+    /// Compute the spread multiplier from the count of whale events in the
+    /// rolling window.  Linear interpolation: 0 events → 1.0; window_blocks
+    /// events → max_multiplier.
+    /// @param events_in_window  Number of whale events in the rolling window.
+    /// @param window_blocks     Config snapshot of whale_window_blocks.
+    /// @param max_multiplier    Config snapshot of whale_max_spread_multiplier.
+    static double compute_whale_spread_multiplier(
+        std::size_t events_in_window,
+        std::size_t window_blocks,
+        double      max_multiplier);
+
+    /// Compute VPIN from the completed volume bars for a pair.
+    /// VPIN = (1/N) * SUM(|buy_vol_i - sell_vol_i|) / bucket_size
+    void recompute_vpin(const std::string& pair_name);
+
+    /// Compute OFI delta from the latest two book snapshots and update metrics.
+    void recompute_ofi(const std::string& pair_name);
+
+    /// Recompute whale metrics for all tracked pairs after a config change.
+    /// Trims stale events from each pair's event deque and recalculates the
+    /// spread multiplier with the updated configuration.
+    void recompute_all_whale_metrics();
+
     /// Build a MarketSnapshot from internal PairState and write it to the
     /// shared State object.
     void publish_snapshot(const PairState& ps);
@@ -414,7 +612,9 @@ private:
 
     // -- Data members -------------------------------------------------------
 
-    /// Configuration (thresholds, capacities).
+    /// Configuration (thresholds, capacities).  Guarded by mtx_config_ for
+    /// thread-safe runtime updates via the set_* methods.
+    mutable std::shared_mutex mtx_config_;
     MarketDataConfig config_;
 
     /// Reference to the shared global state.  refresh() writes MarketSnapshot
@@ -443,6 +643,43 @@ private:
     /// Per-pair latest competitor metrics.  Guarded by mtx_competitor_metrics_.
     mutable std::shared_mutex                          mtx_competitor_metrics_;
     std::unordered_map<std::string, CompetitorMetrics> competitor_metrics_;
+
+    /// Per-pair whale trade event deques (ordered oldest-to-newest by block).
+    /// Guarded by mtx_whale_events_.
+    mutable std::shared_mutex                              mtx_whale_events_;
+    std::unordered_map<std::string, std::deque<WhaleTradeEvent>> whale_events_;
+
+    /// Per-pair latest whale metrics.  Guarded by mtx_whale_metrics_.
+    mutable std::shared_mutex                          mtx_whale_metrics_;
+    std::unordered_map<std::string, WhaleMetrics>      whale_metrics_;
+
+    /// Per-pair VPIN volume-bar state.  Guarded by mtx_vpin_.
+    /// Each pair tracks a current (incomplete) bucket and a deque of completed
+    /// buckets.  When the current bucket fills, it is pushed to the deque.
+    struct VpinState {
+        VpinBucket                current_bucket;   // in-progress bar
+        std::deque<VpinBucket>    completed;        // completed bars (newest last)
+    };
+    mutable std::shared_mutex                          mtx_vpin_;
+    std::unordered_map<std::string, VpinState>         vpin_state_;
+
+    /// Per-pair latest VPIN metrics.  Guarded by mtx_vpin_metrics_.
+    mutable std::shared_mutex                          mtx_vpin_metrics_;
+    std::unordered_map<std::string, VpinMetrics>       vpin_metrics_;
+
+    /// Per-pair OFI book-snapshot history.  Guarded by mtx_ofi_.
+    struct BookSnapshot {
+        double best_bid{0.0};
+        double bid_size{0.0};
+        double best_ask{0.0};
+        double ask_size{0.0};
+    };
+    mutable std::shared_mutex                          mtx_ofi_;
+    std::unordered_map<std::string, std::deque<BookSnapshot>> ofi_snapshots_;
+
+    /// Per-pair latest OFI metrics.  Guarded by mtx_ofi_metrics_.
+    mutable std::shared_mutex                          mtx_ofi_metrics_;
+    std::unordered_map<std::string, OfiMetrics>        ofi_metrics_;
 
     /// Latest block height from the full node.  Atomic for lock-free reads.
     std::atomic<BlockHeight> block_height_{0};

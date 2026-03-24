@@ -43,6 +43,8 @@ add_executable(xop_tests
     test_volatility.cpp
     test_regime.cpp
     test_competitor_detection.cpp
+    test_whale_detection.cpp
+    test_advanced_trading.cpp
 )
 
 target_link_libraries(xop_tests
