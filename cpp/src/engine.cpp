@@ -29,6 +29,7 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cmath>
 #include <functional>
@@ -232,7 +233,19 @@ void Engine::run()
     open_connections();
 
     // Start Prometheus metrics exporter.
-    metrics_->init(config_.monitoring.prometheus_port);
+    // Extract all configured asset IDs so the cardinality guard rejects
+    // unexpected label values.  ISO/IEC 5055: bounded resource allocation.
+    std::vector<std::string> asset_ids;
+    asset_ids.reserve(config_.pairs.size() * 2);
+    for (const auto& pair : config_.pairs) {
+        asset_ids.push_back(pair.base_asset_id);
+        asset_ids.push_back(pair.quote_asset_id);
+    }
+    // Deduplicate: sort + unique to avoid registering the same ID twice.
+    std::sort(asset_ids.begin(), asset_ids.end());
+    asset_ids.erase(std::unique(asset_ids.begin(), asset_ids.end()),
+                    asset_ids.end());
+    metrics_->init(config_.monitoring.prometheus_port, asset_ids);
 
     // Transition to Running.
     state_->set_status(BotStatus::Running);
@@ -545,13 +558,15 @@ void Engine::step_update_market_state(BlockHeight block_height)
                 co.side             = (!orec.offered.empty() &&
                                        orec.offered[0].id == pair.base_asset_id)
                                       ? Side::Ask : Side::Bid;
-                co.price            = static_cast<Mojo>(
-                    orec.price * static_cast<double>(kMojosPerXch));
+                // ISO/IEC 5055: round instead of truncate for price conversion.
+                co.price            = static_cast<Mojo>(std::llround(
+                    orec.price * static_cast<double>(kMojosPerXch)));
                 co.size             = 0;
                 if (!orec.offered.empty()) {
-                    co.size = static_cast<Mojo>(
+                    // ISO/IEC 5055: round instead of truncate for size conversion.
+                    co.size = static_cast<Mojo>(std::llround(
                         orec.offered[0].amount *
-                        static_cast<double>(kMojosPerXch));
+                        static_cast<double>(kMojosPerXch)));
                 }
                 co.first_seen_block = block_height;
                 co.last_seen_block  = block_height;
@@ -606,7 +621,9 @@ void Engine::step_process_fills(BlockHeight block_height)
     for (const auto& fill : fills) {
         // Persist the fill to the audit trail.
         DbTradeRecord tr;
-        tr.timestamp       = ""; // Will be set by Database via CURRENT_TIMESTAMP
+        // Convert the fill's wall-clock timestamp to ISO-8601 for the DB record.
+        // ISO/IEC 5055: use the actual detection time, not DB-generated time.
+        tr.timestamp       = PnLTracker::timestamp_to_iso(fill.timestamp);
         tr.trade_id        = fill.offer_id;
         tr.pair_name       = fill.pair_name;
         tr.side            = (fill.side == Side::Bid) ? "bid" : "ask";
@@ -643,10 +660,10 @@ void Engine::step_process_fills(BlockHeight block_height)
         // multiply (two 1e12-scale values can exceed 2^63).
         // ISO/IEC 5055: explicit unit normalization for financial calc.
         tr.realized_pnl_mojos = (fill.side == Side::Ask)
-            ? static_cast<Mojo>(
+            ? static_cast<Mojo>(std::llround(
                   static_cast<double>(fill.price - asset_rec.weighted_avg_cost_basis)
                   * static_cast<double>(fill.size)
-                  / static_cast<double>(kMojosPerXch))
+                  / static_cast<double>(kMojosPerXch)))
             : 0;
 
         db_->insert_trade(tr);
@@ -697,7 +714,7 @@ void Engine::step_process_fills(BlockHeight block_height)
             if (!pair.enabled) continue;
             double mid = market_data_->get_mid_price(pair.name);
             if (mid <= 0.0) continue;
-            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            Mojo mid_mojos = static_cast<Mojo>(std::llround(mid * static_cast<double>(kMojosPerXch)));
             double inv_ratio = inventory_->inventory_ratio(
                 AssetId{pair.base_asset_id},
                 AssetId{pair.quote_asset_id},
@@ -926,7 +943,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             // Use the 3-arg inventory_ratio with this pair's asset IDs
             // and current mid-price as the ratio reference.
             // pair_cfg was resolved at the top of this loop iteration.
-            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            Mojo mid_mojos = static_cast<Mojo>(std::llround(mid * static_cast<double>(kMojosPerXch)));
             book_state.inventory_ratio = pair_cfg
                 ? std::abs(inventory_->inventory_ratio(
                       AssetId{pair_cfg->base_asset_id},
@@ -987,15 +1004,16 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         double bid_half = half_spread * asym.bid_multiplier;
         double ask_half = half_spread * asym.ask_multiplier;
 
+        // ISO/IEC 5055: round instead of truncate for price/size conversions.
         Quote quote;
-        quote.bid_price  = static_cast<Mojo>(
-            (reservation_mid - bid_half) * static_cast<double>(kMojosPerXch));
-        quote.ask_price  = static_cast<Mojo>(
-            (reservation_mid + ask_half) * static_cast<double>(kMojosPerXch));
-        quote.bid_size   = static_cast<Mojo>(
-            pcs.raw_quote.bid_size * static_cast<double>(kMojosPerXch));
-        quote.ask_size   = static_cast<Mojo>(
-            pcs.raw_quote.ask_size * static_cast<double>(kMojosPerXch));
+        quote.bid_price  = static_cast<Mojo>(std::llround(
+            (reservation_mid - bid_half) * static_cast<double>(kMojosPerXch)));
+        quote.ask_price  = static_cast<Mojo>(std::llround(
+            (reservation_mid + ask_half) * static_cast<double>(kMojosPerXch)));
+        quote.bid_size   = static_cast<Mojo>(std::llround(
+            pcs.raw_quote.bid_size * static_cast<double>(kMojosPerXch)));
+        quote.ask_size   = static_cast<Mojo>(std::llround(
+            pcs.raw_quote.ask_size * static_cast<double>(kMojosPerXch)));
         quote.spread_bps = pcs.spread_result.total_spread_bps;
 
         // Enforce never-sell-at-loss on the ask price.
@@ -1015,7 +1033,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // value.
         // ISO/IEC 27001:2022: advisory-only; no secrets; audit-logged.
         if (loss_manager_ && loss_manager_->config().enabled) {
-            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            Mojo mid_mojos = static_cast<Mojo>(std::llround(mid * static_cast<double>(kMojosPerXch)));
             double inv_ratio = std::abs(inventory_->inventory_ratio(
                 AssetId{pair_cfg->base_asset_id},
                 AssetId{pair_cfg->quote_asset_id},

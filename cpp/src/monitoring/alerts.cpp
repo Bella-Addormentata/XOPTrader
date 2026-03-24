@@ -20,7 +20,7 @@
 // Compliant with:
 //   ISO/IEC 5055       -- no raw pointers (curl is RAII-wrapped), bounds checks
 //   ISO/IEC 25000      -- documented, single-responsibility
-//   ISO/IEC JTC 1/SC 22 -- standard C++17, no undefined behaviour
+//   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
 
 #include "xop/monitoring/alerts.hpp"
 
