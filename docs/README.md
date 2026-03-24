@@ -147,6 +147,10 @@ These supplementary documents cover the C++20 engine architecture and system des
 | [03-technical-architecture.md](./03-technical-architecture.md) | Full system design for the C++20 engine: components, pseudocode, tech stack, DB schema, Docker, security |
 | [04-implementation-roadmap.md](./04-implementation-roadmap.md) | Build plan aligned to the actual C++20 codebase, capital analysis, break-even math, launch checklist |
 | [chia-market-maker.md](./chia-market-maker.md) | Concise research brief covering DEX landscape, four MM models, risk controls, and architecture playbook |
+| [competitor-detection.md](./competitor-detection.md) | Competitor-offer tracking, best-spread computation, adaptive spread response |
+| [whale-trader-response.md](./whale-trader-response.md) | Whale-trade detection, adverse-selection risks, spread-widening guard, configuration reference |
+| [advanced-trading-methods.md](./advanced-trading-methods.md) | VPIN flow-toxicity estimation, OFI order-flow imbalance, asymmetric spread widening — scholarly references |
+| [trading-strategies.md](./trading-strategies.md) | Complete strategy catalog: 12 implemented, 5 considered, 15 future strategies — pros/cons, scholarly references, TODO list |
 
 ---
 

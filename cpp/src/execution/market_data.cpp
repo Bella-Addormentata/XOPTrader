@@ -86,6 +86,14 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
         std::unique_lock lock(other.mtx_competitor_metrics_);
         competitor_metrics_ = std::move(other.competitor_metrics_);
     }
+    {
+        std::unique_lock lock(other.mtx_whale_events_);
+        whale_events_ = std::move(other.whale_events_);
+    }
+    {
+        std::unique_lock lock(other.mtx_whale_metrics_);
+        whale_metrics_ = std::move(other.whale_metrics_);
+    }
 }
 
 MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
@@ -123,6 +131,16 @@ MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
         std::unique_lock lock_dst(mtx_competitor_metrics_);
         std::unique_lock lock_src(other.mtx_competitor_metrics_);
         competitor_metrics_ = std::move(other.competitor_metrics_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_whale_events_);
+        std::unique_lock lock_src(other.mtx_whale_events_);
+        whale_events_ = std::move(other.whale_events_);
+    }
+    {
+        std::unique_lock lock_dst(mtx_whale_metrics_);
+        std::unique_lock lock_src(other.mtx_whale_metrics_);
+        whale_metrics_ = std::move(other.whale_metrics_);
     }
 
     return *this;
@@ -373,6 +391,10 @@ std::optional<ArbitrageSignal> MarketDataFeed::get_latest_arb_signal(
 // =========================================================================
 
 const MarketDataConfig& MarketDataFeed::config() const noexcept {
+    // Note: mtx_config_ is not acquired here to preserve the noexcept contract.
+    // Callers should ensure no concurrent config mutation (i.e. call setters
+    // from the same thread that owns the feed, or accept benign tearing on
+    // double fields).
     return config_;
 }
 
@@ -382,13 +404,75 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
                      threshold_bps);
         return;
     }
-    config_.arb_threshold_bps = threshold_bps;
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.arb_threshold_bps = threshold_bps;
+    }
     spdlog::info("Arbitrage threshold updated to {:.1f} bps", threshold_bps);
 }
 
 void MarketDataFeed::set_arb_callback(ArbitrageCallback cb) {
     arb_callback_ = std::move(cb);
     spdlog::debug("Arbitrage callback updated");
+}
+
+void MarketDataFeed::set_whale_trade_threshold(Mojo threshold) {
+    if (threshold <= 0) {
+        spdlog::warn("set_whale_trade_threshold: invalid threshold={}, ignoring",
+                     threshold);
+        return;
+    }
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_trade_threshold = threshold;
+    }
+    spdlog::info("Whale trade threshold updated to {} mojos ({:.2f} XCH)",
+                 threshold,
+                 static_cast<double>(threshold) / static_cast<double>(kMojosPerXch));
+    recompute_all_whale_metrics();
+}
+
+void MarketDataFeed::set_whale_volume_fraction(double fraction) {
+    if (fraction <= 0.0 || fraction > 1.0) {
+        spdlog::warn("set_whale_volume_fraction: invalid fraction={:.4f}, ignoring",
+                     fraction);
+        return;
+    }
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_volume_fraction = fraction;
+    }
+    spdlog::info("Whale volume fraction updated to {:.4f} ({:.1f}%)",
+                 fraction, fraction * 100.0);
+    recompute_all_whale_metrics();
+}
+
+void MarketDataFeed::set_whale_window_blocks(std::size_t blocks) {
+    if (blocks == 0) {
+        spdlog::warn("set_whale_window_blocks: window must be >= 1, ignoring");
+        return;
+    }
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_window_blocks = blocks;
+    }
+    spdlog::info("Whale window updated to {} blocks (~{:.0f}s at 52s/block)",
+                 blocks, static_cast<double>(blocks) * 52.0);
+    recompute_all_whale_metrics();
+}
+
+void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
+    if (multiplier < 1.0) {
+        spdlog::warn("set_whale_max_spread_multiplier: multiplier={:.2f} < 1.0, ignoring",
+                     multiplier);
+        return;
+    }
+    {
+        std::unique_lock lock(mtx_config_);
+        config_.whale_max_spread_multiplier = multiplier;
+    }
+    spdlog::info("Whale max spread multiplier updated to {:.2f}x", multiplier);
+    recompute_all_whale_metrics();
 }
 
 // =========================================================================
@@ -889,6 +973,355 @@ std::size_t MarketDataFeed::get_num_competing_offers(
     return metrics->num_competing_offers;
 }
 
+// =========================================================================
+// Whale detection methods
+// =========================================================================
+
+// -------------------------------------------------------------------------
+// ingest_trade -- record an individual trade and update whale-activity metrics
+//
+// Classifies the trade as a whale event when its size meets either:
+//   (a) the absolute threshold (whale_trade_threshold), or
+//   (b) the fractional-volume threshold (whale_volume_fraction × vol_24h).
+//
+// Non-whale trades are silently discarded.  Whale trades are appended to a
+// per-pair deque and WhaleMetrics is recomputed.
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::ingest_trade(const std::string& pair_name,
+                                  Side               side,
+                                  Mojo               size,
+                                  BlockHeight        block_height)
+{
+    if (size <= 0) {
+        return;  // Guard against degenerate input.
+    }
+
+    // Snapshot config values under shared lock to avoid data races with setters.
+    Mojo   whale_trade_threshold;
+    double whale_volume_fraction;
+    {
+        std::shared_lock lock(mtx_config_);
+        whale_trade_threshold = config_.whale_trade_threshold;
+        whale_volume_fraction = config_.whale_volume_fraction;
+    }
+
+    // Fetch current 24h volume to evaluate the fractional-volume criterion.
+    const double vol_24h = get_volume_24h(pair_name);  // base-asset units (double)
+
+    // Convert size to base-asset units for the fractional comparison.
+    const double size_units =
+        static_cast<double>(size) / static_cast<double>(kMojosPerXch);
+
+    // Compute size as a fraction of 24h volume (guard against zero volume).
+    const double size_pct_vol =
+        (vol_24h > 0.0) ? (size_units / vol_24h) : 0.0;
+
+    // Determine whether this qualifies as a whale trade.
+    const bool absolute_threshold_met = (size >= whale_trade_threshold);
+    const bool volume_fraction_met =
+        (vol_24h > 0.0) && (size_pct_vol >= whale_volume_fraction);
+
+    if (!absolute_threshold_met && !volume_fraction_met) {
+        return;  // Not a whale trade; ignore.
+    }
+
+    // Record the whale event.
+    detect_and_update_whale(pair_name, side, size, block_height);
+}
+
+// -------------------------------------------------------------------------
+// detect_and_update_whale -- append a confirmed whale event and recompute metrics
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
+                                             Side               side,
+                                             Mojo               size,
+                                             BlockHeight        block_height)
+{
+    // Snapshot config under shared lock to avoid data races with setters.
+    std::size_t whale_window_blocks;
+    double      whale_max_spread_multiplier;
+    {
+        std::shared_lock lock(mtx_config_);
+        whale_window_blocks         = config_.whale_window_blocks;
+        whale_max_spread_multiplier = config_.whale_max_spread_multiplier;
+    }
+
+    const double vol_24h = get_volume_24h(pair_name);
+    const double size_units =
+        static_cast<double>(size) / static_cast<double>(kMojosPerXch);
+    const double size_pct_vol =
+        (vol_24h > 0.0) ? (size_units / vol_24h) : 0.0;
+
+    WhaleTradeEvent evt;
+    evt.pair_name    = pair_name;
+    evt.side         = side;
+    evt.size         = size;
+    evt.size_pct_vol = size_pct_vol;
+    evt.block_height = block_height;
+    evt.detected_at  = std::chrono::system_clock::now();
+
+    // Append event and evict stale events outside the rolling window.
+    {
+        std::unique_lock lock(mtx_whale_events_);
+        auto& deq = whale_events_[pair_name];
+        deq.push_back(evt);
+
+        // Evict events older than whale_window_blocks.
+        // Use uint64_t for the subtraction to avoid narrowing whale_window_blocks
+        // (a size_t) to BlockHeight (uint32_t), which would silently truncate values
+        // above UINT32_MAX.
+        const std::uint64_t effective_window =
+            static_cast<std::uint64_t>(whale_window_blocks);
+        while (!deq.empty() &&
+               block_height >= deq.front().block_height)
+        {
+            const std::uint64_t age =
+                static_cast<std::uint64_t>(block_height) -
+                static_cast<std::uint64_t>(deq.front().block_height);
+            if (age >= effective_window) {
+                deq.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    // Recompute metrics under shared read of the event deque.
+    std::vector<WhaleTradeEvent> events_snapshot;
+    {
+        std::shared_lock lock(mtx_whale_events_);
+        auto it = whale_events_.find(pair_name);
+        if (it != whale_events_.end()) {
+            events_snapshot.assign(it->second.begin(), it->second.end());
+        }
+    }
+
+    if (events_snapshot.empty()) {
+        return;
+    }
+
+    // Find largest trade in window.
+    Mojo largest = 0;
+    for (const auto& e : events_snapshot) {
+        if (e.size > largest) {
+            largest = e.size;
+        }
+    }
+
+    const std::size_t n = events_snapshot.size();
+    const double multiplier = compute_whale_spread_multiplier(
+        n, whale_window_blocks, whale_max_spread_multiplier);
+
+    WhaleMetrics wm;
+    wm.pair_name          = pair_name;
+    wm.events_in_window   = n;
+    wm.largest_trade_size = largest;
+    wm.spread_multiplier  = multiplier;
+    wm.dominant_side      = events_snapshot.back().side;
+    wm.is_active          = true;
+    wm.last_event_block   = events_snapshot.back().block_height;
+    wm.last_updated       = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_whale_metrics_);
+        whale_metrics_[pair_name] = wm;
+    }
+
+    spdlog::warn("MarketDataFeed: whale trade detected on pair={}, "
+                 "side={}, size_xch={:.2f}, events_in_window={}, "
+                 "spread_multiplier={:.2f}x",
+                 pair_name,
+                 to_string(side),
+                 static_cast<double>(size) / static_cast<double>(kMojosPerXch),
+                 n,
+                 multiplier);
+}
+
+// -------------------------------------------------------------------------
+// compute_whale_spread_multiplier -- linear interpolation over event count
+//
+// 0 events → 1.0 (no widening)
+// >= whale_window_blocks events → whale_max_spread_multiplier
+// -------------------------------------------------------------------------
+
+double MarketDataFeed::compute_whale_spread_multiplier(
+    std::size_t events_in_window,
+    std::size_t window_blocks_param,
+    double      max_multiplier)
+{
+    if (events_in_window == 0) {
+        return 1.0;
+    }
+
+    // Ensure we never divide by zero: treat a zero window size as 1 block.
+    const double effective_window = std::max(
+        1.0,
+        static_cast<double>(window_blocks_param));
+
+    // Clamp at the window size so we don't extrapolate beyond max.
+    const double fraction = std::min(
+        static_cast<double>(events_in_window) / effective_window,
+        1.0);
+
+    // Linear interpolation: 1.0 + fraction * (max - 1.0)
+    return 1.0 + fraction * (max_multiplier - 1.0);
+}
+
+// -------------------------------------------------------------------------
+// Public accessor methods for whale metrics
+// -------------------------------------------------------------------------
+
+std::optional<WhaleMetrics> MarketDataFeed::get_whale_metrics(
+    const std::string& pair_name) const
+{
+    // Expire stale whale metrics: if the most recent event is older than the
+    // tracking window, the whale has left and we return nullopt.
+    const BlockHeight current_block =
+        block_height_.load(std::memory_order_relaxed);
+
+    // Snapshot config for the window size.
+    std::uint64_t window_blocks_64;
+    {
+        std::shared_lock lock(mtx_config_);
+        window_blocks_64 = static_cast<std::uint64_t>(config_.whale_window_blocks);
+    }
+
+    std::shared_lock lock(mtx_whale_metrics_);
+    auto it = whale_metrics_.find(pair_name);
+    if (it == whale_metrics_.end()) {
+        return std::nullopt;
+    }
+
+    const WhaleMetrics& wm = it->second;
+    // Compute the expiry comparison in uint64_t to avoid uint32 overflow when
+    // last_event_block is near UINT32_MAX or when whale_window_blocks is large.
+    const auto current64 = static_cast<std::uint64_t>(current_block);
+    const auto last64    = static_cast<std::uint64_t>(wm.last_event_block);
+    if (current64 >= last64 + window_blocks_64)
+    {
+        // Window has expired; behave as if no whale is present.
+        return std::nullopt;
+    }
+
+    return wm;
+}
+
+bool MarketDataFeed::is_whale_active(const std::string& pair_name) const
+{
+    return get_whale_metrics(pair_name).has_value();
+}
+
+double MarketDataFeed::get_whale_spread_multiplier(
+    const std::string& pair_name) const
+{
+    auto wm = get_whale_metrics(pair_name);
+    if (!wm.has_value()) {
+        return 1.0;
+    }
+    return wm->spread_multiplier;
+}
+
+// -------------------------------------------------------------------------
+// recompute_all_whale_metrics -- re-evaluate after config change
+//
+// Called by the runtime setters to ensure cached whale metrics reflect the
+// new configuration immediately (e.g. a changed window size or multiplier).
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::recompute_all_whale_metrics()
+{
+    const BlockHeight current_block =
+        block_height_.load(std::memory_order_relaxed);
+
+    // Snapshot config under shared lock.
+    std::size_t cfg_whale_window_blocks;
+    double      cfg_whale_max_spread_multiplier;
+    {
+        std::shared_lock lock(mtx_config_);
+        cfg_whale_window_blocks         = config_.whale_window_blocks;
+        cfg_whale_max_spread_multiplier = config_.whale_max_spread_multiplier;
+    }
+
+    // Collect pair names with whale events.
+    std::vector<std::string> pair_names;
+    {
+        std::shared_lock lock(mtx_whale_events_);
+        pair_names.reserve(whale_events_.size());
+        for (const auto& [name, _] : whale_events_) {
+            pair_names.push_back(name);
+        }
+    }
+
+    for (const auto& pair_name : pair_names) {
+        // Trim events under the new window.
+        {
+            std::unique_lock lock(mtx_whale_events_);
+            auto it = whale_events_.find(pair_name);
+            if (it == whale_events_.end()) {
+                continue;
+            }
+            auto& deq = it->second;
+            const std::uint64_t window_blocks =
+                static_cast<std::uint64_t>(cfg_whale_window_blocks);
+            while (!deq.empty() && current_block >= deq.front().block_height) {
+                const std::uint64_t age =
+                    static_cast<std::uint64_t>(current_block) -
+                    static_cast<std::uint64_t>(deq.front().block_height);
+                if (age >= window_blocks) {
+                    deq.pop_front();
+                } else {
+                    break;
+                }
+            }
+        }
+
+        // Snapshot surviving events.
+        std::vector<WhaleTradeEvent> events_snapshot;
+        {
+            std::shared_lock lock(mtx_whale_events_);
+            auto it = whale_events_.find(pair_name);
+            if (it != whale_events_.end()) {
+                events_snapshot.assign(it->second.begin(), it->second.end());
+            }
+        }
+
+        if (events_snapshot.empty()) {
+            // Clear metrics if no events survive the new window.
+            std::unique_lock lock(mtx_whale_metrics_);
+            whale_metrics_.erase(pair_name);
+            continue;
+        }
+
+        Mojo largest = 0;
+        for (const auto& e : events_snapshot) {
+            if (e.size > largest) {
+                largest = e.size;
+            }
+        }
+
+        const std::size_t n = events_snapshot.size();
+        const double multiplier = compute_whale_spread_multiplier(
+            n, cfg_whale_window_blocks, cfg_whale_max_spread_multiplier);
+
+        WhaleMetrics wm;
+        wm.pair_name          = pair_name;
+        wm.events_in_window   = n;
+        wm.largest_trade_size = largest;
+        wm.spread_multiplier  = multiplier;
+        wm.dominant_side      = events_snapshot.back().side;
+        wm.is_active          = true;
+        wm.last_event_block   = events_snapshot.back().block_height;
+        wm.last_updated       = std::chrono::system_clock::now();
+
+        {
+            std::unique_lock lock(mtx_whale_metrics_);
+            whale_metrics_[pair_name] = wm;
+        }
+    }
+}
+
 // -------------------------------------------------------------------------
 // get_or_create_pair -- lazy initialization of PairState
 //
@@ -901,6 +1334,383 @@ PairState& MarketDataFeed::get_or_create_pair(const std::string& pair_name) {
         spdlog::info("MarketDataFeed: tracking new pair={}", pair_name);
     }
     return it->second;
+}
+
+// =========================================================================
+// VPIN — Volume-Synchronized Probability of Informed Trading
+//
+// Reference: Easley, López de Prado & O'Hara (2012). "Flow Toxicity and
+// Liquidity in a High-frequency World."
+//
+// Trades are accumulated into volume bars (buckets) of fixed size.  When a
+// bucket fills the buy/sell imbalance is frozen.  VPIN is the rolling mean
+// of absolute imbalances over the last N completed buckets, divided by the
+// bucket size:
+//
+//   VPIN = (1/N) * SUM_i |buy_vol_i - sell_vol_i| / bucket_size
+//
+// This yields a continuous toxicity signal in [0, 1].
+// =========================================================================
+
+void MarketDataFeed::ingest_trade_for_vpin(const std::string& pair_name,
+                                           Side               side,
+                                           double             volume)
+{
+    if (volume <= 0.0) {
+        return;
+    }
+
+    // Snapshot VPIN config under shared lock.
+    double      bucket_size;
+    std::size_t window_buckets;
+    {
+        std::shared_lock lock(mtx_config_);
+        bucket_size    = config_.vpin_bucket_size;
+        window_buckets = config_.vpin_window_buckets;
+    }
+
+    if (bucket_size <= 0.0) {
+        spdlog::warn(
+            "VPIN disabled for pair '{}' due to non-positive bucket size: {}",
+            pair_name,
+            bucket_size);
+        return;
+    }
+
+    {
+        std::unique_lock lock(mtx_vpin_);
+        auto& vs = vpin_state_[pair_name];
+
+        double remaining = volume;
+        while (remaining > 0.0) {
+            // How much capacity is left in the current bucket?
+            const double current_total =
+                vs.current_bucket.buy_volume + vs.current_bucket.sell_volume;
+            const double capacity = bucket_size - current_total;
+
+            if (capacity <= 0.0) {
+                // Current bucket is already full — push and start fresh.
+                vs.current_bucket.complete = true;
+                vs.completed.push_back(vs.current_bucket);
+                vs.current_bucket = VpinBucket{};
+
+                // Trim to window size.
+                while (vs.completed.size() > window_buckets) {
+                    vs.completed.pop_front();
+                }
+                continue;
+            }
+
+            const double fill = std::min(remaining, capacity);
+            if (side == Side::Bid) {
+                vs.current_bucket.buy_volume += fill;
+            } else {
+                vs.current_bucket.sell_volume += fill;
+            }
+            remaining -= fill;
+
+            // Check if bucket is now complete.
+            const double new_total =
+                vs.current_bucket.buy_volume + vs.current_bucket.sell_volume;
+            if (new_total >= bucket_size - 1e-12) {
+                vs.current_bucket.complete = true;
+                vs.completed.push_back(vs.current_bucket);
+                vs.current_bucket = VpinBucket{};
+
+                // Trim to window size.
+                while (vs.completed.size() > window_buckets) {
+                    vs.completed.pop_front();
+                }
+            }
+        }
+    }
+
+    recompute_vpin(pair_name);
+}
+
+void MarketDataFeed::recompute_vpin(const std::string& pair_name)
+{
+    // Read completed buckets under shared lock.
+    std::vector<VpinBucket> buckets;
+    {
+        std::shared_lock lock(mtx_vpin_);
+        auto it = vpin_state_.find(pair_name);
+        if (it == vpin_state_.end()) {
+            return;
+        }
+        buckets.assign(it->second.completed.begin(),
+                       it->second.completed.end());
+    }
+
+    if (buckets.empty()) {
+        return;
+    }
+
+    double bucket_size;
+    {
+        std::shared_lock lock(mtx_config_);
+        bucket_size = config_.vpin_bucket_size;
+    }
+    if (bucket_size <= 0.0) {
+        return;  // VPIN disabled — warning was already logged in ingest_trade_for_vpin.
+    }
+
+    // VPIN = (1/N) * SUM |buy_i - sell_i| / bucket_size
+    double sum_abs_imbalance = 0.0;
+    double total_buy  = 0.0;
+    double total_sell = 0.0;
+    for (const auto& b : buckets) {
+        sum_abs_imbalance += std::abs(b.buy_volume - b.sell_volume);
+        total_buy  += b.buy_volume;
+        total_sell += b.sell_volume;
+    }
+
+    const double n = static_cast<double>(buckets.size());
+    const double vpin = (sum_abs_imbalance / n) / bucket_size;
+
+    const double total = total_buy + total_sell;
+    const double buy_pct  = (total > 0.0) ? (total_buy / total)  : 0.5;
+    const double sell_pct = (total > 0.0) ? (total_sell / total) : 0.5;
+
+    VpinMetrics vm;
+    vm.pair_name        = pair_name;
+    vm.vpin             = std::min(vpin, 1.0);  // clamp to [0, 1]
+    vm.complete_buckets = buckets.size();
+    vm.buy_volume_pct   = buy_pct;
+    vm.sell_volume_pct  = sell_pct;
+    vm.last_updated     = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_vpin_metrics_);
+        vpin_metrics_[pair_name] = vm;
+    }
+}
+
+std::optional<VpinMetrics> MarketDataFeed::get_vpin_metrics(
+    const std::string& pair_name) const
+{
+    std::shared_lock lock(mtx_vpin_metrics_);
+    auto it = vpin_metrics_.find(pair_name);
+    if (it == vpin_metrics_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+double MarketDataFeed::get_vpin(const std::string& pair_name) const
+{
+    auto vm = get_vpin_metrics(pair_name);
+    return vm.has_value() ? vm->vpin : 0.0;
+}
+
+// =========================================================================
+// OFI — Order Flow Imbalance
+//
+// Reference: Cont, Kukanov & Stoikov (2014). "The Price Impact of Order
+// Book Events."
+//
+// OFI aggregates signed volume changes at the best bid/ask.  For each pair
+// of consecutive snapshots (t-1, t):
+//
+//   delta_bid (e^B): { +bid_size_t        if bid_t > bid_{t-1}  (bid improved)
+//                    { -(bid_size_{t-1})  if bid_t < bid_{t-1}  (bid weakened)
+//                    { bid_size_t - bid_size_{t-1}   otherwise  (size change)
+//
+//   delta_ask (e^A): { +ask_size_t        if ask_t < ask_{t-1}  (ask improved)
+//                    { -(ask_size_{t-1})  if ask_t > ask_{t-1}  (ask weakened)
+//                    { ask_size_t - ask_size_{t-1}   otherwise  (size change)
+//
+//   OFI_t = delta_bid - delta_ask
+//
+// Positive OFI → buy pressure (bids strengthening faster than asks).
+// Negative OFI → sell pressure (asks strengthening faster than bids).
+// =========================================================================
+
+void MarketDataFeed::ingest_book_snapshot_for_ofi(
+    const std::string& pair_name,
+    double             best_bid,
+    double             bid_size,
+    double             best_ask,
+    double             ask_size)
+{
+    // Snapshot config under shared lock.
+    std::size_t ofi_window_size;
+    {
+        std::shared_lock lock(mtx_config_);
+        ofi_window_size = config_.ofi_window_size;
+    }
+
+    {
+        std::unique_lock lock(mtx_ofi_);
+        auto& snaps = ofi_snapshots_[pair_name];
+        snaps.push_back(BookSnapshot{best_bid, bid_size, best_ask, ask_size});
+
+        // Keep window + 1 (need at least 2 for a delta).
+        while (snaps.size() > ofi_window_size + 1) {
+            snaps.pop_front();
+        }
+    }
+
+    recompute_ofi(pair_name);
+}
+
+void MarketDataFeed::recompute_ofi(const std::string& pair_name)
+{
+    std::vector<BookSnapshot> snaps;
+    {
+        std::shared_lock lock(mtx_ofi_);
+        auto it = ofi_snapshots_.find(pair_name);
+        if (it == ofi_snapshots_.end() || it->second.size() < 2) {
+            return;
+        }
+        snaps.assign(it->second.begin(), it->second.end());
+    }
+
+    double cumulative = 0.0;
+    for (std::size_t i = 1; i < snaps.size(); ++i) {
+        const auto& prev = snaps[i - 1];
+        const auto& curr = snaps[i];
+
+        // Bid-side delta.
+        double delta_bid = 0.0;
+        if (curr.best_bid > prev.best_bid) {
+            delta_bid = curr.bid_size;
+        } else if (curr.best_bid < prev.best_bid) {
+            delta_bid = -prev.bid_size;
+        } else {
+            delta_bid = curr.bid_size - prev.bid_size;
+        }
+
+        // Ask-side event (e^A) per Cont et al.:
+        //   ask improves (price decreases) → e^A = +ask_size_t
+        //   ask weakens  (price increases) → e^A = -ask_size_{t-1}
+        //   ask unchanged                  → e^A = ask_size_t - ask_size_{t-1}
+        double delta_ask = 0.0;
+        if (curr.best_ask < prev.best_ask) {
+            delta_ask = curr.ask_size;
+        } else if (curr.best_ask > prev.best_ask) {
+            delta_ask = -prev.ask_size;
+        } else {
+            delta_ask = curr.ask_size - prev.ask_size;
+        }
+
+        // OFI = delta_bid - delta_ask (sign: positive = buy pressure).
+        cumulative += (delta_bid - delta_ask);
+    }
+
+    // Normalise OFI to [-1, 1] using a rolling max-absolute-value approach.
+    // We use the maximum possible single-step imbalance (sum of bid+ask sizes
+    // across all observations) as the normalisation factor.
+    double max_abs = 0.0;
+    for (const auto& s : snaps) {
+        max_abs += (s.bid_size + s.ask_size);
+    }
+    max_abs = std::max(max_abs, 1e-12);  // guard against division by zero
+
+    const double norm_ofi = std::clamp(cumulative / max_abs, -1.0, 1.0);
+
+    // Latest single-step OFI for the "current" reading.
+    double latest_ofi = 0.0;
+    if (snaps.size() >= 2) {
+        const auto& prev = snaps[snaps.size() - 2];
+        const auto& curr = snaps[snaps.size() - 1];
+
+        double db = 0.0;
+        if (curr.best_bid > prev.best_bid) db = curr.bid_size;
+        else if (curr.best_bid < prev.best_bid) db = -prev.bid_size;
+        else db = curr.bid_size - prev.bid_size;
+
+        double da = 0.0;
+        if (curr.best_ask < prev.best_ask) da = curr.ask_size;
+        else if (curr.best_ask > prev.best_ask) da = -prev.ask_size;
+        else da = curr.ask_size - prev.ask_size;
+
+        latest_ofi = db - da;
+    }
+
+    OfiMetrics om;
+    om.pair_name      = pair_name;
+    om.ofi            = latest_ofi;
+    om.normalized_ofi = norm_ofi;
+    om.cumulative_ofi = cumulative;
+    om.observations   = snaps.size();
+    om.last_updated   = std::chrono::system_clock::now();
+
+    {
+        std::unique_lock lock(mtx_ofi_metrics_);
+        ofi_metrics_[pair_name] = om;
+    }
+}
+
+std::optional<OfiMetrics> MarketDataFeed::get_ofi_metrics(
+    const std::string& pair_name) const
+{
+    std::shared_lock lock(mtx_ofi_metrics_);
+    auto it = ofi_metrics_.find(pair_name);
+    if (it == ofi_metrics_.end()) {
+        return std::nullopt;
+    }
+    return it->second;
+}
+
+double MarketDataFeed::get_normalized_ofi(const std::string& pair_name) const
+{
+    auto om = get_ofi_metrics(pair_name);
+    return om.has_value() ? om->normalized_ofi : 0.0;
+}
+
+// =========================================================================
+// Asymmetric spread widening
+//
+// Uses the whale detector's dominant_side to skew the spread multiplier.
+// The average widening is preserved: (bid_mult + ask_mult) / 2 = symmetric_mult,
+// but the risk-bearing side gets a larger share of the spread (and bid_mult *
+// ask_mult < symmetric_mult^2 whenever asymmetric_skew_factor α > 0).
+//
+// The asymmetric_skew_factor (α ∈ [0,1]) controls the split:
+//   α = 0.0 → symmetric (same multiplier on both sides)
+//   α = 1.0 → fully asymmetric (all extra widening on informed side)
+//
+// For whale buying (dominant_side = Bid, i.e. taker bought from us):
+//   ask_mult = 1 + (m - 1) * (1 + α)    (widen ask: we're selling into a bid)
+//   bid_mult = 1 + (m - 1) * (1 - α)    (tighten bid: we want to buy cheap)
+//
+// The average of the two multipliers equals the original symmetric one.
+// =========================================================================
+
+AsymmetricMultipliers MarketDataFeed::get_asymmetric_spread_multipliers(
+    const std::string& pair_name) const
+{
+    auto wm = get_whale_metrics(pair_name);
+    if (!wm.has_value() || wm->spread_multiplier <= 1.0 + 1e-9) {
+        return AsymmetricMultipliers{1.0, 1.0};
+    }
+
+    const double m = wm->spread_multiplier;     // symmetric multiplier
+    const double excess = m - 1.0;               // extra widening above 1.0
+
+    double alpha;
+    {
+        std::shared_lock lock(mtx_config_);
+        alpha = std::clamp(config_.asymmetric_skew_factor, 0.0, 1.0);
+    }
+
+    // high_side gets (1 + α) share, low_side gets (1 - α) share.
+    const double high_mult = 1.0 + excess * (1.0 + alpha);
+    const double low_mult  = 1.0 + excess * (1.0 - alpha);
+
+    AsymmetricMultipliers am;
+    if (wm->dominant_side == Side::Bid) {
+        // Whale is buying → widen ask (adverse-selection risk on our ask).
+        am.ask_multiplier = high_mult;
+        am.bid_multiplier = low_mult;
+    } else {
+        // Whale is selling → widen bid (adverse-selection risk on our bid).
+        am.bid_multiplier = high_mult;
+        am.ask_multiplier = low_mult;
+    }
+
+    return am;
 }
 
 }  // namespace xop
