@@ -17,16 +17,23 @@
 // is floored at cost_basis * (1 + min_margin_bps / 10000) when the no-loss
 // constraint is enabled.
 //
+// Volatility convention:
+//   sigma_block = sigma_annual * sqrt(52.0 / kSecondsPerYear)
+//   tau         = remaining_blocks * 52.0 / kSecondsPerYear  (in years)
+//
+// Spread floor: 40 bps minimum (0.004 * mid) enforced on all three strategies.
+//
 // ISO/IEC 27001:2022 -- no secrets; pure numerical computation.
 // ISO/IEC 5055       -- no raw pointers; bounds-checked containers; no UB.
 // ISO/IEC 25000      -- comprehensive annotation; single-responsibility functions.
 
 #include <xop/strategy/new_strategies.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cmath>
 #include <numeric>
-#include <limits>
 
 namespace xop {
 
@@ -35,6 +42,11 @@ namespace xop {
 // ===========================================================================
 
 namespace {
+
+/// Minimum spread expressed as a fraction of mid-price.
+/// 40 bps = 0.004.  Applied as a floor on the full spread (ask - bid)
+/// across all three strategies to prevent sub-economic quoting.
+static constexpr double kMinSpreadFraction = 0.004;
 
 /// Compute the variance ratio VR(q) for a price series.
 /// VR(q) = Var(q-period returns) / (q * Var(1-period returns))
@@ -57,7 +69,7 @@ double compute_variance_ratio(const std::vector<double>& prices) {
 
     const auto n = prices.size();
 
-    // Compute one-period log returns.
+    // Compute one-period log returns (non-overlapping at lag 1).
     std::vector<double> r1;
     r1.reserve(n - 1);
     for (std::size_t i = 1; i < n; ++i) {
@@ -69,7 +81,7 @@ double compute_variance_ratio(const std::vector<double>& prices) {
         return 1.0;
     }
 
-    // Compute two-period log returns.
+    // Compute two-period log returns (overlapping at lag 2).
     std::vector<double> r2;
     r2.reserve(n - 2);
     for (std::size_t i = 2; i < n; ++i) {
@@ -81,7 +93,7 @@ double compute_variance_ratio(const std::vector<double>& prices) {
         return 1.0;
     }
 
-    // Variance of one-period returns.
+    // Variance of one-period returns (unbiased, N-1 denominator).
     const double mean1 = std::accumulate(r1.begin(), r1.end(), 0.0)
                          / static_cast<double>(r1.size());
     double var1 = 0.0;
@@ -91,7 +103,7 @@ double compute_variance_ratio(const std::vector<double>& prices) {
     }
     var1 /= static_cast<double>(r1.size() - 1);
 
-    // Variance of two-period returns.
+    // Variance of two-period returns (unbiased, N-1 denominator).
     const double mean2 = std::accumulate(r2.begin(), r2.end(), 0.0)
                          / static_cast<double>(r2.size());
     double var2 = 0.0;
@@ -124,15 +136,18 @@ RegimeInfo classify_regime(double vr,
     info.variance_ratio = vr;
 
     if (vr < mr_threshold) {
-        info.regime     = MarketRegime::MeanReverting;
+        // Mean-reverting: tighten spreads, reduce inventory shedding.
+        info.regime      = MarketRegime::MeanReverting;
         info.spread_mult = mr_spread_mult;
         info.skew_mult   = mr_skew_mult;
     } else if (vr > mo_threshold) {
-        info.regime     = MarketRegime::Momentum;
+        // Momentum: widen spreads, aggressive inventory shedding.
+        info.regime      = MarketRegime::Momentum;
         info.spread_mult = mo_spread_mult;
         info.skew_mult   = mo_skew_mult;
     } else {
-        info.regime     = MarketRegime::Random;
+        // Random walk: no adjustment.
+        info.regime      = MarketRegime::Random;
         info.spread_mult = 1.0;
         info.skew_mult   = 1.0;
     }
@@ -140,31 +155,82 @@ RegimeInfo classify_regime(double vr,
     return info;
 }
 
-/// Compute the A-S reservation price.
-///   r = S - q * gamma * sigma^2 * tau
-/// where sigma is in per-second units and tau is in seconds.
+/// Convert annualised volatility to per-block volatility.
+///   sigma_block = sigma_annual * sqrt(block_time_seconds / kSecondsPerYear)
+///
+/// For CHIA with block_time = 52 s:
+///   sigma_block = sigma_annual * sqrt(52.0 / 31536000.0)
+///               = sigma_annual * 1.2843e-3
+///
+/// @param sigma_annual  Annualised volatility (dimensionless fraction).
+/// @param block_time_seconds  Block interval in seconds (default 52.0).
+/// @param seconds_per_year  Calendar seconds in a year.
+/// @return Per-block standard deviation.
+double annual_to_per_block_vol(double sigma_annual,
+                               double block_time_seconds,
+                               double seconds_per_year) {
+    return sigma_annual * std::sqrt(block_time_seconds / seconds_per_year);
+}
+
+/// Compute the remaining time tau as a fraction of one year.
+///   tau = remaining_blocks * block_time_seconds / kSecondsPerYear
+///
+/// The rolling horizon ensures tau never reaches zero: when the block
+/// height modulo horizon_blocks equals zero the window resets to full.
+///
+/// @param block_height  Current block height.
+/// @param horizon_blocks  Total horizon length in blocks.
+/// @param block_time_seconds  Block interval in seconds.
+/// @param seconds_per_year  Calendar seconds in a year.
+/// @return Remaining time in years (always > 0).
+double rolling_tau_years(BlockHeight block_height,
+                         uint32_t horizon_blocks,
+                         double block_time_seconds,
+                         double seconds_per_year) {
+    const uint32_t pos       = block_height % horizon_blocks;
+    const uint32_t remaining = (pos == 0) ? horizon_blocks
+                                          : (horizon_blocks - pos);
+    return static_cast<double>(remaining) * block_time_seconds
+           / seconds_per_year;
+}
+
+/// Compute the A-S reservation price using per-block sigma and tau in years.
+///   r = S - q * gamma * sigma_block^2 * tau_years
+///
+/// @param mid    Current mid-price (quote per base).
+/// @param q      Current net inventory (positive = long).
+/// @param gamma  Risk aversion coefficient.
+/// @param sigma  Per-block volatility.
+/// @param tau    Remaining time in years.
+/// @return Reservation price.
 double as_reservation_price(double mid, double q, double gamma,
                             double sigma, double tau) {
     return mid - q * gamma * sigma * sigma * tau;
 }
 
-/// Compute the A-S optimal half-spread.
-///   delta = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
-double as_half_spread(double gamma, double kappa, double sigma, double tau) {
+/// Compute the A-S optimal half-spread using per-block sigma and tau in years.
+///   delta = (1/kappa) * ln(1 + kappa/gamma)
+///         + 0.5 * gamma * sigma_block^2 * tau_years
+///
+/// @param gamma  Risk aversion coefficient.
+/// @param kappa  Fill intensity decay parameter.
+/// @param sigma  Per-block volatility.
+/// @param tau    Remaining time in years.
+/// @return Optimal half-spread (distance from reservation price to each side).
+double as_half_spread(double gamma, double kappa,
+                      double sigma, double tau) {
     return (1.0 / kappa) * std::log(1.0 + kappa / gamma)
            + 0.5 * gamma * sigma * sigma * tau;
-}
-
-/// Convert annualised volatility to per-second volatility.
-///   sigma_per_sec = sigma_annual / sqrt(seconds_per_year)
-double annual_to_per_second_vol(double sigma_annual) {
-    static constexpr double kSecondsPerYear = 365.0 * 24.0 * 3600.0;
-    return sigma_annual / std::sqrt(kSecondsPerYear);
 }
 
 /// Apply the never-sell-at-loss constraint to an ask price.
 ///   ask_floor = cost_basis * (1 + min_margin_bps / 10000)
 ///   ask = max(ask, ask_floor)
+///
+/// @param ask             Raw ask price from the model.
+/// @param cost_basis      Weighted-average acquisition cost per unit.
+/// @param min_margin_bps  Minimum margin above cost basis in basis points.
+/// @return Constrained ask price (>= ask_floor when cost_basis > 0).
 double apply_no_loss_floor(double ask, double cost_basis,
                            double min_margin_bps) {
     if (cost_basis <= 0.0) {
@@ -174,14 +240,26 @@ double apply_no_loss_floor(double ask, double cost_basis,
     return std::max(ask, ask_floor);
 }
 
-/// Compute the remaining time tau for a rolling N-block horizon.
-///   tau = ((horizon - (block % horizon)) * block_time)
-/// Returns tau in seconds; minimum 1 block worth to prevent tau=0.
-double rolling_tau(BlockHeight block_height, uint32_t horizon_blocks,
-                   double block_time_seconds) {
-    const uint32_t pos = block_height % horizon_blocks;
-    const uint32_t remaining = (pos == 0) ? horizon_blocks : (horizon_blocks - pos);
-    return static_cast<double>(remaining) * block_time_seconds;
+/// Enforce the 40 bps minimum spread floor on a bid/ask pair.
+/// If the current spread (ask - bid) is less than kMinSpreadFraction * mid,
+/// symmetrically widen both sides around their midpoint.
+///
+/// @param[in,out] bid  Bid price (may be raised or lowered).
+/// @param[in,out] ask  Ask price (may be raised or lowered).
+/// @param mid          Reference mid-price for the floor computation.
+void enforce_spread_floor(double& bid, double& ask, double mid) {
+    const double min_spread = kMinSpreadFraction * mid;
+    const double current_spread = ask - bid;
+    if (current_spread < min_spread && mid > 0.0) {
+        // Symmetrically widen around the midpoint of the current quotes.
+        const double quote_mid  = (ask + bid) * 0.5;
+        const double half_floor = min_spread * 0.5;
+        bid = quote_mid - half_floor;
+        ask = quote_mid + half_floor;
+        spdlog::debug("Spread floor enforced: bid={:.6f} ask={:.6f} "
+                       "floor={:.1f} bps", bid, ask,
+                       kMinSpreadFraction * 10000.0);
+    }
 }
 
 }  // anonymous namespace
@@ -199,12 +277,18 @@ CoinAgeWeightedQuoting::CoinAgeWeightedQuoting(const CoinAgeConfig& cfg)
 {
     // Validate critical parameters to prevent silent misconfiguration.
     if (cfg_.lambda_age <= 0.0) {
-        cfg_.lambda_age = 1.0 / 3600.0;  // Safe default: 1-hour half-life.
+        spdlog::warn("CoinAgeWeightedQuoting: lambda_age <= 0, "
+                      "resetting to default 1/3600");
+        cfg_.lambda_age = 1.0 / 3600.0;
     }
     if (cfg_.alpha_age < 0.0 || cfg_.alpha_age > 1.0) {
-        cfg_.alpha_age = 0.30;  // Clamp to safe range.
+        spdlog::warn("CoinAgeWeightedQuoting: alpha_age out of [0,1], "
+                      "resetting to 0.30");
+        cfg_.alpha_age = 0.30;
     }
     if (cfg_.beta_age < 0.0 || cfg_.beta_age > 1.0) {
+        spdlog::warn("CoinAgeWeightedQuoting: beta_age out of [0,1], "
+                      "resetting to 0.20");
         cfg_.beta_age = 0.20;
     }
 }
@@ -213,72 +297,81 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute base A-S quotes as the foundation.
+    // Step 1: Compute per-block sigma and tau in years for the A-S model.
     //
-    // Convert sigma from annualised to per-second for the A-S formulas.
-    // tau is from the rolling horizon.
+    //   sigma_block = sigma_annual * sqrt(52.0 / kSecondsPerYear)
+    //   tau         = remaining_blocks * 52.0 / kSecondsPerYear
+    //
+    // This convention scales volatility to the 52-second block interval
+    // and expresses the remaining horizon as a fraction of a year.
     // -----------------------------------------------------------------
-    const double sigma_ps = annual_to_per_second_vol(sigma);
-    const double tau      = rolling_tau(block_height, cfg_.horizon_blocks,
-                                        cfg_.block_time_seconds);
-
-    const double r     = as_reservation_price(mid, q, cfg_.gamma, sigma_ps, tau);
-    const double delta = as_half_spread(cfg_.gamma, cfg_.kappa, sigma_ps, tau);
-
-    // Base quotes before coin-age adjustment.
-    double ask_base = r + delta;
-    double bid_base = r - delta;
+    const double sigma_blk = annual_to_per_block_vol(
+        sigma, cfg_.block_time_seconds, kSecondsPerYear);
+    const double tau = rolling_tau_years(
+        block_height, cfg_.horizon_blocks,
+        cfg_.block_time_seconds, kSecondsPerYear);
 
     // -----------------------------------------------------------------
-    // Step 2: Apply regime multiplier to the half-spread.
+    // Step 2: Compute A-S reservation price and half-spread.
     //
-    // This is consistent with the existing A-S and GLFT implementations.
+    //   r     = mid - q * gamma * sigma_block^2 * tau
+    //   delta = (1/kappa) * ln(1 + kappa/gamma)
+    //         + 0.5 * gamma * sigma_block^2 * tau
     // -----------------------------------------------------------------
-    const double regime_mult = regime_.spread_mult;
-    const double delta_adj   = delta * regime_mult;
-    double ask = r + delta_adj;
-    double bid = r - delta_adj;
+    const double r     = as_reservation_price(mid, q, cfg_.gamma,
+                                              sigma_blk, tau);
+    const double delta = as_half_spread(cfg_.gamma, cfg_.kappa,
+                                        sigma_blk, tau);
 
     // -----------------------------------------------------------------
-    // Step 3: Compute the coin-age urgency factor U and apply multipliers.
+    // Step 3: Apply regime multiplier to the half-spread.
     //
-    // U = (1/n) * SUM_i [1 - exp(-lambda_age * age_seconds_i)]
-    //
-    // ask_spread_adjusted = ask_spread * (1 - alpha_age * U)
-    // bid_spread_adjusted = bid_spread * (1 + beta_age * U)
-    //
-    // The multipliers are applied to the SPREAD (distance from mid),
-    // not to the price directly, preserving the reservation-price logic.
+    // Consistent with the existing A-S and GLFT implementations.
     // -----------------------------------------------------------------
-    const double U = compute_urgency(block_height);
-
-    const double ask_mult = 1.0 - cfg_.alpha_age * U;  // Tighten ask for old coins.
-    const double bid_mult = 1.0 + cfg_.beta_age  * U;  // Widen bid for old inventory.
-
-    // Apply to the half-spread (distance from reservation price r).
-    ask = r + delta_adj * ask_mult;
-    bid = r - delta_adj * bid_mult;
+    const double delta_adj = delta * regime_.spread_mult;
 
     // -----------------------------------------------------------------
-    // Step 4: Apply the never-sell-at-loss constraint.
+    // Step 4: Compute coin-age urgency U and apply spread multipliers.
     //
-    // The ask is floored at cost_basis + minimum margin.
+    //   U = (1/n) * SUM_i [1 - exp(-lambda_age * a_i)]
+    //   ask_mult = (1 - alpha_age * U), clamped to [1-alpha_age, 1.0]
+    //   bid_mult = (1 + beta_age  * U), clamped to [1.0, 1+beta_age]
+    //
+    // Multipliers are applied to the half-spread (distance from the
+    // reservation price r), preserving the A-S inventory-skew logic.
+    // -----------------------------------------------------------------
+    const double ask_mult = ask_spread_multiplier(block_height);
+    const double bid_mult = bid_spread_multiplier(block_height);
+
+    double ask = r + delta_adj * ask_mult;
+    double bid = r - delta_adj * bid_mult;
+
+    // -----------------------------------------------------------------
+    // Step 5: Apply the never-sell-at-loss constraint.
+    //
+    // If enabled, clamp ask >= cost_basis * (1 + min_margin_bps/10000).
     // -----------------------------------------------------------------
     if (cfg_.enable_no_loss_constraint) {
         ask = apply_no_loss_floor(ask, cost_basis_, min_margin_bps_);
     }
 
     // -----------------------------------------------------------------
-    // Step 5: Compute sizes using normalised inventory (same as A-S).
+    // Step 6: Enforce the 40 bps minimum spread floor.
+    // -----------------------------------------------------------------
+    enforce_spread_floor(bid, ask, mid);
+
+    // -----------------------------------------------------------------
+    // Step 7: Compute sizes using normalised inventory.
     //
     // Size decreases on the side where we have excess inventory.
+    // Minimum 10% of q_max to always maintain market presence.
     // -----------------------------------------------------------------
-    const double q_norm = (cfg_.q_max > 0.0) ? (q / cfg_.q_max) : 0.0;
+    const double q_norm   = (cfg_.q_max > 0.0) ? (q / cfg_.q_max) : 0.0;
     const double bid_size = cfg_.q_max * std::max(0.1, 1.0 - q_norm);
     const double ask_size = cfg_.q_max * std::max(0.1, 1.0 + q_norm);
 
     // Compute spread in basis points for diagnostics.
-    const double mid_price = (ask + bid) / 2.0;
+    const double mid_price = (ask + bid) * 0.5;
     const double spread_bps = (mid_price > 0.0)
         ? 10000.0 * (ask - bid) / mid_price
         : 0.0;
@@ -286,7 +379,8 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     return QuoteResult{bid, ask, bid_size, ask_size, spread_bps};
 }
 
-void CoinAgeWeightedQuoting::update_price(double mid, BlockHeight block_height)
+void CoinAgeWeightedQuoting::update_price(double mid,
+                                           BlockHeight block_height)
 {
     // Store price observation for the variance-ratio regime detector.
     price_buffer_.push_back({block_height, mid});
@@ -317,12 +411,14 @@ void CoinAgeWeightedQuoting::set_cost_basis(double cost_basis,
     min_margin_bps_ = min_margin_bps;
 }
 
-void CoinAgeWeightedQuoting::update_coin_ages(const std::vector<CoinAge>& coins)
+void CoinAgeWeightedQuoting::update_coin_ages(
+    const std::vector<CoinAge>& coins)
 {
     coins_ = coins;
 }
 
-double CoinAgeWeightedQuoting::compute_urgency(BlockHeight current_block) const
+double CoinAgeWeightedQuoting::compute_urgency(
+    BlockHeight current_block) const
 {
     // If no coins are tracked, urgency is zero (nothing to be urgent about).
     if (coins_.empty()) {
@@ -330,7 +426,7 @@ double CoinAgeWeightedQuoting::compute_urgency(BlockHeight current_block) const
     }
 
     // U = (1/n) * SUM_i [ 1 - exp(-lambda_age * a_i) ]
-    // where a_i = (current_block - creation_block) * block_time_seconds.
+    // where a_i = (current_block - creation_block) * 52.0 seconds.
     double sum = 0.0;
     for (const auto& coin : coins_) {
         // Guard against future-dated coins (should not happen, but defensive).
@@ -339,7 +435,8 @@ double CoinAgeWeightedQuoting::compute_urgency(BlockHeight current_block) const
             : 0u;
 
         // Clamp age to prevent numerical overflow in exp().
-        const uint32_t clamped_blocks = std::min(age_blocks, cfg_.max_age_blocks);
+        const uint32_t clamped_blocks = std::min(age_blocks,
+                                                  cfg_.max_age_blocks);
         const double age_seconds = static_cast<double>(clamped_blocks)
                                    * cfg_.block_time_seconds;
 
@@ -351,23 +448,32 @@ double CoinAgeWeightedQuoting::compute_urgency(BlockHeight current_block) const
     return sum / static_cast<double>(coins_.size());
 }
 
-double CoinAgeWeightedQuoting::ask_spread_multiplier(BlockHeight current_block) const
+double CoinAgeWeightedQuoting::ask_spread_multiplier(
+    BlockHeight current_block) const
 {
-    // ask_mult = 1 - alpha_age * U.
+    // ask_mult = (1 - alpha_age * U), clamped to [1 - alpha_age, 1.0].
+    //
     // When U=0 (all coins fresh): mult = 1.0 (no change).
-    // When U=1 (all coins old):   mult = 1 - alpha_age (tighten ask).
-    return 1.0 - cfg_.alpha_age * compute_urgency(current_block);
+    // When U~1 (all coins old):   mult = 1 - alpha_age (max tightening).
+    const double U = compute_urgency(current_block);
+    const double raw = 1.0 - cfg_.alpha_age * U;
+    return std::clamp(raw, 1.0 - cfg_.alpha_age, 1.0);
 }
 
-double CoinAgeWeightedQuoting::bid_spread_multiplier(BlockHeight current_block) const
+double CoinAgeWeightedQuoting::bid_spread_multiplier(
+    BlockHeight current_block) const
 {
-    // bid_mult = 1 + beta_age * U.
-    // When U=0: mult = 1.0.  When U=1: mult = 1 + beta_age (widen bid).
-    return 1.0 + cfg_.beta_age * compute_urgency(current_block);
+    // bid_mult = (1 + beta_age * U), clamped to [1.0, 1 + beta_age].
+    //
+    // When U=0: mult = 1.0.  When U~1: mult = 1 + beta_age (max widening).
+    const double U = compute_urgency(current_block);
+    const double raw = 1.0 + cfg_.beta_age * U;
+    return std::clamp(raw, 1.0, 1.0 + cfg_.beta_age);
 }
 
 double CoinAgeWeightedQuoting::variance_ratio_test() const
 {
+    // Extract the price series from the rolling buffer for the VR test.
     std::vector<double> prices;
     prices.reserve(price_buffer_.size());
     for (const auto& obs : price_buffer_) {
@@ -383,11 +489,13 @@ void CoinAgeWeightedQuoting::update_regime()
         vr,
         cfg_.vr_mean_revert_threshold,
         cfg_.vr_momentum_threshold,
-        0.80,  // mr_spread_mult (mean-reverting: tighten)
-        0.50,  // mr_skew_mult
-        1.50,  // mo_spread_mult (momentum: widen)
-        2.00   // mo_skew_mult
+        0.80,  // mr_spread_mult (mean-reverting: tighten to 80%)
+        0.50,  // mr_skew_mult   (halve inventory shedding)
+        1.50,  // mo_spread_mult (momentum: widen to 150%)
+        2.00   // mo_skew_mult   (double inventory shedding)
     );
+    spdlog::trace("CoinAge regime: VR={:.4f} regime={}",
+                   vr, to_string(regime_.regime));
 }
 
 
@@ -400,17 +508,22 @@ void CoinAgeWeightedQuoting::update_regime()
 BlockCadenceAdaptiveSpread::BlockCadenceAdaptiveSpread(
     const BlockCadenceConfig& cfg)
     : cfg_(cfg)
-    , dt_ema_(cfg.target_block_time)  // Initialize EMA to target.
+    , dt_ema_(cfg.target_block_time)  // Initialize EMA to target cadence.
     , min_margin_bps_(cfg.min_margin_bps)
 {
-    // Validate parameters.
+    // Validate parameters with safe fallbacks.
     if (cfg_.target_block_time <= 0.0) {
+        spdlog::warn("BlockCadence: target_block_time <= 0, "
+                      "resetting to 52.0");
         cfg_.target_block_time = 52.0;
     }
     if (cfg_.ema_window_blocks < 2) {
+        spdlog::warn("BlockCadence: ema_window_blocks < 2, "
+                      "resetting to 10");
         cfg_.ema_window_blocks = 10;
     }
     if (cfg_.eta < 0.0) {
+        spdlog::warn("BlockCadence: eta < 0, resetting to 0.5");
         cfg_.eta = 0.5;
     }
 }
@@ -419,59 +532,71 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute base A-S quotes.
+    // Step 1: Compute per-block sigma and tau in years.
     // -----------------------------------------------------------------
-    const double sigma_ps = annual_to_per_second_vol(sigma);
-    const double tau      = rolling_tau(block_height, cfg_.horizon_blocks,
-                                        cfg_.target_block_time);
+    const double sigma_blk = annual_to_per_block_vol(
+        sigma, cfg_.target_block_time, kSecondsPerYear);
+    const double tau = rolling_tau_years(
+        block_height, cfg_.horizon_blocks,
+        cfg_.target_block_time, kSecondsPerYear);
 
+    // -----------------------------------------------------------------
+    // Step 2: Compute A-S reservation price and half-spread.
+    //
     // Use the ADJUSTED kappa that accounts for current block cadence.
-    // When blocks are arriving faster, fills per block decrease (less time
-    // for takers), so effective kappa increases.  Vice versa for slow blocks.
+    // When blocks arrive faster than target, fill intensity per block
+    // decreases (less time for takers), so kappa scales up.
+    // -----------------------------------------------------------------
     const double kappa_adj = adjusted_kappa();
 
-    const double r     = as_reservation_price(mid, q, cfg_.gamma, sigma_ps, tau);
-    const double delta = (1.0 / kappa_adj) * std::log(1.0 + kappa_adj / cfg_.gamma)
-                         + 0.5 * cfg_.gamma * sigma_ps * sigma_ps * tau;
+    const double r = as_reservation_price(mid, q, cfg_.gamma,
+                                          sigma_blk, tau);
+
+    // Half-spread uses the cadence-adjusted kappa, not the base kappa.
+    const double delta = (1.0 / kappa_adj)
+                         * std::log(1.0 + kappa_adj / cfg_.gamma)
+                         + 0.5 * cfg_.gamma * sigma_blk * sigma_blk * tau;
 
     // -----------------------------------------------------------------
-    // Step 2: Apply regime multiplier.
+    // Step 3: Apply regime multiplier.
     // -----------------------------------------------------------------
     const double delta_regime = delta * regime_.spread_mult;
 
     // -----------------------------------------------------------------
-    // Step 3: Apply the cadence spread multiplier.
+    // Step 4: Apply the cadence spread multiplier.
     //
-    // m_cadence = 1 + eta * (R - 1)^2
-    // where R = dt_ema / dt_target.
+    //   m_cadence = 1 + eta * (R - 1)^2
+    //   where R = dt_ema / dt_target.
     //
-    // This is a U-shaped function: widest at extreme cadences, baseline
-    // at R=1.  The rationale:
-    //   - Fast blocks (R < 1): price discovery accelerates, quotes stale faster.
-    //   - Slow blocks (R > 1): accumulated uncertainty is higher.
-    //   - Normal blocks (R ~ 1): no adjustment needed.
+    // U-shaped function: widest at extreme cadences (fast or slow),
+    // baseline at R=1 (normal cadence).
     // -----------------------------------------------------------------
-    const double m_cadence = cadence_spread_multiplier();
-    const double delta_final = delta_regime * m_cadence;
+    const double m_cadence    = cadence_spread_multiplier();
+    const double delta_final  = delta_regime * m_cadence;
 
     double ask = r + delta_final;
     double bid = r - delta_final;
 
     // -----------------------------------------------------------------
-    // Step 4: Apply the never-sell-at-loss constraint.
+    // Step 5: Apply the never-sell-at-loss constraint.
     // -----------------------------------------------------------------
     if (cfg_.enable_no_loss_constraint) {
         ask = apply_no_loss_floor(ask, cost_basis_, min_margin_bps_);
     }
 
     // -----------------------------------------------------------------
-    // Step 5: Compute sizes.
+    // Step 6: Enforce the 40 bps minimum spread floor.
+    // -----------------------------------------------------------------
+    enforce_spread_floor(bid, ask, mid);
+
+    // -----------------------------------------------------------------
+    // Step 7: Compute sizes.
     // -----------------------------------------------------------------
     const double q_norm   = (cfg_.q_max > 0.0) ? (q / cfg_.q_max) : 0.0;
     const double bid_size = cfg_.q_max * std::max(0.1, 1.0 - q_norm);
     const double ask_size = cfg_.q_max * std::max(0.1, 1.0 + q_norm);
 
-    const double mid_price = (ask + bid) / 2.0;
+    const double mid_price = (ask + bid) * 0.5;
     const double spread_bps = (mid_price > 0.0)
         ? 10000.0 * (ask - bid) / mid_price
         : 0.0;
@@ -482,6 +607,7 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
 void BlockCadenceAdaptiveSpread::update_price(double mid,
                                                BlockHeight block_height)
 {
+    // Store observation and trim to regime detection window.
     price_buffer_.push_back({block_height, mid});
     while (price_buffer_.size() > cfg_.regime_window_blocks) {
         price_buffer_.pop_front();
@@ -513,7 +639,8 @@ void BlockCadenceAdaptiveSpread::update_block_arrival(
     block_arrivals_.push_back({block_height, timestamp});
 
     // Keep a bounded history (2x the EMA window for robustness).
-    const auto max_history = static_cast<std::size_t>(cfg_.ema_window_blocks * 2);
+    const auto max_history =
+        static_cast<std::size_t>(cfg_.ema_window_blocks * 2);
     while (block_arrivals_.size() > max_history) {
         block_arrivals_.pop_front();
     }
@@ -528,19 +655,27 @@ void BlockCadenceAdaptiveSpread::update_block_arrival(
     const auto& curr = block_arrivals_[block_arrivals_.size() - 1];
 
     // Use chrono duration_cast for precise interval measurement.
-    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-        curr.arrival - prev.arrival);
-    const double dt_seconds = static_cast<double>(duration.count()) / 1000.0;
+    const auto duration =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            curr.arrival - prev.arrival);
+    const double dt_seconds =
+        static_cast<double>(duration.count()) / 1000.0;
 
-    // Sanity check: reject negative or zero intervals (clock skew, duplicates).
+    // Sanity check: reject non-positive intervals (clock skew, duplicates).
     if (dt_seconds <= 0.0) {
+        spdlog::warn("BlockCadence: non-positive dt={:.3f}s between "
+                      "blocks {} and {}, skipping",
+                      dt_seconds, prev.block, curr.block);
         return;
     }
 
-    // Update the EMA.
-    // alpha = 2 / (N + 1) is the standard EMA smoothing factor.
-    const double alpha = 2.0 / (static_cast<double>(cfg_.ema_window_blocks) + 1.0);
+    // Update the EMA: alpha = 2 / (N + 1) is the standard smoothing factor.
+    const double alpha = 2.0
+        / (static_cast<double>(cfg_.ema_window_blocks) + 1.0);
     dt_ema_ = alpha * dt_seconds + (1.0 - alpha) * dt_ema_;
+
+    spdlog::trace("BlockCadence: dt={:.1f}s dt_ema={:.1f}s R={:.3f}",
+                   dt_seconds, dt_ema_, cadence_ratio());
 }
 
 double BlockCadenceAdaptiveSpread::current_dt_ema() const
@@ -550,8 +685,8 @@ double BlockCadenceAdaptiveSpread::current_dt_ema() const
 
 double BlockCadenceAdaptiveSpread::cadence_ratio() const
 {
-    // R = dt_ema / dt_target.
-    // Guard against division by zero (should never happen with default config).
+    // R = dt_ema / target_block_time.
+    // Guard against division by zero (should never happen with validated config).
     if (cfg_.target_block_time <= 0.0) {
         return 1.0;
     }
@@ -560,36 +695,36 @@ double BlockCadenceAdaptiveSpread::cadence_ratio() const
 
 double BlockCadenceAdaptiveSpread::cadence_spread_multiplier() const
 {
-    // m_cadence = 1 + eta * (R - 1)^2
-    // Clamped to [mult_min, mult_max].
-    const double R = cadence_ratio();
+    // m_cadence = 1 + eta * (R - 1)^2, clamped to [mult_min, mult_max].
+    //
+    // This is a U-shaped function centered at R=1:
+    //   R = 1.0 (normal):  m = 1.0      (no adjustment)
+    //   R = 0.5 (fast):    m = 1 + 0.25*eta
+    //   R = 2.0 (slow):    m = 1 + eta
+    const double R         = cadence_ratio();
     const double deviation = R - 1.0;
-    const double raw_mult = 1.0 + cfg_.eta * deviation * deviation;
+    const double raw_mult  = 1.0 + cfg_.eta * deviation * deviation;
 
     return std::clamp(raw_mult, cfg_.mult_min, cfg_.mult_max);
 }
 
 double BlockCadenceAdaptiveSpread::adjusted_kappa() const
 {
-    // kappa_adjusted = kappa_base * (dt_target / dt_ema)
+    // kappa_adjusted = kappa * (target / dt_ema)
     //
-    // Rationale: kappa measures fill intensity decay per unit of spread.
-    // Fill intensity is proportional to the number of takers per unit time.
-    // When blocks are slow (dt_ema > dt_target), there is MORE time for
-    // takers to discover and take our offers, so effective fill intensity
-    // increases => kappa should decrease (slower decay).  The reciprocal
-    // relationship captures this.
+    // Rationale: fill intensity scales inversely with block time.
+    // Slow blocks (dt_ema > target) => more time for takers => higher
+    // effective fill rate => kappa decreases.
+    // Fast blocks (dt_ema < target) => less time => kappa increases.
     //
-    // When blocks are fast (dt_ema < dt_target), less time per block =>
-    // fewer fills per block => kappa should increase (faster decay).
+    // Clamped to [kappa_adj_min * kappa, kappa_adj_max * kappa].
     if (dt_ema_ <= 0.0) {
         return cfg_.kappa;
     }
 
-    const double ratio = cfg_.target_block_time / dt_ema_;
+    const double ratio    = cfg_.target_block_time / dt_ema_;
     const double kappa_adj = cfg_.kappa * ratio;
 
-    // Clamp to configured bounds.
     return std::clamp(kappa_adj,
                       cfg_.kappa * cfg_.kappa_adj_min,
                       cfg_.kappa * cfg_.kappa_adj_max);
@@ -612,9 +747,11 @@ void BlockCadenceAdaptiveSpread::update_regime()
         vr,
         cfg_.vr_mean_revert_threshold,
         cfg_.vr_momentum_threshold,
-        0.80, 0.50,  // mean-reverting multipliers
-        1.50, 2.00   // momentum multipliers
+        0.80, 0.50,  // mean-reverting: tighten spread, halve skew
+        1.50, 2.00   // momentum: widen spread, double skew
     );
+    spdlog::trace("BlockCadence regime: VR={:.4f} regime={}",
+                   vr, to_string(regime_.regime));
 }
 
 
@@ -629,12 +766,15 @@ MempoolSentinelStrategy::MempoolSentinelStrategy(
     : cfg_(cfg)
     , min_margin_bps_(cfg.min_margin_bps)
 {
-    // Validate parameters.
+    // Validate parameters with safe fallbacks.
     if (cfg_.psi < 0.0) {
+        spdlog::warn("MempoolSentinel: psi < 0, resetting to 1.5");
         cfg_.psi = 1.5;
     }
     if (cfg_.avg_daily_volume <= 0.0) {
-        cfg_.avg_daily_volume = 750.0;  // ~$2K/day at $2.70.
+        spdlog::warn("MempoolSentinel: avg_daily_volume <= 0, "
+                      "resetting to 750.0");
+        cfg_.avg_daily_volume = 750.0;
     }
 }
 
@@ -642,45 +782,51 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
     // -----------------------------------------------------------------
-    // Step 1: Compute base A-S quotes.
+    // Step 1: Compute per-block sigma and tau in years.
     // -----------------------------------------------------------------
-    const double sigma_ps = annual_to_per_second_vol(sigma);
-    const double tau      = rolling_tau(block_height, cfg_.horizon_blocks,
-                                        cfg_.block_time_seconds);
-
-    const double r     = as_reservation_price(mid, q, cfg_.gamma, sigma_ps, tau);
-    const double delta = as_half_spread(cfg_.gamma, cfg_.kappa, sigma_ps, tau);
+    const double sigma_blk = annual_to_per_block_vol(
+        sigma, cfg_.block_time_seconds, kSecondsPerYear);
+    const double tau = rolling_tau_years(
+        block_height, cfg_.horizon_blocks,
+        cfg_.block_time_seconds, kSecondsPerYear);
 
     // -----------------------------------------------------------------
-    // Step 2: Apply regime multiplier.
+    // Step 2: Compute A-S reservation price and half-spread.
+    // -----------------------------------------------------------------
+    const double r     = as_reservation_price(mid, q, cfg_.gamma,
+                                              sigma_blk, tau);
+    const double delta = as_half_spread(cfg_.gamma, cfg_.kappa,
+                                        sigma_blk, tau);
+
+    // -----------------------------------------------------------------
+    // Step 3: Apply regime multiplier.
     // -----------------------------------------------------------------
     const double delta_regime = delta * regime_.spread_mult;
 
     // -----------------------------------------------------------------
-    // Step 3: Apply mempool-based spread multiplier.
+    // Step 4: Apply mempool spread multiplier.
     //
-    // m_mempool = 1 + psi * I_pending
-    // where I_pending = |F_pending| / avg_daily_volume.
+    //   m_mempool = 1 + psi * I_pending
+    //   where I_pending = |F_pending| / avg_daily_volume.
     //
-    // The multiplier widens spreads when significant pending flow is
-    // detected in the mempool, providing anticipatory adverse-selection
-    // protection.
+    // Widens spreads when significant pending flow is detected,
+    // providing anticipatory adverse-selection protection.
     // -----------------------------------------------------------------
-    const double m_mempool = mempool_spread_multiplier();
-    const double delta_final = delta_regime * m_mempool;
+    const double m_mempool    = mempool_spread_multiplier();
+    const double delta_final  = delta_regime * m_mempool;
 
     // -----------------------------------------------------------------
-    // Step 4: Apply mempool-based skew adjustment.
+    // Step 5: Apply mempool skew adjustment.
     //
-    // skew_mempool = -phi_mempool * sign(F_pending) * I_pending
+    //   skew = -phi_mempool * sign(F_pending) * I_pending
     //
-    // If pending flow is net buying (F > 0), we shift quotes UP:
-    //   ask moves up (wider) -- less eager to sell into buying pressure.
-    //   bid moves up (tighter) -- more eager to buy (anticipating price rise).
+    // Net buying in mempool (F > 0) => shift quotes UP (positive skew):
+    //   ask widens  (less eager to sell into buying pressure)
+    //   bid tightens (more eager to buy, anticipating price rise)
     //
-    // If pending flow is net selling (F < 0), we shift quotes DOWN:
-    //   ask moves down (tighter) -- more eager to sell (anticipating price fall).
-    //   bid moves down (wider) -- less eager to buy into selling pressure.
+    // Net selling in mempool (F < 0) => shift quotes DOWN (negative skew):
+    //   ask tightens (more eager to sell, anticipating price fall)
+    //   bid widens   (less eager to buy into selling pressure)
     // -----------------------------------------------------------------
     const double skew_adj = mempool_skew_adjustment();
 
@@ -688,43 +834,52 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
     double bid = r - delta_final + skew_adj;
 
     // -----------------------------------------------------------------
-    // Step 5: Apply the never-sell-at-loss constraint.
+    // Step 6: Apply the never-sell-at-loss constraint.
     // -----------------------------------------------------------------
     if (cfg_.enable_no_loss_constraint) {
         ask = apply_no_loss_floor(ask, cost_basis_, min_margin_bps_);
     }
 
     // -----------------------------------------------------------------
-    // Step 6: Compute sizes.
-    //
-    // When we detect our own offers being taken in the mempool, reduce
-    // sizes on the filled side to limit additional exposure until the
-    // fill confirms and we can fully recompute.
+    // Step 7: Enforce the 40 bps minimum spread floor.
     // -----------------------------------------------------------------
-    const double q_norm   = (cfg_.q_max > 0.0) ? (q / cfg_.q_max) : 0.0;
+    enforce_spread_floor(bid, ask, mid);
+
+    // -----------------------------------------------------------------
+    // Step 8: Compute sizes.
+    //
+    // When our own offers are detected as pending fill in the mempool,
+    // reduce size on the filled side to limit additional exposure until
+    // the fill confirms and we can fully recompute.
+    // -----------------------------------------------------------------
+    const double q_norm = (cfg_.q_max > 0.0) ? (q / cfg_.q_max) : 0.0;
     double bid_size = cfg_.q_max * std::max(0.1, 1.0 - q_norm);
     double ask_size = cfg_.q_max * std::max(0.1, 1.0 + q_norm);
 
-    // Check for imminent fills of our own offers.
+    // Preemptive size reduction for imminent fills of our offers.
     if (cfg_.enable_preemptive_cancel) {
         for (const auto& take : pending_takes_) {
             if (take.is_our_offer) {
-                // A taker is taking our offer.  Reduce remaining size on
-                // the same side to limit adverse selection on stacked orders.
                 if (take.taker_side == Side::Bid) {
-                    // Taker is buying (taking our ask).
-                    // Reduce our ask size by 50% as a precaution.
+                    // Taker is buying (taking our ask).  Reduce our
+                    // remaining ask size by 50% as a precaution.
                     ask_size *= 0.5;
+                    spdlog::info("MempoolSentinel: our ask offer {} "
+                                  "being taken, reducing ask size",
+                                  take.offer_id);
                 } else {
-                    // Taker is selling (taking our bid).
-                    // Reduce our bid size by 50% as a precaution.
+                    // Taker is selling (taking our bid).  Reduce our
+                    // remaining bid size by 50% as a precaution.
                     bid_size *= 0.5;
+                    spdlog::info("MempoolSentinel: our bid offer {} "
+                                  "being taken, reducing bid size",
+                                  take.offer_id);
                 }
             }
         }
     }
 
-    const double mid_price = (ask + bid) / 2.0;
+    const double mid_price = (ask + bid) * 0.5;
     const double spread_bps = (mid_price > 0.0)
         ? 10000.0 * (ask - bid) / mid_price
         : 0.0;
@@ -735,6 +890,7 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
 void MempoolSentinelStrategy::update_price(double mid,
                                             BlockHeight block_height)
 {
+    // Store observation and trim to regime detection window.
     price_buffer_.push_back({block_height, mid});
     while (price_buffer_.size() > cfg_.regime_window_blocks) {
         price_buffer_.pop_front();
@@ -763,10 +919,14 @@ void MempoolSentinelStrategy::update_mempool_takes(
     const std::vector<PendingMempoolTake>& takes)
 {
     // Filter out stale mempool items (older than max_mempool_age_seconds).
+    // Items that have been pending too long are likely stuck or invalid
+    // and should not influence quoting decisions.
     const auto now = std::chrono::system_clock::now();
-    const auto max_age = std::chrono::duration_cast<std::chrono::system_clock::duration>(
-        std::chrono::milliseconds(
-            static_cast<int64_t>(cfg_.max_mempool_age_seconds * 1000.0)));
+    const auto max_age =
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+            std::chrono::milliseconds(
+                static_cast<int64_t>(
+                    cfg_.max_mempool_age_seconds * 1000.0)));
 
     pending_takes_.clear();
     pending_takes_.reserve(takes.size());
@@ -777,12 +937,17 @@ void MempoolSentinelStrategy::update_mempool_takes(
             pending_takes_.push_back(take);
         }
     }
+
+    spdlog::debug("MempoolSentinel: accepted {}/{} takes "
+                   "(stale filter={:.0f}s)",
+                   pending_takes_.size(), takes.size(),
+                   cfg_.max_mempool_age_seconds);
 }
 
 double MempoolSentinelStrategy::pending_net_flow() const
 {
     // F_pending = SUM(size * sign(side))
-    // Bid (taker buying) = +1, Ask (taker selling) = -1.
+    // where Bid (taker buying base) = +1, Ask (taker selling base) = -1.
     double flow = 0.0;
     for (const auto& take : pending_takes_) {
         const double sign = (take.taker_side == Side::Bid) ? 1.0 : -1.0;
@@ -794,6 +959,7 @@ double MempoolSentinelStrategy::pending_net_flow() const
 double MempoolSentinelStrategy::pending_flow_intensity() const
 {
     // I_pending = |F_pending| / avg_daily_volume.
+    // Returns 0.0 if avg_daily_volume is non-positive (defensive).
     if (cfg_.avg_daily_volume <= 0.0) {
         return 0.0;
     }
@@ -809,28 +975,28 @@ double MempoolSentinelStrategy::mempool_spread_multiplier() const
 
 double MempoolSentinelStrategy::mempool_skew_adjustment() const
 {
-    // skew_mempool = -phi_mempool * sign(F_pending) * I_pending
+    // skew = -phi_mempool * sign(F_pending) * I_pending
+    // Clamped to [-skew_max, +skew_max].
     //
-    // The negative sign ensures that if takers are buying (F > 0),
-    // we shift quotes UP (positive skew applied to both bid and ask).
-    // This makes the ask wider (less eager to sell) and the bid
-    // tighter (more eager to buy), which is the correct response
-    // to anticipated buying pressure.
+    // The negative sign ensures correct directional response:
+    //   F > 0 (buying pressure) => positive skew => quotes shift UP
+    //   F < 0 (selling pressure) => negative skew => quotes shift DOWN
     const double F = pending_net_flow();
     if (std::abs(F) < 1e-12) {
         return 0.0;  // No pending flow; no skew adjustment.
     }
 
-    const double I = pending_flow_intensity();
+    const double I      = pending_flow_intensity();
     const double sign_F = (F > 0.0) ? 1.0 : -1.0;
     const double raw_skew = -cfg_.phi_mempool * sign_F * I;
 
-    // Clamp to [-skew_max, +skew_max].
     return std::clamp(raw_skew, -cfg_.skew_max, cfg_.skew_max);
 }
 
-std::vector<std::string> MempoolSentinelStrategy::our_offers_pending_fill() const
+std::vector<std::string>
+MempoolSentinelStrategy::our_offers_pending_fill() const
 {
+    // Filter the pending takes to find those targeting our own offers.
     std::vector<std::string> result;
     for (const auto& take : pending_takes_) {
         if (take.is_our_offer) {
@@ -862,9 +1028,11 @@ void MempoolSentinelStrategy::update_regime()
         vr,
         cfg_.vr_mean_revert_threshold,
         cfg_.vr_momentum_threshold,
-        0.80, 0.50,  // mean-reverting multipliers
-        1.50, 2.00   // momentum multipliers
+        0.80, 0.50,  // mean-reverting: tighten spread, halve skew
+        1.50, 2.00   // momentum: widen spread, double skew
     );
+    spdlog::trace("Mempool regime: VR={:.4f} regime={}",
+                   vr, to_string(regime_.regime));
 }
 
 }  // namespace xop
