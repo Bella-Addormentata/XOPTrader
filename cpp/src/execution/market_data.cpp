@@ -1072,7 +1072,7 @@ void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
         // Use uint64_t for the subtraction to avoid narrowing whale_window_blocks
         // (a size_t) to BlockHeight (uint32_t), which would silently truncate values
         // above UINT32_MAX.
-        const std::uint64_t window_blocks_u64 =
+        const std::uint64_t effective_window =
             static_cast<std::uint64_t>(whale_window_blocks);
         while (!deq.empty() &&
                block_height >= deq.front().block_height)
@@ -1080,7 +1080,7 @@ void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
             const std::uint64_t age =
                 static_cast<std::uint64_t>(block_height) -
                 static_cast<std::uint64_t>(deq.front().block_height);
-            if (age >= window_blocks_u64) {
+            if (age >= effective_window) {
                 deq.pop_front();
             } else {
                 break;
@@ -1156,13 +1156,13 @@ double MarketDataFeed::compute_whale_spread_multiplier(
     }
 
     // Ensure we never divide by zero: treat a zero window size as 1 block.
-    const double window_blocks = std::max(
+    const double effective_window = std::max(
         1.0,
         static_cast<double>(window_blocks_param));
 
     // Clamp at the window size so we don't extrapolate beyond max.
     const double fraction = std::min(
-        static_cast<double>(events_in_window) / window_blocks,
+        static_cast<double>(events_in_window) / effective_window,
         1.0);
 
     // Linear interpolation: 1.0 + fraction * (max - 1.0)
@@ -1182,10 +1182,10 @@ std::optional<WhaleMetrics> MarketDataFeed::get_whale_metrics(
         block_height_.load(std::memory_order_relaxed);
 
     // Snapshot config for the window size.
-    std::uint64_t window64;
+    std::uint64_t window_blocks_64;
     {
         std::shared_lock lock(mtx_config_);
-        window64 = static_cast<std::uint64_t>(config_.whale_window_blocks);
+        window_blocks_64 = static_cast<std::uint64_t>(config_.whale_window_blocks);
     }
 
     std::shared_lock lock(mtx_whale_metrics_);
@@ -1199,7 +1199,7 @@ std::optional<WhaleMetrics> MarketDataFeed::get_whale_metrics(
     // last_event_block is near UINT32_MAX or when whale_window_blocks is large.
     const auto current64 = static_cast<std::uint64_t>(current_block);
     const auto last64    = static_cast<std::uint64_t>(wm.last_event_block);
-    if (current64 >= last64 + window64)
+    if (current64 >= last64 + window_blocks_64)
     {
         // Window has expired; behave as if no whale is present.
         return std::nullopt;
