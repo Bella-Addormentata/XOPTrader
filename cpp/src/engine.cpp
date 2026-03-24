@@ -660,10 +660,10 @@ void Engine::step_process_fills(BlockHeight block_height)
         // multiply (two 1e12-scale values can exceed 2^63).
         // ISO/IEC 5055: explicit unit normalization for financial calc.
         tr.realized_pnl_mojos = (fill.side == Side::Ask)
-            ? static_cast<Mojo>(
+            ? static_cast<Mojo>(std::llround(
                   static_cast<double>(fill.price - asset_rec.weighted_avg_cost_basis)
                   * static_cast<double>(fill.size)
-                  / static_cast<double>(kMojosPerXch))
+                  / static_cast<double>(kMojosPerXch)))
             : 0;
 
         db_->insert_trade(tr);

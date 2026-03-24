@@ -240,6 +240,8 @@ class ChartWidget(QWidget):
         # Maps (pair, block_height) -> timestamp.  Updated on each
         # append_price_data call so _block_to_ts avoids a linear scan.
         self._block_ts_map: dict[tuple[str, int], float] = {}
+        # Per-pair entry count for O(1) eviction checks.
+        self._block_ts_counts: dict[str, int] = {}
 
         root = QVBoxLayout(self)
         root.setContentsMargins(8, 8, 8, 8)
@@ -686,19 +688,22 @@ class ChartWidget(QWidget):
         # Eviction is per-pair to prevent unbounded growth when many
         # pairs each accumulate entries independently.
         pair = self._current_pair
-        self._block_ts_map[(pair, block_height)] = timestamp
+        key = (pair, block_height)
+        if key not in self._block_ts_map:
+            self._block_ts_counts[pair] = self._block_ts_counts.get(pair, 0) + 1
+        self._block_ts_map[key] = timestamp
 
-        # Count entries belonging to the current pair and evict the
-        # oldest (lowest block numbers) when the limit is exceeded.
-        pair_keys = [
-            k for k in self._block_ts_map if k[0] == pair
-        ]
-        if len(pair_keys) > _MAX_DATA_POINTS:
-            # Sort by block height (second tuple element) ascending.
-            pair_keys.sort(key=lambda k: k[1])
+        # Evict oldest entries for the current pair when count exceeds
+        # the limit.  The counter makes the common-path check O(1).
+        if self._block_ts_counts.get(pair, 0) > _MAX_DATA_POINTS:
+            pair_keys = sorted(
+                (k for k in self._block_ts_map if k[0] == pair),
+                key=lambda k: k[1],
+            )
             excess = len(pair_keys) - _MAX_DATA_POINTS
-            for key in pair_keys[:excess]:
-                del self._block_ts_map[key]
+            for evict_key in pair_keys[:excess]:
+                del self._block_ts_map[evict_key]
+            self._block_ts_counts[pair] = len(pair_keys) - excess
         self._dirty = True
 
     def append_pnl_data(
