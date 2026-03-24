@@ -15,9 +15,8 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Deque, Sequence
+from typing import Any, Sequence
 
-import numpy as np
 import pyqtgraph as pg
 from pyqtgraph import DateAxisItem
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
@@ -683,8 +682,13 @@ class ChartWidget(QWidget):
             PriceTick(block=block_height, timestamp=timestamp,
                       mid=mid, bid=bid, ask=ask)
         )
-        # Maintain the O(1) block-to-timestamp lookup table.
+        # Maintain the O(1) block-to-timestamp lookup table (bounded).
         self._block_ts_map[(self._current_pair, block_height)] = timestamp
+        if len(self._block_ts_map) > _MAX_DATA_POINTS * 2:
+            # Evict oldest entries to prevent unbounded growth.
+            excess = len(self._block_ts_map) - _MAX_DATA_POINTS
+            for key in list(self._block_ts_map)[:excess]:
+                del self._block_ts_map[key]
         self._dirty = True
 
     def append_pnl_data(

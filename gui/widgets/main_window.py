@@ -282,11 +282,24 @@ class MainWindow(QMainWindow):
         )
         self._block_label.setText(f"Block: {block_height:,}")
 
-        # Dashboard update.
+        # Dashboard update -- translate bridge dict to card-keyed format.
         if self._dashboard is not None and hasattr(self._dashboard, "update_metrics"):
-            self._dashboard.update_metrics(data)
+            card_data = {
+                "Total PnL": {"value": pnl.get("total", 0), "spark": pnl.get("total", 0)},
+                "Realized PnL": {"value": pnl.get("realized", 0), "spark": pnl.get("realized", 0)},
+                "Unrealized PnL": {"value": pnl.get("unrealized", 0), "spark": pnl.get("unrealized", 0)},
+                "Spread PnL": {"value": pnl.get("spread", 0), "spark": pnl.get("spread", 0)},
+                "Inventory PnL": {"value": pnl.get("inventory", 0), "spark": pnl.get("inventory", 0)},
+                "24h Fill Count": {
+                    "value": data.get("offers", {}).get("filled", 0),
+                    "spark": data.get("offers", {}).get("filled", 0),
+                },
+            }
+            self._dashboard.update_metrics(card_data)
             if hasattr(self._dashboard, "update_bot_status"):
-                self._dashboard.update_bot_status(data.get("bot_status", "Unknown"))
+                status = data.get("bot_status", "Unknown")
+                colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
+                self._dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
             if hasattr(self._dashboard, "update_connection_status"):
                 self._dashboard.update_connection_status({
                     "Full Node": health.get("node_synced", 0.0) >= 1.0,
@@ -294,7 +307,8 @@ class MainWindow(QMainWindow):
                     "Dexie": True,
                 })
             if hasattr(self._dashboard, "update_block_info"):
-                self._dashboard.update_block_info(block_height, 0.0)
+                # Use 0 timestamp as sentinel; dashboard handles it gracefully.
+                self._dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
@@ -796,32 +810,18 @@ class MainWindow(QMainWindow):
         self._status_bar.refresh_clock_and_memory()
 
     def _on_metrics_tick(self) -> None:
-        """Called every 5 seconds to pull fresh metrics from Prometheus.
+        """Called every 5 seconds as a fallback metrics refresh.
 
-        Uses the MetricsService convenience getters to build a snapshot
-        and push values into the status bar, dashboard, and toolbar.
+        When the EngineBridge is wired (via set_bridge), the bridge's own
+        data_updated signal drives all widget updates through _on_bridge_data.
+        This timer serves only as a keep-alive check when no bridge is set.
         """
-        if self.metrics_service is None:
+        if self._bridge is not None:
+            # Bridge handles metrics delivery; nothing to do here.
             return
 
-        try:
-            pnl = self.metrics_service.get_pnl()
-            health = self.metrics_service.get_health()
-
-            pnl_total = int(pnl.get("total", 0))
-            block_height = int(health.get("block_height", 0))
-
-            self._status_bar.update_metrics(
-                pnl_mojos=pnl_total,
-                spread_bps=0.0,  # Aggregated by bridge's data_updated
-                inventory_ratio=0.5,
-                block_height=block_height,
-            )
-            self._block_label.setText(f"Block: {block_height:,}")
-        except Exception:
-            # Log and skip on transient errors; the status bar will
-            # keep displaying stale data, which is acceptable.
-            _log.exception("Metrics tick failed")
+        # No bridge connected -- status bar shows stale/placeholder data.
+        pass
 
     # ===================================================================== #
     #  Slot handlers                                                         #
@@ -884,6 +884,14 @@ class MainWindow(QMainWindow):
             if reply != QMessageBox.StandardButton.Yes:
                 return
 
+        # Delegate to bridge (Phase 1 stubs emit user-facing messages).
+        if self._bridge is not None:
+            if self._bot_running:
+                self._bridge.stop_engine()
+            else:
+                self._bridge.start_engine()
+
+        # Toggle local state for immediate visual feedback.
         self._bot_running = not self._bot_running
         self._style_start_stop_button()
 
@@ -1043,8 +1051,8 @@ class MainWindow(QMainWindow):
                 event.ignore()
                 return
             if reply == QMessageBox.StandardButton.Save:
-                if hasattr(self._settings_widget, "save"):
-                    self._settings_widget.save()
+                if hasattr(self._settings_widget, "save_config"):
+                    self._settings_widget.save_config()
 
         self._status_timer.stop()
         self._metrics_timer.stop()
