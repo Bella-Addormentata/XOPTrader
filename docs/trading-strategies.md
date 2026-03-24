@@ -54,7 +54,7 @@
 5. [On Deliberate Loss-Taking and Inventory Balance](#5-on-deliberate-loss-taking-and-inventory-balance)
 6. [Implementation Priority Ranking](#6-implementation-priority-ranking)
 7. [Key Strategy Trade-offs](#7-key-strategy-trade-offs)
-   - [7.10 Multi-Instance Dynamics](#710-multi-instance-dynamics-multiple-xoptraders-in-the-same-market)
+   - [7.10 Coexisting With Unknown Market Makers](#710-coexisting-with-unknown-market-makers)
 8. [Strategy Interaction Matrix](#8-strategy-interaction-matrix)
 9. [References](#9-references)
 
@@ -1911,114 +1911,159 @@ matters more).
 
 ---
 
-### 7.10 Multi-Instance Dynamics: Multiple XOPTraders in the Same Market
+### 7.10 Coexisting With Unknown Market Makers
 
-**Question:** What happens when two or more XOPTrader instances participate
-in the same market simultaneously?
+**Assumptions we must live with:**
 
-**Short answer:** Without coordination, they will _not_ simply fill gaps in
-the order book — they risk Bertrand competition (a spread-tightening race to
-zero) and, worse, they can enter a **feedback loop where they trade with
-each other**, each instance filling the other's offers and accumulating
-opposite-side inventory while both pay transaction fees without earning
-any spread income.
+1. We never know how many other market makers are active in a given pair.
+2. We never know what software they run — it could be XOPTrader, a custom
+   bot, a manual trader, or an AMM pool.
+3. We cannot coordinate with them.  There is no shared state, no signaling
+   channel, no way to negotiate who quotes where.
 
-#### Why the feedback loop arises
+Under these constraints the question is not "how do we avoid competing"
+but **"how do we find a profitable niche and stay in it while others do
+the same thing?"**
 
-Each XOPTrader instance independently runs the same strategy pipeline:
+#### Why feedback loops can arise — and the natural limits that contain them
 
-1. Compute fair value → set bid/ask spread (A-S/GLFT)
-2. Observe own inventory → skew quotes (move mid toward the side that
-   needs to lighten)
-3. Post offers, wait for fills
+A feedback loop occurs when two market makers with similar strategies
+repeatedly fill each other's rebalancing offers: A accumulates inventory,
+skews quotes to offload, B takes the other side (and vice versa), and both
+pay transaction fees without earning spread income from real takers.
 
-When two instances run identical strategies with similar parameters:
+In theory this is a Bertrand competition problem (Bertrand, 1883) —
+identical dealers in an undifferentiated product compress spreads to
+marginal cost.  Farmer & Joshi (2002) [ref 42] confirmed computationally
+that identical strategies crowding the same market destroy their own edge.
 
-| Instance A state | Instance B state | Result |
-|-----------------|-----------------|--------|
-| Neutral inventory, posts bid 100 / ask 102 | Neutral inventory, posts bid 100.2 / ask 101.8 | B undercuts A; A's offers stale |
-| A detects competitor (§1.7), tightens to 100.5 / 101.5 | B detects A tightened, tightens to 100.6 / 101.4 | **Bertrand race** — spreads compress to near zero |
-| A's bid filled at 100.5 (now long) | B's ask filled at 101.4 (now short) | Each has opposite inventory |
-| A skews ask lower (e.g., 100.8) to offload | B skews bid higher (e.g., 101.0) to offload | **They fill each other** — A sells to B, B sells to A |
-| Cycle repeats | Cycle repeats | Both accumulate fee costs and transaction overhead with no net spread income |
+**In practice, however, several forces limit the damage:**
 
-This is the classic Bertrand competition result (Bertrand, 1883): when two
-dealers offer the same undifferentiated product, the equilibrium price
-converges toward marginal cost — in our case, zero spread — and neither
-makes profit.  Farmer & Joshi (2002) [ref 42] confirmed this
-computationally: identical strategies crowding the same market
-destroy each other's edge.
+- **Capital constraints differ.**  Every operator has different wallet
+  balances, risk tolerance, and rebalancing thresholds.  Even identical
+  software with identical parameters will diverge after the first asymmetric
+  fill because each instance's inventory — and therefore its quote skew —
+  becomes unique.
+- **Timing jitter.**  Each instance observes the blockchain at different
+  moments, processes data at different speeds, and posts offers at different
+  points in the ~52-second block cycle.  This natural desynchronization
+  means "identical" quotes are rarely truly simultaneous.
+- **Taker demand absorbs symmetry.**  Real takers (non-market-makers)
+  choose the best-priced offer for their desired direction — a buyer takes
+  the lowest ask, a seller takes the highest bid.  As long as genuine taker
+  flow exists, two market makers don't exclusively trade with each other —
+  they share the taker flow.  The feedback loop only becomes dominant in
+  markets with near-zero organic taker volume.
+- **Inventory limits are self-correcting.**  If an instance accumulates too
+  much one-sided inventory through feedback trading, it will hit its position
+  limit (§3.5) or its rebalancing threshold (§5.2) and pull quotes.  This
+  breaks the loop automatically.
 
-#### Why it's worse on Chia than on a CEX
+The real risk is not an infinite loop — it's **compressed spreads and
+reduced per-trade profit** when another maker is active.  That's normal
+competitive dynamics, not a bug.
 
-On a CEX limit order book, multiple market makers at least have **time
-priority** — the first order at a given price fills first.  Chia's
-offer-file model has no time priority: offers are atomic take-it-or-leave-it
-files, and takers choose which offer to take.  Two identical-price offers
-from different XOPTrader instances are **perfectly substitutable**, so the
-effective competition is even more intense than on a CEX.
+#### The core strategy: find and fill the gaps
 
-Additionally, because of full UTXO transparency (§4.5), each instance can
-observe the other's complete offer history — but if they run the same
-algorithms, they'll *respond identically* to that observation, amplifying
-rather than dampening the oscillation.
+Rather than trying to outcompete other market makers at the same price
+levels, XOPTrader should **seek out the parts of the order book where
+nobody else is quoting** — or where existing quotes are stale, wide, or
+thin.  This is the gap-filling approach, and it is the natural equilibrium
+for multiple independent market makers:
 
-#### Mitigation strategies
+**1. Quote where the book is empty.**
+Use competitor detection (§1.7) to observe the existing offer landscape.
+If other makers are quoting tight at the inside spread, don't race them —
+instead place offers at the **second and third tiers** (§1.4) where there
+is no liquidity.  These wider-spread offers fill less frequently but earn
+more per fill and face no competition.
 
-**1. Pair partitioning (simplest and most effective).**
-Assign each instance a non-overlapping set of trading pairs.  Instance A
-handles XCH/USDS and XCH/wBTC; Instance B handles XCH/SBX and XCH/HOA.
-No overlap = no competition.
+**2. Quote when others are absent.**
+Block-cadence synchronization (§3.18) and TTL optimization (§3.17) let
+XOPTrader maintain fresh offers across block boundaries.  Many competitors
+leave stale offers or pull quotes during volatile blocks.  Being present
+when others are absent is a structural edge.
 
-**2. Tier partitioning within the same pair.**
-Use Multi-Tier Liquidity Provision (§1.4) with explicit tier assignment:
-Instance A quotes the innermost tier (tightest spread, smallest size),
-Instance B quotes the second tier (wider spread, larger size).  This
-replicates how traditional multi-desk market makers operate — each desk
-"owns" a layer of the book.
+**3. Quote the pairs others ignore.**
+The CAT ecosystem (§4.6) has 50+ tokens.  Most market makers concentrate on
+XCH/USDS and XCH/wBTC.  Illiquid pairs like niche CATs have wider natural
+spreads and fewer competitors — higher profit per trade, lower feedback risk.
 
-**3. Parameter differentiation.**
-Run different risk-aversion parameters (γ in A-S/GLFT).  A high-γ instance
-quotes wide and rarely trades; a low-γ instance quotes tight and trades
-frequently.  Their natural spread bands don't overlap much, so they fill
-different taker demand segments.
+**4. Let the A-S/GLFT model find equilibrium naturally.**
+The Avellaneda-Stoikov (§1.1) and GLFT (§1.2) models already solve this
+problem mathematically: the optimal quote depends on _our_ inventory,
+_our_ risk aversion (γ), and _our_ time horizon.  Two instances with
+different inventories and γ values will naturally quote at different prices
+even without explicit coordination.  **The key parameter is γ** — it
+controls how aggressively we quote.  A higher γ means wider spreads and
+less competition with other makers; a lower γ means tighter spreads and
+more fills but more exposure to crowding.
 
-**4. Offer-self-detection (instance fingerprinting).**
-Each instance tags its offers with a unique instance ID (e.g., in the
-offer memo field or via a deterministic puzzle hash prefix).  The
-competitor detection module (§1.7) is extended to recognize and ignore
-own-family offers.  This prevents the Bertrand tightening response from
-triggering against yourself.
+**5. Don't chase competitors — differentiate from them.**
+The competitor detection module (§1.7) alerts when someone else is quoting
+tighter.  The temptation is to match their spread.  **Resist this unless
+your model independently supports the tighter price.**  If another maker is
+willing to quote at 50 bps and your model says 80 bps is correct for your
+risk level, stay at 80 bps.  They'll absorb the toxic flow at 50 bps; you'll
+pick up the rest at a more profitable width.  This is the Foucault, Kadan &
+Kandel (2005) [ref 38] insight: in a market with both patient and impatient
+takers, multiple spread levels coexist profitably.
 
-**5. Shared inventory state (coordination mode).**
-If instances must overlap on the same pair, they can share inventory state
-via a lightweight coordination layer (e.g., a shared SQLite database or
-Redis).  A global inventory position is maintained, and each instance
-quotes its share of the target exposure.  This is the most complex option
-and only justified for high-capital, multi-machine deployments.
+#### Avoiding feedback loops without coordination
 
-#### Decision table
+| Mechanism | How it prevents feedback | Already implemented? |
+|-----------|------------------------|---------------------|
+| **Inventory-driven quote skew** (A-S/GLFT) | Each instance's quotes diverge as inventory diverges after first asymmetric fill | ✅ Yes (§1.1, §1.2) |
+| **Position limits** | Hard caps prevent runaway inventory accumulation | Future (§3.5) |
+| **Rebalancing thresholds** (§5.2) | Instance pulls one-sided quotes when imbalance exceeds 0.75, breaking the cycle | Documented policy |
+| **Competitor detection** (§1.7) | Detects when another maker is active; shifts to non-overlapping tiers instead of undercutting | ✅ Yes |
+| **Fill-rate monitoring** | If fill rate drops below the normal-conditions target of 30% (§0.3), the market is likely crowded — widen spreads or rotate to less competitive pairs | ✅ Yes (Thompson sampling §1.12 tracks this) |
+| **TTL + block-cadence timing** | Quote at moments when competitor coverage is thin, rather than when the book is already full | Future (§3.17, §3.18) |
+| **Minimum spread floor** | Never quote below a configurable minimum spread (e.g., spread_min_bps = 50–100 for typical CAT pairs, lower for high-volume pairs like XCH/USDS) regardless of competitive pressure — this is the circuit breaker against Bertrand races | Config parameter (spread_min_bps) |
 
-| Deployment scenario | Recommended approach | Feedback loop risk |
-|--------------------|--------------------|-------------------|
-| Single operator, multiple pairs | Pair partitioning (#1) | **None** — no overlap |
-| Single operator, one pair, scaling throughput | Tier partitioning (#2) + self-detection (#4) | **Low** — distinct spread layers |
-| Single operator, same pair, diversified strategies | Parameter differentiation (#3) + self-detection (#4) | **Low** — distinct spread bands |
-| Multiple independent operators | Blockchain intel (§3.21) to detect and treat as competitors ¹ | **Medium** — mitigated by natural divergence |
-| Adversarial (competitor runs XOPTrader against you) | Differentiate via operational edges (§3.17, §3.18, §3.19) ² | **High** — requires active differentiation |
+#### What about running multiple XOPTrader instances ourselves?
 
-¹ Farmer & Joshi (2002) [ref 42] crowding dynamics apply; natural strategy
-divergence and different capital constraints limit the damage.
+If _you_ control multiple instances (e.g., for scaling or redundancy), the
+same principles apply but you can add explicit coordination:
 
-² TTL optimization, block-cadence sync, and CAT correlation are
-non-replicable operational edges that can't be crowded out.
+- **Pair partitioning:** each instance trades non-overlapping pairs.
+  No overlap = no self-competition.
+- **Tier partitioning:** Instance A quotes tier 1 (tight, small), Instance B
+  quotes tier 2 (wide, large) on the same pair.
+- **Self-detection:** tag offers with an instance identifier so competitor
+  detection ignores own-family offers.
+- **Shared state:** for advanced multi-machine setups, share inventory
+  position via a common database so instances quote collaboratively.
 
-**Key takeaway:** Multiple XOPTrader instances in the same market _without_
-coordination will degrade into a negative-sum spread war and potential
-feedback trading.  The solution is to **partition by pair or by tier**, not
-to compete head-on with identical strategies.  This directly echoes the
-Farmer & Joshi (2002) [ref 42] finding: identical strategies in the same
-market destroy their own profitability.
+But the gap-filling and A-S equilibrium strategies above work regardless —
+even against your own other instances.
+
+#### The equilibrium outcome
+
+In a market with multiple independent market makers (whether running
+XOPTrader or not), the expected equilibrium is:
+
+- **Spread compression** toward the level supported by actual taker
+  flow and adverse selection risk — this is healthy competition that
+  benefits takers.
+- **Natural specialization** — makers with lower costs or higher risk
+  tolerance capture the tight-spread, high-frequency segment; others
+  migrate to wider spreads, less liquid pairs, or different timing
+  windows.  This is the Lo (2004) [ref 36] Adaptive Markets prediction:
+  strategies find niches rather than all converging on the same point.
+- **Reduced per-trade profit but not zero profit** — as long as organic
+  taker flow exists, spread income remains positive.  The Menkveld (2013)
+  [ref 37] finding applies: successful market makers survive competition
+  by running diversified strategy portfolios, not by winning a single
+  spread-tightening contest.
+
+**Key takeaway:** Don't try to know or control what other market makers
+are doing.  Instead, (1) use the A-S/GLFT model to find _your_ optimal
+price given _your_ inventory and risk, (2) fill the gaps in the order
+book where others aren't quoting, (3) enforce a minimum spread floor to
+prevent Bertrand races, and (4) monitor fill rates to detect crowding
+early and rotate to less competitive opportunities.  The math finds
+equilibrium; the gap-filling strategy avoids head-on collisions.
 
 ---
 
