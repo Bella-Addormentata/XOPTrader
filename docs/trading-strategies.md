@@ -54,6 +54,7 @@
 5. [On Deliberate Loss-Taking and Inventory Balance](#5-on-deliberate-loss-taking-and-inventory-balance)
 6. [Implementation Priority Ranking](#6-implementation-priority-ranking)
 7. [Key Strategy Trade-offs](#7-key-strategy-trade-offs)
+   - [7.10 Multi-Instance Dynamics](#710-multi-instance-dynamics-multiple-xoptraders-in-the-same-market)
 8. [Strategy Interaction Matrix](#8-strategy-interaction-matrix)
 9. [References](#9-references)
 
@@ -1907,6 +1908,117 @@ matters more).
 | Competitor analysis shows crowding on A-S-style quoting | Shift toward TTL optimization (§3.17) and block-cadence sync (§3.18) — operational edges that can't be crowded | Farmer & Joshi (2002) [ref 42] |
 | CEX lead-lag signal consistently predicts DEX price moves | Activate predictive quoting mode (§3.3) | De Jong & Nijman (1997) [ref 12], Lo (2004) [ref 36] |
 | Monthly PnL attribution shows one strategy dominating | *Reduce* its allocation slightly — check for overfitting to recent conditions | López de Prado (2018) [ref 39] |
+
+---
+
+### 7.10 Multi-Instance Dynamics: Multiple XOPTraders in the Same Market
+
+**Question:** What happens when two or more XOPTrader instances participate
+in the same market simultaneously?
+
+**Short answer:** Without coordination, they will _not_ simply fill gaps in
+the order book — they risk Bertrand competition (a spread-tightening race to
+zero) and, worse, they can enter a **feedback loop where they trade with
+each other**, each instance filling the other's offers and accumulating
+opposite-side inventory while both pay transaction fees without earning
+any spread income.
+
+#### Why the feedback loop arises
+
+Each XOPTrader instance independently runs the same strategy pipeline:
+
+1. Compute fair value → set bid/ask spread (A-S/GLFT)
+2. Observe own inventory → skew quotes (move mid toward the side that
+   needs to lighten)
+3. Post offers, wait for fills
+
+When two instances run identical strategies with similar parameters:
+
+| Instance A state | Instance B state | Result |
+|-----------------|-----------------|--------|
+| Neutral inventory, posts bid 100 / ask 102 | Neutral inventory, posts bid 100.2 / ask 101.8 | B undercuts A; A's offers stale |
+| A detects competitor (§1.7), tightens to 100.5 / 101.5 | B detects A tightened, tightens to 100.6 / 101.4 | **Bertrand race** — spreads compress to near zero |
+| A's bid filled at 100.5 (now long) | B's ask filled at 101.4 (now short) | Each has opposite inventory |
+| A skews ask lower (e.g., 100.8) to offload | B skews bid higher (e.g., 101.0) to offload | **They fill each other** — A sells to B, B sells to A |
+| Cycle repeats | Cycle repeats | Both accumulate fee costs and transaction overhead with no net spread income |
+
+This is the classic Bertrand competition result (Bertrand, 1883): when two
+dealers offer the same undifferentiated product, the equilibrium price
+converges toward marginal cost — in our case, zero spread — and neither
+makes profit.  Farmer & Joshi (2002) [ref 42] confirmed this
+computationally: identical strategies crowding the same market
+destroy each other's edge.
+
+#### Why it's worse on Chia than on a CEX
+
+On a CEX limit order book, multiple market makers at least have **time
+priority** — the first order at a given price fills first.  Chia's
+offer-file model has no time priority: offers are atomic take-it-or-leave-it
+files, and takers choose which offer to take.  Two identical-price offers
+from different XOPTrader instances are **perfectly substitutable**, so the
+effective competition is even more intense than on a CEX.
+
+Additionally, because of full UTXO transparency (§4.5), each instance can
+observe the other's complete offer history — but if they run the same
+algorithms, they'll *respond identically* to that observation, amplifying
+rather than dampening the oscillation.
+
+#### Mitigation strategies
+
+**1. Pair partitioning (simplest and most effective).**
+Assign each instance a non-overlapping set of trading pairs.  Instance A
+handles XCH/USDS and XCH/wBTC; Instance B handles XCH/SBX and XCH/HOA.
+No overlap = no competition.
+
+**2. Tier partitioning within the same pair.**
+Use Multi-Tier Liquidity Provision (§1.4) with explicit tier assignment:
+Instance A quotes the innermost tier (tightest spread, smallest size),
+Instance B quotes the second tier (wider spread, larger size).  This
+replicates how traditional multi-desk market makers operate — each desk
+"owns" a layer of the book.
+
+**3. Parameter differentiation.**
+Run different risk-aversion parameters (γ in A-S/GLFT).  A high-γ instance
+quotes wide and rarely trades; a low-γ instance quotes tight and trades
+frequently.  Their natural spread bands don't overlap much, so they fill
+different taker demand segments.
+
+**4. Offer-self-detection (instance fingerprinting).**
+Each instance tags its offers with a unique instance ID (e.g., in the
+offer memo field or via a deterministic puzzle hash prefix).  The
+competitor detection module (§1.7) is extended to recognize and ignore
+own-family offers.  This prevents the Bertrand tightening response from
+triggering against yourself.
+
+**5. Shared inventory state (coordination mode).**
+If instances must overlap on the same pair, they can share inventory state
+via a lightweight coordination layer (e.g., a shared SQLite database or
+Redis).  A global inventory position is maintained, and each instance
+quotes its share of the target exposure.  This is the most complex option
+and only justified for high-capital, multi-machine deployments.
+
+#### Decision table
+
+| Deployment scenario | Recommended approach | Feedback loop risk |
+|--------------------|--------------------|-------------------|
+| Single operator, multiple pairs | Pair partitioning (#1) | **None** — no overlap |
+| Single operator, one pair, scaling throughput | Tier partitioning (#2) + self-detection (#4) | **Low** — distinct spread layers |
+| Single operator, same pair, diversified strategies | Parameter differentiation (#3) + self-detection (#4) | **Low** — distinct spread bands |
+| Multiple independent operators | Blockchain intel (§3.21) to detect and treat as competitors ¹ | **Medium** — mitigated by natural divergence |
+| Adversarial (competitor runs XOPTrader against you) | Differentiate via operational edges (§3.17, §3.18, §3.19) ² | **High** — requires active differentiation |
+
+¹ Farmer & Joshi (2002) [ref 42] crowding dynamics apply; natural strategy
+divergence and different capital constraints limit the damage.
+
+² TTL optimization, block-cadence sync, and CAT correlation are
+non-replicable operational edges that can't be crowded out.
+
+**Key takeaway:** Multiple XOPTrader instances in the same market _without_
+coordination will degrade into a negative-sum spread war and potential
+feedback trading.  The solution is to **partition by pair or by tier**, not
+to compete head-on with identical strategies.  This directly echoes the
+Farmer & Joshi (2002) [ref 42] finding: identical strategies in the same
+market destroy their own profitability.
 
 ---
 
