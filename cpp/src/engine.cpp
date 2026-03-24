@@ -791,6 +791,7 @@ void Engine::step_compute_quotes(BlockHeight block_height)
 
         // Invoke the strategy to produce raw quotes.
         pcs.raw_quote = strategy_->compute_quotes(mid, sigma, q, block_height);
+        pcs.quote_valid = true;  // Mark as valid for steps 5-8.
 
         spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps",
                       pair_name, pcs.raw_quote.bid_price,

@@ -509,8 +509,9 @@ public:
 
     // -- Accessors -----------------------------------------------------------
 
-    /// Read-only access to the current configuration.
-    const DriftConfig& config() const noexcept;
+    /// Thread-safe copy of the current configuration.
+    /// Returns by value to prevent data races with set_config().
+    DriftConfig config() const;
 
     /// Update configuration (e.g. after market conditions change).
     void set_config(const DriftConfig& cfg);

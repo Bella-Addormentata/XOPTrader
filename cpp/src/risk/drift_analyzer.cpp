@@ -652,8 +652,13 @@ InventoryDriftAnalyzer::empirical_drift_unlocked() const
 // Accessors
 // ===========================================================================
 
-const DriftConfig& InventoryDriftAnalyzer::config() const noexcept
+DriftConfig InventoryDriftAnalyzer::config() const
 {
+    // [M23-b] Return by value under shared lock to prevent data race
+    // with set_config().  Returning a reference would allow the caller
+    // to read a partially-written struct after the lock expires.
+    // ISO/IEC 5055: thread-safe access to shared configuration.
+    std::shared_lock lock(mtx_);
     return cfg_;
 }
 
