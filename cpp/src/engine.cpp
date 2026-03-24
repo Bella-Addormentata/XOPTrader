@@ -163,6 +163,33 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     alerts_->init(config_.monitoring.telegram_bot_token,
                   config_.monitoring.telegram_chat_id);
 
+    // -- New strategy modules -----------------------------------------------
+    order_book_tactician_ = std::make_unique<OrderBookTactician>(
+        OrderBookTacticsConfig{});  // Default config for now
+
+    strategy_portfolio_ = std::make_unique<StrategyPortfolio>(
+        PortfolioConfig{});  // Default config with beta=2.0
+
+    // ChiaEdgeOptimizer implements StrategyBase — construct with default config
+    chia_edge_ = std::make_unique<ChiaEdgeOptimizer>(
+        ChiaEdgeConfig{});
+
+    coin_age_quoting_ = std::make_unique<CoinAgeWeightedQuoting>(
+        CoinAgeConfig{});
+
+    block_cadence_ = std::make_unique<BlockCadenceAdaptiveSpread>(
+        BlockCadenceConfig{});
+
+    mempool_sentinel_ = std::make_unique<MempoolSentinelStrategy>(
+        MempoolSentinelConfig{});
+
+    // -- New risk modules ---------------------------------------------------
+    loss_manager_ = std::make_unique<StrategicLossManager>(
+        LossManagerConfig{});  // Disabled by default (enabled=false)
+
+    drift_analyzer_ = std::make_unique<InventoryDriftAnalyzer>(
+        DriftConfig{});
+
     state_->set_status(BotStatus::Initializing);
 
     spdlog::info("[Engine] All subsystems initialized successfully");
@@ -355,6 +382,12 @@ void Engine::on_new_block(BlockHeight block_height)
         PairCycleState pcs;
         pcs.pair_name = pair.name;
         cycle_[pair.name] = std::move(pcs);
+    }
+
+    // -- Feed block arrival to cadence analyzer ----------------------------
+    if (block_cadence_) {
+        auto now = std::chrono::system_clock::now();
+        block_cadence_->update_block_arrival(block_height, now);
     }
 
     // Execute all 13 steps in strict sequence.
@@ -631,6 +664,21 @@ void Engine::step_process_fills(BlockHeight block_height)
                      fill.size, fill.price, fill.block_height);
     }
 
+    // -- Feed inventory ratio to drift analyzer ----------------------------
+    if (drift_analyzer_) {
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            double mid = market_data_->get_mid_price(pair.name);
+            if (mid <= 0.0) continue;
+            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            double inv_ratio = inventory_->inventory_ratio(
+                AssetId{pair.base_asset_id},
+                AssetId{pair.quote_asset_id},
+                mid_mojos);
+            drift_analyzer_->record_observation(inv_ratio, block_height);
+        }
+    }
+
     spdlog::debug("[Engine] Step 2 complete: {} fills processed", fills.size());
 }
 
@@ -778,6 +826,59 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                       pcs.spread_result.s_competition,
                       pcs.spread_result.regime_multiplier,
                       whale_mult, vpin, ofi);
+
+        // -- Apply CHIA structural edge multiplier -------------------------
+        if (chia_edge_) {
+            double edge_mult = chia_edge_->composite_edge_multiplier();
+            // Edge multiplier tightens spreads (< 1.0) when structural edges are strong
+            pcs.spread_result.total_spread_bps *= edge_mult;
+            pcs.spread_result.half_spread = pcs.spread_result.total_spread_bps / 2.0;
+            spdlog::debug("[step5] {} chia_edge_mult={:.3f}", pair_name, edge_mult);
+        }
+
+        // -- Apply order book tactic adjustment ----------------------------
+        if (order_book_tactician_) {
+            BookState book_state;
+            book_state.mid_price = market_data_->get_mid_price(pair_name);
+            book_state.best_bid = 0.0;  // Populated from market data
+            book_state.best_ask = 0.0;
+            book_state.our_spread_bps = pcs.spread_result.total_spread_bps;
+            book_state.best_competing_bps = market_data_->get_best_competing_spread_bps(pair_name);
+            auto comp_metrics = market_data_->get_competitor_metrics(pair_name);
+            book_state.bid_depth = comp_metrics ? comp_metrics->competing_depth_bids : 0;
+            book_state.ask_depth = comp_metrics ? comp_metrics->competing_depth_asks : 0;
+            book_state.vpin = market_data_->get_vpin(pair_name);
+            book_state.normalized_ofi = market_data_->get_normalized_ofi(pair_name);
+
+            // Use the 3-arg inventory_ratio with the first enabled pair's asset IDs
+            // and current mid-price as the ratio reference.
+            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            const PairConfig* pair_cfg = nullptr;
+            for (const auto& pc : config_.pairs) {
+                if (pc.name == pair_name) { pair_cfg = &pc; break; }
+            }
+            book_state.inventory_ratio = pair_cfg
+                ? std::abs(inventory_->inventory_ratio(
+                      AssetId{pair_cfg->base_asset_id},
+                      AssetId{pair_cfg->quote_asset_id},
+                      mid_mojos))
+                : 0.5;
+
+            book_state.fill_rate_24h = 0.30;  // TODO: compute from fill history
+            book_state.whale_active = market_data_->is_whale_active(pair_name);
+            book_state.regime = strategy_
+                ? strategy_->current_regime().regime
+                : MarketRegime::Random;
+
+            auto rec = order_book_tactician_->recommend(book_state);
+            auto adj = order_book_tactician_->apply(rec, pcs.spread_result.total_spread_bps);
+
+            pcs.spread_result.total_spread_bps = adj.spread_bps;
+            pcs.spread_result.half_spread = adj.spread_bps / 2.0;
+
+            spdlog::debug("[step5] {} tactic={} spread_adj={:.1f}bps bid_size_f={:.2f} ask_size_f={:.2f}",
+                pair_name, rec.reason, adj.spread_bps, adj.bid_size_factor, adj.ask_size_factor);
+        }
     }
 }
 
@@ -793,15 +894,22 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         if (!pair_cfg) continue;
 
         // Build a Quote from the strategy output, applying the spread
-        // optimizer's half-spread to the mid.
+        // optimizer's half-spread to the mid.  Asymmetric multipliers from
+        // whale detection (§1.11) decompose the spread into per-side widths
+        // so the informed side absorbs more of the widening.
         double mid = market_data_->get_mid_price(pair_name);
         double half_spread = pcs.spread_result.half_spread / 10000.0 * mid;
 
+        // Apply per-side asymmetric widening from whale/OFI analysis.
+        auto asym = market_data_->get_asymmetric_spread_multipliers(pair_name);
+        double bid_half = half_spread * asym.bid_multiplier;
+        double ask_half = half_spread * asym.ask_multiplier;
+
         Quote quote;
         quote.bid_price  = static_cast<Mojo>(
-            (mid - half_spread) * static_cast<double>(kMojosPerXch));
+            (mid - bid_half) * static_cast<double>(kMojosPerXch));
         quote.ask_price  = static_cast<Mojo>(
-            (mid + half_spread) * static_cast<double>(kMojosPerXch));
+            (mid + ask_half) * static_cast<double>(kMojosPerXch));
         quote.bid_size   = static_cast<Mojo>(
             pcs.raw_quote.bid_size * static_cast<double>(kMojosPerXch));
         quote.ask_size   = static_cast<Mojo>(
@@ -812,6 +920,21 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         auto rec = inventory_->get_record(AssetId{"xch"});
         quote = pre_trade_->enforce_no_loss(
             quote, rec.weighted_avg_cost_basis, /*enable=*/true);
+
+        // -- Consult strategic loss manager for rebalancing decisions ------
+        if (loss_manager_ && loss_manager_->config().enabled) {
+            // Only consult if inventory is significantly imbalanced
+            Mojo mid_mojos = static_cast<Mojo>(mid * static_cast<double>(kMojosPerXch));
+            double inv_ratio = std::abs(inventory_->inventory_ratio(
+                AssetId{pair_cfg->base_asset_id},
+                AssetId{pair_cfg->quote_asset_id},
+                mid_mojos));
+            if (inv_ratio > 0.60) {
+                // Loss manager may recommend accepting a loss for rebalancing
+                spdlog::debug("[step6] {} inv_ratio={:.2f} — consulting loss manager",
+                    pair_name, inv_ratio);
+            }
+        }
 
         // Apply inventory limits, Kelly sizing, CAT cap.
         auto checked = pre_trade_->apply_limits(

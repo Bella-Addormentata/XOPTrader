@@ -68,6 +68,16 @@
 #include "xop/monitoring/metrics.hpp"
 #include "xop/monitoring/alerts.hpp"
 
+// New strategy modules
+#include "xop/strategy/order_book_tactics.hpp"
+#include "xop/strategy/strategy_portfolio.hpp"
+#include "xop/strategy/chia_edge.hpp"
+#include "xop/strategy/new_strategies.hpp"
+
+// New risk modules
+#include "xop/risk/loss_manager.hpp"
+#include "xop/risk/drift_analyzer.hpp"
+
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -337,6 +347,34 @@ private:
 
     /// Telegram alert manager.
     std::unique_ptr<AlertManager> alerts_;
+
+    // -- New strategy modules ------------------------------------------------
+
+    /// Order book interaction tactician — gap-filling, join/improve/step-back.
+    std::unique_ptr<OrderBookTactician> order_book_tactician_;
+
+    /// Strategy portfolio — Brock-Hommes dynamic blending of strategy components.
+    std::unique_ptr<StrategyPortfolio> strategy_portfolio_;
+
+    /// CHIA structural edge optimizer — 5-factor composite multiplier.
+    std::unique_ptr<ChiaEdgeOptimizer> chia_edge_;
+
+    /// Coin age weighted quoting — age-based spread adjustment.
+    std::unique_ptr<CoinAgeWeightedQuoting> coin_age_quoting_;
+
+    /// Block cadence adaptive spread — block arrival timing.
+    std::unique_ptr<BlockCadenceAdaptiveSpread> block_cadence_;
+
+    /// Mempool sentinel — mempool-aware spread/skew.
+    std::unique_ptr<MempoolSentinelStrategy> mempool_sentinel_;
+
+    // -- New risk modules ----------------------------------------------------
+
+    /// Strategic loss manager — 5-scenario EV analysis for rebalancing.
+    std::unique_ptr<StrategicLossManager> loss_manager_;
+
+    /// Inventory drift analyzer — random walk, trending, Monte Carlo.
+    std::unique_ptr<InventoryDriftAnalyzer> drift_analyzer_;
 
     // -- Runtime state -------------------------------------------------------
 
