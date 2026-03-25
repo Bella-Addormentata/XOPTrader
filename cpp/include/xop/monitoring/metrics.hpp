@@ -12,11 +12,13 @@
 //   5. Offer Lifecycle -- pending, filled, cancelled, expired, fill rate
 //   6. Risk            -- VaR 95%, max drawdown, portfolio concentration
 //
-// Thread safety:
-//   All prometheus-cpp metric objects are internally thread-safe.  The update_*
-//   methods may be called concurrently from any thread without external
-//   synchronization.  The HTTP server runs on its own background thread,
-//   started by init() and joined by shutdown().
+// Thread safety: thread-safe via std::shared_mutex (T2-02).
+//   All prometheus-cpp metric objects are internally thread-safe for Set/Increment.
+//   The MetricsExporter's own state (running_, shadow counters, known_asset_ids_)
+//   is protected by mtx_.  Read operations (is_running) acquire a shared lock;
+//   write operations (init, shutdown, update_*, observe_*) acquire an exclusive
+//   lock.  The HTTP server runs on its own background thread, started by init()
+//   and joined by shutdown().
 //
 // Compliant with:
 //   ISO/IEC 27001:2022 -- no secrets exposed on the metrics endpoint
@@ -37,6 +39,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -208,6 +211,11 @@ private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
     void register_metrics();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    // Protects running_, shadow counters, and known_asset_ids_.
+    mutable std::shared_mutex mtx_;
 
     // -- Prometheus infrastructure -------------------------------------------
 

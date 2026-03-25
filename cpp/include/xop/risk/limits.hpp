@@ -223,24 +223,52 @@ private:
 
     // -- Internal helpers ---------------------------------------------------
 
-    /// Compute the concentration of `asset_id` relative to the sum of
-    /// base and quote balances, returning a value in [0, 1].
-    /// Returns 0.0 if both balances are zero.
+    /// Convert a raw mojo balance to XCH-equivalent mojos using mark-to-market
+    /// pricing from the State's market snapshots.
+    ///
+    /// For "xch" positions the balance is already denominated in XCH mojos, so
+    /// it passes through unchanged.  For CAT positions the mid price from the
+    /// asset's XCH pair is used:
+    ///   xch_value = balance * mid_price_mojos_per_xch_mojo
+    ///
+    /// Conservative fallback (ISO/IEC 27001:2022 -- fail-safe design):
+    ///   When no mid price is available (market snapshot missing or mid == 0),
+    ///   the raw mojo balance is returned as-is (1:1 with XCH mojos).  This
+    ///   over-estimates the value of cheap CATs, causing risk limits to trigger
+    ///   earlier -- the safe direction.
+    ///
+    /// @param pos    Position whose balance is being valued.
+    /// @param state  Current bot state (provides market snapshots).
+    /// @return       Balance expressed in XCH-equivalent mojos.
+    [[nodiscard]]
+    static Mojo mark_to_xch(const Position& pos,
+                             const State&    state) noexcept;
+
+    /// Compute the concentration of base value relative to the sum of
+    /// base and quote values (mark-to-market in XCH), returning [0, 1].
+    /// Returns 0.0 if both values are zero.
+    ///
+    /// Uses mark_to_xch() so that different assets are compared in a common
+    /// numeraire rather than by raw mojo count.
     [[nodiscard]]
     static double compute_concentration(const Position& base_pos,
-                                        const Position& quote_pos) noexcept;
+                                        const Position& quote_pos,
+                                        const State&    state) noexcept;
 
-    /// Compute what fraction of total portfolio value a single asset represents.
-    /// Returns 0.0 if total portfolio value is zero.
+    /// Compute what fraction of total portfolio value (mark-to-market in XCH)
+    /// a single asset represents.  Returns 0.0 if total portfolio value is zero.
     [[nodiscard]]
-    static double compute_portfolio_fraction(const Position& asset_pos,
-                                             const std::vector<Position>& all) noexcept;
+    static double compute_portfolio_fraction(const Position&              asset_pos,
+                                             const std::vector<Position>& all,
+                                             const State&                 state) noexcept;
 
-    /// Compute what fraction of total capital is deployed in a single pair.
+    /// Compute what fraction of total capital (mark-to-market in XCH) is
+    /// deployed in a single pair.
     [[nodiscard]]
-    static double compute_pair_capital_fraction(const Position& base_pos,
-                                                const Position& quote_pos,
-                                                const std::vector<Position>& all) noexcept;
+    static double compute_pair_capital_fraction(const Position&              base_pos,
+                                                const Position&              quote_pos,
+                                                const std::vector<Position>& all,
+                                                const State&                 state) noexcept;
 };
 
 }  // namespace xop

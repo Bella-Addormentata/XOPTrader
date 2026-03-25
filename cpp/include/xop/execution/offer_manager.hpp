@@ -43,6 +43,7 @@
 #include <xop/state.hpp>
 #include <xop/types.hpp>
 #include <xop/rpc/chia_rpc.hpp>
+#include <xop/rpc/dexie_client.hpp>
 #include <xop/strategy/base.hpp>
 
 #include <boost/asio/awaitable.hpp>
@@ -107,13 +108,17 @@ public:
     /**
      * @brief Construct an OfferManager.
      *
-     * @param ioc        Boost.Asio io_context for async operations.
-     * @param wallet     Shared pointer to an open ChiaWalletRPC client.
-     * @param state      Shared pointer to the global mutable state.
-     * @param config     Application configuration (strategy + risk params).
+     * @param ioc           Boost.Asio io_context for async operations.
+     * @param wallet        Shared pointer to an open ChiaWalletRPC client.
+     * @param dexie_client  Shared pointer to an open DexieClient for offer
+     *                      aggregation.  May be nullptr if Dexie submission
+     *                      is not desired (offers remain valid on-chain only).
+     * @param state         Shared pointer to the global mutable state.
+     * @param config        Application configuration (strategy + risk params).
      */
     OfferManager(asio::io_context&                         ioc,
                  std::shared_ptr<rpc::ChiaWalletRPC>       wallet,
+                 std::shared_ptr<rpc::DexieClient>         dexie_client,
                  std::shared_ptr<State>                    state,
                  const AppConfig&                          config);
 
@@ -327,6 +332,10 @@ private:
 
     /// Wallet RPC client (shared -- may be used by CoinManager too).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;
+
+    /// Dexie REST client for cross-platform offer aggregation (optional).
+    /// May be nullptr if Dexie submission is disabled.
+    std::shared_ptr<rpc::DexieClient> dexie_client_;
 
     /// Global mutable state (positions, pending offers, market snapshots).
     std::shared_ptr<State> state_;

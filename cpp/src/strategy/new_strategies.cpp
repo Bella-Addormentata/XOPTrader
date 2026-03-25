@@ -33,7 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <numeric>
+#include <shared_mutex>
 
 namespace xop {
 
@@ -48,112 +48,12 @@ namespace {
 /// across all three strategies to prevent sub-economic quoting.
 static constexpr double kMinSpreadFraction = 0.004;
 
-/// Compute the variance ratio VR(q) for a price series.
-/// VR(q) = Var(q-period returns) / (q * Var(1-period returns))
-/// Under a random walk, VR(q) = 1.0.
-/// VR < 1 => mean-reverting; VR > 1 => trending/momentum.
-///
-/// We use q=2 (compare 2-block returns to 1-block returns) for a simple,
-/// robust test suitable for the short rolling windows available on CHIA.
-///
-/// Reference: Lo & MacKinlay (1988), "Stock market prices do not follow
-/// random walks," Review of Financial Studies, 1(1), 41-66.
-///
-/// @param prices  Vector of mid-prices, ordered oldest to newest.
-/// @return VR statistic (1.0 if insufficient data).
-double compute_variance_ratio(const std::vector<double>& prices) {
-    // Need at least 4 prices (3 one-period returns, 1 two-period return).
-    if (prices.size() < 4) {
-        return 1.0;
-    }
-
-    const auto n = prices.size();
-
-    // Compute one-period log returns (non-overlapping at lag 1).
-    std::vector<double> r1;
-    r1.reserve(n - 1);
-    for (std::size_t i = 1; i < n; ++i) {
-        if (prices[i - 1] > 0.0 && prices[i] > 0.0) {
-            r1.push_back(std::log(prices[i] / prices[i - 1]));
-        }
-    }
-    if (r1.size() < 3) {
-        return 1.0;
-    }
-
-    // Compute two-period log returns (overlapping at lag 2).
-    std::vector<double> r2;
-    r2.reserve(n - 2);
-    for (std::size_t i = 2; i < n; ++i) {
-        if (prices[i - 2] > 0.0 && prices[i] > 0.0) {
-            r2.push_back(std::log(prices[i] / prices[i - 2]));
-        }
-    }
-    if (r2.empty()) {
-        return 1.0;
-    }
-
-    // Variance of one-period returns (unbiased, N-1 denominator).
-    const double mean1 = std::accumulate(r1.begin(), r1.end(), 0.0)
-                         / static_cast<double>(r1.size());
-    double var1 = 0.0;
-    for (const auto& r : r1) {
-        const double d = r - mean1;
-        var1 += d * d;
-    }
-    var1 /= static_cast<double>(r1.size() - 1);
-
-    // Variance of two-period returns (unbiased, N-1 denominator).
-    const double mean2 = std::accumulate(r2.begin(), r2.end(), 0.0)
-                         / static_cast<double>(r2.size());
-    double var2 = 0.0;
-    for (const auto& r : r2) {
-        const double d = r - mean2;
-        var2 += d * d;
-    }
-    var2 /= static_cast<double>(r2.size() - 1);
-
-    // Guard against division by zero (perfectly flat price series).
-    if (var1 < 1e-18) {
-        return 1.0;
-    }
-
-    // VR(2) = Var(2-period) / (2 * Var(1-period)).
-    return var2 / (2.0 * var1);
-}
-
-/// Map a raw variance ratio to a RegimeInfo struct with multipliers.
-/// This logic is shared by all three strategies for consistency with
-/// the existing A-S and GLFT implementations.
-RegimeInfo classify_regime(double vr,
-                           double mr_threshold,
-                           double mo_threshold,
-                           double mr_spread_mult,
-                           double mr_skew_mult,
-                           double mo_spread_mult,
-                           double mo_skew_mult) {
-    RegimeInfo info;
-    info.variance_ratio = vr;
-
-    if (vr < mr_threshold) {
-        // Mean-reverting: tighten spreads, reduce inventory shedding.
-        info.regime      = MarketRegime::MeanReverting;
-        info.spread_mult = mr_spread_mult;
-        info.skew_mult   = mr_skew_mult;
-    } else if (vr > mo_threshold) {
-        // Momentum: widen spreads, aggressive inventory shedding.
-        info.regime      = MarketRegime::Momentum;
-        info.spread_mult = mo_spread_mult;
-        info.skew_mult   = mo_skew_mult;
-    } else {
-        // Random walk: no adjustment.
-        info.regime      = MarketRegime::Random;
-        info.spread_mult = 1.0;
-        info.skew_mult   = 1.0;
-    }
-
-    return info;
-}
+// T3-01: The local compute_variance_ratio() and classify_regime() helper
+// functions have been removed.  All regime detection is now delegated to
+// the shared canonical RegimeDetector (see regime.hpp / regime.cpp) via
+// the to_regime_info() bridge.  This eliminates duplicate VR implementations
+// with inconsistent horizons (q=2 vs q=5), missing Z-statistic significance
+// testing, and no hysteresis.
 
 /// Convert annualised volatility to per-block volatility.
 ///   sigma_block = sigma_annual * sqrt(block_time_seconds / kSecondsPerYear)
@@ -291,11 +191,24 @@ CoinAgeWeightedQuoting::CoinAgeWeightedQuoting(const CoinAgeConfig& cfg)
                       "resetting to 0.20");
         cfg_.beta_age = 0.20;
     }
+
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds.  Uses default regime
+    // multipliers (CoinAgeConfig does not expose custom multiplier fields).
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size    = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size    = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold = cfg_.vr_momentum_threshold;
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
 }
 
 QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- compute_quotes reads and may mutate internal state.
+    std::unique_lock lock(mtx_);
+
     // -----------------------------------------------------------------
     // Step 1: Compute tau in years for the A-S model.
     //
@@ -338,9 +251,25 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     //
     // Multipliers are applied to the half-spread (distance from the
     // reservation price r), preserving the A-S inventory-skew logic.
+    //
+    // T2-02: Inline urgency/multiplier computation here to avoid calling
+    // the public locked methods (compute_urgency, ask/bid_spread_multiplier)
+    // while already holding the exclusive lock (non-recursive mutex).
     // -----------------------------------------------------------------
-    const double ask_mult = ask_spread_multiplier(block_height);
-    const double bid_mult = bid_spread_multiplier(block_height);
+    double U = 0.0;
+    if (!coins_.empty()) {
+        double urgency_sum = 0.0;
+        for (const auto& coin : coins_) {
+            const uint32_t age_blocks = (block_height > coin.creation_block)
+                ? (block_height - coin.creation_block) : 0u;
+            const uint32_t clamped = std::min(age_blocks, cfg_.max_age_blocks);
+            const double age_s = static_cast<double>(clamped) * cfg_.block_time_seconds;
+            urgency_sum += 1.0 - std::exp(-cfg_.lambda_age * age_s);
+        }
+        U = urgency_sum / static_cast<double>(coins_.size());
+    }
+    const double ask_mult = std::clamp(1.0 - cfg_.alpha_age * U, 1.0 - cfg_.alpha_age, 1.0);
+    const double bid_mult = std::clamp(1.0 + cfg_.beta_age * U, 1.0, 1.0 + cfg_.beta_age);
 
     double ask = r + delta_adj * ask_mult;
     double bid = r - delta_adj * bid_mult;
@@ -381,7 +310,11 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
 void CoinAgeWeightedQuoting::update_price(double mid,
                                            BlockHeight block_height)
 {
-    // Store price observation for the variance-ratio regime detector.
+    // T2-02: Exclusive lock -- update_price mutates price_buffer_, regime_,
+    // last_mid_, and feeds data to the active RegimeDetector.
+    std::unique_lock lock(mtx_);
+
+    // Store price observation (retained for backward compatibility).
     price_buffer_.push_back({block_height, mid});
 
     // Trim to the regime detection window size.
@@ -389,23 +322,36 @@ void CoinAgeWeightedQuoting::update_price(double mid,
         price_buffer_.pop_front();
     }
 
-    // Update regime classification from the latest price buffer.
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Update regime classification from the detector's updated state.
     update_regime();
 }
 
 RegimeInfo CoinAgeWeightedQuoting::current_regime() const
 {
+    // T2-02: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
 const std::string& CoinAgeWeightedQuoting::name() const
 {
+    // T2-02: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void CoinAgeWeightedQuoting::set_cost_basis(double cost_basis,
                                              double min_margin_bps)
 {
+    // T2-02: Exclusive lock -- set_cost_basis mutates cost_basis_ and min_margin_bps_.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -413,12 +359,17 @@ void CoinAgeWeightedQuoting::set_cost_basis(double cost_basis,
 void CoinAgeWeightedQuoting::update_coin_ages(
     const std::vector<CoinAge>& coins)
 {
+    // T2-02: Exclusive lock -- update_coin_ages mutates coins_.
+    std::unique_lock lock(mtx_);
     coins_ = coins;
 }
 
 double CoinAgeWeightedQuoting::compute_urgency(
     BlockHeight current_block) const
 {
+    // T2-02: Shared lock -- read-only access to coins_ and cfg_.
+    std::shared_lock lock(mtx_);
+
     // If no coins are tracked, urgency is zero (nothing to be urgent about).
     if (coins_.empty()) {
         return 0.0;
@@ -450,51 +401,56 @@ double CoinAgeWeightedQuoting::compute_urgency(
 double CoinAgeWeightedQuoting::ask_spread_multiplier(
     BlockHeight current_block) const
 {
-    // ask_mult = (1 - alpha_age * U), clamped to [1 - alpha_age, 1.0].
-    //
-    // When U=0 (all coins fresh): mult = 1.0 (no change).
-    // When U~1 (all coins old):   mult = 1 - alpha_age (max tightening).
-    const double U = compute_urgency(current_block);
-    const double raw = 1.0 - cfg_.alpha_age * U;
-    return std::clamp(raw, 1.0 - cfg_.alpha_age, 1.0);
+    // T2-02: Shared lock -- read-only access to coins_ and cfg_.
+    // Urgency computed inline to avoid re-entrant shared lock via compute_urgency().
+    std::shared_lock lock(mtx_);
+    double U = 0.0;
+    if (!coins_.empty()) {
+        double sum = 0.0;
+        for (const auto& coin : coins_) {
+            const uint32_t ab = (current_block > coin.creation_block)
+                ? (current_block - coin.creation_block) : 0u;
+            const uint32_t c = std::min(ab, cfg_.max_age_blocks);
+            sum += 1.0 - std::exp(-cfg_.lambda_age
+                * static_cast<double>(c) * cfg_.block_time_seconds);
+        }
+        U = sum / static_cast<double>(coins_.size());
+    }
+    return std::clamp(1.0 - cfg_.alpha_age * U, 1.0 - cfg_.alpha_age, 1.0);
 }
 
 double CoinAgeWeightedQuoting::bid_spread_multiplier(
     BlockHeight current_block) const
 {
-    // bid_mult = (1 + beta_age * U), clamped to [1.0, 1 + beta_age].
-    //
-    // When U=0: mult = 1.0.  When U~1: mult = 1 + beta_age (max widening).
-    const double U = compute_urgency(current_block);
-    const double raw = 1.0 + cfg_.beta_age * U;
-    return std::clamp(raw, 1.0, 1.0 + cfg_.beta_age);
+    // T2-02: Shared lock -- read-only access to coins_ and cfg_.
+    // Urgency computed inline to avoid re-entrant shared lock via compute_urgency().
+    std::shared_lock lock(mtx_);
+    double U = 0.0;
+    if (!coins_.empty()) {
+        double sum = 0.0;
+        for (const auto& coin : coins_) {
+            const uint32_t ab = (current_block > coin.creation_block)
+                ? (current_block - coin.creation_block) : 0u;
+            const uint32_t c = std::min(ab, cfg_.max_age_blocks);
+            sum += 1.0 - std::exp(-cfg_.lambda_age
+                * static_cast<double>(c) * cfg_.block_time_seconds);
+        }
+        U = sum / static_cast<double>(coins_.size());
+    }
+    return std::clamp(1.0 + cfg_.beta_age * U, 1.0, 1.0 + cfg_.beta_age);
 }
 
-double CoinAgeWeightedQuoting::variance_ratio_test() const
-{
-    // Extract the price series from the rolling buffer for the VR test.
-    std::vector<double> prices;
-    prices.reserve(price_buffer_.size());
-    for (const auto& obs : price_buffer_) {
-        prices.push_back(obs.mid);
-    }
-    return compute_variance_ratio(prices);
-}
+// T3-01: CoinAgeWeightedQuoting::variance_ratio_test() removed.
+// Regime detection is now delegated to the shared canonical RegimeDetector.
 
 void CoinAgeWeightedQuoting::update_regime()
 {
-    const double vr = variance_ratio_test();
-    regime_ = classify_regime(
-        vr,
-        cfg_.vr_mean_revert_threshold,
-        cfg_.vr_momentum_threshold,
-        0.80,  // mr_spread_mult (mean-reverting: tighten to 80%)
-        0.50,  // mr_skew_mult   (halve inventory shedding)
-        1.50,  // mo_spread_mult (momentum: widen to 150%)
-        2.00   // mo_skew_mult   (double inventory shedding)
-    );
-    spdlog::trace("CoinAge regime: VR={:.4f} regime={}",
-                   vr, to_string(regime_.regime));
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).
+    regime_ = to_regime_info(active_detector());
+    spdlog::trace("CoinAge regime: regime={}",
+                   to_string(regime_.regime));
 }
 
 
@@ -525,18 +481,26 @@ BlockCadenceAdaptiveSpread::BlockCadenceAdaptiveSpread(
         spdlog::warn("BlockCadence: eta < 0, resetting to 0.5");
         cfg_.eta = 0.5;
     }
+
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds.  Uses default regime
+    // multipliers (BlockCadenceConfig does not expose custom multiplier fields).
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size    = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size    = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold = cfg_.vr_momentum_threshold;
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
 }
 
 QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- compute_quotes reads and may mutate internal state.
+    std::unique_lock lock(mtx_);
+
     // -----------------------------------------------------------------
     // Step 1: Compute tau in years.
-    //
-    // sigma is already annualized; tau is in years from rolling_tau_years().
-    // sigma_annual^2 * tau_years = variance in years (dimensionally correct).
-    // ISO/IEC 5055: correct dimensional analysis -- no per-block conversion
-    // that would produce sigma_block^2 * tau_years ~6 orders too small.
     // -----------------------------------------------------------------
     const double tau = rolling_tau_years(
         block_height, cfg_.horizon_blocks,
@@ -545,11 +509,17 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     // -----------------------------------------------------------------
     // Step 2: Compute A-S reservation price and half-spread.
     //
-    // Use the ADJUSTED kappa that accounts for current block cadence.
-    // When blocks arrive faster than target, fill intensity per block
-    // decreases (less time for takers), so kappa scales up.
+    // T2-02: adjusted_kappa() and cadence_spread_multiplier() are inlined
+    // to avoid re-entrant lock acquisition (non-recursive shared_mutex).
     // -----------------------------------------------------------------
-    const double kappa_adj = adjusted_kappa();
+    // Inline adjusted_kappa computation.
+    double kappa_adj = cfg_.kappa;
+    if (dt_ema_ > 0.0) {
+        const double ratio = cfg_.target_block_time / dt_ema_;
+        kappa_adj = std::clamp(cfg_.kappa * ratio,
+                               cfg_.kappa * cfg_.kappa_adj_min,
+                               cfg_.kappa * cfg_.kappa_adj_max);
+    }
 
     const double r = as_reservation_price(mid, q, cfg_.gamma,
                                           sigma, tau);
@@ -565,15 +535,16 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
     const double delta_regime = delta * regime_.spread_mult;
 
     // -----------------------------------------------------------------
-    // Step 4: Apply the cadence spread multiplier.
+    // Step 4: Apply the cadence spread multiplier (inlined).
     //
+    //   R = dt_ema / dt_target
     //   m_cadence = 1 + eta * (R - 1)^2
-    //   where R = dt_ema / dt_target.
-    //
-    // U-shaped function: widest at extreme cadences (fast or slow),
-    // baseline at R=1 (normal cadence).
     // -----------------------------------------------------------------
-    const double m_cadence    = cadence_spread_multiplier();
+    const double R_cadence = (cfg_.target_block_time > 0.0)
+        ? (dt_ema_ / cfg_.target_block_time) : 1.0;
+    const double dev = R_cadence - 1.0;
+    const double m_cadence = std::clamp(1.0 + cfg_.eta * dev * dev,
+                                        cfg_.mult_min, cfg_.mult_max);
     const double delta_final  = delta_regime * m_cadence;
 
     double ask = r + delta_final;
@@ -609,27 +580,46 @@ QuoteResult BlockCadenceAdaptiveSpread::compute_quotes(
 void BlockCadenceAdaptiveSpread::update_price(double mid,
                                                BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- update_price mutates price_buffer_, regime_,
+    // last_mid_, and feeds data to the active RegimeDetector.
+    std::unique_lock lock(mtx_);
+
     // Store observation and trim to regime detection window.
     price_buffer_.push_back({block_height, mid});
     while (price_buffer_.size() > cfg_.regime_window_blocks) {
         price_buffer_.pop_front();
     }
+
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Update regime classification from the detector's updated state.
     update_regime();
 }
 
 RegimeInfo BlockCadenceAdaptiveSpread::current_regime() const
 {
+    // T2-02: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
 const std::string& BlockCadenceAdaptiveSpread::name() const
 {
+    // T2-02: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void BlockCadenceAdaptiveSpread::set_cost_basis(double cost_basis,
                                                  double min_margin_bps)
 {
+    // T2-02: Exclusive lock -- mutates cost_basis_ and min_margin_bps_.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -637,6 +627,9 @@ void BlockCadenceAdaptiveSpread::set_cost_basis(double cost_basis,
 void BlockCadenceAdaptiveSpread::update_block_arrival(
     BlockHeight block_height, Timestamp timestamp)
 {
+    // T2-02: Exclusive lock -- mutates block_arrivals_ and dt_ema_.
+    std::unique_lock lock(mtx_);
+
     // Store the arrival.
     block_arrivals_.push_back({block_height, timestamp});
 
@@ -676,19 +669,24 @@ void BlockCadenceAdaptiveSpread::update_block_arrival(
         / (static_cast<double>(cfg_.ema_window_blocks) + 1.0);
     dt_ema_ = alpha * dt_seconds + (1.0 - alpha) * dt_ema_;
 
+    // T2-02: Inline cadence_ratio() to avoid re-entrant lock.
+    const double R_log = (cfg_.target_block_time > 0.0)
+        ? (dt_ema_ / cfg_.target_block_time) : 1.0;
     spdlog::trace("BlockCadence: dt={:.1f}s dt_ema={:.1f}s R={:.3f}",
-                   dt_seconds, dt_ema_, cadence_ratio());
+                   dt_seconds, dt_ema_, R_log);
 }
 
 double BlockCadenceAdaptiveSpread::current_dt_ema() const
 {
+    // T2-02: Shared lock -- read-only access to dt_ema_.
+    std::shared_lock lock(mtx_);
     return dt_ema_;
 }
 
 double BlockCadenceAdaptiveSpread::cadence_ratio() const
 {
-    // R = dt_ema / target_block_time.
-    // Guard against division by zero (should never happen with validated config).
+    // T2-02: Shared lock -- read-only access to dt_ema_ and cfg_.
+    std::shared_lock lock(mtx_);
     if (cfg_.target_block_time <= 0.0) {
         return 1.0;
     }
@@ -697,63 +695,41 @@ double BlockCadenceAdaptiveSpread::cadence_ratio() const
 
 double BlockCadenceAdaptiveSpread::cadence_spread_multiplier() const
 {
-    // m_cadence = 1 + eta * (R - 1)^2, clamped to [mult_min, mult_max].
-    //
-    // This is a U-shaped function centered at R=1:
-    //   R = 1.0 (normal):  m = 1.0      (no adjustment)
-    //   R = 0.5 (fast):    m = 1 + 0.25*eta
-    //   R = 2.0 (slow):    m = 1 + eta
-    const double R         = cadence_ratio();
+    // T2-02: Shared lock -- read-only access to dt_ema_ and cfg_.
+    // Cadence ratio inlined to avoid re-entrant lock via cadence_ratio().
+    std::shared_lock lock(mtx_);
+    const double R = (cfg_.target_block_time > 0.0)
+        ? (dt_ema_ / cfg_.target_block_time) : 1.0;
     const double deviation = R - 1.0;
     const double raw_mult  = 1.0 + cfg_.eta * deviation * deviation;
-
     return std::clamp(raw_mult, cfg_.mult_min, cfg_.mult_max);
 }
 
 double BlockCadenceAdaptiveSpread::adjusted_kappa() const
 {
-    // kappa_adjusted = kappa * (target / dt_ema)
-    //
-    // Rationale: fill intensity scales inversely with block time.
-    // Slow blocks (dt_ema > target) => more time for takers => higher
-    // effective fill rate => kappa decreases.
-    // Fast blocks (dt_ema < target) => less time => kappa increases.
-    //
-    // Clamped to [kappa_adj_min * kappa, kappa_adj_max * kappa].
+    // T2-02: Shared lock -- read-only access to dt_ema_ and cfg_.
+    std::shared_lock lock(mtx_);
     if (dt_ema_ <= 0.0) {
         return cfg_.kappa;
     }
-
     const double ratio    = cfg_.target_block_time / dt_ema_;
     const double kappa_adj = cfg_.kappa * ratio;
-
     return std::clamp(kappa_adj,
                       cfg_.kappa * cfg_.kappa_adj_min,
                       cfg_.kappa * cfg_.kappa_adj_max);
 }
 
-double BlockCadenceAdaptiveSpread::variance_ratio_test() const
-{
-    std::vector<double> prices;
-    prices.reserve(price_buffer_.size());
-    for (const auto& obs : price_buffer_) {
-        prices.push_back(obs.mid);
-    }
-    return compute_variance_ratio(prices);
-}
+// T3-01: BlockCadenceAdaptiveSpread::variance_ratio_test() removed.
+// Regime detection is now delegated to the shared canonical RegimeDetector.
 
 void BlockCadenceAdaptiveSpread::update_regime()
 {
-    const double vr = variance_ratio_test();
-    regime_ = classify_regime(
-        vr,
-        cfg_.vr_mean_revert_threshold,
-        cfg_.vr_momentum_threshold,
-        0.80, 0.50,  // mean-reverting: tighten spread, halve skew
-        1.50, 2.00   // momentum: widen spread, double skew
-    );
-    spdlog::trace("BlockCadence regime: VR={:.4f} regime={}",
-                   vr, to_string(regime_.regime));
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).
+    regime_ = to_regime_info(active_detector());
+    spdlog::trace("BlockCadence regime: regime={}",
+                   to_string(regime_.regime));
 }
 
 
@@ -778,18 +754,26 @@ MempoolSentinelStrategy::MempoolSentinelStrategy(
                       "resetting to 750.0");
         cfg_.avg_daily_volume = 750.0;
     }
+
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds.  Uses default regime
+    // multipliers (MempoolSentinelConfig does not expose custom multiplier fields).
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size    = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size    = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold = cfg_.vr_momentum_threshold;
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
 }
 
 QuoteResult MempoolSentinelStrategy::compute_quotes(
     double mid, double sigma, double q, BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- compute_quotes reads internal state.
+    std::unique_lock lock(mtx_);
+
     // -----------------------------------------------------------------
     // Step 1: Compute tau in years.
-    //
-    // sigma is already annualized; tau is in years from rolling_tau_years().
-    // sigma_annual^2 * tau_years = variance in years (dimensionally correct).
-    // ISO/IEC 5055: correct dimensional analysis -- no per-block conversion
-    // that would produce sigma_block^2 * tau_years ~6 orders too small.
     // -----------------------------------------------------------------
     const double tau = rolling_tau_years(
         block_height, cfg_.horizon_blocks,
@@ -809,31 +793,30 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
     const double delta_regime = delta * regime_.spread_mult;
 
     // -----------------------------------------------------------------
-    // Step 4: Apply mempool spread multiplier.
+    // Step 4: Apply mempool spread multiplier (inlined to avoid re-entrant lock).
     //
-    //   m_mempool = 1 + psi * I_pending
-    //   where I_pending = |F_pending| / avg_daily_volume.
-    //
-    // Widens spreads when significant pending flow is detected,
-    // providing anticipatory adverse-selection protection.
+    // T2-02: pending_net_flow, pending_flow_intensity, mempool_spread_multiplier,
+    // and mempool_skew_adjustment are computed inline within the exclusive lock.
     // -----------------------------------------------------------------
-    const double m_mempool    = mempool_spread_multiplier();
+    double net_flow = 0.0;
+    for (const auto& take : pending_takes_) {
+        net_flow += take.size * ((take.taker_side == Side::Bid) ? 1.0 : -1.0);
+    }
+    const double flow_intensity = (cfg_.avg_daily_volume > 0.0)
+        ? std::abs(net_flow) / cfg_.avg_daily_volume : 0.0;
+    const double m_mempool = std::clamp(1.0 + cfg_.psi * flow_intensity,
+                                        cfg_.mult_min, cfg_.mult_max);
     const double delta_final  = delta_regime * m_mempool;
 
     // -----------------------------------------------------------------
-    // Step 5: Apply mempool skew adjustment.
-    //
-    //   skew = -phi_mempool * sign(F_pending) * I_pending
-    //
-    // Net buying in mempool (F > 0) => shift quotes UP (positive skew):
-    //   ask widens  (less eager to sell into buying pressure)
-    //   bid tightens (more eager to buy, anticipating price rise)
-    //
-    // Net selling in mempool (F < 0) => shift quotes DOWN (negative skew):
-    //   ask tightens (more eager to sell, anticipating price fall)
-    //   bid widens   (less eager to buy into selling pressure)
+    // Step 5: Compute mempool skew adjustment (inlined).
     // -----------------------------------------------------------------
-    const double skew_adj = mempool_skew_adjustment();
+    double skew_adj = 0.0;
+    if (std::abs(net_flow) >= 1e-12) {
+        const double sign_F = (net_flow > 0.0) ? 1.0 : -1.0;
+        skew_adj = std::clamp(cfg_.phi_mempool * sign_F * flow_intensity,
+                              -cfg_.skew_max, cfg_.skew_max);
+    }
 
     double ask = r + delta_final + skew_adj;
     double bid = r - delta_final + skew_adj;
@@ -895,27 +878,46 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
 void MempoolSentinelStrategy::update_price(double mid,
                                             BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- mutates price_buffer_, regime_, last_mid_,
+    // and feeds data to the active RegimeDetector.
+    std::unique_lock lock(mtx_);
+
     // Store observation and trim to regime detection window.
     price_buffer_.push_back({block_height, mid});
     while (price_buffer_.size() > cfg_.regime_window_blocks) {
         price_buffer_.pop_front();
     }
+
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Update regime classification from the detector's updated state.
     update_regime();
 }
 
 RegimeInfo MempoolSentinelStrategy::current_regime() const
 {
+    // T2-02: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
 const std::string& MempoolSentinelStrategy::name() const
 {
+    // T2-02: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void MempoolSentinelStrategy::set_cost_basis(double cost_basis,
                                               double min_margin_bps)
 {
+    // T2-02: Exclusive lock -- mutates cost_basis_ and min_margin_bps_.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -923,12 +925,19 @@ void MempoolSentinelStrategy::set_cost_basis(double cost_basis,
 void MempoolSentinelStrategy::update_mempool_takes(
     const std::vector<PendingMempoolTake>& takes)
 {
+    // T2-02: Exclusive lock -- mutates pending_takes_.
+    std::unique_lock lock(mtx_);
     // Filter out stale mempool items (older than max_mempool_age_seconds).
     // Items that have been pending too long are likely stuck or invalid
     // and should not influence quoting decisions.
-    const auto now = std::chrono::system_clock::now();
+    //
+    // T3-22: Use steady_clock (monotonic) for staleness detection instead of
+    // system_clock.  system_clock is susceptible to NTP step corrections which
+    // can cause items to appear artificially fresh or stale.  steady_clock
+    // guarantees monotonic non-decreasing behaviour per ISO/IEC 5055.
+    const auto now_steady = std::chrono::steady_clock::now();
     const auto max_age =
-        std::chrono::duration_cast<std::chrono::system_clock::duration>(
+        std::chrono::duration_cast<std::chrono::steady_clock::duration>(
             std::chrono::milliseconds(
                 static_cast<int64_t>(
                     cfg_.max_mempool_age_seconds * 1000.0)));
@@ -937,7 +946,9 @@ void MempoolSentinelStrategy::update_mempool_takes(
     pending_takes_.reserve(takes.size());
 
     for (const auto& take : takes) {
-        const auto age = now - take.first_seen;
+        // Compare against the monotonic steady_clock timestamp to avoid
+        // NTP correction artifacts in staleness classification.
+        const auto age = now_steady - take.first_seen_steady;
         if (age <= max_age) {
             pending_takes_.push_back(take);
         }
@@ -951,58 +962,66 @@ void MempoolSentinelStrategy::update_mempool_takes(
 
 double MempoolSentinelStrategy::pending_net_flow() const
 {
-    // F_pending = SUM(size * sign(side))
-    // where Bid (taker buying base) = +1, Ask (taker selling base) = -1.
+    // T2-02: Shared lock -- read-only access to pending_takes_.
+    std::shared_lock lock(mtx_);
     double flow = 0.0;
     for (const auto& take : pending_takes_) {
-        const double sign = (take.taker_side == Side::Bid) ? 1.0 : -1.0;
-        flow += take.size * sign;
+        flow += take.size * ((take.taker_side == Side::Bid) ? 1.0 : -1.0);
     }
     return flow;
 }
 
 double MempoolSentinelStrategy::pending_flow_intensity() const
 {
-    // I_pending = |F_pending| / avg_daily_volume.
-    // Returns 0.0 if avg_daily_volume is non-positive (defensive).
+    // T2-02: Shared lock -- read-only access to pending_takes_ and cfg_.
+    // Net flow computed inline to avoid re-entrant lock via pending_net_flow().
+    std::shared_lock lock(mtx_);
     if (cfg_.avg_daily_volume <= 0.0) {
         return 0.0;
     }
-    return std::abs(pending_net_flow()) / cfg_.avg_daily_volume;
+    double flow = 0.0;
+    for (const auto& take : pending_takes_) {
+        flow += take.size * ((take.taker_side == Side::Bid) ? 1.0 : -1.0);
+    }
+    return std::abs(flow) / cfg_.avg_daily_volume;
 }
 
 double MempoolSentinelStrategy::mempool_spread_multiplier() const
 {
-    // m_mempool = 1 + psi * I_pending, clamped to [mult_min, mult_max].
-    const double raw_mult = 1.0 + cfg_.psi * pending_flow_intensity();
-    return std::clamp(raw_mult, cfg_.mult_min, cfg_.mult_max);
+    // T2-02: Shared lock -- all dependent computations inlined.
+    std::shared_lock lock(mtx_);
+    double flow = 0.0;
+    for (const auto& take : pending_takes_) {
+        flow += take.size * ((take.taker_side == Side::Bid) ? 1.0 : -1.0);
+    }
+    const double I = (cfg_.avg_daily_volume > 0.0)
+        ? std::abs(flow) / cfg_.avg_daily_volume : 0.0;
+    return std::clamp(1.0 + cfg_.psi * I, cfg_.mult_min, cfg_.mult_max);
 }
 
 double MempoolSentinelStrategy::mempool_skew_adjustment() const
 {
-    // skew = phi_mempool * sign(F_pending) * I_pending
-    // Clamped to [-skew_max, +skew_max].
-    //
-    // Positive sign ensures correct directional response:
-    //   F > 0 (buying pressure) => positive skew => quotes shift UP
-    //     (ask widens / less eager to sell, bid tightens / more eager to buy)
-    //   F < 0 (selling pressure) => negative skew => quotes shift DOWN
-    //     (ask tightens / more eager to sell, bid widens / less eager to buy)
-    const double F = pending_net_flow();
-    if (std::abs(F) < 1e-12) {
-        return 0.0;  // No pending flow; no skew adjustment.
+    // T2-02: Shared lock -- all dependent computations inlined.
+    std::shared_lock lock(mtx_);
+    double F = 0.0;
+    for (const auto& take : pending_takes_) {
+        F += take.size * ((take.taker_side == Side::Bid) ? 1.0 : -1.0);
     }
-
-    const double I      = pending_flow_intensity();
+    if (std::abs(F) < 1e-12) {
+        return 0.0;
+    }
+    const double I = (cfg_.avg_daily_volume > 0.0)
+        ? std::abs(F) / cfg_.avg_daily_volume : 0.0;
     const double sign_F = (F > 0.0) ? 1.0 : -1.0;
-    const double raw_skew = cfg_.phi_mempool * sign_F * I;
-
-    return std::clamp(raw_skew, -cfg_.skew_max, cfg_.skew_max);
+    return std::clamp(cfg_.phi_mempool * sign_F * I, -cfg_.skew_max, cfg_.skew_max);
 }
 
 std::vector<std::string>
 MempoolSentinelStrategy::our_offers_pending_fill() const
 {
+    // T2-02: Shared lock -- read-only access to pending_takes_.
+    std::shared_lock lock(mtx_);
+
     // Filter the pending takes to find those targeting our own offers.
     std::vector<std::string> result;
     for (const auto& take : pending_takes_) {
@@ -1015,31 +1034,22 @@ MempoolSentinelStrategy::our_offers_pending_fill() const
 
 std::size_t MempoolSentinelStrategy::pending_take_count() const
 {
+    // T2-02: Shared lock -- read-only access to pending_takes_.
+    std::shared_lock lock(mtx_);
     return pending_takes_.size();
 }
 
-double MempoolSentinelStrategy::variance_ratio_test() const
-{
-    std::vector<double> prices;
-    prices.reserve(price_buffer_.size());
-    for (const auto& obs : price_buffer_) {
-        prices.push_back(obs.mid);
-    }
-    return compute_variance_ratio(prices);
-}
+// T3-01: MempoolSentinelStrategy::variance_ratio_test() removed.
+// Regime detection is now delegated to the shared canonical RegimeDetector.
 
 void MempoolSentinelStrategy::update_regime()
 {
-    const double vr = variance_ratio_test();
-    regime_ = classify_regime(
-        vr,
-        cfg_.vr_mean_revert_threshold,
-        cfg_.vr_momentum_threshold,
-        0.80, 0.50,  // mean-reverting: tighten spread, halve skew
-        1.50, 2.00   // momentum: widen spread, double skew
-    );
-    spdlog::trace("Mempool regime: VR={:.4f} regime={}",
-                   vr, to_string(regime_.regime));
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).
+    regime_ = to_regime_info(active_detector());
+    spdlog::trace("Mempool regime: regime={}",
+                   to_string(regime_.regime));
 }
 
 }  // namespace xop

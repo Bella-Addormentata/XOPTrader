@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <shared_mutex>
 #include <string>
 
 #include <spdlog/spdlog.h>
@@ -48,9 +49,15 @@ OrderBookTactician::OrderBookTactician(const OrderBookTacticsConfig& cfg) noexce
 // Primary interface -- recommend
 // ===========================================================================
 
-TacticRecommendation OrderBookTactician::recommend(const BookState& state) const
+TacticRecommendation OrderBookTactician::recommend(const BookState& state)
 {
+    // T2-02: Exclusive lock -- recommend mutates hysteresis state
+    // (active_tactic_, pending_tactic_, pending_tactic_blocks_) via
+    // select_tactic().
+    std::unique_lock lock(mtx_);
+
     // Select the best tactic via the priority chain.
+    // select_tactic() applies hysteresis internally (T3-19).
     const BookTactic tactic = select_tactic(state);
 
     // Delegate to the tactic-specific evaluator to build the full
@@ -95,6 +102,9 @@ OrderBookTactician::AdjustedQuote
 OrderBookTactician::apply(const TacticRecommendation& rec,
                           double base_spread_bps) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Apply the additive spread adjustment from the tactic.
     double adjusted = base_spread_bps + rec.spread_adjustment_bps;
 
@@ -120,6 +130,9 @@ OrderBookTactician::apply(const TacticRecommendation& rec,
 
 bool OrderBookTactician::is_market_crowded(double fill_rate_24h) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // A fill rate below the crowding threshold means too many MMs are
     // competing for limited flow.  The strategy doc targets > 30% fill
     // rate; the default threshold is 20% (configurable).
@@ -132,6 +145,9 @@ bool OrderBookTactician::is_market_crowded(double fill_rate_24h) const
 
 bool OrderBookTactician::is_own_family_offer(const std::string& offer_id) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_ and own_offer_ids_.
+    std::shared_lock lock(mtx_);
+
     // Self-detection is only meaningful when enabled and the set is populated.
     if (!cfg_.enable_self_detection) {
         return false;
@@ -141,6 +157,9 @@ bool OrderBookTactician::is_own_family_offer(const std::string& offer_id) const
 
 void OrderBookTactician::register_own_offer(const std::string& offer_id)
 {
+    // T2-02: Exclusive lock -- register_own_offer mutates own_offer_ids_.
+    std::unique_lock lock(mtx_);
+
     if (cfg_.enable_self_detection && !offer_id.empty()) {
         own_offer_ids_.insert(offer_id);
     }
@@ -148,6 +167,8 @@ void OrderBookTactician::register_own_offer(const std::string& offer_id)
 
 void OrderBookTactician::clear_own_offers()
 {
+    // T2-02: Exclusive lock -- clear_own_offers mutates own_offer_ids_.
+    std::unique_lock lock(mtx_);
     own_offer_ids_.clear();
 }
 
@@ -157,6 +178,8 @@ void OrderBookTactician::clear_own_offers()
 
 const OrderBookTacticsConfig& OrderBookTactician::config() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
     return cfg_;
 }
 
@@ -176,8 +199,13 @@ const OrderBookTacticsConfig& OrderBookTactician::config() const noexcept
 //   5. ImproveByOne      -- deep queue and wide spread; buy priority.
 //   6. JoinInside        -- default safe posture.
 
-BookTactic OrderBookTactician::select_tactic(const BookState& state) const
+BookTactic OrderBookTactician::select_tactic(const BookState& state)
 {
+    // --- Raw priority chain -------------------------------------------------
+    // Evaluate the priority chain without hysteresis to determine what the
+    // current block's inputs would select on their own.  The hysteresis
+    // filter below decides whether to commit the switch.
+
     // --- Priority 1: Extreme inventory imbalance ---------------------------
     // When inventory imbalance exceeds the rebalance threshold, the position
     // is dangerously one-sided.  Hybrid rebalancing crosses the spread to
@@ -189,57 +217,110 @@ BookTactic OrderBookTactician::select_tactic(const BookState& state) const
     const double imbalance = state.inventory_ratio - 0.5;
     const double abs_imbalance = std::abs(imbalance);
 
-    if (abs_imbalance > cfg_.hybrid_rebalance_threshold) {
-        return BookTactic::HybridRebalance;
-    }
+    BookTactic raw_tactic = BookTactic::JoinInside;  // default
 
+    if (abs_imbalance > cfg_.hybrid_rebalance_threshold) {
+        raw_tactic = BookTactic::HybridRebalance;
+    }
     // --- Priority 2: Toxic flow / whale / crowding -------------------------
     // Step back when any of these danger signals fire:
     //   a) VPIN indicates informed (toxic) order flow.
     //   b) Whale activity detected (large informed participant).
     //   c) Fill rate is too low (market is crowded with MMs).
-    if (state.vpin > cfg_.vpin_step_back_threshold) {
-        return BookTactic::StepBack;
+    else if (state.vpin > cfg_.vpin_step_back_threshold) {
+        raw_tactic = BookTactic::StepBack;
     }
-    if (state.whale_active) {
-        return BookTactic::StepBack;
+    else if (state.whale_active) {
+        raw_tactic = BookTactic::StepBack;
     }
-    if (state.fill_rate_24h < cfg_.crowding_fill_rate_threshold) {
-        return BookTactic::StepBack;
+    else if (state.fill_rate_24h < cfg_.crowding_fill_rate_threshold) {
+        raw_tactic = BookTactic::StepBack;
     }
-
     // --- Priority 3: Inventory skew + OFI confirmation ---------------------
     // When inventory is moderately skewed AND the order flow imbalance
     // exceeds the asymmetry threshold, use asymmetric sizing to passively
     // rebalance by quoting larger on the inventory-reducing side.
     // Use abs_imbalance (deviation from 0.5) for symmetric skew detection.
-    if (abs_imbalance > 0.1 &&
-        std::abs(state.normalized_ofi) > cfg_.ofi_asymmetry_threshold) {
-        return BookTactic::AsymmetricSize;
+    else if (abs_imbalance > 0.1 &&
+             std::abs(state.normalized_ofi) > cfg_.ofi_asymmetry_threshold) {
+        raw_tactic = BookTactic::AsymmetricSize;
     }
-
     // --- Priority 4: Deep book on both sides -------------------------------
     // When total depth exceeds twice the deep-queue threshold, the book is
     // crowded on both sides.  Layering across multiple tiers provides
     // continuous presence without concentrating risk at a single level.
-    if ((state.bid_depth + state.ask_depth) > cfg_.deep_queue_threshold * 2) {
-        return BookTactic::LayerMultiple;
+    else if ((state.bid_depth + state.ask_depth) > cfg_.deep_queue_threshold * 2) {
+        raw_tactic = BookTactic::LayerMultiple;
     }
-
     // --- Priority 5: Deep queue at best + wide spread ----------------------
     // When the queue at the best price is deep (hard to get filled by
     // joining) but our spread is substantially wider than the best
     // competitor, improving by one tick buys queue priority cheaply.
-    if (state.bid_depth > cfg_.deep_queue_threshold &&
-        state.our_spread_bps > state.best_competing_bps + 10.0) {
-        return BookTactic::ImproveByOne;
+    else if (state.bid_depth > cfg_.deep_queue_threshold &&
+             state.our_spread_bps > state.best_competing_bps + 10.0) {
+        raw_tactic = BookTactic::ImproveByOne;
     }
-
     // --- Priority 6 (default): Join the inside queue -----------------------
     // The safest posture.  Queue behind existing orders at the best price.
     // Works best when toxicity is low, the queue is thin, and the market
     // is in a stable (mean-reverting or random) regime.
-    return BookTactic::JoinInside;
+    // (raw_tactic already initialised to JoinInside.)
+
+    // --- Hysteresis filter (T3-19) -----------------------------------------
+    // Require N consecutive blocks confirming a new tactic before switching.
+    // This prevents quote instability when inputs (e.g. inventory_ratio)
+    // oscillate near a decision threshold, which reduces fill probability
+    // due to frequent order cancellation and re-placement.
+    //
+    // A threshold of 1 disables hysteresis (immediate switch, legacy
+    // behaviour).  The default is 3 blocks.
+    //
+    // Safety exception: HybridRebalance bypasses hysteresis entirely.
+    // It represents a critical risk-management action (extreme inventory
+    // imbalance) that must not be delayed.
+
+    const bool bypass_hysteresis =
+        (raw_tactic == BookTactic::HybridRebalance);
+
+    if (bypass_hysteresis) {
+        // Immediate switch -- capital preservation takes priority.
+        active_tactic_         = raw_tactic;
+        pending_tactic_        = raw_tactic;
+        pending_tactic_blocks_ = 0;
+        return active_tactic_;
+    }
+
+    if (raw_tactic == active_tactic_) {
+        // The raw selection agrees with the committed tactic.  Reset the
+        // pending counter so any previous candidate starts over if it
+        // reappears later.
+        pending_tactic_        = active_tactic_;
+        pending_tactic_blocks_ = 0;
+        return active_tactic_;
+    }
+
+    // The raw selection differs from the committed tactic.
+    if (raw_tactic == pending_tactic_) {
+        // Same candidate as last block -- increment confirmation counter.
+        ++pending_tactic_blocks_;
+    } else {
+        // Different candidate -- restart the counter for this new candidate.
+        pending_tactic_        = raw_tactic;
+        pending_tactic_blocks_ = 1;
+    }
+
+    // Check whether the pending candidate has been confirmed for enough
+    // consecutive blocks to warrant a switch.
+    if (pending_tactic_blocks_ >= cfg_.tactic_hysteresis_blocks) {
+        spdlog::debug("[OrderBookTactics] Hysteresis confirmed: "
+                      "switching {} -> {} after {} consecutive blocks",
+                      to_string(active_tactic_), to_string(pending_tactic_),
+                      pending_tactic_blocks_);
+        active_tactic_         = pending_tactic_;
+        pending_tactic_blocks_ = 0;
+    }
+
+    return active_tactic_;
 }
 
 // ===========================================================================

@@ -15,6 +15,7 @@
 #include <cassert>
 #include <cmath>
 #include <numeric>
+#include <shared_mutex>
 
 namespace xop {
 
@@ -22,10 +23,12 @@ namespace xop {
 // Constants
 // ===========================================================================
 
-/// Seconds in one Julian year (365.25 days).  Using the Julian year rather
-/// than a calendar year accounts for leap years and is the standard in
-/// financial volatility annualisation.
-static constexpr double kSecondsPerYear = 365.25 * 24.0 * 3600.0;  // 31,557,600
+// MEDIUM-3: 365-day year, consistent with strategy sigma_block conversion.
+// All strategy files (avellaneda.hpp, glft.hpp) use 365.0 * 24 * 3600 =
+// 31,536,000.  Previously this used 365.25 (Julian year, 31,557,600) which
+// caused a ~0.07% inconsistency in annualised volatility between the
+// estimator and the strategy layer.  Standardised to 365.0 for uniformity.
+static constexpr double kSecondsPerYear = 365.0 * 24.0 * 3600.0;  // 31,536,000
 
 // ===========================================================================
 // Construction
@@ -39,9 +42,9 @@ VolatilityEstimator::VolatilityEstimator(const VolatilityEstimatorConfig& cfg)
     // blocks_per_year = seconds_per_year / block_time_seconds
     // sigma_annual    = sigma_block * sqrt(blocks_per_year)
     //
-    // With block_time = 52 s:
-    //   blocks_per_year = 31,557,600 / 52 = 606,876.923...
-    //   sqrt(blocks_per_year) = 779.15...
+    // MEDIUM-3: With block_time = 52 s and 365-day year (31,536,000 s):
+    //   blocks_per_year = 31,536,000 / 52 = 606,461.54...
+    //   sqrt(blocks_per_year) = 778.89...
     const double blocks_per_year = kSecondsPerYear / cfg_.block_time_seconds;
     sqrt_blocks_per_year_ = std::sqrt(blocks_per_year);
 }
@@ -52,6 +55,10 @@ VolatilityEstimator::VolatilityEstimator(const VolatilityEstimatorConfig& cfg)
 
 double VolatilityEstimator::update(const Candle& candle)
 {
+    // T2-02: Exclusive lock -- update mutates candles_, sigma_block_,
+    // sigma_annual_, variance_ratio_, and regime_.
+    std::unique_lock lock(mtx_);
+
     // Append the new candle to the rolling window.
     candles_.push_back(candle);
 
@@ -62,10 +69,28 @@ double VolatilityEstimator::update(const Candle& candle)
 
     // Recompute volatility if we have enough data; otherwise leave estimates
     // at their initial zero values.
-    if (is_ready()) {
+    // Note: is_ready() accesses candles_ which is already under the lock;
+    // the private helpers recompute_yang_zhang / recompute_variance_ratio /
+    // classify_regime are called within the same exclusive lock scope.
+    if (candles_.size() >= cfg_.min_candles) {
         recompute_yang_zhang();
+        // MEDIUM-2 / T3-01: suppress deprecation for internal call --
+        // VolatilityEstimator still uses its own VR/regime methods for
+        // backward compatibility until all callers migrate to RegimeDetector.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
         recompute_variance_ratio();
         classify_regime();
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
     }
 
     return sigma_block_;
@@ -80,6 +105,9 @@ double VolatilityEstimator::update(double price)
     // Degenerate candle: a single tick with O = H = L = C.
     // The Rogers-Satchell component will be zero for degenerate candles,
     // but the overnight and close-to-open components remain informative.
+    //
+    // T2-02: Constructs the Candle locally and delegates to the Candle
+    // overload which acquires the exclusive lock (no double-lock risk).
     return update(Candle{price, price, price, price});
 }
 
@@ -89,36 +117,50 @@ double VolatilityEstimator::update(double price)
 
 double VolatilityEstimator::get_sigma_block() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to cached estimate.
+    std::shared_lock lock(mtx_);
     return sigma_block_;
 }
 
 double VolatilityEstimator::get_sigma_annual() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to cached estimate.
+    std::shared_lock lock(mtx_);
     return sigma_annual_;
 }
 
 RegimeInfo VolatilityEstimator::get_regime() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to regime classification.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
 double VolatilityEstimator::get_variance_ratio() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to VR statistic.
+    std::shared_lock lock(mtx_);
     return variance_ratio_;
 }
 
 std::size_t VolatilityEstimator::candle_count() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to candle buffer size.
+    std::shared_lock lock(mtx_);
     return candles_.size();
 }
 
 bool VolatilityEstimator::is_ready() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to candle buffer size.
+    std::shared_lock lock(mtx_);
     return candles_.size() >= cfg_.min_candles;
 }
 
 const VolatilityEstimatorConfig& VolatilityEstimator::config() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to immutable-after-construction config.
+    std::shared_lock lock(mtx_);
     return cfg_;
 }
 
@@ -343,6 +385,16 @@ void VolatilityEstimator::recompute_yang_zhang()
 //
 // We use close prices for both the 1-period and q-period returns.
 
+// MEDIUM-2 / T3-01: This local VR implementation is superseded by the shared
+// canonical RegimeDetector.  Retained for backward compatibility; callers
+// should migrate to RegimeDetector.  Suppress deprecation on the definition.
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
 void VolatilityEstimator::recompute_variance_ratio()
 {
     const std::size_t n_candles = candles_.size();
@@ -465,6 +517,9 @@ void VolatilityEstimator::recompute_variance_ratio()
 // Regime classification
 // ===========================================================================
 
+// MEDIUM-2 / T3-01: This local regime classifier is superseded by the shared
+// canonical RegimeDetector.  Retained for backward compatibility; callers
+// should migrate to RegimeDetector.
 void VolatilityEstimator::classify_regime()
 {
     // Classification thresholds from strategy document section 5:
@@ -495,5 +550,10 @@ void VolatilityEstimator::classify_regime()
         };
     }
 }
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
 
 }  // namespace xop

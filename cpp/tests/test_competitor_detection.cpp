@@ -370,7 +370,7 @@ TEST_F(CompetitorDetectionTest, SpreadFloorProtection) {
     EXPECT_LT(best_spread, 10.0);  // Competitor spread is indeed very tight.
 
     // NOTE: The SpreadOptimizer will apply the floor (40 bps default) in
-    // calc_competition_bps(), so the final spread will be max(40, 7.3 + 2) = 40 bps.
+    // calc_competition_bps(), so the undercut cap = max(40, 7.3 - 2) = 40 bps.
     // This test only verifies the MarketDataFeed correctly reports the tight spread.
     // The floor protection is tested in test_spread.cpp.
 }

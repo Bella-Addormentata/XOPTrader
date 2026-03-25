@@ -4,29 +4,41 @@
  *
  * Transport is handled by libcurl configured for mTLS (self-signed certs).
  * Each RPC method is an asio::awaitable coroutine that dispatches the
- * blocking CURL transfer to co_await so the io_context is not stalled.
+ * blocking CURL transfer to a dedicated thread pool via co_spawn, so the
+ * caller's io_context event loop is never stalled.
+ *
+ * Per-request CURL handles (RAII) eliminate shared-state data races and
+ * enable safe concurrent RPC calls from multiple coroutines.
+ *
+ * SSL peer verification is ON by default when a CA cert path is provided.
+ * This prevents MITM on the wallet RPC channel, which could redirect funds.
+ * Verification can be disabled via ChiaRPCConfig::verify_ssl for explicit
+ * localhost scenarios.
  *
  * Retry strategy: up to max_retries attempts with exponential backoff on
  * transient errors (network faults, HTTP 429/5xx).  Non-transient errors
  * propagate immediately as ChiaRPCApplicationError or ChiaRPCTransportError.
  *
  * ISO/IEC 27001:2022 -- cert file contents are never logged; paths are
- *                       logged at debug level only.
+ *                       logged at debug level only.  SSL verification
+ *                       defaults to ON; disabling is logged at warn level.
  * ISO/IEC 5055       -- every CURL call, allocation, and JSON parse is
- *                       checked for errors.
+ *                       checked for errors.  Per-request CURL handles via
+ *                       RAII eliminate use-after-free and data-race defects.
  * ISO/IEC 25000      -- RAII for CURL handles and header lists; move
- *                       semantics for safe ownership transfer.
+ *                       semantics for safe ownership transfer; thread pool
+ *                       joined deterministically on close/destruction.
  */
 
 #include "xop/rpc/chia_rpc.hpp"
 
 #include <cassert>
 #include <sstream>
-#include <thread>
 #include <utility>
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
+#include <boost/asio/post.hpp>
 #include <boost/asio/steady_timer.hpp>
 #include <boost/asio/this_coro.hpp>
 #include <boost/asio/use_awaitable.hpp>
@@ -75,8 +87,10 @@ ChiaRPCTransportError::ChiaRPCTransportError(const std::string& msg,
 namespace {
 
 /**
- * @brief libcurl WRITEFUNCTION callback — appends received data to a
+ * @brief libcurl WRITEFUNCTION callback -- appends received data to a
  *        std::string pointed to by @p userdata.
+ *
+ * ISO/IEC 5055 -- null-pointer check on userdata before dereference.
  */
 std::size_t curl_write_cb(char*       ptr,
                           std::size_t /*size (always 1)*/,
@@ -91,10 +105,99 @@ std::size_t curl_write_cb(char*       ptr,
     return nmemb;
 }
 
+/**
+ * @brief RAII wrapper for a CURL easy handle.
+ *
+ * Calls curl_easy_cleanup on destruction; default-constructible to nullptr.
+ * Provides get() for raw access and release() for ownership transfer.
+ *
+ * ISO/IEC 5055  -- deterministic resource release; no manual cleanup paths.
+ * ISO/IEC 25000 -- value-semantic wrapper with clear ownership.
+ */
+class ScopedCurlEasy {
+public:
+    ScopedCurlEasy() noexcept : handle_(nullptr) {}
+
+    /// Take ownership of an existing CURL* handle.
+    explicit ScopedCurlEasy(CURL* h) noexcept : handle_(h) {}
+
+    ~ScopedCurlEasy() {
+        if (handle_) {
+            curl_easy_cleanup(handle_);
+        }
+    }
+
+    // Non-copyable, movable.
+    ScopedCurlEasy(const ScopedCurlEasy&)            = delete;
+    ScopedCurlEasy& operator=(const ScopedCurlEasy&) = delete;
+
+    ScopedCurlEasy(ScopedCurlEasy&& other) noexcept
+        : handle_(std::exchange(other.handle_, nullptr)) {}
+
+    ScopedCurlEasy& operator=(ScopedCurlEasy&& other) noexcept {
+        if (this != &other) {
+            if (handle_) {
+                curl_easy_cleanup(handle_);
+            }
+            handle_ = std::exchange(other.handle_, nullptr);
+        }
+        return *this;
+    }
+
+    /// Raw pointer access for libcurl API calls.
+    [[nodiscard]] CURL* get() const noexcept { return handle_; }
+
+    /// True if a valid handle is held.
+    explicit operator bool() const noexcept { return handle_ != nullptr; }
+
+private:
+    CURL* handle_;
+};
+
+/**
+ * @brief RAII wrapper for a curl_slist header list.
+ *
+ * Calls curl_slist_free_all on destruction.
+ *
+ * ISO/IEC 5055 -- deterministic cleanup of linked-list allocation.
+ */
+class ScopedCurlSlist {
+public:
+    ScopedCurlSlist() noexcept : list_(nullptr) {}
+    explicit ScopedCurlSlist(curl_slist* s) noexcept : list_(s) {}
+
+    ~ScopedCurlSlist() {
+        if (list_) {
+            curl_slist_free_all(list_);
+        }
+    }
+
+    ScopedCurlSlist(const ScopedCurlSlist&)            = delete;
+    ScopedCurlSlist& operator=(const ScopedCurlSlist&) = delete;
+
+    ScopedCurlSlist(ScopedCurlSlist&& other) noexcept
+        : list_(std::exchange(other.list_, nullptr)) {}
+
+    ScopedCurlSlist& operator=(ScopedCurlSlist&& other) noexcept {
+        if (this != &other) {
+            if (list_) {
+                curl_slist_free_all(list_);
+            }
+            list_ = std::exchange(other.list_, nullptr);
+        }
+        return *this;
+    }
+
+    [[nodiscard]] curl_slist* get() const noexcept { return list_; }
+
+private:
+    curl_slist* list_;
+};
+
 } // anonymous namespace
 
 // ===========================================================================
-// ChiaRPCBase — construction / destruction / move
+// ChiaRPCBase -- construction / destruction / move
 // ===========================================================================
 
 ChiaRPCBase::ChiaRPCBase(asio::io_context& ioc,
@@ -103,8 +206,9 @@ ChiaRPCBase::ChiaRPCBase(asio::io_context& ioc,
     : ioc_(ioc)
     , config_(std::move(cfg))
 {
-    // Obtain or create a named logger. spdlog::get() returns nullptr if the
-    // logger does not yet exist, in which case we create a colour-stdout sink.
+    // Obtain or create a named logger.  spdlog::get() returns nullptr if
+    // the logger does not yet exist; create a colour-stdout sink in that
+    // case.
     logger_ = spdlog::get(std::string(logger_name));
     if (!logger_) {
         logger_ = spdlog::stdout_color_mt(std::string(logger_name));
@@ -120,26 +224,26 @@ ChiaRPCBase::ChiaRPCBase(ChiaRPCBase&& other) noexcept
     : ioc_(other.ioc_)
     , config_(std::move(other.config_))
     , logger_(std::move(other.logger_))
-    , curl_(std::exchange(other.curl_, nullptr))
-    , headers_(std::exchange(other.headers_, nullptr))
+    , thread_pool_(std::move(other.thread_pool_))
+    , open_(std::exchange(other.open_, false))
 {}
 
 ChiaRPCBase& ChiaRPCBase::operator=(ChiaRPCBase&& other) noexcept
 {
     if (this != &other) {
         close();
-        // ioc_ is a reference — cannot be reseated; both sides are expected
-        // to share the same io_context in practice.
-        config_  = std::move(other.config_);
-        logger_  = std::move(other.logger_);
-        curl_    = std::exchange(other.curl_, nullptr);
-        headers_ = std::exchange(other.headers_, nullptr);
+        // ioc_ is a reference -- cannot be reseated; both sides are
+        // expected to share the same io_context in practice.
+        config_      = std::move(other.config_);
+        logger_      = std::move(other.logger_);
+        thread_pool_ = std::move(other.thread_pool_);
+        open_        = std::exchange(other.open_, false);
     }
     return *this;
 }
 
 // ===========================================================================
-// ChiaRPCBase — open / close / is_open
+// ChiaRPCBase -- open / close / is_open
 // ===========================================================================
 
 asio::awaitable<void> ChiaRPCBase::open()
@@ -152,7 +256,7 @@ asio::awaitable<void> ChiaRPCBase::open()
         // Log which specific path is missing at error level.  We log the
         // *paths* (public metadata), never the file contents.
         std::ostringstream oss;
-        oss << "mTLS certificate validation failed — verify paths exist:\n"
+        oss << "mTLS certificate validation failed -- verify paths exist:\n"
             << "  cert : " << config_.tls.cert_path    << "\n"
             << "  key  : " << config_.tls.key_path     << "\n"
             << "  ca   : " << config_.tls.ca_cert_path;
@@ -162,68 +266,53 @@ asio::awaitable<void> ChiaRPCBase::open()
     }
     logger_->debug("TLS certificate paths validated");
 
-    // --- Initialise libcurl easy handle ------------------------------------
-    curl_ = curl_easy_init();
-    if (!curl_) {
-        throw ChiaRPCError("curl_easy_init() returned NULL — "
-                           "libcurl may not be initialised globally");
+    // --- Create the thread pool for offloading blocking CURL calls ---------
+    // The pool size is configurable; default is 4 threads, which handles
+    // typical full-node + wallet + concurrent retry concurrency.
+    const auto pool_size = std::max(1u, config_.curl_thread_pool_size);
+    thread_pool_ = std::make_unique<asio::thread_pool>(pool_size);
+
+    // --- Log SSL verification state ----------------------------------------
+    if (!config_.verify_ssl) {
+        // ISO/IEC 27001:2022 -- disabling SSL verification is a security
+        // policy decision that must be explicitly recorded.
+        logger_->warn("SSL peer verification DISABLED by configuration -- "
+                      "MITM attacks on RPC channel are possible");
+    } else {
+        logger_->debug("SSL peer verification enabled (CA: {})",
+                       config_.tls.ca_cert_path.string());
     }
 
-    // --- Configure mTLS and common options ---------------------------------
-    configure_tls();
-
-    // JSON Content-Type header (reused across all requests).
-    headers_ = curl_slist_append(nullptr, "Content-Type: application/json");
-    if (!headers_) {
-        close();
-        throw ChiaRPCError("Failed to allocate CURL header list");
-    }
-    curl_easy_setopt(curl_, CURLOPT_HTTPHEADER, headers_);
-
-    // Response write callback.
-    curl_easy_setopt(curl_, CURLOPT_WRITEFUNCTION, curl_write_cb);
-
-    // Request timeout.
-    const long timeout_ms =
-        static_cast<long>(config_.request_timeout.count());
-    curl_easy_setopt(curl_, CURLOPT_TIMEOUT_MS, timeout_ms);
-
-    // Connection timeout — half of the request timeout, floored at 5 s.
-    const long connect_ms = std::max(5000L, timeout_ms / 2);
-    curl_easy_setopt(curl_, CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
-
-    // Follow redirects (Chia doesn't redirect, but defense-in-depth).
-    curl_easy_setopt(curl_, CURLOPT_FOLLOWLOCATION, 0L);
-
-    // TCP keepalive to detect dead connections early.
-    curl_easy_setopt(curl_, CURLOPT_TCP_KEEPALIVE, 1L);
-    curl_easy_setopt(curl_, CURLOPT_TCP_KEEPIDLE,  60L);
-    curl_easy_setopt(curl_, CURLOPT_TCP_KEEPINTVL, 30L);
-
-    logger_->info("RPC client opened — {}:{}", config_.host, config_.port);
+    open_ = true;
+    logger_->info("RPC client opened -- {}:{} (pool_size={}, verify_ssl={})",
+                  config_.host, config_.port, pool_size, config_.verify_ssl);
     co_return;
 }
 
 void ChiaRPCBase::close() noexcept
 {
-    if (headers_) {
-        curl_slist_free_all(headers_);
-        headers_ = nullptr;
+    if (!open_) {
+        return;
     }
-    if (curl_) {
-        curl_easy_cleanup(curl_);
-        curl_ = nullptr;
-        logger_->info("RPC client closed");
+
+    // Join all thread-pool workers before releasing.  This ensures any
+    // in-flight CURL transfers complete before we destroy shared state.
+    if (thread_pool_) {
+        thread_pool_->join();
+        thread_pool_.reset();
     }
+
+    open_ = false;
+    logger_->info("RPC client closed");
 }
 
 bool ChiaRPCBase::is_open() const noexcept
 {
-    return curl_ != nullptr;
+    return open_;
 }
 
 // ===========================================================================
-// ChiaRPCBase — private helpers
+// ChiaRPCBase -- private helpers
 // ===========================================================================
 
 std::string ChiaRPCBase::build_url(std::string_view endpoint) const
@@ -235,36 +324,45 @@ std::string ChiaRPCBase::build_url(std::string_view endpoint) const
     return oss.str();
 }
 
-void ChiaRPCBase::configure_tls()
+void ChiaRPCBase::configure_tls(CURL*              curl,
+                                const std::string& cert_str,
+                                const std::string& key_str,
+                                const std::string& ca_str)
 {
-    assert(curl_ && "configure_tls called on null CURL handle");
+    assert(curl && "configure_tls called on null CURL handle");
+
+    // ISO/IEC 5055 -- CWE-416 use-after-free prevention:
+    // std::filesystem::path::string() returns a temporary std::string.
+    // CURL retains the raw pointers set here and only dereferences them
+    // later during curl_easy_perform().  The caller (perform_request)
+    // materialises the path strings into locals whose lifetime spans
+    // the entire CURL transfer, then passes them here by const&.
 
     // Client certificate (PEM format).
-    curl_easy_setopt(curl_, CURLOPT_SSLCERT,
-                     config_.tls.cert_path.string().c_str());
-    curl_easy_setopt(curl_, CURLOPT_SSLCERTTYPE, "PEM");
+    curl_easy_setopt(curl, CURLOPT_SSLCERT, cert_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
 
     // Client private key (PEM format).
-    curl_easy_setopt(curl_, CURLOPT_SSLKEY,
-                     config_.tls.key_path.string().c_str());
-    curl_easy_setopt(curl_, CURLOPT_SSLKEYTYPE, "PEM");
+    curl_easy_setopt(curl, CURLOPT_SSLKEY, key_str.c_str());
+    curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, "PEM");
 
-    // CA certificate used to verify the server's self-signed cert.
-    curl_easy_setopt(curl_, CURLOPT_CAINFO,
-                     config_.tls.ca_cert_path.string().c_str());
+    // CA certificate for server verification.
+    curl_easy_setopt(curl, CURLOPT_CAINFO, ca_str.c_str());
 
-    // Chia uses self-signed certificates.  We disable peer and host
-    // verification so that the handshake succeeds against the daemon's
-    // self-signed cert.  mTLS still authenticates the *client* to the
-    // server via the client cert/key pair.
+    // --- SSL verification policy -------------------------------------------
+    // Default ON: verify the server certificate against the Chia CA.
+    // This prevents MITM attacks on the wallet RPC (which can redirect
+    // funds).  Only disable for explicit localhost testing scenarios.
     //
-    // This matches the Chia reference Python client behaviour
-    // (ssl.CERT_NONE) and is intentional for local-only daemon comms.
-    curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYPEER, 0L);
-    curl_easy_setopt(curl_, CURLOPT_SSL_VERIFYHOST, 0L);
-
-    logger_->debug("mTLS configured (peer verification disabled — "
-                   "Chia self-signed cert mode)");
+    // ISO/IEC 27001:2022 -- verification is the default; disabling requires
+    //                       an explicit config decision and is logged.
+    if (config_.verify_ssl) {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+    } else {
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0L);
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0L);
+    }
 }
 
 CURLcode ChiaRPCBase::perform_request(const std::string& url,
@@ -272,22 +370,78 @@ CURLcode ChiaRPCBase::perform_request(const std::string& url,
                                       std::string&       response_body,
                                       long&              http_code)
 {
-    assert(curl_ && "perform_request called on null CURL handle");
+    // --- Create a fresh per-request CURL handle (RAII) ---------------------
+    // Each request gets its own handle, eliminating thread-safety concerns
+    // when multiple coroutines dispatch concurrent RPC calls to the pool.
+    //
+    // ISO/IEC 5055 -- RAII via ScopedCurlEasy; no manual cleanup paths.
+    ScopedCurlEasy curl(curl_easy_init());
+    if (!curl) {
+        logger_->error("curl_easy_init() returned NULL in perform_request");
+        return CURLE_FAILED_INIT;
+    }
 
-    // Reset per-request state.
+    // --- Materialise TLS path strings in this scope --------------------------
+    // ISO/IEC 5055 -- CWE-416 use-after-free prevention:
+    // std::filesystem::path::string() returns a temporary.  We capture
+    // the result in locals whose lifetime spans curl_easy_perform() below,
+    // then pass them by const& to configure_tls() which hands the raw
+    // c_str() pointers to CURL.  This guarantees the backing memory is
+    // alive for the entire transfer.
+    const std::string cert_str = config_.tls.cert_path.string();
+    const std::string key_str  = config_.tls.key_path.string();
+    const std::string ca_str   = config_.tls.ca_cert_path.string();
+
+    // --- Configure mTLS and SSL verification on this handle ----------------
+    configure_tls(curl.get(), cert_str, key_str, ca_str);
+
+    // --- JSON Content-Type header (per-request, RAII) ----------------------
+    ScopedCurlSlist headers(
+        curl_slist_append(nullptr, "Content-Type: application/json"));
+    if (!headers.get()) {
+        logger_->error("Failed to allocate CURL header list");
+        return CURLE_OUT_OF_MEMORY;
+    }
+    curl_easy_setopt(curl.get(), CURLOPT_HTTPHEADER, headers.get());
+
+    // --- Response write callback -------------------------------------------
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEFUNCTION, curl_write_cb);
+
+    // --- Timeouts ----------------------------------------------------------
+    const long timeout_ms =
+        static_cast<long>(config_.request_timeout.count());
+    curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
+
+    // Connection timeout -- half of request timeout, floored at 5 s.
+    const long connect_ms = std::max(5000L, timeout_ms / 2);
+    curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
+
+    // Disable redirects (Chia doesn't redirect; defense-in-depth).
+    curl_easy_setopt(curl.get(), CURLOPT_FOLLOWLOCATION, 0L);
+
+    // TCP keepalive to detect dead connections early.
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPIDLE,  60L);
+    curl_easy_setopt(curl.get(), CURLOPT_TCP_KEEPINTVL, 30L);
+
+    // --- Set per-request data ----------------------------------------------
     response_body.clear();
     http_code = 0;
 
-    curl_easy_setopt(curl_, CURLOPT_URL,           url.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDS,    body.c_str());
-    curl_easy_setopt(curl_, CURLOPT_POSTFIELDSIZE, static_cast<long>(body.size()));
-    curl_easy_setopt(curl_, CURLOPT_WRITEDATA,     &response_body);
+    curl_easy_setopt(curl.get(), CURLOPT_URL,           url.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDS,    body.c_str());
+    curl_easy_setopt(curl.get(), CURLOPT_POSTFIELDSIZE,
+                     static_cast<long>(body.size()));
+    curl_easy_setopt(curl.get(), CURLOPT_WRITEDATA,     &response_body);
 
-    const CURLcode rc = curl_easy_perform(curl_);
+    // --- Execute the blocking transfer -------------------------------------
+    const CURLcode rc = curl_easy_perform(curl.get());
 
     if (rc == CURLE_OK) {
-        curl_easy_getinfo(curl_, CURLINFO_RESPONSE_CODE, &http_code);
+        curl_easy_getinfo(curl.get(), CURLINFO_RESPONSE_CODE, &http_code);
     }
+
+    // ScopedCurlEasy and ScopedCurlSlist clean up automatically here.
     return rc;
 }
 
@@ -320,14 +474,14 @@ bool ChiaRPCBase::is_transient(CURLcode curl_code, long http_code) noexcept
 }
 
 // ===========================================================================
-// ChiaRPCBase — rpc_post (async with retry + exponential backoff)
+// ChiaRPCBase -- rpc_post (async with retry + exponential backoff)
 // ===========================================================================
 
 asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
                                              const json&      payload)
 {
     if (!is_open()) {
-        throw ChiaRPCError("RPC client is not open — call open() first");
+        throw ChiaRPCError("RPC client is not open -- call open() first");
     }
 
     const std::string url        = build_url(endpoint);
@@ -342,13 +496,24 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         logger_->debug("[attempt {}/{}] POST {} (body {} bytes)",
                        attempt, max_tries, url, body.size());
 
-        // --- Execute the blocking CURL transfer ----------------------------
-        // We perform the transfer directly inside the coroutine.  In a
-        // production build this should be dispatched to a thread pool via
-        // co_await asio::co_spawn(executor, ...) to avoid blocking the
-        // io_context.  The single-threaded form here is correct for
-        // per-strand usage and keeps the implementation dependency-light.
-        const CURLcode rc = perform_request(url, body, response_body, http_code);
+        // --- Dispatch the blocking CURL transfer to the thread pool --------
+        // co_spawn creates a new coroutine on the thread pool's executor.
+        // The inner coroutine calls the blocking perform_request(), which
+        // creates its own per-request CURL handle (RAII).  The outer
+        // coroutine suspends here without blocking the io_context.
+        //
+        // The lambda captures response_body and http_code by reference;
+        // they remain alive on the outer coroutine's frame for the duration
+        // of the co_await.
+        const CURLcode rc = co_await asio::co_spawn(
+            thread_pool_->get_executor(),
+            [this, &url, &body, &response_body, &http_code]()
+                -> asio::awaitable<CURLcode>
+            {
+                co_return perform_request(url, body,
+                                          response_body, http_code);
+            },
+            asio::use_awaitable);
 
         // --- Transport error -----------------------------------------------
         if (rc != CURLE_OK) {
@@ -360,7 +525,7 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
                           retryable);
 
             if (retryable && attempt < max_tries) {
-                // Exponential backoff via an asio steady_timer.
+                // Exponential backoff via an asio steady_timer (non-blocking).
                 asio::steady_timer timer(ioc_, backoff);
                 co_await timer.async_wait(asio::use_awaitable);
                 backoff *= 2;
@@ -395,7 +560,7 @@ asio::awaitable<json> ChiaRPCBase::rpc_post(std::string_view endpoint,
         try {
             result = json::parse(response_body);
         } catch (const json::parse_error& ex) {
-            // Malformed JSON is not transient — fail immediately.
+            // Malformed JSON is not transient -- fail immediately.
             logger_->error("JSON parse error from {}: {}", endpoint, ex.what());
             throw ChiaRPCError(
                 std::string("Failed to parse JSON response from ") +
@@ -443,7 +608,7 @@ asio::awaitable<std::int64_t> ChiaFullNodeRPC::get_block_height()
         !resp["blockchain_state"].contains("peak") ||
         resp["blockchain_state"]["peak"].is_null())
     {
-        throw ChiaRPCError("get_blockchain_state: missing or null peak — "
+        throw ChiaRPCError("get_blockchain_state: missing or null peak -- "
                            "node may still be syncing");
     }
 
@@ -468,7 +633,7 @@ ChiaFullNodeRPC::get_coin_records_by_puzzle_hash(
         {"include_spent_coins", include_spent}
     };
 
-    // Optional height bounds — omit if zero (Chia treats absent fields as
+    // Optional height bounds -- omit if zero (Chia treats absent fields as
     // "no constraint").
     if (start_height > 0) {
         payload["start_height"] = start_height;
@@ -662,6 +827,47 @@ ChiaWalletRPC::get_spendable_coins(std::int64_t wallet_id)
         }
     }
     co_return coins;
+}
+
+// ---------------------------------------------------------------------------
+// ChiaWalletRPC::send_transaction -- send XCH to a target address
+// ---------------------------------------------------------------------------
+// Wraps the Chia wallet daemon "send_transaction" endpoint.
+// Required payload keys: wallet_id (int), amount (uint64 mojos),
+//                        address (bech32m string), fee (uint64 mojos).
+//
+// The daemon returns {"success": true, "transaction_id": "0x...",
+//                     "transaction": {...}} on acceptance.
+//
+// ISO/IEC 5055 -- response structure validated before return;
+//                 transport errors propagated via ChiaRPCError hierarchy.
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json>
+ChiaWalletRPC::send_transaction(const json& params)
+{
+    // Validate required keys before dispatching the RPC call.
+    if (!params.contains("wallet_id") || !params.contains("amount") ||
+        !params.contains("address")   || !params.contains("fee")) {
+        throw ChiaRPCError("send_transaction: missing required parameter "
+                           "(wallet_id, amount, address, fee)");
+    }
+
+    const json resp = co_await rpc_post("send_transaction", params);
+
+    // The Chia wallet daemon returns {"success": false, "error": "..."}
+    // on application-level rejection.  rpc_post already checks HTTP-level
+    // errors and {"success": false}; this is a defensive double-check.
+    if (resp.contains("success") && resp["success"].is_boolean() &&
+        !resp["success"].get<bool>()) {
+        std::string err_msg = resp.contains("error")
+                              ? resp["error"].get<std::string>()
+                              : "unknown error";
+        throw ChiaRPCApplicationError(
+            "send_transaction rejected: " + err_msg, resp);
+    }
+
+    co_return resp;
 }
 
 } // namespace xop::rpc

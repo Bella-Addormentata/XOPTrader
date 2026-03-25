@@ -39,6 +39,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <shared_mutex>
 
 namespace xop {
 
@@ -116,9 +117,10 @@ struct VolatilityEstimatorConfig {
 //                        computes Yang-Zhang volatility, and classifies the
 //                        market regime via the variance-ratio test.
 //
-// Thread safety: NOT thread-safe.  The caller (engine heartbeat loop)
-// serialises access.  All internal state is private and mutation occurs
-// only through the public update() method.
+// Thread safety: thread-safe via std::shared_mutex (T2-02).
+// Read operations (get_*, is_*, candle_count, config) acquire a shared lock.
+// Write operations (update) acquire an exclusive lock.
+// Follows the State class locking pattern from state.hpp.
 //
 // Usage:
 //     VolatilityEstimator vol(config);
@@ -161,10 +163,11 @@ public:
     ///
     /// where blocks_per_year = seconds_per_year / block_time_seconds.
     /// With block_time = 52 s:
-    ///   blocks_per_year = 365.25 * 24 * 3600 / 52 = 606,461.54...
+    ///   blocks_per_year = 365.0 * 24 * 3600 / 52 = 606,461.54...
     ///   sqrt(blocks_per_year) = 778.89...
     ///
-    /// Note: we use 365.25 days/year to account for leap years.
+    /// MEDIUM-3: Uses 365-day year (31,536,000 s), consistent with strategy
+    /// sigma_block conversion in avellaneda.hpp and glft.hpp.
     double get_sigma_annual() const noexcept;
 
     // -- Regime detection ----------------------------------------------------
@@ -198,10 +201,33 @@ private:
 
     /// Recompute the variance-ratio statistic from the rolling log-return
     /// buffer.  Called by update() after appending a new candle.
+    ///
+    /// MEDIUM-2 / T3-01: This local VR implementation is superseded by the
+    /// shared canonical RegimeDetector (T3-01 consolidation).  Canonical
+    /// regime detection should use RegimeDetector, which provides dual-horizon
+    /// VR, Z-statistic significance testing (Lo-MacKinlay 1988), and
+    /// hysteresis.  This method is retained for backward compatibility --
+    /// existing callers (e.g. VolatilityEstimator::update()) still invoke it.
+    /// New code should NOT rely on this; use RegimeDetector instead.
+    [[deprecated("Use shared RegimeDetector (T3-01)")]]
     void recompute_variance_ratio();
 
     /// Classify the regime from the latest VR value and populate regime_.
+    ///
+    /// MEDIUM-2 / T3-01: This local regime classifier is superseded by the
+    /// shared canonical RegimeDetector (T3-01 consolidation).  Canonical
+    /// regime classification should use RegimeDetector, which provides
+    /// configurable multipliers, hysteresis, and optional HMM.  This method
+    /// is retained for backward compatibility -- existing callers (e.g.
+    /// VolatilityEstimator::update()) still invoke it.
+    /// New code should NOT rely on this; use RegimeDetector instead.
+    [[deprecated("Use shared RegimeDetector (T3-01)")]]
     void classify_regime();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    // Follows the State class locking pattern: single mutex, no nesting.
+    mutable std::shared_mutex mtx_;
 
     // -- Configuration -------------------------------------------------------
 
@@ -228,7 +254,8 @@ private:
 
     // -- Precomputed constants -----------------------------------------------
 
-    /// sqrt(blocks_per_year) = sqrt(365.25 * 24 * 3600 / block_time).
+    /// sqrt(blocks_per_year) = sqrt(365.0 * 24 * 3600 / block_time).
+    /// MEDIUM-3: 365-day year, consistent with strategy sigma_block conversion.
     /// Cached at construction for annualisation.
     double sqrt_blocks_per_year_{0.0};
 };

@@ -67,7 +67,7 @@ struct SpreadResult {
     double s_adverse;          // Adverse selection component.
     double s_inventory;        // Inventory risk component.
     double s_cost;             // Transaction cost component.
-    double s_competition;      // Competitive floor / improvement component.
+    double s_competition;      // Competitive undercut cap (0 = no cap).
 
     // Multiplier applied to the raw sum of components.
     double regime_multiplier;  // 1.0 = neutral; <1 tightened; >1 widened.
@@ -295,7 +295,16 @@ public:
         double venue_fee_fraction,
         double trade_size_xch);
 
-    /// Competition: max(s_floor, best_competing + epsilon), in bps.
+    /// Competition: undercut target = max(s_floor, best_competing - epsilon).
+    ///
+    /// Returns a target spread cap (not an additive component).  When
+    /// competition data is present, this value caps the model-derived spread
+    /// to undercut the best competitor by epsilon while respecting the
+    /// minimum profitable floor.  Returns 0 when no competition data is
+    /// available, signalling "no cap".
+    ///
+    /// T3-33: Corrected from (best_competing + epsilon) which widened vs.
+    /// competitor, to (best_competing - epsilon) which undercuts/tightens.
     static double calc_competition_bps(
         double s_floor_bps,
         double best_competing_bps,

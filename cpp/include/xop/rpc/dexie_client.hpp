@@ -1,14 +1,17 @@
 // dexie_client.hpp -- Async REST client for the dexie.space v1 API.
 //
 // Responsibilities:
-//   - HTTP session lifecycle (libcurl multi-handle connection pool)
+//   - HTTP session lifecycle (per-request CURL easy handles, thread pool)
 //   - Sliding-window rate limiter (50 requests per 10-second window)
 //   - Typed wrappers for every public dexie.space/v1 endpoint
 //   - Automatic retry on 429 / 5xx; hard throw on 4xx client errors
+//   - Non-blocking rate-limit waits via boost::asio::steady_timer
+//   - Blocking CURL transfers dispatched to a thread pool so the
+//     caller's io_context is never stalled.
 //
-// Thread safety: the DexieClient instance is NOT thread-safe.  Drive it
-// from a single boost::asio strand and post completions back to the
-// caller's executor.
+// Thread safety: the DexieClient public interface may be called from
+// coroutines on the same io_context.  The rate limiter uses internal
+// mutex synchronisation; CURL handles are per-request (RAII).
 //
 // ISO/IEC 27001:2022 -- secrets (offer bech32m payloads) are truncated
 // in all log output.  Full offer bodies never appear in logs.
@@ -32,6 +35,10 @@
 #include <string_view>
 #include <vector>
 
+#include <boost/asio/awaitable.hpp>
+#include <boost/asio/io_context.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -65,11 +72,16 @@ struct DexieConfig {
     /// Base delay between retries; each retry doubles the wait.
     std::chrono::milliseconds retry_base_delay{500};
 
-    /// libcurl connection-cache size (keep-alive pool).
-    long max_connections = 8;
+    // NOTE (MEDIUM-4): max_connections removed -- it was only consumed
+    // by the CURLM multi-handle that has been deleted (dead code).
+    // Per-request easy handles manage their own connections.
 
     /// Optional User-Agent header value.
     std::string user_agent = "XOPTrader-DexieClient/1.0";
+
+    /// Number of threads in the CURL worker pool.  Blocking CURL
+    /// transfers are dispatched here so the io_context is never stalled.
+    std::uint32_t curl_thread_pool_size{4};
 };
 
 // -----------------------------------------------------------------------
@@ -229,7 +241,21 @@ public:
     /// Block the calling thread until a request slot is available, then
     /// record the current timestamp.  Returns the time spent waiting
     /// (zero if no wait was needed).
+    ///
+    /// NOTE: Prefer try_acquire() in coroutine contexts to avoid blocking
+    /// the io_context event loop thread.
     std::chrono::milliseconds acquire();
+
+    /// Non-blocking attempt to acquire a rate-limiter slot.
+    ///
+    /// If capacity is available, records the current timestamp and returns
+    /// zero (no wait needed).  If the window is full, returns the duration
+    /// the caller should wait before retrying (without recording a slot).
+    /// The caller is responsible for sleeping asynchronously (e.g. via
+    /// boost::asio::steady_timer) and calling try_acquire() again.
+    ///
+    /// @return Duration to wait (zero if a slot was acquired).
+    std::chrono::milliseconds try_acquire();
 
     /// Number of requests currently inside the window (after pruning).
     std::size_t current_count() const;
@@ -255,16 +281,16 @@ private:
 // -----------------------------------------------------------------------
 
 /// Custom deleters for libcurl handles so unique_ptr cleans up correctly.
+/// ISO/IEC 5055 -- RAII via unique_ptr with custom deleters; deterministic
+/// resource release with no manual cleanup paths.
 struct CurlEasyDeleter {
     void operator()(CURL* p) const noexcept {
         if (p) curl_easy_cleanup(p);
     }
 };
-struct CurlMultiDeleter {
-    void operator()(CURLM* p) const noexcept {
-        if (p) curl_multi_cleanup(p);
-    }
-};
+// NOTE (MEDIUM-4): CurlMultiDeleter / CurlMultiPtr removed -- the CURLM
+// multi-handle was allocated but never used (per-request easy handles were
+// never attached to it).  Removed to eliminate dead code.
 struct CurlSlistDeleter {
     void operator()(curl_slist* p) const noexcept {
         if (p) curl_slist_free_all(p);
@@ -272,40 +298,44 @@ struct CurlSlistDeleter {
 };
 
 using CurlEasyPtr  = std::unique_ptr<CURL,       CurlEasyDeleter>;
-using CurlMultiPtr = std::unique_ptr<CURLM,      CurlMultiDeleter>;
 using CurlSlistPtr = std::unique_ptr<curl_slist,  CurlSlistDeleter>;
 
 // -----------------------------------------------------------------------
 // DexieClient
 // -----------------------------------------------------------------------
 
-/// Async-ready REST client for the dexie.space v1 public API.
+/// Async REST client for the dexie.space v1 public API.
 ///
 /// Lifecycle:
-///   DexieClient client(config);
-///   client.open();          // initialises CURL multi-handle pool
-///   auto pairs = client.get_pairs();
-///   client.close();         // tears down all handles
+///   DexieClient client(ioc, config);
+///   client.open();          // initialises CURL thread pool
+///   auto pairs = co_await client.get_pairs();
+///   client.close();         // joins thread pool, releases state
 ///
 /// Every public method that hits the network will:
-///   1. Acquire a rate-limiter slot (may block).
-///   2. Execute the HTTP request via the keep-alive connection pool.
-///   3. Retry automatically on 429 / 5xx (up to max_retries).
+///   1. Acquire a rate-limiter slot via async timer (never blocks io_context).
+///   2. Dispatch the CURL transfer to the thread pool (non-blocking).
+///   3. Retry automatically on 429 / 5xx (up to max_retries) with async
+///      exponential backoff via steady_timer.
 ///   4. Parse JSON and return a typed result (or throw).
 class DexieClient {
 public:
     /// Construct an unopened client with the given configuration.
-    explicit DexieClient(DexieConfig config);
+    ///
+    /// @param ioc     The Boost.Asio io_context for async timers.
+    /// @param config  Transport and rate-limiter configuration.
+    explicit DexieClient(boost::asio::io_context& ioc,
+                         DexieConfig              config);
 
     ~DexieClient();
 
     // -- Session lifecycle ------------------------------------------------
 
-    /// Initialise the libcurl multi-handle and connection pool.
+    /// Initialise the CURL thread pool for async request dispatch.
     /// Safe to call more than once (subsequent calls are no-ops).
     void open();
 
-    /// Tear down the connection pool and release all curl handles.
+    /// Join the thread pool and release all state.
     void close();
 
     /// True after a successful open() and before close().
@@ -315,7 +345,7 @@ public:
 
     /// GET /v1/pairs
     /// Returns every known trading pair (base + quote asset descriptors).
-    [[nodiscard]] std::vector<PairInfo> get_pairs();
+    [[nodiscard]] boost::asio::awaitable<std::vector<PairInfo>> get_pairs();
 
     /// GET /v1/offers
     /// Returns a paginated, optionally filtered set of offers.
@@ -329,7 +359,7 @@ public:
     ///                   "date_found_asc", "date_found_desc", etc.
     /// @param compact    If true the response omits bech32 offer strings.
     /// @param status     Offer status filter (0=active, 4=completed, ...).
-    [[nodiscard]] OffersPage get_offers(
+    [[nodiscard]] boost::asio::awaitable<OffersPage> get_offers(
         std::string_view pair_id    = {},
         std::string_view offered    = {},
         std::string_view requested  = {},
@@ -341,20 +371,20 @@ public:
 
     /// GET /v1/markets
     /// Returns 24-hour ticker data for every market grouped by base asset.
-    [[nodiscard]] std::vector<TickerData> get_tickers();
+    [[nodiscard]] boost::asio::awaitable<std::vector<TickerData>> get_tickers();
 
     /// GET /v1/markets  (filtered client-side for a single pair_id)
     /// Convenience wrapper that returns only the ticker matching pair_id.
-    [[nodiscard]] std::optional<TickerData> get_ticker(
+    [[nodiscard]] boost::asio::awaitable<std::optional<TickerData>> get_ticker(
         std::string_view pair_id);
 
     /// GET /v1/markets  (returns the raw JSON for advanced consumers)
     /// Exposes the full depth/liquidity/price structure.
-    [[nodiscard]] nlohmann::json get_prices();
+    [[nodiscard]] boost::asio::awaitable<nlohmann::json> get_prices();
 
     /// GET /v1/offers?status=4  (settled trades, most recent first)
     /// Convenience wrapper around get_offers with status=4 (completed).
-    [[nodiscard]] OffersPage get_trades(
+    [[nodiscard]] boost::asio::awaitable<OffersPage> get_trades(
         std::string_view pair_id   = {},
         uint32_t         page      = 1,
         uint32_t         page_size = 20);
@@ -363,11 +393,13 @@ public:
 
     /// POST /v1/offers  { "offer": "<bech32m>" }
     /// Submits a new offer to the dexie.space aggregator.
-    [[nodiscard]] SubmitResult submit_offer(std::string_view offer_bech32m);
+    [[nodiscard]] boost::asio::awaitable<SubmitResult> submit_offer(
+        std::string_view offer_bech32m);
 
     /// GET /v1/offers/{offer_id}
     /// Retrieves the current status of a previously submitted offer.
-    [[nodiscard]] OfferStatus get_offer_status(std::string_view offer_id);
+    [[nodiscard]] boost::asio::awaitable<OfferStatus> get_offer_status(
+        std::string_view offer_id);
 
     // -- Diagnostics -----------------------------------------------------
 
@@ -380,23 +412,44 @@ public:
 private:
     // -- Internal HTTP helpers -------------------------------------------
 
-    /// Low-level GET that returns parsed JSON.  Handles rate limiting,
-    /// retries, and error classification internally.
-    [[nodiscard]] nlohmann::json http_get_(const std::string& path);
+    /// Low-level async GET that returns parsed JSON.  Handles async rate
+    /// limiting, thread-pool dispatch, retries, and error classification.
+    [[nodiscard]] boost::asio::awaitable<nlohmann::json> http_get_(
+        const std::string& path);
 
-    /// Low-level POST (JSON body) with the same guarantees as http_get_.
-    [[nodiscard]] nlohmann::json http_post_(const std::string& path,
-                                            const nlohmann::json& body);
+    /// Low-level async POST (JSON body) with the same guarantees.
+    [[nodiscard]] boost::asio::awaitable<nlohmann::json> http_post_(
+        const std::string& path,
+        const nlohmann::json& body);
 
-    /// Shared request execution with retry loop.
+    /// Shared async request execution with retry loop.
+    /// Rate-limit waits use steady_timer (non-blocking); CURL transfers
+    /// are dispatched to thread_pool_ via co_spawn.
+    ///
     /// @param method  "GET" or "POST".
     /// @param url     Fully qualified URL.
     /// @param body    POST payload (empty string for GET).
     /// @return Parsed JSON response body.
-    [[nodiscard]] nlohmann::json execute_request_(
+    [[nodiscard]] boost::asio::awaitable<nlohmann::json> execute_request_(
         std::string_view method,
         const std::string& url,
         const std::string& body);
+
+    /// Perform a single synchronous CURL transfer (blocking).
+    /// Called from within the thread pool.  Returns parsed result via
+    /// out-parameters.
+    ///
+    /// @param method       "GET" or "POST".
+    /// @param url          Full request URL.
+    /// @param body         POST payload (empty string for GET).
+    /// @param[out] response_body  Raw response text.
+    /// @param[out] http_status    HTTP status code.
+    /// @return CURLcode indicating transport-level outcome.
+    CURLcode perform_request_(std::string_view   method,
+                              const std::string& url,
+                              const std::string& body,
+                              std::string&       response_body,
+                              long&              http_status);
 
     /// Build a query-string from key-value pairs, URL-encoding values.
     [[nodiscard]] static std::string build_query_(
@@ -411,11 +464,16 @@ private:
 
     // -- State ------------------------------------------------------------
 
+    boost::asio::io_context&             ioc_;
     DexieConfig                          cfg_;
     bool                                 open_ = false;
-    CurlMultiPtr                         multi_;
+    // NOTE (MEDIUM-4): CurlMultiPtr multi_ removed -- was dead code.
     std::shared_ptr<spdlog::logger>      log_;
     SlidingWindowRateLimiter             limiter_;
+
+    /// Thread pool for offloading blocking CURL transfers.
+    /// Created in open(), joined and destroyed in close().
+    std::unique_ptr<boost::asio::thread_pool> thread_pool_;
 };
 
 } // namespace xop::rpc

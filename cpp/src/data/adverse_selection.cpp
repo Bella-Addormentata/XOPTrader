@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <shared_mutex>
 #include <stdexcept>
 
 namespace xop {
@@ -58,6 +59,10 @@ void AdverseSelectionEstimator::record_fill(
     const std::vector<double>& subsequent_prices,
     BlockHeight block_height)
 {
+    // T2-02: Exclusive lock -- record_fill mutates history_, total_fills_,
+    // alpha_, and beta_.
+    std::unique_lock lock(mtx_);
+
     // Classify this fill as adverse or non-adverse.
     auto [is_adverse, max_adverse_move] =
         classify_fill(fill_price, side, subsequent_prices);
@@ -90,6 +95,9 @@ void AdverseSelectionEstimator::record_fill(
 
 double AdverseSelectionEstimator::get_pin() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to alpha_ and beta_.
+    std::shared_lock lock(mtx_);
+
     // Posterior mean of the Beta distribution:
     //
     //   E[PIN] = alpha / (alpha + beta)
@@ -108,6 +116,9 @@ double AdverseSelectionEstimator::get_pin() const noexcept
 
 double AdverseSelectionEstimator::get_adverse_rate() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to history_.
+    std::shared_lock lock(mtx_);
+
     // Raw (non-Bayesian) adverse fill rate over the rolling window.
     if (history_.empty()) {
         return 0.0;
@@ -126,17 +137,24 @@ double AdverseSelectionEstimator::get_adverse_rate() const noexcept
 
 double AdverseSelectionEstimator::get_alpha() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to alpha_.
+    std::shared_lock lock(mtx_);
     return alpha_;
 }
 
 double AdverseSelectionEstimator::get_beta() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to beta_.
+    std::shared_lock lock(mtx_);
     return beta_;
 }
 
 std::pair<double, double>
 AdverseSelectionEstimator::get_credible_interval() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to alpha_ and beta_.
+    std::shared_lock lock(mtx_);
+
     // Normal approximation to the 95% credible interval of the Beta posterior.
     //
     // For Beta(alpha, beta):
@@ -179,32 +197,89 @@ AdverseSelectionEstimator::get_credible_interval() const noexcept
 
 std::uint64_t AdverseSelectionEstimator::total_fills() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to total_fills_.
+    std::shared_lock lock(mtx_);
     return total_fills_;
 }
 
 std::size_t AdverseSelectionEstimator::history_size() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to history_.
+    std::shared_lock lock(mtx_);
     return history_.size();
 }
 
-const std::deque<FillRecord>&
+std::deque<FillRecord>
 AdverseSelectionEstimator::history() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to history_.
+    // MEDIUM-4: Returns a COPY of history_ so the caller holds an
+    // independent snapshot.  The previous implementation returned a const
+    // reference that became unprotected once the shared_lock went out of
+    // scope, creating a data race if a concurrent writer mutated history_
+    // while the caller was iterating.
+    // ISO/IEC 27001:2022: eliminate TOCTOU race on shared container.
+    std::shared_lock lock(mtx_);
     return history_;
 }
 
 const AdverseSelectionConfig&
 AdverseSelectionEstimator::config() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to config.
+    std::shared_lock lock(mtx_);
     return cfg_;
 }
 
 void AdverseSelectionEstimator::reset()
 {
+    // T2-02: Exclusive lock -- reset mutates all internal state.
+    std::unique_lock lock(mtx_);
     history_.clear();
     total_fills_ = 0;
     alpha_ = cfg_.prior_alpha;
     beta_  = cfg_.prior_beta;
+}
+
+// ===========================================================================
+// set_sigma_block -- update the per-block volatility for dynamic threshold
+// ===========================================================================
+
+void AdverseSelectionEstimator::set_sigma_block(double sigma_block) noexcept
+{
+    // T2-02: Exclusive lock -- set_sigma_block mutates sigma_block_.
+    std::unique_lock lock(mtx_);
+    sigma_block_ = sigma_block;
+}
+
+// ===========================================================================
+// effective_adverse_threshold -- T3-27 dynamic threshold based on volatility
+// ===========================================================================
+//
+// When a valid per-block volatility estimate is available (sigma_block > 0):
+//
+//   threshold = 1.5 * sigma_block * sqrt(observation_blocks)
+//
+// This scales the classification boundary with realised volatility so that
+// in low-vol environments the threshold tightens (fewer false negatives) and
+// in high-vol environments it widens (fewer false positives from random noise).
+//
+// The fixed 30 bps default classifies ~22% of random noise as "adverse" under
+// typical conditions.  The dynamic formula maintains a consistent ~6.7% false-
+// positive rate under a Gaussian random walk (1.5-sigma one-tail).
+//
+// Falls back to cfg_.adverse_threshold when sigma_block is unavailable.
+
+double AdverseSelectionEstimator::effective_adverse_threshold() const noexcept
+{
+    if (sigma_block_ > 0.0 && cfg_.observation_blocks > 0) {
+        // Dynamic threshold: 1.5 * sigma_block * sqrt(observation_blocks).
+        // ISO/IEC 5055: observation_blocks is uint32_t, always non-negative.
+        return 1.5 * sigma_block_
+               * std::sqrt(static_cast<double>(cfg_.observation_blocks));
+    }
+    // Fallback: use the fixed threshold from configuration.
+    return cfg_.adverse_threshold;
 }
 
 // ===========================================================================
@@ -222,8 +297,9 @@ void AdverseSelectionEstimator::reset()
 //     because the informed trader bought from us knowing the price would rise.
 //     Adverse move = (max_subsequent - fill_price) / fill_price.
 //
-// A fill is classified as adverse if the maximum adverse move exceeds the
-// configured threshold (default 30 bps = 0.003).
+// T3-27: A fill is classified as adverse if the maximum adverse move exceeds
+// the effective threshold, which now scales dynamically with volatility when
+// sigma_block is available, falling back to the fixed cfg_.adverse_threshold.
 
 std::pair<bool, double> AdverseSelectionEstimator::classify_fill(
     double fill_price,
@@ -271,7 +347,10 @@ std::pair<bool, double> AdverseSelectionEstimator::classify_fill(
         }
     }
 
-    const bool is_adverse = max_adverse_move > cfg_.adverse_threshold;
+    // T3-27: Use the dynamic volatility-scaled threshold when available,
+    // falling back to the fixed cfg_.adverse_threshold otherwise.
+    const double threshold = effective_adverse_threshold();
+    const bool is_adverse = max_adverse_move > threshold;
 
     return {is_adverse, max_adverse_move};
 }

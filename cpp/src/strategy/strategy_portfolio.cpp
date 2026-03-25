@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <shared_mutex>
 #include <stdexcept>
 #include <limits>
 #include <numeric>
@@ -80,6 +81,10 @@ StrategyPortfolio::StrategyPortfolio(const PortfolioConfig& cfg)
         throw std::invalid_argument(
             "PortfolioConfig: crowding_cooldown_blocks must be > 0");
     }
+    if (cfg_.min_fills_for_full_weight == 0) {
+        throw std::invalid_argument(
+            "PortfolioConfig: min_fills_for_full_weight must be > 0");
+    }
 
     // Enumerate every defined component and initialise with uniform weight.
     static constexpr StrategyComponent kAllComponents[] = {
@@ -95,6 +100,21 @@ StrategyPortfolio::StrategyPortfolio(const PortfolioConfig& cfg)
 
     static constexpr std::size_t kNumComponents =
         sizeof(kAllComponents) / sizeof(kAllComponents[0]);
+
+    // T3-34: Validate that the min_weight constraint is satisfiable.
+    // If N * min_weight > 1.0, the iterative clamp/normalize loop in
+    // clamp_weights() can never converge because clamping every component
+    // to at least min_weight already exceeds the simplex budget of 1.0.
+    // Example: 8 strategies * 0.15 = 1.2 > 1.0 -- impossible to satisfy.
+    // ISO/IEC 5055: fail-fast on unsatisfiable constraint.
+    if (static_cast<double>(kNumComponents) * cfg_.min_weight > 1.0) {
+        throw std::invalid_argument(
+            "PortfolioConfig: num_components (" + std::to_string(kNumComponents)
+            + ") * min_weight (" + std::to_string(cfg_.min_weight)
+            + ") = " + std::to_string(
+                static_cast<double>(kNumComponents) * cfg_.min_weight)
+            + " > 1.0; clamp_weights cannot converge");
+    }
 
     // Uniform initialisation: 1/N for each of the N components.
     const double uniform = 1.0 / static_cast<double>(kNumComponents);
@@ -121,6 +141,10 @@ void StrategyPortfolio::record_pnl(StrategyComponent component,
                                     double adverse_selection_bps,
                                     BlockHeight block)
 {
+    // T2-02: Exclusive lock -- record_pnl mutates components_ (pnl_history,
+    // trailing totals, fill counts).
+    std::unique_lock lock(mtx_);
+
     // Look up the component state.  All valid components are initialised in
     // the constructor; unknown components must be rejected to prevent
     // operator[] from default-constructing a spurious entry in the map.
@@ -160,6 +184,11 @@ void StrategyPortfolio::record_pnl(StrategyComponent component,
 void StrategyPortfolio::recompute_weights(MarketRegime regime,
                                            BlockHeight current_block)
 {
+    // T2-02: Exclusive lock -- recompute_weights mutates components_ (weights,
+    // previous_weight, intensity_score, pnl_history, trailing totals,
+    // crowding state) and current_regime_.
+    std::unique_lock lock(mtx_);
+
     // Log regime transitions for operational visibility.
     if (regime != current_regime_) {
         spdlog::info("StrategyPortfolio::recompute_weights -- regime changed: {} -> {}",
@@ -194,6 +223,9 @@ void StrategyPortfolio::recompute_weights(MarketRegime regime,
 
 double StrategyPortfolio::weight(StrategyComponent component) const
 {
+    // T2-02: Shared lock -- read-only access to components_.
+    std::shared_lock lock(mtx_);
+
     auto it = components_.find(component);
     if (it == components_.end()) {
         return 0.0;
@@ -203,6 +235,9 @@ double StrategyPortfolio::weight(StrategyComponent component) const
 
 std::vector<StrategyWeight> StrategyPortfolio::all_weights() const
 {
+    // T2-02: Shared lock -- read-only access to components_.
+    std::shared_lock lock(mtx_);
+
     std::vector<StrategyWeight> result;
     result.reserve(components_.size());
 
@@ -234,6 +269,11 @@ StrategyPortfolio::BlendedQuote StrategyPortfolio::blend(
     const std::unordered_map<StrategyComponent, QuoteResult,
                              StrategyComponentHash>& component_quotes) const
 {
+    // T2-02: Shared lock -- read-only access to components_.
+    // NOTE: weight() lookup is inlined to avoid re-entrant shared lock
+    // acquisition (std::shared_mutex is non-recursive on Windows SRWLOCK).
+    std::shared_lock lock(mtx_);
+
     // Accumulate weighted sums.  Only components present in the quote map
     // contribute; their weights are renormalised proportionally so the blend
     // always reflects a full allocation.
@@ -244,7 +284,12 @@ StrategyPortfolio::BlendedQuote StrategyPortfolio::blend(
     double w_ask_size   = 0.0;
 
     for (const auto& [comp, quote] : component_quotes) {
-        const double w = weight(comp);
+        // Inlined from weight(): look up directly to avoid re-entrant lock.
+        double w = 0.0;
+        auto wit = components_.find(comp);
+        if (wit != components_.end()) {
+            w = wit->second.weight;
+        }
         if (w <= 0.0) {
             continue;  // Component has no allocation; skip.
         }
@@ -295,6 +340,14 @@ StrategyPortfolio::BlendedQuote StrategyPortfolio::blend(
 
 bool StrategyPortfolio::is_crowded(StrategyComponent component) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_ and components_.
+    // NOTE: When called from compute_intensity_scores() (which runs under
+    // the exclusive lock held by recompute_weights()), this shared lock
+    // would deadlock because std::shared_mutex is non-recursive on Windows.
+    // To handle that case, compute_intensity_scores() inlines this logic
+    // directly.  This public method is safe for external callers only.
+    std::shared_lock lock(mtx_);
+
     if (!cfg_.enable_crowding_detection) {
         return false;
     }
@@ -353,6 +406,9 @@ bool StrategyPortfolio::is_crowded(StrategyComponent component) const
 
 std::vector<StrategyComponent> StrategyPortfolio::priority_ranking() const
 {
+    // T2-02: Shared lock -- read-only access to components_.
+    std::shared_lock lock(mtx_);
+
     // Build a vector of (component, net_pnl) pairs.
     struct Ranked {
         StrategyComponent component;
@@ -440,15 +496,54 @@ void StrategyPortfolio::compute_intensity_scores(MarketRegime regime)
         }
 
         // --- Crowding detection ---
-        // Re-evaluate crowding status on each call.  is_crowded() returns true
-        // only when the component has meaningful weight (> min_weight) and its
-        // fill rate has declined past the threshold.
-        if (is_crowded(comp)) {
-            state.crowding_flagged = true;
+        // Re-evaluate crowding status on each call.
+        // T2-02: is_crowded() logic is inlined here to avoid re-entrant lock
+        // acquisition.  This method runs under the exclusive lock held by
+        // recompute_weights(); calling the public is_crowded() would deadlock
+        // because std::shared_mutex is non-recursive on Windows SRWLOCK.
+        {
+            bool crowded_now = false;
+            if (cfg_.enable_crowding_detection
+                && state.historical_windows > 0
+                && state.weight > cfg_.min_weight)
+            {
+                const double avg_fills_per_window =
+                    static_cast<double>(state.historical_fill_count)
+                    / static_cast<double>(state.historical_windows);
+                if (avg_fills_per_window >= 1e-6) {
+                    const double current_fills_d = static_cast<double>(state.fill_count);
+                    const double fill_ratio_d = current_fills_d / avg_fills_per_window;
+                    crowded_now = (fill_ratio_d < (1.0 - cfg_.crowding_threshold));
+                    if (crowded_now) {
+                        spdlog::info("StrategyPortfolio -- {} crowded: "
+                                     "current_fills={:.0f}, avg={:.1f}, ratio={:.3f}",
+                                     to_string(comp), current_fills_d,
+                                     avg_fills_per_window, fill_ratio_d);
+                    }
+                }
+            }
+            if (crowded_now) {
+                state.crowding_flagged = true;
+            }
         }
 
         // Net PnL: realised profit minus adverse-selection cost.
         const double net_pnl = state.trailing_pnl_bps - state.trailing_adverse_bps;
+
+        // T3-26: Dampen beta by fill count to stabilise the Brock-Hommes
+        // discrete-choice update under sparse data.  With only 2-3 fills in
+        // a lookback window, a single fortunate fill can cause 10%+ weight
+        // reallocation.  We scale beta linearly with fill density:
+        //   effective_beta = beta * min(1.0, fill_count / min_fills)
+        // so that below the minimum fill threshold, the intensity-of-choice
+        // signal is attenuated proportionally.
+        // Brock & Hommes (1998): the discrete-choice model assumes sufficient
+        // observations; this corrects for the small-sample regime.
+        const double fill_ratio_for_beta = std::min(
+            1.0,
+            static_cast<double>(state.fill_count)
+                / static_cast<double>(cfg_.min_fills_for_full_weight));
+        const double effective_beta = cfg_.beta_intensity * fill_ratio_for_beta;
 
         // Regime-dependent base weight (prior).
         const double base_w = regime_prior_weight(comp, regime);
@@ -459,8 +554,9 @@ void StrategyPortfolio::compute_intensity_scores(MarketRegime regime)
             cfg_.switching_cost_bps * std::abs(state.weight - state.previous_weight);
 
         // Exponent argument with overflow protection.
+        // Uses effective_beta (fill-count-dampened) instead of raw beta_intensity.
         const double exponent = std::clamp(
-            cfg_.beta_intensity * net_pnl - switch_penalty,
+            effective_beta * net_pnl - switch_penalty,
             -kMaxExponentArg,
             kMaxExponentArg);
 
@@ -582,7 +678,14 @@ void StrategyPortfolio::clamp_weights()
     // Convergence is guaranteed because each iteration fixes at least one
     // component at a bound, and there are finitely many components.
 
-    static constexpr int kMaxIterations = 20;  // Safety limit.
+    // T3-34: Maximum iteration count for the clamp/normalize loop.
+    // The constructor validates that N * min_weight <= 1.0, which guarantees
+    // theoretical convergence.  This safety net catches any unforeseen edge
+    // case (e.g., floating-point pathology) and logs a warning rather than
+    // spinning indefinitely.
+    // ISO/IEC 5055: bounded iteration prevents unbounded resource consumption.
+    static constexpr int kMaxIterations = 20;
+    bool converged = false;
 
     for (int iter = 0; iter < kMaxIterations; ++iter) {
         double sum_clamped   = 0.0;   // Sum of weights that hit a bound.
@@ -607,6 +710,7 @@ void StrategyPortfolio::clamp_weights()
             for (auto& [comp, state] : components_) {
                 state.weight = std::clamp(state.weight, cfg_.min_weight, cfg_.max_weight);
             }
+            converged = true;
             break;
         }
 
@@ -631,8 +735,18 @@ void StrategyPortfolio::clamp_weights()
 
         // If no new clamps happened this iteration, we are stable.
         if (!any_newly_clamped) {
+            converged = true;
             break;
         }
+    }
+
+    // T3-34: Log a warning if the loop exhausted its iteration budget.
+    // This should never happen when N * min_weight <= 1.0 holds, but
+    // the safety net ensures operational visibility if it does.
+    if (!converged) {
+        spdlog::warn("StrategyPortfolio::clamp_weights -- clamp/normalize loop "
+                     "did not converge within {} iterations; proceeding with "
+                     "best-effort weights", kMaxIterations);
     }
 
     // Final renormalisation pass: ensure weights sum to exactly 1.0.

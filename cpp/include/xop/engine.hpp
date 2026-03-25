@@ -4,10 +4,11 @@
 // loop described in Section 13 of CHIA_MARKET_MAKER_STRATEGY.md.
 //
 // Architecture:
-//   A boost::asio::io_context drives a 5-second polling timer that queries
-//   the Chia full node for the current block height.  When a new block is
-//   detected, the engine executes the 13-step main cycle synchronously
-//   (single-threaded coroutine model).
+//   A boost::asio::io_context drives a native C++20 coroutine loop that
+//   polls the Chia full node for the current block height every 5 seconds.
+//   When a new block is detected, the engine executes the 13-step main
+//   cycle as a co_await chain (single-threaded coroutine model, no
+//   deadlock-prone co_spawn/use_future/.get() patterns).
 //
 //   All subsystems are constructed in the Engine constructor and wired
 //   together through shared pointers to State and the Database.  This
@@ -78,6 +79,7 @@
 #include "xop/risk/loss_manager.hpp"
 #include "xop/risk/drift_analyzer.hpp"
 
+#include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
 
@@ -87,8 +89,58 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <vector>
 
 namespace xop {
+
+// ---------------------------------------------------------------------------
+// FlashCrashState -- three-state machine for flash-crash circuit breaker.
+//
+// Normal    : market is operating within expected parameters.
+// Crash     : a flash crash has been detected (> threshold drop).
+//             New offer posting (Step 8) is gated during this state.
+// Recovery  : stability band met, awaiting required_stable_blocks.
+//             New offer posting (Step 8) is still gated.
+//
+// Transitions:
+//   Normal   -> Crash    : check_flash_crash() returns true.
+//   Crash    -> Recovery : is_stable_after_crash() with partial window.
+//   Recovery -> Normal   : is_stable_after_crash() with full window.
+//   Recovery -> Crash    : another drop detected during recovery.
+//
+// ISO/IEC 5055: exhaustive enum with no implicit int conversion.
+// ---------------------------------------------------------------------------
+enum class FlashCrashState : std::uint8_t {
+    Normal   = 0,
+    Crash    = 1,
+    Recovery = 2
+};
+
+/// Human-readable label for logging.
+inline const char* to_string(FlashCrashState s) noexcept {
+    switch (s) {
+        case FlashCrashState::Normal:   return "Normal";
+        case FlashCrashState::Crash:    return "Crash";
+        case FlashCrashState::Recovery: return "Recovery";
+    }
+    return "Unknown";
+}
+
+// ---------------------------------------------------------------------------
+// PostedOfferInfo -- associates a posted tier with the actual wallet-assigned
+// offer ID (trade_id).  Used by step_manage_offers to persist accurate
+// offer IDs to the database after post_quotes returns.
+//
+// ISO/IEC 5055: structured return prevents orphaned placeholder IDs.
+// ---------------------------------------------------------------------------
+struct PostedOfferInfo {
+    std::string offer_id;       ///< Wallet-assigned trade_id.
+    std::string pair_name;      ///< Trading pair name.
+    Side        side;           ///< Bid or ask.
+    Mojo        price;          ///< Price in mojos.
+    Mojo        size;           ///< Size in mojos.
+    int         tier_index;     ///< Tier index in the ladder.
+};
 
 // ---------------------------------------------------------------------------
 // Engine -- the top-level orchestrator.
@@ -163,17 +215,23 @@ public:
 private:
     // -- Main loop -----------------------------------------------------------
 
-    /// Start the 5-second polling timer.  Each tick queries the full node
-    /// for the current block height and, if a new block is detected,
-    /// invokes on_new_block().
+    /// [T1-03] Launch the native coroutine polling loop via co_spawn.
+    /// Replaces the old start_polling() + poll_block_height() pair that
+    /// used co_spawn(use_future).get() -- a deadlock-prone pattern when
+    /// ioc_.run() is on the same thread as .get().
+    ///
+    /// The coroutine sleeps for kPollInterval between polls and co_awaits
+    /// all async operations directly, keeping the io_context free.
     void start_polling();
 
-    /// Handler invoked by the polling timer.  Queries the full node,
-    /// compares against last_block_, and dispatches on_new_block() if a
-    /// new block has appeared.
-    void poll_block_height();
+    /// [T1-03] Native coroutine polling loop.  Runs indefinitely on the
+    /// io_context, yielding between polls via a steady_timer co_await.
+    /// All RPC calls are co_awaited directly -- no use_future/.get().
+    boost::asio::awaitable<void> poll_loop_coro();
 
-    /// Execute the 13-step per-block heartbeat cycle.
+    /// [T1-03] Execute the 13-step per-block heartbeat cycle as a
+    /// coroutine.  Steps 2 and 8 contain async RPC calls that are
+    /// co_awaited rather than blocking via use_future.
     ///
     /// The 13 steps (from Section 13 of the strategy document):
     ///
@@ -192,17 +250,20 @@ private:
     /// 13. Check alert rules
     ///
     /// @param block_height  The new block height to process.
-    void on_new_block(BlockHeight block_height);
+    boost::asio::awaitable<void> on_new_block_coro(BlockHeight block_height);
 
     // -- Per-step helpers (map 1:1 to the 13 steps) ---------------------------
 
     /// Step 1: Fetch latest prices from dexie and CEX feeds; update the
     /// MarketDataFeed and write MarketSnapshots into State.
-    void step_update_market_state(BlockHeight block_height);
+    /// [T1-02] Coroutine: co_awaits dexie async methods (thread-pool dispatch).
+    /// [T3-24] Sets market_data_valid per pair for dependency gating.
+    boost::asio::awaitable<void> step_update_market_state(BlockHeight block_height);
 
     /// Step 2: Poll the wallet for settled offers, detect fills, record
     /// them in the Database and update positions in State.
-    void step_process_fills(BlockHeight block_height);
+    /// [T1-03] Coroutine: co_awaits offer_mgr_->detect_fills().
+    boost::asio::awaitable<void> step_process_fills(BlockHeight block_height);
 
     /// Step 3: Feed the latest mid-price into the VolatilityEstimator and
     /// AdverseSelectionEstimator; update the regime classification.
@@ -226,7 +287,9 @@ private:
 
     /// Step 8: Cancel offers that have exceeded their TTL and post the new
     /// offer ladder via the OfferManager.
-    void step_manage_offers(BlockHeight block_height);
+    /// [T1-03] Coroutine: co_awaits cancel_stale() and post_quotes().
+    /// [T2-09] Captures actual wallet offer IDs and persists to DB.
+    boost::asio::awaitable<void> step_manage_offers(BlockHeight block_height);
 
     /// Step 9: Scan for CEX-DEX, cross-DEX, triangular, and cross-bridge
     /// arbitrage opportunities.
@@ -249,8 +312,13 @@ private:
 
     // -- Connection management -----------------------------------------------
 
-    /// Open connections to the Chia full node, wallet, and dexie API.
-    void open_connections();
+    /// [CRITICAL-1] Open connections to the Chia full node, wallet, and dexie
+    /// API.  Converted from void to awaitable<void> so it can be co_awaited
+    /// from poll_loop_coro() while ioc_ is already running -- eliminates the
+    /// deadlock caused by co_spawn(use_future).get() before ioc_.run().
+    /// ISO/IEC 27001:2022: connection lifecycle is audit-logged.
+    /// ISO/IEC 5055: no blocking .get() on the event loop thread.
+    boost::asio::awaitable<void> open_connections();
 
     /// Close all RPC/API connections.
     void close_connections();
@@ -313,8 +381,8 @@ private:
     /// Chia wallet RPC (port 9256).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;
 
-    /// Dexie aggregator REST client.
-    std::unique_ptr<rpc::DexieClient> dexie_;
+    /// Dexie aggregator REST client (shared with OfferManager for submission).
+    std::shared_ptr<rpc::DexieClient> dexie_;
 
     // -- Execution layer -----------------------------------------------------
 
@@ -337,9 +405,12 @@ private:
 
     // -- Strategy layer ------------------------------------------------------
 
-    /// Active market-making strategy (Avellaneda-Stoikov or GLFT).
-    /// Pluggable via StrategyBase interface.
-    std::unique_ptr<StrategyBase> strategy_;
+    /// [T1-11] Per-pair strategy instances to prevent state bleed.
+    /// Each enabled pair gets its own StrategyBase (A-S or GLFT) so that
+    /// price histories, regime states, and internal estimators are isolated.
+    /// Follows the same pattern as vol_estimators_ and pin_estimators_.
+    /// ISO/IEC 5055: no shared mutable state across independent pairs.
+    std::unordered_map<std::string, std::unique_ptr<StrategyBase>> strategies_;
 
     /// Four-component spread optimizer.
     std::unique_ptr<SpreadOptimizer> spread_opt_;
@@ -405,6 +476,12 @@ private:
     /// Stop flag checked by the polling loop.
     std::atomic<bool> stop_requested_{false};
 
+    /// [HIGH-2] Shutdown completion flag.  Set to true after cancel_all()
+    /// completes (or times out) during shutdown().  Replaces the deadlock-
+    /// prone promise/future pattern with a non-blocking atomic + timer poll.
+    /// ISO/IEC 5055: no blocking .get()/.wait() on the io_context thread.
+    std::atomic<bool> shutdown_cancel_done_{false};
+
     /// Per-pair working storage for the current cycle's quotes.
     /// Populated by step_compute_quotes, consumed through steps 5-8.
     // [M10] Value-initialize all aggregate members to prevent
@@ -417,6 +494,13 @@ private:
         Quote         risk_quote{};         ///< After risk filter.
         bool          quote_valid{false};   ///< False if risk killed both sides.
         std::vector<TierQuote> ladder;      ///< Multi-tier expansion.
+
+        // [T3-24] Dependency-aware gating: set to true only when Step 1
+        // successfully fetches fresh market data for this pair.  Steps 4-8
+        // are gated on this flag so that stale/missing data cannot propagate
+        // into quoting and offer management.
+        // ISO/IEC 5055: prevents acting on invalid upstream data.
+        bool          market_data_valid{false};
     };
 
     /// Per-pair cycle state for the current block.
@@ -426,6 +510,35 @@ private:
     // Monotonically non-decreasing; updated each cycle in step_check_alerts.
     // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.
     Mojo peak_pnl_hwm_{0};
+
+    // [MEDIUM-7] Tracks whether peak_pnl_hwm_ has been seeded with the
+    // first-cycle total_pnl.  Without this, the drawdown circuit breaker
+    // is bypassed entirely until the first profitable cycle -- leaving the
+    // engine unprotected against losses from startup.
+    // ISO/IEC 27001:2022: ensures continuous risk monitoring from first tick.
+    bool hwm_initialized_{false};
+
+    // [T3-10] Flash-crash circuit breaker state machine.
+    // Transitions: Normal -> Crash -> Recovery -> Normal.
+    // During Crash and Recovery states, Step 8 (offer posting) is gated.
+    // ISO/IEC 5055: deterministic initial state; exhaustive enum.
+    FlashCrashState flash_crash_state_{FlashCrashState::Normal};
+
+    // [T3-09] Max-drawdown global circuit breaker threshold.
+    // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
+    // When exceeded, engine transitions to BotStatus::Paused and alerts.
+    // Default 10% (0.10).  Configurable via risk config extension.
+    // ISO/IEC 5055: named constant with documented default.
+    static constexpr double kDefaultMaxDrawdownPct = 0.10;
+    double max_drawdown_pct_{kDefaultMaxDrawdownPct};
+
+    // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
+    // These running totals track net inventory change and total traded
+    // volume across all pairs for the NHE computation.
+    // Reset each cycle; fed from step 2 fill data.
+    // ISO/IEC 5055: deterministic zero-initialization.
+    double nhe_net_inventory_change_{0.0};
+    double nhe_total_volume_{0.0};
 };
 
 }  // namespace xop

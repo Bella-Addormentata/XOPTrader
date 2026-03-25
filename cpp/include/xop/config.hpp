@@ -72,6 +72,17 @@ struct PairConfig {
     std::string quote_asset_id;  // e.g. 64-hex CAT asset ID.
     std::string name;            // Human-readable label, e.g. "XCH/wUSDC".
     bool        enabled{true};   // Inactive pairs are loaded but skipped.
+
+    /// Mojos-per-displayable-unit for the base asset.
+    /// XCH: 10^12 (1 XCH = 1 000 000 000 000 mojos).
+    /// CAT: 10^3  (1 CAT unit = 1 000 mojos).
+    /// ISO/IEC 5055: explicit denomination prevents silent truncation when
+    /// a CAT amount is divided by the XCH constant (off by 10^9).
+    std::int64_t base_mojos_per_unit{1'000'000'000'000LL};
+
+    /// Mojos-per-displayable-unit for the quote asset.
+    /// Same convention as base_mojos_per_unit.
+    std::int64_t quote_mojos_per_unit{1'000LL};
 };
 
 // ---------------------------------------------------------------------------

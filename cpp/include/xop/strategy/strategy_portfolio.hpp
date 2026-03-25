@@ -35,6 +35,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <shared_mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -144,6 +145,16 @@ struct PortfolioConfig {
     // Farmer & Joshi (2002): gradual withdrawal is more stable than binary.
     double crowding_decay_factor{0.90};
 
+    // -- Brock-Hommes sparse-fill damping (T3-26) -----------------------------
+    // Minimum number of fills within the lookback window before the full
+    // beta_intensity is applied.  With fewer fills, effective_beta is scaled
+    // linearly: effective_beta = beta * min(1.0, fill_count / min_fills).
+    // This prevents a single fortunate fill from causing 10%+ reallocation
+    // under the discrete-choice model when data is sparse.
+    // Brock & Hommes (1998): intensity parameter requires sufficient data
+    // for the discrete-choice update to be statistically meaningful.
+    std::size_t min_fills_for_full_weight{10};
+
     // -- Regime-dependent base (prior) weights ---------------------------------
     // These weights are used as priors before PnL-driven adjustment.
     // MeanReverting regime -> heavier A-S, lighter GLFT.
@@ -169,8 +180,10 @@ struct PortfolioConfig {
 //   2. recompute_weights() -- after all PnL records are pushed.
 //   3. blend()            -- to obtain the weighted-average quotation.
 //
-// Thread safety: not thread-safe.  All methods are called from the single
-// engine thread (one block at a time).
+// Thread safety: thread-safe via std::shared_mutex (T2-02).
+// Read operations (weight, all_weights, blend, is_crowded, priority_ranking,
+// config) acquire a shared lock.  Write operations (record_pnl,
+// recompute_weights) acquire an exclusive lock.
 // ===========================================================================
 
 class StrategyPortfolio {
@@ -303,6 +316,10 @@ private:
     /// Remove PnL records older than pnl_lookback_blocks from every component
     /// and recompute trailing totals.
     void trim_pnl_history(BlockHeight current_block);
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    mutable std::shared_mutex mtx_;
 
     // -- Data members ----------------------------------------------------------
 

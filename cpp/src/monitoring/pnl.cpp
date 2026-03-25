@@ -14,7 +14,7 @@
 //
 // Compliant with:
 //   ISO/IEC 27001:2022  -- parameterised queries, append-only audit log
-//   ISO/IEC 5055        -- no unchecked casts, RAII resource management
+//   ISO/IEC 5055        -- no const_cast on mutable state (T2-07), RAII
 //   ISO/IEC 25000       -- clear error handling, single-responsibility
 //   ISO/IEC JTC 1/SC 22 -- portable C++20, defined behaviour throughout
 
@@ -203,6 +203,7 @@ void PnLTracker::init_database()
             realized_pnl_mojos INTEGER,
             block_height      INTEGER,
             offer_hash        TEXT,
+            acquisition_ts    TEXT,
             created_at        TEXT    DEFAULT CURRENT_TIMESTAMP
         );
     )SQL";
@@ -224,6 +225,16 @@ void PnLTracker::init_database()
         sqlite3_free(errmsg);
         throw std::runtime_error("PnLTracker: CREATE TABLE failed: " + err);
     }
+
+    // T2-06: Migrate existing databases -- add the acquisition_ts column
+    // if it does not already exist.  The ALTER TABLE ... ADD COLUMN
+    // statement returns an error when the column already exists (e.g. on
+    // a fresh database where CREATE TABLE already includes it); we
+    // intentionally ignore that error.
+    static constexpr const char* kMigrateAcqTs = R"SQL(
+        ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;
+    )SQL";
+    sqlite3_exec(db_, kMigrateAcqTs, nullptr, nullptr, nullptr);
 
     errmsg = nullptr;
     rc = sqlite3_exec(db_, kCreateIdxPair, nullptr, nullptr, &errmsg);
@@ -249,15 +260,15 @@ void PnLTracker::init_database()
             (timestamp, trade_id, pair_name, side,
              price_mojos, size_mojos, fee_mojos,
              cost_basis_mojos, realized_pnl_mojos,
-             block_height, offer_hash)
-        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11);
+             block_height, offer_hash, acquisition_ts)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12);
     )SQL";
 
     static constexpr const char* kQueryRangeSql = R"SQL(
         SELECT timestamp, trade_id, pair_name, side,
                price_mojos, size_mojos, fee_mojos,
                cost_basis_mojos, realized_pnl_mojos,
-               block_height, offer_hash
+               block_height, offer_hash, acquisition_ts
         FROM trade_log
         WHERE timestamp >= ?1 AND timestamp < ?2
         ORDER BY timestamp ASC;
@@ -267,7 +278,7 @@ void PnLTracker::init_database()
         SELECT timestamp, trade_id, pair_name, side,
                price_mojos, size_mojos, fee_mojos,
                cost_basis_mojos, realized_pnl_mojos,
-               block_height, offer_hash
+               block_height, offer_hash, acquisition_ts
         FROM trade_log
         WHERE pair_name = ?1 AND timestamp >= ?2 AND timestamp < ?3
         ORDER BY timestamp ASC;
@@ -340,6 +351,16 @@ void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
     sqlite3_bind_int64(stmt_insert_, 10, static_cast<int64_t>(record.block_height));
     sqlite3_bind_text(stmt_insert_, 11, record.offer_hash.c_str(), -1, SQLITE_TRANSIENT);
 
+    // T2-06: Persist acquisition timestamp for IRS Form 8949 "Date Acquired".
+    // Only sell records carry a meaningful acquisition timestamp; buys bind NULL.
+    if (record.side == Side::Ask
+        && record.acquisition_ts != Timestamp{}) {
+        const std::string acq_str = timestamp_to_iso(record.acquisition_ts);
+        sqlite3_bind_text(stmt_insert_, 12, acq_str.c_str(), -1, SQLITE_TRANSIENT);
+    } else {
+        sqlite3_bind_null(stmt_insert_, 12);
+    }
+
     const int rc = sqlite3_step(stmt_insert_);
     if (rc != SQLITE_DONE) {
         spdlog::error("PnLTracker::insert_trade: step failed (rc={}): {}",
@@ -389,13 +410,24 @@ TradeRecord read_row(sqlite3_stmt* stmt)
     const char* hash = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 10));
     rec.offer_hash = hash ? hash : "";
 
+    // T2-06: Read acquisition timestamp (column 11).  NULL for buy records.
+    const char* acq_ts = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 11));
+    rec.acquisition_ts = (acq_ts && acq_ts[0] != '\0')
+                             ? PnLTracker::iso_to_timestamp(acq_ts)
+                             : Timestamp{};
+
     return rec;
 }
 
 }  // anonymous namespace
 
+// T2-07: Removed const qualifier.  SQLite's bind/step/reset API mutates
+// prepared-statement state; the prior const_cast was unsafe because
+// concurrent const accessors could corrupt that state (ISO/IEC 5055,
+// CWE-362).  Non-const communicates the mutation to the type system so
+// the compiler enforces proper synchronisation by callers.
 std::vector<TradeRecord> PnLTracker::get_trade_log(
-    Timestamp start, Timestamp end) const
+    Timestamp start, Timestamp end)
 {
     if (!db_ || !stmt_query_range_) {
         throw std::runtime_error(
@@ -405,28 +437,27 @@ std::vector<TradeRecord> PnLTracker::get_trade_log(
     const std::string start_str = timestamp_to_iso(start);
     const std::string end_str   = timestamp_to_iso(end);
 
-    // The statement is logically const (read-only query) but SQLite's
-    // step/reset API requires mutable access.  The const_cast is safe
-    // because we only read rows, never modify the database.
-    auto* stmt = const_cast<sqlite3_stmt*>(stmt_query_range_);
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
+    // Reset the prepared statement for reuse -- safe now that the method
+    // is non-const and callers cannot alias the statement concurrently.
+    sqlite3_reset(stmt_query_range_);
+    sqlite3_clear_bindings(stmt_query_range_);
 
-    sqlite3_bind_text(stmt, 1, start_str.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, end_str.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt_query_range_, 1, start_str.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt_query_range_, 2, end_str.c_str(), -1, SQLITE_TRANSIENT);
 
     std::vector<TradeRecord> results;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(read_row(stmt));
+    while (sqlite3_step(stmt_query_range_) == SQLITE_ROW) {
+        results.push_back(read_row(stmt_query_range_));
     }
 
     return results;
 }
 
+// T2-07: Removed const qualifier for the same reason as get_trade_log.
 std::vector<TradeRecord> PnLTracker::query_trades(
     const std::string& pair_name,
     const std::string& start,
-    const std::string& end) const
+    const std::string& end)
 {
     if (!db_) {
         throw std::runtime_error(
@@ -445,17 +476,17 @@ std::vector<TradeRecord> PnLTracker::query_trades(
             "PnLTracker::query_trades: pair statement not prepared");
     }
 
-    auto* stmt = const_cast<sqlite3_stmt*>(stmt_query_pair_);
-    sqlite3_reset(stmt);
-    sqlite3_clear_bindings(stmt);
+    // Bind and step the pair-filtered statement directly, without const_cast.
+    sqlite3_reset(stmt_query_pair_);
+    sqlite3_clear_bindings(stmt_query_pair_);
 
-    sqlite3_bind_text(stmt, 1, pair_name.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 2, start.c_str(), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(stmt, 3, end.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt_query_pair_, 1, pair_name.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt_query_pair_, 2, start.c_str(), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt_query_pair_, 3, end.c_str(), -1, SQLITE_TRANSIENT);
 
     std::vector<TradeRecord> results;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
-        results.push_back(read_row(stmt));
+    while (sqlite3_step(stmt_query_pair_) == SQLITE_ROW) {
+        results.push_back(read_row(stmt_query_pair_));
     }
 
     return results;
@@ -525,13 +556,53 @@ void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis)
     // deadlock from nested lock_guard acquisitions.
     std::lock_guard<std::mutex> lock(mtx_);
 
+    // T2-06: For sell fills, attach the pair's current weighted-average
+    // acquisition timestamp so it is persisted alongside the trade record.
+    // This must be read under the lock before the insert, and before the
+    // accumulator update changes the value.
+    auto& ppnl = pair_pnl_[fill.pair_name];
+
+    if (fill.side == Side::Ask) {
+        record.acquisition_ts = ppnl.avg_acquisition_ts;
+    }
+    // Buy records leave acquisition_ts default-initialised (epoch); the
+    // insert_trade_unlocked method binds NULL for those.
+
     insert_trade_unlocked(record);
 
     // -- Step 3: Update in-memory PnL accumulators -----------------------
 
-    auto& ppnl = pair_pnl_[fill.pair_name];
+    if (fill.side == Side::Bid) {
+        // T2-06: Update the weighted-average acquisition timestamp.
+        //
+        // Weighted-average timestamp formula mirrors the cost-basis
+        // weighted-average calculation:
+        //   new_ts = (old_ts * old_qty + fill_ts * fill_qty) / (old_qty + fill_qty)
+        //
+        // Timestamps are converted to durations-since-epoch for the
+        // arithmetic, then converted back.  This is exact for
+        // system_clock::duration (typically nanoseconds or microseconds).
+        const Mojo old_qty = ppnl.acquisition_qty;
+        const Mojo new_qty = old_qty + fill.size;
 
-    if (fill.side == Side::Ask) {
+        if (new_qty > 0) {
+            const auto old_dur = ppnl.avg_acquisition_ts.time_since_epoch();
+            const auto new_dur = fill.timestamp.time_since_epoch();
+
+            // Use double intermediates to avoid overflow on the multiply
+            // (duration count * mojos can exceed int64 if both are large).
+            const double blended =
+                (static_cast<double>(old_dur.count()) * static_cast<double>(old_qty)
+               + static_cast<double>(new_dur.count()) * static_cast<double>(fill.size))
+                / static_cast<double>(new_qty);
+
+            using Dur = Timestamp::duration;
+            ppnl.avg_acquisition_ts = Timestamp{
+                Dur{static_cast<Dur::rep>(blended)}};
+        }
+
+        ppnl.acquisition_qty = new_qty;
+    } else {
         // Sell side: attribute realised spread PnL.
         ppnl.spread_pnl += realized_pnl;
         total_pnl_.spread_pnl += realized_pnl;
@@ -543,6 +614,16 @@ void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis)
             // Absolute value for gross_loss tracking.
             ppnl.gross_loss += (-realized_pnl);
             total_pnl_.gross_loss += (-realized_pnl);
+        }
+
+        // T2-06: Reduce acquisition_qty proportionally on sell (matches
+        // weighted-average cost drawdown).  The timestamp itself is not
+        // changed -- it remains the weighted average of the remaining lots.
+        if (ppnl.acquisition_qty >= fill.size) {
+            ppnl.acquisition_qty -= fill.size;
+        } else {
+            // Sold more than tracked (should not happen in normal operation).
+            ppnl.acquisition_qty = 0;
         }
     }
 
@@ -643,8 +724,10 @@ void PnLTracker::mark_to_market(
     pnl_history_.push_back(snap);
 
     // Cap the history buffer to prevent unbounded memory growth.
+    // T3-21: pop_front() on std::deque is O(1), replacing the prior
+    // std::vector::erase(begin()) which was O(n) per trim.
     if (pnl_history_.size() > kMaxSnapshots) {
-        pnl_history_.erase(pnl_history_.begin());
+        pnl_history_.pop_front();
     }
 
     spdlog::debug("PnLTracker::mark_to_market spread={} inventory={} fee={} "
@@ -858,9 +941,11 @@ DailySummary PnLTracker::get_daily_summary() const
 // Tax reporting
 // =========================================================================
 
+// T2-06: Uses stored acquisition timestamps for "Date Acquired" column.
+// T2-07: Non-const -- transitive from query_trades (ISO/IEC 5055).
 void PnLTracker::export_trades_csv(const std::string& start_date,
                                     const std::string& end_date,
-                                    const std::string& csv_path) const
+                                    const std::string& csv_path)
 {
     // IRS Form 8949 compatible CSV.
     // Columns: Date Acquired, Date Sold, Description, Proceeds (mojos),
@@ -884,19 +969,34 @@ void PnLTracker::export_trades_csv(const std::string& start_date,
             continue;
         }
 
-        const std::string date_str = timestamp_to_date(rec.timestamp);
+        // T2-06: Use the stored acquisition timestamp for "Date Acquired".
+        // Fall back to the sell date if no acquisition timestamp was recorded
+        // (e.g. legacy records persisted before this fix).
+        const std::string date_sold     = timestamp_to_date(rec.timestamp);
+        const std::string date_acquired =
+            (rec.acquisition_ts != Timestamp{})
+                ? timestamp_to_date(rec.acquisition_ts)
+                : date_sold;
+
         const Mojo proceeds = rec.price_mojos * rec.size_mojos;
         const Mojo cost     = rec.cost_basis_mojos * rec.size_mojos;
         const Mojo gain     = proceeds - cost;
 
-        // Holding period: without per-lot acquisition dates we
-        // conservatively classify everything as short-term.  A full
-        // FIFO lot-tracking system would determine the actual term.
+        // T2-06: Determine holding period from actual acquisition date.
+        // Positions held >= 1 year qualify for long-term capital gains.
         const char* term = "Short-term";
+        if (rec.acquisition_ts != Timestamp{}) {
+            const auto holding = rec.timestamp - rec.acquisition_ts;
+            constexpr auto one_year =
+                std::chrono::hours(365 * 24);  // Conservative: 365 days.
+            if (holding >= one_year) {
+                term = "Long-term";
+            }
+        }
 
         // Description follows IRS guidelines: "qty units of asset via pair".
-        out << date_str << ","          // Date Acquired (approx)
-            << date_str << ","          // Date Sold
+        out << date_acquired << ","     // Date Acquired
+            << date_sold << ","         // Date Sold
             << rec.size_mojos << " mojos " << rec.pair_name << ","
             << proceeds << ","
             << cost << ","
@@ -914,7 +1014,9 @@ void PnLTracker::export_trades_csv(const std::string& start_date,
                   records.size(), csv_path);
 }
 
-RealizedGains PnLTracker::compute_realized_gains(int year) const
+// T2-06: Uses stored acquisition timestamps for proper short/long term split.
+// T2-07: Non-const -- transitive from query_trades (ISO/IEC 5055).
+RealizedGains PnLTracker::compute_realized_gains(int year)
 {
     // Query all fills for the calendar year.
     const std::string start = std::to_string(year) + "-01-01T00:00:00.000Z";
@@ -931,14 +1033,20 @@ RealizedGains PnLTracker::compute_realized_gains(int year) const
             continue;
         }
 
-        // Without per-lot acquisition timestamps, all gains are
-        // classified as short-term.  This is the conservative (higher
-        // tax) treatment.  A future enhancement can match FIFO lots to
-        // determine actual holding period.
-        //
-        // realised_pnl_mojos is already computed at fill time and stored
-        // in the database.
-        gains.short_term += rec.realized_pnl_mojos;
+        // T2-06: Classify by actual holding period when an acquisition
+        // timestamp is available.  Fall back to short-term for legacy
+        // records that lack acquisition_ts (conservative / higher tax).
+        if (rec.acquisition_ts != Timestamp{}) {
+            const auto holding = rec.timestamp - rec.acquisition_ts;
+            constexpr auto one_year = std::chrono::hours(365 * 24);
+            if (holding >= one_year) {
+                gains.long_term += rec.realized_pnl_mojos;
+            } else {
+                gains.short_term += rec.realized_pnl_mojos;
+            }
+        } else {
+            gains.short_term += rec.realized_pnl_mojos;
+        }
     }
 
     gains.total = gains.short_term + gains.long_term;

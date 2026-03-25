@@ -16,8 +16,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <shared_mutex>
 #include <stdexcept>
-#include <numeric>
 
 namespace xop {
 
@@ -77,6 +77,22 @@ ChiaEdgeOptimizer::ChiaEdgeOptimizer(const ChiaEdgeConfig& cfg)
     // ISO/IEC 5055: defensive initialization of derived state.
     regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
 
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds and regime multipliers.
+    // This detector is used when no shared detector has been injected
+    // via set_regime_detector(), preserving backward compatibility for
+    // standalone use and unit tests.
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size      = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size      = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold   = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold   = cfg_.vr_momentum_threshold;
+    rd_cfg.mr_multipliers       = {cfg_.regime_mr_spread_mult, 1.0,
+                                   cfg_.regime_mr_skew_mult, 1.0};
+    rd_cfg.momentum_multipliers = {cfg_.regime_mo_spread_mult, 1.0,
+                                   cfg_.regime_mo_skew_mult, 1.0};
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
+
     spdlog::info("[ChiaEdgeOptimizer] Initialised with composite edge = {:.4f} "
                  "(atomic={:.3f}, cancel={:.3f}, utxo={:.3f}, "
                  "block_time={:.3f}, mempool={:.3f})",
@@ -94,6 +110,9 @@ ChiaEdgeOptimizer::ChiaEdgeOptimizer(const ChiaEdgeConfig& cfg)
 
 double ChiaEdgeOptimizer::atomic_offer_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Edge 1: Atomic Offers (no partial fills).
     //
     //   m_atomic = 1.0 - atomic_tightening_bps / reference_spread_bps
@@ -111,6 +130,9 @@ double ChiaEdgeOptimizer::atomic_offer_multiplier() const
 
 double ChiaEdgeOptimizer::free_cancel_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Edge 2: Free Cancellation (zero gas cost to cancel/refresh).
     //
     //   m_cancel = 1.0 - cancel_savings_bps / reference_spread_bps
@@ -128,6 +150,9 @@ double ChiaEdgeOptimizer::free_cancel_multiplier() const
 
 double ChiaEdgeOptimizer::utxo_parallel_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Edge 3: Coin-Set (UTXO) Parallel Offers.
     //
     //   fill_boost = 1.0 + utxo_fill_bonus_pct * (active_tiers - 1)
@@ -150,6 +175,9 @@ double ChiaEdgeOptimizer::utxo_parallel_multiplier() const
 
 double ChiaEdgeOptimizer::block_time_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Edge 4: 52-Second Block Time (latency advantage neutralisation).
     //
     //   m_block_time = 1.0 - latency_savings_bps / reference_spread_bps
@@ -168,6 +196,9 @@ double ChiaEdgeOptimizer::block_time_multiplier() const
 
 double ChiaEdgeOptimizer::mempool_info_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // Edge 5: Transparent Mempool (~40 seconds advance information).
     //
     //   info_ratio = mempool_window_seconds / block_time_seconds
@@ -193,6 +224,12 @@ double ChiaEdgeOptimizer::mempool_info_multiplier() const
 
 double ChiaEdgeOptimizer::composite_edge_multiplier() const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    // NOTE: Individual multiplier computations are inlined here to avoid
+    // re-entrant shared lock acquisition (std::shared_mutex is non-recursive
+    // on Windows SRWLOCK).
+    std::shared_lock lock(mtx_);
+
     // Composite: multiplicative combination of all five edge factors.
     //
     //   m_composite = m_atomic * m_cancel * m_utxo * m_block_time * m_mempool
@@ -200,11 +237,38 @@ double ChiaEdgeOptimizer::composite_edge_multiplier() const
     // Each factor is in (0, 1], so the composite is also in (0, 1].
     // A composite of 0.73 means we can quote ~27% tighter than an equivalent
     // strategy on a chain without these structural advantages.
-    return atomic_offer_multiplier()
-         * free_cancel_multiplier()
-         * utxo_parallel_multiplier()
-         * block_time_multiplier()
-         * mempool_info_multiplier();
+
+    // Edge 1: Atomic offers.
+    const double m_atomic = std::clamp(
+        1.0 - cfg_.atomic_tightening_bps / cfg_.reference_spread_bps,
+        cfg_.atomic_mult_floor, 1.0);
+
+    // Edge 2: Free cancellation.
+    const double m_cancel = std::clamp(
+        1.0 - cfg_.cancel_savings_bps / cfg_.reference_spread_bps,
+        cfg_.cancel_mult_floor, 1.0);
+
+    // Edge 3: UTXO parallel offers.
+    const double tiers = static_cast<double>(std::max(cfg_.active_tiers, 1u));
+    const double fill_boost = 1.0 + cfg_.utxo_fill_bonus_pct * (tiers - 1.0);
+    const double m_utxo = std::clamp(
+        (fill_boost > 1e-9) ? (1.0 / fill_boost) : 1.0,
+        cfg_.utxo_mult_floor, 1.0);
+
+    // Edge 4: Block time.
+    const double m_block_time = std::clamp(
+        1.0 - cfg_.latency_savings_bps / cfg_.reference_spread_bps,
+        cfg_.block_time_mult_floor, 1.0);
+
+    // Edge 5: Mempool info.
+    const double info_ratio = (cfg_.block_time_seconds > 1e-9)
+        ? cfg_.mempool_window_seconds / cfg_.block_time_seconds
+        : 0.0;
+    const double m_mempool = std::clamp(
+        1.0 - cfg_.mempool_info_bps * info_ratio / cfg_.reference_spread_bps,
+        cfg_.mempool_mult_floor, 1.0);
+
+    return m_atomic * m_cancel * m_utxo * m_block_time * m_mempool;
 }
 
 // ===========================================================================
@@ -216,6 +280,13 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
                                               double q,
                                               BlockHeight block_height)
 {
+    // T2-02: Shared lock -- compute_quotes reads cfg_, regime_, cost_basis_,
+    // min_margin_bps_ but does not mutate member state.  All sub-computations
+    // (compute_tau, reservation_price, optimal_half_spread,
+    // composite_edge_multiplier) are inlined to avoid re-entrant lock
+    // acquisition (std::shared_mutex is non-recursive on Windows SRWLOCK).
+    std::shared_lock lock(mtx_);
+
     // -------------------------------------------------------------------
     // Step 1: Compute remaining time in the rolling horizon (seconds).
     //
@@ -224,7 +295,10 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     // where N = horizon_blocks and n = block_height mod N.  The modular
     // rollover prevents tau from reaching zero.
     // -------------------------------------------------------------------
-    const double tau = compute_tau(block_height);
+    // Inlined from compute_tau():
+    const uint32_t n_mod = block_height % cfg_.horizon_blocks;
+    const uint32_t remaining_blocks = cfg_.horizon_blocks - n_mod;
+    const double tau = static_cast<double>(remaining_blocks) * cfg_.block_time_seconds;
 
     // -------------------------------------------------------------------
     // Step 2: Compute the Avellaneda-Stoikov reservation price.
@@ -234,7 +308,8 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     // The reservation price is the mid-price adjusted for the cost of
     // carrying inventory q over the remaining horizon at volatility sigma.
     // -------------------------------------------------------------------
-    const double r_raw = reservation_price(mid, sigma, q, tau);
+    // Inlined from reservation_price():
+    const double r_raw = mid - q * cfg_.gamma * sigma * sigma * tau;
 
     // -------------------------------------------------------------------
     // Step 3: Apply regime-dependent skew multiplier to the inventory
@@ -257,7 +332,11 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     // This is the standard Avellaneda-Stoikov half-spread BEFORE any
     // CHIA-specific or regime adjustments.
     // -------------------------------------------------------------------
-    double delta = optimal_half_spread(sigma, tau);
+    // Inlined from optimal_half_spread():
+    const double term1 = (1.0 / cfg_.kappa)
+                       * std::log(1.0 + cfg_.kappa / cfg_.gamma);
+    const double term2 = 0.5 * cfg_.gamma * sigma * sigma * tau;
+    double delta = term1 + term2;
 
     // -------------------------------------------------------------------
     // Step 5: Apply regime-dependent spread multiplier.
@@ -284,7 +363,28 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     //   4. 52s block time: no HFT latency arms race.
     //   5. Transparent mempool: ~40s advance information.
     // -------------------------------------------------------------------
-    const double edge_mult = composite_edge_multiplier();
+    // Inlined from composite_edge_multiplier():
+    const double m_atomic = std::clamp(
+        1.0 - cfg_.atomic_tightening_bps / cfg_.reference_spread_bps,
+        cfg_.atomic_mult_floor, 1.0);
+    const double m_cancel = std::clamp(
+        1.0 - cfg_.cancel_savings_bps / cfg_.reference_spread_bps,
+        cfg_.cancel_mult_floor, 1.0);
+    const double utxo_tiers = static_cast<double>(std::max(cfg_.active_tiers, 1u));
+    const double utxo_boost = 1.0 + cfg_.utxo_fill_bonus_pct * (utxo_tiers - 1.0);
+    const double m_utxo = std::clamp(
+        (utxo_boost > 1e-9) ? (1.0 / utxo_boost) : 1.0,
+        cfg_.utxo_mult_floor, 1.0);
+    const double m_block_time = std::clamp(
+        1.0 - cfg_.latency_savings_bps / cfg_.reference_spread_bps,
+        cfg_.block_time_mult_floor, 1.0);
+    const double mp_info_ratio = (cfg_.block_time_seconds > 1e-9)
+        ? cfg_.mempool_window_seconds / cfg_.block_time_seconds
+        : 0.0;
+    const double m_mempool = std::clamp(
+        1.0 - cfg_.mempool_info_bps * mp_info_ratio / cfg_.reference_spread_bps,
+        cfg_.mempool_mult_floor, 1.0);
+    const double edge_mult = m_atomic * m_cancel * m_utxo * m_block_time * m_mempool;
     delta *= edge_mult;
 
     // -------------------------------------------------------------------
@@ -382,7 +482,12 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
 
 void ChiaEdgeOptimizer::update_price(double mid, BlockHeight block_height)
 {
-    // Append the new observation to the rolling price buffer.
+    // T2-02: Exclusive lock -- update_price mutates price_buffer_, regime_,
+    // last_mid_, and feeds data to the active RegimeDetector.
+    std::unique_lock lock(mtx_);
+
+    // Append the new observation to the rolling price buffer (retained for
+    // backward compatibility and potential diagnostic use).
     price_buffer_.push_back(PriceObs{block_height, mid});
 
     // Trim to the regime detection window size.
@@ -390,7 +495,14 @@ void ChiaEdgeOptimizer::update_price(double mid, BlockHeight block_height)
         price_buffer_.pop_front();
     }
 
-    // Recompute regime classification from updated price history.
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Recompute regime classification from the detector's updated state.
     update_regime();
 }
 
@@ -400,16 +512,23 @@ void ChiaEdgeOptimizer::update_price(double mid, BlockHeight block_height)
 
 RegimeInfo ChiaEdgeOptimizer::current_regime() const
 {
+    // T2-02: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
 const std::string& ChiaEdgeOptimizer::name() const
 {
+    // T2-02: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void ChiaEdgeOptimizer::set_cost_basis(double cost_basis, double min_margin_bps)
 {
+    // T2-02: Exclusive lock -- set_cost_basis mutates cost_basis_ and
+    // min_margin_bps_.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -421,6 +540,9 @@ void ChiaEdgeOptimizer::set_cost_basis(double cost_basis, double min_margin_bps)
 double ChiaEdgeOptimizer::reservation_price(double mid, double sigma,
                                             double q, double tau) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // r = S - q * gamma * sigma^2 * tau
     //
     // The inventory penalty q * gamma * sigma^2 * tau represents the
@@ -431,6 +553,9 @@ double ChiaEdgeOptimizer::reservation_price(double mid, double sigma,
 
 double ChiaEdgeOptimizer::optimal_half_spread(double sigma, double tau) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // delta = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
     //
     // Term 1: Optimal spread from the Poisson fill-intensity model.
@@ -449,6 +574,9 @@ double ChiaEdgeOptimizer::optimal_half_spread(double sigma, double tau) const
 
 double ChiaEdgeOptimizer::compute_tau(BlockHeight block_height) const
 {
+    // T2-02: Shared lock -- read-only access to cfg_.
+    std::shared_lock lock(mtx_);
+
     // tau = (N - n) * block_time
     //
     // n = block_height mod N.  The sawtooth pattern gives tau in
@@ -471,124 +599,17 @@ double ChiaEdgeOptimizer::per_block_volatility(double sigma_annual,
 }
 
 // ===========================================================================
-// Regime detection -- variance ratio test
+// Regime detection (T3-01: delegated to shared canonical RegimeDetector)
 // ===========================================================================
-
-double ChiaEdgeOptimizer::variance_ratio_test() const
-{
-    // -----------------------------------------------------------------------
-    // Variance Ratio Test (VR)
-    //
-    // Tests whether the price process is a random walk.  Under H0 (random
-    // walk), the variance of k-period log-returns equals k times the
-    // variance of 1-period log-returns:
-    //
-    //   VR(k) = Var(r_k) / (k * Var(r_1))
-    //
-    // We use k = 5 (five blocks) and compute overlapping log-returns.
-    //
-    //   VR ~ 1.0  => random walk (no exploitable pattern).
-    //   VR < 0.85 => mean-reverting (prices bounce back -- tighten spreads).
-    //   VR > 1.15 => momentum (prices trend -- widen spreads).
-    //
-    // Reference: Lo, A.W. & MacKinlay, A.C. (1988). "Stock market prices do
-    //            not follow random walks."
-    // -----------------------------------------------------------------------
-
-    const std::size_t n = price_buffer_.size();
-
-    // Need at least k+2 observations for meaningful k-period returns.
-    constexpr std::size_t k = 5;
-    if (n < k + 2) {
-        return 1.0;  // Insufficient data; assume random walk.
-    }
-
-    // Compute 1-period log-returns: r1[i] = ln(P[i+1] / P[i]).
-    std::vector<double> r1;
-    r1.reserve(n - 1);
-    for (std::size_t i = 0; i + 1 < n; ++i) {
-        if (price_buffer_[i].mid > 0.0 && price_buffer_[i + 1].mid > 0.0) {
-            r1.push_back(
-                std::log(price_buffer_[i + 1].mid / price_buffer_[i].mid));
-        }
-    }
-
-    if (r1.size() < k + 1) {
-        return 1.0;  // Insufficient valid returns.
-    }
-
-    // Compute k-period log-returns (overlapping): rk[i] = sum(r1[i..i+k-1]).
-    std::vector<double> rk;
-    rk.reserve(r1.size() - k + 1);
-    for (std::size_t i = 0; i + k <= r1.size(); ++i) {
-        double sum = 0.0;
-        for (std::size_t j = 0; j < k; ++j) {
-            sum += r1[i + j];
-        }
-        rk.push_back(sum);
-    }
-
-    if (rk.empty()) {
-        return 1.0;
-    }
-
-    // Variance of 1-period returns (unbiased estimator).
-    const double mean_r1 = std::accumulate(r1.begin(), r1.end(), 0.0)
-                         / static_cast<double>(r1.size());
-    double var_r1 = 0.0;
-    for (const double x : r1) {
-        const double d = x - mean_r1;
-        var_r1 += d * d;
-    }
-    var_r1 /= static_cast<double>(r1.size() - 1);
-
-    // Variance of k-period returns (unbiased estimator).
-    const double mean_rk = std::accumulate(rk.begin(), rk.end(), 0.0)
-                         / static_cast<double>(rk.size());
-    double var_rk = 0.0;
-    for (const double x : rk) {
-        const double d = x - mean_rk;
-        var_rk += d * d;
-    }
-    var_rk /= static_cast<double>(rk.size() - 1);
-
-    // Guard against division by zero when prices are flat.
-    if (var_r1 < 1e-20) {
-        return 1.0;
-    }
-
-    // VR = Var(r_k) / (k * Var(r_1)).
-    return var_rk / (static_cast<double>(k) * var_r1);
-}
 
 void ChiaEdgeOptimizer::update_regime()
 {
-    const double vr = variance_ratio_test();
-
-    MarketRegime new_regime = MarketRegime::Random;
-    double spread_mult = 1.0;
-    double skew_mult   = 1.0;
-
-    if (vr < cfg_.vr_mean_revert_threshold) {
-        // Mean-reverting regime: prices tend to bounce back.
-        //   - Tighten spreads (0.8x): lower adverse selection risk.
-        //   - Reduce inventory shedding (0.5x): mean-reversion will
-        //     naturally correct inventory imbalance.
-        new_regime  = MarketRegime::MeanReverting;
-        spread_mult = cfg_.regime_mr_spread_mult;
-        skew_mult   = cfg_.regime_mr_skew_mult;
-    } else if (vr > cfg_.vr_momentum_threshold) {
-        // Momentum regime: prices trend persistently.
-        //   - Widen spreads (1.5x): compensate for higher adverse selection.
-        //   - Aggressive inventory shedding (2.0x): holding directional
-        //     inventory against a trend is costly.
-        new_regime  = MarketRegime::Momentum;
-        spread_mult = cfg_.regime_mo_spread_mult;
-        skew_mult   = cfg_.regime_mo_skew_mult;
-    }
-    // Else: Random regime, multipliers stay at 1.0.
-
-    regime_ = RegimeInfo{new_regime, vr, spread_mult, skew_mult};
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).  The canonical detector provides
+    // dual-horizon VR, Z-statistic significance testing (Lo-MacKinlay 1988),
+    // hysteresis to prevent regime whipsawing, and optional HMM.
+    regime_ = to_regime_info(active_detector());
 }
 
 }  // namespace xop

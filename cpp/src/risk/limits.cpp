@@ -166,7 +166,9 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     //   Conversely, low base concentration (high quote concentration)
     //   means we stop SELLING base (zero the ask).
 
-    const double base_conc = compute_concentration(base_pos, quote_pos);
+    // Mark-to-market: convert raw mojo balances to a common XCH numeraire
+    // so that concentration reflects economic value, not raw token counts.
+    const double base_conc = compute_concentration(base_pos, quote_pos, state);
     const double quote_conc = 1.0 - base_conc;
 
     // Base overweight?
@@ -212,7 +214,7 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     //   (never sell at a loss).
 
     if (base_id != "xch") {
-        const double cat_frac = compute_portfolio_fraction(base_pos, all_positions);
+        const double cat_frac = compute_portfolio_fraction(base_pos, all_positions, state);
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
             quote.bid_size = 0;  // stop accumulating this CAT
         }
@@ -220,7 +222,7 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 
     // Same check for quote side if the quote asset is a CAT.
     if (quote_id != "xch") {
-        const double cat_frac = compute_portfolio_fraction(quote_pos, all_positions);
+        const double cat_frac = compute_portfolio_fraction(quote_pos, all_positions, state);
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
             quote.ask_size = 0;  // stop accumulating quote CAT (i.e., stop selling base)
         }
@@ -232,7 +234,7 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     //   capital, block both sides to prevent further concentration.
 
     const double pair_frac = compute_pair_capital_fraction(base_pos, quote_pos,
-                                                           all_positions);
+                                                           all_positions, state);
     if (pair_frac >= risk_cfg_.max_capital_per_pair_pct) {
         quote.bid_size = 0;
         quote.ask_size = 0;
@@ -378,26 +380,26 @@ LimitStatus PreTradeCheck::get_limit_status(
     ls.base_id  = base_id;
     ls.quote_id = quote_id;
 
-    // Inventory concentration.
-    ls.base_concentration  = compute_concentration(base_pos, quote_pos);
+    // Inventory concentration (mark-to-market in XCH numeraire).
+    ls.base_concentration  = compute_concentration(base_pos, quote_pos, state);
     ls.soft_limit_breached = (ls.base_concentration >= risk_cfg_.soft_limit_pct)
                           || ((1.0 - ls.base_concentration) >= risk_cfg_.soft_limit_pct);
     ls.hard_limit_breached = (ls.base_concentration >= risk_cfg_.hard_limit_pct)
                           || ((1.0 - ls.base_concentration) >= risk_cfg_.hard_limit_pct);
 
-    // Single-CAT cap (only relevant for CAT assets).
+    // Single-CAT cap (only relevant for CAT assets, mark-to-market).
     if (base_id != "xch") {
-        ls.cat_portfolio_pct = compute_portfolio_fraction(base_pos, all_positions);
+        ls.cat_portfolio_pct = compute_portfolio_fraction(base_pos, all_positions, state);
     } else if (quote_id != "xch") {
-        ls.cat_portfolio_pct = compute_portfolio_fraction(quote_pos, all_positions);
+        ls.cat_portfolio_pct = compute_portfolio_fraction(quote_pos, all_positions, state);
     } else {
         ls.cat_portfolio_pct = 0.0;  // XCH/XCH pair (hypothetical)
     }
     ls.cat_cap_breached = (ls.cat_portfolio_pct >= risk_cfg_.single_cat_cap_pct);
 
-    // Capital per pair.
+    // Capital per pair (mark-to-market in XCH numeraire).
     ls.pair_capital_pct  = compute_pair_capital_fraction(base_pos, quote_pos,
-                                                         all_positions);
+                                                         all_positions, state);
     ls.pair_cap_breached = (ls.pair_capital_pct >= risk_cfg_.max_capital_per_pair_pct);
 
     // Flash-crash flag is set externally by the caller; initialise to false.
@@ -411,69 +413,155 @@ LimitStatus PreTradeCheck::get_limit_status(
 // ===========================================================================
 
 // ---------------------------------------------------------------------------
-// compute_concentration -- fraction of combined base+quote value held in base.
+// mark_to_xch -- convert a position's raw mojo balance to XCH-equivalent mojos.
 //
-// Uses raw mojo balances as a proxy for value.  This is exact for XCH/XCH
-// pairs and an approximation for CAT pairs (where 1 mojo of base != 1 mojo
-// of quote in value).  A more precise version would use mark-to-market
-// prices, but for the risk-gate purpose (detecting lopsided inventory) the
-// balance ratio is a robust and manipulation-resistant proxy.
+// The common numeraire for all risk calculations is XCH.  For XCH positions
+// the balance is already in the correct unit; for CAT positions we look up
+// the market mid price (mojos of XCH per mojo of CAT) from the State's
+// market snapshot cache.
+//
+// Pair name convention: market snapshots are keyed as "BASE/QUOTE" where one
+// side is typically XCH.  We probe both orderings:
+//   (1) "<asset_id>/xch" -- asset is base, XCH is quote.
+//       mid_price is in mojos-of-xch per mojo-of-base.
+//       xch_value = balance * mid_price.
+//   (2) "xch/<asset_id>" -- XCH is base, asset is quote.
+//       mid_price is in mojos-of-asset per mojo-of-xch.
+//       xch_value = balance / mid_price.
+//
+// Conservative fallback (ISO/IEC 27001:2022 -- fail-safe):
+//   If neither market snapshot exists or mid_price == 0 (data not yet
+//   available), the raw mojo balance is returned unchanged.  This treats
+//   1 mojo of the CAT as if it were worth 1 mojo of XCH, which massively
+//   over-estimates the value of cheap tokens and causes risk limits to fire
+//   earlier -- the safe direction.
+//
+// ISO/IEC 5055: double used only for the dimensionless ratio computation;
+//   the returned Mojo is rounded back to integer via llround.
+// ---------------------------------------------------------------------------
+
+Mojo PreTradeCheck::mark_to_xch(const Position& pos,
+                                 const State&    state) noexcept
+{
+    // XCH positions need no conversion -- balance is already in XCH mojos.
+    if (pos.asset_id == "xch" || pos.asset_id.empty()) {
+        return pos.balance;
+    }
+
+    // Guard: non-positive balance yields zero value regardless of price.
+    if (pos.balance <= 0) {
+        return 0;
+    }
+
+    // Probe ordering (1): "<asset>/xch" -- mid is mojos-of-xch per mojo-of-base.
+    {
+        const MarketSnapshot snap = state.get_market(pos.asset_id + "/xch");
+        if (snap.mid_price > 0) {
+            // xch_value = balance * mid_price.
+            // Use double for the multiplication to avoid int64 overflow on
+            // large balances, then round back to Mojo.
+            const auto xch_val = static_cast<double>(pos.balance)
+                               * static_cast<double>(snap.mid_price);
+            // Clamp to Mojo range to prevent undefined behaviour on cast.
+            if (xch_val >= static_cast<double>(std::numeric_limits<Mojo>::max())) {
+                return std::numeric_limits<Mojo>::max();
+            }
+            return static_cast<Mojo>(std::llround(xch_val));
+        }
+    }
+
+    // Probe ordering (2): "xch/<asset>" -- mid is mojos-of-asset per mojo-of-xch.
+    {
+        const MarketSnapshot snap = state.get_market("xch/" + pos.asset_id);
+        if (snap.mid_price > 0) {
+            // xch_value = balance / mid_price.
+            const auto xch_val = static_cast<double>(pos.balance)
+                               / static_cast<double>(snap.mid_price);
+            return static_cast<Mojo>(std::llround(xch_val));
+        }
+    }
+
+    // Fallback: no price available.  Return raw balance (conservative --
+    // over-estimates value, triggers risk limits sooner).
+    return pos.balance;
+}
+
+// ---------------------------------------------------------------------------
+// compute_concentration -- fraction of combined mark-to-market value held
+// in the base asset, expressed in XCH-equivalent mojos.
+//
+// Uses mark_to_xch() to convert each position's raw mojo balance into a
+// common numeraire (XCH) before computing the ratio.  This ensures that
+// e.g. 10,000 mojos of USDS ($0.01) and 10,000 mojos of XCH ($30,000)
+// are weighted by their actual economic value, not raw token counts.
+//
+// Returns 0.0 if both marked values are zero (no capital deployed).
+// ISO/IEC 5055: division guarded against zero denominator.
 // ---------------------------------------------------------------------------
 
 double PreTradeCheck::compute_concentration(
     const Position& base_pos,
-    const Position& quote_pos) noexcept
+    const Position& quote_pos,
+    const State&    state) noexcept
 {
-    const auto total = static_cast<double>(base_pos.balance)
-                     + static_cast<double>(quote_pos.balance);
+    const auto base_val  = static_cast<double>(mark_to_xch(base_pos, state));
+    const auto quote_val = static_cast<double>(mark_to_xch(quote_pos, state));
+    const double total = base_val + quote_val;
+
     if (total <= 0.0) {
         return 0.0;  // no capital deployed -- report zero concentration
     }
-    return static_cast<double>(base_pos.balance) / total;
+    return base_val / total;
 }
 
 // ---------------------------------------------------------------------------
-// compute_portfolio_fraction -- what share of total holdings an asset holds.
+// compute_portfolio_fraction -- what share of total portfolio value (mark-to-
+// market in XCH) a single asset represents.
+//
+// Sums mark_to_xch() across all positions to obtain the denominator.
+// Returns 0.0 if total portfolio value is zero.
 // ---------------------------------------------------------------------------
 
 double PreTradeCheck::compute_portfolio_fraction(
     const Position&              asset_pos,
-    const std::vector<Position>& all) noexcept
+    const std::vector<Position>& all,
+    const State&                 state) noexcept
 {
-    // Sum total balance across all assets.
+    // Sum total XCH-equivalent value across all assets.
     double total = 0.0;
     for (const auto& p : all) {
-        total += static_cast<double>(p.balance);
+        total += static_cast<double>(mark_to_xch(p, state));
     }
 
     if (total <= 0.0) {
         return 0.0;
     }
 
-    return static_cast<double>(asset_pos.balance) / total;
+    return static_cast<double>(mark_to_xch(asset_pos, state)) / total;
 }
 
 // ---------------------------------------------------------------------------
-// compute_pair_capital_fraction -- combined base+quote balance as a fraction
-// of total portfolio balance.
+// compute_pair_capital_fraction -- combined mark-to-market (XCH) value of
+// base + quote positions as a fraction of total portfolio value.
 // ---------------------------------------------------------------------------
 
 double PreTradeCheck::compute_pair_capital_fraction(
     const Position&              base_pos,
     const Position&              quote_pos,
-    const std::vector<Position>& all) noexcept
+    const std::vector<Position>& all,
+    const State&                 state) noexcept
 {
     double total = 0.0;
     for (const auto& p : all) {
-        total += static_cast<double>(p.balance);
+        total += static_cast<double>(mark_to_xch(p, state));
     }
 
     if (total <= 0.0) {
         return 0.0;
     }
 
-    const double pair_capital = static_cast<double>(base_pos.balance)
-                              + static_cast<double>(quote_pos.balance);
+    const double pair_capital = static_cast<double>(mark_to_xch(base_pos, state))
+                              + static_cast<double>(mark_to_xch(quote_pos, state));
     return pair_capital / total;
 }
 

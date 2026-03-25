@@ -46,10 +46,12 @@ namespace trade_status {
 
 OfferManager::OfferManager(asio::io_context&                    ioc,
                            std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
+                           std::shared_ptr<rpc::DexieClient>    dexie_client,
                            std::shared_ptr<State>               state,
                            const AppConfig&                     config)
     : ioc_(ioc)
     , wallet_(std::move(wallet))
+    , dexie_client_(std::move(dexie_client))
     , state_(std::move(state))
     , strategy_cfg_(config.strategy)
     , risk_cfg_(config.risk)
@@ -248,25 +250,44 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                     fill.block_height = 0;
                 }
 
-                // Update position accounting in state.
-                //   Bid fill: we BOUGHT base asset.
-                //   Ask fill: we SOLD base asset.
-                if (po.side == Side::Bid) {
-                    state_->record_buy(po.pair_name, po.size, po.price);
-                    logger_->info("FILL BID {} {} mojos @ {} mojos [{}]",
-                                  po.pair_name, po.size, po.price,
-                                  trade_id.substr(0, 12));
+                // T1-08: Update position accounting using canonical asset IDs
+                // from the pair config, NOT the human-readable pair_name.
+                // State::record_buy/record_sell index positions by AssetId
+                // (e.g. "xch", hex CAT ID), so passing pair_name (e.g.
+                // "XCH/wUSDC") would create phantom position entries keyed
+                // by the pair label rather than updating the actual asset
+                // balances.  The pair_config_map_ was added to support this
+                // lookup.
+                //
+                // ISO/IEC 5055: guard against missing pair config to prevent
+                // undefined behaviour on map miss.
+                auto pc_it = pair_config_map_.find(po.pair_name);
+                if (pc_it == pair_config_map_.end()) {
+                    logger_->error(
+                        "detect_fills: no pair config for '{}' -- "
+                        "cannot update position for trade {}",
+                        po.pair_name, trade_id.substr(0, 12));
                 } else {
-                    bool sold = state_->record_sell(po.pair_name, po.size);
-                    if (!sold) {
-                        logger_->error(
-                            "record_sell failed for {} -- insufficient balance",
-                            trade_id.substr(0, 12));
+                    const auto& pc = pc_it->second;
+                    if (po.side == Side::Bid) {
+                        // Bid fill: we BOUGHT base asset.
+                        state_->record_buy(pc.base_asset_id, po.size, po.price);
+                    } else {
+                        // Ask fill: we SOLD base asset.
+                        bool sold = state_->record_sell(pc.base_asset_id, po.size);
+                        if (!sold) {
+                            logger_->error(
+                                "record_sell failed for {} (asset={}) "
+                                "-- insufficient balance",
+                                trade_id.substr(0, 12), pc.base_asset_id);
+                        }
                     }
-                    logger_->info("FILL ASK {} {} mojos @ {} mojos [{}]",
-                                  po.pair_name, po.size, po.price,
-                                  trade_id.substr(0, 12));
                 }
+
+                logger_->info("FILL {} {} {} mojos @ {} mojos [{}]",
+                              (po.side == Side::Bid) ? "BID" : "ASK",
+                              po.pair_name, po.size, po.price,
+                              trade_id.substr(0, 12));
 
                 // Remove from pending offers.
                 state_->remove_offer(trade_id);
@@ -627,30 +648,49 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
         return json::object();
     }
 
+    // Resolve the per-asset mojo denomination from the pair configuration.
+    // XCH uses 10^12 mojos per unit; CAT tokens use 10^3 mojos per unit.
+    // The previous implementation always divided by kMojosPerXch (10^12),
+    // which silently truncated CAT quote amounts by a factor of 10^9.
+    //
+    // ISO/IEC 5055: guard against zero/negative denomination to prevent
+    // division-by-zero undefined behaviour or nonsensical mojo amounts.
+    const std::int64_t quote_denom = pair.quote_mojos_per_unit;
+    if (quote_denom <= 0) {
+        logger_->error("build_offer_dict: invalid quote_mojos_per_unit={} "
+                       "for pair '{}' -- must be > 0",
+                       quote_denom, pair.name);
+        return json::object();
+    }
+
     json offer_dict = json::object();
 
     if (tier.side == Side::Bid) {
-        // BID: we offer quote-asset mojos (negative), request base-asset mojos
-        // (positive).
+        // BID: we offer quote-asset mojos (negative), request base-asset
+        // mojos (positive).
         //
-        // Quote cost = base_size * price_per_base (mojos of quote).
+        // Quote cost = base_size * price_per_base / denomination.
         // The offer_dict keys must be strings of the wallet_id.
+        // Round up (ceil) so that we offer at least enough quote to cover
+        // the requested base amount at the stated price.
         const Mojo quote_amount = static_cast<Mojo>(
             std::ceil(static_cast<double>(tier.size)
                       * static_cast<double>(tier.price)
-                      / static_cast<double>(kMojosPerXch)));
+                      / static_cast<double>(quote_denom)));
 
         // Wallet RPC convention: negative = we spend, positive = we receive.
         offer_dict[std::to_string(quote_wid)] = -quote_amount;
         offer_dict[std::to_string(base_wid)]  =  tier.size;
 
     } else {
-        // ASK: we offer base-asset mojos (negative), request quote-asset mojos
-        // (positive).
+        // ASK: we offer base-asset mojos (negative), request quote-asset
+        // mojos (positive).
+        // Round down (floor) so that we request conservatively, ensuring
+        // the offer is attractive to takers.
         const Mojo quote_amount = static_cast<Mojo>(
             std::floor(static_cast<double>(tier.size)
                        * static_cast<double>(tier.price)
-                       / static_cast<double>(kMojosPerXch)));
+                       / static_cast<double>(quote_denom)));
 
         offer_dict[std::to_string(base_wid)]  = -tier.size;
         offer_dict[std::to_string(quote_wid)] =  quote_amount;
@@ -666,30 +706,68 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
 asio::awaitable<bool> OfferManager::submit_to_dexie(
     const std::string& offer_text)
 {
-    // Dexie offer submission endpoint: POST /v1/offers
-    // Body: {"offer": "<bech32m text>"}
+    // Best-effort submission to the Dexie aggregator for cross-platform
+    // visibility.  The offer is already valid on-chain regardless of
+    // whether Dexie accepts it, so failures are non-fatal.
     //
-    // This is a best-effort submission.  The offer is valid on-chain
-    // regardless of whether dexie accepts it.  Failures are logged but
-    // do not constitute an error in the offer lifecycle.
-    //
-    // Implementation note: in a production build this would use an HTTP
-    // client (libcurl or beast).  For now the structure is defined and
-    // the actual HTTP call is a placeholder awaiting the HTTP client
-    // integration.
+    // ISO/IEC 27001:2022: full offer bech32m payload is never logged;
+    // DexieClient internally truncates the payload in log output.
+    // ISO/IEC 5055: null-pointer guard prevents UB if client is absent.
+
+    // Guard: if no DexieClient was injected, skip silently.
+    if (!dexie_client_) {
+        logger_->debug("submit_to_dexie: no DexieClient configured -- "
+                       "skipping aggregator submission");
+        co_return false;
+    }
 
     try {
-        // TODO(phase-2): integrate dexie HTTP client.
-        // POST to dexie_cfg_.api_base + "/offers"
-        // with JSON body {"offer": offer_text}
-        //
-        // For now, log the intent and return true to allow the flow to
-        // continue during development.
-        logger_->debug("submit_to_dexie: would POST to {}/offers ({} bytes)",
-                       dexie_cfg_.api_base, offer_text.size());
-        co_return true;
+        // Ensure the client session is open before posting.
+        if (!dexie_client_->is_open()) {
+            dexie_client_->open();
+        }
+
+        // POST /v1/offers with JSON body {"offer": "<bech32m text>"}.
+        // DexieClient::submit_offer handles rate limiting, retries on
+        // 429/5xx, and JSON parsing internally.
+        rpc::SubmitResult result = co_await dexie_client_->submit_offer(offer_text);
+
+        if (result.success) {
+            logger_->info("submit_to_dexie: accepted (dexie_id={})",
+                          result.offer_id);
+            co_return true;
+        }
+
+        // Dexie rejected the offer (e.g. duplicate, invalid, expired).
+        // Log the reason but do not treat as a hard failure.
+        logger_->warn("submit_to_dexie: rejected by Dexie -- {}",
+                      result.error_message);
+        co_return false;
+
+    } catch (const rpc::DexieRateLimitError& e) {
+        // Rate-limit exhaustion after max retries.  Non-fatal: the offer
+        // remains valid on-chain; aggregator visibility is best-effort.
+        logger_->warn("submit_to_dexie: rate-limited -- {}", e.what());
+        co_return false;
+    } catch (const rpc::DexieClientError& e) {
+        // Non-retryable 4xx error (bad request, invalid offer format, etc.).
+        logger_->warn("submit_to_dexie: client error -- {}", e.what());
+        co_return false;
+    } catch (const rpc::DexieServerError& e) {
+        // Server-side 5xx that persisted after retries.
+        logger_->warn("submit_to_dexie: server error -- {}", e.what());
+        co_return false;
+    } catch (const rpc::DexieError& e) {
+        // Catch-all for any other DexieClient transport error
+        // (curl failure, JSON parse error, client not open, etc.).
+        logger_->warn("submit_to_dexie: transport error -- {}", e.what());
+        co_return false;
     } catch (const std::exception& e) {
-        logger_->warn("submit_to_dexie failed: {}", e.what());
+        // Defensive catch for unexpected exceptions.  Should not fire in
+        // normal operation, but prevents an unhandled exception from
+        // propagating and crashing the offer lifecycle coroutine.
+        logger_->error("submit_to_dexie: unexpected exception -- {}",
+                       e.what());
         co_return false;
     }
 }

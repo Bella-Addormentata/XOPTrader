@@ -12,9 +12,13 @@
 //                                                 publish_snapshot() ──> State
 //
 // Thread safety:
-//   Three independent shared_mutexes protect three independent data maps.
-//   Every public method acquires at most one mutex (shared or exclusive) and
-//   releases it before returning.  Deadlock is impossible by construction.
+//   Independent shared_mutexes protect independent data maps.  Most methods
+//   acquire at most one mutex (shared or exclusive) and release it before
+//   returning.  The move assignment operator is an exception: it acquires
+//   both this->mtx_ and other.mtx_ per map via std::scoped_lock, which
+//   uses the C++17 deadlock-avoidance algorithm (try-and-back-off) to
+//   prevent ABBA deadlock when two threads move-assign in opposite
+//   directions (T3-23 fix).
 //
 // Monetary note:
 //   Prices in this module use double (not mojos) because the aggregation
@@ -36,6 +40,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>          // std::scoped_lock (deadlock-avoidance, C++17)
 #include <shared_mutex>
 #include <utility>
 
@@ -117,75 +122,94 @@ MarketDataFeed::MarketDataFeed(MarketDataFeed&& other) noexcept
     }
 }
 
+// Move assignment operator.
+//
+// FIX (T3-23): replaced sequential std::unique_lock pairs with
+// std::scoped_lock which employs a deadlock-avoidance algorithm
+// (try-and-back-off, per C++17 [thread.lock.algorithm]).  The previous
+// implementation acquired this->mtx_ then other.mtx_ in fixed order,
+// creating an ABBA deadlock when two threads simultaneously move-assign
+// in opposite directions (thread 1: a=move(b), thread 2: b=move(a)).
+//
+// ISO/IEC 5055  -- eliminates CWE-833 (deadlock) via standard RAII locking.
+// ISO/IEC 27001 -- deterministic lock acquisition; no unbounded blocking.
+// ISO/IEC JTC 1/SC 22 -- uses C++17 std::scoped_lock; well-defined behaviour.
 MarketDataFeed& MarketDataFeed::operator=(MarketDataFeed&& other) noexcept {
     if (this == &other) {
         return *this;
     }
 
-    config_       = other.config_;
+    // HIGH-4 FIX: Acquire mtx_config_ before writing config_ to prevent a
+    // data race with concurrent readers (e.g. detect_stale, check_arbitrage)
+    // that read config_ under shared lock.  Uses std::scoped_lock for
+    // deadlock-safe acquisition of both this and source config mutexes.
+    // ISO/IEC 5055 -- CWE-362 (data race) elimination via RAII locking.
+    // ISO/IEC 27001:2022 -- deterministic lock ordering; no unbounded blocking.
+    {
+        std::scoped_lock lock(mtx_config_, other.mtx_config_);
+        config_ = other.config_;
+    }
     // state_ is a reference -- cannot be reseated; both must reference the same State.
-    arb_callback_ = std::move(other.arb_callback_);
+    // MEDIUM-6 FIX (partial): Protect arb_callback_ write under mtx_config_
+    // to synchronise with concurrent readers in check_arbitrage().
+    // ISO/IEC 5055 -- CWE-362 (data race) elimination.
+    {
+        std::scoped_lock lock(mtx_config_, other.mtx_config_);
+        arb_callback_ = std::move(other.arb_callback_);
+    }
     block_height_.store(other.block_height_.load(std::memory_order_relaxed),
                         std::memory_order_relaxed);
 
+    // Each map is transferred under a std::scoped_lock that acquires both
+    // the destination and source mutexes atomically using the C++17
+    // deadlock-avoidance algorithm.  This prevents ABBA deadlock when two
+    // threads move-assign MarketDataFeed objects in opposite directions.
     {
-        std::unique_lock lock_dst(mtx_pairs_);
-        std::unique_lock lock_src(other.mtx_pairs_);
+        std::scoped_lock lock(mtx_pairs_, other.mtx_pairs_);
         pairs_ = std::move(other.pairs_);
     }
     {
-        std::unique_lock lock_dst(mtx_history_);
-        std::unique_lock lock_src(other.mtx_history_);
+        std::scoped_lock lock(mtx_history_, other.mtx_history_);
         history_ = std::move(other.history_);
     }
     {
-        std::unique_lock lock_dst(mtx_arb_);
-        std::unique_lock lock_src(other.mtx_arb_);
+        std::scoped_lock lock(mtx_arb_, other.mtx_arb_);
         latest_arb_ = std::move(other.latest_arb_);
     }
     {
-        std::unique_lock lock_dst(mtx_competitors_);
-        std::unique_lock lock_src(other.mtx_competitors_);
+        std::scoped_lock lock(mtx_competitors_, other.mtx_competitors_);
         competing_offers_ = std::move(other.competing_offers_);
     }
     {
-        std::unique_lock lock_dst(mtx_competitor_metrics_);
-        std::unique_lock lock_src(other.mtx_competitor_metrics_);
+        std::scoped_lock lock(mtx_competitor_metrics_, other.mtx_competitor_metrics_);
         competitor_metrics_ = std::move(other.competitor_metrics_);
     }
     {
-        std::unique_lock lock_dst(mtx_whale_events_);
-        std::unique_lock lock_src(other.mtx_whale_events_);
+        std::scoped_lock lock(mtx_whale_events_, other.mtx_whale_events_);
         whale_events_ = std::move(other.whale_events_);
     }
     {
-        std::unique_lock lock_dst(mtx_whale_metrics_);
-        std::unique_lock lock_src(other.mtx_whale_metrics_);
+        std::scoped_lock lock(mtx_whale_metrics_, other.mtx_whale_metrics_);
         whale_metrics_ = std::move(other.whale_metrics_);
     }
-    // Transfer VPIN volume-bar state under paired locks.
-    // ISO/IEC 5055: consistent lock ordering (dst then src) prevents deadlock.
+    // Transfer VPIN volume-bar state under deadlock-safe paired lock.
     {
-        std::unique_lock lock_dst(mtx_vpin_);
-        std::unique_lock lock_src(other.mtx_vpin_);
+        std::scoped_lock lock(mtx_vpin_, other.mtx_vpin_);
         vpin_state_ = std::move(other.vpin_state_);
     }
     // Transfer cached VPIN metrics.
     {
-        std::unique_lock lock_dst(mtx_vpin_metrics_);
-        std::unique_lock lock_src(other.mtx_vpin_metrics_);
+        std::scoped_lock lock(mtx_vpin_metrics_, other.mtx_vpin_metrics_);
         vpin_metrics_ = std::move(other.vpin_metrics_);
     }
     // Transfer OFI book-snapshot history.
     {
-        std::unique_lock lock_dst(mtx_ofi_);
-        std::unique_lock lock_src(other.mtx_ofi_);
+        std::scoped_lock lock(mtx_ofi_, other.mtx_ofi_);
         ofi_snapshots_ = std::move(other.ofi_snapshots_);
     }
     // Transfer cached OFI metrics.
     {
-        std::unique_lock lock_dst(mtx_ofi_metrics_);
-        std::unique_lock lock_src(other.mtx_ofi_metrics_);
+        std::scoped_lock lock(mtx_ofi_metrics_, other.mtx_ofi_metrics_);
         ofi_metrics_ = std::move(other.ofi_metrics_);
     }
 
@@ -445,11 +469,11 @@ std::optional<ArbitrageSignal> MarketDataFeed::get_latest_arb_signal(
 //  Configuration access
 // =========================================================================
 
-const MarketDataConfig& MarketDataFeed::config() const noexcept {
-    // Note: mtx_config_ is not acquired here to preserve the noexcept contract.
-    // Callers should ensure no concurrent config mutation (i.e. call setters
-    // from the same thread that owns the feed, or accept benign tearing on
-    // double fields).
+// [MEDIUM-1] Return config by value under shared_lock so callers never
+// observe a partially-written config during concurrent set_*() calls.
+// ISO/IEC 5055 -- CWE-362 (data race) elimination via RAII locking.
+MarketDataConfig MarketDataFeed::config() const {
+    std::shared_lock lk(mtx_config_);
     return config_;
 }
 
@@ -466,8 +490,15 @@ void MarketDataFeed::set_arb_threshold_bps(double threshold_bps) {
     spdlog::info("Arbitrage threshold updated to {:.1f} bps", threshold_bps);
 }
 
+// MEDIUM-6 FIX: Protect arb_callback_ write with mtx_config_ to prevent a
+// data race with check_arbitrage() which reads arb_callback_ concurrently.
+// ISO/IEC 5055 -- CWE-362 (data race) elimination via RAII locking.
+// ISO/IEC 27001:2022 -- deterministic synchronisation; audit-quality logging.
 void MarketDataFeed::set_arb_callback(ArbitrageCallback cb) {
-    arb_callback_ = std::move(cb);
+    {
+        std::unique_lock lock(mtx_config_);
+        arb_callback_ = std::move(cb);
+    }
     spdlog::debug("Arbitrage callback updated");
 }
 
@@ -628,6 +659,9 @@ double MarketDataFeed::compute_spread_bps(double best_bid, double best_ask) {
 // -------------------------------------------------------------------------
 
 bool MarketDataFeed::detect_stale(Timestamp ts) const {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
     // Epoch-zero means the timestamp was never set.
     if (ts == Timestamp{}) {
         return true;
@@ -636,7 +670,7 @@ bool MarketDataFeed::detect_stale(Timestamp ts) const {
     const auto now = std::chrono::system_clock::now();
     const auto age = now - ts;
 
-    return age > config_.stale_threshold;
+    return age > cfg.stale_threshold;
 }
 
 // -------------------------------------------------------------------------
@@ -654,6 +688,9 @@ bool MarketDataFeed::detect_stale(Timestamp ts) const {
 // -------------------------------------------------------------------------
 
 void MarketDataFeed::check_arbitrage(PairState& ps) {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
     // Compute DEX mid from raw dexie quotes (not the blended mid, which
     // already incorporates CEX and would dampen the divergence signal).
     double dex_mid = 0.0;
@@ -670,7 +707,7 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
     const double divergence_bps =
         std::abs(dex_mid - ps.cex_mid) / ps.cex_mid * 10000.0;
 
-    if (divergence_bps < config_.arb_threshold_bps) {
+    if (divergence_bps < cfg.arb_threshold_bps) {
         return;  // Within tolerance; no signal.
     }
 
@@ -701,10 +738,21 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
         latest_arb_.insert_or_assign(ps.pair_name, signal);
     }
 
-    // Invoke callback if registered.
-    if (arb_callback_) {
+    // MEDIUM-6 FIX: Copy arb_callback_ under shared lock before invoking,
+    // to prevent a data race with set_arb_callback() which writes under
+    // unique lock on the same mutex.  The copy is made under lock; the
+    // invocation happens outside the lock to avoid holding it during an
+    // arbitrary user callback (which could block or re-enter).
+    // ISO/IEC 5055 -- CWE-362 (data race) elimination.
+    // ISO/IEC 27001:2022 -- lock-free invocation avoids deadlock risk.
+    ArbitrageCallback cb_copy;
+    {
+        std::shared_lock lock(mtx_config_);
+        cb_copy = arb_callback_;
+    }
+    if (cb_copy) {
         try {
-            arb_callback_(signal);
+            cb_copy(signal);
         } catch (const std::exception& e) {
             spdlog::error("Arbitrage callback threw: {}", e.what());
         }
@@ -723,6 +771,9 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
 void MarketDataFeed::append_price_history(const std::string& pair_name,
                                            BlockHeight         block,
                                            double              price) {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
     std::unique_lock lock(mtx_history_);
 
     auto& deq = history_[pair_name];
@@ -740,7 +791,7 @@ void MarketDataFeed::append_price_history(const std::string& pair_name,
     deq.push_back(PriceHistoryEntry{block, price});
 
     // Evict oldest if over capacity.
-    while (deq.size() > config_.price_history_capacity) {
+    while (deq.size() > cfg.price_history_capacity) {
         deq.pop_front();
     }
 }
@@ -806,7 +857,10 @@ void MarketDataFeed::ingest_competing_offers(
     const std::vector<CompetingOffer>& competing_offers,
     const std::unordered_set<std::string>& own_offer_ids)
 {
-    if (!config_.enable_competitor_tracking) {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
+    if (!cfg.enable_competitor_tracking) {
         return;  // Feature disabled; no-op.
     }
 
@@ -821,7 +875,7 @@ void MarketDataFeed::ingest_competing_offers(
         }
 
         // Skip dust offers (not from serious market makers).
-        if (offer.size < config_.min_competitor_offer_size) {
+        if (offer.size < cfg.min_competitor_offer_size) {
             continue;
         }
 
@@ -871,7 +925,10 @@ void MarketDataFeed::ingest_competing_offers(
 std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
     const std::string& pair_name)
 {
-    if (!config_.enable_competitor_tracking) {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
+    if (!cfg.enable_competitor_tracking) {
         return std::nullopt;
     }
 
@@ -972,11 +1029,11 @@ std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
 
     // Log warning if tight competing spread detected.
     if (best_competing_spread_bps > 0.0 &&
-        best_competing_spread_bps < config_.competitor_alert_threshold_bps) {
+        best_competing_spread_bps < cfg.competitor_alert_threshold_bps) {
         spdlog::warn("MarketDataFeed: tight competitor detected on pair={}, "
                      "competing_spread={:.1f}bps (threshold={:.1f}bps)",
                      pair_name, best_competing_spread_bps,
-                     config_.competitor_alert_threshold_bps);
+                     cfg.competitor_alert_threshold_bps);
     }
 
     if (new_competitor_detected) {
@@ -1037,19 +1094,37 @@ std::size_t MarketDataFeed::get_num_competing_offers(
 //
 // Classifies the trade as a whale event when its size meets either:
 //   (a) the absolute threshold (whale_trade_threshold), or
-//   (b) the fractional-volume threshold (whale_volume_fraction × vol_24h).
+//   (b) the fractional-volume threshold (whale_volume_fraction x vol_24h).
 //
 // Non-whale trades are silently discarded.  Whale trades are appended to a
 // per-pair deque and WhaleMetrics is recomputed.
+//
+// T3-35: When is_own_fill is true, the fill originated from the bot's own
+// offers.  Own fills must NOT contribute to whale detection because the bot's
+// own order flow is not an external toxicity signal.  Treating own fills as
+// whale events creates a self-reinforcing feedback loop: own fill -> whale
+// detected -> spread widens -> fewer external fills -> next own fill has
+// outsized impact -> more widening.  Own fills are logged for attribution
+// only.
 // -------------------------------------------------------------------------
 
 void MarketDataFeed::ingest_trade(const std::string& pair_name,
                                   Side               side,
                                   Mojo               size,
-                                  BlockHeight        block_height)
+                                  BlockHeight        block_height,
+                                  bool               is_own_fill)
 {
     if (size <= 0) {
         return;  // Guard against degenerate input.
+    }
+
+    // T3-35: Own fills are excluded from whale detection to prevent
+    // self-reinforcing toxicity signals.  Log for attribution only.
+    if (is_own_fill) {
+        spdlog::debug("ingest_trade: own fill excluded from whale detection "
+                      "(pair={}, side={}, size={}, block={})",
+                      pair_name, static_cast<int>(side), size, block_height);
+        return;
     }
 
     // Snapshot config values under shared lock to avoid data races with setters.
@@ -1081,7 +1156,7 @@ void MarketDataFeed::ingest_trade(const std::string& pair_name,
         return;  // Not a whale trade; ignore.
     }
 
-    // Record the whale event.
+    // Record the whale event (market-generated only).
     detect_and_update_whale(pair_name, side, size, block_height);
 }
 
@@ -1409,9 +1484,23 @@ PairState& MarketDataFeed::get_or_create_pair(const std::string& pair_name) {
 
 void MarketDataFeed::ingest_trade_for_vpin(const std::string& pair_name,
                                            Side               side,
-                                           double             volume)
+                                           double             volume,
+                                           bool               is_own_fill)
 {
     if (volume <= 0.0) {
+        return;
+    }
+
+    // T3-35: Own fills are excluded from VPIN volume-bar accumulation to
+    // prevent self-generated order flow from inflating flow-toxicity metrics.
+    // The bot's own fills are not informative about external order-flow
+    // toxicity; including them creates a feedback loop where own fills raise
+    // VPIN -> strategy widens spreads -> fewer market fills -> VPIN stays
+    // elevated from stale own-fill data.
+    if (is_own_fill) {
+        spdlog::debug("ingest_trade_for_vpin: own fill excluded from VPIN "
+                      "(pair={}, side={}, volume={:.6f})",
+                      pair_name, static_cast<int>(side), volume);
         return;
     }
 

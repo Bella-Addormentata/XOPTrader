@@ -59,6 +59,7 @@
 #ifndef XOP_STRATEGY_REGIME_HPP
 #define XOP_STRATEGY_REGIME_HPP
 
+#include <xop/strategy/base.hpp>
 #include <xop/types.hpp>
 
 #include <array>
@@ -384,6 +385,16 @@ private:
     /// Run the Viterbi algorithm over the full observation window.
     std::vector<std::size_t> hmm_viterbi() const;
 
+    /// Sort HMM states by emission standard deviation (ascending) after
+    /// Baum-Welch convergence.  Resolves the label-switching ambiguity
+    /// inherent in EM so that state indices are deterministic:
+    ///   state 0 = lowest stddev  (low-vol regime)
+    ///   state 1 = middle stddev  (normal-vol regime)
+    ///   state 2 = highest stddev (high-vol regime)
+    /// Permutes emission_mean, emission_stddev, initial_prob, transition,
+    /// and forward_prob consistently.
+    void hmm_sort_states_by_stddev();
+
     // -- Data members --------------------------------------------------------
 
     RegimeDetectorConfig cfg_;
@@ -426,6 +437,38 @@ private:
     /// Block counter for periodic HMM re-fitting (every N blocks).
     static constexpr std::uint32_t kHmmRefitInterval = 50;
 };
+
+// ---------------------------------------------------------------------------
+// RegimeDetector-to-RegimeInfo bridge
+//
+// The canonical RegimeDetector uses the Regime enum and RegimeMultipliers
+// struct, while the strategy consumers (AvellanedaStoikov, GlftStrategy,
+// CoinAgeWeightedQuoting, etc.) use the MarketRegime enum and RegimeInfo
+// struct defined in base.hpp.
+//
+// This free function converts the canonical detector state into the
+// consumer-facing RegimeInfo, bridging the two type systems so that all
+// strategies can delegate regime detection to the single canonical
+// RegimeDetector without changing their public interfaces.
+//
+// T3-01: consolidate 4 variance ratio implementations into shared
+// RegimeDetector.
+// ---------------------------------------------------------------------------
+
+/// Convert the current state of a RegimeDetector into a RegimeInfo struct.
+///
+/// Maps:
+///   Regime::MeanReverting -> MarketRegime::MeanReverting
+///   Regime::Normal        -> MarketRegime::Random
+///   Regime::Momentum      -> MarketRegime::Momentum
+///
+/// The variance_ratio field is populated from the short-horizon VR value.
+/// The spread_mult and skew_mult fields are populated from the detector's
+/// configured regime multipliers.
+///
+/// @param detector  The canonical regime detector to query.
+/// @return RegimeInfo suitable for consumption by strategy classes.
+RegimeInfo to_regime_info(const RegimeDetector& detector);
 
 }  // namespace xop
 
