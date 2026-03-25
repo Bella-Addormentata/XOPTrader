@@ -73,14 +73,16 @@ namespace xop {
 // ---------------------------------------------------------------------------
 // Regime -- market micro-structure classification.
 //
-//   MeanReverting : VR(q) < lower_threshold  (default 0.85)
+//   MeanReverting : VR(q) < lower_threshold  (default 0.85) AND |Z| > vr_z_threshold
 //                   Negative return autocorrelation favours tighter spreads
 //                   and reduced inventory shedding -- ideal for market making.
 //
-//   Normal        : lower_threshold <= VR(q) <= upper_threshold  (default [0.85, 1.15])
+//   Normal        : VR within thresholds, OR |Z| <= vr_z_threshold (insignificant)
 //                   Returns are approximately independent; use default params.
+//                   T5-CR5: any VR deviation that is not statistically
+//                   significant falls here regardless of raw VR value.
 //
-//   Momentum      : VR(q) > upper_threshold  (default 1.15)
+//   Momentum      : VR(q) > upper_threshold  (default 1.15) AND |Z| > vr_z_threshold
 //                   Positive autocorrelation; widen spreads, shed inventory
 //                   aggressively, reduce sizes to limit adverse selection.
 // ---------------------------------------------------------------------------
@@ -155,9 +157,16 @@ struct RegimeDetectorConfig {
     /// VR above this value signals momentum.
     double vr_upper_threshold{1.15};
 
-    /// Z-statistic significance level.  The regime change is only
-    /// considered if |Z| exceeds this value.  Default 1.96 (95% CI).
-    double z_significance{1.96};
+    /// Z-statistic significance threshold for the VR test (Lo & MacKinlay
+    /// 1988).  A regime is classified as non-random-walk only when the
+    /// absolute Z-statistic exceeds this value, i.e. |Z| > vr_z_threshold.
+    /// Default 1.96 corresponds to a two-sided 95% confidence level.
+    ///
+    /// T5-CR5: Without this gate, the raw VR thresholds (0.85 / 1.15)
+    /// produce classifications that are not statistically significant at
+    /// typical window sizes n=50-200 (Lo & MacKinlay 1989, power ~5-9%).
+    /// ISO/IEC 27001:2022 -- deterministic, auditable threshold; no secrets.
+    double vr_z_threshold{1.96};
 
     // -- Hysteresis ----------------------------------------------------------
 
@@ -421,8 +430,11 @@ private:
     /// Number of blocks the confirmed regime has persisted.
     std::uint32_t regime_duration_{0};
 
-    /// Most recently computed Z-statistic (short horizon) for confidence.
+    /// Most recently computed Z-statistics for confidence and diagnostics.
+    /// T5-CR5: both horizons stored so that diagnostic logging can emit
+    /// the Z-statistic alongside VR for each horizon independently.
     double last_z_short_{0.0};
+    double last_z_long_{0.0};
 
     /// Most recently computed VR values for diagnostics.
     double last_vr_short_{1.0};

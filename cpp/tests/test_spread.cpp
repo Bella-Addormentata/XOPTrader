@@ -357,8 +357,9 @@ TEST(ThompsonSamplerTest, ConvergenceAfterManyFills) {
     }
 
     // Posterior mean for level 1 should be much higher than the others.
-    // Level 1: alpha=101, beta=1 => mean = 101/102 = 0.9902
-    // Level 0: alpha=1, beta=101 => mean = 1/102 = 0.0098
+    // With discounted Thompson Sampling (gamma=0.97), steady-state values
+    // are approximately alpha~34.3, beta~1.0 for consistently profitable
+    // outcomes, so posterior_mean > 0.95 still holds.
     EXPECT_GT(sampler.posterior_mean(1), 0.95);
     EXPECT_LT(sampler.posterior_mean(0), 0.05);
     EXPECT_LT(sampler.posterior_mean(2), 0.05);

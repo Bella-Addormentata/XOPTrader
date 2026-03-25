@@ -869,6 +869,47 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                   / static_cast<double>(kMojosPerXch)))
             : 0;
 
+        // [T5-CR1] VPIN validation: check if this fill is adverse.
+        // An adverse fill is one where the maker sold below cost basis
+        // (realized_pnl < 0) or bought at a price that immediately moved
+        // against the position.  For sells, negative realized PnL is a
+        // direct signal; for buys, we check if the fill price exceeds
+        // the current mid (overpaid).
+        // ISO/IEC 5055: well-defined adverse-fill classification.
+        bool is_adverse_fill = false;
+        if (fill.side == Side::Ask && tr.realized_pnl_mojos < 0) {
+            is_adverse_fill = true;
+        } else if (fill.side == Side::Bid) {
+            double mid = market_data_->get_mid_price(fill.pair_name);
+            Mojo mid_mojos = static_cast<Mojo>(std::llround(
+                mid * static_cast<double>(kMojosPerXch)));
+            if (fill.price > mid_mojos && mid_mojos > 0) {
+                is_adverse_fill = true;
+            }
+        }
+
+        // [T5-CR1] If this fill is adverse, check whether any recent VPIN
+        // activation (within kVpinValidationWindow blocks) preceded it.
+        // If so, the activation was a true positive -- VPIN correctly
+        // predicted elevated toxicity.
+        // ISO/IEC 27001:2022: validates signal quality in real time.
+        if (is_adverse_fill && !vpin_activation_blocks_.empty()) {
+            for (auto it = vpin_activation_blocks_.begin();
+                 it != vpin_activation_blocks_.end(); /* advanced below */) {
+                if (fill.block_height >= *it &&
+                    fill.block_height - *it <= kVpinValidationWindow) {
+                    ++vpin_rolling_tp_;
+                    ++vpin_rolling_resolved_;
+                    it = vpin_activation_blocks_.erase(it);
+                    // One adverse fill can validate at most one activation
+                    // to avoid inflating the TP count from a single event.
+                    break;
+                } else {
+                    ++it;
+                }
+            }
+        }
+
         db_->insert_trade(tr);
 
         // Record the offer as filled in the offer log.
@@ -925,6 +966,15 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // Feed the PnL tracker.
         pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos);
 
+        // [T5-CR3] Notify the strategy that a fill occurred so that the
+        // exponential-decay tau resets to tau_max.  Without this call,
+        // last_fill_block_ stays at 0 and tau decays to tau_min permanently.
+        // ISO/IEC 5055: strategies_ lookup is O(1); record_fill() is virtual.
+        auto fill_strat_it = strategies_.find(fill.pair_name);
+        if (fill_strat_it != strategies_.end() && fill_strat_it->second) {
+            fill_strat_it->second->record_fill();
+        }
+
         // Feed the whale detector with each fill for attribution/calibration.
         // T3-35: is_own_fill=true because these are the bot's own confirmed
         // fills.  Own fills are recorded for calibration only -- they must NOT
@@ -967,6 +1017,24 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 AssetId{pair.quote_asset_id},
                 mid_mojos);
             drift_analyzer_->record_observation(inv_ratio, block_height);
+        }
+    }
+
+    // [T5-CR1] Expire VPIN activations whose validation window has elapsed
+    // without an adverse fill.  These are false positives -- VPIN signalled
+    // toxicity but no adverse fill followed within kVpinValidationWindow blocks.
+    // ISO/IEC 5055: bounded cleanup prevents unbounded growth of the ring buffer.
+    {
+        auto it = vpin_activation_blocks_.begin();
+        while (it != vpin_activation_blocks_.end()) {
+            if (block_height > *it &&
+                block_height - *it > kVpinValidationWindow) {
+                ++vpin_false_positives_;
+                ++vpin_rolling_resolved_;
+                it = vpin_activation_blocks_.erase(it);
+            } else {
+                ++it;
+            }
         }
     }
 
@@ -1161,9 +1229,12 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         // COUNTER-RESEARCH NOTE (CR-1, Andersen & Bondarenko 2014):
         //   VPIN may have no incremental predictive power beyond raw
         //   volume and volatility.  It can produce false high-toxicity
-        //   signals from correlated noise-trader activity.  Validate
-        //   whether VPIN activations correlate with realised adverse
-        //   fills before relying on this multiplier in isolation.
+        //   signals from correlated noise-trader activity.
+        //   VALIDATION GATE (T5-CR1): runtime tracker now records each
+        //   activation (vpin_mult > 1.0) and checks whether an adverse
+        //   fill follows within kVpinValidationWindow blocks.  Precision
+        //   is logged every cycle in Step 10.  If precision < vpin_min_
+        //   precision_ after 100+ activations, a warning is emitted.
         //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §7.
         //
         // COUNTER-RESEARCH NOTE (CR-2, Xu, Lehalle & Alfonsi 2023):
@@ -1181,6 +1252,23 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         double vpin_mult  = 1.0 + vpin * 0.5;   // linear scale [1.0, 1.5]
         double ofi        = std::abs(market_data_->get_normalized_ofi(pair_name));
         double ofi_mult   = 1.0 + ofi * 0.3;    // linear scale [1.0, 1.3]
+
+        // [T5-CR1] Record VPIN activation when the signal is non-trivial.
+        // A minimum threshold avoids counting negligible VPIN values that
+        // widen the spread by effectively zero, which would dilute the
+        // precision metric.  Deduplicate by block: only record one
+        // activation per block_height across all pairs to prevent
+        // multi-pair inflation (N pairs × 1 block = 1 activation, not N).
+        // ISO/IEC 27001:2022: audit-quality signal tracking.
+        // ISO/IEC 5055: bounded container via kMaxPendingActivations cap.
+        static constexpr double kVpinActivationThreshold = 0.01;
+        if (vpin > kVpinActivationThreshold &&
+            (vpin_activation_blocks_.empty() ||
+             vpin_activation_blocks_.back() != block_height) &&
+            vpin_activation_blocks_.size() < kMaxPendingActivations) {
+            ++vpin_activations_;
+            vpin_activation_blocks_.push_back(block_height);
+        }
 
         pcs.spread_result.total_spread_bps *= whale_mult * vpin_mult * ofi_mult;
         pcs.spread_result.half_spread =
@@ -1677,6 +1765,43 @@ void Engine::step_run_hedging(BlockHeight block_height)
     // For Phase 1, we log the suggestions without auto-executing.
     std::unordered_map<AssetId, double> targets;
     // Phase 2: populate targets from the capital allocation config.
+
+    // [T5-CR1] VPIN signal quality reporting (Andersen & Bondarenko 2014).
+    // Rolling precision = rolling_tp / rolling_resolved.  Using a rolling
+    // window (instead of lifetime counters) allows precision to recover
+    // after early false-positive bursts, matching ISO/IEC 25000 requirements
+    // for actionable operational metrics.
+    // ISO/IEC 27001:2022: continuous signal-quality monitoring.
+    if (vpin_rolling_resolved_ > 0) {
+        double vpin_precision = static_cast<double>(vpin_rolling_tp_)
+                              / static_cast<double>(vpin_rolling_resolved_);
+        spdlog::info("[Engine] Step 10: VPIN signal quality: precision={:.2f} "
+                     "({}/{} resolved, {} pending, {} lifetime activations)",
+                     vpin_precision, vpin_rolling_tp_, vpin_rolling_resolved_,
+                     vpin_activation_blocks_.size(), vpin_activations_);
+
+        // Warn when precision is below the minimum threshold after burn-in.
+        // This suggests the VPIN multiplier is widening spreads without
+        // corresponding adverse-fill prediction, costing competitiveness.
+        // ISO/IEC 5055: guard against premature warning during burn-in.
+        if (vpin_activations_ >= kVpinBurnIn &&
+            vpin_precision < vpin_min_precision_) {
+            spdlog::warn("[Engine] Step 10: VPIN precision {:.2f} < "
+                         "min threshold {:.2f} after {} activations -- "
+                         "consider reducing VPIN weight "
+                         "(Andersen & Bondarenko 2014: VPIN may lack "
+                         "incremental power beyond volume+volatility)",
+                         vpin_precision, vpin_min_precision_,
+                         vpin_activations_);
+        }
+
+        // Reset rolling counters when they exceed the window to keep the
+        // metric responsive.  Halve both to preserve the current ratio.
+        if (vpin_rolling_resolved_ >= kVpinRollingWindow) {
+            vpin_rolling_tp_       /= 2;
+            vpin_rolling_resolved_ /= 2;
+        }
+    }
 
     spdlog::debug("[Engine] Step 10: hedging layer complete; {} positions tracked, "
                   "NHE={:.3f}", positions.size(), nhe);

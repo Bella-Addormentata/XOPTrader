@@ -167,45 +167,74 @@ TEST_F(AvellanedaTest, OptimalHalfSpreadAlwaysPositive) {
 // TEST: Compute tau (remaining horizon in seconds)
 // ============================================================================
 //
-// Formula:
-//   tau = (N - (block_height mod N)) * block_time
+// T5-CR3: Exponential-decay tau formula (replaces sawtooth):
 //
-//   N = 60 blocks, block_time = 52 s
+//   tau_max = horizon_blocks * block_time = 60 * 52 = 3120
+//   tau_min = 0.01 (default)
+//   lambda  = -ln(tau_min / tau_max) / horizon_blocks
 //
-//   block_height = 0 => n = 0, remaining = 60, tau = 60*52 = 3120
-//   block_height = 30 => n = 30, remaining = 30, tau = 30*52 = 1560
-//   block_height = 59 => n = 59, remaining = 1, tau = 1*52 = 52
-//   block_height = 60 => n = 0 (rollover), remaining = 60, tau = 3120
+//   tau(blocks_since_fill) = tau_max * exp(-lambda * blocks_since_fill)
+//
+//   At blocks_since_fill = 0:                tau = tau_max = 3120
+//   At blocks_since_fill = horizon/2 = 30:   tau = sqrt(tau_max * tau_min) = sqrt(31.2)
+//   At blocks_since_fill = horizon = 60:     tau = tau_min = 0.01 (by construction)
+//
+// last_fill_block_ initialises to 0, so blocks_since_fill = block_height.
 
-TEST_F(AvellanedaTest, ComputeTauStartOfWindow) {
+TEST_F(AvellanedaTest, ComputeTauAtFillBlock) {
+    // Immediately after a fill (blocks_since_fill = 0), tau = tau_max.
     xop::AvellanedaStoikov strategy(cfg_);
     EXPECT_NEAR(strategy.compute_tau(0), 3120.0, 1e-10);
 }
 
-TEST_F(AvellanedaTest, ComputeTauMiddle) {
+TEST_F(AvellanedaTest, ComputeTauMidDecay) {
+    // At half-horizon, tau = geometric mean of tau_max and tau_min.
     xop::AvellanedaStoikov strategy(cfg_);
-    EXPECT_NEAR(strategy.compute_tau(30), 1560.0, 1e-10);
+    double expected = std::sqrt(3120.0 * cfg_.tau_min);  // sqrt(31.2)
+    EXPECT_NEAR(strategy.compute_tau(30), expected, 1e-6);
 }
 
-TEST_F(AvellanedaTest, ComputeTauEndOfWindow) {
+TEST_F(AvellanedaTest, ComputeTauAtHorizon) {
+    // At exactly horizon_blocks, tau decays to tau_min by construction.
     xop::AvellanedaStoikov strategy(cfg_);
-    // block 59 => remaining = 1, tau = 52.
-    EXPECT_NEAR(strategy.compute_tau(59), 52.0, 1e-10);
+    EXPECT_NEAR(strategy.compute_tau(60), cfg_.tau_min, 1e-10);
 }
 
-TEST_F(AvellanedaTest, ComputeTauRollover) {
+TEST_F(AvellanedaTest, ComputeTauBeyondHorizon) {
+    // Beyond horizon, tau is floored at tau_min (not below).
     xop::AvellanedaStoikov strategy(cfg_);
-    // block 60 => 60 mod 60 = 0, remaining = 60, tau = 3120.
-    EXPECT_NEAR(strategy.compute_tau(60), 3120.0, 1e-10);
+    EXPECT_NEAR(strategy.compute_tau(120), cfg_.tau_min, 1e-10);
 }
 
-// Tau must never be zero (minimum is 1 block = 52 s).
-TEST_F(AvellanedaTest, ComputeTauNeverZero) {
+// Tau must never drop below tau_min (0.01 by default).
+TEST_F(AvellanedaTest, ComputeTauNeverBelowFloor) {
     xop::AvellanedaStoikov strategy(cfg_);
 
     for (uint32_t bh = 0; bh < 1000; ++bh) {
-        EXPECT_GE(strategy.compute_tau(bh), 52.0);
+        EXPECT_GE(strategy.compute_tau(bh), cfg_.tau_min);
     }
+}
+
+// T5-CR3: record_fill() resets tau back to tau_max.
+TEST_F(AvellanedaTest, RecordFillResetsTau) {
+    xop::AvellanedaStoikov strategy(cfg_);
+
+    // Feed a price at block 50 so record_fill() has a block to snapshot.
+    strategy.update_price(2.70, 50);
+
+    // After 50 blocks without a fill, tau should be well below tau_max.
+    double tau_before = strategy.compute_tau(50);
+    EXPECT_LT(tau_before, 100.0);  // Much less than 3120
+
+    // Record a fill -- this sets last_fill_block_ = 50.
+    strategy.record_fill();
+
+    // Now compute_tau(50) should be tau_max (blocks_since_fill = 0).
+    EXPECT_NEAR(strategy.compute_tau(50), 3120.0, 1e-10);
+
+    // And at block 51, tau should be only slightly decayed.
+    double tau_one_block = strategy.compute_tau(51);
+    EXPECT_GT(tau_one_block, 2000.0);  // Barely decayed from 3120
 }
 
 // ============================================================================
@@ -287,16 +316,20 @@ TEST_F(AvellanedaTest, FillIntensityMonotonicallyDecreasing) {
 // TEST: GLFT skew (Section 5)
 // ============================================================================
 //
-// Formula:
-//   skew = phi * q / q_max
+// T5-CR8: skew = effective_phi * q / q_max
 //
-//   phi = 0.5, q = 100, q_max = 1000
-//   skew = 0.5 * 100 / 1000 = 0.05
+// With sparse-fill correction neutralized (dense == actual):
+//   effective_phi = phi * 1.0 = 0.5
+//   skew(100) = 0.5 * 100 / 1000 = 0.05
+//
+// Neutralize sparse correction to isolate the base skew formula.
 
 TEST(GlftTest, InventorySkewKnownValues) {
     xop::GlftConfig gcfg;
     gcfg.phi   = 0.5;
     gcfg.q_max = 1000.0;
+    // Neutralize T5-CR8 sparse correction: set actual == dense => factor = 1.0.
+    gcfg.actual_fills_per_hour = gcfg.expected_dense_fills_per_hour;
 
     xop::GlftStrategy glft(gcfg);
 
@@ -305,18 +338,39 @@ TEST(GlftTest, InventorySkewKnownValues) {
     EXPECT_NEAR(glft.inventory_skew(0.0),    0.0, 1e-10);
 }
 
-// Skew should be linear in q and bounded by [-phi, phi].
+// Skew should be linear in q and bounded by [-effective_phi, effective_phi].
 TEST(GlftTest, InventorySkewBounded) {
     xop::GlftConfig gcfg;
     gcfg.phi   = 0.5;
     gcfg.q_max = 1000.0;
+    // Neutralize T5-CR8 sparse correction.
+    gcfg.actual_fills_per_hour = gcfg.expected_dense_fills_per_hour;
 
     xop::GlftStrategy glft(gcfg);
 
-    // At q = q_max, skew = phi.
+    // At q = q_max, skew = phi (with correction = 1.0).
     EXPECT_NEAR(glft.inventory_skew(1000.0), 0.5, 1e-10);
     // At q = -q_max, skew = -phi.
     EXPECT_NEAR(glft.inventory_skew(-1000.0), -0.5, 1e-10);
+}
+
+// T5-CR8: sparse-fill correction amplifies phi.
+TEST(GlftTest, InventorySkewSparseCorrection) {
+    xop::GlftConfig gcfg;
+    gcfg.phi   = 0.5;
+    gcfg.q_max = 1000.0;
+    // CHIA-like sparse venue: 1 fill/hour vs 100 fills/hour dense.
+    gcfg.expected_dense_fills_per_hour = 100.0;
+    gcfg.actual_fills_per_hour         = 1.0;
+    gcfg.sparse_correction_cap         = 10.0;
+
+    xop::GlftStrategy glft(gcfg);
+
+    // correction = min(max(1, 100/1), 10) = 10.  effective_phi = 0.5 * 10 = 5.0.
+    // skew(100) = 5.0 * 100 / 1000 = 0.5.
+    EXPECT_NEAR(glft.inventory_skew(100.0), 0.5, 1e-10);
+    // skew(1000) = 5.0 * 1000 / 1000 = 5.0.
+    EXPECT_NEAR(glft.inventory_skew(1000.0), 5.0, 1e-10);
 }
 
 // ============================================================================

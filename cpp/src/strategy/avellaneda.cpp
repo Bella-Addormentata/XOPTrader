@@ -9,6 +9,8 @@
 
 #include <xop/strategy/avellaneda.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cmath>
 #include <shared_mutex>
@@ -46,6 +48,24 @@ AvellanedaStoikov::AvellanedaStoikov(const AvellanedaConfig& cfg)
     if (!(cfg_.block_time_seconds > 0.0)) {
         throw std::invalid_argument("AvellanedaConfig: block_time_seconds must be positive");
     }
+    // T5-CR3: tau_min must be strictly positive to prevent log(0) in lambda
+    // computation and to guarantee tau never collapses to zero.
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.tau_min > 0.0)) {
+        throw std::invalid_argument("AvellanedaConfig: tau_min must be strictly positive");
+    }
+    // T5-CR3: tau_min must be less than tau_max (= horizon_blocks * block_time)
+    // to ensure lambda > 0 (tau decays rather than grows after each fill).
+    // If tau_min >= tau_max, log(tau_min/tau_max) >= 0, lambda <= 0.
+    // ISO/IEC 5055: fail-fast on misconfiguration.
+    {
+        const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                             * cfg_.block_time_seconds;
+        if (!(cfg_.tau_min < tau_max)) {
+            throw std::invalid_argument(
+                "AvellanedaConfig: tau_min must be < horizon_blocks * block_time_seconds");
+        }
+    }
 
     // Initialize regime to sane defaults so the first compute_quotes() call
     // before any update_price() produces reasonable spreads (not zero).
@@ -75,21 +95,30 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
                                               double q,
                                               BlockHeight block_height)
 {
+    // NaN/Inf guard at the public API boundary.  If any input is non-finite,
+    // return a zero-spread quote that the engine will skip (spread_bps = 0).
+    // This prevents NaN from propagating through all downstream arithmetic.
+    // ISO/IEC 5055: CWE-754 -- check for exceptional conditions.
+    if (!std::isfinite(mid) || !std::isfinite(sigma) || !std::isfinite(q)) {
+        spdlog::warn("[AvellanedaStoikov] compute_quotes: non-finite input "
+                     "(mid={}, sigma={}, q={}) -- returning zero quote",
+                     mid, sigma, q);
+        return QuoteResult{0.0, 0.0, 0.0, 0.0, 0.0};
+    }
+
     // MEDIUM-1: Exclusive lock -- compute_quotes reads cost_basis_,
     // min_margin_bps_, regime_, and cfg_ (mutable strategy state).
     // ISO/IEC 27001:2022: protect shared mutable state.
     std::unique_lock lock(mtx_);
 
     // -------------------------------------------------------------------
-    // Step 1: Compute remaining time in the rolling horizon (seconds).
+    // Step 1: Compute remaining time via exponential decay (seconds).
     //
-    //   tau = (N - n) * block_time
+    // T5-CR3: tau decays exponentially from tau_max after each fill:
+    //   tau = tau_max * exp(-lambda * blocks_since_last_fill)
     //
-    // where N = horizon_blocks and n = block_height mod N.
-    // When n = 0 (start of window), tau = N * block_time (maximum).
-    // When n = N-1 (end of window), tau = 1 * block_time (minimum).
-    // The modular rollover prevents tau from ever reaching zero, which
-    // would collapse the spread and cause division issues.
+    // This replaces the deterministic sawtooth that adversaries could
+    // exploit.  See compute_tau() for the full derivation.
     // -------------------------------------------------------------------
     const double tau = compute_tau(block_height);
 
@@ -293,6 +322,28 @@ void AvellanedaStoikov::set_cost_basis(double cost_basis,
 }
 
 // ===========================================================================
+// Fill tracking (T5-CR3)
+// ===========================================================================
+
+void AvellanedaStoikov::record_fill()
+{
+    // T5-CR3: record a fill event by snapshotting the latest observed block
+    // height.  compute_tau() uses (block_height - last_fill_block_) to
+    // compute the exponential-decay tau, so resetting last_fill_block_
+    // effectively resets tau to tau_max.
+    //
+    // MEDIUM-1: Exclusive lock -- mutates last_fill_block_.
+    // ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
+    // Use the block height of the most recent price observation as the
+    // fill block.  If no prices have been observed yet, leave at zero.
+    if (!price_buffer_.empty()) {
+        last_fill_block_ = price_buffer_.back().block;
+    }
+}
+
+// ===========================================================================
 // A-S specific computations
 // ===========================================================================
 
@@ -338,29 +389,63 @@ double AvellanedaStoikov::optimal_half_spread(double sigma, double tau) const
 
 double AvellanedaStoikov::compute_tau(BlockHeight block_height) const
 {
-    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
-    // construction.  Called internally from compute_quotes() which already
-    // holds the exclusive lock; acquiring here would deadlock.
+    // MEDIUM-1: No lock needed -- reads only cfg_ (immutable after
+    // construction) and last_fill_block_ (read under the exclusive lock
+    // already held by the caller, compute_quotes()).
+    // ISO/IEC 27001:2022: no additional lock required; caller holds mtx_.
 
-    // tau = (N - n) * block_time
+    // -----------------------------------------------------------------------
+    // T5-CR3: Exponential-decay tau (replaces exploitable sawtooth).
     //
-    // where n = block_height mod N (position within the rolling window).
+    //   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    //   lambda = -ln(tau_min / tau_max) / horizon_blocks
     //
-    // This gives a sawtooth pattern: tau starts at N*block_time, linearly
-    // decreases to 1*block_time, then resets.  The minimum is 1 block
-    // (never zero), preventing degenerate spread collapse.
+    // where tau_max = horizon_blocks * block_time_seconds (the maximum tau
+    // at the instant of a fill), and tau_min is a configurable floor
+    // (default 0.01) that prevents tau from reaching zero.
     //
-    // COUNTER-RESEARCH NOTE (CR-3, Cartea, Jaimungal & Penalva 2015 §10.3):
-    //   The sawtooth tau creates a deterministic, exploitable cycle in 24/7
-    //   markets.  Sophisticated adversaries aware of the modular periodicity
-    //   can time orders to exploit the post-reset complacency window when
-    //   inventory shedding is weakest.  The GLFT infinite-horizon formulation
-    //   avoids this.  Alternative: replace sawtooth with exponential decay
-    //   per Stoikov (2018) "The micro-price".
-    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §2.2.
-    const uint32_t n = block_height % cfg_.horizon_blocks;
-    const uint32_t remaining = cfg_.horizon_blocks - n;
-    return static_cast<double>(remaining) * cfg_.block_time_seconds;
+    // After each fill, tau resets to tau_max and decays smoothly toward
+    // tau_min over the next horizon_blocks blocks.  This eliminates the
+    // deterministic sawtooth cycle that adversaries could predict and
+    // exploit in 24/7 markets (CHIA ~52s blocks, no session boundaries).
+    //
+    // COUNTER-RESEARCH NOTE (CR-3, Cartea, Jaimungal & Penalva 2015 S10.3):
+    //   FIXED.  The previous sawtooth tau created a deterministic, exploitable
+    //   cycle.  Adversaries aware of the modular periodicity could time orders
+    //   to the post-reset complacency window when inventory shedding was
+    //   weakest.  Exponential decay keyed to fills removes the fixed period.
+    //   Reference: Stoikov (2018) "The micro-price".
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, S2.2.
+    // -----------------------------------------------------------------------
+
+    // Maximum tau: full horizon in seconds.
+    const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                         * cfg_.block_time_seconds;
+
+    // Decay rate: lambda = -ln(tau_min / tau_max) / horizon_blocks.
+    // At blocks_since_last_fill == horizon_blocks, tau decays to tau_min.
+    // ISO/IEC 5055: tau_min > 0 validated in constructor; log is safe.
+    const double lambda = -std::log(cfg_.tau_min / tau_max)
+                        / static_cast<double>(cfg_.horizon_blocks);
+
+    // Blocks elapsed since the most recent fill.
+    // If block_height < last_fill_block_ (should not happen under normal
+    // operation), clamp to zero defensively.
+    // ISO/IEC 5055: underflow guard on unsigned subtraction.
+    const uint32_t blocks_since_fill =
+        (block_height >= last_fill_block_)
+            ? (block_height - last_fill_block_)
+            : 0u;
+
+    // Exponential decay: tau = tau_max * exp(-lambda * blocks_since_fill).
+    const double tau = tau_max * std::exp(-lambda
+                     * static_cast<double>(blocks_since_fill));
+
+    // Floor at tau_min to prevent degenerate zero-spread conditions.
+    // ISO/IEC 5055: defensive clamp; mathematically tau >= tau_min already
+    // holds for blocks_since_fill <= horizon_blocks, but floating-point
+    // drift could violate this for very large elapsed counts.
+    return std::max(tau, cfg_.tau_min);
 }
 
 /* static */
