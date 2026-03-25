@@ -1,8 +1,8 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (verified against codebase — 3-round review cycle complete)
-**Source:** Consolidated from all code reviews and logic reviews in `docs/CODE REVIEWS/`
+**Last Updated:** 2026-03-25 (counter-research integration complete)
+**Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
 
@@ -599,9 +599,10 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Status:** `[ ]`
 
 ### T4-19: Replace A-S sawtooth tau with constant risk-decay horizon or GLFT asymptotic
-- **Source:** LOGICREVIEW-Gemini §2, LOGICREVIEW-Claude-Opus-4.6 §AS-1
-- **Issue:** Sawtooth creates periodic vulnerability windows and exploitable quoting cycles.
-- **Fix:** Use constant horizon equal to desired inventory half-life, or GLFT time-independent asymptotic equations.
+- **Source:** LOGICREVIEW-Gemini §2, LOGICREVIEW-Claude-Opus-4.6 §AS-1, COUNTERRESEARCH §2.2 (CR-3)
+- **Issue:** Sawtooth creates periodic vulnerability windows and exploitable quoting cycles. Counter-research (Cartea et al. 2015 §10.3) corroborates with explicit academic opposition.
+- **Fix:** Use constant horizon equal to desired inventory half-life, or GLFT time-independent asymptotic equations. Alternative: exponential decay per Stoikov (2018) "The micro-price".
+- **Cross-ref:** T5-CR3 (counter-research corroboration)
 - **Status:** `[ ]`
 
 ### T4-20: Add cross-strategy disagreement detection for inventory direction
@@ -647,6 +648,119 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ---
 
+## Tier 5 — Counter-Research: Academic Challenges to Cited Literature
+
+Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEARCH-20260325-1-GitHubCopilot-Claude-Sonnet-4.6.md). These address known academic disputes, empirical rebuttals, or limitations of the theories XOPTrader relies on. Inline `COUNTER-RESEARCH NOTE` comments have been placed at each affected code site.
+
+### T5-CR1: Validate VPIN against realized adverse fills before relying on multiplier
+- **Source:** COUNTERRESEARCH §7 (CR-1, HIGH); Andersen & Bondarenko (2014)
+- **Files:** `cpp/src/engine.cpp` (Step 5 VPIN multiplier), `cpp/src/execution/market_data.cpp`
+- **Issue:** VPIN has no incremental predictive power beyond raw volume and volatility. Can fire on pure noise-trader correlation. The 50% spread widening at max toxicity may amplify noise rather than protect.
+- **Fix:** Track VPIN-activation → realized-adverse-fill correlation over rolling 500-fill window. If correlation < threshold (e.g., 0.15), attenuate or disable VPIN multiplier. Consider ensemble with volatility as a cross-check.
+- **Status:** `[ ]`
+
+### T5-CR2: Extend OFI to multi-level (top 5–10 book levels)
+- **Source:** COUNTERRESEARCH §8 (CR-2, HIGH); Xu, Lehalle & Alfonsi (2023)
+- **Files:** `cpp/src/execution/market_data.cpp` (`ingest_book_snapshot_for_ofi`)
+- **Issue:** Current OFI uses best-level bid/ask only. Multi-level OFI explains 10–30% more return variance. CHIA's shallow book (2–5 levels) makes multi-level computation feasible.
+- **Fix:** Extend `ingest_book_snapshot_for_ofi()` to accept vector of `(price, size)` per side. Weight each level's contribution by inverse distance from mid.
+- **Status:** `[ ]`
+
+### T5-CR3: Replace A-S sawtooth tau with exponential decay or GLFT asymptotic
+- **Source:** COUNTERRESEARCH §2.2 (CR-3, HIGH); Cartea, Jaimungal & Penalva (2015) §10.3
+- **Files:** `cpp/src/strategy/avellaneda.cpp` (`compute_tau`)
+- **Issue:** Sawtooth tau creates a deterministic, exploitable complacency window post-reset in 24/7 markets. Adversaries can time orders to exploit the post-reset phase.
+- **Fix:** Replace `block_height % horizon_blocks` modular arithmetic with exponential decay `τ(t) = τ₀ · exp(−λt)` per Stoikov (2018), or use GLFT's time-independent asymptotic equations.
+- **Cross-ref:** T4-19 (same fix from logic review perspective)
+- **Status:** `[ ]`
+
+### T5-CR4: Add PIN/VPIN cross-validation against known-informed-trading episodes
+- **Source:** COUNTERRESEARCH §6 (CR-4, MEDIUM); Duarte & Young (2009); Collin-Dufresne & Fos (2015)
+- **Files:** `cpp/src/data/adverse_selection.cpp`
+- **Issue:** PIN may measure illiquidity friction rather than genuine informed trading. Collin-Dufresne & Fos (2015) find PIN is lowest when known informed traders (Schedule 13D filers) are most active.
+- **Fix:** During backtesting, inject known adverse-selection episodes (e.g., post-hack dumps) and verify that PIN/VPIN elevate at those times. If correlation is weak, reduce PIN weight in spread decisions.
+- **Status:** `[ ]`
+
+### T5-CR5: Add statistical significance gating to VR regime classification
+- **Source:** COUNTERRESEARCH §4 (CR-5, MEDIUM); Lo & MacKinlay (1989); Richardson & Smith (1991)
+- **Files:** `cpp/src/strategy/regime.cpp`
+- **Issue:** VR test has ~5–9% power at n=50–200 (XOPTrader's window sizes). Regime classification relies on raw VR thresholds (0.85/1.15), not statistically significant signals.
+- **Fix:** Compute Z-statistic for VR and only classify regime as non-random-walk when |Z| > 1.96 (95% confidence). When insignificant, default to random-walk regime rather than allowing noisy classifications.
+- **Status:** `[ ]`
+
+### T5-CR6: Construct coarser-grained candles for Yang-Zhang volatility
+- **Source:** COUNTERRESEARCH §5 (CR-6, MEDIUM); Molnár (2012)
+- **Files:** `cpp/src/data/volatility.cpp`
+- **Issue:** >90% of CHIA blocks have zero fills → degenerate candles (O=H=L=C). Yang-Zhang degenerates to close-to-close estimator, losing its minimum-variance advantage.
+- **Fix:** Aggregate blocks into 10-block windows (~8.7 min) to ensure most candles have at least one fill and meaningful OHLC variation. Consider Garman-Klass (1980) as competitive alternative for continuous 24/7 markets.
+- **Status:** `[ ]`
+
+### T5-CR7: Implement discounted Thompson Sampling for spread optimizer
+- **Source:** COUNTERRESEARCH §10 (CR-7, MEDIUM); Besbes, Gur & Zeevi (2014)
+- **Files:** `cpp/src/strategy/spread.cpp` (`ThompsonSampler::record_outcome`)
+- **Issue:** Standard Beta posterior is too slow to forget outdated spread-width feedback across regime changes. Regret guarantees fail under non-stationarity.
+- **Fix:** Replace `alpha += 1, beta += 1` with `alpha = alpha * γ + success, beta = beta * γ + failure` where γ ∈ [0.95, 0.99]. This discounted posterior forgets stale evidence geometrically.
+- **Status:** `[ ]`
+
+### T5-CR8: Amplify GLFT inventory skew coefficient for sparse discrete fills
+- **Source:** COUNTERRESEARCH §3.1 (CR-8, MEDIUM); Fodra & Pham (2015); Laruelle, Lehalle & Pagès (2011)
+- **Files:** `cpp/src/strategy/glft.cpp` (`fill_intensity`)
+- **Issue:** GLFT's continuous-time exponential fill intensity was calibrated for dense electronic markets. On CHIA (~1 fill/hour/pair), optimal inventory skew should be larger than GLFT produces — trader should shed inventory more aggressively per fill.
+- **Fix:** Apply sparse-fill correction factor: multiply inventory skew coefficient by `max(1.0, expected_fills_per_hour_dense / actual_fills_per_hour)`. Calibrate from fill-rate database.
+- **Status:** `[ ]`
+
+### T5-CR9: Enforce minimum fill count for Brock-Hommes weight updates
+- **Source:** COUNTERRESEARCH §9.2 (CR-9, MEDIUM); Brock, Hommes & Wagener (2006)
+- **Files:** `cpp/src/strategy/strategy_portfolio.cpp`
+- **Issue:** 2–3 fills per evaluation window vs. BHW's own requirement of 30+ observations. Single fortunate fill can cause 10%+ reallocation.
+- **Fix:** Already mitigated by T3-26 (fill-count dampened beta). Recommend calibrating `min_fills_for_full_weight ≥ 10` and documenting the BHW threshold requirement.
+- **Cross-ref:** T3-26 (implemented mitigation)
+- **Status:** `[x]` — Mitigated by T3-26 fill-count dampening. Inline comment added with BHW citation.
+
+### T5-CR10: Replace Kyle lambda linear impact with square-root model
+- **Source:** COUNTERRESEARCH §12 (CR-10, LOW); Gatheral (2010); Almgren et al. (2005)
+- **Files:** Documentation / `cpp/src/strategy/spread.cpp` (if Kyle lambda is used in spread formulae)
+- **Issue:** Kyle's λ linear impact is inconsistent with no-dynamic-arbitrage conditions and empirically rejected in favour of square-root impact (√volume).
+- **Fix:** If linear impact is used in any spread or cost computation, replace with `impact = η · sign(Q) · |Q|^0.5` per Almgren empirical estimates.
+- **Status:** `[ ]`
+
+### T5-CR11: Add TibetSwap protocol-evolution risk monitoring
+- **Source:** COUNTERRESEARCH §13 (CR-11, LOW); Milionis et al. (2022); Adams et al. (2023)
+- **Files:** `cpp/src/strategy/arbitrage.cpp`
+- **Issue:** TibetSwap arbitrage revenue is structurally dependent on AMM design. Future LVR-reduction features (dynamic fees, oracle-based pricing) could eliminate this revenue stream.
+- **Fix:** Track TibetSwap protocol version and fee parameters. Alert when fee structure changes suggest reduced arbitrage opportunity. Build revenue dependency diversification into strategy portfolio.
+- **Status:** `[ ]`
+
+### T5-CR12: Calibrate AMH crowding-recovery windows to CHIA timescales
+- **Source:** COUNTERRESEARCH §11 (CR-12, LOW); Urquhart & Hudson (2013)
+- **Files:** `cpp/src/strategy/strategy_portfolio.cpp`
+- **Issue:** AMH (Lo 2004) framework is not falsifiable without operationalization. Crowding-recovery window lengths should be calibrated to CHIA market timescales, not equity-market intuitions.
+- **Fix:** Estimate crowding half-life from historical fill-rate data. Use CHIA-specific block cadence (~52s) as the natural time unit rather than calendar days.
+- **Status:** `[ ]`
+
+### T5-CR13: Implement Stoll three-component spread decomposition
+- **Source:** COUNTERRESEARCH §16 (CR-13, MEDIUM); Stoll (1989)
+- **Files:** `cpp/src/data/adverse_selection.cpp`, `cpp/src/engine.cpp`
+- **Issue:** Glosten-Milgrom spread model attributes entire spread to adverse selection, but on thin DEX markets, order-processing costs (blockchain fees, offer TTL) and inventory costs (capital lockup) are likely dominant components.
+- **Fix:** Decompose spread into: (1) adverse selection (PIN-based), (2) inventory risk (A-S/GLFT skew), (3) order-processing (blockchain fee + TTL opportunity cost). Weight spread decisions by the dominant component rather than assuming all-adverse-selection.
+- **Status:** `[ ]`
+
+### T5-CR14: Evaluate multifractal volatility model as HMM alternative
+- **Source:** COUNTERRESEARCH §18 (CR-14, MEDIUM); Boldin (1996); Calvet & Fisher (2004)
+- **Files:** `cpp/src/strategy/regime.cpp`
+- **Issue:** HMM regime detection suffers from likelihood multimodality and regime identification fragility with short crypto histories. Multifractal models (Calvet-Fisher MSM) capture multi-scale volatility dynamics more faithfully.
+- **Fix:** Prototype Markov-Switching Multifractal (MSM) estimator alongside existing HMM. Compare regime stability over 1000+ blocks. If MSM produces fewer spurious regime switches, adopt as primary.
+- **Status:** `[ ]`
+
+### T5-CR15: Model time-varying liquidity risk (Acharya-Pedersen dynamics)
+- **Source:** COUNTERRESEARCH §17 (CR-15, LOW); Acharya & Pedersen (2005)
+- **Files:** Documentation / spread computation
+- **Issue:** Static Amihud-Mendelson spread-return framework ignores liquidity *risk* dynamics. Time-varying spread is more relevant for CHIA's intermittent liquidity.
+- **Fix:** Track rolling spread volatility (σ_spread over past N blocks). When spread-of-spread is high, increase safety margin on tier sizing to account for liquidity uncertainty.
+- **Status:** `[ ]`
+
+---
+
 ## Already Fixed (Reference Only)
 
 The following were resolved by Claude Code's 3-pass review cycle (commits `d18d396`, `b76ec65`, `18e67f8`):
@@ -670,7 +784,7 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-25 (full codebase audit, 3-round review cycle with clean final pass)
+**Last verification:** 2026-03-25 (counter-research integration complete)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
@@ -678,5 +792,6 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
 | **Tier 3 (Medium)** | 35 | 29 | 3 | 3 | Quality, robustness, correctness |
 | **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
-| **Total** | **96** | **61** | **7** | **28** | |
+| **Tier 5 (Counter-Research)** | 15 | 1 | 0 | 14 | Academic challenges to cited literature |
+| **Total** | **111** | **62** | **7** | **42** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
