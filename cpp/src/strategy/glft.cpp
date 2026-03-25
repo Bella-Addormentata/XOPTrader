@@ -9,6 +9,8 @@
 
 #include <xop/strategy/glft.hpp>
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cmath>
 #include <shared_mutex>
@@ -49,6 +51,39 @@ GlftStrategy::GlftStrategy(const GlftConfig& cfg)
     if (!(cfg_.block_time_seconds > 0.0)) {
         throw std::invalid_argument("GlftConfig: block_time_seconds must be positive");
     }
+    // T5-CR3: tau_min must be strictly positive to prevent log(0) in lambda
+    // computation and to guarantee tau never collapses to zero.
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.tau_min > 0.0)) {
+        throw std::invalid_argument("GlftConfig: tau_min must be strictly positive");
+    }
+    // T5-CR3: tau_min must be less than tau_max (= horizon_blocks * block_time)
+    // to ensure lambda > 0 (tau decays rather than grows after each fill).
+    // If tau_min >= tau_max, log(tau_min/tau_max) >= 0, lambda <= 0.
+    // ISO/IEC 5055: fail-fast on misconfiguration.
+    {
+        const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                             * cfg_.block_time_seconds;
+        if (!(cfg_.tau_min < tau_max)) {
+            throw std::invalid_argument(
+                "GlftConfig: tau_min must be < horizon_blocks * block_time_seconds");
+        }
+    }
+
+    // T5-CR8: validate sparse-fill correction parameters.
+    // ISO/IEC 5055: fail-fast on invalid configuration.
+    if (!(cfg_.expected_dense_fills_per_hour > 0.0)) {
+        throw std::invalid_argument(
+            "GlftConfig: expected_dense_fills_per_hour must be strictly positive");
+    }
+    if (!(cfg_.actual_fills_per_hour > 0.0)) {
+        throw std::invalid_argument(
+            "GlftConfig: actual_fills_per_hour must be strictly positive");
+    }
+    if (!(cfg_.sparse_correction_cap >= 1.0)) {
+        throw std::invalid_argument(
+            "GlftConfig: sparse_correction_cap must be >= 1.0");
+    }
 
     // Initialize regime to sane defaults so the first compute_quotes() call
     // before any update_price() produces reasonable spreads (not zero).
@@ -81,20 +116,32 @@ QuoteResult GlftStrategy::compute_quotes(double mid,
                                          double q,
                                          BlockHeight block_height)
 {
+    // NaN/Inf guard at the public API boundary.  If any input is non-finite,
+    // return a zero-spread quote that the engine will skip (spread_bps = 0).
+    // This prevents NaN from propagating through all downstream arithmetic.
+    // ISO/IEC 5055: CWE-754 -- check for exceptional conditions.
+    if (!std::isfinite(mid) || !std::isfinite(sigma) || !std::isfinite(q)) {
+        spdlog::warn("[GlftStrategy] compute_quotes: non-finite input "
+                     "(mid={}, sigma={}, q={}) -- returning zero quote",
+                     mid, sigma, q);
+        return QuoteResult{0.0, 0.0, 0.0, 0.0, 0.0};
+    }
+
     // MEDIUM-1: Exclusive lock -- compute_quotes reads cost_basis_,
     // min_margin_bps_, regime_, and cfg_ (mutable strategy state).
     // ISO/IEC 27001:2022: protect shared mutable state.
     std::unique_lock lock(mtx_);
 
     // -------------------------------------------------------------------
-    // Step 1: Compute tau for the risk term.
+    // Step 1: Compute tau via exponential decay for the risk term.
     //
-    // Even though GLFT removes the terminal penalty, the base half-spread
-    // formula still uses tau to quantify the per-block inventory risk:
-    //   half_spread = (1/kappa)*ln(1 + kappa/gamma) + 0.5*gamma*sigma^2*tau
+    // T5-CR3: tau decays exponentially from tau_max after each fill:
+    //   tau = tau_max * exp(-lambda * blocks_since_last_fill)
     //
-    // We use the same rolling-horizon tau as A-S so the risk premium term
-    // adapts to how far we are into the current evaluation window.
+    // Even though GLFT removes the terminal penalty, tau is still
+    // needed in the half-spread formula to quantify the per-block
+    // inventory risk.  The exponential decay replaces the deterministic
+    // sawtooth that adversaries could exploit.  See compute_tau().
     // -------------------------------------------------------------------
     const double tau = compute_tau(block_height);
 
@@ -290,6 +337,28 @@ void GlftStrategy::set_cost_basis(double cost_basis,
 }
 
 // ===========================================================================
+// Fill tracking (T5-CR3)
+// ===========================================================================
+
+void GlftStrategy::record_fill()
+{
+    // T5-CR3: record a fill event by snapshotting the latest observed block
+    // height.  compute_tau() uses (block_height - last_fill_block_) to
+    // compute the exponential-decay tau, so resetting last_fill_block_
+    // effectively resets tau to tau_max.
+    //
+    // MEDIUM-1: Exclusive lock -- mutates last_fill_block_.
+    // ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
+    // Use the block height of the most recent price observation as the
+    // fill block.  If no prices have been observed yet, leave at zero.
+    if (!price_buffer_.empty()) {
+        last_fill_block_ = price_buffer_.back().block;
+    }
+}
+
+// ===========================================================================
 // GLFT specific computations
 // ===========================================================================
 
@@ -320,40 +389,117 @@ double GlftStrategy::inventory_skew(double q) const
     // construction.  Called internally from compute_quotes() which already
     // holds the exclusive lock; acquiring here would deadlock.
 
-    // skew = phi * q / q_max
+    // -----------------------------------------------------------------
+    // T5-CR8: Sparse-fill correction (Fodra & Pham 2015; Laruelle et al. 2011).
+    //
+    // In dense electronic markets (e.g., equity CLOB at ~100 fills/hour),
+    // GLFT's continuous-time fill intensity accurately captures the rate
+    // at which the market maker can rebalance inventory.  On sparse
+    // discrete venues such as CHIA (~1 fill/hour/pair), each fill is far
+    // more valuable for inventory management.  The optimal strategy is to
+    // skew quotes more aggressively per fill to compensate for the lower
+    // rebalancing frequency.
+    //
+    // Correction factor:
+    //   sparse_correction = clamp(dense_rate / actual_rate, 1.0, cap)
+    //
+    // The effective skew coefficient becomes:
+    //   effective_phi = phi * sparse_correction
+    //
+    // Example (default config):
+    //   dense_rate = 100, actual_rate = 1  =>  correction = min(100, 10) = 10
+    //   effective_phi = 0.5 * 10 = 5.0
+    //
+    // ISO/IEC 5055: division-by-zero is precluded by construction
+    //               (actual_fills_per_hour validated > 0 in constructor).
+    // ISO/IEC 25000: derivation and rationale documented inline.
+    // -----------------------------------------------------------------
+
+    // Compute the sparse-fill amplification factor, capped to prevent
+    // extreme skew in pathological configurations.
+    const double raw_correction = cfg_.expected_dense_fills_per_hour
+                                / cfg_.actual_fills_per_hour;
+    const double sparse_correction = std::min(
+        std::max(1.0, raw_correction),
+        cfg_.sparse_correction_cap);
+
+    // Apply the amplified skew coefficient.
+    const double effective_phi = cfg_.phi * sparse_correction;
+
+    // skew = effective_phi * q / q_max
     //
     // This is a linear function of inventory:
     //   - Centered at zero when flat.
     //   - Magnitude grows proportionally to |q|.
     //   - Sign matches the sign of q.
-    //   - At q = q_max, skew = phi (maximum skew).
+    //   - At q = q_max, skew = effective_phi (maximum skew).
     //
-    // phi controls the aggressiveness of inventory rebalancing:
+    // phi controls the base aggressiveness of inventory rebalancing:
     //   phi = 0   => no skew, pure symmetric quotes (ignores inventory).
     //   phi = 0.5 => moderate skew (default).
     //   phi = 2.0 => very aggressive skew (fast inventory turnover).
     //
+    // sparse_correction amplifies phi to account for rare fill events:
+    //   sparse_correction = 1.0  => dense market, no amplification.
+    //   sparse_correction = 10.0 => CHIA-like venue, 10x skew per fill.
+    //
     // The units of skew are the same as the price units (quote asset per
     // base asset) because it enters the quote formulas as a price offset.
-    return cfg_.phi * q / cfg_.q_max;
+    return effective_phi * q / cfg_.q_max;
 }
 
 double GlftStrategy::compute_tau(BlockHeight block_height) const
 {
-    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
-    // construction.  Called internally from compute_quotes() which already
-    // holds the exclusive lock; acquiring here would deadlock.
+    // MEDIUM-1: No lock needed -- reads only cfg_ (immutable after
+    // construction) and last_fill_block_ (read under the exclusive lock
+    // already held by the caller, compute_quotes()).
+    // ISO/IEC 27001:2022: no additional lock required; caller holds mtx_.
 
-    // Same rolling-horizon tau as A-S.
-    //   tau = (N - n) * block_time
-    //   n = block_height mod N
+    // -----------------------------------------------------------------------
+    // T5-CR3: Exponential-decay tau (replaces exploitable sawtooth).
+    //
+    //   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    //   lambda = -ln(tau_min / tau_max) / horizon_blocks
+    //
+    // where tau_max = horizon_blocks * block_time_seconds (the maximum tau
+    // at the instant of a fill), and tau_min is a configurable floor
+    // (default 0.01) that prevents tau from reaching zero.
     //
     // Even though GLFT does not have a terminal penalty, tau is still
-    // needed in the half-spread formula to quantify the per-block risk.
-    // The rolling horizon prevents tau from collapsing to zero.
-    const uint32_t n = block_height % cfg_.horizon_blocks;
-    const uint32_t remaining = cfg_.horizon_blocks - n;
-    return static_cast<double>(remaining) * cfg_.block_time_seconds;
+    // needed in the half-spread formula to quantify per-block inventory
+    // risk.  The exponential decay keyed to fills replaces the
+    // deterministic sawtooth cycle that adversaries could exploit.
+    //
+    // Reference: Stoikov (2018) "The micro-price";
+    //            Cartea, Jaimungal & Penalva (2015) S10.3.
+    // -----------------------------------------------------------------------
+
+    // Maximum tau: full horizon in seconds.
+    const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                         * cfg_.block_time_seconds;
+
+    // Decay rate: lambda = -ln(tau_min / tau_max) / horizon_blocks.
+    // At blocks_since_last_fill == horizon_blocks, tau decays to tau_min.
+    // ISO/IEC 5055: tau_min > 0 validated in constructor; log is safe.
+    const double lambda = -std::log(cfg_.tau_min / tau_max)
+                        / static_cast<double>(cfg_.horizon_blocks);
+
+    // Blocks elapsed since the most recent fill.
+    // ISO/IEC 5055: underflow guard on unsigned subtraction.
+    const uint32_t blocks_since_fill =
+        (block_height >= last_fill_block_)
+            ? (block_height - last_fill_block_)
+            : 0u;
+
+    // Exponential decay: tau = tau_max * exp(-lambda * blocks_since_fill).
+    const double tau = tau_max * std::exp(-lambda
+                     * static_cast<double>(blocks_since_fill));
+
+    // Floor at tau_min to prevent degenerate zero-spread conditions.
+    // ISO/IEC 5055: defensive clamp; mathematically tau >= tau_min already
+    // holds for blocks_since_fill <= horizon_blocks, but floating-point
+    // drift could violate this for very large elapsed counts.
+    return std::max(tau, cfg_.tau_min);
 }
 
 /* static */
@@ -387,12 +533,19 @@ double GlftStrategy::fill_intensity(double delta) const
     //   dense electronic markets.  On CHIA (~1 fill/hour/pair), the
     //   discrete sparse-block structure means the optimal inventory
     //   skew coefficient should be larger than what the GLFT formula
-    //   produces — the trader should shed inventory more aggressively
+    //   produces -- the trader should shed inventory more aggressively
     //   per fill because opportunities are rarer.
-    //   Also: Laruelle, Lehalle & Pagès (2011) show empirically that
+    //   Also: Laruelle, Lehalle & Pages (2011) show empirically that
     //   fill intensity has a two-regime structure (plateau near mid,
     //   sharp fall-off outside spread) rather than pure exponential.
-    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §3.1.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, S3.1.
+    //
+    //   FIX (T5-CR8): The sparse-fill miscalibration is now corrected
+    //   in inventory_skew() by amplifying phi with a sparse-fill
+    //   correction factor: effective_phi = phi * min(max(1, dense/actual), cap).
+    //   The fill_intensity() function itself is left unchanged because it
+    //   is the correct Poisson model; only the *downstream skew decision*
+    //   needed adjustment for the sparse regime.
     return cfg_.A * std::exp(-cfg_.kappa * delta);
 }
 

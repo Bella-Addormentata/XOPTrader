@@ -5,10 +5,17 @@
 //            a limit order book." Quantitative Finance, 8(3), 217-224.
 //
 // The classical A-S model assumes continuous time with a fixed terminal horizon
-// T.  On CHIA there is no natural session end, so we use a rolling N-block
-// horizon where tau = (N - n) * 52 seconds and n is the block index within the
-// current window.  The horizon resets every N blocks, preventing tau from
-// collapsing to zero.
+// T.  On CHIA there is no natural session end, so we use an exponential-decay
+// tau that resets on each fill:
+//
+//   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+//   lambda = -ln(tau_min / tau_max) / horizon_blocks
+//
+// T5-CR3: the previous sawtooth tau (block_height % N / N) was exploitable
+// because adversaries could predict the deterministic cycle and time orders
+// to the post-reset complacency window.  Exponential decay keyed to fills
+// eliminates the fixed period.  Reference: Stoikov (2018) "The micro-price";
+// Cartea, Jaimungal & Penalva (2015) S10.3.
 //
 // Key formulas (see compute_quotes for full derivation comments):
 //
@@ -87,6 +94,14 @@ struct AvellanedaConfig {
     double regime_mo_spread_mult{1.50};   // Spread multiplier in momentum.
     double regime_mo_skew_mult{2.00};     // Skew multiplier in momentum.
 
+    // -- Exponential decay tau (T5-CR3) --------------------------------------
+
+    double tau_min{0.01};  // Floor for exponential-decay tau (seconds).
+                           //   Must be > 0 and < tau_max.  Prevents tau from
+                           //   collapsing to zero, which would degenerate
+                           //   spreads and remove inventory-risk compensation.
+                           //   ISO/IEC 5055: validated in constructor.
+
     // -- No-loss constraint (optional) --------------------------------------
 
     bool   enable_no_loss_constraint{false};  // When true, ask is floored at
@@ -131,8 +146,18 @@ public:
     /// Compute the optimal half-spread for current parameters.
     double optimal_half_spread(double sigma, double tau) const;
 
-    /// Compute tau (remaining time in seconds) given the current block height.
+    /// Compute tau using exponential decay based on blocks since last fill.
+    /// T5-CR3: replaces the exploitable sawtooth cycle.
+    ///   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    ///   lambda = -ln(tau_min / tau_max) / horizon_blocks
+    /// Reference: Stoikov (2018); Cartea et al. (2015) S10.3 counter-research.
     double compute_tau(BlockHeight block_height) const;
+
+    /// Record a fill event.  Resets blocks_since_last_fill_ to zero so that
+    /// tau resets to tau_max after each fill, decaying smoothly from there.
+    /// T5-CR3: fill-driven reset eliminates the deterministic sawtooth period.
+    /// ISO/IEC 27001:2022: caller must hold no lock; exclusive lock acquired.
+    void record_fill() override;
 
     /// Compute per-block volatility from annualised volatility.
     ///
@@ -229,6 +254,12 @@ private:
 
     // Last observed mid-price for computing log returns fed to the detector.
     double last_mid_{0.0};
+
+    // T5-CR3: block height of the most recent fill.  Used to compute
+    // blocks_since_last_fill for the exponential-decay tau.  Initialised
+    // to zero; before the first fill, every block increments the decay.
+    // ISO/IEC 27001:2022: mutated by record_fill() under exclusive lock.
+    BlockHeight last_fill_block_{0};
 
     // No-loss constraint state.
     double cost_basis_{0.0};        // weighted-average acquisition price

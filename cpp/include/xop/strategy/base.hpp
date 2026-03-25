@@ -134,6 +134,15 @@ public:
     // shared_lock is undefined behaviour (ISO/IEC 5055 -- CWE-362).
     virtual std::string name() const = 0;
 
+    // -- Fill tracking -------------------------------------------------------
+
+    /// Notify the strategy that a fill has occurred.  Strategies that use
+    /// fill-driven tau decay (T5-CR3) reset their internal timer here.
+    /// Default implementation is a no-op for strategies that do not use
+    /// fill-driven time horizons.
+    /// ISO/IEC 27001:2022: caller must hold no lock; impl acquires its own.
+    virtual void record_fill() {}
+
     // -- No-loss constraint -------------------------------------------------
 
     /// Optionally set the cost basis so the strategy can enforce the

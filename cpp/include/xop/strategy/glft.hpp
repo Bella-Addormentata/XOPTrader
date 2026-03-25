@@ -109,6 +109,45 @@ struct GlftConfig {
     double regime_mo_spread_mult{1.50};
     double regime_mo_skew_mult{2.00};
 
+    // -- Exponential decay tau (T5-CR3) --------------------------------------
+
+    double tau_min{0.01};  // Floor for exponential-decay tau (seconds).
+                           //   Must be > 0 and < tau_max.  Same semantics as
+                           //   AvellanedaConfig.  Prevents tau from collapsing
+                           //   to zero.  ISO/IEC 5055: validated in ctor.
+
+    // -- Sparse-fill correction (T5-CR8) -------------------------------------
+    //
+    // Fodra & Pham (2015) show that GLFT's continuous-time fill intensity
+    // overestimates effective fill rates on sparse discrete markets.
+    // Laruelle, Lehalle & Pages (2011) confirm empirically that the optimal
+    // inventory skew coefficient must be amplified when fills are rare.
+    //
+    // The correction multiplies the skew coefficient phi by:
+    //   sparse_correction = clamp(dense_rate / actual_rate, 1.0, max_cap)
+    //
+    // On CHIA (~1 fill/hour/pair), with dense_rate = 100, this yields a
+    // correction factor of ~100, capped at sparse_correction_cap.
+    //
+    // ISO/IEC 27001:2022: validated at construction; no secrets handled.
+    // ISO/IEC 5055:       guarded against division-by-zero (actual > 0).
+    // ISO/IEC 25000:      inline documentation of correction derivation.
+
+    double expected_dense_fills_per_hour{100.0};  // Typical CLOB fill rate
+                                                  //   (fills/hour) against
+                                                  //   which the continuous-
+                                                  //   time model is calibrated.
+
+    double actual_fills_per_hour{1.0};            // Observed or configured
+                                                  //   fill rate on the target
+                                                  //   venue (e.g., CHIA).
+                                                  //   May be updated at runtime
+                                                  //   from a fill-rate database.
+
+    double sparse_correction_cap{10.0};           // Maximum allowed sparse-fill
+                                                  //   correction factor to
+                                                  //   prevent extreme skew.
+
     // -- No-loss constraint (optional) --------------------------------------
 
     bool   enable_no_loss_constraint{false};
@@ -154,8 +193,18 @@ public:
     /// Returns a signed value: positive when long, negative when short.
     double inventory_skew(double q) const;
 
-    /// Compute tau (remaining time in the current rolling window).
+    /// Compute tau using exponential decay based on blocks since last fill.
+    /// T5-CR3: replaces the exploitable sawtooth cycle.
+    ///   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    ///   lambda = -ln(tau_min / tau_max) / horizon_blocks
+    /// Reference: Stoikov (2018); Cartea et al. (2015) S10.3 counter-research.
     double compute_tau(BlockHeight block_height) const;
+
+    /// Record a fill event.  Resets blocks_since_last_fill_ to zero so that
+    /// tau resets to tau_max after each fill, decaying smoothly from there.
+    /// T5-CR3: fill-driven reset eliminates the deterministic sawtooth period.
+    /// ISO/IEC 27001:2022: caller must hold no lock; exclusive lock acquired.
+    void record_fill() override;
 
     /// Per-block volatility conversion.
     /// sigma_block = sigma_annual * sqrt(block_time / seconds_per_year)
@@ -229,6 +278,12 @@ private:
     std::unique_ptr<RegimeDetector> internal_detector_;
     RegimeDetector* shared_regime_detector_{nullptr};
     double last_mid_{0.0};
+
+    // T5-CR3: block height of the most recent fill.  Used to compute
+    // blocks_since_last_fill for the exponential-decay tau.  Initialised
+    // to zero; before the first fill, every block increments the decay.
+    // ISO/IEC 27001:2022: mutated by record_fill() under exclusive lock.
+    BlockHeight last_fill_block_{0};
 
     // No-loss constraint state.
     double cost_basis_{0.0};

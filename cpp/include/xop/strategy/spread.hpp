@@ -90,6 +90,17 @@ struct ThompsonSamplerConfig {
     /// Initialised to 1.0 if left empty.
     std::vector<double> prior_beta;
 
+    /// Discount factor (gamma) for discounted Thompson Sampling.
+    /// Each update decays the existing posterior by this factor before
+    /// adding the new observation, allowing the posterior to forget stale
+    /// evidence from prior regimes.
+    /// Valid range: (0.0, 1.0].  1.0 = no discounting (standard TS).
+    /// Recommended: [0.95, 0.99].  Default: 0.97.
+    /// Reference: Besbes, Gur & Zeevi (2014), "Stochastic Multi-Armed-
+    /// Bandit Problem with Non-Stationary Rewards".
+    /// ISO/IEC 27001:2022: configurable parameter, no secrets embedded.
+    double thompson_discount_gamma{0.97};
+
     /// Enable / disable Thompson Sampling.  When disabled,
     /// compute_spread() uses the deterministic model exclusively.
     bool enabled{false};
@@ -198,6 +209,12 @@ private:
     std::vector<double> alpha_;      // Beta posterior alpha per level.
     std::vector<double> beta_;       // Beta posterior beta per level.
     std::mt19937        rng_;        // Mersenne Twister PRNG.
+
+    /// Geometric discount factor applied to alpha/beta on every update.
+    /// Enables non-stationary adaptation per Besbes et al. (2014).
+    /// Invariant: discount_gamma_ in (0.0, 1.0].
+    /// ISO/IEC 27001:2022: no secret material; audit-safe numeric param.
+    double discount_gamma_{0.97};
 };
 
 // ---------------------------------------------------------------------------

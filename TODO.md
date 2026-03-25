@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (counter-research integration complete)
+**Last Updated:** 2026-03-25 (counter-research fixes CR-1/3/5/7/8 implemented)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -657,7 +657,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** `cpp/src/engine.cpp` (Step 5 VPIN multiplier), `cpp/src/execution/market_data.cpp`
 - **Issue:** VPIN has no incremental predictive power beyond raw volume and volatility. Can fire on pure noise-trader correlation. The 50% spread widening at max toxicity may amplify noise rather than protect.
 - **Fix:** Track VPIN-activation → realized-adverse-fill correlation over rolling 500-fill window. If correlation < threshold (e.g., 0.15), attenuate or disable VPIN multiplier. Consider ensemble with volatility as a cross-check.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Rolling-window VPIN validation gate: per-block dedup, kVpinActivationThreshold, precision tracking with rolling counters, burn-in gating, kMaxPendingActivations cap.
 
 ### T5-CR2: Extend OFI to multi-level (top 5–10 book levels)
 - **Source:** COUNTERRESEARCH §8 (CR-2, HIGH); Xu, Lehalle & Alfonsi (2023)
@@ -672,7 +672,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Issue:** Sawtooth tau creates a deterministic, exploitable complacency window post-reset in 24/7 markets. Adversaries can time orders to exploit the post-reset phase.
 - **Fix:** Replace `block_height % horizon_blocks` modular arithmetic with exponential decay `τ(t) = τ₀ · exp(−λt)` per Stoikov (2018), or use GLFT's time-independent asymptotic equations.
 - **Cross-ref:** T4-19 (same fix from logic review perspective)
-- **Status:** `[ ]`
+- **Status:** `[x]` — Exponential-decay tau in both A-S and GLFT. Fill-driven reset via record_fill() wired through StrategyBase. tau_min < tau_max constructor guard. Unit tests updated.
 
 ### T5-CR4: Add PIN/VPIN cross-validation against known-informed-trading episodes
 - **Source:** COUNTERRESEARCH §6 (CR-4, MEDIUM); Duarte & Young (2009); Collin-Dufresne & Fos (2015)
@@ -686,7 +686,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** `cpp/src/strategy/regime.cpp`
 - **Issue:** VR test has ~5–9% power at n=50–200 (XOPTrader's window sizes). Regime classification relies on raw VR thresholds (0.85/1.15), not statistically significant signals.
 - **Fix:** Compute Z-statistic for VR and only classify regime as non-random-walk when |Z| > 1.96 (95% confidence). When insignificant, default to random-walk regime rather than allowing noisy classifications.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Z-statistic significance gate in classify_vr(). Both horizons stored. Diagnostic logging with Z-stats. NaN guard at update() boundary.
 
 ### T5-CR6: Construct coarser-grained candles for Yang-Zhang volatility
 - **Source:** COUNTERRESEARCH §5 (CR-6, MEDIUM); Molnár (2012)
@@ -700,14 +700,14 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** `cpp/src/strategy/spread.cpp` (`ThompsonSampler::record_outcome`)
 - **Issue:** Standard Beta posterior is too slow to forget outdated spread-width feedback across regime changes. Regret guarantees fail under non-stationarity.
 - **Fix:** Replace `alpha += 1, beta += 1` with `alpha = alpha * γ + success, beta = beta * γ + failure` where γ ∈ [0.95, 0.99]. This discounted posterior forgets stale evidence geometrically.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Discounted Thompson Sampling with gamma=0.97 default, alpha/beta floor at 1.0, constructor validation.
 
 ### T5-CR8: Amplify GLFT inventory skew coefficient for sparse discrete fills
 - **Source:** COUNTERRESEARCH §3.1 (CR-8, MEDIUM); Fodra & Pham (2015); Laruelle, Lehalle & Pagès (2011)
 - **Files:** `cpp/src/strategy/glft.cpp` (`fill_intensity`)
 - **Issue:** GLFT's continuous-time exponential fill intensity was calibrated for dense electronic markets. On CHIA (~1 fill/hour/pair), optimal inventory skew should be larger than GLFT produces — trader should shed inventory more aggressively per fill.
 - **Fix:** Apply sparse-fill correction factor: multiply inventory skew coefficient by `max(1.0, expected_fills_per_hour_dense / actual_fills_per_hour)`. Calibrate from fill-rate database.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Sparse-fill correction in inventory_skew(): effective_phi = phi * min(max(1, dense/actual), cap). Config validated. Unit tests added.
 
 ### T5-CR9: Enforce minimum fill count for Brock-Hommes weight updates
 - **Source:** COUNTERRESEARCH §9.2 (CR-9, MEDIUM); Brock, Hommes & Wagener (2006)

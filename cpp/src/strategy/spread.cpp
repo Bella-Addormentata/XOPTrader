@@ -103,6 +103,19 @@ ThompsonSampler::ThompsonSampler(const ThompsonSamplerConfig& cfg)
                 + std::to_string(i));
         }
     }
+
+    // Validate and store discount factor for discounted Thompson Sampling.
+    // Valid range: (0.0, 1.0].  Values outside this range indicate a
+    // configuration error rather than a tuning choice.
+    // ISO/IEC 5055: reject invalid config early to prevent silent drift.
+    // ISO/IEC 27001:2022: deterministic validation, audit-friendly error.
+    if (cfg.thompson_discount_gamma <= 0.0
+        || cfg.thompson_discount_gamma > 1.0) {
+        throw std::invalid_argument(
+            "ThompsonSampler: thompson_discount_gamma must be in (0.0, 1.0], got "
+            + std::to_string(cfg.thompson_discount_gamma));
+    }
+    discount_gamma_ = cfg.thompson_discount_gamma;
 }
 
 std::size_t ThompsonSampler::sample() {
@@ -151,20 +164,38 @@ void ThompsonSampler::record_outcome(std::size_t index, bool profit) {
             + " >= grid size " + std::to_string(grid_bps_.size()));
     }
 
-    // Update the Beta posterior:
-    //   Profitable fill    -> increment alpha (evidence of success).
-    //   Adverse selection   -> increment beta  (evidence of failure).
+    // Discounted Thompson Sampling (Besbes, Gur & Zeevi 2014):
     //
-    // COUNTER-RESEARCH NOTE (CR-7, Besbes, Gur & Zeevi 2014):
-    //   Standard Thompson Sampling regret guarantees do not hold under
-    //   non-stationarity.  When optimal spread width shifts with regime
-    //   changes, the Beta posterior is too slow to forget outdated
-    //   observations.  Consider discounted Thompson Sampling:
-    //     alpha_new = alpha * decay + (profit ? 1 : 0)
-    //     beta_new  = beta  * decay + (profit ? 0 : 1)
-    //   with decay in [0.95, 0.99] to let the posterior forget stale
-    //   evidence from prior regimes.
+    //   alpha_new = alpha * gamma + (profit ? 1 : 0)
+    //   beta_new  = beta  * gamma + (profit ? 0 : 1)
+    //
+    // The geometric discount factor gamma in (0, 1] causes the posterior
+    // to exponentially forget stale observations, enabling adaptation to
+    // regime changes in the underlying spread profitability distribution.
+    // A floor of 1.0 on both alpha and beta is enforced after decay to
+    // maintain a valid, well-behaved Beta distribution (prevents the
+    // posterior from collapsing to a point mass near 0 or 1 when both
+    // parameters decay toward zero during observation-sparse periods).
+    //
+    // COUNTER-RESEARCH NOTE (CR-7, Besbes, Gur & Zeevi 2014) -- FIXED:
+    //   The original implementation used additive-only updates
+    //   (alpha += 1, beta += 1) which accumulate indefinitely and make
+    //   the posterior increasingly resistant to regime changes.  This
+    //   discounted formulation resolves the non-stationarity issue
+    //   identified in CR-7 by geometrically weighting recent evidence
+    //   over stale evidence.  Default gamma = 0.97 yields a half-life
+    //   of ~23 observations (ln(0.5)/ln(0.97)), appropriate for the
+    //   low-fill-rate CHIA DEX environment (~2-hour expected fill time).
     //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §10.
+    //
+    // ISO/IEC 5055: floor prevents division-by-zero in posterior_mean().
+    // ISO/IEC 27001:2022: deterministic update, no external data leakage.
+
+    // Decay existing evidence for all posteriors at this grid level.
+    alpha_[index] = std::max(alpha_[index] * discount_gamma_, 1.0);
+    beta_[index]  = std::max(beta_[index]  * discount_gamma_, 1.0);
+
+    // Incorporate the new observation.
     if (profit) {
         alpha_[index] += 1.0;
     } else {

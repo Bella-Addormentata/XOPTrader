@@ -539,6 +539,57 @@ private:
     // ISO/IEC 5055: deterministic zero-initialization.
     double nhe_net_inventory_change_{0.0};
     double nhe_total_volume_{0.0};
+
+    // [T5-CR1] VPIN validation gate (Andersen & Bondarenko 2014).
+    // Runtime tracker that measures whether VPIN activations (vpin_mult > 1.0)
+    // actually predict adverse fills within a sliding block window.  If the
+    // precision drops below vpin_min_precision_ after a burn-in period, the
+    // engine warns the operator that VPIN may lack incremental predictive
+    // power beyond raw volume and volatility.
+    // ISO/IEC 27001:2022: operational monitoring of signal quality.
+    // ISO/IEC 5055: deterministic zero-initialization; named constants.
+
+    /// Rolling-window counters for VPIN signal quality.  The window covers
+    /// the last kVpinRollingWindow activations so that precision reflects
+    /// recent signal quality and can recover from early false-positive bursts.
+    /// ISO/IEC 25000: operational quality metric with bounded memory.
+    static constexpr uint32_t kVpinRollingWindow = 200;
+
+    /// Total activations (lifetime, for burn-in gating only).
+    uint32_t vpin_activations_{0};
+
+    /// Rolling true-positive count (reset when window rolls over).
+    uint32_t vpin_rolling_tp_{0};
+
+    /// Rolling total resolved within the window (TP + FP).
+    uint32_t vpin_rolling_resolved_{0};
+
+    /// Activations whose validation window expired with no adverse fill.
+    uint32_t vpin_false_positives_{0};
+
+    /// How many blocks after a VPIN activation to wait for an adverse fill
+    /// before classifying the activation as a false positive.
+    static constexpr uint32_t kVpinValidationWindow = 10;
+
+    /// Minimum acceptable precision (TP / resolved) before warning.
+    /// Default 0.3 (30%).  Below this after kVpinBurnIn activations, a
+    /// warning is emitted suggesting VPIN weight reduction.
+    static constexpr double kDefaultVpinMinPrecision = 0.30;
+    double vpin_min_precision_{kDefaultVpinMinPrecision};
+
+    /// Burn-in count: precision warnings are suppressed until this many
+    /// activations have been recorded (avoids noisy early signals).
+    static constexpr uint32_t kVpinBurnIn = 100;
+
+    /// Maximum pending activations awaiting validation.  Prevents unbounded
+    /// growth if block_height stalls (node sync failure).
+    /// ISO/IEC 5055: bounded container under all reachable states.
+    static constexpr size_t kMaxPendingActivations = 512;
+
+    /// Ring buffer of block heights at which VPIN activated.
+    /// Entries are removed once validated (TP) or expired (FP).
+    /// ISO/IEC 5055: bounded by kMaxPendingActivations.
+    std::vector<BlockHeight> vpin_activation_blocks_;
 };
 
 }  // namespace xop
