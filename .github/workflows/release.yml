@@ -1,0 +1,277 @@
+# =============================================================================
+# release.yml — XOPTrader automated release workflow
+#
+# Triggers on a version tag push (v*) or manual workflow_dispatch.
+# Builds the C++ engine and Python GUI for three platforms and attaches
+# all artifacts to a new GitHub Release.
+#
+# Artifacts included in the release
+# -----------------------------------
+#   xop_trader-windows-x64.exe       C++ engine — Windows 64-bit
+#   xop_trader-linux-x64             C++ engine — Ubuntu 22.04 x86-64
+#   xop_trader-macos-arm64           C++ engine — macOS 14 Apple-Silicon
+#   xop_trader-gui-windows-x64.exe   Python GUI  — Windows (PyInstaller)
+#   xop_trader-gui-linux-x64         Python GUI  — Ubuntu  (PyInstaller)
+#   xop_trader-gui-macos-arm64       Python GUI  — macOS   (PyInstaller)
+#   xop_trader-0.1.0-py3-none-any.whl  Pure-Python wheel (pip-installable)
+#   config.example.yaml              Reference configuration file
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1)"
+        required: true
+        default: "v0.1"
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+# ---------------------------------------------------------------------------
+# Job 1 — Build the C++ engine on each OS
+# ---------------------------------------------------------------------------
+jobs:
+  build-cpp:
+    name: C++ engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: xop_trader-windows-x64.exe
+            cmake_build_type: Release
+            binary_path: build/Release/xop_trader.exe
+          - os: ubuntu-22.04
+            artifact_name: xop_trader-linux-x64
+            cmake_build_type: Release
+            binary_path: build/xop_trader
+          - os: macos-latest
+            artifact_name: xop_trader-macos-arm64
+            cmake_build_type: Release
+            binary_path: build/xop_trader
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---- vcpkg setup with caching ----------------------------------------
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: "${{ github.workspace }}/vcpkg"
+          vcpkgJsonGlob: "cpp/vcpkg.json"
+
+      # ---- System dependencies (Ubuntu) ------------------------------------
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libcurl4-openssl-dev
+
+      # ---- CMake configure & build -----------------------------------------
+      - name: Configure CMake
+        working-directory: cpp
+        run: >
+          cmake -B ../build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=${{ runner.os == 'Windows' && 'x64-windows' || runner.os == 'Linux' && 'x64-linux' || 'arm64-osx' }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.cmake_build_type }} --parallel
+
+      # ---- Rename binary to platform-specific name -------------------------
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp ${{ matrix.binary_path }} ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "${{ matrix.binary_path }}" "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Build the Python GUI with PyInstaller on each OS
+  # ---------------------------------------------------------------------------
+  build-gui:
+    name: Python GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: xop_trader-gui-windows-x64.exe
+            dist_path: gui/dist/xop_trader_gui.exe
+          - os: ubuntu-22.04
+            artifact_name: xop_trader-gui-linux-x64
+            dist_path: gui/dist/xop_trader_gui
+          - os: macos-latest
+            artifact_name: xop_trader-gui-macos-arm64
+            dist_path: gui/dist/xop_trader_gui
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ---- Ubuntu system libs for PySide6 ----------------------------------
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgl1 libegl1 libxcb-cursor0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 \
+            libdbus-1-3 libfontconfig1 libfreetype6
+
+      - name: Install Python dependencies
+        working-directory: gui
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Build with PyInstaller
+        working-directory: gui
+        run: >
+          pyinstaller
+          --onefile
+          --name xop_trader_gui
+          --windowed
+          main.py
+
+      # ---- Rename dist to platform-specific name ---------------------------
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp ${{ matrix.dist_path }} ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "${{ matrix.dist_path }}" "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — Build the pure-Python wheel (pip-installable package)
+  # ---------------------------------------------------------------------------
+  build-wheel:
+    name: Python wheel
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build wheel
+        run: |
+          pip install --upgrade pip build
+          python -m build --wheel --outdir dist/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-wheel
+          path: dist/*.whl
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 4 — Create the GitHub Release and upload all artifacts
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [build-cpp, build-gui, build-wheel]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download every artifact uploaded by the build jobs
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+
+      # Flatten the nested per-artifact directories produced by download-artifact
+      - name: Flatten artifact directories
+        run: |
+          find release-assets -mindepth 2 -type f \
+               -exec mv -t release-assets/ {} +
+          find release-assets -mindepth 1 -type d -delete
+
+      # Include the example config in the release
+      - name: Copy example config
+        run: cp config.example.yaml release-assets/config.example.yaml
+
+      # Resolve the tag: prefer the real git tag, fall back to workflow_dispatch input
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: "XOPTrader ${{ steps.tag.outputs.value }}"
+          body: |
+            ## XOPTrader ${{ steps.tag.outputs.value }}
+
+            Automated release of the XOPTrader CHIA DEX market-making engine.
+
+            ### Included artifacts
+
+            | File | Description |
+            |------|-------------|
+            | `xop_trader-windows-x64.exe` | C++ engine — Windows 64-bit |
+            | `xop_trader-linux-x64` | C++ engine — Ubuntu 22.04 x86-64 |
+            | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
+            | `xop_trader-gui-windows-x64.exe` | Python GUI — Windows (standalone) |
+            | `xop_trader-gui-linux-x64` | Python GUI — Ubuntu (standalone) |
+            | `xop_trader-gui-macos-arm64` | Python GUI — macOS (standalone) |
+            | `*.whl` | Pure-Python wheel (pip-installable) |
+            | `config.example.yaml` | Reference configuration file |
+            | `Source code (.zip / .tar.gz)` | GitHub-generated source archives |
+
+            ### Quick start
+
+            1. Download the binary for your platform.
+            2. Copy `config.example.yaml` to `config.yaml` and fill in your credentials.
+            3. Run the engine: `./xop_trader-linux-x64 --config config.yaml`
+
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          draft: false
+          prerelease: false
+          files: release-assets/*
+          generate_release_notes: true
