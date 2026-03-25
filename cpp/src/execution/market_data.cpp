@@ -1600,6 +1600,17 @@ void MarketDataFeed::recompute_vpin(const std::string& pair_name)
     }
 
     // VPIN = (1/N) * SUM |buy_i - sell_i| / bucket_size
+    //
+    // COUNTER-RESEARCH NOTE (CR-1, Andersen & Bondarenko 2014):
+    //   VPIN is mechanically correlated with contemporaneous volume and
+    //   volatility.  After controlling for these, VPIN has no incremental
+    //   predictive power for future toxicity or market stress.  The
+    //   "bulk volume" trade classification can reverse signal direction.
+    //   Agent-based simulations (Brandouy & Mathieu 2013) show VPIN can
+    //   flag high toxicity even with zero informed traders present.
+    //   Treat as a lagged volatility/volume proxy, not an independent
+    //   information signal.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §7.
     double sum_abs_imbalance = 0.0;
     double total_buy  = 0.0;
     double total_sell = 0.0;
@@ -1668,6 +1679,14 @@ double MarketDataFeed::get_vpin(const std::string& pair_name) const
 //
 // Positive OFI → buy pressure (bids strengthening faster than asks).
 // Negative OFI → sell pressure (asks strengthening faster than bids).
+//
+// COUNTER-RESEARCH NOTE (CR-2, Xu, Lehalle & Alfonsi 2023):
+//   This implementation uses only best-level bid/ask.  Multi-level OFI
+//   (top 5–10 levels) explains 10–30% more return variance than best-level
+//   alone.  On CHIA's shallow book (typically 2–5 levels), multi-level
+//   OFI is computable from available data.  TODO: extend to accept
+//   multiple book levels, weighted by distance from mid.
+//   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §8.1.
 // =========================================================================
 
 void MarketDataFeed::ingest_book_snapshot_for_ofi(

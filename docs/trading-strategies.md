@@ -2269,3 +2269,11 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 57. Daian, P. et al. (2020). "Flash Boys 2.0: Frontrunning in decentralized exchanges, miner extractable value, and consensus instability." *IEEE Symposium on Security and Privacy 2020*. *(Counter-research to refs. 6 & 19: adversarial non-stationary fill processes on public-blockchain DEXs invalidate GLFT's Poisson arrival assumption.)*
 
 58. Xu, K., Lehalle, C.-A. & Alfonsi, A. (2023). "Cross-impact of order flow imbalance in equity markets." *Quantitative Finance*, 23(7–8), 1167–1185. *(Counter-research to ref. 11: best-level OFI alone explains 10–30% less return variance than multi-level OFI; deeper book information is material.)*
+
+59. Stoll, H. R. (1989). "Inferring the components of the bid-ask spread: Theory and empirical tests." *Journal of Finance*, 44(1), 115–134. *(Counter-research to ref. 21: Glosten-Milgrom attributes entire spread to adverse selection; Stoll decomposes into adverse selection, inventory, and order-processing components — on thin DEX markets, the latter two dominate.)*
+
+60. Boldin, M. D. (1996). "A check on the robustness of Hamilton's Markov switching model approach to the economic analysis of the business cycle." *Studies in Nonlinear Dynamics & Econometrics*, 1(1), 35–46. *(Counter-research to HMM regime detection: likelihood multimodality causes regime identification fragility with short-history crypto data.)*
+
+61. Calvet, L. E. & Fisher, A. J. (2004). "How to forecast long-run volatility: Regime switching and the estimation of multifractal processes." *Journal of Financial Econometrics*, 2(1), 49–83. *(Counter-research to HMM regime detection: pure Markov switching under-models multi-scale volatility dynamics.)*
+
+62. Acharya, V. V. & Pedersen, L. H. (2005). "Asset pricing with liquidity risk." *Journal of Financial Economics*, 77(2), 375–410. *(Counter-research to ref. 12: static spread-return framework ignores liquidity risk dynamics; time-varying spread is more relevant for intermittent CHIA liquidity.)*

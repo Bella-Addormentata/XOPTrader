@@ -381,6 +381,18 @@ double GlftStrategy::fill_intensity(double delta) const
     // lambda(delta) = A * exp(-kappa * delta)
     //
     // Poisson arrival rate of fills at distance delta from mid.
+    //
+    // COUNTER-RESEARCH NOTE (CR-8, Fodra & Pham 2015):
+    //   This continuous-time exponential intensity was calibrated for
+    //   dense electronic markets.  On CHIA (~1 fill/hour/pair), the
+    //   discrete sparse-block structure means the optimal inventory
+    //   skew coefficient should be larger than what the GLFT formula
+    //   produces — the trader should shed inventory more aggressively
+    //   per fill because opportunities are rarer.
+    //   Also: Laruelle, Lehalle & Pagès (2011) show empirically that
+    //   fill intensity has a two-regime structure (plateau near mid,
+    //   sharp fall-off outside spread) rather than pure exponential.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §3.1.
     return cfg_.A * std::exp(-cfg_.kappa * delta);
 }
 
