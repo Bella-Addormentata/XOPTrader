@@ -21,6 +21,24 @@
 //   sample autocovariances of squared returns, adding complexity without
 //   materially improving classification accuracy at our window sizes.
 //
+// COUNTER-RESEARCH NOTE (CR-5, Lo & MacKinlay 1989):
+//   The authors' own follow-up Monte Carlo study shows the VR test has
+//   ~5–9% power to detect mean-reversion (VR=0.70) at n=50–200, which
+//   are XOPTrader's typical window sizes.  This means regime
+//   classification (mean-reverting / momentum / random-walk) relies on
+//   raw VR thresholds (0.85, 1.15), not statistically significant
+//   signals.  Richardson & Smith (1991) further show that overlapping
+//   returns inflate apparent significance.
+//
+// COUNTER-RESEARCH NOTE (CR-14, Boldin 1996; Calvet & Fisher 2004):
+//   Hamilton (1989) Markov regime-switching models suffer from
+//   likelihood multimodality and regime identification fragility with
+//   short-history crypto data (Boldin 1996).  Additionally, pure
+//   Markov switching under-models multi-scale volatility dynamics;
+//   multifractal models capture both short- and long-term regimes
+//   more faithfully (Calvet & Fisher 2004).
+//   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §4 and §18.
+//
 // Compliant with:
 //   ISO/IEC 27001:2022  (no secrets processed; deterministic audit trail)
 //   ISO/IEC 5055        (bounds-checked; no undefined behaviour; NaN guards)

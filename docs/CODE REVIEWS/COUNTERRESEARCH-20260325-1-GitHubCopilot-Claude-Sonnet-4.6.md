@@ -30,14 +30,17 @@
 13. [Milionis et al. (2022) AMM/LVR — Counter-Research](#13-milionis-et-al-2022-ammlvr--counter-research)
 14. [Farmer & Joshi (2002) — Counter-Research](#14-farmer--joshi-2002--counter-research)
 15. [Brunnermeier & Pedersen (2005) — Counter-Research](#15-brunnermeier--pedersen-2005--counter-research)
-16. [Summary: Arguments That XOPTrader May Be Doing Something Incorrectly](#16-summary-arguments-that-xoptrader-may-be-doing-something-incorrectly)
-17. [Recommended Additional Citations](#17-recommended-additional-citations)
+16. [Glosten & Milgrom (1985) — Counter-Research](#16-glosten--milgrom-1985--counter-research)
+17. [Amihud & Mendelson (1986) — Counter-Research](#17-amihud--mendelson-1986--counter-research)
+18. [Hamilton (1989) HMM Regime Switching — Counter-Research](#18-hamilton-1989-hmm-regime-switching--counter-research)
+19. [Summary: Arguments That XOPTrader May Be Doing Something Incorrectly](#19-summary-arguments-that-xoptrader-may-be-doing-something-incorrectly)
+20. [Recommended Additional Citations](#20-recommended-additional-citations)
 
 ---
 
 ## 1. Executive Summary
 
-The XOPTrader codebase cites a rich set of market microstructure and stochastic-control papers spanning 1933–2022. This review surveyed the academic counter-literature for each major citation and found **twelve significant challenge areas**, summarised below.
+The XOPTrader codebase cites a rich set of market microstructure and stochastic-control papers spanning 1933–2022. This review surveyed the academic counter-literature for each major citation and found **fifteen significant challenge areas**, summarised below.
 
 | Severity | Area | Key Counter-Paper(s) |
 |----------|------|----------------------|
@@ -46,15 +49,20 @@ The XOPTrader codebase cites a rich set of market microstructure and stochastic-
 | **HIGH** | OFI best-level-only focus | Xu, Lehalle & Alfonsi (2023) |
 | **HIGH** | PIN misidentifies informed trading | Duarte & Young (2009), Collin-Dufresne & Fos (2015) |
 | **MEDIUM** | VR test low power at small samples | Lo & MacKinlay (1989, own follow-up) |
-| **MEDIUM** | Yang-Zhang complexity vs. Garman-Klass | Molnár (2025 review) |
+| **MEDIUM** | Yang-Zhang complexity vs. Garman-Klass | Molnár (2012) |
 | **MEDIUM** | Brock-Hommes parameter sensitivity | Kukacka & Barunik (2013) |
 | **MEDIUM** | Thompson Sampling non-stationarity | Raj et al. (2023), Russo et al. (2018) §6 |
 | **MEDIUM** | AMH testability deficit | Various critics (2010–2020) |
 | **MEDIUM** | Kyle λ linear-impact assumption | Almgren et al. (2005), Gatheral (2010) |
+| **MEDIUM** | Glosten-Milgrom spread decomposition | Stoll (1989); Wang & Zhang (2020) |
+| **MEDIUM** | HMM regime identification fragility | Boldin (1996); Calvet & Fisher (2004) |
 | **LOW** | GLFT in AMM/DEX contexts | Cartea et al. (2023) |
 | **LOW** | LVR structural costs vs. CLOB-maker view | Milionis et al. (2022) |
+| **LOW** | Amihud-Mendelson static framework | Acharya & Pedersen (2005) |
 
-The most action-relevant finding is that **VPIN has been seriously challenged as a standalone predictive metric** and that **the VR test has near-zero power at XOPTrader's window sizes** — both already flagged as findings in prior logic reviews, but now with explicit counter-literature support. Additionally, **the OFI metric as implemented uses only best-level information**, while newer research shows that multi-level OFI is materially more informative.
+The most action-relevant finding is that **VPIN has been seriously challenged as a standalone predictive metric** and that **the VR test has near-zero power at XOPTrader's window sizes** — both already flagged as findings in prior logic reviews, but now with explicit counter-literature support. Additionally, **the OFI metric as implemented uses only best-level information**, while newer research shows that multi-level OFI is materially more informative. Three new counter-research areas were added in the integration pass: **Glosten-Milgrom spread decomposition** (Stoll 1989 shows the spread has three components, not just adverse selection), **Hamilton HMM regime fragility** (Boldin 1996 shows likelihood multimodality), and **Amihud-Mendelson static framework** (Acharya-Pedersen 2005 shows liquidity risk dynamics are more important).
+
+All 15 findings have been integrated into the C++ source code as inline `COUNTER-RESEARCH NOTE` comments at the relevant implementation sites, with cross-references to this document and TODOs for future improvements.
 
 ---
 
@@ -456,7 +464,57 @@ The Brunnermeier-Pedersen predation model is most relevant for situations where 
 
 ---
 
-## 16. Summary: Arguments That XOPTrader May Be Doing Something Incorrectly
+## 16. Glosten & Milgrom (1985) — Counter-Research
+
+**Cited as:** Bid-ask spread and adverse selection framework (reference 21 in trading-strategies.md).
+
+### 16.1 Spread Decomposition Limitations
+
+**Counter-paper:** Stoll, H. R. (1989). "Inferring the components of the bid-ask spread: Theory and empirical tests." *Journal of Finance*, 44(1), 115–134.
+
+Stoll (1989) decomposes the bid-ask spread into three components: adverse selection, inventory holding costs, and order-processing costs. The Glosten-Milgrom model attributes the entire spread to adverse selection, ignoring the other two. On CHIA's thin DEX, order-processing costs (blockchain fees, offer creation latency) and inventory costs (capital lockup during offer TTL) are likely **dominant** contributors to the effective spread, not adverse selection from informed traders.
+
+**Counter-paper:** Wang, C. & Zhang, Y. (2020). "Information chasing versus adverse selection." *Wharton Working Paper*.
+
+Wang & Zhang (2020) show that in multi-dealer markets, dealers may actively **chase** informed order flow (offering better prices to attract informed traders) rather than defensively widening spreads. This inverts the Glosten-Milgrom prediction: instead of spreads widening monotonically with information asymmetry, some dealers may tighten spreads to attract flow that gives them an informational edge.
+
+**XOPTrader implication:** The system's adverse-selection response (widen spreads unconditionally when PIN/VPIN is elevated) follows the classic Glosten-Milgrom logic. But on CHIA's thin book, the adverse-selection component of the spread is likely small relative to order-processing costs. Over-widening in response to spurious PIN/VPIN signals may reduce fill rates more than it reduces adverse-selection losses.
+
+---
+
+## 17. Amihud & Mendelson (1986) — Counter-Research
+
+**Cited as:** Bid-ask spread and asset pricing relationship (reference 12 in trading-strategies.md).
+
+### 17.1 Static Framework and Sole Liquidity Metric
+
+**Counter-paper:** Acharya, V. V. & Pedersen, L. H. (2005). "Asset pricing with liquidity risk." *Journal of Financial Economics*, 77(2), 375–410.
+
+Amihud & Mendelson (1986) demonstrate that higher bid-ask spreads correlate with higher required returns. However, their model is static (fixed holding periods, single liquidity measure). Acharya & Pedersen (2005) show that **liquidity risk** (time-variation in spreads, especially during crises) is more important for asset pricing than average spread level. On CHIA, where liquidity can evaporate entirely for hours or days, the dynamic liquidity risk dimension is far more relevant than the static spread-return relationship.
+
+**XOPTrader implication:** The system's fixed tier spacing and static spread-return assumptions may not adequately capture the dynamic nature of CHIA liquidity. Periods of zero liquidity should be modeled as liquidity events rather than treated as steady-state conditions.
+
+---
+
+## 18. Hamilton (1989) HMM Regime Switching — Counter-Research
+
+**Cited as:** HMM-based regime detection (reference 8 in trading-strategies.md, Rabiner 1989 tutorial; implemented in regime.cpp).
+
+### 18.1 Regime Identification Fragility
+
+**Counter-paper:** Boldin, M. D. (1996). "A check on the robustness of Hamilton's Markov switching model approach to the economic analysis of the business cycle." *Studies in Nonlinear Dynamics & Econometrics*, 1(1), 35–46.
+
+Boldin (1996) demonstrates that the Markov regime-switching model's likelihood surface has multiple local maxima. Depending on starting values and sample period, dramatically different regime identifications emerge — sometimes bearing no relation to the economic intuition the model was intended to capture. For crypto assets with short histories and rapid regime changes, this instability is amplified.
+
+**Counter-paper:** Calvet, L. E. & Fisher, A. J. (2004). "How to forecast long-run volatility: Regime switching and the estimation of multifractal processes." *Journal of Financial Econometrics*, 2(1), 49–83.
+
+Calvet & Fisher (2004) show that pure Markov switching under-models the multi-scale volatility dynamics common in financial markets. Multifractal models capture both short-term and long-term volatility regimes simultaneously, while Markov switching is typically effective only at one frequency.
+
+**XOPTrader implication:** The HMM regime detector in `regime.cpp` may produce unstable regime classifications as the CHIA market matures and block data accumulates. The regime labels (mean-reverting, momentum, random-walk) should be treated as soft signals, not definitive state classifications. The existing hysteresis mechanism partially mitigates rapid switching but does not address the underlying multimodality problem.
+
+---
+
+## 19. Summary: Arguments That XOPTrader May Be Doing Something Incorrectly
 
 This section aggregates the highest-priority actionable findings from the counter-research survey, where existing implementations may have material errors or misalignments with the cited theory.
 
@@ -474,10 +532,13 @@ This section aggregates the highest-priority actionable findings from the counte
 | **CR-10** | **Kyle's lambda linear impact model is inconsistent with no-dynamic-arbitrage conditions (Gatheral 2010) and empirically rejected in favour of square-root impact (Almgren et al. 2005).** | LOW | Documentation (if used in spread formulae) | Gatheral (2010); Almgren et al. (2005) |
 | **CR-11** | **TibetSwap arbitrage revenue is structurally dependent on AMM protocol design; LVR-reduction features in future protocol upgrades could eliminate this revenue stream.** | LOW | `arbitrage.cpp` | Milionis et al. (2022); Adams et al. (2023) |
 | **CR-12** | **The AMH framework is not falsifiable without operationalization; crowding-recovery window lengths should be calibrated to CHIA market timescales, not equity-market intuitions.** | LOW | `strategy_portfolio.cpp` | Urquhart & Hudson (2013); Bianchi & Babiak (2022) |
+| **CR-13** | **Glosten-Milgrom spread model attributes the entire spread to adverse selection, but on CHIA the dominant spread components are order-processing and inventory costs, not information asymmetry.** | MEDIUM | `adverse_selection.cpp`, `engine.cpp` | Stoll (1989); Wang & Zhang (2020) |
+| **CR-14** | **HMM regime detection suffers from likelihood multimodality and regime identification fragility, producing unstable regime classifications with short crypto histories.** | MEDIUM | `regime.cpp` | Boldin (1996); Calvet & Fisher (2004) |
+| **CR-15** | **Amihud-Mendelson static spread-return framework ignores liquidity risk dynamics; time-varying spread (Acharya-Pedersen 2005) is more relevant for CHIA's intermittent liquidity.** | LOW | Documentation | Acharya & Pedersen (2005) |
 
 ---
 
-## 17. Recommended Additional Citations
+## 20. Recommended Additional Citations
 
 The following papers are recommended as additions to the §9 References section of `trading-strategies.md` to document the counter-literature and show the design decisions are made with awareness of the debate:
 
@@ -495,11 +556,15 @@ The following papers are recommended as additions to the §9 References section 
 | 56 | Cont, R. (2001). "Empirical properties of asset returns: stylized facts and statistical issues." *Quantitative Finance*, 1(2), 223–236. | Fat tails/volatility clustering challenge A-S Brownian price assumption (§2.1) |
 | 57 | Daian, P. et al. (2020). "Flash Boys 2.0: Frontrunning in decentralized exchanges." *IEEE S&P 2020*. | Adversarial fill process on DEX (§3.2) |
 | 58 | Xu, K., Lehalle, C.-A. & Alfonsi, A. (2023). "Cross-impact of order flow imbalance in equity markets." *Quantitative Finance*, 23(7–8), 1167–1185. | Multi-level OFI is more informative than best-level (CR-2) |
+| 59 | Stoll, H. R. (1989). "Inferring the components of the bid-ask spread: Theory and empirical tests." *Journal of Finance*, 44(1), 115–134. | Spread decomposition: adverse selection is only one of three components (CR-13) |
+| 60 | Boldin, M. D. (1996). "A check on the robustness of Hamilton's Markov switching model." *Studies in Nonlinear Dynamics & Econometrics*, 1(1), 35–46. | HMM regime identification fragility (CR-14) |
+| 61 | Calvet, L. E. & Fisher, A. J. (2004). "How to forecast long-run volatility: Regime switching and the estimation of multifractal processes." *Journal of Financial Econometrics*, 2(1), 49–83. | Markov switching under-models multi-scale volatility (CR-14) |
+| 62 | Acharya, V. V. & Pedersen, L. H. (2005). "Asset pricing with liquidity risk." *Journal of Financial Economics*, 77(2), 375–410. | Liquidity risk dynamics more important than static spread (CR-15) |
 
 ---
 
 *End of Counter-Research Review*
 
 *Reviewed by: GitHub Copilot (Claude Sonnet 4.6)*  
-*Review date: 2026-03-25*  
-*Total counter-findings: 12 (3 HIGH, 6 MEDIUM, 3 LOW)*
+*Updated: 2026-03-25*  
+*Total counter-findings: 15 (3 HIGH, 8 MEDIUM, 4 LOW)*

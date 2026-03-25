@@ -349,6 +349,15 @@ double AvellanedaStoikov::compute_tau(BlockHeight block_height) const
     // This gives a sawtooth pattern: tau starts at N*block_time, linearly
     // decreases to 1*block_time, then resets.  The minimum is 1 block
     // (never zero), preventing degenerate spread collapse.
+    //
+    // COUNTER-RESEARCH NOTE (CR-3, Cartea, Jaimungal & Penalva 2015 §10.3):
+    //   The sawtooth tau creates a deterministic, exploitable cycle in 24/7
+    //   markets.  Sophisticated adversaries aware of the modular periodicity
+    //   can time orders to exploit the post-reset complacency window when
+    //   inventory shedding is weakest.  The GLFT infinite-horizon formulation
+    //   avoids this.  Alternative: replace sawtooth with exponential decay
+    //   per Stoikov (2018) "The micro-price".
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §2.2.
     const uint32_t n = block_height % cfg_.horizon_blocks;
     const uint32_t remaining = cfg_.horizon_blocks - n;
     return static_cast<double>(remaining) * cfg_.block_time_seconds;
