@@ -1158,6 +1158,21 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         //   vpin_mult  : up to 50% widening at max toxicity (VPIN=1.0)
         //   ofi_mult   : up to 30% widening at max order-flow imbalance
         //
+        // COUNTER-RESEARCH NOTE (CR-1, Andersen & Bondarenko 2014):
+        //   VPIN may have no incremental predictive power beyond raw
+        //   volume and volatility.  It can produce false high-toxicity
+        //   signals from correlated noise-trader activity.  Validate
+        //   whether VPIN activations correlate with realised adverse
+        //   fills before relying on this multiplier in isolation.
+        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §7.
+        //
+        // COUNTER-RESEARCH NOTE (CR-2, Xu, Lehalle & Alfonsi 2023):
+        //   OFI is computed from best-level bid/ask only.  Multi-level
+        //   OFI (top 5–10 levels) explains 10–30% more return variance.
+        //   TODO: extend ingest_book_snapshot_for_ofi() to accept
+        //   multiple book levels for a stronger directional signal.
+        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §8.
+        //
         // ISO/IEC 27001:2022: no secret data; all signals are market-derived.
         // ISO/IEC 5055: multipliers are clamped via their source methods.
         // ---------------------------------------------------------------

@@ -106,6 +106,18 @@ double VolatilityEstimator::update(double price)
     // The Rogers-Satchell component will be zero for degenerate candles,
     // but the overnight and close-to-open components remain informative.
     //
+    // COUNTER-RESEARCH NOTE (CR-6, Molnár 2012):
+    //   On CHIA, >90% of blocks have zero fills, making nearly all
+    //   candles degenerate (O=H=L=C).  The Rogers-Satchell component
+    //   contributes nothing, so Yang-Zhang degenerates into a simple
+    //   close-to-close estimator and loses its minimum-variance
+    //   advantage.  Garman-Klass (1980) is empirically competitive
+    //   for continuous 24/7 markets without overnight gaps.
+    //   TODO: consider constructing coarser-grained candles (e.g.,
+    //   10-block windows ~8.7 min) to ensure most candles have at
+    //   least one fill and meaningful OHLC variation.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §5.
+    //
     // T2-02: Constructs the Candle locally and delegates to the Candle
     // overload which acquires the exclusive lock (no double-lock risk).
     return update(Candle{price, price, price, price});
