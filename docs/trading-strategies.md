@@ -56,7 +56,8 @@
 7. [Key Strategy Trade-offs](#7-key-strategy-trade-offs)
    - [7.10 Coexisting With Unknown Market Makers](#710-coexisting-with-unknown-market-makers)
 8. [Strategy Interaction Matrix](#8-strategy-interaction-matrix)
-9. [References](#9-references)
+9. [Strategy Selection Rationale & Confidence Assessment](#9-strategy-selection-rationale--confidence-assessment)
+10. [References](#10-references)
 
 ---
 
@@ -2152,7 +2153,421 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 
 ---
 
-## 9. References
+## 9. Strategy Selection Rationale & Confidence Assessment
+
+When multiple academic papers disagree about the best approach, we need a
+principled framework for choosing which theory to implement and when to revisit
+that choice.  This section documents **why** we chose each strategy, **how
+confident** we are in that choice given the counter-research, and **what
+evidence** would cause us to change direction.
+
+### 9.1 Decision Framework
+
+We evaluate competing academic approaches using five criteria, weighted by
+relevance to CHIA's unique market microstructure:
+
+| # | Criterion | Weight | Description |
+|---|-----------|--------|-------------|
+| 1 | **CHIA-specific fit** | 30% | Does the model's assumptions match CHIA's 52-second blocks, thin order books, atomic swaps, and ~1 fill/hour/pair? Models designed for high-frequency equity markets score lower. |
+| 2 | **Empirical validation breadth** | 25% | Has the model been validated across multiple asset classes, time periods, and by independent researchers? Single-paper, single-market results score lower. |
+| 3 | **Degradation characteristics** | 20% | When the model's assumptions are violated, does it degrade gracefully (wider spreads, slower convergence) or catastrophically (inverted signals, unbounded losses)? |
+| 4 | **Implementation complexity** | 15% | Can we implement it correctly with available data? Simpler models with fewer tuning parameters score higher when theoretical advantage is marginal. |
+| 5 | **Counter-research severity** | 10% | How strong is the academic opposition? A single methodological critique scores lower than multiple independent empirical rejections. |
+
+**Decision rule:** When two approaches score within 10% of each other, we
+implement both and let live performance arbitrate (via Thompson Sampling or
+A/B testing over rolling windows).  When one approach clearly dominates, we
+implement it but add inline `COUNTER-RESEARCH NOTE` comments documenting the
+alternative.
+
+### 9.2 Confidence Levels
+
+We assign each implemented strategy a confidence level based on the balance
+between supporting and counter evidence:
+
+| Level | Symbol | Meaning |
+|-------|--------|---------|
+| **HIGH** | 🟢 | Strong theoretical foundation with broad empirical support.  Counter-research is minor, methodological, or applies only to edge cases.  We would need significant new evidence to change approach. |
+| **MEDIUM** | 🟡 | Sound theoretical basis but meaningful counter-research exists.  The approach works well enough in practice, but a superior alternative may exist.  We should monitor live performance and consider switching if a concrete improvement is demonstrated. |
+| **LOW** | 🔴 | Known significant limitations in our context.  We use this approach because alternatives are worse or unimplemented, not because we believe the theory is fully correct.  Active TODO items exist to address the limitations. |
+
+### 9.3 Per-Strategy Confidence Rankings
+
+#### 9.3.1 Avellaneda-Stoikov Optimal Market Making
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟡 MEDIUM |
+| **Supporting papers** | Avellaneda & Stoikov (2008) [ref 6]; Guéant, Lehalle & Fernandez-Tapia (2013) [ref 19] |
+| **Counter-research** | Cartea, Jaimungal & Penalva (2015) §10.3 [ref 10]; Fodra & Pham (2015) [ref 52]; Cont (2001) [ref 56] |
+| **Counter-findings** | CR-3 (sawtooth tau exploitable in 24/7 markets), CR-8 (continuous-time optimal control deviates from discrete sparse-block settings) |
+
+**Why we chose it:** A-S provides the only closed-form inventory-penalized
+quoting formula with decades of empirical validation.  The GLFT extension
+(§1.2 of this document) addresses some limitations.  No competitive alternative
+offers the same interpretability and computational efficiency.
+
+**What the counter-research says:** The sawtooth τ creates a deterministic
+post-reset complacency window that sophisticated adversaries could exploit.
+The continuous-time Brownian motion assumption does not match CHIA's 52-second
+block cadence or fat-tailed return distribution.
+
+**Our mitigation:** The GLFT asymptotic mode eliminates the horizon dependency.
+We plan to replace the sawtooth with exponential decay (TODO T4-19, T5-CR3).
+Regime detection adjusts σ dynamically, partially compensating for
+non-Brownian dynamics.
+
+**What would change our mind:** If backtesting shows that a simple
+symmetric-spread rule with inventory-proportional skew outperforms A-S
+on CHIA data, we would switch to the simpler model.
+
+---
+
+#### 9.3.2 GLFT Running-Inventory-Penalty Model
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟡 MEDIUM |
+| **Supporting papers** | Guéant, Lehalle & Fernandez-Tapia (2013) [ref 19]; Guéant (2017) [ref 17] |
+| **Counter-research** | Fodra & Pham (2015) [ref 52]; Daian et al. (2020) [ref 57]; Cartea, Jaimungal & Penalva (2015) [ref 10] |
+| **Counter-findings** | CR-8 (discrete fill structure means inventory skew coefficient should be larger), CR-11 (model designed for CLOB, not DEX) |
+
+**Why we chose it:** GLFT's infinite-horizon asymptotic eliminates the A-S
+sawtooth problem and provides a natural way to handle running inventory
+penalties.  The model's structure maps well to CHIA's order-book mechanics.
+
+**What the counter-research says:** The continuous-time Poisson fill-intensity
+assumption produces an inventory skew coefficient too small for CHIA's ~1
+fill/hour environment.  The model was designed for central limit order books,
+not atomic-swap DEX markets.
+
+**Our mitigation:** We amplify the inventory skew by the sparse-fill correction
+factor (TODO T5-CR8).  The core insight — penalize inventory continuously
+rather than at a terminal horizon — remains valid regardless of fill frequency.
+
+**What would change our mind:** Empirical evidence that the GLFT skew
+coefficient is wrong by >2× would warrant a fundamental recalibration or
+switch to Fodra-Pham's discrete-time formulation.
+
+---
+
+#### 9.3.3 Four-Component Spread Optimization
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟢 HIGH |
+| **Supporting papers** | Stoll (1978) [ref 30]; Ho & Stoll (1981) [ref 23]; Madhavan (2000) [ref 34] |
+| **Counter-research** | Stoll (1989) [ref 59] — spread decomposition shows adverse selection is only one of three components |
+| **Counter-findings** | CR-13 (on thin DEX markets, order-processing and inventory costs dominate adverse-selection costs) |
+
+**Why we chose it:** The four-component model (base + competition + regime +
+signals) is a practical engineering framework rather than a single academic
+theory.  It composes multiple well-validated signals without requiring any
+single one to be correct.
+
+**What the counter-research says:** Glosten-Milgrom's single-component
+adverse-selection model underweights inventory and order-processing costs.
+Stoll (1989) shows three components should be weighted separately.
+
+**Our mitigation:** Our spread optimizer already separates these concerns:
+competition component handles order-processing (matching competitor spreads),
+regime component handles volatility risk, and signals (VPIN/OFI) handle
+adverse selection.  This naturally implements a multi-component decomposition.
+
+**What would change our mind:** Very little — the compositional architecture
+is robust by design.  Individual component weights may need recalibration,
+but the framework itself is sound.
+
+---
+
+#### 9.3.4 Multi-Tier Liquidity Provision
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟢 HIGH |
+| **Supporting papers** | Ho & Stoll (1981) [ref 23]; Foucault, Kadan & Kandel (2005) [ref 38] |
+| **Counter-research** | None identified |
+| **Counter-findings** | None |
+
+**Why we chose it:** Distributing liquidity across multiple price tiers
+(tight/mid/wide) is standard practice for market makers.  The approach is
+model-agnostic — it works regardless of which spread formula is used.
+
+**What the counter-research says:** No academic paper argues against tiered
+quoting.  The only debate is about optimal tier count, spacing, and sizing,
+which are empirical calibration questions rather than theoretical disputes.
+
+**Our mitigation:** N/A — no counter-research to mitigate.
+
+**What would change our mind:** If CHIA's offer-book mechanics change to
+penalize multi-tier posting (e.g., per-offer fees), we would consolidate
+to fewer tiers.
+
+---
+
+#### 9.3.5 Market Regime Detection (Variance Ratio + HMM)
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🔴 LOW |
+| **Supporting papers** | Lo & MacKinlay (1988) [ref 26]; Hamilton (1989) [ref 22] |
+| **Counter-research** | Lo & MacKinlay (1989) [ref 50]; Boldin (1996) [ref 60]; Calvet & Fisher (2004) [ref 61] |
+| **Counter-findings** | CR-5 (VR test has ~5–9% power at our window sizes), CR-14 (HMM likelihood multimodality causes regime identification fragility) |
+
+**Why we chose it:** Regime detection is essential for adapting strategy
+parameters to changing market conditions.  The VR test is simple,
+interpretable, and widely cited.  HMM adds probabilistic regime labeling.
+
+**What the counter-research says:** Lo & MacKinlay's *own* 1989 Monte Carlo
+study shows the VR test has only 5–9% power at n=50–200 (our window sizes).
+Regime classification is effectively operating on raw VR thresholds, not
+statistically significant signals.  HMM suffers from likelihood multimodality
+with short crypto histories, producing unstable regime labels.
+
+**Our mitigation:** We use regime detection as a *soft signal* (spread
+multiplier adjustment) rather than a *hard switch* (strategy selection).
+Even with low power, the VR test provides directional information that is
+better than assuming a fixed regime.  We plan to add Z-statistic significance
+gating (TODO T5-CR5) and evaluate multifractal alternatives (TODO T5-CR14).
+
+**What would change our mind:** If we demonstrate that a constant-regime
+assumption produces equivalent or better P&L on CHIA data, we would simplify
+to a volatility-only adaptive model.
+
+---
+
+#### 9.3.6 Cross-Platform Arbitrage
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟡 MEDIUM |
+| **Supporting papers** | Shleifer & Vishny (1997) [ref 28]; practitioner models |
+| **Counter-research** | Milionis et al. (2022) [ref 27] — LVR framework; Daian et al. (2020) [ref 57] |
+| **Counter-findings** | CR-11 (TibetSwap arbitrage revenue structurally dependent on AMM design; LVR-reduction features could eliminate it) |
+
+**Why we chose it:** Arbitrage is a fundamental market-making revenue source
+and helps maintain cross-venue price consistency.  The theory is
+uncontroversial — price convergence across venues.
+
+**What the counter-research says:** TibetSwap's AMM design creates structural
+arbitrage opportunities (LVR) that may be eliminated by future protocol
+upgrades (dynamic fees, oracle integration).  Revenue from this source is
+protocol-dependent, not market-structural.
+
+**Our mitigation:** We treat arbitrage as supplemental revenue, not a core
+strategy.  The market-making spread capture remains viable regardless of AMM
+design evolution.  We monitor protocol changes (TODO T5-CR11).
+
+**What would change our mind:** If TibetSwap v3 eliminates >80% of arb
+opportunities, we would deprioritize this module.
+
+---
+
+#### 9.3.7 VPIN — Flow Toxicity Signal
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🔴 LOW |
+| **Supporting papers** | Easley, López de Prado & O'Hara (2012) [ref 14] |
+| **Counter-research** | Andersen & Bondarenko (2014) [ref 47] |
+| **Counter-findings** | CR-1 (VPIN has no incremental predictive power beyond volume + volatility; can fire on pure noise-trader correlation) |
+
+**Why we chose it:** VPIN provides a continuous [0,1] toxicity estimate that
+is easy to integrate into the spread multiplier pipeline.  Even if it is
+primarily a volatility proxy, that signal has value for spread widening.
+
+**What the counter-research says:** Andersen & Bondarenko (2014) demonstrate
+that VPIN has no incremental predictive power after controlling for volume and
+volatility.  The "bulk volume" trade classification can reverse signal
+direction.  Agent-based simulations show VPIN flags high toxicity even with
+zero informed traders.
+
+**Our mitigation:** We treat VPIN as a *supplemental* signal with capped
+influence (max 50% widening).  We plan to validate VPIN activations against
+realized adverse fills (TODO T5-CR1).  If validation shows <15% correlation,
+we will attenuate or disable the signal.
+
+**What would change our mind:** If post-validation correlation is negligible,
+we would replace VPIN with a direct volume-volatility composite indicator.
+
+---
+
+#### 9.3.8 OFI — Order Flow Imbalance
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟡 MEDIUM |
+| **Supporting papers** | Cont, Kukanov & Stoikov (2014) [ref 11] |
+| **Counter-research** | Xu, Lehalle & Alfonsi (2023) [ref 58] |
+| **Counter-findings** | CR-2 (best-level OFI explains 10–30% less return variance than multi-level OFI) |
+
+**Why we chose it:** OFI is a leading indicator that detects order-book
+pressure before fills confirm it.  The original Cont et al. regression
+achieves R² ≈ 65% on equity data.  The signal is lightweight and maps
+directly to CHIA's offer-book snapshots.
+
+**What the counter-research says:** Computing OFI from best bid/ask only
+discards information from deeper book levels.  Multi-level OFI (top 5–10
+levels) explains 10–30% more return variance.  CHIA's shallow book (2–5
+levels) makes this extension feasible.
+
+**Our mitigation:** Current best-level OFI is a valid signal — it is simply
+*weaker* than it could be.  We plan to extend to multi-level OFI (TODO
+T5-CR2).  This is an enhancement, not a correction.
+
+**What would change our mind:** Nothing — the direction is clear.  We will
+implement multi-level OFI when prioritized.
+
+---
+
+#### 9.3.9 Thompson Sampling for Spread Learning
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟡 MEDIUM |
+| **Supporting papers** | Thompson (1933) [ref 31]; Agrawal & Goyal (2012) [ref 1] |
+| **Counter-research** | Besbes, Gur & Zeevi (2014) [ref 55] |
+| **Counter-findings** | CR-7 (regret guarantees fail under non-stationarity; Beta posterior too slow to forget stale data) |
+
+**Why we chose it:** Thompson sampling is the gold standard for multi-armed
+bandit problems.  It naturally balances exploration and exploitation with
+minimal tuning.  The Bayesian framework matches our sparse-feedback
+environment.
+
+**What the counter-research says:** Standard Thompson Sampling assumes
+stationary reward distributions.  When CHIA's optimal spread shifts with
+regime changes, the Beta posterior accumulates stale evidence that takes
+hundreds of observations to dilute.
+
+**Our mitigation:** We plan to implement discounted posteriors with
+`α_new = α × γ + success, β_new = β × γ + failure` where γ ∈ [0.95, 0.99]
+(TODO T5-CR7).  This geometric decay forgets stale evidence across regime
+boundaries.
+
+**What would change our mind:** If EXP3 or sliding-window UCB consistently
+outperforms discounted Thompson Sampling on CHIA data, we would switch.
+
+---
+
+#### 9.3.10 Whale Detection & Spread Widening
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟢 HIGH |
+| **Supporting papers** | Practitioner model; related theory in Kyle (1985) [ref 24] |
+| **Counter-research** | Gatheral (2010) [ref 53]; Almgren et al. (2005) [ref 54] |
+| **Counter-findings** | CR-10 (Kyle's linear permanent impact is empirically rejected; square-root impact preferred) |
+
+**Why we chose it:** Large trades are empirically associated with adverse
+selection risk on all exchanges.  Widening spreads after whale activity is
+a standard market-making defensive measure.
+
+**What the counter-research says:** Kyle's linear price-impact model, which
+informs the sensitivity calibration, is empirically rejected in favor of
+square-root impact.
+
+**Our mitigation:** We use whale detection as a *binary signal* (large trade
+detected → widen spread) rather than relying on Kyle's impact formula for
+sizing.  The spread widening multiplier is configurable and calibrated from
+observed adverse fill rates, not from the linear-impact model.
+
+**What would change our mind:** Nothing — the core signal (large trade →
+higher adverse-selection risk) is uncontroversial.  Only the impact
+*magnitude* calibration may need updating.
+
+---
+
+#### 9.3.11 Competitor Detection & Response
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟢 HIGH |
+| **Supporting papers** | Practitioner model; related to Foucault, Kadan & Kandel (2005) [ref 38] |
+| **Counter-research** | None identified |
+| **Counter-findings** | None |
+
+**Why we chose it:** Monitoring competitor offers and adjusting spreads is
+basic market-making hygiene.  No counter-research challenges this approach.
+
+**What would change our mind:** If CHIA's market structure evolves to make
+competitor detection infeasible (e.g., encrypted offer books), we would need
+an alternative approach.
+
+---
+
+#### 9.3.12 Asymmetric Spread Widening
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🟢 HIGH |
+| **Supporting papers** | Practitioner model combining whale detection with Glosten-Milgrom adverse selection theory |
+| **Counter-research** | None directly; related CR-13 (Stoll 1989: adverse selection is only one spread component) |
+| **Counter-findings** | None directly applicable |
+
+**Why we chose it:** When directional flow is detected, widening the
+spread on the toxic side while keeping the other side competitive is
+strictly better than symmetric widening for both profitability and fill rate.
+
+**What would change our mind:** Nothing — asymmetric widening dominates
+symmetric widening in all theoretical frameworks.  The only question is
+signal quality (whale detection accuracy), not the asymmetric response itself.
+
+---
+
+#### 9.3.13 Bayesian PIN (Considered, Not Implemented)
+
+| Attribute | Assessment |
+|-----------|------------|
+| **Confidence** | 🔴 LOW |
+| **Supporting papers** | Easley et al. (1996) [ref 13]; Easley, López de Prado & O'Hara (2016) [ref 15] |
+| **Counter-research** | Duarte & Young (2009) [ref 48]; Collin-Dufresne & Fos (2015) [ref 49] |
+| **Counter-findings** | CR-4 (PIN may measure illiquidity friction, not informed trading; lowest when known informed traders are most active) |
+
+**Why we haven't implemented it:** The counter-research is particularly
+damaging.  If PIN measures illiquidity rather than information, using it to
+gate adverse-selection responses would be counterproductive — widening
+spreads precisely when the market is most liquid.
+
+**What would make us implement it:** If independent replication on DEX data
+shows PIN correlates with ex-post adverse price moves, we would reconsider.
+
+### 9.4 Summary: Confidence Dashboard
+
+| # | Strategy | Confidence | Key Risk | Status |
+|---|----------|------------|----------|--------|
+| 1.1 | Avellaneda-Stoikov | 🟡 MEDIUM | Sawtooth τ exploitable; continuous-time mismatch | Fix planned (T5-CR3) |
+| 1.2 | GLFT | 🟡 MEDIUM | Inventory skew too small for sparse fills | Fix planned (T5-CR8) |
+| 1.3 | Spread Optimizer | 🟢 HIGH | Component weights need calibration | Monitor |
+| 1.4 | Multi-Tier Liquidity | 🟢 HIGH | No academic challenge | Stable |
+| 1.5 | Regime Detection | 🔴 LOW | VR power ~5–9%; HMM fragile | Fixes planned (T5-CR5, T5-CR14) |
+| 1.6 | Arbitrage | 🟡 MEDIUM | Protocol-dependent revenue | Monitor (T5-CR11) |
+| 1.7 | Competitor Detection | 🟢 HIGH | No academic challenge | Stable |
+| 1.8 | Whale Detection | 🟢 HIGH | Impact model needs recalibration | Minor |
+| 1.9 | VPIN | 🔴 LOW | No incremental predictive power | Validate (T5-CR1) |
+| 1.10 | OFI | 🟡 MEDIUM | Best-level only; multi-level is stronger | Upgrade planned (T5-CR2) |
+| 1.11 | Asymmetric Widening | 🟢 HIGH | Depends on signal quality | Stable |
+| 1.12 | Thompson Sampling | 🟡 MEDIUM | Non-stationarity breaks guarantees | Fix planned (T5-CR7) |
+| 2.1 | Bayesian PIN | 🔴 LOW | May measure illiquidity, not information | Deferred |
+
+### 9.5 When to Revisit Choices
+
+We revisit strategy confidence rankings when any of the following occur:
+
+1. **New counter-research is published** that directly challenges our
+   theoretical foundation (≥2 independent replications).
+2. **Live performance data** accumulates ≥500 fills for A/B comparison
+   between current and alternative approaches.
+3. **CHIA market structure changes** (e.g., sub-second block times, encrypted
+   offer books, new DEX mechanics) that invalidate current assumptions.
+4. **A TODO item from Tier 5 is completed** and the fix materially changes
+   the strategy's behavior or accuracy.
+
+Each revisit should produce a dated addendum to this section documenting the
+new evidence and the resulting confidence change.
+
+---
+
+## 10. References
 
 1. Agrawal, S. & Goyal, N. (2012). "Analysis of Thompson sampling for the multi-armed bandit problem." *COLT 2012*.
 

@@ -540,7 +540,7 @@ This section aggregates the highest-priority actionable findings from the counte
 
 ## 20. Recommended Additional Citations
 
-The following papers are recommended as additions to the §9 References section of `trading-strategies.md` to document the counter-literature and show the design decisions are made with awareness of the debate:
+The following papers are recommended as additions to the §10 References section of `trading-strategies.md` to document the counter-literature and show the design decisions are made with awareness of the debate:
 
 | # | Paper | Relevance |
 |---|-------|-----------|
