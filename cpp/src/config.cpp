@@ -19,6 +19,7 @@
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
@@ -245,6 +246,16 @@ ChiaConfig parse_chia(const YAML::Node& root)
 
     cfg.wallet_fingerprint = read_uint32(node, "wallet_fingerprint", sec);
 
+    // T3-32: Reject sentinel value 0 for wallet_fingerprint.
+    // A zero fingerprint means the wallet key is unconfigured; the daemon
+    // would silently fall back to the first available key, violating the
+    // principle of explicit configuration.
+    // ISO/IEC 27001:2022 -- mandatory authentication parameter must be set.
+    if (cfg.wallet_fingerprint == 0) {
+        throw ConfigError(sec + ".wallet_fingerprint must not be 0; "
+                          "configure the fingerprint of the wallet key to use");
+    }
+
     return cfg;
 }
 
@@ -284,6 +295,17 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         p.base_asset_id  = read_string(item, "base_asset_id", idx);
         p.quote_asset_id = read_string(item, "quote_asset_id", idx);
         p.name           = read_string(item, "name", idx);
+
+        // T3-29: Normalize asset IDs to lowercase before validation.
+        // Chia tools may emit uppercase hex (e.g. "A1B2..."); coerce to
+        // lowercase so all downstream code can rely on consistent casing.
+        // ISO/IEC 25000 -- predictable data normalization at the boundary.
+        auto to_lower = [](std::string& s) {
+            std::transform(s.begin(), s.end(), s.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        };
+        to_lower(p.base_asset_id);
+        to_lower(p.quote_asset_id);
 
         // 'enabled' defaults to true when omitted.
         if (item["enabled"] && item["enabled"].IsDefined() && !item["enabled"].IsNull()) {

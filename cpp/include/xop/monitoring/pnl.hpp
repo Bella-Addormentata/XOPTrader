@@ -33,6 +33,7 @@
 #include "xop/types.hpp"
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -66,6 +67,9 @@ struct TradeRecord {
     Mojo        realized_pnl_mojos;   ///< Realized PnL on this fill (mojos).
     BlockHeight block_height;         ///< Settlement block number.
     std::string offer_hash;           ///< Chia spend-bundle hash.
+    Timestamp   acquisition_ts;       ///< Weighted-average acquisition timestamp
+                                      ///< for the position sold (sells only).
+                                      ///< Used by IRS Form 8949 CSV export.
 };
 
 // ---------------------------------------------------------------------------
@@ -217,11 +221,15 @@ public:
 
     /// Retrieve trade records within a time range from the SQLite database.
     ///
+    /// T2-07: Non-const because SQLite prepared-statement bind/step/reset
+    /// mutates statement state.  Removing const avoids the prior const_cast
+    /// which was unsafe under concurrent access (ISO/IEC 5055, CWE-362).
+    ///
     /// @param start  Inclusive lower bound (UTC).
     /// @param end    Exclusive upper bound (UTC).
     /// @return Records ordered by timestamp ascending.
     [[nodiscard]] std::vector<TradeRecord> get_trade_log(
-        Timestamp start, Timestamp end) const;
+        Timestamp start, Timestamp end);
 
     // -- Trade persistence (direct SQL) -----------------------------------
 
@@ -232,13 +240,16 @@ public:
 
     /// Query trades for a specific pair within a time range.
     ///
+    /// T2-07: Non-const because SQLite prepared-statement bind/step/reset
+    /// mutates statement state (ISO/IEC 5055, CWE-362).
+    ///
     /// @param pair_name  Filter by pair (empty string = all pairs).
     /// @param start      Inclusive lower bound ISO-8601 string.
     /// @param end        Exclusive upper bound ISO-8601 string.
     [[nodiscard]] std::vector<TradeRecord> query_trades(
         const std::string& pair_name,
         const std::string& start,
-        const std::string& end) const;
+        const std::string& end);
 
     // -- Tax reporting ----------------------------------------------------
 
@@ -250,13 +261,15 @@ public:
     /// @param start_date  ISO-8601 date "YYYY-MM-DD" inclusive.
     /// @param end_date    ISO-8601 date "YYYY-MM-DD" exclusive.
     /// @param csv_path    Output file path.  Overwritten if it exists.
+    /// T2-07: Non-const -- transitive from query_trades (ISO/IEC 5055).
     void export_trades_csv(const std::string& start_date,
                            const std::string& end_date,
-                           const std::string& csv_path) const;
+                           const std::string& csv_path);
 
     /// Compute realised capital gains for a tax year, split by holding
     /// period (short-term < 1 year, long-term >= 1 year).
-    [[nodiscard]] RealizedGains compute_realized_gains(int year) const;
+    /// T2-07: Non-const -- transitive from query_trades (ISO/IEC 5055).
+    [[nodiscard]] RealizedGains compute_realized_gains(int year);
 
     // -- Timestamp utilities (public for use by read helpers) -------------
 
@@ -284,6 +297,12 @@ private:
         std::uint64_t adverse_fills = 0; ///< Fills followed by adverse price move.
         Timestamp first_fill_ts = {}; ///< Timestamp of the first fill.
         Timestamp last_fill_ts  = {}; ///< Timestamp of the most recent fill.
+        Timestamp avg_acquisition_ts = {}; ///< Weighted-average acquisition time
+                                           ///< across buys for this pair.  Used to
+                                           ///< populate "Date Acquired" in IRS
+                                           ///< Form 8949 CSV exports (T2-06).
+        Mojo      acquisition_qty    = 0;  ///< Running quantity for acquisition
+                                           ///< timestamp weighting (mojos).
     };
 
     /// A single PnL snapshot for Sharpe ratio and drawdown calculation.
@@ -329,7 +348,9 @@ private:
 
     /// Rolling PnL snapshots for Sharpe and drawdown.
     /// Capped at kMaxSnapshots entries; oldest are discarded.
-    std::vector<PnLSnapshot> pnl_history_;
+    /// T3-21: std::deque provides O(1) front removal for the rolling window
+    /// trim, versus O(n) for std::vector::erase(begin()).
+    std::deque<PnLSnapshot> pnl_history_;
 
     /// Current XCH/USD rate for USD conversion.  Updated by mark_to_market().
     double xch_usd_rate_ = 0.0;

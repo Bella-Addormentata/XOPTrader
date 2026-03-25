@@ -1,9 +1,10 @@
 // engine.cpp -- Top-level orchestrator implementation for XOPTrader.
 //
 // The engine runs a single-threaded event loop driven by boost::asio.
-// A 5-second steady_timer polls the Chia full node for block height.
-// When a new block is detected, the 13-step heartbeat cycle executes
-// synchronously (no coroutine interleaving within a single cycle).
+// A native C++20 coroutine loop polls the Chia full node for block height
+// every 5 seconds.  When a new block is detected, the 13-step heartbeat
+// cycle executes as a co_await chain (no co_spawn/use_future/.get()
+// patterns that risk deadlocking the io_context thread).
 //
 // Error handling strategy:
 //   - Transient RPC errors (network, timeout) are caught per-step and
@@ -25,7 +26,13 @@
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
-#include <boost/asio/use_future.hpp>
+#include <boost/asio/redirect_error.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
+// [CRITICAL-1/HIGH-2] Removed <boost/asio/use_future.hpp> and <future> --
+// all blocking use_future/.get() patterns have been replaced with
+// co_await (open_connections) or co_spawn(detached) (shutdown).
+// ISO/IEC 5055: no dead includes.
 
 #include <spdlog/spdlog.h>
 
@@ -83,15 +90,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     rpc::DexieConfig dexie_cfg;
     dexie_cfg.base_url                = config_.dexie.api_base;
     dexie_cfg.rate_limit_max_requests = config_.dexie.max_requests_per_10s;
-    dexie_ = std::make_unique<rpc::DexieClient>(dexie_cfg);
+    dexie_ = std::make_shared<rpc::DexieClient>(ioc_, dexie_cfg);
 
     // -- Execution layer ------------------------------------------------------
 
     coin_mgr_ = std::make_unique<execution::CoinManager>(
         ioc_, wallet_, config_);
 
+    // Pass the shared dexie client so OfferManager can submit offers to
+    // the Dexie aggregator for cross-platform visibility.
     offer_mgr_ = std::make_unique<execution::OfferManager>(
-        ioc_, wallet_, state_, config_);
+        ioc_, wallet_, dexie_, state_, config_);
 
     // Market data feed: construct with a MarketDataConfig derived from
     // the top-level config (default thresholds are appropriate for Phase 1).
@@ -118,12 +127,20 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 
     // -- Strategy layer -------------------------------------------------------
 
-    // Construct the default Avellaneda-Stoikov strategy.
-    // A GLFT strategy can be substituted here via config in the future.
+    // [T1-11] Construct per-pair Avellaneda-Stoikov strategy instances.
+    // Each enabled pair gets its own StrategyBase so that price histories,
+    // regime states, and internal estimators are isolated.  This prevents
+    // state bleed between pairs with different volatility profiles.
+    // A GLFT strategy can be substituted per-pair via config in the future.
+    // ISO/IEC 5055: no shared mutable state across independent pairs.
     AvellanedaConfig as_strat_cfg;
     as_strat_cfg.gamma = config_.strategy.gamma;
     as_strat_cfg.kappa = config_.strategy.kappa;
-    strategy_ = std::make_unique<AvellanedaStoikov>(as_strat_cfg);
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        strategies_[pair.name] =
+            std::make_unique<AvellanedaStoikov>(as_strat_cfg);
+    }
 
     // Spread optimizer with config-derived parameters.
     SpreadConfig sp_cfg;
@@ -229,8 +246,11 @@ void Engine::run()
 {
     spdlog::info("[Engine] Opening connections and entering main loop");
 
-    // Open all external connections.
-    open_connections();
+    // [CRITICAL-1] Connection opening has been moved into poll_loop_coro()
+    // where it is co_awaited with ioc_ already running.  The old call here
+    // used co_spawn(use_future).get() which deadlocks because ioc_.run()
+    // has not been entered yet at this point.
+    // ISO/IEC 5055: removed deadlock-prone blocking call from startup path.
 
     // Start Prometheus metrics exporter.
     // Extract all configured asset IDs so the cardinality guard rejects
@@ -277,42 +297,53 @@ void Engine::shutdown()
     boost::system::error_code ec;
     poll_timer_.cancel(ec);
 
-    // Cancel all outstanding offers on-chain (secure cancellation).
-    // This is a best-effort operation; errors are logged but do not
-    // prevent the rest of the shutdown sequence.
-    if (!dry_run_) {
-        try {
-            // Synchronous co_spawn: block until cancel_all completes.
-            auto future = asio::co_spawn(
-                ioc_, offer_mgr_->cancel_all(), asio::use_future);
-            // Give up to 60 seconds for the cancellations to complete.
-            if (future.wait_for(std::chrono::seconds(60)) ==
-                std::future_status::timeout) {
-                spdlog::warn("[Engine] Offer cancellation timed out during shutdown");
-            } else {
-                future.get();
+    // [HIGH-2] Cancel all outstanding offers on-chain (secure cancellation).
+    //
+    // The previous implementation used promise/future.wait_for() which
+    // deadlocks if shutdown() is called from the io_context thread (the
+    // .wait_for() blocks the thread that needs to pump completions).
+    //
+    // New approach: post the entire shutdown-continuation (cancel_all ->
+    // unlock -> close -> stop) as a co_spawn(detached) coroutine.  This
+    // is safe from any calling thread because asio::co_spawn always posts
+    // to the io_context.  The atomic shutdown_cancel_done_ flag lets
+    // external observers know when cleanup finished (used only for testing;
+    // the ioc_.stop() at the end unblocks ioc_.run() in run()).
+    //
+    // ISO/IEC 5055: no blocking .get()/.wait() calls; fully async teardown.
+    // ISO/IEC 27001:2022: all cancellation outcomes are audit-logged.
+    asio::co_spawn(ioc_, [this]() -> asio::awaitable<void> {
+        // --- Cancel outstanding offers (skip in dry-run mode) ---
+        if (!dry_run_) {
+            try {
+                co_await offer_mgr_->cancel_all();
                 spdlog::info("[Engine] All outstanding offers cancelled");
+            } catch (const std::exception& ex) {
+                spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
-        } catch (const std::exception& ex) {
-            spdlog::error("[Engine] Error cancelling offers during shutdown: {}",
-                          ex.what());
         }
-    }
 
-    // Unlock all coins held by cancelled offers.
-    coin_mgr_->unlock_all();
+        // --- Post-cancel cleanup (runs on io_context, no deadlock) ---
+        // Unlock all coins held by cancelled offers.
+        coin_mgr_->unlock_all();
 
-    // Close RPC/API connections.
-    close_connections();
+        // Close RPC/API connections.
+        close_connections();
 
-    // Shut down Prometheus exporter.
-    metrics_->shutdown();
+        // Shut down Prometheus exporter.
+        metrics_->shutdown();
 
-    state_->set_status(BotStatus::Stopped);
-    spdlog::info("[Engine] Shutdown complete");
+        state_->set_status(BotStatus::Stopped);
+        spdlog::info("[Engine] Shutdown complete");
 
-    // Stop the io_context so run() returns.
-    ioc_.stop();
+        // Signal completion for any external observer.
+        shutdown_cancel_done_.store(true, std::memory_order_release);
+
+        // Stop the io_context so ioc_.run() in run() returns.
+        ioc_.stop();
+
+        co_return;
+    }, asio::detached);
 }
 
 bool Engine::is_running() const noexcept
@@ -344,56 +375,90 @@ bool Engine::is_dry_run() const noexcept
 // Main loop -- polling and heartbeat dispatch
 // ===========================================================================
 
+// [T1-03] start_polling -- launch the native coroutine polling loop.
+// Replaces the old timer-callback + co_spawn(use_future).get() pattern
+// with a single co_spawn(detached) that loops internally, eliminating
+// the deadlock hazard of blocking .get() on the io_context thread.
+// ISO/IEC 5055: no blocking calls on the event loop thread.
 void Engine::start_polling()
 {
-    poll_timer_.expires_after(kPollInterval);
-    poll_timer_.async_wait(
-        [this](const boost::system::error_code& ec) {
-            if (ec) {
-                // Timer was cancelled (shutdown) or encountered an error.
-                if (ec != boost::asio::error::operation_aborted) {
-                    spdlog::error("[Engine] Poll timer error: {}", ec.message());
-                }
-                return;
-            }
-            poll_block_height();
-        });
+    asio::co_spawn(ioc_, poll_loop_coro(), asio::detached);
 }
 
-void Engine::poll_block_height()
+// [T1-03] Native coroutine polling loop.  All async operations are
+// co_awaited directly, keeping the io_context free to process other
+// completions.  The loop sleeps for kPollInterval between polls.
+asio::awaitable<void> Engine::poll_loop_coro()
 {
-    if (stop_requested_.load(std::memory_order_relaxed)) {
-        return;  // Shutting down; do not reschedule.
-    }
+    // [CRITICAL-1] Open all RPC/API connections as the first action inside
+    // the coroutine loop.  At this point ioc_.run() is active on the calling
+    // thread, so co_await can complete without deadlocking.
+    // ISO/IEC 5055: connection setup runs within the live event loop.
+    // ISO/IEC 27001:2022: any connection failure propagates as an exception,
+    // which terminates the coroutine and ultimately causes ioc_.run() to
+    // return, stopping the engine cleanly.
+    co_await open_connections();
 
-    try {
-        // Spawn a coroutine to query the full node for the current height.
-        auto future = asio::co_spawn(
-            ioc_, full_node_->get_block_height(), asio::use_future);
+    asio::steady_timer timer(ioc_);
 
-        // Wait for the RPC response (should complete within the 30s timeout).
-        std::int64_t height = future.get();
+    while (!stop_requested_.load(std::memory_order_relaxed)) {
+        // Sleep for the polling interval via co_await (non-blocking).
+        timer.expires_after(kPollInterval);
+        boost::system::error_code ec;
+        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
 
-        BlockHeight current_block = static_cast<BlockHeight>(height);
-
-        // If we observed a new block, run the full heartbeat cycle.
-        if (current_block > last_block_.load(std::memory_order_relaxed)) {
-            on_new_block(current_block);
+        if (ec == boost::asio::error::operation_aborted) {
+            break;  // Timer cancelled during shutdown.
         }
-    } catch (const std::exception& ex) {
-        spdlog::error("[Engine] Block height poll failed: {}", ex.what());
-        // Continue polling; transient failures are expected.
+        if (ec) {
+            spdlog::error("[Engine] Poll timer error: {}", ec.message());
+            continue;
+        }
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            break;
+        }
+
+        try {
+            // co_await the full node RPC directly -- no use_future/.get().
+            std::int64_t height = co_await full_node_->get_block_height();
+
+            // [MEDIUM-4] Guard against negative block heights returned by a
+            // malfunctioning or unreachable full node.  The RPC returns
+            // int64_t but BlockHeight is uint32_t; a negative value would
+            // wrap to a very large block number, causing the engine to
+            // process a phantom "new block" and corrupt cycle state.
+            // ISO/IEC 5055: explicit narrowing check prevents undefined
+            //   behavior from signed-to-unsigned conversion.
+            // ISO/IEC 27001:2022: invalid data from external source is
+            //   rejected and logged.
+            if (height < 0) {
+                spdlog::warn("[Engine] Full node returned negative block "
+                             "height ({}); skipping this poll cycle", height);
+                continue;
+            }
+            BlockHeight current_block = static_cast<BlockHeight>(height);
+
+            // If we observed a new block, run the full heartbeat cycle.
+            if (current_block > last_block_.load(std::memory_order_relaxed)) {
+                co_await on_new_block_coro(current_block);
+            }
+        } catch (const std::exception& ex) {
+            spdlog::error("[Engine] Block height poll failed: {}", ex.what());
+            // Continue polling; transient failures are expected.
+        }
     }
 
-    // Reschedule the timer for the next poll.
-    start_polling();
+    co_return;
 }
 
 // ===========================================================================
 // 13-step heartbeat cycle
 // ===========================================================================
 
-void Engine::on_new_block(BlockHeight block_height)
+// [T1-03] on_new_block_coro -- native coroutine heartbeat cycle.
+// Steps 2 and 8 are co_awaited (they contain async RPC calls).
+// All other steps remain synchronous within the coroutine frame.
+asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 {
     spdlog::info("[Engine] Processing block {}", block_height);
 
@@ -402,7 +467,13 @@ void Engine::on_new_block(BlockHeight block_height)
     // Clear per-cycle working state from the previous block.
     cycle_.clear();
 
+    // [T3-08] Reset NHE accumulators for this cycle.
+    nhe_net_inventory_change_ = 0.0;
+    nhe_total_volume_         = 0.0;
+
     // Initialize per-pair cycle state for all enabled pairs.
+    // [T3-24] market_data_valid defaults to false; Step 1 sets it true
+    // on success per pair.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
         PairCycleState pcs;
@@ -421,12 +492,13 @@ void Engine::on_new_block(BlockHeight block_height)
     // does not abort the remaining steps.  The engine logs the error and
     // continues with degraded data.
 
-    try { step_update_market_state(block_height); }
+    try { co_await step_update_market_state(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 1 (market state) failed: {}", e.what());
     }
 
-    try { step_process_fills(block_height); }
+    // [T1-03] Step 2 is a coroutine (co_awaits detect_fills).
+    try { co_await step_process_fills(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 2 (fills) failed: {}", e.what());
     }
@@ -446,6 +518,101 @@ void Engine::on_new_block(BlockHeight block_height)
         spdlog::error("[Engine] Step 5 (spread opt) failed: {}", e.what());
     }
 
+    // [T3-10] Run flash-crash check before Step 6 so that the state
+    // machine is updated before risk limits and offer gating apply.
+    //
+    // [MEDIUM-5] Iterate ALL enabled pairs and use the worst-case (largest
+    // drop) to drive the state machine.  The previous code had a `break`
+    // after the first enabled pair, leaving all other pairs unmonitored.
+    // A flash crash in pair #2+ would go undetected, allowing the engine
+    // to continue posting offers into a crashing market.
+    //
+    // New approach: accumulate a per-pair crash/stable signal, then take
+    // the most conservative outcome (any pair crashing -> Crash state;
+    // recovery requires ALL pairs to be stable).
+    //
+    // ISO/IEC 5055: exhaustive iteration prevents unmonitored risk paths.
+    // ISO/IEC 27001:2022: all pairs contribute to circuit breaker decision.
+    try {
+        bool any_pair_crashing = false;   // True if any pair triggers crash.
+        bool all_pairs_stable_50 = true;  // True if all pairs meet 50-block stability.
+        bool all_pairs_stable_100 = true; // True if all pairs meet 100-block stability.
+        std::string crash_pair_name;      // Name of first crashing pair (for logging).
+
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            auto history = market_data_->get_price_history(pair.name);
+            if (history.empty()) continue;
+
+            // Convert PriceHistoryEntry to Mojo vector for check_flash_crash.
+            std::vector<Mojo> price_vec;
+            price_vec.reserve(history.size());
+            for (const auto& entry : history) {
+                price_vec.push_back(static_cast<Mojo>(
+                    std::llround(entry.price * static_cast<double>(kMojosPerXch))));
+            }
+
+            // Check crash signal for this pair.
+            if (PreTradeCheck::check_flash_crash(price_vec, 0.20)) {
+                any_pair_crashing = true;
+                if (crash_pair_name.empty()) crash_pair_name = pair.name;
+            }
+
+            // Check stability signals for this pair.
+            if (!PreTradeCheck::is_stable_after_crash(
+                    price_vec, /*required_stable_blocks=*/50, 0.05)) {
+                all_pairs_stable_50 = false;
+            }
+            if (!PreTradeCheck::is_stable_after_crash(
+                    price_vec, /*required_stable_blocks=*/100, 0.05)) {
+                all_pairs_stable_100 = false;
+            }
+            // [MEDIUM-5] No break -- continue checking all enabled pairs.
+        }
+
+        // Drive the state machine using the aggregated worst-case signals.
+        switch (flash_crash_state_) {
+            case FlashCrashState::Normal:
+                if (any_pair_crashing) {
+                    flash_crash_state_ = FlashCrashState::Crash;
+                    spdlog::warn("[Engine] Flash crash DETECTED for {} "
+                                 "-- transitioning to Crash state",
+                                 crash_pair_name);
+                    alerts_->send_alert(AlertRule::FlashCrash,
+                        "Flash crash detected for " + crash_pair_name +
+                        " -- offer posting suspended");
+                }
+                break;
+            case FlashCrashState::Crash:
+                if (any_pair_crashing) {
+                    // Still crashing -- remain in Crash state.
+                } else if (all_pairs_stable_50) {
+                    flash_crash_state_ = FlashCrashState::Recovery;
+                    spdlog::info("[Engine] Flash crash entering Recovery "
+                                 "state (all pairs stable 50 blocks)");
+                }
+                break;
+            case FlashCrashState::Recovery:
+                if (any_pair_crashing) {
+                    // Re-crash during recovery.
+                    flash_crash_state_ = FlashCrashState::Crash;
+                    spdlog::warn("[Engine] Re-crash during Recovery for {} "
+                                 "-- back to Crash state", crash_pair_name);
+                } else if (all_pairs_stable_100) {
+                    flash_crash_state_ = FlashCrashState::Normal;
+                    spdlog::info("[Engine] Flash crash Recovery complete "
+                                 "(all pairs stable 100 blocks) "
+                                 "-- Normal state resumed");
+                    alerts_->send_alert(AlertRule::FlashCrash,
+                        "Market stability restored across all pairs "
+                        "-- offer posting resumed");
+                }
+                break;
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] Flash crash check failed: {}", e.what());
+    }
+
     try { step_apply_risk_limits(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 6 (risk limits) failed: {}", e.what());
@@ -456,9 +623,17 @@ void Engine::on_new_block(BlockHeight block_height)
         spdlog::error("[Engine] Step 7 (ladder) failed: {}", e.what());
     }
 
-    try { step_manage_offers(block_height); }
-    catch (const std::exception& e) {
-        spdlog::error("[Engine] Step 8 (offers) failed: {}", e.what());
+    // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
+    // [T3-10] Gate Step 8 during Crash/Recovery states.
+    if (flash_crash_state_ == FlashCrashState::Normal) {
+        try { co_await step_manage_offers(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 8 (offers) failed: {}", e.what());
+        }
+    } else {
+        spdlog::warn("[Engine] Step 8 GATED: flash_crash_state={} "
+                     "-- no new offers posted",
+                     to_string(flash_crash_state_));
     }
 
     try { step_check_arbitrage(block_height); }
@@ -492,23 +667,31 @@ void Engine::on_new_block(BlockHeight block_height)
     auto elapsed = std::chrono::steady_clock::now() - cycle_start;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
     spdlog::info("[Engine] Block {} processed in {} ms", block_height, ms.count());
+
+    co_return;
 }
 
 // ===========================================================================
 // Step implementations
 // ===========================================================================
 
-// Step 1: Update market state (prices from DEX + CEX).
-void Engine::step_update_market_state(BlockHeight block_height)
+// [T1-02] Step 1: Update market state (prices from DEX + CEX).
+// Now a coroutine: co_awaits dexie async methods which dispatch CURL
+// transfers to a thread pool (never blocking the io_context).
+asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 {
     // Ingest the current block height into the market data feed.
     market_data_->ingest_block_height(block_height);
 
     // For each enabled pair, fetch the latest dexie ticker data.
+    // [T3-24] Track per-pair success for dependency-aware gating.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
-        auto ticker = dexie_->get_ticker(pair.name);
+        // [T3-24] Assume invalid until successful data ingestion.
+        bool pair_data_ok = false;
+
+        auto ticker = co_await dexie_->get_ticker(pair.name);
         if (ticker) {
             market_data_->ingest_dexie(
                 pair.name,
@@ -516,6 +699,11 @@ void Engine::step_update_market_state(BlockHeight block_height)
                 ticker->price_sell,
                 ticker->price_last,
                 ticker->volume_xch_daily);
+
+            // [T3-24] Mark pair data as valid if ticker returned prices.
+            if (ticker->price_last > 0.0) {
+                pair_data_ok = true;
+            }
 
             // Feed OFI (Order Flow Imbalance) with best bid/ask from the
             // dexie ticker snapshot.  The ticker provides best-level prices;
@@ -536,7 +724,7 @@ void Engine::step_update_market_state(BlockHeight block_height)
         // so the competitor detector can filter them out.
         // ISO/IEC 27001:2022: no secret data exposed in offers.
         try {
-            auto offers_page = dexie_->get_offers(
+            auto offers_page = co_await dexie_->get_offers(
                 pair.name,
                 /*offered=*/   {},
                 /*requested=*/ {},
@@ -592,6 +780,19 @@ void Engine::step_update_market_state(BlockHeight block_height)
 
         // CEX reference ingestion would go here (Phase 2: OKX/Gate.io).
         // market_data_->ingest_cex_reference(pair.name, cex_mid);
+
+        // [T3-24] Set the market_data_valid flag for this pair.
+        // Steps 4-8 are gated on this flag; if Step 1 fails for a pair,
+        // those steps will skip it rather than acting on stale data.
+        // ISO/IEC 5055: explicit validity tracking per pair.
+        auto cycle_it = cycle_.find(pair.name);
+        if (cycle_it != cycle_.end()) {
+            cycle_it->second.market_data_valid = pair_data_ok;
+            if (!pair_data_ok) {
+                spdlog::warn("[Engine] Step 1: {} market data invalid -- "
+                             "steps 4-8 gated for this pair", pair.name);
+            }
+        }
     }
 
     // Build a list of enabled pair names for the refresh call.
@@ -608,15 +809,17 @@ void Engine::step_update_market_state(BlockHeight block_height)
 
     spdlog::debug("[Engine] Step 1 complete: market state updated for {} pairs",
                   enabled.size());
+    co_return;
 }
 
-// Step 2: Process any fills from this block.
-void Engine::step_process_fills(BlockHeight block_height)
+// [T1-03] Step 2: Process any fills from this block (coroutine).
+// co_awaits detect_fills() directly instead of co_spawn(use_future).get().
+// [T2-17] Checks record_sell() return value for no-loss rejection.
+// [T3-08] Feeds NHE accumulators with fill data for Step 10.
+asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
-    // Spawn the fill-detection coroutine and wait for results.
-    auto future = asio::co_spawn(
-        ioc_, offer_mgr_->detect_fills(), asio::use_future);
-    auto fills = future.get();
+    // [T1-03] co_await the fill-detection coroutine directly.
+    auto fills = co_await offer_mgr_->detect_fills();
 
     for (const auto& fill : fills) {
         // Persist the fill to the audit trail.
@@ -679,28 +882,72 @@ void Engine::step_process_fills(BlockHeight block_height)
             inventory_->record_buy(fill_base, fill.size, fill.price,
                                    fill.block_height, now);
         } else {
-            inventory_->record_sell(fill_base, fill.size, fill.price,
-                                    fill.block_height, now);
+            // [T2-17] Check record_sell() return value.  record_sell()
+            // returns false when the no-loss constraint rejects the sell
+            // (sell_price < cost_basis).  This should not happen for
+            // confirmed on-chain fills, but if it does, it indicates a
+            // state inconsistency between the offer manager's pricing and
+            // the inventory tracker's cost basis.
+            // ISO/IEC 5055: checked return value on every code path.
+            bool sell_ok = inventory_->record_sell(
+                fill_base, fill.size, fill.price,
+                fill.block_height, now);
+            if (!sell_ok) {
+                spdlog::error("[Engine] Step 2: record_sell() REJECTED fill "
+                              "for {} {} @ {} mojos (block {}) -- "
+                              "no-loss constraint violation or state "
+                              "inconsistency.  Fill was confirmed on-chain "
+                              "but inventory tracker refused it.",
+                              fill.pair_name, fill.size, fill.price,
+                              fill.block_height);
+                // Alert on the inconsistency so the operator can investigate.
+                alerts_->send_alert(AlertRule::ExposureBreach,
+                    "record_sell() rejected confirmed fill for " +
+                    fill.pair_name + " at block " +
+                    std::to_string(fill.block_height) +
+                    " -- state inconsistency");
+            }
         }
+
+        // [T3-08] Accumulate NHE (Natural Hedge Efficiency) data from fills.
+        // Buys add positive inventory change; sells subtract.
+        // Total volume accumulates the absolute fill size.
+        // These accumulators are consumed by step_run_hedging (Step 10).
+        // ISO/IEC 5055: double conversion to prevent integer overflow.
+        double fill_size_d = static_cast<double>(fill.size);
+        if (fill.side == Side::Bid) {
+            nhe_net_inventory_change_ += fill_size_d;
+        } else {
+            nhe_net_inventory_change_ -= fill_size_d;
+        }
+        nhe_total_volume_ += fill_size_d;
 
         // Feed the PnL tracker.
         pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos);
 
-        // Feed the whale detector with each fill so that large trades
-        // trigger spread widening via WhaleMetrics.
+        // Feed the whale detector with each fill for attribution/calibration.
+        // T3-35: is_own_fill=true because these are the bot's own confirmed
+        // fills.  Own fills are recorded for calibration only -- they must NOT
+        // contribute to whale detection, VPIN, or OFI toxicity signals.
+        // Treating own fills as market toxicity creates a self-reinforcing
+        // feedback loop: own fill -> toxicity up -> spread widens -> spiral.
         // ISO/IEC 25000: connects the fully-implemented whale subsystem
-        // to the engine heartbeat.
+        // to the engine heartbeat with proper self-fill separation.
+        constexpr bool kIsOwnFill = true;
         market_data_->ingest_trade(
-            fill.pair_name, fill.side, fill.size, fill.block_height);
+            fill.pair_name, fill.side, fill.size, fill.block_height,
+            kIsOwnFill);
 
         // Feed VPIN (Volume-Synchronized Probability of Informed Trading)
         // with each fill's volume.  VPIN accumulates volume bars to detect
-        // flow toxicity; without this feed the VPIN signal was always zero.
+        // flow toxicity.
+        // T3-35: is_own_fill=true -- own fills excluded from VPIN to prevent
+        // self-generated order flow from inflating toxicity metrics.
         // ISO/IEC 5055: convert mojos to base-asset units for VPIN.
         const double fill_volume =
             static_cast<double>(fill.size) / static_cast<double>(kMojosPerXch);
         market_data_->ingest_trade_for_vpin(
-            fill.pair_name, fill.side, fill_volume);
+            fill.pair_name, fill.side, fill_volume, kIsOwnFill);
 
         spdlog::info("[Engine] Fill: {} {} {} @ {} (block {})",
                      fill.pair_name,
@@ -724,6 +971,7 @@ void Engine::step_process_fills(BlockHeight block_height)
     }
 
     spdlog::debug("[Engine] Step 2 complete: {} fills processed", fills.size());
+    co_return;
 }
 
 // Step 3: Update volatility, PIN, regime estimates.
@@ -741,8 +989,12 @@ void Engine::step_update_analytics(BlockHeight block_height)
             vol_it->second->update(mid);
         }
 
-        // Update the strategy's internal price history.
-        strategy_->update_price(mid, block_height);
+        // [T1-11] Update the per-pair strategy's internal price history.
+        // Each pair has its own strategy instance to prevent state bleed.
+        auto strat_it = strategies_.find(pair.name);
+        if (strat_it != strategies_.end()) {
+            strat_it->second->update_price(mid, block_height);
+        }
 
         // PIN estimator updates happen after fills (in step 2, once we
         // have subsequent price data).  Here we just record the latest
@@ -761,9 +1013,21 @@ void Engine::step_update_analytics(BlockHeight block_height)
 }
 
 // Step 4: Compute optimal quotes (A-S / GLFT).
+// [T1-11] Uses per-pair strategy instances from strategies_ map.
+// [T3-24] Gates on market_data_valid flag from Step 1.
 void Engine::step_compute_quotes(BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
+        // [T3-24] Dependency-aware gating: skip pairs where Step 1 failed.
+        // Quoting with invalid/stale market data risks adverse selection.
+        // ISO/IEC 5055: prevents acting on invalid upstream data.
+        if (!pcs.market_data_valid) {
+            spdlog::warn("[Engine] Step 4: {} market data invalid (Step 1 "
+                         "failed) -- skipping quote generation", pair_name);
+            pcs.quote_valid = false;
+            continue;
+        }
+
         // -- Staleness gate: suppress quoting when market data is stale ------
         // If the market data feed has not received a fresh update within the
         // staleness threshold (5 minutes), skip quote generation for this
@@ -789,6 +1053,17 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
 
+        // [T1-11] Look up the per-pair strategy instance.
+        // ISO/IEC 5055: validated lookup before use; skip if missing.
+        auto strat_it = strategies_.find(pair_name);
+        if (strat_it == strategies_.end() || !strat_it->second) {
+            spdlog::error("[Engine] Step 4: no strategy instance for {} "
+                          "-- skipping", pair_name);
+            pcs.quote_valid = false;
+            continue;
+        }
+        auto& strategy = *strat_it->second;
+
         // Look up the volatility estimate for this pair.
         double sigma = 0.0;
         auto vol_it = vol_estimators_.find(pair_name);
@@ -800,14 +1075,15 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         double q = static_cast<double>(
             inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}));
 
-        // Set cost basis on the strategy for the never-sell-at-loss constraint.
+        // Set cost basis on the per-pair strategy for the never-sell-at-loss
+        // constraint.
         auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
         double cost_basis = static_cast<double>(rec.weighted_avg_cost_basis);
-        strategy_->set_cost_basis(
+        strategy.set_cost_basis(
             cost_basis, config_.strategy.min_profit_margin_bps);
 
-        // Invoke the strategy to produce raw quotes.
-        pcs.raw_quote = strategy_->compute_quotes(mid, sigma, q, block_height);
+        // Invoke the per-pair strategy to produce raw quotes.
+        pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
         pcs.quote_valid = true;  // Mark as valid for steps 5-8.
 
         spdlog::debug("[Engine] Step 4: {} bid={:.6f} ask={:.6f} spread={:.1f}bps",
@@ -953,9 +1229,14 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
             book_state.fill_rate_24h = 0.30;  // TODO: compute from fill history
             book_state.whale_active = market_data_->is_whale_active(pair_name);
-            book_state.regime = strategy_
-                ? strategy_->current_regime().regime
-                : MarketRegime::Random;
+            // [T1-11] Use per-pair strategy for regime classification.
+            {
+                auto s5_strat_it = strategies_.find(pair_name);
+                book_state.regime = (s5_strat_it != strategies_.end()
+                                     && s5_strat_it->second)
+                    ? s5_strat_it->second->current_regime().regime
+                    : MarketRegime::Random;
+            }
 
             auto rec = order_book_tactician_->recommend(book_state);
             auto adj = order_book_tactician_->apply(rec, pcs.spread_result.total_spread_bps);
@@ -1081,14 +1362,27 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                         : 0.0;
                 }
                 mkt_params.fill_rate_per_block = 0.03;  // conservative estimate
-                // [C4] Full spread in bps for EV revenue estimation.
-                // ISO/IEC 5055: half_spread was incorrect; loss manager
-                // needs the total spread to estimate capture revenue.
-                mkt_params.spread_bps = pcs.spread_result.total_spread_bps;
+                // [HIGH-3] MarketParams::spread_bps is documented as the
+                // half-spread (one side).  The loss manager formula
+                // internally doubles it to compute the full round-trip
+                // capture.  The previous code passed total_spread_bps
+                // (the full spread), causing the EV revenue estimate to
+                // be 2x the correct value -- overstating profitability
+                // of holding and understating rebalance urgency.
+                // Fix: divide by 2 to supply the half-spread as expected.
+                // ISO/IEC 5055: correct units at module boundary.
+                // ISO/IEC 27001:2022: accurate risk calculation prevents
+                //   masked inventory buildup.
+                mkt_params.spread_bps = pcs.spread_result.total_spread_bps / 2.0;
                 mkt_params.vpin = market_data_->get_vpin(pair_name);
-                mkt_params.variance_ratio = strategy_
-                    ? strategy_->current_regime().variance_ratio
-                    : 1.0;
+                // [T1-11] Use per-pair strategy for variance ratio.
+                {
+                    auto s6_strat_it = strategies_.find(pair_name);
+                    mkt_params.variance_ratio =
+                        (s6_strat_it != strategies_.end() && s6_strat_it->second)
+                        ? s6_strat_it->second->current_regime().variance_ratio
+                        : 1.0;
+                }
                 mkt_params.current_block = block_height;
 
                 auto decision = loss_manager_->should_rebalance_at_loss(
@@ -1182,24 +1476,33 @@ void Engine::step_generate_ladder(BlockHeight block_height)
     }
 }
 
-// Step 8: Cancel stale offers, post new ones.
-void Engine::step_manage_offers(BlockHeight block_height)
+// [T1-03] Step 8: Cancel stale offers, post new ones (coroutine).
+// co_awaits cancel_stale() and post_quotes() directly -- no use_future.
+// [T2-09] Persists actual wallet-assigned offer IDs to the database
+// by reading them from shared State after post_quotes returns.
+// [T3-24] Gates on market_data_valid to prevent posting with stale data.
+asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 {
     if (dry_run_) {
         spdlog::debug("[Engine] Step 8: dry-run mode -- skipping offer management");
-        return;
+        co_return;
     }
 
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
 
-        // Cancel stale offers for this pair.
-        auto cancel_future = asio::co_spawn(
-            ioc_,
-            offer_mgr_->cancel_stale(pair_name, block_height,
-                                     config_.strategy.offer_ttl_blocks),
-            asio::use_future);
-        int cancelled = cancel_future.get();
+        // [T3-24] Final gate: do not post offers if market data was invalid.
+        // This catches pairs that passed step 4 staleness but failed step 1.
+        // ISO/IEC 5055: prevents posting with stale upstream data.
+        if (!pcs.market_data_valid) {
+            spdlog::warn("[Engine] Step 8: {} market data invalid -- "
+                         "skipping offer posting", pair_name);
+            continue;
+        }
+
+        // [T1-03] co_await cancel_stale directly instead of use_future.
+        int cancelled = co_await offer_mgr_->cancel_stale(
+            pair_name, block_height, config_.strategy.offer_ttl_blocks);
         if (cancelled > 0) {
             spdlog::info("[Engine] Step 8: cancelled {} stale offers for {}",
                          cancelled, pair_name);
@@ -1213,30 +1516,63 @@ void Engine::step_manage_offers(BlockHeight block_height)
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
 
-        // Post the new offers.
-        auto post_future = asio::co_spawn(
-            ioc_,
-            offer_mgr_->post_quotes(*pair_cfg, exec_tiers, block_height),
-            asio::use_future);
-        int posted = post_future.get();
+        // [T1-03] co_await post_quotes directly instead of use_future.
+        int posted = co_await offer_mgr_->post_quotes(
+            *pair_cfg, exec_tiers, block_height);
 
-        // Record each posted offer in the database.
-        for (const auto& etq : exec_tiers) {
-            DbOfferRecord orec;
-            orec.pair_name     = pair_name;
-            orec.side          = (etq.side == Side::Bid) ? "bid" : "ask";
-            orec.price_mojos   = etq.price;
-            orec.size_mojos    = etq.size;
-            orec.tier          = etq.tier_index;
-            orec.status        = "pending";
-            orec.created_block = block_height;
-            // offer_id is set by the OfferManager after wallet RPC; for
-            // logging purposes we use a placeholder here.
-            orec.offer_id      = pair_name + "_" +
-                std::to_string(block_height) + "_" +
-                std::to_string(etq.tier_index) + "_" +
-                ((etq.side == Side::Bid) ? "bid" : "ask");
-            db_->insert_offer(orec);
+        // [T2-09] Persist actual wallet-assigned offer IDs to the database.
+        // post_quotes() stores PendingOffers in shared State with the real
+        // trade_id from the wallet RPC response.  We query State for the
+        // current pending offers for this pair and match them to our ladder
+        // tiers by (side, tier_index, price) to get the actual offer IDs.
+        // This replaces the old placeholder ID approach.
+        // ISO/IEC 5055: no orphaned placeholder IDs in the audit trail.
+        {
+            auto pending_offers = state_->get_all_offers();
+            // Build a lookup from (pair, side, tier) to the real offer_id.
+            std::unordered_map<std::string, std::string> tier_to_id;
+            for (const auto& po : pending_offers) {
+                if (po.pair_name != pair_name) continue;
+                if (po.created_at_block != block_height) continue;
+                // Key: "side_tier" for matching.
+                std::string key = std::to_string(static_cast<int>(po.side))
+                    + "_" + std::to_string(po.tier);
+                tier_to_id[key] = po.offer_id;
+            }
+
+            for (const auto& etq : exec_tiers) {
+                DbOfferRecord orec;
+                orec.pair_name     = pair_name;
+                orec.side          = (etq.side == Side::Bid) ? "bid" : "ask";
+                orec.price_mojos   = etq.price;
+                orec.size_mojos    = etq.size;
+                orec.tier          = etq.tier_index;
+                orec.status        = "pending";
+                orec.created_block = block_height;
+
+                // Look up the actual offer_id from State.
+                std::string key = std::to_string(static_cast<int>(etq.side))
+                    + "_" + std::to_string(etq.tier_index);
+                auto id_it = tier_to_id.find(key);
+                if (id_it != tier_to_id.end()) {
+                    // [T2-09] Use the actual wallet-assigned offer ID.
+                    orec.offer_id = id_it->second;
+                } else {
+                    // Fallback: post_quotes may have skipped this tier due
+                    // to a wallet RPC error.  Use a placeholder and log.
+                    orec.offer_id = pair_name + "_" +
+                        std::to_string(block_height) + "_" +
+                        std::to_string(etq.tier_index) + "_" +
+                        ((etq.side == Side::Bid) ? "bid" : "ask") +
+                        "_unresolved";
+                    spdlog::warn("[Engine] Step 8: no wallet offer_id for {} "
+                                 "{} tier {} -- using placeholder",
+                                 pair_name,
+                                 (etq.side == Side::Bid) ? "bid" : "ask",
+                                 etq.tier_index);
+                }
+                db_->insert_offer(orec);
+            }
         }
 
         // Record rebalance baseline so the LiquidityEngine can evaluate
@@ -1255,6 +1591,8 @@ void Engine::step_manage_offers(BlockHeight block_height)
         spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {})",
                      posted, pair_name, cancelled);
     }
+
+    co_return;
 }
 
 // Step 9: Check arbitrage opportunities.
@@ -1279,17 +1617,42 @@ void Engine::step_check_arbitrage(BlockHeight block_height)
 }
 
 // Step 10: Run hedging layer (compute skew, NHE).
+// [T3-08] Now calls compute_nhe() with actual fill data from Step 2
+// accumulators (nhe_net_inventory_change_, nhe_total_volume_) and
+// alerts when NHE drops below the 0.70 target.
 void Engine::step_run_hedging(BlockHeight block_height)
 {
     // Layer 1: inventory-based skew (already applied in step 7 via
     // LiquidityEngine::apply_inventory_skew).
 
-    // Layer 2: compute Natural Hedge Efficiency.
-    // NHE is a cumulative metric; for now we compute it from the
-    // PnLTracker's fill history as a diagnostic.
-    auto pnl_summary = pnl_->get_total_pnl();
-    // NHE requires net_inventory_change and total_volume from recent fills;
-    // Phase 2 will maintain these running accumulators.
+    // [T3-08] Layer 2: compute Natural Hedge Efficiency from fill data.
+    // NHE = 1 - |net_inventory_change| / total_volume.
+    // A high NHE (close to 1.0) means fills are balanced (buys ~ sells).
+    // A low NHE means the engine is accumulating one-sided inventory.
+    // ISO/IEC 5055: uses the actual fill accumulators from Step 2.
+    double nhe = HedgingManager::compute_nhe(
+        nhe_net_inventory_change_, nhe_total_volume_);
+
+    if (nhe_total_volume_ > 0.0) {
+        spdlog::info("[Engine] Step 10: NHE={:.3f} (net_inv_change={:.0f}, "
+                     "total_vol={:.0f})",
+                     nhe, nhe_net_inventory_change_, nhe_total_volume_);
+
+        // [T3-08] Alert when NHE drops below the 0.70 target.
+        // Low NHE indicates the engine is consistently accumulating
+        // one-sided inventory, which increases adverse selection risk.
+        // ISO/IEC 27001:2022: alert for operational visibility.
+        if (nhe < HedgingManager::nhe_target()) {
+            spdlog::warn("[Engine] Step 10: NHE {:.3f} < target {:.2f} "
+                         "-- one-sided inventory accumulation detected",
+                         nhe, HedgingManager::nhe_target());
+            alerts_->send_alert(AlertRule::ExposureBreach,
+                "Natural Hedge Efficiency " + std::to_string(nhe) +
+                " below target " +
+                std::to_string(HedgingManager::nhe_target()) +
+                " -- review inventory balance");
+        }
+    }
 
     // Layer 3: portfolio-level netting.
     auto positions = state_->get_all_positions();
@@ -1300,8 +1663,8 @@ void Engine::step_run_hedging(BlockHeight block_height)
     std::unordered_map<AssetId, double> targets;
     // Phase 2: populate targets from the capital allocation config.
 
-    spdlog::debug("[Engine] Step 10: hedging layer complete; {} positions tracked",
-                  positions.size());
+    spdlog::debug("[Engine] Step 10: hedging layer complete; {} positions tracked, "
+                  "NHE={:.3f}", positions.size(), nhe);
 }
 
 // Step 11: Update PnL attribution.
@@ -1467,6 +1830,23 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // PnL state.
     auto total = pnl_->get_total_pnl();
     bs.total_pnl = total.total_pnl;
+
+    // [MEDIUM-7] Seed peak_pnl_hwm_ on the very first cycle so the drawdown
+    // circuit breaker is active from startup.  Previously, peak_pnl_hwm_
+    // started at 0 and the drawdown check was gated on peak_pnl_hwm_ > 0,
+    // which meant the engine had ZERO drawdown protection until the first
+    // profitable cycle.  If the engine started losing money from the first
+    // block, the circuit breaker would never fire.
+    //
+    // Fix: on the first cycle, initialize peak_pnl_hwm_ to total_pnl
+    // (which may be 0 or negative).  On subsequent cycles, the existing
+    // max() logic ensures monotonic non-decrease.
+    // ISO/IEC 27001:2022: continuous risk monitoring from first tick.
+    // ISO/IEC 5055: deterministic initialization prevents unprotected window.
+    if (!hwm_initialized_) {
+        peak_pnl_hwm_    = total.total_pnl;
+        hwm_initialized_ = true;
+    }
     // [H6] Track the PnL high-water mark across cycles for drawdown alerts.
     // ISO/IEC 5055: monotonically non-decreasing peak prevents false
     // drawdown resets when total_pnl oscillates.
@@ -1480,6 +1860,57 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // Run all 14 alert rules.
     alerts_->check_and_alert(bs);
 
+    // [T3-09] Max-drawdown global circuit breaker.
+    // Compute drawdown = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
+    // If the drawdown exceeds max_drawdown_pct_, transition to Paused state
+    // and alert.  This is a global safety net that prevents runaway losses.
+    //
+    // [MEDIUM-7] The condition now checks peak_pnl_hwm_ > 0 OR total_pnl < 0.
+    // This ensures the circuit breaker fires even when the engine has never
+    // been profitable (peak == 0) but is actively losing money.  The division
+    // by abs(peak_pnl_hwm_) is guarded: when peak is exactly 0 and PnL is
+    // negative, we treat any loss as exceeding the threshold.
+    //
+    // ISO/IEC 5055: guards against division by zero and sign errors.
+    // ISO/IEC 27001:2022: audit-logged state transition; no unprotected
+    //   window at startup.
+    if (peak_pnl_hwm_ > 0 || total.total_pnl < 0) {
+        double drawdown_frac = 0.0;
+
+        if (peak_pnl_hwm_ > 0) {
+            // Normal case: we've had profit, measure drop from peak.
+            drawdown_frac =
+                static_cast<double>(peak_pnl_hwm_ - total.total_pnl)
+                / static_cast<double>(std::abs(peak_pnl_hwm_));
+        } else {
+            // [MEDIUM-7] Edge case: peak is zero or negative (never
+            // profitable).  Any negative PnL constitutes a drawdown.
+            // Use abs(total_pnl) relative to a nominal unit to produce
+            // a meaningful fraction; treat it as 100% drawdown if we
+            // are losing money from a zero-profit baseline.
+            // ISO/IEC 5055: explicit handling of zero-denominator case.
+            drawdown_frac = (total.total_pnl < 0) ? 1.0 : 0.0;
+        }
+
+        if (drawdown_frac > max_drawdown_pct_) {
+            spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
+                          "drawdown={:.2f}% > threshold={:.2f}% -- "
+                          "transitioning to Paused state",
+                          drawdown_frac * 100.0,
+                          max_drawdown_pct_ * 100.0);
+
+            // Transition to Paused: stops new offer creation in subsequent
+            // cycles while keeping connections open for monitoring.
+            state_->set_status(BotStatus::Paused);
+
+            alerts_->send_alert(AlertRule::PnlDrawdown,
+                "Global max-drawdown circuit breaker triggered: drawdown " +
+                std::to_string(drawdown_frac * 100.0) + "% exceeds threshold " +
+                std::to_string(max_drawdown_pct_ * 100.0) +
+                "% -- engine PAUSED.  Manual intervention required.");
+        }
+    }
+
     spdlog::debug("[Engine] Step 13: alert check complete");
 }
 
@@ -1487,26 +1918,37 @@ void Engine::step_check_alerts(BlockHeight block_height)
 // Connection management
 // ===========================================================================
 
-void Engine::open_connections()
+// [CRITICAL-1] open_connections() -- converted from void (blocking) to
+// awaitable<void> (coroutine).  The previous implementation used
+// co_spawn(use_future).get() which deadlocks when ioc_ is not yet running
+// because .get() blocks the calling thread while ioc_.run() has not been
+// entered, so there is no event loop to drive the completion.
+//
+// Now open_connections() is co_awaited from the start of poll_loop_coro(),
+// which runs after ioc_.run() begins.  This guarantees the io_context is
+// pumping events while the coroutine awaits the RPC connections.
+//
+// ISO/IEC 5055: no blocking .get() on any thread; fully async connection
+//               lifecycle within the coroutine model.
+// ISO/IEC 27001:2022: connection events are audit-logged.
+asio::awaitable<void> Engine::open_connections()
 {
-    // Open the Chia full node RPC (mTLS).
-    auto fn_future = asio::co_spawn(
-        ioc_, full_node_->open(), asio::use_future);
-    fn_future.get();
+    // Open the Chia full node RPC (mTLS) -- co_await on running io_context.
+    co_await full_node_->open();
     spdlog::info("[Engine] Connected to Chia full node at {}:{}",
                  config_.chia.full_node_host, config_.chia.full_node_port);
 
-    // Open the Chia wallet RPC (mTLS).
-    auto wal_future = asio::co_spawn(
-        ioc_, wallet_->open(), asio::use_future);
-    wal_future.get();
+    // Open the Chia wallet RPC (mTLS) -- co_await on running io_context.
+    co_await wallet_->open();
     spdlog::info("[Engine] Connected to Chia wallet at {}:{}",
                  config_.chia.wallet_host, config_.chia.wallet_port);
 
-    // Open the dexie REST client.
+    // Open the dexie REST client (synchronous HTTP -- no coroutine needed).
     dexie_->open();
     spdlog::info("[Engine] Connected to dexie API at {}",
                  config_.dexie.api_base);
+
+    co_return;
 }
 
 void Engine::close_connections()

@@ -4,21 +4,28 @@
  *
  * Provides async mTLS-authenticated JSON-RPC communication with the Chia
  * daemon (full node on port 8555, wallet on port 9256). Both client classes
- * inherit from ChiaRPCBase, which owns the SSL context, libcurl session
- * management, automatic retry with exponential backoff, and structured
- * error handling.
+ * inherit from ChiaRPCBase, which owns the SSL context, automatic retry
+ * with exponential backoff, and structured error handling.
+ *
+ * Blocking CURL transfers are dispatched to a dedicated thread pool so that
+ * the caller's io_context event loop is never stalled.  Each RPC call creates
+ * a per-request CURL easy handle (RAII) for thread safety.
  *
  * Dependencies: libcurl (OpenSSL backend), nlohmann/json, spdlog,
- *               boost::asio (coroutines).
+ *               boost::asio (coroutines, thread_pool).
  *
- * Security: mTLS with Chia self-signed certificates; peer verification is
- *           disabled (CURLOPT_SSL_VERIFYPEER = 0) per Chia convention.
+ * Security: mTLS with Chia self-signed certificates.  SSL peer verification
+ *           is ON by default when a CA cert path is available, but can be
+ *           disabled via config for explicit localhost overrides.
  *           Certificate file contents are never logged.
  *
  * ISO/IEC 27001:2022 -- sensitive material (cert paths) validated before use;
- *                       no secrets written to log sinks.
- * ISO/IEC 5055       -- defensive null/error checks on every external call.
- * ISO/IEC 25000      -- deterministic resource cleanup via RAII.
+ *                       no secrets written to log sinks.  SSL verification
+ *                       enabled by default to prevent MITM on wallet RPC.
+ * ISO/IEC 5055       -- defensive null/error checks on every external call;
+ *                       per-request CURL handles eliminate shared-state races.
+ * ISO/IEC 25000      -- deterministic resource cleanup via RAII; thread pool
+ *                       joined on destruction.
  */
 
 #ifndef XOP_RPC_CHIA_RPC_HPP
@@ -35,6 +42,7 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
+#include <boost/asio/thread_pool.hpp>
 #include <curl/curl.h>
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
@@ -92,6 +100,24 @@ struct ChiaRPCConfig {
 
     /// Initial backoff delay — doubled after each retry (exponential).
     std::chrono::milliseconds retry_base_delay{500};
+
+    /// Enable SSL peer verification (default: true).
+    ///
+    /// When true and a CA cert path is available in ChiaTLSConfig, the CURL
+    /// handle will verify the server certificate against the CA.  This
+    /// prevents MITM attacks on the wallet RPC channel.
+    ///
+    /// Set to false only for explicit localhost/loopback testing scenarios
+    /// where the Chia daemon uses self-signed certs without a matching CA.
+    ///
+    /// ISO/IEC 27001:2022 -- SSL verification is ON by default; disabling
+    /// requires an explicit configuration decision logged at warning level.
+    bool verify_ssl{true};
+
+    /// Number of threads in the CURL worker pool.  Blocking CURL transfers
+    /// are dispatched here so the io_context event loop is never stalled.
+    /// Default of 4 handles typical full-node + wallet + retry concurrency.
+    std::uint32_t curl_thread_pool_size{4};
 };
 
 // ---------------------------------------------------------------------------
@@ -140,46 +166,54 @@ private:
 /**
  * @brief Common foundation for all Chia RPC clients.
  *
- * Owns a libcurl easy handle configured for mTLS with the Chia daemon.
  * Provides:
  *   - rpc_post()  : async JSON-RPC POST with automatic retry.
- *   - open()      : validate certs and initialise the CURL handle.
- *   - close()     : deterministic cleanup.
+ *   - open()      : validate certs and start the CURL thread pool.
+ *   - close()     : deterministic cleanup (joins all pool threads).
+ *
+ * Per-request CURL handles are created and destroyed within each RPC call,
+ * providing full thread safety without external synchronisation.  All
+ * blocking CURL transfers are dispatched to an internal thread pool via
+ * boost::asio::co_spawn so the caller's io_context is never stalled.
+ *
+ * SSL verification is enabled by default when a CA cert is configured,
+ * preventing MITM attacks on the wallet RPC channel.
  *
  * Subclasses add endpoint-specific methods (full-node, wallet).
  *
- * Thread safety: NOT thread-safe.  Each instance must be used from a single
- * strand (boost::asio::strand) or serialised externally.
+ * Thread safety: the public interface (rpc_post and derived methods) is
+ * safe to call concurrently from multiple coroutines on the same
+ * io_context -- each call gets its own CURL handle and response buffer.
  */
 class ChiaRPCBase {
 public:
     virtual ~ChiaRPCBase();
 
-    // Non-copyable, movable
+    // Non-copyable, movable.
     ChiaRPCBase(const ChiaRPCBase&)            = delete;
     ChiaRPCBase& operator=(const ChiaRPCBase&) = delete;
     ChiaRPCBase(ChiaRPCBase&&) noexcept;
     ChiaRPCBase& operator=(ChiaRPCBase&&) noexcept;
 
     /**
-     * @brief Validate certificate paths and initialise the CURL handle.
+     * @brief Validate certificate paths and start the CURL thread pool.
      *
      * Must be called once before any RPC method.  Re-opening an already-open
      * client is safe (close + re-open).
      *
-     * @throws ChiaRPCError if certificate files are missing or CURL init fails.
+     * @throws ChiaRPCError if certificate files are missing.
      */
     asio::awaitable<void> open();
 
     /**
-     * @brief Release the CURL handle and cancel any pending timers.
+     * @brief Join the thread pool and mark the client as closed.
      *
-     * Idempotent — safe to call on a closed or never-opened client.
+     * Idempotent -- safe to call on a closed or never-opened client.
      */
     void close() noexcept;
 
     /**
-     * @brief Check whether the client has an active, configured CURL handle.
+     * @brief Check whether the client has been opened and not yet closed.
      */
     [[nodiscard]] bool is_open() const noexcept;
 
@@ -201,6 +235,10 @@ protected:
      *   https://<host>:<port>/<endpoint>
      * and returns the parsed JSON response body.
      *
+     * The blocking CURL transfer is dispatched to the internal thread pool
+     * via co_spawn, so the caller's io_context is never blocked.  Each call
+     * creates a fresh CURL easy handle (RAII) for thread safety.
+     *
      * Retry policy (applied only for transient errors):
      *   - Network errors (CURL codes indicating connection / timeout)
      *   - HTTP 429, 500, 502, 503, 504
@@ -219,7 +257,7 @@ protected:
     /// Reference to the driving io_context (for timer creation).
     asio::io_context& ioc_;
 
-    /// Endpoint configuration (host, port, TLS, timeouts, retry).
+    /// Endpoint configuration (host, port, TLS, timeouts, retry, SSL).
     ChiaRPCConfig config_;
 
     /// Per-client spdlog logger.
@@ -234,26 +272,47 @@ private:
     [[nodiscard]] std::string build_url(std::string_view endpoint) const;
 
     /**
-     * @brief Configure mTLS options on the CURL handle.
+     * @brief Configure mTLS and SSL verification on a CURL handle.
      *
-     * Sets CURLOPT_SSLCERT, CURLOPT_SSLKEY, CURLOPT_CAINFO, and
-     * disables peer verification (Chia self-signed certs).
+     * Sets CURLOPT_SSLCERT, CURLOPT_SSLKEY, CURLOPT_CAINFO.
+     * SSL peer/host verification is controlled by config_.verify_ssl:
+     *   - When true (default): VERIFYPEER=1, VERIFYHOST=2, CAINFO set.
+     *   - When false: VERIFYPEER=0, VERIFYHOST=0 (logged at warn level).
      *
-     * @throws ChiaRPCError on configuration failure.
+     * The caller must materialise the path strings and pass them by
+     * const reference so their lifetime spans curl_easy_perform().
+     *
+     * @param curl      The CURL easy handle to configure.
+     * @param cert_str  Materialised cert_path  (must outlive CURL transfer).
+     * @param key_str   Materialised key_path   (must outlive CURL transfer).
+     * @param ca_str    Materialised ca_cert_path (must outlive CURL transfer).
+     *
+     * ISO/IEC 27001:2022 -- SSL verification default-on; disabling
+     *                       triggers a warning log entry.
+     * ISO/IEC 5055       -- CWE-416 use-after-free prevention: path strings
+     *                       are accepted by const& from the caller whose
+     *                       scope covers the entire CURL transfer.
      */
-    void configure_tls();
+    void configure_tls(CURL*              curl,
+                       const std::string& cert_str,
+                       const std::string& key_str,
+                       const std::string& ca_str);
 
     /**
      * @brief Perform a single synchronous CURL transfer (blocking).
      *
-     * Called from rpc_post() after being dispatched to the thread pool so
-     * that the coroutine does not block the io_context.
+     * Creates a per-request CURL easy handle with full mTLS and timeout
+     * configuration, executes the transfer, and cleans up the handle.
+     * Called from rpc_post() inside the thread pool so the io_context
+     * is never blocked.
      *
      * @param url       Full request URL.
      * @param body      JSON-encoded request body string.
      * @param[out] response_body  Buffer for the response.
      * @param[out] http_code      HTTP status code from the server.
      * @return CURLcode indicating transport-level success / failure.
+     *
+     * ISO/IEC 5055 -- RAII for the CURL handle; all CURL calls checked.
      */
     CURLcode perform_request(const std::string& url,
                              const std::string& body,
@@ -268,11 +327,12 @@ private:
     [[nodiscard]] static bool is_transient(CURLcode curl_code,
                                            long     http_code) noexcept;
 
-    /// libcurl easy handle — nullptr when closed.
-    CURL* curl_{nullptr};
+    /// Thread pool for offloading blocking CURL transfers.
+    /// Created in open(), joined and destroyed in close().
+    std::unique_ptr<asio::thread_pool> thread_pool_;
 
-    /// Reusable HTTP header list for JSON Content-Type.
-    curl_slist* headers_{nullptr};
+    /// True after successful open(), false after close().
+    bool open_{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -453,6 +513,24 @@ public:
      */
     asio::awaitable<std::vector<json>> get_spendable_coins(
         std::int64_t wallet_id);
+
+    // -- Transaction sending -------------------------------------------------
+
+    /**
+     * @brief Send XCH to a target address (self-send for coin splitting).
+     *
+     * Wraps the Chia wallet RPC "send_transaction" endpoint.  The caller
+     * provides pre-built parameters including wallet_id, amount, address,
+     * and fee.  Returns the full JSON response containing "transaction_id"
+     * and "transaction" on success.
+     *
+     * @param params  JSON with keys: wallet_id, amount, address, fee.
+     * @return JSON response from the Chia wallet daemon.
+     * @throws ChiaRPCError on transport or application-level failure.
+     *
+     * ISO/IEC 5055 -- all error paths throw; caller must handle exceptions.
+     */
+    asio::awaitable<json> send_transaction(const json& params);
 };
 
 } // namespace xop::rpc

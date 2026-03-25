@@ -1,8 +1,10 @@
 // alerts.cpp -- Telegram alert manager implementation for XOPTrader.
 //
 // Uses libcurl to POST messages to the Telegram Bot API sendMessage endpoint.
-// Each HTTP call runs on a detached std::thread so that the trading loop is
-// never blocked by network I/O.
+// A persistent worker thread with a thread-safe message queue handles all
+// HTTP sends, ensuring clean shutdown and bounded thread usage.  The trading
+// loop is never blocked by network I/O; callers enqueue messages and return
+// immediately.
 //
 // Rate limiting is enforced per-tier using steady_clock timestamps:
 //   CRITICAL  -- at most once per 60 seconds
@@ -21,6 +23,9 @@
 //   ISO/IEC 5055       -- no raw pointers (curl is RAII-wrapped), bounds checks
 //   ISO/IEC 25000      -- documented, single-responsibility
 //   ISO/IEC JTC 1/SC 22 -- standard C++20, no undefined behaviour
+//
+// T2-03: Detached threads replaced with a persistent worker queue.
+// T2-12: send_alert(AlertTier, ...) marked [[deprecated]].
 
 #include "xop/monitoring/alerts.hpp"
 
@@ -29,8 +34,11 @@
 #include <curl/curl.h>
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <condition_variable>
 #include <mutex>
+#include <queue>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -140,7 +148,11 @@ AlertManager::AlertManager()
         = kDefaultOfferFailCount;
 }
 
-AlertManager::~AlertManager() = default;
+AlertManager::~AlertManager()
+{
+    // Ensure the worker thread drains its queue and exits cleanly.
+    stop_worker();
+}
 
 // ===================================================================
 //  Lifecycle
@@ -161,6 +173,11 @@ void AlertManager::init(const std::string& bot_token,
     } else {
         spdlog::info("AlertManager: Telegram alerts disabled (log-only mode)");
     }
+
+    // Start the persistent send-worker thread (T2-03).
+    // Started unconditionally so that shutdown is always uniform; if
+    // Telegram is disabled the queue simply remains empty.
+    start_worker();
 }
 
 bool AlertManager::is_enabled() const noexcept
@@ -380,76 +397,145 @@ void AlertManager::flush_info_batch()
 }
 
 // ===================================================================
-//  Telegram HTTP Transport
+//  Telegram HTTP Transport -- Worker Queue (T2-03)
+// ===================================================================
+//
+// The previous implementation spawned a detached std::thread for every
+// Telegram send.  Detached threads have no cleanup path: if the process
+// exits while a detached thread is in-flight, the behaviour is undefined
+// (ISO/IEC JTC 1/SC 22 [basic.start.term]).
+//
+// The replacement uses a single persistent worker thread that drains a
+// thread-safe FIFO queue.  post_telegram() pushes a message string and
+// returns immediately (non-blocking for callers).  On destruction,
+// stop_worker() sets the stop flag, notifies the worker, and joins it,
+// ensuring all pending messages are delivered or discarded cleanly.
 // ===================================================================
 
 void AlertManager::post_telegram(const std::string& text)
 {
-    // Capture copies for the detached thread (bot_token_ and chat_id_ are
-    // stable after init(), but we copy for strict thread-safety).
+    // Enqueue the message for the worker thread.
+    {
+        std::lock_guard lock(send_mtx_);
+        send_queue_.push(text);
+    }
+    send_cv_.notify_one();
+}
+
+void AlertManager::start_worker()
+{
+    // Guard against double-start (e.g. if init() is called more than once).
+    if (send_worker_.joinable()) {
+        return;
+    }
+
+    // Capture bot_token_ and chat_id_ by value so the worker does not
+    // access AlertManager members after destruction begins.  Both are
+    // stable after init() returns.
     const std::string token = bot_token_;
     const std::string chat  = chat_id_;
 
-    // Fire-and-forget: detached thread so the trading loop never blocks on
-    // Telegram API latency.
-    std::thread([token, chat, text]() {
-        CURL* curl = curl_easy_init();
-        if (!curl) {
-            spdlog::warn("AlertManager: curl_easy_init failed");
-            return;
-        }
+    send_stop_.store(false, std::memory_order_release);
 
-        // Build the Telegram sendMessage URL.
-        // URL format: https://api.telegram.org/bot<token>/sendMessage
-        const std::string url =
-            "https://api.telegram.org/bot" + token + "/sendMessage";
+    send_worker_ = std::thread([this, token, chat]() {
+        spdlog::debug("AlertManager: send-worker thread started");
 
-        // Build the POST body as URL-encoded form data.
-        // chat_id and text are the required parameters.
-        std::string escaped_text;
-        char* curl_escaped = curl_easy_escape(curl, text.c_str(),
-                                              static_cast<int>(text.size()));
-        if (curl_escaped) {
-            escaped_text = curl_escaped;
-            curl_free(curl_escaped);
-        } else {
-            escaped_text = text; // Fallback: send unescaped.
-        }
+        while (true) {
+            std::string message;
 
-        const std::string post_data =
-            "chat_id=" + chat + "&text=" + escaped_text;
+            // Wait for a message or a stop signal.
+            {
+                std::unique_lock lock(send_mtx_);
+                send_cv_.wait(lock, [this]() {
+                    return !send_queue_.empty()
+                        || send_stop_.load(std::memory_order_acquire);
+                });
 
-        // Configure curl.
-        curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-        curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
-        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_write);
+                // Drain one message if available, even during shutdown,
+                // to guarantee ordered delivery of queued messages.
+                if (send_queue_.empty()) {
+                    // Queue is empty and stop was requested -- exit.
+                    break;
+                }
 
-        // Timeout: 10 seconds total, 5 seconds for connection.
-        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
-
-        // Enforce TLS (Telegram API is HTTPS-only).
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-
-        // Execute the request.
-        CURLcode res = curl_easy_perform(curl);
-        if (res != CURLE_OK) {
-            // Log the error WITHOUT including the URL (which contains the
-            // secret bot token).
-            spdlog::warn("AlertManager: Telegram POST failed: {}",
-                         curl_easy_strerror(res));
-        } else {
-            long http_code = 0;
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-            if (http_code != 200) {
-                spdlog::warn("AlertManager: Telegram API returned HTTP {}",
-                             http_code);
+                message = std::move(send_queue_.front());
+                send_queue_.pop();
             }
+
+            // Perform the HTTP POST outside any lock.
+            CURL* curl = curl_easy_init();
+            if (!curl) {
+                spdlog::warn("AlertManager: curl_easy_init failed");
+                continue;
+            }
+
+            // Build the Telegram sendMessage URL.
+            // URL format: https://api.telegram.org/bot<token>/sendMessage
+            // Security (ISO/IEC 27001:2022): the URL containing the token
+            // is never logged.
+            const std::string url =
+                "https://api.telegram.org/bot" + token + "/sendMessage";
+
+            // Build the POST body as URL-encoded form data.
+            std::string escaped_text;
+            char* curl_escaped = curl_easy_escape(
+                curl, message.c_str(), static_cast<int>(message.size()));
+            if (curl_escaped) {
+                escaped_text = curl_escaped;
+                curl_free(curl_escaped);
+            } else {
+                escaped_text = message;  // Fallback: send unescaped.
+            }
+
+            const std::string post_data =
+                "chat_id=" + chat + "&text=" + escaped_text;
+
+            // Configure curl.
+            curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, post_data.c_str());
+            curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, curl_discard_write);
+
+            // Timeout: 10 seconds total, 5 seconds for connection.
+            curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+            curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
+
+            // Enforce TLS (Telegram API is HTTPS-only).
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+            curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+
+            // Execute the request.
+            CURLcode res = curl_easy_perform(curl);
+            if (res != CURLE_OK) {
+                // Log error WITHOUT the URL (contains secret bot token).
+                spdlog::warn("AlertManager: Telegram POST failed: {}",
+                             curl_easy_strerror(res));
+            } else {
+                long http_code = 0;
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+                if (http_code != 200) {
+                    spdlog::warn("AlertManager: Telegram API returned HTTP {}",
+                                 http_code);
+                }
+            }
+
+            curl_easy_cleanup(curl);
         }
 
-        curl_easy_cleanup(curl);
-    }).detach();
+        spdlog::debug("AlertManager: send-worker thread exiting");
+    });
+}
+
+void AlertManager::stop_worker()
+{
+    // Signal the worker to finish after draining the queue.
+    send_stop_.store(true, std::memory_order_release);
+    send_cv_.notify_one();
+
+    // Join the thread to ensure clean shutdown (ISO/IEC JTC 1/SC 22:
+    // a joinable std::thread must be joined or detached before destruction).
+    if (send_worker_.joinable()) {
+        send_worker_.join();
+    }
 }
 
 // ===================================================================

@@ -15,8 +15,10 @@
  *     XCH, producing multiple outputs of the target denomination.  This
  *     is the standard approach recommended by the Chia documentation for
  *     pre-splitting coins before offer creation.
- *   - coin_name derivation: sha256(parent_coin_info || puzzle_hash || amount)
- *     where amount is encoded as a big-endian 8-byte integer.
+ *   - coin_name derivation: SHA-256(parent_coin_info || puzzle_hash || amount)
+ *     where amount is encoded as a CLVM-style big-endian integer with minimal
+ *     bytes (no leading zeros for positive values, except when the high bit
+ *     is set to preserve sign).  Implemented via OpenSSL EVP.
  *
  * ISO/IEC 27001:2022 -- coin_name hashes are not secrets; logged freely.
  * ISO/IEC 5055       -- all arithmetic checked; no UB on mojo conversions.
@@ -30,9 +32,15 @@
 #include <cmath>
 #include <cstring>
 #include <functional>
+#include <limits>         // std::numeric_limits -- overflow guards (HIGH-1, HIGH-3)
 #include <sstream>
 #include <stdexcept>
 #include <iomanip>
+
+// OpenSSL EVP interface for SHA-256 (T1-04: proper coin name computation).
+// EVP is the recommended API as of OpenSSL 3.x; the legacy SHA256_*
+// functions are deprecated.  Linked via OpenSSL::Crypto in CMake.
+#include <openssl/evp.h>
 
 namespace xop::execution {
 
@@ -81,15 +89,12 @@ asio::awaitable<Mojo> CoinManager::get_balance_mojos(std::int64_t wallet_id)
     try {
         json result = co_await wallet_->get_wallet_balance(wallet_id);
 
-        // The wallet balance response nests the data under "wallet_balance".
-        if (result.contains("wallet_balance") &&
-            result["wallet_balance"].contains("spendable_balance")) {
-            Mojo balance = result["wallet_balance"]["spendable_balance"]
-                               .get<Mojo>();
-            co_return balance;
-        }
-
-        // Fallback: try top-level "spendable_balance".
+        // MEDIUM-5 FIX: The wallet RPC already unwraps the "wallet_balance"
+        // envelope, so `result` IS the balance object.  Access the balance
+        // fields directly from the unwrapped object; the nested
+        // "wallet_balance" path was dead code (always false).
+        // ISO/IEC 25000 -- remove unreachable branch to improve maintainability.
+        // ISO/IEC 5055 -- CWE-561 (dead code) elimination.
         if (result.contains("spendable_balance")) {
             co_return result["spendable_balance"].get<Mojo>();
         }
@@ -190,11 +195,35 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
     // Step 2: Calculate total mojos required for the split.
     // Each new coin will be target_amount_mojos, plus the fee.
+    //
+    // HIGH-1 FIX: Overflow guard -- needed * target_amount_mojos can exceed
+    // int64_t range for large coin counts or denominations.  Validate before
+    // the multiplication to prevent undefined behaviour (signed overflow).
+    // ISO/IEC 5055 -- CWE-190 (integer overflow) prevention.
+    // ISO/IEC 27001:2022 -- deterministic error reporting on arithmetic fault.
+    if (needed > 0 && target_amount_mojos > 0 &&
+        static_cast<Mojo>(needed) >
+            (std::numeric_limits<std::int64_t>::max() - fee)
+            / target_amount_mojos) {
+        logger_->error("coin_manager: split total_needed overflows int64_t "
+                       "(needed={}, target={}, fee={})",
+                       needed, target_amount_mojos, fee);
+        co_return SplitResult{false, "overflow in total_needed calculation"};
+    }
     Mojo total_needed = static_cast<Mojo>(needed) * target_amount_mojos + fee;
 
     // Step 3: Verify we have sufficient balance.
+    //
+    // HIGH-3 FIX: Overflow guard on cumulative summation -- if a wallet
+    // holds many large coins, total_available may exceed int64_t range.
+    // ISO/IEC 5055 -- CWE-190 (integer overflow) prevention.
+    // ISO/IEC 27001:2022 -- deterministic error reporting on arithmetic fault.
     Mojo total_available = 0;
     for (const auto& c : free_coins) {
+        if (total_available > std::numeric_limits<std::int64_t>::max() - c.amount) {
+            logger_->error("coin_manager: balance summation overflow");
+            co_return SplitResult{false, "balance overflow"};
+        }
         total_available += c.amount;
     }
 
@@ -224,38 +253,63 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
         for (int j = 0; j < batch; ++j) {
             try {
-                // Build the send_transaction request.
+                // Build the send_transaction request per the Chia wallet
+                // RPC specification.  Each call creates one output coin
+                // of the target denomination at our own receive address.
                 json send_params;
                 send_params["wallet_id"] = wallet_id;
                 send_params["amount"]    = target_amount_mojos;
                 send_params["address"]   = address;
                 send_params["fee"]       = fee;
 
-                // Use the wallet RPC's generic rpc_post via create_offer
-                // with a self-send pattern.  The actual RPC endpoint is
-                // "send_transaction" on the wallet daemon.
+                // Execute the send_transaction RPC call.
+                // The Chia wallet daemon creates a spend bundle that
+                // consumes one or more input coins and produces:
+                //   1. An output of target_amount_mojos to our address.
+                //   2. A change output for any remainder.
+                // The transaction enters the mempool and confirms within
+                // ~52 seconds (one block time) under normal conditions.
                 //
-                // Note: ChiaWalletRPC currently does not expose
-                // send_transaction directly.  This call will be routed
-                // through the base class rpc_post once the method is added.
-                // For now we document the expected flow.
-                //
-                // co_await wallet_->send_transaction(send_params);
-                //
-                // Placeholder: count as created.  The actual RPC
-                // integration will replace this block.
+                // ISO/IEC 5055 -- exceptions from send_transaction are
+                // caught below; partial results are still returned.
+                json tx_resp = co_await wallet_->send_transaction(send_params);
 
                 ++coins_created;
                 total_fee += fee;
 
-                logger_->debug("Split coin {}/{}: {} mojos to {}",
+                // Extract and log the transaction ID if present.
+                std::string tx_id = "(unknown)";
+                if (tx_resp.contains("transaction_id")) {
+                    tx_id = tx_resp["transaction_id"].get<std::string>();
+                }
+
+                logger_->debug("Split coin {}/{}: {} mojos to {} [tx={}]",
                                coins_created, needed, target_amount_mojos,
-                               address.substr(0, 20));
-            } catch (const std::exception& e) {
-                logger_->error("ensure_split: send_transaction failed at "
+                               address.substr(0, 20), tx_id.substr(0, 16));
+
+                // Capture the transaction ID from the last successful send
+                // into the result for caller inspection.
+                if (tx_resp.contains("transaction_id")) {
+                    result.tx_id = tx_id;
+                }
+
+            } catch (const rpc::ChiaRPCError& e) {
+                // RPC-level error (transport, application rejection, etc.).
+                // Log and return partial results -- partial splits are
+                // still useful for concurrency.
+                logger_->error("ensure_split: send_transaction RPC error at "
                                "coin {}/{}: {}",
                                coins_created + 1, needed, e.what());
-                // Partial split is still useful -- continue with what we have.
+                result.coins_created = coins_created;
+                result.fee_paid      = total_fee;
+                result.success       = (coins_created > 0);
+                co_return result;
+
+            } catch (const std::exception& e) {
+                // Unexpected non-RPC error (JSON parse failure, etc.).
+                logger_->error("ensure_split: unexpected error at "
+                               "coin {}/{}: {}",
+                               coins_created + 1, needed, e.what());
                 result.coins_created = coins_created;
                 result.fee_paid      = total_fee;
                 result.success       = (coins_created > 0);
@@ -415,45 +469,193 @@ CoinInfo CoinManager::parse_coin(const json& coin_json)
 }
 
 // ---------------------------------------------------------------------------
-// compute_coin_name -- derive the unique coin identifier via sha256
+// hex_to_bytes -- decode a hex string to a byte vector
+// ---------------------------------------------------------------------------
+// Utility for compute_coin_name: converts 64-hex-character strings
+// (parent_coin_info, puzzle_hash) into their 32-byte binary representations.
+//
+// ISO/IEC 5055 -- validates input length is even; throws on malformed hex.
+// ---------------------------------------------------------------------------
+
+static std::vector<std::uint8_t> hex_to_bytes(const std::string& hex)
+{
+    if (hex.size() % 2 != 0) {
+        throw std::invalid_argument(
+            "hex_to_bytes: odd-length hex string");
+    }
+
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(hex.size() / 2);
+
+    for (std::size_t i = 0; i < hex.size(); i += 2) {
+        // Convert each pair of hex characters to a byte.
+        const unsigned int byte_val = static_cast<unsigned int>(
+            std::stoul(hex.substr(i, 2), nullptr, 16));
+        bytes.push_back(static_cast<std::uint8_t>(byte_val));
+    }
+
+    return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// encode_clvm_int -- encode an integer as a CLVM-style big-endian byte string
+// ---------------------------------------------------------------------------
+// CLVM integer serialisation rules (Chia specification):
+//   - Zero is encoded as an empty byte string (0 bytes).
+//   - Positive integers use the minimum number of big-endian bytes.
+//   - If the most significant bit of the leading byte is set (i.e. the value
+//     would appear negative in two's-complement), a leading 0x00 byte is
+//     prepended to preserve the sign.
+//   - Negative integers use two's-complement with minimal bytes (not needed
+//     here since Mojo amounts are always non-negative).
+//
+// This encoding is critical for coin_name correctness: using a fixed 8-byte
+// big-endian representation (as many implementations assume) produces
+// incorrect hashes for amounts that fit in fewer bytes.
+//
+// Reference: https://chialisp.com/docs/ref/clvm#atoms
+// ISO/IEC 5055 -- no UB; all shifts on unsigned types.
+// ---------------------------------------------------------------------------
+
+static std::vector<std::uint8_t> encode_clvm_int(Mojo amount)
+{
+    // HIGH-2 FIX: Guard against negative input.  Mojo coin amounts are
+    // strictly non-negative; casting a negative int64_t to uint64_t would
+    // produce a large spurious value, corrupting the CLVM encoding and
+    // yielding an incorrect coin_name hash.  Return empty bytes (encodes
+    // as zero) and log the error for diagnostics.
+    // ISO/IEC 5055 -- CWE-681 (incorrect conversion) prevention.
+    // ISO/IEC 27001:2022 -- audit-quality error logging.
+    if (amount < 0) {
+        spdlog::error("encode_clvm_int: negative amount {} is invalid "
+                      "for coin amounts", amount);
+        return {};  // Empty bytes encodes as zero per CLVM spec.
+    }
+
+    // Zero encodes as empty byte string per CLVM spec.
+    if (amount == 0) {
+        return {};
+    }
+
+    // Work with unsigned representation for bit manipulation.
+    // Mojo (int64_t) amounts are non-negative in valid coin records.
+    auto uval = static_cast<std::uint64_t>(amount);
+
+    // Extract big-endian bytes, most significant first.
+    std::vector<std::uint8_t> bytes;
+    bytes.reserve(8);  // At most 8 bytes for a 64-bit value.
+
+    while (uval > 0) {
+        bytes.push_back(static_cast<std::uint8_t>(uval & 0xFF));
+        uval >>= 8;
+    }
+
+    // Reverse to big-endian order.
+    std::reverse(bytes.begin(), bytes.end());
+
+    // CLVM sign-bit rule: if the high bit of the leading byte is set,
+    // prepend 0x00 so the value is not misinterpreted as negative.
+    if (!bytes.empty() && (bytes.front() & 0x80) != 0) {
+        bytes.insert(bytes.begin(), 0x00);
+    }
+
+    return bytes;
+}
+
+// ---------------------------------------------------------------------------
+// compute_coin_name -- derive the unique coin identifier via SHA-256
+// ---------------------------------------------------------------------------
+// Chia coin name specification:
+//   coin_name = SHA-256(parent_coin_info || puzzle_hash || amount_clvm)
+//
+// Where:
+//   - parent_coin_info: 32 bytes (the coin_name of the parent coin)
+//   - puzzle_hash:      32 bytes (hash of the CLVM puzzle that locks this coin)
+//   - amount_clvm:      variable-length CLVM-encoded big-endian integer
+//
+// The result is a 32-byte (256-bit) digest, returned as a 64-character
+// lowercase hex string.
+//
+// Reference: https://docs.chia.net/coin-set-model/#coin-id
+//
+// Uses the OpenSSL EVP interface (recommended over deprecated SHA256_*).
+// ISO/IEC 5055 -- RAII via unique_ptr with custom deleter for EVP_MD_CTX.
+// ISO/IEC 27001:2022 -- coin names are public identifiers, not secrets.
 // ---------------------------------------------------------------------------
 
 std::string CoinManager::compute_coin_name(const std::string& parent_id,
                                            const std::string& puzzle_hash,
                                            Mojo               amount)
 {
-    // coin_name = sha256(parent_coin_info || puzzle_hash || amount_be64)
-    //
-    // parent_coin_info and puzzle_hash are each 32 bytes (64 hex chars).
-    // amount is encoded as a big-endian 8-byte integer.
-    //
-    // Implementation note: a full SHA-256 implementation requires either
-    // OpenSSL, a crypto library, or a standalone implementation.  We
-    // provide the data layout here; the actual hash is deferred to the
-    // crypto backend that the build system provides (OpenSSL is already
-    // a dependency via libcurl).
-    //
-    // For now, we construct a deterministic placeholder from the input
-    // components that is unique per coin.  The production build will
-    // replace this with the real sha256.
+    // Decode hex inputs to raw bytes.
+    const std::vector<std::uint8_t> parent_bytes  = hex_to_bytes(parent_id);
+    const std::vector<std::uint8_t> puzzle_bytes  = hex_to_bytes(puzzle_hash);
+    const std::vector<std::uint8_t> amount_bytes  = encode_clvm_int(amount);
 
-    // Deterministic placeholder: concatenate the hex inputs and amount.
-    // This is NOT the real coin_name but is unique per coin for our
-    // bookkeeping purposes until the sha256 integration is completed.
+    // Validate expected sizes for parent_coin_info and puzzle_hash.
+    if (parent_bytes.size() != 32 || puzzle_bytes.size() != 32) {
+        throw std::invalid_argument(
+            "compute_coin_name: parent_id and puzzle_hash must each be "
+            "64 hex characters (32 bytes)");
+    }
+
+    // Allocate EVP digest context with RAII cleanup.
+    // ISO/IEC 5055 -- deterministic resource release via unique_ptr.
+    std::unique_ptr<EVP_MD_CTX, decltype(&EVP_MD_CTX_free)> ctx(
+        EVP_MD_CTX_new(), EVP_MD_CTX_free);
+
+    if (!ctx) {
+        throw std::runtime_error(
+            "compute_coin_name: EVP_MD_CTX_new() failed");
+    }
+
+    // Initialise SHA-256 digest computation.
+    if (EVP_DigestInit_ex(ctx.get(), EVP_sha256(), nullptr) != 1) {
+        throw std::runtime_error(
+            "compute_coin_name: EVP_DigestInit_ex(SHA-256) failed");
+    }
+
+    // Feed the three components in order: parent || puzzle || amount.
+    if (EVP_DigestUpdate(ctx.get(), parent_bytes.data(),
+                         parent_bytes.size()) != 1) {
+        throw std::runtime_error(
+            "compute_coin_name: EVP_DigestUpdate(parent) failed");
+    }
+
+    if (EVP_DigestUpdate(ctx.get(), puzzle_bytes.data(),
+                         puzzle_bytes.size()) != 1) {
+        throw std::runtime_error(
+            "compute_coin_name: EVP_DigestUpdate(puzzle) failed");
+    }
+
+    // Amount may be zero-length (for amount == 0); EVP_DigestUpdate
+    // handles empty input correctly.
+    if (!amount_bytes.empty()) {
+        if (EVP_DigestUpdate(ctx.get(), amount_bytes.data(),
+                             amount_bytes.size()) != 1) {
+            throw std::runtime_error(
+                "compute_coin_name: EVP_DigestUpdate(amount) failed");
+        }
+    }
+
+    // Finalise and extract the 32-byte digest.
+    std::array<unsigned char, 32> digest{};
+    unsigned int digest_len = 0;
+
+    if (EVP_DigestFinal_ex(ctx.get(), digest.data(), &digest_len) != 1 ||
+        digest_len != 32) {
+        throw std::runtime_error(
+            "compute_coin_name: EVP_DigestFinal_ex() failed");
+    }
+
+    // Encode the digest as a 64-character lowercase hex string.
     std::ostringstream oss;
-    oss << parent_id << puzzle_hash << std::hex << std::setfill('0')
-        << std::setw(16) << static_cast<std::uint64_t>(amount);
-    return oss.str();
+    oss << std::hex << std::setfill('0');
+    for (unsigned int i = 0; i < digest_len; ++i) {
+        oss << std::setw(2) << static_cast<unsigned int>(digest[i]);
+    }
 
-    // TODO(phase-2): replace with real SHA-256:
-    //   unsigned char hash[SHA256_DIGEST_LENGTH];
-    //   SHA256_CTX ctx;
-    //   SHA256_Init(&ctx);
-    //   SHA256_Update(&ctx, parent_bytes, 32);
-    //   SHA256_Update(&ctx, puzzle_bytes, 32);
-    //   SHA256_Update(&ctx, amount_be64, 8);
-    //   SHA256_Final(hash, &ctx);
-    //   return hex_encode(hash, 32);
+    return oss.str();
 }
 
 }  // namespace xop::execution

@@ -1,13 +1,15 @@
 // dexie_client.cpp -- Implementation of the dexie.space v1 REST client.
 //
-// Transport   : libcurl easy handles drawn from a multi-handle pool
-//               with persistent TCP + TLS connections (keep-alive).
-// Rate control: true sliding-window limiter (deque of timestamps).
-// Retry policy: exponential back-off on HTTP 429 / 5xx; immediate
-//               throw on 4xx client errors.
+// Transport   : libcurl easy handles (per-request, RAII) dispatched to a
+//               dedicated thread pool so the io_context is never blocked.
+// Rate control: true sliding-window limiter with non-blocking async waits
+//               via boost::asio::steady_timer (no std::this_thread::sleep).
+// Retry policy: exponential back-off on HTTP 429 / 5xx via async timer;
+//               immediate throw on 4xx client errors.
 //
 // ISO/IEC 27001:2022 -- offer bech32m payloads are never logged in full.
-// ISO/IEC 5055       -- no raw owning pointers; RAII throughout.
+// ISO/IEC 5055       -- no raw owning pointers; RAII throughout; per-request
+//                       CURL handles eliminate shared-state data races.
 
 #include "xop/rpc/dexie_client.hpp"
 
@@ -17,9 +19,14 @@
 #include <thread>
 #include <utility>
 
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/steady_timer.hpp>
+#include <boost/asio/use_awaitable.hpp>
 #include <spdlog/sinks/stdout_color_sinks.h>
 
 namespace xop::rpc {
+
+namespace asio = boost::asio;
 
 // =======================================================================
 // SlidingWindowRateLimiter
@@ -61,9 +68,33 @@ std::chrono::milliseconds SlidingWindowRateLimiter::acquire() {
                                      expires_at - now) + milliseconds{1};
         lock.unlock();
 
+        // NOTE: This blocking sleep is retained for non-coroutine callers.
+        // Coroutine callers should use try_acquire() + steady_timer instead.
         std::this_thread::sleep_for(sleep_dur);
         total_waited += sleep_dur;
     }
+}
+
+std::chrono::milliseconds SlidingWindowRateLimiter::try_acquire() {
+    using namespace std::chrono;
+
+    std::unique_lock lock(mu_);
+
+    const auto now = Clock::now();
+    prune_(now);
+
+    // If there is capacity, record this request and return zero (acquired).
+    if (timestamps_.size() < max_requests_) {
+        timestamps_.push_back(now);
+        return milliseconds{0};
+    }
+
+    // Window is full.  Return the duration the caller should wait before
+    // retrying.  We do NOT record a slot -- the caller must call again.
+    const auto oldest     = timestamps_.front();
+    const auto expires_at = oldest + window_;
+    // Add 1 ms margin for clock granularity (Windows ~15.6 ms ticks).
+    return duration_cast<milliseconds>(expires_at - now) + milliseconds{1};
 }
 
 std::size_t SlidingWindowRateLimiter::current_count() const {
@@ -93,10 +124,15 @@ void SlidingWindowRateLimiter::prune_(TimePoint now) {
 namespace {
 
 /// libcurl invokes this for every chunk of the response body.
+/// ISO/IEC 5055 -- null-pointer check on userdata before dereference,
+/// matching the defensive pattern in chia_rpc.cpp's curl_write_cb.
 std::size_t curl_write_cb(char*       data,
                           std::size_t /*size -- always 1*/,
                           std::size_t nmemb,
                           void*       userdata) {
+    if (!userdata) {
+        return 0; // Signal error to libcurl; prevents null dereference.
+    }
     auto* buf = static_cast<std::string*>(userdata);
     buf->append(data, nmemb);
     return nmemb;
@@ -133,8 +169,9 @@ std::string json_string_or(const nlohmann::json& j,
 // DexieClient -- construction / destruction / session lifecycle
 // =======================================================================
 
-DexieClient::DexieClient(DexieConfig config)
-    : cfg_(std::move(config)),
+DexieClient::DexieClient(asio::io_context& ioc, DexieConfig config)
+    : ioc_(ioc),
+      cfg_(std::move(config)),
       limiter_(cfg_.rate_limit_max_requests, cfg_.rate_limit_window) {
 
     // Obtain or create a named logger for this component.
@@ -159,27 +196,34 @@ void DexieClient::open() {
     // with Chia RPC's curl usage.
     // ISO/IEC 5055: single initialization point for global resources.
 
-    // Create the multi-handle that acts as the connection pool.
-    CURLM* raw_multi = curl_multi_init();
-    if (!raw_multi) {
-        throw DexieError("curl_multi_init returned null");
-    }
-    multi_.reset(raw_multi);
+    // NOTE (MEDIUM-4 cleanup): The CURLM multi-handle that was previously
+    // allocated here was dead code -- per-request easy handles were never
+    // attached to it via curl_multi_add_handle(), so it served no purpose.
+    // Removed to eliminate misleading resource allocation and simplify the
+    // session lifecycle.  Per-request easy handles (RAII via CurlEasyPtr)
+    // manage their own connections independently.
 
-    // Cap the number of cached connections (keep-alive pool size).
-    curl_multi_setopt(multi_.get(), CURLMOPT_MAXCONNECTS,
-                      cfg_.max_connections);
+    // Create the thread pool for offloading blocking CURL transfers.
+    const auto pool_size = std::max(1u, cfg_.curl_thread_pool_size);
+    thread_pool_ = std::make_unique<asio::thread_pool>(pool_size);
 
     open_ = true;
     log_->info("DexieClient opened (base_url={}, pool_size={})",
-               cfg_.base_url, cfg_.max_connections);
+               cfg_.base_url, pool_size);
 }
 
 void DexieClient::close() {
     if (!open_) {
         return;
     }
-    multi_.reset();  // Releases all pooled connections.
+
+    // Join all thread-pool workers before releasing shared state.
+    if (thread_pool_) {
+        thread_pool_->join();
+        thread_pool_.reset();
+    }
+
+    // multi_ removed (MEDIUM-4): no CURLM handle to release.
     open_ = false;
     log_->info("DexieClient closed");
 }
@@ -220,10 +264,19 @@ std::string DexieClient::build_query_(
         first = false;
 
         // URL-encode both key and value to guard against injection.
+        // ISO/IEC 5055 -- curl_easy_escape can return nullptr on
+        // allocation failure; skip the parameter rather than deref null.
         char* ek = curl_easy_escape(encoder.get(), key.c_str(),
                                     static_cast<int>(key.size()));
         char* ev = curl_easy_escape(encoder.get(), value.c_str(),
                                     static_cast<int>(value.size()));
+        if (!ek || !ev) {
+            // Allocation failure: free whichever succeeded and skip
+            // this parameter to avoid undefined behaviour.
+            curl_free(ek); // curl_free is safe on nullptr.
+            curl_free(ev);
+            continue;
+        }
         qs << ek << '=' << ev;
         curl_free(ek);
         curl_free(ev);
@@ -231,7 +284,86 @@ std::string DexieClient::build_query_(
     return qs.str();
 }
 
-nlohmann::json DexieClient::execute_request_(
+CURLcode DexieClient::perform_request_(
+    std::string_view   method,
+    const std::string& url,
+    const std::string& body,
+    std::string&       response_body,
+    long&              http_status) {
+
+    // --- Create a fresh per-request CURL handle (RAII) -------------------
+    // Each request gets its own handle, eliminating thread-safety concerns
+    // when dispatched to the thread pool.
+    //
+    // ISO/IEC 5055 -- RAII via CurlEasyPtr; no manual cleanup paths.
+    CurlEasyPtr easy(curl_easy_init());
+    if (!easy) {
+        log_->error("curl_easy_init returned null in perform_request_");
+        return CURLE_FAILED_INIT;
+    }
+
+    response_body.clear();
+    response_body.reserve(4096);
+    http_status = 0;
+
+    curl_easy_setopt(easy.get(), CURLOPT_URL, url.c_str());
+    curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, curl_write_cb);
+    curl_easy_setopt(easy.get(), CURLOPT_WRITEDATA, &response_body);
+
+    // Timeouts.
+    curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS,
+                     static_cast<long>(cfg_.request_timeout.count()));
+    curl_easy_setopt(easy.get(), CURLOPT_CONNECTTIMEOUT_MS,
+                     static_cast<long>(cfg_.connect_timeout.count()));
+
+    // Connection keep-alive.
+    curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPALIVE, 1L);
+    curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPIDLE,  60L);
+    curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPINTVL, 30L);
+
+    // Follow redirects (up to 5 hops).
+    curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, 1L);
+    curl_easy_setopt(easy.get(), CURLOPT_MAXREDIRS, 5L);
+
+    // Accept compressed responses for bandwidth savings.
+    curl_easy_setopt(easy.get(), CURLOPT_ACCEPT_ENCODING, "");
+
+    // TLS verification (public API -- system CA bundle is fine).
+    curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYPEER, 1L);
+    curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+
+    // User-Agent header.
+    curl_easy_setopt(easy.get(), CURLOPT_USERAGENT,
+                     cfg_.user_agent.c_str());
+
+    // Build headers list (RAII).
+    curl_slist* raw_headers = nullptr;
+    raw_headers = curl_slist_append(raw_headers,
+                                    "Accept: application/json");
+
+    // POST-specific configuration.
+    if (method == "POST") {
+        raw_headers = curl_slist_append(raw_headers,
+                                        "Content-Type: application/json");
+        curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDS, body.c_str());
+        curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDSIZE,
+                         static_cast<long>(body.size()));
+    }
+
+    CurlSlistPtr headers_guard(raw_headers);
+    curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, raw_headers);
+
+    // --- Execute the blocking transfer -----------------------------------
+    const CURLcode rc = curl_easy_perform(easy.get());
+    if (rc == CURLE_OK) {
+        curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &http_status);
+    }
+
+    // CurlEasyPtr and CurlSlistPtr clean up automatically here.
+    return rc;
+}
+
+asio::awaitable<nlohmann::json> DexieClient::execute_request_(
     std::string_view   method,
     const std::string& url,
     const std::string& body) {
@@ -244,72 +376,40 @@ nlohmann::json DexieClient::execute_request_(
     auto retry_delay    = cfg_.retry_base_delay;
 
     for (;;) {
-        // 1. Acquire a rate-limiter slot (may block).
-        const auto waited = limiter_.acquire();
-        if (waited.count() > 0) {
-            log_->debug("Rate limiter waited {}ms before {} {}",
-                        waited.count(), method, url);
+        // 1. Acquire a rate-limiter slot via non-blocking try_acquire().
+        //    If the window is full, sleep asynchronously via steady_timer
+        //    instead of blocking the io_context event loop thread.
+        for (;;) {
+            const auto wait_dur = limiter_.try_acquire();
+            if (wait_dur.count() == 0) {
+                break; // Slot acquired.
+            }
+            log_->debug("Rate limiter: async wait {}ms before {} {}",
+                        wait_dur.count(), method, url);
+            asio::steady_timer timer(ioc_, wait_dur);
+            co_await timer.async_wait(asio::use_awaitable);
         }
 
-        // 2. Prepare the easy handle.
-        CurlEasyPtr easy(curl_easy_init());
-        if (!easy) {
-            throw DexieError("curl_easy_init returned null");
-        }
-
+        // 2. Dispatch the blocking CURL transfer to the thread pool.
+        //    The inner coroutine runs on a pool thread; the outer
+        //    coroutine suspends without blocking the io_context.
         std::string response_body;
-        response_body.reserve(4096);
+        long        http_status = 0;
 
-        curl_easy_setopt(easy.get(), CURLOPT_URL, url.c_str());
-        curl_easy_setopt(easy.get(), CURLOPT_WRITEFUNCTION, curl_write_cb);
-        curl_easy_setopt(easy.get(), CURLOPT_WRITEDATA, &response_body);
+        // Capture method as a string to avoid dangling string_view in
+        // the lambda when it runs on the thread pool.
+        const std::string method_str(method);
 
-        // Timeouts.
-        curl_easy_setopt(easy.get(), CURLOPT_TIMEOUT_MS,
-                         static_cast<long>(cfg_.request_timeout.count()));
-        curl_easy_setopt(easy.get(), CURLOPT_CONNECTTIMEOUT_MS,
-                         static_cast<long>(cfg_.connect_timeout.count()));
+        const CURLcode rc = co_await asio::co_spawn(
+            thread_pool_->get_executor(),
+            [this, &method_str, &url, &body, &response_body, &http_status]()
+                -> asio::awaitable<CURLcode>
+            {
+                co_return perform_request_(method_str, url, body,
+                                           response_body, http_status);
+            },
+            asio::use_awaitable);
 
-        // Connection keep-alive and pooling via multi-handle.
-        curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPALIVE, 1L);
-        curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPIDLE,  60L);
-        curl_easy_setopt(easy.get(), CURLOPT_TCP_KEEPINTVL, 30L);
-
-        // Follow redirects (up to 5 hops).
-        curl_easy_setopt(easy.get(), CURLOPT_FOLLOWLOCATION, 1L);
-        curl_easy_setopt(easy.get(), CURLOPT_MAXREDIRS, 5L);
-
-        // Accept compressed responses for bandwidth savings.
-        curl_easy_setopt(easy.get(), CURLOPT_ACCEPT_ENCODING, "");
-
-        // TLS verification (public API -- system CA bundle is fine).
-        curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYPEER, 1L);
-        curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYHOST, 2L);
-
-        // User-Agent header.
-        curl_easy_setopt(easy.get(), CURLOPT_USERAGENT,
-                         cfg_.user_agent.c_str());
-
-        // Build headers list.
-        curl_slist* raw_headers = nullptr;
-        raw_headers = curl_slist_append(raw_headers,
-                                        "Accept: application/json");
-
-        // POST-specific configuration.
-        if (method == "POST") {
-            raw_headers = curl_slist_append(raw_headers,
-                                            "Content-Type: application/json");
-            curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDS, body.c_str());
-            curl_easy_setopt(easy.get(), CURLOPT_POSTFIELDSIZE,
-                             static_cast<long>(body.size()));
-        }
-
-        CurlSlistPtr headers_guard(raw_headers);
-        curl_easy_setopt(easy.get(), CURLOPT_HTTPHEADER, raw_headers);
-
-        // 3. Perform the request (synchronous -- the caller should be
-        //    running inside an asio::post / strand context).
-        const CURLcode rc = curl_easy_perform(easy.get());
         if (rc != CURLE_OK) {
             log_->error("{} {} -- curl error: {}", method, url,
                         curl_easy_strerror(rc));
@@ -317,18 +417,15 @@ nlohmann::json DexieClient::execute_request_(
                              curl_easy_strerror(rc));
         }
 
-        long http_status = 0;
-        curl_easy_getinfo(easy.get(), CURLINFO_RESPONSE_CODE, &http_status);
-
         log_->debug("{} {} -> HTTP {} ({} bytes)", method, url,
                     http_status, response_body.size());
 
-        // 4. Classify the response.
+        // 3. Classify the response.
 
         // Success range (2xx).
         if (http_status >= 200 && http_status < 300) {
             try {
-                return nlohmann::json::parse(response_body);
+                co_return nlohmann::json::parse(response_body);
             } catch (const nlohmann::json::parse_error& ex) {
                 log_->error("JSON parse error on {} {}: {}", method, url,
                             ex.what());
@@ -359,8 +456,10 @@ nlohmann::json DexieClient::execute_request_(
                        "in {}ms", method, url, http_status, attempt,
                        cfg_.max_retries, retry_delay.count());
 
-            std::this_thread::sleep_for(retry_delay);
-            retry_delay *= 2; // Exponential back-off.
+            // Async exponential backoff via steady_timer (non-blocking).
+            asio::steady_timer timer(ioc_, retry_delay);
+            co_await timer.async_wait(asio::use_awaitable);
+            retry_delay *= 2;
             continue;
         }
 
@@ -372,16 +471,18 @@ nlohmann::json DexieClient::execute_request_(
     }
 }
 
-nlohmann::json DexieClient::http_get_(const std::string& path) {
+asio::awaitable<nlohmann::json> DexieClient::http_get_(
+    const std::string& path) {
     const std::string url = cfg_.base_url + path;
-    return execute_request_("GET", url, /*body=*/"");
+    co_return co_await execute_request_("GET", url, /*body=*/"");
 }
 
-nlohmann::json DexieClient::http_post_(const std::string& path,
-                                       const nlohmann::json& body) {
+asio::awaitable<nlohmann::json> DexieClient::http_post_(
+    const std::string& path,
+    const nlohmann::json& body) {
     const std::string url      = cfg_.base_url + path;
     const std::string body_str = body.dump();
-    return execute_request_("POST", url, body_str);
+    co_return co_await execute_request_("POST", url, body_str);
 }
 
 // =======================================================================
@@ -506,21 +607,21 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
 }
 
 // =======================================================================
-// Public API methods
+// Public API methods -- now coroutines using co_await
 // =======================================================================
 
 // -----------------------------------------------------------------------
 // GET /v1/pairs
 // -----------------------------------------------------------------------
-std::vector<PairInfo> DexieClient::get_pairs() {
+asio::awaitable<std::vector<PairInfo>> DexieClient::get_pairs() {
     log_->info("get_pairs()");
 
-    const auto json = http_get_("/pairs");
+    const auto json = co_await http_get_("/pairs");
     std::vector<PairInfo> result;
 
     if (!json.contains("pairs") || !json["pairs"].is_array()) {
         log_->warn("get_pairs: unexpected response shape");
-        return result;
+        co_return result;
     }
 
     result.reserve(json["pairs"].size());
@@ -540,13 +641,13 @@ std::vector<PairInfo> DexieClient::get_pairs() {
     }
 
     log_->info("get_pairs -> {} pairs", result.size());
-    return result;
+    co_return result;
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/offers
 // -----------------------------------------------------------------------
-OffersPage DexieClient::get_offers(
+asio::awaitable<OffersPage> DexieClient::get_offers(
     std::string_view   pair_id,
     std::string_view   offered,
     std::string_view   requested,
@@ -571,7 +672,7 @@ OffersPage DexieClient::get_offers(
     if (status.has_value()) params.emplace_back("status",    std::to_string(*status));
 
     const std::string path = "/offers" + build_query_(params);
-    const auto json = http_get_(path);
+    const auto json = co_await http_get_(path);
 
     OffersPage result;
     result.success   = json.value("success", false);
@@ -588,21 +689,21 @@ OffersPage DexieClient::get_offers(
 
     log_->info("get_offers -> {} offers (total={})",
                result.offers.size(), result.count);
-    return result;
+    co_return result;
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/markets  (tickers)
 // -----------------------------------------------------------------------
-std::vector<TickerData> DexieClient::get_tickers() {
+asio::awaitable<std::vector<TickerData>> DexieClient::get_tickers() {
     log_->info("get_tickers()");
 
-    const auto json = http_get_("/markets");
+    const auto json = co_await http_get_("/markets");
     std::vector<TickerData> result;
 
     if (!json.contains("markets") || !json["markets"].is_object()) {
         log_->warn("get_tickers: unexpected response shape");
-        return result;
+        co_return result;
     }
 
     for (const auto& [base_asset, market_array] : json["markets"].items()) {
@@ -615,24 +716,24 @@ std::vector<TickerData> DexieClient::get_tickers() {
     }
 
     log_->info("get_tickers -> {} tickers", result.size());
-    return result;
+    co_return result;
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/markets  (single pair ticker)
 // -----------------------------------------------------------------------
-std::optional<TickerData> DexieClient::get_ticker(
+asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
     std::string_view pair_id) {
 
     log_->info("get_ticker(pair_id={})", pair_id);
 
     // The dexie API does not offer a single-pair ticker endpoint.
     // We fetch the full markets response and filter client-side.
-    const auto json = http_get_("/markets");
+    const auto json = co_await http_get_("/markets");
 
     if (!json.contains("markets") || !json["markets"].is_object()) {
         log_->warn("get_ticker: unexpected response shape");
-        return std::nullopt;
+        co_return std::nullopt;
     }
 
     for (const auto& [base_asset, market_array] : json["markets"].items()) {
@@ -643,27 +744,27 @@ std::optional<TickerData> DexieClient::get_ticker(
             if (m.value("pair_id", "") == pair_id) {
                 auto td = parse_ticker_(m, base_asset);
                 log_->info("get_ticker -> found {} ({})", td.code, td.pair_id);
-                return td;
+                co_return td;
             }
         }
     }
 
     log_->info("get_ticker -> pair_id={} not found", pair_id);
-    return std::nullopt;
+    co_return std::nullopt;
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/markets  (raw prices / depth data)
 // -----------------------------------------------------------------------
-nlohmann::json DexieClient::get_prices() {
+asio::awaitable<nlohmann::json> DexieClient::get_prices() {
     log_->info("get_prices()");
-    return http_get_("/markets");
+    co_return co_await http_get_("/markets");
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/offers?status=4  (recent trades)
 // -----------------------------------------------------------------------
-OffersPage DexieClient::get_trades(
+asio::awaitable<OffersPage> DexieClient::get_trades(
     std::string_view pair_id,
     uint32_t         page,
     uint32_t         page_size) {
@@ -672,7 +773,7 @@ OffersPage DexieClient::get_trades(
                pair_id, page, page_size);
 
     // Settled offers have status=4.  Sort newest first.
-    return get_offers(
+    co_return co_await get_offers(
         pair_id,
         /*offered=*/   {},
         /*requested=*/ {},
@@ -686,7 +787,8 @@ OffersPage DexieClient::get_trades(
 // -----------------------------------------------------------------------
 // POST /v1/offers  (submit a new offer)
 // -----------------------------------------------------------------------
-SubmitResult DexieClient::submit_offer(std::string_view offer_bech32m) {
+asio::awaitable<SubmitResult> DexieClient::submit_offer(
+    std::string_view offer_bech32m) {
     // Security: never log the full offer payload.
     log_->info("submit_offer(offer={})",
                truncate_for_log(offer_bech32m, 24));
@@ -694,7 +796,7 @@ SubmitResult DexieClient::submit_offer(std::string_view offer_bech32m) {
     nlohmann::json body;
     body["offer"] = offer_bech32m;
 
-    const auto json = http_post_("/offers", body);
+    const auto json = co_await http_post_("/offers", body);
 
     SubmitResult sr;
     sr.success       = json.value("success", false);
@@ -706,17 +808,18 @@ SubmitResult DexieClient::submit_offer(std::string_view offer_bech32m) {
     } else {
         log_->warn("submit_offer -> failed: {}", sr.error_message);
     }
-    return sr;
+    co_return sr;
 }
 
 // -----------------------------------------------------------------------
 // GET /v1/offers/{offer_id}  (offer status lookup)
 // -----------------------------------------------------------------------
-OfferStatus DexieClient::get_offer_status(std::string_view offer_id) {
+asio::awaitable<OfferStatus> DexieClient::get_offer_status(
+    std::string_view offer_id) {
     log_->info("get_offer_status(id={})", offer_id);
 
     const std::string path = "/offers/" + std::string(offer_id);
-    const auto json = http_get_(path);
+    const auto json = co_await http_get_(path);
 
     OfferStatus os;
     os.success = json.value("success", false);
@@ -735,7 +838,7 @@ OfferStatus DexieClient::get_offer_status(std::string_view offer_id) {
 
     log_->info("get_offer_status -> success={}, status={}",
                os.success, os.offer.status);
-    return os;
+    co_return os;
 }
 
 } // namespace xop::rpc

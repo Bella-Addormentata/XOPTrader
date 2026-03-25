@@ -161,34 +161,42 @@ TEST(SpreadComponentTest, CostBpsZeroTradeSize) {
 }
 
 // ============================================================================
-// Component 4: Competition
+// Component 4: Competition (T3-33 corrected)
 // ============================================================================
 //
-// Formula (strategy doc S6):
-//   s_competition = max(s_floor, best_competing + epsilon)
+// Corrected formula:
+//   s_competition = max(s_floor, best_competing - epsilon)
+//
+// Returns a target spread cap (undercut), not an additive component.
+// compute_spread() uses min(base_spread, s_competition) to ensure we
+// quote tighter than the best competitor by epsilon, floored at s_floor.
 //
 //   s_floor = 40 bps, epsilon = 2 bps
 //
-//   No competition (best <= 0): s_competition = 40 bps.
-//   Competition at 30 bps:  max(40, 30+2) = max(40, 32) = 40 bps (floor wins).
-//   Competition at 50 bps:  max(40, 50+2) = max(40, 52) = 52 bps.
+//   No competition (best <= 0): returns 0 (no cap; floor applied separately).
+//   Competition at 30 bps:  max(40, 30-2) = max(40, 28) = 40 bps (floor wins).
+//   Competition at 50 bps:  max(40, 50-2) = max(40, 48) = 48 bps (undercut).
 
 TEST(SpreadComponentTest, CompetitionNoData) {
+    // No competition data: returns 0 to signal "no cap".
     EXPECT_NEAR(
         xop::SpreadOptimizer::calc_competition_bps(40.0, 0.0, 2.0),
-        40.0, 1e-10);
+        0.0, 1e-10);
 }
 
 TEST(SpreadComponentTest, CompetitionFloorWins) {
+    // Competitor at 30 bps: undercutting to 28 would breach the 40 bps
+    // floor, so the floor wins.
     EXPECT_NEAR(
         xop::SpreadOptimizer::calc_competition_bps(40.0, 30.0, 2.0),
         40.0, 1e-10);
 }
 
 TEST(SpreadComponentTest, CompetitionImprovesOnBest) {
+    // Competitor at 50 bps: undercut by 2 -> 48 bps (above the 40 bps floor).
     EXPECT_NEAR(
         xop::SpreadOptimizer::calc_competition_bps(40.0, 50.0, 2.0),
-        52.0, 1e-10);
+        48.0, 1e-10);
 }
 
 // ============================================================================

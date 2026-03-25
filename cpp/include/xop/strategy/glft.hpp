@@ -58,10 +58,13 @@
 #define XOP_STRATEGY_GLFT_HPP
 
 #include <xop/strategy/base.hpp>
+#include <xop/strategy/regime.hpp>
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
 #include <deque>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 
 namespace xop {
@@ -132,7 +135,9 @@ public:
 
     RegimeInfo current_regime() const override;
 
-    const std::string& name() const override;
+    // [MEDIUM-2] Return by value -- reference through expiring shared_lock
+    // is undefined behaviour (ISO/IEC 5055 -- CWE-362).
+    std::string name() const override;
 
     void set_cost_basis(double cost_basis,
                         double min_margin_bps) override;
@@ -161,13 +166,48 @@ public:
     double fill_intensity(double delta) const;
 
     /// Read-only access to the config.
+    // cfg_ is immutable after construction; no lock required.
     const GlftConfig& config() const { return cfg_; }
 
-private:
-    // -- Regime detection helpers --------------------------------------------
+    // -- Shared regime detector (T3-01) -------------------------------------
 
-    double variance_ratio_test() const;
-    void   update_regime();
+    /// Set a shared RegimeDetector instance.  Pass nullptr to revert to
+    /// internal detection.  The shared detector must outlive this instance.
+    ///
+    /// MEDIUM-1: Exclusive lock -- mutates shared_regime_detector_.
+    /// ISO/IEC 27001:2022: protect shared mutable state.
+    void set_regime_detector(RegimeDetector* detector) noexcept {
+        std::unique_lock lock(mtx_);
+        shared_regime_detector_ = detector;
+    }
+
+    /// Return the active RegimeDetector (shared if set, else internal).
+    ///
+    /// MEDIUM-1: Shared lock -- read-only access to shared_regime_detector_.
+    const RegimeDetector* regime_detector() const noexcept {
+        std::shared_lock lock(mtx_);
+        return shared_regime_detector_ ? shared_regime_detector_
+                                       : internal_detector_.get();
+    }
+
+private:
+    /// Return the active detector (shared or internal).
+    RegimeDetector& active_detector() noexcept {
+        return shared_regime_detector_ ? *shared_regime_detector_
+                                       : *internal_detector_;
+    }
+
+    /// Update regime classification.
+    /// T3-01: delegates to the active RegimeDetector.
+    void update_regime();
+
+    // -- Thread safety (MEDIUM-1) --------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    // Follows the same locking pattern used by ChiaEdgeOptimizer, State,
+    // VolatilityEstimator, and AdverseSelectionEstimator: single mutex,
+    // no nesting.  ISO/IEC 27001:2022 -- protects mutable state from
+    // concurrent access.
+    mutable std::shared_mutex mtx_;
 
     // -- Data members -------------------------------------------------------
 
@@ -184,6 +224,11 @@ private:
 
     // Current regime state.
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: canonical RegimeDetector instances.
+    std::unique_ptr<RegimeDetector> internal_detector_;
+    RegimeDetector* shared_regime_detector_{nullptr};
+    double last_mid_{0.0};
 
     // No-loss constraint state.
     double cost_basis_{0.0};

@@ -877,6 +877,14 @@ void RegimeDetector::hmm_baum_welch() {
 
     hmm_.fitted = true;
 
+    // -- Sort states by emission stddev (ascending) --------------------------
+    // Resolves the label-switching ambiguity inherent in EM: after
+    // Baum-Welch converges, state indices have no guaranteed ordering.
+    // Sorting by stddev ensures state 0 = low-vol, 1 = normal, 2 = high-vol,
+    // which is required for correct regime classification downstream.
+    // (T3-28: sort by stddev, not mean -- volatility level defines regime.)
+    hmm_sort_states_by_stddev();
+
     // -- Re-run forward algorithm to set current state probabilities ---------
     // Run over the full window to ensure temporal consistency.
     hmm_.forward_prob = hmm_.initial_prob;
@@ -903,6 +911,93 @@ void RegimeDetector::hmm_baum_welch() {
         }
         hmm_.forward_prob = new_fp;
     }
+}
+
+// ---------------------------------------------------------------------------
+// hmm_sort_states_by_stddev -- Canonical ordering of HMM states post EM.
+//
+// The Baum-Welch algorithm is invariant to state permutations (the "label
+// switching" problem): any permutation of the hidden state indices yields
+// an identical likelihood.  Without a canonical ordering, the state index
+// returned by get_hmm_most_likely_state() or the Viterbi path has no
+// stable semantic meaning across successive re-fits.
+//
+// We sort states by ascending emission standard deviation so that:
+//   state 0 = lowest  stddev  (low-volatility / quiet regime)
+//   state 1 = middle  stddev  (normal-volatility regime)
+//   state 2 = highest stddev  (high-volatility / turbulent regime)
+//
+// Sorting by stddev (not mean) is the correct criterion because regime
+// classification is driven by volatility level, not return drift.  If the
+// return distribution has non-zero drift, sorting by mean can misassign
+// the low-vol label to a high-vol state that happens to have a lower mean.
+//
+// All HMM arrays (emission_mean, emission_stddev, initial_prob,
+// transition matrix rows and columns, forward_prob) are permuted
+// consistently according to the derived index mapping.
+//
+// Complexity: O(S^2) where S = kNumStates = 3.  Negligible.
+// ---------------------------------------------------------------------------
+
+void RegimeDetector::hmm_sort_states_by_stddev() {
+    constexpr std::size_t S = HmmState::kNumStates;
+
+    // -- Build permutation index sorted by ascending emission stddev ----------
+    std::array<std::size_t, S> perm;
+    for (std::size_t i = 0; i < S; ++i) {
+        perm[i] = i;
+    }
+    std::sort(perm.begin(), perm.end(),
+              [this](std::size_t a, std::size_t b) {
+                  return hmm_.emission_stddev[a] < hmm_.emission_stddev[b];
+              });
+
+    // -- Check whether the permutation is already the identity ----------------
+    // If so, no work is needed; skip the copy operations.
+    bool already_sorted = true;
+    for (std::size_t i = 0; i < S; ++i) {
+        if (perm[i] != i) {
+            already_sorted = false;
+            break;
+        }
+    }
+    if (already_sorted) {
+        return;
+    }
+
+    // -- Apply the permutation to all per-state arrays ------------------------
+    // Work on temporaries to avoid aliasing during the permutation.
+
+    std::array<double, S> new_mean{};
+    std::array<double, S> new_stddev{};
+    std::array<double, S> new_initial{};
+    std::array<double, S> new_forward{};
+
+    for (std::size_t i = 0; i < S; ++i) {
+        new_mean[i]    = hmm_.emission_mean[perm[i]];
+        new_stddev[i]  = hmm_.emission_stddev[perm[i]];
+        new_initial[i] = hmm_.initial_prob[perm[i]];
+        new_forward[i] = hmm_.forward_prob[perm[i]];
+    }
+
+    hmm_.emission_mean   = new_mean;
+    hmm_.emission_stddev = new_stddev;
+    hmm_.initial_prob    = new_initial;
+    hmm_.forward_prob    = new_forward;
+
+    // -- Permute the transition matrix rows and columns -----------------------
+    // A'[i][j] = A[perm[i]][perm[j]]
+    // This preserves the transition semantics: the probability of moving
+    // from new-state-i to new-state-j equals the probability of moving
+    // from old-state-perm[i] to old-state-perm[j].
+
+    std::array<std::array<double, S>, S> new_trans{};
+    for (std::size_t i = 0; i < S; ++i) {
+        for (std::size_t j = 0; j < S; ++j) {
+            new_trans[i][j] = hmm_.transition[perm[i]][perm[j]];
+        }
+    }
+    hmm_.transition = new_trans;
 }
 
 // ---------------------------------------------------------------------------
@@ -984,6 +1079,46 @@ std::vector<std::size_t> RegimeDetector::hmm_viterbi() const {
     }
 
     return path;
+}
+
+// ===========================================================================
+// RegimeDetector-to-RegimeInfo bridge (T3-01)
+// ===========================================================================
+
+RegimeInfo to_regime_info(const RegimeDetector& detector) {
+    // Map the canonical Regime enum to the consumer MarketRegime enum.
+    MarketRegime market_regime = MarketRegime::Random;
+    switch (detector.get_regime()) {
+        case Regime::MeanReverting:
+            market_regime = MarketRegime::MeanReverting;
+            break;
+        case Regime::Normal:
+            market_regime = MarketRegime::Random;
+            break;
+        case Regime::Momentum:
+            market_regime = MarketRegime::Momentum;
+            break;
+    }
+
+    // Extract the multipliers from the canonical detector.
+    const RegimeMultipliers mults = detector.get_multipliers();
+
+    // Populate the RegimeInfo struct expected by strategy consumers.
+    // variance_ratio: use the short-horizon VR value from the detector config.
+    // spread_mult:    maps from RegimeMultipliers::spread_mult.
+    // skew_mult:      maps from RegimeMultipliers::shedding_mult (the consumer
+    //                 "skew_mult" controls inventory shedding aggressiveness,
+    //                 which corresponds to the shedding_mult in the canonical
+    //                 multiplier table).
+    const double vr_short = detector.get_variance_ratio(
+        detector.config().vr_q_short);
+
+    return RegimeInfo{
+        market_regime,
+        vr_short,
+        mults.spread_mult,
+        mults.shedding_mult
+    };
 }
 
 }  // namespace xop

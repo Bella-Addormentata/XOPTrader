@@ -130,7 +130,9 @@ public:
 
     /// Return the strategy name (e.g. "AvellanedaStoikov", "GLFT") for
     /// logging and metrics labelling.
-    virtual const std::string& name() const = 0;
+    // [MEDIUM-2] Return by value -- returning a reference through an expiring
+    // shared_lock is undefined behaviour (ISO/IEC 5055 -- CWE-362).
+    virtual std::string name() const = 0;
 
     // -- No-loss constraint -------------------------------------------------
 

@@ -345,14 +345,27 @@ double SpreadOptimizer::calc_cost_bps(
 }
 
 // ---------------------------------------------------------------------------
-// Competition: max(s_floor, best_competing + epsilon)
+// Competition: undercut the best competing spread by epsilon, floored at
+//              s_floor_bps.
 //
-// s_floor is the minimum profitable spread (35-60 bps at current CHIA
-// conditions per Section 6).  epsilon is a small improvement to be price-
-// competitive (typically 1-3 bps).
+// T3-33 FIX: The original formula returned (best_competing + epsilon),
+// which *widens* our spread relative to the competitor.  Competitive
+// market-making practice requires *undercutting* (tightening inside) the
+// best competing quote so that our offers are more attractive to takers.
 //
-// If no competition data is available (best_competing <= 0), the floor
-// alone determines this component.
+// Corrected formula:
+//     max(s_floor_bps, best_competing_bps - epsilon_bps)
+//
+// This returns a target total-spread cap, not an additive component.
+// The caller (compute_spread) uses this to cap the model-derived spread
+// so we never quote wider than the best competitor minus epsilon, while
+// respecting the minimum profitable floor.
+//
+// If no competition data is available (best_competing <= 0), return 0 to
+// signal "no cap" -- the final floor in compute_spread() handles the
+// minimum.
+//
+// ISO/IEC 5055: bounds-checked, no undefined behaviour on edge inputs.
 // ---------------------------------------------------------------------------
 double SpreadOptimizer::calc_competition_bps(
     double s_floor_bps,
@@ -362,17 +375,17 @@ double SpreadOptimizer::calc_competition_bps(
     // When no competition data is available, return 0 -- the final spread
     // floor (total_spread_bps = max(total_spread_bps, s_floor_bps)) handles
     // the minimum.  Returning s_floor_bps here would double-count the floor
-    // because it gets added to the other components and THEN the floor is
-    // re-applied on the total.
+    // because the floor is already enforced on the total.
     // ISO/IEC 5055: prevent double-counting of the spread floor that would
     // inflate quoted spreads beyond intended minimums.
     if (best_competing_bps <= 0.0) {
         return 0.0;
     }
 
-    // When competition data is present, improve upon the best competing
-    // spread by epsilon.  The final floor on total_spread_bps still applies.
-    return best_competing_bps + epsilon_bps;
+    // Undercut the best competing spread by epsilon, but never go below
+    // the minimum profitable floor.  This ensures we are tighter than
+    // the competitor (attracting order flow) while remaining profitable.
+    return std::max(s_floor_bps, best_competing_bps - epsilon_bps);
 }
 
 // ---------------------------------------------------------------------------
@@ -472,14 +485,26 @@ SpreadResult SpreadOptimizer::compute_spread(
         cfg_.blockchain_fee_xch, venue_fee_fraction(venue),
         cfg_.default_trade_size_xch);
 
+    // T3-33: calc_competition_bps returns a target *cap* (undercut value),
+    // not an additive component.  When competition data is present it
+    // returns max(floor, best_competing - epsilon); when absent it returns 0
+    // to signal "no cap".
     const double s_comp = calc_competition_bps(
         cfg_.s_floor_bps, best_competing_bps, cfg_.epsilon_bps);
 
     // --- Combine components ---
-    // The base spread is the sum of all four components.  The components
-    // capture independent risk/cost factors and are additive by design
-    // (Section 6: "spread = s_adverse + s_inventory + s_cost + s_competition").
-    double base_spread_bps = s_adv + s_inv + s_cost + s_comp;
+    // The base spread is the sum of the risk and cost components.
+    // The competition component is applied as a cap (not additive) so
+    // that we undercut the best competitor rather than widening past them.
+    double base_spread_bps = s_adv + s_inv + s_cost;
+
+    // If competition data is available (s_comp > 0), cap the base spread
+    // at the competitive target.  This ensures we quote at or tighter
+    // than (best_competing - epsilon), while the floor still protects
+    // profitability.
+    if (s_comp > 0.0) {
+        base_spread_bps = std::min(base_spread_bps, s_comp);
+    }
 
     // --- Apply dynamic regime multiplier ---
     const double regime_mult = calc_regime_multiplier(

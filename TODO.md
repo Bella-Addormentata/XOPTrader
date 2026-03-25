@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-24 (verified against codebase)
+**Last Updated:** 2026-03-25 (verified against codebase — 3-round review cycle complete)
 **Source:** Consolidated from all code reviews and logic reviews in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -25,47 +25,47 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/rpc/chia_rpc.cpp`, `cpp/src/rpc/dexie_client.cpp`
 - **Issue:** `curl_easy_perform()` blocks the single-threaded `io_context` event loop for up to 30+ seconds per RPC call. `dexie_client.cpp` also uses `std::this_thread::sleep_for()` for rate limiting, blocking the event loop.
 - **Fix:** Dispatch CURL to a thread pool via `boost::asio::post()`, or use async HTTP (Beast / CURLM multi-handle).
-- **Status:** `[ ]`
+- **Status:** `[x]` — CURL dispatched to boost::asio thread_pool; dexie_client converted to coroutines with non-blocking rate limiting.
 
 ### T1-03: Eliminate `co_spawn(..., use_future).get()` deadlock pattern
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §7.2, CODEREVIEW-GPT-5.4 §2, CODEREVIEW-GPT5.3-Codex §P0-2, CODEREVIEW-ClaudeCode-Opus §Phase2-1
 - **Files:** `cpp/src/engine.cpp` (lines ~214, ~345, ~589, ~1017, ~1310)
 - **Issue:** Blocking `future.get()` on the same `io_context` thread the coroutine is scheduled on = potential deadlock in single-threaded mode.
 - **Fix:** Convert step methods to `co_await` pipeline end-to-end; avoid `.get()`/`wait_for()` inside handlers on the same event loop.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Engine converted to native co_await chain. poll_loop_coro(), on_new_block_coro(), step methods all awaitables. open_connections() co_awaited from poll_loop_coro(). shutdown() uses co_spawn+detached.
 
 ### T1-04: Implement proper SHA-256 coin name computation
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §3.5, CODEREVIEW-ClaudeCode-Opus §Phase2-4
 - **Files:** `cpp/src/execution/coin_manager.cpp`
 - **Issue:** `compute_coin_name()` returns concatenated hex strings, not SHA-256 hash. All coin identity, locking, and double-spend tracking is broken.
 - **Fix:** Implement `SHA256(parent_coin_info || puzzle_hash || amount)` using OpenSSL.
-- **Status:** `[ ]`
+- **Status:** `[x]` — SHA-256 via OpenSSL EVP with CLVM integer encoding. Overflow guards on mojo arithmetic.
 
 ### T1-05: Activate coin splitting RPC call
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §3.6, CODEREVIEW-ClaudeCode-Opus §Phase2-5
 - **Files:** `cpp/src/execution/coin_manager.cpp`
 - **Issue:** `ensure_split()` has the `send_transaction` RPC call commented out. Multi-tier offer ladder requires pre-split coins.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Activated co_await wallet_->send_transaction(). Overflow guards on total_needed calculation.
 
 ### T1-06: Implement Dexie offer submission
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §3.7, CODEREVIEW-GPT-5.4 §14
 - **Files:** `cpp/src/execution/offer_manager.cpp`
 - **Issue:** `submit_to_dexie()` always returns `true` without actually submitting to the DEX.
-- **Status:** `[ ]`
+- **Status:** `[x]` — submit_to_dexie() calls dexie_client_->submit_offer() with full error handling.
 
 ### T1-07: Fix dangling `c_str()` pointer in TLS configuration
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §3.4
 - **Files:** `cpp/src/rpc/chia_rpc.cpp`
 - **Issue:** If `config` object lifetime ends before CURL uses the TLS cert path, it's a use-after-free.
 - **Fix:** Store TLS paths in member variables that outlive the CURL handle.
-- **Status:** `[~]` — Safe in practice: libcurl copies string data internally. Low priority; cosmetic improvement only.
+- **Status:** `[x]` — TLS path strings materialized in perform_request() with lifetime spanning curl_easy_perform(). Passed to configure_tls() by const ref.
 
 ### T1-08: Fix asset/pair identity mismatch in fills and risk checks
 - **Source:** CODEREVIEW-GPT-5.4 §3, CODEREVIEW-GPT5.3-Codex §P0-3, LOGICREVIEW-GPT5.3-Codex §CRITICAL-1
 - **Files:** `cpp/src/execution/offer_manager.cpp`, `cpp/src/state.cpp`, `cpp/src/risk/limits.cpp`
 - **Issue:** Fill handling writes positions by `pair_name`, but risk checks read by `asset_id`. State positions may be fragmented or invisible to risk gates.
 - **Fix:** Normalize all position updates to canonical `AssetId`. Derive pair exposure from asset-level balances.
-- **Status:** `[~]` — Partially done: `engine.cpp` correctly uses `base_asset_id`, but `offer_manager.cpp` still uses `pair_name` for `record_buy`/`record_sell`.
+- **Status:** `[x]` — detect_fills() uses pair_config_map_ to resolve base_asset_id. Engine uses base_asset_id throughout.
 
 ### T1-09: Fix inventory updates hardcoded to `"xch"` for all pairs
 - **Source:** CODEREVIEW-GPT-5.4 §4, CODEREVIEW-GPT5.3-Codex §P0-4
@@ -86,7 +86,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp` (lines ~111-116)
 - **Issue:** One mutable `AvellanedaStoikov` instance shared across all pairs. `price_buffer_`, `regime_`, `cost_basis_` state bleeds between unrelated markets.
 - **Fix:** Maintain one strategy instance per pair, or make strategy stateless and pass pair state explicitly.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Per-pair strategy instances via strategies_ map in engine. Each pair gets independent state.
 
 ### T1-12: Fix inventory units mismatch passed to Avellaneda-Stoikov
 - **Source:** CODEREVIEW-GPT-5.4 §7, LOGICREVIEW-GPT-5.4 §2, LOGICREVIEW-Gemini §3
@@ -107,7 +107,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/rpc/chia_rpc.cpp`
 - **Issue:** Single CURL handle reused across all RPC requests with no synchronization. Concurrent coroutines (e.g., shutdown cancel-all) corrupt handle state.
 - **Fix:** Per-request handle pool or mutex protection.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Per-request CURL handles with ScopedCurlEasy/ScopedCurlSlist RAII wrappers. Dead CURLM multi-handle removed.
 
 ---
 
@@ -125,14 +125,14 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/data/volatility.cpp`, `cpp/src/data/adverse_selection.cpp`, `cpp/src/strategy/new_strategies.cpp`, `cpp/src/strategy/order_book_tactics.cpp`, `cpp/src/strategy/chia_edge.cpp`, `cpp/src/strategy/strategy_portfolio.cpp`, `cpp/src/monitoring/metrics.cpp`
 - **Issue:** 8+ modules have zero thread synchronization on mutable state. Any future multi-threading or coroutine interleaving causes data races.
 - **Fix:** Add mutexes consistent with `state.cpp` pattern, or annotate as explicitly single-threaded.
-- **Status:** `[ ]`
+- **Status:** `[x]` — std::shared_mutex added to volatility, adverse_selection, metrics, A-S, GLFT, new_strategies, order_book_tactics, chia_edge. Config snapshots in MarketDataFeed. Lock ordering documented.
 
 ### T2-03: Replace detached threads in alerts with worker queue
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §4.2, CODEREVIEW-ClaudeCode-Opus §M27
 - **Files:** `cpp/src/monitoring/alerts.cpp`
 - **Issue:** Detached threads for Telegram sends have no cleanup path. On exit, undefined behavior.
 - **Fix:** Persistent worker thread with message queue, or async HTTP client.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Worker thread with std::queue + mutex + condition_variable. Proper start/stop/drain lifecycle.
 
 ### T2-04: Fix OFI normalization (sliding window)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §4.4
@@ -153,28 +153,28 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/monitoring/pnl.cpp`
 - **Issue:** Both `Date Acquired` and `Date Sold` set to sell date. IRS Form 8949 export is incorrect.
 - **Fix:** Look up original buy fill(s) or store average acquisition timestamp in `AssetRecord`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — acquisition_ts added to TradeRecord and trade_log table. Weighted-average acquisition timestamp tracked in PairPnL.
 
 ### T2-07: Fix `const_cast` on SQLite prepared statements
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §4.7
 - **Files:** `cpp/src/monitoring/pnl.cpp`
 - **Issue:** `const` methods use `const_cast` to mutate `sqlite3_stmt`. Concurrent const accessors corrupt statement state.
 - **Fix:** Remove `const` qualifier or use separate statement instances per query.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Removed const from 4 methods, eliminated all const_cast.
 
 ### T2-08: Make SSL verification configurable (default ON for Chia CA)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §9.8, CODEREVIEW-ClaudeCode-Opus §M30
 - **Files:** `cpp/src/rpc/chia_rpc.cpp`
 - **Issue:** SSL verification completely disabled (`CURLOPT_SSL_VERIFYPEER = 0`). MITM on wallet RPC could redirect funds.
 - **Fix:** Load Chia CA cert and verify. Only disable for localhost.
-- **Status:** `[ ]`
+- **Status:** `[x]` — SSL verification configurable via config_.verify_ssl (default true). Chia CA cert loaded.
 
 ### T2-09: Persist actual wallet offer IDs (not placeholders)
 - **Source:** CODEREVIEW-GPT-5.4 §11, CODEREVIEW-GPT5.3-Codex §P0-5, CODEREVIEW-Claude-Opus-4.6 §7.4, CODEREVIEW-ClaudeCode-Opus §M-V1
 - **Files:** `cpp/src/engine.cpp` (Step 8)
 - **Issue:** Placeholder `offer_id` persisted to DB. Real wallet/Dexie IDs assigned later. `update_offer_status()` throws on mismatch.
 - **Fix:** Insert offer records after `OfferManager::post_quotes()` returns actual IDs.
-- **Status:** `[ ]`
+- **Status:** `[x]` — PostedOffer struct with offer_id field. Actual wallet-assigned IDs persisted.
 
 ### T2-10: Fix trade log `timestamp` column always empty
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §M-V1
@@ -195,7 +195,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/monitoring/alerts.cpp`
 - **Issue:** Tier-based `send_alert()` bypasses rate limiting. Future callers could flood Telegram.
 - **Fix:** Mark `[[deprecated]]` or make private.
-- **Status:** `[ ]`
+- **Status:** `[x]` — send_alert(AlertTier, ...) marked [[deprecated]].
 
 ### T2-13: Use `std::llround()` for mojo price conversions (truncation bias)
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §M-V4, CODEREVIEW-ClaudeCode-Opus §M7
@@ -223,21 +223,21 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/risk/limits.cpp`
 - **Issue:** `compute_concentration()` sums raw mojo balances across different assets. Not economically comparable.
 - **Fix:** Mark positions to common numeraire using latest mid/mark prices.
-- **Status:** `[ ]`
+- **Status:** `[x]` — mark_to_xch() converts positions to XCH numeraire via mid prices from State. Conservative fallback when price unavailable.
 
 ### T2-17: Fix record_sell() return value ignored during fill processing
 - **Source:** LOGICREVIEW-GPT-5.4 §C.3
 - **Files:** `cpp/src/engine.cpp` (Step 2)
 - **Issue:** `record_sell()` can reject a sell due to no-loss rule, but engine doesn't check returned bool. Inventory state desynchronizes from actual executed fills.
 - **Fix:** Check return value; if rejected, log error and flag state inconsistency.
-- **Status:** `[ ]`
+- **Status:** `[x]` — record_sell() return value checked with error logging on rejection.
 
 ### T2-18: Fix `build_offer_dict` quote-asset denomination assumption
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §5.5, CODEREVIEW-ClaudeCode-Opus §Phase2-6
 - **Files:** `cpp/src/execution/offer_manager.cpp`
 - **Issue:** Divides quote amount by `kMojosPerXch` always. CAT tokens use different denomination (typically 10^3).
 - **Fix:** Look up denomination per asset from pair config or token registry.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Uses pair.quote_mojos_per_unit from PairConfig (default 10^3 for CAT).
 
 ### T2-19: Add Kelly sizing division-by-zero guard
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §INV-1 (HIGH)
@@ -262,7 +262,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/data/volatility.cpp`, `cpp/src/strategy/avellaneda.cpp`, `cpp/src/strategy/glft.cpp`, `cpp/src/strategy/new_strategies.cpp`, `cpp/src/strategy/chia_edge.cpp`, `cpp/src/strategy/regime.cpp`
 - **Issue:** Four VR implementations with different denominators (N vs N-1), different horizons, and no hysteresis. Strategies can disagree on regime classification.
 - **Fix:** Share one canonical `RegimeDetector` (the one in `regime.cpp`) across all consumers.
-- **Status:** `[ ]` — 4 separate VR implementations remain in avellaneda, glft, chia_edge, new_strategies. `regime.cpp`’s canonical version is unused by others.
+- **Status:** `[x]` — All 4 local VR implementations removed from A-S, GLFT, ChiaEdge, new_strategies. All delegate to shared RegimeDetector. VolatilityEstimator local VR deprecated with [[deprecated]].
 
 ### T3-02: Add PreTradeCheck tests (`enforce_no_loss`, `flash_crash`, `apply_limits`)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.1/§10
@@ -308,21 +308,21 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp` (Step 10), `cpp/src/risk/hedging.cpp`
 - **Issue:** `compute_nhe()` exists but is never called. Layer 2 (NHE) computed nowhere.
 - **Fix:** Wire into heartbeat; alert when NHE drops below 0.70.
-- **Status:** `[ ]`
+- **Status:** `[x]` — NHE accumulators reset per cycle. compute_nhe() wired into Step 10 with alert.
 
 ### T3-09: Add max-drawdown global circuit breaker
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.5
 - **Files:** `cpp/src/engine.cpp`
 - **Issue:** No global stop-loss. Slow series of adverse fills can deplete capital without triggering alerts.
 - **Fix:** Add `max_drawdown_pct` parameter; transition engine to `Paused` when HWM drawdown exceeds threshold.
-- **Status:** `[ ]`
+- **Status:** `[x]` — 10% default max drawdown. HWM seeded on first cycle. Active from startup (no profit-gate bypass).
 
 ### T3-10: Add flash-crash state machine (Normal → Crash → Recovery → Normal)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.6, LOGICREVIEW-GPT5.3-Codex §HIGH-2
 - **Files:** `cpp/src/engine.cpp`, `cpp/src/risk/limits.cpp`
 - **Issue:** `check_flash_crash()` detects but never called from heartbeat. No state machine. Also uses global-max anchor rather than rolling max-drawdown.
 - **Fix:** Add `flash_crash_state_` member; gate Step 8 during crash/recovery phases. Use rolling peak-to-trough.
-- **Status:** `[ ]`
+- **Status:** `[x]` — FlashCrashState enum (Normal/Crash/Recovery). All pairs checked with worst-case aggregation. Step 8 gated during crash.
 
 ### T3-11: Implement graduated soft-limit response (proportional sizing)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.2, LOGICREVIEW-Claude-Opus-4.6 §RL-1
@@ -385,7 +385,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/strategy/order_book_tactics.cpp`
 - **Issue:** Tactic alternates every block when `inventory_ratio` oscillates near threshold. Quote instability reduces fill probability.
 - **Fix:** Require N consecutive blocks (default 3) confirming new tactic before switching.
-- **Status:** `[ ]`
+- **Status:** `[x]` — tactic_hysteresis_blocks config (default 3). Counter accumulates before switch. HybridRebalance bypasses for safety.
 
 ### T3-20: Fix NHE returning 0.0 when no volume (should be 1.0 or nullopt)
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §HG-1
@@ -398,27 +398,27 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §9.4
 - **Files:** `cpp/src/monitoring/pnl.cpp`
 - **Issue:** `std::vector::erase(begin())` is O(n) per trim.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Changed to std::deque<PnLSnapshot>, erase(begin()) → pop_front().
 
 ### T3-22: Use `steady_clock` for staleness in `MempoolSentinelStrategy`
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §9.5
 - **Files:** `cpp/src/strategy/new_strategies.cpp`
 - **Issue:** `system_clock` susceptible to NTP corrections.
-- **Status:** `[ ]`
+- **Status:** `[x]` — first_seen_steady uses steady_clock::time_point.
 
 ### T3-23: Fix move assignment operator lock ordering risk in `MarketDataFeed`
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §9.7
 - **Files:** `cpp/src/execution/market_data.cpp`
 - **Issue:** Two locks acquired without global ordering → ABBA deadlock potential.
 - **Fix:** Use `std::scoped_lock(mtx_a, mtx_b)`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — std::scoped_lock(mtx_a, mtx_b) in move assignment. Lock ordering documented in header.
 
 ### T3-24: Add dependency-aware gating in engine step failure handling
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §ENG-2, LOGICREVIEW-GPT5.3-Codex §HIGH-4
 - **Files:** `cpp/src/engine.cpp`
 - **Issue:** Failed Step 1 allows Steps 4-8 to proceed with stale data. No per-pair validity tracking.
 - **Fix:** If Step 1 fails for a pair, block Steps 4-8 for that pair. Track `data_quality` flags.
-- **Status:** `[~]` — Per-pair `quote_valid` flag gates later steps, but no formal step-dependency DAG or `data_quality` flags.
+- **Status:** `[x]` — Per-pair market_data_valid flag in PairCycleState gates steps 4-8. Invalid data skips quoting for that pair.
 
 ### T3-25: Add stale-quote detection for own offers (price deviation trigger)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.1
@@ -432,28 +432,28 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/strategy/strategy_portfolio.cpp`
 - **Issue:** 2-3 fills per lookback window. Single fortunate fill → 10%+ reallocation.
 - **Fix:** Weight PnL updates by fill count: `effective_beta = beta × min(1.0, fill_count / 10)`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — effective_beta = beta_intensity * min(1.0, fill_count / min_fills_for_full_weight). Default 10 fills.
 
 ### T3-27: Dynamic PIN threshold based on volatility
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §PIN-1
 - **Files:** `cpp/src/data/adverse_selection.cpp`
 - **Issue:** Fixed 30 bps threshold classifies ~22% of random noise as "adverse".
 - **Fix:** `threshold = 1.5 × sigma_block × sqrt(observation_blocks)`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — effective_adverse_threshold() computes 1.5 * sigma_block * sqrt(obs_blocks). Falls back to fixed threshold.
 
 ### T3-28: Fix HMM state sorting (by stddev, not mean)
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §RD-2
 - **Files:** `cpp/src/strategy/regime.cpp`
 - **Issue:** Post Baum-Welch, states sorted by emission mean. If return distribution has drift, sort order may be wrong.
 - **Fix:** Sort by emission standard deviation.
-- **Status:** `[ ]`
+- **Status:** `[x]` — hmm_sort_states_by_stddev() sorts by emission stddev ascending. Permutes all arrays + transition matrix.
 
 ### T3-29: Fix `config.cpp` rejecting uppercase hex in asset IDs
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §L-V4
 - **Files:** `cpp/src/config.cpp`
 - **Issue:** `validate_asset_id()` only accepts `[0-9a-f]{64}`. Chia tools sometimes emit uppercase.
 - **Fix:** Case-insensitive check or normalize to lowercase.
-- **Status:** `[ ]`
+- **Status:** `[x]` — to_lower lambda normalizes asset IDs to lowercase before validation.
 
 ### T3-30: Fix OU drift simulation numerical instability (Euler → exact)
 - **Source:** LOGICREVIEW-Gemini §6
@@ -473,28 +473,28 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11 (Config Gaps)
 - **Files:** `cpp/src/config.cpp`
 - **Issue:** Sentinel value 0 should fail validation.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Guard wallet_fingerprint == 0 throws ConfigError.
 
 ### T3-33: Fix competition spread formula sign (widen vs. undercut)
 - **Source:** CODEREVIEW-GPT5.3-Codex §P1-7
 - **Files:** `cpp/src/strategy/spread.cpp`
 - **Issue:** `calc_competition_bps` returns `max(floor, best_competing + epsilon)` — widens vs. competitor. Docs imply undercut/join-inside.
 - **Fix:** Re-validate intended sign. Competitiveness usually means tightening.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Fixed to max(s_floor, best_competing - epsilon) (undercut). Competition caps base spread via min(base, s_comp).
 
 ### T3-34: Validate weight clamping convergence (`N × min_weight ≤ 1.0`)
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §SP-5
 - **Files:** `cpp/src/strategy/strategy_portfolio.cpp`
 - **Issue:** Non-convergence when `8 × min_weight > 1.0`.
 - **Fix:** Validate in constructor.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Constructor validates kNumComponents * cfg_.min_weight > 1.0 throws. Max iteration guard in clamp_weights.
 
 ### T3-35: Separate self-generated fills from market-generated toxicity signals
 - **Source:** LOGICREVIEW-GPT-5.4 §3 (endogenous feedback loops)
 - **Files:** `cpp/src/data/adverse_selection.cpp`, `cpp/src/execution/market_data.cpp`
 - **Issue:** Whale/VPIN/OFI fed from own fills → self-reinforcing → widening spiral.
 - **Fix:** Use own fills for attribution/calibration, not as primary toxicity input.
-- **Status:** `[ ]`
+- **Status:** `[x]` — is_own_fill parameter on ingest_trade() and ingest_trade_for_vpin(). Own fills skip whale detection and VPIN accumulation.
 
 ---
 
@@ -670,13 +670,13 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-24 (full codebase audit)
+**Last verification:** 2026-03-25 (full codebase audit, 3-round review cycle with clean final pass)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
-| **Tier 1 (Critical)** | 14 | 3 | 4 | 7 | Must fix before live trading |
-| **Tier 2 (High)** | 20 | 12 | 0 | 8 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 13 | 4 | 18 | Quality, robustness, correctness |
+| **Tier 1 (Critical)** | 14 | 12 | 2 | 0 | Must fix before live trading |
+| **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
+| **Tier 3 (Medium)** | 35 | 29 | 3 | 3 | Quality, robustness, correctness |
 | **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
-| **Total** | **96** | **28** | **10** | **58** | |
+| **Total** | **96** | **61** | **7** | **28** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |

@@ -11,8 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <shared_mutex>
 #include <stdexcept>
-#include <numeric>
 
 namespace xop {
 
@@ -51,6 +51,19 @@ AvellanedaStoikov::AvellanedaStoikov(const AvellanedaConfig& cfg)
     // before any update_price() produces reasonable spreads (not zero).
     // ISO/IEC 5055: defensive initialization of derived state.
     regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds and regime multipliers.
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size      = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size      = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold   = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold   = cfg_.vr_momentum_threshold;
+    rd_cfg.mr_multipliers       = {cfg_.regime_mr_spread_mult, 1.0,
+                                   cfg_.regime_mr_skew_mult, 1.0};
+    rd_cfg.momentum_multipliers = {cfg_.regime_mo_spread_mult, 1.0,
+                                   cfg_.regime_mo_skew_mult, 1.0};
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
 }
 
 // ===========================================================================
@@ -62,6 +75,11 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
                                               double q,
                                               BlockHeight block_height)
 {
+    // MEDIUM-1: Exclusive lock -- compute_quotes reads cost_basis_,
+    // min_margin_bps_, regime_, and cfg_ (mutable strategy state).
+    // ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
     // -------------------------------------------------------------------
     // Step 1: Compute remaining time in the rolling horizon (seconds).
     //
@@ -215,7 +233,13 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
 
 void AvellanedaStoikov::update_price(double mid, BlockHeight block_height)
 {
-    // Append to the rolling buffer.
+    // MEDIUM-1: Exclusive lock -- update_price mutates price_buffer_,
+    // last_mid_, and regime_ via active_detector().update() and
+    // update_regime().  ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
+    // Append to the rolling buffer (retained for backward compatibility
+    // and potential diagnostic use).
     price_buffer_.push_back(PriceObs{block_height, mid});
 
     // Trim to the regime detection window size.
@@ -223,7 +247,18 @@ void AvellanedaStoikov::update_price(double mid, BlockHeight block_height)
         price_buffer_.pop_front();
     }
 
-    // Recompute regime classification.
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // The detector maintains its own rolling window and computes VR(q_short)
+    // and VR(q_long) internally with proper Z-statistic significance testing
+    // and hysteresis.  Guard against non-positive prices to prevent log(0)
+    // or log(negative).
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Recompute regime classification from the detector's updated state.
     update_regime();
 }
 
@@ -233,17 +268,26 @@ void AvellanedaStoikov::update_price(double mid, BlockHeight block_height)
 
 RegimeInfo AvellanedaStoikov::current_regime() const
 {
+    // MEDIUM-1: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
-const std::string& AvellanedaStoikov::name() const
+// [MEDIUM-2] Return by value so the caller does not hold a reference through
+// an expiring shared_lock (ISO/IEC 5055 -- CWE-362).
+std::string AvellanedaStoikov::name() const
 {
+    // MEDIUM-1: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void AvellanedaStoikov::set_cost_basis(double cost_basis,
                                        double min_margin_bps)
 {
+    // MEDIUM-1: Exclusive lock -- set_cost_basis mutates cost_basis_
+    // and min_margin_bps_.  ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -255,6 +299,11 @@ void AvellanedaStoikov::set_cost_basis(double cost_basis,
 double AvellanedaStoikov::reservation_price(double mid, double sigma,
                                             double q, double tau) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+    // ISO/IEC 27001:2022: cfg_ is const-after-init, safe without lock.
+
     // r = S - q * gamma * sigma^2 * tau
     //
     // The inventory penalty q * gamma * sigma^2 * tau represents the
@@ -265,6 +314,10 @@ double AvellanedaStoikov::reservation_price(double mid, double sigma,
 
 double AvellanedaStoikov::optimal_half_spread(double sigma, double tau) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+
     // delta = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
     //
     // Term 1: (1/kappa) * ln(1 + kappa/gamma)
@@ -285,6 +338,10 @@ double AvellanedaStoikov::optimal_half_spread(double sigma, double tau) const
 
 double AvellanedaStoikov::compute_tau(BlockHeight block_height) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+
     // tau = (N - n) * block_time
     //
     // where n = block_height mod N (position within the rolling window).
@@ -315,6 +372,9 @@ double AvellanedaStoikov::per_block_volatility(double sigma_annual,
 
 double AvellanedaStoikov::fill_intensity(double delta) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Safe for concurrent callers.
+
     // lambda(delta) = A * exp(-kappa * delta)
     //
     // Models the arrival rate of counter-party fills as a decreasing
@@ -330,122 +390,17 @@ double AvellanedaStoikov::fill_intensity(double delta) const
 }
 
 // ===========================================================================
-// Regime detection -- variance ratio test
+// Regime detection (T3-01: delegated to shared canonical RegimeDetector)
 // ===========================================================================
-
-double AvellanedaStoikov::variance_ratio_test() const
-{
-    // ---------------------------------------------------------------------------
-    // Variance Ratio Test (VR)
-    //
-    // Tests whether the price process is a random walk.  Under H0 (random walk),
-    // the variance of k-period log-returns equals k times the variance of
-    // 1-period log-returns:
-    //
-    //   VR(k) = Var(r_k) / (k * Var(r_1))
-    //
-    // We use k = 5 (five blocks) and compute overlapping log-returns.
-    //
-    //   VR ≈ 1.0  => random walk (no exploitable pattern)
-    //   VR < 0.85 => mean-reverting (prices bounce back -- tighten spreads)
-    //   VR > 1.15 => momentum (prices trend -- widen spreads)
-    //
-    // Reference: Lo, A.W. & MacKinlay, A.C. (1988). "Stock market prices do
-    //            not follow random walks."
-    // ---------------------------------------------------------------------------
-
-    const size_t n = price_buffer_.size();
-
-    // Need at least k+1 observations for meaningful k-period returns.
-    constexpr size_t k = 5;
-    if (n < k + 2) {
-        return 1.0;  // insufficient data; assume random walk
-    }
-
-    // Compute 1-period log-returns: r1[i] = ln(P[i+1] / P[i]).
-    std::vector<double> r1;
-    r1.reserve(n - 1);
-    for (size_t i = 0; i + 1 < n; ++i) {
-        if (price_buffer_[i].mid > 0.0 && price_buffer_[i + 1].mid > 0.0) {
-            r1.push_back(std::log(price_buffer_[i + 1].mid / price_buffer_[i].mid));
-        }
-    }
-
-    if (r1.size() < k + 1) {
-        return 1.0;
-    }
-
-    // Compute k-period log-returns (overlapping): rk[i] = sum(r1[i..i+k-1]).
-    std::vector<double> rk;
-    rk.reserve(r1.size() - k + 1);
-    for (size_t i = 0; i + k <= r1.size(); ++i) {
-        double sum = 0.0;
-        for (size_t j = 0; j < k; ++j) {
-            sum += r1[i + j];
-        }
-        rk.push_back(sum);
-    }
-
-    if (rk.empty()) {
-        return 1.0;
-    }
-
-    // Variance of 1-period returns.
-    const double mean_r1 = std::accumulate(r1.begin(), r1.end(), 0.0)
-                           / static_cast<double>(r1.size());
-    double var_r1 = 0.0;
-    for (double x : r1) {
-        const double d = x - mean_r1;
-        var_r1 += d * d;
-    }
-    var_r1 /= static_cast<double>(r1.size() - 1);  // unbiased estimator
-
-    // Variance of k-period returns.
-    const double mean_rk = std::accumulate(rk.begin(), rk.end(), 0.0)
-                           / static_cast<double>(rk.size());
-    double var_rk = 0.0;
-    for (double x : rk) {
-        const double d = x - mean_rk;
-        var_rk += d * d;
-    }
-    var_rk /= static_cast<double>(rk.size() - 1);
-
-    // Guard against division by zero when prices are flat.
-    if (var_r1 < 1e-20) {
-        return 1.0;
-    }
-
-    // VR = Var(r_k) / (k * Var(r_1))
-    return var_rk / (static_cast<double>(k) * var_r1);
-}
 
 void AvellanedaStoikov::update_regime()
 {
-    const double vr = variance_ratio_test();
-
-    MarketRegime new_regime = MarketRegime::Random;
-    double spread_mult = 1.0;
-    double skew_mult   = 1.0;
-
-    if (vr < cfg_.vr_mean_revert_threshold) {
-        // Mean-reverting regime: prices tend to bounce back.
-        //   - Tighten spreads (0.8x) because adverse selection risk is lower.
-        //   - Reduce inventory shedding (0.5x) because mean-reversion will
-        //     naturally bring the inventory back toward target.
-        new_regime  = MarketRegime::MeanReverting;
-        spread_mult = cfg_.regime_mr_spread_mult;
-        skew_mult   = cfg_.regime_mr_skew_mult;
-    } else if (vr > cfg_.vr_momentum_threshold) {
-        // Momentum regime: prices trend persistently.
-        //   - Widen spreads (1.5x) to compensate for higher adverse selection.
-        //   - Aggressive inventory shedding (2.0x) because holding directional
-        //     inventory against a trend is costly.
-        new_regime  = MarketRegime::Momentum;
-        spread_mult = cfg_.regime_mo_spread_mult;
-        skew_mult   = cfg_.regime_mo_skew_mult;
-    }
-
-    regime_ = RegimeInfo{new_regime, vr, spread_mult, skew_mult};
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).  The canonical detector provides
+    // dual-horizon VR, Z-statistic significance testing (Lo-MacKinlay 1988),
+    // hysteresis to prevent regime whipsawing, and optional HMM.
+    regime_ = to_regime_info(active_detector());
 }
 
 }  // namespace xop

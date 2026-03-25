@@ -31,15 +31,18 @@
 #define XOP_STRATEGY_NEW_STRATEGIES_HPP
 
 #include <xop/strategy/base.hpp>
+#include <xop/strategy/regime.hpp>
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
-#include <cstdint>
-#include <deque>
-#include <string>
-#include <vector>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <deque>
+#include <memory>
+#include <shared_mutex>
+#include <string>
+#include <vector>
 
 namespace xop {
 
@@ -199,19 +202,37 @@ public:
     /// Read-only access to the config.
     const CoinAgeConfig& config() const { return cfg_; }
 
+    // -- Shared regime detector (T3-01) --------------------------------------
+
+    /// Set a shared RegimeDetector.  Pass nullptr to revert to internal.
+    void set_regime_detector(RegimeDetector* detector) noexcept {
+        shared_regime_detector_ = detector;
+    }
+
+    /// Return the active RegimeDetector (shared if set, else internal).
+    const RegimeDetector* regime_detector() const noexcept {
+        return shared_regime_detector_ ? shared_regime_detector_
+                                       : internal_detector_.get();
+    }
+
 private:
-    // -- Regime detection (reused from A-S pattern) ---------------------------
-    double variance_ratio_test() const;
-    void   update_regime();
+    RegimeDetector& active_detector() noexcept {
+        return shared_regime_detector_ ? *shared_regime_detector_
+                                       : *internal_detector_;
+    }
+
+    /// Update regime classification via the active RegimeDetector.
+    void update_regime();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    mutable std::shared_mutex mtx_;
 
     // -- Data members ---------------------------------------------------------
     CoinAgeConfig cfg_;
     std::string   name_{"CoinAgeWeightedQuoting"};
 
-    // Inventory coin set with ages.
     std::vector<CoinAge> coins_;
 
-    // Rolling price buffer for regime detection.
     struct PriceObs {
         BlockHeight block;
         double      mid;
@@ -219,6 +240,11 @@ private:
     std::deque<PriceObs> price_buffer_;
 
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: canonical RegimeDetector instances.
+    std::unique_ptr<RegimeDetector> internal_detector_;
+    RegimeDetector* shared_regime_detector_{nullptr};
+    double last_mid_{0.0};
 
     double cost_basis_{0.0};
     double min_margin_bps_{35.0};
@@ -397,26 +423,40 @@ public:
     /// Read-only access to the config.
     const BlockCadenceConfig& config() const { return cfg_; }
 
+    // -- Shared regime detector (T3-01) --------------------------------------
+
+    void set_regime_detector(RegimeDetector* detector) noexcept {
+        shared_regime_detector_ = detector;
+    }
+
+    const RegimeDetector* regime_detector() const noexcept {
+        return shared_regime_detector_ ? shared_regime_detector_
+                                       : internal_detector_.get();
+    }
+
 private:
-    // -- Regime detection helpers ----------------------------------------------
-    double variance_ratio_test() const;
-    void   update_regime();
+    RegimeDetector& active_detector() noexcept {
+        return shared_regime_detector_ ? *shared_regime_detector_
+                                       : *internal_detector_;
+    }
+
+    void update_regime();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    mutable std::shared_mutex mtx_;
 
     // -- Data members ---------------------------------------------------------
     BlockCadenceConfig cfg_;
     std::string        name_{"BlockCadenceAdaptiveSpread"};
 
-    // Block arrival timestamps for EMA computation.
     struct BlockArrival {
         BlockHeight block;
         Timestamp   arrival;
     };
     std::deque<BlockArrival> block_arrivals_;
 
-    // Current EMA of inter-block intervals.  Initialized to target.
     double dt_ema_{52.0};
 
-    // Rolling price buffer for regime detection.
     struct PriceObs {
         BlockHeight block;
         double      mid;
@@ -424,6 +464,11 @@ private:
     std::deque<PriceObs> price_buffer_;
 
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: canonical RegimeDetector instances.
+    std::unique_ptr<RegimeDetector> internal_detector_;
+    RegimeDetector* shared_regime_detector_{nullptr};
+    double last_mid_{0.0};
 
     double cost_basis_{0.0};
     double min_margin_bps_{35.0};
@@ -581,6 +626,10 @@ struct MempoolSentinelConfig {
 };
 
 /// Represents a single pending offer-take transaction observed in the mempool.
+///
+/// T3-22: Uses steady_clock for staleness detection to avoid NTP correction
+/// artifacts.  The wall-clock Timestamp is retained for logging/diagnostics
+/// only; monotonic first_seen_steady drives all duration calculations.
 struct PendingMempoolTake {
     std::string offer_id;         // The offer being taken (spend-bundle hash).
     Side        taker_side;       // Direction from taker's perspective:
@@ -589,7 +638,13 @@ struct PendingMempoolTake {
     double      size;             // Trade size in base-asset units.
     double      price;            // Implied execution price (quote per base).
     bool        is_our_offer;     // True if the offer being taken belongs to us.
-    Timestamp   first_seen;       // When we first observed this in the mempool.
+    Timestamp   first_seen;       // Wall-clock time (for logging/diagnostics only).
+
+    /// Monotonic timestamp for staleness detection (immune to NTP corrections).
+    /// ISO/IEC 5055: steady_clock guarantees monotonic non-decreasing behaviour,
+    /// preventing false staleness classifications from clock adjustments.
+    std::chrono::steady_clock::time_point first_seen_steady{
+        std::chrono::steady_clock::now()};
 };
 
 /// MempoolSentinelStrategy -- monitors the CHIA mempool for pending offer-take
@@ -649,19 +704,34 @@ public:
     /// Read-only access to the config.
     const MempoolSentinelConfig& config() const { return cfg_; }
 
+    // -- Shared regime detector (T3-01) --------------------------------------
+
+    void set_regime_detector(RegimeDetector* detector) noexcept {
+        shared_regime_detector_ = detector;
+    }
+
+    const RegimeDetector* regime_detector() const noexcept {
+        return shared_regime_detector_ ? shared_regime_detector_
+                                       : internal_detector_.get();
+    }
+
 private:
-    // -- Regime detection helpers ----------------------------------------------
-    double variance_ratio_test() const;
-    void   update_regime();
+    RegimeDetector& active_detector() noexcept {
+        return shared_regime_detector_ ? *shared_regime_detector_
+                                       : *internal_detector_;
+    }
+
+    void update_regime();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    mutable std::shared_mutex mtx_;
 
     // -- Data members ---------------------------------------------------------
     MempoolSentinelConfig cfg_;
     std::string           name_{"MempoolSentinel"};
 
-    // Current set of pending offer-take transactions (post-filtering).
     std::vector<PendingMempoolTake> pending_takes_;
 
-    // Rolling price buffer for regime detection.
     struct PriceObs {
         BlockHeight block;
         double      mid;
@@ -669,6 +739,11 @@ private:
     std::deque<PriceObs> price_buffer_;
 
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: canonical RegimeDetector instances.
+    std::unique_ptr<RegimeDetector> internal_detector_;
+    RegimeDetector* shared_regime_detector_{nullptr};
+    double last_mid_{0.0};
 
     double cost_basis_{0.0};
     double min_margin_bps_{35.0};

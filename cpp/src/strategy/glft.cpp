@@ -11,8 +11,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <shared_mutex>
 #include <stdexcept>
-#include <numeric>
 
 namespace xop {
 
@@ -54,6 +54,22 @@ GlftStrategy::GlftStrategy(const GlftConfig& cfg)
     // before any update_price() produces reasonable spreads (not zero).
     // ISO/IEC 5055: defensive initialization of derived state.
     regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: create the internal canonical RegimeDetector with config
+    // derived from the strategy's VR thresholds and regime multipliers.
+    // This detector is used when no shared detector has been injected
+    // via set_regime_detector(), preserving backward compatibility for
+    // standalone use and unit tests.
+    RegimeDetectorConfig rd_cfg;
+    rd_cfg.min_window_size      = cfg_.regime_window_blocks / 2;
+    rd_cfg.max_window_size      = cfg_.regime_window_blocks;
+    rd_cfg.vr_lower_threshold   = cfg_.vr_mean_revert_threshold;
+    rd_cfg.vr_upper_threshold   = cfg_.vr_momentum_threshold;
+    rd_cfg.mr_multipliers       = {cfg_.regime_mr_spread_mult, 1.0,
+                                   cfg_.regime_mr_skew_mult, 1.0};
+    rd_cfg.momentum_multipliers = {cfg_.regime_mo_spread_mult, 1.0,
+                                   cfg_.regime_mo_skew_mult, 1.0};
+    internal_detector_ = std::make_unique<RegimeDetector>(rd_cfg);
 }
 
 // ===========================================================================
@@ -65,6 +81,11 @@ QuoteResult GlftStrategy::compute_quotes(double mid,
                                          double q,
                                          BlockHeight block_height)
 {
+    // MEDIUM-1: Exclusive lock -- compute_quotes reads cost_basis_,
+    // min_margin_bps_, regime_, and cfg_ (mutable strategy state).
+    // ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
     // -------------------------------------------------------------------
     // Step 1: Compute tau for the risk term.
     //
@@ -213,6 +234,13 @@ QuoteResult GlftStrategy::compute_quotes(double mid,
 
 void GlftStrategy::update_price(double mid, BlockHeight block_height)
 {
+    // MEDIUM-1: Exclusive lock -- update_price mutates price_buffer_,
+    // last_mid_, and regime_ via active_detector().update() and
+    // update_regime().  ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
+
+    // Append to the rolling buffer (retained for backward compatibility
+    // and potential diagnostic use).
     price_buffer_.push_back(PriceObs{block_height, mid});
 
     // Trim to the regime detection window.
@@ -220,6 +248,14 @@ void GlftStrategy::update_price(double mid, BlockHeight block_height)
         price_buffer_.pop_front();
     }
 
+    // T3-01: feed the single-block log return to the active RegimeDetector.
+    // ISO/IEC 5055: guard against domain error in std::log.
+    if (last_mid_ > 0.0 && mid > 0.0) {
+        active_detector().update(std::log(mid / last_mid_));
+    }
+    last_mid_ = mid;
+
+    // Recompute regime classification from the detector's updated state.
     update_regime();
 }
 
@@ -229,17 +265,26 @@ void GlftStrategy::update_price(double mid, BlockHeight block_height)
 
 RegimeInfo GlftStrategy::current_regime() const
 {
+    // MEDIUM-1: Shared lock -- read-only access to regime_.
+    std::shared_lock lock(mtx_);
     return regime_;
 }
 
-const std::string& GlftStrategy::name() const
+// [MEDIUM-2] Return by value so the caller does not hold a reference through
+// an expiring shared_lock (ISO/IEC 5055 -- CWE-362).
+std::string GlftStrategy::name() const
 {
+    // MEDIUM-1: Shared lock -- read-only access to name_.
+    std::shared_lock lock(mtx_);
     return name_;
 }
 
 void GlftStrategy::set_cost_basis(double cost_basis,
                                   double min_margin_bps)
 {
+    // MEDIUM-1: Exclusive lock -- set_cost_basis mutates cost_basis_
+    // and min_margin_bps_.  ISO/IEC 27001:2022: protect shared mutable state.
+    std::unique_lock lock(mtx_);
     cost_basis_     = cost_basis;
     min_margin_bps_ = min_margin_bps;
 }
@@ -250,6 +295,10 @@ void GlftStrategy::set_cost_basis(double cost_basis,
 
 double GlftStrategy::base_half_spread(double sigma, double tau) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+
     // half_spread = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
     //
     // Term 1: pure market-making component from the fill-intensity model.
@@ -267,6 +316,10 @@ double GlftStrategy::base_half_spread(double sigma, double tau) const
 
 double GlftStrategy::inventory_skew(double q) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+
     // skew = phi * q / q_max
     //
     // This is a linear function of inventory:
@@ -287,6 +340,10 @@ double GlftStrategy::inventory_skew(double q) const
 
 double GlftStrategy::compute_tau(BlockHeight block_height) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Called internally from compute_quotes() which already
+    // holds the exclusive lock; acquiring here would deadlock.
+
     // Same rolling-horizon tau as A-S.
     //   tau = (N - n) * block_time
     //   n = block_height mod N
@@ -318,6 +375,9 @@ double GlftStrategy::per_block_volatility(double sigma_annual,
 
 double GlftStrategy::fill_intensity(double delta) const
 {
+    // MEDIUM-1: No lock needed -- reads only cfg_ which is immutable after
+    // construction.  Safe for concurrent callers.
+
     // lambda(delta) = A * exp(-kappa * delta)
     //
     // Poisson arrival rate of fills at distance delta from mid.
@@ -325,124 +385,17 @@ double GlftStrategy::fill_intensity(double delta) const
 }
 
 // ===========================================================================
-// Regime detection -- variance ratio test
+// Regime detection (T3-01: delegated to shared canonical RegimeDetector)
 // ===========================================================================
-
-double GlftStrategy::variance_ratio_test() const
-{
-    // ---------------------------------------------------------------------------
-    // Variance Ratio Test (VR) with k = 5 blocks.
-    //
-    //   VR(k) = Var(r_k) / (k * Var(r_1))
-    //
-    // Under a pure random walk, VR = 1.
-    //   VR < 1 => negative autocorrelation => mean-reverting.
-    //   VR > 1 => positive autocorrelation => momentum / trending.
-    //
-    // We use overlapping k-period returns for maximum statistical power
-    // given the limited sample size (50-100 blocks).
-    //
-    // The thresholds (0.85 / 1.15) are conservative to avoid regime
-    // whipsawing.  In practice, CHIA's thin order book may exhibit
-    // pronounced VR deviations, making these thresholds appropriate.
-    // ---------------------------------------------------------------------------
-
-    const size_t n = price_buffer_.size();
-    constexpr size_t k = 5;
-
-    if (n < k + 2) {
-        return 1.0;  // insufficient data; default to random walk
-    }
-
-    // 1-period log-returns.
-    std::vector<double> r1;
-    r1.reserve(n - 1);
-    for (size_t i = 0; i + 1 < n; ++i) {
-        if (price_buffer_[i].mid > 0.0 && price_buffer_[i + 1].mid > 0.0) {
-            r1.push_back(std::log(price_buffer_[i + 1].mid / price_buffer_[i].mid));
-        }
-    }
-
-    if (r1.size() < k + 1) {
-        return 1.0;
-    }
-
-    // Overlapping k-period log-returns.
-    std::vector<double> rk;
-    rk.reserve(r1.size() - k + 1);
-    for (size_t i = 0; i + k <= r1.size(); ++i) {
-        double sum = 0.0;
-        for (size_t j = 0; j < k; ++j) {
-            sum += r1[i + j];
-        }
-        rk.push_back(sum);
-    }
-
-    if (rk.empty()) {
-        return 1.0;
-    }
-
-    // Unbiased sample variance of 1-period returns.
-    const double mean_r1 = std::accumulate(r1.begin(), r1.end(), 0.0)
-                           / static_cast<double>(r1.size());
-    double var_r1 = 0.0;
-    for (double x : r1) {
-        const double d = x - mean_r1;
-        var_r1 += d * d;
-    }
-    var_r1 /= static_cast<double>(r1.size() - 1);
-
-    // Unbiased sample variance of k-period returns.
-    const double mean_rk = std::accumulate(rk.begin(), rk.end(), 0.0)
-                           / static_cast<double>(rk.size());
-    double var_rk = 0.0;
-    for (double x : rk) {
-        const double d = x - mean_rk;
-        var_rk += d * d;
-    }
-    var_rk /= static_cast<double>(rk.size() - 1);
-
-    // Avoid division by zero when prices are flat.
-    if (var_r1 < 1e-20) {
-        return 1.0;
-    }
-
-    return var_rk / (static_cast<double>(k) * var_r1);
-}
 
 void GlftStrategy::update_regime()
 {
-    const double vr = variance_ratio_test();
-
-    MarketRegime new_regime = MarketRegime::Random;
-    double spread_mult = 1.0;
-    double skew_mult   = 1.0;
-
-    if (vr < cfg_.vr_mean_revert_threshold) {
-        // Mean-reverting: tighten spreads, reduce shedding.
-        //
-        // Rationale: mean-reversion implies that price deviations are
-        // temporary.  Adverse selection risk is lower (informed traders
-        // cannot exploit a persistent trend), so we can safely narrow
-        // spreads.  Inventory that drifts away from target will naturally
-        // correct, so aggressive shedding is unnecessary.
-        new_regime  = MarketRegime::MeanReverting;
-        spread_mult = cfg_.regime_mr_spread_mult;
-        skew_mult   = cfg_.regime_mr_skew_mult;
-    } else if (vr > cfg_.vr_momentum_threshold) {
-        // Momentum: widen spreads, aggressive shedding.
-        //
-        // Rationale: trending prices imply higher adverse selection risk
-        // (informed flow is directional).  Wider spreads compensate for
-        // the probability that a fill puts us on the wrong side of a
-        // continued move.  Aggressive skew / shedding ensures we do not
-        // accumulate large directional exposure during a trend.
-        new_regime  = MarketRegime::Momentum;
-        spread_mult = cfg_.regime_mo_spread_mult;
-        skew_mult   = cfg_.regime_mo_skew_mult;
-    }
-
-    regime_ = RegimeInfo{new_regime, vr, spread_mult, skew_mult};
+    // T3-01: delegate regime classification to the active RegimeDetector
+    // (shared if injected via set_regime_detector(), else the internal
+    // detector created in the constructor).  The canonical detector provides
+    // dual-horizon VR, Z-statistic significance testing (Lo-MacKinlay 1988),
+    // hysteresis to prevent regime whipsawing, and optional HMM.
+    regime_ = to_regime_info(active_detector());
 }
 
 }  // namespace xop

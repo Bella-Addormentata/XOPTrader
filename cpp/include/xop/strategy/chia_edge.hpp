@@ -218,11 +218,14 @@
 #define XOP_STRATEGY_CHIA_EDGE_HPP
 
 #include <xop/strategy/base.hpp>
+#include <xop/strategy/regime.hpp>
 #include <xop/config.hpp>
 #include <xop/types.hpp>
 
 #include <cstdint>
 #include <deque>
+#include <memory>
+#include <shared_mutex>
 #include <string>
 
 namespace xop {
@@ -407,15 +410,34 @@ public:
     /// Read-only access to the configuration.
     const ChiaEdgeConfig& config() const { return cfg_; }
 
+    // -- Shared regime detector (T3-01) --------------------------------------
+
+    /// Set a shared RegimeDetector instance.  Pass nullptr to revert to
+    /// internal detection.  The shared detector must outlive this instance.
+    void set_regime_detector(RegimeDetector* detector) noexcept {
+        shared_regime_detector_ = detector;
+    }
+
+    /// Return the active RegimeDetector (shared if set, else internal).
+    const RegimeDetector* regime_detector() const noexcept {
+        return shared_regime_detector_ ? shared_regime_detector_
+                                       : internal_detector_.get();
+    }
+
 private:
-    // -- Regime detection helpers (variance-ratio test) -----------------------
+    /// Return the active detector (shared or internal).
+    RegimeDetector& active_detector() noexcept {
+        return shared_regime_detector_ ? *shared_regime_detector_
+                                       : *internal_detector_;
+    }
 
-    /// Run the variance-ratio test over the rolling price buffer.
-    /// Returns the raw VR statistic (1.0 under a random walk).
-    double variance_ratio_test() const;
-
-    /// Update regime classification from the latest VR value.
+    /// Update regime classification.
+    /// T3-01: delegates to the active RegimeDetector.
     void update_regime();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    mutable std::shared_mutex mtx_;
 
     // -- Data members ---------------------------------------------------------
 
@@ -432,6 +454,11 @@ private:
 
     // Current regime state.
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    // T3-01: canonical RegimeDetector instances.
+    std::unique_ptr<RegimeDetector> internal_detector_;
+    RegimeDetector* shared_regime_detector_{nullptr};
+    double last_mid_{0.0};
 
     // No-loss constraint state.
     double cost_basis_{0.0};        // Weighted-average acquisition price.

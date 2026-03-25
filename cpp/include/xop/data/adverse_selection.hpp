@@ -41,6 +41,7 @@
 
 #include <cstdint>
 #include <deque>
+#include <shared_mutex>
 #include <utility>
 #include <vector>
 
@@ -117,8 +118,10 @@ struct FillRecord {
 // AdverseSelectionEstimator -- maintains a Bayesian posterior over the
 //                               probability of informed trading (PIN).
 //
-// Thread safety: NOT thread-safe.  The caller (engine heartbeat loop)
-// serialises access.
+// Thread safety: thread-safe via std::shared_mutex (T2-02).
+// Read operations (get_*, total_fills, history_size, history, config) acquire
+// a shared lock.  Write operations (record_fill, set_sigma_block, reset)
+// acquire an exclusive lock.  Follows the State class locking pattern.
 //
 // Usage:
 //     AdverseSelectionEstimator as(config);
@@ -149,6 +152,18 @@ public:
                      Side side,
                      const std::vector<double>& subsequent_prices,
                      BlockHeight block_height = 0);
+
+    /// Update the per-block volatility estimate used for dynamic adverse
+    /// threshold computation (T3-27).
+    ///
+    /// When sigma_block > 0, the adverse threshold becomes:
+    ///   threshold = 1.5 * sigma_block * sqrt(observation_blocks)
+    /// which scales with realised volatility instead of using a fixed 30 bps.
+    /// If sigma_block is not set (or <= 0), the fixed cfg_.adverse_threshold
+    /// is used as a fallback.
+    ///
+    /// @param sigma_block  Per-block standard deviation (fractional, e.g. 0.001).
+    void set_sigma_block(double sigma_block) noexcept;
 
     // -- Estimator outputs ---------------------------------------------------
 
@@ -192,7 +207,15 @@ public:
     std::size_t history_size() const noexcept;
 
     /// Read-only access to the fill history (most recent max_history fills).
-    const std::deque<FillRecord>& history() const noexcept;
+    ///
+    /// MEDIUM-4: Returns a COPY of history_ to prevent callers from holding
+    /// a dangling reference after the lock is released.  The previous
+    /// implementation returned a const reference which became unprotected
+    /// once the shared_lock in history() went out of scope, creating a
+    /// data race if a concurrent writer mutated history_ while the caller
+    /// was iterating.  ISO/IEC 27001:2022: eliminate TOCTOU race on
+    /// shared container.
+    std::deque<FillRecord> history() const noexcept;
 
     /// Read-only access to the configuration.
     const AdverseSelectionConfig& config() const noexcept;
@@ -210,9 +233,23 @@ private:
         Side side,
         const std::vector<double>& subsequent_prices) const;
 
+    /// Compute the effective adverse threshold, scaling with volatility when
+    /// a valid sigma_block estimate is available (T3-27).
+    ///
+    /// Dynamic threshold = 1.5 * sigma_block * sqrt(observation_blocks).
+    /// Falls back to the fixed cfg_.adverse_threshold when sigma is unavailable.
+    ///
+    /// @return The adverse threshold (fractional, e.g. 0.003 for 30 bps).
+    double effective_adverse_threshold() const noexcept;
+
     /// Recompute the effective alpha and beta from the history, applying
     /// decay if configured.
     void recompute_posterior();
+
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    // Follows the State class locking pattern: single mutex, no nesting.
+    mutable std::shared_mutex mtx_;
 
     // -- Configuration -------------------------------------------------------
 
@@ -233,6 +270,11 @@ private:
 
     /// Effective posterior beta (after prior + observations + optional decay).
     double beta_;
+
+    /// Per-block volatility estimate for dynamic adverse threshold (T3-27).
+    /// When > 0, the threshold scales as 1.5 * sigma_block * sqrt(obs_blocks).
+    /// When <= 0, the fixed cfg_.adverse_threshold is used as fallback.
+    double sigma_block_{0.0};
 };
 
 }  // namespace xop

@@ -16,9 +16,10 @@
 //   WARNING   -- max 1 per 300 seconds (5 minutes)
 //   INFO      -- batched and flushed once per hour
 //
-// HTTP transport uses libcurl (async via a detached std::thread per send to
-// avoid blocking the main trading loop).  The Telegram Bot API sendMessage
-// endpoint is used for all message delivery.
+// HTTP transport uses libcurl routed through a persistent worker thread with
+// a thread-safe message queue (replacing the previous detached-thread-per-send
+// pattern).  This ensures clean shutdown and bounded resource usage.
+// The Telegram Bot API sendMessage endpoint is used for all message delivery.
 //
 // Security:
 //   The bot_token is classified SECRET (ISO/IEC 27001:2022) and is never
@@ -40,11 +41,15 @@
 #include "xop/types.hpp"
 #include "xop/config.hpp"
 
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <mutex>
+#include <queue>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <vector>
 
@@ -171,14 +176,15 @@ struct AlertDailySummary {
 //
 // Lifecycle:
 //   1. Construct (no-op).
-//   2. Call init(bot_token, chat_id) to configure the Telegram endpoint.
+//   2. Call init(bot_token, chat_id) to configure the Telegram endpoint
+//      and start the persistent worker thread.
 //   3. Call check_and_alert(state) from the main loop on each heartbeat.
 //   4. Call flush_info_batch() hourly to deliver batched INFO alerts.
 //   5. Call send_daily_summary() once per day.
-//   6. No explicit shutdown needed; destructor is safe.
+//   6. Destructor signals the worker thread to drain its queue and join.
 //
-// If init() is called with empty credentials, all send operations become
-// no-ops (alerts are logged via spdlog but not delivered).
+// If init() is called with empty credentials, the worker thread is still
+// started (for uniform shutdown) but all queued messages are discarded.
 // ---------------------------------------------------------------------------
 
 class AlertManager {
@@ -204,13 +210,15 @@ public:
     // -- Alert Dispatch ------------------------------------------------------
 
     /// Send a single alert message at the given severity tier.
-    /// Respects per-tier rate limits:
-    ///   CRITICAL -- max 1 per 60 seconds.
-    ///   WARNING  -- max 1 per 300 seconds.
-    ///   INFO     -- queued into the hourly batch buffer.
     ///
-    /// If the rate limit has not elapsed, the message is silently dropped
-    /// (but logged at debug level for audit).
+    /// @deprecated  This overload bypasses per-rule rate limiting; callers
+    ///              can inadvertently flood Telegram.  Use the AlertRule-based
+    ///              send_alert(AlertRule, message) overload instead, which
+    ///              enforces independent cooldowns per rule (ISO/IEC 5055).
+    ///
+    /// Retained only for backward compatibility with direct INFO sends
+    /// from event-driven code paths that do not map to a single AlertRule.
+    [[deprecated("Use rate-limited send_alert(AlertRule, ...) overload instead")]]
     void send_alert(AlertTier tier, const std::string& message);
 
     /// ISO/IEC 5055: per-rule overload for rate-limited dispatch.
@@ -245,14 +253,22 @@ public:
     void set_threshold(AlertRule rule, double value);
 
 private:
-    // -- Telegram HTTP transport ---------------------------------------------
+    // -- Telegram HTTP transport (worker-queue model) -------------------------
 
-    /// Post a message to the Telegram Bot API (sendMessage endpoint).
-    /// Executed asynchronously on a detached thread.  Failures are logged
-    /// but do not propagate exceptions to the caller.
+    /// Enqueue a message for asynchronous delivery by the persistent worker
+    /// thread.  The message is pushed onto a thread-safe queue and the
+    /// worker is notified via condition variable.  Non-blocking for callers.
     ///
     /// @param text  UTF-8 message body (Telegram MarkdownV2 or plain text).
     void post_telegram(const std::string& text);
+
+    /// Start the persistent worker thread.  Called once from init().
+    /// The worker drains send_queue_ and delivers each message via libcurl.
+    void start_worker();
+
+    /// Signal the worker to stop, drain remaining messages, and join the
+    /// thread.  Called from the destructor to guarantee clean shutdown.
+    void stop_worker();
 
     // -- Rate limiting -------------------------------------------------------
 
@@ -273,6 +289,17 @@ private:
     void check_concentration_breach(const BotState& state);
     void check_pnl_drawdown(const BotState& state);
     void check_offer_creation_fail(const BotState& state);
+
+    // -- Worker thread data (T2-03: replaces detached threads) ---------------
+
+    /// Thread-safe message queue for Telegram sends.  Protected by
+    /// send_mtx_ and signalled by send_cv_.  The worker thread drains
+    /// this queue in FIFO order.
+    std::queue<std::string>   send_queue_;
+    std::mutex                send_mtx_;
+    std::condition_variable   send_cv_;
+    std::atomic<bool>         send_stop_{false};
+    std::thread               send_worker_;
 
     // -- Internal data -------------------------------------------------------
 

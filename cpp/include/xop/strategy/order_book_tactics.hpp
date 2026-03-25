@@ -22,7 +22,10 @@
 //   - Inventory-driven quote skew (reinforces A-S / GLFT skew).
 //   - Self-detection for own-family offers in multi-instance deployments.
 //
-// Thread safety: NOT thread-safe.  The caller must serialise access.
+// Thread safety: thread-safe via std::shared_mutex (T2-02).
+// Read operations (apply, is_market_crowded, is_own_family_offer, config)
+// acquire a shared lock.  Write operations (recommend, register_own_offer,
+// clear_own_offers) acquire an exclusive lock.
 //
 // Compliant with:
 //   ISO/IEC 27001:2022  (no secrets; pure algorithmic logic)
@@ -37,6 +40,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <shared_mutex>
 #include <string>
 #include <unordered_set>
 
@@ -156,6 +160,13 @@ struct OrderBookTacticsConfig {
     /// Spread widening applied by the StepBack tactic (additive bps).
     double step_back_widening_bps{20.0};
 
+    // -- Tactic hysteresis -------------------------------------------------------
+    /// Number of consecutive blocks a new tactic must be selected before the
+    /// switch is committed.  Prevents quote instability when inventory_ratio
+    /// or other inputs oscillate near a decision threshold.  A value of 1
+    /// disables hysteresis (immediate switching, legacy behaviour).
+    std::uint32_t tactic_hysteresis_blocks{3};
+
     // -- Self-detection (multi-instance) --------------------------------------
     /// When true, the tactician filters out own-family offers before computing
     /// competing depth.  Required when running multiple XOPTrader instances
@@ -199,7 +210,9 @@ public:
     ///   4. LayerMultiple     if book is deep on both sides.
     ///   5. ImproveByOne      if queue is deep and spread has room.
     ///   6. JoinInside        otherwise (default, safest posture).
-    TacticRecommendation recommend(const BookState& state) const;
+    ///
+    /// Note: non-const because it updates internal hysteresis state (T3-19).
+    TacticRecommendation recommend(const BookState& state);
 
     /// Adjusted quote parameters after applying a tactic recommendation.
     struct AdjustedQuote {
@@ -245,7 +258,11 @@ private:
 
     /// Select the appropriate tactic based on the current book state.
     /// Implements the priority chain documented in recommend().
-    BookTactic select_tactic(const BookState& state) const;
+    /// Applies hysteresis: a new tactic must be confirmed for
+    /// tactic_hysteresis_blocks consecutive blocks before it replaces the
+    /// active tactic, preventing quote instability from threshold
+    /// oscillation (T3-19).
+    BookTactic select_tactic(const BookState& state);
 
     // -- Individual tactic evaluators -----------------------------------------
     // Each evaluator builds a TacticRecommendation with tactic-specific
@@ -275,10 +292,29 @@ private:
     /// Extreme inventory imbalance or stale book.  Crosses the spread.
     TacticRecommendation eval_hybrid_rebalance(const BookState& state) const;
 
+    // -- Thread safety (T2-02) -----------------------------------------------
+    // Mutable to allow shared (read) locking in const accessor methods.
+    mutable std::shared_mutex mtx_;
+
     // -- Data members ---------------------------------------------------------
 
     OrderBookTacticsConfig              cfg_;           // Immutable configuration.
     std::unordered_set<std::string>     own_offer_ids_; // Self-detection registry.
+
+    // -- Tactic hysteresis state (T3-19) --------------------------------------
+    // Prevents rapid tactic switching when inputs oscillate near thresholds.
+    // A candidate tactic must persist for tactic_hysteresis_blocks consecutive
+    // evaluations before it replaces the currently active tactic.
+
+    /// The currently committed tactic; starts as JoinInside (safest posture).
+    BookTactic    active_tactic_{BookTactic::JoinInside};
+
+    /// Candidate tactic that is accumulating confirmation blocks.
+    BookTactic    pending_tactic_{BookTactic::JoinInside};
+
+    /// Number of consecutive blocks the pending tactic has been selected by
+    /// the raw priority chain.  Resets to zero when the raw selection changes.
+    std::uint32_t pending_tactic_blocks_{0};
 };
 
 }  // namespace xop

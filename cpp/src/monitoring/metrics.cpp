@@ -29,6 +29,7 @@
 #include <prometheus/histogram.h>
 #include <prometheus/registry.h>
 
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 
@@ -53,6 +54,10 @@ MetricsExporter::~MetricsExporter()
 void MetricsExporter::init(std::uint16_t port,
                            const std::vector<std::string>& asset_ids)
 {
+    // T2-02: Exclusive lock -- init mutates running_, registry_, exposer_,
+    // known_asset_ids_, and all metric family pointers.
+    std::unique_lock lock(mtx_);
+
     if (running_) {
         spdlog::warn("MetricsExporter::init called while already running; ignoring");
         return;
@@ -97,6 +102,9 @@ void MetricsExporter::init(std::uint16_t port,
 
 void MetricsExporter::shutdown()
 {
+    // T2-02: Exclusive lock -- shutdown mutates running_, exposer_, registry_.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -114,6 +122,8 @@ void MetricsExporter::shutdown()
 
 bool MetricsExporter::is_running() const noexcept
 {
+    // T2-02: Shared lock -- read-only access to running_.
+    std::shared_lock lock(mtx_);
     return running_;
 }
 
@@ -254,6 +264,9 @@ void MetricsExporter::register_metrics()
 
 void MetricsExporter::update_pnl(const MetricsPnlSnapshot& summary)
 {
+    // T2-02: Exclusive lock -- update_pnl writes to prometheus gauge objects.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -274,6 +287,10 @@ void MetricsExporter::update_inventory(
     const std::vector<InventorySnapshot>& positions,
     const std::vector<InventorySkewSnapshot>& skews)
 {
+    // T2-02: Exclusive lock -- update_inventory writes to prometheus gauge
+    // objects and reads known_asset_ids_.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -316,6 +333,9 @@ void MetricsExporter::update_inventory(
 
 void MetricsExporter::update_market(const std::vector<MarketSnapshot>& snapshots)
 {
+    // T2-02: Exclusive lock -- update_market writes to prometheus gauge objects.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -341,6 +361,10 @@ void MetricsExporter::update_market(const std::vector<MarketSnapshot>& snapshots
 
 void MetricsExporter::update_system_health(const SystemHealthSnapshot& health)
 {
+    // T2-02: Exclusive lock -- update_system_health writes to prometheus gauge
+    // objects.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -352,6 +376,10 @@ void MetricsExporter::update_system_health(const SystemHealthSnapshot& health)
 
 void MetricsExporter::observe_offer_latency_ms(double latency_ms)
 {
+    // T2-02: Exclusive lock -- observe_offer_latency_ms writes to prometheus
+    // histogram object.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -370,6 +398,11 @@ void MetricsExporter::update_offers(
     std::uint64_t expired_count,
     double fill_rate_per_hour)
 {
+    // T2-02: Exclusive lock -- update_offers mutates shadow counters
+    // (last_fill_count_, last_cancel_count_, last_expired_count_) and writes
+    // to prometheus gauge/counter objects.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
@@ -411,6 +444,10 @@ void MetricsExporter::update_risk(
     const RiskSnapshot& risk,
     const std::vector<ConcentrationEntry>& concentrations)
 {
+    // T2-02: Exclusive lock -- update_risk writes to prometheus gauge objects
+    // and reads known_asset_ids_.
+    std::unique_lock lock(mtx_);
+
     if (!running_) {
         return;
     }
