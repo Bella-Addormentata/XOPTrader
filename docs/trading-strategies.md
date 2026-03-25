@@ -2245,3 +2245,27 @@ final_ask_spread = base_bps * vpin_mult * ofi_mult * asym.ask_multiplier;
 45. Bouchaud, J.-P. (2010). "The endogenous dynamics of markets: price impact, feedback loops and instabilities." *arXiv:1009.2928*.
 
 46. Lu, X. & Abergel, F. (2018). "Order-book modelling and market making strategies." *FINEC Working Paper 2018-028*.
+
+47. Andersen, T. G. & Bondarenko, O. (2014). "Reflecting on the VPIN dispute." *Journal of Financial Markets*, 17, 292–300. *(Counter-research to ref. 14: challenges VPIN predictive validity.)*
+
+48. Duarte, J. & Young, L. (2009). "Why is PIN priced?" *Journal of Financial Economics*, 91(2), 119–138. *(Counter-research to ref. 13: PIN may measure illiquidity, not just informed trading.)*
+
+49. Collin-Dufresne, P. & Fos, V. (2015). "Do prices reveal the presence of informed trading?" *Journal of Finance*, 70(4), 1555–1582. *(Counter-research to ref. 13: PIN is lowest when informed trading is documented; model may invert.)*
+
+50. Lo, A. W. & MacKinlay, A. C. (1989). "The size and power of the variance ratio test in finite samples: A Monte Carlo investigation." *Journal of Econometrics*, 40(2), 203–238. *(Counter-research to ref. 26: VR test has ~5–9% power at XOPTrader's 50–200 block window sizes.)*
+
+51. Molnár, P. (2012). "Properties of range-based volatility estimators." *International Review of Financial Analysis*, 23, 20–29. *(Counter-research to refs. 4 and Yang-Zhang 2000: Garman-Klass is empirically competitive in continuous markets without overnight gaps.)*
+
+52. Fodra, P. & Pham, H. (2015). "High frequency trading and asymptotics for small risk aversion in a Markov renewal model." *SIAM Journal on Financial Mathematics*, 6(1), 656–684. *(Counter-research to refs. 6 & 19: GLFT/A-S continuous-time optimal control deviates from true optimum in sparse discrete-block settings.)*
+
+53. Gatheral, J. (2010). "No-dynamic-arbitrage and market impact." *Quantitative Finance*, 10(7), 749–759. *(Counter-research to ref. 24: Kyle (1985) linear permanent-impact model violates no-dynamic-arbitrage; square-root impact preferred.)*
+
+54. Almgren, R., Thum, C., Hauptmann, E. & Li, H. (2005). "Direct estimation of equity market impact." *Risk*, 18(7), 57–62. *(Counter-research to ref. 24: empirical square-root market-impact law in lieu of Kyle's linear lambda.)*
+
+55. Besbes, O., Gur, Y. & Zeevi, A. (2014). "Stochastic multi-armed-bandit problem with non-stationary rewards." *Advances in Neural Information Processing Systems*, 27. *(Counter-research to refs. 1 & 31: Thompson Sampling regret guarantees fail under non-stationarity; discounted posteriors recommended.)*
+
+56. Cont, R. (2001). "Empirical properties of asset returns: stylized facts and statistical issues." *Quantitative Finance*, 1(2), 223–236. *(Counter-research to ref. 6: A-S/GLFT Brownian motion assumption does not capture fat tails, volatility clustering, or jumps found in crypto.)*
+
+57. Daian, P. et al. (2020). "Flash Boys 2.0: Frontrunning in decentralized exchanges, miner extractable value, and consensus instability." *IEEE Symposium on Security and Privacy 2020*. *(Counter-research to refs. 6 & 19: adversarial non-stationary fill processes on public-blockchain DEXs invalidate GLFT's Poisson arrival assumption.)*
+
+58. Xu, K., Lehalle, C.-A. & Alfonsi, A. (2023). "Cross-impact of order flow imbalance in equity markets." *Quantitative Finance*, 23(7–8), 1167–1185. *(Counter-research to ref. 11: best-level OFI alone explains 10–30% less return variance than multi-level OFI; deeper book information is material.)*
