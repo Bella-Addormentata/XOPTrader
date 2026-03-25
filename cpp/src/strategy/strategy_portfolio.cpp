@@ -539,6 +539,15 @@ void StrategyPortfolio::compute_intensity_scores(MarketRegime regime)
         // signal is attenuated proportionally.
         // Brock & Hommes (1998): the discrete-choice model assumes sufficient
         // observations; this corrects for the small-sample regime.
+        //
+        // COUNTER-RESEARCH NOTE (CR-9, Brock, Hommes & Wagener 2006):
+        //   The authors' own follow-up explicitly requires 30+ strategy
+        //   realisations per evaluation window for the law of large numbers
+        //   to hold.  At CHIA's ~1 fill/hour, a 200-block window yields
+        //   only 1–3 fills per strategy — well below the 30-fill threshold.
+        //   The fill-count dampening above mitigates this; calibrating
+        //   min_fills_for_full_weight ≥ 10 is recommended.
+        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §9.2.
         const double fill_ratio_for_beta = std::min(
             1.0,
             static_cast<double>(state.fill_count)

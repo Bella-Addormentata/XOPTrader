@@ -272,6 +272,17 @@ void AdverseSelectionEstimator::set_sigma_block(double sigma_block) noexcept
 
 double AdverseSelectionEstimator::effective_adverse_threshold() const noexcept
 {
+    // COUNTER-RESEARCH NOTE (CR-4, Duarte & Young 2009;
+    //   Collin-Dufresne & Fos 2015):
+    //   The PIN model may measure illiquidity friction rather than
+    //   genuine informed trading.  Collin-Dufresne & Fos (2015) find
+    //   PIN is lowest precisely when Schedule 13D filers (known informed
+    //   traders) are most active — sophisticated informed traders
+    //   minimise their market impact, reducing observable imbalance.
+    //   Treat the resulting adverse-selection estimate as a rough
+    //   heuristic, not a calibrated information-theoretic measure.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §6.
+
     if (sigma_block_ > 0.0 && cfg_.observation_blocks > 0) {
         // Dynamic threshold: 1.5 * sigma_block * sqrt(observation_blocks).
         // ISO/IEC 5055: observation_blocks is uint32_t, always non-negative.

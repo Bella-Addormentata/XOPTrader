@@ -154,6 +154,17 @@ void ThompsonSampler::record_outcome(std::size_t index, bool profit) {
     // Update the Beta posterior:
     //   Profitable fill    -> increment alpha (evidence of success).
     //   Adverse selection   -> increment beta  (evidence of failure).
+    //
+    // COUNTER-RESEARCH NOTE (CR-7, Besbes, Gur & Zeevi 2014):
+    //   Standard Thompson Sampling regret guarantees do not hold under
+    //   non-stationarity.  When optimal spread width shifts with regime
+    //   changes, the Beta posterior is too slow to forget outdated
+    //   observations.  Consider discounted Thompson Sampling:
+    //     alpha_new = alpha * decay + (profit ? 1 : 0)
+    //     beta_new  = beta  * decay + (profit ? 0 : 1)
+    //   with decay in [0.95, 0.99] to let the posterior forget stale
+    //   evidence from prior regimes.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §10.
     if (profit) {
         alpha_[index] += 1.0;
     } else {
