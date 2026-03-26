@@ -10,7 +10,6 @@ Usage:
 Requires: Pillow  (pip install pillow)
 """
 
-import math
 import sys
 from pathlib import Path
 
@@ -24,60 +23,54 @@ except ImportError:
 # ---------------------------------------------------------------------------
 # Icon design
 # ---------------------------------------------------------------------------
-# Dark navy background, cyan chart line, bold "XOP" label.
-# The hexagonal outline nods to Chia's geometry; the upward-trending
-# polyline represents market-making activity.
+# Sky-blue background, green tree with layered foliage canopy, brown trunk,
+# and a small white "XOP" label at the bottom.
 # ---------------------------------------------------------------------------
 
-BG_COLOR    = (15,  25,  50, 255)   # dark navy
-ACCENT      = (0,  212, 255, 255)   # Chia cyan
-BORDER      = (0,  180, 220, 200)
-
-
-def _hex_points(cx: float, cy: float, r: float) -> list[tuple[float, float]]:
-    """Return the 6 vertices of a flat-top hexagon."""
-    return [
-        (cx + r * math.cos(math.radians(60 * i - 30)),
-         cy + r * math.sin(math.radians(60 * i - 30)))
-        for i in range(6)
-    ]
+BG_COLOR    = (200, 230, 255, 255)   # light sky blue
+TRUNK_COLOR = (101,  67,  33, 255)   # brown
+LEAF_DARK   = ( 34, 120,  34, 255)   # dark green (bottom layer)
+LEAF_MID    = ( 56, 160,  56, 255)   # mid green
+LEAF_LIGHT  = ( 80, 200,  80, 255)   # bright green (top layer)
+TEXT_COLOR  = ( 20,  20,  20, 255)   # near-black for "XOP"
 
 
 def create_base_image(size: int = 256) -> Image.Image:
-    img  = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+    img  = Image.new("RGBA", (size, size), BG_COLOR)
     draw = ImageDraw.Draw(img)
 
-    cx, cy = size / 2, size / 2
-    r      = size * 0.46          # hexagon radius
+    s  = size
+    cx = s / 2
 
-    # ---- Hexagon background ------------------------------------------------
-    hex_pts = _hex_points(cx, cy, r)
-    draw.polygon(hex_pts, fill=BG_COLOR)
-    # Glow border (two passes for soft effect)
-    draw.line(hex_pts + [hex_pts[0]], fill=(*BORDER[:3], 120), width=max(2, size // 40))
-    draw.line(hex_pts + [hex_pts[0]], fill=ACCENT,             width=max(1, size // 80))
+    # ---- Trunk -------------------------------------------------------
+    tw  = s * 0.10   # trunk width
+    th  = s * 0.22   # trunk height
+    ty0 = s * 0.78   # trunk top y
+    ty1 = s * 0.93   # trunk bottom y
+    draw.rectangle(
+        [cx - tw / 2, ty0, cx + tw / 2, ty1],
+        fill=TRUNK_COLOR,
+    )
 
-    # ---- Candlestick-style chart line --------------------------------------
-    # Five data points tracing an upward trend.
-    s = size
-    chart = [
-        (s * 0.22, s * 0.68),
-        (s * 0.35, s * 0.50),
-        (s * 0.50, s * 0.60),
-        (s * 0.65, s * 0.35),
-        (s * 0.78, s * 0.42),
+    # ---- Foliage — three stacked triangles (bottom → top) ---------------
+    # Each layer is slightly narrower and higher to give a classic pine shape.
+    layers = [
+        # (base_y, tip_y, half_width, color)
+        (s * 0.82, s * 0.55, s * 0.40, LEAF_DARK),
+        (s * 0.68, s * 0.38, s * 0.32, LEAF_MID),
+        (s * 0.52, s * 0.18, s * 0.22, LEAF_LIGHT),
     ]
-    lw = max(3, size // 32)
-    draw.line(chart, fill=ACCENT, width=lw, joint="curve")
+    for base_y, tip_y, hw, color in layers:
+        pts = [
+            (cx,       tip_y),
+            (cx - hw,  base_y),
+            (cx + hw,  base_y),
+        ]
+        draw.polygon(pts, fill=color)
 
-    # Dot at each vertex
-    dot = max(2, size // 48)
-    for px, py in chart:
-        draw.ellipse([px - dot, py - dot, px + dot, py + dot], fill=ACCENT)
-
-    # ---- "XOP" label -------------------------------------------------------
+    # ---- "XOP" label ---------------------------------------------------
     label     = "XOP"
-    font_size = max(16, size // 7)
+    font_size = max(12, s // 9)
     try:
         font = ImageFont.truetype("arialbd.ttf", font_size)
     except Exception:
@@ -87,10 +80,10 @@ def create_base_image(size: int = 256) -> Image.Image:
             font = ImageFont.load_default()
 
     bbox = draw.textbbox((0, 0), label, font=font)
-    tw   = bbox[2] - bbox[0]
-    tx   = (size - tw) // 2
-    ty   = int(size * 0.73)
-    draw.text((tx, ty), label, fill=ACCENT, font=font)
+    tw_text = bbox[2] - bbox[0]
+    tx = (s - tw_text) // 2
+    ty = int(s * 0.92)
+    draw.text((tx, ty), label, fill=TEXT_COLOR, font=font)
 
     return img
 
