@@ -1,4 +1,6 @@
-PySide6>=6.6.0
-pyqtgraph>=0.13.0
-PyYAML>=6.0
-requests>=2.31.0
+# GUI dependencies — canonical source is pyproject.toml [project.optional-dependencies] gui
+# Install via: pip install -e ".[gui]"
+PySide6>=6.6.0,<7
+pyqtgraph>=0.13.0,<1
+PyYAML>=6.0,<7
+requests>=2.31.0,<3

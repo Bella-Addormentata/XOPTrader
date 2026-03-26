@@ -32,7 +32,6 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <execution>
 #include <fstream>
@@ -502,8 +501,10 @@ BacktestResult BacktestEngine::simulate_range(
     std::size_t           end_idx,
     bool                  no_loss_constraint) const
 {
-    assert(start_idx < end_idx);
-    assert(end_idx <= blocks_.size());
+    if (start_idx >= end_idx)
+        throw std::invalid_argument("start_idx must be < end_idx");
+    if (end_idx > blocks_.size())
+        throw std::invalid_argument("end_idx must be <= blocks_.size()");
 
     BacktestResult result{};
     result.parameter_set  = params;

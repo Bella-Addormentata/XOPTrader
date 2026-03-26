@@ -32,8 +32,8 @@
 
 #include "xop/rpc/chia_rpc.hpp"
 
-#include <cassert>
 #include <sstream>
+#include <stdexcept>
 #include <utility>
 
 #include <boost/asio/co_spawn.hpp>
@@ -329,7 +329,8 @@ void ChiaRPCBase::configure_tls(CURL*              curl,
                                 const std::string& key_str,
                                 const std::string& ca_str)
 {
-    assert(curl && "configure_tls called on null CURL handle");
+    if (!curl)
+        throw std::invalid_argument("configure_tls called on null CURL handle");
 
     // ISO/IEC 5055 -- CWE-416 use-after-free prevention:
     // std::filesystem::path::string() returns a temporary std::string.
