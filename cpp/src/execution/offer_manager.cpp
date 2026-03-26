@@ -395,6 +395,7 @@ asio::awaitable<void> OfferManager::cancel_all()
     }
 
     if (bulk_ok) {
+        // Bulk success: all offers are considered cancelled.
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         for (const auto& po : all_offers) {
             cancelled_ids.push_back(po.offer_id);
