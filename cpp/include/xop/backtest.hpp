@@ -312,11 +312,11 @@ public:
     BacktestEngine();
     ~BacktestEngine();
 
-    // Non-copyable (holds large data buffers); movable.
+    // Non-copyable, non-movable (contains std::mutex).
     BacktestEngine(const BacktestEngine&) = delete;
     BacktestEngine& operator=(const BacktestEngine&) = delete;
-    BacktestEngine(BacktestEngine&&) noexcept;
-    BacktestEngine& operator=(BacktestEngine&&) noexcept;
+    BacktestEngine(BacktestEngine&&) = delete;
+    BacktestEngine& operator=(BacktestEngine&&) = delete;
 
     // -- Data Loading -------------------------------------------------------
 
