@@ -5,6 +5,29 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.1] — 2026-03-26
+
+### Fixed
+
+- Fill-rate feedback loop: replaced hardcoded `fill_rate_24h = 0.30` and `fill_rate_per_block = 0.03` with DB-computed values from offer_log history
+- Telegram alert HTML injection: added entity escaping (`&<>"`) in `post_telegram()` including unsafe fallback path
+- SQLite diagnostic queries: `trade_count()`, `offer_count()`, `snapshot_count()` now check `sqlite3_step()` return values
+- FetchContent supply-chain: pinned nlohmann_json, spdlog, yaml-cpp to commit SHAs instead of mutable tags
+- Desktop file `Exec` path corrected for Linux packaging
+
+### Added
+
+- Configurable `offer_fee_mojos` in `StrategyConfig` (was hardcoded 100M mojos across 5 call sites)
+- Link-Time Optimization for Release builds via `CheckIPOSupported`
+- `ctest` step in CI workflow — tests now gate artifact upload
+- Linux `uninstall.sh` with `--purge` option, bundled in release tarball
+- `CHANGELOG.md`
+- Release workflow triggers on GitHub UI release publish (+ concurrency guard)
+
+### Changed
+
+- TODO.md summary table updated (84/121 items complete)
+
 ## [0.1.0] — 2026-03-25
 
 Initial release of the XOPTrader CHIA DEX market-making engine.

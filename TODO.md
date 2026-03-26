@@ -861,17 +861,17 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-25 (implementation pass: T1-12, T3-06, T6-01..07)
+**Last verification:** 2026-03-26 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-09, T6-10 + CHANGELOG + CI tests)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
 | **Tier 1 (Critical)** | 14 | 14 | 0 | 0 | Must fix before live trading |
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 30 | 2 | 3 | Quality, robustness, correctness |
-| **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
+| **Tier 3 (Medium)** | 35 | 31 | 2 | 2 | Quality, robustness, correctness |
+| **Tier 4 (Low/Enhancement)** | 27 | 3 | 2 | 22 | Improvements and strategic features |
 | **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
-| **Tier 6 (New 2026-03-25)** | 10 | 5 | 0 | 5 | Build, packaging, config, code quality |
-| **Total** | **121** | **75** | **4** | **42** | |
+| **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
+| **Total** | **121** | **84** | **4** | **33** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
