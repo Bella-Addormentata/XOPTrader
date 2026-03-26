@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (code review + logic review pass 2)
+**Last Updated:** 2026-03-25 (implementation pass: T1-12, T3-06, T6-01..07)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -93,7 +93,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp` (lines ~1144, ~1198), `cpp/src/strategy/avellaneda.cpp`
 - **Issue:** `q_max` documented in base-asset units, but engine passes mojos via `net_inventory()`. `q_ratio = q / q_max` off by ~10^12. Dimensional analysis confirms: mid (XCH) minus q (mojos) × gamma × sigma² × tau produces r ≈ -10^9, clamping all bids to zero. Sizing formula also broken: q_ratio ≈ 10^12 → bid_size = 0 always.
 - **Fix:** Convert q to base units: `double q = static_cast<double>(net_inventory(...)) / static_cast<double>(pair_cfg->base_mojos_per_unit);` Same conversion needed in Step 5 (line ~1198).
-- **Status:** `[~]` — **Confirmed still broken** by 2026-03-25 logic review. No conversion visible in engine.cpp between net_inventory() (mojos) and compute_quotes()/compute_spread() calls. BLOCKS LIVE TRADING.
+- **Status:** `[x]` — Inventory converted from mojos to base-asset display units via `/ pair_cfg->base_mojos_per_unit` in both Step 4 (compute_quotes) and Step 5 (compute_spread).
 
 ### T1-13: Implement global maximum spread cap
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §ENG-1 (CRITICAL), LOGICREVIEW-Grok §3.1
@@ -294,7 +294,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp`, `cpp/src/execution/market_data.cpp`
 - **Issue:** No staleness counter. No distinction between 1-block-stale and 100-blocks-stale. Offers on dangerously stale data invite adverse selection.
 - **Fix:** Track `blocks_since_last_update` per pair. Widen spreads proportionally; pull quotes entirely after configurable max-staleness.
-- **Status:** `[~]` — Engine pulls quotes when `is_stale()`, but no intermediate graduated spread-widening step.
+- **Status:** `[x]` — `get_staleness_fraction()` added to MarketDataFeed. Engine Step 5 applies graduated spread widening (1x→2x) when data age exceeds 50-100% of stale_threshold.
 
 ### T3-07: Wire Strategic Loss Manager decisions into Step 6
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.3, CODEREVIEW-GPT-5.4 §13
@@ -769,29 +769,28 @@ Items from [CODEREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Source:** CODEREVIEW-20260325 §CR-1
 - **Files:** `cpp/src/backtest.cpp` (L505-506), `cpp/src/risk/hedging.cpp` (L61), `cpp/src/rpc/chia_rpc.cpp` (L332), `cpp/src/rpc/dexie_client.cpp` (L40-41)
 - **Issue:** 6 `assert()` calls compiled out in Release. Two are guarded by subsequent `if` checks (hedging.cpp, chia_rpc.cpp); four are not (backtest.cpp, dexie_client.cpp).
-- **Fix:** Replace with `throw std::invalid_argument(...)` or remove where runtime guard already exists.
-- **Status:** `[ ]`
+- **Status:** `[x]` — All 6 `assert()` replaced: backtest.cpp → `throw std::invalid_argument`; hedging.cpp → redundant assert removed (runtime guard retained); chia_rpc.cpp → `throw std::invalid_argument`; dexie_client.cpp → `throw std::invalid_argument`. `#include <cassert>` replaced with `#include <stdexcept>` where needed.
 
 ### T6-02: Fix `pyproject.toml` deprecated build backend
 - **Source:** CODEREVIEW-20260325 §CR-3
 - **Files:** `pyproject.toml` (L3)
 - **Issue:** `setuptools.backends._legacy:_Backend` is deprecated and will break in future setuptools.
 - **Fix:** Use `setuptools.build_meta`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Build backend changed to `setuptools.build_meta`.
 
 ### T6-03: Consolidate `requirements.txt` into `pyproject.toml`
 - **Source:** CODEREVIEW-20260325 §CR-4
 - **Files:** `gui/requirements.txt`, `pyproject.toml`
 - **Issue:** Two dependency manifests with non-overlapping packages. Confusing and error-prone.
 - **Fix:** Move GUI deps (`PySide6`, `pyqtgraph`, `requests`) into `[project.optional-dependencies] gui = [...]`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — GUI deps already in pyproject.toml `[project.optional-dependencies] gui`. requirements.txt updated with comment pointing to pyproject.toml as canonical source.
 
 ### T6-04: Add upper bounds to Python dependency versions
 - **Source:** CODEREVIEW-20260325 §CR-5
 - **Files:** `pyproject.toml`, `gui/requirements.txt`
 - **Issue:** `PySide6>=6.6.0`, `PyYAML>=6.0`, `requests>=2.31.0` have no upper bounds. Breaking changes in major versions will not be caught.
 - **Fix:** Add `<7.0.0` or `<N+1.0` upper bounds. Add `requires-python = ">=3.11,<4"`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Upper bounds added to all deps in pyproject.toml. `requires-python = ">=3.11,<4"` set. gui/requirements.txt bounds aligned.
 
 ### T6-05: Add SHA-256 verification for C++ FetchContent downloads
 - **Source:** CODEREVIEW-20260325 §CR-5
@@ -805,14 +804,14 @@ Items from [CODEREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `config.example.yaml` (L29, L32, L43-44)
 - **Issue:** Asset IDs truncated (32 of 64 hex chars). `tier_spacing_bps: [60, 200, 500, 1000]` has tiers exceeding `max_half_spread_bps: 250`. `wallet_fingerprint: 0` should be a clear placeholder.
 - **Fix:** Use full 64-char placeholder asset IDs. Align tier_spacing with max_half_spread_bps. Use descriptive placeholder for fingerprint.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Asset IDs padded to 64 hex chars. tier_spacing_bps reduced to [60,120,180,240] (all ≤ max_half_spread_bps 250). wallet_fingerprint uses descriptive placeholder.
 
 ### T6-07: Add error handling in GUI service initialization
 - **Source:** CODEREVIEW-20260325 §CR-7
 - **Files:** `gui/main.py`
 - **Issue:** `bridge.initialise()` failures not caught; UI shows responsive but is disconnected from backend.
 - **Fix:** Wrap in try/except, show QMessageBox error, exit gracefully.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `bridge.initialise()` wrapped in try/except with QMessageBox.critical and sys.exit(1).
 
 ### T6-08: Add LTO for Release builds
 - **Source:** CODEREVIEW-20260325 §CR-10
@@ -859,19 +858,18 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-25 (code review + logic review pass 2)
+**Last verification:** 2026-03-25 (implementation pass: T1-12, T3-06, T6-01..07)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
-| **Tier 1 (Critical)** | 14 | 12 | 2 | 0 | Must fix before live trading |
+| **Tier 1 (Critical)** | 14 | 14 | 0 | 0 | Must fix before live trading |
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 29 | 3 | 3 | Quality, robustness, correctness |
+| **Tier 3 (Medium)** | 35 | 30 | 2 | 3 | Quality, robustness, correctness |
 | **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
 | **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
-| **Tier 6 (New 2026-03-25)** | 10 | 0 | 0 | 10 | Build, packaging, config, code quality |
-| **Total** | **121** | **67** | **7** | **47** | |
+| **Tier 6 (New 2026-03-25)** | 10 | 5 | 0 | 5 | Build, packaging, config, code quality |
+| **Total** | **121** | **75** | **4** | **42** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
-1. **T1-12** — Inventory units mismatch (mojos vs base units in A-S formula) — **CONFIRMED BROKEN**
-2. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)
+1. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)

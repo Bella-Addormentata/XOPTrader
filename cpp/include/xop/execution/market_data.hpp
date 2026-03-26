@@ -370,6 +370,11 @@ public:
     /// Returns true if the pair is unknown.
     bool is_stale(const std::string& pair_name) const;
 
+    /// Staleness fraction for graduated spread widening (T3-06).
+    /// Returns 0.0 when data is fresh, 1.0 at stale_threshold, >1.0 beyond.
+    /// Returns 1.0 if the pair is unknown.
+    double get_staleness_fraction(const std::string& pair_name) const;
+
     /// Retrieve the latest block height ingested from the full node.
     BlockHeight current_block_height() const;
 

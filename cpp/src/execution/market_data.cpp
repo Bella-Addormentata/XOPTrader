@@ -417,6 +417,35 @@ bool MarketDataFeed::is_stale(const std::string& pair_name) const {
     return it->second.is_stale;
 }
 
+double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) const {
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return 1.0;  // Unknown pair treated as fully stale.
+    }
+    const auto& ps = it->second;
+    const auto now = std::chrono::system_clock::now();
+
+    // Use the freshest data source available.
+    auto best_ts = ps.dex_updated_at;
+    if (ps.cex_mid > 0.0 && ps.cex_updated_at > best_ts) {
+        best_ts = ps.cex_updated_at;
+    }
+
+    // Epoch-zero means never updated.
+    if (best_ts == Timestamp{}) {
+        return 1.0;
+    }
+
+    const auto age = std::chrono::duration_cast<std::chrono::seconds>(now - best_ts);
+    const auto threshold_s = std::chrono::duration_cast<std::chrono::seconds>(
+        config_.stale_threshold);
+    if (threshold_s.count() <= 0) return 0.0;
+
+    return static_cast<double>(age.count()) / static_cast<double>(threshold_s.count());
+}
+
 BlockHeight MarketDataFeed::current_block_height() const {
     return block_height_.load(std::memory_order_acquire);
 }

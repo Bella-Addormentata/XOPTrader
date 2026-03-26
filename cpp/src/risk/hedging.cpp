@@ -14,7 +14,6 @@
 #include "xop/risk/hedging.hpp"
 
 #include <algorithm>
-#include <cassert>
 #include <cmath>
 #include <cstddef>
 #include <numeric>
@@ -56,9 +55,6 @@ double HedgingManager::compute_skew_adjustment(double inventory_q,
                                                double phi) noexcept
 {
     // Guard: q_max must be positive.
-    // In debug builds this is a hard assertion; in release builds we clamp
-    // to avoid division by zero.
-    assert(q_max > 0.0 && "q_max must be strictly positive");
     if (q_max <= 0.0) {
         return 0.0;
     }
