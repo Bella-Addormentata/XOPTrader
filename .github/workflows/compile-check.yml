@@ -1,0 +1,83 @@
+# =============================================================================
+# compile-check.yml — XOPTrader compile-error check
+#
+# Runs on every push and pull request to catch C++ and Python compile errors
+# before they land on the main branch.
+#
+# C++ check  — full CMake + vcpkg build on Ubuntu (GCC, C++20)
+# Python check — py_compile syntax scan of all .py files
+# =============================================================================
+
+name: Compile Check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 — C++ compile check (Ubuntu, GCC, vcpkg managed dependencies)
+  # ---------------------------------------------------------------------------
+  cpp-compile:
+    name: C++ compile check (Ubuntu)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---- vcpkg setup with caching ----------------------------------------
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: "${{ github.workspace }}/vcpkg"
+          vcpkgJsonGlob: "cpp/vcpkg.json"
+
+      # ---- System dependencies ---------------------------------------------
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libcurl4-openssl-dev
+
+      # ---- CMake configure -------------------------------------------------
+      - name: Configure CMake
+        working-directory: cpp
+        run: >
+          cmake -B ../build -S .
+          -DCMAKE_BUILD_TYPE=Debug
+          -DXOP_BUILD_TESTS=OFF
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=x64-linux
+
+      # ---- Build (compile-error check) -------------------------------------
+      - name: Build
+        run: cmake --build build --parallel
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Python syntax check
+  # ---------------------------------------------------------------------------
+  python-syntax:
+    name: Python syntax check
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Check Python syntax
+        run: |
+          find . -name "*.py" -not -path "./.git/*" \
+            -print -exec python -m py_compile {} \;
+          echo "All Python files compiled without errors."
