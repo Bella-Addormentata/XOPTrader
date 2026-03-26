@@ -243,7 +243,6 @@ jobs:
           cp gui/icon.png                     linux-bundle/
           cp config.example.yaml              linux-bundle/
           cp packaging/linux/install.sh       linux-bundle/
-          cp packaging/linux/xop_trader.desktop linux-bundle/
           chmod +x linux-bundle/install.sh linux-bundle/xop_trader_gui
           tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
 
@@ -256,36 +255,11 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Job 3 — Build the pure-Python wheel (pip-installable package)
-  # ---------------------------------------------------------------------------
-  build-wheel:
-    name: Python wheel
-    runs-on: ubuntu-22.04
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Build wheel
-        run: |
-          pip install --upgrade pip build
-          python -m build --wheel --outdir dist/
-
-      - uses: actions/upload-artifact@v4
-        with:
-          name: python-wheel
-          path: dist/*.whl
-          if-no-files-found: error
-
-  # ---------------------------------------------------------------------------
-  # Job 4 — Create the GitHub Release and upload all artifacts
+  # Job 3 — Create the GitHub Release and upload all artifacts
   # ---------------------------------------------------------------------------
   release:
     name: Create GitHub Release
-    needs: [build-cpp, build-gui, build-wheel]
+    needs: [build-cpp, build-gui]
     runs-on: ubuntu-22.04
 
     steps:
