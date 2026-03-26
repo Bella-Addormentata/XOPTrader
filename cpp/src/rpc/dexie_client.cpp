@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <mutex>
 #include <sstream>
 #include <thread>
 #include <utility>

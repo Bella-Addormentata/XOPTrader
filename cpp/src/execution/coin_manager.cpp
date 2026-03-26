@@ -28,6 +28,7 @@
 #include <xop/execution/coin_manager.hpp>
 
 #include <algorithm>
+#include <mutex>
 #include <array>
 #include <cmath>
 #include <cstring>

@@ -38,6 +38,7 @@
 #include <fstream>
 #include <future>
 #include <iomanip>
+#include <mutex>
 #include <iostream>
 #include <limits>
 #include <numeric>

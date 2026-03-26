@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
 
 namespace xop {

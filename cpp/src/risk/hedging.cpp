@@ -17,6 +17,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstddef>
+#include <mutex>
 #include <numeric>
 #include <sstream>
 #include <shared_mutex>
