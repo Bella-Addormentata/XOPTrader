@@ -359,7 +359,7 @@ public:
     RegimeInfo current_regime() const override;
 
     /// Return the strategy name for logging and metrics.
-    const std::string& name() const override;
+    std::string name() const override;
 
     /// Set the cost basis for the never-sell-at-loss constraint.
     void set_cost_basis(double cost_basis, double min_margin_bps) override;

@@ -89,8 +89,9 @@ endif()
 # ==========================================================================
 # Options
 # ==========================================================================
-option(XOP_BUILD_TESTS      "Build unit and integration tests"    ON)
-option(XOP_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds" OFF)
+option(XOP_BUILD_TESTS       "Build unit and integration tests"    ON)
+option(XOP_ENABLE_SANITIZERS "Enable ASan/UBSan in Debug builds"  OFF)
+option(XOP_ENABLE_CLANG_TIDY "Run clang-tidy during build"        OFF)
 
 if(XOP_ENABLE_SANITIZERS AND NOT MSVC)
     add_compile_options(-fsanitize=address,undefined -fno-omit-frame-pointer)
@@ -189,11 +190,13 @@ install(TARGETS xop_trader RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
 # ==========================================================================
 # Static analysis targets (optional convenience)
 # ==========================================================================
-find_program(CLANG_TIDY_EXE NAMES clang-tidy)
-if(CLANG_TIDY_EXE)
-    set_target_properties(xop_core PROPERTIES
-        CXX_CLANG_TIDY "${CLANG_TIDY_EXE};-checks=-*,bugprone-*,cppcoreguidelines-*,performance-*,readability-*"
-    )
+if(XOP_ENABLE_CLANG_TIDY)
+    find_program(CLANG_TIDY_EXE NAMES clang-tidy)
+    if(CLANG_TIDY_EXE)
+        set_target_properties(xop_core PROPERTIES
+            CXX_CLANG_TIDY "${CLANG_TIDY_EXE};-checks=-*,bugprone-*,cppcoreguidelines-*,performance-*,readability-*"
+        )
+    endif()
 endif()
 
 find_program(CPPCHECK_EXE NAMES cppcheck)

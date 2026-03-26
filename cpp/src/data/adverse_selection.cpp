@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 

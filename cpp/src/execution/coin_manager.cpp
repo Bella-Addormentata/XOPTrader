@@ -28,6 +28,7 @@
 #include <xop/execution/coin_manager.hpp>
 
 #include <algorithm>
+#include <mutex>
 #include <array>
 #include <cmath>
 #include <cstring>
@@ -206,7 +207,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         logger_->error("coin_manager: split total_needed overflows int64_t "
                        "(needed={}, target={}, fee={})",
                        needed, target_amount_mojos, fee);
-        co_return SplitResult{false, "overflow in total_needed calculation"};
+        co_return SplitResult{.success = false, .tx_id = "overflow in total_needed calculation"};
     }
     Mojo total_needed = static_cast<Mojo>(needed) * target_amount_mojos + fee;
 
@@ -220,7 +221,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
     for (const auto& c : free_coins) {
         if (total_available > std::numeric_limits<std::int64_t>::max() - c.amount) {
             logger_->error("coin_manager: balance summation overflow");
-            co_return SplitResult{false, "balance overflow"};
+            co_return SplitResult{.success = false, .tx_id = "balance overflow"};
         }
         total_available += c.amount;
     }

@@ -382,18 +382,25 @@ asio::awaitable<void> OfferManager::cancel_all()
 
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
+    std::string bulk_err;
     try {
         co_await wallet_->cancel_offers(strategy_cfg_.offer_fee_mojos, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
+    } catch (const rpc::ChiaRPCError& e) {
+        bulk_err = e.what();
+    }
+
+    if (bulk_ok) {
         // Bulk success: all offers are considered cancelled.
+        logger_->info("cancel_all: bulk cancel_offers succeeded");
         for (const auto& po : all_offers) {
             cancelled_ids.push_back(po.offer_id);
         }
-    } catch (const rpc::ChiaRPCError& e) {
+    } else {
         // Bulk cancel failed -- fall back to individual cancellation.
         logger_->warn("Bulk cancel_offers failed: {} -- falling back to "
-                      "individual cancellation", e.what());
+                      "individual cancellation", bulk_err);
 
         for (const auto& po : all_offers) {
             try {

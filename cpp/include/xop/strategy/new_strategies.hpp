@@ -176,7 +176,7 @@ public:
 
     RegimeInfo current_regime() const override;
 
-    const std::string& name() const override;
+    std::string name() const override;
 
     void set_cost_basis(double cost_basis,
                         double min_margin_bps) override;
@@ -390,7 +390,7 @@ public:
 
     RegimeInfo current_regime() const override;
 
-    const std::string& name() const override;
+    std::string name() const override;
 
     void set_cost_basis(double cost_basis,
                         double min_margin_bps) override;
@@ -665,7 +665,7 @@ public:
 
     RegimeInfo current_regime() const override;
 
-    const std::string& name() const override;
+    std::string name() const override;
 
     void set_cost_basis(double cost_basis,
                         double min_margin_bps) override;

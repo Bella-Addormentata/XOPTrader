@@ -48,11 +48,13 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
 #include <functional>
 #include <optional>
+#include <mutex>
 #include <shared_mutex>
 #include <string>
 #include <unordered_map>
