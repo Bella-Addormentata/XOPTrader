@@ -12,9 +12,7 @@ name: Compile Check
 
 on:
   push:
-    branches: ["**"]
   pull_request:
-    branches: ["**"]
 
 permissions:
   contents: read
@@ -80,6 +78,5 @@ jobs:
         env:
           PYTHONDONTWRITEBYTECODE: "1"
         run: |
-          find . -name "*.py" -not -path "./.git/*" \
-            -print -exec python -m py_compile {} \;
+          python -m compileall -q -x '(^|/)\.git(/|$)' .
           echo "All Python files compiled without errors."
