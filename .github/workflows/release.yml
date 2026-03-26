@@ -91,6 +91,9 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ matrix.cmake_build_type }} --parallel
 
+      - name: Run tests
+        run: ctest --test-dir build --build-config ${{ matrix.cmake_build_type }} --output-on-failure
+
       # ---- Rename binary to platform-specific name -------------------------
       - name: Rename binary (Unix)
         if: runner.os != 'Windows'
@@ -243,7 +246,8 @@ jobs:
           cp config.example.yaml              linux-bundle/
           cp packaging/linux/xop_trader.desktop linux-bundle/
           cp packaging/linux/install.sh       linux-bundle/
-          chmod +x linux-bundle/install.sh linux-bundle/xop_trader_gui
+          cp packaging/linux/uninstall.sh     linux-bundle/
+          chmod +x linux-bundle/install.sh linux-bundle/uninstall.sh linux-bundle/xop_trader_gui
           tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
 
       - name: Upload Linux bundle artifact

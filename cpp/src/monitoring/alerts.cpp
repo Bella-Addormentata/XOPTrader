@@ -477,14 +477,36 @@ void AlertManager::start_worker()
                 "https://api.telegram.org/bot" + token + "/sendMessage";
 
             // Build the POST body as URL-encoded form data.
+            // HTML-escape the message first to prevent injection via
+            // user-controlled data (pair names, asset IDs, error messages).
+            // Telegram's default parse_mode treats <, >, & as HTML if the
+            // server echoes them; escaping neutralises this (T4-25).
+            auto html_escape = [](const std::string& s) -> std::string {
+                std::string out;
+                out.reserve(s.size() + s.size() / 8);
+                for (char c : s) {
+                    switch (c) {
+                        case '&':  out += "&amp;";  break;
+                        case '<':  out += "&lt;";   break;
+                        case '>':  out += "&gt;";   break;
+                        case '"': out += "&quot;";  break;
+                        default:   out += c;         break;
+                    }
+                }
+                return out;
+            };
+            std::string safe_message = html_escape(message);
+
             std::string escaped_text;
             char* curl_escaped = curl_easy_escape(
-                curl, message.c_str(), static_cast<int>(message.size()));
+                curl, safe_message.c_str(), static_cast<int>(safe_message.size()));
             if (curl_escaped) {
                 escaped_text = curl_escaped;
                 curl_free(curl_escaped);
             } else {
-                escaped_text = message;  // Fallback: send unescaped.
+                // Fallback: URL-encode manually is not practical, so use
+                // the already HTML-escaped text (safe against injection).
+                escaped_text = safe_message;
             }
 
             const std::string post_data =

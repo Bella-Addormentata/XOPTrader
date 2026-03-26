@@ -14,9 +14,8 @@
 #include "xop/rpc/dexie_client.hpp"
 
 #include <algorithm>
-#include <cassert>
-#include <mutex>
 #include <sstream>
+#include <stdexcept>
 #include <thread>
 #include <utility>
 
@@ -38,8 +37,10 @@ SlidingWindowRateLimiter::SlidingWindowRateLimiter(
     std::chrono::milliseconds window)
     : max_requests_(max_requests),
       window_(window) {
-    assert(max_requests_ > 0);
-    assert(window_.count() > 0);
+    if (max_requests_ == 0)
+        throw std::invalid_argument("max_requests must be > 0");
+    if (window_.count() <= 0)
+        throw std::invalid_argument("window duration must be > 0");
 }
 
 std::chrono::milliseconds SlidingWindowRateLimiter::acquire() {

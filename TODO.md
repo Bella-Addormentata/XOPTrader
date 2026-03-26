@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (code review + logic review pass 2)
+**Last Updated:** 2026-03-25 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-10)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -93,7 +93,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp` (lines ~1144, ~1198), `cpp/src/strategy/avellaneda.cpp`
 - **Issue:** `q_max` documented in base-asset units, but engine passes mojos via `net_inventory()`. `q_ratio = q / q_max` off by ~10^12. Dimensional analysis confirms: mid (XCH) minus q (mojos) × gamma × sigma² × tau produces r ≈ -10^9, clamping all bids to zero. Sizing formula also broken: q_ratio ≈ 10^12 → bid_size = 0 always.
 - **Fix:** Convert q to base units: `double q = static_cast<double>(net_inventory(...)) / static_cast<double>(pair_cfg->base_mojos_per_unit);` Same conversion needed in Step 5 (line ~1198).
-- **Status:** `[~]` — **Confirmed still broken** by 2026-03-25 logic review. No conversion visible in engine.cpp between net_inventory() (mojos) and compute_quotes()/compute_spread() calls. BLOCKS LIVE TRADING.
+- **Status:** `[x]` — Inventory converted from mojos to base-asset display units via `/ pair_cfg->base_mojos_per_unit` in both Step 4 (compute_quotes) and Step 5 (compute_spread).
 
 ### T1-13: Implement global maximum spread cap
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §ENG-1 (CRITICAL), LOGICREVIEW-Grok §3.1
@@ -284,17 +284,17 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T3-05: Implement fill-rate feedback loop from database
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.2, CODEREVIEW-GPT-5.4 §15
-- **Files:** `cpp/src/engine.cpp`, `cpp/src/monitoring/pnl.cpp`
+- **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/database.hpp`, `cpp/src/database.cpp`
 - **Issue:** `fill_rate_24h = 0.30` and `fill_rate_per_block = 0.03` hardcoded. Critical input to Kelly sizing, loss manager, Thompson Sampler.
-- **Fix:** Compute rolling fill rate from DB trade log: `fills_in_last_N_blocks / N`.
-- **Status:** `[ ]`
+- **Fix:** Added `Database::fill_rate_since_block()` querying resolved offers from offer_log. Engine computes rolling fill rate from last ~4608 blocks (24h) with safe fallbacks.
+- **Status:** `[x]`
 
 ### T3-06: Add stale-data escalation (widen spread → pull quotes)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.7, CODEREVIEW-GPT-5.4 §10, CODEREVIEW-Gemini §1.2
 - **Files:** `cpp/src/engine.cpp`, `cpp/src/execution/market_data.cpp`
 - **Issue:** No staleness counter. No distinction between 1-block-stale and 100-blocks-stale. Offers on dangerously stale data invite adverse selection.
 - **Fix:** Track `blocks_since_last_update` per pair. Widen spreads proportionally; pull quotes entirely after configurable max-staleness.
-- **Status:** `[~]` — Engine pulls quotes when `is_stale()`, but no intermediate graduated spread-widening step.
+- **Status:** `[x]` — `get_staleness_fraction()` added to MarketDataFeed. Engine Step 5 applies graduated spread widening (1x→2x) when data age exceeds 50-100% of stale_threshold.
 
 ### T3-07: Wire Strategic Loss Manager decisions into Step 6
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.3, CODEREVIEW-GPT-5.4 §13
@@ -561,8 +561,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-12: Feature-gate incomplete live paths (arb, hedging, Dexie submission)
 - **Source:** CODEREVIEW-GPT-5.4 §14 (Missing Safeguards §6)
 - **Issue:** Incomplete features (arbitrage execution, hedging trades, Dexie submission) return success silently.
-- **Fix:** Explicit `NotImplemented` / feature flags.
-- **Status:** `[ ]`
+- **Fix:** Verified all previously-flagged stubs are now fully implemented — no feature-gating needed.
+- **Status:** `[x]` — N/A, all paths implemented.
 
 ### T4-13: Consolidate fill accounting into single function
 - **Source:** CODEREVIEW-GPT-5.4 §cleanup-3
@@ -623,17 +623,19 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T4-23: Fix diagnostic count functions not checking `sqlite3_step()` return
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §L-V6
-- **Files:** `cpp/src/database.cpp` (lines ~492-510)
-- **Status:** `[ ]`
+- **Files:** `cpp/src/database.cpp`
+- **Fix:** Added `int rc =` check + `spdlog::warn` on failure for `trade_count()`, `offer_count()`, `snapshot_count()`.
+- **Status:** `[x]`
 
 ### T4-24: Document which config fields are required vs. optional
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11
-- **Status:** `[~]` — `config.example.yaml` marks alerts as optional; most other fields undocumented. `config.cpp` enforces some but doesn’t document which.
+- **Status:** `[~]` — `config.example.yaml` marks alerts as optional; most other fields undocumented. `config.cpp` enforces some but doesn't document which.
 
 ### T4-25: Add no-HTML-escaping guard for Telegram alert messages
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §12
 - **Issue:** Injection risk in Telegram Bot API messages.
-- **Status:** `[ ]`
+- **Fix:** Added `html_escape` lambda in `post_telegram()` escaping `&<>"` before URL-encoding. Unsafe fallback path now uses escaped text.
+- **Status:** `[x]`
 
 ### T4-26: Add multivariate / cross-asset correlation modeling
 - **Source:** LOGICREVIEW-Grok §4.4, LOGICREVIEW-Gemini §4.3 (gap)
@@ -769,70 +771,70 @@ Items from [CODEREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Source:** CODEREVIEW-20260325 §CR-1
 - **Files:** `cpp/src/backtest.cpp` (L505-506), `cpp/src/risk/hedging.cpp` (L61), `cpp/src/rpc/chia_rpc.cpp` (L332), `cpp/src/rpc/dexie_client.cpp` (L40-41)
 - **Issue:** 6 `assert()` calls compiled out in Release. Two are guarded by subsequent `if` checks (hedging.cpp, chia_rpc.cpp); four are not (backtest.cpp, dexie_client.cpp).
-- **Fix:** Replace with `throw std::invalid_argument(...)` or remove where runtime guard already exists.
-- **Status:** `[ ]`
+- **Status:** `[x]` — All 6 `assert()` replaced: backtest.cpp → `throw std::invalid_argument`; hedging.cpp → redundant assert removed (runtime guard retained); chia_rpc.cpp → `throw std::invalid_argument`; dexie_client.cpp → `throw std::invalid_argument`. `#include <cassert>` replaced with `#include <stdexcept>` where needed.
 
 ### T6-02: Fix `pyproject.toml` deprecated build backend
 - **Source:** CODEREVIEW-20260325 §CR-3
 - **Files:** `pyproject.toml` (L3)
 - **Issue:** `setuptools.backends._legacy:_Backend` is deprecated and will break in future setuptools.
 - **Fix:** Use `setuptools.build_meta`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Build backend changed to `setuptools.build_meta`.
 
 ### T6-03: Consolidate `requirements.txt` into `pyproject.toml`
 - **Source:** CODEREVIEW-20260325 §CR-4
 - **Files:** `gui/requirements.txt`, `pyproject.toml`
 - **Issue:** Two dependency manifests with non-overlapping packages. Confusing and error-prone.
 - **Fix:** Move GUI deps (`PySide6`, `pyqtgraph`, `requests`) into `[project.optional-dependencies] gui = [...]`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — GUI deps already in pyproject.toml `[project.optional-dependencies] gui`. requirements.txt updated with comment pointing to pyproject.toml as canonical source.
 
 ### T6-04: Add upper bounds to Python dependency versions
 - **Source:** CODEREVIEW-20260325 §CR-5
 - **Files:** `pyproject.toml`, `gui/requirements.txt`
 - **Issue:** `PySide6>=6.6.0`, `PyYAML>=6.0`, `requests>=2.31.0` have no upper bounds. Breaking changes in major versions will not be caught.
 - **Fix:** Add `<7.0.0` or `<N+1.0` upper bounds. Add `requires-python = ">=3.11,<4"`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Upper bounds added to all deps in pyproject.toml. `requires-python = ">=3.11,<4"` set. gui/requirements.txt bounds aligned.
 
 ### T6-05: Add SHA-256 verification for C++ FetchContent downloads
 - **Source:** CODEREVIEW-20260325 §CR-5
 - **Files:** `cpp/cmake/dependencies.cmake`
 - **Issue:** nlohmann_json, spdlog, yaml-cpp fetched via git tag with no hash verification. Supply-chain attack vector.
-- **Fix:** Add `GIT_TAG_SHA512` or switch to tarball downloads with checksums.
-- **Status:** `[ ]`
+- **Fix:** Pinned GIT_TAG to full commit SHAs: nlohmann_json `9cca280a4d0ccf7c29f049debff758194de23041` (v3.11.3), spdlog `27cb4c76708608465c413f6d0e6b8d99a4d84302` (v1.14.1), yaml-cpp `f7320141120f720aecc4c32be25586e7da9eb978` (0.8.0).
+- **Status:** `[x]`
 
 ### T6-06: Fix `config.example.yaml` truncated asset IDs and internal inconsistencies
 - **Source:** CODEREVIEW-20260325 §CR-6
 - **Files:** `config.example.yaml` (L29, L32, L43-44)
 - **Issue:** Asset IDs truncated (32 of 64 hex chars). `tier_spacing_bps: [60, 200, 500, 1000]` has tiers exceeding `max_half_spread_bps: 250`. `wallet_fingerprint: 0` should be a clear placeholder.
 - **Fix:** Use full 64-char placeholder asset IDs. Align tier_spacing with max_half_spread_bps. Use descriptive placeholder for fingerprint.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Asset IDs padded to 64 hex chars. tier_spacing_bps reduced to [60,120,180,240] (all ≤ max_half_spread_bps 250). wallet_fingerprint uses descriptive placeholder.
 
 ### T6-07: Add error handling in GUI service initialization
 - **Source:** CODEREVIEW-20260325 §CR-7
 - **Files:** `gui/main.py`
 - **Issue:** `bridge.initialise()` failures not caught; UI shows responsive but is disconnected from backend.
 - **Fix:** Wrap in try/except, show QMessageBox error, exit gracefully.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `bridge.initialise()` wrapped in try/except with QMessageBox.critical and sys.exit(1).
 
 ### T6-08: Add LTO for Release builds
 - **Source:** CODEREVIEW-20260325 §CR-10
 - **Files:** `cpp/CMakeLists.txt`
 - **Issue:** No Link-Time Optimization in Release builds. 5-15% speedup available.
-- **Fix:** `set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)`
-- **Status:** `[ ]`
+- **Fix:** Added `CheckIPOSupported` check + `CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON` after hardening flags.
+- **Status:** `[x]`
 
 ### T6-09: Packaging files missing required assets
 - **Source:** CODEREVIEW-20260325 §CR-8, §CR-9
-- **Files:** `packaging/windows/installer.iss`, `packaging/linux/install.sh`
-- **Issue:** Windows installer references `icon.ico` not in repo. Linux script uses `${BASH_SOURCE[0]}` (bash-only). Desktop file has stale `Exec` path. No uninstall script for Linux.
-- **Status:** `[ ]`
+- **Files:** `packaging/windows/installer.iss`, `packaging/linux/install.sh`, `packaging/linux/xop_trader.desktop`, `packaging/linux/uninstall.sh`
+- **Issue:** Windows installer references `icon.ico` not in repo. Desktop file has stale `Exec` path. No uninstall script for Linux.
+- **Fix:** Icon generated at CI time via `generate_icon.py`. Desktop `Exec` path updated to `~/.local/bin/xop_trader_gui`. Uninstall script (`uninstall.sh`) added with `--purge` option. CI bundles uninstall script in Linux release tarball.
+- **Status:** `[x]`
 
 ### T6-10: Offer fee hardcoded (100M mojos) across all pairs
 - **Source:** CODEREVIEW-20260325 (offer_manager.cpp analysis)
-- **Files:** `cpp/src/execution/offer_manager.cpp` (L106, L279, L317), `cpp/src/execution/coin_manager.cpp` (L63)
+- **Files:** `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, `cpp/src/execution/offer_manager.cpp`, `cpp/src/execution/coin_manager.cpp`, `config.example.yaml`
 - **Issue:** Offer creation fee and split fee hardcoded at 100,000,000 mojos (~0.0001 XCH). If Chia network fee dynamics change, this must be configurable.
-- **Fix:** Move to AppConfig as `offer_fee_mojos` parameter.
-- **Status:** `[ ]`
+- **Fix:** Added `offer_fee_mojos` field to `StrategyConfig` (default 100M). YAML parsing with validation. All 5 hardcoded constants replaced with `strategy_cfg_.offer_fee_mojos`.
+- **Status:** `[x]`
 
 ---
 
@@ -859,19 +861,18 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-25 (code review + logic review pass 2)
+**Last verification:** 2026-03-25 (implementation pass: T1-12, T3-06, T6-01..07)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
-| **Tier 1 (Critical)** | 14 | 12 | 2 | 0 | Must fix before live trading |
+| **Tier 1 (Critical)** | 14 | 14 | 0 | 0 | Must fix before live trading |
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 29 | 3 | 3 | Quality, robustness, correctness |
+| **Tier 3 (Medium)** | 35 | 30 | 2 | 3 | Quality, robustness, correctness |
 | **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
 | **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
-| **Tier 6 (New 2026-03-25)** | 10 | 0 | 0 | 10 | Build, packaging, config, code quality |
-| **Total** | **121** | **67** | **7** | **47** | |
+| **Tier 6 (New 2026-03-25)** | 10 | 5 | 0 | 5 | Build, packaging, config, code quality |
+| **Total** | **121** | **75** | **4** | **42** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
-1. **T1-12** — Inventory units mismatch (mojos vs base units in A-S formula) — **CONFIRMED BROKEN**
-2. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)
+1. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)

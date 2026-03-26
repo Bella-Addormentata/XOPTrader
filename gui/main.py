@@ -156,7 +156,19 @@ def _start_services(
     app.aboutToQuit.connect(bridge.shutdown)
 
     # Run the startup sequence (config -> metrics -> DB -> ready).
-    bridge.initialise()
+    try:
+        bridge.initialise()
+    except Exception:
+        _log.exception("Service layer initialisation failed.")
+        from PySide6.QtWidgets import QMessageBox  # noqa: WPS433
+
+        QMessageBox.critical(
+            None,
+            "XOPTrader — Startup Error",
+            "Failed to initialise backend services.\n"
+            "Check the log output for details.",
+        )
+        sys.exit(1)
 
     _log.info("Service layer initialised (dry_run=%s).", dry_run)
     return bridge
