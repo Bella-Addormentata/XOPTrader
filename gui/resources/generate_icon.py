@@ -32,7 +32,7 @@ TRUNK_COLOR = (101,  67,  33, 255)   # brown
 LEAF_DARK   = ( 34, 120,  34, 255)   # dark green (bottom layer)
 LEAF_MID    = ( 56, 160,  56, 255)   # mid green
 LEAF_LIGHT  = ( 80, 200,  80, 255)   # bright green (top layer)
-TEXT_COLOR  = ( 20,  20,  20, 255)   # near-black for "XOP"
+TEXT_COLOR  = (255, 255, 255, 255)   # white for "XOP" label
 
 
 def create_base_image(size: int = 256) -> Image.Image:

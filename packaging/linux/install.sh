@@ -44,10 +44,15 @@ ask_yes_no() {
 # ---------------------------------------------------------------------------
 mkdir -p "$INSTALL_DIR"
 
-if [[ -f "$SCRIPT_DIR/xop_trader_gui" ]]; then
-  install -m 755 "$SCRIPT_DIR/xop_trader_gui" "$INSTALL_DIR/xop_trader_gui"
-  echo "Installed GUI binary → $INSTALL_DIR/xop_trader_gui"
+# Fail fast if the required GUI binary is missing
+if [[ ! -f "$SCRIPT_DIR/xop_trader_gui" ]]; then
+  echo "Error: Required GUI binary 'xop_trader_gui' not found in $SCRIPT_DIR." >&2
+  echo "Make sure you run install.sh from the directory that contains xop_trader_gui." >&2
+  exit 1
 fi
+
+install -m 755 "$SCRIPT_DIR/xop_trader_gui" "$INSTALL_DIR/xop_trader_gui"
+echo "Installed GUI binary → $INSTALL_DIR/xop_trader_gui"
 
 if [[ -f "$SCRIPT_DIR/xop_trader" ]]; then
   install -m 755 "$SCRIPT_DIR/xop_trader" "$INSTALL_DIR/xop_trader"

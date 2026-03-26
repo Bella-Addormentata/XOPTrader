@@ -17,7 +17,7 @@
 #endif
 
 [Setup]
-AppId={{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}
+AppId={{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}}
 AppName=XOPTrader
 AppVersion={#AppVersion}
 AppPublisher=XOPTrader Project
@@ -39,8 +39,8 @@ SolidCompression=yes
 WizardStyle=modern
 WizardSmallImageFile=icon.ico
 ; ---- Misc ----
-PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequired=admin
+PrivilegesRequiredOverridesAllowed=none
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 
