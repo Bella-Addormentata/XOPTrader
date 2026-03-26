@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (counter-research fixes CR-1/3/5/7/8 implemented)
+**Last Updated:** 2026-03-25 (code review + logic review pass 2)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -79,7 +79,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/strategy/liquidity.cpp`, `cpp/src/execution/offer_manager.cpp`
 - **Issue:** `LiquidityEngine` sets bid `TierQuote.size` as quote-side capital; `OfferManager::build_offer_dict()` interprets it as base quantity. Orders are materially mis-sized.
 - **Fix:** Make `TierQuote` explicit with `base_size` + `quote_notional`, or enforce one invariant.
-- **Status:** `[~]` — TierQuote.size is consistently base quantity in final builder. Semantics consistent but undocumented; consider adding explicit doc/strong types.
+- **Status:** `[~]` — TierQuote.size is consistently base quantity in final builder. Semantics consistent but undocumented; consider adding explicit doc/strong types. Verified 2026-03-25: no functional bug, but documentation/typing gap remains.
 
 ### T1-11: Create per-pair strategy instances (shared mutable state bug)
 - **Source:** CODEREVIEW-GPT-5.4 §6, CODEREVIEW-ClaudeCode-Opus §Phase2-7
@@ -89,11 +89,11 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Status:** `[x]` — Per-pair strategy instances via strategies_ map in engine. Each pair gets independent state.
 
 ### T1-12: Fix inventory units mismatch passed to Avellaneda-Stoikov
-- **Source:** CODEREVIEW-GPT-5.4 §7, LOGICREVIEW-GPT-5.4 §2, LOGICREVIEW-Gemini §3
-- **Files:** `cpp/src/engine.cpp` (lines ~728-738), `cpp/src/strategy/avellaneda.cpp`
-- **Issue:** `q_max` documented in base-asset units, but engine passes mojos. `q_ratio = q / q_max` off by orders of magnitude.
-- **Fix:** Normalize inventory to same unit convention as strategy config. Adopt one invariant (annualized σ + τ in years, OR per-block σ + τ in blocks) across entire codebase.
-- **Status:** `[~]` — Likely done (implicit unit handling), but undocumented. Needs explicit unit convention documentation.
+- **Source:** CODEREVIEW-GPT-5.4 §7, LOGICREVIEW-GPT-5.4 §2, LOGICREVIEW-Gemini §3, LOGICREVIEW-20260325-Claude-Opus-4.6 §LR-1
+- **Files:** `cpp/src/engine.cpp` (lines ~1144, ~1198), `cpp/src/strategy/avellaneda.cpp`
+- **Issue:** `q_max` documented in base-asset units, but engine passes mojos via `net_inventory()`. `q_ratio = q / q_max` off by ~10^12. Dimensional analysis confirms: mid (XCH) minus q (mojos) × gamma × sigma² × tau produces r ≈ -10^9, clamping all bids to zero. Sizing formula also broken: q_ratio ≈ 10^12 → bid_size = 0 always.
+- **Fix:** Convert q to base units: `double q = static_cast<double>(net_inventory(...)) / static_cast<double>(pair_cfg->base_mojos_per_unit);` Same conversion needed in Step 5 (line ~1198).
+- **Status:** `[~]` — **Confirmed still broken** by 2026-03-25 logic review. No conversion visible in engine.cpp between net_inventory() (mojos) and compute_quotes()/compute_spread() calls. BLOCKS LIVE TRADING.
 
 ### T1-13: Implement global maximum spread cap
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §ENG-1 (CRITICAL), LOGICREVIEW-Grok §3.1
@@ -746,7 +746,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Status:** `[ ]`
 
 ### T5-CR14: Evaluate multifractal volatility model as HMM alternative
-- **Source:** COUNTERRESEARCH §18 (CR-14, MEDIUM); Boldin (1996); Calvet & Fisher (2004)
+- **Source:** COUNTERRESEARCH §18 (CR-14, MEDIUM); Calvet & Fisher (2004)
 - **Files:** `cpp/src/strategy/regime.cpp`
 - **Issue:** HMM regime detection suffers from likelihood multimodality and regime identification fragility with short crypto histories. Multifractal models (Calvet-Fisher MSM) capture multi-scale volatility dynamics more faithfully.
 - **Fix:** Prototype Markov-Switching Multifractal (MSM) estimator alongside existing HMM. Compare regime stability over 1000+ blocks. If MSM produces fewer spurious regime switches, adopt as primary.
@@ -757,6 +757,81 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** Documentation / spread computation
 - **Issue:** Static Amihud-Mendelson spread-return framework ignores liquidity *risk* dynamics. Time-varying spread is more relevant for CHIA's intermittent liquidity.
 - **Fix:** Track rolling spread volatility (σ_spread over past N blocks). When spread-of-spread is high, increase safety margin on tier sizing to account for liquidity uncertainty.
+- **Status:** `[ ]`
+
+---
+
+## Tier 6 — New Findings from 2026-03-25 Review Cycle
+
+Items from [CODEREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/CODEREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6.md) and [LOGICREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/LOGICREVIEW-20260325-GitHubCopilot-Claude-Opus-4.6.md).
+
+### T6-01: Remove residual `assert()` calls in production code
+- **Source:** CODEREVIEW-20260325 §CR-1
+- **Files:** `cpp/src/backtest.cpp` (L505-506), `cpp/src/risk/hedging.cpp` (L61), `cpp/src/rpc/chia_rpc.cpp` (L332), `cpp/src/rpc/dexie_client.cpp` (L40-41)
+- **Issue:** 6 `assert()` calls compiled out in Release. Two are guarded by subsequent `if` checks (hedging.cpp, chia_rpc.cpp); four are not (backtest.cpp, dexie_client.cpp).
+- **Fix:** Replace with `throw std::invalid_argument(...)` or remove where runtime guard already exists.
+- **Status:** `[ ]`
+
+### T6-02: Fix `pyproject.toml` deprecated build backend
+- **Source:** CODEREVIEW-20260325 §CR-3
+- **Files:** `pyproject.toml` (L3)
+- **Issue:** `setuptools.backends._legacy:_Backend` is deprecated and will break in future setuptools.
+- **Fix:** Use `setuptools.build_meta`.
+- **Status:** `[ ]`
+
+### T6-03: Consolidate `requirements.txt` into `pyproject.toml`
+- **Source:** CODEREVIEW-20260325 §CR-4
+- **Files:** `gui/requirements.txt`, `pyproject.toml`
+- **Issue:** Two dependency manifests with non-overlapping packages. Confusing and error-prone.
+- **Fix:** Move GUI deps (`PySide6`, `pyqtgraph`, `requests`) into `[project.optional-dependencies] gui = [...]`.
+- **Status:** `[ ]`
+
+### T6-04: Add upper bounds to Python dependency versions
+- **Source:** CODEREVIEW-20260325 §CR-5
+- **Files:** `pyproject.toml`, `gui/requirements.txt`
+- **Issue:** `PySide6>=6.6.0`, `PyYAML>=6.0`, `requests>=2.31.0` have no upper bounds. Breaking changes in major versions will not be caught.
+- **Fix:** Add `<7.0.0` or `<N+1.0` upper bounds. Add `requires-python = ">=3.11,<4"`.
+- **Status:** `[ ]`
+
+### T6-05: Add SHA-256 verification for C++ FetchContent downloads
+- **Source:** CODEREVIEW-20260325 §CR-5
+- **Files:** `cpp/cmake/dependencies.cmake`
+- **Issue:** nlohmann_json, spdlog, yaml-cpp fetched via git tag with no hash verification. Supply-chain attack vector.
+- **Fix:** Add `GIT_TAG_SHA512` or switch to tarball downloads with checksums.
+- **Status:** `[ ]`
+
+### T6-06: Fix `config.example.yaml` truncated asset IDs and internal inconsistencies
+- **Source:** CODEREVIEW-20260325 §CR-6
+- **Files:** `config.example.yaml` (L29, L32, L43-44)
+- **Issue:** Asset IDs truncated (32 of 64 hex chars). `tier_spacing_bps: [60, 200, 500, 1000]` has tiers exceeding `max_half_spread_bps: 250`. `wallet_fingerprint: 0` should be a clear placeholder.
+- **Fix:** Use full 64-char placeholder asset IDs. Align tier_spacing with max_half_spread_bps. Use descriptive placeholder for fingerprint.
+- **Status:** `[ ]`
+
+### T6-07: Add error handling in GUI service initialization
+- **Source:** CODEREVIEW-20260325 §CR-7
+- **Files:** `gui/main.py`
+- **Issue:** `bridge.initialise()` failures not caught; UI shows responsive but is disconnected from backend.
+- **Fix:** Wrap in try/except, show QMessageBox error, exit gracefully.
+- **Status:** `[ ]`
+
+### T6-08: Add LTO for Release builds
+- **Source:** CODEREVIEW-20260325 §CR-10
+- **Files:** `cpp/CMakeLists.txt`
+- **Issue:** No Link-Time Optimization in Release builds. 5-15% speedup available.
+- **Fix:** `set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)`
+- **Status:** `[ ]`
+
+### T6-09: Packaging files missing required assets
+- **Source:** CODEREVIEW-20260325 §CR-8, §CR-9
+- **Files:** `packaging/windows/installer.iss`, `packaging/linux/install.sh`
+- **Issue:** Windows installer references `icon.ico` not in repo. Linux script uses `${BASH_SOURCE[0]}` (bash-only). Desktop file has stale `Exec` path. No uninstall script for Linux.
+- **Status:** `[ ]`
+
+### T6-10: Offer fee hardcoded (100M mojos) across all pairs
+- **Source:** CODEREVIEW-20260325 (offer_manager.cpp analysis)
+- **Files:** `cpp/src/execution/offer_manager.cpp` (L106, L279, L317), `cpp/src/execution/coin_manager.cpp` (L63)
+- **Issue:** Offer creation fee and split fee hardcoded at 100,000,000 mojos (~0.0001 XCH). If Chia network fee dynamics change, this must be configurable.
+- **Fix:** Move to AppConfig as `offer_fee_mojos` parameter.
 - **Status:** `[ ]`
 
 ---
@@ -784,7 +859,7 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-25 (counter-research integration complete)
+**Last verification:** 2026-03-25 (code review + logic review pass 2)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
@@ -792,6 +867,11 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
 | **Tier 3 (Medium)** | 35 | 29 | 3 | 3 | Quality, robustness, correctness |
 | **Tier 4 (Low/Enhancement)** | 27 | 0 | 2 | 25 | Improvements and strategic features |
-| **Tier 5 (Counter-Research)** | 15 | 1 | 0 | 14 | Academic challenges to cited literature |
-| **Total** | **111** | **62** | **7** | **42** | |
+| **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
+| **Tier 6 (New 2026-03-25)** | 10 | 0 | 0 | 10 | Build, packaging, config, code quality |
+| **Total** | **121** | **67** | **7** | **47** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
+
+### Blocking Items for Live Trading
+1. **T1-12** — Inventory units mismatch (mojos vs base units in A-S formula) — **CONFIRMED BROKEN**
+2. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)
