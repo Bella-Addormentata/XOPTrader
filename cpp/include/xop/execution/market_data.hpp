@@ -48,6 +48,7 @@
 #include "xop/config.hpp"
 #include "xop/state.hpp"
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <deque>
