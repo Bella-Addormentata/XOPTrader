@@ -23,6 +23,7 @@
 
 #include "xop/types.hpp"
 
+#include <atomic>
 #include <functional>
 #include <shared_mutex>
 #include <string>
