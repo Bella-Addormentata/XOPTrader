@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 
@@ -517,7 +518,7 @@ RegimeInfo ChiaEdgeOptimizer::current_regime() const
     return regime_;
 }
 
-const std::string& ChiaEdgeOptimizer::name() const
+std::string ChiaEdgeOptimizer::name() const
 {
     // T2-02: Shared lock -- read-only access to name_.
     std::shared_lock lock(mtx_);

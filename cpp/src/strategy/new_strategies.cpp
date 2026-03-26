@@ -33,6 +33,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <shared_mutex>
 
 namespace xop {
@@ -340,7 +341,7 @@ RegimeInfo CoinAgeWeightedQuoting::current_regime() const
     return regime_;
 }
 
-const std::string& CoinAgeWeightedQuoting::name() const
+std::string CoinAgeWeightedQuoting::name() const
 {
     // T2-02: Shared lock -- read-only access to name_.
     std::shared_lock lock(mtx_);
@@ -608,7 +609,7 @@ RegimeInfo BlockCadenceAdaptiveSpread::current_regime() const
     return regime_;
 }
 
-const std::string& BlockCadenceAdaptiveSpread::name() const
+std::string BlockCadenceAdaptiveSpread::name() const
 {
     // T2-02: Shared lock -- read-only access to name_.
     std::shared_lock lock(mtx_);
@@ -906,7 +907,7 @@ RegimeInfo MempoolSentinelStrategy::current_regime() const
     return regime_;
 }
 
-const std::string& MempoolSentinelStrategy::name() const
+std::string MempoolSentinelStrategy::name() const
 {
     // T2-02: Shared lock -- read-only access to name_.
     std::shared_lock lock(mtx_);
