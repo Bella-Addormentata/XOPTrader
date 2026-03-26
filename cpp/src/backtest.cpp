@@ -56,8 +56,8 @@ namespace xop {
 BacktestEngine::BacktestEngine() = default;
 BacktestEngine::~BacktestEngine() = default;
 
-BacktestEngine::BacktestEngine(BacktestEngine&&) noexcept = default;
-BacktestEngine& BacktestEngine::operator=(BacktestEngine&&) noexcept = default;
+// Move operations are deleted because BacktestEngine contains a std::mutex
+// (export_mtx_), which is non-movable.  See class declaration in backtest.hpp.
 
 // ===========================================================================
 //  Data loading
