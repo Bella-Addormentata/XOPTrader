@@ -5,7 +5,7 @@
 # before they land on the main branch.
 #
 # C++ check  — full CMake + vcpkg build on Ubuntu (GCC, C++20)
-# Python check — py_compile syntax scan of all .py files
+# Python check — compileall-based syntax scan of all .py files
 # =============================================================================
 
 name: Compile Check
