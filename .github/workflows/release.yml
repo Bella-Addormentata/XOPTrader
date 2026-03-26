@@ -13,9 +13,8 @@
 #   xop_trader-gui-windows-x64.exe        Python GUI — Windows (PyInstaller)
 #   xop_trader-installer-windows-x64.exe  Windows installer with desktop-shortcut prompt
 #   xop_trader-gui-linux-x64              Python GUI — Ubuntu (PyInstaller)
-#   xop_trader-linux-bundle.tar.gz        Linux bundle: binary + icon + .desktop + install.sh
+#   xop_trader-linux-bundle.tar.gz        Linux bundle: GUI binary + icon + .desktop + install.sh
 #   xop_trader-gui-macos-arm64            Python GUI — macOS (PyInstaller)
-#   xop_trader-0.1.0-py3-none-any.whl     Pure-Python wheel (pip-installable)
 #   config.example.yaml                   Reference configuration file
 # =============================================================================
 
@@ -242,6 +241,7 @@ jobs:
           cp gui/dist/xop_trader_gui          linux-bundle/
           cp gui/icon.png                     linux-bundle/
           cp config.example.yaml              linux-bundle/
+          cp packaging/linux/xop_trader.desktop linux-bundle/
           cp packaging/linux/install.sh       linux-bundle/
           chmod +x linux-bundle/install.sh linux-bundle/xop_trader_gui
           tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
@@ -313,7 +313,6 @@ jobs:
             | `xop_trader-linux-x64` | C++ engine — Ubuntu 22.04 x86-64 |
             | `xop_trader-gui-macos-arm64` | Python GUI — macOS (standalone) |
             | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
-            | `*.whl` | Pure-Python wheel (pip-installable) |
             | `config.example.yaml` | Reference configuration file |
             | `Source code (.zip / .tar.gz)` | GitHub-generated source archives |
 
