@@ -29,6 +29,7 @@
 #include <prometheus/histogram.h>
 #include <prometheus/registry.h>
 
+#include <mutex>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>

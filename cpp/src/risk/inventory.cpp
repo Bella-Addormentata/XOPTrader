@@ -34,6 +34,7 @@
 #include <cmath>
 #include <cstring>
 #include <limits>
+#include <mutex>
 #include <stdexcept>
 
 // ---------------------------------------------------------------------------
