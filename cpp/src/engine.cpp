@@ -1349,7 +1349,8 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                       mid_mojos))
                 : 0.5;
 
-            book_state.fill_rate_24h = 0.30;  // TODO: compute from fill history
+            book_state.fill_rate_24h = db_ ? db_->fill_rate_since_block(
+                block_height > 4608 ? block_height - 4608 : 0, 0.30) : 0.30;
             book_state.whale_active = market_data_->is_whale_active(pair_name);
             // [T1-11] Use per-pair strategy for regime classification.
             {
@@ -1483,7 +1484,10 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                         ? vol_it->second->get_sigma_block()
                         : 0.0;
                 }
-                mkt_params.fill_rate_per_block = 0.03;  // conservative estimate
+                mkt_params.fill_rate_per_block = db_
+                    ? std::max(0.005, db_->fill_rate_since_block(
+                          block_height > 4608 ? block_height - 4608 : 0, 0.03) / 4608.0)
+                    : 0.03;
                 // [HIGH-3] MarketParams::spread_bps is documented as the
                 // half-spread (one side).  The loss manager formula
                 // internally doubles it to compute the full round-trip
