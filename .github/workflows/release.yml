@@ -24,6 +24,8 @@ on:
   push:
     tags:
       - "v*"
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       tag:
@@ -33,6 +35,11 @@ on:
 
 permissions:
   contents: write   # needed to create releases and upload assets
+
+# Prevent duplicate runs when a release also creates a tag push
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
 
 # ---------------------------------------------------------------------------
 # Job 1 — Build the C++ engine on each OS
