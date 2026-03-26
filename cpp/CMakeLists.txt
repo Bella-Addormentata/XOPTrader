@@ -77,6 +77,15 @@ else()
     add_link_options(/guard:cf)
 endif()
 
+# ---------- Link-Time Optimization for Release (T6-08) ---------------------
+include(CheckIPOSupported)
+check_ipo_supported(RESULT _ipo_supported OUTPUT _ipo_output)
+if(_ipo_supported)
+    set(CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE ON)
+else()
+    message(STATUS "LTO not supported: ${_ipo_output}")
+endif()
+
 # ==========================================================================
 # Options
 # ==========================================================================

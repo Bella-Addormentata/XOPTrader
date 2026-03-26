@@ -115,6 +115,9 @@ struct StrategyConfig {
     /// from producing effective market withdrawal.
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
+
+    /// On-chain fee per offer/cancel (mojos).  Default 0.0001 XCH.
+    std::uint64_t offer_fee_mojos{100'000'000ULL};
 };
 
 // ---------------------------------------------------------------------------

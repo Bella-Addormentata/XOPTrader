@@ -110,10 +110,8 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         json result;
         try {
-            // Fee: 0.0001 XCH (100_000_000 mojos) per offer is standard.
-            constexpr std::uint64_t kOfferFee = 100'000'000ULL;
             result = co_await wallet_->create_offer(
-                offer_dict, kOfferFee, /*validate_only=*/false);
+                offer_dict, strategy_cfg_.offer_fee_mojos, /*validate_only=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} tier {}: {}",
                            pair.name, tier.tier_index, e.what());
@@ -338,9 +336,8 @@ asio::awaitable<int> OfferManager::cancel_stale(
 
         // Cancel via wallet RPC (secure = true to spend the locked coin).
         try {
-            constexpr std::uint64_t kCancelFee = 100'000'000ULL; // 0.0001 XCH
             co_await wallet_->cancel_offer(
-                po.offer_id, kCancelFee, /*secure=*/true);
+                po.offer_id, strategy_cfg_.offer_fee_mojos, /*secure=*/true);
 
             state_->remove_offer(po.offer_id);
             ++cancelled;
@@ -386,8 +383,7 @@ asio::awaitable<void> OfferManager::cancel_all()
     // Attempt bulk cancellation first (wallet cancel_offers endpoint).
     bool bulk_ok = false;
     try {
-        constexpr std::uint64_t kCancelFee = 100'000'000ULL;
-        co_await wallet_->cancel_offers(kCancelFee, /*secure=*/true);
+        co_await wallet_->cancel_offers(strategy_cfg_.offer_fee_mojos, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
         // Bulk success: all offers are considered cancelled.
@@ -401,9 +397,8 @@ asio::awaitable<void> OfferManager::cancel_all()
 
         for (const auto& po : all_offers) {
             try {
-                constexpr std::uint64_t kCancelFee = 100'000'000ULL;
                 co_await wallet_->cancel_offer(
-                    po.offer_id, kCancelFee, /*secure=*/true);
+                    po.offer_id, strategy_cfg_.offer_fee_mojos, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
                 cancelled_ids.push_back(po.offer_id);
             } catch (const rpc::ChiaRPCError& inner_e) {

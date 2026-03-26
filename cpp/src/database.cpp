@@ -173,6 +173,14 @@ constexpr const char* kTradeCount  = "SELECT COUNT(*) FROM trade_log;";
 constexpr const char* kOfferCount  = "SELECT COUNT(*) FROM offer_log;";
 constexpr const char* kSnapshotCount = "SELECT COUNT(*) FROM snapshots;";
 
+constexpr const char* kFillRateSinceBlock = R"SQL(
+SELECT
+    COALESCE(SUM(CASE WHEN status = 'filled' THEN 1 ELSE 0 END), 0),
+    COUNT(*)
+FROM offer_log
+WHERE created_block >= ? AND status IN ('filled', 'cancelled', 'expired');
+)SQL";
+
 } // anonymous namespace
 
 // ===========================================================================
@@ -215,6 +223,7 @@ Database::Database(const std::string& db_path)
     stmt_trade_count_        = prepare(kTradeCount);
     stmt_offer_count_        = prepare(kOfferCount);
     stmt_snapshot_count_     = prepare(kSnapshotCount);
+    stmt_fill_rate_          = prepare(kFillRateSinceBlock);
 
     spdlog::info("[Database] Schema migration complete; prepared statements compiled");
 }
@@ -232,6 +241,7 @@ Database::~Database()
     finalize(stmt_trade_count_);
     finalize(stmt_offer_count_);
     finalize(stmt_snapshot_count_);
+    finalize(stmt_fill_rate_);
 
     if (db_) {
         sqlite3_close(db_);
@@ -454,26 +464,59 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
 
 std::int64_t Database::trade_count() const
 {
-    sqlite3_step(stmt_trade_count_);
-    std::int64_t count = sqlite3_column_int64(stmt_trade_count_, 0);
+    int rc = sqlite3_step(stmt_trade_count_);
+    std::int64_t count = 0;
+    if (rc == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt_trade_count_, 0);
+    } else if (rc != SQLITE_DONE) {
+        spdlog::warn("Database::trade_count: sqlite3_step failed ({})", rc);
+    }
     sqlite3_reset(stmt_trade_count_);
     return count;
 }
 
 std::int64_t Database::offer_count() const
 {
-    sqlite3_step(stmt_offer_count_);
-    std::int64_t count = sqlite3_column_int64(stmt_offer_count_, 0);
+    int rc = sqlite3_step(stmt_offer_count_);
+    std::int64_t count = 0;
+    if (rc == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt_offer_count_, 0);
+    } else if (rc != SQLITE_DONE) {
+        spdlog::warn("Database::offer_count: sqlite3_step failed ({})", rc);
+    }
     sqlite3_reset(stmt_offer_count_);
     return count;
 }
 
 std::int64_t Database::snapshot_count() const
 {
-    sqlite3_step(stmt_snapshot_count_);
-    std::int64_t count = sqlite3_column_int64(stmt_snapshot_count_, 0);
+    int rc = sqlite3_step(stmt_snapshot_count_);
+    std::int64_t count = 0;
+    if (rc == SQLITE_ROW) {
+        count = sqlite3_column_int64(stmt_snapshot_count_, 0);
+    } else if (rc != SQLITE_DONE) {
+        spdlog::warn("Database::snapshot_count: sqlite3_step failed ({})", rc);
+    }
     sqlite3_reset(stmt_snapshot_count_);
     return count;
+}
+
+double Database::fill_rate_since_block(BlockHeight since, double fallback) const
+{
+    bind_int64(stmt_fill_rate_, 1, static_cast<std::int64_t>(since));
+    int rc = sqlite3_step(stmt_fill_rate_);
+    double rate = fallback;
+    if (rc == SQLITE_ROW) {
+        std::int64_t filled = sqlite3_column_int64(stmt_fill_rate_, 0);
+        std::int64_t total  = sqlite3_column_int64(stmt_fill_rate_, 1);
+        if (total > 0) {
+            rate = static_cast<double>(filled) / static_cast<double>(total);
+        }
+    } else if (rc != SQLITE_DONE) {
+        spdlog::warn("Database::fill_rate_since_block: sqlite3_step failed ({})", rc);
+    }
+    sqlite3_reset(stmt_fill_rate_);
+    return rate;
 }
 
 bool Database::is_open() const noexcept
