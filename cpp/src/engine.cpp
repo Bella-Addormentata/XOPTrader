@@ -1140,8 +1140,11 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         }
 
         // Compute inventory (signed net position in the pair's base asset).
+        // Convert from mojos to base-asset display units so that q and q_max
+        // are in the same units (T1-12 fix: prevents ~10^12 ratio error).
         double q = static_cast<double>(
-            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}));
+            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}))
+            / static_cast<double>(pair_cfg->base_mojos_per_unit);
 
         // Set cost basis on the per-pair strategy for the never-sell-at-loss
         // constraint.
@@ -1194,8 +1197,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         }
 
         // Inventory for spread sizing -- use the pair's actual base asset.
+        // Convert from mojos to base-asset display units (T1-12 fix).
         double q = static_cast<double>(
-            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}));
+            inventory_->net_inventory(AssetId{pair_cfg->base_asset_id}))
+            / static_cast<double>(pair_cfg->base_mojos_per_unit);
         double q_max = config_.strategy.q_max;
 
         // PIN estimate.
@@ -1271,6 +1276,20 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         }
 
         pcs.spread_result.total_spread_bps *= whale_mult * vpin_mult * ofi_mult;
+
+        // [T3-06] Graduated staleness spread widening.
+        // When data age exceeds 50% of stale_threshold, widen spreads
+        // linearly up to 2x at the threshold.  Beyond the threshold,
+        // Step 4 already pulls quotes entirely via is_stale().
+        double staleness_frac = market_data_->get_staleness_fraction(pair_name);
+        if (staleness_frac > 0.5) {
+            // Linear ramp from 1.0 at 50% to 2.0 at 100%.
+            double staleness_mult = 1.0 + std::min(staleness_frac - 0.5, 0.5) * 2.0;
+            pcs.spread_result.total_spread_bps *= staleness_mult;
+            spdlog::debug("[Engine] Step 5: {} staleness={:.0f}% spread widened by {:.2f}x",
+                          pair_name, staleness_frac * 100.0, staleness_mult);
+        }
+
         pcs.spread_result.half_spread =
             pcs.spread_result.total_spread_bps / 2.0;
 
@@ -1330,7 +1349,8 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                       mid_mojos))
                 : 0.5;
 
-            book_state.fill_rate_24h = 0.30;  // TODO: compute from fill history
+            book_state.fill_rate_24h = db_ ? db_->fill_rate_since_block(
+                block_height > 4608 ? block_height - 4608 : 0, 0.30) : 0.30;
             book_state.whale_active = market_data_->is_whale_active(pair_name);
             // [T1-11] Use per-pair strategy for regime classification.
             {
@@ -1464,7 +1484,10 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                         ? vol_it->second->get_sigma_block()
                         : 0.0;
                 }
-                mkt_params.fill_rate_per_block = 0.03;  // conservative estimate
+                mkt_params.fill_rate_per_block = db_
+                    ? std::max(0.005, db_->fill_rate_since_block(
+                          block_height > 4608 ? block_height - 4608 : 0, 0.03) / 4608.0)
+                    : 0.03;
                 // [HIGH-3] MarketParams::spread_bps is documented as the
                 // half-spread (one side).  The loss manager formula
                 // internally doubles it to compute the full round-trip

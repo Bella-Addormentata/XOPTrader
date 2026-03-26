@@ -213,6 +213,12 @@ public:
     /// Return the total number of rows in the snapshots table.
     [[nodiscard]] std::int64_t snapshot_count() const;
 
+    /// Compute fill rate from resolved offers created at or after the given block.
+    /// Returns the fraction of resolved offers that were filled (0.0-1.0).
+    /// If no resolved offers exist since the block, returns the provided default.
+    [[nodiscard]] double fill_rate_since_block(BlockHeight since,
+                                               double fallback = 0.30) const;
+
     /// True if the database connection is open and usable.
     [[nodiscard]] bool is_open() const noexcept;
 
@@ -289,6 +295,9 @@ private:
 
     /// SELECT COUNT(*) FROM snapshots
     sqlite3_stmt* stmt_snapshot_count_{nullptr};
+
+    /// Fill rate query: filled / total resolved offers since a given block
+    sqlite3_stmt* stmt_fill_rate_{nullptr};
 };
 
 }  // namespace xop

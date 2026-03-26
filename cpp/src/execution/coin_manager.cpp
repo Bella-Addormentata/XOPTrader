@@ -56,9 +56,7 @@ CoinManager::CoinManager(asio::io_context&                    ioc,
     , wallet_(std::move(wallet))
     , logger_(spdlog::default_logger()->clone("CoinMgr"))
 {
-    // Default split fee: 0.0001 XCH (100,000,000 mojos).
-    // This ensures prompt inclusion without overpaying.
-    default_split_fee_ = 100'000'000LL;
+    default_split_fee_ = static_cast<Mojo>(config.strategy.offer_fee_mojos);
 
     // Dust threshold: coins smaller than 1,000,000 mojos (0.000001 XCH)
     // are ignored to avoid unnecessary UTXO bloat.

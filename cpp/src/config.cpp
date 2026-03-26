@@ -412,6 +412,16 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     // else: default from StrategyConfig{} is used (250.0 bps).
 
+    // Optional: on-chain fee per offer/cancel (mojos).  Default 0.0001 XCH.
+    if (node["offer_fee_mojos"] && node["offer_fee_mojos"].IsDefined()
+        && !node["offer_fee_mojos"].IsNull()) {
+        auto fee = node["offer_fee_mojos"].as<std::uint64_t>();
+        if (fee == 0) {
+            throw ConfigError(sec + ".offer_fee_mojos must be > 0");
+        }
+        cfg.offer_fee_mojos = fee;
+    }
+
     return cfg;
 }
 
