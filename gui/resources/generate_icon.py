@@ -46,7 +46,7 @@ def create_base_image(size: int = 256) -> Image.Image:
     tw  = s * 0.10   # trunk width
     th  = s * 0.22   # trunk height
     ty0 = s * 0.78   # trunk top y
-    ty1 = s * 0.93   # trunk bottom y
+    ty1 = ty0 + th   # trunk bottom y
     draw.rectangle(
         [cx - tw / 2, ty0, cx + tw / 2, ty1],
         fill=TRUNK_COLOR,
