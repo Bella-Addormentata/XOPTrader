@@ -1,0 +1,352 @@
+# =============================================================================
+# release.yml — XOPTrader automated release workflow
+#
+# Triggers on a version tag push (v*) or manual workflow_dispatch.
+# Builds the C++ engine and Python GUI for three platforms and attaches
+# all artifacts to a new GitHub Release.
+#
+# Artifacts included in the release
+# -----------------------------------
+#   xop_trader-windows-x64.exe            C++ engine — Windows 64-bit
+#   xop_trader-linux-x64                  C++ engine — Ubuntu 22.04 x86-64
+#   xop_trader-macos-arm64                C++ engine — macOS 14 Apple-Silicon
+#   xop_trader-gui-windows-x64.exe        Python GUI — Windows (PyInstaller)
+#   xop_trader-installer-windows-x64.exe  Windows installer with desktop-shortcut prompt
+#   xop_trader-gui-linux-x64              Python GUI — Ubuntu (PyInstaller)
+#   xop_trader-linux-bundle.tar.gz        Linux bundle: binary + icon + .desktop + install.sh
+#   xop_trader-gui-macos-arm64            Python GUI — macOS (PyInstaller)
+#   xop_trader-0.1.0-py3-none-any.whl     Pure-Python wheel (pip-installable)
+#   config.example.yaml                   Reference configuration file
+# =============================================================================
+
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag (e.g. v0.1)"
+        required: true
+        default: "v0.1"
+
+permissions:
+  contents: write   # needed to create releases and upload assets
+
+# ---------------------------------------------------------------------------
+# Job 1 — Build the C++ engine on each OS
+# ---------------------------------------------------------------------------
+jobs:
+  build-cpp:
+    name: C++ engine (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: xop_trader-windows-x64.exe
+            cmake_build_type: Release
+            binary_path: build/Release/xop_trader.exe
+          - os: ubuntu-22.04
+            artifact_name: xop_trader-linux-x64
+            cmake_build_type: Release
+            binary_path: build/xop_trader
+          - os: macos-latest
+            artifact_name: xop_trader-macos-arm64
+            cmake_build_type: Release
+            binary_path: build/xop_trader
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      # ---- vcpkg setup with caching ----------------------------------------
+      - name: Set up vcpkg
+        uses: lukka/run-vcpkg@v11
+        with:
+          vcpkgDirectory: "${{ github.workspace }}/vcpkg"
+          vcpkgJsonGlob: "cpp/vcpkg.json"
+
+      # ---- System dependencies (Ubuntu) ------------------------------------
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libcurl4-openssl-dev
+
+      # ---- CMake configure & build -----------------------------------------
+      - name: Configure CMake
+        working-directory: cpp
+        run: >
+          cmake -B ../build -S .
+          -DCMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
+          -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
+          -DVCPKG_TARGET_TRIPLET=${{ runner.os == 'Windows' && 'x64-windows' || runner.os == 'Linux' && 'x64-linux' || 'arm64-osx' }}
+
+      - name: Build
+        run: cmake --build build --config ${{ matrix.cmake_build_type }} --parallel
+
+      # ---- Rename binary to platform-specific name -------------------------
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp ${{ matrix.binary_path }} ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "${{ matrix.binary_path }}" "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 2 — Build the Python GUI with PyInstaller on each OS
+  # ---------------------------------------------------------------------------
+  build-gui:
+    name: Python GUI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact_name: xop_trader-gui-windows-x64.exe
+            dist_path: gui/dist/xop_trader_gui.exe
+            icon_fmt: ico
+            icon_flag: --icon icon.ico
+          - os: ubuntu-22.04
+            artifact_name: xop_trader-gui-linux-x64
+            dist_path: gui/dist/xop_trader_gui
+            icon_fmt: png
+            icon_flag: --icon icon.png
+          - os: macos-latest
+            artifact_name: xop_trader-gui-macos-arm64
+            dist_path: gui/dist/xop_trader_gui
+            icon_fmt: png
+            icon_flag: --icon icon.png
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ---- Ubuntu system libs for PySide6 ----------------------------------
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            libgl1 libegl1 libxcb-cursor0 libxkbcommon-x11-0 \
+            libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-xfixes0 \
+            libdbus-1-3 libfontconfig1 libfreetype6
+
+      - name: Install Python dependencies
+        working-directory: gui
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller pillow
+
+      # ---- Generate application icon ---------------------------------------
+      - name: Generate application icon
+        working-directory: gui
+        run: python resources/generate_icon.py . ${{ matrix.icon_fmt }}
+
+      # ---- Build with PyInstaller ------------------------------------------
+      - name: Build with PyInstaller
+        working-directory: gui
+        run: >
+          pyinstaller
+          --onefile
+          --name xop_trader_gui
+          --windowed
+          ${{ matrix.icon_flag }}
+          main.py
+
+      # ---- Rename dist to platform-specific name ---------------------------
+      - name: Rename binary (Unix)
+        if: runner.os != 'Windows'
+        run: cp ${{ matrix.dist_path }} ${{ matrix.artifact_name }}
+
+      - name: Rename binary (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: Copy-Item "${{ matrix.dist_path }}" "${{ matrix.artifact_name }}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      # =========================================================================
+      # Windows — build an Inno Setup installer that prompts for desktop shortcut
+      # =========================================================================
+      - name: Install Inno Setup
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: choco install innosetup --yes --no-progress
+
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Resolve AppVersion from tag (strip leading 'v'), fall back to "0.1"
+          $version = if ($env:GITHUB_REF -match "refs/tags/v(.+)") { $Matches[1] } `
+                     elseif ("${{ github.event.inputs.tag }}" -match "v(.+)") { $Matches[1] } `
+                     else { "0.1" }
+
+          # Assemble the files Inno Setup expects in one directory
+          New-Item -ItemType Directory -Force -Path installer-staging
+          Copy-Item packaging\windows\installer.iss  installer-staging\
+          Copy-Item gui\dist\xop_trader_gui.exe       installer-staging\
+          Copy-Item gui\icon.ico                      installer-staging\
+          Copy-Item config.example.yaml               installer-staging\
+
+          # Compile the installer
+          iscc /DAppVersion=$version `
+               /O"installer-staging" `
+               installer-staging\installer.iss
+
+          Copy-Item installer-staging\xop_trader-installer-windows-x64.exe .
+
+      - name: Upload Windows installer artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xop_trader-installer-windows-x64
+          path: xop_trader-installer-windows-x64.exe
+          if-no-files-found: error
+
+      # =========================================================================
+      # Linux — bundle binary + icon + .desktop file + install.sh
+      # =========================================================================
+      - name: Build Linux install bundle
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p linux-bundle
+          cp gui/dist/xop_trader_gui          linux-bundle/
+          cp gui/icon.png                     linux-bundle/
+          cp config.example.yaml              linux-bundle/
+          cp packaging/linux/install.sh       linux-bundle/
+          chmod +x linux-bundle/install.sh linux-bundle/xop_trader_gui
+          tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
+
+      - name: Upload Linux bundle artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xop_trader-linux-bundle
+          path: xop_trader-linux-bundle.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 3 — Create the GitHub Release and upload all artifacts
+  # ---------------------------------------------------------------------------
+  release:
+    name: Create GitHub Release
+    needs: [build-cpp, build-gui]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Download every artifact uploaded by the build jobs
+      - uses: actions/download-artifact@v4
+        with:
+          path: release-assets/
+
+      # Flatten the nested per-artifact directories produced by download-artifact
+      - name: Flatten artifact directories
+        run: |
+          find release-assets -mindepth 2 -type f \
+               -exec mv -t release-assets/ {} +
+          find release-assets -mindepth 1 -type d -delete
+
+      # Include the example config in the release
+      - name: Copy example config
+        run: cp config.example.yaml release-assets/config.example.yaml
+
+      # Resolve the tag: prefer the real git tag, fall back to workflow_dispatch input
+      - name: Resolve release tag
+        id: tag
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
+            echo "value=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.value }}
+          name: "XOPTrader ${{ steps.tag.outputs.value }}"
+          body: |
+            ## XOPTrader ${{ steps.tag.outputs.value }}
+
+            Automated release of the XOPTrader CHIA DEX market-making engine.
+
+            ### Included artifacts
+
+            | File | Description |
+            |------|-------------|
+            | `xop_trader-installer-windows-x64.exe` | **Windows installer** — prompts to create desktop shortcut |
+            | `xop_trader-gui-windows-x64.exe` | Windows GUI standalone binary (no installer) |
+            | `xop_trader-windows-x64.exe` | C++ engine — Windows 64-bit |
+            | `xop_trader-linux-bundle.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
+            | `xop_trader-gui-linux-x64` | Linux GUI standalone binary (no installer) |
+            | `xop_trader-linux-x64` | C++ engine — Ubuntu 22.04 x86-64 |
+            | `xop_trader-gui-macos-arm64` | Python GUI — macOS (standalone) |
+            | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
+            | `*.whl` | Pure-Python wheel (pip-installable) |
+            | `config.example.yaml` | Reference configuration file |
+            | `Source code (.zip / .tar.gz)` | GitHub-generated source archives |
+
+            ### Quick start
+
+            **Windows** — run the installer and follow the wizard:
+            ```
+            xop_trader-installer-windows-x64.exe
+            ```
+            The installer will offer to create a desktop shortcut (optional, unchecked by default).
+
+            **Linux** — extract the bundle and run the install script:
+            ```bash
+            tar -xzf xop_trader-linux-bundle.tar.gz
+            ./install.sh          # prompts: "Create a desktop shortcut?" [Y/n]
+            # or: ./install.sh --no-desktop  (skip the prompt)
+            ```
+
+            **macOS** — run the GUI binary directly; drag it to Applications if you wish:
+            ```bash
+            chmod +x xop_trader-gui-macos-arm64
+            ./xop_trader-gui-macos-arm64
+            ```
+
+            **All platforms** — copy the example config and edit before first run:
+            ```bash
+            cp config.example.yaml config.yaml
+            # edit config.yaml with your credentials
+            ./xop_trader-{platform} --config config.yaml
+            ```
+
+            See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
+          draft: false
+          prerelease: false
+          files: release-assets/*
+          generate_release_notes: true

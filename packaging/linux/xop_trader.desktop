@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=XOPTrader
+GenericName=Chia DEX Market Maker
+Comment=Automated market-making bot for the Chia XOP DEX
+Exec=xop_trader_gui
+Icon=xop_trader
+Categories=Finance;
+Terminal=false
+StartupNotify=true
+StartupWMClass=xop_trader_gui
