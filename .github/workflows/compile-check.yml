@@ -53,13 +53,13 @@ jobs:
         run: >
           cmake -B ../build -S .
           -DCMAKE_BUILD_TYPE=Debug
-          -DXOP_BUILD_TESTS=OFF
+          -DXOP_BUILD_TESTS=ON
           -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=x64-linux
 
       # ---- Build (compile-error check) -------------------------------------
       - name: Build
-        run: cmake --build build --parallel
+        run: cmake --build build --config Debug --parallel
 
   # ---------------------------------------------------------------------------
   # Job 2 — Python syntax check
@@ -77,6 +77,8 @@ jobs:
           python-version: "3.11"
 
       - name: Check Python syntax
+        env:
+          PYTHONDONTWRITEBYTECODE: "1"
         run: |
           find . -name "*.py" -not -path "./.git/*" \
             -print -exec python -m py_compile {} \;
