@@ -7,14 +7,16 @@
 #
 # Artifacts included in the release
 # -----------------------------------
-#   xop_trader-windows-x64.exe       C++ engine — Windows 64-bit
-#   xop_trader-linux-x64             C++ engine — Ubuntu 22.04 x86-64
-#   xop_trader-macos-arm64           C++ engine — macOS 14 Apple-Silicon
-#   xop_trader-gui-windows-x64.exe   Python GUI  — Windows (PyInstaller)
-#   xop_trader-gui-linux-x64         Python GUI  — Ubuntu  (PyInstaller)
-#   xop_trader-gui-macos-arm64       Python GUI  — macOS   (PyInstaller)
-#   xop_trader-0.1.0-py3-none-any.whl  Pure-Python wheel (pip-installable)
-#   config.example.yaml              Reference configuration file
+#   xop_trader-windows-x64.exe            C++ engine — Windows 64-bit
+#   xop_trader-linux-x64                  C++ engine — Ubuntu 22.04 x86-64
+#   xop_trader-macos-arm64                C++ engine — macOS 14 Apple-Silicon
+#   xop_trader-gui-windows-x64.exe        Python GUI — Windows (PyInstaller)
+#   xop_trader-installer-windows-x64.exe  Windows installer with desktop-shortcut prompt
+#   xop_trader-gui-linux-x64              Python GUI — Ubuntu (PyInstaller)
+#   xop_trader-linux-bundle.tar.gz        Linux bundle: binary + icon + .desktop + install.sh
+#   xop_trader-gui-macos-arm64            Python GUI — macOS (PyInstaller)
+#   xop_trader-0.1.0-py3-none-any.whl     Pure-Python wheel (pip-installable)
+#   config.example.yaml                   Reference configuration file
 # =============================================================================
 
 name: Release
@@ -119,12 +121,18 @@ jobs:
           - os: windows-latest
             artifact_name: xop_trader-gui-windows-x64.exe
             dist_path: gui/dist/xop_trader_gui.exe
+            icon_fmt: ico
+            icon_flag: --icon icon.ico
           - os: ubuntu-22.04
             artifact_name: xop_trader-gui-linux-x64
             dist_path: gui/dist/xop_trader_gui
+            icon_fmt: png
+            icon_flag: --icon icon.png
           - os: macos-latest
             artifact_name: xop_trader-gui-macos-arm64
             dist_path: gui/dist/xop_trader_gui
+            icon_fmt: png
+            icon_flag: --icon icon.png
 
     steps:
       - uses: actions/checkout@v4
@@ -151,8 +159,14 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller
+          pip install pyinstaller pillow
 
+      # ---- Generate application icon ---------------------------------------
+      - name: Generate application icon
+        working-directory: gui
+        run: python resources/generate_icon.py . ${{ matrix.icon_fmt }}
+
+      # ---- Build with PyInstaller ------------------------------------------
       - name: Build with PyInstaller
         working-directory: gui
         run: >
@@ -160,6 +174,7 @@ jobs:
           --onefile
           --name xop_trader_gui
           --windowed
+          ${{ matrix.icon_flag }}
           main.py
 
       # ---- Rename dist to platform-specific name ---------------------------
@@ -176,6 +191,63 @@ jobs:
         with:
           name: ${{ matrix.artifact_name }}
           path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+      # =========================================================================
+      # Windows — build an Inno Setup installer that prompts for desktop shortcut
+      # =========================================================================
+      - name: Build Windows installer (Inno Setup)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          # Resolve AppVersion from tag (strip leading 'v'), fall back to "0.1"
+          $version = if ($env:GITHUB_REF -match "refs/tags/v(.+)") { $Matches[1] } `
+                     elseif ("${{ github.event.inputs.tag }}" -match "v(.+)") { $Matches[1] } `
+                     else { "0.1" }
+
+          # Assemble the files Inno Setup expects in one directory
+          New-Item -ItemType Directory -Force -Path installer-staging
+          Copy-Item packaging\windows\installer.iss  installer-staging\
+          Copy-Item gui\dist\xop_trader_gui.exe       installer-staging\
+          Copy-Item gui\icon.ico                      installer-staging\
+          Copy-Item config.example.yaml               installer-staging\
+
+          # Compile the installer
+          iscc /DAppVersion=$version `
+               /O"installer-staging" `
+               installer-staging\installer.iss
+
+          Copy-Item installer-staging\xop_trader-installer-windows-x64.exe .
+
+      - name: Upload Windows installer artifact
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xop_trader-installer-windows-x64
+          path: xop_trader-installer-windows-x64.exe
+          if-no-files-found: error
+
+      # =========================================================================
+      # Linux — bundle binary + icon + .desktop file + install.sh
+      # =========================================================================
+      - name: Build Linux install bundle
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p linux-bundle
+          cp gui/dist/xop_trader_gui          linux-bundle/
+          cp gui/icon.png                     linux-bundle/
+          cp config.example.yaml              linux-bundle/
+          cp packaging/linux/install.sh       linux-bundle/
+          cp packaging/linux/xop_trader.desktop linux-bundle/
+          chmod +x linux-bundle/install.sh linux-bundle/xop_trader_gui
+          tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
+
+      - name: Upload Linux bundle artifact
+        if: runner.os == 'Linux'
+        uses: actions/upload-artifact@v4
+        with:
+          name: xop_trader-linux-bundle
+          path: xop_trader-linux-bundle.tar.gz
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -254,21 +326,45 @@ jobs:
 
             | File | Description |
             |------|-------------|
+            | `xop_trader-installer-windows-x64.exe` | **Windows installer** — prompts to create desktop shortcut |
+            | `xop_trader-gui-windows-x64.exe` | Windows GUI standalone binary (no installer) |
             | `xop_trader-windows-x64.exe` | C++ engine — Windows 64-bit |
+            | `xop_trader-linux-bundle.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
+            | `xop_trader-gui-linux-x64` | Linux GUI standalone binary (no installer) |
             | `xop_trader-linux-x64` | C++ engine — Ubuntu 22.04 x86-64 |
-            | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
-            | `xop_trader-gui-windows-x64.exe` | Python GUI — Windows (standalone) |
-            | `xop_trader-gui-linux-x64` | Python GUI — Ubuntu (standalone) |
             | `xop_trader-gui-macos-arm64` | Python GUI — macOS (standalone) |
+            | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
             | `*.whl` | Pure-Python wheel (pip-installable) |
             | `config.example.yaml` | Reference configuration file |
             | `Source code (.zip / .tar.gz)` | GitHub-generated source archives |
 
             ### Quick start
 
-            1. Download the binary for your platform.
-            2. Copy `config.example.yaml` to `config.yaml` and fill in your credentials.
-            3. Run the engine: `./xop_trader-linux-x64 --config config.yaml`
+            **Windows** — run the installer and follow the wizard:
+            ```
+            xop_trader-installer-windows-x64.exe
+            ```
+            The installer will offer to create a desktop shortcut (optional, unchecked by default).
+
+            **Linux** — extract the bundle and run the install script:
+            ```bash
+            tar -xzf xop_trader-linux-bundle.tar.gz
+            ./install.sh          # prompts: "Create a desktop shortcut?" [Y/n]
+            # or: ./install.sh --no-desktop  (skip the prompt)
+            ```
+
+            **macOS** — run the GUI binary directly; drag it to Applications if you wish:
+            ```bash
+            chmod +x xop_trader-gui-macos-arm64
+            ./xop_trader-gui-macos-arm64
+            ```
+
+            **All platforms** — copy the example config and edit before first run:
+            ```bash
+            cp config.example.yaml config.yaml
+            # edit config.yaml with your credentials
+            ./xop_trader-{platform} --config config.yaml
+            ```
 
             See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
           draft: false
