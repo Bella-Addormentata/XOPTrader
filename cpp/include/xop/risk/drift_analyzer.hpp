@@ -493,13 +493,20 @@ public:
 
     // -- Real-time monitoring ------------------------------------------------
 
-    /// Check whether the current drift rate is anomalous relative to the
-    /// expected drift under the given market condition.
+    /// Check whether the current drift rate is anomalous by testing whether
+    /// the empirical inventory-ratio drift is statistically distinguishable
+    /// from zero.
     ///
-    /// @param condition  Current market regime.
+    /// Specifically, computes z = |slope| / sigma from the OLS regression of
+    /// the observation window and returns true when z > anomaly_z_threshold.
+    /// A z-score above the threshold indicates that inventory is drifting
+    /// systematically (in either direction) faster than sampling noise would
+    /// explain — a signal to review position limits regardless of the current
+    /// market condition.
+    ///
     /// @return True if the z-score of the empirical drift exceeds the
-    ///         configured threshold.
-    bool is_drift_anomalous(MarketCondition condition) const;
+    ///         configured anomaly_z_threshold.
+    bool is_drift_anomalous() const;
 
     /// Get the empirical drift rate (change in inventory ratio per block)
     /// estimated from the rolling observation window.
