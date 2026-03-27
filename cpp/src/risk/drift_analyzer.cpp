@@ -563,7 +563,7 @@ std::vector<TimeToBreachEntry> InventoryDriftAnalyzer::compute_breach_table() co
 // ===========================================================================
 
 bool InventoryDriftAnalyzer::is_drift_anomalous(
-    MarketCondition condition) const
+    [[maybe_unused]] MarketCondition condition) const
 {
     auto emp = empirical_drift();
     if (!emp.has_value() || emp->second <= 0.0) {

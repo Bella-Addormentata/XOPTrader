@@ -1561,7 +1561,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 }
 
 // Step 7: Generate multi-tier offer ladder.
-void Engine::step_generate_ladder(BlockHeight block_height)
+void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid) continue;
@@ -1725,7 +1725,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 }
 
 // Step 9: Check arbitrage opportunities.
-void Engine::step_check_arbitrage(BlockHeight block_height)
+void Engine::step_check_arbitrage([[maybe_unused]] BlockHeight block_height)
 {
     // Arbitrage scanning is driven by the MarketDataFeed's ArbitrageSignal
     // callback.  Here we check for signals that fired during step 1.
@@ -1749,7 +1749,7 @@ void Engine::step_check_arbitrage(BlockHeight block_height)
 // [T3-08] Now calls compute_nhe() with actual fill data from Step 2
 // accumulators (nhe_net_inventory_change_, nhe_total_volume_) and
 // alerts when NHE drops below the 0.70 target.
-void Engine::step_run_hedging(BlockHeight block_height)
+void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 {
     // Layer 1: inventory-based skew (already applied in step 7 via
     // LiquidityEngine::apply_inventory_skew).
@@ -1839,7 +1839,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // Mark-to-market all positions.
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
-        [this](const std::string& pair, const std::string& asset) -> Mojo {
+        [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
             auto snap = state_->get_market(pair);
             return snap.mid_price;
         },

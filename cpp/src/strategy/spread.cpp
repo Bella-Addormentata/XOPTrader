@@ -21,6 +21,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <string>
 
 namespace xop {
 
