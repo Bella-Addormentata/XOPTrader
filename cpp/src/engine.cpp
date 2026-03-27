@@ -294,8 +294,11 @@ void Engine::shutdown()
     state_->set_status(BotStatus::ShuttingDown);
 
     // Cancel the polling timer so the loop exits.
-    boost::system::error_code ec;
-    poll_timer_.cancel(ec);
+    try {
+        poll_timer_.cancel();
+    } catch (const boost::system::system_error& e) {
+        spdlog::warn("[Engine] poll_timer_.cancel() failed: {}", e.what());
+    }
 
     // [HIGH-2] Cancel all outstanding offers on-chain (secure cancellation).
     //
