@@ -464,10 +464,16 @@ TEST_F(AvellanedaTest, ZeroInventorySymmetricQuotes) {
     // r = S when q = 0.
     EXPECT_NEAR(strategy.reservation_price(S, sigma, q, tau), S, 1e-10);
 
-    // Quotes should be symmetric around S.
-    auto quotes = strategy.compute_quotes(S, sigma, q, 0);
+    // Quotes should be symmetric around the mid price when q = 0, i.e.
+    // (bid + ask) / 2 == r == mid.
+    //
+    // Note: with sigma=0.05 and tau_max=3120s the half-spread delta≈3.38 >
+    // S=2.70, so bid would go negative and be floored to 0, breaking the
+    // midpoint invariant.  Use S=10.0 (> delta) to keep the bid positive.
+    const double S_large = 10.0;
+    auto quotes = strategy.compute_quotes(S_large, sigma, q, 0);
     const double mid = (quotes.bid_price + quotes.ask_price) / 2.0;
-    EXPECT_NEAR(mid, S, 1e-6);
+    EXPECT_NEAR(mid, S_large, 1e-6);
 }
 
 // ============================================================================

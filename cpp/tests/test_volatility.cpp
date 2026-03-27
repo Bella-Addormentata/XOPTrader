@@ -148,7 +148,7 @@ TEST(VolatilityTest, AnnualisationFactor) {
         const double expected_ratio =
             std::sqrt(365.25 * 24.0 * 3600.0 / 52.0);
         EXPECT_NEAR(ratio, expected_ratio, 0.1);
-        EXPECT_NEAR(expected_ratio, 779.15, 0.1);
+        EXPECT_NEAR(expected_ratio, 779.0, 0.1);
     }
 }
 
