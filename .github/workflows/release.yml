@@ -76,6 +76,7 @@ jobs:
         with:
           vcpkgDirectory: "${{ github.workspace }}/vcpkg"
           vcpkgJsonGlob: "cpp/vcpkg.json"
+          vcpkgCommitId: "c3867e714dd3a51c272826eea77267876517ed99"
 
       # ---- System dependencies (Ubuntu) ------------------------------------
       - name: Install system dependencies (Ubuntu)
