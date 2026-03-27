@@ -30,13 +30,18 @@ jobs:
         with:
           submodules: recursive
 
+      # ---- Read vcpkg baseline from manifest (single source of truth) -------
+      - name: Read vcpkg baseline
+        id: vcpkg-baseline
+        run: echo "sha=$(jq -r '.["builtin-baseline"]' cpp/vcpkg.json)" >> "$GITHUB_OUTPUT"
+
       # ---- vcpkg setup with caching ----------------------------------------
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: "${{ github.workspace }}/vcpkg"
           vcpkgJsonGlob: "cpp/vcpkg.json"
-          vcpkgCommitId: "c3867e714dd3a51c272826eea77267876517ed99"
+          vcpkgCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
 
       # ---- System dependencies ---------------------------------------------
       - name: Install system dependencies
