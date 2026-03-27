@@ -310,18 +310,12 @@ TEST(RegimeDetectionTest, RegimeTransition) {
     EXPECT_EQ(regime_mr.regime, xop::MarketRegime::MeanReverting);
 
     // Phase 2: flush with AR(1) autocorrelated data to replace the window.
-    // A constant drift (no noise) gives zero 1-period variance and VR=1 by
-    // default; use AR(1) with positive rho to produce genuine Momentum.
-    uint32_t ar_seed = 31337;
-    double ar_price = 2.70;
-    double ar_r_prev = 0.0;
-    for (int i = 100; i < 250; ++i) {
-        double eps = lcg_step(ar_seed);
-        double r_t = 0.5 * ar_r_prev + 0.02 * eps;  // AR(1) rho=0.5
-        ar_price *= std::exp(r_t);
-        if (ar_price < 0.01) ar_price = 0.01;
-        ar_r_prev = r_t;
-        strategy.update_price(ar_price, static_cast<xop::BlockHeight>(i));
+    // generate_ar1_prices() with rho=0.5 produces genuine positive serial
+    // autocorrelation (VR≈1.9, Z≈4.3 >> 1.96), triggering the Momentum regime.
+    auto ar_prices = generate_ar1_prices(150, 2.70, 0.5, 0.02, 31337);
+    for (size_t i = 0; i < ar_prices.size(); ++i) {
+        strategy.update_price(ar_prices[i],
+                              static_cast<xop::BlockHeight>(100 + i));
     }
 
     auto regime_mo = strategy.current_regime();
