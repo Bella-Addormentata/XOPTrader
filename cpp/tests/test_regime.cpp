@@ -30,6 +30,19 @@
 namespace {
 
 // ============================================================================
+// LCG pseudo-random helper (deterministic, reproducible across platforms)
+// ============================================================================
+//
+// Advances the seed using the classic Glibc LCG formula and returns a
+// uniform draw in [-1, 1].  All price generators use this shared helper
+// to guarantee identical behaviour regardless of call site.
+
+inline double lcg_step(uint32_t& seed) {
+    seed = seed * 1103515245u + 12345u;
+    return (static_cast<double>(seed % 10001) / 10000.0 - 0.5) * 2.0;
+}
+
+// ============================================================================
 // Helper: generate synthetic Ornstein-Uhlenbeck (OU) mean-reverting prices
 // ============================================================================
 //
@@ -49,9 +62,7 @@ std::vector<double> generate_ou_prices(
     double p = mu;
     for (int i = 0; i < n; ++i) {
         prices.push_back(p);
-        // Deterministic pseudo-random: LCG.
-        seed = seed * 1103515245u + 12345u;
-        double eps = (static_cast<double>(seed % 10001) / 10000.0 - 0.5) * 2.0;
+        double eps = lcg_step(seed);
         p += theta * (mu - p) + sigma_noise * eps;
         // Floor price at a small positive number.
         if (p < 0.01) p = 0.01;
@@ -66,9 +77,13 @@ std::vector<double> generate_ou_prices(
 //
 //   P_{t+1} = P_t * exp(drift + sigma * epsilon_t)
 //
-// Positive drift creates an upward trend; the variance of k-period returns
-// exceeds k * variance of 1-period returns, yielding VR > 1.
+// NOTE: Although the name says "trending", this generator produces IID
+// log-returns (mean=drift, constant variance).  Because VR(q) is computed
+// after subtracting the sample mean, IID returns yield VR ≈ 1 regardless
+// of the drift magnitude.  For tests that require VR > 1 (Momentum regime),
+// use generate_ar1_prices() which produces genuine positive autocorrelation.
 
+[[maybe_unused]]
 std::vector<double> generate_trending_prices(
     int n, double start, double drift, double sigma, uint32_t seed)
 {
@@ -78,10 +93,42 @@ std::vector<double> generate_trending_prices(
     double p = start;
     for (int i = 0; i < n; ++i) {
         prices.push_back(p);
-        seed = seed * 1103515245u + 12345u;
-        double eps = (static_cast<double>(seed % 10001) / 10000.0 - 0.5) * 2.0;
+        double eps = lcg_step(seed);
         p *= std::exp(drift + sigma * eps);
         if (p < 0.01) p = 0.01;
+    }
+
+    return prices;
+}
+
+// ============================================================================
+// Helper: generate prices with AR(1) log-returns (genuine momentum)
+// ============================================================================
+//
+//   r_t = rho * r_{t-1} + sigma * epsilon_t   (AR(1) log return)
+//   P_t = P_{t-1} * exp(r_t)
+//
+// With rho > 0, returns exhibit positive serial autocorrelation, which
+// causes VR(q) > 1 and Z > 1.96 at window sizes n=100+.  This is the
+// correct model for testing the Momentum regime.
+//
+// Example: rho=0.5, sigma=0.02 gives VR(5) ≈ 1.8 >> 1.15, Z ≈ 3.7 >> 1.96.
+
+std::vector<double> generate_ar1_prices(
+    int n, double start, double rho, double sigma, uint32_t seed)
+{
+    std::vector<double> prices;
+    prices.reserve(static_cast<size_t>(n));
+
+    double p = start;
+    double r_prev = 0.0;
+    for (int i = 0; i < n; ++i) {
+        prices.push_back(p);
+        double eps = lcg_step(seed);
+        double r_t = rho * r_prev + sigma * eps;
+        p *= std::exp(r_t);
+        if (p < 0.01) p = 0.01;
+        r_prev = r_t;
     }
 
     return prices;
@@ -160,12 +207,15 @@ TEST(RegimeDetectionTest, OUProcessMeanReverting) {
 TEST(RegimeDetectionTest, TrendingPricesMomentum) {
     auto cfg = regime_test_config();
 
-    // Strong drift: 1% per block, low noise.
-    auto prices = generate_trending_prices(200, 2.70, 0.01, 0.002, 99);
+    // AR(1) log-returns (rho=0.5) produce genuine positive autocorrelation:
+    // VR(5) ≈ 1.8 >> 1.15 and Z ≈ 3.7 >> 1.96 at n=100.
+    // A plain drift (IID returns) yields VR ≈ 1 after mean subtraction and
+    // would not trigger the Momentum regime.
+    auto prices = generate_ar1_prices(200, 2.70, 0.5, 0.02, 99);
     auto regime = feed_prices_to_as(prices, cfg);
 
     EXPECT_EQ(regime.regime, xop::MarketRegime::Momentum)
-        << "Strongly trending prices should be classified as Momentum";
+        << "AR(1) autocorrelated returns should be classified as Momentum";
     EXPECT_GT(regime.variance_ratio, 1.15)
         << "VR should exceed 1.15 for momentum data";
     EXPECT_NEAR(regime.spread_mult, 1.50, 1e-10);
@@ -211,8 +261,7 @@ TEST(RegimeDetectionTest, HysteresisNoFlipOnSingleOutlier) {
     double price = 2.70;
     uint32_t seed = 7777;
     for (int i = 0; i < 150; ++i) {
-        seed = seed * 1103515245u + 12345u;
-        double ret = (static_cast<double>(seed % 10001) / 10000.0 - 0.5) * 0.002;
+        double ret = lcg_step(seed) * 0.001;
         price *= std::exp(ret);
         strategy.update_price(price, static_cast<xop::BlockHeight>(i));
     }
@@ -260,11 +309,13 @@ TEST(RegimeDetectionTest, RegimeTransition) {
     auto regime_mr = strategy.current_regime();
     EXPECT_EQ(regime_mr.regime, xop::MarketRegime::MeanReverting);
 
-    // Phase 2: flush with strongly trending data to replace the window.
-    double trending_price = 2.70;
-    for (int i = 100; i < 250; ++i) {
-        trending_price *= std::exp(0.01);  // 1% drift per block
-        strategy.update_price(trending_price, static_cast<xop::BlockHeight>(i));
+    // Phase 2: flush with AR(1) autocorrelated data to replace the window.
+    // generate_ar1_prices() with rho=0.5 produces genuine positive serial
+    // autocorrelation (VR≈1.9, Z≈4.3 >> 1.96), triggering the Momentum regime.
+    auto ar_prices = generate_ar1_prices(150, 2.70, 0.5, 0.02, 31337);
+    for (size_t i = 0; i < ar_prices.size(); ++i) {
+        strategy.update_price(ar_prices[i],
+                              static_cast<xop::BlockHeight>(100 + i));
     }
 
     auto regime_mo = strategy.current_regime();
@@ -311,7 +362,10 @@ TEST(RegimeDetectionTest, VRDirectionMeanReverting) {
 
 TEST(RegimeDetectionTest, VRDirectionTrending) {
     auto cfg = regime_test_config();
-    auto prices = generate_trending_prices(200, 2.70, 0.008, 0.001, 456);
+    // AR(1) with positive rho produces genuine positive serial autocorrelation,
+    // ensuring VR > 1.0.  A plain drift (IID returns) gives VR ≈ 1 after
+    // mean subtraction and cannot reliably satisfy this inequality.
+    auto prices = generate_ar1_prices(200, 2.70, 0.4, 0.02, 456);
     auto regime = feed_prices_to_as(prices, cfg);
 
     EXPECT_GT(regime.variance_ratio, 1.0)
@@ -409,9 +463,11 @@ TEST(RegimeDetectionTest, ThresholdBoundaryVerification) {
         EXPECT_EQ(s.current_regime().regime, xop::MarketRegime::MeanReverting);
     }
 
-    // VR > 1.15 (strong trend) => Momentum.
+    // VR > 1.15 (AR(1) autocorrelated returns) => Momentum.
+    // generate_trending_prices() uses IID+drift which gives VR≈1 after mean
+    // subtraction.  generate_ar1_prices() with rho=0.5 gives genuine VR>>1.15.
     {
-        auto prices = generate_trending_prices(200, 2.70, 0.01, 0.001, 333);
+        auto prices = generate_ar1_prices(200, 2.70, 0.5, 0.02, 333);
         auto regime = feed_prices_to_as(prices, cfg);
         EXPECT_EQ(regime.regime, xop::MarketRegime::Momentum);
     }
