@@ -148,6 +148,7 @@ add_library(xop_core STATIC
     # -- RPC / networking ------------------------------------------------------
     src/rpc/chia_rpc.cpp
     src/rpc/dexie_client.cpp
+    src/rpc/coingecko_client.cpp
 
     # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp

@@ -265,6 +265,60 @@ struct ArbitrageSettings {
 };
 
 // ---------------------------------------------------------------------------
+// CoinGecko external price reference -- free-tier API configuration.
+//
+// Provides CEX-grade mid-prices for assets that have CoinGecko listings.
+// The free tier allows ~10-30 calls/min with no API key.  An optional
+// api_key field supports the "Demo" plan (30 calls/min guaranteed).
+//
+// Asset mapping:
+//   XCH          -> coingecko id "chia"
+//   wmilliETH.b  -> coingecko id "ethereum" (price / 1000)
+//   wmilliETH    -> coingecko id "ethereum" (price / 1000)
+//   wUSDC.b      -> coingecko id "usd-coin" (~1.0)
+//   BYC          -> no CoinGecko listing (DEX-only)
+// ---------------------------------------------------------------------------
+struct CoinGeckoConfig {
+    bool        enabled{false};              // Master switch.
+
+    /// Base URL for the CoinGecko API (no trailing slash).
+    std::string base_url{"https://api.coingecko.com/api/v3"};
+
+    /// CoinGecko coin IDs to fetch (e.g. "chia", "ethereum", "usd-coin").
+    std::vector<std::string> coin_ids;
+
+    /// How often to poll CoinGecko (milliseconds).  Free tier: 30-60 s.
+    uint32_t    polling_interval_ms{30'000};
+
+    /// HTTP request timeout.
+    uint32_t    request_timeout_ms{15'000};
+
+    /// TCP + TLS connect timeout.
+    uint32_t    connect_timeout_ms{10'000};
+
+    /// Maximum retries on 429 / 5xx.
+    uint32_t    max_retries{3};
+
+    /// Base delay between retries (exponential backoff).
+    uint32_t    retry_base_delay_ms{1'000};
+
+    /// Rate limiter: max requests per window.
+    uint32_t    rate_limit_max_requests{10};
+
+    /// Rate limiter: sliding window width (milliseconds).
+    uint32_t    rate_limit_window_ms{60'000};
+
+    /// Number of threads in the CURL worker pool.
+    uint32_t    curl_thread_pool_size{2};
+
+    /// Optional API key (CoinGecko Demo plan).  Empty = free tier.
+    std::string api_key;
+
+    /// User-Agent header.
+    std::string user_agent{"XOPTrader-CoinGecko/1.0"};
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -278,6 +332,7 @@ struct AppConfig {
     DatabaseConfig   database;
     DepegConfig      depeg;
     ArbitrageSettings arbitrage;
+    CoinGeckoConfig  coingecko;
 };
 
 // ---------------------------------------------------------------------------

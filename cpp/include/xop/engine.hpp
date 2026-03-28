@@ -43,6 +43,7 @@
 // RPC / API clients
 #include "xop/rpc/chia_rpc.hpp"
 #include "xop/rpc/dexie_client.hpp"
+#include "xop/rpc/coingecko_client.hpp"
 
 // Execution layer
 #include "xop/execution/coin_manager.hpp"
@@ -91,6 +92,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -389,6 +391,16 @@ private:
 
     /// Dexie aggregator REST client (shared with OfferManager for submission).
     std::shared_ptr<rpc::DexieClient> dexie_;
+
+    /// CoinGecko external price reference client.
+    std::shared_ptr<rpc::CoinGeckoClient> coingecko_;
+
+    /// Cached CoinGecko prices (coin_id -> USD price).
+    /// Updated once per polling_interval_ms in step_update_market_state.
+    std::map<std::string, double> coingecko_prices_;
+
+    /// Timestamp of the last successful CoinGecko fetch.
+    std::chrono::steady_clock::time_point coingecko_last_fetch_;
 
     // -- Execution layer -----------------------------------------------------
 

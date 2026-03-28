@@ -98,6 +98,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     dexie_cfg.rate_limit_max_requests = config_.dexie.max_requests_per_10s;
     dexie_ = std::make_shared<rpc::DexieClient>(ioc_, dexie_cfg);
 
+    // Build CoinGecko client from AppConfig (external price reference).
+    if (config_.coingecko.enabled) {
+        coingecko_ = std::make_shared<rpc::CoinGeckoClient>(
+            ioc_, config_.coingecko);
+    }
+
     // -- Execution layer ------------------------------------------------------
 
     coin_mgr_ = std::make_unique<execution::CoinManager>(
@@ -1003,6 +1009,24 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     // Ingest the current block height into the market data feed.
     market_data_->ingest_block_height(block_height);
 
+    // -- CoinGecko external price reference (throttled by polling interval) ---
+    // Fetch once per polling_interval_ms; cache prices for the per-pair loop.
+    if (coingecko_ && coingecko_->is_open()) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto interval = std::chrono::milliseconds{
+            config_.coingecko.polling_interval_ms};
+        if (now - coingecko_last_fetch_ >= interval) {
+            try {
+                coingecko_prices_ = co_await coingecko_->fetch_prices();
+                coingecko_last_fetch_ = now;
+            } catch (const std::exception& ex) {
+                // Transient CoinGecko errors should not abort the cycle.
+                spdlog::warn("[Engine] Step 1: CoinGecko fetch failed: {}",
+                             ex.what());
+            }
+        }
+    }
+
     // For each enabled pair, fetch the latest dexie ticker data.
     // [T3-24] Track per-pair success for dependency-aware gating.
     for (const auto& pair : config_.pairs) {
@@ -1098,8 +1122,48 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                          "for {}: {}", pair.name, ex.what());
         }
 
-        // CEX reference ingestion would go here (Phase 2: OKX/Gate.io).
-        // market_data_->ingest_cex_reference(pair.name, cex_mid);
+        // -- CoinGecko-derived CEX reference price ----------------------------
+        // Derive a pair-level mid-price from the cached CoinGecko USD prices.
+        //
+        //   XCH/wUSDC.b     : chia.usd / usd-coin.usd
+        //   wmilliETH.b/XCH : (ethereum.usd / 1000) / chia.usd
+        //   wmilliETH/XCH   : (ethereum.usd / 1000) / chia.usd
+        //   XCH/BYC         : no CoinGecko listing for BYC (skipped)
+        //   BYC/wUSDC.b     : no CoinGecko listing for BYC (skipped)
+        //
+        if (!coingecko_prices_.empty()) {
+            double cex_mid = 0.0;
+            bool   derived = false;
+
+            if (pair.name == "XCH/wUSDC.b") {
+                auto xch_it  = coingecko_prices_.find("chia");
+                auto usdc_it = coingecko_prices_.find("usd-coin");
+                if (xch_it != coingecko_prices_.end() &&
+                    usdc_it != coingecko_prices_.end() &&
+                    usdc_it->second > 0.0) {
+                    cex_mid = xch_it->second / usdc_it->second;
+                    derived = true;
+                }
+            } else if (pair.name == "wmilliETH.b/XCH" ||
+                       pair.name == "wmilliETH/XCH") {
+                auto eth_it = coingecko_prices_.find("ethereum");
+                auto xch_it = coingecko_prices_.find("chia");
+                if (eth_it != coingecko_prices_.end() &&
+                    xch_it != coingecko_prices_.end() &&
+                    xch_it->second > 0.0) {
+                    // wmilliETH = 1/1000 of ETH
+                    cex_mid = (eth_it->second / 1000.0) / xch_it->second;
+                    derived = true;
+                }
+            }
+            // Pairs with no CoinGecko mapping (BYC) are silently skipped.
+
+            if (derived && cex_mid > 0.0) {
+                market_data_->ingest_cex_reference(pair.name, cex_mid);
+                spdlog::debug("[Engine] Step 1: {} CoinGecko cex_mid={:.6f}",
+                              pair.name, cex_mid);
+            }
+        }
 
         // [T3-24] Set the market_data_valid flag for this pair.
         // Steps 4-8 are gated on this flag; if Step 1 fails for a pair,
@@ -2621,6 +2685,13 @@ asio::awaitable<void> Engine::open_connections()
     spdlog::info("[Engine] Connected to dexie API at {}",
                  config_.dexie.api_base);
 
+    // Open the CoinGecko client if enabled.
+    if (coingecko_) {
+        coingecko_->open();
+        spdlog::info("[Engine] CoinGecko price reference enabled "
+                     "(polling every {}ms)", config_.coingecko.polling_interval_ms);
+    }
+
     co_return;
 }
 
@@ -2629,6 +2700,9 @@ void Engine::close_connections()
     full_node_->close();
     wallet_->close();
     dexie_->close();
+    if (coingecko_) {
+        coingecko_->close();
+    }
     spdlog::info("[Engine] All connections closed");
 }
 
