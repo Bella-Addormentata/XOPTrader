@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-10)
+**Last Updated:** 2026-03-28 (implementation pass 3: T3-02, T3-04, T4-02, T4-03, T4-09, T4-11, T4-15, T4-16, T4-17, T4-18, T4-22, T5-CR6, T5-CR15)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -874,17 +874,17 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-26 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-09, T6-10 + CHANGELOG + CI tests)
+**Last verification:** 2026-03-28 (implementation pass 3: T3-02, T3-04, T4-02, T4-03, T4-09, T4-11, T4-15, T4-16, T4-17, T4-18, T4-22, T5-CR6, T5-CR15)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
 | **Tier 1 (Critical)** | 14 | 14 | 0 | 0 | Must fix before live trading |
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 31 | 2 | 2 | Quality, robustness, correctness |
-| **Tier 4 (Low/Enhancement)** | 27 | 3 | 2 | 22 | Improvements and strategic features |
-| **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
+| **Tier 3 (Medium)** | 35 | 33 | 2 | 0 | Quality, robustness, correctness |
+| **Tier 4 (Low/Enhancement)** | 27 | 12 | 2 | 13 | Improvements and strategic features |
+| **Tier 5 (Counter-Research)** | 15 | 8 | 0 | 7 | Academic challenges to cited literature |
 | **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
-| **Total** | **121** | **84** | **4** | **33** | |
+| **Total** | **121** | **97** | **4** | **20** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
