@@ -118,6 +118,11 @@ struct StrategyConfig {
 
     /// On-chain fee per offer/cancel (mojos).  Default 0.0001 XCH.
     std::uint64_t offer_fee_mojos{100'000'000ULL};
+
+    /// Number of blocks to observe in startup market-analysis mode before
+    /// entering active trading.  0 = skip analysis.  Default 20 blocks
+    /// (~17 minutes at 52 s/block).  Range [0, 1440].
+    uint32_t startup_analysis_blocks{20};
 };
 
 // ---------------------------------------------------------------------------

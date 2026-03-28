@@ -79,6 +79,9 @@
 #include "xop/risk/loss_manager.hpp"
 #include "xop/risk/drift_analyzer.hpp"
 
+// Startup market analysis
+#include "xop/data/market_analyzer.hpp"
+
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -467,6 +470,19 @@ private:
 
     /// Inventory drift analyzer — random walk, trending, Monte Carlo.
     std::unique_ptr<InventoryDriftAnalyzer> drift_analyzer_;
+
+    // -- Startup market analysis ---------------------------------------------
+
+    /// Startup market analyzer.  Collects market observations for
+    /// config_.strategy.startup_analysis_blocks blocks before entering
+    /// active trading.  nullptr when startup_analysis_blocks == 0.
+    std::unique_ptr<MarketAnalyzer> market_analyzer_;
+
+    /// [T0] Coroutine: run the startup analysis phase.  Collects
+    /// startup_analysis_blocks blocks of market data, exports per-block
+    /// metrics, and logs the completed analysis summary.  Called from
+    /// poll_loop_coro() before the main trading loop begins.
+    boost::asio::awaitable<void> run_startup_analysis();
 
     // -- Runtime state -------------------------------------------------------
 

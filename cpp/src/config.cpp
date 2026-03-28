@@ -422,6 +422,16 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.offer_fee_mojos = fee;
     }
 
+    // Optional: startup market-analysis window (blocks).  0 = skip.
+    if (node["startup_analysis_blocks"] && node["startup_analysis_blocks"].IsDefined()
+        && !node["startup_analysis_blocks"].IsNull()) {
+        auto blocks = node["startup_analysis_blocks"].as<uint32_t>();
+        if (blocks > 1440) {
+            throw ConfigError(sec + ".startup_analysis_blocks must be <= 1440");
+        }
+        cfg.startup_analysis_blocks = blocks;
+    }
+
     return cfg;
 }
 

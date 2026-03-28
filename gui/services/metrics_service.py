@@ -493,6 +493,64 @@ class MetricsService(QObject):
             "concentration": concentration,
         }
 
+    def get_analysis(self, pairs: list[str]) -> dict[str, dict[str, float]]:
+        """Return startup market analysis metrics for all specified pairs.
+
+        Reads the ``xop_analysis`` (global) and ``xop_analysis_pair``
+        (per-pair) metrics published by the C++ engine during the
+        ``Analyzing`` phase.
+
+        Parameters
+        ----------
+        pairs : list[str]
+            Pair names to query (e.g. ``["XCH/wUSDC"]``).
+
+        Returns
+        -------
+        dict[str, dict[str, float]]
+            Outer key: pair name.
+            Inner keys: ``blocks_collected``, ``blocks_target``,
+            ``vol_annual``, ``mean_spread_bps``, ``spread_cv``,
+            ``variance_ratio``, ``book_imbalance``, ``momentum``,
+            ``regime_code``, ``agg_code``, ``complete``.
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        blocks_target = _labelled(
+            m, "xop_analysis", "metric", "blocks_target"
+        )
+
+        result: dict[str, dict[str, float]] = {}
+        for pair in pairs:
+            def _pair_metric(metric_name: str, default: float = 0.0, _p: str = pair) -> float:
+                inner = m.get("xop_analysis_pair", {})
+                for labels, value in inner.items():
+                    label_dict = dict(labels)
+                    if (label_dict.get("pair_name") == _p and
+                            label_dict.get("metric") == metric_name):
+                        return value
+                return default
+
+            collected = _pair_metric("blocks_collected")
+            complete  = _pair_metric("complete") >= 1.0
+
+            result[pair] = {
+                "blocks_collected": collected,
+                "blocks_target":    blocks_target,
+                "vol_annual":       _pair_metric("volatility_annual"),
+                "mean_spread_bps":  _pair_metric("mean_spread_bps"),
+                "spread_cv":        _pair_metric("spread_cv"),
+                "variance_ratio":   _pair_metric("variance_ratio", default=1.0),
+                "book_imbalance":   _pair_metric("book_imbalance", default=0.5),
+                "momentum":         _pair_metric("momentum"),
+                "regime_code":      _pair_metric("regime", default=1.0),
+                "agg_code":         _pair_metric("aggressiveness", default=1.0),
+                "complete":         1.0 if complete else 0.0,
+            }
+
+        return result
+
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.
 
