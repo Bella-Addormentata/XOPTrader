@@ -43,6 +43,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 #include <vector>
 #include <unordered_map>
 
@@ -144,6 +145,14 @@ struct CexPrice {
 /// All pair prices for triangular-arb scanning.
 /// Key: "BASE/QUOTE" (e.g. "XCH/SBX"), Value: mid-price (quote per base).
 using PairPriceMap = std::unordered_map<std::string, double>;
+
+/// Per-pair depth information for liquidity-aware arb sizing.
+/// Key: "BASE/QUOTE", Value: available depth (base-asset units) at best level.
+using PairDepthMap = std::unordered_map<std::string, double>;
+
+/// Set of pair names flagged as stablecoin-vs-stablecoin (e.g. "BYC/wUSDC.b").
+/// Used to boost confidence and tighten slippage estimates for pegged pairs.
+using StablecoinPairSet = std::unordered_set<std::string>;
 
 // ---------------------------------------------------------------------------
 // ArbitrageConfig -- tunable parameters for each arbitrage strategy.
@@ -380,10 +389,21 @@ public:
     ///
     /// @param all_pair_prices  Map of "BASE/QUOTE" -> mid_price for all
     ///                         known pairs.
+    /// @param pair_depths      Optional depth map (base-asset units available
+    ///                         at best level) per pair.  If provided, trade
+    ///                         size is capped at the minimum depth across all
+    ///                         three legs.  If empty, falls back to the
+    ///                         conservative fixed trade_size.
+    /// @param stablecoin_pairs Optional set of pair names that are
+    ///                         stablecoin-vs-stablecoin.  Legs through these
+    ///                         pairs receive a confidence boost (lower vol,
+    ///                         higher mean-reversion).
     ///
     /// @return Vector of opportunities, sorted by estimated_profit descending.
     std::vector<ArbitrageOpportunity>
-    scan_triangular(const PairPriceMap& all_pair_prices) const;
+    scan_triangular(const PairPriceMap& all_pair_prices,
+                    const PairDepthMap& pair_depths = {},
+                    const StablecoinPairSet& stablecoin_pairs = {}) const;
 
     /// Scan for cross-bridge arbitrage between wUSDC variants.
     ///
@@ -428,6 +448,12 @@ public:
     /// Set the latest pair-price map for triangular scanning.
     void set_pair_prices(const PairPriceMap& prices);
 
+    /// Set the latest per-pair depth map for liquidity-aware sizing.
+    void set_pair_depths(const PairDepthMap& depths);
+
+    /// Set the set of stablecoin-vs-stablecoin pair names.
+    void set_stablecoin_pairs(const StablecoinPairSet& pairs);
+
     /// Set the latest wUSDC and wUSDC.b prices for cross-bridge scanning.
     void set_bridge_prices(double wusdc_price, double wusdc_b_price);
 
@@ -457,6 +483,8 @@ private:
     std::vector<DexieBookSnapshot>  cached_dexie_books_;
     std::vector<TibetSwapReserves>  cached_tibetswap_reserves_;
     PairPriceMap                    cached_pair_prices_;
+    PairDepthMap                    cached_pair_depths_;
+    StablecoinPairSet               cached_stablecoin_pairs_;
     double                          cached_wusdc_price_{0.0};
     double                          cached_wusdc_b_price_{0.0};
 };

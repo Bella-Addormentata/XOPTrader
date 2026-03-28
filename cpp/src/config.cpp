@@ -334,6 +334,134 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         validate_asset_id(p.base_asset_id, "base_asset_id");
         validate_asset_id(p.quote_asset_id, "quote_asset_id");
 
+        // -- Per-pair strategy overrides (all optional) ---------------------
+        if (item["gamma_override"] && item["gamma_override"].IsDefined()
+            && !item["gamma_override"].IsNull()) {
+            double v = item["gamma_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".gamma_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.gamma_override = v;
+        }
+        if (item["kappa_override"] && item["kappa_override"].IsDefined()
+            && !item["kappa_override"].IsNull()) {
+            double v = item["kappa_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".kappa_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.kappa_override = v;
+        }
+        if (item["phi_override"] && item["phi_override"].IsDefined()
+            && !item["phi_override"].IsNull()) {
+            double v = item["phi_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".phi_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.phi_override = v;
+        }
+        if (item["q_max_override"] && item["q_max_override"].IsDefined()
+            && !item["q_max_override"].IsNull()) {
+            double v = item["q_max_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".q_max_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.q_max_override = v;
+        }
+        if (item["min_profit_margin_bps_override"]
+            && item["min_profit_margin_bps_override"].IsDefined()
+            && !item["min_profit_margin_bps_override"].IsNull()) {
+            double v = item["min_profit_margin_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".min_profit_margin_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.min_profit_margin_bps_override = v;
+        }
+        if (item["tier_spacing_bps_override"]
+            && item["tier_spacing_bps_override"].IsSequence()
+            && item["tier_spacing_bps_override"].size() > 0) {
+            std::vector<double> ts;
+            ts.reserve(item["tier_spacing_bps_override"].size());
+            for (std::size_t j = 0; j < item["tier_spacing_bps_override"].size(); ++j) {
+                double v = item["tier_spacing_bps_override"][j].as<double>();
+                if (!(v > 0.0)) {
+                    throw ConfigError(idx + ".tier_spacing_bps_override[" + std::to_string(j)
+                                      + "] must be > 0; got " + std::to_string(v));
+                }
+                ts.push_back(v);
+            }
+            p.tier_spacing_bps_override = std::move(ts);
+        }
+        if (item["tier_size_pct_override"]
+            && item["tier_size_pct_override"].IsSequence()
+            && item["tier_size_pct_override"].size() > 0) {
+            std::vector<double> tp;
+            tp.reserve(item["tier_size_pct_override"].size());
+            for (std::size_t j = 0; j < item["tier_size_pct_override"].size(); ++j) {
+                double v = item["tier_size_pct_override"][j].as<double>();
+                if (!(v > 0.0 && v <= 1.0)) {
+                    throw ConfigError(idx + ".tier_size_pct_override[" + std::to_string(j)
+                                      + "] must be in (0, 1]; got " + std::to_string(v));
+                }
+                tp.push_back(v);
+            }
+            double tp_sum = std::accumulate(tp.begin(), tp.end(), 0.0);
+            if (std::fabs(tp_sum - 1.0) > 0.01) {
+                throw ConfigError(idx + ".tier_size_pct_override must sum to ~1.0; got "
+                                  + std::to_string(tp_sum));
+            }
+            p.tier_size_pct_override = std::move(tp);
+        }
+
+        // -- Stablecoin peg configuration (optional) ------------------------
+        if (item["is_stablecoin"] && item["is_stablecoin"].IsDefined()
+            && !item["is_stablecoin"].IsNull()) {
+            p.is_stablecoin = item["is_stablecoin"].as<bool>();
+        }
+        if (item["peg_target"] && item["peg_target"].IsDefined()
+            && !item["peg_target"].IsNull()) {
+            double v = item["peg_target"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".peg_target must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.peg_target = v;
+        }
+        if (item["depeg_warn_pct"] && item["depeg_warn_pct"].IsDefined()
+            && !item["depeg_warn_pct"].IsNull()) {
+            double v = item["depeg_warn_pct"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".depeg_warn_pct must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.depeg_warn_pct = v;
+        }
+        if (item["depeg_bail_pct"] && item["depeg_bail_pct"].IsDefined()
+            && !item["depeg_bail_pct"].IsNull()) {
+            double v = item["depeg_bail_pct"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".depeg_bail_pct must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.depeg_bail_pct = v;
+        }
+        if (item["depeg_sustained_blocks"] && item["depeg_sustained_blocks"].IsDefined()
+            && !item["depeg_sustained_blocks"].IsNull()) {
+            p.depeg_sustained_blocks = item["depeg_sustained_blocks"].as<uint32_t>();
+        }
+
+        // Validate: depeg_bail_pct must exceed depeg_warn_pct.
+        if (p.is_stablecoin && p.depeg_bail_pct <= p.depeg_warn_pct) {
+            throw ConfigError(idx + ".depeg_bail_pct ("
+                              + std::to_string(p.depeg_bail_pct)
+                              + ") must be greater than depeg_warn_pct ("
+                              + std::to_string(p.depeg_warn_pct) + ")");
+        }
+
         pairs.push_back(std::move(p));
     }
 
@@ -505,6 +633,125 @@ DatabaseConfig parse_database(const YAML::Node& root)
     return cfg;
 }
 
+DepegConfig parse_depeg(const YAML::Node& root)
+{
+    const std::string sec = "depeg";
+    DepegConfig cfg;  // All fields have sensible defaults.
+
+    // Section is optional; return defaults if absent.
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    if (node["enabled"] && node["enabled"].IsDefined()
+        && !node["enabled"].IsNull()) {
+        cfg.enabled = node["enabled"].as<bool>();
+    }
+    if (node["default_warn_pct"] && node["default_warn_pct"].IsDefined()
+        && !node["default_warn_pct"].IsNull()) {
+        cfg.default_warn_pct = node["default_warn_pct"].as<double>();
+        if (!(cfg.default_warn_pct > 0.0)) {
+            throw ConfigError(sec + ".default_warn_pct must be > 0");
+        }
+    }
+    if (node["default_bail_pct"] && node["default_bail_pct"].IsDefined()
+        && !node["default_bail_pct"].IsNull()) {
+        cfg.default_bail_pct = node["default_bail_pct"].as<double>();
+        if (!(cfg.default_bail_pct > 0.0)) {
+            throw ConfigError(sec + ".default_bail_pct must be > 0");
+        }
+    }
+    if (node["default_sustained_blocks"] && node["default_sustained_blocks"].IsDefined()
+        && !node["default_sustained_blocks"].IsNull()) {
+        cfg.default_sustained_blocks = node["default_sustained_blocks"].as<uint32_t>();
+    }
+    if (node["auto_disable_pair"] && node["auto_disable_pair"].IsDefined()
+        && !node["auto_disable_pair"].IsNull()) {
+        cfg.auto_disable_pair = node["auto_disable_pair"].as<bool>();
+    }
+    if (node["alert_on_warn"] && node["alert_on_warn"].IsDefined()
+        && !node["alert_on_warn"].IsNull()) {
+        cfg.alert_on_warn = node["alert_on_warn"].as<bool>();
+    }
+    if (node["alert_on_bail"] && node["alert_on_bail"].IsDefined()
+        && !node["alert_on_bail"].IsNull()) {
+        cfg.alert_on_bail = node["alert_on_bail"].as<bool>();
+    }
+
+    if (cfg.default_bail_pct <= cfg.default_warn_pct) {
+        throw ConfigError(sec + ".default_bail_pct ("
+                          + std::to_string(cfg.default_bail_pct)
+                          + ") must be greater than default_warn_pct ("
+                          + std::to_string(cfg.default_warn_pct) + ")");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// parse_arbitrage -- optional `arbitrage:` section.
+// ---------------------------------------------------------------------------
+ArbitrageSettings parse_arbitrage(const YAML::Node& root)
+{
+    const std::string sec = "arbitrage";
+    ArbitrageSettings cfg;  // All fields have sensible defaults.
+
+    // Section is optional; return defaults if absent.
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_dbl = [&](const char* key, double& out, double lo = 0.0) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull()) {
+            out = node[key].as<double>();
+            if (out < lo)
+                throw ConfigError(sec + "." + key + " must be >= "
+                                  + std::to_string(lo));
+        }
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_bool("enabled",                        cfg.enabled);
+
+    // Triangular
+    read_dbl ("triangular_min_profit_bps",      cfg.triangular_min_profit_bps);
+    read_dbl ("triangular_slippage_bps",        cfg.triangular_slippage_bps);
+    read_dbl ("triangular_per_leg_fee_bps",     cfg.triangular_per_leg_fee_bps);
+    read_u32 ("triangular_max_legs",            cfg.triangular_max_legs);
+
+    // CEX-DEX
+    read_dbl ("cex_dex_min_edge_bps",           cfg.cex_dex_min_edge_bps);
+    read_dbl ("cex_dex_max_edge_bps",           cfg.cex_dex_max_edge_bps);
+    read_dbl ("cex_fee_bps",                    cfg.cex_fee_bps);
+    read_dbl ("bridge_fee_bps",                 cfg.bridge_fee_bps);
+
+    // Cross-DEX
+    read_dbl ("cross_dex_min_edge_bps",         cfg.cross_dex_min_edge_bps);
+    read_dbl ("tibetswap_fee_bps",              cfg.tibetswap_fee_bps);
+    read_dbl ("dexie_fee_bps",                  cfg.dexie_fee_bps);
+
+    // Cross-Bridge
+    read_dbl ("cross_bridge_min_edge_bps",      cfg.cross_bridge_min_edge_bps);
+    read_dbl ("bridge_cost_bps",                cfg.bridge_cost_bps);
+
+    // General
+    read_dbl ("max_position_size",              cfg.max_position_size, 0.001);
+    read_dbl ("default_confidence",             cfg.default_confidence, 0.01);
+    read_dbl ("min_confidence_threshold",       cfg.min_confidence_threshold);
+    read_u32 ("default_urgency_blocks",         cfg.default_urgency_blocks);
+
+    return cfg;
+}
+
 // ---------------------------------------------------------------------------
 // Redacted summary printer.  Emits every operationally useful field while
 // suppressing all classified secrets (SSL paths, fingerprint, tokens).
@@ -535,7 +782,19 @@ void log_config_summary(const AppConfig& cfg)
     out << "[pairs] (" << cfg.pairs.size() << " configured)\n";
     for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
         out << "  " << i << ": " << cfg.pairs[i].name
-            << (cfg.pairs[i].enabled ? " [enabled]" : " [disabled]") << "\n";
+            << (cfg.pairs[i].enabled ? " [enabled]" : " [disabled]");
+        if (cfg.pairs[i].is_stablecoin) {
+            out << " [stablecoin peg=" << cfg.pairs[i].peg_target
+                << " warn=" << cfg.pairs[i].depeg_warn_pct
+                << "% bail=" << cfg.pairs[i].depeg_bail_pct << "%]";
+        }
+        if (cfg.pairs[i].gamma_override) {
+            out << " [gamma=" << *cfg.pairs[i].gamma_override << "]";
+        }
+        if (cfg.pairs[i].phi_override) {
+            out << " [phi=" << *cfg.pairs[i].phi_override << "]";
+        }
+        out << "\n";
     }
 
     // Strategy -- all fields are tuning parameters, no secrets.
@@ -585,6 +844,23 @@ void log_config_summary(const AppConfig& cfg)
     out << "[database]\n"
         << "  path       = " << cfg.database.path << "\n";
 
+    // Depeg detection -- operational settings.
+    out << "[depeg]\n"
+        << "  enabled    = " << (cfg.depeg.enabled ? "true" : "false") << "\n"
+        << "  warn_pct   = " << cfg.depeg.default_warn_pct << "%\n"
+        << "  bail_pct   = " << cfg.depeg.default_bail_pct << "%\n"
+        << "  sustained  = " << cfg.depeg.default_sustained_blocks << " blocks\n"
+        << "  auto_off   = " << (cfg.depeg.auto_disable_pair ? "true" : "false") << "\n";
+
+    // Arbitrage detection -- operational settings.
+    out << "[arbitrage]\n"
+        << "  enabled              = " << (cfg.arbitrage.enabled ? "true" : "false") << "\n"
+        << "  tri_min_profit_bps   = " << cfg.arbitrage.triangular_min_profit_bps << "\n"
+        << "  tri_slippage_bps     = " << cfg.arbitrage.triangular_slippage_bps << "\n"
+        << "  tri_fee_bps/leg      = " << cfg.arbitrage.triangular_per_leg_fee_bps << "\n"
+        << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
+        << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
+
     out << "======================================\n";
 
     std::cout << out.str();
@@ -623,6 +899,8 @@ AppConfig load_config(const std::string& path)
     cfg.volatility = parse_volatility(root);
     cfg.monitoring = parse_monitoring(root);
     cfg.database   = parse_database(root);
+    cfg.depeg      = parse_depeg(root);
+    cfg.arbitrage  = parse_arbitrage(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

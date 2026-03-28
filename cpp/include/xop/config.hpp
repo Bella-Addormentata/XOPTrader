@@ -16,6 +16,7 @@
 #define XOP_CONFIG_HPP
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <vector>
 #include <stdexcept>
@@ -83,6 +84,27 @@ struct PairConfig {
     /// Mojos-per-displayable-unit for the quote asset.
     /// Same convention as base_mojos_per_unit.
     std::int64_t quote_mojos_per_unit{1'000LL};
+
+    // -- Per-pair strategy overrides ----------------------------------------
+    // When set, these override the global StrategyConfig values for this
+    // pair only.  Allows stablecoin pairs (e.g. BYC/wUSDC.b) to use
+    // tighter spreads and lower risk aversion than volatile pairs.
+    std::optional<double>   gamma_override;
+    std::optional<double>   kappa_override;
+    std::optional<double>   phi_override;
+    std::optional<double>   q_max_override;
+    std::optional<double>   min_profit_margin_bps_override;
+    std::optional<std::vector<double>> tier_spacing_bps_override;
+    std::optional<std::vector<double>> tier_size_pct_override;
+
+    // -- Stablecoin peg configuration ---------------------------------------
+    // When is_stablecoin is true, the depeg detector monitors this pair
+    // and can flag it as suspected-failed, pulling all quotes.
+    bool   is_stablecoin{false};
+    double peg_target{1.0};               // Expected trading price.
+    double depeg_warn_pct{2.0};           // Warn when >2% off peg.
+    double depeg_bail_pct{10.0};          // Bail out (pull quotes) when >10% off peg.
+    uint32_t depeg_sustained_blocks{30};  // Must persist N blocks before bail (~26 min).
 };
 
 // ---------------------------------------------------------------------------
@@ -168,6 +190,59 @@ struct DatabaseConfig {
 };
 
 // ---------------------------------------------------------------------------
+// Depeg detector configuration (applies to all stablecoin pairs globally).
+// Individual thresholds are set per-pair in PairConfig.
+// ---------------------------------------------------------------------------
+struct DepegConfig {
+    bool   enabled{true};                 // Master switch for depeg detection.
+    double default_warn_pct{2.0};         // Default warn threshold (%).
+    double default_bail_pct{10.0};        // Default bail threshold (%).
+    uint32_t default_sustained_blocks{30};// Default sustained-blocks window.
+    bool   auto_disable_pair{true};       // Automatically disable pair on bail.
+    bool   alert_on_warn{true};           // Send Telegram alert on warning.
+    bool   alert_on_bail{true};           // Send Telegram alert on bail.
+};
+
+// ---------------------------------------------------------------------------
+// ArbitrageSettings -- YAML-configurable parameters for arbitrage detection.
+//
+// Maps 1:1 to the `arbitrage:` section of config.yaml.  These values are
+// copied into the ArbitrageConfig struct (strategy/arbitrage.hpp) at engine
+// construction time.  Keeping the YAML parsing separate from the strategy
+// struct avoids a circular dependency between config.hpp and arbitrage.hpp.
+// ---------------------------------------------------------------------------
+struct ArbitrageSettings {
+    bool     enabled{true};                 // Master switch for arb scanning.
+
+    // -- Triangular arbitrage ------------------------------------------------
+    double   triangular_min_profit_bps{30.0};
+    double   triangular_slippage_bps{10.0};
+    double   triangular_per_leg_fee_bps{5.0};
+    uint32_t triangular_max_legs{3};
+
+    // -- CEX-DEX arbitrage ---------------------------------------------------
+    double   cex_dex_min_edge_bps{50.0};
+    double   cex_dex_max_edge_bps{500.0};
+    double   cex_fee_bps{10.0};
+    double   bridge_fee_bps{0.0};
+
+    // -- Cross-DEX arbitrage -------------------------------------------------
+    double   cross_dex_min_edge_bps{15.0};
+    double   tibetswap_fee_bps{70.0};
+    double   dexie_fee_bps{0.0};
+
+    // -- Cross-Bridge arbitrage ----------------------------------------------
+    double   cross_bridge_min_edge_bps{20.0};
+    double   bridge_cost_bps{15.0};
+
+    // -- General parameters --------------------------------------------------
+    double   max_position_size{100.0};
+    double   default_confidence{0.75};
+    double   min_confidence_threshold{0.40};
+    uint32_t default_urgency_blocks{5};
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -179,6 +254,8 @@ struct AppConfig {
     VolatilityConfig volatility;
     MonitoringConfig monitoring;
     DatabaseConfig   database;
+    DepegConfig      depeg;
+    ArbitrageSettings arbitrage;
 };
 
 // ---------------------------------------------------------------------------

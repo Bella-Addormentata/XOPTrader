@@ -131,13 +131,18 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     // Each enabled pair gets its own StrategyBase so that price histories,
     // regime states, and internal estimators are isolated.  This prevents
     // state bleed between pairs with different volatility profiles.
-    // A GLFT strategy can be substituted per-pair via config in the future.
+    // Per-pair strategy overrides allow stablecoin pairs to use tighter
+    // spreads and lower risk aversion than volatile pairs.
     // ISO/IEC 5055: no shared mutable state across independent pairs.
-    AvellanedaConfig as_strat_cfg;
-    as_strat_cfg.gamma = config_.strategy.gamma;
-    as_strat_cfg.kappa = config_.strategy.kappa;
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
+        AvellanedaConfig as_strat_cfg;
+        as_strat_cfg.gamma = pair.gamma_override.value_or(config_.strategy.gamma);
+        as_strat_cfg.kappa = pair.kappa_override.value_or(config_.strategy.kappa);
+        as_strat_cfg.q_max = pair.q_max_override.value_or(config_.strategy.q_max);
+        as_strat_cfg.min_margin_bps =
+            pair.min_profit_margin_bps_override.value_or(
+                config_.strategy.min_profit_margin_bps);
         strategies_[pair.name] =
             std::make_unique<AvellanedaStoikov>(as_strat_cfg);
     }
@@ -148,17 +153,62 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     sp_cfg.s_floor_bps = config_.strategy.min_profit_margin_bps;
     spread_opt_ = std::make_unique<SpreadOptimizer>(sp_cfg);
 
-    // Per-pair liquidity engines.
-    LiquidityConfig liq_cfg;
-    liq_cfg.num_tiers        = config_.strategy.num_tiers;
-    liq_cfg.tier_spacing_bps = config_.strategy.tier_spacing_bps;
-    liq_cfg.tier_size_pct    = config_.strategy.tier_size_pct;
-    liq_cfg.offer_ttl_blocks = config_.strategy.offer_ttl_blocks;
-
+    // Per-pair liquidity engines — use per-pair tier overrides when present.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
+        LiquidityConfig liq_cfg;
+        liq_cfg.num_tiers        = config_.strategy.num_tiers;
+        liq_cfg.tier_spacing_bps =
+            pair.tier_spacing_bps_override.value_or(
+                config_.strategy.tier_spacing_bps);
+        liq_cfg.tier_size_pct    =
+            pair.tier_size_pct_override.value_or(
+                config_.strategy.tier_size_pct);
+        liq_cfg.offer_ttl_blocks = config_.strategy.offer_ttl_blocks;
         liquidity_engines_[pair.name] =
             std::make_unique<LiquidityEngine>(pair.name, liq_cfg);
+    }
+
+    // -- Depeg detector -------------------------------------------------------
+    depeg_detector_ = std::make_unique<DepegDetector>(config_.depeg);
+    for (const auto& pair : config_.pairs) {
+        depeg_detector_->register_pair(pair);
+    }
+
+    // -- Arbitrage detector ---------------------------------------------------
+    {
+        // Build ArbitrageConfig from the YAML-parsed ArbitrageSettings.
+        ArbitrageConfig arb_cfg;
+        arb_cfg.triangular_min_profit_bps  = config_.arbitrage.triangular_min_profit_bps;
+        arb_cfg.triangular_slippage_bps    = config_.arbitrage.triangular_slippage_bps;
+        arb_cfg.triangular_per_leg_fee_bps = config_.arbitrage.triangular_per_leg_fee_bps;
+        arb_cfg.triangular_max_legs        = config_.arbitrage.triangular_max_legs;
+        arb_cfg.cex_dex_min_edge_bps       = config_.arbitrage.cex_dex_min_edge_bps;
+        arb_cfg.cex_dex_max_edge_bps       = config_.arbitrage.cex_dex_max_edge_bps;
+        arb_cfg.cex_fee_bps               = config_.arbitrage.cex_fee_bps;
+        arb_cfg.bridge_fee_bps            = config_.arbitrage.bridge_fee_bps;
+        arb_cfg.cross_dex_min_edge_bps    = config_.arbitrage.cross_dex_min_edge_bps;
+        arb_cfg.tibetswap_fee_bps         = config_.arbitrage.tibetswap_fee_bps;
+        arb_cfg.dexie_fee_bps             = config_.arbitrage.dexie_fee_bps;
+        arb_cfg.cross_bridge_min_edge_bps = config_.arbitrage.cross_bridge_min_edge_bps;
+        arb_cfg.bridge_cost_bps           = config_.arbitrage.bridge_cost_bps;
+        arb_cfg.max_position_size         = config_.arbitrage.max_position_size;
+        arb_cfg.default_confidence        = config_.arbitrage.default_confidence;
+        arb_cfg.min_confidence_threshold  = config_.arbitrage.min_confidence_threshold;
+        arb_cfg.default_urgency_blocks    = config_.arbitrage.default_urgency_blocks;
+
+        arb_detector_ = std::make_unique<ArbitrageDetector>(arb_cfg);
+
+        // Pre-populate the stablecoin pair set from config.
+        StablecoinPairSet stable_pairs;
+        for (const auto& pair : config_.pairs) {
+            if (pair.is_stablecoin && pair.enabled) {
+                stable_pairs.insert(pair.name);
+            }
+        }
+        if (!stable_pairs.empty()) {
+            arb_detector_->set_stablecoin_pairs(stable_pairs);
+        }
     }
 
     // -- Risk layer -----------------------------------------------------------
@@ -1080,6 +1130,30 @@ void Engine::step_update_analytics(BlockHeight block_height)
         spdlog::debug("[Engine] Step 3: {} sigma_block={:.6f} regime={}",
                       pair.name, vol_est.get_sigma_block(),
                       to_string(regime.regime));
+
+        // -- Stablecoin depeg monitoring ------------------------------------
+        // Feed the current mid-price to the depeg detector for any pair
+        // flagged as a stablecoin.  The detector tracks sustained deviations
+        // and transitions through Normal → Warning → Bailed states.
+        if (pair.is_stablecoin && depeg_detector_) {
+            auto depeg_status = depeg_detector_->update(
+                pair.name, mid, block_height);
+
+            if (depeg_status == DepegStatus::Warning) {
+                spdlog::warn("[Engine] Step 3: DEPEG WARNING {} price={:.6f} "
+                             "peg={:.4f} -- deviation above warn threshold",
+                             pair.name, mid, pair.peg_target);
+            } else if (depeg_status == DepegStatus::Bailed) {
+                spdlog::error("[Engine] Step 3: DEPEG BAIL-OUT {} price={:.6f} "
+                              "peg={:.4f} -- pulling all quotes! Suspected "
+                              "peg failure (like Stably).",
+                              pair.name, mid, pair.peg_target);
+            } else if (depeg_status == DepegStatus::SuspectedFailure) {
+                spdlog::error("[Engine] Step 3: {} FLAGGED as suspected "
+                              "failure -- all quotes suppressed",
+                              pair.name);
+            }
+        }
     }
 }
 
@@ -1095,6 +1169,17 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         if (!pcs.market_data_valid) {
             spdlog::warn("[Engine] Step 4: {} market data invalid (Step 1 "
                          "failed) -- skipping quote generation", pair_name);
+            pcs.quote_valid = false;
+            continue;
+        }
+
+        // Depeg bail-out gate: suppress all quoting for stablecoin pairs
+        // where the depeg detector has triggered Bailed or SuspectedFailure.
+        // This prevents us from market-making a coin that has lost its peg
+        // (e.g. Stably) and accumulating worthless inventory.
+        if (depeg_detector_ && depeg_detector_->should_bail(pair_name)) {
+            spdlog::error("[Engine] Step 4: {} depeg bail-out active -- "
+                          "suppressing all quotes", pair_name);
             pcs.quote_valid = false;
             continue;
         }
@@ -1150,11 +1235,12 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             / static_cast<double>(pair_cfg->base_mojos_per_unit);
 
         // Set cost basis on the per-pair strategy for the never-sell-at-loss
-        // constraint.
+        // constraint.  Uses per-pair min_profit_margin_bps if overridden.
         auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
         double cost_basis = static_cast<double>(rec.weighted_avg_cost_basis);
-        strategy.set_cost_basis(
-            cost_basis, config_.strategy.min_profit_margin_bps);
+        double margin_bps = pair_cfg->min_profit_margin_bps_override.value_or(
+            config_.strategy.min_profit_margin_bps);
+        strategy.set_cost_basis(cost_basis, margin_bps);
 
         // Invoke the per-pair strategy to produce raw quotes.
         pcs.raw_quote = strategy.compute_quotes(mid, sigma, q, block_height);
@@ -1727,21 +1813,82 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 // Step 9: Check arbitrage opportunities.
 void Engine::step_check_arbitrage(BlockHeight block_height)
 {
-    // Arbitrage scanning is driven by the MarketDataFeed's ArbitrageSignal
-    // callback.  Here we check for signals that fired during step 1.
+    // -- 9a: Legacy MarketDataFeed CEX-DEX signal check ----------------------
+    // The MarketDataFeed emits ArbitrageSignals for CEX-DEX divergences
+    // detected during step 1.  Log them for visibility.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
         auto signal = market_data_->get_latest_arb_signal(pair.name);
         if (signal) {
-            spdlog::info("[Engine] Step 9: Arbitrage signal for {}: "
+            spdlog::info("[Engine] Step 9: CEX-DEX signal for {}: "
                          "dex={:.4f} cex={:.4f} divergence={:.1f}bps dir={}",
                          pair.name,
                          signal->dex_price, signal->cex_price,
                          signal->divergence_bps,
                          to_string(signal->direction));
-            // Phase 2: execute the arbitrage via ArbitrageScanner.
         }
+    }
+
+    // -- 9b: Full ArbitrageDetector scan -------------------------------------
+    // Feed current mid-prices and depth from this block's market data into
+    // the detector, then run all scans (CEX-DEX, cross-DEX, triangular,
+    // cross-bridge).
+    if (!config_.arbitrage.enabled || !arb_detector_) {
+        return;
+    }
+
+    // Build pair-price map from the current cycle state.
+    // Depth data is not yet available from MarketDataFeed (Phase 2), so
+    // the depth map stays empty — scan_triangular will use its fallback
+    // max_position_size cap.
+    PairPriceMap pair_prices;
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+
+        auto it = cycle_.find(pair.name);
+        if (it == cycle_.end() || !it->second.market_data_valid) continue;
+
+        // Get mid-price from the market data feed (double, quote-per-base).
+        const double mid = market_data_->get_mid_price(pair.name);
+        if (mid > 0.0) {
+            pair_prices[pair.name] = mid;
+        }
+    }
+
+    if (pair_prices.empty()) {
+        return;  // no valid market data this block
+    }
+
+    // Feed data to detector.
+    arb_detector_->set_pair_prices(pair_prices);
+    // Depth data: Phase 2 will populate pair depths from dexie order book
+    // snapshots for liquidity-aware sizing.  For now the detector falls
+    // back to the max_position_size cap.
+
+    // Run all scans.
+    auto opportunities = arb_detector_->scan_all();
+
+    if (opportunities.empty()) {
+        spdlog::debug("[Engine] Step 9: no arbitrage opportunities detected "
+                      "(block {})", block_height);
+        return;
+    }
+
+    // Log all detected opportunities.
+    spdlog::info("[Engine] Step 9: {} arbitrage opportunities detected "
+                 "(block {})", opportunities.size(), block_height);
+
+    for (const auto& opp : opportunities) {
+        spdlog::info("[Engine] Step 9: {} | edge={:.1f}bps "
+                     "profit={:.6f} conf={:.3f} urgency={}blk | {}",
+                     to_string(opp.type), opp.edge_bps,
+                     opp.estimated_profit, opp.confidence,
+                     opp.urgency_blocks, opp.description);
+
+        // Phase 2: execute the arbitrage trade.
+        // TODO: ArbitrageExecutor that takes the top opportunity and
+        //       constructs + submits the multi-leg spend bundle.
     }
 }
 

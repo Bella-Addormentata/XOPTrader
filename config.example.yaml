@@ -23,13 +23,33 @@ dexie:
 # Trading pairs to market-make
 pairs:
   - base_asset_id: "xch"          # XCH native
-    quote_asset_id: "fa4a180ac326e67ea289b24e68c5e0be0000000000000000000000000000dead"  # wUSDC — replace with real 64-char hex asset ID
-    name: "XCH/wUSDC"
+    quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"  # wUSDC.b
+    name: "XCH/wUSDC.b"
     enabled: true
   - base_asset_id: "xch"
-    quote_asset_id: "a628c1c2c6fcb74d53746157e438e1080000000000000000000000000000dead"  # SBX — replace with real 64-char hex asset ID
-    name: "SBX/XCH"
-    enabled: false
+    quote_asset_id: "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"  # BYC
+    name: "XCH/BYC"
+    enabled: true
+  - base_asset_id: "ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac"  # BYC
+    quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"  # wUSDC.b
+    name: "BYC/wUSDC.b"
+    enabled: true
+    # Per-pair strategy overrides for stablecoin-vs-stablecoin pair
+    gamma_override: 0.003          # Lower risk aversion — tight spreads are safe
+    phi_override: 0.15             # Hold ~50/50 balance, don't shed inventory
+    min_profit_margin_bps_override: 12  # Tighter margin — DBX subsidy offsets
+    tier_spacing_bps_override: [15, 30, 50, 80]  # Much tighter ladder
+    tier_size_pct_override: [0.30, 0.25, 0.25, 0.20]
+    # Stablecoin peg monitoring — both sides are USD-pegged
+    is_stablecoin: true
+    peg_target: 1.0                # Both BYC and wUSDC.b should be $1
+    depeg_warn_pct: 2.0            # Warn at 2% deviation
+    depeg_bail_pct: 10.0           # Pull all quotes at 10% deviation
+    depeg_sustained_blocks: 30     # Must persist ~26 min before bail
+  - base_asset_id: "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6"  # wmilliETH.b
+    quote_asset_id: "xch"
+    name: "wmilliETH.b/XCH"
+    enabled: true
 
 strategy:
   # Avellaneda-Stoikov / GLFT parameters
@@ -69,3 +89,42 @@ monitoring:
 database:
   # SQLite for Phase 1, PostgreSQL later
   path: "data/xop_trader.db"
+
+# Stablecoin depeg detection — global settings
+# Per-pair thresholds are set in each pair's is_stablecoin / depeg_* fields.
+depeg:
+  enabled: true                    # Master switch for depeg monitoring
+  default_warn_pct: 2.0            # Default warn threshold (% off peg)
+  default_bail_pct: 10.0           # Default bail threshold (% off peg) — pull all quotes
+  default_sustained_blocks: 30     # Deviation must persist N blocks before bail (~26 min)
+  auto_disable_pair: true          # Automatically disable pair on bail-out
+  alert_on_warn: true              # Send Telegram alert on peg warning
+  alert_on_bail: true              # Send Telegram alert on bail-out
+
+# Arbitrage detection — triangular, CEX-DEX, cross-DEX, cross-bridge
+# All thresholds are in basis points (bps).  1 bps = 0.01%.
+arbitrage:
+  enabled: true                         # Master switch for arb scanning
+
+  # Triangular arb (XCH -> A -> B -> XCH)
+  triangular_min_profit_bps: 30         # Min net profit after all fees/slippage
+  triangular_slippage_bps: 10           # Per-leg slippage estimate
+  triangular_per_leg_fee_bps: 5         # Blockchain settlement fee per hop
+
+  # CEX-DEX arb (dexie vs OKX/MEXC/Gate)
+  cex_dex_min_edge_bps: 50              # Min raw edge to flag opportunity
+  cex_dex_max_edge_bps: 500             # Reject edges above this (stale data)
+  cex_fee_bps: 10                       # CEX taker fee (OKX VIP0 = 10)
+
+  # Cross-DEX arb (dexie order book vs TibetSwap AMM)
+  cross_dex_min_edge_bps: 15            # Lower — both legs are on-chain atomic
+  tibetswap_fee_bps: 70                 # TibetSwap v2: 0.7%
+
+  # Cross-bridge arb (wUSDC vs wUSDC.b)
+  cross_bridge_min_edge_bps: 20         # Min divergence for same-underlying arb
+  bridge_cost_bps: 15                   # warp.green bridge round-trip cost
+
+  # General
+  max_position_size: 100                # Max base-asset units per arb trade
+  default_confidence: 0.75              # Base confidence when depth unknown
+  min_confidence_threshold: 0.40        # Discard opportunities below this
