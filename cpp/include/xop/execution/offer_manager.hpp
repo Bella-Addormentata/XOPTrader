@@ -108,7 +108,8 @@ public:
     /**
      * @brief Construct an OfferManager.
      *
-     * @param ioc           Boost.Asio io_context for async operations.
+     * @param ioc           Boost.Asio io_context (accepted for API stability;
+     *                      not stored — async work runs on the caller's strand).
      * @param wallet        Shared pointer to an open ChiaWalletRPC client.
      * @param dexie_client  Shared pointer to an open DexieClient for offer
      *                      aggregation.  May be nullptr if Dexie submission
@@ -358,9 +359,6 @@ private:
     asio::awaitable<void> init_wallet_id_map();
 
     // -- Member data --------------------------------------------------------
-
-    /// Boost.Asio io_context for async timer and dispatch operations.
-    asio::io_context& ioc_;
 
     /// Wallet RPC client (shared -- may be used by CoinManager too).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;

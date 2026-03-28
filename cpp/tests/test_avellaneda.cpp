@@ -435,8 +435,7 @@ TEST_F(AvellanedaTest, NoLossConstraintDisabledAllowsBelowCost) {
     const double sigma = 0.001;
     const double q     = 0.0;
     auto quotes = strategy.compute_quotes(S, sigma, q, 0);
-
-    // With constraint disabled, ask can be below cost basis.
+    (void)quotes;  // computed to verify no crash; constraint disabled below
     // The unconstrained ask is approximately S + delta ~ 2.70 + 3.345 ~ 6.04
     // which happens to exceed 5.00 with these params.  Use extreme cost to test.
     strategy.set_cost_basis(100.0, 35.0);

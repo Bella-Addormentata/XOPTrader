@@ -106,7 +106,8 @@ public:
     /**
      * @brief Construct a CoinManager.
      *
-     * @param ioc     Boost.Asio io_context for async operations.
+     * @param ioc     Boost.Asio io_context (accepted for API stability;
+     *                not stored — async work runs on the caller's strand).
      * @param wallet  Shared pointer to an open ChiaWalletRPC client.
      * @param config  Application configuration (for default fee, etc.).
      */
@@ -294,9 +295,6 @@ private:
                                          Mojo               amount);
 
     // -- Member data --------------------------------------------------------
-
-    /// Boost.Asio io_context for async dispatch.
-    asio::io_context& ioc_;
 
     /// Wallet RPC client (shared with OfferManager).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;
