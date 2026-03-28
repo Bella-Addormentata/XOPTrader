@@ -51,6 +51,11 @@ jobs:
   build-cpp:
     name: C++ engine (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
+    env:
+      VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg-downloads
+      VCPKG_BINARY_SOURCES: "x-gha,readwrite"
+      VCPKG_HTTP_RETRY_COUNT: "10"
+      VCPKG_HTTP_TIMEOUT: "300"
     strategy:
       fail-fast: false
       matrix:
