@@ -26,29 +26,18 @@ from __future__ import annotations
 
 from typing import Any, Optional
 
-import pyqtgraph as pg
 from PySide6.QtCore import Qt, Slot
 from PySide6.QtWidgets import (
     QFrame,
-    QGridLayout,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QProgressBar,
     QScrollArea,
-    QSizePolicy,
-    QSplitter,
-    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
 
 from gui.theme import COLORS as _C
-
-# ---------------------------------------------------------------------------
-# pyqtgraph global defaults matching the CHIA dark theme
-# ---------------------------------------------------------------------------
-pg.setConfigOptions(antialias=True, background=_C.DARK_BG, foreground=_C.TEXT_PRIMARY)
 
 # ---------------------------------------------------------------------------
 # Palette aliases
