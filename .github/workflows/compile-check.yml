@@ -43,13 +43,18 @@ jobs:
         id: vcpkg-baseline
         run: echo "sha=$(jq -r '.["builtin-baseline"]' cpp/vcpkg.json)" >> "$GITHUB_OUTPUT"
 
+      # ---- Ensure vcpkg-downloads directory exists before bootstrap -----------
+      - name: Create vcpkg downloads directory
+        shell: bash
+        run: mkdir -p "${{ github.workspace }}/vcpkg-downloads"
+
       # ---- vcpkg setup with caching ----------------------------------------
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
         with:
           vcpkgDirectory: "${{ github.workspace }}/vcpkg"
           vcpkgJsonGlob: "cpp/vcpkg.json"
-          vcpkgCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
+          vcpkgGitCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
 
       # ---- System dependencies ---------------------------------------------
       - name: Install system dependencies
