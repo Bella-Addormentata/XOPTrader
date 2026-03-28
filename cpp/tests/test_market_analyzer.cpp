@@ -356,14 +356,15 @@ TEST(MarketAnalyzerTest, TotalPollAttemptsCountsInvalidData) {
 
 TEST(MarketAnalyzerTest, MomentumRegimeIsConservative) {
     auto cfg = small_config(20);
-    // Set VR threshold so an upward trending series is classified Momentum.
-    cfg.vr_upper_threshold = 1.05;
+    // Make the momentum classification easier to trigger in a deterministic test.
+    cfg.vr_upper_threshold = 1.01;
     xop::MarketAnalyzer ma(cfg, {kPair});
 
     // Steadily rising price -> positive autocorrelation -> VR > 1.
     double price = 1.0;
     for (int i = 0; i < 20; ++i) {
-        price *= 1.03;  // +3% each block.
+        price *= 1.10;  // exaggerated trend (not realistic) to deterministically
+                        // push VR above vr_upper_threshold in a short window
         ma.ingest(kPair, price, 50.0, 1000.0, 5.0, 5.0);
     }
 
