@@ -53,11 +53,9 @@ jobs:
     runs-on: ${{ matrix.os }}
     env:
       VCPKG_DOWNLOADS: ${{ github.workspace }}/vcpkg-downloads
-      X_VCPKG_ASSET_SOURCES: "x-gha,readwrite"
-      VCPKG_FEATURE_FLAGS: manifests,binarycaching
+      VCPKG_BINARY_SOURCES: "x-gha,readwrite"
       VCPKG_HTTP_RETRY_COUNT: "10"
       VCPKG_HTTP_TIMEOUT: "300"
-      VCPKG_GITHUB_BASE_URL: https://github.com
     strategy:
       fail-fast: false
       matrix:
