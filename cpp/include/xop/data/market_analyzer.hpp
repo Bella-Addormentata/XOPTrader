@@ -129,7 +129,14 @@ struct PairAnalysisSummary {
 
     // -- Completeness -------------------------------------------------------
     uint32_t blocks_collected{0}; ///< Actual observations ingested.
-    bool     complete{false};     ///< True once the full window is filled.
+    bool     complete{false};     ///< True when analysis has ended (either
+                                  ///  the full window was observed OR the
+                                  ///  analysis was force-completed due to
+                                  ///  a timeout).
+    bool     window_filled{false};///< True only when the full observation
+                                  ///  window was filled (blocks_collected
+                                  ///  >= analysis_blocks).  False after
+                                  ///  force_complete() with partial data.
 };
 
 // ---------------------------------------------------------------------------
@@ -238,10 +245,13 @@ public:
     /// Reset all accumulated data (useful for re-analysis after reconnect).
     void reset();
 
-    /// Force all pairs to be marked complete, even if they have not collected
-    /// enough blocks.  Used by the engine when the analysis timeout expires
-    /// (e.g. a pair has no market data) to prevent the bot from hanging
-    /// indefinitely in the Analyzing state.
+    /// Force all pairs to be marked complete (``complete = true``), even
+    /// if they have not collected enough blocks.  ``window_filled`` will
+    /// remain false for pairs that did not reach ``analysis_blocks``,
+    /// allowing callers to distinguish forced vs. fully-observed results.
+    /// Used by the engine when the analysis timeout expires (e.g. a pair
+    /// has no market data) to prevent the bot from hanging indefinitely
+    /// in the Analyzing state.
     void force_complete();
 
     /// Overall aggressiveness recommendation across all pairs.
@@ -271,7 +281,7 @@ private:
 
         uint32_t blocks_collected{0};
         uint32_t total_poll_attempts{0};  ///< Total ingest calls (incl. invalid).
-        bool     complete{false};
+        bool     complete{false};         ///< Analysis ended (natural or forced).
     };
 
     // -- Helpers --------------------------------------------------------------

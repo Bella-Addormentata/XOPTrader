@@ -254,6 +254,8 @@ TEST(MarketAnalyzerTest, ForceCompleteMarksPairsComplete) {
     const auto s = ma.get_summary(kPair);
     EXPECT_EQ(s.blocks_collected, 3u);
     EXPECT_TRUE(s.complete);
+    // Force-completed pairs should NOT have window_filled.
+    EXPECT_FALSE(s.window_filled);
 }
 
 // ============================================================================
@@ -267,9 +269,18 @@ TEST(MarketAnalyzerTest, ForceCompleteAlreadyComplete) {
     feed_constant(ma, kPair, 2.70, 3);
     EXPECT_TRUE(ma.is_complete());
 
-    // Should not throw or change anything.
+    // Naturally completed: both flags are true.
+    const auto s_before = ma.get_summary(kPair);
+    EXPECT_TRUE(s_before.complete);
+    EXPECT_TRUE(s_before.window_filled);
+
+    // force_complete() on already-complete pair should not change anything.
     ma.force_complete();
     EXPECT_TRUE(ma.is_complete());
+
+    const auto s_after = ma.get_summary(kPair);
+    EXPECT_TRUE(s_after.complete);
+    EXPECT_TRUE(s_after.window_filled);
 }
 
 // ============================================================================

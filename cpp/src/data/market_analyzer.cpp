@@ -243,6 +243,7 @@ PairAnalysisSummary MarketAnalyzer::compute_summary(const PairState& ps) const {
     s.pair_name        = ps.pair_name;
     s.blocks_collected = ps.blocks_collected;
     s.complete         = ps.complete;
+    s.window_filled    = ps.complete && (ps.blocks_collected >= cfg_.analysis_blocks);
 
     const std::size_t n = ps.prices.size();
 
