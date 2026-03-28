@@ -231,9 +231,6 @@ public:
                                      double total_volume);
 
 private:
-    const StrategyConfig& strat_cfg_;
-    const RiskConfig&     risk_cfg_;
-
     /// Pairwise correlation table for Layer 4.
     /// Guarded by its own mutex because set_correlations() is a writer.
     mutable std::shared_mutex mtx_correlations_;

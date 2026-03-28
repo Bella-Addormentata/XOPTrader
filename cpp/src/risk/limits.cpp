@@ -46,7 +46,6 @@ const char* to_string(EmergencyRule r) noexcept {
 PreTradeCheck::PreTradeCheck(const RiskConfig&     cfg,
                              const StrategyConfig& strat_cfg)
     : risk_cfg_(cfg)
-    , strat_cfg_(strat_cfg)
     , margin_fraction_(strat_cfg.min_profit_margin_bps / 10'000.0)
 {
     // Validate: margin_fraction_ should be a small positive number (e.g. 0.0035

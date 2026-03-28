@@ -33,9 +33,6 @@ namespace xop::execution {
 // Chia wallet trade-record status codes (from chia-blockchain source).
 // ---------------------------------------------------------------------------
 namespace trade_status {
-    constexpr int kPendingAccept    = 0;
-    constexpr int kPendingConfirm   = 1;
-    constexpr int kPendingCancel    = 2;
     constexpr int kCancelled        = 3;
     constexpr int kConfirmed        = 4;
     constexpr int kFailed           = 5;
@@ -45,13 +42,12 @@ namespace trade_status {
 // Constructor
 // ---------------------------------------------------------------------------
 
-OfferManager::OfferManager(asio::io_context&                    ioc,
+OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
                            std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
                            std::shared_ptr<rpc::DexieClient>    dexie_client,
                            std::shared_ptr<State>               state,
                            const AppConfig&                     config)
-    : ioc_(ioc)
-    , wallet_(std::move(wallet))
+    : wallet_(std::move(wallet))
     , dexie_client_(std::move(dexie_client))
     , state_(std::move(state))
     , strategy_cfg_(config.strategy)
