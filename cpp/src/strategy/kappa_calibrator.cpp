@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <mutex>
 #include <numeric>
 
 namespace xop {

@@ -146,7 +146,14 @@ std::int64_t get_output_amount(std::int64_t input_amount,
 
 #if defined(__SIZEOF_INT128__)
     // Exact 128-bit integer arithmetic (GCC/Clang).
+  #if defined(__GNUC__) || defined(__clang__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+  #endif
     using u128 = unsigned __int128;
+  #if defined(__GNUC__) || defined(__clang__)
+    #pragma GCC diagnostic pop
+  #endif
 
     const auto ua_out_res = static_cast<u128>(output_reserve);
     const auto ua_input   = static_cast<u128>(input_amount);

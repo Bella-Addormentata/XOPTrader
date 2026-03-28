@@ -33,6 +33,14 @@ set(INSTALL_GTEST OFF CACHE BOOL "" FORCE)
 
 FetchContent_MakeAvailable(googletest)
 
+# Third-party: relax strict warning flags for googletest targets so that
+# diagnostics inside gtest headers (e.g. -Wdouble-promotion) do not fail
+# our build.  First-party targets retain -Werror.
+if (NOT MSVC)
+    target_compile_options(gtest      PRIVATE -Wno-error -Wno-double-promotion)
+    target_compile_options(gtest_main PRIVATE -Wno-error -Wno-double-promotion)
+endif()
+
 # ---------------------------------------------------------------------------
 # Test executable -- links against the xop_core library and GTest.
 # ---------------------------------------------------------------------------
