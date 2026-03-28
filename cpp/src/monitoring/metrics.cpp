@@ -566,4 +566,14 @@ void MetricsExporter::update_analysis(
         .Set(static_cast<double>(agg_code));
 }
 
+void MetricsExporter::set_analysis_spread_multiplier(double mult)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    analysis_family_
+        ->Add({{"metric", "recommended_spread_multiplier"}})
+        .Set(mult);
+}
+
 }  // namespace xop

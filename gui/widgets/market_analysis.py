@@ -181,10 +181,11 @@ class PairAnalysisPanel(QFrame):
         self._imb_row     = _StatRow("Book Imbalance", self)
         self._mom_row     = _StatRow("Price Momentum", self)
         self._rec_row     = _StatRow("Recommendation", self)
+        self._mult_row    = _StatRow("Spread Multiplier", self)
 
         for row in (self._vol_row, self._spread_row, self._cv_row,
                     self._vr_row, self._regime_row, self._imb_row,
-                    self._mom_row, self._rec_row):
+                    self._mom_row, self._rec_row, self._mult_row):
             root.addWidget(row)
 
         root.addStretch(1)
@@ -204,6 +205,7 @@ class PairAnalysisPanel(QFrame):
         regime_code: int,
         agg_code: int,
         complete: bool,
+        spread_multiplier: float = 1.0,
     ) -> None:
         """Refresh all displayed statistics.
 
@@ -231,6 +233,9 @@ class PairAnalysisPanel(QFrame):
             0 = Conservative, 1 = Normal, 2 = Aggressive.
         complete:
             True when the analysis window is complete.
+        spread_multiplier:
+            Recommended spread multiplier (1.5=Conservative, 1.0=Normal,
+            0.8=Aggressive).
         """
         pct = int(blocks_collected * 100 / blocks_target) if blocks_target > 0 else 0
         self._progress.setValue(pct)
@@ -284,6 +289,14 @@ class PairAnalysisPanel(QFrame):
         agg_label = _AGG_LABELS.get(agg_code, "Unknown")
         agg_col   = _AGG_COLORS.get(agg_code, TEXT_PRIMARY)
         self._rec_row.set_value(agg_label, agg_col)
+
+        # Spread multiplier (derived from recommendation)
+        mult_col = (
+            WARNING      if spread_multiplier > 1.0 else
+            PROFIT_GREEN if spread_multiplier < 1.0 else
+            TEXT_PRIMARY
+        )
+        self._mult_row.set_value(f"{spread_multiplier:.2f}x", mult_col)
 
 
 # ---------------------------------------------------------------------------
@@ -416,7 +429,7 @@ class MarketAnalysisWidget(QWidget):
             ``blocks_collected``, ``blocks_target``, ``vol_annual``,
             ``mean_spread_bps``, ``spread_cv``, ``variance_ratio``,
             ``book_imbalance``, ``momentum``, ``regime_code``,
-            ``agg_code``, ``complete``.
+            ``agg_code``, ``complete``, ``spread_multiplier``.
         """
         if not analysis_data:
             return
@@ -461,6 +474,7 @@ class MarketAnalysisWidget(QWidget):
                 regime_code      = data.get("regime_code", 1),
                 agg_code         = data.get("agg_code", 1),
                 complete         = complete,
+                spread_multiplier = data.get("spread_multiplier", 1.0),
             )
 
         # Update overall progress bar.

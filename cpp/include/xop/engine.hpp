@@ -478,6 +478,15 @@ private:
     /// active trading.  nullptr when startup_analysis_blocks == 0.
     std::unique_ptr<MarketAnalyzer> market_analyzer_;
 
+    /// Spread multiplier derived from startup analysis.  Applied in
+    /// step_apply_spread_optimizer() to widen/tighten initial spreads
+    /// based on the analysis recommendation.
+    ///   Conservative → 1.5  (50% wider)
+    ///   Normal       → 1.0  (no change)
+    ///   Aggressive   → 0.8  (20% tighter)
+    /// Default 1.0 (no adjustment) if analysis is skipped.
+    double analysis_spread_mult_{1.0};
+
     /// [T0] Coroutine: run the startup analysis phase.  Collects
     /// startup_analysis_blocks blocks of market data, exports per-block
     /// metrics, and logs the completed analysis summary.  Called from

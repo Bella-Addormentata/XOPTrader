@@ -22,6 +22,7 @@
 #define XOP_STATE_HPP
 
 #include "xop/types.hpp"
+#include "xop/data/market_analyzer.hpp"
 
 #include <atomic>
 #include <functional>
@@ -153,6 +154,21 @@ public:
     /// Get all market snapshots under a single shared lock.
     std::vector<MarketSnapshot> get_all_markets() const;
 
+    // -- analysis summaries -----------------------------------------------
+
+    /// Store completed startup analysis summaries and the derived
+    /// spread multiplier.  Called once after the analysis phase finishes.
+    void set_analysis_results(std::vector<PairAnalysisSummary> summaries,
+                              double spread_multiplier);
+
+    /// Get the stored analysis summaries (empty if analysis was skipped
+    /// or has not yet completed).
+    std::vector<PairAnalysisSummary> get_analysis_summaries() const;
+
+    /// Get the analysis-derived spread multiplier (1.0 if analysis was
+    /// skipped or not yet completed).
+    double analysis_spread_multiplier() const;
+
 private:
     // Each map is guarded by its own shared_mutex.  This is the
     // foundation of the deadlock-free guarantee: a public method locks
@@ -166,6 +182,10 @@ private:
 
     mutable std::shared_mutex                              mtx_markets_;
     std::unordered_map<std::string, MarketSnapshot>        markets_;
+
+    mutable std::shared_mutex                              mtx_analysis_;
+    std::vector<PairAnalysisSummary>                       analysis_summaries_;
+    double                                                 analysis_spread_mult_{1.0};
 
     // Bot status uses a simple atomic -- no mutex needed.
     std::atomic<BotStatus>                                 status_;
