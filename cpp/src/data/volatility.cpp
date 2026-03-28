@@ -259,8 +259,7 @@ void VolatilityEstimator::set_block_time_seconds(double seconds) noexcept
     cfg_.block_time_seconds = clamped;
 
     // Recache the annualisation constant.
-    // MEDIUM-3: 365-day year = 31,536,000 seconds.
-    constexpr double kSecondsPerYear = 365.0 * 24.0 * 3600.0;
+    // MEDIUM-3: reuse the file-scope kSecondsPerYear (365-day year = 31,536,000 s).
     const double blocks_per_year = kSecondsPerYear / clamped;
     sqrt_blocks_per_year_ = std::sqrt(blocks_per_year);
 

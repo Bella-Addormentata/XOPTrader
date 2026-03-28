@@ -67,6 +67,7 @@ static constexpr double kMinSpreadFraction = 0.004;
 /// @param block_time_seconds  Block interval in seconds (default 52.0).
 /// @param seconds_per_year  Calendar seconds in a year.
 /// @return Per-block standard deviation.
+[[maybe_unused]]
 double annual_to_per_block_vol(double sigma_annual,
                                double block_time_seconds,
                                double seconds_per_year) {

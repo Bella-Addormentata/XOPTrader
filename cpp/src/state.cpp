@@ -58,12 +58,20 @@ inline U128 umul128(std::uint64_t a, std::uint64_t b) {
 
 #elif defined(__SIZEOF_INT128__)
 //  GCC / Clang: native __int128 support.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
 
 inline U128 umul128(std::uint64_t a, std::uint64_t b) {
     unsigned __int128 p = static_cast<unsigned __int128>(a) * b;
     return { static_cast<std::uint64_t>(p >> 64),
              static_cast<std::uint64_t>(p) };
 }
+
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 
 #else
 //  Fallback: schoolbook 32-bit multiply (always correct, slightly slower).
@@ -154,8 +162,15 @@ inline std::int64_t wide_mul_div(std::int64_t a, std::int64_t b, std::int64_t d)
     return static_cast<std::int64_t>(quot);
 #elif defined(__SIZEOF_INT128__)
     // GCC / Clang: native 128-bit arithmetic.
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wpedantic"
+#endif
     unsigned __int128 p = static_cast<unsigned __int128>(ua) * ub;
     return static_cast<std::int64_t>(p / ud);
+#if defined(__GNUC__) || defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
 #else
     // Pure software fallback -- no compiler extensions required.
     U128 prod = umul128(ua, ub);
