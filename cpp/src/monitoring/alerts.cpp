@@ -66,6 +66,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::WalletUnreachable:   return "WalletUnreachable";
         case AlertRule::ExposureBreach:      return "ExposureBreach";
         case AlertRule::FlashCrash:          return "FlashCrash";
+        case AlertRule::CircuitBreaker:      return "CircuitBreaker";
         case AlertRule::FillRateDrop:        return "FillRateDrop";
         case AlertRule::SpreadWidening:      return "SpreadWidening";
         case AlertRule::UnderwaterPosition:  return "UnderwaterPosition";
@@ -83,14 +84,15 @@ const char* to_string(AlertRule rule) noexcept
 AlertTier tier_for_rule(AlertRule rule) noexcept
 {
     switch (rule) {
-        // CRITICAL (rules 1-4).
+        // CRITICAL (rules 1-5).
         case AlertRule::NodeDesync:
         case AlertRule::WalletUnreachable:
         case AlertRule::ExposureBreach:
         case AlertRule::FlashCrash:
+        case AlertRule::CircuitBreaker:
             return AlertTier::CRITICAL;
 
-        // WARNING (rules 5-10).
+        // WARNING (rules 6-11).
         case AlertRule::FillRateDrop:
         case AlertRule::SpreadWidening:
         case AlertRule::UnderwaterPosition:
@@ -99,7 +101,7 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         case AlertRule::OfferCreationFail:
             return AlertTier::WARNING;
 
-        // INFO (rules 11-14).
+        // INFO (rules 12-15).
         case AlertRule::HourlyPnl:
         case AlertRule::DailyPnl:
         case AlertRule::NewPairVolume:
@@ -612,13 +614,16 @@ void AlertManager::check_and_alert(const BotState& state)
     check_pnl_drawdown(state);
     check_offer_creation_fail(state);
 
-    // INFO rules (11-14) are not checked here because they are event-driven:
-    //   11. HourlyPnl    -- triggered by the hourly timer in the main loop.
-    //   12. DailyPnl     -- triggered by the daily timer.
-    //   13. NewPairVolume -- triggered by the market data feed.
-    //   14. ArbitrageDetected -- triggered by the arbitrage scanner.
+    // INFO rules (12-15) are not checked here because they are event-driven:
+    //   12. HourlyPnl    -- triggered by the hourly timer in the main loop.
+    //   13. DailyPnl     -- triggered by the daily timer.
+    //   14. NewPairVolume -- triggered by the market data feed.
+    //   15. ArbitrageDetected -- triggered by the arbitrage scanner.
     //
-    // The caller fires send_alert(INFO, ...) directly for those events.
+    // CircuitBreaker (rule 5) is also event-driven (fired by engine.cpp on
+    // pause transitions) and is not checked here.
+    //
+    // The caller fires send_alert(AlertRule::..., ...) directly for those events.
 }
 
 // ===================================================================

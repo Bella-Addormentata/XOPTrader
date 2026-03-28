@@ -2075,7 +2075,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
             // cycles while keeping connections open for monitoring.
             state_->set_status(BotStatus::Paused);
 
-            alerts_->send_alert(AlertRule::PnlDrawdown,
+            alerts_->send_alert(AlertRule::CircuitBreaker,
                 "Global max-drawdown circuit breaker triggered: drawdown " +
                 std::to_string(drawdown_frac * 100.0) + "% exceeds threshold " +
                 std::to_string(max_drawdown_pct_ * 100.0) +
@@ -2155,7 +2155,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
 
                 state_->set_status(BotStatus::Paused);
 
-                alerts_->send_alert(AlertRule::PnlDrawdown,
+                alerts_->send_alert(AlertRule::CircuitBreaker,
                     "Rolling-window circuit breaker triggered: lost " +
                     std::to_string(window_loss) + " mojos in " +
                     std::to_string(window_actual) + " blocks (limit " +
