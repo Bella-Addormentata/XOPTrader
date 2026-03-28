@@ -218,6 +218,26 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     drift_analyzer_ = std::make_unique<InventoryDriftAnalyzer>(
         DriftConfig{});
 
+    // -- Startup market analysis --------------------------------------------
+    // Build the list of enabled pair names for the analyzer.
+    const uint32_t analysis_blocks = config_.strategy.startup_analysis_blocks;
+    if (analysis_blocks > 0) {
+        std::vector<std::string> enabled_pairs;
+        enabled_pairs.reserve(config_.pairs.size());
+        for (const auto& pc : config_.pairs) {
+            if (pc.enabled) enabled_pairs.push_back(pc.name);
+        }
+
+        MarketAnalyzerConfig ma_cfg;
+        ma_cfg.analysis_blocks = analysis_blocks;
+        market_analyzer_ = std::make_unique<MarketAnalyzer>(ma_cfg, enabled_pairs);
+        spdlog::info("[Engine] Startup analysis enabled: {} blocks (~{}s)",
+                     analysis_blocks,
+                     static_cast<uint32_t>(analysis_blocks * ma_cfg.block_time_seconds));
+    } else {
+        spdlog::info("[Engine] Startup analysis disabled (startup_analysis_blocks=0)");
+    }
+
     // -- Pair config lookup map -----------------------------------------------
     // Build the O(1) pair_config_map_ from config_.pairs so that every step
     // can resolve a pair name to its PairConfig without a linear scan.
@@ -235,7 +255,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 Engine::~Engine()
 {
     // Ensure clean shutdown if the caller did not invoke shutdown() explicitly.
-    if (is_running()) {
+    // Guard also covers BotStatus::Analyzing so that destroying the engine
+    // during the startup analysis phase correctly cancels the timer and tears
+    // down the io_context.
+    const BotStatus st = state_->status();
+    if (st == BotStatus::Running || st == BotStatus::Analyzing ||
+        st == BotStatus::Paused) {
         try {
             shutdown();
         } catch (const std::exception& ex) {
@@ -273,8 +298,12 @@ void Engine::run()
                     asset_ids.end());
     metrics_->init(config_.monitoring.prometheus_port, asset_ids);
 
-    // Transition to Running.
-    state_->set_status(BotStatus::Running);
+    // Transition to Analyzing (if startup analysis is enabled) or Running.
+    if (market_analyzer_) {
+        state_->set_status(BotStatus::Analyzing);
+    } else {
+        state_->set_status(BotStatus::Running);
+    }
 
     // Start the block-height polling timer.
     start_polling();
@@ -408,6 +437,24 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // return, stopping the engine cleanly.
     co_await open_connections();
 
+    // -- Startup market analysis phase ---------------------------------------
+    // If configured, observe the market for startup_analysis_blocks before
+    // entering active trading.  The engine is in BotStatus::Analyzing during
+    // this period; no offers are posted.
+    // ISO/IEC 5055: analysis is optional and gracefully skipped on error.
+    if (market_analyzer_) {
+        try {
+            co_await run_startup_analysis();
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Startup analysis failed: {}; starting trading",
+                         ex.what());
+            // Disable further use of the market analyzer and transition to
+            // Running so the engine does not remain stuck in Analyzing state.
+            market_analyzer_.reset();
+            state_->set_status(BotStatus::Running);
+        }
+    }
+
     asio::steady_timer timer(ioc_);
 
     while (!stop_requested_.load(std::memory_order_relaxed)) {
@@ -461,8 +508,175 @@ asio::awaitable<void> Engine::poll_loop_coro()
 }
 
 // ===========================================================================
-// 13-step heartbeat cycle
+// Startup market analysis
 // ===========================================================================
+
+// run_startup_analysis -- collect market observations before trading.
+//
+// The coroutine polls for new blocks (same cadence as the main loop) and,
+// for each new block, fetches market data via step_update_market_state and
+// feeds the observations to market_analyzer_.  Progress and per-block
+// summaries are exported to Prometheus so the GUI can display them.
+//
+// On completion the analysis summary is logged at INFO level and the bot
+// transitions from Analyzing -> Running.
+//
+// ISO/IEC 5055: no blocking calls; fully async via co_await.
+// ISO/IEC 27001:2022: all failure paths log a warning and continue.
+asio::awaitable<void> Engine::run_startup_analysis()
+{
+    if (!market_analyzer_) co_return;
+
+    const uint32_t target = market_analyzer_->analysis_blocks();
+    spdlog::info("[Engine] Starting market analysis phase ({} blocks)", target);
+
+    asio::steady_timer timer(ioc_);
+    BlockHeight last_analysis_block{0};
+
+    // Fail-open timeout: if we have observed 3× the target block count but
+    // some pairs still lack valid market data (mid_price <= 0 every block),
+    // stop waiting and proceed to trading rather than stalling indefinitely.
+    // 3× is chosen so a pair that misses data on every other block still gets
+    // a full analysis window, while a pair with persistently bad data (e.g.
+    // delisted or misconfigured) does not block trading forever.
+    static constexpr uint32_t kTimeoutMultiplier = 3;
+    // target >= 3 by invariant (MarketAnalyzer constructor clamps to 3).
+    const uint32_t timeout_blocks = target * kTimeoutMultiplier;
+    uint32_t blocks_polled = 0;
+
+    while (!stop_requested_.load(std::memory_order_relaxed) &&
+           !market_analyzer_->is_complete()) {
+
+        timer.expires_after(kPollInterval);
+        boost::system::error_code ec;
+        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == boost::asio::error::operation_aborted) {
+            co_return;  // Shutdown during analysis.
+        }
+        if (ec || stop_requested_.load(std::memory_order_relaxed)) {
+            co_return;
+        }
+
+        // Fetch current block height.
+        std::int64_t height{0};
+        try {
+            height = co_await full_node_->get_block_height();
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
+            continue;
+        }
+
+        if (height <= 0) continue;
+        const BlockHeight current_block = static_cast<BlockHeight>(height);
+        if (current_block <= last_analysis_block) continue;
+        last_analysis_block = current_block;
+
+        // Count each new block towards the stall timeout.
+        ++blocks_polled;
+        if (blocks_polled > timeout_blocks) {
+            spdlog::warn("[Engine] Analysis timeout after {} blocks polled "
+                         "(target={}, timeout={}); proceeding to trading",
+                         blocks_polled, target, timeout_blocks);
+            break;
+        }
+
+        // Fetch market data for this block.
+        // Initialize per-pair cycle entries so step_update_market_state can write.
+        cycle_.clear();
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            PairCycleState pcs;
+            pcs.pair_name = pair.name;
+            cycle_[pair.name] = std::move(pcs);
+        }
+
+        try {
+            co_await step_update_market_state(current_block);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Analysis: market state update failed: {}", ex.what());
+            continue;
+        }
+
+        // Feed observations to the analyzer for each pair.
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+
+            const MarketSnapshot snap = state_->get_market(pair.name);
+            if (snap.mid_price <= 0) continue;
+
+            const double mid_d    = static_cast<double>(snap.mid_price);
+            const double spread_d = snap.spread_bps;
+            const double vol_d    = static_cast<double>(snap.volume_24h);
+
+            // Use competing offer depth counts as proxy for book imbalance.
+            // competing_depth_bids / asks are size_t counts of resting offers.
+            double bid_depth = 0.0;
+            double ask_depth = 0.0;
+            {
+                const auto cm = market_data_->get_competitor_metrics(pair.name);
+                if (cm.has_value()) {
+                    bid_depth = static_cast<double>(cm->competing_depth_bids);
+                    ask_depth = static_cast<double>(cm->competing_depth_asks);
+                }
+            }
+
+            market_analyzer_->ingest(pair.name, mid_d, spread_d, vol_d,
+                                     bid_depth, ask_depth);
+
+            // Export per-pair analysis metrics to Prometheus.
+            if (metrics_->is_running()) {
+                const auto summary = market_analyzer_->get_summary(pair.name);
+                metrics_->update_analysis(
+                    pair.name,
+                    summary.blocks_collected,
+                    target,
+                    summary.volatility_annual,
+                    summary.mean_spread_bps,
+                    summary.spread_cv,
+                    summary.variance_ratio,
+                    summary.book_imbalance,
+                    summary.momentum,
+                    static_cast<int>(summary.regime),
+                    static_cast<int>(summary.aggressiveness));
+            }
+        }
+
+        // Log progress.
+        const uint32_t min_collected = [&]() -> uint32_t {
+            uint32_t m = target;
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled) continue;
+                m = std::min(m, market_analyzer_->blocks_collected(pair.name));
+            }
+            return m;
+        }();
+        spdlog::info("[Engine] Analysis progress: {}/{} blocks", min_collected, target);
+    }
+
+    if (stop_requested_.load(std::memory_order_relaxed)) co_return;
+
+    // Log the completed analysis summaries.
+    const auto summaries = market_analyzer_->get_summaries();
+    for (const auto& s : summaries) {
+        spdlog::info("[Engine] Analysis complete for {}: "
+                     "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "
+                     "VR={:.3f} regime={} recommendation={}",
+                     s.pair_name,
+                     s.volatility_annual * 100.0,
+                     s.mean_spread_bps,
+                     s.spread_cv,
+                     s.variance_ratio,
+                     to_string(s.regime),
+                     to_string(s.aggressiveness));
+    }
+
+    // Transition to active trading.
+    state_->set_status(BotStatus::Running);
+    spdlog::info("[Engine] Startup analysis complete; entering trading mode");
+
+    co_return;
+}
 
 // [T1-03] on_new_block_coro -- native coroutine heartbeat cycle.
 // Steps 2 and 8 are co_awaited (they contain async RPC calls).

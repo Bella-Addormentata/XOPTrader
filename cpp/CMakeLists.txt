@@ -152,6 +152,7 @@ add_library(xop_core STATIC
     # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp
     src/data/adverse_selection.cpp
+    src/data/market_analyzer.cpp
 
     # -- Monitoring ------------------------------------------------------------
     src/monitoring/pnl.cpp

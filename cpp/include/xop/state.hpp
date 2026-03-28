@@ -65,10 +65,11 @@ struct Position {
 
 enum class BotStatus : std::uint8_t {
     Initializing = 0,
-    Running      = 1,
-    Paused       = 2,
-    ShuttingDown = 3,
-    Stopped      = 4
+    Analyzing    = 1,   ///< Startup market analysis phase (pre-trading).
+    Running      = 2,
+    Paused       = 3,
+    ShuttingDown = 4,
+    Stopped      = 5
 };
 
 /// Human-readable label for logging.
