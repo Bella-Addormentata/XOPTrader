@@ -99,6 +99,10 @@ void MarketAnalyzer::ingest(const std::string& pair_name,
 
     PairState& ps = it->second;
 
+    // Track total poll attempts (including invalid data) for timeout
+    // and data-quality reporting.
+    ++ps.total_poll_attempts;
+
     if (ps.complete) {
         return;  // Window already full; ignore further observations.
     }
@@ -160,6 +164,10 @@ uint32_t MarketAnalyzer::analysis_blocks() const noexcept {
     return cfg_.analysis_blocks;
 }
 
+uint32_t MarketAnalyzer::timeout_block_multiplier() const noexcept {
+    return cfg_.timeout_block_multiplier;
+}
+
 std::vector<PairAnalysisSummary> MarketAnalyzer::get_summaries() const {
     std::vector<PairAnalysisSummary> result;
     result.reserve(states_.size());
@@ -186,8 +194,43 @@ void MarketAnalyzer::reset() {
         ps.volumes.clear();
         ps.bid_depths.clear();
         ps.ask_depths.clear();
-        ps.blocks_collected = 0;
-        ps.complete         = false;
+        ps.blocks_collected     = 0;
+        ps.total_poll_attempts  = 0;
+        ps.complete             = false;
+    }
+}
+
+void MarketAnalyzer::force_complete() {
+    for (auto& [name, ps] : states_) {
+        if (!ps.complete) {
+            ps.complete = true;
+            spdlog::warn("[MarketAnalyzer] {} force-completed after {} valid / {} total polls",
+                         name, ps.blocks_collected, ps.total_poll_attempts);
+        }
+    }
+}
+
+AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
+    if (states_.empty()) return AnalysisAggressiveness::Normal;
+
+    // Return the most conservative recommendation across all pairs.
+    // Conservative(0) < Normal(1) < Aggressive(2) — lower is more conservative.
+    auto most_conservative = AnalysisAggressiveness::Aggressive;
+    for (const auto& [name, ps] : states_) {
+        const auto summary = compute_summary(ps);
+        if (static_cast<uint8_t>(summary.aggressiveness) <
+            static_cast<uint8_t>(most_conservative)) {
+            most_conservative = summary.aggressiveness;
+        }
+    }
+    return most_conservative;
+}
+
+double MarketAnalyzer::recommended_spread_multiplier() const {
+    switch (overall_recommendation()) {
+        case AnalysisAggressiveness::Conservative: return 1.5;
+        case AnalysisAggressiveness::Aggressive:   return 0.8;
+        default:                                   return 1.0;
     }
 }
 
@@ -200,6 +243,7 @@ PairAnalysisSummary MarketAnalyzer::compute_summary(const PairState& ps) const {
     s.pair_name        = ps.pair_name;
     s.blocks_collected = ps.blocks_collected;
     s.complete         = ps.complete;
+    s.window_filled    = ps.complete && (ps.blocks_collected >= cfg_.analysis_blocks);
 
     const std::size_t n = ps.prices.size();
 

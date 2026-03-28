@@ -448,8 +448,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup analysis failed: {}; starting trading",
                          ex.what());
-            // Disable further use of the market analyzer and transition to
-            // Running so the engine does not remain stuck in Analyzing state.
+            // Disable further use of the market analyzer and ensure we
+            // transition to Running even on analysis failure.
             market_analyzer_.reset();
             state_->set_status(BotStatus::Running);
         }
@@ -533,19 +533,34 @@ asio::awaitable<void> Engine::run_startup_analysis()
     asio::steady_timer timer(ioc_);
     BlockHeight last_analysis_block{0};
 
-    // Fail-open timeout: if we have observed 3× the target block count but
-    // some pairs still lack valid market data (mid_price <= 0 every block),
-    // stop waiting and proceed to trading rather than stalling indefinitely.
-    // 3× is chosen so a pair that misses data on every other block still gets
-    // a full analysis window, while a pair with persistently bad data (e.g.
-    // delisted or misconfigured) does not block trading forever.
-    static constexpr uint32_t kTimeoutMultiplier = 3;
-    // target >= 3 by invariant (MarketAnalyzer constructor clamps to 3).
-    const uint32_t timeout_blocks = target * kTimeoutMultiplier;
-    uint32_t blocks_polled = 0;
+    // [TIMEOUT] Maximum total block polls before forcing completion.
+    // Prevents the engine from hanging indefinitely if a pair has no
+    // market data (e.g. a newly listed pair with zero trading activity).
+    // Uses MarketAnalyzerConfig::timeout_block_multiplier (default 3x).
+    // Clamp to >= 1 so that a misconfigured 0 doesn't trigger an
+    // immediate timeout before any data is collected.
+    uint32_t timeout_mult = market_analyzer_->timeout_block_multiplier();
+    if (timeout_mult == 0) {
+        spdlog::warn("[Engine] MarketAnalyzer timeout_block_multiplier configured "
+                     "as 0; clamping to 1 to avoid immediate analysis timeout");
+        timeout_mult = 1;
+    }
+    const uint32_t max_total_polls = target * timeout_mult;
+    uint32_t total_polls = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
+
+        // Check timeout: force-complete if we've polled too many blocks
+        // without all pairs finishing.
+        if (total_polls >= max_total_polls) {
+            spdlog::warn("[Engine] Analysis timeout after {} block polls "
+                         "(target was {} blocks); forcing completion with "
+                         "partial data",
+                         total_polls, target);
+            market_analyzer_->force_complete();
+            break;
+        }
 
         timer.expires_after(kPollInterval);
         boost::system::error_code ec;
@@ -554,8 +569,15 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (ec == boost::asio::error::operation_aborted) {
             co_return;  // Shutdown during analysis.
         }
-        if (ec || stop_requested_.load(std::memory_order_relaxed)) {
-            co_return;
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            co_return;  // Shutdown requested.
+        }
+        if (ec) {
+            // Non-shutdown timer error — log and fall through to
+            // complete analysis with whatever data we have.
+            spdlog::warn("[Engine] Analysis timer error: {}; ending analysis early",
+                         ec.message());
+            break;
         }
 
         // Fetch current block height.
@@ -571,15 +593,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
         const BlockHeight current_block = static_cast<BlockHeight>(height);
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
-
-        // Count each new block towards the stall timeout.
-        ++blocks_polled;
-        if (blocks_polled > timeout_blocks) {
-            spdlog::warn("[Engine] Analysis timeout after {} blocks polled "
-                         "(target={}, timeout={}); proceeding to trading",
-                         blocks_polled, target, timeout_blocks);
-            break;
-        }
+        ++total_polls;
 
         // Fetch market data for this block.
         // Initialize per-pair cycle entries so step_update_market_state can write.
@@ -599,11 +613,13 @@ asio::awaitable<void> Engine::run_startup_analysis()
         }
 
         // Feed observations to the analyzer for each pair.
+        // Always call ingest() even with invalid mid_price so that
+        // total_poll_attempts is tracked for data-quality reporting.
+        // MarketAnalyzer::ingest() will reject invalid data internally.
         for (const auto& pair : config_.pairs) {
             if (!pair.enabled) continue;
 
             const MarketSnapshot snap = state_->get_market(pair.name);
-            if (snap.mid_price <= 0) continue;
 
             const double mid_d    = static_cast<double>(snap.mid_price);
             const double spread_d = snap.spread_bps;
@@ -657,7 +673,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
 
     // Log the completed analysis summaries.
-    const auto summaries = market_analyzer_->get_summaries();
+    auto summaries = market_analyzer_->get_summaries();
     for (const auto& s : summaries) {
         spdlog::info("[Engine] Analysis complete for {}: "
                      "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "
@@ -669,6 +685,37 @@ asio::awaitable<void> Engine::run_startup_analysis()
                      s.variance_ratio,
                      to_string(s.regime),
                      to_string(s.aggressiveness));
+    }
+
+    // Apply the analysis recommendation to derive an initial spread
+    // multiplier.  This influences how conservatively/aggressively the
+    // engine quotes during the first trading blocks.
+    //
+    // The multiplier is stored both locally (for step_apply_spread_optimizer)
+    // and in State (for GUI/monitoring accessibility).
+    //
+    // Conservative → 1.5  (50% wider spreads: protect against adverse selection)
+    // Normal       → 1.0  (no change from configured defaults)
+    // Aggressive   → 0.8  (20% tighter: capture spread in stable markets)
+    //
+    // Compute overall_recommendation() once and derive the multiplier from
+    // it, avoiding a second full traversal of all pair summaries.
+    const auto overall = market_analyzer_->overall_recommendation();
+    switch (overall) {
+        case AnalysisAggressiveness::Conservative: analysis_spread_mult_ = 1.5; break;
+        case AnalysisAggressiveness::Aggressive:   analysis_spread_mult_ = 0.8; break;
+        default:                                   analysis_spread_mult_ = 1.0; break;
+    }
+
+    spdlog::info("[Engine] Analysis recommendation: {} → spread multiplier {:.2f}x",
+                 to_string(overall), analysis_spread_mult_);
+
+    // Persist summaries and multiplier in State for GUI/monitoring.
+    state_->set_analysis_results(std::move(summaries), analysis_spread_mult_);
+
+    // Export spread multiplier to Prometheus.
+    if (metrics_->is_running()) {
+        metrics_->set_analysis_spread_multiplier(analysis_spread_mult_);
     }
 
     // Transition to active trading.
@@ -1500,6 +1547,15 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         pcs.spread_result.total_spread_bps *= whale_mult * vpin_mult * ofi_mult;
 
+        // Apply startup-analysis spread multiplier.
+        // This adjusts initial quoting based on the pre-trading observation:
+        //   Conservative → 1.5x (wider spreads)
+        //   Normal       → 1.0x (no change)
+        //   Aggressive   → 0.8x (tighter spreads)
+        if (analysis_spread_mult_ != 1.0) {
+            pcs.spread_result.total_spread_bps *= analysis_spread_mult_;
+        }
+
         // [T3-06] Graduated staleness spread widening.
         // When data age exceeds 50% of stale_threshold, widen spreads
         // linearly up to 2x at the threshold.  Beyond the threshold,
@@ -1518,7 +1574,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         spdlog::debug("[Engine] Step 5: {} spread={:.1f}bps (adverse={:.1f} inv={:.1f} "
                       "cost={:.1f} comp={:.1f} mult={:.2f} "
-                      "whale={:.2f} vpin={:.3f} ofi={:.3f})",
+                      "whale={:.2f} vpin={:.3f} ofi={:.3f} analysis={:.2f})",
                       pair_name,
                       pcs.spread_result.total_spread_bps,
                       pcs.spread_result.s_adverse,
@@ -1526,7 +1582,8 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                       pcs.spread_result.s_cost,
                       pcs.spread_result.s_competition,
                       pcs.spread_result.regime_multiplier,
-                      whale_mult, vpin, ofi);
+                      whale_mult, vpin, ofi,
+                      analysis_spread_mult_);
 
         // -- Apply CHIA structural edge multiplier -------------------------
         if (chia_edge_) {

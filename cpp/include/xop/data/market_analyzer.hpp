@@ -129,7 +129,14 @@ struct PairAnalysisSummary {
 
     // -- Completeness -------------------------------------------------------
     uint32_t blocks_collected{0}; ///< Actual observations ingested.
-    bool     complete{false};     ///< True once the full window is filled.
+    bool     complete{false};     ///< True when analysis has ended (either
+                                  ///  the full window was observed OR the
+                                  ///  analysis was force-completed due to
+                                  ///  a timeout).
+    bool     window_filled{false};///< True only when the full observation
+                                  ///  window was filled (blocks_collected
+                                  ///  >= analysis_blocks).  False after
+                                  ///  force_complete() with partial data.
 };
 
 // ---------------------------------------------------------------------------
@@ -160,6 +167,12 @@ struct MarketAnalyzerConfig {
 
     /// Minimum mean spread (bps) to trigger Aggressive recommendation.
     double wide_spread_bps_threshold{80.0};
+
+    /// Timeout multiplier: if total block polls exceed
+    /// analysis_blocks * timeout_block_multiplier without all pairs
+    /// completing, the engine forces completion.  Prevents hanging
+    /// indefinitely when a pair has no market data.  Default 3x.
+    uint32_t timeout_block_multiplier{3};
 };
 
 // ---------------------------------------------------------------------------
@@ -217,6 +230,9 @@ public:
     /// Configured analysis window length (blocks).
     [[nodiscard]] uint32_t analysis_blocks() const noexcept;
 
+    /// Configured timeout multiplier for analysis completion.
+    [[nodiscard]] uint32_t timeout_block_multiplier() const noexcept;
+
     /// Per-pair analysis summaries.  Complete() must be true for the
     /// recommendations to be meaningful; calling before completion returns
     /// partial results with complete == false.
@@ -228,6 +244,28 @@ public:
 
     /// Reset all accumulated data (useful for re-analysis after reconnect).
     void reset();
+
+    /// Force all pairs to be marked complete (``complete = true``), even
+    /// if they have not collected enough blocks.  ``window_filled`` will
+    /// remain false for pairs that did not reach ``analysis_blocks``,
+    /// allowing callers to distinguish forced vs. fully-observed results.
+    /// Used by the engine when the analysis timeout expires (e.g. a pair
+    /// has no market data) to prevent the bot from hanging indefinitely
+    /// in the Analyzing state.
+    void force_complete();
+
+    /// Overall aggressiveness recommendation across all pairs.
+    /// Returns the most conservative recommendation among all pairs
+    /// (i.e. if any pair recommends Conservative, the overall is
+    /// Conservative).  Returns Normal if no pairs are tracked.
+    [[nodiscard]] AnalysisAggressiveness overall_recommendation() const;
+
+    /// Spread multiplier derived from the overall aggressiveness
+    /// recommendation:
+    ///   Conservative → 1.5  (50% wider initial spreads)
+    ///   Normal       → 1.0  (no change)
+    ///   Aggressive   → 0.8  (20% tighter initial spreads)
+    [[nodiscard]] double recommended_spread_multiplier() const;
 
 private:
     // -- Per-pair rolling storage ---------------------------------------------
@@ -242,7 +280,8 @@ private:
         std::deque<double> ask_depths;  // ask depth per block.
 
         uint32_t blocks_collected{0};
-        bool     complete{false};
+        uint32_t total_poll_attempts{0};  ///< Total ingest calls (incl. invalid).
+        bool     complete{false};         ///< Analysis ended (natural or forced).
     };
 
     // -- Helpers --------------------------------------------------------------
