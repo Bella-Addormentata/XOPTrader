@@ -53,6 +53,10 @@ risk:
   # Position sizing
   kelly_fraction: 0.5    # Half-Kelly
   max_capital_per_pair_pct: 0.20
+  # Circuit breakers (all optional -- defaults shown)
+  max_drawdown_pct: 0.10        # Pause when peak-to-trough PnL drop exceeds 10%
+  loss_window_blocks: 1152      # Rolling window for time-window breaker (~10 h)
+  max_window_loss_bps: 500      # Pause if this many bps lost within window; 0 = disabled
 
 volatility:
   # Yang-Zhang hybrid estimator
