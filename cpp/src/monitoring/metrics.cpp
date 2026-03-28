@@ -262,7 +262,8 @@ void MetricsExporter::register_metrics()
     //  Dashboard 7: Startup Market Analysis
     // ---------------------------------------------------------------
 
-    // Scalar gauges: blocks_target and overall complete flag.
+    // Scalar gauge: analysis window block-count target.
+    // Per-pair complete flags are published under xop_analysis_pair.
     analysis_family_ = &prometheus::BuildGauge()
         .Name("xop_analysis")
         .Help("Startup market analysis global state")

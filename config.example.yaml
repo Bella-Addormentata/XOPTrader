@@ -45,9 +45,9 @@ strategy:
   max_half_spread_bps: 250  # Global cap on half-spread (250 = 500bps round-trip = 5%)
   offer_fee_mojos: 100000000  # On-chain fee per offer/cancel (0.0001 XCH)
   # Startup market analysis: observe this many blocks before trading begins.
-  # 0 = skip analysis and start trading immediately.
-  # Default: 20 blocks (~17 min at 52 s/block).
-  startup_analysis_blocks: 20
+  # 0 = skip analysis and start trading immediately (default).
+  # Example: 20 blocks (~17 min at 52 s/block).
+  startup_analysis_blocks: 0
 
 risk:
   # Inventory limits
@@ -57,6 +57,10 @@ risk:
   # Position sizing
   kelly_fraction: 0.5    # Half-Kelly
   max_capital_per_pair_pct: 0.20
+  # Circuit breakers (all optional -- defaults shown)
+  max_drawdown_pct: 0.10        # Pause when peak-to-trough PnL drop exceeds 10%
+  loss_window_blocks: 1152      # Rolling window for time-window breaker (~10 h)
+  max_window_loss_bps: 500      # Pause if this many bps lost within window; 0 = disabled
 
 volatility:
   # Yang-Zhang hybrid estimator

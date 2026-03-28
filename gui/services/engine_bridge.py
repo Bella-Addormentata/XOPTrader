@@ -286,9 +286,14 @@ class EngineBridge(QObject):
             if pair_name
         }
 
-        # Collect startup market analysis data for each pair.
+        # Collect startup market analysis data — only when the bot is
+        # actively in the Analyzing phase to avoid rendering a non-existent
+        # analysis session in the GUI.
         pair_names = [p.get("name", "") for p in pairs if p.get("name")]
-        analysis_data = self._metrics_svc.get_analysis(pair_names) if pair_names else {}
+        if self._bot_status == STATUS_ANALYZING and pair_names:
+            analysis_data = self._metrics_svc.get_analysis(pair_names)
+        else:
+            analysis_data = {}
 
         data: dict[str, Any] = {
             "pnl": self._metrics_svc.get_pnl(),
@@ -427,13 +432,16 @@ class EngineBridge(QObject):
         # engine is running.  If the endpoint is reachable but the
         # node is not synced, we report it as running (degraded) --
         # the status bar can show the detail.
-        if node_synced >= 1.0 and wallet_connected >= 1.0:
-            new_status = STATUS_RUNNING
-        elif node_synced >= 1.0 or wallet_connected >= 1.0:
-            # Partially connected -- still consider it running.
+        if node_synced >= 1.0 or wallet_connected >= 1.0:
             new_status = STATUS_RUNNING
         else:
             new_status = STATUS_STOPPED
+
+        # Check if the engine is currently in the startup analysis phase.
+        # Infer Analyzing from Prometheus metrics: blocks_target > 0 and
+        # at least one pair has not yet completed its analysis window.
+        if new_status == STATUS_RUNNING and self._metrics_svc.is_analysis_active():
+            new_status = STATUS_ANALYZING
 
         self._update_status(new_status)
 
