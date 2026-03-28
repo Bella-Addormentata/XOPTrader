@@ -219,7 +219,7 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    spdlog::info("XOPTrader v{} starting", "0.1.0");
+    spdlog::info("XOPTrader v{} starting", "0.1.3");
     if (cli.dry_run) {
         spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
     }
