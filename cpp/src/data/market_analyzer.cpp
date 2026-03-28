@@ -29,7 +29,7 @@ double annualisation_factor(double block_time_seconds) noexcept {
     return std::sqrt(kSecondsPerYear / block_time_seconds);
 }
 
-// Population standard deviation of a sequence.
+// Sample standard deviation of a sequence.
 // Returns 0.0 if the sequence has fewer than 2 elements.
 // Uses the sample standard deviation formula (denominator n-1) for
 // unbiased estimation from a finite sample, consistent with the

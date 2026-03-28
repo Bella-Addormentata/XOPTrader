@@ -191,7 +191,7 @@ class PairAnalysisPanel(QFrame):
 
     # -- public API -----------------------------------------------------------
 
-    def update(  # type: ignore[override]
+    def update_stats(
         self,
         blocks_collected: int,
         blocks_target: int,
@@ -226,7 +226,7 @@ class PairAnalysisPanel(QFrame):
         momentum:
             Cumulative log-return over the analysis window.
         regime_code:
-            0 = Mean-Reverting, 1 = Normal, 2 = Momentum.
+            0 = Mean-Reverting, 1 = Random Walk, 2 = Momentum.
         agg_code:
             0 = Conservative, 1 = Normal, 2 = Aggressive.
         complete:
@@ -449,7 +449,7 @@ class MarketAnalysisWidget(QWidget):
                 self._pairs_layout.insertWidget(idx, panel)
 
             # Update the panel.
-            self._pair_panels[pair_name].update(
+            self._pair_panels[pair_name].update_stats(
                 blocks_collected = collected,
                 blocks_target    = target,
                 vol_annual       = data.get("vol_annual", 0.0),
