@@ -537,7 +537,7 @@ double SpreadOptimizer::calc_regime_multiplier(
 // ===========================================================================
 
 SpreadResult SpreadOptimizer::compute_spread(
-    double mid_price_xch,
+    [[maybe_unused]] double mid_price_xch,
     double sigma_daily,
     double inventory_q,
     double q_max,

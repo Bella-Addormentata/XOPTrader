@@ -44,8 +44,15 @@
 // denominator share the same magnitude.
 // ---------------------------------------------------------------------------
 #if defined(__SIZEOF_INT128__)
+  #if defined(__GNUC__) || defined(__clang__)
+    #pragma GCC diagnostic push
+    #pragma GCC diagnostic ignored "-Wpedantic"
+  #endif
     using Wide = __int128;
     #define XOP_WIDE_DIV(num, den) static_cast<Mojo>((num) / (den))
+  #if defined(__GNUC__) || defined(__clang__)
+    #pragma GCC diagnostic pop
+  #endif
 #else
     using Wide = double;
     #define XOP_WIDE_DIV(num, den) static_cast<Mojo>(static_cast<double>(num) / \
