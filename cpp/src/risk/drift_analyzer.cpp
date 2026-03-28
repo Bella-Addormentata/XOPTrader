@@ -562,8 +562,7 @@ std::vector<TimeToBreachEntry> InventoryDriftAnalyzer::compute_breach_table() co
 // Real-time monitoring
 // ===========================================================================
 
-bool InventoryDriftAnalyzer::is_drift_anomalous(
-    MarketCondition condition) const
+bool InventoryDriftAnalyzer::is_drift_anomalous() const
 {
     auto emp = empirical_drift();
     if (!emp.has_value() || emp->second <= 0.0) {
@@ -573,12 +572,20 @@ bool InventoryDriftAnalyzer::is_drift_anomalous(
 
     const auto& [slope, emp_sigma] = emp.value();
 
-    // For RandomWalk and MeanReverting, expected drift is zero.
-    // For trending conditions, the empirical drift IS the expectation,
-    // so we compare against zero (any drift is the expected drift).
-    double expected_drift = 0.0;
-
-    const double z = std::abs(slope - expected_drift) / emp_sigma;
+    // Z-test: is the empirical drift statistically distinguishable from zero?
+    //
+    // For RandomWalk and MeanReverting regimes, the expected inventory drift
+    // is zero; any non-zero slope is a potential anomaly.
+    //
+    // For Trending regimes, some drift is expected.  However, without an
+    // explicit trend magnitude (trend_pct_day) this function cannot compute
+    // the model-predicted drift rate.  Comparing against zero still catches
+    // large systematic inventory accumulation — the main risk signal.
+    // Callers who need condition-specific baselines should use analyze_drift()
+    // which incorporates the full model with trend_pct_day.
+    //
+    // ISO/IEC 5055: CWE-190 -- slope and emp_sigma are finite by construction.
+    const double z = std::abs(slope) / emp_sigma;
     return z > cfg_.anomaly_z_threshold;
 }
 

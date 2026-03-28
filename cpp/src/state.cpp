@@ -269,6 +269,7 @@ const char* to_string(BotStatus s) noexcept
 {
     switch (s) {
         case BotStatus::Initializing: return "Initializing";
+        case BotStatus::Analyzing:    return "Analyzing";
         case BotStatus::Running:      return "Running";
         case BotStatus::Paused:       return "Paused";
         case BotStatus::ShuttingDown: return "ShuttingDown";
@@ -483,6 +484,30 @@ std::vector<MarketSnapshot> State::get_all_markets() const
         out.push_back(snap);
     }
     return out;
+}
+
+// ===========================================================================
+// Analysis summaries
+// ===========================================================================
+
+void State::set_analysis_results(std::vector<PairAnalysisSummary> summaries,
+                                  double spread_multiplier)
+{
+    std::unique_lock lock(mtx_analysis_);
+    analysis_summaries_   = std::move(summaries);
+    analysis_spread_mult_ = spread_multiplier;
+}
+
+std::vector<PairAnalysisSummary> State::get_analysis_summaries() const
+{
+    std::shared_lock lock(mtx_analysis_);
+    return analysis_summaries_;
+}
+
+double State::analysis_spread_multiplier() const
+{
+    std::shared_lock lock(mtx_analysis_);
+    return analysis_spread_mult_;
 }
 
 }  // namespace xop

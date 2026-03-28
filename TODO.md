@@ -315,7 +315,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/engine.cpp`
 - **Issue:** No global stop-loss. Slow series of adverse fills can deplete capital without triggering alerts.
 - **Fix:** Add `max_drawdown_pct` parameter; transition engine to `Paused` when HWM drawdown exceeds threshold.
-- **Status:** `[x]` — 10% default max drawdown. HWM seeded on first cycle. Active from startup (no profit-gate bypass).
+- **Status:** `[x]` — 10% default max drawdown. HWM seeded on first cycle. Active from startup (no profit-gate bypass). `max_drawdown_pct` is now configurable via `risk.max_drawdown_pct` in config.yaml (T3-36 extended it).
 
 ### T3-10: Add flash-crash state machine (Normal → Crash → Recovery → Normal)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.6, LOGICREVIEW-GPT5.3-Codex §HIGH-2
@@ -495,6 +495,13 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Issue:** Whale/VPIN/OFI fed from own fills → self-reinforcing → widening spiral.
 - **Fix:** Use own fills for attribution/calibration, not as primary toxicity input.
 - **Status:** `[x]` — is_own_fill parameter on ingest_trade() and ingest_trade_for_vpin(). Own fills skip whale detection and VPIN accumulation.
+
+### T3-36: Add rolling time-window PnL loss circuit breaker
+- **Source:** GitHub Issue "circuit breaker"
+- **Files:** `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, `cpp/include/xop/engine.hpp`, `cpp/src/engine.cpp`, `README.md`
+- **Issue:** The existing max-drawdown circuit breaker (T3-09) measures peak-to-trough over all time. It does not detect rapid, concentrated loss bursts within a short window (loss velocity). A bot losing 5% of peak PnL in 10 minutes would not trigger the HWM circuit breaker if the HWM was set long ago. Academic literature (FINRA Rule 15c3-5; Brunnermeier & Pedersen 2009; Kyle 1985) identifies loss velocity as a distinct risk signal warranting a separate control.
+- **Fix:** Add `loss_window_blocks` and `max_window_loss_bps` to `RiskConfig`. Maintain a `pnl_window_` deque in the engine. In `step_check_alerts()`, trim entries outside the window and pause if window loss exceeds the threshold. Also expose `max_drawdown_pct` as a config field (was hardcoded at 0.10).
+- **Status:** `[x]` — Rolling-window deque bounded by `loss_window_blocks`. Threshold = `peak_pnl_hwm_ * max_window_loss_bps / 10000` mojos. Fires independently of HWM circuit breaker. Default: 500 bps / 1152 blocks (~10 h). `max_window_loss_bps = 0` disables check. `max_drawdown_pct` now configurable.
 
 ---
 

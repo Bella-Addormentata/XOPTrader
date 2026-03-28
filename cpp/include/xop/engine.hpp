@@ -80,6 +80,9 @@
 #include "xop/risk/loss_manager.hpp"
 #include "xop/risk/drift_analyzer.hpp"
 
+// Startup market analysis
+#include "xop/data/market_analyzer.hpp"
+
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <boost/asio/steady_timer.hpp>
@@ -87,9 +90,11 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <deque>
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 namespace xop {
@@ -476,6 +481,28 @@ private:
     /// Inventory drift analyzer — random walk, trending, Monte Carlo.
     std::unique_ptr<InventoryDriftAnalyzer> drift_analyzer_;
 
+    // -- Startup market analysis ---------------------------------------------
+
+    /// Startup market analyzer.  Collects market observations for
+    /// config_.strategy.startup_analysis_blocks blocks before entering
+    /// active trading.  nullptr when startup_analysis_blocks == 0.
+    std::unique_ptr<MarketAnalyzer> market_analyzer_;
+
+    /// Spread multiplier derived from startup analysis.  Applied in
+    /// step_apply_spread_optimizer() to widen/tighten initial spreads
+    /// based on the analysis recommendation.
+    ///   Conservative → 1.5  (50% wider)
+    ///   Normal       → 1.0  (no change)
+    ///   Aggressive   → 0.8  (20% tighter)
+    /// Default 1.0 (no adjustment) if analysis is skipped.
+    double analysis_spread_mult_{1.0};
+
+    /// [T0] Coroutine: run the startup analysis phase.  Collects
+    /// startup_analysis_blocks blocks of market data, exports per-block
+    /// metrics, and logs the completed analysis summary.  Called from
+    /// poll_loop_coro() before the main trading loop begins.
+    boost::asio::awaitable<void> run_startup_analysis();
+
     // -- Runtime state -------------------------------------------------------
 
     /// The last block height successfully processed by on_new_block().
@@ -535,10 +562,28 @@ private:
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
     // When exceeded, engine transitions to BotStatus::Paused and alerts.
-    // Default 10% (0.10).  Configurable via risk config extension.
+    // Configurable via risk.max_drawdown_pct in config.yaml; default 10%.
     // ISO/IEC 5055: named constant with documented default.
-    static constexpr double kDefaultMaxDrawdownPct = 0.10;
-    double max_drawdown_pct_{kDefaultMaxDrawdownPct};
+    double max_drawdown_pct_;
+
+    // [T3-36] Rolling time-window PnL loss circuit breaker.
+    //
+    // Records (block_height, total_pnl_mojos) pairs each heartbeat cycle.
+    // The deque is trimmed to retain only entries within the most recent
+    // loss_window_blocks blocks; stale entries (age >= window) are discarded
+    // from the front.  The oldest surviving entry provides the baseline PnL
+    // for the window loss calculation.
+    //
+    // Loss in window = oldest_pnl - current_pnl  (positive when losing).
+    // Threshold      = peak_pnl_hwm_ * max_window_loss_bps / 10000.
+    //
+    // When loss_in_window > threshold AND threshold > 0, the engine
+    // transitions to BotStatus::Paused the same way the HWM circuit breaker
+    // does.  The two circuit breakers are independent; either can fire first.
+    //
+    // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
+    // ISO/IEC 5055: deque prevents unbounded memory growth.
+    std::deque<std::pair<BlockHeight, Mojo>> pnl_window_;
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded
