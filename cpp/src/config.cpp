@@ -461,12 +461,17 @@ RiskConfig parse_risk(const YAML::Node& root)
     }
 
     // loss_window_blocks: rolling window in blocks >= 1.  Default 1152 (~10 h).
+    // ISO/IEC 5055 -- CWE-681: validate both bounds before int64_t→uint32_t cast.
     if (node["loss_window_blocks"] && node["loss_window_blocks"].IsDefined()
             && !node["loss_window_blocks"].IsNull()) {
         int64_t wblocks = node["loss_window_blocks"].as<int64_t>();
-        if (wblocks < 1) {
-            throw ConfigError(sec + ".loss_window_blocks must be >= 1; got "
-                              + std::to_string(wblocks));
+        if (wblocks < 1
+                || wblocks > static_cast<int64_t>(
+                       std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(
+                sec + ".loss_window_blocks must be in [1, "
+                + std::to_string(std::numeric_limits<uint32_t>::max())
+                + "]; got " + std::to_string(wblocks));
         }
         cfg.loss_window_blocks = static_cast<uint32_t>(wblocks);
     }
