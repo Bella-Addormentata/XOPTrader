@@ -71,31 +71,32 @@ enum class AlertTier : std::uint8_t {
 const char* to_string(AlertTier tier) noexcept;
 
 // ---------------------------------------------------------------------------
-// AlertRule -- unique identifier for each of the 14 alert rules.
+// AlertRule -- unique identifier for each of the 15 alert rules.
 //
 // Enum values are stable (used as map keys and in rate-limit tracking).
 // ---------------------------------------------------------------------------
 
 enum class AlertRule : std::uint8_t {
-    // CRITICAL (rules 1-4)
+    // CRITICAL (rules 1-5)
     NodeDesync          = 1,  // Node > 5 blocks behind chain tip.
     WalletUnreachable   = 2,  // Wallet RPC connection failed.
     ExposureBreach      = 3,  // Inventory exceeds hard_limit_pct.
     FlashCrash          = 4,  // Price drop > 20% detected.
+    CircuitBreaker      = 5,  // HWM or rolling-window circuit breaker fired.
 
-    // WARNING (rules 5-10)
-    FillRateDrop        = 5,  // Fill rate < 50% of 24h average.
-    SpreadWidening      = 6,  // Spread > 2x normal for the pair.
-    UnderwaterPosition  = 7,  // Cost basis > market price on held asset.
-    ConcentrationBreach = 8,  // Single asset > 12% of portfolio.
-    PnlDrawdown         = 9,  // PnL drawdown exceeds 5% of peak.
-    OfferCreationFail   = 10, // Consecutive offer creation failures.
+    // WARNING (rules 6-11)
+    FillRateDrop        = 6,  // Fill rate < 50% of 24h average.
+    SpreadWidening      = 7,  // Spread > 2x normal for the pair.
+    UnderwaterPosition  = 8,  // Cost basis > market price on held asset.
+    ConcentrationBreach = 9,  // Single asset > 12% of portfolio.
+    PnlDrawdown         = 10, // PnL drawdown exceeds 5% of peak.
+    OfferCreationFail   = 11, // Consecutive offer creation failures.
 
-    // INFO (rules 11-14)
-    HourlyPnl           = 11, // Hourly PnL summary.
-    DailyPnl            = 12, // Daily PnL summary.
-    NewPairVolume        = 13, // Volume detected on a newly listed pair.
-    ArbitrageDetected    = 14  // Cross-venue or cross-bridge arb opportunity.
+    // INFO (rules 12-15)
+    HourlyPnl           = 12, // Hourly PnL summary.
+    DailyPnl            = 13, // Daily PnL summary.
+    NewPairVolume        = 14, // Volume detected on a newly listed pair.
+    ArbitrageDetected    = 15  // Cross-venue or cross-bridge arb opportunity.
 };
 
 /// Human-readable label for logging.
