@@ -50,6 +50,10 @@ pairs:
     quote_asset_id: "xch"
     name: "wmilliETH.b/XCH"
     enabled: true
+  - base_asset_id: "4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f"  # wmilliETH
+    quote_asset_id: "xch"
+    name: "wmilliETH/XCH"
+    enabled: true
 
 strategy:
   # Avellaneda-Stoikov / GLFT parameters
@@ -136,3 +140,30 @@ arbitrage:
   max_position_size: 100                # Max base-asset units per arb trade
   default_confidence: 0.75              # Base confidence when depth unknown
   min_confidence_threshold: 0.40        # Discard opportunities below this
+
+# CoinGecko external price reference — provides CEX-grade mid-prices
+# for assets with CoinGecko listings.  Feeds into the existing 70/30
+# DEX/CEX blending pipeline in MarketDataFeed.
+#
+# Free tier: ~10-30 calls/min, no API key needed.
+# Demo tier: set api_key for guaranteed 30 calls/min.
+#
+# Asset mapping:
+#   XCH          -> "chia"
+#   wmilliETH.b  -> "ethereum" (price / 1000)
+#   wmilliETH    -> "ethereum" (price / 1000)
+#   wUSDC.b      -> "usd-coin" (~1.0)
+#   BYC          -> no CoinGecko listing (DEX-only, skipped)
+coingecko:
+  enabled: true
+  # base_url: "https://api.coingecko.com/api/v3"   # Default; override for pro tier
+  coin_ids: [chia, ethereum, usd-coin]              # CoinGecko coin identifiers
+  polling_interval_ms: 30000                        # Poll every 30 s (free tier safe)
+  # request_timeout_ms: 15000
+  # connect_timeout_ms: 10000
+  # max_retries: 3
+  # retry_base_delay_ms: 1000
+  # rate_limit_max_requests: 10                     # 10 req per 60 s window
+  # rate_limit_window_ms: 60000
+  # curl_thread_pool_size: 2
+  api_key: ""                                       # Empty = free tier; set for Demo plan

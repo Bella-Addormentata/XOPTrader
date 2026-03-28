@@ -802,6 +802,61 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_coingecko -- optional `coingecko:` section.
+// ---------------------------------------------------------------------------
+CoinGeckoConfig parse_coingecko(const YAML::Node& root)
+{
+    const std::string sec = "coingecko";
+    CoinGeckoConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_str = [&](const char* key, std::string& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::string>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_bool("enabled",                   cfg.enabled);
+    read_str ("base_url",                  cfg.base_url);
+    read_u32 ("polling_interval_ms",       cfg.polling_interval_ms);
+    read_u32 ("request_timeout_ms",        cfg.request_timeout_ms);
+    read_u32 ("connect_timeout_ms",        cfg.connect_timeout_ms);
+    read_u32 ("max_retries",               cfg.max_retries);
+    read_u32 ("retry_base_delay_ms",       cfg.retry_base_delay_ms);
+    read_u32 ("rate_limit_max_requests",   cfg.rate_limit_max_requests);
+    read_u32 ("rate_limit_window_ms",      cfg.rate_limit_window_ms);
+    read_u32 ("curl_thread_pool_size",     cfg.curl_thread_pool_size);
+    read_str ("api_key",                   cfg.api_key);
+    read_str ("user_agent",                cfg.user_agent);
+
+    // Parse coin_ids as a YAML sequence of strings.
+    if (node["coin_ids"] && node["coin_ids"].IsSequence()) {
+        for (const auto& item : node["coin_ids"]) {
+            cfg.coin_ids.push_back(item.as<std::string>());
+        }
+    }
+
+    // Validate polling interval isn't too aggressive for free tier.
+    if (cfg.polling_interval_ms < 5'000) {
+        throw ConfigError(sec + ".polling_interval_ms must be >= 5000 "
+                          "(CoinGecko free tier rate limit)");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // Redacted summary printer.  Emits every operationally useful field while
 // suppressing all classified secrets (SSL paths, fingerprint, tokens).
 // ---------------------------------------------------------------------------
@@ -914,6 +969,21 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
         << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
 
+    // CoinGecko external price reference -- api_key is secret.
+    out << "[coingecko]\n"
+        << "  enabled    = " << (cfg.coingecko.enabled ? "true" : "false") << "\n"
+        << "  base_url   = " << cfg.coingecko.base_url << "\n"
+        << "  coin_ids   = [";
+    for (std::size_t i = 0; i < cfg.coingecko.coin_ids.size(); ++i) {
+        if (i > 0) out << ", ";
+        out << cfg.coingecko.coin_ids[i];
+    }
+    out << "]\n"
+        << "  poll_ms    = " << cfg.coingecko.polling_interval_ms << "\n"
+        << "  api_key    = "
+        << (cfg.coingecko.api_key.empty() ? "none (free tier)" : "<configured>")
+        << "\n";
+
     out << "======================================\n";
 
     std::cout << out.str();
@@ -954,6 +1024,7 @@ AppConfig load_config(const std::string& path)
     cfg.database   = parse_database(root);
     cfg.depeg      = parse_depeg(root);
     cfg.arbitrage  = parse_arbitrage(root);
+    cfg.coingecko  = parse_coingecko(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.
