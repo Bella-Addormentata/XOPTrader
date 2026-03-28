@@ -295,17 +295,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # Download every artifact uploaded by the build jobs
+      # Download every artifact uploaded by the build jobs into a temp directory
+      # to avoid name collisions (artifact folder names match the target file names)
       - uses: actions/download-artifact@v4
         with:
-          path: release-assets/
+          path: release-assets-tmp/
 
-      # Flatten the nested per-artifact directories produced by download-artifact
+      # Flatten the nested per-artifact directories into release-assets/
       - name: Flatten artifact directories
         run: |
-          find release-assets -mindepth 2 -type f \
-               -exec mv -t release-assets/ {} +
-          find release-assets -mindepth 1 -type d -delete
+          mkdir -p release-assets
+          find release-assets-tmp -type f -exec mv -t release-assets/ {} +
+          rm -rf release-assets-tmp
 
       # Include the example config in the release
       - name: Copy example config
