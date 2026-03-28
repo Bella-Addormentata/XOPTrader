@@ -177,7 +177,7 @@ TEST_F(CostBasisTest, BuyAfterFullLiquidation) {
     xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL, false);
 
     tracker.record_buy("xch", 100, 2'700'000, 1, now_);
-    tracker.record_sell("xch", 100, 2'800'000, 2, now_);
+    EXPECT_TRUE(tracker.record_sell("xch", 100, 2'800'000, 2, now_));
 
     // Fresh buy at a new price.
     tracker.record_buy("xch", 200, 3'000'000, 3, now_);
@@ -408,8 +408,8 @@ TEST_F(CostBasisTest, CapitalFreeAndReallocate) {
     const xop::Mojo total = 10'000'000'000LL;
     xop::InventoryTracker tracker(risk_cfg_, total);
 
-    tracker.allocate_capital(
-        xop::CapitalCategory::ActiveOffers, 3'000'000'000LL);
+    EXPECT_TRUE(tracker.allocate_capital(
+        xop::CapitalCategory::ActiveOffers, 3'000'000'000LL));
     tracker.free_capital(
         xop::CapitalCategory::ActiveOffers, 1'000'000'000LL);
 

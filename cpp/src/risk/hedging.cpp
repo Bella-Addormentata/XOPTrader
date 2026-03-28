@@ -27,10 +27,8 @@ namespace xop {
 // Construction
 // ---------------------------------------------------------------------------
 
-HedgingManager::HedgingManager(const StrategyConfig& strat_cfg,
-                               const RiskConfig&     risk_cfg) noexcept
-    : strat_cfg_(strat_cfg)
-    , risk_cfg_(risk_cfg)
+HedgingManager::HedgingManager(const StrategyConfig& /*strat_cfg*/,
+                               const RiskConfig&     /*risk_cfg*/) noexcept
 {
 }
 

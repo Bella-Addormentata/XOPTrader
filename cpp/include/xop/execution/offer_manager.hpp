@@ -359,9 +359,6 @@ private:
 
     // -- Member data --------------------------------------------------------
 
-    /// Boost.Asio io_context for async timer and dispatch operations.
-    asio::io_context& ioc_;
-
     /// Wallet RPC client (shared -- may be used by CoinManager too).
     std::shared_ptr<rpc::ChiaWalletRPC> wallet_;
 
