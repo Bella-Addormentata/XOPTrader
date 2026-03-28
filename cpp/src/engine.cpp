@@ -2105,7 +2105,7 @@ void Engine::step_check_alerts(BlockHeight block_height)
     //   that individual HWM drawdown or flash-crash checks may miss.
     // ISO/IEC 5055: deque bounded by loss_window_blocks; no UB division.
     if (config_.risk.max_window_loss_bps > 0.0
-            && state_->get_status() == BotStatus::Running) {
+            && state_->status() == BotStatus::Running) {
 
         // 1. Append current snapshot.
         pnl_window_.push_back({block_height, total.total_pnl});
