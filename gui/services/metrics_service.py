@@ -549,6 +549,14 @@ class MetricsService(QObject):
                 "complete":         1.0 if complete else 0.0,
             }
 
+        # Attach the global recommended_spread_multiplier to every pair entry.
+        spread_mult = _labelled(
+            m, "xop_analysis", "metric", "recommended_spread_multiplier",
+            default=1.0,
+        )
+        for pair in result:
+            result[pair]["spread_multiplier"] = spread_mult
+
         return result
 
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:

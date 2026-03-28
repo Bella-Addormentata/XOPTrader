@@ -238,6 +238,10 @@ public:
                          int      regime_code,
                          int      agg_code);
 
+    /// Export the analysis-derived spread multiplier as a global metric.
+    /// Called once after analysis completes; persists for the engine lifetime.
+    void set_analysis_spread_multiplier(double mult);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
