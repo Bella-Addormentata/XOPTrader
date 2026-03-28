@@ -120,9 +120,9 @@ struct StrategyConfig {
     std::uint64_t offer_fee_mojos{100'000'000ULL};
 
     /// Number of blocks to observe in startup market-analysis mode before
-    /// entering active trading.  0 = skip analysis.  Default 20 blocks
-    /// (~17 minutes at 52 s/block).  Range [0, 1440].
-    uint32_t startup_analysis_blocks{20};
+    /// entering active trading.  0 = skip analysis.  Range [0, 1440].
+    /// Example: 20 blocks ≈ 17 minutes at 52 s/block.
+    uint32_t startup_analysis_blocks{0};
 };
 
 // ---------------------------------------------------------------------------

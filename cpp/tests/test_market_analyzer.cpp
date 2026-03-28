@@ -6,9 +6,15 @@
 //   - ingest() correctly fills the rolling window.
 //   - is_complete() returns false until analysis_blocks observations are fed.
 //   - Volatility is zero for a constant-price series.
-//   - Variance ratio is 1.0 for a pure random-walk series (within tolerance).
-//   - Aggressiveness recommendation follows the documented heuristic.
+//   - Balanced and bid-heavy book imbalance calculations.
+//   - Spread mean and coefficient of variation.
 //   - reset() clears all accumulated state.
+//   - Invalid price observations are ignored.
+//   - Aggressiveness recommendation: Conservative (high vol), Conservative
+//     (momentum regime), Aggressive (low vol + wide spread + mean-reverting),
+//     and Normal for typical market conditions.
+//   - analysis_blocks clamped to minimum of 3.
+//   - Unknown pairs are added on-the-fly during ingest.
 //
 // ISO/IEC 27001:2022 -- no secrets; pure numerical verification.
 // ISO/IEC 5055       -- deterministic tests; no undefined behaviour.
@@ -230,6 +236,76 @@ TEST(MarketAnalyzerTest, UnknownPairAddedOnFly) {
     EXPECT_EQ(ma.blocks_collected("NEW/PAIR"), 0u);
     ma.ingest("NEW/PAIR", 1.0, 50.0, 1000.0, 5.0, 5.0);
     EXPECT_EQ(ma.blocks_collected("NEW/PAIR"), 1u);
+}
+
+// ============================================================================
+// TEST: Aggressiveness heuristic -- Conservative for momentum regime
+// ============================================================================
+
+TEST(MarketAnalyzerTest, MomentumRegimeIsConservative) {
+    auto cfg = small_config(20);
+    // Set VR threshold so an upward trending series is classified Momentum.
+    cfg.vr_upper_threshold = 1.05;
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    // Steadily rising price -> positive autocorrelation -> VR > 1.
+    double price = 1.0;
+    for (int i = 0; i < 20; ++i) {
+        price *= 1.03;  // +3% each block.
+        ma.ingest(kPair, price, 50.0, 1000.0, 5.0, 5.0);
+    }
+
+    const auto s = ma.get_summary(kPair);
+    // Momentum regime OR high vol must produce Conservative recommendation.
+    EXPECT_EQ(s.aggressiveness, xop::AnalysisAggressiveness::Conservative);
+}
+
+// ============================================================================
+// TEST: Aggressiveness heuristic -- Aggressive for low-vol mean-reverting
+//       market with wide observed spread
+// ============================================================================
+
+TEST(MarketAnalyzerTest, LowVolWideMeanRevertingIsAggressive) {
+    // Use thresholds that make it easy to trigger Aggressive:
+    //   high_vol_threshold       = 1.0  (never triggered -- very high)
+    //   wide_spread_bps_threshold = 10.0 (low threshold, easy to exceed)
+    //   vr_lower_threshold        = 1.1  (most series will appear mean-reverting)
+    auto cfg = small_config(10);
+    cfg.high_vol_threshold        = 1.0;    // Effectively disable vol check.
+    cfg.wide_spread_bps_threshold = 10.0;   // Wide threshold easily exceeded.
+    cfg.vr_lower_threshold        = 2.0;    // Force MeanReverting regime.
+
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    // Constant price (zero vol) and very wide spread (500 bps).
+    for (int i = 0; i < 10; ++i) {
+        ma.ingest(kPair, 2.70, 500.0, 1000.0, 5.0, 5.0);
+    }
+
+    const auto s = ma.get_summary(kPair);
+    // VR will be 1.0 (constant price → no variance), which is below 2.0 →
+    // MeanReverting regime.  Low vol + wide spread + MeanReverting → Aggressive.
+    EXPECT_EQ(s.regime, xop::MarketRegime::MeanReverting);
+    EXPECT_EQ(s.aggressiveness, xop::AnalysisAggressiveness::Aggressive);
+}
+
+// ============================================================================
+// TEST: Aggressiveness heuristic -- Normal for average market conditions
+// ============================================================================
+
+TEST(MarketAnalyzerTest, NormalMarketConditionsIsNormal) {
+    auto cfg = small_config(10);
+    // Default thresholds: vol < 40%, spread_cv < 0.8, spread < 80 bps
+    // → Normal recommendation.
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    // Constant price (zero vol), moderate spread (50 bps).
+    for (int i = 0; i < 10; ++i) {
+        ma.ingest(kPair, 2.70, 50.0, 1000.0, 5.0, 5.0);
+    }
+
+    const auto s = ma.get_summary(kPair);
+    EXPECT_EQ(s.aggressiveness, xop::AnalysisAggressiveness::Normal);
 }
 
 }  // anonymous namespace

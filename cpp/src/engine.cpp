@@ -442,6 +442,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup analysis failed: {}; starting trading",
                          ex.what());
+            // Disable further use of the market analyzer and transition to
+            // Running so the engine does not remain stuck in Analyzing state.
+            market_analyzer_.reset();
+            state_->set_status(BotStatus::Running);
         }
     }
 
@@ -523,6 +527,17 @@ asio::awaitable<void> Engine::run_startup_analysis()
     asio::steady_timer timer(ioc_);
     BlockHeight last_analysis_block{0};
 
+    // Fail-open timeout: if we have observed 3× the target block count but
+    // some pairs still lack valid market data (mid_price <= 0 every block),
+    // stop waiting and proceed to trading rather than stalling indefinitely.
+    // 3× is chosen so a pair that misses data on every other block still gets
+    // a full analysis window, while a pair with persistently bad data (e.g.
+    // delisted or misconfigured) does not block trading forever.
+    static constexpr uint32_t kTimeoutMultiplier = 3;
+    // target >= 3 by invariant (MarketAnalyzer constructor clamps to 3).
+    const uint32_t timeout_blocks = target * kTimeoutMultiplier;
+    uint32_t blocks_polled = 0;
+
     while (!stop_requested_.load(std::memory_order_relaxed) &&
            !market_analyzer_->is_complete()) {
 
@@ -550,6 +565,15 @@ asio::awaitable<void> Engine::run_startup_analysis()
         const BlockHeight current_block = static_cast<BlockHeight>(height);
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
+
+        // Count each new block towards the stall timeout.
+        ++blocks_polled;
+        if (blocks_polled > timeout_blocks) {
+            spdlog::warn("[Engine] Analysis timeout after {} blocks polled "
+                         "(target={}, timeout={}); proceeding to trading",
+                         blocks_polled, target, timeout_blocks);
+            break;
+        }
 
         // Fetch market data for this block.
         // Initialize per-pair cycle entries so step_update_market_state can write.
