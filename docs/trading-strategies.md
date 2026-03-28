@@ -1670,7 +1670,7 @@ Setting `max_window_loss_bps = 0` disables the rolling-window breaker.
 |-----------|-------------------|-----------|
 | `max_drawdown_pct` | 5–20% | Below 5%: too sensitive to normal PnL noise. Above 20%: too permissive for a leveraged maker. Standard industry range 10–15%. |
 | `max_window_loss_bps` | 200–1000 bps | A 2% loss within the window is plausible during normal volatility; a 5% loss within the same window (default ~10 h) signals a structural problem. |
-| `loss_window_blocks` | 576–2880 blocks | 576 ≈ 8 h, 1152 ≈ 10 h, 2880 ≈ 41 h (one trading day). Shorter windows reduce lag but increase false positives. |
+| `loss_window_blocks` | 576–2880 blocks | 576 ≈ 8 h, 1152 ≈ 10 h, 2880 ≈ 41 h (~1.7 days). Shorter windows reduce lag but increase false positives. |
 
 #### What to Do After a Circuit Breaker Fires
 

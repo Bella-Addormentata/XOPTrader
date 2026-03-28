@@ -460,24 +460,29 @@ RiskConfig parse_risk(const YAML::Node& root)
         }
     }
 
-    // loss_window_blocks: rolling window in blocks >= 1.  Default 1152 (~10 h).
+    // loss_window_blocks: rolling window in blocks in [1, UINT32_MAX].
+    // Default 1152 (~10 h).  Parsed as int64 so we can detect negative /
+    // out-of-range values before casting.
     if (node["loss_window_blocks"] && node["loss_window_blocks"].IsDefined()
             && !node["loss_window_blocks"].IsNull()) {
         int64_t wblocks = node["loss_window_blocks"].as<int64_t>();
-        if (wblocks < 1) {
-            throw ConfigError(sec + ".loss_window_blocks must be >= 1; got "
-                              + std::to_string(wblocks));
+        if (wblocks < 1
+                || wblocks > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".loss_window_blocks must be in [1, "
+                              + std::to_string(std::numeric_limits<uint32_t>::max())
+                              + "]; got " + std::to_string(wblocks));
         }
         cfg.loss_window_blocks = static_cast<uint32_t>(wblocks);
     }
 
-    // max_window_loss_bps: max loss in bps within the window, >= 0.
+    // max_window_loss_bps: max loss in bps within the window, in [0, 10000].
     // A value of 0 disables the rolling-window circuit breaker.
+    // Upper-bound 10000 (= 100%) prevents float→Mojo overflow at the use site.
     if (node["max_window_loss_bps"] && node["max_window_loss_bps"].IsDefined()
             && !node["max_window_loss_bps"].IsNull()) {
         cfg.max_window_loss_bps = node["max_window_loss_bps"].as<double>();
-        if (!(cfg.max_window_loss_bps >= 0.0)) {
-            throw ConfigError(sec + ".max_window_loss_bps must be >= 0; got "
+        if (!(cfg.max_window_loss_bps >= 0.0 && cfg.max_window_loss_bps <= 10000.0)) {
+            throw ConfigError(sec + ".max_window_loss_bps must be in [0, 10000]; got "
                               + std::to_string(cfg.max_window_loss_bps));
         }
     }
