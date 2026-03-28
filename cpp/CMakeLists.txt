@@ -26,9 +26,17 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(xop_trader
-    VERSION   0.1.2
+    VERSION   0.1.3
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
+)
+
+# Generate xop/version.hpp from the project VERSION above so the binary
+# never has a hand-maintained version literal.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/xop/version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/xop/version.hpp"
+    @ONLY
 )
 
 # ==========================================================================
@@ -167,6 +175,7 @@ add_library(xop_core STATIC
 target_include_directories(xop_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 
