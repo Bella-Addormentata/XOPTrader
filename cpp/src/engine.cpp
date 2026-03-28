@@ -249,7 +249,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 Engine::~Engine()
 {
     // Ensure clean shutdown if the caller did not invoke shutdown() explicitly.
-    if (is_running()) {
+    // Guard also covers BotStatus::Analyzing so that destroying the engine
+    // during the startup analysis phase correctly cancels the timer and tears
+    // down the io_context.
+    const BotStatus st = state_->status();
+    if (st == BotStatus::Running || st == BotStatus::Analyzing ||
+        st == BotStatus::Paused) {
         try {
             shutdown();
         } catch (const std::exception& ex) {
