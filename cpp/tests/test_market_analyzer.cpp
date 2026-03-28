@@ -48,6 +48,19 @@ xop::MarketAnalyzerConfig small_config(uint32_t blocks = 10) {
 
 const std::string kPair = "XCH/wUSDC";
 
+// ============================================================================
+// LCG pseudo-random helper (deterministic, reproducible across platforms)
+// ============================================================================
+//
+// Advances the seed using the Glibc LCG formula and returns a uniform draw
+// in [-1, 1].  Identical to the helper in test_regime.cpp so that test
+// fixtures can produce the same statistical properties.
+
+inline double lcg_step(uint32_t& seed) {
+    seed = seed * 1103515245u + 12345u;
+    return (static_cast<double>(seed % 10001) / 10000.0 - 0.5) * 2.0;
+}
+
 // Ingest N identical observations into the analyzer.
 void feed_constant(xop::MarketAnalyzer& ma,
                    const std::string& pair,
@@ -355,20 +368,35 @@ TEST(MarketAnalyzerTest, TotalPollAttemptsCountsInvalidData) {
 // ============================================================================
 
 TEST(MarketAnalyzerTest, MomentumRegimeIsConservative) {
-    auto cfg = small_config(20);
-    // Set VR threshold so an upward trending series is classified Momentum.
-    cfg.vr_upper_threshold = 1.05;
+    // Use enough blocks so the VR estimator has adequate history.
+    // vr_short_lag = 5, so we need >> 7 observations.
+    auto cfg = small_config(50);
+    // Use default vr_upper_threshold = 1.15; AR(1) with rho=0.7 produces
+    // VR(5) >> 1.15 deterministically.
     xop::MarketAnalyzer ma(cfg, {kPair});
 
-    // Steadily rising price -> positive autocorrelation -> VR > 1.
-    double price = 1.0;
-    for (int i = 0; i < 20; ++i) {
-        price *= 1.03;  // +3% each block.
+    // AR(1) log-returns: r_t = rho * r_{t-1} + sigma * epsilon_t
+    // With rho=0.7 and sigma=0.02 the process has strong positive
+    // autocorrelation, which makes VR(q) >> 1 and reliably triggers
+    // the Momentum regime classification.
+    const double rho   = 0.7;
+    const double sigma = 0.02;
+    uint32_t seed  = 42;
+    double   price = 1.0;
+    double   r_prev = 0.0;
+    for (int i = 0; i < 50; ++i) {
+        double eps = lcg_step(seed);
+        double r_t = rho * r_prev + sigma * eps;
+        price *= std::exp(r_t);
+        if (price < 0.01) price = 0.01;
+        r_prev = r_t;
         ma.ingest(kPair, price, 50.0, 1000.0, 5.0, 5.0);
     }
 
     const auto s = ma.get_summary(kPair);
-    // Momentum regime OR high vol must produce Conservative recommendation.
+    // Genuine AR(1) series must be classified as Momentum regime.
+    EXPECT_EQ(s.regime, xop::MarketRegime::Momentum);
+    // Momentum regime must produce Conservative recommendation.
     EXPECT_EQ(s.aggressiveness, xop::AnalysisAggressiveness::Conservative);
 }
 

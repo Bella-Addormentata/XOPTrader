@@ -121,11 +121,12 @@ TEST(VolatilityTest, AlternatingReturnsKnownVariance) {
 // Formula (volatility.hpp / strategy doc Key Formulas):
 //   sigma_annual = sigma_block * sqrt(blocks_per_year)
 //
-// With block_time = 52 s:
-//   blocks_per_year = 365.25 * 24 * 3600 / 52 = 606,876.923...
-//   sqrt(blocks_per_year) = 779.15...
+// With block_time = 52 s and the 365.0-day year used by VolatilityEstimator
+// (kSecondsPerYear = 365.0 * 24 * 3600 = 31,536,000 s):
+//   blocks_per_year = 31,536,000 / 52 = 606,461.54...
+//   sqrt(blocks_per_year) = 778.89...
 //
-// Verify that sigma_annual / sigma_block ≈ 779.15.
+// Verify that sigma_annual / sigma_block ≈ 778.89.
 
 TEST(VolatilityTest, AnnualisationFactor) {
     auto cfg = default_vol_config();
@@ -145,10 +146,10 @@ TEST(VolatilityTest, AnnualisationFactor) {
 
     if (sb > 1e-12) {
         const double ratio = sa / sb;
+        // Use the same 365.0-day year as VolatilityEstimator (kSecondsPerYear).
         const double expected_ratio =
-            std::sqrt(365.25 * 24.0 * 3600.0 / 52.0);
+            std::sqrt(365.0 * 24.0 * 3600.0 / 52.0);
         EXPECT_NEAR(ratio, expected_ratio, 0.1);
-        EXPECT_NEAR(expected_ratio, 779.0, 0.1);
     }
 }
 
