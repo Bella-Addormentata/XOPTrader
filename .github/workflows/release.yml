@@ -86,7 +86,7 @@ jobs:
       # ---- Ensure vcpkg-downloads directory exists before bootstrap -----------
       - name: Create vcpkg downloads directory
         shell: bash
-        run: mkdir -p "${{ github.workspace }}/vcpkg-downloads"
+        run: mkdir -p "$VCPKG_DOWNLOADS"
 
       # ---- vcpkg setup with caching ----------------------------------------
       - name: Set up vcpkg
