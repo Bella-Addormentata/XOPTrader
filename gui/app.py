@@ -14,6 +14,7 @@ from typing import Optional
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+import gui
 from gui.theme import apply_theme
 
 
@@ -46,7 +47,7 @@ class XOPTraderApp(QApplication):
         # Application identity -- used by QSettings and window titles.
         self.setApplicationName("XOPTrader")
         self.setOrganizationName("XOP")
-        self.setApplicationVersion("0.1.3")
+        self.setApplicationVersion(gui.__version__)
 
         # Apply the CHIA dark theme (Fusion base + full QSS).
         apply_theme(self, font_size_delta=font_size_delta)
