@@ -1603,6 +1603,107 @@ The practical remedy is a tiered rebalancing policy:
 This policy ensures the maker never reaches the "involuntary speculator"
 state while keeping deliberate losses small and infrequent.
 
+### 5.3 Circuit Breakers: Halting When Losses Exceed a Threshold
+
+A *circuit breaker* is a risk-management rule that automatically suspends
+trading when a bot loses a specified amount of money in a specified time
+window.  The concept borrows from equity-market circuit breakers (e.g.,
+NYSE Rule 80B; FINRA Rule 15c3-5 "Market Access Rule") and is equally
+applicable to algorithmic market makers on DEX platforms.
+
+#### Why Circuit Breakers Are Necessary
+
+Even a bot whose individual trades are sound can experience *loss cascades*
+through two mechanisms:
+
+1. **Adverse selection spiral** — When informed traders consistently fill
+   our offers, we accumulate a large one-sided inventory at unfavourable
+   prices.  Each fill individually appears rational under A-S/GLFT, but the
+   cumulative effect is capital destruction at an accelerating rate.
+   Brunnermeier & Pedersen (2009) [ref 63] show that such spirals are
+   self-reinforcing: rising losses reduce available capital, which forces
+   tighter risk limits, which further degrades quoting quality.
+
+2. **Model error or market regime change** — Calibrated parameters
+   (γ, κ, σ) may become stale if the market transitions to a regime the
+   model was not trained on.  Kyle (1985) [ref 64] demonstrates that a
+   market maker facing a highly informed counterparty will lose money in
+   every trade regardless of spread width.  A circuit breaker limits
+   exposure during such regime failures while the operator recalibrates.
+
+#### Two Complementary Circuit Breakers in XOPTrader
+
+XOPTrader implements two independent circuit breakers, both of which
+transition the engine to `BotStatus::Paused` (all new offer posting halted,
+existing offers remain open, monitoring continues) when triggered:
+
+**1. Peak-to-Trough (HWM) Drawdown Breaker** (`max_drawdown_pct`)
+
+Measures the fractional decline from the all-time PnL high-water mark:
+
+```
+drawdown = (peak_pnl - current_pnl) / |peak_pnl|
+```
+
+Triggers when `drawdown > max_drawdown_pct`.  This breaker catches slow,
+persistent losses that erode gains built up over weeks.  Default: 10%.
+
+**2. Rolling Time-Window Loss Breaker** (`max_window_loss_bps`, `loss_window_blocks`)
+
+Measures the PnL change over the most recent `loss_window_blocks` blocks:
+
+```
+window_loss = pnl_at_window_start - current_pnl
+threshold   = |peak_pnl| × max_window_loss_bps / 10 000
+```
+
+Triggers when `window_loss > threshold`.  This breaker catches sudden
+concentrated loss bursts that the HWM breaker would miss (because the
+HWM may have been set long ago and the percentage drop appears small
+against it).  Default: 500 bps (5%) within 1 152 blocks (~10 h).
+
+Setting `max_window_loss_bps = 0` disables the rolling-window breaker.
+
+#### Scholarly Guidance on Circuit Breaker Calibration
+
+| Parameter | Recommended Range | Rationale |
+|-----------|-------------------|-----------|
+| `max_drawdown_pct` | 5–20% | Below 5%: too sensitive to normal PnL noise. Above 20%: too permissive for a leveraged maker. Standard industry range 10–15%. |
+| `max_window_loss_bps` | 200–1000 bps | A 2% loss within the window is plausible during normal volatility; a 5% loss within the same window (default ~10 h) signals a structural problem. |
+| `loss_window_blocks` | 576–2880 blocks | 576 ≈ 8 h, 1152 ≈ 10 h, 2880 ≈ 41 h (~1.7 days). Shorter windows reduce lag but increase false positives. |
+
+#### What to Do After a Circuit Breaker Fires
+
+1. **Do not restart immediately.** Investigate the root cause using the
+   PnL attribution tables and trade log (§1.4 SQLite trade_log table).
+2. **Identify the proximate cause:** inventory imbalance, adverse selection
+   signal correlation, or model parameter drift?
+3. **Recalibrate if needed:** update γ, κ, σ via the backtester (§3.1).
+4. **Resume in dry-run mode** for at least two full trading cycles before
+   enabling live trading.
+5. **Consider widening spreads** by 20–50% for the first live cycle after
+   resumption to limit exposure while the system stabilises.
+
+#### Are There Scholarly Papers on Market-Maker Circuit Breakers?
+
+Yes.  The relevant literature spans market microstructure theory and
+regulatory practice:
+
+- **Kyle (1985)** [ref 64] — foundational model showing a market maker
+  will systematically lose to an informed trader; motivates stopping early.
+- **Brunnermeier & Pedersen (2009)** [ref 63] — demonstrates that funding
+  constraints amplify losses into spirals; circuit breakers interrupt the
+  feedback loop by preserving residual capital.
+- **Madhavan (2012)** [ref 65] — surveys algorithmic trading risk controls
+  including pre-trade limits, loss limits, and kill switches mandated by
+  regulators after the 2010 Flash Crash.
+- **FINRA Rule 15c3-5 (Market Access Rule, 2010)** [ref 66] — U.S.
+  regulatory requirement for automated pre-trade and post-trade risk
+  controls including order-rate limits, position limits, and loss limits.
+- **Gomber et al. (2011)** [ref 67] — reviews European MiFID requirements
+  for algorithmic market makers; recommends time-windowed loss limits as
+  the primary mandatory control.
+
 ---
 
 ## 6. Implementation Priority Ranking
@@ -2692,3 +2793,14 @@ new evidence and the resulting confidence change.
 61. Calvet, L. E. & Fisher, A. J. (2004). "How to forecast long-run volatility: Regime switching and the estimation of multifractal processes." *Journal of Financial Econometrics*, 2(1), 49–83. *(Counter-research to HMM regime detection: pure Markov switching under-models multi-scale volatility dynamics.)*
 
 62. Acharya, V. V. & Pedersen, L. H. (2005). "Asset pricing with liquidity risk." *Journal of Financial Economics*, 77(2), 375–410. *(Counter-research to ref. 12: static spread-return framework ignores liquidity risk dynamics; time-varying spread is more relevant for intermittent CHIA liquidity.)*
+
+
+63. Brunnermeier, M. K. & Pedersen, L. H. (2009). "Market liquidity and funding liquidity." *Review of Financial Studies*, 22(6), 2201–2238. *(Circuit-breaker motivation: funding constraints amplify trading losses into spirals; interrupting the loop preserves residual capital.)*
+
+64. Kyle, A. S. (1985). "Continuous auctions and insider trading." *Econometrica*, 53(6), 1315–1335. *(Market-maker loss theory: a maker facing a fully-informed counterparty loses money on every trade regardless of spread width; motivates stopping to reassess.)*
+
+65. Madhavan, A. (2012). "Exchange-traded funds, market structure, and the flash crash." *Financial Analysts Journal*, 68(4), 20–35. *(Algorithmic risk controls survey: pre-trade limits, post-trade loss limits, and kill switches mandated after the 2010 Flash Crash.)*
+
+66. FINRA (2010). *Rule 15c3-5: Market Access Rule*. U.S. Securities and Exchange Commission Release No. 34-63241. *(Regulatory circuit-breaker requirement: automated risk controls including order-rate limits, position limits, and rolling time-window loss limits.)*
+
+67. Gomber, P., Arndt, B., Lutat, M. & Uhle, T. (2011). "High-frequency trading." *Deutsche Börse AG White Paper*. *(European MiFID algorithmic market-maker requirements: time-windowed loss limits are the primary mandatory pre-trade control.)*

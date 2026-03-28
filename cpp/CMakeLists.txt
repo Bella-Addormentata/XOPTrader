@@ -70,10 +70,17 @@ if(NOT MSVC)
         # it in Debug (-O0) builds causes compiler warnings or has no effect.
         $<$<NOT:$<CONFIG:Debug>>:-D_FORTIFY_SOURCE=2>
     )
-    add_link_options(-Wl,-z,relro -Wl,-z,now)
+    # ISO/IEC 5055 -- RELRO and BIND_NOW harden the GOT/PLT on Linux only.
+    # Apple ld (macOS/Clang) does not support -z; guard with Linux check.
+    if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        add_link_options(-Wl,-z,relro -Wl,-z,now)
+    endif()
 else()
     # ISO/IEC 5055 -- /WX promotes warnings to errors, enforcing clean builds.
+    # _CRT_SECURE_NO_WARNINGS suppresses MSVC C4996 deprecation warnings for
+    # standard POSIX functions like getenv() that are safe in this context.
     add_compile_options(/W4 /WX /sdl /GS /guard:cf)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS)
     add_link_options(/guard:cf)
 endif()
 
@@ -145,6 +152,7 @@ add_library(xop_core STATIC
     # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp
     src/data/adverse_selection.cpp
+    src/data/market_analyzer.cpp
 
     # -- Monitoring ------------------------------------------------------------
     src/monitoring/pnl.cpp

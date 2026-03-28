@@ -257,6 +257,23 @@ void MetricsExporter::register_metrics()
         .Name("xop_risk_concentration")
         .Help("Per-asset portfolio concentration fraction (0-1)")
         .Register(*registry_);
+
+    // ---------------------------------------------------------------
+    //  Dashboard 7: Startup Market Analysis
+    // ---------------------------------------------------------------
+
+    // Scalar gauge: analysis window block-count target.
+    // Per-pair complete flags are published under xop_analysis_pair.
+    analysis_family_ = &prometheus::BuildGauge()
+        .Name("xop_analysis")
+        .Help("Startup market analysis global state")
+        .Register(*registry_);
+
+    // Per-pair gauges: all analysis metrics labelled by pair_name.
+    analysis_pair_family_ = &prometheus::BuildGauge()
+        .Name("xop_analysis_pair")
+        .Help("Startup market analysis per-pair observations")
+        .Register(*registry_);
 }
 
 // ===================================================================
@@ -470,6 +487,94 @@ void MetricsExporter::update_risk(
             ->Add({{"asset_id", c.asset_id}})
             .Set(c.concentration);
     }
+}
+
+// ===================================================================
+//  Dashboard 7: Startup Market Analysis
+// ===================================================================
+
+void MetricsExporter::update_analysis(
+    const std::string& pair_name,
+    uint32_t blocks_collected,
+    uint32_t blocks_target,
+    double   vol_annual,
+    double   mean_spread_bps,
+    double   spread_cv,
+    double   variance_ratio,
+    double   book_imbalance,
+    double   momentum,
+    int      regime_code,
+    int      agg_code)
+{
+    std::unique_lock lock(mtx_);
+
+    if (!running_) {
+        return;
+    }
+
+    // Global scalar: target block count (same for all pairs).
+    analysis_family_
+        ->Add({{"metric", "blocks_target"}})
+        .Set(static_cast<double>(blocks_target));
+
+    // Per-pair: blocks collected.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "blocks_collected"}})
+        .Set(static_cast<double>(blocks_collected));
+
+    // Per-pair: complete flag.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "complete"}})
+        .Set(blocks_collected >= blocks_target ? 1.0 : 0.0);
+
+    // Per-pair: volatility.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "volatility_annual"}})
+        .Set(vol_annual);
+
+    // Per-pair: spread.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "mean_spread_bps"}})
+        .Set(mean_spread_bps);
+
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "spread_cv"}})
+        .Set(spread_cv);
+
+    // Per-pair: variance ratio.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "variance_ratio"}})
+        .Set(variance_ratio);
+
+    // Per-pair: order-book imbalance.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "book_imbalance"}})
+        .Set(book_imbalance);
+
+    // Per-pair: momentum.
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "momentum"}})
+        .Set(momentum);
+
+    // Per-pair: regime code (0=MeanReverting, 1=Normal, 2=Momentum).
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "regime"}})
+        .Set(static_cast<double>(regime_code));
+
+    // Per-pair: aggressiveness code (0=Conservative, 1=Normal, 2=Aggressive).
+    analysis_pair_family_
+        ->Add({{"pair_name", pair_name}, {"metric", "aggressiveness"}})
+        .Set(static_cast<double>(agg_code));
+}
+
+void MetricsExporter::set_analysis_spread_multiplier(double mult)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    analysis_family_
+        ->Add({{"metric", "recommended_spread_multiplier"}})
+        .Set(mult);
 }
 
 }  // namespace xop

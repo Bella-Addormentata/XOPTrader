@@ -961,8 +961,18 @@ std::optional<CompetitorMetrics> MarketDataFeed::compute_competitor_metrics(
         return std::nullopt;
     }
 
-    // Read mid-price internally; if unavailable, we can still compute depth counts.
-    const double mid_price = get_mid_price(pair_name);
+    // Read mid-price directly from the pair's raw DEX quotes so that the
+    // calculation works even before refresh() has been called.  get_mid_price()
+    // returns the cached ps.mid_price which is only populated by refresh();
+    // reading the raw dex_best_bid/ask avoids that dependency.
+    double mid_price = 0.0;
+    {
+        std::shared_lock lock(mtx_pairs_);
+        auto it = pairs_.find(pair_name);
+        if (it != pairs_.end()) {
+            mid_price = compute_mid(it->second);
+        }
+    }
 
     // Read competing offers under shared lock.
     std::vector<CompetingOffer> offers;

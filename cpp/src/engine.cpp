@@ -62,8 +62,14 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , ioc_()
     , poll_timer_(ioc_)
     , state_(std::make_shared<State>())
+    , max_drawdown_pct_(config.risk.max_drawdown_pct)
 {
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
+    spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% "
+                 "window_loss={:.0f}bps/{} blocks",
+                 config_.risk.max_drawdown_pct * 100.0,
+                 config_.risk.max_window_loss_bps,
+                 config_.risk.loss_window_blocks);
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -262,6 +268,26 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     drift_analyzer_ = std::make_unique<InventoryDriftAnalyzer>(
         DriftConfig{});
 
+    // -- Startup market analysis --------------------------------------------
+    // Build the list of enabled pair names for the analyzer.
+    const uint32_t analysis_blocks = config_.strategy.startup_analysis_blocks;
+    if (analysis_blocks > 0) {
+        std::vector<std::string> enabled_pairs;
+        enabled_pairs.reserve(config_.pairs.size());
+        for (const auto& pc : config_.pairs) {
+            if (pc.enabled) enabled_pairs.push_back(pc.name);
+        }
+
+        MarketAnalyzerConfig ma_cfg;
+        ma_cfg.analysis_blocks = analysis_blocks;
+        market_analyzer_ = std::make_unique<MarketAnalyzer>(ma_cfg, enabled_pairs);
+        spdlog::info("[Engine] Startup analysis enabled: {} blocks (~{}s)",
+                     analysis_blocks,
+                     static_cast<uint32_t>(analysis_blocks * ma_cfg.block_time_seconds));
+    } else {
+        spdlog::info("[Engine] Startup analysis disabled (startup_analysis_blocks=0)");
+    }
+
     // -- Pair config lookup map -----------------------------------------------
     // Build the O(1) pair_config_map_ from config_.pairs so that every step
     // can resolve a pair name to its PairConfig without a linear scan.
@@ -279,7 +305,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 Engine::~Engine()
 {
     // Ensure clean shutdown if the caller did not invoke shutdown() explicitly.
-    if (is_running()) {
+    // Guard also covers BotStatus::Analyzing so that destroying the engine
+    // during the startup analysis phase correctly cancels the timer and tears
+    // down the io_context.
+    const BotStatus st = state_->status();
+    if (st == BotStatus::Running || st == BotStatus::Analyzing ||
+        st == BotStatus::Paused) {
         try {
             shutdown();
         } catch (const std::exception& ex) {
@@ -317,8 +348,12 @@ void Engine::run()
                     asset_ids.end());
     metrics_->init(config_.monitoring.prometheus_port, asset_ids);
 
-    // Transition to Running.
-    state_->set_status(BotStatus::Running);
+    // Transition to Analyzing (if startup analysis is enabled) or Running.
+    if (market_analyzer_) {
+        state_->set_status(BotStatus::Analyzing);
+    } else {
+        state_->set_status(BotStatus::Running);
+    }
 
     // Start the block-height polling timer.
     start_polling();
@@ -452,6 +487,24 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // return, stopping the engine cleanly.
     co_await open_connections();
 
+    // -- Startup market analysis phase ---------------------------------------
+    // If configured, observe the market for startup_analysis_blocks before
+    // entering active trading.  The engine is in BotStatus::Analyzing during
+    // this period; no offers are posted.
+    // ISO/IEC 5055: analysis is optional and gracefully skipped on error.
+    if (market_analyzer_) {
+        try {
+            co_await run_startup_analysis();
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Startup analysis failed: {}; starting trading",
+                         ex.what());
+            // Disable further use of the market analyzer and ensure we
+            // transition to Running even on analysis failure.
+            market_analyzer_.reset();
+            state_->set_status(BotStatus::Running);
+        }
+    }
+
     asio::steady_timer timer(ioc_);
 
     while (!stop_requested_.load(std::memory_order_relaxed)) {
@@ -505,8 +558,222 @@ asio::awaitable<void> Engine::poll_loop_coro()
 }
 
 // ===========================================================================
-// 13-step heartbeat cycle
+// Startup market analysis
 // ===========================================================================
+
+// run_startup_analysis -- collect market observations before trading.
+//
+// The coroutine polls for new blocks (same cadence as the main loop) and,
+// for each new block, fetches market data via step_update_market_state and
+// feeds the observations to market_analyzer_.  Progress and per-block
+// summaries are exported to Prometheus so the GUI can display them.
+//
+// On completion the analysis summary is logged at INFO level and the bot
+// transitions from Analyzing -> Running.
+//
+// ISO/IEC 5055: no blocking calls; fully async via co_await.
+// ISO/IEC 27001:2022: all failure paths log a warning and continue.
+asio::awaitable<void> Engine::run_startup_analysis()
+{
+    if (!market_analyzer_) co_return;
+
+    const uint32_t target = market_analyzer_->analysis_blocks();
+    spdlog::info("[Engine] Starting market analysis phase ({} blocks)", target);
+
+    asio::steady_timer timer(ioc_);
+    BlockHeight last_analysis_block{0};
+
+    // [TIMEOUT] Maximum total block polls before forcing completion.
+    // Prevents the engine from hanging indefinitely if a pair has no
+    // market data (e.g. a newly listed pair with zero trading activity).
+    // Uses MarketAnalyzerConfig::timeout_block_multiplier (default 3x).
+    // Clamp to >= 1 so that a misconfigured 0 doesn't trigger an
+    // immediate timeout before any data is collected.
+    uint32_t timeout_mult = market_analyzer_->timeout_block_multiplier();
+    if (timeout_mult == 0) {
+        spdlog::warn("[Engine] MarketAnalyzer timeout_block_multiplier configured "
+                     "as 0; clamping to 1 to avoid immediate analysis timeout");
+        timeout_mult = 1;
+    }
+    const uint32_t max_total_polls = target * timeout_mult;
+    uint32_t total_polls = 0;
+
+    while (!stop_requested_.load(std::memory_order_relaxed) &&
+           !market_analyzer_->is_complete()) {
+
+        // Check timeout: force-complete if we've polled too many blocks
+        // without all pairs finishing.
+        if (total_polls >= max_total_polls) {
+            spdlog::warn("[Engine] Analysis timeout after {} block polls "
+                         "(target was {} blocks); forcing completion with "
+                         "partial data",
+                         total_polls, target);
+            market_analyzer_->force_complete();
+            break;
+        }
+
+        timer.expires_after(kPollInterval);
+        boost::system::error_code ec;
+        co_await timer.async_wait(asio::redirect_error(asio::use_awaitable, ec));
+
+        if (ec == boost::asio::error::operation_aborted) {
+            co_return;  // Shutdown during analysis.
+        }
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            co_return;  // Shutdown requested.
+        }
+        if (ec) {
+            // Non-shutdown timer error — log and fall through to
+            // complete analysis with whatever data we have.
+            spdlog::warn("[Engine] Analysis timer error: {}; ending analysis early",
+                         ec.message());
+            break;
+        }
+
+        // Fetch current block height.
+        std::int64_t height{0};
+        try {
+            height = co_await full_node_->get_block_height();
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
+            continue;
+        }
+
+        if (height <= 0) continue;
+        const BlockHeight current_block = static_cast<BlockHeight>(height);
+        if (current_block <= last_analysis_block) continue;
+        last_analysis_block = current_block;
+        ++total_polls;
+
+        // Fetch market data for this block.
+        // Initialize per-pair cycle entries so step_update_market_state can write.
+        cycle_.clear();
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            PairCycleState pcs;
+            pcs.pair_name = pair.name;
+            cycle_[pair.name] = std::move(pcs);
+        }
+
+        try {
+            co_await step_update_market_state(current_block);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Analysis: market state update failed: {}", ex.what());
+            continue;
+        }
+
+        // Feed observations to the analyzer for each pair.
+        // Always call ingest() even with invalid mid_price so that
+        // total_poll_attempts is tracked for data-quality reporting.
+        // MarketAnalyzer::ingest() will reject invalid data internally.
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+
+            const MarketSnapshot snap = state_->get_market(pair.name);
+
+            const double mid_d    = static_cast<double>(snap.mid_price);
+            const double spread_d = snap.spread_bps;
+            const double vol_d    = static_cast<double>(snap.volume_24h);
+
+            // Use competing offer depth counts as proxy for book imbalance.
+            // competing_depth_bids / asks are size_t counts of resting offers.
+            double bid_depth = 0.0;
+            double ask_depth = 0.0;
+            {
+                const auto cm = market_data_->get_competitor_metrics(pair.name);
+                if (cm.has_value()) {
+                    bid_depth = static_cast<double>(cm->competing_depth_bids);
+                    ask_depth = static_cast<double>(cm->competing_depth_asks);
+                }
+            }
+
+            market_analyzer_->ingest(pair.name, mid_d, spread_d, vol_d,
+                                     bid_depth, ask_depth);
+
+            // Export per-pair analysis metrics to Prometheus.
+            if (metrics_->is_running()) {
+                const auto summary = market_analyzer_->get_summary(pair.name);
+                metrics_->update_analysis(
+                    pair.name,
+                    summary.blocks_collected,
+                    target,
+                    summary.volatility_annual,
+                    summary.mean_spread_bps,
+                    summary.spread_cv,
+                    summary.variance_ratio,
+                    summary.book_imbalance,
+                    summary.momentum,
+                    static_cast<int>(summary.regime),
+                    static_cast<int>(summary.aggressiveness));
+            }
+        }
+
+        // Log progress.
+        const uint32_t min_collected = [&]() -> uint32_t {
+            uint32_t m = target;
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled) continue;
+                m = std::min(m, market_analyzer_->blocks_collected(pair.name));
+            }
+            return m;
+        }();
+        spdlog::info("[Engine] Analysis progress: {}/{} blocks", min_collected, target);
+    }
+
+    if (stop_requested_.load(std::memory_order_relaxed)) co_return;
+
+    // Log the completed analysis summaries.
+    auto summaries = market_analyzer_->get_summaries();
+    for (const auto& s : summaries) {
+        spdlog::info("[Engine] Analysis complete for {}: "
+                     "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "
+                     "VR={:.3f} regime={} recommendation={}",
+                     s.pair_name,
+                     s.volatility_annual * 100.0,
+                     s.mean_spread_bps,
+                     s.spread_cv,
+                     s.variance_ratio,
+                     to_string(s.regime),
+                     to_string(s.aggressiveness));
+    }
+
+    // Apply the analysis recommendation to derive an initial spread
+    // multiplier.  This influences how conservatively/aggressively the
+    // engine quotes during the first trading blocks.
+    //
+    // The multiplier is stored both locally (for step_apply_spread_optimizer)
+    // and in State (for GUI/monitoring accessibility).
+    //
+    // Conservative → 1.5  (50% wider spreads: protect against adverse selection)
+    // Normal       → 1.0  (no change from configured defaults)
+    // Aggressive   → 0.8  (20% tighter: capture spread in stable markets)
+    //
+    // Compute overall_recommendation() once and derive the multiplier from
+    // it, avoiding a second full traversal of all pair summaries.
+    const auto overall = market_analyzer_->overall_recommendation();
+    switch (overall) {
+        case AnalysisAggressiveness::Conservative: analysis_spread_mult_ = 1.5; break;
+        case AnalysisAggressiveness::Aggressive:   analysis_spread_mult_ = 0.8; break;
+        default:                                   analysis_spread_mult_ = 1.0; break;
+    }
+
+    spdlog::info("[Engine] Analysis recommendation: {} → spread multiplier {:.2f}x",
+                 to_string(overall), analysis_spread_mult_);
+
+    // Persist summaries and multiplier in State for GUI/monitoring.
+    state_->set_analysis_results(std::move(summaries), analysis_spread_mult_);
+
+    // Export spread multiplier to Prometheus.
+    if (metrics_->is_running()) {
+        metrics_->set_analysis_spread_multiplier(analysis_spread_mult_);
+    }
+
+    // Transition to active trading.
+    state_->set_status(BotStatus::Running);
+    spdlog::info("[Engine] Startup analysis complete; entering trading mode");
+
+    co_return;
+}
 
 // [T1-03] on_new_block_coro -- native coroutine heartbeat cycle.
 // Steps 2 and 8 are co_awaited (they contain async RPC calls).
@@ -1366,6 +1633,15 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         pcs.spread_result.total_spread_bps *= whale_mult * vpin_mult * ofi_mult;
 
+        // Apply startup-analysis spread multiplier.
+        // This adjusts initial quoting based on the pre-trading observation:
+        //   Conservative → 1.5x (wider spreads)
+        //   Normal       → 1.0x (no change)
+        //   Aggressive   → 0.8x (tighter spreads)
+        if (analysis_spread_mult_ != 1.0) {
+            pcs.spread_result.total_spread_bps *= analysis_spread_mult_;
+        }
+
         // [T3-06] Graduated staleness spread widening.
         // When data age exceeds 50% of stale_threshold, widen spreads
         // linearly up to 2x at the threshold.  Beyond the threshold,
@@ -1384,7 +1660,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         spdlog::debug("[Engine] Step 5: {} spread={:.1f}bps (adverse={:.1f} inv={:.1f} "
                       "cost={:.1f} comp={:.1f} mult={:.2f} "
-                      "whale={:.2f} vpin={:.3f} ofi={:.3f})",
+                      "whale={:.2f} vpin={:.3f} ofi={:.3f} analysis={:.2f})",
                       pair_name,
                       pcs.spread_result.total_spread_bps,
                       pcs.spread_result.s_adverse,
@@ -1392,7 +1668,8 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                       pcs.spread_result.s_cost,
                       pcs.spread_result.s_competition,
                       pcs.spread_result.regime_multiplier,
-                      whale_mult, vpin, ofi);
+                      whale_mult, vpin, ofi,
+                      analysis_spread_mult_);
 
         // -- Apply CHIA structural edge multiplier -------------------------
         if (chia_edge_) {
@@ -1647,7 +1924,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 }
 
 // Step 7: Generate multi-tier offer ladder.
-void Engine::step_generate_ladder(BlockHeight block_height)
+void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 {
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid) continue;
@@ -1811,7 +2088,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 }
 
 // Step 9: Check arbitrage opportunities.
-void Engine::step_check_arbitrage(BlockHeight block_height)
+void Engine::step_check_arbitrage([[maybe_unused]] BlockHeight block_height)
 {
     // -- 9a: Legacy MarketDataFeed CEX-DEX signal check ----------------------
     // The MarketDataFeed emits ArbitrageSignals for CEX-DEX divergences
@@ -1896,7 +2173,7 @@ void Engine::step_check_arbitrage(BlockHeight block_height)
 // [T3-08] Now calls compute_nhe() with actual fill data from Step 2
 // accumulators (nhe_net_inventory_change_, nhe_total_volume_) and
 // alerts when NHE drops below the 0.70 target.
-void Engine::step_run_hedging(BlockHeight block_height)
+void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 {
     // Layer 1: inventory-based skew (already applied in step 7 via
     // LiquidityEngine::apply_inventory_skew).
@@ -1986,7 +2263,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // Mark-to-market all positions.
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
-        [this](const std::string& pair, const std::string& asset) -> Mojo {
+        [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
             auto snap = state_->get_market(pair);
             return snap.mid_price;
         },
@@ -2216,11 +2493,94 @@ void Engine::step_check_alerts(BlockHeight block_height)
             // cycles while keeping connections open for monitoring.
             state_->set_status(BotStatus::Paused);
 
-            alerts_->send_alert(AlertRule::PnlDrawdown,
+            alerts_->send_alert(AlertRule::CircuitBreaker,
                 "Global max-drawdown circuit breaker triggered: drawdown " +
                 std::to_string(drawdown_frac * 100.0) + "% exceeds threshold " +
                 std::to_string(max_drawdown_pct_ * 100.0) +
                 "% -- engine PAUSED.  Manual intervention required.");
+        }
+    }
+
+    // [T3-36] Rolling time-window loss circuit breaker.
+    //
+    // Maintains a deque of (block_height, total_pnl) snapshots capped at
+    // loss_window_blocks entries.  On each cycle:
+    //   1. Append the current (block_height, total_pnl) to the back.
+    //   2. Pop front entries older than loss_window_blocks blocks.
+    //   3. Compute window_loss = front_pnl - current_pnl.
+    //   4. If window_loss exceeds the configured threshold, pause.
+    //
+    // The loss threshold is expressed in mojos: it equals
+    //   |peak_pnl_hwm_| * max_window_loss_bps / 10 000
+    // anchored to the all-time peak so that the threshold scales with the
+    // bot's trading volume.  When peak_pnl_hwm_ <= 0 we use the absolute
+    // window loss in mojos compared to the bps threshold applied to a
+    // nominal 1 XCH (1e12 mojos) to avoid a zero denominator.
+    //
+    // A configured max_window_loss_bps of 0 disables this check entirely.
+    //
+    // ISO/IEC 27001:2022: time-windowed monitoring catches slow loss spirals
+    //   that individual HWM drawdown or flash-crash checks may miss.
+    // ISO/IEC 5055: deque bounded by loss_window_blocks; no UB division.
+    if (config_.risk.max_window_loss_bps > 0.0
+            && state_->status() == BotStatus::Running) {
+
+        // 1. Append current snapshot.
+        pnl_window_.push_back({block_height, total.total_pnl});
+
+        // 2. Trim entries that fall outside the rolling window.
+        //    Entries are ordered by ascending block_height; pop from front.
+        //    We keep only entries whose age is strictly less than
+        //    loss_window_blocks (i.e., within the window).  An entry is
+        //    considered stale when block_height - entry_block >= window_size.
+        while (pnl_window_.size() > 1) {
+            const BlockHeight oldest = pnl_window_.front().first;
+            if (block_height - oldest >= config_.risk.loss_window_blocks) {
+                pnl_window_.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // 3. Compute window_loss (positive = PnL decreased over the window).
+        if (pnl_window_.size() >= 2) {
+            const Mojo window_start_pnl = pnl_window_.front().second;
+            const Mojo window_loss      = window_start_pnl - total.total_pnl;
+
+            // Compute the threshold in mojos.
+            // Anchored to |peak_pnl_hwm_| when positive; fall back to 1 XCH.
+            const Mojo anchor   = (peak_pnl_hwm_ > 0)
+                                ? peak_pnl_hwm_
+                                : kMojosPerXch;
+            const Mojo threshold_mojos = static_cast<Mojo>(
+                static_cast<double>(anchor)
+                * config_.risk.max_window_loss_bps / 10'000.0);
+
+            // 4. Fire if window_loss exceeds the threshold.
+            if (window_loss > 0 && threshold_mojos > 0
+                    && window_loss > threshold_mojos) {
+
+                const BlockHeight window_actual =
+                    block_height - pnl_window_.front().first;
+
+                spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT BREAKER "
+                              "-- loss={} mojos over {} blocks "
+                              "> threshold={} mojos ({:.1f} bps) "
+                              "-- transitioning to Paused state",
+                              window_loss, window_actual,
+                              threshold_mojos,
+                              config_.risk.max_window_loss_bps);
+
+                state_->set_status(BotStatus::Paused);
+
+                alerts_->send_alert(AlertRule::CircuitBreaker,
+                    "Rolling-window circuit breaker triggered: lost " +
+                    std::to_string(window_loss) + " mojos in " +
+                    std::to_string(window_actual) + " blocks (limit " +
+                    std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
+                    " bps = " + std::to_string(threshold_mojos) +
+                    " mojos) -- engine PAUSED.  Manual intervention required.");
+            }
         }
     }
 

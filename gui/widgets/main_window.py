@@ -77,6 +77,11 @@ try:
 except ImportError:
     BotLogWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.market_analysis import MarketAnalysisWidget
+except ImportError:
+    MarketAnalysisWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -177,6 +182,7 @@ class MainWindow(QMainWindow):
         self._chart: Optional[QWidget] = None
         self._order_panel: Optional[QWidget] = None
         self._order_book: Optional[QWidget] = None
+        self._market_analysis: Optional[QWidget] = None
         self._settings_widget: Optional[QWidget] = None
         self._trade_log: Optional[QWidget] = None
         self._bot_log: Optional[QWidget] = None
@@ -333,6 +339,14 @@ class MainWindow(QMainWindow):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
                 self._dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
 
+        # Market analysis update -- forward analysis data to the widget.
+        if self._market_analysis is not None and hasattr(
+            self._market_analysis, "update_analysis"
+        ):
+            analysis_data = data.get("analysis", {})
+            if analysis_data:
+                self._market_analysis.update_analysis(analysis_data)
+
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
 
@@ -345,6 +359,9 @@ class MainWindow(QMainWindow):
         if status in ("Running",):
             colour = LIGHT_GREEN
             self._bot_running = True
+        elif status in ("Analyzing",):
+            colour = _C.INFO_BLUE
+            self._bot_running = False
         elif status in ("Disconnected",):
             colour = LOSS_RED
             self._bot_running = False
@@ -518,7 +535,7 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("S&ettings")
 
         act_open_settings = QAction("&Open Settings Panel", self)
-        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(4))
+        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(5))
         settings_menu.addAction(act_open_settings)
 
         # -- Help menu ------------------------------------------------------
@@ -702,15 +719,18 @@ class MainWindow(QMainWindow):
         # Top area: stacked widget (65 %)
         self._stacked = QStackedWidget(self)
         self._dashboard = self._create_page_widget(DashboardWidget, "Dashboard")
-        self._stacked.addWidget(self._dashboard)
+        self._stacked.addWidget(self._dashboard)                    # index 0
         self._chart = self._create_page_widget(ChartWidget, "Charts")
-        self._stacked.addWidget(self._chart)
+        self._stacked.addWidget(self._chart)                        # index 1
         self._order_panel = self._create_page_widget(OrderPanel, "Orders")
-        self._stacked.addWidget(self._order_panel)
+        self._stacked.addWidget(self._order_panel)                  # index 2
         self._order_book = self._create_page_widget(OrderBookWidget, "Order Book")
-        self._stacked.addWidget(self._order_book)
+        self._stacked.addWidget(self._order_book)                   # index 3
+        self._market_analysis = self._create_page_widget(           # index 4
+            MarketAnalysisWidget, "Market Analysis")
+        self._stacked.addWidget(self._market_analysis)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)
+        self._stacked.addWidget(self._settings_widget)              # index 5
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
