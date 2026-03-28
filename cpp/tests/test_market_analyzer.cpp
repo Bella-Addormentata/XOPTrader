@@ -239,6 +239,118 @@ TEST(MarketAnalyzerTest, UnknownPairAddedOnFly) {
 }
 
 // ============================================================================
+// TEST: force_complete() marks all pairs as complete
+// ============================================================================
+
+TEST(MarketAnalyzerTest, ForceCompleteMarksPairsComplete) {
+    auto cfg = small_config(10);
+    xop::MarketAnalyzer ma(cfg, {kPair, "XCH/DBX"});
+
+    // Feed only 3 blocks (not enough to complete normally).
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest(kPair, 2.70, 50.0, 1000.0, 5.0, 5.0);
+        ma.ingest("XCH/DBX", 1.20, 40.0, 500.0, 3.0, 3.0);
+    }
+    EXPECT_FALSE(ma.is_complete());
+
+    ma.force_complete();
+    EXPECT_TRUE(ma.is_complete());
+
+    // Summaries should still have the data we ingested.
+    const auto s = ma.get_summary(kPair);
+    EXPECT_EQ(s.blocks_collected, 3u);
+    EXPECT_TRUE(s.complete);
+    // Force-completed pairs should NOT have window_filled.
+    EXPECT_FALSE(s.window_filled);
+}
+
+// ============================================================================
+// TEST: force_complete() on already-complete pair is a no-op
+// ============================================================================
+
+TEST(MarketAnalyzerTest, ForceCompleteAlreadyComplete) {
+    auto cfg = small_config(3);
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    feed_constant(ma, kPair, 2.70, 3);
+    EXPECT_TRUE(ma.is_complete());
+
+    // Naturally completed: both flags are true.
+    const auto s_before = ma.get_summary(kPair);
+    EXPECT_TRUE(s_before.complete);
+    EXPECT_TRUE(s_before.window_filled);
+
+    // force_complete() on already-complete pair should not change anything.
+    ma.force_complete();
+    EXPECT_TRUE(ma.is_complete());
+
+    const auto s_after = ma.get_summary(kPair);
+    EXPECT_TRUE(s_after.complete);
+    EXPECT_TRUE(s_after.window_filled);
+}
+
+// ============================================================================
+// TEST: overall_recommendation returns most conservative across pairs
+// ============================================================================
+
+TEST(MarketAnalyzerTest, OverallRecommendationMostConservative) {
+    auto cfg = small_config(10);
+    cfg.high_vol_threshold = 0.05;  // Lower threshold so synthetic data triggers.
+    xop::MarketAnalyzer ma(cfg, {kPair, "XCH/DBX"});
+
+    // kPair: alternating ±5% → high vol → Conservative.
+    double price = 2.70;
+    for (int i = 0; i < 10; ++i) {
+        price *= (i % 2 == 0) ? 1.05 : (1.0 / 1.05);
+        ma.ingest(kPair, price, 50.0, 1000.0, 5.0, 5.0);
+    }
+
+    // XCH/DBX: constant price → Normal.
+    feed_constant(ma, "XCH/DBX", 1.20, 10);
+
+    EXPECT_TRUE(ma.is_complete());
+
+    // Overall should be Conservative (worst of Conservative + Normal).
+    EXPECT_EQ(ma.overall_recommendation(), xop::AnalysisAggressiveness::Conservative);
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 1.5);
+}
+
+// ============================================================================
+// TEST: overall_recommendation Normal when all pairs are Normal
+// ============================================================================
+
+TEST(MarketAnalyzerTest, OverallRecommendationNormalWhenAllNormal) {
+    auto cfg = small_config(5);
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    // Constant price, moderate spread → Normal recommendation.
+    feed_constant(ma, kPair, 2.70, 5);
+
+    EXPECT_EQ(ma.overall_recommendation(), xop::AnalysisAggressiveness::Normal);
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 1.0);
+}
+
+// ============================================================================
+// TEST: total_poll_attempts tracks invalid ingestions
+// ============================================================================
+
+TEST(MarketAnalyzerTest, TotalPollAttemptsCountsInvalidData) {
+    auto cfg = small_config(3);
+    xop::MarketAnalyzer ma(cfg, {kPair});
+
+    // Invalid: mid_price <= 0.
+    ma.ingest(kPair, 0.0, 50.0, 1000.0, 5.0, 5.0);
+    ma.ingest(kPair, -1.0, 50.0, 1000.0, 5.0, 5.0);
+
+    // blocks_collected should be 0 (invalid data rejected).
+    EXPECT_EQ(ma.blocks_collected(kPair), 0u);
+
+    // But if we feed enough valid data, it still completes.
+    feed_constant(ma, kPair, 2.70, 3);
+    EXPECT_TRUE(ma.is_complete());
+}
+
+// ============================================================================
 // TEST: Aggressiveness heuristic -- Conservative for momentum regime
 // ============================================================================
 

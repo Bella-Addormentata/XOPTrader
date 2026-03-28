@@ -512,7 +512,8 @@ class MetricsService(QObject):
             Inner keys: ``blocks_collected`` (float), ``blocks_target`` (float),
             ``vol_annual``, ``mean_spread_bps``, ``spread_cv``,
             ``variance_ratio``, ``book_imbalance``, ``momentum``,
-            ``regime_code``, ``agg_code`` (all float), ``complete`` (bool).
+            ``regime_code``, ``agg_code`` (all float), ``complete`` (bool),
+            ``spread_multiplier`` (float).
         """
         with QMutexLocker(self._mutex):
             m = self._latest
@@ -548,6 +549,14 @@ class MetricsService(QObject):
                 "agg_code":         _pair_metric("aggressiveness", default=1.0),
                 "complete":         complete,
             }
+
+        # Attach the global recommended_spread_multiplier to every pair entry.
+        spread_mult = _labelled(
+            m, "xop_analysis", "metric", "recommended_spread_multiplier",
+            default=1.0,
+        )
+        for pair in result:
+            result[pair]["spread_multiplier"] = spread_mult
 
         return result
 
