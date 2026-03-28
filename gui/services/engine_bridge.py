@@ -40,6 +40,7 @@ _DEFAULT_MASTER_REFRESH_MS: Final[int] = 5_000
 # Bot status strings.
 STATUS_UNKNOWN: Final[str] = "Unknown"
 STATUS_RUNNING: Final[str] = "Running"
+STATUS_ANALYZING: Final[str] = "Analyzing"
 STATUS_STOPPED: Final[str] = "Stopped"
 STATUS_SHUTTING_DOWN: Final[str] = "ShuttingDown"
 STATUS_DISCONNECTED: Final[str] = "Disconnected"
@@ -262,8 +263,9 @@ class EngineBridge(QObject):
         -------
         dict
             Keys: ``pnl``, ``health``, ``offers``, ``risk``,
-            ``market_data`` (dict of pair -> data), ``trade_summary``,
-            ``config``, ``bot_status``.
+            ``market_data`` (dict of pair -> data), ``order_book``,
+            ``analysis`` (startup analysis data, empty dict when not in
+            Analyzing phase), ``trade_summary``, ``config``, ``bot_status``.
         """
         # Collect per-pair market data from configured pairs.
         pairs = self._config_svc.get_pairs()
@@ -284,6 +286,10 @@ class EngineBridge(QObject):
             if pair_name
         }
 
+        # Collect startup market analysis data for each pair.
+        pair_names = [p.get("name", "") for p in pairs if p.get("name")]
+        analysis_data = self._metrics_svc.get_analysis(pair_names) if pair_names else {}
+
         data: dict[str, Any] = {
             "pnl": self._metrics_svc.get_pnl(),
             "health": self._metrics_svc.get_health(),
@@ -291,6 +297,7 @@ class EngineBridge(QObject):
             "risk": self._metrics_svc.get_risk(),
             "market_data": market_data,
             "order_book": order_book,
+            "analysis": analysis_data,
             "trade_summary": self._last_data.get("trade_summary", {}),
             "config": self._config_svc.get_full_config(),
             "bot_status": self._bot_status,

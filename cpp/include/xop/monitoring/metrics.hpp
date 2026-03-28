@@ -207,6 +207,37 @@ public:
     void update_risk(const RiskSnapshot& risk,
                      const std::vector<ConcentrationEntry>& concentrations);
 
+    // -- Dashboard 7: Startup Market Analysis --------------------------------
+
+    /// Push startup market-analysis observations for a single pair.
+    ///
+    /// Call this during the Analyzing phase once per block per pair.
+    /// The method is safe to call before and after init(); it is a no-op
+    /// until init() has completed.
+    ///
+    /// @param pair_name         Trading pair label (e.g. "XCH/wUSDC").
+    /// @param blocks_collected  Number of blocks observed so far.
+    /// @param blocks_target     Total blocks in the analysis window.
+    /// @param vol_annual        Annualised volatility (0–1 fraction).
+    /// @param mean_spread_bps   Mean observed spread in bps.
+    /// @param spread_cv         Spread coefficient of variation (σ/μ).
+    /// @param variance_ratio    Lo-MacKinlay VR(q) estimate.
+    /// @param book_imbalance    Bid-fraction of total depth [0, 1].
+    /// @param momentum          Cumulative log-return over analysis window.
+    /// @param regime_code       0=MeanReverting, 1=Normal, 2=Momentum.
+    /// @param agg_code          0=Conservative, 1=Normal, 2=Aggressive.
+    void update_analysis(const std::string& pair_name,
+                         uint32_t blocks_collected,
+                         uint32_t blocks_target,
+                         double   vol_annual,
+                         double   mean_spread_bps,
+                         double   spread_cv,
+                         double   variance_ratio,
+                         double   book_imbalance,
+                         double   momentum,
+                         int      regime_code,
+                         int      agg_code);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
@@ -277,6 +308,13 @@ private:
     prometheus::Gauge* risk_var_95_{nullptr};
     prometheus::Gauge* risk_max_drawdown_{nullptr};
     prometheus::Family<prometheus::Gauge>* risk_concentration_family_{nullptr};
+
+    // -- Dashboard 7: Startup Market Analysis gauges (label-keyed) -----------
+    // Per-pair analysis metrics emitted during the Analyzing phase.
+    // Cleared / overwritten each block until the window is complete.
+
+    prometheus::Family<prometheus::Gauge>* analysis_family_{nullptr};
+    prometheus::Family<prometheus::Gauge>* analysis_pair_family_{nullptr};
 
     // -- Cardinality guard ----------------------------------------------------
     // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered

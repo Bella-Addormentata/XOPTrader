@@ -269,6 +269,7 @@ const char* to_string(BotStatus s) noexcept
 {
     switch (s) {
         case BotStatus::Initializing: return "Initializing";
+        case BotStatus::Analyzing:    return "Analyzing";
         case BotStatus::Running:      return "Running";
         case BotStatus::Paused:       return "Paused";
         case BotStatus::ShuttingDown: return "ShuttingDown";
