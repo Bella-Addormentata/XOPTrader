@@ -72,6 +72,12 @@ strategy:
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
   startup_analysis_blocks: 0
+  # [T4-02] Reorg protection: require N confirmations before accepting a fill.
+  # Default 6 blocks (~5 min).  0 = accept fills immediately (no protection).
+  confirmation_depth_blocks: 6
+  # [T4-11] Offer state reconciliation: full wallet-vs-state check every N blocks.
+  # Default 20 blocks (~17 min).  0 = disabled.
+  reconciliation_interval_blocks: 20
 
 risk:
   # Inventory limits
@@ -90,6 +96,10 @@ volatility:
   # Yang-Zhang hybrid estimator
   lookback_blocks: 200   # ~2.9 hours
   yz_alpha: 0.34         # Yang-Zhang optimal weight
+  # [T5-CR6] Multi-block candle aggregation: aggregate N blocks into one OHLC
+  # candle to recover H/L variation when >90% of blocks are degenerate.
+  # Default 10 (~8.7 min).  1 = no aggregation (legacy).
+  candle_aggregation_blocks: 10
 
 monitoring:
   # Prometheus
@@ -167,3 +177,43 @@ coingecko:
   # rate_limit_window_ms: 60000
   # curl_thread_pool_size: 2
   api_key: ""                                       # Empty = free tier; set for Demo plan
+
+# Fee budget tracking and dynamic fee selection (T4-03)
+# Controls two behaviours:
+#   1. Fee-vs-gain gating: skip posting when fee exceeds X% of expected profit.
+#   2. Adaptive fee selection: track mempool state and pay the smallest fee
+#      likely to achieve timely inclusion.
+# When disabled, the static offer_fee_mojos from [strategy] is used unchanged.
+fees:
+  enabled: true                       # Master switch for fee tracking
+  daily_budget_mojos: 10000000000     # Max fees per 24h rolling window (0.01 XCH)
+  fee_to_gain_max_ratio: 0.30        # Skip tier if fee > 30% of expected gain
+  min_fee_mojos: 50000000            # Fee floor (0.00005 XCH)
+  max_fee_mojos: 500000000           # Fee ceiling (0.0005 XCH)
+  adaptive_enabled: false            # Query full node get_fee_estimate for mempool-aware fees
+  fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
+
+# Inventory aging (T4-09): gradually relax the no-loss floor for positions
+# held underwater for an extended period.  Capital locked in permanently-
+# underwater positions has an opportunity cost; accepting a small controlled
+# loss to free it up can be net-positive.
+inventory_aging:
+  enabled: false                      # Master switch (disabled by default)
+  aging_start_blocks: 1000            # Begin relaxation after 1000 blocks (~14.4 h)
+  max_loss_relax_bps: 50              # Maximum loss allowed: 50 bps (0.50%)
+  relax_rate_bps_per_block: 0.05      # 0.05 bps/block => full 50 bps after ~1000 extra blocks
+
+# --- T4-16: Online Kappa Calibration ----------------------------------------
+# The kappa calibrator tracks fill rates at different spread levels and fits
+# the fill-intensity decay parameter λ(δ) = A·exp(−κ·δ) using log-linear
+# regression.  Runs every calibration_interval_blocks blocks.
+# Note: kappa_calibrator settings are currently hardcoded from strategy.kappa;
+# these fields are documented for future YAML extraction.
+# kappa_calibrator:
+#   num_buckets: 10                   # Spread buckets for fill binning
+#   bucket_width_bps: 10              # Width of each bucket (bps)
+#   min_fills_for_calibration: 20     # Minimum fills before producing estimates
+#   decay_factor: 0.95                # Exponential decay for aging observations
+#   kappa_min: 0.1                    # Lower bound on fitted κ
+#   kappa_max: 10.0                   # Upper bound on fitted κ
+#   calibration_interval_blocks: 50   # Run calibration every N blocks (~43 min)

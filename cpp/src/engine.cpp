@@ -124,6 +124,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     VolatilityEstimatorConfig vol_cfg;
     vol_cfg.lookback_blocks = config_.volatility.lookback_blocks;
     vol_cfg.yz_alpha        = config_.volatility.yz_alpha;
+    // [T5-CR6] Pass candle aggregation window from user config.
+    vol_cfg.candle_aggregation_blocks = config_.volatility.candle_aggregation_blocks;
 
     AdverseSelectionConfig as_cfg;  // defaults are suitable for Phase 1
 
@@ -221,6 +223,16 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         if (!stable_pairs.empty()) {
             arb_detector_->set_stablecoin_pairs(stable_pairs);
         }
+    }
+
+    // -- Fee tracker ----------------------------------------------------------
+    fee_tracker_ = std::make_unique<FeeTracker>(config_.fees);
+
+    // -- [T4-16] Online kappa calibrator --------------------------------------
+    {
+        KappaCalibratorConfig kc_cfg;
+        kc_cfg.default_kappa = config_.strategy.kappa;
+        kappa_calibrator_ = std::make_unique<KappaCalibrator>(kc_cfg);
     }
 
     // -- Risk layer -----------------------------------------------------------
@@ -1191,6 +1203,22 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     // Compute aggregated mid-prices, spreads, arbitrage signals.
     market_data_->refresh(enabled);
 
+    // -- Adaptive fee estimation (T4-03) ------------------------------------
+    // Query the full node's mempool for a fee estimate when adaptive mode
+    // is enabled.  The FeeTracker uses this to dynamically adjust the
+    // per-offer fee downward when the mempool is uncongested.
+    if (fee_tracker_->enabled() && config_.fees.adaptive_enabled) {
+        try {
+            auto est = co_await full_node_->get_fee_estimate(/*target_time=*/60);
+            if (est > 0) {
+                fee_tracker_->update_mempool_estimate(est);
+            }
+        } catch (const std::exception& e) {
+            spdlog::debug("[Engine] Step 1: get_fee_estimate failed: {} "
+                          "-- using static/historic fee", e.what());
+        }
+    }
+
     spdlog::debug("[Engine] Step 1 complete: market state updated for {} pairs",
                   enabled.size());
     co_return;
@@ -1203,7 +1231,46 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
     // [T1-03] co_await the fill-detection coroutine directly.
-    auto fills = co_await offer_mgr_->detect_fills();
+    auto new_fills = co_await offer_mgr_->detect_fills();
+
+    // [T4-02] Reorg protection: confirmation depth gating.
+    // Newly detected fills are buffered in pending_unconfirmed_fills_ and
+    // only promoted to actual processing once their chain depth exceeds
+    // the configured confirmation_depth_blocks threshold.  This prevents
+    // a chain reorg from causing the bot to record fills that subsequently
+    // disappear, which would corrupt cost-basis tracking.
+    const uint32_t conf_depth = config_.strategy.confirmation_depth_blocks;
+
+    // Append newly detected fills to the pending buffer.
+    for (auto& f : new_fills) {
+        pending_unconfirmed_fills_.push_back(std::move(f));
+    }
+
+    // Partition: confirmed fills (sufficient depth) move to processing;
+    // unconfirmed fills remain in the buffer.
+    std::vector<Fill> confirmed_fills;
+    std::vector<Fill> still_pending;
+    still_pending.reserve(pending_unconfirmed_fills_.size());
+
+    for (auto& f : pending_unconfirmed_fills_) {
+        if (conf_depth == 0 ||
+            (block_height >= f.block_height &&
+             block_height - f.block_height >= conf_depth)) {
+            confirmed_fills.push_back(std::move(f));
+        } else {
+            still_pending.push_back(std::move(f));
+        }
+    }
+    pending_unconfirmed_fills_ = std::move(still_pending);
+
+    if (!pending_unconfirmed_fills_.empty()) {
+        spdlog::debug("[Engine] Step 2: {} fills awaiting confirmation "
+                      "(depth requirement: {} blocks)",
+                      pending_unconfirmed_fills_.size(), conf_depth);
+    }
+
+    // Process only confirmed fills.
+    auto& fills = confirmed_fills;
 
     for (const auto& fill : fills) {
         // Persist the fill to the audit trail.
@@ -1387,6 +1454,18 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                      fill.pair_name,
                      (fill.side == Side::Bid) ? "BUY" : "SELL",
                      fill.size, fill.price, fill.block_height);
+
+        // [T4-16] Feed the kappa calibrator with each fill's half-spread.
+        if (kappa_calibrator_) {
+            double mid = market_data_->get_mid_price(fill.pair_name);
+            if (mid > 0.0) {
+                const double half_spread_bps =
+                    std::abs(static_cast<double>(fill.price) -
+                             mid * static_cast<double>(kMojosPerXch))
+                    / (mid * static_cast<double>(kMojosPerXch)) * 10'000.0;
+                kappa_calibrator_->record_fill(half_spread_bps);
+            }
+        }
     }
 
     // -- Feed inventory ratio to drift analyzer ----------------------------
@@ -1429,16 +1508,45 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 // Step 3: Update volatility, PIN, regime estimates.
 void Engine::step_update_analytics(BlockHeight block_height)
 {
+    // [T4-15] Adaptive block time: if the block cadence tracker has a
+    // stable EMA estimate, propagate it to all volatility estimators so
+    // that annualisation uses the observed inter-block interval.
+    if (block_cadence_) {
+        const double dt_ema = block_cadence_->current_dt_ema();
+        if (dt_ema > 0.0) {
+            for (auto& [name, vol] : vol_estimators_) {
+                vol->set_block_time_seconds(dt_ema);
+            }
+        }
+    }
+
+    // [T4-16] Online kappa calibration: periodically fit the fill-intensity
+    // decay parameter from observed fill data.
+    if (kappa_calibrator_) {
+        const auto& kc_cfg = kappa_calibrator_->config();
+        if (kc_cfg.calibration_interval_blocks > 0 &&
+            block_height % kc_cfg.calibration_interval_blocks == 0) {
+            const double new_kappa = kappa_calibrator_->calibrate();
+            spdlog::debug("[Engine] Step 3: kappa calibrated to {:.4f} "
+                          "(fills={})", new_kappa,
+                          kappa_calibrator_->total_fills());
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
         double mid = market_data_->get_mid_price(pair.name);
         if (mid <= 0.0) continue;  // No valid price data.
 
-        // Update the Yang-Zhang volatility estimator with the latest mid.
+        // [T5-CR6] Update the Yang-Zhang volatility estimator using the
+        // multi-block candle accumulator.  update_tick() buffers individual
+        // prices and produces a proper OHLC candle every
+        // candle_aggregation_blocks ticks, recovering meaningful H/L
+        // variation that the single-block degenerate path discards.
         auto vol_it = vol_estimators_.find(pair.name);
         if (vol_it != vol_estimators_.end()) {
-            vol_it->second->update(mid);
+            vol_it->second->update_tick(mid);
         }
 
         // [T1-11] Update the per-pair strategy's internal price history.
@@ -1877,8 +1985,60 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // Enforce never-sell-at-loss on the ask price.
         // Use the pair's base asset (not hardcoded "xch") for cost-basis lookup.
         auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
+
+        // [T4-09] Inventory aging: for positions that have been underwater
+        // for an extended period, gradually relax the no-loss floor so that
+        // aged capital is not permanently locked.  The effective cost basis
+        // is lowered by a discount that grows linearly with position age
+        // beyond aging_start_blocks, capped at max_loss_relax_bps.
+        //
+        // Formula:
+        //   age_past_start = max(0, position_age - aging_start_blocks)
+        //   discount_bps   = min(max_loss_relax_bps,
+        //                        age_past_start * relax_rate_bps_per_block)
+        //   effective_basis = cost_basis * (1 - discount_bps / 10000)
+        //
+        // The no-loss constraint is then applied against the lowered basis,
+        // effectively allowing a controlled loss on the ask side.
+        Mojo effective_cost_basis = rec.weighted_avg_cost_basis;
+        const auto& aging_cfg = config_.inventory_aging;
+
+        if (aging_cfg.enabled && effective_cost_basis > 0) {
+            int pos_age = inventory_->position_age_blocks(
+                AssetId{pair_cfg->base_asset_id}, block_height);
+
+            if (pos_age > 0 &&
+                static_cast<uint32_t>(pos_age) > aging_cfg.aging_start_blocks) {
+                // Position is old enough -- check if it is underwater.
+                Mojo mid_mojos_age = static_cast<Mojo>(std::llround(
+                    mid * static_cast<double>(kMojosPerXch)));
+
+                if (inventory_->is_underwater(
+                        AssetId{pair_cfg->base_asset_id}, mid_mojos_age)) {
+                    uint32_t age_past_start =
+                        static_cast<uint32_t>(pos_age) - aging_cfg.aging_start_blocks;
+                    double discount_bps = std::min(
+                        aging_cfg.max_loss_relax_bps,
+                        static_cast<double>(age_past_start)
+                            * aging_cfg.relax_rate_bps_per_block);
+
+                    effective_cost_basis = static_cast<Mojo>(std::llround(
+                        static_cast<double>(rec.weighted_avg_cost_basis)
+                        * (1.0 - discount_bps / 10'000.0)));
+
+                    if (discount_bps > 0.0) {
+                        spdlog::info("[step6] {} Inventory aging: position "
+                            "age={} blocks, discount={:.1f} bps, "
+                            "basis {} -> {} mojos",
+                            pair_name, pos_age, discount_bps,
+                            rec.weighted_avg_cost_basis, effective_cost_basis);
+                    }
+                }
+            }
+        }
+
         quote = pre_trade_->enforce_no_loss(
-            quote, rec.weighted_avg_cost_basis, /*enable=*/true);
+            quote, effective_cost_basis, /*enable=*/true);
 
         // -- Consult strategic loss manager for rebalancing decisions ------
         // The loss manager evaluates whether taking a deliberate loss to
@@ -2044,12 +2204,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // -- T4-03: Dynamic fee selection ----------------------------------------
+    // Ask the FeeTracker for the recommended fee and push it into the
+    // OfferManager so that every subsequent create/cancel uses the
+    // optimal fee.  When fee tracking is disabled, the static
+    // offer_fee_mojos from StrategyConfig is used unchanged.
+    const std::uint64_t recommended_fee = fee_tracker_->get_recommended_fee(
+        config_.strategy.offer_fee_mojos, block_height);
+
+    if (recommended_fee == 0 && fee_tracker_->enabled()) {
+        spdlog::warn("[Engine] Step 8: fee budget exhausted -- "
+                     "skipping all offer posting this block");
+        co_return;
+    }
+
+    offer_mgr_->set_dynamic_fee(recommended_fee);
+
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
 
         // [T3-24] Final gate: do not post offers if market data was invalid.
-        // This catches pairs that passed step 4 staleness but failed step 1.
-        // ISO/IEC 5055: prevents posting with stale upstream data.
         if (!pcs.market_data_valid) {
             spdlog::warn("[Engine] Step 8: {} market data invalid -- "
                          "skipping offer posting", pair_name);
@@ -2062,20 +2236,78 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (cancelled > 0) {
             spdlog::info("[Engine] Step 8: cancelled {} stale offers for {}",
                          cancelled, pair_name);
+            // T4-03: Record cancel fees in the tracker.
+            if (fee_tracker_->enabled()) {
+                fee_tracker_->record_fee(
+                    static_cast<std::uint64_t>(cancelled) * recommended_fee,
+                    block_height);
+            }
         }
-
-        // Both the strategy and execution layers now use the unified
-        // xop::TierQuote from types.hpp.  No conversion needed.
-        const auto& exec_tiers = pcs.ladder;
 
         // Find the PairConfig for this pair (O(1) map lookup).
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
 
+        // -- T4-03: Fee-vs-gain gating per tier ------------------------------
+        // Estimate expected gain for each tier and filter out tiers where
+        // the fee exceeds the configured ratio of expected gain.
+        // mid_price for the gain calculation.
+        const Mojo mid = (pcs.risk_quote.bid_price + pcs.risk_quote.ask_price) / 2;
+
+        std::vector<TierQuote> fee_filtered_tiers;
+        if (fee_tracker_->enabled() && mid > 0) {
+            fee_filtered_tiers.reserve(pcs.ladder.size());
+            for (const auto& tier : pcs.ladder) {
+                // Expected gain = |tier_price - mid| * size / mid
+                // This gives gain in base-mojos (proportional, same scale
+                // as fee when converted to XCH).
+                const double price_diff = std::abs(
+                    static_cast<double>(tier.price) - static_cast<double>(mid));
+                const double gain_fraction = price_diff / static_cast<double>(mid);
+                // Convert to XCH-equivalent mojos for comparison with fee.
+                const double gain_mojos =
+                    gain_fraction * static_cast<double>(tier.size)
+                    * static_cast<double>(pair_cfg->base_mojos_per_unit)
+                    / static_cast<double>(kMojosPerXch);
+
+                const auto expected_gain = static_cast<std::uint64_t>(
+                    std::max(0.0, gain_mojos));
+
+                if (fee_tracker_->should_post_offer(
+                        expected_gain, recommended_fee, block_height)) {
+                    fee_filtered_tiers.push_back(tier);
+                } else {
+                    spdlog::info("[Engine] Step 8: {} {} tier {} skipped "
+                                 "(fee {} > {:.0f}% of gain {})",
+                                 pair_name,
+                                 (tier.side == Side::Bid) ? "bid" : "ask",
+                                 tier.tier_index,
+                                 recommended_fee,
+                                 config_.fees.fee_to_gain_max_ratio * 100.0,
+                                 expected_gain);
+                }
+            }
+        } else {
+            // Fee tracking disabled or mid is 0 -- pass all tiers through.
+            fee_filtered_tiers = pcs.ladder;
+        }
+
+        if (fee_filtered_tiers.empty()) {
+            spdlog::info("[Engine] Step 8: {} all tiers filtered by "
+                         "fee-vs-gain gating", pair_name);
+            continue;
+        }
+
         // [T1-03] co_await post_quotes directly instead of use_future.
         int posted = co_await offer_mgr_->post_quotes(
-            *pair_cfg, exec_tiers, block_height);
+            *pair_cfg, fee_filtered_tiers, block_height);
 
+        // T4-03: Record posting fees in the tracker.
+        if (fee_tracker_->enabled() && posted > 0) {
+            fee_tracker_->record_fee(
+                static_cast<std::uint64_t>(posted) * recommended_fee,
+                block_height);
+        }
         // [T2-09] Persist actual wallet-assigned offer IDs to the database.
         // post_quotes() stores PendingOffers in shared State with the real
         // trade_id from the wallet RPC response.  We query State for the
@@ -2096,7 +2328,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 tier_to_id[key] = po.offer_id;
             }
 
-            for (const auto& etq : exec_tiers) {
+            for (const auto& etq : fee_filtered_tiers) {
                 DbOfferRecord orec;
                 orec.pair_name     = pair_name;
                 orec.side          = (etq.side == Side::Bid) ? "bid" : "ask";
@@ -2144,8 +2376,29 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
         liq.record_rebalance(block_height, mid_mojos, inv_ratio);
 
-        spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {})",
-                     posted, pair_name, cancelled);
+        spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {}, "
+                     "fee {} mojos/offer)",
+                     posted, pair_name, cancelled, recommended_fee);
+    }
+
+    // -- [T4-11] Periodic offer-state reconciliation -------------------------
+    // Every reconciliation_interval_blocks, perform a full comparison of
+    // the in-memory pending-offer map against the authoritative wallet RPC
+    // state.  Corrects orphans, phantoms, and missed status transitions.
+    const uint32_t recon_interval = config_.strategy.reconciliation_interval_blocks;
+    if (recon_interval > 0 &&
+        block_height >= last_reconciliation_block_ + recon_interval) {
+        try {
+            int corrections = co_await offer_mgr_->reconcile_offers();
+            last_reconciliation_block_ = block_height;
+            if (corrections > 0) {
+                spdlog::info("[Engine] Step 8: offer reconciliation corrected "
+                             "{} discrepancies", corrections);
+            }
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] Step 8: offer reconciliation failed: {}",
+                         e.what());
+        }
     }
 
     co_return;

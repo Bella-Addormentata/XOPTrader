@@ -125,6 +125,75 @@ double VolatilityEstimator::update(double price)
 }
 
 // ===========================================================================
+// [T5-CR6] update_tick -- multi-block candle aggregation
+// ===========================================================================
+
+double VolatilityEstimator::update_tick(double price)
+{
+    // T2-02: Exclusive lock -- mutates accumulator and may mutate candles_.
+    std::unique_lock lock(mtx_);
+
+    const uint32_t agg_n = cfg_.candle_aggregation_blocks;
+
+    // Fast path: no aggregation configured -- delegate to single-tick update.
+    if (agg_n <= 1) {
+        lock.unlock();
+        return update(price);
+    }
+
+    // Accumulate the tick into the current aggregation window.
+    if (agg_tick_count_ == 0) {
+        // First tick in the window: initialise all four OHLC fields.
+        agg_open_  = price;
+        agg_high_  = price;
+        agg_low_   = price;
+        agg_close_ = price;
+    } else {
+        // Subsequent ticks: update H, L, C.
+        if (price > agg_high_) agg_high_ = price;
+        if (price < agg_low_)  agg_low_  = price;
+        agg_close_ = price;
+    }
+    ++agg_tick_count_;
+
+    // Check if the aggregation window is complete.
+    if (agg_tick_count_ >= agg_n) {
+        // Construct the aggregated candle with proper OHLC variation.
+        Candle aggregated{agg_open_, agg_high_, agg_low_, agg_close_};
+
+        // Reset the accumulator for the next window.
+        agg_tick_count_ = 0;
+
+        // Feed the aggregated candle through the existing pipeline.
+        // Note: we already hold the exclusive lock, so we inline the
+        // update(Candle) logic here to avoid double-lock UB.
+        candles_.push_back(aggregated);
+        while (candles_.size() > cfg_.lookback_blocks) {
+            candles_.pop_front();
+        }
+        if (candles_.size() >= cfg_.min_candles) {
+            recompute_yang_zhang();
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#elif defined(_MSC_VER)
+#pragma warning(push)
+#pragma warning(disable : 4996)
+#endif
+            recompute_variance_ratio();
+            classify_regime();
+#if defined(__clang__) || defined(__GNUC__)
+#pragma GCC diagnostic pop
+#elif defined(_MSC_VER)
+#pragma warning(pop)
+#endif
+        }
+    }
+
+    return sigma_block_;
+}
+
+// ===========================================================================
 // Accessors
 // ===========================================================================
 
@@ -175,6 +244,28 @@ const VolatilityEstimatorConfig& VolatilityEstimator::config() const noexcept
     // T2-02: Shared lock -- read-only access to immutable-after-construction config.
     std::shared_lock lock(mtx_);
     return cfg_;
+}
+
+// ---------------------------------------------------------------------------
+// [T4-15] Adaptive block-time setter.
+// ---------------------------------------------------------------------------
+
+void VolatilityEstimator::set_block_time_seconds(double seconds) noexcept
+{
+    // Clamp to physically reasonable range.
+    const double clamped = std::clamp(seconds, 10.0, 300.0);
+
+    std::unique_lock lock(mtx_);
+    cfg_.block_time_seconds = clamped;
+
+    // Recache the annualisation constant.
+    // MEDIUM-3: 365-day year = 31,536,000 seconds.
+    constexpr double kSecondsPerYear = 365.0 * 24.0 * 3600.0;
+    const double blocks_per_year = kSecondsPerYear / clamped;
+    sqrt_blocks_per_year_ = std::sqrt(blocks_per_year);
+
+    // Recompute sigma_annual from sigma_block with the new constant.
+    sigma_annual_ = sigma_block_ * sqrt_blocks_per_year_;
 }
 
 // ===========================================================================

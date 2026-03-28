@@ -266,9 +266,10 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T3-02: Add PreTradeCheck tests (`enforce_no_loss`, `flash_crash`, `apply_limits`)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §6.1/§10
-- **Files:** `cpp/tests/` (new test file needed)
+- **Files:** `cpp/tests/test_limits.cpp`
 - **Issue:** System's last line of defense before real money is deployed has zero test coverage.
-- **Status:** `[ ]`
+- **Fix:** Created `test_limits.cpp` with 15 GTest cases covering `enforce_no_loss` (floor, disabled, zero/negative cost basis), `check_flash_crash` (large drop, small drop, recovery, monotonic, flat, exact threshold), `is_stable_after_crash` (insufficient history, all stable, outlier, zero price), `congestion_buffer_multiplier`, and construction validation.
+- **Status:** `[x]`
 
 ### T3-03: Add GLFT strategy tests
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §10
@@ -278,9 +279,10 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T3-04: Add config parsing tests
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §10
-- **Files:** `cpp/tests/` (new test file needed)
+- **Files:** `cpp/tests/test_config.cpp`
 - **Issue:** No tests that YAML loader correctly rejects invalid input.
-- **Status:** `[ ]`
+- **Fix:** Created `test_config.cpp` with GTest cases for: valid YAML parsing, optional section defaults (CoinGecko, fees, inventory aging, confirmation depth, candle aggregation), nonexistent file, empty file, invalid YAML, missing required sections, and domain validation of struct defaults.
+- **Status:** `[x]`
 
 ### T3-05: Implement fill-rate feedback loop from database
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.2, CODEREVIEW-GPT-5.4 §15
@@ -515,14 +517,14 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-02: Add reorg/confirmation-depth protection
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.4, LOGICREVIEW-Claude-Opus-4.6 §10.4
 - **Issue:** No mechanism to detect reverted fills, roll back cost basis, or mark offers as uncertain during chain reorg.
-- **Fix:** Add confirmation-depth parameter (e.g., 6 blocks); only record fills behind current height by that depth.
-- **Status:** `[ ]`
+- **Fix:** Implemented confirmation_depth_blocks config (default 6). Fills from detect_fills() are buffered in pending_unconfirmed_fills_ and only promoted to cost-basis/inventory processing once current_block - fill_block >= confirmation_depth. Configurable via strategy.confirmation_depth_blocks in YAML.
+- **Status:** `[x]`
 
 ### T4-03: Fee budget tracking and alerting
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.6
 - **Issue:** No cumulative fee tracking. During Chia congestion, fees could exceed spread earnings.
-- **Fix:** Add `fee_budget_per_day` config; warn and reduce quoting frequency when approaching budget.
-- **Status:** `[ ]`
+- **Fix:** Implemented FeeTracker with rolling 24h budget, fee-vs-gain gating (skip tiers where fee > X% of expected gain), dynamic fee selection via mempool estimation, and configurable [min, max] fee band. New `fees:` config section. OfferManager accepts dynamic fee from FeeTracker. Step 8 filters tiers and records fees.
+- **Status:** `[x]`
 
 ### T4-04: Environment variable substitution in YAML config
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §12
@@ -551,8 +553,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-09: Implement partial inventory recovery / aging schedule
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.3
 - **Issue:** No DCA, time-based spreading, or progressive loss-floor relaxation for aged underwater positions.
-- **Fix:** After N blocks underwater, gradually relax no-loss floor (e.g., accept 10bps after 1000 blocks).
-- **Status:** `[ ]`
+- **Fix:** Implemented InventoryAgingConfig with aging_start_blocks, max_loss_relax_bps, and relax_rate_bps_per_block. In step_apply_risk_limits, aged underwater positions get a linearly-growing discount on effective cost basis, allowing controlled loss acceptance (capped at max_loss_relax_bps). Disabled by default.
+- **Status:** `[x]`
 
 ### T4-10: Implement per-tier fill-rate monitoring and dynamic allocation
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §10.3
@@ -563,7 +565,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-11: Implement offer-state reconciliation daemon
 - **Source:** CODEREVIEW-GPT5.3-Codex (Missing Safeguards §4), CODEREVIEW-GPT-5.4 §cleanup-4
 - **Issue:** No periodic reconciliation of DB/state with wallet truth. Orphaned/cancelled offers can accumulate.
-- **Status:** `[ ]`
+- **Fix:** Implemented OfferManager::reconcile_offers() coroutine that queries the wallet, detects orphans (State offers missing from wallet) and phantoms (wallet offers in terminal state), and corrects State. Wired into step_manage_offers every reconciliation_interval_blocks (default 20). Configurable via strategy.reconciliation_interval_blocks.
+- **Status:** `[x]`
 
 ### T4-12: Feature-gate incomplete live paths (arb, hedging, Dexie submission)
 - **Source:** CODEREVIEW-GPT-5.4 §14 (Missing Safeguards §6)
@@ -586,24 +589,26 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-15: Implement adaptive block time estimation
 - **Source:** LOGICREVIEW-Gemini §2, LOGICREVIEW-Grok §4.1
 - **Issue:** Fixed 52s block time assumption. Chia blocks follow exponential distribution.
-- **Fix:** Rolling average from recent block arrivals.
-- **Status:** `[ ]`
+- **Fix:** Added `set_block_time_seconds()` to `VolatilityEstimator` that updates the annualisation constant. Wired into `step_update_analytics()` to feed the `BlockCadenceAdaptiveSpread` EMA (`current_dt_ema()`) into all volatility estimators each block.
+- **Status:** `[x]`
 
 ### T4-16: Online κ / fill-intensity calibration
 - **Source:** LOGICREVIEW-Grok §4.2
 - **Issue:** Static κ parameter becomes stale as market evolves.
-- **Fix:** Online estimation from recent fill data.
-- **Status:** `[ ]`
+- **Fix:** Created `KappaCalibrator` class (`kappa_calibrator.hpp/cpp`): 10-bucket fill-rate tracker with exponential decay aging. Fits λ(δ) = A·exp(−κ·δ) via log-linear regression. Wired into engine: `record_fill()` in `step_process_fills()`, periodic `calibrate()` in `step_update_analytics()` every 50 blocks.
+- **Status:** `[x]`
 
 ### T4-17: Add `MempoolSentinelStrategy` mempool sign/comment fix
 - **Source:** LOGICREVIEW-GPT-5.4 §A.6
 - **Issue:** `mempool_skew_adjustment()` has sign inconsistency with comments.
-- **Status:** `[ ]`
+- **Fix:** Sign verified as CORRECT: level shift (both sides move together) is standard for anticipatory adverse-selection protection. Added 13-line explanatory comment documenting the economics: buying pressure → skew > 0 → ask UP (discourages buying) + bid UP (reservation price rises). Consistent with A-S inventory skew mechanics.
+- **Status:** `[x]`
 
 ### T4-18: Add Guéant correction citation to A-S half-spread formula
 - **Source:** LOGICREVIEW-Gemini §1
 - **Issue:** Formula uses GLFT-corrected kappa/gamma positions. Without comments, maintainers may "fix" it back to flawed original.
-- **Status:** `[ ]`
+- **Fix:** Added inline citation to `optimal_half_spread()` in `avellaneda.cpp`: references Guéant, Lehalle & Fernandez-Tapia (Math. Finance, 2013) and Guéant (Applied Mathematical Finance, 2016). Notes the difference from original A-S (2008) approximation.
+- **Status:** `[x]`
 
 ### T4-19: Replace A-S sawtooth tau with constant risk-decay horizon or GLFT asymptotic
 - **Source:** LOGICREVIEW-Gemini §2, LOGICREVIEW-Claude-Opus-4.6 §AS-1, COUNTERRESEARCH §2.2 (CR-3)
@@ -626,7 +631,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-22: Add GCC/Clang global `-Werror`
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §L-V3
 - **Issue:** Only `-Werror=return-type` set; other warnings don't fail builds.
-- **Status:** `[ ]`
+- **Fix:** Changed `-Werror=return-type` to `-Werror` in `CMakeLists.txt`, matching MSVC's `/WX`. All warnings are now errors on GCC/Clang.
+- **Status:** `[x]`
 
 ### T4-23: Fix diagnostic count functions not checking `sqlite3_step()` return
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §L-V6
@@ -699,10 +705,10 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 
 ### T5-CR6: Construct coarser-grained candles for Yang-Zhang volatility
 - **Source:** COUNTERRESEARCH §5 (CR-6, MEDIUM); Molnár (2012)
-- **Files:** `cpp/src/data/volatility.cpp`
+- **Files:** `cpp/src/data/volatility.cpp`, `cpp/include/xop/data/volatility.hpp`
 - **Issue:** >90% of CHIA blocks have zero fills → degenerate candles (O=H=L=C). Yang-Zhang degenerates to close-to-close estimator, losing its minimum-variance advantage.
-- **Fix:** Aggregate blocks into 10-block windows (~8.7 min) to ensure most candles have at least one fill and meaningful OHLC variation. Consider Garman-Klass (1980) as competitive alternative for continuous 24/7 markets.
-- **Status:** `[ ]`
+- **Fix:** Implemented update_tick() with multi-block candle accumulator. Buffers N single-block prices (default 10 = ~8.7 min) and produces proper OHLC candles with meaningful H/L variation. Engine step 3 now calls update_tick() instead of update(). Configurable via volatility.candle_aggregation_blocks.
+- **Status:** `[x]`
 
 ### T5-CR7: Implement discounted Thompson Sampling for spread optimizer
 - **Source:** COUNTERRESEARCH §10 (CR-7, MEDIUM); Besbes, Gur & Zeevi (2014)
@@ -763,10 +769,10 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 
 ### T5-CR15: Model time-varying liquidity risk (Acharya-Pedersen dynamics)
 - **Source:** COUNTERRESEARCH §17 (CR-15, LOW); Acharya & Pedersen (2005)
-- **Files:** Documentation / spread computation
+- **Files:** `cpp/include/xop/strategy/spread.hpp`, `cpp/src/strategy/spread.cpp`
 - **Issue:** Static Amihud-Mendelson spread-return framework ignores liquidity *risk* dynamics. Time-varying spread is more relevant for CHIA's intermittent liquidity.
-- **Fix:** Track rolling spread volatility (σ_spread over past N blocks). When spread-of-spread is high, increase safety margin on tier sizing to account for liquidity uncertainty.
-- **Status:** `[ ]`
+- **Fix:** Added `SpreadVolatilityTracker` class with 50-block rolling window tracking σ_spread, mean, coefficient of variation (CV), and safety multiplier (1 + clamp(CV - 0.10, 0, 0.50)). Integrated into `SpreadOptimizer::compute_spread()`: feeds each computed spread into the tracker and applies the safety multiplier when liquidity conditions are unstable (CV > 0.10).
+- **Status:** `[x]`
 
 ---
 

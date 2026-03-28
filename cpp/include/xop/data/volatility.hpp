@@ -110,6 +110,11 @@ struct VolatilityEstimatorConfig {
 
     /// Threshold above which VR indicates momentum.
     double vr_momentum_threshold{1.15};
+
+    /// [T5-CR6] Number of single-block ticks to aggregate into one OHLC
+    /// candle before feeding the Yang-Zhang estimator.  Default 10 blocks
+    /// (~8.7 min).  1 = no aggregation (legacy behaviour).
+    std::uint32_t candle_aggregation_blocks{10};
 };
 
 // ---------------------------------------------------------------------------
@@ -151,6 +156,23 @@ public:
     /// @return Current per-block volatility estimate (sigma_block).
     double update(double price);
 
+    /// [T5-CR6] Ingest a single tick and aggregate into multi-block candles.
+    ///
+    /// Buffers individual price observations and produces a proper OHLC
+    /// candle every `candle_aggregation_blocks` ticks.  This dramatically
+    /// improves the Yang-Zhang estimator when >90% of single-block candles
+    /// are degenerate (O=H=L=C) because it recovers meaningful open-high-
+    /// low-close variation across the aggregation window.
+    ///
+    /// When candle_aggregation_blocks == 1, this is equivalent to
+    /// update(double price) with zero overhead.
+    ///
+    /// @param price  Latest trade or mid-price.
+    /// @return Current per-block volatility estimate (sigma_block).
+    ///         The estimate is only updated when a full aggregated candle
+    ///         is completed; intermediate ticks return the last-known sigma.
+    double update_tick(double price);
+
     // -- Volatility accessors ------------------------------------------------
 
     /// Per-block volatility: the standard deviation of log-returns over one
@@ -190,6 +212,16 @@ public:
 
     /// Read-only access to the configuration.
     const VolatilityEstimatorConfig& config() const noexcept;
+
+    /// [T4-15] Update the assumed block time (seconds) used for annualisation.
+    ///
+    /// Called by the engine when the adaptive block-time estimator produces
+    /// a new EMA.  Recaches sqrt_blocks_per_year_ so that subsequent
+    /// get_sigma_annual() calls reflect the observed cadence.
+    ///
+    /// @param seconds  New estimated mean inter-block interval; clamped
+    ///                 to [10.0, 300.0] for safety.
+    void set_block_time_seconds(double seconds) noexcept;
 
 private:
     // -- Yang-Zhang computation helpers --------------------------------------
@@ -258,6 +290,18 @@ private:
     /// MEDIUM-3: 365-day year, consistent with strategy sigma_block conversion.
     /// Cached at construction for annualisation.
     double sqrt_blocks_per_year_{0.0};
+
+    // -- [T5-CR6] Multi-block candle accumulator state -----------------------
+    // Buffers individual ticks within the current aggregation window.
+    // When agg_tick_count_ reaches cfg_.candle_aggregation_blocks, a proper
+    // OHLC candle is constructed from the accumulated high/low/open/close
+    // and fed into update(Candle).  Reset after each emission.
+
+    double   agg_open_{0.0};         ///< First price in the aggregation window.
+    double   agg_high_{0.0};         ///< Highest price in the window.
+    double   agg_low_{0.0};          ///< Lowest price in the window.
+    double   agg_close_{0.0};        ///< Most recent price in the window.
+    uint32_t agg_tick_count_{0};     ///< Ticks accumulated so far.
 };
 
 }  // namespace xop

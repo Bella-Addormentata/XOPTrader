@@ -63,7 +63,8 @@ if(NOT MSVC)
         # -Wshadow: detect accidental variable shadowing (CWE-710)
         # -Wformat-security / -Wformat=2: catch format-string vulnerabilities (CWE-134)
         # -Wdouble-promotion: flag implicit float-to-double promotions in arithmetic
-        -Wall -Wextra -Wpedantic -Werror=return-type
+        # T4-22: -Werror promotes all warnings to errors (matching MSVC /WX).
+        -Wall -Wextra -Wpedantic -Werror
         -Wshadow -Wformat-security -Wformat=2 -Wdouble-promotion
         -fstack-protector-strong
         # ISO/IEC 5055 -- _FORTIFY_SOURCE requires optimisation (-O1+); applying
@@ -132,6 +133,8 @@ add_library(xop_core STATIC
     src/strategy/chia_edge.cpp
     src/strategy/order_book_tactics.cpp
     src/strategy/strategy_portfolio.cpp
+    src/strategy/fee_tracker.cpp
+    src/strategy/kappa_calibrator.cpp
 
     # -- Risk layer ------------------------------------------------------------
     src/risk/inventory.cpp

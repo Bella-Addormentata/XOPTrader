@@ -145,6 +145,17 @@ struct StrategyConfig {
     /// entering active trading.  0 = skip analysis.  Range [0, 1440].
     /// Example: 20 blocks ≈ 17 minutes at 52 s/block.
     uint32_t startup_analysis_blocks{0};
+
+    /// [T4-02] Reorg protection: number of confirmations required before a
+    /// fill is treated as final.  Fills detected at confirmed_at_index are
+    /// held in a pending buffer until current_block - fill_block >= this
+    /// value.  Default 6 blocks (~5 min at 52 s/block).  0 = instant.
+    uint32_t confirmation_depth_blocks{6};
+
+    /// [T4-11] How often (in blocks) to run full offer-state reconciliation
+    /// between wallet RPC state and in-memory pending-offers map.
+    /// Default 20 blocks (~17 min).  0 = disabled.
+    uint32_t reconciliation_interval_blocks{20};
 };
 
 // ---------------------------------------------------------------------------
@@ -191,6 +202,13 @@ struct RiskConfig {
 struct VolatilityConfig {
     uint32_t lookback_blocks{200};
     double   yz_alpha{0.34};
+
+    /// [T5-CR6] Number of blocks to aggregate into a single OHLC candle
+    /// before feeding the Yang-Zhang estimator.  With >90% of blocks
+    /// producing degenerate (O=H=L=C) candles, aggregating N blocks into
+    /// one proper candle dramatically improves the Rogers-Satchell component.
+    /// Default 10 blocks (~8.7 min).  1 = no aggregation (legacy).
+    uint32_t candle_aggregation_blocks{10};
 };
 
 // ---------------------------------------------------------------------------
@@ -319,6 +337,83 @@ struct CoinGeckoConfig {
 };
 
 // ---------------------------------------------------------------------------
+// Fee budget tracking and dynamic fee selection.
+//
+// Controls two behaviours:
+//   1. Fee-vs-gain gating: skip posting an offer when the blockchain fee
+//      exceeds a configurable fraction of the expected gain from the trade.
+//   2. Adaptive fee selection: track observed on-chain fees and try to pay
+//      the minimum fee that achieves timely inclusion.
+//
+// When disabled (enabled == false), the static offer_fee_mojos from
+// StrategyConfig is used in all fee sites (backward-compatible).
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Inventory aging configuration (T4-09).
+//
+// Controls gradual relaxation of the no-loss constraint for positions that
+// have been held for an extended period.  The rationale is that capital
+// locked in a permanently-underwater position has an opportunity cost;
+// accepting a small controlled loss to free it up can be net-positive.
+//
+// The effective margin discount grows linearly from 0 at aging_start_blocks
+// to max_loss_relax_bps at the maximum aging horizon:
+//   discount_bps = min(max_loss_relax_bps,
+//                      (age - aging_start_blocks) * relax_rate_bps_per_block)
+//   effective_margin = min_profit_margin_bps - discount_bps
+//
+// The effective margin is never allowed to go below -max_loss_relax_bps
+// (i.e. the bot will never accept a loss larger than the configured cap).
+// ---------------------------------------------------------------------------
+struct InventoryAgingConfig {
+    bool     enabled{false};                   // Master switch.
+
+    /// Number of blocks an underwater position must age before relaxation
+    /// begins.  Default 1000 blocks (~14.4 hours at 52 s/block).
+    uint32_t aging_start_blocks{1000};
+
+    /// Maximum allowed loss (in basis points) for aged positions.
+    /// Default 50 bps (0.50%).  The effective margin will never go below
+    /// -max_loss_relax_bps.
+    double   max_loss_relax_bps{50.0};
+
+    /// Rate at which the no-loss floor relaxes, in bps per block, once
+    /// the position age exceeds aging_start_blocks.
+    /// Default 0.05 bps/block => 50 bps max loss reached after ~1000 extra
+    /// blocks (~14.4 hours after aging begins).
+    double   relax_rate_bps_per_block{0.05};
+};
+
+struct FeeConfig {
+    bool     enabled{false};                    // Master switch.
+
+    /// Maximum total blockchain fees the bot may spend in a rolling 24 h
+    /// window.  Default 10 000 000 000 mojos (0.01 XCH/day).
+    std::uint64_t daily_budget_mojos{10'000'000'000ULL};
+
+    /// Maximum acceptable ratio of fee-to-expected-gain per offer tier.
+    /// If fee / expected_gain > this value, the tier is skipped.
+    /// Default 0.30 (30%).  0.0 disables fee-vs-gain gating.
+    double   fee_to_gain_max_ratio{0.30};
+
+    /// Absolute fee floor (mojos).  The tracker will never recommend a fee
+    /// below this value.  Default 50 000 000 (0.00005 XCH).
+    std::uint64_t min_fee_mojos{50'000'000ULL};
+
+    /// Absolute fee ceiling (mojos).  The tracker will never recommend a
+    /// fee above this value.  Default 500 000 000 (0.0005 XCH).
+    std::uint64_t max_fee_mojos{500'000'000ULL};
+
+    /// When true, query the full node's get_fee_estimate RPC to adapt the
+    /// fee dynamically based on mempool congestion.
+    bool     adaptive_enabled{false};
+
+    /// Rolling window (in blocks) over which cumulative fees are tracked
+    /// for daily budget enforcement.  Default 1662 ≈ 24 h at 52 s/block.
+    uint32_t fee_window_blocks{1662};
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -333,6 +428,8 @@ struct AppConfig {
     DepegConfig      depeg;
     ArbitrageSettings arbitrage;
     CoinGeckoConfig  coingecko;
+    FeeConfig        fees;
+    InventoryAgingConfig inventory_aging;
 };
 
 // ---------------------------------------------------------------------------

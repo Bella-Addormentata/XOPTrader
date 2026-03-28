@@ -381,6 +381,21 @@ public:
         bool               include_spent = false,
         std::int64_t       start_height  = 0,
         std::int64_t       end_height    = 0);
+
+    /**
+     * @brief Estimate the recommended transaction fee based on mempool state.
+     *
+     * Calls the Chia full-node `get_fee_estimate` RPC endpoint (available
+     * since Chia 1.6).  Returns the estimated fee (in mojos per cost unit)
+     * for the requested target inclusion time.
+     *
+     * @param target_time_seconds  Desired inclusion time in seconds
+     *                             (e.g. 60 for next ~1 block).
+     * @return Estimated fee in mojos.  Returns 0 if the RPC call fails or
+     *         the endpoint is not supported by the connected node.
+     */
+    asio::awaitable<std::uint64_t> get_fee_estimate(
+        std::uint64_t target_time_seconds = 60);
 };
 
 // ---------------------------------------------------------------------------

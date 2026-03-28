@@ -560,6 +560,18 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.startup_analysis_blocks = blocks;
     }
 
+    // [T4-02] Optional: confirmation depth for reorg protection.
+    if (node["confirmation_depth_blocks"] && node["confirmation_depth_blocks"].IsDefined()
+        && !node["confirmation_depth_blocks"].IsNull()) {
+        cfg.confirmation_depth_blocks = node["confirmation_depth_blocks"].as<uint32_t>();
+    }
+
+    // [T4-11] Optional: offer reconciliation interval.
+    if (node["reconciliation_interval_blocks"] && node["reconciliation_interval_blocks"].IsDefined()
+        && !node["reconciliation_interval_blocks"].IsNull()) {
+        cfg.reconciliation_interval_blocks = node["reconciliation_interval_blocks"].as<uint32_t>();
+    }
+
     return cfg;
 }
 
@@ -639,6 +651,16 @@ VolatilityConfig parse_volatility(const YAML::Node& root)
     VolatilityConfig cfg;
     cfg.lookback_blocks = read_uint32_positive(node, "lookback_blocks", sec);
     cfg.yz_alpha        = read_fraction_open(node, "yz_alpha", sec);
+
+    // [T5-CR6] Optional: candle aggregation window.  Default 10.
+    if (node["candle_aggregation_blocks"] && node["candle_aggregation_blocks"].IsDefined()
+        && !node["candle_aggregation_blocks"].IsNull()) {
+        auto agg = node["candle_aggregation_blocks"].as<uint32_t>();
+        if (agg == 0) {
+            throw ConfigError(sec + ".candle_aggregation_blocks must be >= 1");
+        }
+        cfg.candle_aggregation_blocks = agg;
+    }
 
     return cfg;
 }
@@ -857,6 +879,109 @@ CoinGeckoConfig parse_coingecko(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_fees -- optional `fees:` section.
+// ---------------------------------------------------------------------------
+FeeConfig parse_fees(const YAML::Node& root)
+{
+    const std::string sec = "fees";
+    FeeConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_u64 = [&](const char* key, std::uint64_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::uint64_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_bool("enabled",              cfg.enabled);
+    read_u64 ("daily_budget_mojos",   cfg.daily_budget_mojos);
+    read_dbl ("fee_to_gain_max_ratio", cfg.fee_to_gain_max_ratio);
+    read_u64 ("min_fee_mojos",        cfg.min_fee_mojos);
+    read_u64 ("max_fee_mojos",        cfg.max_fee_mojos);
+    read_bool("adaptive_enabled",     cfg.adaptive_enabled);
+    read_u32 ("fee_window_blocks",    cfg.fee_window_blocks);
+
+    // Validate constraints.
+    if (cfg.min_fee_mojos > cfg.max_fee_mojos) {
+        throw ConfigError(sec + ".min_fee_mojos ("
+                          + std::to_string(cfg.min_fee_mojos)
+                          + ") must be <= max_fee_mojos ("
+                          + std::to_string(cfg.max_fee_mojos) + ")");
+    }
+    if (cfg.fee_to_gain_max_ratio < 0.0 || cfg.fee_to_gain_max_ratio > 1.0) {
+        throw ConfigError(sec + ".fee_to_gain_max_ratio must be in [0.0, 1.0]; got "
+                          + std::to_string(cfg.fee_to_gain_max_ratio));
+    }
+    if (cfg.fee_window_blocks == 0) {
+        throw ConfigError(sec + ".fee_window_blocks must be > 0");
+    }
+    if (cfg.daily_budget_mojos == 0) {
+        throw ConfigError(sec + ".daily_budget_mojos must be > 0");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// parse_inventory_aging -- optional `inventory_aging:` section (T4-09).
+// ---------------------------------------------------------------------------
+InventoryAgingConfig parse_inventory_aging(const YAML::Node& root)
+{
+    const std::string sec = "inventory_aging";
+    InventoryAgingConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+
+    read_bool("enabled",                   cfg.enabled);
+    read_u32 ("aging_start_blocks",        cfg.aging_start_blocks);
+    read_dbl ("max_loss_relax_bps",        cfg.max_loss_relax_bps);
+    read_dbl ("relax_rate_bps_per_block",  cfg.relax_rate_bps_per_block);
+
+    // Validate constraints.
+    if (cfg.max_loss_relax_bps < 0.0) {
+        throw ConfigError(sec + ".max_loss_relax_bps must be >= 0; got "
+                          + std::to_string(cfg.max_loss_relax_bps));
+    }
+    if (cfg.relax_rate_bps_per_block < 0.0) {
+        throw ConfigError(sec + ".relax_rate_bps_per_block must be >= 0; got "
+                          + std::to_string(cfg.relax_rate_bps_per_block));
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // Redacted summary printer.  Emits every operationally useful field while
 // suppressing all classified secrets (SSL paths, fingerprint, tokens).
 // ---------------------------------------------------------------------------
@@ -984,6 +1109,30 @@ void log_config_summary(const AppConfig& cfg)
         << (cfg.coingecko.api_key.empty() ? "none (free tier)" : "<configured>")
         << "\n";
 
+    // Fees -- operational settings.
+    out << "[fees]\n"
+        << "  enabled    = " << (cfg.fees.enabled ? "true" : "false") << "\n"
+        << "  budget/day = " << cfg.fees.daily_budget_mojos << " mojos\n"
+        << "  gain_ratio = " << cfg.fees.fee_to_gain_max_ratio << "\n"
+        << "  min_fee    = " << cfg.fees.min_fee_mojos << " mojos\n"
+        << "  max_fee    = " << cfg.fees.max_fee_mojos << " mojos\n"
+        << "  adaptive   = " << (cfg.fees.adaptive_enabled ? "true" : "false") << "\n"
+        << "  window     = " << cfg.fees.fee_window_blocks << " blocks\n";
+
+    // Strategy: new fields.
+    out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"
+        << "  reconcile  = " << cfg.strategy.reconciliation_interval_blocks << " blocks\n";
+
+    // Volatility: new fields.
+    out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";
+
+    // Inventory aging -- operational settings.
+    out << "[inventory_aging]\n"
+        << "  enabled    = " << (cfg.inventory_aging.enabled ? "true" : "false") << "\n"
+        << "  start      = " << cfg.inventory_aging.aging_start_blocks << " blocks\n"
+        << "  max_relax  = " << cfg.inventory_aging.max_loss_relax_bps << " bps\n"
+        << "  rate       = " << cfg.inventory_aging.relax_rate_bps_per_block << " bps/block\n";
+
     out << "======================================\n";
 
     std::cout << out.str();
@@ -1025,6 +1174,8 @@ AppConfig load_config(const std::string& path)
     cfg.depeg      = parse_depeg(root);
     cfg.arbitrage  = parse_arbitrage(root);
     cfg.coingecko  = parse_coingecko(root);
+    cfg.fees       = parse_fees(root);
+    cfg.inventory_aging = parse_inventory_aging(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

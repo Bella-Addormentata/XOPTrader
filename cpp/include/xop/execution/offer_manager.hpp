@@ -273,6 +273,38 @@ public:
     /// Number of currently tracked pending offers.
     std::size_t pending_count() const;
 
+    // -- Dynamic fee control ------------------------------------------------
+
+    /// Set the per-transaction fee used by subsequent post_quotes(),
+    /// cancel_stale(), and cancel_all() calls.  Allows the engine's
+    /// FeeTracker to override the static offer_fee_mojos at runtime.
+    ///
+    /// @param fee_mojos  Fee in mojos.  Must be > 0.
+    void set_dynamic_fee(std::uint64_t fee_mojos) noexcept;
+
+    /// Return the fee currently in effect (dynamic or static fallback).
+    [[nodiscard]] std::uint64_t current_fee() const noexcept;
+
+    // -- Offer reconciliation -----------------------------------------------
+
+    /**
+     * @brief [T4-11] Full reconciliation of in-memory offer state against
+     *        the authoritative wallet RPC.
+     *
+     * Queries get_all_offers() from the wallet, compares each offer against
+     * the in-memory pending-offers map in State, and corrects discrepancies:
+     *   - Wallet offers missing from State (phantoms) -> add to State.
+     *   - State offers missing from wallet (orphans)  -> remove from State.
+     *   - Status mismatches                           -> update State.
+     *
+     * Should be called periodically (e.g. every N blocks) to prevent
+     * state drift caused by missed RPC events, partial failures, or
+     * wallet restarts.
+     *
+     * @return Number of discrepancies corrected.
+     */
+    asio::awaitable<int> reconcile_offers();
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -360,6 +392,10 @@ private:
 
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;
+
+    /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
+    /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
+    std::uint64_t current_fee_mojos_;
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()
