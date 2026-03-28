@@ -22,6 +22,7 @@
 
 #include <cstdint>
 #include <array>
+#include <deque>
 #include <optional>
 #include <random>
 #include <vector>
@@ -218,6 +219,56 @@ private:
 };
 
 // ---------------------------------------------------------------------------
+// [T5-CR15] SpreadVolatilityTracker -- rolling volatility-of-spread.
+//
+// Tracks the standard deviation of computed spreads over a rolling window.
+// When the spread-of-spread is high, liquidity conditions are unstable
+// and tier sizing should be more conservative.
+//
+// Usage:
+//   SpreadVolatilityTracker tracker(50);  // 50-block window
+//   tracker.update(total_spread_bps);
+//   double sigma_spread = tracker.spread_volatility();  // std dev in bps
+//   double multiplier   = tracker.safety_multiplier();  // >= 1.0
+// ---------------------------------------------------------------------------
+class SpreadVolatilityTracker {
+public:
+    /// @param window_size  Rolling window length in observations.
+    ///                     Default 50 blocks (~43 min).
+    explicit SpreadVolatilityTracker(std::size_t window_size = 50);
+
+    /// Record a new spread observation.
+    void update(double total_spread_bps);
+
+    /// Rolling standard deviation of spreads (bps).
+    /// Returns 0.0 if fewer than 2 observations.
+    double spread_volatility() const noexcept;
+
+    /// Rolling mean spread (bps).
+    double spread_mean() const noexcept;
+
+    /// Coefficient of variation = sigma / mean.
+    /// Returns 0.0 if mean is near zero.
+    double coefficient_of_variation() const noexcept;
+
+    /// Safety multiplier for tier sizing: 1 + clamp(CV - 0.10, 0, 0.50).
+    /// When CV is low (stable spreads), returns 1.0.
+    /// When CV is high (unstable), returns up to 1.50 (50% wider sizing margin).
+    double safety_multiplier() const noexcept;
+
+    /// Number of observations in the window.
+    std::size_t count() const noexcept;
+
+private:
+    std::size_t window_size_;
+    std::deque<double> observations_;
+
+    // Running statistics for O(1) update.
+    double sum_{0.0};
+    double sum_sq_{0.0};
+};
+
+// ---------------------------------------------------------------------------
 // SpreadOptimizer -- the primary class that computes the four-component
 //                    spread and applies dynamic adjustments.
 //
@@ -344,6 +395,11 @@ public:
     /// Return a const reference to the active configuration.
     const SpreadConfig& config() const noexcept;
 
+    /// [T5-CR15] Read-only access to the spread volatility tracker.
+    const SpreadVolatilityTracker& spread_vol_tracker() const noexcept {
+        return spread_vol_tracker_;
+    }
+
 private:
     SpreadConfig                        cfg_;
     mutable std::optional<ThompsonSampler> sampler_;
@@ -351,6 +407,9 @@ private:
     /// Index of the most recently sampled Thompson grid level.
     /// Used to attribute fill outcomes to the correct grid bucket.
     mutable std::optional<std::size_t>  last_thompson_index_;
+
+    /// [T5-CR15] Rolling volatility-of-spread tracker (50-block window).
+    mutable SpreadVolatilityTracker spread_vol_tracker_{50};
 };
 
 }  // namespace xop

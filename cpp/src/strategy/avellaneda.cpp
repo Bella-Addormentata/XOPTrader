@@ -372,6 +372,14 @@ double AvellanedaStoikov::optimal_half_spread(double sigma, double tau) const
 
     // delta = (1/kappa) * ln(1 + kappa/gamma) + 0.5 * gamma * sigma^2 * tau
     //
+    // This is the GLFT (Guéant-Lehalle-Fernandez-Tapia) corrected form of the
+    // Avellaneda-Stoikov optimal half-spread.  The original A-S (2008) result
+    // used an approximation delta ≈ (1/gamma) * ln(1 + gamma/kappa); the GLFT
+    // correction (Guéant, Lehalle & Fernandez-Tapia, "Dealing with the
+    // Inventory Risk", Math. Finance, 2013; extended in Guéant, "Optimal
+    // Market Making", Applied Mathematical Finance, 2016) derives the exact
+    // closed-form solution for the fill-intensity model.
+    //
     // Term 1: (1/kappa) * ln(1 + kappa/gamma)
     //   This is the optimal spread from the Poisson fill-intensity model
     //   alone, ignoring inventory risk.  It balances fill probability

@@ -232,6 +232,60 @@ const std::vector<double>& ThompsonSampler::betas() const noexcept {
 }
 
 // ===========================================================================
+// [T5-CR15] SpreadVolatilityTracker
+// ===========================================================================
+
+SpreadVolatilityTracker::SpreadVolatilityTracker(std::size_t window_size)
+    : window_size_(std::max(window_size, std::size_t{2}))
+{
+}
+
+void SpreadVolatilityTracker::update(double total_spread_bps) {
+    observations_.push_back(total_spread_bps);
+    sum_    += total_spread_bps;
+    sum_sq_ += total_spread_bps * total_spread_bps;
+
+    // Evict oldest if over window.
+    if (observations_.size() > window_size_) {
+        const double old = observations_.front();
+        observations_.pop_front();
+        sum_    -= old;
+        sum_sq_ -= old * old;
+    }
+}
+
+double SpreadVolatilityTracker::spread_volatility() const noexcept {
+    const auto n = observations_.size();
+    if (n < 2) return 0.0;
+
+    const double mean = sum_ / static_cast<double>(n);
+    const double var  = sum_sq_ / static_cast<double>(n) - mean * mean;
+    return (var > 0.0) ? std::sqrt(var) : 0.0;
+}
+
+double SpreadVolatilityTracker::spread_mean() const noexcept {
+    if (observations_.empty()) return 0.0;
+    return sum_ / static_cast<double>(observations_.size());
+}
+
+double SpreadVolatilityTracker::coefficient_of_variation() const noexcept {
+    const double m = spread_mean();
+    if (m < 1e-10) return 0.0;
+    return spread_volatility() / m;
+}
+
+double SpreadVolatilityTracker::safety_multiplier() const noexcept {
+    // When CV is < 0.10 (stable), no extra margin.
+    // When CV is high (unstable), up to 50% wider.
+    const double cv = coefficient_of_variation();
+    return 1.0 + std::clamp(cv - 0.10, 0.0, 0.50);
+}
+
+std::size_t SpreadVolatilityTracker::count() const noexcept {
+    return observations_.size();
+}
+
+// ===========================================================================
 // SpreadOptimizer -- construction
 // ===========================================================================
 
@@ -597,6 +651,19 @@ SpreadResult SpreadOptimizer::compute_spread(
     // model output or Thompson sampling.  This is the ultimate safety
     // net described in Section 6 (35-60 bps).
     total_spread_bps = std::max(total_spread_bps, cfg_.s_floor_bps);
+
+    // --- [T5-CR15] Spread volatility tracking & safety margin ---
+    // Feed the completed spread into the rolling tracker.  When the
+    // spread-of-spread coefficient of variation is high (liquidity
+    // conditions are unstable), apply a safety multiplier that widens
+    // the spread to protect against adverse fills during uncertainty.
+    spread_vol_tracker_.update(total_spread_bps);
+    const double sv_mult = spread_vol_tracker_.safety_multiplier();
+    if (sv_mult > 1.0) {
+        total_spread_bps *= sv_mult;
+        // Re-enforce floor after multiplier.
+        total_spread_bps = std::max(total_spread_bps, cfg_.s_floor_bps);
+    }
 
     // --- Assemble result ---
     SpreadResult result;

@@ -46,6 +46,8 @@ add_executable(xop_tests
     test_whale_detection.cpp
     test_advanced_trading.cpp
     test_market_analyzer.cpp
+    test_limits.cpp
+    test_config.cpp
 )
 
 target_link_libraries(xop_tests

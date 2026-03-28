@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace xop::execution {
 
@@ -57,6 +58,7 @@ OfferManager::OfferManager(asio::io_context&                    ioc,
     , risk_cfg_(config.risk)
     , dexie_cfg_(config.dexie)
     , logger_(spdlog::default_logger()->clone("OfferMgr"))
+    , current_fee_mojos_(config.strategy.offer_fee_mojos)
 {
     // Validate tier configuration arrays match declared tier count.
     if (strategy_cfg_.tier_spacing_bps.size() != strategy_cfg_.num_tiers) {
@@ -111,7 +113,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         json result;
         try {
             result = co_await wallet_->create_offer(
-                offer_dict, strategy_cfg_.offer_fee_mojos, /*validate_only=*/false);
+                offer_dict, current_fee_mojos_, /*validate_only=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} tier {}: {}",
                            pair.name, tier.tier_index, e.what());
@@ -337,7 +339,7 @@ asio::awaitable<int> OfferManager::cancel_stale(
         // Cancel via wallet RPC (secure = true to spend the locked coin).
         try {
             co_await wallet_->cancel_offer(
-                po.offer_id, strategy_cfg_.offer_fee_mojos, /*secure=*/true);
+                po.offer_id, current_fee_mojos_, /*secure=*/true);
 
             state_->remove_offer(po.offer_id);
             ++cancelled;
@@ -384,7 +386,7 @@ asio::awaitable<void> OfferManager::cancel_all()
     bool bulk_ok = false;
     std::string bulk_err;
     try {
-        co_await wallet_->cancel_offers(strategy_cfg_.offer_fee_mojos, /*secure=*/true);
+        co_await wallet_->cancel_offers(current_fee_mojos_, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
@@ -405,7 +407,7 @@ asio::awaitable<void> OfferManager::cancel_all()
         for (const auto& po : all_offers) {
             try {
                 co_await wallet_->cancel_offer(
-                    po.offer_id, strategy_cfg_.offer_fee_mojos, /*secure=*/true);
+                    po.offer_id, current_fee_mojos_, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
                 cancelled_ids.push_back(po.offer_id);
             } catch (const rpc::ChiaRPCError& inner_e) {
@@ -629,6 +631,129 @@ std::vector<TierQuote> OfferManager::build_tier_ladder(
 std::size_t OfferManager::pending_count() const
 {
     return state_->offer_count();
+}
+
+// ---------------------------------------------------------------------------
+// set_dynamic_fee / current_fee -- dynamic fee override
+// ---------------------------------------------------------------------------
+
+void OfferManager::set_dynamic_fee(std::uint64_t fee_mojos) noexcept
+{
+    current_fee_mojos_ = fee_mojos;
+}
+
+std::uint64_t OfferManager::current_fee() const noexcept
+{
+    return current_fee_mojos_;
+}
+
+// ---------------------------------------------------------------------------
+// [T4-11] reconcile_offers -- Full state reconciliation against wallet.
+//
+// Detects and corrects three classes of discrepancy:
+//   1. Orphans: offers in State but not in wallet (wallet may have cancelled
+//      or timed out without our knowledge).
+//   2. Phantoms: offers in wallet matching our pending set that have
+//      transitioned to a terminal status we missed.
+//   3. Status mismatches: offers that changed state between polls.
+//
+// This is intentionally a heavyweight operation (full wallet scan) and
+// should only be called periodically (e.g. every 20 blocks).
+// ---------------------------------------------------------------------------
+
+asio::awaitable<int> OfferManager::reconcile_offers()
+{
+    int corrections = 0;
+
+    auto pending_offers = state_->get_all_offers();
+    if (pending_offers.empty()) {
+        co_return 0;
+    }
+
+    // Build a lookup of all pending offer IDs from our state.
+    std::unordered_map<std::string, PendingOffer> pending_map;
+    pending_map.reserve(pending_offers.size());
+    for (auto& po : pending_offers) {
+        pending_map.emplace(po.offer_id, std::move(po));
+    }
+
+    // Collect all offer IDs found in the wallet for orphan detection.
+    std::unordered_set<std::string> wallet_offer_ids;
+
+    // Paginate through all wallet offers.
+    constexpr std::int64_t kPageSize = 50;
+    std::int64_t offset = 0;
+    bool more = true;
+
+    while (more) {
+        std::vector<json> trade_records;
+        try {
+            trade_records = co_await wallet_->get_all_offers(
+                offset, offset + kPageSize, /*file_contents=*/false);
+        } catch (const rpc::ChiaRPCError& e) {
+            logger_->error("[reconcile] get_all_offers failed: {}", e.what());
+            co_return corrections;
+        }
+
+        if (trade_records.empty() ||
+            static_cast<std::int64_t>(trade_records.size()) < kPageSize) {
+            more = false;
+        }
+
+        for (const auto& rec : trade_records) {
+            if (!rec.contains("trade_id") || !rec.contains("status")) {
+                continue;
+            }
+            std::string trade_id = rec["trade_id"].get<std::string>();
+            int status = rec["status"].get<int>();
+
+            wallet_offer_ids.insert(trade_id);
+
+            // Check if this wallet offer is one we are tracking.
+            auto it = pending_map.find(trade_id);
+            if (it == pending_map.end()) {
+                continue;  // Not one of ours.
+            }
+
+            // Detected terminal state that we missed during normal polling.
+            if (status == trade_status::kCancelled ||
+                status == trade_status::kFailed) {
+                state_->remove_offer(trade_id);
+                ++corrections;
+                logger_->warn("[reconcile] Removed orphaned offer {} "
+                              "(wallet status={}, was pending in State)",
+                              trade_id.substr(0, 12), status);
+            }
+            // Note: confirmed fills (status==4) that we missed are NOT
+            // processed here -- they are handled exclusively through
+            // detect_fills() + confirmation depth gating so that the
+            // cost-basis pipeline remains the single authoritative path.
+        }
+
+        offset += kPageSize;
+    }
+
+    // Detect orphans: offers in State that no longer exist in the wallet.
+    // This can happen if the wallet was restarted or the offer expired
+    // server-side without a cancel call.
+    for (const auto& [offer_id, po] : pending_map) {
+        if (wallet_offer_ids.find(offer_id) == wallet_offer_ids.end()) {
+            state_->remove_offer(offer_id);
+            ++corrections;
+            logger_->warn("[reconcile] Removed phantom offer {} ({}) "
+                          "-- not found in wallet",
+                          offer_id.substr(0, 12), po.pair_name);
+        }
+    }
+
+    if (corrections > 0) {
+        logger_->info("[reconcile] Corrected {} state discrepancies",
+                      corrections);
+    } else {
+        logger_->debug("[reconcile] State consistent -- no discrepancies");
+    }
+
+    co_return corrections;
 }
 
 // ---------------------------------------------------------------------------

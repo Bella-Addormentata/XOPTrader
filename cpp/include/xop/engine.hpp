@@ -76,6 +76,8 @@
 #include "xop/strategy/strategy_portfolio.hpp"
 #include "xop/strategy/chia_edge.hpp"
 #include "xop/strategy/new_strategies.hpp"
+#include "xop/strategy/fee_tracker.hpp"
+#include "xop/strategy/kappa_calibrator.hpp"
 
 // New risk modules
 #include "xop/risk/loss_manager.hpp"
@@ -443,6 +445,14 @@ private:
     /// cross-bridge opportunities each block.
     std::unique_ptr<ArbitrageDetector> arb_detector_;
 
+    /// Fee budget tracker -- dynamic fee selection, fee-vs-gain gating,
+    /// daily budget enforcement.
+    std::unique_ptr<FeeTracker> fee_tracker_;
+
+    /// [T4-16] Online κ calibrator -- rolling fill-rate estimator that
+    /// fits λ(δ) = A·exp(−κ·δ) from observed fill data.
+    std::unique_ptr<KappaCalibrator> kappa_calibrator_;
+
     // -- Risk layer ----------------------------------------------------------
 
     /// Inventory tracking, cost basis, Kelly sizing, capital allocation.
@@ -655,6 +665,22 @@ private:
     /// Entries are removed once validated (TP) or expired (FP).
     /// ISO/IEC 5055: bounded by kMaxPendingActivations.
     std::vector<BlockHeight> vpin_activation_blocks_;
+
+    // -- [T4-02] Reorg protection: pending-fill confirmation buffer --------
+    // Fills detected by detect_fills() are first inserted here keyed by
+    // their confirmed block height.  Each heartbeat cycle, fills whose
+    // age (current_block - fill_block) >= confirmation_depth_blocks are
+    // promoted to actual fill processing (inventory, PnL, DB, etc.).
+    // Fills are evicted after processing or if the wallet reports them as
+    // no longer confirmed (reorg rollback).
+    // ISO/IEC 27001:2022: prevents accepting fills that a chain reorg may
+    // reverse, protecting cost-basis integrity.
+    std::vector<Fill> pending_unconfirmed_fills_;
+
+    // -- [T4-11] Offer reconciliation tracking -----------------------------
+    // Block height of the last full reconciliation run.  Compared against
+    // current_block to decide when to trigger the next reconciliation.
+    BlockHeight last_reconciliation_block_{0};
 };
 
 }  // namespace xop

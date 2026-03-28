@@ -656,6 +656,37 @@ ChiaFullNodeRPC::get_coin_records_by_puzzle_hash(
     co_return records;
 }
 
+asio::awaitable<std::uint64_t>
+ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
+{
+    // The Chia full node's `get_fee_estimate` endpoint (added in Chia 1.6)
+    // accepts `target_times` (list of seconds) and an optional
+    // `spend_type`.  It returns `estimates` (list of mojos) aligned 1:1
+    // with the requested target times.
+    //
+    // We request a single target time and return the corresponding estimate.
+    // If the endpoint is unavailable (older node) or fails, return 0 so the
+    // caller falls back to the static fee.
+    try {
+        json payload = {
+            {"target_times", {target_time_seconds}}
+        };
+
+        const json resp = co_await rpc_post("get_fee_estimate", payload);
+
+        if (resp.contains("estimates") && resp["estimates"].is_array()
+            && !resp["estimates"].empty()) {
+            co_return resp["estimates"][0].get<std::uint64_t>();
+        }
+
+        // Fallback: response format unexpected.
+        co_return 0;
+    } catch (const ChiaRPCError&) {
+        // Endpoint not supported or node unavailable -- return 0.
+        co_return 0;
+    }
+}
+
 // ===========================================================================
 // ChiaWalletRPC
 // ===========================================================================

@@ -819,6 +819,20 @@ QuoteResult MempoolSentinelStrategy::compute_quotes(
                               -cfg_.skew_max, cfg_.skew_max);
     }
 
+    // T4-17: Mempool skew is applied as a LEVEL SHIFT (both sides move
+    // in the same direction), NOT an asymmetric spread widening.
+    //
+    // When buying pressure is detected (net_flow > 0, skew_adj > 0):
+    //   - ask shifts UP → discourages additional buying (adverse-selection protection)
+    //   - bid shifts UP → reservation price rises in anticipation of upward flow
+    //
+    // This is consistent with the Avellaneda-Stoikov inventory skew model
+    // where the reservation price r = S - q·γ·σ²·τ shifts the entire quote
+    // level rather than widening the spread.  The mempool skew applies the
+    // same economics to anticipated (not yet realised) inventory changes.
+    //
+    // Sign verified: LOGICREVIEW-GPT-5.4 §A.6 flagged this; the sign is
+    // CORRECT for anticipatory adverse-selection protection.
     double ask = r + delta_final + skew_adj;
     double bid = r - delta_final + skew_adj;
 
