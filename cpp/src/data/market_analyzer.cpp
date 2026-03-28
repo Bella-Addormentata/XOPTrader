@@ -164,6 +164,10 @@ uint32_t MarketAnalyzer::analysis_blocks() const noexcept {
     return cfg_.analysis_blocks;
 }
 
+uint32_t MarketAnalyzer::timeout_block_multiplier() const noexcept {
+    return cfg_.timeout_block_multiplier;
+}
+
 std::vector<PairAnalysisSummary> MarketAnalyzer::get_summaries() const {
     std::vector<PairAnalysisSummary> result;
     result.reserve(states_.size());
@@ -211,15 +215,15 @@ AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
 
     // Return the most conservative recommendation across all pairs.
     // Conservative(0) < Normal(1) < Aggressive(2) — lower is more conservative.
-    auto worst = AnalysisAggressiveness::Aggressive;
+    auto most_conservative = AnalysisAggressiveness::Aggressive;
     for (const auto& [name, ps] : states_) {
         const auto summary = compute_summary(ps);
         if (static_cast<uint8_t>(summary.aggressiveness) <
-            static_cast<uint8_t>(worst)) {
-            worst = summary.aggressiveness;
+            static_cast<uint8_t>(most_conservative)) {
+            most_conservative = summary.aggressiveness;
         }
     }
-    return worst;
+    return most_conservative;
 }
 
 double MarketAnalyzer::recommended_spread_multiplier() const {

@@ -528,8 +528,9 @@ asio::awaitable<void> Engine::run_startup_analysis()
     // [TIMEOUT] Maximum total block polls before forcing completion.
     // Prevents the engine from hanging indefinitely if a pair has no
     // market data (e.g. a newly listed pair with zero trading activity).
-    // Default: analysis_blocks * 3 (roughly 3x the expected duration).
-    const uint32_t max_total_polls = target * 3;
+    // Uses MarketAnalyzerConfig::timeout_block_multiplier (default 3x).
+    const uint32_t max_total_polls =
+        target * market_analyzer_->timeout_block_multiplier();
     uint32_t total_polls = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&

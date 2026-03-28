@@ -223,6 +223,9 @@ public:
     /// Configured analysis window length (blocks).
     [[nodiscard]] uint32_t analysis_blocks() const noexcept;
 
+    /// Configured timeout multiplier for analysis completion.
+    [[nodiscard]] uint32_t timeout_block_multiplier() const noexcept;
+
     /// Per-pair analysis summaries.  Complete() must be true for the
     /// recommendations to be meaningful; calling before completion returns
     /// partial results with complete == false.
