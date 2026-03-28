@@ -62,8 +62,14 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , ioc_()
     , poll_timer_(ioc_)
     , state_(std::make_shared<State>())
+    , max_drawdown_pct_(config.risk.max_drawdown_pct)
 {
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
+    spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% "
+                 "window_loss={:.0f}bps/{} blocks",
+                 config_.risk.max_drawdown_pct * 100.0,
+                 config_.risk.max_window_loss_bps,
+                 config_.risk.loss_window_blocks);
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -2074,6 +2080,89 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 std::to_string(drawdown_frac * 100.0) + "% exceeds threshold " +
                 std::to_string(max_drawdown_pct_ * 100.0) +
                 "% -- engine PAUSED.  Manual intervention required.");
+        }
+    }
+
+    // [T3-36] Rolling time-window loss circuit breaker.
+    //
+    // Maintains a deque of (block_height, total_pnl) snapshots capped at
+    // loss_window_blocks entries.  On each cycle:
+    //   1. Append the current (block_height, total_pnl) to the back.
+    //   2. Pop front entries older than loss_window_blocks blocks.
+    //   3. Compute window_loss = front_pnl - current_pnl.
+    //   4. If window_loss exceeds the configured threshold, pause.
+    //
+    // The loss threshold is expressed in mojos: it equals
+    //   |peak_pnl_hwm_| * max_window_loss_bps / 10 000
+    // anchored to the all-time peak so that the threshold scales with the
+    // bot's trading volume.  When peak_pnl_hwm_ <= 0 we use the absolute
+    // window loss in mojos compared to the bps threshold applied to a
+    // nominal 1 XCH (1e12 mojos) to avoid a zero denominator.
+    //
+    // A configured max_window_loss_bps of 0 disables this check entirely.
+    //
+    // ISO/IEC 27001:2022: time-windowed monitoring catches slow loss spirals
+    //   that individual HWM drawdown or flash-crash checks may miss.
+    // ISO/IEC 5055: deque bounded by loss_window_blocks; no UB division.
+    if (config_.risk.max_window_loss_bps > 0.0
+            && state_->get_status() == BotStatus::Running) {
+
+        // 1. Append current snapshot.
+        pnl_window_.push_back({block_height, total.total_pnl});
+
+        // 2. Trim entries that fall outside the rolling window.
+        //    Entries are ordered by ascending block_height; pop from front.
+        //    We keep only entries whose age is strictly less than
+        //    loss_window_blocks (i.e., within the window).  An entry is
+        //    considered stale when block_height - entry_block >= window_size.
+        while (pnl_window_.size() > 1) {
+            const BlockHeight oldest = pnl_window_.front().first;
+            if (block_height - oldest >= config_.risk.loss_window_blocks) {
+                pnl_window_.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        // 3. Compute window_loss (positive = PnL decreased over the window).
+        if (pnl_window_.size() >= 2) {
+            const Mojo window_start_pnl = pnl_window_.front().second;
+            const Mojo window_loss      = window_start_pnl - total.total_pnl;
+
+            // Compute the threshold in mojos.
+            // Anchored to |peak_pnl_hwm_| when positive; fall back to 1 XCH.
+            const Mojo anchor   = (peak_pnl_hwm_ > 0)
+                                ? peak_pnl_hwm_
+                                : kMojosPerXch;
+            const Mojo threshold_mojos = static_cast<Mojo>(
+                static_cast<double>(anchor)
+                * config_.risk.max_window_loss_bps / 10'000.0);
+
+            // 4. Fire if window_loss exceeds the threshold.
+            if (window_loss > 0 && threshold_mojos > 0
+                    && window_loss > threshold_mojos) {
+
+                const BlockHeight window_actual =
+                    block_height - pnl_window_.front().first;
+
+                spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT BREAKER "
+                              "-- loss={} mojos over {} blocks "
+                              "> threshold={} mojos ({:.1f} bps) "
+                              "-- transitioning to Paused state",
+                              window_loss, window_actual,
+                              threshold_mojos,
+                              config_.risk.max_window_loss_bps);
+
+                state_->set_status(BotStatus::Paused);
+
+                alerts_->send_alert(AlertRule::PnlDrawdown,
+                    "Rolling-window circuit breaker triggered: lost " +
+                    std::to_string(window_loss) + " mojos in " +
+                    std::to_string(window_actual) + " blocks (limit " +
+                    std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
+                    " bps = " + std::to_string(threshold_mojos) +
+                    " mojos) -- engine PAUSED.  Manual intervention required.");
+            }
         }
     }
 
