@@ -211,7 +211,6 @@ public:
 
 private:
     const RiskConfig&     risk_cfg_;
-    const StrategyConfig& strat_cfg_;
 
     /// Minimum profit margin expressed in mojos-per-mojo, derived from
     /// StrategyConfig::min_profit_margin_bps at construction time.

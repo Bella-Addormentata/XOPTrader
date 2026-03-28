@@ -164,7 +164,7 @@ TEST_F(CompetitorDetectionTest, BestSpreadCalculation) {
     std::unordered_set<std::string> own_ids;
 
     // Ingest dexie data first (needed for mid-price).
-    feed_->ingest_dexie(pair, 2.70, 2.75, 2.725, 1000.0);
+    feed_->ingest_dexie(pair, 2.70, 2.75, mid_price, 1000.0);
     feed_->ingest_block_height(100);
 
     // Ingest competing offers.

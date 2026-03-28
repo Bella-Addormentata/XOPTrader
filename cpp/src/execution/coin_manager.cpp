@@ -49,11 +49,10 @@ namespace xop::execution {
 // Constructor
 // ---------------------------------------------------------------------------
 
-CoinManager::CoinManager(asio::io_context&                    ioc,
+CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
                          std::shared_ptr<rpc::ChiaWalletRPC>  wallet,
                          const AppConfig&                     config)
-    : ioc_(ioc)
-    , wallet_(std::move(wallet))
+    : wallet_(std::move(wallet))
     , logger_(spdlog::default_logger()->clone("CoinMgr"))
 {
     default_split_fee_ = static_cast<Mojo>(config.strategy.offer_fee_mojos);

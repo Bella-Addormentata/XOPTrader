@@ -117,6 +117,7 @@ inline bool exceeds_int64(U128 v) {
 /// Software 128-bit / 64-bit unsigned division using shift-and-subtract.
 /// Returns quotient.  Only used on exotic platforms lacking both __int128
 /// and MSVC _udiv128 -- kept simple rather than fast.
+#if !(defined(_MSC_VER) && defined(_M_X64)) && !defined(__SIZEOF_INT128__)
 inline std::uint64_t udiv128_software(U128 num, std::uint64_t den) {
     if (num.hi == 0) {
         return num.lo / den;
@@ -145,6 +146,7 @@ inline std::uint64_t udiv128_software(U128 num, std::uint64_t den) {
     }
     return quotient;
 }
+#endif  // !(defined(_MSC_VER) && defined(_M_X64)) && !defined(__SIZEOF_INT128__)
 
 /// Compute (a * b) / d  using 128-bit intermediate.  Returns the int64 result.
 /// Precondition: all inputs positive, result fits int64.
