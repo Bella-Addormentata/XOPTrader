@@ -31,6 +31,14 @@ project(xop_trader
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )
 
+# Generate xop/version.hpp from the project VERSION above so the binary
+# never has a hand-maintained version literal.
+configure_file(
+    "${CMAKE_CURRENT_SOURCE_DIR}/include/xop/version.hpp.in"
+    "${CMAKE_CURRENT_BINARY_DIR}/include/xop/version.hpp"
+    @ONLY
+)
+
 # ==========================================================================
 # Global compiler settings
 # ==========================================================================
@@ -167,6 +175,7 @@ add_library(xop_core STATIC
 target_include_directories(xop_core
     PUBLIC
         $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_BINARY_DIR}/include>
         $<INSTALL_INTERFACE:include>
 )
 
