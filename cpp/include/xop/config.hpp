@@ -129,13 +129,30 @@ struct StrategyConfig {
 //   single_cat_cap_pct      -- max portfolio fraction in any one CAT.
 //   kelly_fraction          -- fraction of full Kelly to use (Half-Kelly = 0.5).
 //   max_capital_per_pair_pct-- upper bound on capital allocated to one pair.
+//
+// Circuit breakers (ISO/IEC 27001:2022 §8.20 -- continuous risk monitoring):
+//   max_drawdown_pct     -- peak-to-trough drawdown fraction that pauses the
+//                           engine.  Default 10% (0.10).  Measures the drop
+//                           from the all-time PnL high-water mark.
+//   loss_window_blocks   -- rolling window size in blocks for the time-window
+//                           loss circuit breaker.  Default 1152 blocks ≈ 10 h
+//                           at the Chia mean block time of 52 s.
+//   max_window_loss_bps  -- maximum loss (in basis points, i.e. 0.01 % per bp)
+//                           permitted within the rolling window before the
+//                           engine is paused.  Default 500 bps = 5 %.
+//                           A value of 0 disables the window circuit breaker.
 // ---------------------------------------------------------------------------
 struct RiskConfig {
-    double soft_limit_pct{0.60};
-    double hard_limit_pct{0.80};
-    double single_cat_cap_pct{0.12};
-    double kelly_fraction{0.50};
-    double max_capital_per_pair_pct{0.20};
+    double   soft_limit_pct{0.60};
+    double   hard_limit_pct{0.80};
+    double   single_cat_cap_pct{0.12};
+    double   kelly_fraction{0.50};
+    double   max_capital_per_pair_pct{0.20};
+
+    // -- Circuit breakers ---------------------------------------------------
+    double   max_drawdown_pct{0.10};        ///< HWM drawdown threshold (0,1].
+    uint32_t loss_window_blocks{1152};      ///< Rolling window size in blocks.
+    double   max_window_loss_bps{500.0};    ///< Max loss in window (bps; 0=disabled).
 };
 
 // ---------------------------------------------------------------------------
