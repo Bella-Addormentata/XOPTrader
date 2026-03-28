@@ -529,8 +529,15 @@ asio::awaitable<void> Engine::run_startup_analysis()
     // Prevents the engine from hanging indefinitely if a pair has no
     // market data (e.g. a newly listed pair with zero trading activity).
     // Uses MarketAnalyzerConfig::timeout_block_multiplier (default 3x).
-    const uint32_t max_total_polls =
-        target * market_analyzer_->timeout_block_multiplier();
+    // Clamp to >= 1 so that a misconfigured 0 doesn't trigger an
+    // immediate timeout before any data is collected.
+    uint32_t timeout_mult = market_analyzer_->timeout_block_multiplier();
+    if (timeout_mult == 0) {
+        spdlog::warn("[Engine] MarketAnalyzer timeout_block_multiplier configured "
+                     "as 0; clamping to 1 to avoid immediate analysis timeout");
+        timeout_mult = 1;
+    }
+    const uint32_t max_total_polls = target * timeout_mult;
     uint32_t total_polls = 0;
 
     while (!stop_requested_.load(std::memory_order_relaxed) &&
@@ -554,8 +561,15 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (ec == boost::asio::error::operation_aborted) {
             co_return;  // Shutdown during analysis.
         }
-        if (ec || stop_requested_.load(std::memory_order_relaxed)) {
-            co_return;
+        if (stop_requested_.load(std::memory_order_relaxed)) {
+            co_return;  // Shutdown requested.
+        }
+        if (ec) {
+            // Non-shutdown timer error — log and fall through to
+            // complete analysis with whatever data we have.
+            spdlog::warn("[Engine] Analysis timer error: {}; ending analysis early",
+                         ec.message());
+            break;
         }
 
         // Fetch current block height.
@@ -591,11 +605,13 @@ asio::awaitable<void> Engine::run_startup_analysis()
         }
 
         // Feed observations to the analyzer for each pair.
+        // Always call ingest() even with invalid mid_price so that
+        // total_poll_attempts is tracked for data-quality reporting.
+        // MarketAnalyzer::ingest() will reject invalid data internally.
         for (const auto& pair : config_.pairs) {
             if (!pair.enabled) continue;
 
             const MarketSnapshot snap = state_->get_market(pair.name);
-            if (snap.mid_price <= 0) continue;
 
             const double mid_d    = static_cast<double>(snap.mid_price);
             const double spread_d = snap.spread_bps;
@@ -649,7 +665,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
 
     // Log the completed analysis summaries.
-    const auto summaries = market_analyzer_->get_summaries();
+    auto summaries = market_analyzer_->get_summaries();
     for (const auto& s : summaries) {
         spdlog::info("[Engine] Analysis complete for {}: "
                      "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "
@@ -673,14 +689,21 @@ asio::awaitable<void> Engine::run_startup_analysis()
     // Conservative → 1.5  (50% wider spreads: protect against adverse selection)
     // Normal       → 1.0  (no change from configured defaults)
     // Aggressive   → 0.8  (20% tighter: capture spread in stable markets)
-    analysis_spread_mult_ = market_analyzer_->recommended_spread_multiplier();
+    //
+    // Compute overall_recommendation() once and derive the multiplier from
+    // it, avoiding a second full traversal of all pair summaries.
     const auto overall = market_analyzer_->overall_recommendation();
+    switch (overall) {
+        case AnalysisAggressiveness::Conservative: analysis_spread_mult_ = 1.5; break;
+        case AnalysisAggressiveness::Aggressive:   analysis_spread_mult_ = 0.8; break;
+        default:                                   analysis_spread_mult_ = 1.0; break;
+    }
 
     spdlog::info("[Engine] Analysis recommendation: {} → spread multiplier {:.2f}x",
                  to_string(overall), analysis_spread_mult_);
 
     // Persist summaries and multiplier in State for GUI/monitoring.
-    state_->set_analysis_results(summaries, analysis_spread_mult_);
+    state_->set_analysis_results(std::move(summaries), analysis_spread_mult_);
 
     // Export spread multiplier to Prometheus.
     if (metrics_->is_running()) {

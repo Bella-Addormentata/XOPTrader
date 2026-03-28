@@ -512,7 +512,8 @@ class MetricsService(QObject):
             Inner keys: ``blocks_collected``, ``blocks_target``,
             ``vol_annual``, ``mean_spread_bps``, ``spread_cv``,
             ``variance_ratio``, ``book_imbalance``, ``momentum``,
-            ``regime_code``, ``agg_code``, ``complete``.
+            ``regime_code``, ``agg_code``, ``complete``,
+            ``spread_multiplier``.
         """
         with QMutexLocker(self._mutex):
             m = self._latest
