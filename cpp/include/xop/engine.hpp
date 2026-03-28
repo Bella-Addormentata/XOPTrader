@@ -58,6 +58,7 @@
 #include "xop/strategy/spread.hpp"
 #include "xop/strategy/liquidity.hpp"
 #include "xop/strategy/arbitrage.hpp"
+#include "xop/strategy/depeg_detector.hpp"
 
 // Risk layer
 #include "xop/risk/inventory.hpp"
@@ -417,6 +418,13 @@ private:
 
     /// Per-pair multi-tier liquidity engine.
     std::unordered_map<std::string, std::unique_ptr<LiquidityEngine>> liquidity_engines_;
+
+    /// Stablecoin depeg detector -- monitors pegged pairs for failure.
+    std::unique_ptr<DepegDetector> depeg_detector_;
+
+    /// Arbitrage detector -- scans for CEX-DEX, cross-DEX, triangular, and
+    /// cross-bridge opportunities each block.
+    std::unique_ptr<ArbitrageDetector> arb_detector_;
 
     // -- Risk layer ----------------------------------------------------------
 

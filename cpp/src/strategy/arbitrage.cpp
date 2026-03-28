@@ -553,7 +553,9 @@ ArbitrageDetector::scan_cross_dex(
 // ---------------------------------------------------------------------------
 
 std::vector<ArbitrageOpportunity>
-ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
+ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
+                                   const PairDepthMap& pair_depths,
+                                   const StablecoinPairSet& stablecoin_pairs) const
 {
     std::vector<ArbitrageOpportunity> result;
 
@@ -584,11 +586,14 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
         }
     }
 
-    // Step 2: Build a fast lookup lambda.
+    // Step 2: Build fast lookup lambdas.
     //
     // get_rate("A", "B") returns the mid-price of the A/B pair if it exists,
     // or the inverse of B/A if that exists instead.  Returns 0.0 if neither
     // direction is found.
+    //
+    // get_pair_key("A", "B") returns the actual pair key found in the map
+    // (direct or inverse), so we can look up depth for that pair.
 
     auto get_rate = [&](const std::string& base,
                         const std::string& quote) -> double {
@@ -605,6 +610,38 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
             return 1.0 / it->second;
         }
         return 0.0;
+    };
+
+    // Returns the canonical pair key that exists in the map, or "" if none.
+    auto get_pair_key = [&](const std::string& base,
+                            const std::string& quote) -> std::string {
+        const std::string direct = base + "/" + quote;
+        if (all_pair_prices.count(direct)) {
+            return direct;
+        }
+        const std::string inverse = quote + "/" + base;
+        if (all_pair_prices.count(inverse)) {
+            return inverse;
+        }
+        return {};
+    };
+
+    // Look up available depth for a pair.  Returns a large sentinel if no
+    // depth data is available (effectively unconstrained).
+    auto get_depth = [&](const std::string& pair_key) -> double {
+        if (pair_depths.empty() || pair_key.empty()) {
+            return 1e9;  // no depth data → unconstrained
+        }
+        auto it = pair_depths.find(pair_key);
+        if (it != pair_depths.end() && it->second > 0.0) {
+            return it->second;
+        }
+        return 1e9;
+    };
+
+    // Check if a pair key is a stablecoin-vs-stablecoin pair.
+    auto is_stable_pair = [&](const std::string& pair_key) -> bool {
+        return !stablecoin_pairs.empty() && stablecoin_pairs.count(pair_key);
     };
 
     // Step 3: Enumerate all ordered pairs (A, B) where A != B.
@@ -639,6 +676,7 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
         if (rate_xch_a <= 0.0) {
             continue;  // no XCH/A pair exists
         }
+        const std::string key_leg1 = get_pair_key("XCH", a);
 
         for (std::size_t j = 0; j < n; ++j) {
             if (j == i) {
@@ -652,12 +690,14 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
             if (rate_a_b <= 0.0) {
                 continue;  // no A/B pair exists
             }
+            const std::string key_leg2 = get_pair_key(a, b);
 
             // Leg 3: B -> XCH.
             const double rate_b_xch = get_rate(b, "XCH");
             if (rate_b_xch <= 0.0) {
                 continue;  // no B/XCH pair exists
             }
+            const std::string key_leg3 = get_pair_key(b, "XCH");
 
             // Gross profit ratio (before fees).
             const double gross_ratio = rate_xch_a * rate_a_b * rate_b_xch;
@@ -672,17 +712,72 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
                 continue;  // insufficient profit after costs
             }
 
+            // -- Depth-aware trade sizing --
+            // Cap trade size at the minimum available depth across all 3 legs
+            // (converted to XCH-equivalent for legs that aren't denominated
+            //  in XCH).  This prevents trying to push more volume than the
+            // order book can absorb without excessive slippage.
+            const double depth_leg1 = get_depth(key_leg1);
+            const double depth_leg2 = get_depth(key_leg2);
+            const double depth_leg3 = get_depth(key_leg3);
+
+            // Convert non-XCH depths to XCH-equivalent.
+            // Leg 1 depth is in XCH (we're buying A with XCH).
+            // Leg 2 depth is in A-units; convert to XCH via 1/rate_xch_a.
+            // Leg 3 depth is in B-units; convert to XCH via rate_b_xch.
+            const double depth_xch_1 = depth_leg1;
+            const double depth_xch_2 = (rate_xch_a > 0.0)
+                ? depth_leg2 / rate_xch_a : 1e9;
+            const double depth_xch_3 = depth_leg3 * rate_b_xch;
+
+            const double min_depth = std::min({depth_xch_1,
+                                               depth_xch_2,
+                                               depth_xch_3});
+
+            // Trade size: smallest of max_position_size and min available
+            // depth.  Apply a safety margin (use 80% of depth to reduce
+            // price impact).
+            const double depth_limited = min_depth * 0.80;
+            const double trade_size = std::min(
+                cfg_.max_position_size, std::max(depth_limited, 0.01));
+
             // Estimated profit in XCH for a unit-size trade.
             // If we start with 1 XCH, we end with net_ratio XCH.
             // Profit = (net_ratio - 1.0) * trade_size.
-            const double trade_size = std::min(
-                cfg_.max_position_size, 10.0);  // conservative for tri-arb
             const double est_profit = (net_ratio - 1.0) * trade_size;
 
-            // Confidence: higher for larger edges, lower for exotic assets.
-            const double conf = clamp_d(
-                cfg_.default_confidence * (net_profit_bps / 100.0),
-                cfg_.min_confidence_threshold, 0.95);
+            // -- Stablecoin-aware confidence boost --
+            // If any leg in the route involves a stablecoin-vs-stablecoin
+            // pair, the price relationship is mean-reverting (pegged).
+            // Deviations from peg are more likely to close profitably,
+            // so we boost confidence.
+            const bool has_stable_leg = is_stable_pair(key_leg1)
+                                     || is_stable_pair(key_leg2)
+                                     || is_stable_pair(key_leg3);
+
+            // Count how many legs are stable for graduated boost.
+            int stable_leg_count = 0;
+            if (is_stable_pair(key_leg1)) ++stable_leg_count;
+            if (is_stable_pair(key_leg2)) ++stable_leg_count;
+            if (is_stable_pair(key_leg3)) ++stable_leg_count;
+
+            // Base confidence from edge magnitude.
+            double conf = cfg_.default_confidence * (net_profit_bps / 100.0);
+
+            // Stablecoin boost: +10% per stable leg (pegged pairs mean-revert).
+            if (has_stable_leg) {
+                conf *= (1.0 + 0.10 * stable_leg_count);
+            }
+
+            // Depth penalty: reduce confidence when trade size is large
+            // relative to available depth.
+            if (min_depth < 1e8 && trade_size > 0.0) {
+                const double depth_ratio = trade_size / min_depth;
+                const double depth_penalty = 1.0 - 0.3 * depth_ratio;
+                conf *= std::max(depth_penalty, 0.3);
+            }
+
+            conf = clamp_d(conf, cfg_.min_confidence_threshold, 0.95);
 
             const std::uint32_t urgency = compute_urgency(
                 net_profit_bps, kDefaultVolPerBlockBps);
@@ -703,8 +798,11 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices) const
             opp.urgency_blocks   = urgency;
 
             spdlog::info("Triangular arb: {} gross_ratio={:.6f} "
-                         "net_profit={:.1f}bps est_profit={:.6f} XCH",
-                         route, gross_ratio, net_profit_bps, est_profit);
+                         "net_profit={:.1f}bps trade_size={:.2f} "
+                         "est_profit={:.6f} XCH conf={:.3f}{}",
+                         route, gross_ratio, net_profit_bps,
+                         trade_size, est_profit, conf,
+                         has_stable_leg ? " [stablecoin-leg]" : "");
 
             result.push_back(std::move(opp));
         }
@@ -824,7 +922,9 @@ ArbitrageDetector::scan_all() const
 
     // -- 3. Triangular scan: uses the complete pair-price map.
     if (!cached_pair_prices_.empty()) {
-        auto opps = scan_triangular(cached_pair_prices_);
+        auto opps = scan_triangular(cached_pair_prices_,
+                                    cached_pair_depths_,
+                                    cached_stablecoin_pairs_);
         all.insert(all.end(),
                    std::make_move_iterator(opps.begin()),
                    std::make_move_iterator(opps.end()));
@@ -887,6 +987,16 @@ void ArbitrageDetector::set_tibetswap_reserves(
 void ArbitrageDetector::set_pair_prices(const PairPriceMap& prices)
 {
     cached_pair_prices_ = prices;
+}
+
+void ArbitrageDetector::set_pair_depths(const PairDepthMap& depths)
+{
+    cached_pair_depths_ = depths;
+}
+
+void ArbitrageDetector::set_stablecoin_pairs(const StablecoinPairSet& pairs)
+{
+    cached_stablecoin_pairs_ = pairs;
 }
 
 void ArbitrageDetector::set_bridge_prices(double wusdc_price,
