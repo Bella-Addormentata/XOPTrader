@@ -108,7 +108,8 @@ public:
     /**
      * @brief Construct an OfferManager.
      *
-     * @param ioc           Boost.Asio io_context for async operations.
+     * @param ioc           Boost.Asio io_context (accepted for API stability;
+     *                      not stored — async work runs on the caller's strand).
      * @param wallet        Shared pointer to an open ChiaWalletRPC client.
      * @param dexie_client  Shared pointer to an open DexieClient for offer
      *                      aggregation.  May be nullptr if Dexie submission

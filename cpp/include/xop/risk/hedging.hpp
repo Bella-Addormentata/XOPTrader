@@ -86,9 +86,13 @@ struct CorrelationEntry {
 
 class HedgingManager {
 public:
-    /// Construct with the strategy configuration (for skew parameters)
-    /// and risk configuration (for limits that constrain suggestions).
-    /// Both references must outlive this object.
+    /// Construct a HedgingManager.
+    ///
+    /// @param strat_cfg  Strategy configuration (accepted for API stability;
+    ///                   not stored -- all methods are stateless or use only
+    ///                   the correlation table).
+    /// @param risk_cfg   Risk configuration (accepted for API stability;
+    ///                   not stored).
     explicit HedgingManager(const StrategyConfig& strat_cfg,
                             const RiskConfig&     risk_cfg) noexcept;
 
