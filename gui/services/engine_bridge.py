@@ -4,10 +4,11 @@
 database) and exposes a single cohesive API that GUI widgets call to
 read bot state, market data, and trade history.
 
-Phase 1 (current) is strictly **read-only** -- all data flows from the
-engine to the GUI via Prometheus scraping and SQLite queries.  Direct
-engine control (start/stop, cancel offers) is stubbed for future IPC
-integration.
+Phase 1 data flows are **read-only** -- metrics via Prometheus scraping
+and history via SQLite queries.  The bridge can auto-launch the C++
+engine as a managed subprocess when the binary is co-located with the
+GUI (e.g. after running the Windows installer).  Cancel-offer control
+is stubbed for future IPC integration.
 
 Compliant with:
     - ISO/IEC 27001:2022  (no credentials in memory beyond config load)
@@ -18,6 +19,8 @@ Compliant with:
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -125,6 +128,8 @@ class EngineBridge(QObject):
         # -- Internal state -------------------------------------------------
         self._bot_status: str = STATUS_UNKNOWN
         self._last_data: dict[str, Any] = {}
+        self._engine_process: subprocess.Popen | None = None
+        self._engine_log_fh: Any = None
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
@@ -186,6 +191,15 @@ class EngineBridge(QObject):
         if not config_ok:
             _log.warning("Config load failed; continuing with defaults.")
 
+        # Step 1.5 -- Auto-start C++ engine if a co-located binary exists
+        # and no engine is already responding on the metrics endpoint.
+        if not self._is_engine_reachable():
+            engine_ok = self._start_engine_process()
+            if engine_ok:
+                _log.info("C++ engine auto-started; waiting for metrics endpoint.")
+            else:
+                _log.info("C++ engine binary not found; GUI-only monitoring mode.")
+
         # Step 2 -- Start metrics poller.  The URL may be overridden by
         # config if config loaded successfully.
         if config_ok:
@@ -235,6 +249,7 @@ class EngineBridge(QObject):
         self._master_timer.stop()
         self._metrics_svc.stop()
         self._database_svc.stop()
+        self._stop_engine_process()
         _log.info("EngineBridge shutdown complete.")
 
     # ===================================================================
@@ -310,37 +325,32 @@ class EngineBridge(QObject):
         return data
 
     # ===================================================================
-    # Public API -- engine control stubs (Phase 1: passive)
+    # Public API -- engine control
     # ===================================================================
 
     def start_engine(self) -> None:
-        """Request the C++ engine to start.
+        """Start the C++ engine as a managed subprocess.
 
-        Phase 1 stub -- emits a status signal for the GUI to display
-        a prompt asking the user to start the engine manually.
+        Locates the engine binary next to the GUI executable and
+        launches it.  Emits an error signal if the binary is missing
+        or the process fails to start.
         """
-        _log.warning(
-            "start_engine() called but direct engine control is not "
-            "yet available.  Please start the engine process manually."
-        )
-        self.error.emit(
-            "Direct engine control not yet available. "
-            "Please start the engine process manually."
-        )
+        if self._engine_process is not None and self._engine_process.poll() is None:
+            _log.info("Engine already running (PID %d).", self._engine_process.pid)
+            return
+
+        if self._start_engine_process():
+            _log.info("Engine started via start_engine().")
+        else:
+            self.error.emit(
+                "Could not start the engine.  Make sure xop_trader"
+                + (".exe" if sys.platform == "win32" else "")
+                + " is in the same folder as the GUI."
+            )
 
     def stop_engine(self) -> None:
-        """Request the C++ engine to stop.
-
-        Phase 1 stub -- logs a warning.
-        """
-        _log.warning(
-            "stop_engine() called but direct engine control is not "
-            "yet available.  Please stop the engine process manually."
-        )
-        self.error.emit(
-            "Direct engine control not yet available. "
-            "Please stop the engine process manually."
-        )
+        """Gracefully stop the managed C++ engine subprocess."""
+        self._stop_engine_process()
 
     def cancel_offer(self, offer_id: str) -> None:
         """Request cancellation of a single offer.
@@ -479,6 +489,115 @@ class EngineBridge(QObject):
         """
         _log.warning("Service error: %s", msg)
         self.error.emit(msg)
+
+    # ===================================================================
+    # Engine subprocess management
+    # ===================================================================
+
+    def _find_engine_binary(self) -> Path | None:
+        """Locate the C++ engine binary relative to the GUI executable.
+
+        When running from a PyInstaller bundle the binary is expected
+        next to ``sys.executable``.  In development mode the current
+        working directory is checked instead.
+        """
+        if getattr(sys, "frozen", False):
+            exe_dir = Path(sys.executable).parent
+        else:
+            exe_dir = Path.cwd()
+
+        engine_name = "xop_trader.exe" if sys.platform == "win32" else "xop_trader"
+        engine_path = exe_dir / engine_name
+        return engine_path if engine_path.is_file() else None
+
+    def _is_engine_reachable(self) -> bool:
+        """Return True if the Prometheus metrics endpoint already responds.
+
+        Prevents spawning a duplicate engine when one is already
+        running (e.g. started manually or by a service manager).
+        """
+        import requests as _req  # noqa: WPS433 — keep top-level imports light
+
+        try:
+            resp = _req.get(self._metrics_url, timeout=2)
+            return resp.status_code == 200
+        except Exception:
+            return False
+
+    def _start_engine_process(self) -> bool:
+        """Launch the C++ engine as a child process.
+
+        Engine stdout/stderr is redirected to ``engine.log`` next to
+        the binary so users can inspect output without a console window.
+        Returns *True* on success.
+        """
+        engine_path = self._find_engine_binary()
+        if engine_path is None:
+            return False
+
+        cmd: list[str] = [str(engine_path)]
+        if self._config_path.is_file():
+            cmd.extend(["--config", str(self._config_path)])
+
+        try:
+            log_path = engine_path.parent / "engine.log"
+            self._engine_log_fh = open(log_path, "a")  # noqa: SIM115
+
+            kwargs: dict[str, Any] = {}
+            if sys.platform == "win32":
+                kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+
+            self._engine_process = subprocess.Popen(
+                cmd,
+                stdout=self._engine_log_fh,
+                stderr=subprocess.STDOUT,
+                **kwargs,
+            )
+            _log.info(
+                "Started C++ engine (PID %d): %s  log → %s",
+                self._engine_process.pid,
+                cmd,
+                log_path,
+            )
+            return True
+        except Exception:
+            _log.exception("Failed to start C++ engine subprocess.")
+            if self._engine_log_fh is not None:
+                self._engine_log_fh.close()
+                self._engine_log_fh = None
+            return False
+
+    def _stop_engine_process(self) -> None:
+        """Terminate the managed engine subprocess if it is still running."""
+        if self._engine_process is None:
+            return
+
+        if self._engine_process.poll() is None:
+            _log.info(
+                "Terminating C++ engine (PID %d).",
+                self._engine_process.pid,
+            )
+            self._engine_process.terminate()
+            try:
+                self._engine_process.wait(timeout=10)
+                _log.info("Engine process exited cleanly.")
+            except subprocess.TimeoutExpired:
+                _log.warning("Engine did not exit in 10 s; sending SIGKILL.")
+                self._engine_process.kill()
+                try:
+                    self._engine_process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    _log.error("Engine process could not be killed.")
+        else:
+            _log.info(
+                "Engine process already exited (rc=%d).",
+                self._engine_process.returncode,
+            )
+
+        self._engine_process = None
+        if self._engine_log_fh is not None:
+            self._engine_log_fh.close()
+            self._engine_log_fh = None
 
     # ===================================================================
     # Internal helpers
