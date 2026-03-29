@@ -16,6 +16,10 @@ Layout
       |     +-- Strategy
       |     +-- Risk Management
       |     +-- Monitoring
+      |     +-- Fees
+      |     +-- Arbitrage
+      |     +-- Depeg & Aging
+      |     +-- CoinGecko
       |     +-- Appearance
       |     +-- Advanced
       +-- Status line: config path + last-saved timestamp
@@ -329,13 +333,17 @@ class SettingsWidget(QWidget):
 
         # Build each tab and register its title.
         tab_builders: list[tuple[str, callable]] = [
-            ("Connection", self._build_connection_tab),
-            ("Trading Pairs", self._build_pairs_tab),
-            ("Strategy", self._build_strategy_tab),
-            ("Risk Management", self._build_risk_tab),
-            ("Monitoring", self._build_monitoring_tab),
-            ("Appearance", self._build_appearance_tab),
-            ("Advanced", self._build_advanced_tab),
+            ("Connection", self._build_connection_tab),       # 0
+            ("Trading Pairs", self._build_pairs_tab),         # 1
+            ("Strategy", self._build_strategy_tab),           # 2
+            ("Risk Management", self._build_risk_tab),        # 3
+            ("Monitoring", self._build_monitoring_tab),       # 4
+            ("Fees", self._build_fees_tab),                   # 5
+            ("Arbitrage", self._build_arbitrage_tab),         # 6
+            ("Depeg & Aging", self._build_depeg_aging_tab),   # 7
+            ("CoinGecko", self._build_coingecko_tab),         # 8
+            ("Appearance", self._build_appearance_tab),       # 9
+            ("Advanced", self._build_advanced_tab),           # 10
         ]
         for idx, (title_text, builder) in enumerate(tab_builders):
             widget = builder()
@@ -743,13 +751,52 @@ class SettingsWidget(QWidget):
         ps_form.addRow("Max Capital/Pair (%):", self._max_capital_per_pair)
 
         layout.addWidget(ps_group)
+
+        # -- Circuit Breakers --
+        cb_group = QGroupBox("Circuit Breakers")
+        cb_form = QFormLayout(cb_group)
+        cb_form.setSpacing(8)
+
+        self._max_drawdown_pct = QDoubleSpinBox()
+        self._max_drawdown_pct.setRange(0.01, 1.0)
+        self._max_drawdown_pct.setSingleStep(0.01)
+        self._max_drawdown_pct.setDecimals(2)
+        self._max_drawdown_pct.setValue(0.10)
+        self._max_drawdown_pct.setToolTip(
+            "Pause trading when peak-to-trough PnL drop exceeds this fraction "
+            "(e.g. 0.10 = 10%)."
+        )
+        cb_form.addRow("Max Drawdown:", self._max_drawdown_pct)
+
+        self._loss_window_blocks = QSpinBox()
+        self._loss_window_blocks.setRange(1, 100_000)
+        self._loss_window_blocks.setValue(1152)
+        self._loss_window_blocks.setSuffix(" blocks")
+        self._loss_window_blocks.setToolTip(
+            "Rolling window for the time-window loss circuit breaker "
+            "(default 1152 ≈ 10 hours at 52 s/block)."
+        )
+        cb_form.addRow("Loss Window:", self._loss_window_blocks)
+
+        self._max_window_loss_bps = QSpinBox()
+        self._max_window_loss_bps.setRange(0, 10_000)
+        self._max_window_loss_bps.setValue(500)
+        self._max_window_loss_bps.setSuffix(" bps")
+        self._max_window_loss_bps.setToolTip(
+            "Pause if this many basis points are lost within the rolling window. "
+            "0 = disabled. Default 500 bps."
+        )
+        cb_form.addRow("Max Window Loss:", self._max_window_loss_bps)
+
+        layout.addWidget(cb_group)
         layout.addStretch(1)
 
         # Wire dirty tracking (tab index 3).
         for widget in (
             self._soft_limit, self._hard_limit,
             self._single_cat_cap, self._kelly_fraction,
-            self._max_capital_per_pair,
+            self._max_capital_per_pair, self._max_drawdown_pct,
+            self._loss_window_blocks, self._max_window_loss_bps,
         ):
             widget.valueChanged.connect(lambda _v, ti=3: self._mark_dirty(ti))
 
@@ -893,24 +940,24 @@ class SettingsWidget(QWidget):
         # Load saved appearance preferences from QSettings.
         self._load_appearance_settings()
 
-        # Wire dirty tracking (tab index 5).
+        # Wire dirty tracking (tab index 9).
         self._theme_combo.currentIndexChanged.connect(
-            lambda _i, ti=5: self._mark_dirty(ti)
+            lambda _i, ti=9: self._mark_dirty(ti)
         )
         self._font_size_spin.valueChanged.connect(
-            lambda _v, ti=5: self._mark_dirty(ti)
+            lambda _v, ti=9: self._mark_dirty(ti)
         )
         self._chart_interval.valueChanged.connect(
-            lambda _v, ti=5: self._mark_dirty(ti)
+            lambda _v, ti=9: self._mark_dirty(ti)
         )
         self._dash_interval.valueChanged.connect(
-            lambda _v, ti=5: self._mark_dirty(ti)
+            lambda _v, ti=9: self._mark_dirty(ti)
         )
         self._show_grid.stateChanged.connect(
-            lambda _s, ti=5: self._mark_dirty(ti)
+            lambda _s, ti=9: self._mark_dirty(ti)
         )
         self._mono_font_combo.currentIndexChanged.connect(
-            lambda _i, ti=5: self._mark_dirty(ti)
+            lambda _i, ti=9: self._mark_dirty(ti)
         )
 
         return page
@@ -947,6 +994,17 @@ class SettingsWidget(QWidget):
             "Yang-Zhang optimal weight (\u03b1).  Default 0.34."
         )
         vol_form.addRow("YZ Alpha:", self._yz_alpha)
+
+        self._candle_agg_blocks = QSpinBox()
+        self._candle_agg_blocks.setRange(1, 1_000)
+        self._candle_agg_blocks.setValue(10)
+        self._candle_agg_blocks.setSuffix(" blocks")
+        self._candle_agg_blocks.setToolTip(
+            "Aggregate N consecutive blocks into one OHLC candle to recover "
+            "H/L variation when >90% of blocks are degenerate. "
+            "Default 10 (~8.7 min). 1 = no aggregation (legacy)."
+        )
+        vol_form.addRow("Candle Aggregation:", self._candle_agg_blocks)
 
         layout.addWidget(vol_group)
 
@@ -1007,18 +1065,557 @@ class SettingsWidget(QWidget):
 
         layout.addWidget(yaml_group, stretch=1)
 
-        # Wire dirty tracking (tab index 6).
+        # Wire dirty tracking (tab index 10).
         self._lookback_blocks.valueChanged.connect(
-            lambda _v, ti=6: self._mark_dirty(ti)
+            lambda _v, ti=10: self._mark_dirty(ti)
         )
         self._yz_alpha.valueChanged.connect(
-            lambda _v, ti=6: self._mark_dirty(ti)
+            lambda _v, ti=10: self._mark_dirty(ti)
+        )
+        self._candle_agg_blocks.valueChanged.connect(
+            lambda _v, ti=10: self._mark_dirty(ti)
         )
         self._db_path.textChanged.connect(
-            lambda _t, ti=6: self._mark_dirty(ti)
+            lambda _t, ti=10: self._mark_dirty(ti)
         )
         self._yaml_editor.textChanged.connect(
-            lambda ti=6: self._mark_dirty(ti)
+            lambda ti=10: self._mark_dirty(ti)
+        )
+
+        return page
+
+    # -------------------------------------------------------------------
+    # Fees tab
+    # -------------------------------------------------------------------
+
+    def _build_fees_tab(self) -> QWidget:
+        """Build the Fees tab: fee budget and adaptive fee settings."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # -- Fee Budget --
+        budget_group = QGroupBox("Fee Budget")
+        budget_form = QFormLayout(budget_group)
+        budget_form.setSpacing(8)
+
+        self._fees_enabled = QCheckBox("Enable fee tracking")
+        self._fees_enabled.setToolTip(
+            "Master switch for fee budget tracking and fee-vs-gain gating. "
+            "When disabled the static offer_fee_mojos from Strategy is used unchanged."
+        )
+        budget_form.addRow("", self._fees_enabled)
+
+        self._daily_budget_mojos = QDoubleSpinBox()
+        self._daily_budget_mojos.setRange(0, 1_000_000_000_000)
+        self._daily_budget_mojos.setDecimals(0)
+        self._daily_budget_mojos.setSingleStep(1_000_000_000)
+        self._daily_budget_mojos.setValue(10_000_000_000)
+        self._daily_budget_mojos.setSuffix(" mojos")
+        self._daily_budget_mojos.setToolTip(
+            "Maximum fees allowed per 24-hour rolling window, in mojos "
+            "(1 XCH = 1 000 000 000 000 mojos). Default 10 000 000 000 = 0.01 XCH."
+        )
+        budget_form.addRow("Daily Budget:", self._daily_budget_mojos)
+
+        self._fee_to_gain_max_ratio = QDoubleSpinBox()
+        self._fee_to_gain_max_ratio.setRange(0.0, 1.0)
+        self._fee_to_gain_max_ratio.setSingleStep(0.01)
+        self._fee_to_gain_max_ratio.setDecimals(2)
+        self._fee_to_gain_max_ratio.setValue(0.30)
+        self._fee_to_gain_max_ratio.setToolTip(
+            "Skip posting a tier when fee/expected_gain exceeds this ratio. "
+            "Default 0.30 = 30%."
+        )
+        budget_form.addRow("Fee / Gain Max Ratio:", self._fee_to_gain_max_ratio)
+
+        self._fee_window_blocks = QSpinBox()
+        self._fee_window_blocks.setRange(1, 100_000)
+        self._fee_window_blocks.setValue(1662)
+        self._fee_window_blocks.setSuffix(" blocks")
+        self._fee_window_blocks.setToolTip(
+            "Rolling window used for the daily budget calculation "
+            "(default 1662 ≈ 24 h at 52 s/block)."
+        )
+        budget_form.addRow("Budget Window:", self._fee_window_blocks)
+
+        layout.addWidget(budget_group)
+
+        # -- Fee Range --
+        range_group = QGroupBox("Fee Range")
+        range_form = QFormLayout(range_group)
+        range_form.setSpacing(8)
+
+        self._min_fee_mojos = QDoubleSpinBox()
+        self._min_fee_mojos.setRange(0, 1_000_000_000_000)
+        self._min_fee_mojos.setDecimals(0)
+        self._min_fee_mojos.setSingleStep(10_000_000)
+        self._min_fee_mojos.setValue(50_000_000)
+        self._min_fee_mojos.setSuffix(" mojos")
+        self._min_fee_mojos.setToolTip(
+            "Fee floor — never pay less than this per offer/cancel "
+            "(default 50 000 000 = 0.00005 XCH)."
+        )
+        range_form.addRow("Min Fee:", self._min_fee_mojos)
+
+        self._max_fee_mojos = QDoubleSpinBox()
+        self._max_fee_mojos.setRange(0, 1_000_000_000_000)
+        self._max_fee_mojos.setDecimals(0)
+        self._max_fee_mojos.setSingleStep(10_000_000)
+        self._max_fee_mojos.setValue(500_000_000)
+        self._max_fee_mojos.setSuffix(" mojos")
+        self._max_fee_mojos.setToolTip(
+            "Fee ceiling — never pay more than this per offer/cancel "
+            "(default 500 000 000 = 0.0005 XCH)."
+        )
+        range_form.addRow("Max Fee:", self._max_fee_mojos)
+
+        layout.addWidget(range_group)
+
+        # -- Adaptive Fees --
+        adaptive_group = QGroupBox("Adaptive Fee Selection")
+        adaptive_form = QFormLayout(adaptive_group)
+        adaptive_form.setSpacing(8)
+
+        self._adaptive_fee_enabled = QCheckBox("Enable adaptive fees")
+        self._adaptive_fee_enabled.setToolTip(
+            "Query the full-node get_fee_estimate endpoint to pay the smallest fee "
+            "likely to achieve timely inclusion based on current mempool state."
+        )
+        adaptive_form.addRow("", self._adaptive_fee_enabled)
+
+        layout.addWidget(adaptive_group)
+        layout.addStretch(1)
+
+        # Wire dirty tracking (tab index 5).
+        self._fees_enabled.stateChanged.connect(
+            lambda _s, ti=5: self._mark_dirty(ti)
+        )
+        self._adaptive_fee_enabled.stateChanged.connect(
+            lambda _s, ti=5: self._mark_dirty(ti)
+        )
+        for widget in (
+            self._daily_budget_mojos, self._fee_to_gain_max_ratio,
+            self._min_fee_mojos, self._max_fee_mojos,
+        ):
+            widget.valueChanged.connect(lambda _v, ti=5: self._mark_dirty(ti))
+        self._fee_window_blocks.valueChanged.connect(
+            lambda _v, ti=5: self._mark_dirty(ti)
+        )
+
+        return page
+
+    # -------------------------------------------------------------------
+    # Arbitrage tab
+    # -------------------------------------------------------------------
+
+    def _build_arbitrage_tab(self) -> QWidget:
+        """Build the Arbitrage tab: triangular, CEX-DEX, cross-DEX, cross-bridge."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # -- Master switch --
+        arb_top_group = QGroupBox("Arbitrage Detection")
+        arb_top_form = QFormLayout(arb_top_group)
+        arb_top_form.setSpacing(8)
+
+        self._arb_enabled = QCheckBox("Enable arbitrage scanning")
+        self._arb_enabled.setToolTip(
+            "Master switch for all arbitrage detection modules."
+        )
+        arb_top_form.addRow("", self._arb_enabled)
+
+        layout.addWidget(arb_top_group)
+
+        # -- Triangular --
+        tri_group = QGroupBox("Triangular Arbitrage (XCH \u2192 A \u2192 B \u2192 XCH)")
+        tri_form = QFormLayout(tri_group)
+        tri_form.setSpacing(8)
+
+        self._tri_min_profit_bps = QSpinBox()
+        self._tri_min_profit_bps.setRange(0, 10_000)
+        self._tri_min_profit_bps.setValue(30)
+        self._tri_min_profit_bps.setSuffix(" bps")
+        self._tri_min_profit_bps.setToolTip(
+            "Minimum net profit after all fees and estimated slippage."
+        )
+        tri_form.addRow("Min Net Profit:", self._tri_min_profit_bps)
+
+        self._tri_slippage_bps = QSpinBox()
+        self._tri_slippage_bps.setRange(0, 1_000)
+        self._tri_slippage_bps.setValue(10)
+        self._tri_slippage_bps.setSuffix(" bps")
+        self._tri_slippage_bps.setToolTip("Per-leg slippage estimate.")
+        tri_form.addRow("Per-Leg Slippage:", self._tri_slippage_bps)
+
+        self._tri_per_leg_fee_bps = QSpinBox()
+        self._tri_per_leg_fee_bps.setRange(0, 1_000)
+        self._tri_per_leg_fee_bps.setValue(5)
+        self._tri_per_leg_fee_bps.setSuffix(" bps")
+        self._tri_per_leg_fee_bps.setToolTip(
+            "Blockchain settlement fee per hop, in basis points."
+        )
+        tri_form.addRow("Per-Leg Settlement Fee:", self._tri_per_leg_fee_bps)
+
+        layout.addWidget(tri_group)
+
+        # -- CEX-DEX --
+        cex_group = QGroupBox("CEX-DEX Arbitrage (dexie vs OKX/MEXC/Gate)")
+        cex_form = QFormLayout(cex_group)
+        cex_form.setSpacing(8)
+
+        self._cex_dex_min_edge_bps = QSpinBox()
+        self._cex_dex_min_edge_bps.setRange(0, 10_000)
+        self._cex_dex_min_edge_bps.setValue(50)
+        self._cex_dex_min_edge_bps.setSuffix(" bps")
+        self._cex_dex_min_edge_bps.setToolTip(
+            "Minimum raw edge to flag a CEX-DEX opportunity."
+        )
+        cex_form.addRow("Min Edge:", self._cex_dex_min_edge_bps)
+
+        self._cex_dex_max_edge_bps = QSpinBox()
+        self._cex_dex_max_edge_bps.setRange(0, 100_000)
+        self._cex_dex_max_edge_bps.setValue(500)
+        self._cex_dex_max_edge_bps.setSuffix(" bps")
+        self._cex_dex_max_edge_bps.setToolTip(
+            "Reject edges above this threshold as likely stale data."
+        )
+        cex_form.addRow("Max Edge (stale filter):", self._cex_dex_max_edge_bps)
+
+        self._cex_fee_bps = QSpinBox()
+        self._cex_fee_bps.setRange(0, 1_000)
+        self._cex_fee_bps.setValue(10)
+        self._cex_fee_bps.setSuffix(" bps")
+        self._cex_fee_bps.setToolTip(
+            "CEX taker fee in basis points (OKX VIP0 = 10 bps)."
+        )
+        cex_form.addRow("CEX Taker Fee:", self._cex_fee_bps)
+
+        layout.addWidget(cex_group)
+
+        # -- Cross-DEX --
+        xdex_group = QGroupBox("Cross-DEX Arbitrage (dexie vs TibetSwap AMM)")
+        xdex_form = QFormLayout(xdex_group)
+        xdex_form.setSpacing(8)
+
+        self._cross_dex_min_edge_bps = QSpinBox()
+        self._cross_dex_min_edge_bps.setRange(0, 10_000)
+        self._cross_dex_min_edge_bps.setValue(15)
+        self._cross_dex_min_edge_bps.setSuffix(" bps")
+        self._cross_dex_min_edge_bps.setToolTip(
+            "Lower threshold — both legs are on-chain atomic."
+        )
+        xdex_form.addRow("Min Edge:", self._cross_dex_min_edge_bps)
+
+        self._tibetswap_fee_bps = QSpinBox()
+        self._tibetswap_fee_bps.setRange(0, 1_000)
+        self._tibetswap_fee_bps.setValue(70)
+        self._tibetswap_fee_bps.setSuffix(" bps")
+        self._tibetswap_fee_bps.setToolTip(
+            "TibetSwap v2 swap fee (0.7% = 70 bps)."
+        )
+        xdex_form.addRow("TibetSwap Fee:", self._tibetswap_fee_bps)
+
+        layout.addWidget(xdex_group)
+
+        # -- Cross-Bridge --
+        xbridge_group = QGroupBox("Cross-Bridge Arbitrage (wUSDC vs wUSDC.b)")
+        xbridge_form = QFormLayout(xbridge_group)
+        xbridge_form.setSpacing(8)
+
+        self._cross_bridge_min_edge_bps = QSpinBox()
+        self._cross_bridge_min_edge_bps.setRange(0, 10_000)
+        self._cross_bridge_min_edge_bps.setValue(20)
+        self._cross_bridge_min_edge_bps.setSuffix(" bps")
+        self._cross_bridge_min_edge_bps.setToolTip(
+            "Minimum divergence for same-underlying cross-bridge arbitrage."
+        )
+        xbridge_form.addRow("Min Edge:", self._cross_bridge_min_edge_bps)
+
+        self._bridge_cost_bps = QSpinBox()
+        self._bridge_cost_bps.setRange(0, 1_000)
+        self._bridge_cost_bps.setValue(15)
+        self._bridge_cost_bps.setSuffix(" bps")
+        self._bridge_cost_bps.setToolTip(
+            "warp.green bridge round-trip cost in basis points."
+        )
+        xbridge_form.addRow("Bridge Round-Trip Cost:", self._bridge_cost_bps)
+
+        layout.addWidget(xbridge_group)
+
+        # -- General --
+        arb_gen_group = QGroupBox("General")
+        arb_gen_form = QFormLayout(arb_gen_group)
+        arb_gen_form.setSpacing(8)
+
+        self._arb_max_position = QSpinBox()
+        self._arb_max_position.setRange(1, 1_000_000)
+        self._arb_max_position.setValue(100)
+        self._arb_max_position.setToolTip(
+            "Maximum base-asset units per arbitrage trade."
+        )
+        arb_gen_form.addRow("Max Position Size:", self._arb_max_position)
+
+        self._arb_default_confidence = QDoubleSpinBox()
+        self._arb_default_confidence.setRange(0.0, 1.0)
+        self._arb_default_confidence.setSingleStep(0.05)
+        self._arb_default_confidence.setDecimals(2)
+        self._arb_default_confidence.setValue(0.75)
+        self._arb_default_confidence.setToolTip(
+            "Base confidence score when order-book depth is unknown."
+        )
+        arb_gen_form.addRow("Default Confidence:", self._arb_default_confidence)
+
+        self._arb_min_confidence = QDoubleSpinBox()
+        self._arb_min_confidence.setRange(0.0, 1.0)
+        self._arb_min_confidence.setSingleStep(0.05)
+        self._arb_min_confidence.setDecimals(2)
+        self._arb_min_confidence.setValue(0.40)
+        self._arb_min_confidence.setToolTip(
+            "Discard arbitrage opportunities whose confidence falls below this threshold."
+        )
+        arb_gen_form.addRow("Min Confidence Threshold:", self._arb_min_confidence)
+
+        layout.addWidget(arb_gen_group)
+        layout.addStretch(1)
+
+        # Wire dirty tracking (tab index 6).
+        self._arb_enabled.stateChanged.connect(
+            lambda _s, ti=6: self._mark_dirty(ti)
+        )
+        for widget in (
+            self._tri_min_profit_bps, self._tri_slippage_bps,
+            self._tri_per_leg_fee_bps,
+            self._cex_dex_min_edge_bps, self._cex_dex_max_edge_bps,
+            self._cex_fee_bps,
+            self._cross_dex_min_edge_bps, self._tibetswap_fee_bps,
+            self._cross_bridge_min_edge_bps, self._bridge_cost_bps,
+            self._arb_max_position,
+        ):
+            widget.valueChanged.connect(lambda _v, ti=6: self._mark_dirty(ti))
+        for widget in (self._arb_default_confidence, self._arb_min_confidence):
+            widget.valueChanged.connect(lambda _v, ti=6: self._mark_dirty(ti))
+
+        return page
+
+    # -------------------------------------------------------------------
+    # Depeg & Aging tab
+    # -------------------------------------------------------------------
+
+    def _build_depeg_aging_tab(self) -> QWidget:
+        """Build the Depeg & Aging tab: global depeg + inventory aging."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        # -- Depeg Monitoring --
+        depeg_group = QGroupBox("Depeg Monitoring (Global Defaults)")
+        depeg_form = QFormLayout(depeg_group)
+        depeg_form.setSpacing(8)
+
+        self._depeg_enabled = QCheckBox("Enable depeg monitoring")
+        self._depeg_enabled.setToolTip(
+            "Master switch for stablecoin peg deviation monitoring. "
+            "Per-pair thresholds are configured in the Trading Pairs tab."
+        )
+        depeg_form.addRow("", self._depeg_enabled)
+
+        self._depeg_warn_pct = QDoubleSpinBox()
+        self._depeg_warn_pct.setRange(0.0, 100.0)
+        self._depeg_warn_pct.setSingleStep(0.5)
+        self._depeg_warn_pct.setDecimals(1)
+        self._depeg_warn_pct.setValue(2.0)
+        self._depeg_warn_pct.setSuffix(" %")
+        self._depeg_warn_pct.setToolTip(
+            "Default warn threshold: raise an alert when price deviates "
+            "this percentage from peg."
+        )
+        depeg_form.addRow("Default Warn Threshold:", self._depeg_warn_pct)
+
+        self._depeg_bail_pct = QDoubleSpinBox()
+        self._depeg_bail_pct.setRange(0.0, 100.0)
+        self._depeg_bail_pct.setSingleStep(1.0)
+        self._depeg_bail_pct.setDecimals(1)
+        self._depeg_bail_pct.setValue(10.0)
+        self._depeg_bail_pct.setSuffix(" %")
+        self._depeg_bail_pct.setToolTip(
+            "Default bail threshold: pull all quotes when price deviates "
+            "this percentage from peg."
+        )
+        depeg_form.addRow("Default Bail Threshold:", self._depeg_bail_pct)
+
+        self._depeg_sustained_blocks = QSpinBox()
+        self._depeg_sustained_blocks.setRange(1, 10_000)
+        self._depeg_sustained_blocks.setValue(30)
+        self._depeg_sustained_blocks.setSuffix(" blocks")
+        self._depeg_sustained_blocks.setToolTip(
+            "Deviation must persist this many blocks before triggering bail "
+            "(default 30 ≈ 26 min)."
+        )
+        depeg_form.addRow("Sustained Blocks:", self._depeg_sustained_blocks)
+
+        self._depeg_auto_disable = QCheckBox("Auto-disable pair on bail-out")
+        self._depeg_auto_disable.setToolTip(
+            "Automatically disable the trading pair when bail-out is triggered."
+        )
+        depeg_form.addRow("", self._depeg_auto_disable)
+
+        self._depeg_alert_warn = QCheckBox("Send Telegram alert on peg warning")
+        self._depeg_alert_warn.setToolTip(
+            "Send a Telegram notification when the warn threshold is exceeded."
+        )
+        depeg_form.addRow("", self._depeg_alert_warn)
+
+        self._depeg_alert_bail = QCheckBox("Send Telegram alert on bail-out")
+        self._depeg_alert_bail.setToolTip(
+            "Send a Telegram notification when bail-out is triggered."
+        )
+        depeg_form.addRow("", self._depeg_alert_bail)
+
+        layout.addWidget(depeg_group)
+
+        # -- Inventory Aging --
+        aging_group = QGroupBox("Inventory Aging")
+        aging_form = QFormLayout(aging_group)
+        aging_form.setSpacing(8)
+
+        self._aging_enabled = QCheckBox("Enable inventory aging")
+        self._aging_enabled.setToolTip(
+            "Gradually relax the no-loss floor for positions held underwater for "
+            "an extended period. Disabled by default."
+        )
+        aging_form.addRow("", self._aging_enabled)
+
+        self._aging_start_blocks = QSpinBox()
+        self._aging_start_blocks.setRange(1, 1_000_000)
+        self._aging_start_blocks.setValue(1000)
+        self._aging_start_blocks.setSuffix(" blocks")
+        self._aging_start_blocks.setToolTip(
+            "Begin relaxation after this many blocks underwater "
+            "(default 1000 ≈ 14.4 h)."
+        )
+        aging_form.addRow("Aging Start:", self._aging_start_blocks)
+
+        self._aging_max_loss_relax_bps = QSpinBox()
+        self._aging_max_loss_relax_bps.setRange(0, 10_000)
+        self._aging_max_loss_relax_bps.setValue(50)
+        self._aging_max_loss_relax_bps.setSuffix(" bps")
+        self._aging_max_loss_relax_bps.setToolTip(
+            "Maximum loss allowed after full relaxation (default 50 bps = 0.50%)."
+        )
+        aging_form.addRow("Max Loss Relaxation:", self._aging_max_loss_relax_bps)
+
+        self._aging_relax_rate = QDoubleSpinBox()
+        self._aging_relax_rate.setRange(0.0, 10.0)
+        self._aging_relax_rate.setSingleStep(0.01)
+        self._aging_relax_rate.setDecimals(3)
+        self._aging_relax_rate.setValue(0.05)
+        self._aging_relax_rate.setSuffix(" bps/block")
+        self._aging_relax_rate.setToolTip(
+            "Relaxation rate in bps per block "
+            "(default 0.05 bps/block → full 50 bps after ~1000 extra blocks)."
+        )
+        aging_form.addRow("Relax Rate:", self._aging_relax_rate)
+
+        layout.addWidget(aging_group)
+        layout.addStretch(1)
+
+        # Wire dirty tracking (tab index 7).
+        for widget in (
+            self._depeg_enabled, self._depeg_auto_disable,
+            self._depeg_alert_warn, self._depeg_alert_bail,
+            self._aging_enabled,
+        ):
+            widget.stateChanged.connect(lambda _s, ti=7: self._mark_dirty(ti))
+        for widget in (
+            self._depeg_warn_pct, self._depeg_bail_pct, self._aging_relax_rate,
+        ):
+            widget.valueChanged.connect(lambda _v, ti=7: self._mark_dirty(ti))
+        for widget in (
+            self._depeg_sustained_blocks,
+            self._aging_start_blocks, self._aging_max_loss_relax_bps,
+        ):
+            widget.valueChanged.connect(lambda _v, ti=7: self._mark_dirty(ti))
+
+        return page
+
+    # -------------------------------------------------------------------
+    # CoinGecko tab
+    # -------------------------------------------------------------------
+
+    def _build_coingecko_tab(self) -> QWidget:
+        """Build the CoinGecko tab: external price reference settings."""
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        cg_group = QGroupBox("CoinGecko Price Feed")
+        cg_form = QFormLayout(cg_group)
+        cg_form.setSpacing(8)
+
+        self._cg_enabled = QCheckBox("Enable CoinGecko price feed")
+        self._cg_enabled.setToolTip(
+            "Enable CEX-grade mid-price references from CoinGecko. "
+            "Feeds into the 70/30 DEX/CEX blending pipeline. "
+            "Free tier: ~10-30 calls/min (no API key required)."
+        )
+        cg_form.addRow("", self._cg_enabled)
+
+        self._cg_coin_ids = QLineEdit()
+        self._cg_coin_ids.setPlaceholderText("chia, ethereum, usd-coin")
+        self._cg_coin_ids.setToolTip(
+            "Comma-separated list of CoinGecko coin identifiers "
+            "(e.g. 'chia, ethereum, usd-coin')."
+        )
+        cg_form.addRow("Coin IDs:", self._cg_coin_ids)
+
+        self._cg_polling_interval = QSpinBox()
+        self._cg_polling_interval.setRange(5_000, 300_000)
+        self._cg_polling_interval.setValue(30_000)
+        self._cg_polling_interval.setSingleStep(1_000)
+        self._cg_polling_interval.setSuffix(" ms")
+        self._cg_polling_interval.setToolTip(
+            "Price polling interval in milliseconds "
+            "(default 30 000 ms = 30 s, safe for free tier)."
+        )
+        cg_form.addRow("Polling Interval:", self._cg_polling_interval)
+
+        # API key with show/hide toggle.
+        apikey_row = QHBoxLayout()
+        self._cg_api_key = QLineEdit()
+        self._cg_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+        self._cg_api_key.setPlaceholderText("Leave blank for free tier")
+        self._cg_api_key.setToolTip(
+            "CoinGecko API key. Empty = free tier; set for Demo plan (30 calls/min)."
+        )
+        apikey_row.addWidget(self._cg_api_key)
+        self._cg_apikey_toggle = QPushButton("Show")
+        self._cg_apikey_toggle.setFixedWidth(56)
+        self._cg_apikey_toggle.setToolTip("Toggle API key visibility")
+        self._cg_apikey_toggle.clicked.connect(self._toggle_cg_apikey_visibility)
+        apikey_row.addWidget(self._cg_apikey_toggle)
+        cg_form.addRow("API Key:", apikey_row)
+
+        layout.addWidget(cg_group)
+        layout.addStretch(1)
+
+        # Wire dirty tracking (tab index 8).
+        self._cg_enabled.stateChanged.connect(
+            lambda _s, ti=8: self._mark_dirty(ti)
+        )
+        self._cg_coin_ids.textChanged.connect(
+            lambda _t, ti=8: self._mark_dirty(ti)
+        )
+        self._cg_polling_interval.valueChanged.connect(
+            lambda _v, ti=8: self._mark_dirty(ti)
+        )
+        self._cg_api_key.textChanged.connect(
+            lambda _t, ti=8: self._mark_dirty(ti)
         )
 
         return page
@@ -1101,6 +1698,45 @@ class SettingsWidget(QWidget):
         if not available:
             available.append("monospace")
         self._mono_font_combo.addItems(available)
+
+    # ===================================================================
+    # CoinGecko coin-ID parsing helpers
+    # ===================================================================
+
+    @staticmethod
+    def _coin_ids_to_list(text: str) -> list[str]:
+        """Parse a comma-separated coin-ID string into a list.
+
+        Parameters
+        ----------
+        text : str
+            Raw value from the coin-IDs line edit
+            (e.g. ``"chia, ethereum, usd-coin"``).
+
+        Returns
+        -------
+        list[str]
+            Stripped, non-empty token list.
+        """
+        return [s.strip() for s in text.split(",") if s.strip()]
+
+    @staticmethod
+    def _coin_ids_to_text(value: Any) -> str:
+        """Convert a YAML coin-ID value to a comma-separated display string.
+
+        Parameters
+        ----------
+        value : list | str | Any
+            Raw value from the YAML config (may be a list or a string).
+
+        Returns
+        -------
+        str
+            Comma-separated string suitable for the line edit.
+        """
+        if isinstance(value, list):
+            return ", ".join(str(i) for i in value)
+        return str(value) if value else ""
 
     # ===================================================================
     # QSettings-based appearance load / save
@@ -1215,8 +1851,9 @@ class SettingsWidget(QWidget):
         # -- pairs --
         pairs_list: list[dict[str, Any]] = []
         for row in range(self._pairs_table.rowCount()):
-            cb_widget = self._pairs_table.cellWidget(row, 0)
-            enabled = cb_widget.isChecked() if cb_widget else True
+            cb_container = self._pairs_table.cellWidget(row, 0)
+            cb = cb_container.findChild(QCheckBox) if cb_container else None
+            enabled = cb.isChecked() if cb is not None else True
             name_item = self._pairs_table.item(row, 1)
             base_item = self._pairs_table.item(row, 2)
             quote_item = self._pairs_table.item(row, 3)
@@ -1260,12 +1897,16 @@ class SettingsWidget(QWidget):
             "single_cat_cap_pct": self._single_cat_cap.value(),
             "kelly_fraction": self._kelly_fraction.value(),
             "max_capital_per_pair_pct": self._max_capital_per_pair.value(),
+            "max_drawdown_pct": self._max_drawdown_pct.value(),
+            "loss_window_blocks": self._loss_window_blocks.value(),
+            "max_window_loss_bps": self._max_window_loss_bps.value(),
         }
 
         # -- volatility --
         cfg["volatility"] = {
             "lookback_blocks": self._lookback_blocks.value(),
             "yz_alpha": self._yz_alpha.value(),
+            "candle_aggregation_blocks": self._candle_agg_blocks.value(),
         }
 
         # -- monitoring --
@@ -1273,6 +1914,62 @@ class SettingsWidget(QWidget):
             "prometheus_port": self._prom_port.value(),
             "telegram_bot_token": self._tg_token.text(),
             "telegram_chat_id": self._tg_chat_id.text(),
+        }
+
+        # -- depeg --
+        cfg["depeg"] = {
+            "enabled": self._depeg_enabled.isChecked(),
+            "default_warn_pct": self._depeg_warn_pct.value(),
+            "default_bail_pct": self._depeg_bail_pct.value(),
+            "default_sustained_blocks": self._depeg_sustained_blocks.value(),
+            "auto_disable_pair": self._depeg_auto_disable.isChecked(),
+            "alert_on_warn": self._depeg_alert_warn.isChecked(),
+            "alert_on_bail": self._depeg_alert_bail.isChecked(),
+        }
+
+        # -- arbitrage --
+        cfg["arbitrage"] = {
+            "enabled": self._arb_enabled.isChecked(),
+            "triangular_min_profit_bps": self._tri_min_profit_bps.value(),
+            "triangular_slippage_bps": self._tri_slippage_bps.value(),
+            "triangular_per_leg_fee_bps": self._tri_per_leg_fee_bps.value(),
+            "cex_dex_min_edge_bps": self._cex_dex_min_edge_bps.value(),
+            "cex_dex_max_edge_bps": self._cex_dex_max_edge_bps.value(),
+            "cex_fee_bps": self._cex_fee_bps.value(),
+            "cross_dex_min_edge_bps": self._cross_dex_min_edge_bps.value(),
+            "tibetswap_fee_bps": self._tibetswap_fee_bps.value(),
+            "cross_bridge_min_edge_bps": self._cross_bridge_min_edge_bps.value(),
+            "bridge_cost_bps": self._bridge_cost_bps.value(),
+            "max_position_size": self._arb_max_position.value(),
+            "default_confidence": self._arb_default_confidence.value(),
+            "min_confidence_threshold": self._arb_min_confidence.value(),
+        }
+
+        # -- coingecko --
+        cfg["coingecko"] = {
+            "enabled": self._cg_enabled.isChecked(),
+            "coin_ids": self._coin_ids_to_list(self._cg_coin_ids.text()),
+            "polling_interval_ms": self._cg_polling_interval.value(),
+            "api_key": self._cg_api_key.text(),
+        }
+
+        # -- fees --
+        cfg["fees"] = {
+            "enabled": self._fees_enabled.isChecked(),
+            "daily_budget_mojos": int(self._daily_budget_mojos.value()),
+            "fee_to_gain_max_ratio": self._fee_to_gain_max_ratio.value(),
+            "min_fee_mojos": int(self._min_fee_mojos.value()),
+            "max_fee_mojos": int(self._max_fee_mojos.value()),
+            "adaptive_enabled": self._adaptive_fee_enabled.isChecked(),
+            "fee_window_blocks": self._fee_window_blocks.value(),
+        }
+
+        # -- inventory_aging --
+        cfg["inventory_aging"] = {
+            "enabled": self._aging_enabled.isChecked(),
+            "aging_start_blocks": self._aging_start_blocks.value(),
+            "max_loss_relax_bps": self._aging_max_loss_relax_bps.value(),
+            "relax_rate_bps_per_block": self._aging_relax_rate.value(),
         }
 
         # -- database --
@@ -1354,6 +2051,15 @@ class SettingsWidget(QWidget):
             self._max_capital_per_pair.setValue(
                 float(risk.get("max_capital_per_pair_pct", 0.20))
             )
+            self._max_drawdown_pct.setValue(
+                float(risk.get("max_drawdown_pct", 0.10))
+            )
+            self._loss_window_blocks.setValue(
+                int(risk.get("loss_window_blocks", 1152))
+            )
+            self._max_window_loss_bps.setValue(
+                int(risk.get("max_window_loss_bps", 500))
+            )
 
             # -- volatility --
             vol = cfg.get("volatility", {})
@@ -1361,12 +2067,124 @@ class SettingsWidget(QWidget):
                 int(vol.get("lookback_blocks", 200))
             )
             self._yz_alpha.setValue(float(vol.get("yz_alpha", 0.34)))
+            self._candle_agg_blocks.setValue(
+                int(vol.get("candle_aggregation_blocks", 10))
+            )
 
             # -- monitoring --
             mon = cfg.get("monitoring", {})
             self._prom_port.setValue(int(mon.get("prometheus_port", 9090)))
             self._tg_token.setText(str(mon.get("telegram_bot_token", "")))
             self._tg_chat_id.setText(str(mon.get("telegram_chat_id", "")))
+
+            # -- depeg --
+            dep = cfg.get("depeg", {})
+            self._depeg_enabled.setChecked(bool(dep.get("enabled", True)))
+            self._depeg_warn_pct.setValue(
+                float(dep.get("default_warn_pct", 2.0))
+            )
+            self._depeg_bail_pct.setValue(
+                float(dep.get("default_bail_pct", 10.0))
+            )
+            self._depeg_sustained_blocks.setValue(
+                int(dep.get("default_sustained_blocks", 30))
+            )
+            self._depeg_auto_disable.setChecked(
+                bool(dep.get("auto_disable_pair", True))
+            )
+            self._depeg_alert_warn.setChecked(
+                bool(dep.get("alert_on_warn", True))
+            )
+            self._depeg_alert_bail.setChecked(
+                bool(dep.get("alert_on_bail", True))
+            )
+
+            # -- arbitrage --
+            arb = cfg.get("arbitrage", {})
+            self._arb_enabled.setChecked(bool(arb.get("enabled", True)))
+            self._tri_min_profit_bps.setValue(
+                int(arb.get("triangular_min_profit_bps", 30))
+            )
+            self._tri_slippage_bps.setValue(
+                int(arb.get("triangular_slippage_bps", 10))
+            )
+            self._tri_per_leg_fee_bps.setValue(
+                int(arb.get("triangular_per_leg_fee_bps", 5))
+            )
+            self._cex_dex_min_edge_bps.setValue(
+                int(arb.get("cex_dex_min_edge_bps", 50))
+            )
+            self._cex_dex_max_edge_bps.setValue(
+                int(arb.get("cex_dex_max_edge_bps", 500))
+            )
+            self._cex_fee_bps.setValue(int(arb.get("cex_fee_bps", 10)))
+            self._cross_dex_min_edge_bps.setValue(
+                int(arb.get("cross_dex_min_edge_bps", 15))
+            )
+            self._tibetswap_fee_bps.setValue(
+                int(arb.get("tibetswap_fee_bps", 70))
+            )
+            self._cross_bridge_min_edge_bps.setValue(
+                int(arb.get("cross_bridge_min_edge_bps", 20))
+            )
+            self._bridge_cost_bps.setValue(
+                int(arb.get("bridge_cost_bps", 15))
+            )
+            self._arb_max_position.setValue(
+                int(arb.get("max_position_size", 100))
+            )
+            self._arb_default_confidence.setValue(
+                float(arb.get("default_confidence", 0.75))
+            )
+            self._arb_min_confidence.setValue(
+                float(arb.get("min_confidence_threshold", 0.40))
+            )
+
+            # -- coingecko --
+            cg = cfg.get("coingecko", {})
+            self._cg_enabled.setChecked(bool(cg.get("enabled", True)))
+            self._cg_coin_ids.setText(
+                self._coin_ids_to_text(cg.get("coin_ids", []))
+            )
+            self._cg_polling_interval.setValue(
+                int(cg.get("polling_interval_ms", 30_000))
+            )
+            self._cg_api_key.setText(str(cg.get("api_key", "")))
+
+            # -- fees --
+            fees = cfg.get("fees", {})
+            self._fees_enabled.setChecked(bool(fees.get("enabled", True)))
+            self._daily_budget_mojos.setValue(
+                float(fees.get("daily_budget_mojos", 10_000_000_000))
+            )
+            self._fee_to_gain_max_ratio.setValue(
+                float(fees.get("fee_to_gain_max_ratio", 0.30))
+            )
+            self._min_fee_mojos.setValue(
+                float(fees.get("min_fee_mojos", 50_000_000))
+            )
+            self._max_fee_mojos.setValue(
+                float(fees.get("max_fee_mojos", 500_000_000))
+            )
+            self._adaptive_fee_enabled.setChecked(
+                bool(fees.get("adaptive_enabled", False))
+            )
+            self._fee_window_blocks.setValue(
+                int(fees.get("fee_window_blocks", 1662))
+            )
+
+            # -- inventory_aging --
+            aging = cfg.get("inventory_aging", {})
+            self._aging_enabled.setChecked(bool(aging.get("enabled", False)))
+            self._aging_start_blocks.setValue(
+                int(aging.get("aging_start_blocks", 1000))
+            )
+            self._aging_max_loss_relax_bps.setValue(
+                int(aging.get("max_loss_relax_bps", 50))
+            )
+            self._aging_relax_rate.setValue(
+                float(aging.get("relax_rate_bps_per_block", 0.05))
+            )
 
             # -- database --
             db = cfg.get("database", {})
@@ -1402,12 +2220,38 @@ class SettingsWidget(QWidget):
             self._tier_table,
             self._soft_limit, self._hard_limit, self._single_cat_cap,
             self._kelly_fraction, self._max_capital_per_pair,
+            self._max_drawdown_pct, self._loss_window_blocks,
+            self._max_window_loss_bps,
             self._prom_port, self._tg_token, self._tg_chat_id,
-            self._lookback_blocks, self._yz_alpha, self._db_path,
-            self._yaml_editor,
+            self._lookback_blocks, self._yz_alpha, self._candle_agg_blocks,
+            self._db_path, self._yaml_editor,
             self._theme_combo, self._font_size_spin,
             self._chart_interval, self._dash_interval,
             self._show_grid, self._mono_font_combo,
+            # Fees
+            self._fees_enabled, self._daily_budget_mojos,
+            self._fee_to_gain_max_ratio, self._min_fee_mojos,
+            self._max_fee_mojos, self._adaptive_fee_enabled,
+            self._fee_window_blocks,
+            # Arbitrage
+            self._arb_enabled,
+            self._tri_min_profit_bps, self._tri_slippage_bps,
+            self._tri_per_leg_fee_bps,
+            self._cex_dex_min_edge_bps, self._cex_dex_max_edge_bps,
+            self._cex_fee_bps,
+            self._cross_dex_min_edge_bps, self._tibetswap_fee_bps,
+            self._cross_bridge_min_edge_bps, self._bridge_cost_bps,
+            self._arb_max_position, self._arb_default_confidence,
+            self._arb_min_confidence,
+            # Depeg & Aging
+            self._depeg_enabled, self._depeg_warn_pct, self._depeg_bail_pct,
+            self._depeg_sustained_blocks, self._depeg_auto_disable,
+            self._depeg_alert_warn, self._depeg_alert_bail,
+            self._aging_enabled, self._aging_start_blocks,
+            self._aging_max_loss_relax_bps, self._aging_relax_rate,
+            # CoinGecko
+            self._cg_enabled, self._cg_coin_ids, self._cg_polling_interval,
+            self._cg_api_key,
         ]
         for w in widgets_to_block:
             w.blockSignals(block)
@@ -1640,6 +2484,15 @@ class SettingsWidget(QWidget):
         else:
             self._tg_token.setEchoMode(QLineEdit.EchoMode.Password)
             self._tg_token_toggle.setText("Show")
+
+    def _toggle_cg_apikey_visibility(self) -> None:
+        """Toggle the CoinGecko API key between hidden and visible."""
+        if self._cg_api_key.echoMode() == QLineEdit.EchoMode.Password:
+            self._cg_api_key.setEchoMode(QLineEdit.EchoMode.Normal)
+            self._cg_apikey_toggle.setText("Hide")
+        else:
+            self._cg_api_key.setEchoMode(QLineEdit.EchoMode.Password)
+            self._cg_apikey_toggle.setText("Show")
 
     # ===================================================================
     # Validation
