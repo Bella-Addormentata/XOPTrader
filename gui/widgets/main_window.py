@@ -117,6 +117,15 @@ _METRICS_INTERVAL_MS: Final[int] = 5_000
 _DEFAULT_WIDTH: Final[int] = 1400
 _DEFAULT_HEIGHT: Final[int] = 900
 
+# Stacked-widget page indices — must match the order widgets are added in
+# _build_central_area().
+_PAGE_DASHBOARD: Final[int] = 0
+_PAGE_CHARTS: Final[int] = 1
+_PAGE_ORDERS: Final[int] = 2
+_PAGE_ORDER_BOOK: Final[int] = 3
+_PAGE_ANALYSIS: Final[int] = 4
+_PAGE_SETTINGS: Final[int] = 5
+
 
 def _placeholder_widget(label: str) -> QWidget:
     """Create a simple centred-label placeholder for unimplemented pages.
@@ -271,7 +280,7 @@ class MainWindow(QMainWindow):
             else:
                 # No config file loaded — guide the user to the Settings tab
                 # so they can configure credentials before starting the engine.
-                self._switch_page(5)
+                self._switch_page(_PAGE_SETTINGS)
                 self._on_bridge_error(
                     "No configuration file found. "
                     "Please fill in your credentials here and click Save."
@@ -552,7 +561,7 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("S&ettings")
 
         act_open_settings = QAction("&Open Settings Panel", self)
-        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(5))
+        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(_PAGE_SETTINGS))
         settings_menu.addAction(act_open_settings)
 
         # -- Help menu ------------------------------------------------------

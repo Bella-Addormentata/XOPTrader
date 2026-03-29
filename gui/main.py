@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import shutil
 import signal
 import sys
@@ -147,7 +148,14 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
     for example in candidates:
         if example.is_file():
             try:
-                shutil.copy2(example, target)
+                # Use copyfile (content only) then apply restrictive
+                # permissions because config.yaml will contain credentials.
+                shutil.copyfile(example, target)
+                try:
+                    os.chmod(target, 0o600)
+                except NotImplementedError:
+                    # Windows does not support POSIX chmod; skip silently.
+                    pass
                 _log.info(
                     "First-run bootstrap: copied %s → %s. "
                     "Open Settings to review your credentials.",
