@@ -312,7 +312,11 @@ class SettingsWidget(QWidget):
         self._apply_btn.setEnabled(False)
         self._apply_btn.clicked.connect(self._on_apply_clicked)
 
-        for btn in (self._save_btn, self._reset_btn, self._apply_btn):
+        self._load_btn = QPushButton("Load…")
+        self._load_btn.setToolTip("Open an existing configuration file")
+        self._load_btn.clicked.connect(self._on_load_clicked)
+
+        for btn in (self._load_btn, self._save_btn, self._reset_btn, self._apply_btn):
             btn.setFixedHeight(30)
             btn.setMinimumWidth(70)
             header.addWidget(btn)
@@ -1836,6 +1840,22 @@ class SettingsWidget(QWidget):
     def _on_save_clicked(self) -> None:
         """Handle the Save button click."""
         self.save_config()
+
+    def _on_load_clicked(self) -> None:
+        """Open a file dialog to load an existing configuration file."""
+        start_dir = (
+            str(Path(self._config_path).parent)
+            if self._config_path
+            else str(Path.cwd())
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Open Configuration File",
+            start_dir,
+            "YAML Files (*.yaml *.yml);;All Files (*)",
+        )
+        if path:
+            self.load_config(path)
 
     def _on_reset_clicked(self) -> None:
         """Discard unsaved changes and restore the last-saved snapshot."""

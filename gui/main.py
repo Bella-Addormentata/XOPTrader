@@ -14,10 +14,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+import shutil
 import signal
 import sys
 from pathlib import Path
-from typing import Optional
+from typing import Final, Optional
 
 from gui.app import XOPTraderApp
 from gui.services.engine_bridge import EngineBridge
@@ -110,6 +111,55 @@ def _install_signal_handlers(app: XOPTraderApp) -> None:
 
 
 # ---------------------------------------------------------------------------
+# First-run configuration bootstrap
+# ---------------------------------------------------------------------------
+
+_DEFAULT_CONFIG_NAME: Final[str] = "config.yaml"
+_EXAMPLE_CONFIG_NAME: Final[str] = "config.example.yaml"
+
+
+def _bootstrap_config(config_path: Optional[Path]) -> None:
+    """Copy ``config.example.yaml`` → ``config.yaml`` on first run.
+
+    When *config_path* is *None* or points to a non-existent file, this
+    function searches for ``config.example.yaml`` in the same directory
+    (or the current working directory) and copies it to the target so
+    that the GUI can start with a sensible template on first launch.
+
+    The copy is silent; a log message records what happened.  No error
+    is raised if neither the target nor the example can be found; the
+    service layer handles the missing-file case gracefully.
+
+    Parameters
+    ----------
+    config_path:
+        The path supplied via ``--config``, or *None* for the default.
+    """
+    target = Path(config_path or _DEFAULT_CONFIG_NAME).resolve()
+    if target.is_file():
+        return  # Already exists — nothing to do.
+
+    # Candidate locations for the example config.
+    candidates = [
+        target.parent / _EXAMPLE_CONFIG_NAME,
+        Path.cwd() / _EXAMPLE_CONFIG_NAME,
+    ]
+    for example in candidates:
+        if example.is_file():
+            try:
+                shutil.copy2(example, target)
+                _log.info(
+                    "First-run bootstrap: copied %s → %s. "
+                    "Open Settings to review your credentials.",
+                    example,
+                    target,
+                )
+            except OSError as exc:
+                _log.warning("Could not copy example config: %s", exc)
+            return
+
+
+# ---------------------------------------------------------------------------
 # Service bootstrap
 # ---------------------------------------------------------------------------
 
@@ -190,6 +240,10 @@ def main() -> None:
 
     # Register OS signal handlers for orderly shutdown.
     _install_signal_handlers(app)
+
+    # On first run, copy config.example.yaml → config.yaml so the GUI
+    # can launch with a template the user can edit via the Settings panel.
+    _bootstrap_config(args.config)
 
     # Import MainWindow here (not at module level) to keep the import
     # graph acyclic and to defer heavy widget instantiation until
