@@ -1101,9 +1101,11 @@ class SettingsWidget(QWidget):
         budget_form.setSpacing(8)
 
         self._fees_enabled = QCheckBox("Enable fee tracking")
+        self._fees_enabled.setChecked(True)
         self._fees_enabled.setToolTip(
             "Master switch for fee budget tracking and fee-vs-gain gating. "
-            "When disabled the static offer_fee_mojos from Strategy is used unchanged."
+            "When disabled, the static offer_fee_mojos value from the strategy "
+            "section in config.yaml (or the Advanced YAML editor) is used unchanged."
         )
         budget_form.addRow("", self._fees_enabled)
 
@@ -1223,6 +1225,7 @@ class SettingsWidget(QWidget):
         arb_top_form.setSpacing(8)
 
         self._arb_enabled = QCheckBox("Enable arbitrage scanning")
+        self._arb_enabled.setChecked(True)
         self._arb_enabled.setToolTip(
             "Master switch for all arbitrage detection modules."
         )
@@ -1418,6 +1421,7 @@ class SettingsWidget(QWidget):
         depeg_form.setSpacing(8)
 
         self._depeg_enabled = QCheckBox("Enable depeg monitoring")
+        self._depeg_enabled.setChecked(True)
         self._depeg_enabled.setToolTip(
             "Master switch for stablecoin peg deviation monitoring. "
             "Per-pair thresholds are configured in the Trading Pairs tab."
@@ -1459,18 +1463,21 @@ class SettingsWidget(QWidget):
         depeg_form.addRow("Sustained Blocks:", self._depeg_sustained_blocks)
 
         self._depeg_auto_disable = QCheckBox("Auto-disable pair on bail-out")
+        self._depeg_auto_disable.setChecked(True)
         self._depeg_auto_disable.setToolTip(
             "Automatically disable the trading pair when bail-out is triggered."
         )
         depeg_form.addRow("", self._depeg_auto_disable)
 
         self._depeg_alert_warn = QCheckBox("Send Telegram alert on peg warning")
+        self._depeg_alert_warn.setChecked(True)
         self._depeg_alert_warn.setToolTip(
             "Send a Telegram notification when the warn threshold is exceeded."
         )
         depeg_form.addRow("", self._depeg_alert_warn)
 
         self._depeg_alert_bail = QCheckBox("Send Telegram alert on bail-out")
+        self._depeg_alert_bail.setChecked(True)
         self._depeg_alert_bail.setToolTip(
             "Send a Telegram notification when bail-out is triggered."
         )
@@ -1559,6 +1566,7 @@ class SettingsWidget(QWidget):
         cg_form.setSpacing(8)
 
         self._cg_enabled = QCheckBox("Enable CoinGecko price feed")
+        self._cg_enabled.setChecked(True)
         self._cg_enabled.setToolTip(
             "Enable CEX-grade mid-price references from CoinGecko. "
             "Feeds into the 70/30 DEX/CEX blending pipeline. "
