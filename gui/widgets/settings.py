@@ -774,7 +774,7 @@ class SettingsWidget(QWidget):
         self._loss_window_blocks.setSuffix(" blocks")
         self._loss_window_blocks.setToolTip(
             "Rolling window for the time-window loss circuit breaker "
-            "(default 1152 ≈ 10 hours at 52 s/block)."
+            "(default 1152 ≈ 16.6 hours at 52 s/block)."
         )
         cb_form.addRow("Loss Window:", self._loss_window_blocks)
 
@@ -1172,6 +1172,18 @@ class SettingsWidget(QWidget):
             "(default 500 000 000 = 0.0005 XCH)."
         )
         range_form.addRow("Max Fee:", self._max_fee_mojos)
+
+        # Enforce invariant: min_fee_mojos <= max_fee_mojos
+        def _on_min_fee_changed(value: float) -> None:
+            if self._max_fee_mojos.value() < value:
+                self._max_fee_mojos.setValue(value)
+
+        def _on_max_fee_changed(value: float) -> None:
+            if self._min_fee_mojos.value() > value:
+                self._min_fee_mojos.setValue(value)
+
+        self._min_fee_mojos.valueChanged.connect(_on_min_fee_changed)
+        self._max_fee_mojos.valueChanged.connect(_on_max_fee_changed)
 
         layout.addWidget(range_group)
 
@@ -1807,8 +1819,8 @@ class SettingsWidget(QWidget):
             self._reset_btn.setEnabled(True)
             self._apply_btn.setEnabled(True)
 
-        # Emit real-time change notification.
-        self.config_changed.emit(self._collect_config_dict())
+        # Emit real-time change notification (api_key redacted).
+        self.config_changed.emit(self._redacted_config_for_signal())
 
     def _clear_dirty(self) -> None:
         """Clear all dirty flags and restore clean tab titles."""
@@ -1985,6 +1997,19 @@ class SettingsWidget(QWidget):
             "path": self._db_path.text(),
         }
 
+        return cfg
+
+    def _redacted_config_for_signal(self) -> dict:
+        """Return a copy of the config dict with secrets redacted.
+
+        The ``coingecko.api_key`` is stripped (replaced with an empty string)
+        so it is not broadcast in plaintext to every ``config_changed`` listener.
+        The full key is still written to disk by :meth:`save_config`.
+        """
+        import copy
+        cfg = copy.deepcopy(self._collect_config_dict())
+        if "coingecko" in cfg and "api_key" in cfg["coingecko"]:
+            cfg["coingecko"]["api_key"] = ""
         return cfg
 
     # ===================================================================
@@ -2749,8 +2774,8 @@ class SettingsWidget(QWidget):
     def _on_apply_clicked(self) -> None:
         """Save config and emit config_changed so the engine reloads."""
         if self.save_config():
-            # Re-emit with the freshly saved dict so listeners reload.
-            self.config_changed.emit(self._collect_config_dict())
+            # Re-emit with the freshly saved dict so listeners reload (api_key redacted).
+            self.config_changed.emit(self._redacted_config_for_signal())
 
     # ===================================================================
     # Connection test stubs
