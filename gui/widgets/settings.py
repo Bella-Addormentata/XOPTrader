@@ -1176,11 +1176,15 @@ class SettingsWidget(QWidget):
         # Enforce invariant: min_fee_mojos <= max_fee_mojos
         def _on_min_fee_changed(value: float) -> None:
             if self._max_fee_mojos.value() < value:
+                self._max_fee_mojos.blockSignals(True)
                 self._max_fee_mojos.setValue(value)
+                self._max_fee_mojos.blockSignals(False)
 
         def _on_max_fee_changed(value: float) -> None:
             if self._min_fee_mojos.value() > value:
+                self._min_fee_mojos.blockSignals(True)
                 self._min_fee_mojos.setValue(value)
+                self._min_fee_mojos.blockSignals(False)
 
         self._min_fee_mojos.valueChanged.connect(_on_min_fee_changed)
         self._max_fee_mojos.valueChanged.connect(_on_max_fee_changed)
@@ -2006,7 +2010,6 @@ class SettingsWidget(QWidget):
         so it is not broadcast in plaintext to every ``config_changed`` listener.
         The full key is still written to disk by :meth:`save_config`.
         """
-        import copy
         cfg = copy.deepcopy(self._collect_config_dict())
         if "coingecko" in cfg and "api_key" in cfg["coingecko"]:
             cfg["coingecko"]["api_key"] = ""
