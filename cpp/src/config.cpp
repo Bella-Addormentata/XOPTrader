@@ -797,6 +797,9 @@ RiskConfig parse_risk(const YAML::Node& root)
     }
 
     return cfg;
+}
+
+VolatilityConfig parse_volatility(const YAML::Node& root)
 {
     const std::string sec = "volatility";
     if (!root[sec] || !root[sec].IsMap()) {
