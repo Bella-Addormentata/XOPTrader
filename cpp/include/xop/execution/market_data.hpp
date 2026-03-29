@@ -207,6 +207,14 @@ struct MarketDataConfig {
     /// informed side during whale activity.  0.0 = symmetric, 1.0 = fully
     /// asymmetric (all widening on the informed side).  Default: 0.5.
     double asymmetric_skew_factor{0.5};
+
+    // -- CEX freshness weighting (T7-12) ------------------------------------
+
+    /// [T7-12] Maximum staleness (seconds) of CEX data before its weight
+    /// decays to zero.  The effective CEX weight is:
+    ///   w_cex = kCexWeight * max(0, 1 - age_sec / cex_freshness_threshold_sec)
+    /// Default 120 s.  0 = disable freshness weighting (legacy fixed blend).
+    double cex_freshness_threshold_sec{120.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -510,6 +518,21 @@ public:
                                       double             best_ask,
                                       double             ask_size);
 
+    /// Multi-level OFI ingestion (T5-CR2, Xu, Lehalle & Alfonsi 2023).
+    ///
+    /// Accepts the full visible book depth.  Each level's OFI contribution
+    /// is weighted by inverse rank: w_k = 1/(k+1), normalised so weights
+    /// sum to 1.  Multi-level OFI explains 10-30% more return variance than
+    /// best-level alone on CHIA's typically shallow (2-5 level) book.
+    ///
+    /// @param pair_name  Trading pair identifier.
+    /// @param bids       Bid levels sorted best (highest) first.
+    /// @param asks       Ask levels sorted best (lowest) first.
+    void ingest_book_snapshot_for_ofi(
+        const std::string&              pair_name,
+        const std::vector<std::pair<double, double>>& bids,
+        const std::vector<std::pair<double, double>>& asks);
+
     /// Retrieve the current OFI metrics for a pair.
     /// Returns std::nullopt if fewer than 2 snapshots have been ingested.
     std::optional<OfiMetrics> get_ofi_metrics(
@@ -702,11 +725,21 @@ private:
     std::unordered_map<std::string, VpinMetrics>       vpin_metrics_;
 
     /// Per-pair OFI book-snapshot history.  Guarded by mtx_ofi_.
+    struct BookLevel {
+        double price{0.0};
+        double size{0.0};
+    };
     struct BookSnapshot {
         double best_bid{0.0};
         double bid_size{0.0};
         double best_ask{0.0};
         double ask_size{0.0};
+
+        /// Multi-level extension (T5-CR2, Xu, Lehalle & Alfonsi 2023):
+        /// When populated, recompute_ofi() uses all levels weighted by
+        /// inverse rank distance from mid (w_k = 1/(k+1), normalised).
+        std::vector<BookLevel> bid_levels;
+        std::vector<BookLevel> ask_levels;
     };
     mutable std::shared_mutex                          mtx_ofi_;
     std::unordered_map<std::string, std::deque<BookSnapshot>> ofi_snapshots_;

@@ -128,6 +128,11 @@ public:
     /// Retrieve the most recent regime classification.
     virtual RegimeInfo current_regime() const = 0;
 
+    /// Return whether the regime detector has enough data for meaningful
+    /// classification.  Returns false during warm-up.  Callers should
+    /// widen spreads defensively when !is_regime_ready().  [T7-11]
+    virtual bool is_regime_ready() const { return true; }
+
     /// Return the strategy name (e.g. "AvellanedaStoikov", "GLFT") for
     /// logging and metrics labelling.
     // [MEDIUM-2] Return by value -- returning a reference through an expiring

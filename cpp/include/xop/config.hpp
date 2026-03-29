@@ -156,6 +156,15 @@ struct StrategyConfig {
     /// between wallet RPC state and in-memory pending-offers map.
     /// Default 20 blocks (~17 min).  0 = disabled.
     uint32_t reconciliation_interval_blocks{20};
+
+    /// [T7-10] Batch offer creation: merge same-side tiers for a pair into
+    /// a single RPC call, reducing per-heartbeat transaction count from ~40
+    /// to ~10 (one offer per side per pair).  The merged offer sums the
+    /// mojo amounts across tiers.  All constituent tiers share the same
+    /// offer ID for lifecycle tracking.
+    /// false = current behavior (one offer per tier).
+    /// true  = merge same-side tiers.
+    bool     batch_offers_enabled{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -191,6 +200,23 @@ struct RiskConfig {
     double   max_drawdown_pct{0.10};        ///< HWM drawdown threshold (0,1].
     uint32_t loss_window_blocks{1152};      ///< Rolling window size in blocks.
     double   max_window_loss_bps{500.0};    ///< Max loss in window (bps; 0=disabled).
+
+    // -- Flash crash detection (T7-07, T7-08) --------------------------------
+    double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
+    uint32_t recovery_stable_blocks_phase1{50};     ///< Blocks stable for Crash→Recovery.
+    uint32_t recovery_stable_blocks_phase2{100};    ///< Blocks stable for Recovery→Normal.
+    double   recovery_stability_band_pct{0.05};     ///< Max price deviation in recovery.
+
+    // -- Circuit-breaker rebalance (T7-09) -----------------------------------
+    // Automatically enables StrategicLossManager for a pair when all of:
+    //   1. inventory_ratio > circuit_breaker_hard_limit_ratio (one-sided)
+    //   2. DriftAnalyzer recommends ManualRebalance or PullOverweight
+    //   3. position_age > aging_start_blocks * circuit_breaker_age_multiplier
+    // The loss is capped at circuit_breaker_max_loss_bps.
+    bool     circuit_breaker_enabled{false};         ///< Master switch (opt-in).
+    double   circuit_breaker_hard_limit_ratio{0.80}; ///< Inventory ratio trigger (0,1].
+    double   circuit_breaker_age_multiplier{2.0};    ///< age >= aging_start * this.
+    double   circuit_breaker_max_loss_bps{100.0};    ///< Max loss cap per rebalance [0,500].
 };
 
 // ---------------------------------------------------------------------------
@@ -414,6 +440,70 @@ struct FeeConfig {
 };
 
 // ---------------------------------------------------------------------------
+// Market data aggregation configuration (T4-05).
+//
+// Exposes VPIN, OFI, whale detection, and competitor detection parameters
+// that were previously only code-configurable.  All fields have sensible
+// defaults matching MarketDataConfig in execution/market_data.hpp.
+// ---------------------------------------------------------------------------
+struct MarketDataSettings {
+    // -- Whale detection ---------------------------------------------------
+    /// Minimum trade size (mojos) to classify as a whale trade.
+    /// Default: 50 XCH = 50e12 mojos.
+    std::int64_t whale_trade_threshold{50LL * 1'000'000'000'000LL};
+
+    /// Fraction of rolling 24h volume that triggers whale classification.
+    double whale_volume_fraction{0.05};
+
+    /// Blocks over which whale events are counted.
+    uint32_t whale_window_blocks{10};
+
+    /// Maximum spread multiplier during whale activity.
+    double whale_max_spread_multiplier{3.0};
+
+    // -- VPIN (flow toxicity) -----------------------------------------------
+    /// Volume per VPIN bucket (base-asset units, e.g. XCH).
+    double vpin_bucket_size{10.0};
+
+    /// Number of completed buckets in the rolling VPIN window.
+    uint32_t vpin_window_buckets{50};
+
+    // -- OFI (order flow imbalance) ----------------------------------------
+    /// Number of order-book snapshots for OFI computation.
+    uint32_t ofi_window_size{20};
+
+    // -- Competitor detection -----------------------------------------------
+    /// Enable competitor tracking from order book data.
+    bool enable_competitor_tracking{true};
+
+    /// Minimum offer size (mojos) to consider as competitor.
+    std::int64_t min_competitor_offer_size{1'000'000'000'000LL};
+
+    /// Spread threshold (bps) that triggers a competitor alert.
+    double competitor_alert_threshold_bps{50.0};
+
+    // -- Asymmetric spread --------------------------------------------------
+    /// Skew factor controlling whale-side asymmetry (0.0–1.0).
+    double asymmetric_skew_factor{0.5};
+
+    // -- CEX freshness ------------------------------------------------------
+    /// Seconds before CEX data weight decays to zero.
+    double cex_freshness_threshold_sec{120.0};
+};
+
+// ---------------------------------------------------------------------------
+// Adverse selection (PIN model) configuration (T4-05).
+// ---------------------------------------------------------------------------
+struct AdverseSelectionSettings {
+    double prior_alpha{2.0};         ///< Adverse fill pseudo-count.
+    double prior_beta{8.0};          ///< Non-adverse fill pseudo-count.
+    uint32_t observation_blocks{10}; ///< Post-fill observation window.
+    double adverse_threshold{0.003}; ///< 30 bps adverse classification.
+    uint32_t max_history{500};       ///< Rolling fill window.
+    double decay_factor{0.0};        ///< Exponential decay in posterior.
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -430,6 +520,8 @@ struct AppConfig {
     CoinGeckoConfig  coingecko;
     FeeConfig        fees;
     InventoryAgingConfig inventory_aging;
+    MarketDataSettings market_data;
+    AdverseSelectionSettings adverse_selection;
 };
 
 // ---------------------------------------------------------------------------

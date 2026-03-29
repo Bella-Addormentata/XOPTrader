@@ -336,6 +336,60 @@ StrategyPortfolio::BlendedQuote StrategyPortfolio::blend(
 }
 
 // ===========================================================================
+// Crowding cooldown calibration (T5-CR12)
+// ===========================================================================
+//
+// Urquhart & Hudson (2013): the Adaptive Markets Hypothesis predicts that
+// crowding recovery timescales depend on the market microstructure.  CHIA's
+// ~52-second block cadence means we should calibrate in block units, not
+// calendar days from equity literature.
+//
+// Model: fill rate recovers exponentially after a crowding event:
+//   rate(t) = rate_before * (1 - (1 - rate_after/rate_before) * exp(-t/τ))
+//
+// The half-life (blocks until rate recovers halfway) is:
+//   t_half = τ * ln(2) ≈ 0.693 * τ
+//
+// We use the fill-rate-drop ratio to estimate τ, then set cooldown = 2 * t_half
+// (full recovery is effectively 2 half-lives).
+
+std::size_t StrategyPortfolio::calibrate_crowding_cooldown(
+    double fills_per_block_before,
+    double fills_per_block_after) noexcept
+{
+    constexpr std::size_t kDefaultCooldown = 500;
+    constexpr std::size_t kMinCooldown     = 100;   // ~1.4 hours
+    constexpr std::size_t kMaxCooldown     = 2000;  // ~29 hours
+
+    if (fills_per_block_before <= 0.0 || fills_per_block_after <= 0.0) {
+        return kDefaultCooldown;
+    }
+    if (fills_per_block_after >= fills_per_block_before) {
+        return kMinCooldown;  // No crowding detected.
+    }
+
+    // Drop ratio: how severe the crowding impact was.
+    const double drop_ratio = fills_per_block_after / fills_per_block_before;
+
+    // Estimate recovery time constant from the drop severity.
+    // Deeper drops require longer recovery (larger τ).
+    // τ = -1 / ln(drop_ratio) makes τ increase as drop_ratio → 0.
+    const double ln_drop = std::log(drop_ratio);
+    if (ln_drop >= 0.0) {
+        return kMinCooldown;
+    }
+
+    const double tau = -1.0 / ln_drop;
+    const double half_life = 0.693 * tau;
+
+    // Cooldown = 2 half-lives, in blocks, clamped to valid range.
+    auto cooldown = static_cast<std::size_t>(
+        std::clamp(2.0 * half_life, static_cast<double>(kMinCooldown),
+                   static_cast<double>(kMaxCooldown)));
+    return cooldown;
+}
+
+// ===========================================================================
 // Crowding detection (Farmer & Joshi 2002)
 // ===========================================================================
 

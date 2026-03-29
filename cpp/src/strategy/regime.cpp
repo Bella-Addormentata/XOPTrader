@@ -39,13 +39,20 @@
 //     statistical power.  The hysteresis counter provides an additional
 //     confirmation layer on top of the Z-gate.
 //
-// COUNTER-RESEARCH NOTE (CR-14, Boldin 1996; Calvet & Fisher 2004):
+// COUNTER-RESEARCH NOTE (CR-14, Boldin 1996; Calvet & Fisher 2004) -- FIXED:
 //   Hamilton (1989) Markov regime-switching models suffer from
 //   likelihood multimodality and regime identification fragility with
 //   short-history crypto data (Boldin 1996).  Additionally, pure
 //   Markov switching under-models multi-scale volatility dynamics;
 //   multifractal models capture both short- and long-term regimes
 //   more faithfully (Calvet & Fisher 2004).
+//
+//   T5-CR14: A Markov-Switching Multifractal (MSM) estimator with K=2
+//   frequency components has been added alongside the existing HMM.
+//   The MSM captures multi-scale dynamics (short bursts within long
+//   regime shifts) with 4 parameters vs HMM's 9+ parameters, and is
+//   more robust to short data histories.  Enable via msm_enabled=true
+//   in RegimeDetectorConfig.
 //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §4 and §18.
 //
 // Compliant with:
@@ -140,6 +147,11 @@ RegimeDetector::RegimeDetector(const RegimeDetectorConfig& cfg)
         hmm_.forward_prob    = hmm_.initial_prob;
         hmm_.log_likelihood  = 0.0;
         hmm_.fitted          = false;
+    }
+
+    // -- Initialise MSM if enabled (T5-CR14) ---------------------------------
+    if (cfg_.msm_enabled) {
+        msm_initialise();
     }
 }
 
@@ -270,6 +282,11 @@ void RegimeDetector::update(double log_return) {
             hmm_baum_welch();
         }
     }
+
+    // -- MSM grid filter step (if enabled, T5-CR14) --------------------------
+    if (cfg_.msm_enabled && msm_.initialised) {
+        msm_filter_step(log_return);
+    }
 }
 
 Regime RegimeDetector::get_regime() const noexcept {
@@ -299,6 +316,10 @@ double RegimeDetector::get_confidence() const noexcept {
 
 int RegimeDetector::get_regime_duration_blocks() const noexcept {
     return static_cast<int>(regime_duration_);
+}
+
+bool RegimeDetector::is_ready() const noexcept {
+    return returns_.size() >= cfg_.min_window_size;
 }
 
 // ===========================================================================
@@ -1214,6 +1235,170 @@ RegimeInfo to_regime_info(const RegimeDetector& detector) {
         mults.spread_mult,
         mults.shedding_mult
     };
+}
+
+// ===========================================================================
+// MSM -- Markov-Switching Multifractal (Calvet & Fisher 2004) -- T5-CR14
+//
+// The MSM models instantaneous volatility as:
+//   σ_t = σ̄ · √(M_1,t · M_2,t · ... · M_K,t)
+//
+// Each multiplier M_k ∈ {m_0, 2 - m_0} switches independently with
+// transition probability γ_k per block.  The slowest component (k=K)
+// captures persistent regime shifts; the fastest (k=1) captures short
+// bursts.  This multi-scale structure is the key advantage over
+// single-scale HMMs.
+//
+// Grid filter: for each new observation r_t, update the posterior
+// probability of each of the 2^K states using Bayesian filtering with
+// Gaussian emission density.
+// ===========================================================================
+
+void RegimeDetector::msm_initialise()
+{
+    const auto K = cfg_.msm_k_frequencies;
+    const auto num_states = static_cast<std::size_t>(1U << K);
+
+    msm_.k = K;
+    msm_.num_states = num_states;
+
+    // Compute transition probabilities for each component.
+    msm_.gamma.resize(K);
+    for (std::uint32_t k = 0; k < K; ++k) {
+        // γ_k = 1 - (1 - γ_1)^(b^(k-1))
+        const double exponent = std::pow(cfg_.msm_b,
+                                         static_cast<double>(k));
+        msm_.gamma[k] = 1.0 - std::pow(1.0 - cfg_.msm_gamma1, exponent);
+    }
+
+    // Compute volatility multiplier for each state.
+    // State index s encodes the K-bit pattern: bit k = 0 means M_k = m_0,
+    // bit k = 1 means M_k = 2 - m_0.
+    msm_.state_vol_multipliers.resize(num_states);
+    for (std::size_t s = 0; s < num_states; ++s) {
+        double product = 1.0;
+        for (std::uint32_t k = 0; k < K; ++k) {
+            const bool high = ((s >> k) & 1U) != 0;
+            const double mk = high ? (2.0 - cfg_.msm_m0) : cfg_.msm_m0;
+            product *= mk;
+        }
+        msm_.state_vol_multipliers[s] = std::sqrt(product);
+    }
+
+    // Uniform prior over all states.
+    msm_.state_probs.assign(num_states, 1.0 / static_cast<double>(num_states));
+
+    // Base volatility: use configured value or estimate from data.
+    if (cfg_.msm_sigma_bar > 0.0) {
+        msm_.sigma_bar = cfg_.msm_sigma_bar;
+    } else {
+        // Will be re-estimated when enough data arrives.
+        msm_.sigma_bar = 0.003;  // Conservative default (~5% daily vol).
+    }
+
+    msm_.initialised = true;
+}
+
+void RegimeDetector::msm_filter_step(double observation)
+{
+    // Re-estimate σ̄ from the sample standard deviation of returns when
+    // σ̄ was not explicitly configured and we have sufficient data.
+    if (cfg_.msm_sigma_bar <= 0.0 && returns_.size() >= cfg_.min_window_size) {
+        double sum = 0.0, sum2 = 0.0;
+        for (const auto r : returns_) {
+            sum  += r;
+            sum2 += r * r;
+        }
+        const auto n = static_cast<double>(returns_.size());
+        const double var = (sum2 - sum * sum / n) / (n - 1.0);
+        if (var > 0.0) {
+            msm_.sigma_bar = std::sqrt(var);
+        }
+    }
+
+    const auto num_states = msm_.num_states;
+
+    // Prediction step: incorporate transition probabilities.
+    // For each state s, compute P(s_t | y_{1:t-1}) by marginalising over
+    // transitions from all possible previous states.
+    //
+    // Because each component transitions independently, the transition
+    // probability from state s to state s' factorises as:
+    //   P(s'|s) = ∏_k T_k(s'_k | s_k)
+    // where T_k(same) = 1 - γ_k/2 and T_k(flip) = γ_k/2.
+    // (Each component draws a new value from {m_0, 2-m_0} with equal
+    //  probability γ_k, or stays with probability 1-γ_k.)
+    std::vector<double> predicted(num_states, 0.0);
+    for (std::size_t s_prev = 0; s_prev < num_states; ++s_prev) {
+        const double p_prev = msm_.state_probs[s_prev];
+        if (p_prev < 1e-15) continue;
+
+        for (std::size_t s_next = 0; s_next < num_states; ++s_next) {
+            double trans_prob = 1.0;
+            for (std::uint32_t k = 0; k < msm_.k; ++k) {
+                const bool prev_bit = ((s_prev >> k) & 1U) != 0;
+                const bool next_bit = ((s_next >> k) & 1U) != 0;
+                if (prev_bit == next_bit) {
+                    // Stay: probability (1 - γ_k) + γ_k * 0.5 = 1 - γ_k/2
+                    trans_prob *= (1.0 - msm_.gamma[k] / 2.0);
+                } else {
+                    // Flip: probability γ_k * 0.5
+                    trans_prob *= (msm_.gamma[k] / 2.0);
+                }
+            }
+            predicted[s_next] += p_prev * trans_prob;
+        }
+    }
+
+    // Update step: weight by Gaussian emission likelihood.
+    double total = 0.0;
+    for (std::size_t s = 0; s < num_states; ++s) {
+        const double sigma_s = msm_.sigma_bar * msm_.state_vol_multipliers[s];
+        // Gaussian emission: N(observation | 0, sigma_s)
+        const double z = observation / std::max(sigma_s, 1e-15);
+        const double likelihood = std::exp(-0.5 * z * z)
+                                / std::max(sigma_s, 1e-15);
+        predicted[s] *= likelihood;
+        total += predicted[s];
+    }
+
+    // Normalise posterior.
+    if (total > 0.0) {
+        for (auto& p : predicted) {
+            p /= total;
+        }
+        msm_.state_probs = std::move(predicted);
+    }
+}
+
+double RegimeDetector::get_msm_volatility_multiplier() const noexcept
+{
+    if (!cfg_.msm_enabled || !msm_.initialised) {
+        return 1.0;
+    }
+
+    // Expected volatility multiplier = sum_s P(s) * vol_mult(s).
+    double expected = 0.0;
+    for (std::size_t s = 0; s < msm_.num_states; ++s) {
+        expected += msm_.state_probs[s] * msm_.state_vol_multipliers[s];
+    }
+    return expected;
+}
+
+double RegimeDetector::get_msm_high_vol_probability() const noexcept
+{
+    if (!cfg_.msm_enabled || !msm_.initialised) {
+        return 0.5;
+    }
+
+    // Sum posterior probability of states where vol_multiplier > 1.
+    double prob = 0.0;
+    for (std::size_t s = 0; s < msm_.num_states; ++s) {
+        if (msm_.state_vol_multipliers[s] > 1.0) {
+            prob += msm_.state_probs[s];
+        }
+    }
+    return prob;
 }
 
 }  // namespace xop

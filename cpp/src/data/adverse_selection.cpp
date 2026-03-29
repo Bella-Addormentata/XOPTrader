@@ -232,6 +232,90 @@ AdverseSelectionEstimator::config() const noexcept
     return cfg_;
 }
 
+// ===========================================================================
+// validate_predictive_power -- T5-CR4 cross-validation
+// ===========================================================================
+//
+// Duarte & Young (2009) and Collin-Dufresne & Fos (2015) challenge PIN's
+// ability to detect genuine informed trading.  This method checks how well
+// the PIN level at each fill predicts the fill's adverse outcome, using the
+// existing fill history as ground truth.
+//
+// For each fill, we use the rolling PIN *at that point in the history*
+// (approximated by the cumulative adverse rate up to that fill), and check
+// whether high-PIN fills were actually adverse more often than low-PIN fills.
+
+AdverseSelectionEstimator::ValidationResult
+AdverseSelectionEstimator::validate_predictive_power(
+    double pin_threshold) const noexcept
+{
+    std::shared_lock lock(mtx_);
+
+    ValidationResult result;
+    result.sample_size = history_.size();
+
+    if (history_.size() < 2) {
+        return result;
+    }
+
+    // Build per-fill running PIN estimate and adverse outcome.
+    std::size_t true_pos  = 0;  // high-PIN AND adverse
+    std::size_t false_pos = 0;  // high-PIN AND non-adverse
+    std::size_t false_neg = 0;  // low-PIN  AND adverse
+    std::size_t total_adverse = 0;
+
+    double running_alpha = cfg_.prior_alpha;
+    double running_beta  = cfg_.prior_beta;
+
+    // For Pearson correlation: accumulate sums.
+    double sum_pin = 0.0, sum_adv = 0.0;
+    double sum_pin2 = 0.0, sum_adv2 = 0.0, sum_pin_adv = 0.0;
+    const auto n = static_cast<double>(history_.size());
+
+    for (const auto& rec : history_) {
+        const double pin_at_fill = running_alpha / (running_alpha + running_beta);
+        const double adv_val = rec.adverse ? 1.0 : 0.0;
+        const bool high_pin = pin_at_fill >= pin_threshold;
+
+        if (high_pin && rec.adverse) ++true_pos;
+        if (high_pin && !rec.adverse) ++false_pos;
+        if (!high_pin && rec.adverse) ++false_neg;
+        if (rec.adverse) ++total_adverse;
+
+        sum_pin     += pin_at_fill;
+        sum_adv     += adv_val;
+        sum_pin2    += pin_at_fill * pin_at_fill;
+        sum_adv2    += adv_val * adv_val;
+        sum_pin_adv += pin_at_fill * adv_val;
+
+        // Update running posterior (simple counting, no decay).
+        if (rec.adverse) running_alpha += 1.0;
+        else             running_beta  += 1.0;
+    }
+
+    // Precision = TP / (TP + FP).
+    if (true_pos + false_pos > 0) {
+        result.precision = static_cast<double>(true_pos)
+                         / static_cast<double>(true_pos + false_pos);
+    }
+    // Recall = TP / (TP + FN).
+    if (true_pos + false_neg > 0) {
+        result.recall = static_cast<double>(true_pos)
+                      / static_cast<double>(true_pos + false_neg);
+    }
+
+    // Pearson correlation between PIN and adverse outcome.
+    const double denom_pin = n * sum_pin2 - sum_pin * sum_pin;
+    const double denom_adv = n * sum_adv2 - sum_adv * sum_adv;
+    if (denom_pin > 0.0 && denom_adv > 0.0) {
+        result.correlation = (n * sum_pin_adv - sum_pin * sum_adv)
+                           / (std::sqrt(denom_pin) * std::sqrt(denom_adv));
+    }
+
+    result.reliable = (result.sample_size >= 30);
+    return result;
+}
+
 void AdverseSelectionEstimator::reset()
 {
     // T2-02: Exclusive lock -- reset mutates all internal state.

@@ -18,9 +18,10 @@
 //     constructor is safe to call against an existing database file.
 //
 // Thread safety:
-//   The Database object must be used from a single thread (the engine loop).
-//   WAL mode permits concurrent *readers* from other processes (e.g. Grafana
-//   querying the database file directly), but only one writer at a time.
+//   All public methods are protected by an internal std::mutex (T7-01),
+//   making the Database safe for concurrent use from the engine loop and
+//   the GUI's DatabaseService QThread.  WAL mode permits concurrent
+//   *readers* from other processes (e.g. Grafana).
 //
 // Compliant with:
 //   ISO/IEC 27001:2022 -- append-only audit trail, parameterised queries
@@ -34,6 +35,7 @@
 #include "xop/types.hpp"
 
 #include <cstdint>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <vector>
@@ -257,6 +259,13 @@ private:
     void step_and_reset(sqlite3_stmt* stmt) const;
 
     // -- Data members --------------------------------------------------------
+
+    /// Mutex protecting all statement execution.  [T7-01]
+    /// While the engine loop is single-stranded, the GUI's DatabaseService
+    /// may query from a separate QThread.  The mutex serialises access to
+    /// the prepared statements whose sqlite3_step/sqlite3_reset calls
+    /// mutate internal state even through const methods.
+    mutable std::mutex mtx_;
 
     /// Filesystem path of the database file (for diagnostics).
     std::string db_path_;

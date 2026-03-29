@@ -198,6 +198,36 @@ struct RegimeDetectorConfig {
 
     /// Convergence tolerance for Baum-Welch log-likelihood improvement.
     double hmm_convergence_tol{1e-6};
+
+    // -- MSM (optional, advanced — T5-CR14) -----------------------------------
+
+    /// Enable the Markov-Switching Multifractal model (Calvet & Fisher 2004)
+    /// as a complement to or replacement for the HMM.  MSM captures multi-
+    /// scale volatility dynamics (short bursts within long trends) with fewer
+    /// parameters and better regime stability than single-scale HMMs.
+    bool msm_enabled{false};
+
+    /// Number of frequency components (K).  K=2 gives 4 states (2^K),
+    /// sufficient for CHIA's low-frequency data.  Higher K requires more
+    /// data to identify.
+    std::uint32_t msm_k_frequencies{2};
+
+    /// Low-volatility multiplier m_0 ∈ (1, 2).  Each component switches
+    /// between m_0 (low) and 2-m_0 (high).  Default 1.4 gives a 3.5:1
+    /// high-to-low ratio: 0.6 vs 1.4.
+    double msm_m0{1.4};
+
+    /// Short-term transition probability γ_1 (probability the fastest
+    /// component flips per block).  Default 0.10.
+    double msm_gamma1{0.10};
+
+    /// Frequency spacing ratio b.  Component k transitions with
+    /// probability γ_k = 1 - (1 - γ_1)^(b^(k-1)).  Default 2.0.
+    double msm_b{2.0};
+
+    /// Base volatility σ̄ (unconditional per-block vol).  If 0, estimated
+    /// from the return window.
+    double msm_sigma_bar{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -237,6 +267,45 @@ struct HmmState {
 
     /// Whether the HMM has been initialised via Baum-Welch at least once.
     bool fitted{false};
+};
+
+// ---------------------------------------------------------------------------
+// MsmState -- internal state of the Markov-Switching Multifractal model.
+//
+// Calvet, L. & Fisher, A. (2004). "How to Forecast Long-Run Volatility:
+//   Regime Switching and the Estimation of Multifractal Processes."
+//   Journal of Financial Econometrics, 2(1), 49-83.
+//
+// The MSM with K frequency components generates 2^K possible volatility
+// states.  Each state s = (M_1, ..., M_K) where M_k ∈ {m_0, 2 - m_0}.
+// Instantaneous volatility: σ_t = σ̄ · √(∏ M_k,t).
+//
+// For K=2: states are {(m0,m0), (m0,2-m0), (2-m0,m0), (2-m0,2-m0)},
+// giving 4 volatility levels.  The slowest component captures persistent
+// regime shifts; the fastest captures short bursts.
+// ---------------------------------------------------------------------------
+
+struct MsmState {
+    /// Number of frequency components (K).
+    std::uint32_t k{2};
+
+    /// Number of states = 2^K.
+    std::size_t num_states{4};
+
+    /// Posterior probabilities for each of the 2^K states.
+    std::vector<double> state_probs;
+
+    /// Volatility multiplier for each state: √(∏ M_k) for that state.
+    std::vector<double> state_vol_multipliers;
+
+    /// Transition probability for each frequency component k.
+    std::vector<double> gamma;
+
+    /// Base volatility σ̄.
+    double sigma_bar{0.003};
+
+    /// Whether the MSM has been initialised.
+    bool initialised{false};
 };
 
 // ---------------------------------------------------------------------------
@@ -319,6 +388,13 @@ public:
     /// Minimum value is 1 (the block at which the current regime was confirmed).
     int get_regime_duration_blocks() const noexcept;
 
+    /// Return whether the detector has enough data to produce a meaningful
+    /// regime classification.  Returns false during warm-up (< min_window_size
+    /// observations), during which get_regime() returns Regime::Normal by
+    /// default.  Callers should widen spreads defensively when !is_ready().
+    /// [T7-11]
+    bool is_ready() const noexcept;
+
     // -- Diagnostic accessors ------------------------------------------------
 
     /// Return the Z-statistic for VR(q) using the Lo-MacKinlay formula.
@@ -357,6 +433,17 @@ public:
     /// observation window.  Returns an empty vector if HMM is disabled.
     std::vector<std::size_t> get_hmm_viterbi_path() const;
 
+    // -- MSM accessors (T5-CR14, meaningful only when msm_enabled) -----------
+
+    /// Return the MSM-estimated current volatility multiplier (relative to
+    /// σ̄).  Values < 1 indicate low-vol, > 1 indicate high-vol.
+    /// Returns 1.0 if MSM is disabled or not initialised.
+    double get_msm_volatility_multiplier() const noexcept;
+
+    /// Return the MSM posterior probability of being in a high-volatility
+    /// state (any state where ∏ M_k > 1).  Returns 0.5 if MSM is disabled.
+    double get_msm_high_vol_probability() const noexcept;
+
 private:
     // -- Variance ratio helpers ----------------------------------------------
 
@@ -390,6 +477,14 @@ private:
 
     /// Execute one forward-algorithm step for a new observation.
     void hmm_forward_step(double observation);
+
+    // -- MSM helpers (T5-CR14) -----------------------------------------------
+
+    /// Initialise MSM state probabilities and volatility multipliers.
+    void msm_initialise();
+
+    /// Execute one MSM grid-filter step for a new observation.
+    void msm_filter_step(double observation);
 
     /// Run the Viterbi algorithm over the full observation window.
     std::vector<std::size_t> hmm_viterbi() const;
@@ -445,6 +540,9 @@ private:
 
     /// HMM internal state (allocated only when hmm_enabled).
     HmmState hmm_;
+
+    /// MSM internal state (T5-CR14, allocated only when msm_enabled).
+    MsmState msm_;
 
     /// Block counter for periodic HMM re-fitting (every N blocks).
     static constexpr std::uint32_t kHmmRefitInterval = 50;

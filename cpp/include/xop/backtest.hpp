@@ -442,7 +442,8 @@ public:
         const std::vector<ParameterSet>& param_grid,
         double                        train_pct       = 0.70,
         std::uint32_t                 advance_blocks  = 11631,
-        double                        min_train_sharpe = 0.5);
+        double                        min_train_sharpe = 0.5,
+        const StrategyConfig&         base_cfg        = StrategyConfig{});
 
     // -- Parameter Sweep (parallelised) -------------------------------------
 
@@ -462,7 +463,8 @@ public:
     std::vector<BacktestResult> parameter_sweep(
         const StrategyFactory&           strategy_factory,
         const std::vector<ParameterSet>& param_grid,
-        std::uint32_t                    max_threads = 0);
+        std::uint32_t                    max_threads = 0,
+        const StrategyConfig&            base_cfg    = StrategyConfig{});
 
     // -- Export --------------------------------------------------------------
 

@@ -256,6 +256,7 @@ Database::~Database()
 
 void Database::insert_trade(const DbTradeRecord& r)
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     // Bind all 10 parameters to the prepared INSERT statement.
     bind_text  (stmt_insert_trade_, 1, r.timestamp);
     bind_text  (stmt_insert_trade_, 2, r.trade_id);
@@ -279,6 +280,7 @@ std::vector<DbTradeRecord> Database::query_trades(
     const std::string& start_ts,
     const std::string& end_ts) const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     std::vector<DbTradeRecord> results;
 
     // Choose the appropriate prepared statement based on whether a pair
@@ -333,6 +335,7 @@ std::vector<DbTradeRecord> Database::query_trades(
 
 void Database::insert_offer(const DbOfferRecord& r)
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     bind_text  (stmt_insert_offer_, 1, r.offer_id);
     bind_text  (stmt_insert_offer_, 2, r.pair_name);
     bind_text  (stmt_insert_offer_, 3, r.side);
@@ -352,6 +355,7 @@ void Database::update_offer_status(const std::string& offer_id,
                                    const std::string& new_status,
                                    BlockHeight        resolved_block)
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     bind_text  (stmt_update_offer_, 1, new_status);
     bind_int64 (stmt_update_offer_, 2, static_cast<std::int64_t>(resolved_block));
     bind_text  (stmt_update_offer_, 3, offer_id);
@@ -375,6 +379,7 @@ void Database::update_offer_status(const std::string& offer_id,
 
 void Database::insert_snapshot(const DbSnapshot& s)
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     bind_int64 (stmt_insert_snapshot_, 1, static_cast<std::int64_t>(s.block_height));
     bind_text  (stmt_insert_snapshot_, 2, s.pair_name);
     bind_int64 (stmt_insert_snapshot_, 3, s.mid_price_mojos);
@@ -393,6 +398,7 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
         return;
     }
 
+    std::lock_guard<std::mutex> lock(mtx_);
     // Wrap the batch in an explicit transaction to amortise fsync.
     char* err_msg = nullptr;
     int rc = sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg);
@@ -404,7 +410,16 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
 
     try {
         for (const auto& s : batch) {
-            insert_snapshot(s);
+            // Inline the snapshot insert to avoid recursive lock on mtx_.
+            bind_int64 (stmt_insert_snapshot_, 1, static_cast<std::int64_t>(s.block_height));
+            bind_text  (stmt_insert_snapshot_, 2, s.pair_name);
+            bind_int64 (stmt_insert_snapshot_, 3, s.mid_price_mojos);
+            bind_double(stmt_insert_snapshot_, 4, s.spread_bps);
+            bind_double(stmt_insert_snapshot_, 5, s.inventory_ratio);
+            bind_double(stmt_insert_snapshot_, 6, s.sigma_block);
+            bind_text  (stmt_insert_snapshot_, 7, s.regime);
+            bind_int64 (stmt_insert_snapshot_, 8, s.pnl_total_mojos);
+            step_and_reset(stmt_insert_snapshot_);
         }
     } catch (...) {
         // Roll back on any failure to maintain atomicity.
@@ -427,6 +442,7 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
 std::optional<DbSnapshot> Database::get_last_snapshot(
     const std::string& pair_name) const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     bind_text(stmt_last_snapshot_, 1, pair_name);
 
     int rc = sqlite3_step(stmt_last_snapshot_);
@@ -464,6 +480,7 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
 
 std::int64_t Database::trade_count() const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     int rc = sqlite3_step(stmt_trade_count_);
     std::int64_t count = 0;
     if (rc == SQLITE_ROW) {
@@ -477,6 +494,7 @@ std::int64_t Database::trade_count() const
 
 std::int64_t Database::offer_count() const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     int rc = sqlite3_step(stmt_offer_count_);
     std::int64_t count = 0;
     if (rc == SQLITE_ROW) {
@@ -490,6 +508,7 @@ std::int64_t Database::offer_count() const
 
 std::int64_t Database::snapshot_count() const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     int rc = sqlite3_step(stmt_snapshot_count_);
     std::int64_t count = 0;
     if (rc == SQLITE_ROW) {
@@ -503,6 +522,7 @@ std::int64_t Database::snapshot_count() const
 
 double Database::fill_rate_since_block(BlockHeight since, double fallback) const
 {
+    std::lock_guard<std::mutex> lock(mtx_);
     bind_int64(stmt_fill_rate_, 1, static_cast<std::int64_t>(since));
     int rc = sqlite3_step(stmt_fill_rate_);
     double rate = fallback;
@@ -538,8 +558,10 @@ void Database::configure_pragmas()
     if (rc != SQLITE_OK) {
         std::string msg = "[Database] PRAGMA journal_mode=WAL failed: ";
         if (err_msg) { msg += err_msg; sqlite3_free(err_msg); }
-        spdlog::warn("{}", msg);
-        // Non-fatal: WAL is a performance optimisation, not required.
+        // [T7-06] WAL is required for concurrent reader safety.  Throw
+        // rather than silently falling back to journal mode, which would
+        // cause "database locked" errors under concurrent GUI access.
+        throw std::runtime_error(msg);
     }
 
     // NORMAL synchronous: fsync only at critical moments (checkpoint).

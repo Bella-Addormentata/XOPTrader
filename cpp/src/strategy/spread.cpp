@@ -7,6 +7,10 @@
 //
 // with dynamic regime multipliers and optional Thompson Sampling.
 //
+// Thread safety: one SpreadOptimizer instance per pair; not thread-safe
+// for shared use.  compute_spread() is const but modifies mutable members
+// (sampler_, last_thompson_index_, spread_vol_tracker_).  [T7-02]
+//
 // Compliant with:
 //   ISO/IEC 27001:2022  (no secrets processed, deterministic audit trail)
 //   ISO/IEC 5055        (bounds-checked, no undefined behaviour)
@@ -674,6 +678,17 @@ SpreadResult SpreadOptimizer::compute_spread(
     result.s_cost           = s_cost;
     result.s_competition    = s_comp;
     result.regime_multiplier = regime_mult;
+
+    // T5-CR13 (Stoll 1989): Compute three-component spread fractions.
+    // The raw sum (pre-multiplier, pre-competition-cap) measures the
+    // economic composition.  Competition cap is excluded because it
+    // constrains the total but doesn't represent a cost component.
+    const double raw_sum = s_adv + s_inv + s_cost;
+    if (raw_sum > 0.0) {
+        result.frac_adverse   = s_adv  / raw_sum;
+        result.frac_inventory = s_inv  / raw_sum;
+        result.frac_cost      = s_cost / raw_sum;
+    }
 
     return result;
 }

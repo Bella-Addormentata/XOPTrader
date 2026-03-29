@@ -291,7 +291,21 @@ struct TierQuote {
     std::uint8_t tier_index;   // 0-based tier (0 = tightest, N-1 = widest).
     Side         side;         // Bid (buy) or Ask (sell).
     Mojo         price;        // Offer price in mojos.
-    Mojo         size;         // Offer quantity in mojos of the relevant asset.
+
+    // Offer quantity in mojos of the *side-relevant* asset:
+    //   - Bid (buy):  quote-asset mojos — the capital we are willing to spend.
+    //   - Ask (sell): base-asset mojos  — the inventory we are willing to sell.
+    //
+    // The execution layer (OfferManager::build_offer_dict) uses this convention
+    // to compute the counter-leg amount:
+    //   Bid: quote_amount = size * price / quote_denom   (we spend quote, receive base)
+    //   Ask: quote_amount = size * price / quote_denom   (we spend base, receive quote)
+    //
+    // LiquidityEngine::build_ladder() sets bid size from available quote
+    // capital (`cap * size_frac`) and ask size from available base inventory
+    // (`inv * size_frac`), both already in mojos.
+    Mojo         size;
+
     double       spread_bps;   // Distance from mid-price in basis points
                                //   (informational, for logging and metrics).
 };

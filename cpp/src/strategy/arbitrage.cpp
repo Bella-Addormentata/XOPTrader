@@ -307,8 +307,17 @@ ArbitrageDetector::scan_cex_dex(
         const double dex_fee   = 10000.0 * kBlockchainFeeXch / buy_price;
         const double bridge    = cfg_.bridge_fee_bps;
 
-        // Slippage estimate: assume linear price impact proportional to
-        // trade_size / available_depth.  Capped at 50% of edge.
+        // Slippage estimate: square-root price impact model per Almgren
+        // et al. (2005) and Gatheral (2010).  Linear impact (λ·Q) is
+        // inconsistent with no-dynamic-arbitrage conditions and empirically
+        // rejected in favour of impact ∝ √(trade_size / depth).
+        //
+        // T5-CR10: impact_bps = η · √(trade_size / available_depth)
+        //   where η = 10.0 bps calibration constant (same order-of-magnitude
+        //   as the previous linear model at ratio = 1.0, but produces higher
+        //   slippage for small trades and lower for large trades, matching
+        //   empirical concave impact functions).
+        // Capped at 50% of edge to avoid negative-profit opportunities.
         const double available_depth = buy_on_dex ? dex_snapshot.ask_depth
                                                   : dex_snapshot.bid_depth;
         const double trade_size = std::min(cfg_.max_position_size,
@@ -316,7 +325,7 @@ ArbitrageDetector::scan_cex_dex(
 
         double slippage_bps = 0.0;
         if (available_depth > 0.0 && trade_size > 0.0) {
-            slippage_bps = 10.0 * (trade_size / available_depth);
+            slippage_bps = 10.0 * std::sqrt(trade_size / available_depth);
         }
         slippage_bps = std::min(slippage_bps, exec_edge * 0.5);
 
@@ -989,6 +998,29 @@ void ArbitrageDetector::set_tibetswap_reserves(
     const std::vector<TibetSwapReserves>& reserves)
 {
     cached_tibetswap_reserves_ = reserves;
+
+    // T5-CR11: Track fee changes per pool.  The first observation for each
+    // pool establishes the baseline; subsequent observations that differ
+    // trigger a warning.  This detects protocol upgrades (e.g. LVR-reducing
+    // dynamic fees) that could eliminate cross-DEX arbitrage revenue.
+    for (const auto& pool : reserves) {
+        auto [it, inserted] = tibetswap_baseline_fees_.try_emplace(
+            pool.pair_name, pool.fee_bps);
+
+        if (!inserted && it->second != pool.fee_bps) {
+            spdlog::warn("[ArbitrageDetector] TibetSwap fee change detected "
+                         "for {}: {} -> {} bps (T5-CR11: possible protocol "
+                         "upgrade reducing arb opportunity)",
+                         pool.pair_name, it->second, pool.fee_bps);
+            it->second = pool.fee_bps;  // Update baseline.
+            tibetswap_fee_changed_ = true;
+        }
+    }
+}
+
+bool ArbitrageDetector::tibetswap_fee_changed() const noexcept
+{
+    return tibetswap_fee_changed_;
 }
 
 void ArbitrageDetector::set_pair_prices(const PairPriceMap& prices)

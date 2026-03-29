@@ -55,6 +55,9 @@ ChiaEdgeOptimizer::ChiaEdgeOptimizer(const ChiaEdgeConfig& cfg)
     if (!(cfg_.spread_floor_bps >= 0.0)) {
         throw std::invalid_argument("ChiaEdgeConfig: spread_floor_bps must be non-negative");
     }
+    if (!(cfg_.tau_min > 0.0)) {
+        throw std::invalid_argument("ChiaEdgeConfig: tau_min must be strictly positive");
+    }
 
     // Validate edge factor floor bounds: each must be in (0.0, 1.0].
     if (!(cfg_.atomic_mult_floor > 0.0 && cfg_.atomic_mult_floor <= 1.0)) {
@@ -238,6 +241,19 @@ double ChiaEdgeOptimizer::composite_edge_multiplier() const
     // Each factor is in (0, 1], so the composite is also in (0, 1].
     // A composite of 0.73 means we can quote ~27% tighter than an equivalent
     // strategy on a chain without these structural advantages.
+    //
+    // T3-31 DESIGN DECISION: multiplicative (not additive) composition.
+    // Each edge factor represents an independent structural cost savings
+    // applied to the *residual* spread after preceding edges.  If atomic
+    // offers save 7% of the spread, free cancellation saves 5% of the
+    // *remaining* 93%, not 5% of the original.  This prevents the total
+    // savings from exceeding 100% (which additive could if enough edges
+    // are stacked) and correctly models the economic independence of each
+    // advantage.  The difference is small at current defaults (3.9 bps
+    // on a 200 bps base) but matters when edges are large or numerous.
+    //
+    // Reference: standard option-pricing treatment of independent
+    // survival probabilities — product of (1 - p_i), not sum.
 
     // Edge 1: Atomic offers.
     const double m_atomic = std::clamp(
@@ -291,15 +307,29 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     // -------------------------------------------------------------------
     // Step 1: Compute remaining time in the rolling horizon (seconds).
     //
-    //   tau = (N - n) * block_time
+    // T4-19: Exponential-decay tau (replaces exploitable sawtooth).
     //
-    // where N = horizon_blocks and n = block_height mod N.  The modular
-    // rollover prevents tau from reaching zero.
+    //   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    //   lambda = -ln(tau_min / tau_max) / horizon_blocks
+    //
+    // After each fill, tau resets to tau_max and decays smoothly toward
+    // tau_min over the next horizon_blocks blocks.  This eliminates the
+    // deterministic sawtooth cycle that adversaries could predict and
+    // exploit in 24/7 markets (CHIA ~52s blocks, no session boundaries).
+    // Reference: Stoikov (2018) "The micro-price".
     // -------------------------------------------------------------------
     // Inlined from compute_tau():
-    const uint32_t n_mod = block_height % cfg_.horizon_blocks;
-    const uint32_t remaining_blocks = cfg_.horizon_blocks - n_mod;
-    const double tau = static_cast<double>(remaining_blocks) * cfg_.block_time_seconds;
+    const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                         * cfg_.block_time_seconds;
+    const double lambda = -std::log(cfg_.tau_min / tau_max)
+                        / static_cast<double>(cfg_.horizon_blocks);
+    const uint32_t blocks_since_fill =
+        (block_height >= last_fill_block_)
+            ? (block_height - last_fill_block_)
+            : 0u;
+    const double tau = std::max(
+        tau_max * std::exp(-lambda * static_cast<double>(blocks_since_fill)),
+        cfg_.tau_min);
 
     // -------------------------------------------------------------------
     // Step 2: Compute the Avellaneda-Stoikov reservation price.
@@ -355,6 +385,11 @@ QuoteResult ChiaEdgeOptimizer::compute_quotes(double mid,
     //
     // where m_composite = product of all five structural edge factors.
     // Each factor is in (0, 1], so this can only tighten the spread.
+    //
+    // T3-31: multiplicative composition is intentional — see the
+    // detailed design-decision comment in composite_edge_multiplier().
+    // Independent edges are applied to the residual spread, preventing
+    // the total from exceeding 100% of the base.
     //
     // The edge reflects structural cost savings and informational
     // advantages unique to the CHIA DEX environment:
@@ -507,6 +542,23 @@ void ChiaEdgeOptimizer::update_price(double mid, BlockHeight block_height)
     update_regime();
 }
 
+void ChiaEdgeOptimizer::record_fill()
+{
+    // T4-19: Record a fill event by snapshotting the latest observed block
+    // height.  compute_tau() uses (block_height - last_fill_block_) to
+    // compute the exponential-decay tau, so resetting last_fill_block_
+    // effectively resets tau to tau_max.
+    //
+    // T2-02: Exclusive lock -- mutates last_fill_block_.
+    std::unique_lock lock(mtx_);
+
+    // Use the block height of the most recent price observation as the
+    // fill block.  If no prices have been observed yet, leave at zero.
+    if (!price_buffer_.empty()) {
+        last_fill_block_ = price_buffer_.back().block;
+    }
+}
+
 // ===========================================================================
 // Accessors
 // ===========================================================================
@@ -575,16 +627,29 @@ double ChiaEdgeOptimizer::optimal_half_spread(double sigma, double tau) const
 
 double ChiaEdgeOptimizer::compute_tau(BlockHeight block_height) const
 {
-    // T2-02: Shared lock -- read-only access to cfg_.
+    // T2-02: Shared lock -- read-only access to cfg_ and last_fill_block_.
     std::shared_lock lock(mtx_);
 
-    // tau = (N - n) * block_time
+    // T4-19: Exponential-decay tau (replaces exploitable sawtooth).
     //
-    // n = block_height mod N.  The sawtooth pattern gives tau in
-    // [1*block_time, N*block_time], never reaching zero.
-    const uint32_t n = block_height % cfg_.horizon_blocks;
-    const uint32_t remaining = cfg_.horizon_blocks - n;
-    return static_cast<double>(remaining) * cfg_.block_time_seconds;
+    //   tau(t) = tau_max * exp(-lambda * blocks_since_last_fill)
+    //   lambda = -ln(tau_min / tau_max) / horizon_blocks
+    //
+    // After each fill, tau resets to tau_max and decays smoothly toward
+    // tau_min.  This eliminates the deterministic sawtooth cycle that
+    // adversaries could predict and exploit.
+    // Reference: Stoikov (2018) "The micro-price".
+    const double tau_max = static_cast<double>(cfg_.horizon_blocks)
+                         * cfg_.block_time_seconds;
+    const double lambda = -std::log(cfg_.tau_min / tau_max)
+                        / static_cast<double>(cfg_.horizon_blocks);
+    const uint32_t blocks_since_fill =
+        (block_height >= last_fill_block_)
+            ? (block_height - last_fill_block_)
+            : 0u;
+    return std::max(
+        tau_max * std::exp(-lambda * static_cast<double>(blocks_since_fill)),
+        cfg_.tau_min);
 }
 
 /* static */

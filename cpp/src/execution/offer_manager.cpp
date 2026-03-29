@@ -94,6 +94,28 @@ asio::awaitable<int> OfferManager::post_quotes(
         co_await init_wallet_id_map();
     }
 
+    // [T7-10] Batch mode: merge same-side tiers into a single RPC call.
+    if (strategy_cfg_.batch_offers_enabled && quotes.size() > 1) {
+        // Split quotes by side.
+        std::vector<TierQuote> bids, asks;
+        for (const auto& tq : quotes) {
+            if (tq.side == Side::Bid) bids.push_back(tq);
+            else                      asks.push_back(tq);
+        }
+
+        int created_count = 0;
+        if (!bids.empty()) {
+            created_count += co_await post_merged_side(pair, bids, block_height);
+        }
+        if (!asks.empty()) {
+            created_count += co_await post_merged_side(pair, asks, block_height);
+        }
+
+        logger_->info("post_quotes (batched): {}/{} offers created for {}",
+                      created_count, quotes.size(), pair.name);
+        co_return created_count;
+    }
+
     int created_count = 0;
 
     for (const auto& tier : quotes) {
@@ -820,6 +842,115 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
     }
 
     return offer_dict;
+}
+
+// ---------------------------------------------------------------------------
+// [T7-10] post_merged_side -- merge same-side tiers into one RPC call
+// ---------------------------------------------------------------------------
+
+asio::awaitable<int> OfferManager::post_merged_side(
+    const PairConfig&              pair,
+    const std::vector<TierQuote>&  tiers,
+    BlockHeight                    block_height)
+{
+    if (tiers.empty()) co_return 0;
+
+    // Build individual offer_dicts and merge by summing wallet_id amounts.
+    json merged_dict = json::object();
+    for (const auto& tier : tiers) {
+        json single = build_offer_dict(pair, tier);
+        if (single.empty()) {
+            logger_->warn("Batch: skipping tier {} {} -- could not build dict",
+                          tier.tier_index, to_string(tier.side));
+            continue;
+        }
+        for (auto& [key, val] : single.items()) {
+            if (merged_dict.contains(key)) {
+                merged_dict[key] = merged_dict[key].get<std::int64_t>()
+                                 + val.get<std::int64_t>();
+            } else {
+                merged_dict[key] = val;
+            }
+        }
+    }
+
+    if (merged_dict.empty()) co_return 0;
+
+    // Create the merged offer via RPC.
+    json result;
+    try {
+        result = co_await wallet_->create_offer(
+            merged_dict, current_fee_mojos_, /*validate_only=*/false);
+    } catch (const rpc::ChiaRPCError& e) {
+        // Fallback: if batch fails, fall through to individual creation.
+        logger_->warn("Batch create_offer failed for {} {} -- "
+                      "falling back to individual: {}",
+                      pair.name, to_string(tiers.front().side), e.what());
+        int fallback_count = 0;
+        for (const auto& tier : tiers) {
+            json single_dict = build_offer_dict(pair, tier);
+            if (single_dict.empty()) continue;
+            try {
+                auto sr = co_await wallet_->create_offer(
+                    single_dict, current_fee_mojos_, /*validate_only=*/false);
+                if (sr.contains("offer") && sr.contains("trade_record")
+                    && sr["trade_record"].contains("trade_id")) {
+                    std::string offer_text = sr["offer"].get<std::string>();
+                    co_await submit_to_dexie(offer_text);
+                    PendingOffer po;
+                    po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
+                    po.pair_name        = pair.name;
+                    po.side             = tier.side;
+                    po.price            = tier.price;
+                    po.size             = tier.size;
+                    po.tier             = tier.tier_index;
+                    po.created_at_block = block_height;
+                    po.created_at_ts    = std::chrono::system_clock::now();
+                    state_->upsert_offer(po);
+                    ++fallback_count;
+                }
+            } catch (const rpc::ChiaRPCError& e2) {
+                logger_->error("Fallback create_offer failed for {} tier {}: {}",
+                               pair.name, tier.tier_index, e2.what());
+            }
+        }
+        co_return fallback_count;
+    }
+
+    // Extract trade_id and offer text.
+    if (!result.contains("offer") || !result["offer"].is_string()
+        || !result.contains("trade_record")
+        || !result["trade_record"].contains("trade_id")) {
+        logger_->error("Batch: create_offer response missing fields for {} {}",
+                       pair.name, to_string(tiers.front().side));
+        co_return 0;
+    }
+
+    std::string trade_id   = result["trade_record"]["trade_id"].get<std::string>();
+    std::string offer_text = result["offer"].get<std::string>();
+
+    // Submit to dexie (best-effort).
+    co_await submit_to_dexie(offer_text);
+
+    // Track all constituent tiers with the same offer_id.
+    for (const auto& tier : tiers) {
+        PendingOffer pending;
+        pending.offer_id         = trade_id;
+        pending.pair_name        = pair.name;
+        pending.side             = tier.side;
+        pending.price            = tier.price;
+        pending.size             = tier.size;
+        pending.tier             = tier.tier_index;
+        pending.created_at_block = block_height;
+        pending.created_at_ts    = std::chrono::system_clock::now();
+        state_->upsert_offer(pending);
+    }
+
+    logger_->info("Batch: posted {} {} ({} tiers merged) [{}]",
+                  pair.name, to_string(tiers.front().side),
+                  tiers.size(), trade_id.substr(0, 12));
+
+    co_return static_cast<int>(tiers.size());
 }
 
 // ---------------------------------------------------------------------------

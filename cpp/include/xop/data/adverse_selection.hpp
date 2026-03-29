@@ -220,6 +220,36 @@ public:
     /// Read-only access to the configuration.
     const AdverseSelectionConfig& config() const noexcept;
 
+    // -- Cross-validation (T5-CR4) -------------------------------------------
+
+    /// Result of PIN/VPIN predictive-power validation.
+    ///
+    /// Duarte & Young (2009): PIN may measure illiquidity friction, not
+    /// genuine informed trading.  Collin-Dufresne & Fos (2015): PIN is
+    /// lowest when known informed traders are most active.
+    ///
+    /// This struct captures how well PIN elevations predict actual adverse
+    /// fills, computed from the fill history internal to this estimator.
+    struct ValidationResult {
+        double precision{0.0};       // fraction of high-PIN fills actually adverse
+        double recall{0.0};          // fraction of adverse fills during high-PIN
+        double correlation{0.0};     // Pearson r between PIN and adverse outcome
+        std::size_t sample_size{0};  // number of fills used
+        bool   reliable{false};      // true if sample_size >= 30
+    };
+
+    /// Validate PIN predictive power against the fill history.
+    ///
+    /// Partitions the history into high-PIN and low-PIN periods using the
+    /// given threshold.  Computes precision, recall, and Pearson correlation
+    /// between the PIN level at each fill and the binary adverse outcome.
+    ///
+    /// @param pin_threshold  PIN above which a fill is classified as
+    ///                       "high-PIN".  Default 0.25.
+    /// @return ValidationResult with precision/recall/correlation.
+    ValidationResult validate_predictive_power(
+        double pin_threshold = 0.25) const noexcept;
+
     /// Reset the estimator to its prior state, clearing all fill history.
     void reset();
 

@@ -121,15 +121,16 @@ struct DexieBookSnapshot {
 };
 
 /// TibetSwap AMM pool reserves for a single pair.
+/// [T7-13] fee_bps should be populated from ArbitrageConfig::tibetswap_fee_bps
+/// (converting from basis points: config_bps / 10) when constructing reserves
+/// from RPC data, rather than relying on the hardcoded default.
 struct TibetSwapReserves {
     std::string pair_name;          // e.g. "XCH/wUSDC"
     std::int64_t xch_reserve;      // XCH-side reserve (mojos)
     std::int64_t token_reserve;    // token-side reserve (smallest unit)
-    std::uint32_t fee_bps;         // pool fee in basis points (default 7 = 0.07%
-                                   //   per leg; total round-trip 0.7%)
-                                   //   NOTE: TibetSwap v2 takes 0.7% total, so
-                                   //   the INVERSE_FEE factor is 993/1000 for a
-                                   //   single swap direction.
+    std::uint32_t fee_bps{7};      // pool fee in per-mille numerator
+                                   //   (7 = 0.7% per swap direction).
+                                   //   Populate from config: tibetswap_fee_bps / 10.
 };
 
 /// CEX price for a single asset pair, fetched from OKX / MEXC / Gate.io.
@@ -443,7 +444,19 @@ public:
     void set_dexie_books(const std::vector<DexieBookSnapshot>& books);
 
     /// Set the latest TibetSwap pool reserves (one per pair).
+    /// Also performs fee-change detection (T5-CR11): logs a warning when
+    /// a pool's fee_bps differs from its previously observed value, which
+    /// may indicate protocol upgrades that reduce arbitrage opportunity.
     void set_tibetswap_reserves(const std::vector<TibetSwapReserves>& reserves);
+
+    /// Check if any TibetSwap pool has changed its fee since first observed.
+    /// Returns true if at least one pool's fee differs from baseline.
+    ///
+    /// T5-CR11 (Milionis et al. 2022; Adams et al. 2023): TibetSwap arb
+    /// revenue is structurally dependent on AMM design.  Future LVR-reduction
+    /// features (dynamic fees, oracle pricing) could eliminate this revenue.
+    /// Monitor fee changes as an early warning signal.
+    bool tibetswap_fee_changed() const noexcept;
 
     /// Set the latest pair-price map for triangular scanning.
     void set_pair_prices(const PairPriceMap& prices);
@@ -487,6 +500,13 @@ private:
     StablecoinPairSet               cached_stablecoin_pairs_;
     double                          cached_wusdc_price_{0.0};
     double                          cached_wusdc_b_price_{0.0};
+
+    // -- T5-CR11: TibetSwap fee-change tracking ------------------------------
+    // Maps pool pair_name -> first-observed fee_bps.  When a subsequent
+    // set_tibetswap_reserves() call provides a different fee for a known
+    // pool, fee_changed_ is set to true and a warning is logged.
+    std::unordered_map<std::string, std::uint32_t> tibetswap_baseline_fees_;
+    bool tibetswap_fee_changed_{false};
 };
 
 }  // namespace xop
