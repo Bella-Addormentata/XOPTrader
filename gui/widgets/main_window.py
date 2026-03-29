@@ -260,6 +260,23 @@ class MainWindow(QMainWindow):
                 lambda path: bridge.reload_config()
             )
 
+        # Auto-populate the settings panel from the bridge's config file so
+        # users can edit credentials without touching the file system manually.
+        if self._settings_widget is not None and hasattr(
+            self._settings_widget, "load_config"
+        ):
+            cfg_path = bridge.config_service.path
+            if cfg_path.is_file():
+                self._settings_widget.load_config(str(cfg_path))
+            else:
+                # No config file loaded — guide the user to the Settings tab
+                # so they can configure credentials before starting the engine.
+                self._switch_page(5)
+                self._on_bridge_error(
+                    "No configuration file found. "
+                    "Please fill in your credentials here and click Save."
+                )
+
         # -- Dashboard context menu -> page switching ----------------------
         if self._dashboard is not None:
             if hasattr(self._dashboard, "view_chart_requested"):
