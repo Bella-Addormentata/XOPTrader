@@ -72,6 +72,22 @@ struct SpreadResult {
 
     // Multiplier applied to the raw sum of components.
     double regime_multiplier;  // 1.0 = neutral; <1 tightened; >1 widened.
+
+    // -- Stoll (1989) three-component decomposition (T5-CR13) -----------------
+    // Component fractions (each in [0, 1], summing to 1) quantifying which
+    // factor dominates the current spread.  On thin DEX markets, order-
+    // processing costs (blockchain fees, offer TTL) and inventory costs
+    // (capital lockup) are often dominant over adverse selection — contrary
+    // to the Glosten-Milgrom (1985) assumption that adverse selection is
+    // the primary spread determinant.
+    //
+    // These fractions let the engine tune behaviour by dominant factor:
+    //   - High frac_adverse  → widen more, reduce size (informed flow risk)
+    //   - High frac_inventory → shed inventory, skew quotes
+    //   - High frac_cost     → venue-hop to cheaper platforms, increase TTL
+    double frac_adverse{0.0};       // s_adverse / raw_sum
+    double frac_inventory{0.0};     // s_inventory / raw_sum
+    double frac_cost{0.0};          // s_cost / raw_sum
 };
 
 // ---------------------------------------------------------------------------

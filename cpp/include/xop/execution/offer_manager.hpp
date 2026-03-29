@@ -328,6 +328,24 @@ private:
                           const TierQuote&  tier) const;
 
     /**
+     * @brief [T7-10] Create a single merged offer for all same-side tiers.
+     *
+     * Sums the mojo amounts across tiers for each wallet ID, producing one
+     * aggregate offer per side.  All constituent tiers are tracked with the
+     * same offer ID in shared State.  Falls back to individual creation on
+     * RPC failure.
+     *
+     * @param pair          Pair configuration (asset IDs).
+     * @param tiers         Same-side tier quotes to merge.
+     * @param block_height  Current block height for PendingOffer stamping.
+     * @return Number of tiers successfully posted (0 or tiers.size()).
+     */
+    asio::awaitable<int> post_merged_side(
+        const PairConfig&              pair,
+        const std::vector<TierQuote>&  tiers,
+        BlockHeight                    block_height);
+
+    /**
      * @brief Submit bech32m offer text to the dexie aggregator API.
      *
      * Posts to the dexie /v1/offers endpoint for cross-platform visibility.

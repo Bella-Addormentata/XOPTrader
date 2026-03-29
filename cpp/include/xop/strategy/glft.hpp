@@ -240,6 +240,12 @@ public:
                                        : internal_detector_.get();
     }
 
+    /// [T7-11] Return whether the regime detector has enough observations.
+    bool is_regime_ready() const override {
+        const auto* det = regime_detector();
+        return det ? det->is_ready() : true;
+    }
+
 private:
     /// Return the active detector (shared or internal).
     RegimeDetector& active_detector() noexcept {

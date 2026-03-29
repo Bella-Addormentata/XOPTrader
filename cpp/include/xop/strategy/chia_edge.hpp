@@ -318,6 +318,11 @@ struct ChiaEdgeConfig {
     double regime_mo_spread_mult{1.50};  // Spread multiplier in momentum.
     double regime_mo_skew_mult{2.00};    // Skew multiplier in momentum.
 
+    // -- Exponential-decay tau floor (T4-19) ----------------------------------
+    // Minimum tau value (seconds) for the exponential-decay model.
+    // Prevents tau from reaching zero when no fills occur for extended periods.
+    double tau_min{0.01};
+
     // -- No-loss constraint (optional) ---------------------------------------
     bool   enable_no_loss_constraint{false};
     double min_margin_bps{35.0};
@@ -354,6 +359,9 @@ public:
 
     /// Push a new mid-price observation for regime detection.
     void update_price(double mid, BlockHeight block_height) override;
+
+    /// Record a fill event to reset the exponential-decay tau (T4-19).
+    void record_fill() override;
 
     /// Retrieve the most recent regime classification.
     RegimeInfo current_regime() const override;
@@ -463,6 +471,12 @@ private:
     // No-loss constraint state.
     double cost_basis_{0.0};        // Weighted-average acquisition price.
     double min_margin_bps_{35.0};   // Minimum margin above cost (bps).
+
+    // T4-19: Exponential-decay tau -- block height of the most recent fill.
+    // Used by compute_tau() to compute blocks_since_last_fill for the
+    // exponential-decay formula.  Zero means no fill recorded yet.
+    // ISO/IEC 27001:2022: mutated by record_fill() under exclusive lock.
+    BlockHeight last_fill_block_{0};
 
     // Seconds per year (365 days, non-leap).
     static constexpr double kSecondsPerYear = 365.0 * 24.0 * 3600.0;

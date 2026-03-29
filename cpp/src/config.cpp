@@ -16,6 +16,7 @@
 
 #include "xop/config.hpp"
 
+#include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -23,7 +24,6 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdlib>
-#include <iostream>
 #include <limits>
 #include <numeric>
 #include <sstream>
@@ -58,6 +58,81 @@ std::string expand_tilde(const std::string& path)
     return std::string(home) + path.substr(1);
 }
 
+// [T4-04] Expand `${VAR}` environment-variable references in a string value.
+//
+// Syntax:
+//   ${VAR}            — replaced with the value of environment variable VAR.
+//                       Throws ConfigError if VAR is not set.
+//   ${VAR:-default}   — replaced with VAR's value, or "default" if unset.
+//
+// Unmatched or malformed `${...}` sequences are left unchanged so that
+// non-env-var uses of `$` (e.g., in asset IDs) are never silently altered.
+//
+// ISO/IEC 27001:2022 — enables externalization of secrets (SSL paths,
+// Telegram tokens, API keys) from plaintext YAML into the OS environment.
+std::string expand_env_vars(const std::string& input)
+{
+    std::string result;
+    result.reserve(input.size());
+
+    std::size_t i = 0;
+    while (i < input.size()) {
+        // Look for `${`
+        if (i + 1 < input.size() && input[i] == '$' && input[i + 1] == '{') {
+            const auto close = input.find('}', i + 2);
+            if (close == std::string::npos) {
+                // No closing brace — not an env-var reference; copy literally.
+                result += input[i];
+                ++i;
+                continue;
+            }
+
+            // Extract the content between ${ and }.
+            const std::string spec = input.substr(i + 2, close - (i + 2));
+
+            // Check for default value syntax: VAR:-default
+            std::string var_name;
+            std::string default_val;
+            bool has_default = false;
+
+            const auto sep = spec.find(":-");
+            if (sep != std::string::npos) {
+                var_name    = spec.substr(0, sep);
+                default_val = spec.substr(sep + 2);
+                has_default = true;
+            } else {
+                var_name = spec;
+            }
+
+            // Validate variable name: must be non-empty and alphanumeric + underscores.
+            if (var_name.empty()) {
+                result += input.substr(i, close - i + 1);
+                i = close + 1;
+                continue;
+            }
+
+            const char* env_val = std::getenv(var_name.c_str());
+            if (env_val) {
+                result += env_val;
+            } else if (has_default) {
+                result += default_val;
+            } else {
+                throw ConfigError(
+                    "Environment variable '" + var_name + "' referenced in "
+                    "config via ${" + var_name + "} is not set. "
+                    "Set the variable or use ${" + var_name + ":-default} syntax.");
+            }
+
+            i = close + 1;
+        } else {
+            result += input[i];
+            ++i;
+        }
+    }
+
+    return result;
+}
+
 // Require that a YAML node exists and is a scalar; throw ConfigError otherwise.
 void require_scalar(const YAML::Node& parent,
                     const std::string& key,
@@ -85,12 +160,14 @@ void require_sequence(const YAML::Node& parent,
 }
 
 // Read a required string field, trim whitespace from both ends.
+// [T4-04] Environment variable references (${VAR}, ${VAR:-default}) are
+// expanded before trimming, allowing secrets to be externalized.
 std::string read_string(const YAML::Node& parent,
                         const std::string& key,
                         const std::string& section)
 {
     require_scalar(parent, key, section);
-    std::string value = parent[key].as<std::string>();
+    std::string value = expand_env_vars(parent[key].as<std::string>());
     // Trim leading and trailing whitespace.
     auto start = value.find_first_not_of(" \t\r\n");
     auto end   = value.find_last_not_of(" \t\r\n");
@@ -101,6 +178,7 @@ std::string read_string(const YAML::Node& parent,
 }
 
 // Read an optional string field; return fallback when absent.
+// [T4-04] Environment variable references are expanded in the value.
 std::string read_string_opt(const YAML::Node& parent,
                             const std::string& key,
                             const std::string& fallback)
@@ -108,7 +186,7 @@ std::string read_string_opt(const YAML::Node& parent,
     if (!parent[key] || parent[key].IsNull()) {
         return fallback;
     }
-    return parent[key].as<std::string>();
+    return expand_env_vars(parent[key].as<std::string>());
 }
 
 // Read a required unsigned 16-bit port in [1, 65535].
@@ -572,6 +650,12 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.reconciliation_interval_blocks = node["reconciliation_interval_blocks"].as<uint32_t>();
     }
 
+    // [T7-10] Optional: batch offer creation.
+    if (node["batch_offers_enabled"] && node["batch_offers_enabled"].IsDefined()
+        && !node["batch_offers_enabled"].IsNull()) {
+        cfg.batch_offers_enabled = node["batch_offers_enabled"].as<bool>();
+    }
+
     return cfg;
 }
 
@@ -637,10 +721,82 @@ RiskConfig parse_risk(const YAML::Node& root)
         }
     }
 
-    return cfg;
-}
+    // flash_crash_threshold_pct: flash crash drop threshold in (0, 1].
+    if (node["flash_crash_threshold_pct"] && node["flash_crash_threshold_pct"].IsDefined()
+            && !node["flash_crash_threshold_pct"].IsNull()) {
+        cfg.flash_crash_threshold_pct = node["flash_crash_threshold_pct"].as<double>();
+        if (!(cfg.flash_crash_threshold_pct > 0.0 && cfg.flash_crash_threshold_pct <= 1.0)) {
+            throw ConfigError(sec + ".flash_crash_threshold_pct must be in (0, 1]; got "
+                              + std::to_string(cfg.flash_crash_threshold_pct));
+        }
+    }
 
-VolatilityConfig parse_volatility(const YAML::Node& root)
+    // recovery_stable_blocks_phase1: blocks that must be stable for Crash→Recovery.
+    if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
+            && !node["recovery_stable_blocks_phase1"].IsNull()) {
+        int64_t v = node["recovery_stable_blocks_phase1"].as<int64_t>();
+        if (v < 1 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".recovery_stable_blocks_phase1 must be >= 1; got "
+                              + std::to_string(v));
+        }
+        cfg.recovery_stable_blocks_phase1 = static_cast<uint32_t>(v);
+    }
+
+    // recovery_stable_blocks_phase2: blocks that must be stable for Recovery→Normal.
+    if (node["recovery_stable_blocks_phase2"] && node["recovery_stable_blocks_phase2"].IsDefined()
+            && !node["recovery_stable_blocks_phase2"].IsNull()) {
+        int64_t v = node["recovery_stable_blocks_phase2"].as<int64_t>();
+        if (v < 1 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".recovery_stable_blocks_phase2 must be >= 1; got "
+                              + std::to_string(v));
+        }
+        cfg.recovery_stable_blocks_phase2 = static_cast<uint32_t>(v);
+    }
+
+    // recovery_stability_band_pct: max price deviation for stability check in (0, 1].
+    if (node["recovery_stability_band_pct"] && node["recovery_stability_band_pct"].IsDefined()
+            && !node["recovery_stability_band_pct"].IsNull()) {
+        cfg.recovery_stability_band_pct = node["recovery_stability_band_pct"].as<double>();
+        if (!(cfg.recovery_stability_band_pct > 0.0 && cfg.recovery_stability_band_pct <= 1.0)) {
+            throw ConfigError(sec + ".recovery_stability_band_pct must be in (0, 1]; got "
+                              + std::to_string(cfg.recovery_stability_band_pct));
+        }
+    }
+
+    // -- Circuit-breaker rebalance (T7-09) -----------------------------------
+    if (node["circuit_breaker_enabled"] && node["circuit_breaker_enabled"].IsDefined()
+            && !node["circuit_breaker_enabled"].IsNull()) {
+        cfg.circuit_breaker_enabled = node["circuit_breaker_enabled"].as<bool>();
+    }
+
+    if (node["circuit_breaker_hard_limit_ratio"] && node["circuit_breaker_hard_limit_ratio"].IsDefined()
+            && !node["circuit_breaker_hard_limit_ratio"].IsNull()) {
+        cfg.circuit_breaker_hard_limit_ratio = node["circuit_breaker_hard_limit_ratio"].as<double>();
+        if (!(cfg.circuit_breaker_hard_limit_ratio > 0.0 && cfg.circuit_breaker_hard_limit_ratio <= 1.0)) {
+            throw ConfigError(sec + ".circuit_breaker_hard_limit_ratio must be in (0, 1]; got "
+                              + std::to_string(cfg.circuit_breaker_hard_limit_ratio));
+        }
+    }
+
+    if (node["circuit_breaker_age_multiplier"] && node["circuit_breaker_age_multiplier"].IsDefined()
+            && !node["circuit_breaker_age_multiplier"].IsNull()) {
+        cfg.circuit_breaker_age_multiplier = node["circuit_breaker_age_multiplier"].as<double>();
+        if (!(cfg.circuit_breaker_age_multiplier >= 1.0)) {
+            throw ConfigError(sec + ".circuit_breaker_age_multiplier must be >= 1.0; got "
+                              + std::to_string(cfg.circuit_breaker_age_multiplier));
+        }
+    }
+
+    if (node["circuit_breaker_max_loss_bps"] && node["circuit_breaker_max_loss_bps"].IsDefined()
+            && !node["circuit_breaker_max_loss_bps"].IsNull()) {
+        cfg.circuit_breaker_max_loss_bps = node["circuit_breaker_max_loss_bps"].as<double>();
+        if (!(cfg.circuit_breaker_max_loss_bps >= 0.0 && cfg.circuit_breaker_max_loss_bps <= 500.0)) {
+            throw ConfigError(sec + ".circuit_breaker_max_loss_bps must be in [0, 500]; got "
+                              + std::to_string(cfg.circuit_breaker_max_loss_bps));
+        }
+    }
+
+    return cfg;
 {
     const std::string sec = "volatility";
     if (!root[sec] || !root[sec].IsMap()) {
@@ -1059,7 +1215,15 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_drawdown   = " << cfg.risk.max_drawdown_pct * 100.0 << "%\n"
         << "  loss_window    = " << cfg.risk.loss_window_blocks << " blocks\n"
         << "  max_window_loss = " << cfg.risk.max_window_loss_bps << " bps"
-        << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n";
+        << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n"
+        << "  flash_crash    = " << cfg.risk.flash_crash_threshold_pct * 100.0 << "%\n"
+        << "  recovery_ph1   = " << cfg.risk.recovery_stable_blocks_phase1 << " blocks\n"
+        << "  recovery_ph2   = " << cfg.risk.recovery_stable_blocks_phase2 << " blocks\n"
+        << "  recovery_band  = " << cfg.risk.recovery_stability_band_pct * 100.0 << "%\n"
+        << "  circuit_break  = " << (cfg.risk.circuit_breaker_enabled ? "ON" : "off")
+        << " (limit=" << cfg.risk.circuit_breaker_hard_limit_ratio
+        << " age_mult=" << cfg.risk.circuit_breaker_age_multiplier
+        << " max_loss=" << cfg.risk.circuit_breaker_max_loss_bps << "bps)\n";
 
     // Volatility -- no secrets.
     out << "[volatility]\n"
@@ -1121,7 +1285,8 @@ void log_config_summary(const AppConfig& cfg)
 
     // Strategy: new fields.
     out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"
-        << "  reconcile  = " << cfg.strategy.reconciliation_interval_blocks << " blocks\n";
+        << "  reconcile  = " << cfg.strategy.reconciliation_interval_blocks << " blocks\n"
+        << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n";
 
     // Volatility: new fields.
     out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";
@@ -1135,7 +1300,118 @@ void log_config_summary(const AppConfig& cfg)
 
     out << "======================================\n";
 
-    std::cout << out.str();
+    // [T7-05] Use spdlog instead of std::cout to respect log-level filtering,
+    // rotation, and structured output.
+    spdlog::info("{}", out.str());
+}
+
+// ---------------------------------------------------------------------------
+// parse_market_data -- optional `market_data:` section (T4-05).
+//
+// Exposes VPIN, OFI, whale detection, competitor detection params in YAML.
+// ---------------------------------------------------------------------------
+MarketDataSettings parse_market_data(const YAML::Node& root)
+{
+    const std::string sec = "market_data";
+    MarketDataSettings cfg;
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_i64 = [&](const char* key, std::int64_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::int64_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    // Whale detection.
+    read_i64 ("whale_trade_threshold",        cfg.whale_trade_threshold);
+    read_dbl ("whale_volume_fraction",         cfg.whale_volume_fraction);
+    read_u32 ("whale_window_blocks",           cfg.whale_window_blocks);
+    read_dbl ("whale_max_spread_multiplier",   cfg.whale_max_spread_multiplier);
+
+    // VPIN.
+    read_dbl ("vpin_bucket_size",              cfg.vpin_bucket_size);
+    read_u32 ("vpin_window_buckets",           cfg.vpin_window_buckets);
+
+    // OFI.
+    read_u32 ("ofi_window_size",               cfg.ofi_window_size);
+
+    // Competitor detection.
+    read_bool("enable_competitor_tracking",    cfg.enable_competitor_tracking);
+    read_i64 ("min_competitor_offer_size",     cfg.min_competitor_offer_size);
+    read_dbl ("competitor_alert_threshold_bps", cfg.competitor_alert_threshold_bps);
+
+    // Asymmetric spread.
+    read_dbl ("asymmetric_skew_factor",        cfg.asymmetric_skew_factor);
+
+    // CEX freshness.
+    read_dbl ("cex_freshness_threshold_sec",   cfg.cex_freshness_threshold_sec);
+
+    // Validate ranges.
+    if (cfg.whale_volume_fraction < 0.0 || cfg.whale_volume_fraction > 1.0) {
+        throw ConfigError(sec + ".whale_volume_fraction must be in [0, 1]");
+    }
+    if (cfg.whale_max_spread_multiplier < 1.0) {
+        throw ConfigError(sec + ".whale_max_spread_multiplier must be >= 1.0");
+    }
+    if (cfg.vpin_bucket_size <= 0.0) {
+        throw ConfigError(sec + ".vpin_bucket_size must be > 0");
+    }
+    if (cfg.asymmetric_skew_factor < 0.0 || cfg.asymmetric_skew_factor > 1.0) {
+        throw ConfigError(sec + ".asymmetric_skew_factor must be in [0, 1]");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// parse_adverse_selection -- optional `adverse_selection:` section (T4-05).
+// ---------------------------------------------------------------------------
+AdverseSelectionSettings parse_adverse_selection(const YAML::Node& root)
+{
+    const std::string sec = "adverse_selection";
+    AdverseSelectionSettings cfg;
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_dbl ("prior_alpha",        cfg.prior_alpha);
+    read_dbl ("prior_beta",         cfg.prior_beta);
+    read_u32 ("observation_blocks", cfg.observation_blocks);
+    read_dbl ("adverse_threshold",  cfg.adverse_threshold);
+    read_u32 ("max_history",        cfg.max_history);
+    read_dbl ("decay_factor",       cfg.decay_factor);
+
+    if (cfg.prior_alpha <= 0.0 || cfg.prior_beta <= 0.0) {
+        throw ConfigError(sec + ".prior_alpha and .prior_beta must be > 0");
+    }
+
+    return cfg;
 }
 
 } // anonymous namespace
@@ -1176,6 +1452,8 @@ AppConfig load_config(const std::string& path)
     cfg.coingecko  = parse_coingecko(root);
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
+    cfg.market_data = parse_market_data(root);
+    cfg.adverse_selection = parse_adverse_selection(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

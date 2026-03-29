@@ -1,6 +1,28 @@
 # XOPTrader Configuration
 # Copy to config.yaml and fill in your values.
+#
+# Environment variable substitution:
+#   Any string value may contain ${VAR} or ${VAR:-default} references.
+#   ${VAR}           — replaced with the env var's value; error if unset.
+#   ${VAR:-default}  — replaced with the env var's value, or "default" if unset.
+#   This keeps secrets (tokens, fingerprints, API keys) out of plaintext YAML.
+#   Example:  telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
+#
+# --- Required vs Optional Sections -------------------------------------------
+#
+# REQUIRED sections (engine will not start without them):
+#   chia, dexie, pairs, strategy, risk, volatility, monitoring, database
+#
+# OPTIONAL sections (omit entirely to use defaults):
+#   depeg, arbitrage, coingecko, fees, inventory_aging, market_data,
+#   adverse_selection
+#
+# Within required sections, individual fields are marked [REQUIRED] or
+# [OPTIONAL] (with their default value) in comments below.
+# ---------------------------------------------------------------------------
 
+# --- chia: REQUIRED ----------------------------------------------------------
+# All fields in this section are REQUIRED.
 chia:
   # Chia RPC endpoints (local full node + wallet)
   full_node_host: "localhost"
@@ -13,14 +35,19 @@ chia:
   wallet_cert_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.crt"
   wallet_key_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.key"
   # Wallet fingerprint (integer — get yours from `chia keys show`)
+  # Supports env vars: wallet_fingerprint: ${XOP_WALLET_FINGERPRINT}
   wallet_fingerprint: 1234567890
 
+# --- dexie: REQUIRED ---------------------------------------------------------
+# All fields are REQUIRED.
 dexie:
   # Dexie API — rate limit 50 req / 10s
-  api_base: "https://api.dexie.space/v1"
-  max_requests_per_10s: 50
+  api_base: "https://api.dexie.space/v1"         # [REQUIRED]
+  max_requests_per_10s: 50                        # [REQUIRED]
 
-# Trading pairs to market-make
+# --- pairs: REQUIRED (at least one enabled pair) ----------------------------
+# Per-pair: base_asset_id, quote_asset_id, name are REQUIRED.
+# All other fields (enabled, *_override, is_stablecoin, depeg_*) are OPTIONAL.
 pairs:
   - base_asset_id: "xch"          # XCH native
     quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"  # wUSDC.b
@@ -55,65 +82,77 @@ pairs:
     name: "wmilliETH/XCH"
     enabled: true
 
+# --- strategy: REQUIRED ------------------------------------------------------
+# Fields marked [REQUIRED] must be present; others use defaults if omitted.
 strategy:
   # Avellaneda-Stoikov / GLFT parameters
-  gamma: 0.01            # Risk aversion coefficient
-  kappa: 1.5             # Fill intensity decay
-  phi: 0.5               # Inventory skew strength (GLFT)
-  q_max: 1000            # Max inventory in base units
-  min_profit_margin_bps: 35  # Never post ask below cost_basis + this margin
-  offer_ttl_blocks: 60       # Cancel stale offers after N blocks (~52 min)
-  num_tiers: 4               # Multi-tier offer ladder depth
-  tier_spacing_bps: [60, 120, 180, 240]  # Spread per tier (bps from mid) — must be ≤ max_half_spread_bps
-  tier_size_pct: [0.30, 0.25, 0.25, 0.20] # Capital fraction per tier
-  max_half_spread_bps: 250  # Global cap on half-spread (250 = 500bps round-trip = 5%)
-  offer_fee_mojos: 100000000  # On-chain fee per offer/cancel (0.0001 XCH)
+  gamma: 0.01            # [REQUIRED] Risk aversion coefficient
+  kappa: 1.5             # [REQUIRED] Fill intensity decay
+  phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT)
+  q_max: 1000            # [REQUIRED] Max inventory in base units
+  min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
+  offer_ttl_blocks: 60       # [REQUIRED] Cancel stale offers after N blocks (~52 min)
+  num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth
+  tier_spacing_bps: [60, 120, 180, 240]  # [REQUIRED] Spread per tier (bps) — must be ≤ max_half_spread_bps
+  tier_size_pct: [0.30, 0.25, 0.25, 0.20] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
+  max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
+  offer_fee_mojos: 100000000  # [OPTIONAL, default: 100000000] On-chain fee per offer/cancel
   # Startup market analysis: observe this many blocks before trading begins.
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
   startup_analysis_blocks: 0
   # [T4-02] Reorg protection: require N confirmations before accepting a fill.
   # Default 6 blocks (~5 min).  0 = accept fills immediately (no protection).
-  confirmation_depth_blocks: 6
+  confirmation_depth_blocks: 6          # [OPTIONAL, default: 6]
   # [T4-11] Offer state reconciliation: full wallet-vs-state check every N blocks.
   # Default 20 blocks (~17 min).  0 = disabled.
-  reconciliation_interval_blocks: 20
+  reconciliation_interval_blocks: 20     # [OPTIONAL, default: 20]
 
+# --- risk: REQUIRED ----------------------------------------------------------
+# First 5 fields are REQUIRED; circuit breaker fields are OPTIONAL.
 risk:
   # Inventory limits
-  soft_limit_pct: 0.60   # Begin aggressive skewing
-  hard_limit_pct: 0.80   # Pull quotes on overweight side
-  single_cat_cap_pct: 0.12  # Max portfolio % in one CAT
+  soft_limit_pct: 0.60   # [REQUIRED] Begin aggressive skewing
+  hard_limit_pct: 0.80   # [REQUIRED] Pull quotes on overweight side (must > soft_limit_pct)
+  single_cat_cap_pct: 0.12  # [REQUIRED] Max portfolio % in one CAT
   # Position sizing
-  kelly_fraction: 0.5    # Half-Kelly
-  max_capital_per_pair_pct: 0.20
-  # Circuit breakers (all optional -- defaults shown)
-  max_drawdown_pct: 0.10        # Pause when peak-to-trough PnL drop exceeds 10%
-  loss_window_blocks: 1152      # Rolling window for time-window breaker (~10 h)
-  max_window_loss_bps: 500      # Pause if this many bps lost within window; 0 = disabled
+  kelly_fraction: 0.5    # [REQUIRED] Half-Kelly
+  max_capital_per_pair_pct: 0.20  # [REQUIRED]
+  # Circuit breakers (all OPTIONAL -- defaults shown)
+  max_drawdown_pct: 0.10        # [OPTIONAL, default: 0.10]
+  loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
+  max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 
+# --- volatility: REQUIRED ----------------------------------------------------
 volatility:
   # Yang-Zhang hybrid estimator
-  lookback_blocks: 200   # ~2.9 hours
-  yz_alpha: 0.34         # Yang-Zhang optimal weight
+  lookback_blocks: 200   # [REQUIRED] ~2.9 hours
+  yz_alpha: 0.34         # [REQUIRED] Yang-Zhang optimal weight
   # [T5-CR6] Multi-block candle aggregation: aggregate N blocks into one OHLC
   # candle to recover H/L variation when >90% of blocks are degenerate.
   # Default 10 (~8.7 min).  1 = no aggregation (legacy).
-  candle_aggregation_blocks: 10
+  candle_aggregation_blocks: 10  # [OPTIONAL, default: 10]
 
+# --- monitoring: REQUIRED ----------------------------------------------------
+# prometheus_port is REQUIRED; telegram fields are OPTIONAL (pair or omit both).
 monitoring:
   # Prometheus
-  prometheus_port: 9090
-  # Alerts (optional)
+  prometheus_port: 9090             # [REQUIRED]
+  # Alerts (optional — use env vars to keep tokens out of config files)
+  # telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
+  # telegram_chat_id: "${TELEGRAM_CHAT_ID}"
   telegram_bot_token: ""
   telegram_chat_id: ""
 
+# --- database: REQUIRED ------------------------------------------------------
 database:
   # SQLite for Phase 1, PostgreSQL later
-  path: "data/xop_trader.db"
+  path: "data/xop_trader.db"       # [REQUIRED]
 
-# Stablecoin depeg detection — global settings
+# --- depeg: OPTIONAL (omit section to disable depeg monitoring) --------------
+# Stablecoin depeg detection — global settings.
 # Per-pair thresholds are set in each pair's is_stablecoin / depeg_* fields.
+# All fields are OPTIONAL with defaults.
 depeg:
   enabled: true                    # Master switch for depeg monitoring
   default_warn_pct: 2.0            # Default warn threshold (% off peg)
@@ -123,8 +162,10 @@ depeg:
   alert_on_warn: true              # Send Telegram alert on peg warning
   alert_on_bail: true              # Send Telegram alert on bail-out
 
-# Arbitrage detection — triangular, CEX-DEX, cross-DEX, cross-bridge
+# --- arbitrage: OPTIONAL (omit section to use defaults) ----------------------
+# Arbitrage detection — triangular, CEX-DEX, cross-DEX, cross-bridge.
 # All thresholds are in basis points (bps).  1 bps = 0.01%.
+# All fields are OPTIONAL with defaults.
 arbitrage:
   enabled: true                         # Master switch for arb scanning
 
@@ -151,19 +192,9 @@ arbitrage:
   default_confidence: 0.75              # Base confidence when depth unknown
   min_confidence_threshold: 0.40        # Discard opportunities below this
 
+# --- coingecko: OPTIONAL (omit section to disable CEX price reference) -------
 # CoinGecko external price reference — provides CEX-grade mid-prices
-# for assets with CoinGecko listings.  Feeds into the existing 70/30
-# DEX/CEX blending pipeline in MarketDataFeed.
-#
-# Free tier: ~10-30 calls/min, no API key needed.
-# Demo tier: set api_key for guaranteed 30 calls/min.
-#
-# Asset mapping:
-#   XCH          -> "chia"
-#   wmilliETH.b  -> "ethereum" (price / 1000)
-#   wmilliETH    -> "ethereum" (price / 1000)
-#   wUSDC.b      -> "usd-coin" (~1.0)
-#   BYC          -> no CoinGecko listing (DEX-only, skipped)
+# for assets with CoinGecko listings.  All fields are OPTIONAL with defaults.
 coingecko:
   enabled: true
   # base_url: "https://api.coingecko.com/api/v3"   # Default; override for pro tier
@@ -176,14 +207,12 @@ coingecko:
   # rate_limit_max_requests: 10                     # 10 req per 60 s window
   # rate_limit_window_ms: 60000
   # curl_thread_pool_size: 2
+  # api_key: "${COINGECKO_API_KEY:-}"    # Empty = free tier; set env var for Demo plan
   api_key: ""                                       # Empty = free tier; set for Demo plan
 
-# Fee budget tracking and dynamic fee selection (T4-03)
-# Controls two behaviours:
-#   1. Fee-vs-gain gating: skip posting when fee exceeds X% of expected profit.
-#   2. Adaptive fee selection: track mempool state and pay the smallest fee
-#      likely to achieve timely inclusion.
-# When disabled, the static offer_fee_mojos from [strategy] is used unchanged.
+# --- fees: OPTIONAL (omit section to use static offer_fee_mojos) -------------
+# Fee budget tracking and dynamic fee selection (T4-03).
+# All fields are OPTIONAL with defaults.
 fees:
   enabled: true                       # Master switch for fee tracking
   daily_budget_mojos: 10000000000     # Max fees per 24h rolling window (0.01 XCH)
@@ -197,6 +226,8 @@ fees:
 # held underwater for an extended period.  Capital locked in permanently-
 # underwater positions has an opportunity cost; accepting a small controlled
 # loss to free it up can be net-positive.
+# --- inventory_aging: OPTIONAL (omit section to disable aging) ---------------
+# All fields are OPTIONAL with defaults.
 inventory_aging:
   enabled: false                      # Master switch (disabled by default)
   aging_start_blocks: 1000            # Begin relaxation after 1000 blocks (~14.4 h)
@@ -217,3 +248,39 @@ inventory_aging:
 #   kappa_min: 0.1                    # Lower bound on fitted κ
 #   kappa_max: 10.0                   # Upper bound on fitted κ
 #   calibration_interval_blocks: 50   # Run calibration every N blocks (~43 min)
+
+# --- market_data: OPTIONAL (omit section to use defaults) --------------------
+# VPIN, OFI, whale detection, and competitor detection parameters.
+# All fields are OPTIONAL with defaults shown below.
+market_data:
+  # Whale detection
+  whale_trade_threshold: 50000000000000  # 50 XCH in mojos
+  whale_volume_fraction: 0.05            # 5% of 24h volume triggers whale
+  whale_window_blocks: 10                # ~520 s observation window
+  whale_max_spread_multiplier: 3.0       # Max spread widening during whale activity
+
+  # VPIN (Volume-Synchronized Probability of Informed Trading)
+  vpin_bucket_size: 10.0                 # XCH per VPIN volume bucket
+  vpin_window_buckets: 50                # Rolling bucket window
+
+  # OFI (Order Flow Imbalance)
+  ofi_window_size: 20                    # Snapshots retained for OFI
+
+  # Competitor detection
+  enable_competitor_tracking: true
+  min_competitor_offer_size: 1000000000000  # 1 XCH in mojos
+  competitor_alert_threshold_bps: 50.0   # Alert when competitor spread < this
+
+  # Asymmetric spread during whale activity (0.0 = symmetric, 1.0 = fully asymmetric)
+  asymmetric_skew_factor: 0.5
+
+  # CEX data freshness: seconds before CEX weight decays to zero
+  cex_freshness_threshold_sec: 120.0
+
+# --- adverse_selection: OPTIONAL (omit section to use defaults) ---------------\n# Bayesian PIN estimator parameters.  All fields are OPTIONAL.\nadverse_selection:
+  prior_alpha: 2.0                       # Adverse fill pseudo-count (E[PIN] = α/(α+β))
+  prior_beta: 8.0                        # Non-adverse fill pseudo-count
+  observation_blocks: 10                 # Post-fill observation window (~8.7 min)
+  adverse_threshold: 0.003               # 30 bps adverse classification
+  max_history: 500                       # Rolling fill window
+  decay_factor: 0.0                      # Exponential decay in posterior (0 = none)

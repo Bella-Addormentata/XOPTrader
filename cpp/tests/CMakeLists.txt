@@ -46,6 +46,7 @@ endif()
 # ---------------------------------------------------------------------------
 add_executable(xop_tests
     test_avellaneda.cpp
+    test_glft.cpp
     test_spread.cpp
     test_inventory.cpp
     test_volatility.cpp

@@ -320,10 +320,16 @@ void BacktestEngine::build_blocks()
     std::unordered_map<BlockHeight, std::vector<const HistoricalOffer*>>
         offers_by_block;
 
+    // [T7-03] Also pre-index offers_posted by created_block to avoid O(n²).
+    std::unordered_map<BlockHeight, std::size_t> posted_by_block;
+
     for (const auto& offer : raw_offers_) {
         if (offer.was_filled && offer.filled_block >= min_block
                              && offer.filled_block <= max_block) {
             offers_by_block[offer.filled_block].push_back(&offer);
+        }
+        if (offer.created_block >= min_block && offer.created_block <= max_block) {
+            ++posted_by_block[offer.created_block];
         }
     }
 
@@ -430,10 +436,9 @@ void BacktestEngine::build_blocks()
         }
 
         // Count offers posted at this block (not just filled).
-        for (const auto& offer : raw_offers_) {
-            if (offer.created_block == h) {
-                blk.offers_posted++;
-            }
+        // [T7-03] O(1) lookup via pre-indexed map instead of O(n) scan.
+        if (auto pit = posted_by_block.find(h); pit != posted_by_block.end()) {
+            blk.offers_posted = static_cast<decltype(blk.offers_posted)>(pit->second);
         }
 
         // Volatility is assigned later (after all blocks are built) in
@@ -1050,7 +1055,8 @@ OptimizationResult BacktestEngine::walk_forward_optimize(
     const std::vector<ParameterSet>& param_grid,
     double                           train_pct,
     std::uint32_t                    advance_blocks,
-    double                           min_train_sharpe)
+    double                           min_train_sharpe,
+    const StrategyConfig&            base_cfg)
 {
     if (blocks_.empty()) {
         throw std::runtime_error(
@@ -1081,15 +1087,8 @@ OptimizationResult BacktestEngine::walk_forward_optimize(
 
     // -- Slide the window across the data -----------------------------------
 
-    // Use a base StrategyConfig to merge ParameterSet overrides.
-    StrategyConfig base_cfg;
-    base_cfg.gamma                = 0.01;
-    base_cfg.kappa                = 1.5;
-    base_cfg.phi                  = 0.5;
-    base_cfg.q_max                = 1000.0;
-    base_cfg.min_profit_margin_bps = 35.0;
-    base_cfg.offer_ttl_blocks     = 60;
-    base_cfg.num_tiers            = 4;
+    // [T7-04] base_cfg is now passed by the caller instead of hardcoded.
+    // ParameterSet overrides are merged onto it via params_to_config().
 
     std::size_t window_start = 0;
     std::uint32_t total_windows = 0;
@@ -1292,7 +1291,8 @@ OptimizationResult BacktestEngine::walk_forward_optimize(
 std::vector<BacktestResult> BacktestEngine::parameter_sweep(
     const StrategyFactory&           strategy_factory,
     const std::vector<ParameterSet>& param_grid,
-    std::uint32_t                    max_threads)
+    std::uint32_t                    max_threads,
+    const StrategyConfig&            base_cfg)
 {
     if (blocks_.empty()) {
         throw std::runtime_error(
@@ -1307,14 +1307,7 @@ std::vector<BacktestResult> BacktestEngine::parameter_sweep(
     spdlog::info("Parameter sweep: {} combinations, {} threads",
                   param_grid.size(), n_threads);
 
-    StrategyConfig base_cfg;
-    base_cfg.gamma                 = 0.01;
-    base_cfg.kappa                 = 1.5;
-    base_cfg.phi                   = 0.5;
-    base_cfg.q_max                 = 1000.0;
-    base_cfg.min_profit_margin_bps = 35.0;
-    base_cfg.offer_ttl_blocks      = 60;
-    base_cfg.num_tiers             = 4;
+    // [T7-04] base_cfg is now passed by the caller instead of hardcoded.
 
     std::vector<BacktestResult> results(param_grid.size());
 

@@ -135,6 +135,13 @@ struct PortfolioConfig {
     // component is allowed to re-enter fair evaluation.  500 blocks at ~52s
     // each equals approximately 7.2 hours -- long enough for the competitive
     // landscape to shift, short enough to recover within a trading day.
+    //
+    // T5-CR12 (Urquhart & Hudson 2013): This value is calibrated to CHIA's
+    // block cadence (~52s/block), NOT equity-market calendar-day timescales.
+    // The natural unit is blocks (the market's discrete clock).  500 blocks
+    // ≈ 7.2 hours, which is approximately one "trading session" for
+    // 24/7 crypto markets.  Use calibrate_crowding_cooldown() to derive
+    // an optimal value from historical fill-rate data.
     // ISO/IEC 25000: prevents permanent strategy extinction (Lo 2004).
     std::size_t crowding_cooldown_blocks{500};
 
@@ -268,6 +275,27 @@ public:
     // -- Configuration access ---------------------------------------------------
 
     const PortfolioConfig& config() const noexcept { return cfg_; }
+
+    // -- Crowding calibration (T5-CR12) ----------------------------------------
+
+    /// Estimate optimal crowding cooldown (in blocks) from historical
+    /// fill-rate data.
+    ///
+    /// Urquhart & Hudson (2013): AMH crowding recovery should be calibrated
+    /// to the market's own timescales, not borrowed from equity markets.
+    /// CHIA's ~52-second block cadence means recovery dynamics play out on
+    /// the scale of hours, not days.
+    ///
+    /// The estimate is the half-life of fill-rate recovery after a crowding
+    /// event, clamped to [100, 2000] blocks (~1.4h to ~29h).  If no valid
+    /// estimate is possible, returns the default 500 blocks.
+    ///
+    /// @param fills_per_block_before  Average fill rate before crowding.
+    /// @param fills_per_block_after   Average fill rate after crowding (lower).
+    /// @return Recommended crowding_cooldown_blocks.
+    static std::size_t calibrate_crowding_cooldown(
+        double fills_per_block_before,
+        double fills_per_block_after) noexcept;
 
 private:
     // -- Internal state per component ------------------------------------------

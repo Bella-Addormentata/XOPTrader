@@ -114,9 +114,21 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     offer_mgr_ = std::make_unique<execution::OfferManager>(
         ioc_, wallet_, dexie_, state_, config_);
 
-    // Market data feed: construct with a MarketDataConfig derived from
-    // the top-level config (default thresholds are appropriate for Phase 1).
+    // Market data feed: construct with a MarketDataConfig populated from
+    // the YAML `market_data:` section (T4-05).
     MarketDataConfig md_cfg;
+    md_cfg.whale_trade_threshold        = config_.market_data.whale_trade_threshold;
+    md_cfg.whale_volume_fraction        = config_.market_data.whale_volume_fraction;
+    md_cfg.whale_window_blocks          = config_.market_data.whale_window_blocks;
+    md_cfg.whale_max_spread_multiplier  = config_.market_data.whale_max_spread_multiplier;
+    md_cfg.vpin_bucket_size             = config_.market_data.vpin_bucket_size;
+    md_cfg.vpin_window_buckets          = config_.market_data.vpin_window_buckets;
+    md_cfg.ofi_window_size              = config_.market_data.ofi_window_size;
+    md_cfg.enable_competitor_tracking   = config_.market_data.enable_competitor_tracking;
+    md_cfg.min_competitor_offer_size    = config_.market_data.min_competitor_offer_size;
+    md_cfg.competitor_alert_threshold_bps = config_.market_data.competitor_alert_threshold_bps;
+    md_cfg.asymmetric_skew_factor       = config_.market_data.asymmetric_skew_factor;
+    md_cfg.cex_freshness_threshold_sec  = config_.market_data.cex_freshness_threshold_sec;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -127,7 +139,13 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     // [T5-CR6] Pass candle aggregation window from user config.
     vol_cfg.candle_aggregation_blocks = config_.volatility.candle_aggregation_blocks;
 
-    AdverseSelectionConfig as_cfg;  // defaults are suitable for Phase 1
+    AdverseSelectionConfig as_cfg;
+    as_cfg.prior_alpha        = config_.adverse_selection.prior_alpha;
+    as_cfg.prior_beta         = config_.adverse_selection.prior_beta;
+    as_cfg.observation_blocks = config_.adverse_selection.observation_blocks;
+    as_cfg.adverse_threshold  = config_.adverse_selection.adverse_threshold;
+    as_cfg.max_history        = config_.adverse_selection.max_history;
+    as_cfg.decay_factor       = config_.adverse_selection.decay_factor;
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
@@ -891,18 +909,23 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             }
 
             // Check crash signal for this pair.
-            if (PreTradeCheck::check_flash_crash(price_vec, 0.20)) {
+            if (PreTradeCheck::check_flash_crash(price_vec,
+                    config_.risk.flash_crash_threshold_pct)) {
                 any_pair_crashing = true;
                 if (crash_pair_name.empty()) crash_pair_name = pair.name;
             }
 
             // Check stability signals for this pair.
             if (!PreTradeCheck::is_stable_after_crash(
-                    price_vec, /*required_stable_blocks=*/50, 0.05)) {
+                    price_vec,
+                    static_cast<int>(config_.risk.recovery_stable_blocks_phase1),
+                    config_.risk.recovery_stability_band_pct)) {
                 all_pairs_stable_50 = false;
             }
             if (!PreTradeCheck::is_stable_after_crash(
-                    price_vec, /*required_stable_blocks=*/100, 0.05)) {
+                    price_vec,
+                    static_cast<int>(config_.risk.recovery_stable_blocks_phase2),
+                    config_.risk.recovery_stability_band_pct)) {
                 all_pairs_stable_100 = false;
             }
             // [MEDIUM-5] No break -- continue checking all enabled pairs.
@@ -1270,9 +1293,23 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     }
 
     // Process only confirmed fills.
+    // T4-13: All fill accounting (DB, inventory, PnL, analytics) is
+    // consolidated in this single loop.  Each fill is processed atomically:
+    // if any sub-step fails, the fill is logged and skipped to prevent
+    // partial state corruption.  The processing order is:
+    //   1. Build trade record (DB row + cost basis + PnL)
+    //   2. VPIN validation (adverse fill classification)
+    //   3. Persist to DB (insert_trade + update_offer_status)
+    //   4. Update inventory tracker (record_buy / record_sell)
+    //   5. Accumulate NHE (hedging efficiency) data
+    //   6. Feed PnL tracker
+    //   7. Notify strategy (tau reset)
+    //   8. Feed market data (whale detector, VPIN)
+    //   9. Feed kappa calibrator
     auto& fills = confirmed_fills;
 
     for (const auto& fill : fills) {
+      try {
         // Persist the fill to the audit trail.
         DbTradeRecord tr;
         // Convert the fill's wall-clock timestamp to ISO-8601 for the DB record.
@@ -1466,6 +1503,18 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 kappa_calibrator_->record_fill(half_spread_bps);
             }
         }
+      } catch (const std::exception& ex) {
+        // T4-13: If any sub-step fails for this fill, log the error and
+        // continue to the next fill.  This prevents a transient failure
+        // (e.g., DB write error) from corrupting state by leaving some
+        // subsystems updated and others not for the same fill.
+        spdlog::error("[Engine] Step 2: fill processing failed for {} "
+                      "(block {}): {}",
+                      fill.pair_name, fill.block_height, ex.what());
+        alerts_->send_alert(AlertRule::ExposureBreach,
+            "Fill processing error for " + fill.pair_name + " at block " +
+            std::to_string(fill.block_height) + ": " + ex.what());
+      }
     }
 
     // -- Feed inventory ratio to drift analyzer ----------------------------
@@ -1750,6 +1799,24 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             mid, sigma, q, q_max, pin,
             Venue::Dexie, best_competing_bps,
             hour_utc, day_of_week);
+
+        // [T7-11] Defensive spread widening during regime detector warm-up.
+        // When the regime detector has not yet accumulated min_window_size
+        // observations, it defaults to Normal regime with unit multipliers.
+        // If the bot starts during a momentum period, this exposes us to
+        // adverse selection at normal-width spreads.  Apply a defensive 1.3x
+        // multiplier until the detector is ready.
+        {
+            auto warmup_it = strategies_.find(pair_name);
+            if (warmup_it != strategies_.end() &&
+                !warmup_it->second->is_regime_ready()) {
+                constexpr double kWarmupDefensiveMultiplier = 1.3;
+                pcs.spread_result.total_spread_bps *= kWarmupDefensiveMultiplier;
+                spdlog::debug("[Engine] Step 5: {} regime warm-up defense "
+                              "— spread widened by {:.1f}x",
+                              pair_name, kWarmupDefensiveMultiplier);
+            }
+        }
 
         // ---------------------------------------------------------------
         // Apply whale / VPIN / OFI post-multipliers to the base spread.
@@ -2125,6 +2192,139 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                     spdlog::debug("[step6] {} Loss manager: hold (inv_ratio="
                         "{:.2f}, rationale='{}')",
                         pair_name, inv_ratio, decision.rationale);
+                }
+            }
+        }
+
+        // -- [T7-09] Circuit-breaker rebalance for aged inventory ----------
+        // When the base loss_manager is disabled (default), this automatic
+        // circuit breaker can still engage it for a single pair when ALL of:
+        //   1. circuit_breaker_enabled == true
+        //   2. inventory_ratio > circuit_breaker_hard_limit_ratio
+        //   3. DriftAnalyzer recommends ManualRebalance or PullOverweight
+        //   4. position_age > aging_start_blocks * circuit_breaker_age_multiplier
+        // One rebalance per pair per heartbeat; capped at max_loss_bps.
+        if (config_.risk.circuit_breaker_enabled
+            && loss_manager_ && drift_analyzer_
+            && !(loss_manager_->config().enabled))  // Skip if base loss_mgr already handled it
+        {
+            Mojo mid_mojos_cb = static_cast<Mojo>(std::llround(
+                mid * static_cast<double>(kMojosPerXch)));
+            double inv_ratio_cb = std::abs(inventory_->inventory_ratio(
+                AssetId{pair_cfg->base_asset_id},
+                AssetId{pair_cfg->quote_asset_id},
+                mid_mojos_cb));
+
+            if (inv_ratio_cb > config_.risk.circuit_breaker_hard_limit_ratio) {
+                // Check position age against threshold.
+                int pos_age_cb = inventory_->position_age_blocks(
+                    AssetId{pair_cfg->base_asset_id}, block_height);
+                const uint32_t age_threshold = static_cast<uint32_t>(
+                    config_.inventory_aging.aging_start_blocks
+                    * config_.risk.circuit_breaker_age_multiplier);
+
+                if (pos_age_cb > 0
+                    && static_cast<uint32_t>(pos_age_cb) > age_threshold)
+                {
+                    // Consult drift analyzer for rebalance recommendation.
+                    double sigma_cb = 0.0;
+                    {
+                        auto vol_cb_it = vol_estimators_.find(pair_name);
+                        if (vol_cb_it != vol_estimators_.end()
+                            && vol_cb_it->second->is_ready()) {
+                            sigma_cb = vol_cb_it->second->get_sigma_annual();
+                        }
+                    }
+
+                    // Map regime to MarketCondition.
+                    MarketCondition mc_cb = MarketCondition::RandomWalk;
+                    {
+                        auto strat_cb_it = strategies_.find(pair_name);
+                        if (strat_cb_it != strategies_.end()
+                            && strat_cb_it->second) {
+                            auto reg = strat_cb_it->second->current_regime().regime;
+                            if (reg == MarketRegime::Momentum)
+                                mc_cb = MarketCondition::TrendingUp;
+                            else if (reg == MarketRegime::MeanReverting)
+                                mc_cb = MarketCondition::MeanReverting;
+                        }
+                    }
+
+                    auto drift_report = drift_analyzer_->analyze_drift(
+                        inv_ratio_cb, sigma_cb, mc_cb);
+
+                    if (drift_report.recommended_action >= RecommendedAction::PullOverweight)
+                    {
+                        // Build a temporary LossManagerConfig with the CB cap.
+                        LossManagerConfig cb_cfg;
+                        cb_cfg.enabled = true;
+                        cb_cfg.max_acceptable_loss_bps =
+                            config_.risk.circuit_breaker_max_loss_bps;
+                        cb_cfg.min_spread_recovery_blocks = 200.0;
+                        cb_cfg.target_inventory_ratio = 0.50;
+
+                        StrategicLossManager cb_loss_mgr(cb_cfg);
+
+                        std::unordered_map<AssetId, Mojo> price_map_cb;
+                        price_map_cb[pair_cfg->base_asset_id] = mid_mojos_cb;
+
+                        MarketParams mkt_cb{};
+                        {
+                            auto vol_cb_it2 = vol_estimators_.find(pair_name);
+                            mkt_cb.sigma = (vol_cb_it2 != vol_estimators_.end()
+                                            && vol_cb_it2->second->is_ready())
+                                ? vol_cb_it2->second->get_sigma_block()
+                                : 0.0;
+                        }
+                        mkt_cb.fill_rate_per_block = db_
+                            ? std::max(0.005, db_->fill_rate_since_block(
+                                  block_height > 4608 ? block_height - 4608 : 0,
+                                  0.03) / 4608.0)
+                            : 0.03;
+                        mkt_cb.spread_bps =
+                            pcs.spread_result.total_spread_bps / 2.0;
+                        mkt_cb.vpin = market_data_->get_vpin(pair_name);
+                        {
+                            auto s_cb_it = strategies_.find(pair_name);
+                            mkt_cb.variance_ratio =
+                                (s_cb_it != strategies_.end() && s_cb_it->second)
+                                ? s_cb_it->second->current_regime().variance_ratio
+                                : 1.0;
+                        }
+                        mkt_cb.current_block = block_height;
+
+                        auto cb_decision = cb_loss_mgr.should_rebalance_at_loss(
+                            AssetId{pair_cfg->base_asset_id},
+                            mid_mojos_cb,
+                            cb_cfg.target_inventory_ratio,
+                            *inventory_,
+                            price_map_cb,
+                            mkt_cb);
+
+                        if (cb_decision.should_take_loss
+                            && cb_decision.loss_bps <=
+                               config_.risk.circuit_breaker_max_loss_bps)
+                        {
+                            spdlog::warn("[step6] {} CIRCUIT-BREAKER rebalance: "
+                                "inv_ratio={:.2f} age={} drift_action={} "
+                                "loss={:.1f}bps breakeven={:.0f}blk "
+                                "rationale='{}'",
+                                pair_name, inv_ratio_cb, pos_age_cb,
+                                to_string(drift_report.recommended_action),
+                                cb_decision.loss_bps,
+                                cb_decision.blocks_to_breakeven,
+                                cb_decision.rationale);
+
+                            quote = pre_trade_->enforce_no_loss(
+                                quote, rec.weighted_avg_cost_basis,
+                                /*enable=*/false);
+                        } else {
+                            spdlog::info("[step6] {} circuit-breaker: hold "
+                                "(loss={:.1f}bps > cap={:.0f}bps or EV negative)",
+                                pair_name, cb_decision.loss_bps,
+                                config_.risk.circuit_breaker_max_loss_bps);
+                        }
+                    }
                 }
             }
         }

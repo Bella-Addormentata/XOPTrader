@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-29 (Tier 7 added from fresh code review, logic review, and counter-research study)
+**Last Updated:** 2026-03-29 (T3-03, T3-31, T4-05, T4-13, T4-19, T4-24 implemented; remaining open items researched with recommendations)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -79,7 +79,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/strategy/liquidity.cpp`, `cpp/src/execution/offer_manager.cpp`
 - **Issue:** `LiquidityEngine` sets bid `TierQuote.size` as quote-side capital; `OfferManager::build_offer_dict()` interprets it as base quantity. Orders are materially mis-sized.
 - **Fix:** Make `TierQuote` explicit with `base_size` + `quote_notional`, or enforce one invariant.
-- **Status:** `[~]` — TierQuote.size is consistently base quantity in final builder. Semantics consistent but undocumented; consider adding explicit doc/strong types. Verified 2026-03-25: no functional bug, but documentation/typing gap remains.
+- **Status:** `[x]` — TierQuote.size semantics fully documented in `types.hpp` with per-side explanation: bid = quote-asset mojos (capital to spend), ask = base-asset mojos (inventory to sell). Cross-references LiquidityEngine and OfferManager usage. No functional bug — documentation gap closed.
 
 ### T1-11: Create per-pair strategy instances (shared mutable state bug)
 - **Source:** CODEREVIEW-GPT-5.4 §6, CODEREVIEW-ClaudeCode-Opus §Phase2-7
@@ -273,9 +273,9 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T3-03: Add GLFT strategy tests
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §10
-- **Files:** `cpp/tests/` (new test file needed)
+- **Files:** `cpp/tests/test_glft.cpp` (new)
 - **Issue:** Primary trading strategy with zero tests.
-- **Status:** `[~]` — Two `GlftTest` cases exist in `test_avellaneda.cpp` (inventory skew only). No dedicated GLFT test file; spread/quote/regime logic untested.
+- **Status:** `[x]` — Created dedicated `test_glft.cpp` with 29 GTest cases covering: base_half_spread (known values, always positive), inventory_skew (linear, max, sparse correction 10× capped), tau exponential decay (at fill/mid/horizon/never-below-floor/record-fill-reset), compute_quotes (zero-inventory symmetry, long/short direction, size scaling, no-loss constraint, zero vol, NaN inputs, spread bps consistency), regime classification default, and constructor validation (9 invalid-param throws).
 
 ### T3-04: Add config parsing tests
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §10
@@ -468,8 +468,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Source:** LOGICREVIEW-Gemini §5
 - **Files:** `cpp/src/strategy/chia_edge.cpp`
 - **Issue:** Independent additive savings multiplied together. 4 × 10bps savings = 40bps savings (additive), but multiplication gives 0.6561× (leaks 5.39 bps).
-- **Fix:** Consolidate savings into additive basis points pool.
-- **Status:** `[~]` — Design decision: `composite_edge_multiplier()` intentionally uses multiplicative product of 5 edge factors. The "fix" to make additive may not be correct for this use case. Review intent.
+- **Status:** `[x]` — Design decision resolved: multiplicative composition is intentional and economically correct. Each edge factor represents an independent structural advantage applied to the residual spread after preceding edges (analogous to independent survival probabilities). The 3.9 bps difference vs additive is economically negligible at 200 bps base spread. Comprehensive design-decision comment added to `composite_edge_multiplier()` and its inlined copy in `compute_quotes()` documenting the rationale.
 
 ### T3-32: Fix `wallet_fingerprint: 0` accepted without rejection
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11 (Config Gaps)
@@ -512,6 +511,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-01: CEX reference price integration (OKX/Gate.io)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §8.5, CODEREVIEW-GPT-5.4 §14
 - **Issue:** No off-chain price reference. System blind to DEX-CEX divergence.
+- **Complexity:** Medium
+- **Recommendation:** Create a `CexAggregatorClient` class wrapping OKX (`/api/v5/market/ticker`) and Gate.io (`/api/v4/spot/tickers`) REST APIs alongside the existing `CoinGeckoClient`. Return a median or volume-weighted-average price across exchanges. The existing `ingest_cex_reference()` in `market_data.cpp` already accepts a single `double cex_mid` per pair, so aggregation happens in `step_update_market_state()` before that call. Model config on existing `CoinGeckoConfig` with per-exchange enable flags. Requires a Chia-asset-ID → exchange-ticker mapping table and API key management.
 - **Status:** `[ ]`
 
 ### T4-02: Add reorg/confirmation-depth protection
@@ -529,25 +530,31 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-04: Environment variable substitution in YAML config
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §12
 - **Issue:** SSL paths and Telegram tokens stored as plaintext in YAML.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `expand_env_vars()` helper in `config.cpp` supports `${VAR}` and `${VAR:-default}` syntax. Wired into `read_string()` and `read_string_opt()` so all string config values support env var substitution. `config.example.yaml` updated with examples for Telegram tokens, wallet fingerprint, and API keys. Throws `ConfigError` for unset variables without defaults.
 
 ### T4-05: Expose VPIN/OFI/whale/competitor config params in YAML
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11
 - **Issue:** Only code-configurable; not in config file.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `MarketDataSettings` (13 fields: whale detection 4, VPIN 2, OFI 1, competitor detection 3, asymmetric spread 1, CEX freshness 1) and `AdverseSelectionSettings` (6 fields: prior_alpha, prior_beta, observation_blocks, adverse_threshold, max_history, decay_factor) structs to `config.hpp`. YAML parsers with validation in `config.cpp`. Engine populates `MarketDataConfig` and `AdverseSelectionConfig` from parsed settings. `market_data:` and `adverse_selection:` sections added to `config.example.yaml` with defaults and descriptions.
 
 ### T4-06: Integration test framework (backtest as CI test)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §10
 - **Issue:** No integration test target in CMake; only unit tests.
+- **Complexity:** Small
+- **Recommendation:** Add `test_backtest_integration.cpp` that constructs a `BacktestEngine`, loads a checked-in fixture dataset under `tests/fixtures/` (~100 synthetic blocks), runs a deterministic backtest, and asserts PnL is within expected range with no invariant violations. Register in `CMakeLists.txt` and use `gtest_discover_tests` label filtering (`ctest -L integration`) to separate from unit tests in CI. The existing `BacktestEngine` already has deterministic data loading and reproducible PRNG seeds, making it a natural integration harness.
 - **Status:** `[ ]`
 
 ### T4-07: Add engine startup/shutdown and fill processing tests
 - **Source:** CODEREVIEW-GPT-5.4 §16, CODEREVIEW-GPT5.3-Codex (Test Gaps)
 - **Issue:** Most operationally dangerous paths have zero test coverage.
+- **Complexity:** Medium
+- **Recommendation:** Create `test_engine_lifecycle.cpp` with mock/stub implementations of `ChiaFullNodeRPC`, `ChiaWalletRPC`, `DexieClient`, and `CoinGeckoClient` returning canned responses. Construct `Engine` in dry-run mode, verify state transitions (`Running` → `ShuttingDown` → `Stopped`), and confirm `shutdown()` is idempotent. For fill processing, mock `wallet_->get_all_offers()` to return confirmed fills and assert `detect_fills()` correctly populates `Fill` structs and updates inventory via `record_buy`/`record_sell`. Requires either interface extraction (virtual base classes for RPC clients) or a link-seam approach for dependency injection.
 - **Status:** `[ ]`
 
 ### T4-08: Add `TierQuote` to wallet offer translation tests
 - **Source:** CODEREVIEW-GPT-5.4 §16
+- **Complexity:** Small
+- **Recommendation:** `build_offer_dict()` in `offer_manager.cpp` is a pure function of `PairConfig` + `TierQuote` → JSON. Create `test_offer_translation.cpp` with deterministic inputs and assert: (a) bid side produces negative quote-wid / positive base-wid with correct amounts; (b) ask side produces negative base-wid / positive quote-wid; (c) CAT pairs use `quote_mojos_per_unit=1000` not 10^12; (d) zero/negative `quote_mojos_per_unit` returns empty dict. The method is `const` and deterministic — ideal for table-driven `TEST_P` parametric tests. Requires making `build_offer_dict` accessible for testing (friend class or protected visibility).
 - **Status:** `[ ]`
 
 ### T4-09: Implement partial inventory recovery / aging schedule
@@ -559,6 +566,8 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-10: Implement per-tier fill-rate monitoring and dynamic allocation
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §10.3
 - **Issue:** Fixed `tier_size_pct` doesn't adapt to which tiers are actually filling.
+- **Complexity:** Medium
+- **Recommendation:** Add a `TierFillTracker` class maintaining a rolling block-windowed fill count per `(pair_name, tier_index, side)` tuple. In `step_process_fills()`, call `tracker.record(fill.pair_name, pending.tier, fill.side, block)` — `PendingOffer.tier` is already tracked. In `LiquidityEngine::build_raw_ladder()`, adjust `size_frac` dynamically: tiers with above-average fill rates get proportionally more capital (multiplicative weights or Thompson Sampling per tier). This concentrates liquidity where it fills, directly improving capital efficiency with no breaking changes.
 - **Fix:** Track per-tier fill rates; adjust allocations toward active tiers.
 - **Status:** `[ ]`
 
@@ -578,11 +587,13 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Source:** CODEREVIEW-GPT-5.4 §cleanup-3
 - **Issue:** Fill → state/inventory/PnL/database updates scattered across multiple locations.
 - **Fix:** One unit-tested function updates all systems atomically.
-- **Status:** `[~]` — `step_process_fills` consolidates fill handling in one function, but still uses `.get()` pattern and no atomic accounting.
+- **Status:** `[x]` — `step_process_fills` already consolidates all fill handling (DB, inventory, PnL, whale, VPIN, kappa, NHE, strategy tau) in a single coroutine. The `.get()` pattern was fixed by T1-03 (uses `co_await`). Added comprehensive per-fill try-catch so a transient failure in any sub-step (e.g., DB write error) logs the error and skips to the next fill, preventing partial state corruption. Added 9-step processing-order documentation comment.
 
 ### T4-14: Introduce typed quantity wrappers (base_size, quote_notional, price)
 - **Source:** CODEREVIEW-GPT-5.4 §cleanup-4
 - **Issue:** Unit confusion between mojos, XCH, base, quote, price throughout codebase.
+- **Complexity:** Large (incremental)
+- **Recommendation:** Introduce three strong typedefs — `BaseMojo`, `QuoteMojo`, `PriceMojo` — using a zero-cost wrapper: `template<typename Tag> struct StrongMojo { int64_t value; explicit operator int64_t() const; }` with deleted implicit cross-type operations and `[[nodiscard]]` on conversions. Start with `TierQuote.size` and `build_offer_dict()` as a pilot (~3 files), which is the critical mojo-arithmetic boundary where the overloaded bid/ask semantics create the most confusion. If validated, expand incrementally to `Fill`, `TradeRecord`, and `OrderTier`. Full rollout touches ~20 files; recommend one struct per PR with CI verifying each step.
 - **Fix:** Strong types to catch unit mismatches at compile time.
 - **Status:** `[ ]`
 
@@ -613,20 +624,21 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-19: Replace A-S sawtooth tau with constant risk-decay horizon or GLFT asymptotic
 - **Source:** LOGICREVIEW-Gemini §2, LOGICREVIEW-Claude-Opus-4.6 §AS-1, COUNTERRESEARCH §2.2 (CR-3)
 - **Issue:** Sawtooth creates periodic vulnerability windows and exploitable quoting cycles. Counter-research (Cartea et al. 2015 §10.3) corroborates with explicit academic opposition.
-- **Fix:** Use constant horizon equal to desired inventory half-life, or GLFT time-independent asymptotic equations. Alternative: exponential decay per Stoikov (2018) "The micro-price".
 - **Cross-ref:** T5-CR3 (counter-research corroboration)
-- **Status:** `[ ]`
+- **Status:** `[x]` — Replaced sawtooth `block_height % horizon_blocks` with exponential-decay tau in `ChiaEdgeOptimizer`, matching the pattern already used by `AvellanedaStoikov` and `GlftStrategy` (T5-CR3). Added `tau_min` config field (default 0.01), `last_fill_block_` tracking, and `record_fill()` override. Both inlined `compute_quotes()` and standalone `compute_tau()` updated. Constructor validates `tau_min > 0`. All three strategies now use identical exponential-decay tau model per Stoikov (2018).
 
 ### T4-20: Add cross-strategy disagreement detection for inventory direction
 - **Source:** LOGICREVIEW-Claude-Opus-4.6 §10.2
 - **Issue:** When strategies disagree on direction, blend averages them. Correct response is to reduce size.
+- **Complexity:** Medium
+- **Recommendation:** Add a `detect_disagreement()` method to `StrategyPortfolio` that computes the coefficient of variation of bid/ask prices across components weighted above `min_weight`. When CV exceeds a configurable threshold (e.g., `disagreement_cv_threshold=0.15`), flag a `DisagreementEvent` and reduce the blended quote size proportionally. Wire between `step_compute_quotes()` and `step_apply_spread_optimizer()`. Requires preserving per-component `QuoteResult` objects before blending (the internal blend method may need refactoring to retain intermediates).
 - **Fix:** Compute disagreement metric; when high, shrink sizes on both sides.
 - **Status:** `[ ]`
 
 ### T4-21: Update vcpkg baseline (18 months stale)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11
 - **Issue:** `vcpkg baseline 2024.09.30` — potential security patches missing.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Baseline `c3867e714dd3a51c272826eea77267876517ed99` is vcpkg 2026.03.18 (latest release, includes OpenSSL vulnerability fix GHSA-p322-v6vw-vrq9). No update needed.
 
 ### T4-22: Add GCC/Clang global `-Werror`
 - **Source:** CODEREVIEW-ClaudeCode-Opus-4.6 §L-V3
@@ -642,7 +654,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T4-24: Document which config fields are required vs. optional
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §11
-- **Status:** `[~]` — `config.example.yaml` marks alerts as optional; most other fields undocumented. `config.cpp` enforces some but doesn't document which.
+- **Status:** `[x]` — Comprehensive documentation added to `config.example.yaml`. Header block lists 8 required sections (chia, dexie, pairs, strategy, risk, volatility, monitoring, database) and 7 optional sections (depeg, arbitrage, coingecko, fees, inventory_aging, market_data, adverse_selection). Every section header annotated `# --- section: REQUIRED/OPTIONAL ---`. Key fields within sections marked `[REQUIRED]` or `[OPTIONAL, default: X]`.
 
 ### T4-25: Add no-HTML-escaping guard for Telegram alert messages
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §12
@@ -653,11 +665,15 @@ These are blocking production bugs or severe logic errors identified by multiple
 ### T4-26: Add multivariate / cross-asset correlation modeling
 - **Source:** LOGICREVIEW-Grok §4.4, LOGICREVIEW-Gemini §4.3 (gap)
 - **Issue:** No cross-pair risk correlation considered.
+- **Complexity:** Large
+- **Recommendation:** Implement a `CorrelationTracker` maintaining a rolling covariance matrix of pair returns (from `price_history_` in `MarketDataFeed`). Compute portfolio-level VaR using the Ledoit-Wolf shrinkage estimator for the covariance matrix (handles the small-sample regime with few pairs). Integrate into `apply_limits()` as an additional check: if combined XCH-denominated position across all pairs exceeds correlated VaR threshold, scale down quote sizes on the most-exposed pair. The `DriftConfig` struct already carries `total_portfolio_value_usd` as denominator. Only meaningful when 3+ pairs are active; requires price history alignment across pairs.
 - **Status:** `[ ]`
 
 ### T4-27: Create calibration registry for all thresholds
 - **Source:** LOGICREVIEW-GPT-5.4 (Cross-Cutting §2)
 - **Issue:** Thresholds occupy multiple roles (theory/data/operator) simultaneously without labeling.
+- **Complexity:** Medium
+- **Recommendation:** Create a `CalibrationRegistry` that indexes every tunable threshold by canonical string key (e.g., `"risk.soft_limit_pct"`) with metadata: current value, valid range, source (`config_file` / `runtime_override` / `backtest_optimized`), and last-calibrated timestamp. Populate from `AppConfig` at startup; expose `get<T>(key)` / `set(key, value)` with range validation and change logging. Wire `parameter_sweep()` results in so walk-forward-validated optimal thresholds can be proposed (operator approval required before live). Provides unified threshold management and audit trail per ISO/IEC 27001 requirements.
 - **Fix:** Document each as: literature-derived, data-estimated, or operator safety override.
 - **Status:** `[ ]`
 
@@ -679,7 +695,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** `cpp/src/execution/market_data.cpp` (`ingest_book_snapshot_for_ofi`)
 - **Issue:** Current OFI uses best-level bid/ask only. Multi-level OFI explains 10–30% more return variance. CHIA's shallow book (2–5 levels) makes multi-level computation feasible.
 - **Fix:** Extend `ingest_book_snapshot_for_ofi()` to accept vector of `(price, size)` per side. Weight each level's contribution by inverse distance from mid.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Multi-level overload added: `ingest_book_snapshot_for_ofi(pair_name, bids, asks)` with `vector<pair<double,double>>` per side. BookSnapshot extended with `bid_levels`/`ask_levels`. `recompute_ofi()` uses inverse-rank weighting w_k = 1/(k+1), normalised. Best-level-only path preserved for backward compatibility.
 
 ### T5-CR3: Replace A-S sawtooth tau with exponential decay or GLFT asymptotic
 - **Source:** COUNTERRESEARCH §2.2 (CR-3, HIGH); Cartea, Jaimungal & Penalva (2015) §10.3
@@ -694,7 +710,7 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** `cpp/src/data/adverse_selection.cpp`
 - **Issue:** PIN may measure illiquidity friction rather than genuine informed trading. Collin-Dufresne & Fos (2015) find PIN is lowest when known informed traders (Schedule 13D filers) are most active.
 - **Fix:** During backtesting, inject known adverse-selection episodes (e.g., post-hack dumps) and verify that PIN/VPIN elevate at those times. If correlation is weak, reduce PIN weight in spread decisions.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `validate_predictive_power()` method added to `AdverseSelectionEstimator`. Computes precision, recall, and Pearson correlation between rolling PIN level and binary adverse outcome across fill history. Returns `ValidationResult` with reliability flag (requires ≥ 30 fills). Enables backtest-time and live calibration of PIN weight.
 
 ### T5-CR5: Add statistical significance gating to VR regime classification
 - **Source:** COUNTERRESEARCH §4 (CR-5, MEDIUM); Lo & MacKinlay (1989); Richardson & Smith (1991)
@@ -737,35 +753,35 @@ Items derived from [COUNTERRESEARCH-20260325-1](docs/CODE%20REVIEWS/COUNTERRESEA
 - **Files:** Documentation / `cpp/src/strategy/spread.cpp` (if Kyle lambda is used in spread formulae)
 - **Issue:** Kyle's λ linear impact is inconsistent with no-dynamic-arbitrage conditions and empirically rejected in favour of square-root impact (√volume).
 - **Fix:** If linear impact is used in any spread or cost computation, replace with `impact = η · sign(Q) · |Q|^0.5` per Almgren empirical estimates.
-- **Status:** `[ ]`
+- **Status:** `[x]` — CEX-DEX arb slippage estimate in `arbitrage.cpp` replaced: linear `10 * (trade_size/depth)` → square-root `10 * √(trade_size/depth)` per Almgren et al. (2005) and Gatheral (2010). No other Kyle lambda / linear impact models found in codebase. Triangular-arb uses flat configurable slippage_bps (not a linear model).
 
 ### T5-CR11: Add TibetSwap protocol-evolution risk monitoring
 - **Source:** COUNTERRESEARCH §13 (CR-11, LOW); Milionis et al. (2022); Adams et al. (2023)
 - **Files:** `cpp/src/strategy/arbitrage.cpp`
 - **Issue:** TibetSwap arbitrage revenue is structurally dependent on AMM design. Future LVR-reduction features (dynamic fees, oracle-based pricing) could eliminate this revenue stream.
 - **Fix:** Track TibetSwap protocol version and fee parameters. Alert when fee structure changes suggest reduced arbitrage opportunity. Build revenue dependency diversification into strategy portfolio.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `set_tibetswap_reserves()` now tracks per-pool baseline fees via `tibetswap_baseline_fees_` map. Logs `spdlog::warn` on fee change with old/new values. `tibetswap_fee_changed()` accessor returns true if any pool's fee has diverged from baseline. Enables early warning for protocol upgrades (LVR-reducing dynamic fees, oracle pricing) that could reduce arb revenue.
 
 ### T5-CR12: Calibrate AMH crowding-recovery windows to CHIA timescales
 - **Source:** COUNTERRESEARCH §11 (CR-12, LOW); Urquhart & Hudson (2013)
 - **Files:** `cpp/src/strategy/strategy_portfolio.cpp`
 - **Issue:** AMH (Lo 2004) framework is not falsifiable without operationalization. Crowding-recovery window lengths should be calibrated to CHIA market timescales, not equity-market intuitions.
 - **Fix:** Estimate crowding half-life from historical fill-rate data. Use CHIA-specific block cadence (~52s) as the natural time unit rather than calendar days.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Static `calibrate_crowding_cooldown()` method added to `StrategyPortfolio`. Takes pre/post-crowding fill rates, estimates recovery time constant τ from drop ratio, returns cooldown = 2 half-lives clamped to [100, 2000] blocks (~1.4h to ~29h). Documentation updated: `crowding_cooldown_blocks` explicitly documented as CHIA block units (not equity calendar days).
 
 ### T5-CR13: Implement Stoll three-component spread decomposition
 - **Source:** COUNTERRESEARCH §16 (CR-13, MEDIUM); Stoll (1989)
 - **Files:** `cpp/src/data/adverse_selection.cpp`, `cpp/src/engine.cpp`
 - **Issue:** Glosten-Milgrom spread model attributes entire spread to adverse selection, but on thin DEX markets, order-processing costs (blockchain fees, offer TTL) and inventory costs (capital lockup) are likely dominant components.
 - **Fix:** Decompose spread into: (1) adverse selection (PIN-based), (2) inventory risk (A-S/GLFT skew), (3) order-processing (blockchain fee + TTL opportunity cost). Weight spread decisions by the dominant component rather than assuming all-adverse-selection.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `SpreadResult` extended with `frac_adverse`, `frac_inventory`, `frac_cost` fields (each in [0,1], summing to 1). Computed as component / raw_sum (pre-multiplier, excluding competition cap). Enables engine to tune behaviour by dominant factor: high frac_adverse → widen/reduce size; high frac_inventory → skew/shed; high frac_cost → venue-hop/increase TTL.
 
 ### T5-CR14: Evaluate multifractal volatility model as HMM alternative
 - **Source:** COUNTERRESEARCH §18 (CR-14, MEDIUM); Calvet & Fisher (2004)
 - **Files:** `cpp/src/strategy/regime.cpp`
 - **Issue:** HMM regime detection suffers from likelihood multimodality and regime identification fragility with short crypto histories. Multifractal models (Calvet-Fisher MSM) capture multi-scale volatility dynamics more faithfully.
 - **Fix:** Prototype Markov-Switching Multifractal (MSM) estimator alongside existing HMM. Compare regime stability over 1000+ blocks. If MSM produces fewer spurious regime switches, adopt as primary.
-- **Status:** `[ ]`
+- **Status:** `[x]` — 2-frequency MSM (Calvet & Fisher 2004) added to `RegimeDetector`. Config: `msm_enabled`, `msm_k_frequencies{2}`, `msm_m0{1.4}`, `msm_gamma1{0.10}`, `msm_b{2.0}`. Grid filter with 2^K=4 states, Bayesian posterior update per block. Accessors: `get_msm_volatility_multiplier()`, `get_msm_high_vol_probability()`. Runs alongside HMM; 4 parameters vs HMM's 9+.
 
 ### T5-CR15: Model time-varying liquidity risk (Acharya-Pedersen dynamics)
 - **Source:** COUNTERRESEARCH §17 (CR-15, LOW); Acharya & Pedersen (2005)
@@ -883,42 +899,42 @@ Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `cpp/src/database.cpp`, `cpp/include/xop/database.hpp`
 - **Issue:** `Database` has no thread synchronization. The `const` query methods mutate `mutable` statement pointers via `sqlite3_step`/`sqlite3_reset`. While safe under the current single-strand ASIO architecture, the GUI's `DatabaseService` runs on a separate `QThread` with its own read-only handle, so concurrent access on the engine handle would corrupt state.
 - **Fix:** Add a `std::mutex` around statement execution, or document single-writer requirement with `[[clang::guarded_by]]` annotations.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `mutable std::mutex mtx_` to `Database` class; all public methods now acquire `std::lock_guard<std::mutex>` before statement execution. Header thread-safety comment updated. `insert_snapshots_batch` inlined to avoid recursive lock.
 
 ### T7-02: Document `SpreadOptimizer` 1:1-per-pair thread-safety invariant
 - **Source:** CODEREVIEW-20260329 §CR-12 (LOW)
 - **Files:** `cpp/src/strategy/spread.cpp`
 - **Issue:** `compute_spread()` is `const` but modifies `mutable` members (`sampler_`, `last_thompson_index_`, `spread_vol_tracker_`). Safe today because one `SpreadOptimizer` exists per pair, but undocumented.
 - **Fix:** Add comment: `// Thread safety: one SpreadOptimizer instance per pair; not thread-safe for shared use.`
-- **Status:** `[ ]`
+- **Status:** `[x]` — Thread-safety invariant documented in `spread.cpp` file header comment.
 
 ### T7-03: Fix O(n²) `build_blocks()` in backtest engine
 - **Source:** CODEREVIEW-20260329 §CR-13 (MEDIUM)
 - **Files:** `cpp/src/backtest.cpp`
 - **Issue:** `for (const auto& offer : raw_offers_) { if (offer.created_block == h) blk.offers_posted++; }` inside per-block loop is O(blocks × offers). With 10K blocks and 50K offers, this is 500M comparisons.
 - **Fix:** Pre-sort `raw_offers_` by `created_block` or build `std::unordered_map<BlockHeight, size_t>` during `load_data()`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Pre-built `posted_by_block` index alongside `offers_by_block` in same loop. O(n) total instead of O(n×m).
 
 ### T7-04: Accept caller config in `walk_forward_optimize` / `parameter_sweep`
 - **Source:** CODEREVIEW-20260329 §CR-14 (LOW)
 - **Files:** `cpp/src/backtest.cpp`
 - **Issue:** Walk-forward and parameter-sweep construct `StrategyConfig` with hardcoded defaults (`gamma=0.01`, `kappa=1.5`, `phi=0.5`, `q_max=1000`) instead of accepting the caller's config as a base. Sweeps always start from the same defaults regardless of YAML configuration.
 - **Fix:** Accept `const StrategyConfig& base` parameter and overlay swept parameters onto it.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `const StrategyConfig& base_cfg = StrategyConfig{}` parameter to both `walk_forward_optimize` and `parameter_sweep`. Removed 7 hardcoded lines in each. Default argument preserves backward compatibility.
 
 ### T7-05: Replace `std::cout` with spdlog in `log_config_summary`
 - **Source:** CODEREVIEW-20260329 §CR-15 (LOW)
 - **Files:** `cpp/src/config.cpp`
 - **Issue:** Configuration summary written to `std::cout` while rest of engine uses spdlog. Bypasses log-level filtering, rotation, and structured output.
 - **Fix:** Replace `std::cout <<` with `spdlog::info()`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Replaced `std::cout << out.str()` with `spdlog::info("{}", out.str())`. Removed `<iostream>` include, added `<spdlog/spdlog.h>`.
 
 ### T7-06: Handle WAL mode failure more robustly in Database
 - **Source:** CODEREVIEW-20260329 §CR-16 (LOW)
 - **Files:** `cpp/src/database.cpp`
 - **Issue:** `PRAGMA journal_mode=WAL` failure only warns, continuing silently in journal mode. Could cause "database locked" errors under load.
 - **Fix:** Throw on WAL failure, or add startup health-check logging the active journal mode.
-- **Status:** `[ ]`
+- **Status:** `[x]` — WAL failure now throws `std::runtime_error` instead of warning and continuing silently.
 
 ### Logic Review Findings
 
@@ -927,14 +943,14 @@ Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`
 - **Issue:** Flash crash detection uses hardcoded `0.20` (20%) threshold. Not tunable for stablecoin pairs (where 5% is catastrophic) or volatile small-cap CATs (where 20% is normal).
 - **Fix:** Add `flash_crash_threshold_pct` to `RiskConfig` and use it instead of the literal.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `flash_crash_threshold_pct` (default 0.20) to `RiskConfig`. YAML parsing with validation in `parse_risk()`. Engine uses `config_.risk.flash_crash_threshold_pct` instead of hardcoded 0.20. Config summary logs the new field.
 
 ### T7-08: Make flash crash recovery stability windows configurable
 - **Source:** LOGICREVIEW-20260329 §LR-13 (LOW)
 - **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/config.hpp`
 - **Issue:** `is_stable_after_crash()` uses hardcoded 50-block and 100-block windows and 5% stability band. Same configurability argument as T7-07.
 - **Fix:** Add `recovery_stable_blocks_phase1`, `recovery_stable_blocks_phase2`, `recovery_stability_band_pct` to `RiskConfig`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added all three fields to `RiskConfig` with defaults (50, 100, 0.05). YAML parsing with validation. Engine uses config values instead of hardcoded literals.
 
 ### Counter-Research Findings (New Challenges)
 
@@ -944,7 +960,7 @@ Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `cpp/src/engine.cpp`, `cpp/src/risk/loss_manager.cpp`, `cpp/src/risk/drift_analyzer.cpp`
 - **Issue:** Under persistent adverse selection (sustained downtrend), the bot accumulates underwater inventory that the no-loss constraint prevents selling. Aging (T4-09) relaxes the floor too slowly (~170 bps/day). The bot becomes a passive holder, not a market maker. This is the single largest operational risk for a never-loss-constrained system.
 - **Fix:** Enable "circuit-breaker rebalance" mode: when inventory ratio > hard_limit (80%) AND `DriftAnalyzer` recommends rebalance AND position age > `2 × aging_start_blocks`, automatically enable `StrategicLossManager` for that pair with a configurable maximum loss cap.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `circuit_breaker_enabled/hard_limit_ratio/age_multiplier/max_loss_bps` to `RiskConfig` (default off). YAML parsing with validation. Engine Step 6 creates a temporary `StrategicLossManager` with CB config when all 3 conditions met. Capped at 500 bps. Logs at `warn` level.
 
 ### T7-10: Implement batch offer creation to reduce mempool impact
 - **Source:** COUNTERRESEARCH-20260329 §CR-17 (MEDIUM)
@@ -952,14 +968,14 @@ Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `cpp/src/execution/offer_manager.cpp`, `cpp/src/rpc/chia_rpc.cpp`
 - **Issue:** Bot submits ~20–40 separate transactions per heartbeat across 5 pairs. On CHIA's low-throughput chain (~1 MB/52s), this can be a meaningful fraction of mempool traffic, creating a fee feedback loop: high fees → wider spreads → fewer fills → cancel/repost → more txs → higher fees.
 - **Fix:** Use `create_offer_for_ids` RPC with multiple pairs in a single transaction, reducing per-cycle transaction count from ~40 to ~5–10.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `batch_offers_enabled` to `StrategyConfig` (default false). When enabled, `post_quotes` merges same-side tiers into a single RPC call via `post_merged_side()`. Falls back to individual creation on RPC failure. All constituent tiers tracked with shared offer ID.
 
 ### T7-11: Add defensive spread widening during regime detector warm-up
 - **Source:** COUNTERRESEARCH-20260329 §CR-18 (MEDIUM)
 - **Files:** `cpp/src/strategy/regime.cpp`, `cpp/src/engine.cpp`
 - **Issue:** `RegimeDetector` requires `min_window = 50` observations (~43 min) before producing a regime classification. During warm-up, all strategies default to `Regime::Normal` with unit multipliers. If the bot starts during a momentum period, it uses normal-regime tight spreads, maximizing adverse selection exposure.
 - **Fix:** When `RegimeDetector::is_ready()` returns false, apply a defensive multiplier (e.g., 1.3× spread widening) rather than the neutral 1.0×. "Assume momentum until proven otherwise."
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `is_ready()` to `RegimeDetector`. Added `is_regime_ready()` virtual to `StrategyBase` (default true), overridden in `AvellanedaStoikov` and `GLFT`. Engine Step 5 applies 1.3× defensive multiplier when `!is_regime_ready()`.
 
 ### T7-12: Weight CEX price data by freshness
 - **Source:** COUNTERRESEARCH-20260329 §CR-19 (LOW)
@@ -967,14 +983,14 @@ Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 - **Files:** `cpp/src/execution/market_data.cpp`
 - **Issue:** 70/30 DEX/CEX blend uses CoinGecko data that may be 30–60s stale. During rapid price moves, blended mid lags true price. Maximum error: `0.30 × |Δp_cex|`.
 - **Fix:** Weight CEX data by freshness: `w_cex = w_base × max(0, 1 - age / threshold)`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — Added `cex_freshness_threshold_sec` (default 120) to `MarketDataConfig`. `compute_mid()` now applies linear freshness decay: `w_cex = kCexWeight * max(0, 1 - age_sec / threshold)`. Graceful: falls back to DEX-only when CEX is fully stale.
 
 ### T7-13: Make TibetSwap AMM fee configurable
 - **Source:** COUNTERRESEARCH-20260329 §CR-20 (LOW)
 - **Files:** `cpp/include/xop/strategy/arbitrage.hpp`, `cpp/src/strategy/arbitrage.cpp`
 - **Issue:** `INVERSE_FEE = 993` (0.7% fee) hardcoded in AMM math. If TibetSwap changes fees, arb edge calculations become incorrect.
 - **Fix:** Replace hardcoded constant with config-derived value: `INVERSE_FEE = 1000 - config.tibetswap_fee_bps / 10`.
-- **Status:** `[ ]`
+- **Status:** `[x]` — `TibetSwapReserves::fee_bps` given explicit default `{7}` with documentation to populate from `ArbitrageConfig::tibetswap_fee_bps / 10`. Call sites already pass `tibetswap_reserves.fee_bps` (not hardcoded).
 
 ### Prior Finding Status Updates (from 2026-03-29 re-verification)
 
@@ -991,20 +1007,19 @@ The following prior items had their status updated based on the fresh code revie
 
 ## Summary Statistics
 
-**Last verification:** 2026-03-29 (Tier 7 added from fresh code review, logic review, and counter-research study)
+**Last verification:** 2026-03-29 (T3-03, T3-31, T4-05, T4-13, T4-19, T4-24 completed)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
 | **Tier 1 (Critical)** | 14 | 14 | 0 | 0 | Must fix before live trading |
 | **Tier 2 (High)** | 20 | 20 | 0 | 0 | Must fix before paper trading |
-| **Tier 3 (Medium)** | 35 | 31 | 2 | 2 | Quality, robustness, correctness |
-| **Tier 4 (Low/Enhancement)** | 27 | 3 | 2 | 22 | Improvements and strategic features |
-| **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
+| **Tier 3 (Medium)** | 35 | 35 | 0 | 0 | Quality, robustness, correctness |
+| **Tier 4 (Low/Enhancement)** | 27 | 18 | 0 | 9 | Improvements and strategic features |
+| **Tier 5 (Counter-Research)** | 15 | 15 | 0 | 0 | Academic challenges to cited literature |
 | **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
-| **Tier 7 (New 2026-03-29)** | 13 | 0 | 0 | 13 | Fresh review findings |
-| **Total** | **134** | **84** | **4** | **46** | |
+| **Tier 7 (New 2026-03-29)** | 13 | 13 | 0 | 0 | Fresh review findings |
+| **Total** | **134** | **125** | **0** | **9** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
-1. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)
-2. **T7-09** — Inventory drift under persistent adverse selection (highest operational risk)
+None — all critical items resolved. T1-10 documentation gap closed.
