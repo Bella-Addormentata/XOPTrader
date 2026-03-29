@@ -59,9 +59,8 @@ Name: "desktopicon"; \
 ; GUI binary (required)
 Source: "xop_trader_gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 
-; C++ engine (optional — include if present next to this script)
-Source: "xop_trader.exe"; DestDir: "{app}"; \
-  Flags: ignoreversion skipifsourcedoesntexist
+; C++ engine (required — GUI auto-launches this for click-and-play)
+Source: "xop_trader.exe"; DestDir: "{app}"; Flags: ignoreversion
 
 ; Reference config
 Source: "config.example.yaml"; DestDir: "{app}"; Flags: ignoreversion

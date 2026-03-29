@@ -81,6 +81,7 @@ jobs:
       # ---- Read vcpkg baseline from manifest (single source of truth) -------
       - name: Read vcpkg baseline
         id: vcpkg-baseline
+        shell: bash
         run: echo "sha=$(jq -r '.["builtin-baseline"]' cpp/vcpkg.json)" >> "$GITHUB_OUTPUT"
 
       # ---- Ensure vcpkg-downloads directory exists before bootstrap -----------
@@ -221,16 +222,44 @@ jobs:
           path: ${{ matrix.artifact_name }}
           if-no-files-found: error
 
-      # =========================================================================
-      # Windows — build an Inno Setup installer that prompts for desktop shortcut
-      # =========================================================================
+  # ---------------------------------------------------------------------------
+  # Job 3 — Windows Installer (needs both C++ engine and GUI artifacts)
+  # ---------------------------------------------------------------------------
+  build-installer:
+    name: Windows Installer
+    needs: [build-cpp, build-gui]
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate application icon
+        run: |
+          pip install pillow
+          python gui/resources/generate_icon.py gui ico
+
+      - name: Download C++ engine artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-windows-x64.exe
+          path: dl/
+
+      - name: Download GUI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-gui-windows-x64.exe
+          path: dl/
+
       - name: Install Inno Setup
-        if: runner.os == 'Windows'
         shell: pwsh
         run: choco install innosetup --yes --no-progress
 
       - name: Build Windows installer (Inno Setup)
-        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # Resolve AppVersion from tag (strip leading 'v'), fall back to "0.1"
@@ -238,12 +267,13 @@ jobs:
                      elseif ("${{ github.event.inputs.tag }}" -match "v(.+)") { $Matches[1] } `
                      else { "0.1" }
 
-          # Assemble the files Inno Setup expects in one directory
+          # Stage files with the names installer.iss expects
           New-Item -ItemType Directory -Force -Path installer-staging
-          Copy-Item packaging\windows\installer.iss  installer-staging\
-          Copy-Item gui\dist\xop_trader_gui.exe       installer-staging\
-          Copy-Item gui\icon.ico                      installer-staging\
-          Copy-Item config.example.yaml               installer-staging\
+          Copy-Item dl\xop_trader-windows-x64.exe     installer-staging\xop_trader.exe
+          Copy-Item dl\xop_trader-gui-windows-x64.exe installer-staging\xop_trader_gui.exe
+          Copy-Item packaging\windows\installer.iss    installer-staging\
+          Copy-Item gui\icon.ico                       installer-staging\
+          Copy-Item config.example.yaml                installer-staging\
 
           # Compile the installer
           iscc /DAppVersion=$version `
@@ -253,31 +283,60 @@ jobs:
           Copy-Item installer-staging\xop_trader-installer-windows-x64.exe .
 
       - name: Upload Windows installer artifact
-        if: runner.os == 'Windows'
         uses: actions/upload-artifact@v4
         with:
           name: xop_trader-installer-windows-x64
           path: xop_trader-installer-windows-x64.exe
           if-no-files-found: error
 
-      # =========================================================================
-      # Linux — bundle binary + icon + .desktop file + install.sh
-      # =========================================================================
+  # ---------------------------------------------------------------------------
+  # Job 4 — Linux Install Bundle (needs both C++ engine and GUI artifacts)
+  # ---------------------------------------------------------------------------
+  build-linux-bundle:
+    name: Linux Install Bundle
+    needs: [build-cpp, build-gui]
+    runs-on: ubuntu-22.04
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Generate application icon
+        run: |
+          pip install pillow
+          python gui/resources/generate_icon.py gui png
+
+      - name: Download C++ engine artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-linux-x64
+          path: dl/
+
+      - name: Download GUI artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-gui-linux-x64
+          path: dl/
+
       - name: Build Linux install bundle
-        if: runner.os == 'Linux'
         run: |
           mkdir -p linux-bundle
-          cp gui/dist/xop_trader_gui          linux-bundle/
-          cp gui/icon.png                     linux-bundle/
-          cp config.example.yaml              linux-bundle/
-          cp packaging/linux/xop_trader.desktop linux-bundle/
-          cp packaging/linux/install.sh       linux-bundle/
-          cp packaging/linux/uninstall.sh     linux-bundle/
-          chmod +x linux-bundle/install.sh linux-bundle/uninstall.sh linux-bundle/xop_trader_gui
+          cp dl/xop_trader-linux-x64            linux-bundle/xop_trader
+          cp dl/xop_trader-gui-linux-x64        linux-bundle/xop_trader_gui
+          cp gui/icon.png                       linux-bundle/
+          cp config.example.yaml                linux-bundle/
+          cp packaging/linux/xop_trader.desktop  linux-bundle/
+          cp packaging/linux/install.sh          linux-bundle/
+          cp packaging/linux/uninstall.sh        linux-bundle/
+          chmod +x linux-bundle/install.sh linux-bundle/uninstall.sh \
+                   linux-bundle/xop_trader_gui linux-bundle/xop_trader
           tar -czf xop_trader-linux-bundle.tar.gz -C linux-bundle .
 
       - name: Upload Linux bundle artifact
-        if: runner.os == 'Linux'
         uses: actions/upload-artifact@v4
         with:
           name: xop_trader-linux-bundle
@@ -285,11 +344,11 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Job 3 — Create the GitHub Release and upload all artifacts
+  # Job 5 — Create the GitHub Release and upload all artifacts
   # ---------------------------------------------------------------------------
   release:
     name: Create GitHub Release
-    needs: [build-cpp, build-gui]
+    needs: [build-cpp, build-gui, build-installer, build-linux-bundle]
     runs-on: ubuntu-22.04
 
     steps:
