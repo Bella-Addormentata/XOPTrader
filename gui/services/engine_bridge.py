@@ -398,6 +398,40 @@ class EngineBridge(QObject):
         else:
             self.error.emit("Config reload failed -- see logs for details.")
 
+    def update_config_path(self, new_path: str) -> None:
+        """Switch the active configuration file and reload it.
+
+        Called when the Settings panel saves or loads a file that differs
+        from the bridge's current path.  Keeps ``self._config_path`` and
+        the ``ConfigService`` in sync so subsequent ``reload_config()``
+        calls and engine restarts use the new file.
+
+        Parameters
+        ----------
+        new_path : str
+            Absolute path of the YAML file that was just saved/loaded.
+        """
+        resolved = Path(new_path).resolve()
+        if resolved == self._config_path:
+            # Path unchanged; just reload in case the file changed on disk.
+            self.reload_config()
+            return
+
+        _log.info(
+            "Config path changed: %s → %s",
+            self._config_path,
+            resolved,
+        )
+        self._config_path = resolved
+        success = self._config_svc.switch_path(resolved)
+        if success:
+            _log.info("Config path updated and reloaded.")
+        else:
+            self.error.emit(
+                f"Could not load config from {resolved}. "
+                "See logs for details."
+            )
+
     # ===================================================================
     # Internal slots
     # ===================================================================
