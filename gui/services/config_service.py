@@ -189,6 +189,28 @@ class ConfigService(QObject):
         _log.info("Reloading config from %s", self._path)
         return self.load()
 
+    def switch_path(self, new_path: str | Path) -> bool:
+        """Switch to a different configuration file and reload.
+
+        Atomically updates the active path and reads the new file.
+        If the load fails the active path is *not* reverted; call
+        :meth:`reload` with the previous path to recover manually.
+
+        Parameters
+        ----------
+        new_path : str | Path
+            Filesystem path of the replacement YAML file.
+
+        Returns
+        -------
+        bool
+            ``True`` if the file was loaded and validated successfully.
+        """
+        resolved = Path(new_path).resolve()
+        _log.info("Switching config path: %s → %s", self._path, resolved)
+        self._path = resolved
+        return self.load()
+
     # ===================================================================
     # Public API -- typed getters
     # ===================================================================
