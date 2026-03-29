@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-25 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-10)
+**Last Updated:** 2026-03-29 (Tier 7 added from fresh code review, logic review, and counter-research study)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -345,7 +345,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/strategy/strategy_portfolio.cpp`, `cpp/src/strategy/chia_edge.cpp`, `cpp/src/risk/limits.cpp`
 - **Issue:** `assert()` stripped in Release builds. Invalid config silently accepted in production.
 - **Fix:** `if (...) throw std::invalid_argument(...)`.
-- **Status:** `[x]` — Verified: Named files use `throw` instead of `assert()`. Note: `assert()` persists in `backtest.cpp`, `hedging.cpp`, `dexie_client.cpp`, `chia_rpc.cpp`.
+- **Status:** `[x]` — Verified: All files use `throw` instead of `assert()`. Zero `assert()` calls remain in any `.cpp` or `.hpp` (verified 2026-03-29).
 
 ### T3-14: Walk-forward test window fix (window should slide)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §5.3
@@ -872,9 +872,126 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 
 ---
 
+## Tier 7 — Findings from 2026-03-29 Review Cycle
+
+Items from [CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/CODEREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6.md), [LOGICREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/LOGICREVIEW-20260329-GitHubCopilot-Claude-Opus-4.6.md), and [COUNTERRESEARCH-20260329-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/COUNTERRESEARCH-20260329-GitHubCopilot-Claude-Opus-4.6.md).
+
+### Code Review Findings
+
+### T7-01: Add thread-safety to `Database` class
+- **Source:** CODEREVIEW-20260329 §CR-11 (MEDIUM)
+- **Files:** `cpp/src/database.cpp`, `cpp/include/xop/database.hpp`
+- **Issue:** `Database` has no thread synchronization. The `const` query methods mutate `mutable` statement pointers via `sqlite3_step`/`sqlite3_reset`. While safe under the current single-strand ASIO architecture, the GUI's `DatabaseService` runs on a separate `QThread` with its own read-only handle, so concurrent access on the engine handle would corrupt state.
+- **Fix:** Add a `std::mutex` around statement execution, or document single-writer requirement with `[[clang::guarded_by]]` annotations.
+- **Status:** `[ ]`
+
+### T7-02: Document `SpreadOptimizer` 1:1-per-pair thread-safety invariant
+- **Source:** CODEREVIEW-20260329 §CR-12 (LOW)
+- **Files:** `cpp/src/strategy/spread.cpp`
+- **Issue:** `compute_spread()` is `const` but modifies `mutable` members (`sampler_`, `last_thompson_index_`, `spread_vol_tracker_`). Safe today because one `SpreadOptimizer` exists per pair, but undocumented.
+- **Fix:** Add comment: `// Thread safety: one SpreadOptimizer instance per pair; not thread-safe for shared use.`
+- **Status:** `[ ]`
+
+### T7-03: Fix O(n²) `build_blocks()` in backtest engine
+- **Source:** CODEREVIEW-20260329 §CR-13 (MEDIUM)
+- **Files:** `cpp/src/backtest.cpp`
+- **Issue:** `for (const auto& offer : raw_offers_) { if (offer.created_block == h) blk.offers_posted++; }` inside per-block loop is O(blocks × offers). With 10K blocks and 50K offers, this is 500M comparisons.
+- **Fix:** Pre-sort `raw_offers_` by `created_block` or build `std::unordered_map<BlockHeight, size_t>` during `load_data()`.
+- **Status:** `[ ]`
+
+### T7-04: Accept caller config in `walk_forward_optimize` / `parameter_sweep`
+- **Source:** CODEREVIEW-20260329 §CR-14 (LOW)
+- **Files:** `cpp/src/backtest.cpp`
+- **Issue:** Walk-forward and parameter-sweep construct `StrategyConfig` with hardcoded defaults (`gamma=0.01`, `kappa=1.5`, `phi=0.5`, `q_max=1000`) instead of accepting the caller's config as a base. Sweeps always start from the same defaults regardless of YAML configuration.
+- **Fix:** Accept `const StrategyConfig& base` parameter and overlay swept parameters onto it.
+- **Status:** `[ ]`
+
+### T7-05: Replace `std::cout` with spdlog in `log_config_summary`
+- **Source:** CODEREVIEW-20260329 §CR-15 (LOW)
+- **Files:** `cpp/src/config.cpp`
+- **Issue:** Configuration summary written to `std::cout` while rest of engine uses spdlog. Bypasses log-level filtering, rotation, and structured output.
+- **Fix:** Replace `std::cout <<` with `spdlog::info()`.
+- **Status:** `[ ]`
+
+### T7-06: Handle WAL mode failure more robustly in Database
+- **Source:** CODEREVIEW-20260329 §CR-16 (LOW)
+- **Files:** `cpp/src/database.cpp`
+- **Issue:** `PRAGMA journal_mode=WAL` failure only warns, continuing silently in journal mode. Could cause "database locked" errors under load.
+- **Fix:** Throw on WAL failure, or add startup health-check logging the active journal mode.
+- **Status:** `[ ]`
+
+### Logic Review Findings
+
+### T7-07: Make flash crash threshold configurable
+- **Source:** LOGICREVIEW-20260329 §LR-12 (MEDIUM)
+- **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`
+- **Issue:** Flash crash detection uses hardcoded `0.20` (20%) threshold. Not tunable for stablecoin pairs (where 5% is catastrophic) or volatile small-cap CATs (where 20% is normal).
+- **Fix:** Add `flash_crash_threshold_pct` to `RiskConfig` and use it instead of the literal.
+- **Status:** `[ ]`
+
+### T7-08: Make flash crash recovery stability windows configurable
+- **Source:** LOGICREVIEW-20260329 §LR-13 (LOW)
+- **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/config.hpp`
+- **Issue:** `is_stable_after_crash()` uses hardcoded 50-block and 100-block windows and 5% stability band. Same configurability argument as T7-07.
+- **Fix:** Add `recovery_stable_blocks_phase1`, `recovery_stable_blocks_phase2`, `recovery_stability_band_pct` to `RiskConfig`.
+- **Status:** `[ ]`
+
+### Counter-Research Findings (New Challenges)
+
+### T7-09: Implement automatic strategic loss for aged high-inventory positions
+- **Source:** COUNTERRESEARCH-20260329 §CR-16 (HIGH)
+- **Academic basis:** Cartea, Jaimungal & Penalva (2015) §10.6; Guéant (2017) §6
+- **Files:** `cpp/src/engine.cpp`, `cpp/src/risk/loss_manager.cpp`, `cpp/src/risk/drift_analyzer.cpp`
+- **Issue:** Under persistent adverse selection (sustained downtrend), the bot accumulates underwater inventory that the no-loss constraint prevents selling. Aging (T4-09) relaxes the floor too slowly (~170 bps/day). The bot becomes a passive holder, not a market maker. This is the single largest operational risk for a never-loss-constrained system.
+- **Fix:** Enable "circuit-breaker rebalance" mode: when inventory ratio > hard_limit (80%) AND `DriftAnalyzer` recommends rebalance AND position age > `2 × aging_start_blocks`, automatically enable `StrategicLossManager` for that pair with a configurable maximum loss cap.
+- **Status:** `[ ]`
+
+### T7-10: Implement batch offer creation to reduce mempool impact
+- **Source:** COUNTERRESEARCH-20260329 §CR-17 (MEDIUM)
+- **Academic basis:** Roughgarden (2021); Huberman, Leshno & Moallemi (2021)
+- **Files:** `cpp/src/execution/offer_manager.cpp`, `cpp/src/rpc/chia_rpc.cpp`
+- **Issue:** Bot submits ~20–40 separate transactions per heartbeat across 5 pairs. On CHIA's low-throughput chain (~1 MB/52s), this can be a meaningful fraction of mempool traffic, creating a fee feedback loop: high fees → wider spreads → fewer fills → cancel/repost → more txs → higher fees.
+- **Fix:** Use `create_offer_for_ids` RPC with multiple pairs in a single transaction, reducing per-cycle transaction count from ~40 to ~5–10.
+- **Status:** `[ ]`
+
+### T7-11: Add defensive spread widening during regime detector warm-up
+- **Source:** COUNTERRESEARCH-20260329 §CR-18 (MEDIUM)
+- **Files:** `cpp/src/strategy/regime.cpp`, `cpp/src/engine.cpp`
+- **Issue:** `RegimeDetector` requires `min_window = 50` observations (~43 min) before producing a regime classification. During warm-up, all strategies default to `Regime::Normal` with unit multipliers. If the bot starts during a momentum period, it uses normal-regime tight spreads, maximizing adverse selection exposure.
+- **Fix:** When `RegimeDetector::is_ready()` returns false, apply a defensive multiplier (e.g., 1.3× spread widening) rather than the neutral 1.0×. "Assume momentum until proven otherwise."
+- **Status:** `[ ]`
+
+### T7-12: Weight CEX price data by freshness
+- **Source:** COUNTERRESEARCH-20260329 §CR-19 (LOW)
+- **Academic basis:** Hasbrouck (1993)
+- **Files:** `cpp/src/execution/market_data.cpp`
+- **Issue:** 70/30 DEX/CEX blend uses CoinGecko data that may be 30–60s stale. During rapid price moves, blended mid lags true price. Maximum error: `0.30 × |Δp_cex|`.
+- **Fix:** Weight CEX data by freshness: `w_cex = w_base × max(0, 1 - age / threshold)`.
+- **Status:** `[ ]`
+
+### T7-13: Make TibetSwap AMM fee configurable
+- **Source:** COUNTERRESEARCH-20260329 §CR-20 (LOW)
+- **Files:** `cpp/include/xop/strategy/arbitrage.hpp`, `cpp/src/strategy/arbitrage.cpp`
+- **Issue:** `INVERSE_FEE = 993` (0.7% fee) hardcoded in AMM math. If TibetSwap changes fees, arb edge calculations become incorrect.
+- **Fix:** Replace hardcoded constant with config-derived value: `INVERSE_FEE = 1000 - config.tibetswap_fee_bps / 10`.
+- **Status:** `[ ]`
+
+### Prior Finding Status Updates (from 2026-03-29 re-verification)
+
+The following prior items had their status updated based on the fresh code review:
+
+- **T6-01** (CR-1, assert()): Confirmed `[x]` — zero `assert()` calls remain in any `.cpp` or `.hpp`.
+- **T1-12** (LR-1, inventory units): Confirmed `[x]` — `q` divided by `base_mojos_per_unit` in both Step 4 and Step 5.
+- **T5-CR1** (VPIN validation): Confirmed `[x]` — validation gate operational but **advisory-only** (see T7-09 for auto-attenuate recommendation).
+- **T5-CR3** (tau decay): Confirmed `[x]` — exponential decay with fill-driven reset.
+- **T5-CR7** (Thompson Sampling): Confirmed `[x]` — discounted TS with γ=0.97.
+- **T5-CR6** (YZ degeneration): Confirmed `[x]` — candle aggregation at 10 blocks.
+
+---
+
 ## Summary Statistics
 
-**Last verification:** 2026-03-26 (implementation pass 2: T3-05, T4-12, T4-23, T4-25, T6-05, T6-08, T6-09, T6-10 + CHANGELOG + CI tests)
+**Last verification:** 2026-03-29 (Tier 7 added from fresh code review, logic review, and counter-research study)
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
@@ -884,8 +1001,10 @@ The following were resolved by Claude Code's 3-pass review cycle (commits `d18d3
 | **Tier 4 (Low/Enhancement)** | 27 | 3 | 2 | 22 | Improvements and strategic features |
 | **Tier 5 (Counter-Research)** | 15 | 6 | 0 | 9 | Academic challenges to cited literature |
 | **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
-| **Total** | **121** | **84** | **4** | **33** | |
+| **Tier 7 (New 2026-03-29)** | 13 | 0 | 0 | 13 | Fresh review findings |
+| **Total** | **134** | **84** | **4** | **46** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
 1. **T1-10** — TierQuote.size documentation/typing gap (functional but undocumented)
+2. **T7-09** — Inventory drift under persistent adverse selection (highest operational risk)
