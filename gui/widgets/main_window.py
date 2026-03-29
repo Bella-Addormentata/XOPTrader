@@ -265,9 +265,7 @@ class MainWindow(QMainWindow):
             self._tab_order_panel.cancel_offer_requested.connect(bridge.cancel_offer)
             self._tab_order_panel.cancel_all_requested.connect(bridge.cancel_all_offers)
         if self._settings_widget is not None and hasattr(self._settings_widget, "config_saved"):
-            self._settings_widget.config_saved.connect(
-                lambda path: bridge.reload_config()
-            )
+            self._settings_widget.config_saved.connect(bridge.update_config_path)
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
@@ -415,8 +413,8 @@ class MainWindow(QMainWindow):
         pair_name : str
             Trading pair to display.
         """
-        self._stacked.setCurrentIndex(1)
-        self._sidebar.select_page(1)
+        self._stacked.setCurrentIndex(_PAGE_CHARTS)
+        self._sidebar.select_page(_PAGE_CHARTS)
         if self._chart is not None and hasattr(self._chart, "set_pair"):
             self._chart.set_pair(pair_name)
 
@@ -431,8 +429,8 @@ class MainWindow(QMainWindow):
         pair_name : str
             Trading pair to filter.
         """
-        self._stacked.setCurrentIndex(2)
-        self._sidebar.select_page(2)
+        self._stacked.setCurrentIndex(_PAGE_ORDERS)
+        self._sidebar.select_page(_PAGE_ORDERS)
         # Keep the order book widget in sync with the selected pair.
         if self._order_book is not None and hasattr(self._order_book, "set_pair"):
             self._order_book.set_pair(pair_name)
@@ -561,7 +559,7 @@ class MainWindow(QMainWindow):
         settings_menu = menu_bar.addMenu("S&ettings")
 
         act_open_settings = QAction("&Open Settings Panel", self)
-        act_open_settings.triggered.connect(lambda: self._stacked.setCurrentIndex(_PAGE_SETTINGS))
+        act_open_settings.triggered.connect(lambda: self._switch_page(_PAGE_SETTINGS))
         settings_menu.addAction(act_open_settings)
 
         # -- Help menu ------------------------------------------------------

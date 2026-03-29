@@ -1842,7 +1842,21 @@ class SettingsWidget(QWidget):
         self.save_config()
 
     def _on_load_clicked(self) -> None:
-        """Open a file dialog to load an existing configuration file."""
+        """Open a file dialog to load an existing configuration file.
+
+        Prompts the user to confirm discarding unsaved edits when the
+        settings panel has pending (dirty) changes.
+        """
+        if self._dirty:
+            reply = QMessageBox.question(
+                self,
+                "Load Configuration",
+                "You have unsaved changes. Discard them and load a new file?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                return
+
         start_dir = (
             str(Path(self._config_path).parent)
             if self._config_path
