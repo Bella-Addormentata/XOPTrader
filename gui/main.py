@@ -147,23 +147,46 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
     ]
     for example in candidates:
         if example.is_file():
+            # Ensure the destination directory exists when --config points
+            # to a path whose parent has not been created yet.
             try:
-                # Use copyfile (content only) then apply restrictive
-                # permissions because config.yaml will contain credentials.
-                shutil.copyfile(example, target)
-                try:
-                    os.chmod(target, 0o600)
-                except NotImplementedError:
-                    # Windows does not support POSIX chmod; skip silently.
-                    pass
-                _log.info(
-                    "First-run bootstrap: copied %s → %s. "
-                    "Open Settings to review your credentials.",
-                    example,
-                    target,
+                target.parent.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                _log.warning(
+                    "Could not create config directory %s: %s",
+                    target.parent,
+                    exc,
                 )
+                return
+
+            try:
+                # Use copyfile (content only, no metadata) because the
+                # destination will contain credentials.
+                shutil.copyfile(example, target)
             except OSError as exc:
                 _log.warning("Could not copy example config: %s", exc)
+                return
+
+            _log.info(
+                "First-run bootstrap: copied %s → %s. "
+                "Open Settings to review your credentials.",
+                example,
+                target,
+            )
+
+            # Apply restrictive permissions separately so a chmod failure
+            # never obscures a successful copy.
+            try:
+                os.chmod(target, 0o600)
+            except NotImplementedError:
+                # Windows does not support POSIX chmod; skip silently.
+                pass
+            except OSError as exc:
+                _log.warning(
+                    "Could not set permissions on config file %s: %s",
+                    target,
+                    exc,
+                )
             return
 
 
