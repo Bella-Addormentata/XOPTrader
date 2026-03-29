@@ -614,7 +614,7 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // local supply/demand conditions relevant to our offers.
 // -------------------------------------------------------------------------
 
-double MarketDataFeed::compute_mid(const PairState& ps) {
+double MarketDataFeed::compute_mid(const PairState& ps) const {
     double dex_mid = 0.0;
 
     // Case 1: Two-sided dexie order book.
@@ -1758,7 +1758,12 @@ void MarketDataFeed::ingest_book_snapshot_for_ofi(
     {
         std::unique_lock lock(mtx_ofi_);
         auto& snaps = ofi_snapshots_[pair_name];
-        snaps.push_back(BookSnapshot{best_bid, bid_size, best_ask, ask_size});
+        BookSnapshot snap;
+        snap.best_bid = best_bid;
+        snap.bid_size = bid_size;
+        snap.best_ask = best_ask;
+        snap.ask_size = ask_size;
+        snaps.push_back(std::move(snap));
 
         // Keep window + 1 (need at least 2 for a delta).
         while (snaps.size() > ofi_window_size + 1) {

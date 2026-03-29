@@ -597,7 +597,7 @@ private:
     ///   3. If CEX reference is available: mid = kDexWeight*dex + kCexWeight*cex
     ///   4. Otherwise: mid = dex_mid
     /// Returns 0.0 if no price data is available at all.
-    static double compute_mid(const PairState& ps);
+    double compute_mid(const PairState& ps) const;
 
     /// Compute the spread in basis points from best_bid and best_ask.
     /// Returns 0.0 if either side is zero (no two-sided market).
