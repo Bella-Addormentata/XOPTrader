@@ -50,6 +50,11 @@ protected:
     }
 
     xop::GlftConfig cfg_;
+
+    static void construct_strategy(const xop::GlftConfig& c) {
+        xop::GlftStrategy s(c);
+        (void)s;
+    }
 };
 
 // ============================================================================
@@ -361,47 +366,47 @@ TEST_F(GlftFullTest, RegimeClassificationDefaultIsRandom) {
 
 TEST_F(GlftFullTest, InvalidGammaThrows) {
     cfg_.gamma = 0.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidKappaThrows) {
     cfg_.kappa = -1.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidPhiThrows) {
     cfg_.phi = -0.1;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidQMaxThrows) {
     cfg_.q_max = 0.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidTauMinThrows) {
     cfg_.tau_min = 0.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, TauMinExceedsTauMaxThrows) {
     cfg_.tau_min = 999999.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidSparseActualThrows) {
     cfg_.actual_fills_per_hour = 0.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidSparseDenseThrows) {
     cfg_.expected_dense_fills_per_hour = 0.0;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 TEST_F(GlftFullTest, InvalidSparseCapThrows) {
     cfg_.sparse_correction_cap = 0.5;
-    EXPECT_THROW(xop::GlftStrategy(cfg_), std::invalid_argument);
+    EXPECT_THROW(construct_strategy(cfg_), std::invalid_argument);
 }
 
 }  // namespace
