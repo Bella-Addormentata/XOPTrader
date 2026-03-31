@@ -77,6 +77,10 @@ struct ChiaConfig {
     std::string wallet_cert_path;       // SECRET -- never log.
     std::string wallet_key_path;        // SECRET -- never log.
 
+    // CA certificate used to verify the Chia daemon's server certificate.
+    // Required when verify_ssl is true (the default).
+    std::string ca_cert_path;           // SECRET -- never log.
+
     // Wallet fingerprint that identifies the key to use.
     uint32_t    wallet_fingerprint{0};  // SECRET -- never log.
 };

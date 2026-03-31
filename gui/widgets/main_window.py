@@ -494,19 +494,26 @@ class MainWindow(QMainWindow):
                 background-color: {PANEL_BG};
                 color: {TEXT_PRIMARY};
                 border-bottom: 1px solid {BORDER};
-                padding: 2px 0;
+                padding: 4px 0;
+                min-height: 32px;
             }}
             QMenuBar::item:selected {{
                 background-color: {ELEVATED_BG};
+                border-radius: 6px;
             }}
             QMenu {{
                 background-color: {PANEL_BG};
                 color: {TEXT_PRIMARY};
                 border: 1px solid {BORDER};
+                border-radius: 8px;
+            }}
+            QMenu::item {{
+                padding: 8px 24px 8px 16px;
             }}
             QMenu::item:selected {{
                 background-color: {PRIMARY_GREEN};
                 color: white;
+                border-radius: 4px;
             }}
             """
         )
@@ -588,19 +595,20 @@ class MainWindow(QMainWindow):
         block height, uptime, and start/stop button."""
         toolbar: QToolBar = QToolBar("Main Toolbar", self)
         toolbar.setMovable(False)
-        toolbar.setIconSize(QSize(18, 18))
+        toolbar.setIconSize(QSize(24, 24))
         toolbar.setStyleSheet(
             f"""
             QToolBar {{
                 background-color: {PANEL_BG};
                 border-bottom: 1px solid {BORDER};
-                spacing: 8px;
-                padding: 4px 8px;
+                spacing: 12px;
+                padding: 8px 16px;
+                min-height: 48px;
             }}
             QLabel {{
                 color: {TEXT_PRIMARY};
-                font-size: 12px;
-                padding: 0 4px;
+                font-size: 13px;
+                padding: 0 6px;
             }}
             """
         )
@@ -608,7 +616,7 @@ class MainWindow(QMainWindow):
 
         # Connection indicator (coloured dot + label)
         self._conn_dot = QLabel("\u25CF")  # filled circle
-        self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 14px;")
+        self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
         self._conn_dot.setToolTip("Connection status to CHIA full node")
         toolbar.addWidget(self._conn_dot)
 
@@ -649,7 +657,7 @@ class MainWindow(QMainWindow):
 
         # Start / Stop button
         self._start_stop_btn = QPushButton("Start")
-        self._start_stop_btn.setFixedSize(80, 28)
+        self._start_stop_btn.setFixedSize(100, 36)
         self._start_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
         self._start_stop_btn.setToolTip("Start or stop the trading engine")
         self._start_stop_btn.clicked.connect(self._on_start_stop)
@@ -666,9 +674,10 @@ class MainWindow(QMainWindow):
                     background-color: {LOSS_RED};
                     color: white;
                     border: none;
-                    border-radius: 4px;
+                    border-radius: 8px;
                     font-weight: bold;
-                    font-size: 12px;
+                    font-size: 13px;
+                    padding: 8px 16px;
                 }}
                 QPushButton:hover {{ background-color: #F06060; }}
                 """
@@ -681,9 +690,10 @@ class MainWindow(QMainWindow):
                     background-color: {PRIMARY_GREEN};
                     color: white;
                     border: none;
-                    border-radius: 4px;
+                    border-radius: 8px;
                     font-weight: bold;
-                    font-size: 12px;
+                    font-size: 13px;
+                    padding: 8px 16px;
                 }}
                 QPushButton:hover {{ background-color: {LIGHT_GREEN}; }}
                 """
@@ -777,10 +787,12 @@ class MainWindow(QMainWindow):
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
                 border-bottom: none;
-                padding: 6px 14px;
+                padding: 10px 20px;
                 margin-right: 2px;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
+                border-top-left-radius: 8px;
+                border-top-right-radius: 8px;
+                font-size: 12px;
+                min-width: 90px;
             }}
             QTabBar::tab:selected {{
                 background-color: {DARK_BG};
@@ -789,21 +801,9 @@ class MainWindow(QMainWindow):
             }}
             QTabBar::tab:hover {{
                 color: {TEXT_PRIMARY};
+                background-color: {ELEVATED_BG};
             }}
             """
-        )
-
-        # Tab 0 -- Active Offers (second OrderPanel for bottom panel)
-        self._tab_order_panel = self._create_page_widget(OrderPanel, "Active Offers")
-        self._bottom_tabs.addTab(self._tab_order_panel, "Active Offers")
-        # Tab 1 -- Trade History
-        self._trade_log = self._create_page_widget(TradeLogWidget, "Trade History")
-        self._bottom_tabs.addTab(self._trade_log, "Trade History")
-        # Tab 2 -- Bot Log
-        self._bot_log = self._create_page_widget(BotLogWidget, "Bot Log")
-        self._bottom_tabs.addTab(self._bot_log, "Bot Log")
-        # Tab 3 -- Configuration (live view)
-        self._bottom_tabs.addTab(
             _placeholder_widget("Live Configuration View"),
             "Configuration",
         )
@@ -952,7 +952,7 @@ class MainWindow(QMainWindow):
     def _on_connect(self) -> None:
         """Handle File > Connect."""
         self._connected = True
-        self._conn_dot.setStyleSheet(f"color: {PRIMARY_GREEN}; font-size: 14px;")
+        self._conn_dot.setStyleSheet(f"color: {PRIMARY_GREEN}; font-size: 18px;")
         self._conn_label.setText("Connected")
         self._act_connect.setEnabled(False)
         self._act_disconnect.setEnabled(True)
@@ -960,7 +960,7 @@ class MainWindow(QMainWindow):
     def _on_disconnect(self) -> None:
         """Handle File > Disconnect."""
         self._connected = False
-        self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 14px;")
+        self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
         self._conn_label.setText("Disconnected")
         self._act_connect.setEnabled(True)
         self._act_disconnect.setEnabled(False)

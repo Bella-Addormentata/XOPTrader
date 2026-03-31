@@ -77,16 +77,16 @@ class _StatRow(QWidget):
     def __init__(self, label: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(4, 2, 4, 2)
-        layout.setSpacing(8)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(12)
 
         self._label = QLabel(label + ":")
-        self._label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
-        self._label.setFixedWidth(170)
+        self._label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 13px;")
+        self._label.setFixedWidth(190)
 
-        self._value = QLabel("—")
+        self._value = QLabel("\u2014")
         self._value.setStyleSheet(
-            f"color: {TEXT_PRIMARY}; font-size: 12px; font-family: {_MONO};"
+            f"color: {TEXT_PRIMARY}; font-size: 13px; font-family: {_MONO};"
         )
         self._value.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
@@ -101,11 +101,11 @@ class _StatRow(QWidget):
         self._value.setText(text)
         if colour:
             self._value.setStyleSheet(
-                f"color: {colour}; font-size: 12px; font-family: {_MONO};"
+                f"color: {colour}; font-size: 13px; font-family: {_MONO};"
             )
         else:
             self._value.setStyleSheet(
-                f"color: {TEXT_PRIMARY}; font-size: 12px; font-family: {_MONO};"
+                f"color: {TEXT_PRIMARY}; font-size: 13px; font-family: {_MONO};"
             )
 
 
@@ -133,18 +133,18 @@ class PairAnalysisPanel(QFrame):
             f"PairAnalysisPanel {{"
             f"  background-color: {ELEVATED_BG};"
             f"  border: 1px solid {BORDER};"
-            f"  border-radius: 4px;"
+            f"  border-radius: 12px;"
             f"}}"
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(6)
 
         # Title
         title = QLabel(pair_name)
         title.setStyleSheet(
-            f"color: {PRIMARY_GREEN}; font-size: 14px; font-weight: bold;"
+            f"color: {PRIMARY_GREEN}; font-size: 16px; font-weight: bold;"
         )
         root.addWidget(title)
 
@@ -152,21 +152,21 @@ class PairAnalysisPanel(QFrame):
         self._progress = QProgressBar()
         self._progress.setRange(0, 100)
         self._progress.setValue(0)
-        self._progress.setFixedHeight(14)
+        self._progress.setFixedHeight(18)
         self._progress.setTextVisible(True)
         self._progress.setStyleSheet(
             f"""
             QProgressBar {{
                 background-color: {DARK_BG};
                 border: 1px solid {BORDER};
-                border-radius: 3px;
+                border-radius: 6px;
                 text-align: center;
                 color: {TEXT_PRIMARY};
-                font-size: 10px;
+                font-size: 11px;
             }}
             QProgressBar::chunk {{
                 background-color: {PRIMARY_GREEN};
-                border-radius: 2px;
+                border-radius: 5px;
             }}
             """
         )
@@ -331,23 +331,23 @@ class MarketAnalysisWidget(QWidget):
     def _build_ui(self) -> None:
         """Build the widget layout."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
-        root.setSpacing(8)
+        root.setContentsMargins(16, 16, 16, 16)
+        root.setSpacing(12)
 
         # Header
         hdr_layout = QHBoxLayout()
-        hdr_layout.setSpacing(12)
+        hdr_layout.setSpacing(16)
 
         title = QLabel("Startup Market Analysis")
         title.setStyleSheet(
-            f"color: {PRIMARY_GREEN}; font-size: 18px; font-weight: bold;"
+            f"color: {PRIMARY_GREEN}; font-size: 22px; font-weight: bold;"
         )
         hdr_layout.addWidget(title)
         hdr_layout.addStretch(1)
 
-        self._status_label = QLabel("Waiting for data…")
+        self._status_label = QLabel("Waiting for data\u2026")
         self._status_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 13px;"
+            f"color: {TEXT_SECONDARY}; font-size: 14px;"
         )
         hdr_layout.addWidget(self._status_label)
 

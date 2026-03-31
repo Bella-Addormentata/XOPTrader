@@ -92,52 +92,52 @@ class MetricCard(QFrame):
 
         # --- frame appearance -----------------------------------------------
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setFixedHeight(120)
+        self.setFixedHeight(150)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet(
             f"MetricCard {{"
             f"  background-color: {ELEVATED_BG};"
             f"  border: 1px solid {BORDER};"
-            f"  border-radius: 6px;"
+            f"  border-radius: 12px;"
             f"}}"
         )
 
         # --- layout ---------------------------------------------------------
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 6, 10, 6)
-        root.setSpacing(2)
+        root.setContentsMargins(14, 10, 14, 10)
+        root.setSpacing(4)
 
         # Title row
         self._title_label = QLabel(title.upper())
         self._title_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: 600;"
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: 600; letter-spacing: 1px;"
         )
         root.addWidget(self._title_label)
 
         # Value + change row (side by side)
         value_row = QHBoxLayout()
-        value_row.setSpacing(6)
+        value_row.setSpacing(8)
 
         self._value_label = QLabel("--")
         self._value_label.setStyleSheet(
             f"color: {TEXT_PRIMARY};"
             f"font-family: {_MONO_FAMILY};"
-            f"font-size: 18px;"
+            f"font-size: 22px;"
             f"font-weight: 700;"
         )
         value_row.addWidget(self._value_label)
 
         self._change_label = QLabel("")
         self._change_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 11px;"
+            f"color: {TEXT_SECONDARY}; font-size: 12px;"
         )
         value_row.addWidget(self._change_label)
         value_row.addStretch()
         root.addLayout(value_row)
 
-        # Sparkline (pyqtgraph, 80px tall, minimal chrome)
+        # Sparkline (pyqtgraph, 40px tall, minimal chrome)
         self._sparkline = pg.PlotWidget()
-        self._sparkline.setFixedHeight(36)
+        self._sparkline.setFixedHeight(40)
         self._sparkline.setBackground(ELEVATED_BG)
         self._sparkline.hideAxis("left")
         self._sparkline.hideAxis("bottom")
@@ -170,7 +170,7 @@ class MetricCard(QFrame):
         self._value_label.setStyleSheet(
             f"color: {colour};"
             f"font-family: {_MONO_FAMILY};"
-            f"font-size: 18px;"
+            f"font-size: 22px;"
             f"font-weight: 700;"
         )
         self._value_label.setText(text)
@@ -258,17 +258,17 @@ class StatusCard(QFrame):
             f"StatusCard {{"
             f"  background-color: {ELEVATED_BG};"
             f"  border: 1px solid {BORDER};"
-            f"  border-radius: 6px;"
+            f"  border-radius: 12px;"
             f"}}"
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 8, 10, 8)
-        root.setSpacing(4)
+        root.setContentsMargins(14, 12, 14, 12)
+        root.setSpacing(6)
 
         title_label = QLabel(title.upper())
         title_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: 600;"
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: 600; letter-spacing: 1px;"
         )
         root.addWidget(title_label)
 
@@ -301,7 +301,7 @@ def _make_dot_label(
 
     dot = StatusDot(colour)
     label = QLabel(text)
-    label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 12px;")
+    label.setStyleSheet(f"color: {TEXT_PRIMARY}; font-size: 13px;")
 
     layout.addWidget(dot)
     layout.addWidget(label)
@@ -335,8 +335,8 @@ class DashboardWidget(QWidget):
 
         # Root layout -- scrollable grid
         self._grid = QGridLayout(self)
-        self._grid.setContentsMargins(16, 16, 16, 16)
-        self._grid.setSpacing(12)
+        self._grid.setContentsMargins(20, 20, 20, 20)
+        self._grid.setSpacing(16)
 
         # ---- Row 0: Metric cards -----------------------------------------
         self._metric_cards: dict[str, MetricCard] = {}
@@ -394,13 +394,13 @@ class DashboardWidget(QWidget):
         self._block_height_label.setStyleSheet(
             f"color: {TEXT_PRIMARY};"
             f"font-family: {_MONO_FAMILY};"
-            f"font-size: 16px; font-weight: 700;"
+            f"font-size: 20px; font-weight: 700;"
         )
         self._block_card.add_row(self._block_height_label)
 
         self._block_age_label = QLabel("")
         self._block_age_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 11px;"
+            f"color: {TEXT_SECONDARY}; font-size: 12px;"
         )
         self._block_card.add_row(self._block_age_label)
         self._grid.addWidget(self._block_card, status_row, 2)
@@ -445,9 +445,14 @@ class DashboardWidget(QWidget):
             f"  alternate-background-color: {ELEVATED_BG};"
             f"  color: {TEXT_PRIMARY};"
             f"  border: 1px solid {BORDER};"
+            f"  border-radius: 8px;"
             f"  gridline-color: {BORDER};"
             f"  font-family: {_MONO_FAMILY};"
-            f"  font-size: 12px;"
+            f"  font-size: 13px;"
+            f"}}"
+            f"QTableWidget::item {{"
+            f"  padding: 6px 10px;"
+            f"  min-height: 28px;"
             f"}}"
             f"QTableWidget::item:selected {{"
             f"  background-color: {BORDER};"
@@ -456,8 +461,8 @@ class DashboardWidget(QWidget):
             f"  background-color: {ELEVATED_BG};"
             f"  color: {TEXT_SECONDARY};"
             f"  border: 1px solid {BORDER};"
-            f"  padding: 4px;"
-            f"  font-size: 11px;"
+            f"  padding: 8px 10px;"
+            f"  font-size: 12px;"
             f"  font-weight: 600;"
             f"}}"
         )
@@ -469,8 +474,8 @@ class DashboardWidget(QWidget):
         """Construct the recent-activity QListWidget with auto-scroll."""
         feed_label = QLabel("RECENT ACTIVITY")
         feed_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 10px; font-weight: 600;"
-            f"padding-top: 6px;"
+            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: 600;"
+            f" letter-spacing: 1px; padding-top: 8px;"
         )
         self._grid.addWidget(feed_label, 5, 0, 1, 3)
 
@@ -480,15 +485,16 @@ class DashboardWidget(QWidget):
             f"  background-color: {PANEL_BG};"
             f"  color: {TEXT_PRIMARY};"
             f"  border: 1px solid {BORDER};"
+            f"  border-radius: 8px;"
             f"  font-family: {_MONO_FAMILY};"
-            f"  font-size: 12px;"
+            f"  font-size: 13px;"
             f"}}"
             f"QListWidget::item {{"
-            f"  padding: 4px 8px;"
+            f"  padding: 8px 12px;"
             f"  border-bottom: 1px solid {BORDER};"
             f"}}"
         )
-        self._activity_list.setMaximumHeight(260)
+        self._activity_list.setMaximumHeight(300)
 
         # Track whether the user has scrolled away from the bottom
         self._auto_scroll: bool = True

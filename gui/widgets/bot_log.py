@@ -188,7 +188,7 @@ class BotLogWidget(QWidget):
         """Assemble the complete widget layout."""
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(8)
 
         root.addLayout(self._build_toolbar())
         self._log_view = self._build_log_view()
@@ -203,7 +203,7 @@ class BotLogWidget(QWidget):
         spin box.
         """
         bar = QHBoxLayout()
-        bar.setSpacing(6)
+        bar.setSpacing(10)
 
         # Log level filter
         lbl_level = QLabel("Level:")

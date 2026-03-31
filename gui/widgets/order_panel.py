@@ -135,7 +135,7 @@ class OrderPanel(QWidget):
         """Construct the complete widget layout."""
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(8)
 
         # -- Top filter bar ------------------------------------------------
         root.addLayout(self._build_filter_bar())
@@ -155,13 +155,13 @@ class OrderPanel(QWidget):
         danger button.
         """
         bar = QHBoxLayout()
-        bar.setSpacing(6)
+        bar.setSpacing(10)
 
         # Pair filter
         lbl_pair = QLabel("Pair:")
         self._combo_pair = QComboBox()
         self._combo_pair.addItem("All Pairs")
-        self._combo_pair.setMinimumWidth(120)
+        self._combo_pair.setMinimumWidth(140)
         self._combo_pair.currentIndexChanged.connect(self._apply_filters)
         bar.addWidget(lbl_pair)
         bar.addWidget(self._combo_pair)
@@ -185,7 +185,7 @@ class OrderPanel(QWidget):
         # Search box
         self._search = QLineEdit()
         self._search.setPlaceholderText("\U0001F50D Search offers...")
-        self._search.setMinimumWidth(160)
+        self._search.setMinimumWidth(200)
         self._search.textChanged.connect(self._apply_filters)
         bar.addWidget(self._search)
 
@@ -233,7 +233,7 @@ class OrderPanel(QWidget):
     def _build_summary_bar(self) -> QHBoxLayout:
         """Create the bottom summary bar with aggregate statistics."""
         bar = QHBoxLayout()
-        bar.setSpacing(16)
+        bar.setSpacing(24)
 
         self._lbl_total = QLabel("Total: 0")
         self._lbl_pending = QLabel("Pending: 0")

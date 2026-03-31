@@ -77,14 +77,14 @@ class StatusBar(QStatusBar):
 
         # -- Left section: PnL ---------------------------------------------
         self._pnl_label = QLabel("PnL: 0.0000 XCH")
-        self._pnl_label.setMinimumWidth(160)
+        self._pnl_label.setMinimumWidth(200)
         self.addWidget(self._pnl_label, stretch=0)
 
         # -- Centre section: spread, inventory, block height ----------------
         centre_container = QWidget(self)
         centre_layout = QHBoxLayout(centre_container)
-        centre_layout.setContentsMargins(8, 0, 8, 0)
-        centre_layout.setSpacing(16)
+        centre_layout.setContentsMargins(12, 0, 12, 0)
+        centre_layout.setSpacing(20)
 
         self._spread_label = QLabel("Spread: -- bps")
         self._spread_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -94,8 +94,8 @@ class StatusBar(QStatusBar):
         self._inventory_bar = QProgressBar()
         self._inventory_bar.setRange(0, 100)
         self._inventory_bar.setValue(50)
-        self._inventory_bar.setFixedWidth(80)
-        self._inventory_bar.setFixedHeight(12)
+        self._inventory_bar.setFixedWidth(100)
+        self._inventory_bar.setFixedHeight(14)
         self._inventory_bar.setTextVisible(False)
         self._inventory_bar.setStyleSheet(
             f"""
@@ -125,7 +125,7 @@ class StatusBar(QStatusBar):
 
         self._clock_label = QLabel("UTC --:--:--")
         self._clock_label.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-        self._clock_label.setMinimumWidth(100)
+        self._clock_label.setMinimumWidth(120)
         self.addPermanentWidget(self._clock_label)
 
     def _apply_stylesheet(self) -> None:
@@ -136,13 +136,14 @@ class StatusBar(QStatusBar):
                 background-color: {PANEL_BG};
                 border-top: 1px solid {BORDER};
                 color: {TEXT_SECONDARY};
-                font-size: 12px;
-                padding: 2px 6px;
+                font-size: 13px;
+                padding: 4px 12px;
+                min-height: 28px;
             }}
             QLabel {{
                 color: {TEXT_SECONDARY};
-                font-size: 12px;
-                padding: 0 4px;
+                font-size: 13px;
+                padding: 0 6px;
             }}
             """
         )
@@ -174,7 +175,7 @@ class StatusBar(QStatusBar):
         colour = PROFIT_GREEN if pnl_mojos >= 0 else LOSS_RED
         sign = "+" if pnl_mojos > 0 else ""
         self._pnl_label.setText(f"PnL: {sign}{xch_value:.4f} XCH")
-        self._pnl_label.setStyleSheet(f"color: {colour}; font-weight: bold; font-size: 12px;")
+        self._pnl_label.setStyleSheet(f"color: {colour}; font-weight: bold; font-size: 13px;")
 
         # Spread
         self._spread_label.setText(f"Spread: {spread_bps:.0f} bps")

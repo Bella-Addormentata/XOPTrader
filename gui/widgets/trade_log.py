@@ -104,7 +104,7 @@ class TradeLogWidget(QWidget):
         """Assemble the complete widget layout."""
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(4)
+        root.setSpacing(8)
 
         root.addLayout(self._build_filter_bar())
         self._table = self._build_table()
@@ -118,7 +118,7 @@ class TradeLogWidget(QWidget):
         an export button, and a trade-count label.
         """
         bar = QHBoxLayout()
-        bar.setSpacing(6)
+        bar.setSpacing(10)
 
         # Date range: From
         lbl_from = QLabel("From:")
@@ -149,7 +149,7 @@ class TradeLogWidget(QWidget):
         lbl_pair = QLabel("Pair:")
         self._combo_pair = QComboBox()
         self._combo_pair.addItem("All Pairs")
-        self._combo_pair.setMinimumWidth(120)
+        self._combo_pair.setMinimumWidth(140)
         self._combo_pair.currentIndexChanged.connect(self._apply_filters)
         bar.addWidget(lbl_pair)
         bar.addWidget(self._combo_pair)
@@ -167,7 +167,7 @@ class TradeLogWidget(QWidget):
         # Trade count label
         self._lbl_count = QLabel("Trades: 0")
         self._lbl_count.setStyleSheet(
-            f"color: {COLORS.TEXT_SECONDARY}; font-size: 9pt;"
+            f"color: {COLORS.TEXT_SECONDARY}; font-size: 10pt;"
         )
         bar.addWidget(self._lbl_count)
 

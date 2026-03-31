@@ -544,6 +544,28 @@ private:
     /// ISO/IEC 5055: no blocking .get()/.wait() on the io_context thread.
     std::atomic<bool> shutdown_cancel_done_{false};
 
+    // -- Wallet circuit breaker ----------------------------------------------
+    // After consecutive wallet RPC failures, skip wallet-dependent heartbeat
+    // steps (2 and 8) and poll for wallet recovery instead.  This prevents
+    // timeout cascades from stalling the entire heartbeat loop when the
+    // wallet daemon is unreachable.
+
+    /// Number of consecutive wallet RPC failures.
+    std::uint32_t wallet_consecutive_failures_{0};
+
+    /// Threshold: after this many consecutive failures, wallet-dependent
+    /// heartbeat steps are skipped until the wallet recovers.
+    static constexpr std::uint32_t kWalletCircuitBreakerThreshold{3};
+
+    /// True when the circuit breaker has tripped (wallet assumed unreachable).
+    bool wallet_circuit_open_{false};
+
+    /// Timestamp of the last wallet recovery probe (to throttle retries).
+    std::chrono::steady_clock::time_point wallet_last_probe_{};
+
+    /// Minimum interval between wallet recovery probes when circuit is open.
+    static constexpr std::chrono::seconds kWalletProbeInterval{30};
+
     /// Per-pair working storage for the current cycle's quotes.
     /// Populated by step_compute_quotes, consumed through steps 5-8.
     // [M10] Value-initialize all aggregate members to prevent

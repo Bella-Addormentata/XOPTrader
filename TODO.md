@@ -164,10 +164,10 @@ These are blocking production bugs or severe logic errors identified by multiple
 
 ### T2-08: Make SSL verification configurable (default ON for Chia CA)
 - **Source:** CODEREVIEW-Claude-Opus-4.6 §9.8, CODEREVIEW-ClaudeCode-Opus §M30
-- **Files:** `cpp/src/rpc/chia_rpc.cpp`
-- **Issue:** SSL verification completely disabled (`CURLOPT_SSL_VERIFYPEER = 0`). MITM on wallet RPC could redirect funds.
-- **Fix:** Load Chia CA cert and verify. Only disable for localhost.
-- **Status:** `[x]` — SSL verification configurable via config_.verify_ssl (default true). Chia CA cert loaded.
+- **Files:** `cpp/src/rpc/chia_rpc.cpp`, `cpp/include/xop/config.hpp`, `cpp/src/config.cpp`, `cpp/src/engine.cpp`, `config.example.yaml`
+- **Issue:** SSL verification completely disabled (`CURLOPT_SSL_VERIFYPEER = 0`). MITM on wallet RPC could redirect funds. CA cert path missing from ChiaConfig struct and never wired into RPC clients.
+- **Fix:** Added `ca_cert_path` to ChiaConfig, config parser, and engine RPC client initialization. Added field to `config.example.yaml`. SSL verification configurable via `verify_ssl` (default true). Added `CURLE_SSL_CONNECT_ERROR` to transient retry list. Lowered localhost connect timeout from 15s to 3s. Added wallet circuit breaker (3 consecutive failures → skip wallet steps, probe every 30s). Offer reconciliation triggered on wallet reconnection.
+- **Status:** `[x]` — Complete: CA cert path wired end-to-end, SSL retry for daemon restarts, circuit breaker prevents timeout cascades, orphan reconciliation on reconnect.
 
 ### T2-09: Persist actual wallet offer IDs (not placeholders)
 - **Source:** CODEREVIEW-GPT-5.4 §11, CODEREVIEW-GPT5.3-Codex §P0-5, CODEREVIEW-Claude-Opus-4.6 §7.4, CODEREVIEW-ClaudeCode-Opus §M-V1
