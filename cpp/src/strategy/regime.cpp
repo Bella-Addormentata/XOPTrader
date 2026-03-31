@@ -149,6 +149,20 @@ RegimeDetector::RegimeDetector(const RegimeDetectorConfig& cfg)
         hmm_.fitted          = false;
     }
 
+    // -- Validate MSM config (T5-CR14) ----------------------------------------
+    if (cfg_.msm_enabled) {
+        // msm_k_frequencies is used as the exponent in 1ULL << K, so values
+        // >= 64 are undefined behaviour and even moderately large K will
+        // exhaust memory (2^K state vectors).  Enforce a practical ceiling.
+        constexpr std::uint32_t kMaxMsmK = 20;
+        if (cfg_.msm_k_frequencies == 0 || cfg_.msm_k_frequencies > kMaxMsmK) {
+            throw std::invalid_argument(
+                "RegimeDetector: msm_k_frequencies must be in [1, "
+                + std::to_string(kMaxMsmK)
+                + "], got " + std::to_string(cfg_.msm_k_frequencies));
+        }
+    }
+
     // -- Initialise MSM if enabled (T5-CR14) ---------------------------------
     if (cfg_.msm_enabled) {
         msm_initialise();
@@ -1257,7 +1271,7 @@ RegimeInfo to_regime_info(const RegimeDetector& detector) {
 void RegimeDetector::msm_initialise()
 {
     const auto K = cfg_.msm_k_frequencies;
-    const auto num_states = static_cast<std::size_t>(1U << K);
+    const auto num_states = static_cast<std::size_t>(1ULL << K);
 
     msm_.k = K;
     msm_.num_states = num_states;
