@@ -262,7 +262,6 @@ AdverseSelectionEstimator::validate_predictive_power(
     std::size_t true_pos  = 0;  // high-PIN AND adverse
     std::size_t false_pos = 0;  // high-PIN AND non-adverse
     std::size_t false_neg = 0;  // low-PIN  AND adverse
-    std::size_t total_adverse = 0;
 
     double running_alpha = cfg_.prior_alpha;
     double running_beta  = cfg_.prior_beta;
@@ -280,7 +279,6 @@ AdverseSelectionEstimator::validate_predictive_power(
         if (high_pin && rec.adverse) ++true_pos;
         if (high_pin && !rec.adverse) ++false_pos;
         if (!high_pin && rec.adverse) ++false_neg;
-        if (rec.adverse) ++total_adverse;
 
         sum_pin     += pin_at_fill;
         sum_adv     += adv_val;
