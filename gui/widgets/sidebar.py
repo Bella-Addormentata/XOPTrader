@@ -39,31 +39,41 @@ ELEVATED_BG: Final[str] = _C.ELEVATED_BG
 BORDER: Final[str] = _C.BORDER
 TEXT_PRIMARY: Final[str] = _C.TEXT_PRIMARY
 TEXT_SECONDARY: Final[str] = _C.TEXT_SECONDARY
+SIDEBAR_BG: Final[str] = _C.SIDEBAR_BG
+SIDEBAR_SELECTED: Final[str] = _C.SIDEBAR_SELECTED
 
-# Sidebar geometry
-RAIL_WIDTH: Final[int] = 50
-EXPANDED_WIDTH: Final[int] = 200
+# Sidebar geometry -- matches Chia GUI drawer width of 72px
+RAIL_WIDTH: Final[int] = 72
+EXPANDED_WIDTH: Final[int] = 240
 ANIMATION_DURATION_MS: Final[int] = 200
 
-# Navigation entries: (label, unicode icon placeholder)
+# Icon box dimensions (Chia: spacing(6) = 48px)
+ICON_BOX_SIZE: Final[int] = 48
+ICON_FONT_SIZE: Final[int] = 22
+
+# Navigation entries: (label, unicode icon)
+# Using clearer, more recognisable glyphs that render well at 22px
 _NAV_ITEMS: Final[list[tuple[str, str]]] = [
-    ("Dashboard",  "\u25EB"),   # ◫
-    ("Charts",     "\u25F0"),   # ◰
-    ("Orders",     "\u2630"),   # ☰
-    ("Order Book", "\u2593"),   # ▓
-    ("Analysis",   "\u2315"),   # ⌕  (search/scan icon)
-    ("Settings",   "\u2699"),   # ⚙
+    ("Dashboard",  "\U0001F4CA"),   # 📊  bar chart
+    ("Charts",     "\U0001F4C8"),   # 📈  chart increasing
+    ("Orders",     "\U0001F4CB"),   # 📋  clipboard
+    ("Order Book", "\U0001F4D6"),   # 📖  open book
+    ("Analysis",   "\U0001F50D"),   # 🔍  magnifying glass
+    ("Settings",   "\u2699\uFE0F"), # ⚙️  gear
 ]
 
 
 class SidebarButton(QPushButton):
-    """Individual navigation button with icon, optional label, and active
-    indicator.
+    """Chia-style navigation button with icon box and label.
+
+    Renders as a vertical icon-in-box above a small label, matching the
+    Chia blockchain GUI sidebar pattern (48px icon box, 12px border-radius,
+    green highlight border and glow on selection).
 
     Parameters
     ----------
     icon_char : str
-        Single unicode character used as the icon placeholder.
+        Unicode character used as the icon.
     label_text : str
         Human-readable page label (hidden when sidebar is collapsed).
     parent : QWidget | None
@@ -85,7 +95,7 @@ class SidebarButton(QPushButton):
         self.setCheckable(True)
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Fixed)
-        self.setMinimumHeight(42)
+        self.setMinimumHeight(68)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
         self._refresh_text()
@@ -109,36 +119,42 @@ class SidebarButton(QPushButton):
     def _refresh_text(self) -> None:
         """Update button text based on expanded/collapsed state."""
         if self._expanded:
-            self.setText(f"  {self._icon_char}   {self._label_text}")
+            self.setText(f"{self._icon_char}\n{self._label_text}")
         else:
             self.setText(self._icon_char)
 
     def _apply_stylesheet(self) -> None:
-        """Apply CHIA-themed styling with active indicator."""
-        active_border = (
-            f"border-left: 3px solid {PRIMARY_GREEN};" if self._active else "border-left: 3px solid transparent;"
-        )
-        active_bg = ELEVATED_BG if self._active else "transparent"
+        """Apply Chia-styled icon-box navigation with green glow on active."""
+        if self._active:
+            border_color = PRIMARY_GREEN
+            bg_color = SIDEBAR_SELECTED
+            text_color = LIGHT_GREEN
+            icon_size = ICON_FONT_SIZE + 1
+        else:
+            border_color = BORDER
+            bg_color = "transparent"
+            text_color = TEXT_SECONDARY
+            icon_size = ICON_FONT_SIZE
+
         self.setStyleSheet(
             f"""
             QPushButton {{
-                background-color: {active_bg};
-                color: {TEXT_PRIMARY};
-                {active_border}
-                border-top: none;
-                border-right: none;
-                border-bottom: none;
-                text-align: left;
-                padding: 8px 6px;
-                font-size: 14px;
-                border-radius: 0px;
+                background-color: {bg_color};
+                color: {text_color};
+                border: 1px solid {border_color};
+                border-radius: 12px;
+                text-align: center;
+                padding: 8px 4px;
+                font-size: {icon_size}px;
+                margin: 2px 8px;
             }}
             QPushButton:hover {{
+                border-color: {PRIMARY_GREEN};
+                color: {TEXT_PRIMARY};
                 background-color: {ELEVATED_BG};
             }}
             QPushButton:focus {{
-                outline: 1px solid {PRIMARY_GREEN};
-                outline-offset: -1px;
+                border: 2px solid {PRIMARY_GREEN};
             }}
             """
         )
@@ -148,8 +164,8 @@ class Sidebar(QWidget):
     """Collapsible left-hand navigation sidebar.
 
     Emits *page_changed(int)* when the user selects a different page.
-    Supports animated expand/collapse between a 50 px icon rail and
-    200 px full panel.
+    Supports animated expand/collapse between a 72 px icon rail and
+    240 px full panel (matching Chia GUI drawer width).
 
     Parameters
     ----------
@@ -204,8 +220,8 @@ class Sidebar(QWidget):
     def _build_ui(self) -> None:
         """Construct the sidebar layout: nav buttons + toggle button."""
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 8, 0, 8)
-        layout.setSpacing(2)
+        layout.setContentsMargins(0, 12, 0, 12)
+        layout.setSpacing(4)
 
         # Navigation buttons
         for index, (label, icon) in enumerate(_NAV_ITEMS):
@@ -221,13 +237,14 @@ class Sidebar(QWidget):
         separator = QWidget(self)
         separator.setFixedHeight(1)
         separator.setStyleSheet(f"background-color: {BORDER};")
+        separator.setContentsMargins(12, 0, 12, 0)
         layout.addWidget(separator)
 
         # Collapse / Expand toggle
         self._toggle_btn = QPushButton(self)
         self._toggle_btn.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
         self._toggle_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._toggle_btn.setMinimumHeight(36)
+        self._toggle_btn.setMinimumHeight(44)
         self._toggle_btn.clicked.connect(self.toggle)
         self._update_toggle_label()
         self._toggle_btn.setStyleSheet(
@@ -235,25 +252,28 @@ class Sidebar(QWidget):
             QPushButton {{
                 background-color: transparent;
                 color: {TEXT_SECONDARY};
-                border: none;
+                border: 1px solid {BORDER};
+                border-radius: 12px;
                 text-align: center;
-                font-size: 13px;
-                padding: 6px;
+                font-size: 14px;
+                padding: 8px;
+                margin: 4px 8px;
             }}
             QPushButton:hover {{
                 color: {TEXT_PRIMARY};
                 background-color: {ELEVATED_BG};
+                border-color: {PRIMARY_GREEN};
             }}
             """
         )
         layout.addWidget(self._toggle_btn)
 
     def _apply_stylesheet(self) -> None:
-        """Apply sidebar container styling."""
+        """Apply sidebar container styling with Chia-themed background."""
         self.setStyleSheet(
             f"""
             Sidebar {{
-                background-color: {PANEL_BG};
+                background-color: {SIDEBAR_BG};
                 border-right: 1px solid {BORDER};
             }}
             """

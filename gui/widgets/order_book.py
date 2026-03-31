@@ -217,7 +217,7 @@ class OrderBookWidget(QWidget):
         """Assemble toolbar, table, and depth chart into the layout."""
         root_layout = QVBoxLayout(self)
         root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(4)
+        root_layout.setSpacing(8)
 
         # -- Top toolbar --
         root_layout.addLayout(self._build_toolbar())
@@ -248,13 +248,13 @@ class OrderBookWidget(QWidget):
         Configured QHBoxLayout ready to be added to the root layout.
         """
         toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(6, 4, 6, 4)
-        toolbar.setSpacing(8)
+        toolbar.setContentsMargins(10, 8, 10, 8)
+        toolbar.setSpacing(12)
 
         # Pair selector
         lbl_pair = QLabel("Pair:")
         self._combo_pair = QComboBox()
-        self._combo_pair.setMinimumWidth(120)
+        self._combo_pair.setMinimumWidth(140)
         self._combo_pair.currentTextChanged.connect(self._on_pair_changed)
         toolbar.addWidget(lbl_pair)
         toolbar.addWidget(self._combo_pair)

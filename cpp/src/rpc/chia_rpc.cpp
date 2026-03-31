@@ -413,8 +413,14 @@ CURLcode ChiaRPCBase::perform_request(const std::string& url,
         static_cast<long>(config_.request_timeout.count());
     curl_easy_setopt(curl.get(), CURLOPT_TIMEOUT_MS, timeout_ms);
 
-    // Connection timeout -- half of request timeout, floored at 5 s.
-    const long connect_ms = std::max(5000L, timeout_ms / 2);
+    // Connection timeout -- use a short timeout for localhost (most common
+    // deployment), and half of request timeout otherwise, floored at 3 s.
+    const bool is_localhost = (config_.host == "localhost"
+                               || config_.host == "127.0.0.1"
+                               || config_.host == "::1");
+    const long connect_ms = is_localhost
+        ? 3000L
+        : std::max(3000L, timeout_ms / 2);
     curl_easy_setopt(curl.get(), CURLOPT_CONNECTTIMEOUT_MS, connect_ms);
 
     // Disable redirects (Chia doesn't redirect; defense-in-depth).
@@ -456,6 +462,7 @@ bool ChiaRPCBase::is_transient(CURLcode curl_code, long http_code) noexcept
     case CURLE_SEND_ERROR:
     case CURLE_RECV_ERROR:
     case CURLE_PARTIAL_FILE:
+    case CURLE_SSL_CONNECT_ERROR:  // Wallet daemon restart can cause transient SSL failures.
         return true;
     default:
         break;

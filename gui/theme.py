@@ -26,27 +26,38 @@ class ChiaColors:
     interpolation into QSS rules.
     """
 
-    # Brand greens
-    PRIMARY_GREEN: str = "#3AAC59"
+    # Brand greens (from Chia Color.ts: Green[500], Green[400])
+    PRIMARY_GREEN: str = "#35B24B"
     LIGHT_GREEN: str = "#5ECE71"
 
-    # Surface / background hierarchy (darkest -> lightest)
-    DARK_BG: str = "#0D1117"
-    PANEL_BG: str = "#161B22"
-    ELEVATED_BG: str = "#1A2332"
+    # Surface / background hierarchy -- Chia Neutral palette (teal-tinted)
+    DARK_BG: str = "#0F252A"       # Neutral[900]
+    PANEL_BG: str = "#1E353B"      # Neutral[800]
+    ELEVATED_BG: str = "#243E45"   # between Neutral[700-800]
+
+    # Sidebar surfaces
+    SIDEBAR_BG: str = "#1E353B"    # Neutral[800] -- matches panel
+    SIDEBAR_SELECTED: str = "#1B4C24"  # Green[900] subtle highlight
 
     # Borders
-    BORDER: str = "#2A2E39"
+    BORDER: str = "#344E54"        # Neutral[700]
+    BORDER_LIGHT: str = "#486268"  # Neutral[600] - for subtle dividers
 
-    # Typography
-    TEXT_PRIMARY: str = "#E1E4E8"
-    TEXT_SECONDARY: str = "#9CA3AF"  # Brightened for WCAG AA 4.5:1 on DARK_BG
+    # Typography (from Chia Color.Text.Dark)
+    TEXT_PRIMARY: str = "#E5F2F5"   # alpha('#F8FBFC', 0.9) approximation
+    TEXT_SECONDARY: str = "#AEC5CA" # alpha('#F8FBFC', 0.7) approximation
+    TEXT_DISABLED: str = "#536D73"  # alpha('#F8FBFC', 0.32) approximation
 
     # Semantic / trading
-    PROFIT_GREEN: str = "#3AAC59"
-    LOSS_RED: str = "#EF5350"
-    WARNING_YELLOW: str = "#F59E0B"
-    INFO_BLUE: str = "#3B82F6"
+    PROFIT_GREEN: str = "#35B24B"   # Green[500]
+    LOSS_RED: str = "#EE455F"       # Red[500]
+    WARNING_YELLOW: str = "#FEE611" # Yellow[400]
+    INFO_BLUE: str = "#04A9F6"     # Blue[500]
+
+    # Accent palette (from Chia)
+    AQUA: str = "#3EC3C1"           # Aqua[400]
+    PURPLE: str = "#CD48ED"         # Purple[500]
+    ORANGE: str = "#FF9B20"         # Orange[400]
 
 
 # Module-level singleton so callers can import colours directly.
@@ -68,8 +79,9 @@ _MONO_FALLBACK: str = "'JetBrains Mono', 'Fira Code', 'Consolas', monospace"
 _UI_FALLBACK: str = "'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif"
 
 # Base sizes (points).  Adjusted by *font_size_delta* at runtime.
-_BASE_UI_FONT_SIZE: int = 10
-_BASE_MONO_FONT_SIZE: int = 10
+# Increased from 10pt to match Chia GUI's more generous typography.
+_BASE_UI_FONT_SIZE: int = 11
+_BASE_MONO_FONT_SIZE: int = 11
 
 
 def _resolve_font(family: str, fallback: str, size_pt: int) -> QFont:
@@ -157,19 +169,20 @@ QMenuBar {{
     background-color: {c.PANEL_BG};
     color: {c.TEXT_PRIMARY};
     border-bottom: 1px solid {c.BORDER};
-    padding: 2px 0px;
+    padding: 4px 0px;
     font-size: {fs}pt;
+    min-height: 32px;
 }}
 
 QMenuBar::item {{
     background: transparent;
-    padding: 4px 10px;
+    padding: 6px 14px;
 }}
 
 QMenuBar::item:selected {{
     background-color: {c.PRIMARY_GREEN};
     color: {c.DARK_BG};
-    border-radius: 3px;
+    border-radius: 6px;
 }}
 
 /* ----- Drop-down menus ----- */
@@ -182,7 +195,7 @@ QMenu {{
 }}
 
 QMenu::item {{
-    padding: 5px 28px 5px 20px;
+    padding: 8px 28px 8px 20px;
 }}
 
 QMenu::item:selected {{
@@ -200,8 +213,9 @@ QMenu::separator {{
 QToolBar {{
     background-color: {c.PANEL_BG};
     border: none;
-    spacing: 4px;
-    padding: 2px;
+    spacing: 8px;
+    padding: 6px 8px;
+    min-height: 44px;
 }}
 
 QToolBar::separator {{
@@ -216,10 +230,10 @@ QPushButton {{
     background-color: {c.ELEVATED_BG};
     color: {c.TEXT_PRIMARY};
     border: 1px solid {c.BORDER};
-    border-radius: 4px;
-    padding: 5px 16px;
+    border-radius: 8px;
+    padding: 8px 20px;
     font-size: {fs}pt;
-    min-height: 20px;
+    min-height: 28px;
 }}
 
 QPushButton:hover {{
@@ -285,11 +299,12 @@ QTabBar::tab {{
     color: {c.TEXT_SECONDARY};
     border: 1px solid {c.BORDER};
     border-bottom: none;
-    padding: 6px 18px;
+    padding: 10px 24px;
     margin-right: 2px;
-    border-top-left-radius: 4px;
-    border-top-right-radius: 4px;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
     font-size: {fs}pt;
+    min-width: 80px;
 }}
 
 QTabBar::tab:selected {{
@@ -330,7 +345,8 @@ QTreeView, QTableView {{
 }}
 
 QTreeView::item, QTableView::item {{
-    padding: 3px 6px;
+    padding: 6px 10px;
+    min-height: 28px;
 }}
 
 QTreeView::item:hover, QTableView::item:hover {{
@@ -347,9 +363,10 @@ QHeaderView::section {{
     border: none;
     border-right: 1px solid {c.BORDER};
     border-bottom: 1px solid {c.BORDER};
-    padding: 4px 8px;
+    padding: 8px 12px;
     font-weight: 600;
     font-size: {sfs}pt;
+    min-height: 28px;
 }}
 
 QHeaderView::section:hover {{
@@ -359,14 +376,14 @@ QHeaderView::section:hover {{
 /* ----- Scroll bars (thin, unobtrusive) ----- */
 QScrollBar:vertical {{
     background: {c.DARK_BG};
-    width: 8px;
-    margin: 0;
+    width: 10px;
+    margin: 2px;
 }}
 
 QScrollBar::handle:vertical {{
     background: {c.BORDER};
-    min-height: 30px;
-    border-radius: 4px;
+    min-height: 40px;
+    border-radius: 5px;
 }}
 
 QScrollBar::handle:vertical:hover {{
@@ -379,14 +396,14 @@ QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{
 
 QScrollBar:horizontal {{
     background: {c.DARK_BG};
-    height: 8px;
-    margin: 0;
+    height: 10px;
+    margin: 2px;
 }}
 
 QScrollBar::handle:horizontal {{
     background: {c.BORDER};
-    min-width: 30px;
-    border-radius: 4px;
+    min-width: 40px;
+    border-radius: 5px;
 }}
 
 QScrollBar::handle:horizontal:hover {{
@@ -402,10 +419,11 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     background-color: {c.ELEVATED_BG};
     color: {c.TEXT_PRIMARY};
     border: 1px solid {c.BORDER};
-    border-radius: 4px;
-    padding: 4px 8px;
+    border-radius: 8px;
+    padding: 8px 12px;
     font-family: {_MONO_FALLBACK};
     font-size: {mfs}pt;
+    min-height: 20px;
     selection-background-color: {c.PRIMARY_GREEN};
     selection-color: {c.DARK_BG};
 }}
@@ -430,9 +448,9 @@ QComboBox QAbstractItemView {{
 /* ----- Group box ----- */
 QGroupBox {{
     border: 1px solid {c.BORDER};
-    border-radius: 6px;
-    margin-top: 12px;
-    padding-top: 16px;
+    border-radius: 12px;
+    margin-top: 16px;
+    padding: 20px 12px 12px 12px;
     font-size: {fs}pt;
 }}
 
@@ -467,8 +485,8 @@ QToolTip {{
     background-color: {c.PANEL_BG};
     color: {c.TEXT_PRIMARY};
     border: 1px solid {c.PRIMARY_GREEN};
-    border-radius: 3px;
-    padding: 4px 8px;
+    border-radius: 8px;
+    padding: 8px 12px;
     font-size: {sfs}pt;
 }}
 
@@ -476,16 +494,16 @@ QToolTip {{
 QProgressBar {{
     background-color: {c.ELEVATED_BG};
     border: 1px solid {c.BORDER};
-    border-radius: 4px;
+    border-radius: 6px;
     text-align: center;
     color: {c.TEXT_PRIMARY};
     font-size: {sfs}pt;
-    min-height: 16px;
+    min-height: 20px;
 }}
 
 QProgressBar::chunk {{
     background-color: {c.PRIMARY_GREEN};
-    border-radius: 3px;
+    border-radius: 5px;
 }}
 
 /* ----- Check box & radio button ----- */
@@ -496,18 +514,18 @@ QCheckBox, QRadioButton {{
 }}
 
 QCheckBox::indicator, QRadioButton::indicator {{
-    width: 16px;
-    height: 16px;
-    border: 1px solid {c.BORDER};
+    width: 20px;
+    height: 20px;
+    border: 2px solid {c.BORDER};
     background-color: {c.ELEVATED_BG};
 }}
 
 QCheckBox::indicator {{
-    border-radius: 3px;
+    border-radius: 4px;
 }}
 
 QRadioButton::indicator {{
-    border-radius: 8px;
+    border-radius: 10px;
 }}
 
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{

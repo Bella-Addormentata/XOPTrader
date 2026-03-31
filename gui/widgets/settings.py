@@ -176,11 +176,11 @@ class _AddPairDialog(QDialog):
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         self.setWindowTitle("Add Trading Pair")
-        self.setMinimumWidth(460)
+        self.setMinimumWidth(520)
 
         layout = QFormLayout(self)
-        layout.setContentsMargins(16, 16, 16, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(14)
 
         # -- Name --
         self.name_edit = QLineEdit()
@@ -288,14 +288,14 @@ class SettingsWidget(QWidget):
     def _build_ui(self) -> None:
         """Assemble the top-level layout: header, tabs, status bar."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 10, 12, 8)
-        root.setSpacing(8)
+        root.setContentsMargins(16, 14, 16, 12)
+        root.setSpacing(12)
 
         # -- Header row: title + action buttons --
         header = QHBoxLayout()
         title = QLabel("Settings")
         title.setStyleSheet(
-            f"font-size: 18px; font-weight: bold; color: {_C.TEXT_PRIMARY};"
+            f"font-size: 22px; font-weight: bold; color: {_C.TEXT_PRIMARY};"
         )
         header.addWidget(title)
         header.addStretch(1)
@@ -321,8 +321,8 @@ class SettingsWidget(QWidget):
         self._load_btn.clicked.connect(self._on_load_clicked)
 
         for btn in (self._load_btn, self._save_btn, self._reset_btn, self._apply_btn):
-            btn.setFixedHeight(30)
-            btn.setMinimumWidth(70)
+            btn.setFixedHeight(36)
+            btn.setMinimumWidth(80)
             header.addWidget(btn)
 
         root.addLayout(header)

@@ -244,8 +244,8 @@ class ChartWidget(QWidget):
         self._block_ts_counts: dict[str, int] = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(8, 8, 8, 8)
-        root.setSpacing(6)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
 
         self._build_toolbar(root)
         self._build_chart_area(root)
@@ -257,7 +257,7 @@ class ChartWidget(QWidget):
     def _build_toolbar(self, parent_layout: QVBoxLayout) -> None:
         """Create the top toolbar with selectors, toggles, and buttons."""
         toolbar = QHBoxLayout()
-        toolbar.setSpacing(8)
+        toolbar.setSpacing(12)
 
         # Pair selector
         self._pair_combo = QComboBox()
@@ -287,8 +287,8 @@ class ChartWidget(QWidget):
         self._auto_cb = QCheckBox("Auto-scroll")
         self._auto_cb.setChecked(True)
         self._auto_cb.setStyleSheet(
-            f"QCheckBox {{ color: {TEXT_PRIMARY}; font-size: 12px; }}"
-            f"QCheckBox::indicator {{ width: 14px; height: 14px; }}"
+            f"QCheckBox {{ color: {TEXT_PRIMARY}; font-size: 13px; }}"
+            f"QCheckBox::indicator {{ width: 18px; height: 18px; }}"
         )
         self._auto_cb.toggled.connect(self._on_auto_scroll_toggled)
         toolbar.addWidget(self._auto_cb)

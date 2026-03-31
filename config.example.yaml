@@ -43,6 +43,8 @@ chia:
   ssl_key_path: "~/.chia/mainnet/config/ssl/full_node/private_full_node.key"
   wallet_cert_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.crt"
   wallet_key_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.key"
+  # CA certificate for verifying the Chia daemon (required for mTLS)
+  ca_cert_path: "~/.chia/mainnet/config/ssl/ca/chia_ca.crt"
   # Wallet fingerprint (integer — get yours from `chia keys show`)
   # Supports env vars: wallet_fingerprint: ${XOP_WALLET_FINGERPRINT}
   wallet_fingerprint: 1234567890

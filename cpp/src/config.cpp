@@ -348,6 +348,9 @@ ChiaConfig parse_chia(const YAML::Node& root)
     cfg.wallet_cert_path = expand_tilde(read_string(node, "wallet_cert_path", sec));
     cfg.wallet_key_path  = expand_tilde(read_string(node, "wallet_key_path", sec));
 
+    // CA certificate — required for SSL verification (default ON).
+    cfg.ca_cert_path = expand_tilde(read_string(node, "ca_cert_path", sec));
+
     if (cfg.mode == ChiaMode::WalletOnly) {
         // Full-node SSL paths optional -- read if present.
         if (node["ssl_cert_path"] && node["ssl_cert_path"].IsScalar()) {

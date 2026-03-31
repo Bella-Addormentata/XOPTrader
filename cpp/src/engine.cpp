@@ -81,8 +81,9 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         rpc::ChiaRPCConfig fn_cfg;
         fn_cfg.host = config_.chia.full_node_host;
         fn_cfg.port = config_.chia.full_node_port;
-        fn_cfg.tls.cert_path = config_.chia.ssl_cert_path;
-        fn_cfg.tls.key_path  = config_.chia.ssl_key_path;
+        fn_cfg.tls.cert_path    = config_.chia.ssl_cert_path;
+        fn_cfg.tls.key_path     = config_.chia.ssl_key_path;
+        fn_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
         full_node_ = std::make_shared<rpc::ChiaFullNodeRPC>(ioc_, fn_cfg);
     }
 
@@ -90,8 +91,9 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     rpc::ChiaRPCConfig wal_cfg;
     wal_cfg.host = config_.chia.wallet_host;
     wal_cfg.port = config_.chia.wallet_port;
-    wal_cfg.tls.cert_path = config_.chia.wallet_cert_path;
-    wal_cfg.tls.key_path  = config_.chia.wallet_key_path;
+    wal_cfg.tls.cert_path    = config_.chia.wallet_cert_path;
+    wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
+    wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
     wallet_ = std::make_shared<rpc::ChiaWalletRPC>(ioc_, wal_cfg);
 
     // Build dexie client config from AppConfig.
@@ -563,6 +565,41 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
 
         try {
+            // -- Wallet circuit breaker: probe for recovery ----------------
+            if (wallet_circuit_open_) {
+                auto now = std::chrono::steady_clock::now();
+                if (now - wallet_last_probe_ >= kWalletProbeInterval) {
+                    wallet_last_probe_ = now;
+                    try {
+                        co_await wallet_->get_sync_status();
+                        // Success — wallet is back.
+                        wallet_circuit_open_       = false;
+                        wallet_consecutive_failures_ = 0;
+                        spdlog::info("[Engine] Wallet circuit breaker CLOSED "
+                                     "-- wallet is reachable again");
+                        // Reconcile offers to catch any orphans from the
+                        // outage period.
+                        if (offer_mgr_) {
+                            try {
+                                int fixed = co_await offer_mgr_->reconcile_offers();
+                                if (fixed > 0) {
+                                    spdlog::info("[Engine] Post-reconnect offer "
+                                                 "reconciliation corrected {} "
+                                                 "discrepancies", fixed);
+                                }
+                            } catch (const std::exception& re) {
+                                spdlog::warn("[Engine] Post-reconnect offer "
+                                             "reconciliation failed: {}",
+                                             re.what());
+                            }
+                        }
+                    } catch (...) {
+                        spdlog::debug("[Engine] Wallet circuit breaker probe "
+                                      "failed -- still unreachable");
+                    }
+                }
+            }
+
             // co_await the block height -- use wallet RPC in wallet-only mode.
             std::int64_t height = wallet_only_mode_
                 ? co_await wallet_->get_height_info()
@@ -860,9 +897,26 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     }
 
     // [T1-03] Step 2 is a coroutine (co_awaits detect_fills).
-    try { co_await step_process_fills(block_height); }
-    catch (const std::exception& e) {
-        spdlog::error("[Engine] Step 2 (fills) failed: {}", e.what());
+    // Gated by the wallet circuit breaker to avoid timeout cascades.
+    if (!wallet_circuit_open_) {
+        try {
+            co_await step_process_fills(block_height);
+            wallet_consecutive_failures_ = 0;  // Reset on success.
+        }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 2 (fills) failed: {}", e.what());
+            ++wallet_consecutive_failures_;
+            if (wallet_consecutive_failures_ >= kWalletCircuitBreakerThreshold) {
+                wallet_circuit_open_ = true;
+                wallet_last_probe_   = std::chrono::steady_clock::now();
+                spdlog::warn("[Engine] Wallet circuit breaker OPEN after {} "
+                             "consecutive failures -- skipping wallet-dependent "
+                             "steps until recovery",
+                             wallet_consecutive_failures_);
+            }
+        }
+    } else {
+        spdlog::debug("[Engine] Step 2 SKIPPED: wallet circuit breaker open");
     }
 
     try { step_update_analytics(block_height); }
@@ -992,10 +1046,25 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
     // [T3-10] Gate Step 8 during Crash/Recovery states.
-    if (flash_crash_state_ == FlashCrashState::Normal) {
-        try { co_await step_manage_offers(block_height); }
+    // Also gated by the wallet circuit breaker.
+    if (wallet_circuit_open_) {
+        spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
+    } else if (flash_crash_state_ == FlashCrashState::Normal) {
+        try {
+            co_await step_manage_offers(block_height);
+            wallet_consecutive_failures_ = 0;  // Reset on success.
+        }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 8 (offers) failed: {}", e.what());
+            ++wallet_consecutive_failures_;
+            if (wallet_consecutive_failures_ >= kWalletCircuitBreakerThreshold) {
+                wallet_circuit_open_ = true;
+                wallet_last_probe_   = std::chrono::steady_clock::now();
+                spdlog::warn("[Engine] Wallet circuit breaker OPEN after {} "
+                             "consecutive failures -- skipping wallet-dependent "
+                             "steps until recovery",
+                             wallet_consecutive_failures_);
+            }
         }
     } else {
         spdlog::warn("[Engine] Step 8 GATED: flash_crash_state={} "
