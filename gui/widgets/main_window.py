@@ -573,6 +573,12 @@ class MainWindow(QMainWindow):
         act_docs.triggered.connect(self._on_open_docs)
         help_menu.addAction(act_docs)
 
+        help_menu.addSeparator()
+
+        act_updates = QAction("Check for &Updates\u2026", self)
+        act_updates.triggered.connect(self._on_check_updates)
+        help_menu.addAction(act_updates)
+
     # ===================================================================== #
     #  Toolbar                                                               #
     # ===================================================================== #
@@ -1092,6 +1098,48 @@ class MainWindow(QMainWindow):
         QDesktopServices.openUrl(
             QUrl("https://github.com/XOPTrader/xoptrader/wiki")
         )
+
+    def _on_check_updates(self) -> None:
+        """Launch a background check for newer releases on GitHub."""
+        from gui.services.update_service import UpdateService
+
+        svc = UpdateService(self._get_version(), parent=self)
+        svc.update_available.connect(self._on_update_available)
+        svc.up_to_date.connect(
+            lambda: QMessageBox.information(
+                self, "Up to Date",
+                f"You are running the latest version ({self._get_version()}).",
+            )
+        )
+        svc.check_failed.connect(
+            lambda err: QMessageBox.warning(
+                self, "Update Check Failed",
+                f"Could not check for updates:\n{err}",
+            )
+        )
+        # Store a reference so the service isn't garbage-collected.
+        self._update_svc = svc
+        svc.check()
+
+    def _on_update_available(self, version: str, url: str) -> None:
+        """Show a dialog when a newer version is found."""
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+
+        result = QMessageBox.information(
+            self,
+            "Update Available",
+            (
+                f"<p>A new version of XOPTrader is available: "
+                f"<b>v{version}</b></p>"
+                f"<p>You are running v{self._get_version()}.</p>"
+                f"<p>Would you like to open the release page?</p>"
+            ),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if result == QMessageBox.StandardButton.Yes:
+            QDesktopServices.openUrl(QUrl(url))
 
     @staticmethod
     def _get_version() -> str:
