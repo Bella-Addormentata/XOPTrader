@@ -498,6 +498,29 @@ public:
         bool         file_contents = false);
 
     /**
+     * @brief Retrieve the wallet's synced block height.
+     *
+     * Calls the Chia wallet RPC "get_height_info" endpoint.  In wallet-only
+     * mode this replaces the full-node's get_block_height() call.  The wallet
+     * service tracks block height from its peer connections even when no
+     * local full node is running.
+     *
+     * @return The wallet's current synced block height.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::int64_t> get_height_info();
+
+    /**
+     * @brief Retrieve the wallet's sync status.
+     *
+     * Calls the Chia wallet RPC "get_sync_status" endpoint.  Returns the
+     * raw JSON containing "syncing" and "synced" boolean fields.
+     *
+     * @return JSON with sync status information.
+     */
+    asio::awaitable<json> get_sync_status();
+
+    /**
      * @brief Check whether an offer is still valid (coins unspent).
      *
      * @param offer  Bech32-encoded offer string.

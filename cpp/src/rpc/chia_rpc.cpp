@@ -697,6 +697,21 @@ ChiaWalletRPC::ChiaWalletRPC(asio::io_context& ioc, ChiaRPCConfig cfg)
 
 // -- Wallet info ------------------------------------------------------------
 
+asio::awaitable<std::int64_t> ChiaWalletRPC::get_height_info()
+{
+    const json resp = co_await rpc_post("get_height_info");
+
+    if (!resp.contains("height")) {
+        throw ChiaRPCError("get_height_info: response missing 'height' field");
+    }
+    co_return resp["height"].get<std::int64_t>();
+}
+
+asio::awaitable<json> ChiaWalletRPC::get_sync_status()
+{
+    co_return co_await rpc_post("get_sync_status");
+}
+
 asio::awaitable<json>
 ChiaWalletRPC::get_wallet_balance(std::int64_t wallet_id)
 {

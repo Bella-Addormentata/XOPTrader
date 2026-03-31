@@ -33,10 +33,37 @@ public:
 };
 
 // ---------------------------------------------------------------------------
+// Chia node operating mode.
+//   Auto:       Attempt full_node first; fall back to wallet_only if the
+//               full node is unreachable at startup (recommended).
+//   FullNode:   Require a running Chia full node — abort if unavailable.
+//   WalletOnly: Run with the Chia wallet service only — no full node
+//               required.  Block height is obtained from the wallet's
+//               synced view (get_height_info), and fee estimation falls
+//               back to static fees.
+// ---------------------------------------------------------------------------
+enum class ChiaMode : std::uint8_t {
+    Auto       = 0,
+    FullNode   = 1,
+    WalletOnly = 2
+};
+
+/// Human-readable label for logging.
+inline const char* to_string(ChiaMode m) noexcept {
+    switch (m) {
+        case ChiaMode::Auto:       return "auto";
+        case ChiaMode::FullNode:   return "full_node";
+        case ChiaMode::WalletOnly: return "wallet_only";
+    }
+    return "unknown";
+}
+
+// ---------------------------------------------------------------------------
 // Chia blockchain RPC connectivity and authentication.
 // Covers both the full-node and wallet daemon endpoints.
 // ---------------------------------------------------------------------------
 struct ChiaConfig {
+    ChiaMode    mode{ChiaMode::Auto};   // Node operating mode (auto/full_node/wallet_only).
     std::string full_node_host;         // Full-node RPC hostname.
     uint16_t    full_node_port{8555};   // Full-node RPC port (default 8555).
     std::string wallet_host;            // Wallet RPC hostname.

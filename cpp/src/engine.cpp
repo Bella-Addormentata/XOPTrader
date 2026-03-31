@@ -76,13 +76,15 @@ Engine::Engine(const AppConfig& config, bool dry_run)
 
     // -- RPC / API clients ----------------------------------------------------
 
-    // Build full-node RPC config from AppConfig.
-    rpc::ChiaRPCConfig fn_cfg;
-    fn_cfg.host = config_.chia.full_node_host;
-    fn_cfg.port = config_.chia.full_node_port;
-    fn_cfg.tls.cert_path = config_.chia.ssl_cert_path;
-    fn_cfg.tls.key_path  = config_.chia.ssl_key_path;
-    full_node_ = std::make_shared<rpc::ChiaFullNodeRPC>(ioc_, fn_cfg);
+    // Build full-node RPC config from AppConfig (skipped in wallet_only mode).
+    if (config_.chia.mode != ChiaMode::WalletOnly) {
+        rpc::ChiaRPCConfig fn_cfg;
+        fn_cfg.host = config_.chia.full_node_host;
+        fn_cfg.port = config_.chia.full_node_port;
+        fn_cfg.tls.cert_path = config_.chia.ssl_cert_path;
+        fn_cfg.tls.key_path  = config_.chia.ssl_key_path;
+        full_node_ = std::make_shared<rpc::ChiaFullNodeRPC>(ioc_, fn_cfg);
+    }
 
     // Build wallet RPC config from AppConfig.
     rpc::ChiaRPCConfig wal_cfg;
@@ -561,8 +563,10 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
 
         try {
-            // co_await the full node RPC directly -- no use_future/.get().
-            std::int64_t height = co_await full_node_->get_block_height();
+            // co_await the block height -- use wallet RPC in wallet-only mode.
+            std::int64_t height = wallet_only_mode_
+                ? co_await wallet_->get_height_info()
+                : co_await full_node_->get_block_height();
 
             // [MEDIUM-4] Guard against negative block heights returned by a
             // malfunctioning or unreachable full node.  The RPC returns
@@ -669,7 +673,9 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // Fetch current block height.
         std::int64_t height{0};
         try {
-            height = co_await full_node_->get_block_height();
+            height = wallet_only_mode_
+                ? co_await wallet_->get_height_info()
+                : co_await full_node_->get_block_height();
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
             continue;
@@ -1228,9 +1234,10 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 
     // -- Adaptive fee estimation (T4-03) ------------------------------------
     // Query the full node's mempool for a fee estimate when adaptive mode
-    // is enabled.  The FeeTracker uses this to dynamically adjust the
-    // per-offer fee downward when the mempool is uncongested.
-    if (fee_tracker_->enabled() && config_.fees.adaptive_enabled) {
+    // is enabled.  Skipped in wallet-only mode (no full node mempool access);
+    // falls back to static/historic fees.
+    if (fee_tracker_->enabled() && config_.fees.adaptive_enabled
+        && !wallet_only_mode_) {
         try {
             auto est = co_await full_node_->get_fee_estimate(/*target_time=*/60);
             if (est > 0) {
@@ -3123,15 +3130,64 @@ void Engine::step_check_alerts(BlockHeight block_height)
 // ISO/IEC 27001:2022: connection events are audit-logged.
 asio::awaitable<void> Engine::open_connections()
 {
-    // Open the Chia full node RPC (mTLS) -- co_await on running io_context.
-    co_await full_node_->open();
-    spdlog::info("[Engine] Connected to Chia full node at {}:{}",
-                 config_.chia.full_node_host, config_.chia.full_node_port);
+    // Determine operating mode: full_node, wallet_only, or auto-detect.
+    if (config_.chia.mode == ChiaMode::WalletOnly) {
+        wallet_only_mode_ = true;
+        spdlog::info("[Engine] Configured for wallet-only mode "
+                     "(no full node required)");
+    } else if (config_.chia.mode == ChiaMode::FullNode) {
+        wallet_only_mode_ = false;
+    } else {
+        // Auto-detect: try full node first, fall back to wallet-only.
+        wallet_only_mode_ = false;  // optimistic
+    }
 
-    // Open the Chia wallet RPC (mTLS) -- co_await on running io_context.
+    // Open the Chia wallet RPC (always required).
     co_await wallet_->open();
     spdlog::info("[Engine] Connected to Chia wallet at {}:{}",
                  config_.chia.wallet_host, config_.chia.wallet_port);
+
+    // Open the Chia full node RPC (skip in wallet-only mode).
+    if (!wallet_only_mode_) {
+        try {
+            co_await full_node_->open();
+            // Verify reachability with a quick height query.
+            co_await full_node_->get_block_height();
+            spdlog::info("[Engine] Connected to Chia full node at {}:{}",
+                         config_.chia.full_node_host,
+                         config_.chia.full_node_port);
+        } catch (const std::exception& ex) {
+            if (config_.chia.mode == ChiaMode::Auto) {
+                spdlog::warn("[Engine] Full node unreachable ({}); "
+                             "falling back to wallet-only mode", ex.what());
+                wallet_only_mode_ = true;
+                full_node_->close();
+            } else {
+                // FullNode mode: failure is fatal.
+                throw;
+            }
+        }
+    }
+
+    if (wallet_only_mode_) {
+        // Verify wallet sync status.
+        try {
+            auto sync = co_await wallet_->get_sync_status();
+            bool synced = sync.contains("synced")
+                          && sync["synced"].is_boolean()
+                          && sync["synced"].get<bool>();
+            if (!synced) {
+                spdlog::warn("[Engine] Wallet is not fully synced yet; "
+                             "block heights may be stale until sync completes");
+            }
+            auto height = co_await wallet_->get_height_info();
+            spdlog::info("[Engine] Wallet-only mode active — wallet synced "
+                         "height: {}", height);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Could not verify wallet sync status: {}",
+                         ex.what());
+        }
+    }
 
     // Open the dexie REST client (synchronous HTTP -- no coroutine needed).
     dexie_->open();
@@ -3150,7 +3206,9 @@ asio::awaitable<void> Engine::open_connections()
 
 void Engine::close_connections()
 {
-    full_node_->close();
+    if (!wallet_only_mode_) {
+        full_node_->close();
+    }
     wallet_->close();
     dexie_->close();
     if (coingecko_) {

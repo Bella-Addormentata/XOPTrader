@@ -379,8 +379,26 @@ class SettingsWidget(QWidget):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
 
+        # -- Node Mode --
+        mode_group = QGroupBox("Node Mode")
+        mode_form = QFormLayout(mode_group)
+        mode_form.setSpacing(8)
+
+        self._chia_mode = QComboBox()
+        self._chia_mode.addItems(["auto", "full_node", "wallet_only"])
+        self._chia_mode.setCurrentIndex(0)
+        self._chia_mode.setToolTip(
+            "auto: try full node, fall back to wallet-only\n"
+            "full_node: require a running Chia full node\n"
+            "wallet_only: run with wallet service only (no full node)"
+        )
+        self._chia_mode.currentIndexChanged.connect(self._on_mode_changed)
+        mode_form.addRow("Mode:", self._chia_mode)
+        layout.addWidget(mode_group)
+
         # -- Chia Full Node --
         fn_group = QGroupBox("Chia Full Node")
+        self._fn_group = fn_group  # keep ref for enable/disable
         fn_form = QFormLayout(fn_group)
         fn_form.setSpacing(8)
 
@@ -1855,6 +1873,7 @@ class SettingsWidget(QWidget):
 
         # -- chia --
         cfg["chia"] = {
+            "mode": self._chia_mode.currentText(),
             "full_node_host": self._fn_host.text(),
             "full_node_port": self._fn_port.value(),
             "wallet_host": self._wl_host.text(),
@@ -2032,6 +2051,10 @@ class SettingsWidget(QWidget):
 
         try:
             chia = cfg.get("chia", {})
+            mode_str = str(chia.get("mode", "auto"))
+            mode_idx = ["auto", "full_node", "wallet_only"].index(mode_str) \
+                if mode_str in ("auto", "full_node", "wallet_only") else 0
+            self._chia_mode.setCurrentIndex(mode_idx)
             self._fn_host.setText(str(chia.get("full_node_host", "localhost")))
             self._fn_port.setValue(int(chia.get("full_node_port", 8555)))
             self._fn_cert.setText(str(chia.get("ssl_cert_path", "")))
@@ -2234,6 +2257,11 @@ class SettingsWidget(QWidget):
             # Update visual helpers.
             self._update_soft_limit_bar(self._soft_limit.value())
             self._update_tier_sum_label()
+
+            # Sync full-node group enabled state with mode selection.
+            self._fn_group.setEnabled(
+                self._chia_mode.currentText() != "wallet_only"
+            )
 
         finally:
             self._block_all_signals(False)
@@ -2779,6 +2807,22 @@ class SettingsWidget(QWidget):
         if self.save_config():
             # Re-emit with the freshly saved dict so listeners reload (api_key redacted).
             self.config_changed.emit(self._redacted_config_for_signal())
+
+    # ===================================================================
+    # Mode change handler
+    # ===================================================================
+
+    def _on_mode_changed(self, index: int) -> None:
+        """Enable/disable full-node fields based on the selected mode.
+
+        In ``wallet_only`` mode the full-node group box is disabled since
+        no full-node connection is required.  In ``auto`` and ``full_node``
+        modes it remains enabled.
+        """
+        mode = self._chia_mode.currentText()
+        full_node_needed = mode != "wallet_only"
+        self._fn_group.setEnabled(full_node_needed)
+        self._mark_dirty(0)  # Connection tab = index 0
 
     # ===================================================================
     # Connection test stubs

@@ -341,6 +341,11 @@ private:
     /// Dry-run mode flag.
     bool dry_run_;
 
+    /// True when running without the full node (wallet-only mode).
+    /// Set during open_connections() based on config_.chia.mode and
+    /// full-node reachability (auto-detect).
+    bool wallet_only_mode_{false};
+
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order
     // is correct (pair_config_map_ depends on config_.pairs pointers).

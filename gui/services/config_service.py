@@ -42,8 +42,6 @@ _REQUIRED_SECTIONS: Final[tuple[str, ...]] = (
 # Per-section required keys and their expected Python types.
 _REQUIRED_KEYS: Final[dict[str, list[tuple[str, type]]]] = {
     "chia": [
-        ("full_node_host", str),
-        ("full_node_port", int),
         ("wallet_host", str),
         ("wallet_port", int),
     ],
