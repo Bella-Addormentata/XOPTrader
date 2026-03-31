@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] — 2026-03-31
+
+### Fixed
+
+- Fixed `AttributeError` in `MetricsService`: use `Qt.TimerType.CoarseTimer` instead of `QTimer.TimerType`
+
+### Changed
+
+- Version bump to 0.1.5
+
 ## [0.1.4] — 2026-03-31
 
 ### Changed
