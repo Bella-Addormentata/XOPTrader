@@ -915,8 +915,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                pair.name, tier.tier_index, tier_err);
                 continue;
             }
-            if (sr.contains("offer") && sr.contains("trade_record")
-                && sr["trade_record"].contains("trade_id")) {
+            if (sr.contains("offer") && sr["offer"].is_string()
+                && sr.contains("trade_record")
+                && sr["trade_record"].contains("trade_id")
+                && sr["trade_record"]["trade_id"].is_string()) {
                 std::string offer_text = sr["offer"].get<std::string>();
                 co_await submit_to_dexie(offer_text);
                 PendingOffer po;
