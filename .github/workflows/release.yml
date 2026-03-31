@@ -34,8 +34,7 @@ on:
         default: "v0.1"
 
 permissions:
-  contents: write   # needed to create releases and upload assets
-  issues: write     # needed to create failure notification issues
+  contents: read
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
@@ -351,6 +350,8 @@ jobs:
     name: Create GitHub Release
     needs: [build-cpp, build-gui, build-installer, build-linux-bundle]
     runs-on: ubuntu-22.04
+    permissions:
+      contents: write   # needed to create releases and upload assets
 
     steps:
       - uses: actions/checkout@v4
@@ -449,6 +450,8 @@ jobs:
     runs-on: ubuntu-22.04
     needs: [build-cpp, build-gui, build-installer, build-linux-bundle, release]
     if: failure()
+    permissions:
+      issues: write     # needed to create failure notification issues
 
     steps:
       - name: Create failure issue
