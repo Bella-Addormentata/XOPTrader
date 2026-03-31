@@ -27,6 +27,7 @@ from PySide6.QtCore import (
     QMutex,
     QMutexLocker,
     QObject,
+    Qt,
     QThread,
     QTimer,
     Signal,
@@ -324,7 +325,7 @@ class MetricsService(QObject):
 
         # -- Poll timer (fires on the main thread) --------------------------
         self._timer: QTimer = QTimer(self)
-        self._timer.setTimerType(self._timer.TimerType.CoarseTimer)
+        self._timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._timer.timeout.connect(self._request_fetch)
 
         # Dispatch the initial URL to the worker via queued signal so
