@@ -877,41 +877,59 @@ asio::awaitable<int> OfferManager::post_merged_side(
     if (merged_dict.empty()) co_return 0;
 
     // Create the merged offer via RPC.
+    // co_await cannot appear inside a catch handler in a C++20 coroutine,
+    // so capture any exception info here and perform the fallback after the
+    // try/catch block.
     json result;
+    bool batch_failed = false;
+    std::string batch_err;
     try {
         result = co_await wallet_->create_offer(
             merged_dict, current_fee_mojos_, /*validate_only=*/false);
     } catch (const rpc::ChiaRPCError& e) {
+        batch_failed = true;
+        batch_err = e.what();
+    }
+
+    if (batch_failed) {
         // Fallback: if batch fails, fall through to individual creation.
         logger_->warn("Batch create_offer failed for {} {} -- "
                       "falling back to individual: {}",
-                      pair.name, to_string(tiers.front().side), e.what());
+                      pair.name, to_string(tiers.front().side), batch_err);
         int fallback_count = 0;
         for (const auto& tier : tiers) {
             json single_dict = build_offer_dict(pair, tier);
             if (single_dict.empty()) continue;
+            bool tier_failed = false;
+            std::string tier_err;
+            json sr;
             try {
-                auto sr = co_await wallet_->create_offer(
+                sr = co_await wallet_->create_offer(
                     single_dict, current_fee_mojos_, /*validate_only=*/false);
-                if (sr.contains("offer") && sr.contains("trade_record")
-                    && sr["trade_record"].contains("trade_id")) {
-                    std::string offer_text = sr["offer"].get<std::string>();
-                    co_await submit_to_dexie(offer_text);
-                    PendingOffer po;
-                    po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
-                    po.pair_name        = pair.name;
-                    po.side             = tier.side;
-                    po.price            = tier.price;
-                    po.size             = tier.size;
-                    po.tier             = tier.tier_index;
-                    po.created_at_block = block_height;
-                    po.created_at_ts    = std::chrono::system_clock::now();
-                    state_->upsert_offer(po);
-                    ++fallback_count;
-                }
             } catch (const rpc::ChiaRPCError& e2) {
+                tier_failed = true;
+                tier_err = e2.what();
+            }
+            if (tier_failed) {
                 logger_->error("Fallback create_offer failed for {} tier {}: {}",
-                               pair.name, tier.tier_index, e2.what());
+                               pair.name, tier.tier_index, tier_err);
+                continue;
+            }
+            if (sr.contains("offer") && sr.contains("trade_record")
+                && sr["trade_record"].contains("trade_id")) {
+                std::string offer_text = sr["offer"].get<std::string>();
+                co_await submit_to_dexie(offer_text);
+                PendingOffer po;
+                po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
+                po.pair_name        = pair.name;
+                po.side             = tier.side;
+                po.price            = tier.price;
+                po.size             = tier.size;
+                po.tier             = tier.tier_index;
+                po.created_at_block = block_height;
+                po.created_at_ts    = std::chrono::system_clock::now();
+                state_->upsert_offer(po);
+                ++fallback_count;
             }
         }
         co_return fallback_count;
