@@ -1257,7 +1257,7 @@ RegimeInfo to_regime_info(const RegimeDetector& detector) {
 void RegimeDetector::msm_initialise()
 {
     const auto K = cfg_.msm_k_frequencies;
-    const auto num_states = static_cast<std::size_t>(1U << K);
+    const auto num_states = static_cast<std::size_t>(1ULL << K);
 
     msm_.k = K;
     msm_.num_states = num_states;
