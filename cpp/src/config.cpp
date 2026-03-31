@@ -311,16 +311,55 @@ ChiaConfig parse_chia(const YAML::Node& root)
     const YAML::Node& node = root[sec];
 
     ChiaConfig cfg;
-    cfg.full_node_host   = read_string(node, "full_node_host", sec);
-    cfg.full_node_port   = read_port(node, "full_node_port", sec);
+
+    // Parse mode (optional, defaults to "auto").
+    if (node["mode"] && node["mode"].IsScalar()) {
+        const std::string mode_str = node["mode"].as<std::string>();
+        if (mode_str == "auto") {
+            cfg.mode = ChiaMode::Auto;
+        } else if (mode_str == "full_node") {
+            cfg.mode = ChiaMode::FullNode;
+        } else if (mode_str == "wallet_only") {
+            cfg.mode = ChiaMode::WalletOnly;
+        } else {
+            throw ConfigError(sec + ".mode must be 'auto', 'full_node', "
+                              "or 'wallet_only'; got '" + mode_str + "'");
+        }
+    }
+
     cfg.wallet_host      = read_string(node, "wallet_host", sec);
     cfg.wallet_port      = read_port(node, "wallet_port", sec);
 
-    // SSL paths are expanded and stored; they are never logged.
-    cfg.ssl_cert_path    = expand_tilde(read_string(node, "ssl_cert_path", sec));
-    cfg.ssl_key_path     = expand_tilde(read_string(node, "ssl_key_path", sec));
+    // Full node settings are optional in wallet_only mode.
+    if (cfg.mode == ChiaMode::WalletOnly) {
+        if (node["full_node_host"] && node["full_node_host"].IsScalar()) {
+            cfg.full_node_host = node["full_node_host"].as<std::string>();
+        }
+        if (node["full_node_port"] && node["full_node_port"].IsScalar()) {
+            cfg.full_node_port = node["full_node_port"].as<uint16_t>();
+        }
+    } else {
+        cfg.full_node_host   = read_string(node, "full_node_host", sec);
+        cfg.full_node_port   = read_port(node, "full_node_port", sec);
+    }
+
+    // SSL paths: wallet certs are always required; full-node certs are
+    // optional when running in wallet_only mode.
     cfg.wallet_cert_path = expand_tilde(read_string(node, "wallet_cert_path", sec));
     cfg.wallet_key_path  = expand_tilde(read_string(node, "wallet_key_path", sec));
+
+    if (cfg.mode == ChiaMode::WalletOnly) {
+        // Full-node SSL paths optional -- read if present.
+        if (node["ssl_cert_path"] && node["ssl_cert_path"].IsScalar()) {
+            cfg.ssl_cert_path = expand_tilde(node["ssl_cert_path"].as<std::string>());
+        }
+        if (node["ssl_key_path"] && node["ssl_key_path"].IsScalar()) {
+            cfg.ssl_key_path = expand_tilde(node["ssl_key_path"].as<std::string>());
+        }
+    } else {
+        cfg.ssl_cert_path    = expand_tilde(read_string(node, "ssl_cert_path", sec));
+        cfg.ssl_key_path     = expand_tilde(read_string(node, "ssl_key_path", sec));
+    }
 
     cfg.wallet_fingerprint = read_uint32(node, "wallet_fingerprint", sec);
 
@@ -1149,10 +1188,13 @@ void log_config_summary(const AppConfig& cfg)
     std::ostringstream out;
     out << "=== XOPTrader configuration loaded ===\n";
 
-    // Chia -- hosts and ports only; SSL paths and fingerprint are secret.
+    // Chia -- mode, hosts and ports; SSL paths and fingerprint are secret.
     out << "[chia]\n"
+        << "  mode       = " << to_string(cfg.chia.mode) << "\n"
         << "  full_node  = " << cfg.chia.full_node_host
-        << ":" << cfg.chia.full_node_port << "\n"
+        << ":" << cfg.chia.full_node_port
+        << (cfg.chia.mode == ChiaMode::WalletOnly ? " (not used)" : "")
+        << "\n"
         << "  wallet     = " << cfg.chia.wallet_host
         << ":" << cfg.chia.wallet_port << "\n"
         << "  ssl_cert   = <redacted>\n"

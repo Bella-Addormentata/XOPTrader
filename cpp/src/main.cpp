@@ -247,10 +247,15 @@ int main(int argc, char* argv[]) {
     for (const auto& pair : app_config.pairs) {
         if (pair.enabled) ++enabled_pairs;
     }
-    spdlog::info("Configuration loaded: {} pair(s) enabled, target {}:{}",
+    spdlog::info("Configuration loaded: {} pair(s) enabled, mode={}, target {}:{}",
                  enabled_pairs,
-                 app_config.chia.full_node_host,
-                 app_config.chia.full_node_port);
+                 xop::to_string(app_config.chia.mode),
+                 app_config.chia.mode == xop::ChiaMode::WalletOnly
+                     ? app_config.chia.wallet_host
+                     : app_config.chia.full_node_host,
+                 app_config.chia.mode == xop::ChiaMode::WalletOnly
+                     ? app_config.chia.wallet_port
+                     : app_config.chia.full_node_port);
 
     // ------------------------------------------------------------------
     // 5. Construct the Engine (owns io_context, State, all subsystems).

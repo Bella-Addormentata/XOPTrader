@@ -24,7 +24,16 @@
 # --- chia: REQUIRED ----------------------------------------------------------
 # All fields in this section are REQUIRED.
 chia:
+  # Node operating mode: auto | full_node | wallet_only
+  #   auto        - try full node first, fall back to wallet-only (default)
+  #   full_node   - require a running Chia full node
+  #   wallet_only - run with Chia wallet service only (no full node needed)
+  #                 Uses wallet's synced height; fee estimation uses static fees.
+  #                 Saves ~60-100 GB disk (no blockchain DB) and syncs in minutes.
+  mode: auto
+
   # Chia RPC endpoints (local full node + wallet)
+  # In wallet_only mode, full_node_host/port and ssl_cert/key are not required.
   full_node_host: "localhost"
   full_node_port: 8555
   wallet_host: "localhost"
