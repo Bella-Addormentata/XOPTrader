@@ -28,6 +28,7 @@ from PySide6.QtCore import (
     QMutex,
     QMutexLocker,
     QObject,
+    Qt,
     QThread,
     QTimer,
     Signal,
@@ -465,7 +466,7 @@ class DatabaseService(QObject):
 
         # -- Auto-refresh timer ---------------------------------------------
         self._refresh_timer: QTimer = QTimer(self)
-        self._refresh_timer.setTimerType(QTimer.TimerType.CoarseTimer)
+        self._refresh_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._refresh_timer.timeout.connect(self._on_auto_refresh)
 
         # Track the last auto-refresh query parameters so the timer
