@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.7] — 2026-03-31
+
+### Changed
+
+- Version bump to 0.1.7
+
 ## [0.1.6] — 2026-03-31
 
 ### Changed
