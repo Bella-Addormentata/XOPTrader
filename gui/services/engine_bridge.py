@@ -24,7 +24,7 @@ import sys
 from pathlib import Path
 from typing import Any, Final, Optional
 
-from PySide6.QtCore import QObject, QTimer, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 
 from gui.services.config_service import ConfigService
 from gui.services.database_service import DatabaseService
@@ -133,7 +133,7 @@ class EngineBridge(QObject):
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
-        self._master_timer.setTimerType(QTimer.TimerType.CoarseTimer)
+        self._master_timer.setTimerType(Qt.TimerType.CoarseTimer)
         self._master_timer.setInterval(max(1_000, master_refresh_ms))
         self._master_timer.timeout.connect(self._on_master_tick)
 
