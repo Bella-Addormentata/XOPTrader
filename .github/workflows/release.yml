@@ -203,6 +203,8 @@ jobs:
           --onefile
           --name xop_trader_gui
           --windowed
+          --collect-submodules gui
+          --hidden-import requests
           ${{ matrix.icon_flag }}
           main.py
 
