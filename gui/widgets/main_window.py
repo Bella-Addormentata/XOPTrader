@@ -804,6 +804,8 @@ class MainWindow(QMainWindow):
                 background-color: {ELEVATED_BG};
             }}
             """
+        )
+        self._bottom_tabs.addTab(
             _placeholder_widget("Live Configuration View"),
             "Configuration",
         )
