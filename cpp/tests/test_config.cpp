@@ -56,6 +56,7 @@ chia:
   ssl_key_path: "/tmp/key.pem"
   wallet_cert_path: "/tmp/wcert.pem"
   wallet_key_path: "/tmp/wkey.pem"
+  ca_cert_path: "/tmp/ca.crt"
   wallet_fingerprint: 123456
 
 dexie:
