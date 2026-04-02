@@ -7,15 +7,20 @@
 #
 # Artifacts included in the release
 # -----------------------------------
-#   xop_trader-windows-x64.exe            C++ engine — Windows 64-bit
-#   xop_trader-linux-x64                  C++ engine — Ubuntu 22.04 x86-64
-#   xop_trader-macos-arm64                C++ engine — macOS 14 Apple-Silicon
-#   xop_trader-gui-windows-x64.exe        Python GUI — Windows (PyInstaller)
-#   xop_trader-installer-windows-x64.exe  Windows installer with desktop-shortcut prompt
-#   xop_trader-gui-linux-x64              Python GUI — Ubuntu (PyInstaller)
-#   xop_trader-linux-bundle.tar.gz        Linux bundle: GUI binary + icon + .desktop + install.sh
-#   xop_trader-gui-macos-arm64            Python GUI — macOS (PyInstaller)
-#   config.example.yaml                   Reference configuration file
+# All files are placed under RELEASE/XOPTrader-{slug}/ (e.g. XOPTrader-020
+# for v0.2.0) and bundled into XOPTrader-{slug}.zip.  Each versioned binary
+# also carries the release tag in its filename.
+#
+#   xop_trader-windows-x64-{tag}.exe            C++ engine — Windows 64-bit
+#   xop_trader-linux-x64-{tag}                  C++ engine — Ubuntu 22.04 x86-64
+#   xop_trader-macos-arm64-{tag}                C++ engine — macOS 14 Apple-Silicon
+#   xop_trader-gui-windows-x64-{tag}.exe        Python GUI — Windows (PyInstaller)
+#   xop_trader-installer-windows-x64-{tag}.exe  Windows installer with desktop-shortcut prompt
+#   xop_trader-gui-linux-x64-{tag}              Python GUI — Ubuntu (PyInstaller)
+#   xop_trader-linux-bundle-{tag}.tar.gz        Linux bundle: GUI binary + icon + .desktop + install.sh
+#   xop_trader-gui-macos-arm64-{tag}            Python GUI — macOS (PyInstaller)
+#   config.example.yaml                         Reference configuration file
+#   XOPTrader-{slug}.zip                        Full release bundle (RELEASE/{folder}/ tree)
 # =============================================================================
 
 name: Release
@@ -428,10 +433,6 @@ jobs:
           find release-assets-tmp -type f -exec mv -t release-assets/ {} +
           rm -rf release-assets-tmp
 
-      # Include the example config in the release
-      - name: Copy example config
-        run: cp config.example.yaml release-assets/config.example.yaml
-
       # Resolve the tag: prefer the real git tag, fall back to workflow_dispatch input
       - name: Resolve release tag
         id: tag
@@ -441,6 +442,53 @@ jobs:
           else
             echo "value=${{ github.event.inputs.tag }}" >> "$GITHUB_OUTPUT"
           fi
+
+      # Compute a compact version slug: v0.2.0 → 020  (strip 'v', remove dots)
+      - name: Compute version slug
+        id: version
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          SLUG="${TAG#v}"
+          SLUG="${SLUG//./}"
+          echo "slug=${SLUG}" >> "$GITHUB_OUTPUT"
+          echo "folder=XOPTrader-${SLUG}" >> "$GITHUB_OUTPUT"
+
+      # Organise all artifacts into RELEASE/{folder}/ with versioned filenames,
+      # then create a zip archive of the entire RELEASE/ tree.
+      - name: Organise versioned release folder
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          FOLDER="${{ steps.version.outputs.folder }}"
+          SLUG="${{ steps.version.outputs.slug }}"
+          DEST="RELEASE/${FOLDER}"
+          mkdir -p "${DEST}"
+
+          # Include the example config alongside the built artifacts
+          cp config.example.yaml release-assets/config.example.yaml
+
+          for f in release-assets/*; do
+            name=$(basename "$f")
+            case "$name" in
+              *.tar.gz)
+                base="${name%.tar.gz}"
+                cp "$f" "${DEST}/${base}-${TAG}.tar.gz" ;;
+              *.exe)
+                base="${name%.exe}"
+                cp "$f" "${DEST}/${base}-${TAG}.exe" ;;
+              *.yaml)
+                # Keep config files with their original name (no version suffix)
+                cp "$f" "${DEST}/${name}" ;;
+              *.dll | *.pdb)
+                # Windows runtime DLLs keep their original name
+                cp "$f" "${DEST}/${name}" ;;
+              *)
+                # Linux/macOS binaries and other extension-less files
+                cp "$f" "${DEST}/${name}-${TAG}" ;;
+            esac
+          done
+
+          # Bundle the entire RELEASE/ folder tree into a single zip archive
+          zip -r "XOPTrader-${SLUG}.zip" "RELEASE/"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
@@ -454,16 +502,20 @@ jobs:
 
             ### Included artifacts
 
+            All files are also bundled together in **`XOPTrader-${{ steps.version.outputs.slug }}.zip`**
+            under `RELEASE/XOPTrader-${{ steps.version.outputs.slug }}/`.
+
             | File | Description |
             |------|-------------|
-            | `xop_trader-installer-windows-x64.exe` | **Windows installer** — prompts to create desktop shortcut |
-            | `xop_trader-gui-windows-x64.exe` | Windows GUI standalone binary (no installer) |
-            | `xop_trader-windows-x64.exe` | C++ engine — Windows 64-bit |
-            | `xop_trader-linux-bundle.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
-            | `xop_trader-gui-linux-x64` | Linux GUI standalone binary (no installer) |
-            | `xop_trader-linux-x64` | C++ engine — Ubuntu 22.04 x86-64 |
-            | `xop_trader-gui-macos-arm64` | Python GUI — macOS (standalone) |
-            | `xop_trader-macos-arm64` | C++ engine — macOS 14 Apple-Silicon |
+            | `XOPTrader-${{ steps.version.outputs.slug }}.zip` | **Full release bundle** — all artifacts inside `RELEASE/XOPTrader-${{ steps.version.outputs.slug }}/` |
+            | `xop_trader-installer-windows-x64-${{ steps.tag.outputs.value }}.exe` | **Windows installer** — prompts to create desktop shortcut |
+            | `xop_trader-gui-windows-x64-${{ steps.tag.outputs.value }}.exe` | Windows GUI standalone binary (no installer) |
+            | `xop_trader-windows-x64-${{ steps.tag.outputs.value }}.exe` | C++ engine — Windows 64-bit |
+            | `xop_trader-linux-bundle-${{ steps.tag.outputs.value }}.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
+            | `xop_trader-gui-linux-x64-${{ steps.tag.outputs.value }}` | Linux GUI standalone binary (no installer) |
+            | `xop_trader-linux-x64-${{ steps.tag.outputs.value }}` | C++ engine — Ubuntu 22.04 x86-64 |
+            | `xop_trader-gui-macos-arm64-${{ steps.tag.outputs.value }}` | Python GUI — macOS (standalone) |
+            | `xop_trader-macos-arm64-${{ steps.tag.outputs.value }}` | C++ engine — macOS 14 Apple-Silicon |
             | `config.example.yaml` | Reference configuration file |
             | `Source code (.zip / .tar.gz)` | GitHub-generated source archives |
 
@@ -471,34 +523,36 @@ jobs:
 
             **Windows** — run the installer and follow the wizard:
             ```
-            xop_trader-installer-windows-x64.exe
+            xop_trader-installer-windows-x64-${{ steps.tag.outputs.value }}.exe
             ```
             The installer will offer to create a desktop shortcut (optional, unchecked by default).
 
             **Linux** — extract the bundle and run the install script:
             ```bash
-            tar -xzf xop_trader-linux-bundle.tar.gz
+            tar -xzf xop_trader-linux-bundle-${{ steps.tag.outputs.value }}.tar.gz
             ./install.sh          # prompts: "Create a desktop shortcut?" [Y/n]
             # or: ./install.sh --no-desktop  (skip the prompt)
             ```
 
             **macOS** — run the GUI binary directly; drag it to Applications if you wish:
             ```bash
-            chmod +x xop_trader-gui-macos-arm64
-            ./xop_trader-gui-macos-arm64
+            chmod +x xop_trader-gui-macos-arm64-${{ steps.tag.outputs.value }}
+            ./xop_trader-gui-macos-arm64-${{ steps.tag.outputs.value }}
             ```
 
             **All platforms** — copy the example config and edit before first run:
             ```bash
             cp config.example.yaml config.yaml
             # edit config.yaml with your credentials
-            ./xop_trader-{platform} --config config.yaml
+            ./xop_trader-{platform}-${{ steps.tag.outputs.value }} --config config.yaml
             ```
 
             See [README.md](https://github.com/${{ github.repository }}/blob/main/README.md) for full documentation.
           draft: false
           prerelease: false
-          files: release-assets/*
+          files: |
+            RELEASE/${{ steps.version.outputs.folder }}/*
+            XOPTrader-${{ steps.version.outputs.slug }}.zip
           generate_release_notes: true
 
   # ---------------------------------------------------------------------------
