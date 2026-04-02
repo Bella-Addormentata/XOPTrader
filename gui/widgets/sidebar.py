@@ -20,6 +20,7 @@ from PySide6.QtCore import (
     Signal,
 )
 from PySide6.QtWidgets import (
+    QLabel,
     QPushButton,
     QSizePolicy,
     QVBoxLayout,
@@ -98,6 +99,20 @@ class SidebarButton(QPushButton):
         self.setMinimumHeight(68)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
+        self._layout = QVBoxLayout(self)
+        self._layout.setContentsMargins(0, 8, 0, 8)
+        self._layout.setSpacing(2)
+
+        self._icon_label = QLabel(self._icon_char)
+        self._icon_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._icon_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._layout.addWidget(self._icon_label)
+
+        self._text_label = QLabel(self._label_text)
+        self._text_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._text_label.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self._layout.addWidget(self._text_label)
+
         self._refresh_text()
         self._apply_stylesheet()
 
@@ -119,9 +134,9 @@ class SidebarButton(QPushButton):
     def _refresh_text(self) -> None:
         """Update button text based on expanded/collapsed state."""
         if self._expanded:
-            self.setText(f"{self._icon_char}\n{self._label_text}")
+            self._text_label.show()
         else:
-            self.setText(self._icon_char)
+            self._text_label.hide()
 
     def _apply_stylesheet(self) -> None:
         """Apply Chia-styled icon-box navigation with green glow on active."""
@@ -130,11 +145,16 @@ class SidebarButton(QPushButton):
             bg_color = SIDEBAR_SELECTED
             text_color = LIGHT_GREEN
             icon_size = ICON_FONT_SIZE + 1
+            font_weight = "bold"
         else:
             border_color = BORDER
             bg_color = "transparent"
             text_color = TEXT_SECONDARY
             icon_size = ICON_FONT_SIZE
+            font_weight = "normal"
+            
+        self._icon_label.setStyleSheet(f"font-size: {icon_size}px; font-weight: {font_weight}; background-color: transparent; border: none;")
+        self._text_label.setStyleSheet(f"font-size: 11px; font-weight: normal; background-color: transparent; border: none;")
 
         self.setStyleSheet(
             f"""
@@ -142,11 +162,8 @@ class SidebarButton(QPushButton):
                 background-color: {bg_color};
                 color: {text_color};
                 border: 1px solid {border_color};
-                border-radius: 12px;
-                text-align: center;
-                padding: 8px 4px;
-                font-size: {icon_size}px;
-                margin: 2px 8px;
+                border-radius: 0px;
+                margin: 0px;
             }}
             QPushButton:hover {{
                 border-color: {PRIMARY_GREEN};
@@ -154,7 +171,7 @@ class SidebarButton(QPushButton):
                 background-color: {ELEVATED_BG};
             }}
             QPushButton:focus {{
-                border: 2px solid {PRIMARY_GREEN};
+                border: 1px solid {PRIMARY_GREEN};
             }}
             """
         )
@@ -252,17 +269,17 @@ class Sidebar(QWidget):
             QPushButton {{
                 background-color: transparent;
                 color: {TEXT_SECONDARY};
-                border: 1px solid {BORDER};
-                border-radius: 12px;
-                text-align: center;
+                border: 1px solid transparent;
+                border-radius: 0px;
+                text-align: left;
                 font-size: 14px;
-                padding: 8px;
-                margin: 4px 8px;
+                padding: 4px;
+                margin: 0px;
             }}
             QPushButton:hover {{
                 color: {TEXT_PRIMARY};
                 background-color: {ELEVATED_BG};
-                border-color: {PRIMARY_GREEN};
+                border-color: transparent;
             }}
             """
         )

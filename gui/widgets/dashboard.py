@@ -98,14 +98,14 @@ class MetricCard(QFrame):
             f"MetricCard {{"
             f"  background-color: {ELEVATED_BG};"
             f"  border: 1px solid {BORDER};"
-            f"  border-radius: 12px;"
+            f"  border-radius: 0px;"
             f"}}"
         )
 
         # --- layout ---------------------------------------------------------
         root = QVBoxLayout(self)
-        root.setContentsMargins(18, 14, 18, 14)
-        root.setSpacing(8)
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(4)
 
         # Title row
         self._title_label = QLabel(title.upper())
@@ -335,8 +335,8 @@ class DashboardWidget(QWidget):
 
         # Root layout -- scrollable grid
         self._grid = QGridLayout(self)
-        self._grid.setContentsMargins(20, 20, 20, 20)
-        self._grid.setSpacing(16)
+        self._grid.setContentsMargins(8, 8, 8, 8)
+        self._grid.setSpacing(6)
 
         # ---- Row 0: Metric cards -----------------------------------------
         self._metric_cards: dict[str, MetricCard] = {}

@@ -313,14 +313,10 @@ class ChartWidget(QWidget):
             row=0, col=0,
             axisItems={"bottom": DateAxisItem(orientation="bottom")},
         )
-        self._price_plot.setLabel("left", "Price (mojos/XCH)")
+        self._price_plot.setLabel("right", "Price (mojos/XCH)")
         self._price_plot.showGrid(x=True, y=True, alpha=0.15)
-        self._price_plot.getAxis("left").setWidth(70)
+        self._price_plot.getAxis("right").setWidth(70)
         self._price_plot.hideAxis("bottom")  # hidden; shared via plot 3
-        self._style_plot(self._price_plot)
-
-        # Price series
-        self._mid_curve = self._price_plot.plot(
             pen=pg.mkPen(color=TEXT_PRIMARY, width=1.5), name="Mid",
         )
         self._bid_curve = self._price_plot.plot(
@@ -352,10 +348,9 @@ class ChartWidget(QWidget):
 
         # Plot 2 -- PnL (25 % height)
         self._pnl_plot: pg.PlotItem = self._graphics.addPlot(row=1, col=0)
-        self._pnl_plot.setLabel("left", "PnL")
+        self._pnl_plot.setLabel("right", "PnL")
         self._pnl_plot.showGrid(x=True, y=True, alpha=0.15)
-        self._pnl_plot.getAxis("left").setWidth(70)
-        self._pnl_plot.hideAxis("bottom")
+        self._pnl_plot.getAxis("right").setWidth(70)
         self._style_plot(self._pnl_plot)
 
         # PnL area fill (green above zero, red below) via two FillBetween
@@ -379,14 +374,14 @@ class ChartWidget(QWidget):
             name="Realized",
         )
 
-        # Plot 3 -- Volume / Inventory (15 % height, visible bottom axis)
+# Plot 3 -- Volume / Inventory (15 % height, visible bottom axis)
         self._vol_plot: pg.PlotItem = self._graphics.addPlot(
             row=2, col=0,
             axisItems={"bottom": DateAxisItem(orientation="bottom")},
         )
-        self._vol_plot.setLabel("left", "Volume")
+        self._vol_plot.setLabel("right", "Volume")
         self._vol_plot.showGrid(x=True, y=True, alpha=0.15)
-        self._vol_plot.getAxis("left").setWidth(70)
+        self._vol_plot.getAxis("right").setWidth(70)
         self._style_plot(self._vol_plot)
 
         # Volume bars (stacked: buy green, sell red)
@@ -421,15 +416,32 @@ class ChartWidget(QWidget):
             [self._price_plot, self._pnl_plot, self._vol_plot]
         )
 
-    # =====================================================================
-    # Paint coalescing
-    # =====================================================================
+        self._price_plot.sigRangeChanged.connect(self._on_x_range_changed)
 
-    @Slot()
-    def _maybe_repaint(self) -> None:
-        """Flush a pending repaint if the dirty flag is set.
+    @Slot(object, object)
+    def _on_x_range_changed(self, window, viewRange) -> None:
+        """Auto-scale Y axis to fit the max/min of the currently visible X range."""
+        x_min, x_max = viewRange[0]
+        
+        if not self._price_history:
+            return
+            
+        visible_ticks = [t for t in self._price_history if x_min <= t.timestamp <= x_max]
+        if not visible_ticks:
+            return
+            
+        y_min = min(t.bid for t in visible_ticks)
+        y_max = max(t.ask for t in visible_ticks)
+        
+        # Add a 5% margin to the top and bottom
+        padding = (y_max - y_min) * 0.05
+        # If flat line
+        if padding == 0:
+            padding = y_max * 0.05 if y_max != 0 else 0.05
+            
+        self._price_plot.setYRange(y_min - padding, y_max + padding, padding=0)
 
-        Connected to ``_repaint_timer`` (50 ms interval) so that many
+    # =====================================================================
         rapid-fire data appends are collapsed into a single redraw.
         """
         if self._dirty:
@@ -443,7 +455,10 @@ class ChartWidget(QWidget):
     @staticmethod
     def _style_plot(plot: pg.PlotItem) -> None:
         """Apply CHIA dark theme to a PlotItem's axes and grid."""
-        for axis_name in ("left", "bottom"):
+        plot.showAxis('right')
+        plot.hideAxis('left')
+        plot.setMouseEnabled(x=True, y=False)
+        for axis_name in ("right", "bottom"):
             axis = plot.getAxis(axis_name)
             axis.setPen(pg.mkPen(color=BORDER))
             axis.setTextPen(pg.mkPen(color=TEXT_SECONDARY))

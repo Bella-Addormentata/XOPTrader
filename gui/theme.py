@@ -27,32 +27,32 @@ class ChiaColors:
     """
 
     # Brand greens (from Chia Color.ts: Green[500], Green[400])
-    PRIMARY_GREEN: str = "#35B24B"
-    LIGHT_GREEN: str = "#5ECE71"
+    PRIMARY_GREEN: str = "#FF9900"  # Amber for Bloomberg feel
+    LIGHT_GREEN: str = "#FFB347"
 
     # Surface / background hierarchy -- Chia Neutral palette (teal-tinted)
-    DARK_BG: str = "#0F252A"       # Neutral[900]
-    PANEL_BG: str = "#1E353B"      # Neutral[800]
-    ELEVATED_BG: str = "#243E45"   # between Neutral[700-800]
+    DARK_BG: str = "#000000"       # Pure Black
+    PANEL_BG: str = "#000000"      # Pure Black
+    ELEVATED_BG: str = "#111111"   # Very Dark Gray
 
     # Sidebar surfaces
-    SIDEBAR_BG: str = "#1E353B"    # Neutral[800] -- matches panel
-    SIDEBAR_SELECTED: str = "#1B4C24"  # Green[900] subtle highlight
+    SIDEBAR_BG: str = "#000000"    # Pure Black
+    SIDEBAR_SELECTED: str = "#221100"  # Amber Tint
 
     # Borders
-    BORDER: str = "#344E54"        # Neutral[700]
-    BORDER_LIGHT: str = "#486268"  # Neutral[600] - for subtle dividers
+    BORDER: str = "#333333"        # Dark Gray
+    BORDER_LIGHT: str = "#444444"  
 
     # Typography (from Chia Color.Text.Dark)
-    TEXT_PRIMARY: str = "#E5F2F5"   # alpha('#F8FBFC', 0.9) approximation
-    TEXT_SECONDARY: str = "#AEC5CA" # alpha('#F8FBFC', 0.7) approximation
-    TEXT_DISABLED: str = "#536D73"  # alpha('#F8FBFC', 0.32) approximation
+    TEXT_PRIMARY: str = "#FF9900"   # Amber
+    TEXT_SECONDARY: str = "#CC7700" # Dim Amber
+    TEXT_DISABLED: str = "#663300"  
 
     # Semantic / trading
-    PROFIT_GREEN: str = "#35B24B"   # Green[500]
-    LOSS_RED: str = "#EE455F"       # Red[500]
-    WARNING_YELLOW: str = "#FEE611" # Yellow[400]
-    INFO_BLUE: str = "#04A9F6"     # Blue[500]
+    PROFIT_GREEN: str = "#00FF00"   # Neon Green
+    LOSS_RED: str = "#FF0000"       # Neon Red
+    WARNING_YELLOW: str = "#FFFF00" 
+    INFO_BLUE: str = "#00FFFF"     
 
     # Accent palette (from Chia)
     AQUA: str = "#3EC3C1"           # Aqua[400]
@@ -69,14 +69,14 @@ COLORS = ChiaColors()
 # ---------------------------------------------------------------------------
 
 # Preferred monospaced font for numeric / data display.
-MONO_FONT_FAMILY: str = "JetBrains Mono"
+MONO_FONT_FAMILY: str = "Consolas"
 
 # Preferred proportional font for general UI text.
-UI_FONT_FAMILY: str = "Inter"
+UI_FONT_FAMILY: str = "Consolas"
 
 # Fallback stack when preferred fonts are unavailable.
-_MONO_FALLBACK: str = "'JetBrains Mono', 'Fira Code', 'Consolas', monospace"
-_UI_FALLBACK: str = "'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif"
+_MONO_FALLBACK: str = "'Consolas', 'Courier New', monospace"
+_UI_FALLBACK: str = "'Consolas', 'Courier New', monospace"
 
 # Base sizes (points).  Adjusted by *font_size_delta* at runtime.
 # Increased from 10pt to match Chia GUI's more generous typography.
