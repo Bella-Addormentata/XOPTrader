@@ -333,6 +333,9 @@ CURLcode DexieClient::perform_request_(
     // TLS verification (public API -- system CA bundle is fine).
     curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+#if defined(CURLSSLOPT_NATIVE_CA)
+    curl_easy_setopt(easy.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
 
     // User-Agent header.
     curl_easy_setopt(easy.get(), CURLOPT_USERAGENT,
@@ -722,12 +725,14 @@ asio::awaitable<std::vector<TickerData>> DexieClient::get_tickers() {
 }
 
 // -----------------------------------------------------------------------
-// GET /v1/markets  (single pair ticker)
+// GET /v1/markets  (single asset-pair ticker)
 // -----------------------------------------------------------------------
 asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
-    std::string_view pair_id) {
+    std::string_view base_asset_id,
+    std::string_view quote_asset_id) {
 
-    log_->info("get_ticker(pair_id={})", pair_id);
+    log_->info("get_ticker(base_asset_id={}, quote_asset_id={})",
+               base_asset_id, quote_asset_id);
 
     // The dexie API does not offer a single-pair ticker endpoint.
     // We fetch the full markets response and filter client-side.
@@ -739,11 +744,14 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
     }
 
     for (const auto& [base_asset, market_array] : json["markets"].items()) {
+        if (base_asset != base_asset_id) {
+            continue;
+        }
         if (!market_array.is_array()) {
             continue;
         }
         for (const auto& m : market_array) {
-            if (m.value("pair_id", "") == pair_id) {
+            if (m.value("id", "") == quote_asset_id) {
                 auto td = parse_ticker_(m, base_asset);
                 log_->info("get_ticker -> found {} ({})", td.code, td.pair_id);
                 co_return td;
@@ -751,7 +759,46 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
         }
     }
 
-    log_->info("get_ticker -> pair_id={} not found", pair_id);
+    // Some Dexie markets are only published in the opposite orientation
+    // (for example XCH/<CAT> when the configured pair is <CAT>/XCH).
+    // When we find the reverse market, invert the price fields so callers
+    // still receive values in the configured base/quote direction.
+    for (const auto& [base_asset, market_array] : json["markets"].items()) {
+        if (base_asset != quote_asset_id) {
+            continue;
+        }
+        if (!market_array.is_array()) {
+            continue;
+        }
+        for (const auto& m : market_array) {
+            if (m.value("id", "") != base_asset_id) {
+                continue;
+            }
+
+            auto td = parse_ticker_(m, base_asset);
+            auto invert_price = [](double value) {
+                return value > 0.0 ? (1.0 / value) : 0.0;
+            };
+
+            const double reverse_buy = td.price_buy;
+            const double reverse_sell = td.price_sell;
+            const double reverse_high = td.price_high;
+            const double reverse_low = td.price_low;
+
+            td.price_buy = invert_price(reverse_sell);
+            td.price_sell = invert_price(reverse_buy);
+            td.price_last = invert_price(td.price_last);
+            td.price_high = invert_price(reverse_low);
+            td.price_low = invert_price(reverse_high);
+
+            log_->info("get_ticker -> found reverse market {} ({})",
+                       td.code, td.pair_id);
+            co_return td;
+        }
+    }
+
+    log_->info("get_ticker -> base_asset_id={}, quote_asset_id={} not found",
+               base_asset_id, quote_asset_id);
     co_return std::nullopt;
 }
 

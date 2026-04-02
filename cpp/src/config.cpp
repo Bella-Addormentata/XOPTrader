@@ -351,6 +351,11 @@ ChiaConfig parse_chia(const YAML::Node& root)
     // CA certificate — required; used for SSL peer verification.
     cfg.ca_cert_path = expand_tilde(read_string(node, "ca_cert_path", sec));
 
+    // SSL verification defaults to true when omitted.
+    if (node["verify_ssl"] && node["verify_ssl"].IsDefined() && !node["verify_ssl"].IsNull()) {
+        cfg.verify_ssl = node["verify_ssl"].as<bool>();
+    }
+
     if (cfg.mode == ChiaMode::WalletOnly) {
         // Full-node SSL paths optional -- read if present.
         if (node["ssl_cert_path"] && node["ssl_cert_path"].IsScalar()) {
@@ -1194,6 +1199,7 @@ void log_config_summary(const AppConfig& cfg)
     // Chia -- mode, hosts and ports; SSL paths and fingerprint are secret.
     out << "[chia]\n"
         << "  mode       = " << to_string(cfg.chia.mode) << "\n"
+        << "  verify_ssl = " << (cfg.chia.verify_ssl ? "true" : "false") << "\n"
         << "  full_node  = " << cfg.chia.full_node_host
         << ":" << cfg.chia.full_node_port
         << (cfg.chia.mode == ChiaMode::WalletOnly ? " (not used)" : "")

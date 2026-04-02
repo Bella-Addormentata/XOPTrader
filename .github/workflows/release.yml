@@ -118,6 +118,17 @@ jobs:
       - name: Build
         run: cmake --build build --config ${{ matrix.cmake_build_type }} --parallel
 
+      - name: Stage Windows runtime bundle
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          cmake --install build --config Release --prefix install
+          New-Item -ItemType Directory -Force -Path windows-runtime | Out-Null
+          Copy-Item install\bin\* windows-runtime\
+          Invoke-WebRequest `
+            -Uri "https://aka.ms/vs/17/release/vc_redist.x64.exe" `
+            -OutFile "windows-runtime\VC_redist.x64.exe"
+
       - name: Run tests
         run: ctest --test-dir build --build-config ${{ matrix.cmake_build_type }} --output-on-failure
 
@@ -137,11 +148,19 @@ jobs:
           path: ${{ matrix.artifact_name }}
           if-no-files-found: error
 
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: xop_trader-windows-runtime-x64
+          path: windows-runtime/*
+          if-no-files-found: error
+
   # ---------------------------------------------------------------------------
   # Job 2 — Build the Python GUI with PyInstaller on each OS
   # ---------------------------------------------------------------------------
   build-gui:
     name: Python GUI (${{ matrix.os }})
+    needs: [build-cpp]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -190,13 +209,21 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller pillow
 
+      - name: Download Windows runtime bundle
+        if: runner.os == 'Windows'
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-windows-runtime-x64
+          path: gui/engine-runtime
+
       # ---- Generate application icon ---------------------------------------
       - name: Generate application icon
         working-directory: gui
         run: python resources/generate_icon.py . ${{ matrix.icon_fmt }}
 
       # ---- Build with PyInstaller ------------------------------------------
-      - name: Build with PyInstaller
+      - name: Build with PyInstaller (Unix)
+        if: runner.os != 'Windows'
         working-directory: gui
         run: >
           pyinstaller
@@ -207,6 +234,28 @@ jobs:
           --hidden-import requests
           ${{ matrix.icon_flag }}
           main.py
+
+      - name: Build with PyInstaller (Windows + bundled engine)
+        if: runner.os == 'Windows'
+        working-directory: gui
+        shell: pwsh
+        run: |
+          $args = @(
+            '--onefile',
+            '--name', 'xop_trader_gui',
+            '--windowed',
+            '--collect-submodules', 'gui',
+            '--hidden-import', 'requests',
+            '--icon', 'icon.ico'
+          )
+
+          Get-ChildItem engine-runtime -File | ForEach-Object {
+            $args += '--add-binary'
+            $args += "$($_.FullName);engine-runtime"
+          }
+
+          $args += 'main.py'
+          pyinstaller @args
 
       # ---- Rename dist to platform-specific name ---------------------------
       - name: Rename binary (Unix)
@@ -251,6 +300,12 @@ jobs:
           name: xop_trader-windows-x64.exe
           path: dl/
 
+      - name: Download C++ runtime bundle artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-windows-runtime-x64
+          path: dl/runtime/
+
       - name: Download GUI artifact
         uses: actions/download-artifact@v4
         with:
@@ -273,6 +328,8 @@ jobs:
           New-Item -ItemType Directory -Force -Path installer-staging
           Copy-Item dl\xop_trader-windows-x64.exe     installer-staging\xop_trader.exe
           Copy-Item dl\xop_trader-gui-windows-x64.exe installer-staging\xop_trader_gui.exe
+          Copy-Item dl\runtime\*.dll                  installer-staging\
+          Copy-Item dl\runtime\VC_redist.x64.exe      installer-staging\
           Copy-Item packaging\windows\installer.iss    installer-staging\
           Copy-Item gui\icon.ico                       installer-staging\
           Copy-Item config.example.yaml                installer-staging\

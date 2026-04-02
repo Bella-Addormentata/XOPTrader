@@ -244,7 +244,7 @@ class ChartWidget(QWidget):
         self._block_ts_counts: dict[str, int] = {}
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(12, 12, 12, 12)
+        root.setContentsMargins(16, 14, 16, 14)
         root.setSpacing(10)
 
         self._build_toolbar(root)

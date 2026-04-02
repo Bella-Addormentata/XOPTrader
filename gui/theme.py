@@ -80,8 +80,8 @@ _UI_FALLBACK: str = "'Inter', 'Segoe UI', 'Helvetica Neue', sans-serif"
 
 # Base sizes (points).  Adjusted by *font_size_delta* at runtime.
 # Increased from 10pt to match Chia GUI's more generous typography.
-_BASE_UI_FONT_SIZE: int = 11
-_BASE_MONO_FONT_SIZE: int = 11
+_BASE_UI_FONT_SIZE: int = 12
+_BASE_MONO_FONT_SIZE: int = 12
 
 
 def _resolve_font(family: str, fallback: str, size_pt: int) -> QFont:
@@ -299,12 +299,12 @@ QTabBar::tab {{
     color: {c.TEXT_SECONDARY};
     border: 1px solid {c.BORDER};
     border-bottom: none;
-    padding: 10px 24px;
+    padding: 12px 28px;
     margin-right: 2px;
     border-top-left-radius: 8px;
     border-top-right-radius: 8px;
     font-size: {fs}pt;
-    min-width: 80px;
+    min-width: 90px;
 }}
 
 QTabBar::tab:selected {{
@@ -345,8 +345,8 @@ QTreeView, QTableView {{
 }}
 
 QTreeView::item, QTableView::item {{
-    padding: 6px 10px;
-    min-height: 28px;
+    padding: 10px 14px;
+    min-height: 32px;
 }}
 
 QTreeView::item:hover, QTableView::item:hover {{
@@ -363,10 +363,10 @@ QHeaderView::section {{
     border: none;
     border-right: 1px solid {c.BORDER};
     border-bottom: 1px solid {c.BORDER};
-    padding: 8px 12px;
+    padding: 10px 16px;
     font-weight: 600;
     font-size: {sfs}pt;
-    min-height: 28px;
+    min-height: 32px;
 }}
 
 QHeaderView::section:hover {{
@@ -420,10 +420,10 @@ QLineEdit, QSpinBox, QDoubleSpinBox, QComboBox {{
     color: {c.TEXT_PRIMARY};
     border: 1px solid {c.BORDER};
     border-radius: 8px;
-    padding: 8px 12px;
+    padding: 10px 14px;
     font-family: {_MONO_FALLBACK};
     font-size: {mfs}pt;
-    min-height: 20px;
+    min-height: 24px;
     selection-background-color: {c.PRIMARY_GREEN};
     selection-color: {c.DARK_BG};
 }}
@@ -450,7 +450,7 @@ QGroupBox {{
     border: 1px solid {c.BORDER};
     border-radius: 12px;
     margin-top: 16px;
-    padding: 20px 12px 12px 12px;
+    padding: 24px 16px 16px 16px;
     font-size: {fs}pt;
 }}
 

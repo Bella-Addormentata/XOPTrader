@@ -22,7 +22,14 @@
       "name": "boost-json",
       "version>=": "1.84.0"
     },
-    "curl",
+    {
+      "name": "curl",
+      "default-features": false,
+      "features": [
+        "non-http",
+        "openssl"
+      ]
+    },
     "openssl",
     "nlohmann-json",
     "spdlog",

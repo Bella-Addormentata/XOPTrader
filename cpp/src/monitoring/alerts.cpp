@@ -526,6 +526,9 @@ void AlertManager::start_worker()
             // Enforce TLS (Telegram API is HTTPS-only).
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
             curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+#if defined(CURLSSLOPT_NATIVE_CA)
+            curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
 
             // Execute the request.
             CURLcode res = curl_easy_perform(curl);

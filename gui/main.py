@@ -138,13 +138,22 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
     """
     target = Path(config_path or _DEFAULT_CONFIG_NAME).resolve()
     if target.is_file():
-        return  # Already exists — nothing to do.
+        return
 
     # Candidate locations for the example config.
+    app_dir = Path(__file__).resolve().parent
+    project_dir = app_dir.parent
     candidates = [
         target.parent / _EXAMPLE_CONFIG_NAME,
         Path.cwd() / _EXAMPLE_CONFIG_NAME,
+        project_dir / _EXAMPLE_CONFIG_NAME,
+        app_dir / _EXAMPLE_CONFIG_NAME,
     ]
+
+    # PyInstaller one-file bundles extract files under _MEIPASS.
+    meipass = getattr(sys, "_MEIPASS", None)
+    if meipass:
+        candidates.append(Path(meipass) / _EXAMPLE_CONFIG_NAME)
     for example in candidates:
         if example.is_file():
             # Ensure the destination directory exists when --config points
@@ -188,6 +197,21 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
                     exc,
                 )
             return
+
+
+def _bootstrap_config_info(config_path: Optional[Path]) -> tuple[Path, bool]:
+    """Bootstrap config and report whether a first-run copy happened.
+
+    Returns
+    -------
+    tuple[Path, bool]
+        ``(resolved_config_path, created_from_template)``
+    """
+    target = Path(config_path or _DEFAULT_CONFIG_NAME).resolve()
+    existed_before = target.is_file()
+    _bootstrap_config(config_path)
+    created = (not existed_before) and target.is_file()
+    return target, created
 
 
 # ---------------------------------------------------------------------------
@@ -274,7 +298,7 @@ def main() -> None:
 
     # On first run, copy config.example.yaml → config.yaml so the GUI
     # can launch with a template the user can edit via the Settings panel.
-    _bootstrap_config(args.config)
+    cfg_path, first_run_bootstrap = _bootstrap_config_info(args.config)
 
     # Import MainWindow here (not at module level) to keep the import
     # graph acyclic and to defer heavy widget instantiation until
@@ -294,6 +318,25 @@ def main() -> None:
 
     # Inject the bridge and wire all service signals to child widgets.
     window.set_bridge(bridge)
+
+    if first_run_bootstrap:
+        # On first run, guide users directly to the Settings page where
+        # wallet fingerprint, cert paths, and pair IDs are configured.
+        from PySide6.QtWidgets import QMessageBox  # noqa: WPS433
+
+        if hasattr(window, "open_settings_page"):
+            window.open_settings_page()
+
+        QMessageBox.information(
+            window,
+            "XOPTrader — First-Time Setup",
+            "A starter config file was created automatically:\n\n"
+            f"{cfg_path}\n\n"
+            "Next steps:\n"
+            "1. Open Settings and fill in your Chia cert paths and wallet fingerprint.\n"
+            "2. Review trading pairs and strategy settings.\n"
+            "3. Click Save, then start in Dry Run first.",
+        )
 
     # Show the main window and hand control to the Qt event loop.
     window.show()

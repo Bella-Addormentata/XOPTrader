@@ -185,6 +185,7 @@ class MainWindow(QMainWindow):
         self._bot_running: bool = False
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
+        self._last_engine_start_failure: str = ""
 
         # -- Child widget references (populated in _build_central_area) -----
         self._dashboard: Optional[QWidget] = None
@@ -239,6 +240,8 @@ class MainWindow(QMainWindow):
         bridge.data_updated.connect(self._on_bridge_data)
         bridge.bot_status_changed.connect(self._on_bot_status_changed)
         bridge.error.connect(self._on_bridge_error)
+        if hasattr(bridge, "engine_start_failed"):
+            bridge.engine_start_failed.connect(self._on_engine_start_failed)
 
         # -- Database -> widget signals ------------------------------------
         db = bridge.database_service
@@ -404,6 +407,19 @@ class MainWindow(QMainWindow):
             Error message.
         """
         self._status_bar.showMessage(msg, 5000)
+
+    def _on_engine_start_failed(self, msg: str) -> None:
+        """Show a detailed dialog when the managed engine exits on startup."""
+        self._status_bar.showMessage("Engine startup failed.", 10_000)
+        if msg == self._last_engine_start_failure:
+            return
+
+        self._last_engine_start_failure = msg
+        QMessageBox.critical(
+            self,
+            "XOPTrader — Engine Startup Failed",
+            msg,
+        )
 
     def _on_view_chart(self, pair_name: str) -> None:
         """Switch to chart page for the given pair.
@@ -894,6 +910,14 @@ class MainWindow(QMainWindow):
         """
         self._stacked.setCurrentIndex(index)
         self._sidebar.select_page(index)
+
+    def open_settings_page(self) -> None:
+        """Navigate to the Settings page.
+
+        This is used by first-run onboarding code to direct users to
+        configuration without relying on private page-index internals.
+        """
+        self._switch_page(_PAGE_SETTINGS)
 
     # ===================================================================== #
     #  Timers                                                                #

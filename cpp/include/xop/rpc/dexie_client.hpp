@@ -373,10 +373,12 @@ public:
     /// Returns 24-hour ticker data for every market grouped by base asset.
     [[nodiscard]] boost::asio::awaitable<std::vector<TickerData>> get_tickers();
 
-    /// GET /v1/markets  (filtered client-side for a single pair_id)
-    /// Convenience wrapper that returns only the ticker matching pair_id.
+    /// GET /v1/markets  (filtered client-side for a single asset pair)
+    /// Convenience wrapper that returns only the ticker matching the
+    /// configured base and quote asset IDs.
     [[nodiscard]] boost::asio::awaitable<std::optional<TickerData>> get_ticker(
-        std::string_view pair_id);
+        std::string_view base_asset_id,
+        std::string_view quote_asset_id);
 
     /// GET /v1/markets  (returns the raw JSON for advanced consumers)
     /// Exposes the full depth/liquidity/price structure.

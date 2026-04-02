@@ -23,6 +23,7 @@
 #include <xop/execution/offer_manager.hpp>
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <stdexcept>
 #include <unordered_set>
@@ -94,6 +95,17 @@ asio::awaitable<int> OfferManager::post_quotes(
         co_await init_wallet_id_map();
     }
 
+    const std::int64_t base_wid = resolve_wallet_id(pair.base_asset_id);
+    const std::int64_t quote_wid = resolve_wallet_id(pair.quote_asset_id);
+    if (base_wid < 0 || quote_wid < 0) {
+        logger_->error("Skipping {} -- required wallet IDs are unavailable: "
+                       "base='{}' (wid={}), quote='{}' (wid={})",
+                       pair.name,
+                       pair.base_asset_id, base_wid,
+                       pair.quote_asset_id, quote_wid);
+        co_return 0;
+    }
+
     // [T7-10] Batch mode: merge same-side tiers into a single RPC call.
     if (strategy_cfg_.batch_offers_enabled && quotes.size() > 1) {
         // Split quotes by side.
@@ -135,6 +147,13 @@ asio::awaitable<int> OfferManager::post_quotes(
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("create_offer failed for {} tier {}: {}",
                            pair.name, tier.tier_index, e.what());
+            if (std::string_view{e.what()}.find("insufficient funds") !=
+                std::string_view::npos) {
+                logger_->warn("Stopping additional tiers for {} this cycle -- "
+                              "wallet reported insufficient funds",
+                              pair.name);
+                break;
+            }
             continue;
         }
 
@@ -1089,6 +1108,20 @@ asio::awaitable<void> OfferManager::init_wallet_id_map()
             if (w.contains("type") && w["type"].get<int>() == 6 &&
                 w.contains("data")) {
                 std::string asset_id = w["data"].get<std::string>();
+
+                std::transform(asset_id.begin(), asset_id.end(), asset_id.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+
+                // Wallet RPC returns CAT asset IDs with a trailing "00"
+                // suffix in this field; normalize back to the canonical
+                // 64-hex asset ID used throughout config and Dexie.
+                if (asset_id.size() == 66 &&
+                    asset_id.compare(asset_id.size() - 2, 2, "00") == 0) {
+                    asset_id.resize(64);
+                }
+
                 wallet_id_map_[asset_id] = wid;
                 logger_->debug("Mapped asset {} -> wallet_id {}", asset_id,
                                wid);

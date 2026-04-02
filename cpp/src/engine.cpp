@@ -84,6 +84,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         fn_cfg.tls.cert_path    = config_.chia.ssl_cert_path;
         fn_cfg.tls.key_path     = config_.chia.ssl_key_path;
         fn_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
+        fn_cfg.verify_ssl       = config_.chia.verify_ssl;
         full_node_ = std::make_shared<rpc::ChiaFullNodeRPC>(ioc_, fn_cfg);
     }
 
@@ -94,6 +95,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     wal_cfg.tls.cert_path    = config_.chia.wallet_cert_path;
     wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
     wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
+    wal_cfg.verify_ssl       = config_.chia.verify_ssl;
     wallet_ = std::make_shared<rpc::ChiaWalletRPC>(ioc_, wal_cfg);
 
     // Build dexie client config from AppConfig.
@@ -1145,7 +1147,9 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // [T3-24] Assume invalid until successful data ingestion.
         bool pair_data_ok = false;
 
-        auto ticker = co_await dexie_->get_ticker(pair.name);
+        auto ticker = co_await dexie_->get_ticker(
+            pair.base_asset_id,
+            pair.quote_asset_id);
         if (ticker) {
             market_data_->ingest_dexie(
                 pair.name,
@@ -1178,8 +1182,11 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // so the competitor detector can filter them out.
         // ISO/IEC 27001:2022: no secret data exposed in offers.
         try {
+            const std::string dexie_pair_id =
+                ticker ? ticker->pair_id : pair.base_asset_id;
+
             auto offers_page = co_await dexie_->get_offers(
-                pair.name,
+                dexie_pair_id,
                 /*offered=*/   {},
                 /*requested=*/ {},
                 /*page=*/      1,
@@ -1192,6 +1199,19 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             std::vector<CompetingOffer> comp_offers;
             comp_offers.reserve(offers_page.offers.size());
             for (const auto& orec : offers_page.offers) {
+                if (orec.offered.empty() || orec.requested.empty()) {
+                    continue;
+                }
+
+                const std::string& offered_id = orec.offered[0].id;
+                const std::string& requested_id = orec.requested[0].id;
+                const bool matches_pair =
+                    (offered_id == pair.base_asset_id && requested_id == pair.quote_asset_id)
+                    || (offered_id == pair.quote_asset_id && requested_id == pair.base_asset_id);
+                if (!matches_pair) {
+                    continue;
+                }
+
                 CompetingOffer co;
                 co.offer_id         = orec.id;
                 co.pair_name        = pair.name;
@@ -2622,18 +2642,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     // [T2-09] Use the actual wallet-assigned offer ID.
                     orec.offer_id = id_it->second;
                 } else {
-                    // Fallback: post_quotes may have skipped this tier due
-                    // to a wallet RPC error.  Use a placeholder and log.
-                    orec.offer_id = pair_name + "_" +
-                        std::to_string(block_height) + "_" +
-                        std::to_string(etq.tier_index) + "_" +
-                        ((etq.side == Side::Bid) ? "bid" : "ask") +
-                        "_unresolved";
+                    // post_quotes may have skipped this tier due to a wallet
+                    // RPC error (for example insufficient funds).  Do not
+                    // persist a fake placeholder ID into the audit trail.
                     spdlog::warn("[Engine] Step 8: no wallet offer_id for {} "
-                                 "{} tier {} -- using placeholder",
+                                 "{} tier {} -- skipping database insert",
                                  pair_name,
                                  (etq.side == Side::Bid) ? "bid" : "ask",
                                  etq.tier_index);
+                    continue;
                 }
                 db_->insert_offer(orec);
             }

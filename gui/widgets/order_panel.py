@@ -135,7 +135,7 @@ class OrderPanel(QWidget):
         """Construct the complete widget layout."""
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
-        root.setSpacing(8)
+        root.setSpacing(12)
 
         # -- Top filter bar ------------------------------------------------
         root.addLayout(self._build_filter_bar())
@@ -155,7 +155,7 @@ class OrderPanel(QWidget):
         danger button.
         """
         bar = QHBoxLayout()
-        bar.setSpacing(10)
+        bar.setSpacing(14)
 
         # Pair filter
         lbl_pair = QLabel("Pair:")

@@ -22,3 +22,11 @@ Thumbs.db
 
 # Build artifacts
 build/
+build.log
+
+# Local runtime config (contains machine-specific values/secrets)
+config.yaml
+
+# GUI packaging artifacts
+gui/build-improved/
+gui/dist-improved/

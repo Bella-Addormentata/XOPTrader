@@ -16,6 +16,10 @@
 
 cmake_minimum_required(VERSION 3.24)
 
+if(POLICY CMP0207)
+    cmake_policy(SET CMP0207 NEW)
+endif()
+
 # ---------- vcpkg manifest mode auto-detection ----------------------------
 # If the user forgot -DCMAKE_TOOLCHAIN_FILE, try the VCPKG_ROOT env variable.
 if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
@@ -26,7 +30,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(xop_trader
-    VERSION   0.1.7
+    VERSION   0.1.9
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )
@@ -206,7 +210,24 @@ endif()
 # Install rules
 # ==========================================================================
 include(GNUInstallDirs)
-install(TARGETS xop_trader RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR})
+
+# Install the engine and its runtime dependencies (DLLs/.so/.dylib)
+# so packaging jobs can ship a self-contained runtime bundle.
+install(
+    TARGETS xop_trader
+    RUNTIME_DEPENDENCY_SET xop_runtime_deps
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+)
+
+install(
+    RUNTIME_DEPENDENCY_SET xop_runtime_deps
+    DESTINATION ${CMAKE_INSTALL_BINDIR}
+    PRE_EXCLUDE_REGEXES
+        "api-ms-.*"
+        "ext-ms-.*"
+    POST_EXCLUDE_REGEXES
+        ".*system32/.*"
+)
 
 # ==========================================================================
 # Static analysis targets (optional convenience)
