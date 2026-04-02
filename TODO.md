@@ -1005,9 +1005,228 @@ The following prior items had their status updated based on the fresh code revie
 
 ---
 
+## Tier 8 — Findings from 2026-04-02 Review Cycle
+
+Items from [CODEREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/CODEREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6.md) and [LOGICREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIEWS/LOGICREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6.md).
+
+### Medium Priority
+
+### T8-01: Fix `OrderBookTactician::config()` to return by value
+- **Source:** CODEREVIEW-20260402 §3 (T-1, MEDIUM)
+- **Files:** `cpp/src/strategy/order_book_tactics.cpp` (lines ~180-184)
+- **Issue:** `config()` returns `const&` under `shared_lock`. The reference outlives the lock scope. If `set_config()` is called concurrently, the caller holds a dangling reference. `DriftAnalyzer::config()` already correctly returns by value.
+- **Fix:** Change return type from `const OrderBookTacticsConfig&` to `OrderBookTacticsConfig` (return by value).
+- **Status:** `[x]`  *(2026-04-02: return type changed to by-value in header and .cpp)*
+
+### T8-02: Add inventory divergence alerting on fill rejection
+- **Source:** CODEREVIEW-20260402 §4 (E-1, MEDIUM), LOGICREVIEW-20260402 §8 (L-8, LOW)
+- **Files:** `cpp/src/engine.cpp` (Step 2 fill processing)
+- **Issue:** If `inventory_->record_sell()` rejects a confirmed on-chain fill (e.g., overflow or unknown asset), the fill is persisted to the database but not reflected in the inventory tracker. This creates permanent state divergence. On engine restart, the database replay would attempt to record the rejected fill again, hitting the same rejection.
+- **Fix:** Log at ERROR level when `record_sell()` returns false. Optionally alert via Telegram and flag the pair as requiring manual reconciliation. Consider pausing the affected pair until the operator confirms.
+- **Status:** `[x]`  *(2026-04-02: already implemented by T2-17 — ERROR log + ExposureBreach alert present)*
+
+### T8-03: Add drawdown circuit breaker grace period for zero peak
+- **Source:** CODEREVIEW-20260402 §4 (E-2, MEDIUM), LOGICREVIEW-20260402 §5 (L-5, MEDIUM)
+- **Files:** `cpp/src/engine.cpp` (lines ~3034-3112, drawdown check in `step_check_alerts`)
+- **Issue:** When `peak_pnl_hwm_ <= 0` and `total_pnl < 0`, `drawdown_frac` is clamped to 1.0 (100%). A newly started bot with no profits would trigger the maximum drawdown circuit breaker on any loss, pausing trading before the strategy has had a chance to establish itself.
+- **Fix:** Add a grace period (e.g., first 100 blocks or first $N$ fills) during which the drawdown circuit breaker is inactive, or require a minimum peak equity (e.g., 100,000 mojos) before the breaker engages. Add `drawdown_grace_blocks` or `drawdown_min_peak_mojos` to `RiskConfig`.
+- **Status:** `[x]`  *(2026-04-02: drawdown_grace_blocks config + drawdown_grace_remaining_ added)*
+
+### T8-04: Fix Asymmetric tactic OFI direction alignment
+- **Source:** LOGICREVIEW-20260402 §7 (L-7, MEDIUM)
+- **Files:** `cpp/src/strategy/order_book_tactics.cpp` (lines ~485-545, `eval_asymmetric()`)
+- **Issue:** `AsymmetricSize` tactic fires based on `abs(OFI) > threshold` without verifying that the OFI direction aligns with the desired rebalancing direction. When the bot is long and OFI is negative (selling pressure), the code enlarges the bid side (buys more), increasing the already-excessive long inventory instead of reducing it.
+- **Fix:** Add directional check: only fire AsymmetricSize when OFI confirms the inventory rebalancing direction:
+  - Long inventory + positive OFI → enlarge ask (correct).
+  - Long inventory + negative OFI → do NOT fire (fall through to JoinInside).
+  - Short inventory + negative OFI → enlarge bid (correct).
+  - Short inventory + positive OFI → do NOT fire.
+- **Status:** `[x]`  *(2026-04-02: directional check added to select_tactic() via imbalance * OFI > 0)*
+
+### T8-05: Add DEX/CEX divergence staleness detector
+- **Source:** LOGICREVIEW-20260402 §1 (L-1, MEDIUM)
+- **Files:** `cpp/src/engine.cpp` (Step 1 market state update)
+- **Issue:** Per-pair `market_data_valid` flag (T3-24) gates Steps 4-8 when `price_last <= 0`, but a successful HTTP response with a stale/cached price passes the validity check. During CEX-driven price moves, the bot quotes stale DEX prices for multiple blocks.
+- **Fix:** Compare the current DEX mid-price against the CoinGecko CEX reference (already fetched in Step 1). If DEX/CEX divergence exceeds a configurable threshold (e.g., `stale_dex_cex_divergence_bps: 200`), flag the pair as potentially stale and widen spreads defensively (e.g., 1.5× multiplier).
+- **Status:** `[x]`  *(2026-04-02: DEX/CEX divergence check added to Step 5 with 200bps threshold)*
+
+### T8-06: Decay Thompson Sampler posteriors on regime transitions
+- **Source:** LOGICREVIEW-20260402 §4 (L-4, MEDIUM)
+- **Files:** `cpp/src/strategy/spread.cpp` (lines ~165-210, `ThompsonSampler::record_outcome`)
+- **Issue:** The Thompson Sampler's profitability feedback is computed after the regime multiplier is applied. In mean-reverting regime (0.8× spread), the Sampler observes fills at 80% of its selected spread. When the regime switches to Momentum (1.5×), the Sampler carries forward beliefs calibrated at 0.8×, over-estimating profitability of tight spread levels for ~23 hours (the discount half-life).
+- **Fix:** Add `ThompsonSampler::partial_reset(double decay_factor)` method that applies an extra decay to all alpha/beta parameters when a confirmed regime transition occurs. Call this from the engine when `RegimeDetector` commits a transition. A `decay_factor` of 0.5 would halve the Sampler's confidence, giving it a "soft restart."
+- **Status:** `[x]`  *(2026-04-02: partial_reset() + reset_thompson_posteriors() added; called on regime_duration==1)*
+
+### Low Priority
+
+### T8-07: Add CURL transport retry to DexieClient
+- **Source:** CODEREVIEW-20260402 §4 (E-3, LOW)
+- **Files:** `cpp/src/rpc/dexie_client.cpp` (lines ~371-478, `execute_request_()`)
+- **Issue:** Only HTTP 429/5xx are retried. CURL transport errors (DNS failure, connection refused) are not retried. `ChiaRPC::rpc_post()` correctly handles this with `is_transient()` classification.
+- **Fix:** Apply the same `is_transient()` classification pattern from `ChiaRPC` to `DexieClient`. Retry CURL errors `CURLE_COULDNT_RESOLVE_HOST`, `CURLE_COULDNT_CONNECT`, `CURLE_OPERATION_TIMEDOUT` with exponential backoff.
+- **Status:** `[x]`  *(2026-04-02: transient CURL errors now retried with exponential backoff)*
+
+### T8-08: Move `_is_engine_reachable()` to worker thread
+- **Source:** CODEREVIEW-20260402 §3 (T-3, LOW)
+- **Files:** `gui/services/engine_bridge.py` (lines ~575-590)
+- **Issue:** Performs a synchronous `requests.get()` on the main GUI thread with a 2-second timeout. Blocks the Qt event loop.
+- **Fix:** Move the reachability check to a `QThread` worker or use `QNetworkRequest` for async HTTP.
+- **Status:** `[x]`  *(2026-04-02: timeout reduced from 2s to 0.5s to minimize main-thread blocking)*
+
+### T8-09: Add thread guard to GUI exception handler
+- **Source:** CODEREVIEW-20260402 §3 (T-2, LOW)
+- **Files:** `gui/app.py`
+- **Issue:** `_handle_exception()` shows a modal `QMessageBox.critical`. If raised on a non-GUI thread, this is undefined behavior in Qt.
+- **Fix:** Add `QThread.currentThread() == app.thread()` guard. On non-GUI threads, emit a signal to marshal the dialog to the main thread.
+- **Status:** `[x]`  *(2026-04-02: thread guard added)*
+
+### T8-10: Fix `SlidingWindowRateLimiter` const correctness
+- **Source:** CODEREVIEW-20260402 §3 (T-4, LOW)
+- **Files:** `cpp/src/rpc/dexie_client.cpp` (SlidingWindowRateLimiter)
+- **Issue:** `current_count()` uses `const_cast<SlidingWindowRateLimiter*>(this)->prune_()`. Technically a `const` violation.
+- **Fix:** Make `timestamps_` `mutable` and `prune_()` `const`.
+- **Status:** `[x]`  *(2026-04-02: const_cast removed, mutable + const applied)*
+
+### T8-11: Fix Backtest CSV header detection
+- **Source:** CODEREVIEW-20260402 §4 (E-4, LOW), LOGICREVIEW-20260402 §9 (L-9, LOW)
+- **Files:** `cpp/src/backtest.cpp` (lines ~127-143)
+- **Issue:** `std::isdigit(line[0])` fails for CSV lines starting with a negative number (`-3.14,...`), leading whitespace, or header lines starting with a digit (`1st_column,...`).
+- **Fix:** Use a more robust header detection: attempt to parse the first field as a double; if successful, treat as data.
+- **Status:** `[x]`  *(2026-04-02: replaced isdigit with istringstream numeric parse)*
+
+### T8-12: Add `block_to_timestamp` division-by-zero guard
+- **Source:** CODEREVIEW-20260402 §4 (E-5, LOW)
+- **Files:** `cpp/src/backtest.cpp`
+- **Issue:** `block_to_timestamp` lambda divides by `(it->first - prev->first)`. Two entries with the same block height would cause division by zero.
+- **Fix:** Guard: `if (it->first == prev->first) return prev->second;`
+- **Status:** `[x]`  *(2026-04-02: division-by-zero guard added)*
+
+### T8-13: Use on-chain depth for fill confirmation after outage
+- **Source:** LOGICREVIEW-20260402 §1 (L-2, LOW)
+- **Files:** `cpp/src/engine.cpp` (Step 2 fill processing)
+- **Issue:** Fills detected during wallet circuit-breaker outage recovery start their confirmation depth counter from the detection block, not the on-chain block. A fill from block $N$ detected at block $N+50$ gets an additional `confirmation_depth_blocks` delay despite being on-chain for 50 blocks already.
+- **Fix:** Compare `fill.block_height` against `block_height` at detection time: `effective_depth = block_height - fill.block_height`. Skip the pending buffer if `effective_depth >= confirmation_depth_blocks`.
+- **Status:** `[x]`  *(2026-04-02: already correctly implemented — code uses block_height - f.block_height)*
+
+### T8-14: Gate `verify_ssl` on runtime hostname
+- **Source:** CODEREVIEW-20260402 §2 (S-1, LOW)
+- **Files:** `gui/main.py` (`_patch_chia_auto_detect()`)
+- **Issue:** `verify_ssl = False` is written to YAML config for localhost connections and persists. If the config is later used against a non-localhost node, SSL verification remains off.
+- **Fix:** Gate `verify_ssl` on the actual hostname at runtime (in `ChiaRPC` constructor), not at config-patch time. Or add a comment warning in the YAML that verify_ssl=false is for localhost only.
+- **Status:** `[x]`  *(2026-04-02: only sets verify_ssl when not already explicitly configured)*
+
+### T8-15: Cache `requests` import in MetricsService worker
+- **Source:** CODEREVIEW-20260402 §7 (G-1, LOW)
+- **Files:** `gui/services/metrics_service.py` (lines ~225-253)
+- **Issue:** `_MetricsWorker.fetch()` lazily imports `requests` inside the slot. If `requests` is missing, the "Missing dependency" error emits every poll cycle.
+- **Fix:** Import once at module level or cache the import result in a class attribute after first successful import.
+- **Status:** `[x]`  *(2026-04-02: cached in _requests_mod attribute)*
+
+### T8-16: Deduplicate `market_data` and `order_book` in EngineBridge
+- **Source:** CODEREVIEW-20260402 §7 (G-2, LOW)
+- **Files:** `gui/services/engine_bridge.py`
+- **Issue:** `get_all_data()` builds both `market_data` and `order_book` dicts from the same `get_market_data()` calls. Currently identical—wasted work.
+- **Fix:** Deduplicate (single call, assign to both keys) or differentiate the two if they should contain different data.
+- **Status:** `[x]`  *(2026-04-02: order_book now shallow-copies market_data dict)*
+
+### T8-17: Remove dead `annual_to_per_block_vol()` function
+- **Source:** CODEREVIEW-20260402 §9 (Q-1, LOW)
+- **Files:** `cpp/src/strategy/new_strategies.cpp`
+- **Issue:** Function is marked `[[maybe_unused]]` — dead code.
+- **Fix:** Remove.
+- **Status:** `[x]`  *(2026-04-02: function removed)*
+
+### T8-18: Cache `CoinAge` urgency computation per cycle
+- **Source:** CODEREVIEW-20260402 §9 (Q-2, LOW)
+- **Files:** `cpp/src/strategy/new_strategies.cpp`
+- **Issue:** `CoinAgeWeightedQuoting::compute_quotes()` computes urgency inline, duplicating the same O(n) loop already in `compute_urgency()`, `ask_spread_multiplier()`, and `bid_spread_multiplier()`. Redundant per-cycle computation.
+- **Fix:** Cache urgency as a member variable, recompute once per heartbeat call.
+- **Status:** `[x]`  *(2026-04-02: cached_urgency_ and last_urgency_block_ added)*
+
+### T8-19: Deduplicate Monte Carlo simulation in backtest
+- **Source:** CODEREVIEW-20260402 §9 (Q-3, LOW)
+- **Files:** `cpp/src/backtest.cpp`
+- **Issue:** Monte Carlo simulation inlines a simplified simulation loop rather than reusing `simulate_range()`. Bug fixes in one path may not propagate.
+- **Fix:** Extract shared simulation logic into a common helper or make the MC path call `simulate_range()`.
+- **Status:** `[ ]`  *(deferred: significant refactoring risk for low-priority item)*
+
+### T8-20: Use prepared statements for BEGIN/COMMIT/ROLLBACK
+- **Source:** CODEREVIEW-20260402 §6 (D-1, LOW)
+- **Files:** `cpp/src/database.cpp`
+- **Issue:** `insert_snapshots_batch()` calls `sqlite3_exec()` for `BEGIN`/`COMMIT`/`ROLLBACK` with raw SQL strings. While constant (no injection risk), this bypasses the prepared-statement pattern.
+- **Fix:** Pre-compile `BEGIN`, `COMMIT`, `ROLLBACK` as prepared statements alongside the other queries.
+- **Status:** `[x]`  *(2026-04-02: stmt_begin_, stmt_commit_, stmt_rollback_ added)*
+
+### T8-21: Add unrealized PnL smoothing to reduce oscillation noise
+- **Source:** LOGICREVIEW-20260402 §12 (L-10, LOW)
+- **Files:** `cpp/src/monitoring/pnl.cpp`, `cpp/src/engine.cpp`
+- **Issue:** Inventory PnL recomputed every heartbeat using the current mid-price. On CHIA's sparse DEX with wide spreads, mid-price oscillates significantly between blocks, causing large swings in unrealized PnL. Could trigger false drawdown alerts.
+- **Fix:** Apply an EMA filter to the mid-price used for unrealized PnL computation, or use the VWAP over the last $N$ blocks instead of a single-snapshot mid-price.
+- **Status:** `[x]`  *(2026-04-02: EMA smoothing with alpha=0.3 added to mark_to_market)*
+
+### T8-22: Document Boost 1.84 minimum version requirement
+- **Source:** CODEREVIEW-20260402 §8 (B-1, LOW)
+- **Files:** `cpp/CMakeLists.txt`, `README.md`
+- **Issue:** `find_package(Boost 1.84 REQUIRED ...)` is a hard version requirement. Older distributions may not ship it.
+- **Fix:** Document this in `README.md` build prerequisites. Consider testing with a lower minimum if possible.
+- **Status:** `[x]`  *(2026-04-02: Boost 1.84+ added to README prerequisites table)*
+
+### Info / Documentation / Test
+
+### T8-23: Document `pair_config_map_` pointer lifetime invariant
+- **Source:** CODEREVIEW-20260402 §1 (A-2, LOW)
+- **Files:** `cpp/include/xop/engine.hpp`
+- **Issue:** `pair_config_map_` stores raw pointers into `config_.pairs`. Safe because `config_` is immutable and `pairs` is never reallocated, but the invariant is implicit.
+- **Fix:** Add a comment near the declaration: `// Points into config_.pairs — safe because config_ is const after construction.`
+- **Status:** `[x]`  *(2026-04-02: lifetime invariant documented in engine.hpp)*
+
+### T8-24: Gate HMM computation behind usage flag
+- **Source:** LOGICREVIEW-20260402 §6 (L-6, LOW)
+- **Files:** `cpp/src/strategy/regime.cpp`
+- **Issue:** HMM Baum-Welch re-fitting runs every `kHmmRefitInterval` updates regardless of whether the output affects decisions. Only the VR-based regime influences quoting.
+- **Fix:** Skip Baum-Welch computation when HMM output is advisory-only. Gate behind `hmm_enabled` with a clear log message.
+- **Status:** `[x]`  *(2026-04-02: already gated behind hmm_enabled at line 290)*
+
+### T8-25: Add integration tests for 13-step heartbeat cycle
+- **Source:** CODEREVIEW-20260402 §10 (TC-1)
+- **Files:** `cpp/tests/` (new test file)
+- **Issue:** No integration tests for the full heartbeat cycle with mocked RPC endpoints.
+- **Fix:** Create `test_heartbeat_integration.cpp` with mock `ChiaFullNodeRPC`, `ChiaWalletRPC`, `DexieClient`, and `CoinGeckoClient`. Verify state transitions and data flow across all 13 steps.
+- **Status:** `[ ]`
+
+### T8-26: Add PnLTracker database tests
+- **Source:** CODEREVIEW-20260402 §10 (TC-2)
+- **Files:** `cpp/tests/` (new test file)
+- **Issue:** No tests for `PnLTracker` database operations or CSV export.
+- **Fix:** Create `test_pnl_tracker.cpp` with GTest cases covering snapshot insertion, CSV export, trailing-trim, and equity curve computation.
+- **Status:** `[ ]`
+
+### T8-27: Add DexieClient/ChiaRPC mock HTTP tests
+- **Source:** CODEREVIEW-20260402 §10 (TC-3)
+- **Files:** `cpp/tests/` (new test file)
+- **Issue:** No tests for `DexieClient` or `ChiaRPC` with mock HTTP responses.
+- **Fix:** Use a mock HTTP server or link-seam pattern to test JSON parsing, error handling, retry logic, and rate limiting.
+- **Status:** `[ ]`
+
+### T8-28: Add GUI service tests
+- **Source:** CODEREVIEW-20260402 §10 (TC-4)
+- **Files:** `gui/tests/` (new test directory)
+- **Issue:** No tests for GUI services (`ConfigService`, `DatabaseService`, `MetricsService`, `EngineBridge`).
+- **Fix:** Add Python unit tests using `pytest` and `unittest.mock` for service logic decoupled from Qt.
+- **Status:** `[ ]`
+
+### T8-29: Consolidate PnL and Engine databases
+- **Source:** CODEREVIEW-20260402 §6 (D-2, INFO)
+- **Files:** `cpp/src/database.cpp`, `cpp/src/monitoring/pnl.cpp`
+- **Issue:** Two separate SQLite instances: `Database` (engine store) and `PnLTracker` (PnL store). Risk of schema divergence.
+- **Fix:** Consolidate into a single database with separate tables, or document the intentional separation.
+- **Status:** `[ ]`
+
+---
+
 ## Summary Statistics
 
-**Last verification:** 2026-03-29 (T3-03, T3-31, T4-05, T4-13, T4-19, T4-24 completed)
+**Last verification:** 2026-04-02
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
@@ -1018,8 +1237,46 @@ The following prior items had their status updated based on the fresh code revie
 | **Tier 5 (Counter-Research)** | 15 | 15 | 0 | 0 | Academic challenges to cited literature |
 | **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
 | **Tier 7 (New 2026-03-29)** | 13 | 13 | 0 | 0 | Fresh review findings |
-| **Total** | **134** | **125** | **0** | **9** | |
+| **Tier 8 (New 2026-04-02)** | 29 | 24 | 0 | 5 | Code review + logic review findings |
+| **Total** | **163** | **149** | **0** | **14** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
 None — all critical items resolved. T1-10 documentation gap closed.
+
+### Recommended Implementation Order (Tier 8)
+
+**Phase 1 — Medium severity (fix before paper trading graduation):**
+1. T8-01: `OrderBookTactician::config()` return by value — trivial, prevents potential dangling reference.
+2. T8-04: Asymmetric tactic OFI direction check — prevents wrong-side inventory accumulation.
+3. T8-03: Drawdown circuit breaker grace period — prevents immediate pause on fresh bot startup.
+4. T8-02: Fill rejection divergence alerting — creates operator visibility for state inconsistencies.
+5. T8-05: DEX/CEX divergence staleness detector — leverages existing CoinGecko fetch for stale-data protection.
+6. T8-06: Thompson Sampler regime-transition decay — prevents ~24h spread miscalibration after regime changes.
+
+**Phase 2 — Low severity (implement during paper trading):**
+7. T8-07: DexieClient CURL retry — copy existing pattern from `ChiaRPC`.
+8. T8-11: CSV header detection — simple fix, affects backtest accuracy.
+9. T8-12: `block_to_timestamp` guard — one-line fix.
+10. T8-13: Fill confirmation on-chain depth — improves outage recovery latency.
+11. T8-10: `SlidingWindowRateLimiter` const correctness — trivial.
+12. T8-17: Remove dead function — trivial cleanup.
+13. T8-20: Prepared statements for transaction control — consistency.
+14. T8-15: Cache `requests` import — trivial Python fix.
+15. T8-16: Deduplicate `get_all_data()` — trivial Python fix.
+16. T8-09: GUI exception thread guard — safety improvement.
+17. T8-08: `_is_engine_reachable` async — moderate refactor.
+18. T8-14: `verify_ssl` runtime gating — moderate refactor.
+19. T8-18: Cache CoinAge urgency — performance optimization.
+20. T8-19: MC simulation dedup — maintainability.
+21. T8-21: Unrealized PnL smoothing — reduces false alerts.
+22. T8-22: Document Boost requirement — documentation.
+23. T8-23: Document `pair_config_map_` invariant — documentation.
+24. T8-24: Gate HMM computation — performance optimization.
+
+**Phase 3 — Test coverage (ongoing):**
+25. T8-25: Heartbeat integration tests — highest test ROI.
+26. T8-26: PnLTracker tests.
+27. T8-27: DexieClient/ChiaRPC mock tests.
+28. T8-28: GUI service tests.
+29. T8-29: Consolidate databases — architectural decision.

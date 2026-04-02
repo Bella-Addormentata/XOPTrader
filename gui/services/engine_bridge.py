@@ -281,13 +281,9 @@ class EngineBridge(QObject):
         # Build per-pair order book data from the latest market-data
         # snapshots.  This provides the depth information that the
         # OrderBookWidget uses to render bid/ask levels.
-        order_book: dict[str, dict[str, float]] = {
-            pair_name: self._metrics_svc.get_market_data(pair_name)
-            for pair_name in (
-                p.get("name", "") for p in pairs if p.get("name")
-            )
-            if pair_name
-        }
+        # T8-16: Reuse the market_data dict instead of calling
+        # get_market_data() a second time for each pair.
+        order_book: dict[str, dict[str, float]] = dict(market_data)
 
         # Collect startup market analysis data — only when the bot is
         # actively in the Analyzing phase to avoid rendering a non-existent
@@ -577,11 +573,14 @@ class EngineBridge(QObject):
 
         Prevents spawning a duplicate engine when one is already
         running (e.g. started manually or by a service manager).
+
+        T8-08: Uses a short timeout (0.5 s) for the probe so the
+        main-thread GUI event loop is not blocked noticeably.
         """
         import requests as _req  # noqa: WPS433 — keep top-level imports light
 
         try:
-            resp = _req.get(self._metrics_url, timeout=2)
+            resp = _req.get(self._metrics_url, timeout=0.5)
             return resp.status_code == 200
         except Exception:
             return False

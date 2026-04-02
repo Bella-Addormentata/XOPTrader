@@ -221,6 +221,12 @@ public:
     /// Read-only access to the current beta (failure) counts.
     const std::vector<double>& betas() const noexcept;
 
+    /// [T8-06] Partially reset posteriors toward the prior on regime change.
+    /// Multiplies all alpha/beta values by decay_factor and enforces the
+    /// floor of 1.0 to keep the Beta distributions well-formed.
+    /// @param decay_factor  In (0, 1]; 0.5 halves accumulated evidence.
+    void partial_reset(double decay_factor);
+
 private:
     std::vector<double> grid_bps_;   // Discrete spread levels.
     std::vector<double> alpha_;      // Beta posterior alpha per level.
@@ -353,6 +359,11 @@ public:
 
     /// Read-only access to the Thompson Sampler (nullopt if disabled).
     const ThompsonSampler* sampler() const noexcept;
+
+    /// [T8-06] Partially reset Thompson posteriors on regime transition.
+    /// No-op if Thompson Sampling is disabled.
+    /// @param decay_factor  In (0, 1]; forwarded to ThompsonSampler::partial_reset.
+    void reset_thompson_posteriors(double decay_factor);
 
     // -----------------------------------------------------------------------
     // Component accessors (for diagnostics / unit testing)

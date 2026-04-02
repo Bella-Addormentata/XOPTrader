@@ -355,6 +355,12 @@ private:
     /// in config_.pairs.  Built once during construction; eliminates the
     /// repeated O(N) linear scans that previously appeared in steps 2, 5,
     /// 6, 7, and 8.
+    ///
+    /// [T8-23] Pointer lifetime invariant: the raw pointers stored here
+    /// point into `config_.pairs`, which is const after Engine construction
+    /// and never reallocated.  Do NOT modify `config_.pairs` after the
+    /// Engine constructor completes.
+    ///
     /// ISO/IEC 5055: deterministic lookup, no raw pointer ownership.
     std::unordered_map<std::string, const PairConfig*> pair_config_map_;
 
@@ -601,6 +607,11 @@ private:
     // engine unprotected against losses from startup.
     // ISO/IEC 27001:2022: ensures continuous risk monitoring from first tick.
     bool hwm_initialized_{false};
+
+    // [T8-03] Drawdown grace period: skip the HWM drawdown circuit breaker
+    // for the first N blocks after engine start so that a small initial
+    // loss from the zero-peak case does not immediately pause the engine.
+    uint32_t drawdown_grace_remaining_{0};
 
     // [T3-10] Flash-crash circuit breaker state machine.
     // Transitions: Normal -> Crash -> Recovery -> Normal.

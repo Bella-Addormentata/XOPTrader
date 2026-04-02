@@ -127,8 +127,18 @@ void BacktestEngine::load_data(const std::string& dexie_json_path,
 
         // Skip the header line if present.
         if (std::getline(ifs, line)) {
-            // Check if first character is a digit (data) or a letter (header).
-            if (!line.empty() && !std::isdigit(static_cast<unsigned char>(line[0]))) {
+            // [T8-11] Robust header detection: attempt to parse the first
+            // field as a number.  std::isdigit(line[0]) fails for lines
+            // starting with a negative number, leading whitespace, or
+            // header lines starting with a digit (e.g. '1st_column').
+            bool is_data_line = false;
+            if (!line.empty()) {
+                std::istringstream probe(line);
+                double first_field;
+                char   sep;
+                is_data_line = static_cast<bool>(probe >> first_field >> sep);
+            }
+            if (!is_data_line) {
                 // Header line -- skip.
             } else {
                 // No header; parse this line as data.
@@ -353,6 +363,11 @@ void BacktestEngine::build_blocks()
             if (it != block_timestamps_.begin()) {
                 auto prev = std::prev(it);
                 if (it != block_timestamps_.end()) {
+                    // [T8-12] Guard against two entries with the same
+                    // block height which would produce division by zero.
+                    if (it->first == prev->first) {
+                        return prev->second;
+                    }
                     const double frac =
                         static_cast<double>(h - prev->first) /
                         static_cast<double>(it->first - prev->first);

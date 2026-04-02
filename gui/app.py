@@ -11,7 +11,7 @@ import sys
 import traceback
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread
 from PySide6.QtWidgets import QApplication, QMessageBox
 
 import gui
@@ -96,9 +96,11 @@ class XOPTraderApp(QApplication):
         sys.stderr.write(f"[XOPTrader] Unhandled exception:\n{tb_text}")
         sys.stderr.flush()
 
-        # Show a modal dialog if a QApplication is still running.
+        # Show a modal dialog if a QApplication is still running and
+        # we are on the main GUI thread.  QMessageBox is not thread-safe;
+        # calling it from a worker thread would crash or deadlock (T8-09).
         app = QApplication.instance()
-        if app is not None:
+        if app is not None and QThread.currentThread() == app.thread():
             QMessageBox.critical(
                 None,
                 "XOPTrader -- Unhandled Exception",

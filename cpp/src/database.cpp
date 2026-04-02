@@ -227,6 +227,11 @@ Database::Database(const std::string& db_path)
     stmt_snapshot_count_     = prepare(kSnapshotCount);
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
 
+    // [T8-20] Transaction control prepared statements.
+    stmt_begin_    = prepare("BEGIN TRANSACTION");
+    stmt_commit_   = prepare("COMMIT");
+    stmt_rollback_ = prepare("ROLLBACK");
+
     spdlog::info("[Database] Schema migration complete; prepared statements compiled");
 }
 
@@ -244,6 +249,9 @@ Database::~Database()
     finalize(stmt_offer_count_);
     finalize(stmt_snapshot_count_);
     finalize(stmt_fill_rate_);
+    finalize(stmt_begin_);
+    finalize(stmt_commit_);
+    finalize(stmt_rollback_);
 
     if (db_) {
         sqlite3_close(db_);
@@ -402,13 +410,8 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
 
     std::lock_guard<std::mutex> lock(mtx_);
     // Wrap the batch in an explicit transaction to amortise fsync.
-    char* err_msg = nullptr;
-    int rc = sqlite3_exec(db_, "BEGIN TRANSACTION;", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        std::string msg = "[Database] BEGIN failed: ";
-        if (err_msg) { msg += err_msg; sqlite3_free(err_msg); }
-        throw std::runtime_error(msg);
-    }
+    // [T8-20] Use prepared statements instead of sqlite3_exec().
+    step_and_reset(stmt_begin_);
 
     try {
         for (const auto& s : batch) {
@@ -425,18 +428,13 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
         }
     } catch (...) {
         // Roll back on any failure to maintain atomicity.
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        sqlite3_reset(stmt_rollback_);
+        sqlite3_step(stmt_rollback_);
+        sqlite3_reset(stmt_rollback_);
         throw;
     }
 
-    rc = sqlite3_exec(db_, "COMMIT;", nullptr, nullptr, &err_msg);
-    if (rc != SQLITE_OK) {
-        std::string msg = "[Database] COMMIT failed: ";
-        if (err_msg) { msg += err_msg; sqlite3_free(err_msg); }
-        // Attempt rollback after failed commit.
-        sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
-        throw std::runtime_error(msg);
-    }
+    step_and_reset(stmt_commit_);
 
     spdlog::debug("[Database] Batch-inserted {} snapshots", batch.size());
 }

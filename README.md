@@ -485,6 +485,7 @@ XOPTrader/
 | **Chia wallet** | 2.x+ | Offer creation/cancellation, balance queries |
 | **C++20 compiler** | MSVC 19.29+ / GCC 11+ / Clang 14+ | Coroutine support required |
 | **CMake** | 3.24+ | Build system |
+| **Boost** | 1.84+ | `boost::asio` coroutines, `boost::beast` HTTP (hard requirement — older versions lack `co_spawn` overloads used by the engine) |
 | **vcpkg** | Latest | Dependency management |
 
 ### Required Capital

@@ -355,6 +355,11 @@ private:
     /// Current XCH/USD rate for USD conversion.  Updated by mark_to_market().
     double xch_usd_rate_ = 0.0;
 
+    // [T8-21] EMA-smoothed mid-prices per pair for unrealized PnL.
+    // Reduces mark-to-market noise from volatile spot prices.
+    // EMA alpha = 0.3 (half-life ~1.7 observations = ~90 s at 52 s heartbeat).
+    std::unordered_map<std::string, double> price_ema_;
+
     /// Maximum number of PnL snapshots retained for analytics.
     /// 8640 snapshots at 52-second intervals covers ~5.2 days -- enough
     /// for a robust annualised Sharpe estimate.

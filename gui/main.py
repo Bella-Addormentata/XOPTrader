@@ -369,10 +369,14 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
                 patched = True
 
         # Localhost connections don't need SSL verification.
+        # T8-14: Only override verify_ssl when the user has not explicitly
+        # set it.  Persisting False when the host later changes to a
+        # remote address would silently disable certificate validation.
         host = str(chia_section.get("full_node_host", "localhost"))
         if host in ("localhost", "127.0.0.1", "::1"):
-            chia_section["verify_ssl"] = False
-            patched = True
+            if "verify_ssl" not in chia_section:
+                chia_section["verify_ssl"] = False
+                patched = True
 
     if not patched:
         return False
