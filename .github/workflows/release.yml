@@ -472,9 +472,12 @@ jobs:
               *.tar.gz)
                 base="${name%.tar.gz}"
                 cp "$f" "${DEST}/${base}-${TAG}.tar.gz" ;;
-              *.exe)
+              xop_trader*.exe)
                 base="${name%.exe}"
                 cp "$f" "${DEST}/${base}-${TAG}.exe" ;;
+              *.exe)
+                # Third-party runtime executables keep their original name
+                cp "$f" "${DEST}/${name}" ;;
               *.yaml)
                 # Keep config files with their original name (no version suffix)
                 cp "$f" "${DEST}/${name}" ;;
