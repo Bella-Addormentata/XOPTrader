@@ -8,7 +8,7 @@
 # Artifacts included in the release
 # -----------------------------------
 # All files are placed under RELEASE/XOPTrader-{slug}/ (e.g. XOPTrader-020
-# for v0.2.0) and bundled into XOPTrader-{slug}.zip.  Each versioned binary
+# for v0.2.0) and bundled into XOPTrader-{slug}.zip. Each versioned binary
 # also carries the release tag in its filename.
 #
 #   xop_trader-windows-x64-{tag}.exe            C++ engine — Windows 64-bit
