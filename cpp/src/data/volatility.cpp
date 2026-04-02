@@ -92,6 +92,14 @@ double VolatilityEstimator::update(const Candle& candle)
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
+        // Track regime duration for transition detection.
+        const auto new_regime = regime_.regime;
+        if (regime_duration_blocks_ == 0 || new_regime != last_regime_) {
+            regime_duration_blocks_ = 1;
+            last_regime_ = new_regime;
+        } else {
+            ++regime_duration_blocks_;
+        }
     }
 
     return sigma_block_;
@@ -187,6 +195,14 @@ double VolatilityEstimator::update_tick(double price)
 #elif defined(_MSC_VER)
 #pragma warning(pop)
 #endif
+            // Track regime duration for transition detection.
+            const auto new_regime = regime_.regime;
+            if (regime_duration_blocks_ == 0 || new_regime != last_regime_) {
+                regime_duration_blocks_ = 1;
+                last_regime_ = new_regime;
+            } else {
+                ++regime_duration_blocks_;
+            }
         }
     }
 
@@ -223,6 +239,13 @@ double VolatilityEstimator::get_variance_ratio() const noexcept
     // T2-02: Shared lock -- read-only access to VR statistic.
     std::shared_lock lock(mtx_);
     return variance_ratio_;
+}
+
+std::uint32_t VolatilityEstimator::get_regime_duration_blocks() const noexcept
+{
+    // T2-02: Shared lock -- read-only access to regime duration counter.
+    std::shared_lock lock(mtx_);
+    return regime_duration_blocks_;
 }
 
 std::size_t VolatilityEstimator::candle_count() const noexcept

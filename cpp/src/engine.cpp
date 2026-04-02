@@ -62,8 +62,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , ioc_()
     , poll_timer_(ioc_)
     , state_(std::make_shared<State>())
-    , max_drawdown_pct_(config.risk.max_drawdown_pct)
     , drawdown_grace_remaining_(config.risk.drawdown_grace_blocks)
+    , max_drawdown_pct_(config.risk.max_drawdown_pct)
 {
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
     spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% "
