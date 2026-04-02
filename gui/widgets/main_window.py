@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QMenuBar,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSplitter,
     QStackedWidget,
@@ -510,26 +511,26 @@ class MainWindow(QMainWindow):
                 background-color: {PANEL_BG};
                 color: {TEXT_PRIMARY};
                 border-bottom: 1px solid {BORDER};
-                padding: 4px 0;
-                min-height: 32px;
+                padding: 2px 0;
+                min-height: 24px;
             }}
             QMenuBar::item:selected {{
                 background-color: {ELEVATED_BG};
-                border-radius: 6px;
+                border-radius: 0px;
             }}
             QMenu {{
                 background-color: {PANEL_BG};
                 color: {TEXT_PRIMARY};
                 border: 1px solid {BORDER};
-                border-radius: 8px;
+                border-radius: 0px;
             }}
             QMenu::item {{
-                padding: 8px 24px 8px 16px;
+                padding: 4px 12px 4px 8px;
             }}
             QMenu::item:selected {{
                 background-color: {PRIMARY_GREEN};
                 color: white;
-                border-radius: 4px;
+                border-radius: 0px;
             }}
             """
         )
@@ -774,7 +775,9 @@ class MainWindow(QMainWindow):
 
         # Top area: stacked widget (65 %)
         self._stacked = QStackedWidget(self)
-        self._dashboard = self._create_page_widget(DashboardWidget, "Dashboard")
+        self._dashboard = self._create_page_widget(
+            DashboardWidget, "Dashboard", scrollable=True
+        )
         self._stacked.addWidget(self._dashboard)                    # index 0
         self._chart = self._create_page_widget(ChartWidget, "Charts")
         self._stacked.addWidget(self._chart)                        # index 1
@@ -783,7 +786,8 @@ class MainWindow(QMainWindow):
         self._order_book = self._create_page_widget(OrderBookWidget, "Order Book")
         self._stacked.addWidget(self._order_book)                   # index 3
         self._market_analysis = self._create_page_widget(           # index 4
-            MarketAnalysisWidget, "Market Analysis")
+            MarketAnalysisWidget, "Market Analysis", scrollable=True
+        )
         self._stacked.addWidget(self._market_analysis)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
         self._stacked.addWidget(self._settings_widget)              # index 5
@@ -803,12 +807,12 @@ class MainWindow(QMainWindow):
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
                 border-bottom: none;
-                padding: 10px 20px;
-                margin-right: 2px;
-                border-top-left-radius: 8px;
-                border-top-right-radius: 8px;
-                font-size: 12px;
-                min-width: 90px;
+                padding: 4px 10px;
+                margin-right: 1px;
+                border-top-left-radius: 0px;
+                border-top-right-radius: 0px;
+                font-size: 11px;
+                min-width: 60px;
             }}
             QTabBar::tab:selected {{
                 background-color: {DARK_BG};
@@ -838,6 +842,7 @@ class MainWindow(QMainWindow):
     def _create_page_widget(
         widget_class: Optional[type],
         fallback_label: str,
+        scrollable: bool = False,
     ) -> QWidget:
         """Instantiate *widget_class* if available, otherwise return a
         placeholder.
@@ -849,6 +854,8 @@ class MainWindow(QMainWindow):
             has not been created yet.
         fallback_label : str
             Label text for the placeholder widget.
+        scrollable : bool
+            If true, wraps the widget in a QScrollArea.
 
         Returns
         -------
@@ -857,11 +864,14 @@ class MainWindow(QMainWindow):
         """
         if widget_class is not None:
             try:
-                return widget_class()
-            except Exception as exc:
-                _log.warning(
-                    "Failed to create widget %s: %s",
-                    widget_class.__name__,
+                w = widget_class()
+                if scrollable:
+                    scroll = QScrollArea()
+                    scroll.setWidgetResizable(True)
+                    scroll.setWidget(w)
+                    scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+                    return scroll
+                return w
                     exc,
                 )
         return _placeholder_widget(f"{fallback_label} (not yet implemented)")
@@ -890,6 +900,9 @@ class MainWindow(QMainWindow):
         Ctrl+5  -- Settings page
         F11     -- Toggle full screen
         Ctrl+B  -- Toggle sidebar
+        Space   -- Play/Pause Market Maker Bot
+        Ctrl+X  -- Emergency Cancel All Orders
+        Esc     -- Jump back to Dashboard
         """
         # Page switching: Ctrl+1 through Ctrl+5
         for index in range(5):
@@ -899,6 +912,32 @@ class MainWindow(QMainWindow):
                 lambda checked, idx=index: self._switch_page(idx)
             )
             self.addAction(action)
+
+        # Space -> Start/Stop Bot
+        play_action = QAction(self)
+        play_action.setShortcut(QKeySequence("Space"))
+        play_action.triggered.connect(self._on_start_stop)
+        self.addAction(play_action)
+
+        # Ctrl+X -> Cancel All Orders
+        cancel_action = QAction(self)
+        cancel_action.setShortcut(QKeySequence("Ctrl+X"))
+        cancel_action.triggered.connect(self._on_emergency_cancel)
+        self.addAction(cancel_action)
+
+        # Esc -> Jump to Dashboard
+        esc_action = QAction(self)
+        esc_action.setShortcut(QKeySequence("Esc"))
+        esc_action.triggered.connect(lambda: self._switch_page(0))
+        self.addAction(esc_action)
+
+    def _on_emergency_cancel(self) -> None:
+        """Globally trigger cancel all offers if the bot is running."""
+        try:
+            if self._bot_running and self._order_panel:
+                self._order_panel.cancel_all_requested.emit()
+        except Exception:
+            pass
 
     def _switch_page(self, index: int) -> None:
         """Switch both the stacked widget and the sidebar selection.

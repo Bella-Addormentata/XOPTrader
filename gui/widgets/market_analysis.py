@@ -331,8 +331,8 @@ class MarketAnalysisWidget(QWidget):
     def _build_ui(self) -> None:
         """Build the widget layout."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(20, 20, 20, 20)
-        root.setSpacing(12)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
         # Header
         hdr_layout = QHBoxLayout()

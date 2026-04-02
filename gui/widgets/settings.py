@@ -76,6 +76,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QTableWidget,
@@ -288,8 +289,8 @@ class SettingsWidget(QWidget):
     def _build_ui(self) -> None:
         """Assemble the top-level layout: header, tabs, status bar."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 14, 16, 12)
-        root.setSpacing(12)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
 
         # -- Header row: title + action buttons --
         header = QHBoxLayout()
@@ -347,7 +348,14 @@ class SettingsWidget(QWidget):
         ]
         for idx, (title_text, builder) in enumerate(tab_builders):
             widget = builder()
-            self._tabs.addTab(widget, title_text)
+            
+            # Wrap each tab in a scroll area to avoid sizing issues
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(widget)
+            scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+            
+            self._tabs.addTab(scroll, title_text)
             self._tab_titles[idx] = title_text
             self._tab_dirty[idx] = False
 

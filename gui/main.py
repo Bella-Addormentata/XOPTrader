@@ -17,6 +17,7 @@ import logging
 import os
 import shutil
 import signal
+import subprocess
 import sys
 from pathlib import Path
 from typing import Final, Optional
@@ -215,6 +216,186 @@ def _bootstrap_config_info(config_path: Optional[Path]) -> tuple[Path, bool]:
 
 
 # ---------------------------------------------------------------------------
+# Chia auto-detection
+# ---------------------------------------------------------------------------
+
+def _detect_chia_root() -> Optional[Path]:
+    """Return the Chia mainnet root directory if it can be found on this machine.
+
+    Checks the standard ``~/.chia/mainnet`` location; returns *None* if
+    the SSL directory is absent (Chia not installed / different root).
+    """
+    candidate = Path.home() / ".chia" / "mainnet"
+    if (candidate / "config" / "ssl").is_dir():
+        return candidate
+    return None
+
+
+def _detect_chia_rpc_ports(chia_root: Path) -> dict[str, int]:
+    """Read full_node and wallet RPC ports from the Chia config file.
+
+    Falls back to XOPTrader defaults (8555 / 9256) if the Chia config
+    cannot be read or parsed.
+
+    Parameters
+    ----------
+    chia_root:
+        The Chia mainnet root returned by :func:`_detect_chia_root`.
+
+    Returns
+    -------
+    dict with keys ``full_node_port`` and ``wallet_port``.
+    """
+    defaults = {"full_node_port": 8555, "wallet_port": 9256}
+    chia_cfg_path = chia_root / "config" / "config.yaml"
+    if not chia_cfg_path.is_file():
+        return defaults
+    try:
+        import yaml  # noqa: WPS433
+
+        with open(chia_cfg_path, "r", encoding="utf-8") as fh:
+            chia_cfg = yaml.safe_load(fh) or {}
+        ports = {}
+        fn = chia_cfg.get("full_node", {})
+        if isinstance(fn.get("rpc_port"), int):
+            ports["full_node_port"] = fn["rpc_port"]
+        wlt = chia_cfg.get("wallet", {})
+        if isinstance(wlt.get("rpc_port"), int):
+            ports["wallet_port"] = wlt["rpc_port"]
+        return {**defaults, **ports}
+    except Exception:  # pragma: no cover
+        return defaults
+
+
+def _detect_wallet_fingerprint() -> Optional[int]:
+    """Return the first wallet fingerprint reported by ``chia keys show``.
+
+    Runs ``chia`` from PATH with a 5-second timeout.  Returns *None* on
+    any error (not installed, no keys, timeout, parse failure).
+    """
+    try:
+        result = subprocess.run(
+            ["chia", "keys", "show"],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        for line in result.stdout.splitlines():
+            if "Fingerprint" in line:
+                parts = line.split(":", 1)
+                if len(parts) == 2 and parts[1].strip().isdigit():
+                    return int(parts[1].strip())
+    except Exception:
+        pass
+    return None
+
+
+def _patch_chia_auto_detect(config_path: Path) -> bool:
+    """Overwrite placeholder Chia connection values with auto-detected ones.
+
+    Reads *config_path*, replaces ``wallet_fingerprint``, SSL cert/key
+    paths, and ``verify_ssl`` with values discovered from the local
+    Chia installation, then writes the file back.  Only patches fields
+    that still hold their template placeholder values so that any
+    manually-set values are left untouched.
+
+    Parameters
+    ----------
+    config_path:
+        Path to the YAML config file that was just bootstrapped.
+
+    Returns
+    -------
+    bool
+        *True* if at least one value was patched; *False* otherwise
+        (Chia not found or all fields already customised).
+    """
+    try:
+        import yaml  # noqa: WPS433
+    except ImportError:
+        _log.warning("PyYAML not available — skipping Chia auto-detect.")
+        return False
+
+    chia_root = _detect_chia_root()
+    fingerprint = _detect_wallet_fingerprint()
+
+    if chia_root is None and fingerprint is None:
+        return False
+
+    try:
+        with open(config_path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+    except OSError as exc:
+        _log.warning("Could not read config for auto-patching: %s", exc)
+        return False
+
+    chia_section = data.get("chia", {})
+    patched = False
+    ssl = chia_root / "config" / "ssl" if chia_root else None
+
+    _PLACEHOLDER_FINGERPRINT = 1234567890
+
+    # --- wallet fingerprint ---
+    if fingerprint is not None and chia_section.get("wallet_fingerprint") == _PLACEHOLDER_FINGERPRINT:
+        chia_section["wallet_fingerprint"] = fingerprint
+        patched = True
+
+    # --- RPC ports (read from Chia's own config.yaml) ---
+    if chia_root is not None:
+        detected_ports = _detect_chia_rpc_ports(chia_root)
+        for port_key, port_val in detected_ports.items():
+            # Only overwrite if the current value matches the template default.
+            template_defaults = {"full_node_port": 8555, "wallet_port": 9256}
+            if chia_section.get(port_key) == template_defaults.get(port_key):
+                chia_section[port_key] = port_val
+                if port_val != template_defaults.get(port_key):
+                    patched = True  # Only flag as patched if value actually changed.
+
+    if ssl is not None:
+        # Map config key → relative path under the ssl directory.
+        cert_map = {
+            "ssl_cert_path":    ssl / "full_node" / "private_full_node.crt",
+            "ssl_key_path":     ssl / "full_node" / "private_full_node.key",
+            "wallet_cert_path": ssl / "wallet"    / "private_wallet.crt",
+            "wallet_key_path":  ssl / "wallet"    / "private_wallet.key",
+            "ca_cert_path":     ssl / "ca"         / "chia_ca.crt",
+        }
+        for key, resolved in cert_map.items():
+            # Only replace tilde-style placeholder paths from the template.
+            existing = str(chia_section.get(key, ""))
+            if existing.startswith("~") and resolved.is_file():
+                # Store as forward-slash string for cross-platform YAML.
+                chia_section[key] = resolved.as_posix()
+                patched = True
+
+        # Localhost connections don't need SSL verification.
+        host = str(chia_section.get("full_node_host", "localhost"))
+        if host in ("localhost", "127.0.0.1", "::1"):
+            chia_section["verify_ssl"] = False
+            patched = True
+
+    if not patched:
+        return False
+
+    data["chia"] = chia_section
+    try:
+        with open(config_path, "w", encoding="utf-8") as fh:
+            yaml.dump(data, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
+    except OSError as exc:
+        _log.warning("Could not write auto-patched config: %s", exc)
+        return False
+
+    _log.info(
+        "Auto-detected Chia settings written to %s "
+        "(root=%s, fingerprint=%s).",
+        config_path,
+        chia_root,
+        fingerprint,
+    )
+    return True
+
+
+# ---------------------------------------------------------------------------
 # Service bootstrap
 # ---------------------------------------------------------------------------
 
@@ -300,6 +481,12 @@ def main() -> None:
     # can launch with a template the user can edit via the Settings panel.
     cfg_path, first_run_bootstrap = _bootstrap_config_info(args.config)
 
+    # If a fresh config was just created, auto-fill Chia cert paths and
+    # wallet fingerprint from the local Chia installation.
+    chia_auto_patched = False
+    if first_run_bootstrap:
+        chia_auto_patched = _patch_chia_auto_detect(cfg_path)
+
     # Import MainWindow here (not at module level) to keep the import
     # graph acyclic and to defer heavy widget instantiation until
     # the QApplication exists.
@@ -320,23 +507,20 @@ def main() -> None:
     window.set_bridge(bridge)
 
     if first_run_bootstrap:
-        # On first run, guide users directly to the Settings page where
-        # wallet fingerprint, cert paths, and pair IDs are configured.
-        from PySide6.QtWidgets import QMessageBox  # noqa: WPS433
+        # On first run, open the Settings page and show the setup wizard
+        # so users can review auto-detected values and enter credentials
+        # (e.g. Telegram) that cannot be discovered automatically.
+        from gui.widgets.setup_wizard import FirstRunSetupDialog  # noqa: WPS433
 
         if hasattr(window, "open_settings_page"):
             window.open_settings_page()
 
-        QMessageBox.information(
-            window,
-            "XOPTrader — First-Time Setup",
-            "A starter config file was created automatically:\n\n"
-            f"{cfg_path}\n\n"
-            "Next steps:\n"
-            "1. Open Settings and fill in your Chia cert paths and wallet fingerprint.\n"
-            "2. Review trading pairs and strategy settings.\n"
-            "3. Click Save, then start in Dry Run first.",
+        wizard = FirstRunSetupDialog(
+            config_path=cfg_path,
+            chia_detected=chia_auto_patched,
+            parent=window,
         )
+        wizard.exec()
 
     # Show the main window and hand control to the Qt event loop.
     window.show()
