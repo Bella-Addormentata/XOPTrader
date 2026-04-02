@@ -63,6 +63,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , poll_timer_(ioc_)
     , state_(std::make_shared<State>())
     , max_drawdown_pct_(config.risk.max_drawdown_pct)
+    , drawdown_grace_remaining_(config.risk.drawdown_grace_blocks)
 {
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
     spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% "
@@ -1715,6 +1716,15 @@ void Engine::step_update_analytics(BlockHeight block_height)
                       pair.name, vol_est.get_sigma_block(),
                       to_string(regime.regime));
 
+        // [T8-06] On regime transition, partially reset the Thompson Sampler
+        // posteriors so accumulated evidence from the old regime does not
+        // anchor spread selection in the new regime.
+        if (vol_est.get_regime_duration_blocks() == 1 && spread_opt_) {
+            spread_opt_->reset_thompson_posteriors(0.5);
+            spdlog::info("[Engine] Step 3: {} regime transition detected -- "
+                         "Thompson posteriors decayed by 50%", pair.name);
+        }
+
         // -- Stablecoin depeg monitoring ------------------------------------
         // Feed the current mid-price to the depeg detector for any pair
         // flagged as a stablecoin.  The detector tracks sustained deviations
@@ -1988,6 +1998,27 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             pcs.spread_result.total_spread_bps *= staleness_mult;
             spdlog::debug("[Engine] Step 5: {} staleness={:.0f}% spread widened by {:.2f}x",
                           pair_name, staleness_frac * 100.0, staleness_mult);
+        }
+
+        // [T8-05] DEX/CEX divergence spread widening.
+        // When the DEX mid price diverges significantly from the CEX
+        // reference, widen spreads to avoid adverse selection from
+        // cross-venue arbitrageurs.
+        if (auto cex_ref = market_data_->get_cex_reference(pair_name)) {
+            double dex_mid = market_data_->get_mid_price(pair_name);
+            if (dex_mid > 0.0 && *cex_ref > 0.0) {
+                double divergence_bps =
+                    std::abs(dex_mid - *cex_ref) / dex_mid * 10000.0;
+                constexpr double kDexCexDivergenceThresholdBps = 200.0;
+                if (divergence_bps > kDexCexDivergenceThresholdBps) {
+                    constexpr double kDivergenceMult = 1.5;
+                    pcs.spread_result.total_spread_bps *= kDivergenceMult;
+                    spdlog::warn("[Engine] Step 5: {} DEX/CEX divergence={:.0f}bps "
+                                 "> {:.0f}bps -- spread widened by {:.1f}x",
+                                 pair_name, divergence_bps,
+                                 kDexCexDivergenceThresholdBps, kDivergenceMult);
+                }
+            }
         }
 
         pcs.spread_result.half_spread =
@@ -3074,7 +3105,15 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // ISO/IEC 5055: guards against division by zero and sign errors.
     // ISO/IEC 27001:2022: audit-logged state transition; no unprotected
     //   window at startup.
-    if (peak_pnl_hwm_ > 0 || total.total_pnl < 0) {
+    // [T8-03] Decrement the grace period counter each cycle.  During the
+    // grace window the HWM drawdown check is skipped so that a small initial
+    // loss from the zero-peak baseline does not immediately pause the engine.
+    if (drawdown_grace_remaining_ > 0) {
+        --drawdown_grace_remaining_;
+    }
+
+    if ((peak_pnl_hwm_ > 0 || total.total_pnl < 0)
+            && drawdown_grace_remaining_ == 0) {
         double drawdown_frac = 0.0;
 
         if (peak_pnl_hwm_ > 0) {

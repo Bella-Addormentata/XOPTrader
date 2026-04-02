@@ -233,6 +233,12 @@ private:
 
     std::vector<CoinAge> coins_;
 
+    // [T8-18] Cached urgency value, updated by compute_quotes() and
+    // compute_urgency().  ask_spread_multiplier / bid_spread_multiplier
+    // reuse this instead of recomputing the O(n) coin-age loop.
+    double   cached_urgency_{0.0};
+    uint32_t last_urgency_block_{0};
+
     struct PriceObs {
         BlockHeight block;
         double      mid;

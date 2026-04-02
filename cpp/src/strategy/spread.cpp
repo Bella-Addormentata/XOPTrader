@@ -235,6 +235,15 @@ const std::vector<double>& ThompsonSampler::betas() const noexcept {
     return beta_;
 }
 
+void ThompsonSampler::partial_reset(double decay_factor) {
+    // Clamp to (0, 1] to avoid nonsensical values.
+    const double d = std::clamp(decay_factor, 0.01, 1.0);
+    for (std::size_t i = 0; i < alpha_.size(); ++i) {
+        alpha_[i] = std::max(alpha_[i] * d, 1.0);
+        beta_[i]  = std::max(beta_[i]  * d, 1.0);
+    }
+}
+
 // ===========================================================================
 // [T5-CR15] SpreadVolatilityTracker
 // ===========================================================================
@@ -715,6 +724,12 @@ std::optional<double> SpreadOptimizer::thompson_sample() {
 
 const ThompsonSampler* SpreadOptimizer::sampler() const noexcept {
     return sampler_.has_value() ? &sampler_.value() : nullptr;
+}
+
+void SpreadOptimizer::reset_thompson_posteriors(double decay_factor) {
+    if (sampler_.has_value()) {
+        sampler_->partial_reset(decay_factor);
+    }
 }
 
 // ===========================================================================

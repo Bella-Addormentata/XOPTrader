@@ -741,6 +741,19 @@ RiskConfig parse_risk(const YAML::Node& root)
         }
     }
 
+    // drawdown_grace_blocks: blocks to skip drawdown check at startup [0, UINT32_MAX].
+    // Default 100.  Allows the engine to absorb small initial losses before
+    // the circuit breaker is armed (T8-03).
+    if (node["drawdown_grace_blocks"] && node["drawdown_grace_blocks"].IsDefined()
+            && !node["drawdown_grace_blocks"].IsNull()) {
+        int64_t v = node["drawdown_grace_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".drawdown_grace_blocks must be >= 0; got "
+                              + std::to_string(v));
+        }
+        cfg.drawdown_grace_blocks = static_cast<uint32_t>(v);
+    }
+
     // loss_window_blocks: rolling window in blocks in [1, UINT32_MAX].
     // Default 1152 (~10 h).  Parsed as int64 so we can detect negative /
     // out-of-range values before casting.

@@ -258,6 +258,8 @@ public:
     std::chrono::milliseconds try_acquire();
 
     /// Number of requests currently inside the window (after pruning).
+    /// [T8-10] Const-correct: prune_ is logically const (only removes
+    /// stale entries), so timestamps_ is mutable and prune_ is const.
     std::size_t current_count() const;
 
     /// Reset internal state (useful in tests).
@@ -268,12 +270,13 @@ private:
     using TimePoint = Clock::time_point;
 
     /// Remove entries older than (now - window_).
-    void prune_(TimePoint now);
+    /// [T8-10] Marked const -- mutates only mutable members.
+    void prune_(TimePoint now) const;
 
     std::size_t                    max_requests_;
     std::chrono::milliseconds      window_;
     mutable std::mutex             mu_;
-    std::deque<TimePoint>          timestamps_;
+    mutable std::deque<TimePoint>  timestamps_;
 };
 
 // -----------------------------------------------------------------------

@@ -251,7 +251,10 @@ public:
     // -- Configuration access -------------------------------------------------
 
     /// Read-only access to the active configuration.
-    const OrderBookTacticsConfig& config() const noexcept;
+    /// [T8-01] Returns by value to prevent dangling reference -- the
+    /// shared_lock that protects cfg_ would expire before the caller
+    /// uses the returned reference.
+    OrderBookTacticsConfig config() const noexcept;
 
 private:
     // -- Tactic selection (priority chain) ------------------------------------

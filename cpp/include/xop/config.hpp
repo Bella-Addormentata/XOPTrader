@@ -234,6 +234,7 @@ struct RiskConfig {
 
     // -- Circuit breakers ---------------------------------------------------
     double   max_drawdown_pct{0.10};        ///< HWM drawdown threshold (0,1].
+    uint32_t drawdown_grace_blocks{100};    ///< Blocks to skip drawdown check at startup.
     uint32_t loss_window_blocks{1152};      ///< Rolling window size in blocks.
     double   max_window_loss_bps{500.0};    ///< Max loss in window (bps; 0=disabled).
 

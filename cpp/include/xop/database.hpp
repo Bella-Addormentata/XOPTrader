@@ -307,6 +307,11 @@ private:
 
     /// Fill rate query: filled / total resolved offers since a given block
     sqlite3_stmt* stmt_fill_rate_{nullptr};
+
+    // [T8-20] Transaction control prepared statements.
+    sqlite3_stmt* stmt_begin_{nullptr};
+    sqlite3_stmt* stmt_commit_{nullptr};
+    sqlite3_stmt* stmt_rollback_{nullptr};
 };
 
 }  // namespace xop

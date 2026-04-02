@@ -177,9 +177,13 @@ void OrderBookTactician::clear_own_offers()
 // Configuration accessor
 // ===========================================================================
 
-const OrderBookTacticsConfig& OrderBookTactician::config() const noexcept
+OrderBookTacticsConfig OrderBookTactician::config() const noexcept
 {
     // T2-02: Shared lock -- read-only access to cfg_.
+    // [T8-01] Return by value -- returning const& allowed the reference
+    // to outlive the lock scope, creating a potential dangling reference
+    // if set_config() is called concurrently.  DriftAnalyzer::config()
+    // already follows this pattern correctly.
     std::shared_lock lock(mtx_);
     return cfg_;
 }
@@ -242,8 +246,14 @@ BookTactic OrderBookTactician::select_tactic(const BookState& state)
     // exceeds the asymmetry threshold, use asymmetric sizing to passively
     // rebalance by quoting larger on the inventory-reducing side.
     // Use abs_imbalance (deviation from 0.5) for symmetric skew detection.
+    //
+    // T8-04: OFI must confirm the rebalancing direction.  When long
+    // (imbalance > 0) we need buy-pressure (OFI > 0) to sell into;
+    // when short (imbalance < 0) we need sell-pressure (OFI < 0) to
+    // buy from.  Same-sign check: imbalance * OFI > 0.
     else if (abs_imbalance > 0.1 &&
-             std::abs(state.normalized_ofi) > cfg_.ofi_asymmetry_threshold) {
+             std::abs(state.normalized_ofi) > cfg_.ofi_asymmetry_threshold &&
+             imbalance * state.normalized_ofi > 0.0) {
         raw_tactic = BookTactic::AsymmetricSize;
     }
     // --- Priority 4: Deep book on both sides -------------------------------

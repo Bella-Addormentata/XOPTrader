@@ -226,11 +226,18 @@ class _MetricsWorker(QObject):
         """
         # Import requests lazily so the module loads even if the library
         # is somehow missing (error surfaces at fetch time instead).
+        # T8-15: Cache the module reference after first import to avoid
+        # the import-system lookup overhead on every polling cycle.
         try:
-            import requests  # type: ignore[import-untyped]
-        except ImportError as exc:
-            self.request_failed.emit(f"Missing dependency: {exc}")
-            return
+            requests = self._requests_mod
+        except AttributeError:
+            try:
+                import requests as _req  # type: ignore[import-untyped]
+                self._requests_mod = _req
+                requests = _req
+            except ImportError as exc:
+                self.request_failed.emit(f"Missing dependency: {exc}")
+                return
 
         try:
             response = requests.get(self._url, timeout=_HTTP_TIMEOUT_S)

@@ -56,23 +56,7 @@ static constexpr double kMinSpreadFraction = 0.004;
 // with inconsistent horizons (q=2 vs q=5), missing Z-statistic significance
 // testing, and no hysteresis.
 
-/// Convert annualised volatility to per-block volatility.
-///   sigma_block = sigma_annual * sqrt(block_time_seconds / kSecondsPerYear)
-///
-/// For CHIA with block_time = 52 s:
-///   sigma_block = sigma_annual * sqrt(52.0 / 31536000.0)
-///               = sigma_annual * 1.2843e-3
-///
-/// @param sigma_annual  Annualised volatility (dimensionless fraction).
-/// @param block_time_seconds  Block interval in seconds (default 52.0).
-/// @param seconds_per_year  Calendar seconds in a year.
-/// @return Per-block standard deviation.
-[[maybe_unused]]
-double annual_to_per_block_vol(double sigma_annual,
-                               double block_time_seconds,
-                               double seconds_per_year) {
-    return sigma_annual * std::sqrt(block_time_seconds / seconds_per_year);
-}
+// [T8-17] Removed dead annual_to_per_block_vol() function (was [[maybe_unused]]).
 
 /// Compute the remaining time tau as a fraction of one year.
 ///   tau = remaining_blocks * block_time_seconds / kSecondsPerYear
@@ -273,6 +257,10 @@ QuoteResult CoinAgeWeightedQuoting::compute_quotes(
     const double ask_mult = std::clamp(1.0 - cfg_.alpha_age * U, 1.0 - cfg_.alpha_age, 1.0);
     const double bid_mult = std::clamp(1.0 + cfg_.beta_age * U, 1.0, 1.0 + cfg_.beta_age);
 
+    // [T8-18] Cache the urgency value for ask/bid_spread_multiplier().
+    cached_urgency_ = U;
+    last_urgency_block_ = block_height;
+
     double ask = r + delta_adj * ask_mult;
     double bid = r - delta_adj * bid_mult;
 
@@ -403,11 +391,12 @@ double CoinAgeWeightedQuoting::compute_urgency(
 double CoinAgeWeightedQuoting::ask_spread_multiplier(
     BlockHeight current_block) const
 {
-    // T2-02: Shared lock -- read-only access to coins_ and cfg_.
-    // Urgency computed inline to avoid re-entrant shared lock via compute_urgency().
+    // T2-02: Shared lock -- read-only access to cached_urgency_ and cfg_.
+    // T8-18: Use cached urgency computed by compute_quotes() instead
+    // of recomputing the O(n) coin-age loop.
     std::shared_lock lock(mtx_);
-    double U = 0.0;
-    if (!coins_.empty()) {
+    double U = cached_urgency_;
+    if (last_urgency_block_ != current_block && !coins_.empty()) {
         double sum = 0.0;
         for (const auto& coin : coins_) {
             const uint32_t ab = (current_block > coin.creation_block)
@@ -424,11 +413,12 @@ double CoinAgeWeightedQuoting::ask_spread_multiplier(
 double CoinAgeWeightedQuoting::bid_spread_multiplier(
     BlockHeight current_block) const
 {
-    // T2-02: Shared lock -- read-only access to coins_ and cfg_.
-    // Urgency computed inline to avoid re-entrant shared lock via compute_urgency().
+    // T2-02: Shared lock -- read-only access to cached_urgency_ and cfg_.
+    // T8-18: Use cached urgency computed by compute_quotes() instead
+    // of recomputing the O(n) coin-age loop.
     std::shared_lock lock(mtx_);
-    double U = 0.0;
-    if (!coins_.empty()) {
+    double U = cached_urgency_;
+    if (last_urgency_block_ != current_block && !coins_.empty()) {
         double sum = 0.0;
         for (const auto& coin : coins_) {
             const uint32_t ab = (current_block > coin.creation_block)

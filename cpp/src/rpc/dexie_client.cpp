@@ -101,9 +101,9 @@ std::chrono::milliseconds SlidingWindowRateLimiter::try_acquire() {
 
 std::size_t SlidingWindowRateLimiter::current_count() const {
     std::lock_guard lock(mu_);
-    // Const-cast is safe: prune_ only removes stale entries.
-    auto& self = const_cast<SlidingWindowRateLimiter&>(*this);
-    self.prune_(Clock::now());
+    // [T8-10] No const_cast needed: timestamps_ is mutable and
+    // prune_ is const (only removes stale entries).
+    prune_(Clock::now());
     return timestamps_.size();
 }
 
@@ -112,7 +112,7 @@ void SlidingWindowRateLimiter::reset() {
     timestamps_.clear();
 }
 
-void SlidingWindowRateLimiter::prune_(TimePoint now) {
+void SlidingWindowRateLimiter::prune_(TimePoint now) const {
     const auto cutoff = now - window_;
     while (!timestamps_.empty() && timestamps_.front() <= cutoff) {
         timestamps_.pop_front();
@@ -416,6 +416,37 @@ asio::awaitable<nlohmann::json> DexieClient::execute_request_(
             asio::use_awaitable);
 
         if (rc != CURLE_OK) {
+            // [T8-07] Classify transient CURL transport errors as retryable.
+            // DNS failures, connection refused, and timeouts are typically
+            // temporary and should be retried with exponential backoff,
+            // mirroring the HTTP 429/5xx retry path.
+            const bool transient =
+                rc == CURLE_COULDNT_RESOLVE_HOST ||
+                rc == CURLE_COULDNT_CONNECT      ||
+                rc == CURLE_OPERATION_TIMEDOUT    ||
+                rc == CURLE_SEND_ERROR            ||
+                rc == CURLE_RECV_ERROR             ||
+                rc == CURLE_GOT_NOTHING;
+
+            if (transient) {
+                ++attempt;
+                if (attempt > cfg_.max_retries) {
+                    log_->error("{} {} -- curl transport error '{}' persisted "
+                                "after {} retries", method, url,
+                                curl_easy_strerror(rc), cfg_.max_retries);
+                    throw DexieError(std::string("curl_easy_perform: ") +
+                                     curl_easy_strerror(rc));
+                }
+                log_->warn("{} {} -- curl transport error '{}' (attempt {}/{}) "
+                           "-- retrying in {}ms", method, url,
+                           curl_easy_strerror(rc), attempt,
+                           cfg_.max_retries, retry_delay.count());
+                asio::steady_timer timer(ioc_, retry_delay);
+                co_await timer.async_wait(asio::use_awaitable);
+                retry_delay *= 2;
+                continue;
+            }
+
             log_->error("{} {} -- curl error: {}", method, url,
                         curl_easy_strerror(rc));
             throw DexieError(std::string("curl_easy_perform: ") +

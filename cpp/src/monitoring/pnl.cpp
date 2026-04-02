@@ -700,16 +700,27 @@ void PnLTracker::mark_to_market(
         const std::string base_asset = pair_name.substr(0, slash_pos);
 
         const Mojo current_price = get_price(pair_name, base_asset);
+
+        // [T8-21] Smooth the mid-price with an EMA to reduce unrealized
+        // PnL noise from volatile spot price ticks.
+        constexpr double kEmaAlpha = 0.3;
+        auto ema_it = price_ema_.find(pair_name);
+        Mojo smoothed_price = current_price;
+        if (current_price > 0) {
+            if (ema_it != price_ema_.end()) {
+                double ema = kEmaAlpha * static_cast<double>(current_price)
+                           + (1.0 - kEmaAlpha) * ema_it->second;
+                ema_it->second = ema;
+                smoothed_price = static_cast<Mojo>(ema);
+            } else {
+                price_ema_[pair_name] = static_cast<double>(current_price);
+            }
+        }
         const Mojo balance       = get_balance(base_asset);
         const Mojo basis         = get_cost_basis(base_asset);
 
-        // Inventory PnL = (current_price - cost_basis) * balance.
-        // Both prices are in mojos-of-quote per mojo-of-base, and balance
-        // is in mojos-of-base.  The product is mojos-of-quote.
-        //
-        // When cost_basis is zero (no position), inventory_pnl is zero.
         if (basis > 0 && balance > 0) {
-            ppnl.inventory_pnl = (current_price - basis) * balance;
+            ppnl.inventory_pnl = (smoothed_price - basis) * balance;
         } else {
             ppnl.inventory_pnl = 0;
         }
