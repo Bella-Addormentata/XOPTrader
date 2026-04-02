@@ -32,8 +32,11 @@
 
 #include "xop/rpc/chia_rpc.hpp"
 
+#include <algorithm>
+#include <cctype>
 #include <sstream>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include <boost/asio/co_spawn.hpp>
@@ -339,16 +342,41 @@ void ChiaRPCBase::configure_tls(CURL*              curl,
     // materialises the path strings into locals whose lifetime spans
     // the entire CURL transfer, then passes them here by const&.
 
-    // Client certificate (PEM format).
-    curl_easy_setopt(curl, CURLOPT_SSLCERT, cert_str.c_str());
-    curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
+    // Client certificate:
+    // - PEM cert + separate PEM key (OpenSSL-style)
+    // - PKCS#12 bundle (.p12/.pfx) for Schannel-compatible Windows setups
+    auto to_lower = [](std::string s) {
+        std::transform(s.begin(), s.end(), s.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        return s;
+    };
+    const std::string cert_path_lc = to_lower(cert_str);
+    const bool is_pkcs12 =
+        (cert_path_lc.size() >= 4
+         && cert_path_lc.compare(cert_path_lc.size() - 4, 4, ".p12") == 0)
+        || (cert_path_lc.size() >= 4
+            && cert_path_lc.compare(cert_path_lc.size() - 4, 4, ".pfx") == 0);
 
-    // Client private key (PEM format).
-    curl_easy_setopt(curl, CURLOPT_SSLKEY, key_str.c_str());
-    curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, "PEM");
+    curl_easy_setopt(curl, CURLOPT_SSLCERT, cert_str.c_str());
+    if (is_pkcs12) {
+        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "P12");
+        // Empty password for local unencrypted bundles produced during setup.
+        curl_easy_setopt(curl, CURLOPT_KEYPASSWD, "");
+    } else {
+        curl_easy_setopt(curl, CURLOPT_SSLCERTTYPE, "PEM");
+
+        // Client private key (PEM format).
+        curl_easy_setopt(curl, CURLOPT_SSLKEY, key_str.c_str());
+        curl_easy_setopt(curl, CURLOPT_SSLKEYTYPE, "PEM");
+    }
 
     // CA certificate for server verification.
     curl_easy_setopt(curl, CURLOPT_CAINFO, ca_str.c_str());
+
+    // Windows Schannel often fails local/self-signed RPC handshakes when
+    // revocation endpoints are unavailable. Disable CRL checks for this
+    // local mTLS channel to avoid false negatives.
+    curl_easy_setopt(curl, CURLOPT_SSL_OPTIONS, CURLSSLOPT_NO_REVOKE);
 
     // --- SSL verification policy -------------------------------------------
     // Default ON: verify the server certificate against the Chia CA.
@@ -676,7 +704,8 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     // caller falls back to the static fee.
     try {
         json payload = {
-            {"target_times", {target_time_seconds}}
+            {"target_times", {target_time_seconds}},
+            {"spend_type", "send_xch_transaction"}
         };
 
         const json resp = co_await rpc_post("get_fee_estimate", payload);

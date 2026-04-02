@@ -376,7 +376,7 @@ class SettingsWidget(QWidget):
         """Build the Connection tab: Chia node, wallet, and Dexie API."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Node Mode --
@@ -528,7 +528,7 @@ class SettingsWidget(QWidget):
         """Build the Trading Pairs tab with an editable table."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(8)
 
         # -- Toolbar --
@@ -569,7 +569,7 @@ class SettingsWidget(QWidget):
         """Build the Strategy tab: AS/GLFT params, spread, tiers."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Avellaneda-Stoikov / GLFT section --
@@ -695,7 +695,7 @@ class SettingsWidget(QWidget):
         """Build the Risk Management tab."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Inventory Limits --
@@ -828,7 +828,7 @@ class SettingsWidget(QWidget):
         """Build the Monitoring tab: Prometheus and Telegram alerts."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Prometheus --
@@ -896,7 +896,7 @@ class SettingsWidget(QWidget):
         """Build the Appearance tab for GUI-only preferences."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         grp = QGroupBox("Display Preferences")
@@ -988,7 +988,7 @@ class SettingsWidget(QWidget):
         """Build the Advanced tab: volatility, DB path, raw YAML editor."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Volatility section --
@@ -1110,7 +1110,7 @@ class SettingsWidget(QWidget):
         """Build the Fees tab: fee budget and adaptive fee settings."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Fee Budget --
@@ -1250,7 +1250,7 @@ class SettingsWidget(QWidget):
         """Build the Arbitrage tab: triangular, CEX-DEX, cross-DEX, cross-bridge."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Master switch --
@@ -1446,7 +1446,7 @@ class SettingsWidget(QWidget):
         """Build the Depeg & Aging tab: global depeg + inventory aging."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         # -- Depeg Monitoring --
@@ -1592,7 +1592,7 @@ class SettingsWidget(QWidget):
         """Build the CoinGecko tab: external price reference settings."""
         page = QWidget()
         layout = QVBoxLayout(page)
-        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setContentsMargins(16, 14, 16, 14)
         layout.setSpacing(10)
 
         cg_group = QGroupBox("CoinGecko Price Feed")

@@ -52,6 +52,8 @@ CREATE TABLE IF NOT EXISTS trade_log (
     cost_basis_mojos  INTEGER,
     realized_pnl_mojos INTEGER,
     block_height      INTEGER NOT NULL,
+    offer_hash        TEXT,
+    acquisition_ts    TEXT,
     created_at        TEXT    DEFAULT CURRENT_TIMESTAMP
 );
 )SQL";
@@ -617,6 +619,13 @@ void Database::run_migrations()
             throw std::runtime_error(msg);
         }
     }
+
+    // Forward-compatible column migrations for pre-existing databases.
+    // We intentionally ignore "duplicate column name" errors.
+    sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN offer_hash TEXT;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;",
+                 nullptr, nullptr, nullptr);
 }
 
 // ===========================================================================

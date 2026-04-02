@@ -62,6 +62,12 @@ Source: "xop_trader_gui.exe"; DestDir: "{app}"; Flags: ignoreversion
 ; C++ engine (required — GUI auto-launches this for click-and-play)
 Source: "xop_trader.exe"; DestDir: "{app}"; Flags: ignoreversion
 
+; Runtime dependencies for the C++ engine (copied from CI staging)
+Source: "*.dll"; DestDir: "{app}"; Flags: ignoreversion
+
+; Microsoft VC++ redistributable for clean Windows machines
+Source: "VC_redist.x64.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall ignoreversion
+
 ; Reference config
 Source: "config.example.yaml"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -78,6 +84,11 @@ Name: "{autodesktop}\XOPTrader"; Filename: "{app}\xop_trader_gui.exe"; \
   Tasks: desktopicon
 
 [Run]
+Filename: "{tmp}\VC_redist.x64.exe"; \
+  Parameters: "/install /quiet /norestart"; \
+  StatusMsg: "Installing Microsoft Visual C++ runtime..."; \
+  Flags: runhidden waituntilterminated
+
 Filename: "{app}\xop_trader_gui.exe"; \
   Description: "{cm:LaunchProgram,XOPTrader}"; \
   Flags: nowait postinstall skipifsilent

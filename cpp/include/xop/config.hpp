@@ -81,6 +81,11 @@ struct ChiaConfig {
     // Required when verify_ssl is true (the default).
     std::string ca_cert_path;           // SECRET -- never log.
 
+    // SSL certificate verification policy for Chia RPC.
+    // Keep true in normal operation; set false only for trusted localhost
+    // troubleshooting when certificate validation is failing.
+    bool        verify_ssl{true};
+
     // Wallet fingerprint that identifies the key to use.
     uint32_t    wallet_fingerprint{0};  // SECRET -- never log.
 };

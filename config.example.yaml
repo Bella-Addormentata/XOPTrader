@@ -45,6 +45,10 @@ chia:
   wallet_key_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.key"
   # CA certificate for verifying the Chia daemon (required for mTLS)
   ca_cert_path: "~/.chia/mainnet/config/ssl/ca/chia_ca.crt"
+  # SSL verification for Chia RPC certificates.
+  # Keep true in normal operation; set false only for trusted localhost
+  # troubleshooting when certificate chain validation fails.
+  verify_ssl: true
   # Wallet fingerprint (integer — get yours from `chia keys show`)
   # Supports env vars: wallet_fingerprint: ${XOP_WALLET_FINGERPRINT}
   wallet_fingerprint: 1234567890

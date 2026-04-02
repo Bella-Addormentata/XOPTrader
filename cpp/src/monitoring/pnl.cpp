@@ -227,11 +227,15 @@ void PnLTracker::init_database()
         throw std::runtime_error("PnLTracker: CREATE TABLE failed: " + err);
     }
 
-    // T2-06: Migrate existing databases -- add the acquisition_ts column
-    // if it does not already exist.  The ALTER TABLE ... ADD COLUMN
-    // statement returns an error when the column already exists (e.g. on
-    // a fresh database where CREATE TABLE already includes it); we
-    // intentionally ignore that error.
+    // T2-06: Migrate existing databases -- add columns that may be
+    // missing in older schemas.  ALTER TABLE ... ADD COLUMN returns an
+    // error when a column already exists; this is intentionally ignored.
+    static constexpr const char* kMigrateOfferHash = R"SQL(
+        ALTER TABLE trade_log ADD COLUMN offer_hash TEXT;
+    )SQL";
+
+    sqlite3_exec(db_, kMigrateOfferHash, nullptr, nullptr, nullptr);
+
     static constexpr const char* kMigrateAcqTs = R"SQL(
         ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;
     )SQL";

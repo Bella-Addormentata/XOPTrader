@@ -560,6 +560,14 @@ cd build && ctest --output-on-failure
 
 ## Configuration
 
+### GUI First Run (recommended)
+
+On first launch, the GUI automatically creates `config.yaml` from
+`config.example.yaml` when no config file exists, then opens the
+Settings workflow so you can fill in machine-specific values.
+
+### CLI / Manual Setup
+
 ```bash
 # Copy template
 cp config.example.yaml config.yaml

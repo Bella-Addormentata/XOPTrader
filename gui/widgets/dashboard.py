@@ -104,32 +104,32 @@ class MetricCard(QFrame):
 
         # --- layout ---------------------------------------------------------
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 10, 14, 10)
-        root.setSpacing(4)
+        root.setContentsMargins(18, 14, 18, 14)
+        root.setSpacing(8)
 
         # Title row
         self._title_label = QLabel(title.upper())
         self._title_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 11px; font-weight: 600; letter-spacing: 1px;"
+            f"color: {TEXT_SECONDARY}; font-size: 12px; font-weight: 600; letter-spacing: 1px;"
         )
         root.addWidget(self._title_label)
 
         # Value + change row (side by side)
         value_row = QHBoxLayout()
-        value_row.setSpacing(8)
+        value_row.setSpacing(12)
 
         self._value_label = QLabel("--")
         self._value_label.setStyleSheet(
             f"color: {TEXT_PRIMARY};"
             f"font-family: {_MONO_FAMILY};"
-            f"font-size: 22px;"
+            f"font-size: 24px;"
             f"font-weight: 700;"
         )
         value_row.addWidget(self._value_label)
 
         self._change_label = QLabel("")
         self._change_label.setStyleSheet(
-            f"color: {TEXT_SECONDARY}; font-size: 12px;"
+            f"color: {TEXT_SECONDARY}; font-size: 13px;"
         )
         value_row.addWidget(self._change_label)
         value_row.addStretch()

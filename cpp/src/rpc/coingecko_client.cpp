@@ -151,6 +151,9 @@ CURLcode CoinGeckoClient::perform_request_(
     // TLS verification (public API -- system CA bundle).
     curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYPEER, 1L);
     curl_easy_setopt(easy.get(), CURLOPT_SSL_VERIFYHOST, 2L);
+#if defined(CURLSSLOPT_NATIVE_CA)
+    curl_easy_setopt(easy.get(), CURLOPT_SSL_OPTIONS, CURLSSLOPT_NATIVE_CA);
+#endif
 
     // User-Agent header.
     curl_easy_setopt(easy.get(), CURLOPT_USERAGENT,

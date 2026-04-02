@@ -77,7 +77,7 @@ class _StatRow(QWidget):
     def __init__(self, label: str, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
         layout = QHBoxLayout(self)
-        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setContentsMargins(12, 8, 12, 8)
         layout.setSpacing(12)
 
         self._label = QLabel(label + ":")
@@ -138,8 +138,8 @@ class PairAnalysisPanel(QFrame):
         )
 
         root = QVBoxLayout(self)
-        root.setContentsMargins(14, 12, 14, 12)
-        root.setSpacing(6)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(8)
 
         # Title
         title = QLabel(pair_name)
@@ -331,7 +331,7 @@ class MarketAnalysisWidget(QWidget):
     def _build_ui(self) -> None:
         """Build the widget layout."""
         root = QVBoxLayout(self)
-        root.setContentsMargins(16, 16, 16, 16)
+        root.setContentsMargins(20, 20, 20, 20)
         root.setSpacing(12)
 
         # Header

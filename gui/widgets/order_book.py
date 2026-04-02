@@ -248,7 +248,7 @@ class OrderBookWidget(QWidget):
         Configured QHBoxLayout ready to be added to the root layout.
         """
         toolbar = QHBoxLayout()
-        toolbar.setContentsMargins(10, 8, 10, 8)
+        toolbar.setContentsMargins(12, 10, 12, 10)
         toolbar.setSpacing(12)
 
         # Pair selector

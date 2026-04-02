@@ -19,6 +19,7 @@ Compliant with:
 from __future__ import annotations
 
 import logging
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -88,6 +89,9 @@ class EngineBridge(QObject):
         Emitted after the startup sequence completes successfully.
     error(str)
         Emitted on any non-fatal service-level error.
+    engine_start_failed(str)
+        Emitted when the managed engine process exits during startup and
+        a user-actionable diagnostic message is available.
     """
 
     # -- Qt signals ---------------------------------------------------------
@@ -95,6 +99,7 @@ class EngineBridge(QObject):
     bot_status_changed = Signal(str)
     ready = Signal()
     error = Signal(str)
+    engine_start_failed = Signal(str)
 
     def __init__(
         self,
@@ -130,6 +135,8 @@ class EngineBridge(QObject):
         self._last_data: dict[str, Any] = {}
         self._engine_process: subprocess.Popen | None = None
         self._engine_log_fh: Any = None
+        self._engine_log_path: Path | None = None
+        self._engine_launch_dir: Path | None = None
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
@@ -190,6 +197,8 @@ class EngineBridge(QObject):
         config_ok: bool = self._config_svc.load()
         if not config_ok:
             _log.warning("Config load failed; continuing with defaults.")
+        else:
+            self._apply_configured_database_path()
 
         # Step 1.5 -- Auto-start C++ engine if a co-located binary exists
         # and no engine is already responding on the metrics endpoint.
@@ -211,27 +220,6 @@ class EngineBridge(QObject):
                 self._metrics_svc.set_url(self._metrics_url)
 
         self._metrics_svc.start()
-
-        # Step 3 -- Open database.  If the config specifies a custom
-        # path, use that instead of the constructor default.
-        if config_ok:
-            cfg_db_path = self._config_svc.get_str("database", "path", "")
-            if cfg_db_path:
-                resolved = Path(cfg_db_path).resolve()
-                if resolved.is_file():
-                    self._db_path = resolved
-                    # Recreate the database service with the config path.
-                    self._database_svc.stop()
-                    self._database_svc = DatabaseService(
-                        db_path=self._db_path,
-                        parent=self,
-                    )
-                    self._database_svc.trade_summary_loaded.connect(
-                        self._on_trade_summary
-                    )
-                    self._database_svc.query_error.connect(
-                        self._on_service_error
-                    )
 
         db_ok: bool = self._database_svc.start()
         if not db_ok:
@@ -524,6 +512,24 @@ class EngineBridge(QObject):
         _log.warning("Service error: %s", msg)
         self.error.emit(msg)
 
+    @Slot()
+    def _check_engine_startup_result(self) -> None:
+        """Detect early engine exit and emit a detailed diagnostic."""
+        if self._engine_process is None:
+            return
+
+        if self._engine_process.poll() is None:
+            return
+
+        if self._is_engine_reachable():
+            return
+
+        return_code = self._engine_process.returncode
+        message = self._build_engine_start_failure_message(return_code)
+        self._stop_engine_process()
+        self.engine_start_failed.emit(message)
+        self.error.emit("Engine startup failed. See the error dialog for details.")
+
     # ===================================================================
     # Engine subprocess management
     # ===================================================================
@@ -532,17 +538,39 @@ class EngineBridge(QObject):
         """Locate the C++ engine binary relative to the GUI executable.
 
         When running from a PyInstaller bundle the binary is expected
-        next to ``sys.executable``.  In development mode the current
-        working directory is checked instead.
+        next to ``sys.executable``.  For one-file bundles, fallback to
+        ``sys._MEIPASS`` where PyInstaller extracts bundled binaries.
+        In development mode the current working directory is checked.
         """
+        engine_name = "xop_trader.exe" if sys.platform == "win32" else "xop_trader"
+
+        # Optional override for power users and troubleshooting.
+        override_path = os.environ.get("XOP_ENGINE_PATH", "").strip()
+        if override_path:
+            candidate = Path(override_path).resolve()
+            if candidate.is_file():
+                return candidate
+
+        candidates: list[Path] = []
+
         if getattr(sys, "frozen", False):
             exe_dir = Path(sys.executable).parent
-        else:
-            exe_dir = Path.cwd()
+            candidates.append(exe_dir / engine_name)
 
-        engine_name = "xop_trader.exe" if sys.platform == "win32" else "xop_trader"
-        engine_path = exe_dir / engine_name
-        return engine_path if engine_path.is_file() else None
+            # PyInstaller one-file bundles extract resources here at runtime.
+            meipass = getattr(sys, "_MEIPASS", None)
+            if meipass:
+                meipass_dir = Path(str(meipass))
+                candidates.append(meipass_dir / engine_name)
+                candidates.append(meipass_dir / "engine-runtime" / engine_name)
+        else:
+            candidates.append(Path.cwd() / engine_name)
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return candidate
+
+        return None
 
     def _is_engine_reachable(self) -> bool:
         """Return True if the Prometheus metrics endpoint already responds.
@@ -574,12 +602,24 @@ class EngineBridge(QObject):
             cmd.extend(["--config", str(self._config_path)])
 
         try:
-            log_path = engine_path.parent / "engine.log"
+            launch_dir = self._determine_engine_launch_dir(engine_path)
+            self._ensure_engine_runtime_dirs(launch_dir)
+
+            # Keep logs next to the GUI executable when frozen.  This avoids
+            # writing logs into ephemeral extraction directories.
+            if getattr(sys, "frozen", False):
+                log_path = Path(sys.executable).parent / "engine.log"
+            else:
+                log_path = engine_path.parent / "engine.log"
+            log_path.parent.mkdir(parents=True, exist_ok=True)
             self._engine_log_fh = open(log_path, "a")  # noqa: SIM115
+            self._engine_log_path = log_path
+            self._engine_launch_dir = launch_dir
 
             kwargs: dict[str, Any] = {}
             if sys.platform == "win32":
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+            kwargs["cwd"] = str(launch_dir)
 
             self._engine_process = subprocess.Popen(
                 cmd,
@@ -593,12 +633,15 @@ class EngineBridge(QObject):
                 cmd,
                 log_path,
             )
+            QTimer.singleShot(3_000, self._check_engine_startup_result)
             return True
         except Exception:
             _log.exception("Failed to start C++ engine subprocess.")
             if self._engine_log_fh is not None:
                 self._engine_log_fh.close()
                 self._engine_log_fh = None
+            self._engine_log_path = None
+            self._engine_launch_dir = None
             return False
 
     def _stop_engine_process(self) -> None:
@@ -632,10 +675,138 @@ class EngineBridge(QObject):
         if self._engine_log_fh is not None:
             self._engine_log_fh.close()
             self._engine_log_fh = None
+        self._engine_log_path = None
+        self._engine_launch_dir = None
 
     # ===================================================================
     # Internal helpers
     # ===================================================================
+
+    def _apply_configured_database_path(self) -> None:
+        """Sync the GUI database service path to the active config file."""
+        cfg_db_path = self._config_svc.get_str("database", "path", "").strip()
+        if not cfg_db_path:
+            return
+
+        resolved = self._resolve_config_relative_path(cfg_db_path)
+        try:
+            resolved.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning("Could not create database directory %s: %s", resolved.parent, exc)
+
+        if resolved == self._db_path:
+            return
+
+        self._db_path = resolved
+        self._database_svc.stop()
+        self._database_svc = DatabaseService(
+            db_path=self._db_path,
+            parent=self,
+        )
+        self._database_svc.trade_summary_loaded.connect(self._on_trade_summary)
+        self._database_svc.query_error.connect(self._on_service_error)
+
+    def _resolve_config_relative_path(self, raw_path: str) -> Path:
+        """Resolve config paths relative to the config file directory."""
+        candidate = Path(raw_path).expanduser()
+        if candidate.is_absolute():
+            return candidate.resolve()
+        return (self._config_path.parent / candidate).resolve()
+
+    def _determine_engine_launch_dir(self, engine_path: Path) -> Path:
+        """Return the working directory to use for the engine process."""
+        if self._config_path.is_file():
+            return self._config_path.parent
+        return engine_path.parent
+
+    def _ensure_engine_runtime_dirs(self, launch_dir: Path) -> None:
+        """Create common runtime directories expected by the engine."""
+        try:
+            (launch_dir / "logs").mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning("Could not create logs directory %s: %s", launch_dir / "logs", exc)
+
+        cfg_db_path = self._config_svc.get_str("database", "path", "").strip()
+        if not cfg_db_path:
+            return
+
+        db_path = self._resolve_config_relative_path(cfg_db_path)
+        try:
+            db_path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            _log.warning("Could not create database directory %s: %s", db_path.parent, exc)
+
+    def _build_engine_start_failure_message(self, return_code: int | None) -> str:
+        """Build a detailed diagnostic for early managed-engine failures."""
+        engine_path = self._find_engine_binary()
+        log_tail = self._read_log_tail(self._engine_log_path)
+        lowered_log_tail = log_tail.lower()
+
+        if (
+            "application control policy has blocked this file" in lowered_log_tail
+            or "smart app control" in lowered_log_tail
+        ):
+            lines = [
+                "Windows blocked the XOPTrader engine from starting.",
+                "",
+                "Recommended fixes:",
+                "1. Install or run XOPTrader from a trusted local folder.",
+                "2. If Windows shows a security prompt for the engine, allow or unblock the app if you trust it.",
+                "3. Prefer the signed installer or an allow-list rule over disabling Smart App Control globally.",
+                "",
+            ]
+
+            if engine_path is not None:
+                lines.append(f"Engine binary: {engine_path}")
+            if self._engine_launch_dir is not None:
+                lines.append(f"Working directory: {self._engine_launch_dir}")
+            if self._config_path:
+                lines.append(f"Config file: {self._config_path}")
+            if self._engine_log_path is not None:
+                lines.append(f"Launch log: {self._engine_log_path}")
+
+            lines.extend([
+                "",
+                "Recent log output:",
+                log_tail,
+            ])
+            return "\n".join(lines)
+
+        lines = [
+            "XOPTrader could not start the engine automatically.",
+            "",
+        ]
+
+        if engine_path is not None:
+            lines.append(f"Engine binary: {engine_path}")
+        if self._engine_launch_dir is not None:
+            lines.append(f"Working directory: {self._engine_launch_dir}")
+        if self._config_path:
+            lines.append(f"Config file: {self._config_path}")
+        if return_code is not None:
+            lines.append(f"Exit code: {return_code}")
+        if self._engine_log_path is not None:
+            lines.append(f"Launch log: {self._engine_log_path}")
+
+        lines.extend([
+            "",
+            "Recent log output:",
+            log_tail,
+        ])
+        return "\n".join(lines)
+
+    def _read_log_tail(self, log_path: Path | None, max_lines: int = 20) -> str:
+        """Return the last few log lines for user-facing diagnostics."""
+        if log_path is None or not log_path.is_file():
+            return "(No log output available.)"
+
+        try:
+            lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return "(Could not read log output.)"
+
+        tail = lines[-max_lines:]
+        return "\n".join(tail) if tail else "(Log file was empty.)"
 
     def _update_status(self, new_status: str) -> None:
         """Update cached bot status and emit a signal on change.
