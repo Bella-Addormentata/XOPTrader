@@ -210,6 +210,10 @@ public:
     /// non-trivial volatility estimate (candle_count() >= min_candles).
     bool is_ready() const noexcept;
 
+    /// Number of consecutive blocks the current regime has persisted.
+    /// Returns 1 on the first block after a regime transition.
+    std::uint32_t get_regime_duration_blocks() const noexcept;
+
     /// Read-only access to the configuration.
     const VolatilityEstimatorConfig& config() const noexcept;
 
@@ -283,6 +287,12 @@ private:
 
     /// Current regime classification.
     RegimeInfo regime_{MarketRegime::Random, 1.0, 1.0, 1.0};
+
+    /// Number of consecutive blocks the current regime has persisted.
+    std::uint32_t regime_duration_blocks_{0};
+
+    /// Previous regime, used to detect transitions.
+    MarketRegime last_regime_{MarketRegime::Random};
 
     // -- Precomputed constants -----------------------------------------------
 
