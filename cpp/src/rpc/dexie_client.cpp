@@ -165,6 +165,17 @@ std::string json_string_or(const nlohmann::json& j,
     return it->get<std::string>();
 }
 
+/// Safely extract a numeric value from JSON, returning fallback when
+/// the key is missing OR the value is JSON null.
+template <typename T>
+T json_number_or(const nlohmann::json& j, const char* key, T fallback = {}) {
+    auto it = j.find(key);
+    if (it == j.end() || it->is_null()) {
+        return fallback;
+    }
+    return it->get<T>();
+}
+
 } // anonymous namespace
 
 // =======================================================================
@@ -527,25 +538,25 @@ asio::awaitable<nlohmann::json> DexieClient::http_post_(
 
 AssetInfo DexieClient::parse_asset_(const nlohmann::json& j) {
     AssetInfo a;
-    a.id     = j.value("id", "");
-    a.code   = j.value("code", "");
-    a.name   = j.value("name", "");
-    a.amount = j.value("amount", 0.0);
+    a.id     = json_string_or(j, "id");
+    a.code   = json_string_or(j, "code");
+    a.name   = json_string_or(j, "name");
+    a.amount = json_number_or<double>(j, "amount", 0.0);
     return a;
 }
 
 OfferRecord DexieClient::parse_offer_(const nlohmann::json& j) {
     OfferRecord o;
     o.id             = json_string_or(j, "id");
-    o.status         = j.value("status", 0);
+    o.status         = json_number_or<int>(j, "status", 0);
     o.offer_bech32   = json_string_or(j, "offer");
     o.date_found     = json_string_or(j, "date_found");
     o.date_completed = json_string_or(j, "date_completed");
     o.date_pending   = json_string_or(j, "date_pending");
     o.date_expiry    = json_string_or(j, "date_expiry");
-    o.price          = j.value("price", 0.0);
-    o.fees           = j.value("fees", static_cast<uint64_t>(0));
-    o.mod_version    = j.value("mod_version", 0);
+    o.price          = json_number_or<double>(j, "price", 0.0);
+    o.fees           = json_number_or<uint64_t>(j, "fees", 0);
+    o.mod_version    = json_number_or<int>(j, "mod_version", 0);
     o.trade_id       = json_string_or(j, "trade_id");
 
     // Nullable integer fields.
@@ -581,11 +592,12 @@ OfferRecord DexieClient::parse_offer_(const nlohmann::json& j) {
 TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
                                       std::string_view base_asset) {
     TickerData t;
-    t.id          = j.value("id", "");
-    t.code        = j.value("code", "");
-    t.name        = j.value("name", "");
-    t.pair_id     = j.value("pair_id", "");
-    t.incentives  = j.value("incentives", false);
+    t.id          = json_string_or(j, "id");
+    t.code        = json_string_or(j, "code");
+    t.name        = json_string_or(j, "name");
+    t.pair_id     = json_string_or(j, "pair_id");
+    t.incentives  = j.contains("incentives") && !j["incentives"].is_null()
+                    ? j["incentives"].get<bool>() : false;
 
     // Volume -- keyed by asset id.
     if (j.contains("volume") && j["volume"].is_object()) {
@@ -593,11 +605,11 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
         // XCH-denominated daily volume.
         const std::string base_key(base_asset);
         if (vol.contains(base_key) && vol[base_key].is_object()) {
-            t.volume_xch_daily = vol[base_key].value("daily", 0.0);
+            t.volume_xch_daily = json_number_or<double>(vol[base_key], "daily", 0.0);
         }
         // Quote-token-denominated daily volume.
         if (vol.contains(t.id) && vol[t.id].is_object()) {
-            t.volume_quote_daily = vol[t.id].value("daily", 0.0);
+            t.volume_quote_daily = json_number_or<double>(vol[t.id], "daily", 0.0);
         }
     }
 
@@ -608,8 +620,8 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
         // Best bid (buy depth 0).
         if (px.contains("buy") && px["buy"].is_array()) {
             for (const auto& lvl : px["buy"]) {
-                if (lvl.value("depth", -1) == 0) {
-                    t.price_buy = lvl.value("price", 0.0);
+                if (json_number_or<int>(lvl, "depth", -1) == 0) {
+                    t.price_buy = json_number_or<double>(lvl, "price", 0.0);
                     break;
                 }
             }
@@ -618,8 +630,8 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
         // Best ask (sell depth 0).
         if (px.contains("sell") && px["sell"].is_array()) {
             for (const auto& lvl : px["sell"]) {
-                if (lvl.value("depth", -1) == 0) {
-                    t.price_sell = lvl.value("price", 0.0);
+                if (json_number_or<int>(lvl, "depth", -1) == 0) {
+                    t.price_sell = json_number_or<double>(lvl, "price", 0.0);
                     break;
                 }
             }
@@ -627,15 +639,15 @@ TickerData DexieClient::parse_ticker_(const nlohmann::json& j,
 
         // Last trade.
         if (px.contains("last") && px["last"].is_object()) {
-            t.price_last = px["last"].value("price", 0.0);
+            t.price_last = json_number_or<double>(px["last"], "price", 0.0);
         }
 
         // 24-hour high / low.
         if (px.contains("high") && px["high"].is_object()) {
-            t.price_high = px["high"].value("daily", 0.0);
+            t.price_high = json_number_or<double>(px["high"], "daily", 0.0);
         }
         if (px.contains("low") && px["low"].is_object()) {
-            t.price_low = px["low"].value("daily", 0.0);
+            t.price_low = json_number_or<double>(px["low"], "daily", 0.0);
         }
     }
 

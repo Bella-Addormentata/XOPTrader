@@ -5,6 +5,27 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] — 2026-04-03
+
+### Fixed
+
+- Fix QScrollArea wrapping hiding widget methods (dashboard, market analysis, settings)
+- Fix startup analysis never displaying in GUI (`_create_page_widget` scroll wrapper)
+- Fix per-side offer posting: bid-side insufficient funds no longer blocks ask-side offers
+- Fix `compute_concentration()` returning 0.0 with empty positions (now returns 0.5 balanced)
+- Fix GUI metric name mismatches (5 getters: pnl, health, market_data, offers, risk)
+- Fix analysis data gating in EngineBridge (removed bot_status == Analyzing requirement)
+- Fix null JSON crash in dexie_client.cpp with `json_number_or<T>()` helper
+
+### Added
+
+- Per-pair fault isolation in `step_update_market_state()` (try/catch per pair)
+- `_unwrap()` helper for QScrollArea-wrapped page widgets in MainWindow
+
+### Changed
+
+- Default `q_max` guidance: must match actual wallet capacity (was 1000, realistic ~10)
+
 ## [0.2.2] — 2026-04-02
 
 ### Changed

@@ -285,11 +285,12 @@ class EngineBridge(QObject):
         # get_market_data() a second time for each pair.
         order_book: dict[str, dict[str, float]] = dict(market_data)
 
-        # Collect startup market analysis data — only when the bot is
-        # actively in the Analyzing phase to avoid rendering a non-existent
-        # analysis session in the GUI.
+        # Collect startup market analysis data.  The C++ engine publishes
+        # xop_analysis / xop_analysis_pair metrics throughout the analysis
+        # window and retains them after completion, so always fetch them
+        # when pair names are available.
         pair_names = [p.get("name", "") for p in pairs if p.get("name")]
-        if self._bot_status == STATUS_ANALYZING and pair_names:
+        if pair_names:
             analysis_data = self._metrics_svc.get_analysis(pair_names)
         else:
             analysis_data = {}

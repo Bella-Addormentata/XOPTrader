@@ -129,8 +129,15 @@ asio::awaitable<int> OfferManager::post_quotes(
     }
 
     int created_count = 0;
+    bool bid_funds_exhausted = false;
+    bool ask_funds_exhausted = false;
 
     for (const auto& tier : quotes) {
+        // Skip further tiers on the side that already reported
+        // insufficient funds; the other side may still succeed.
+        if (tier.side == Side::Bid && bid_funds_exhausted) continue;
+        if (tier.side == Side::Ask && ask_funds_exhausted) continue;
+
         // Step 1: Build the offer_dict for the wallet RPC.
         json offer_dict = build_offer_dict(pair, tier);
         if (offer_dict.empty()) {
@@ -145,14 +152,22 @@ asio::awaitable<int> OfferManager::post_quotes(
             result = co_await wallet_->create_offer(
                 offer_dict, current_fee_mojos_, /*validate_only=*/false);
         } catch (const rpc::ChiaRPCError& e) {
-            logger_->error("create_offer failed for {} tier {}: {}",
-                           pair.name, tier.tier_index, e.what());
+            logger_->error("create_offer failed for {} {} tier {}: {}",
+                           pair.name, to_string(tier.side),
+                           tier.tier_index, e.what());
             if (std::string_view{e.what()}.find("insufficient funds") !=
                 std::string_view::npos) {
-                logger_->warn("Stopping additional tiers for {} this cycle -- "
-                              "wallet reported insufficient funds",
-                              pair.name);
-                break;
+                if (tier.side == Side::Bid) {
+                    bid_funds_exhausted = true;
+                    logger_->warn("Stopping {} BID tiers -- "
+                                  "wallet reported insufficient funds",
+                                  pair.name);
+                } else {
+                    ask_funds_exhausted = true;
+                    logger_->warn("Stopping {} ASK tiers -- "
+                                  "wallet reported insufficient funds",
+                                  pair.name);
+                }
             }
             continue;
         }

@@ -391,11 +391,11 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             m = self._latest
         return {
-            "total": _scalar(m, "xop_pnl_total_mojos"),
-            "realized": _scalar(m, "xop_pnl_realized_mojos"),
-            "unrealized": _scalar(m, "xop_pnl_unrealized_mojos"),
-            "spread": _scalar(m, "xop_pnl_spread_mojos"),
-            "inventory": _scalar(m, "xop_pnl_inventory_mojos"),
+            "total": _labelled(m, "xop_pnl_mojos", "component", "total"),
+            "realized": _labelled(m, "xop_pnl_mojos", "component", "realized"),
+            "unrealized": _labelled(m, "xop_pnl_mojos", "component", "unrealized"),
+            "spread": _labelled(m, "xop_pnl_mojos", "component", "spread"),
+            "inventory": _labelled(m, "xop_pnl_mojos", "component", "inventory"),
         }
 
     def get_inventory(self, asset_id: str) -> dict[str, float]:
@@ -435,9 +435,9 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             m = self._latest
         return {
-            "mid_price": _labelled(m, "xop_market_mid_price_mojos", "pair", pair),
-            "spread_bps": _labelled(m, "xop_market_spread_bps", "pair", pair),
-            "volume_24h": _labelled(m, "xop_market_volume_24h", "pair", pair),
+            "mid_price": _labelled(m, "xop_market_mid_price", "pair_name", pair),
+            "spread_bps": _labelled(m, "xop_market_spread_bps", "pair_name", pair),
+            "volume_24h": _labelled(m, "xop_market_volume_24h", "pair_name", pair),
         }
 
     def get_health(self) -> dict[str, float]:
@@ -453,9 +453,9 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             m = self._latest
         return {
-            "block_height": _scalar(m, "xop_health_block_height"),
-            "node_synced": _scalar(m, "xop_health_node_synced"),
-            "wallet_connected": _scalar(m, "xop_health_wallet_connected"),
+            "block_height": _labelled(m, "xop_node", "metric", "block_height"),
+            "node_synced": _labelled(m, "xop_node", "metric", "synced"),
+            "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
         }
 
     def get_offers_summary(self) -> dict[str, float]:
@@ -469,10 +469,10 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             m = self._latest
         return {
-            "pending": _scalar(m, "xop_offers_pending"),
-            "filled": _scalar(m, "xop_offers_filled_total"),
-            "cancelled": _scalar(m, "xop_offers_cancelled_total"),
-            "expired": _scalar(m, "xop_offers_expired_total"),
+            "pending": _labelled(m, "xop_offers", "state", "pending"),
+            "filled": _labelled(m, "xop_offers_total", "event", "filled"),
+            "cancelled": _labelled(m, "xop_offers_total", "event", "cancelled"),
+            "expired": _labelled(m, "xop_offers_total", "event", "expired"),
         }
 
     def get_risk(self) -> dict[str, Any]:
@@ -496,8 +496,8 @@ class MetricsService(QObject):
                     concentration[val] = value
 
         return {
-            "var_95": _scalar(m, "xop_risk_var_95_mojos"),
-            "max_drawdown": _scalar(m, "xop_risk_max_drawdown_mojos"),
+            "var_95": _labelled(m, "xop_risk", "metric", "var_95"),
+            "max_drawdown": _labelled(m, "xop_risk", "metric", "max_drawdown"),
             "concentration": concentration,
         }
 

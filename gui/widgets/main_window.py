@@ -273,12 +273,11 @@ class MainWindow(QMainWindow):
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
-        if self._settings_widget is not None and hasattr(
-            self._settings_widget, "load_config"
-        ):
+        settings = self._unwrap(self._settings_widget)
+        if settings is not None and hasattr(settings, "load_config"):
             cfg_path = bridge.config_service.path
             if cfg_path.is_file():
-                self._settings_widget.load_config(str(cfg_path))
+                settings.load_config(str(cfg_path))
             else:
                 # No config file loaded — guide the user to the Settings tab
                 # so they can configure credentials before starting the engine.
@@ -289,15 +288,17 @@ class MainWindow(QMainWindow):
                 )
 
         # -- Dashboard context menu -> page switching ----------------------
-        if self._dashboard is not None:
-            if hasattr(self._dashboard, "view_chart_requested"):
-                self._dashboard.view_chart_requested.connect(self._on_view_chart)
-            if hasattr(self._dashboard, "view_orders_requested"):
-                self._dashboard.view_orders_requested.connect(self._on_view_orders)
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is not None:
+            if hasattr(dashboard, "view_chart_requested"):
+                dashboard.view_chart_requested.connect(self._on_view_chart)
+            if hasattr(dashboard, "view_orders_requested"):
+                dashboard.view_orders_requested.connect(self._on_view_orders)
 
         # -- Bot log error forwarding --------------------------------------
-        if self._bot_log is not None and hasattr(self._bot_log, "error_detected"):
-            self._bot_log.error_detected.connect(self._on_bot_error)
+        bot_log = self._unwrap(self._bot_log)
+        if bot_log is not None and hasattr(bot_log, "error_detected"):
+            bot_log.error_detected.connect(self._on_bot_error)
 
     def _on_bridge_data(self, data: dict) -> None:
         """Handle aggregated data snapshot from EngineBridge.
@@ -331,7 +332,8 @@ class MainWindow(QMainWindow):
         self._block_label.setText(f"Block: {block_height:,}")
 
         # Dashboard update -- translate bridge dict to card-keyed format.
-        if self._dashboard is not None and hasattr(self._dashboard, "update_metrics"):
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is not None and hasattr(dashboard, "update_metrics"):
             # Convert PnL values from raw mojos (int) to XCH (float) so
             # that MetricCard's {:+,.2f} formatter shows human-readable
             # amounts rather than 12-digit mojo integers.
@@ -352,28 +354,27 @@ class MainWindow(QMainWindow):
                     "spark": data.get("offers", {}).get("filled", 0),
                 },
             }
-            self._dashboard.update_metrics(card_data)
-            if hasattr(self._dashboard, "update_bot_status"):
+            dashboard.update_metrics(card_data)
+            if hasattr(dashboard, "update_bot_status"):
                 status = data.get("bot_status", "Unknown")
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
-                self._dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
-            if hasattr(self._dashboard, "update_connection_status"):
-                self._dashboard.update_connection_status({
+                dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
+            if hasattr(dashboard, "update_connection_status"):
+                dashboard.update_connection_status({
                     "Full Node": health.get("node_synced", 0.0) >= 1.0,
                     "Wallet": health.get("wallet_connected", 0.0) >= 1.0,
                     "Dexie": True,
                 })
-            if hasattr(self._dashboard, "update_block_info"):
+            if hasattr(dashboard, "update_block_info"):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
-                self._dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
+                dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
 
         # Market analysis update -- forward analysis data to the widget.
-        if self._market_analysis is not None and hasattr(
-            self._market_analysis, "update_analysis"
-        ):
+        analysis_widget = self._unwrap(self._market_analysis)
+        if analysis_widget is not None and hasattr(analysis_widget, "update_analysis"):
             analysis_data = data.get("analysis", {})
             if analysis_data:
-                self._market_analysis.update_analysis(analysis_data)
+                analysis_widget.update_analysis(analysis_data)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
@@ -870,6 +871,7 @@ class MainWindow(QMainWindow):
                     scroll.setWidgetResizable(True)
                     scroll.setWidget(w)
                     scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
+                    scroll._inner_widget = w  # type: ignore[attr-defined]
                     return scroll
                 return w
             except Exception as exc:
@@ -879,6 +881,13 @@ class MainWindow(QMainWindow):
     # ===================================================================== #
     #  Status bar                                                            #
     # ===================================================================== #
+
+    @staticmethod
+    def _unwrap(widget: Optional[QWidget]) -> Optional[QWidget]:
+        """Return the inner widget if *widget* is a QScrollArea wrapper."""
+        if widget is not None and hasattr(widget, "_inner_widget"):
+            return widget._inner_widget  # type: ignore[attr-defined]
+        return widget
 
     def _build_status_bar(self) -> None:
         """Install the custom CHIA-branded status bar."""

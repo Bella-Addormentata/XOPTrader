@@ -1148,6 +1148,10 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // [T3-24] Assume invalid until successful data ingestion.
         bool pair_data_ok = false;
 
+        // Per-pair isolation: a failure in one pair must not abort the
+        // market-data update for the remaining pairs.
+        try {
+
         auto ticker = co_await dexie_->get_ticker(
             pair.base_asset_id,
             pair.quote_asset_id);
@@ -1307,6 +1311,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 spdlog::warn("[Engine] Step 1: {} market data invalid -- "
                              "steps 4-8 gated for this pair", pair.name);
             }
+        }
+
+        } catch (const std::exception& ex) {
+            spdlog::error("[Engine] Step 1: {} data fetch failed: {} "
+                          "-- pair isolated, continuing with remaining pairs",
+                          pair.name, ex.what());
         }
     }
 

@@ -508,7 +508,8 @@ double PreTradeCheck::compute_concentration(
     const double total = base_val + quote_val;
 
     if (total <= 0.0) {
-        return 0.0;  // no capital deployed -- report zero concentration
+        return 0.5;  // no capital deployed -- assume balanced to avoid
+                     // erroneously tripping inventory limits on either side
     }
     return base_val / total;
 }
