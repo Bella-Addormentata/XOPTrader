@@ -317,6 +317,7 @@ class ChartWidget(QWidget):
         self._price_plot.showGrid(x=True, y=True, alpha=0.15)
         self._price_plot.getAxis("right").setWidth(70)
         self._price_plot.hideAxis("bottom")  # hidden; shared via plot 3
+        self._mid_curve = self._price_plot.plot(
             pen=pg.mkPen(color=TEXT_PRIMARY, width=1.5), name="Mid",
         )
         self._bid_curve = self._price_plot.plot(
