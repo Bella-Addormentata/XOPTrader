@@ -203,8 +203,8 @@ jobs:
           - os: macos-latest
             artifact_name: xop_trader-gui-macos-arm64
             dist_path: gui/dist/xop_trader_gui
-            icon_fmt: png
-            icon_flag: --icon icon.png
+            icon_fmt: icns
+            icon_flag: --icon icon.icns
 
     steps:
       - uses: actions/checkout@v4
