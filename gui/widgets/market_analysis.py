@@ -486,7 +486,16 @@ class MarketAnalysisWidget(QWidget):
             )
 
         # Update status label.
-        if all_complete:
+        if blocks_target == 0:
+            self._overall_progress.setValue(100)
+            self._overall_progress.setFormat("N/A")
+            self._status_label.setText(
+                "Analysis disabled — trading immediately"
+            )
+            self._status_label.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 13px;"
+            )
+        elif all_complete:
             self._status_label.setText("✔ Analysis complete — trading active")
             self._status_label.setStyleSheet(
                 f"color: {PROFIT_GREEN}; font-size: 13px; font-weight: bold;"

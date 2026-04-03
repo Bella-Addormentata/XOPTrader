@@ -30,6 +30,7 @@ from PySide6.QtCore import QObject, Qt, QTimer, Signal, Slot
 from gui.services.config_service import ConfigService
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
+from gui.services.wallet_service import WalletService
 
 # ---------------------------------------------------------------------------
 # Module-level logger and constants
@@ -130,6 +131,10 @@ class EngineBridge(QObject):
             db_path=self._db_path,
             parent=self,
         )
+        self._wallet_svc: WalletService = WalletService(
+            config={},
+            parent=self,
+        )
 
         # -- Internal state -------------------------------------------------
         self._bot_status: str = STATUS_UNKNOWN
@@ -138,6 +143,7 @@ class EngineBridge(QObject):
         self._engine_log_fh: Any = None
         self._engine_log_path: Path | None = None
         self._engine_launch_dir: Path | None = None
+        self._tick_count: int = 0
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
@@ -309,6 +315,7 @@ class EngineBridge(QObject):
             "bot_status": self._bot_status,
             "spendable_reserve": self._metrics_svc.get_spendable_reserve(),
             "stuck_offers": self._metrics_svc.get_stuck_offers(),
+            "wallet_balances": self._wallet_svc.get_balances(),
         }
         return data
 
@@ -458,6 +465,17 @@ class EngineBridge(QObject):
 
         Aggregates the latest service data and emits ``data_updated``.
         """
+        self._tick_count += 1
+
+        # Fetch wallet balances every 6th tick (~30s at 5s interval)
+        # to avoid spamming the Chia wallet RPC on every refresh.
+        if self._tick_count % 6 == 1:
+            self._wallet_svc.fetch_balances()
+
+        # Refresh reports every 6th tick (~30s), offset from wallet.
+        if self._tick_count % 6 == 3:
+            self._database_svc.get_reports()
+
         data = self.get_all_data()
         self._last_data = data
         self.data_updated.emit(data)
@@ -472,6 +490,7 @@ class EngineBridge(QObject):
             Full parsed configuration.
         """
         _log.info("Config loaded into EngineBridge (%d keys).", len(config))
+        self._wallet_svc.update_config(config)
 
     @Slot(dict)
     def _on_metrics_updated(self, metrics: dict) -> None:
@@ -596,7 +615,12 @@ class EngineBridge(QObject):
                 candidates.append(meipass_dir / engine_name)
                 candidates.append(meipass_dir / "engine-runtime" / engine_name)
         else:
-            candidates.append(Path.cwd() / engine_name)
+            cwd = Path.cwd()
+            candidates.append(cwd / engine_name)
+            # Development build output directories.
+            candidates.append(cwd / "cpp" / "build" / "Release" / engine_name)
+            candidates.append(cwd / "cpp" / "build" / "Debug" / engine_name)
+            candidates.append(cwd / "cpp" / "build" / engine_name)
 
         for candidate in candidates:
             if candidate.is_file():

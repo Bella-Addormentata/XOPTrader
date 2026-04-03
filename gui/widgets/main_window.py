@@ -83,6 +83,16 @@ try:
 except ImportError:
     MarketAnalysisWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.wallet_balances import WalletBalancesWidget
+except ImportError:
+    WalletBalancesWidget = None  # type: ignore[assignment,misc]
+
+try:
+    from gui.widgets.reports import ReportsWidget
+except ImportError:
+    ReportsWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -125,7 +135,9 @@ _PAGE_CHARTS: Final[int] = 1
 _PAGE_ORDERS: Final[int] = 2
 _PAGE_ORDER_BOOK: Final[int] = 3
 _PAGE_ANALYSIS: Final[int] = 4
-_PAGE_SETTINGS: Final[int] = 5
+_PAGE_WALLET: Final[int] = 5
+_PAGE_REPORTS: Final[int] = 6
+_PAGE_SETTINGS: Final[int] = 7
 
 
 def _placeholder_widget(label: str) -> QWidget:
@@ -195,6 +207,8 @@ class MainWindow(QMainWindow):
         self._order_panel: Optional[QWidget] = None
         self._order_book: Optional[QWidget] = None
         self._market_analysis: Optional[QWidget] = None
+        self._wallet_balances: Optional[QWidget] = None
+        self._reports: Optional[QWidget] = None
         self._settings_widget: Optional[QWidget] = None
         self._trade_log: Optional[QWidget] = None
         self._bot_log: Optional[QWidget] = None
@@ -253,6 +267,11 @@ class MainWindow(QMainWindow):
             db.offers_loaded.connect(self._tab_order_panel.update_offers)
         if self._trade_log is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._trade_log.load_trades)
+
+        # -- Reports widget signal -----------------------------------------
+        reports_widget = self._unwrap(self._reports)
+        if reports_widget is not None and hasattr(db, "reports_loaded"):
+            db.reports_loaded.connect(reports_widget.update_reports)
 
         # -- Order book data signals ---------------------------------------
         if self._order_book is not None:
@@ -381,6 +400,14 @@ class MainWindow(QMainWindow):
             analysis_data = data.get("analysis", {})
             if analysis_data:
                 analysis_widget.update_analysis(analysis_data)
+
+        # Wallet balances update -- forward to the wallet page widget.
+        wallet_widget = self._unwrap(self._wallet_balances)
+        if wallet_widget is not None and hasattr(wallet_widget, "update_balances"):
+            wallet_bals = data.get("wallet_balances", {})
+            reserve = data.get("spendable_reserve", {})
+            stuck = data.get("stuck_offers", 0)
+            wallet_widget.update_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
@@ -898,8 +925,16 @@ class MainWindow(QMainWindow):
             MarketAnalysisWidget, "Market Analysis", scrollable=True
         )
         self._stacked.addWidget(self._market_analysis)
+        self._wallet_balances = self._create_page_widget(           # index 5
+            WalletBalancesWidget, "Wallet Balances", scrollable=True
+        )
+        self._stacked.addWidget(self._wallet_balances)
+        self._reports = self._create_page_widget(                   # index 6
+            ReportsWidget, "Reports", scrollable=True
+        )
+        self._stacked.addWidget(self._reports)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 5
+        self._stacked.addWidget(self._settings_widget)              # index 7
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)

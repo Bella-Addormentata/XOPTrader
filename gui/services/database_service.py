@@ -73,6 +73,7 @@ class _DatabaseWorker(QObject):
     trade_summary_ready = Signal(dict)
     pairs_list_ready = Signal(list)
     latest_snapshot_ready = Signal(dict)
+    reports_ready = Signal(dict)
     query_error = Signal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -312,6 +313,184 @@ class _DatabaseWorker(QObject):
         else:
             self.latest_snapshot_ready.emit({})
 
+    @Slot()
+    def fetch_reports(self) -> None:
+        """Compute comprehensive P&L and trade analytics for the reports page.
+
+        Emits ``reports_ready`` with a dict containing time-period P&L,
+        per-pair breakdown, capital gains estimates, and offer statistics.
+        """
+        result: dict[str, Any] = {
+            "periods": {},
+            "per_pair": [],
+            "capital_gains": {},
+            "offer_stats": {},
+            "top_trades": [],
+            "worst_trades": [],
+            "daily_pnl": [],
+        }
+
+        # -- Period-based P&L -------------------------------------------------
+        period_sql = """
+            SELECT
+                COUNT(*)                                                    AS trade_count,
+                COALESCE(SUM(realized_pnl_mojos), 0)                       AS total_pnl,
+                COALESCE(SUM(CASE WHEN realized_pnl_mojos > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN realized_pnl_mojos < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(size_mojos), 0)                               AS total_volume,
+                COALESCE(SUM(fee_mojos), 0)                                AS total_fees,
+                COALESCE(AVG(realized_pnl_mojos), 0)                       AS avg_pnl,
+                COALESCE(MAX(realized_pnl_mojos), 0)                       AS best_trade,
+                COALESCE(MIN(realized_pnl_mojos), 0)                       AS worst_trade
+            FROM trade_log
+            WHERE timestamp >= ?
+        """
+
+        import datetime as _dt
+        now = _dt.datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+        periods = {
+            "today": today_start.isoformat(),
+            "7d": (now - _dt.timedelta(days=7)).isoformat(),
+            "30d": (now - _dt.timedelta(days=30)).isoformat(),
+            "90d": (now - _dt.timedelta(days=90)).isoformat(),
+            "ytd": now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat(),
+            "1y": (now - _dt.timedelta(days=365)).isoformat(),
+            "all": "2000-01-01T00:00:00",
+        }
+
+        for label, since_ts in periods.items():
+            rows = self._execute_query(period_sql, [since_ts])
+            if rows and rows[0]:
+                r = rows[0]
+                result["periods"][label] = {
+                    "trade_count": r["trade_count"],
+                    "total_pnl": r["total_pnl"],
+                    "wins": r["wins"],
+                    "losses": r["losses"],
+                    "total_volume": r["total_volume"],
+                    "total_fees": r["total_fees"],
+                    "avg_pnl": r["avg_pnl"],
+                    "best_trade": r["best_trade"],
+                    "worst_trade": r["worst_trade"],
+                }
+
+        # -- Per-pair breakdown -----------------------------------------------
+        pair_sql = """
+            SELECT
+                pair_name,
+                COUNT(*)                                                    AS trade_count,
+                COALESCE(SUM(realized_pnl_mojos), 0)                       AS total_pnl,
+                COALESCE(SUM(CASE WHEN realized_pnl_mojos > 0 THEN 1 ELSE 0 END), 0) AS wins,
+                COALESCE(SUM(CASE WHEN realized_pnl_mojos < 0 THEN 1 ELSE 0 END), 0) AS losses,
+                COALESCE(SUM(size_mojos), 0)                               AS total_volume,
+                COALESCE(SUM(fee_mojos), 0)                                AS total_fees,
+                COALESCE(AVG(cost_basis_mojos), 0)                         AS avg_cost_basis
+            FROM trade_log
+            GROUP BY pair_name
+            ORDER BY total_pnl DESC
+        """
+        rows = self._execute_query(pair_sql, [])
+        if rows:
+            result["per_pair"] = [dict(r) for r in rows]
+
+        # -- Capital gains (short-term vs long-term) --------------------------
+        # Short-term: held < 365 days.  Long-term: held >= 365 days.
+        # Since trades are fills (not lot-matching), we estimate using
+        # timestamp-based age of realized PnL.
+        one_year_ago = (now - _dt.timedelta(days=365)).isoformat()
+        current_year_start = now.replace(
+            month=1, day=1, hour=0, minute=0, second=0, microsecond=0
+        ).isoformat()
+
+        cg_sql = """
+            SELECT
+                COALESCE(SUM(CASE WHEN timestamp >= ? THEN realized_pnl_mojos ELSE 0 END), 0)
+                    AS short_term_pnl,
+                COALESCE(SUM(CASE WHEN timestamp <  ? THEN realized_pnl_mojos ELSE 0 END), 0)
+                    AS long_term_pnl,
+                COALESCE(SUM(realized_pnl_mojos), 0) AS total_pnl,
+                COALESCE(SUM(fee_mojos), 0)          AS total_fees
+            FROM trade_log
+            WHERE timestamp >= ?
+        """
+        rows = self._execute_query(cg_sql, [one_year_ago, one_year_ago, current_year_start])
+        if rows and rows[0]:
+            r = rows[0]
+            result["capital_gains"] = {
+                "short_term": r["short_term_pnl"],
+                "long_term": r["long_term_pnl"],
+                "total": r["total_pnl"],
+                "fees_deductible": r["total_fees"],
+                "year": now.year,
+            }
+
+        # -- Offer statistics -------------------------------------------------
+        offer_sql = """
+            SELECT
+                COUNT(*)                                                         AS total_offers,
+                COALESCE(SUM(CASE WHEN status = 'filled'    THEN 1 ELSE 0 END), 0) AS filled,
+                COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
+                COALESCE(SUM(CASE WHEN status = 'expired'   THEN 1 ELSE 0 END), 0) AS expired,
+                COALESCE(SUM(CASE WHEN status = 'pending'   THEN 1 ELSE 0 END), 0) AS pending
+            FROM offer_log
+        """
+        rows = self._execute_query(offer_sql, [])
+        if rows and rows[0]:
+            r = rows[0]
+            total = r["total_offers"] or 1
+            result["offer_stats"] = {
+                "total": r["total_offers"],
+                "filled": r["filled"],
+                "cancelled": r["cancelled"],
+                "expired": r["expired"],
+                "pending": r["pending"],
+                "fill_rate": r["filled"] / total * 100.0,
+            }
+
+        # -- Top 5 best and worst trades --------------------------------------
+        best_sql = """
+            SELECT timestamp, pair_name, side, price_mojos, size_mojos,
+                   realized_pnl_mojos, cost_basis_mojos
+            FROM trade_log
+            WHERE realized_pnl_mojos > 0
+            ORDER BY realized_pnl_mojos DESC LIMIT 5
+        """
+        rows = self._execute_query(best_sql, [])
+        if rows:
+            result["top_trades"] = [dict(r) for r in rows]
+
+        worst_sql = """
+            SELECT timestamp, pair_name, side, price_mojos, size_mojos,
+                   realized_pnl_mojos, cost_basis_mojos
+            FROM trade_log
+            WHERE realized_pnl_mojos < 0
+            ORDER BY realized_pnl_mojos ASC LIMIT 5
+        """
+        rows = self._execute_query(worst_sql, [])
+        if rows:
+            result["worst_trades"] = [dict(r) for r in rows]
+
+        # -- Daily P&L (last 30 days) -----------------------------------------
+        daily_sql = """
+            SELECT
+                DATE(timestamp) AS trade_date,
+                COUNT(*)        AS trade_count,
+                COALESCE(SUM(realized_pnl_mojos), 0) AS daily_pnl,
+                COALESCE(SUM(fee_mojos), 0)          AS daily_fees
+            FROM trade_log
+            WHERE timestamp >= ?
+            GROUP BY DATE(timestamp)
+            ORDER BY trade_date ASC
+        """
+        thirty_days_ago = (now - _dt.timedelta(days=30)).isoformat()
+        rows = self._execute_query(daily_sql, [thirty_days_ago])
+        if rows:
+            result["daily_pnl"] = [dict(r) for r in rows]
+
+        self.reports_ready.emit(result)
+
     # -- Internal helpers ---------------------------------------------------
 
     def _execute_query(
@@ -413,6 +592,7 @@ class DatabaseService(QObject):
     trade_summary_loaded = Signal(dict)
     pairs_list_loaded = Signal(list)
     latest_snapshot_loaded = Signal(dict)
+    reports_loaded = Signal(dict)
     query_error = Signal(str)
 
     # -- Internal trigger signals (queued connections to worker thread) ------
@@ -424,6 +604,7 @@ class DatabaseService(QObject):
     _trigger_summary = Signal()
     _trigger_pairs = Signal()
     _trigger_latest_snapshot = Signal(str)
+    _trigger_reports = Signal()
 
     def __init__(
         self,
@@ -450,6 +631,7 @@ class DatabaseService(QObject):
         self._worker.trade_summary_ready.connect(self.trade_summary_loaded)
         self._worker.pairs_list_ready.connect(self.pairs_list_loaded)
         self._worker.latest_snapshot_ready.connect(self.latest_snapshot_loaded)
+        self._worker.reports_ready.connect(self.reports_loaded)
         self._worker.query_error.connect(self._on_worker_error)
 
         # Queued connections: emit trigger signals to dispatch work to
@@ -463,6 +645,7 @@ class DatabaseService(QObject):
         self._trigger_summary.connect(self._worker.fetch_trade_summary)
         self._trigger_pairs.connect(self._worker.fetch_pairs_list)
         self._trigger_latest_snapshot.connect(self._worker.fetch_latest_snapshot)
+        self._trigger_reports.connect(self._worker.fetch_reports)
 
         # -- Auto-refresh timer ---------------------------------------------
         self._refresh_timer: QTimer = QTimer(self)
@@ -636,6 +819,13 @@ class DatabaseService(QObject):
             Pair name.
         """
         self._trigger_latest_snapshot.emit(pair)
+
+    def get_reports(self) -> None:
+        """Request comprehensive report data.
+
+        Results arrive on :pyattr:`reports_loaded`.
+        """
+        self._trigger_reports.emit()
 
     # ===================================================================
     # Internal slots

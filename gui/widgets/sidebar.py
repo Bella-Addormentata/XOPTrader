@@ -60,6 +60,8 @@ _NAV_ITEMS: Final[list[tuple[str, str]]] = [
     ("Orders",     "\U0001F4CB"),   # 📋  clipboard
     ("Order Book", "\U0001F4D6"),   # 📖  open book
     ("Analysis",   "\U0001F50D"),   # 🔍  magnifying glass
+    ("Wallet",     "\U0001F4B0"),   # 💰  money bag
+    ("Reports",    "\U0001F4C4"),   # 📄  document (reports)
     ("Settings",   "\u2699\uFE0F"), # ⚙️  gear
 ]
 
