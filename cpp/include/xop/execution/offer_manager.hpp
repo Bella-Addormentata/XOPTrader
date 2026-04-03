@@ -75,6 +75,36 @@ inline bool any_trigger(RebalanceReason r) noexcept {
 }
 
 // ---------------------------------------------------------------------------
+// TierStaleness -- per-tier classification for selective refresh
+// ---------------------------------------------------------------------------
+
+/// [T5-01] Classification of an existing pending offer relative to the
+/// current optimal ladder.  Used by selective_cancel() to decide which
+/// offers to refresh and which to keep.
+///
+/// Scholarly basis:
+///   - Gao, X. & Wang, Y. (2020).  "Optimal market making in the presence
+///     of latency."  The optimal cancel decision depends on the price
+///     deviation of the stale quote relative to the new optimal.
+///   - Aït-Sahalia, Y. & Saglam, M. (2017).  "High frequency market
+///     making."  Endogenous cancellation threshold derived from adverse
+///     selection risk.
+enum class TierStaleness : std::uint8_t {
+    Fresh   = 0,  ///< Price deviation < 0.5% -- keep, don't cancel.
+    Stale   = 1,  ///< Price deviation > kSelectiveRefreshThreshold -- cancel & replace.
+    Expired = 2,  ///< Age exceeds TTL -- must cancel regardless of price.
+};
+
+/// Result of classifying a single pending offer against the optimal ladder.
+struct TierClassification {
+    std::string     offer_id;        ///< The pending offer's trade ID.
+    TierStaleness   staleness;       ///< Fresh / Stale / Expired.
+    double          price_deviation; ///< Absolute fractional price deviation.
+    std::uint8_t    tier_index;      ///< Tier index of this offer.
+    Side            side;            ///< Bid or Ask.
+};
+
+// ---------------------------------------------------------------------------
 // RebalanceSnapshot -- context captured at the moment of last rebalance,
 //                      used to evaluate whether a new rebalance is needed.
 // ---------------------------------------------------------------------------
@@ -187,11 +217,12 @@ public:
      * @param pair_name      Trading pair name (e.g. "XCH/wUSDC").
      * @param current_block  Latest known block height.
      * @param ttl_blocks     Maximum offer age in blocks before cancellation.
-     * @return Number of offers actually cancelled.
+     * @return Offer IDs that were successfully cancelled.
      */
-    asio::awaitable<int> cancel_stale(const std::string& pair_name,
-                                      BlockHeight        current_block,
-                                      BlockHeight        ttl_blocks);
+    asio::awaitable<std::vector<std::string>> cancel_stale(
+        const std::string& pair_name,
+        BlockHeight        current_block,
+        BlockHeight        ttl_blocks);
 
     /**
      * @brief Cancel every pending offer.  Called during graceful shutdown.
@@ -199,8 +230,48 @@ public:
      * Uses the wallet's cancel_offers() bulk endpoint with secure=true
      * to guarantee all locked coins are released on-chain.  Clears the
      * internal pending-offer map in State.
+     *
+     * @return Offer IDs that were successfully cancelled.
      */
-    asio::awaitable<void> cancel_all();
+    asio::awaitable<std::vector<std::string>> cancel_all();
+
+    // -- Selective refresh --------------------------------------------------
+
+    /**
+     * @brief [T5-01] Classify each pending offer's staleness relative to
+     *        the current optimal ladder.
+     *
+     * Compares every pending offer for the given pair against the new
+     * ladder tiers by (side, tier_index) and computes the fractional
+     * price deviation.  Offers whose prices have drifted beyond
+     * kSelectiveRefreshThreshold are classified as Stale; offers past
+     * TTL are classified as Expired; all others are Fresh.
+     *
+     * @param pair_name     Trading pair name.
+     * @param new_ladder    The newly computed optimal tier ladder.
+     * @param current_block Current block height (for TTL check).
+     * @param ttl_blocks    Maximum offer age in blocks.
+     * @return Per-offer classification results.
+     */
+    std::vector<TierClassification> classify_tier_staleness(
+        const std::string&             pair_name,
+        const std::vector<TierQuote>&  new_ladder,
+        BlockHeight                    current_block,
+        BlockHeight                    ttl_blocks) const;
+
+    /**
+     * @brief [T5-01] Cancel only the offers classified as Stale or Expired.
+     *
+     * Implements the "selective refresh" pattern from Gao & Wang (2020):
+     * only cancel the subset of tiers whose prices have drifted beyond
+     * the staleness threshold.  Fresh tiers remain live on-chain,
+     * eliminating the zero-offer gap for the unaffected levels.
+     *
+     * @param stale_ids  Offer IDs to cancel (from classify_tier_staleness).
+     * @return Offer IDs that were successfully cancelled.
+     */
+    asio::awaitable<std::vector<std::string>> selective_cancel(
+        const std::vector<std::string>& stale_ids);
 
     // -- Rebalancing --------------------------------------------------------
 
@@ -274,6 +345,14 @@ public:
     /// Number of currently tracked pending offers.
     std::size_t pending_count() const;
 
+    // -- Wallet ID cache management -----------------------------------------
+
+    /// [T5-10] Invalidate the wallet-ID cache so that the next
+    /// post_quotes() call re-queries get_wallets().  Must be called
+    /// when the Chia wallet adds or removes CAT wallets at runtime
+    /// (e.g. after a token airdrop or wallet recovery).
+    void invalidate_wallet_ids() noexcept;
+
     // -- Dynamic fee control ------------------------------------------------
 
     /// Set the per-transaction fee used by subsequent post_quotes(),
@@ -302,9 +381,9 @@ public:
      * state drift caused by missed RPC events, partial failures, or
      * wallet restarts.
      *
-     * @return Number of discrepancies corrected.
+     * @return Offer IDs removed from state (orphans/phantoms).
      */
-    asio::awaitable<int> reconcile_offers();
+    asio::awaitable<std::vector<std::string>> reconcile_offers();
 
     /**
      * @brief Resolve an asset ID to a wallet ID.
@@ -435,6 +514,14 @@ private:
 
     /// Volatility spike multiplier (2x 7-day average triggers rebalance).
     static constexpr double kVolSpikeMult            = 2.0;
+
+    /// [T5-01] Selective refresh: fractional price deviation threshold.
+    /// Tiers with |Δprice/price| > this value are classified as Stale
+    /// and will be cancelled + replaced.  Tiers below this threshold
+    /// remain live, eliminating the zero-offer gap.
+    /// Set to 0.5% -- tight enough to catch meaningful mispricing but
+    /// wide enough to avoid unnecessary cancel/re-post churn.
+    static constexpr double kSelectiveRefreshThreshold = 0.005;
 };
 
 }  // namespace xop::execution

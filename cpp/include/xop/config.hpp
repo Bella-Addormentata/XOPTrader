@@ -477,7 +477,7 @@ struct FeeConfig {
 
     /// When true, query the full node's get_fee_estimate RPC to adapt the
     /// fee dynamically based on mempool congestion.
-    bool     adaptive_enabled{false};
+    bool     adaptive_enabled{true};
 
     /// Rolling window (in blocks) over which cumulative fees are tracked
     /// for daily budget enforcement.  Default 1662 ≈ 24 h at 52 s/block.

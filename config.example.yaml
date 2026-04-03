@@ -234,7 +234,7 @@ fees:
   fee_to_gain_max_ratio: 0.30        # Skip tier if fee > 30% of expected gain
   min_fee_mojos: 50000000            # Fee floor (0.00005 XCH)
   max_fee_mojos: 500000000           # Fee ceiling (0.0005 XCH)
-  adaptive_enabled: false            # Query full node get_fee_estimate for mempool-aware fees
+  adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
 
 # Inventory aging (T4-09): gradually relax the no-loss floor for positions

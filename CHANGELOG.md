@@ -5,7 +5,32 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.4.0] — 2026-04-03
+## [0.5.1] — 2026-04-03
+
+### Fixed
+
+- **Critical**: Eliminate zero-offer gap during cancel→repost cycle via selective refresh (Gao & Wang 2020). New `classify_tier_staleness()` evaluates per-tier price deviation; only stale/expired tiers are cancelled while Fresh tiers remain live on the order book
+- **Critical**: `cancel_stale()` now treats wallet cancel as authoritative — offer ID recorded as cancelled even if `state_->remove_offer()` returns false, preventing orphaned-offer re-cancel loops
+- **Critical**: Shutdown DB persistence retries `update_offer_status()` up to 3 times, preventing ghost "pending" records that cause phantom offers on next startup
+- **Critical**: `detect_fills()` position accounting failures no longer suppress fill emission — fills are always recorded and offers always removed regardless of `record_buy`/`record_sell` outcome
+- **High**: Asymmetric ladder guard in batched `post_quotes()` — if one side (bid/ask) fails completely while the other succeeds, the posted side is cancelled to prevent one-sided book exposure
+- **High**: Wallet ID cache (`wallet_ids_resolved_`) now invalidated on circuit-breaker recovery via new `invalidate_wallet_ids()` method, allowing runtime discovery of newly added CAT wallets
+
+### Added
+
+- `OfferManager::classify_tier_staleness()` — per-tier staleness classification (Fresh/Stale/Expired) based on price deviation from optimal ladder
+- `OfferManager::selective_cancel()` — cancel only stale/expired tiers, leaving fresh tiers live
+- `OfferManager::invalidate_wallet_ids()` — force wallet-ID cache rebuild on next `post_quotes()`
+- `TierStaleness` enum and `TierClassification` struct for selective refresh decision-making
+- Selective refresh filter in `Engine::step_manage_offers()` — posts replacement tiers only for cancelled slots, preventing double-exposure at fresh price levels
+- `kSelectiveRefreshThreshold` constant (0.5%) for per-tier staleness classification
+
+### Changed
+
+- `Engine::step_manage_offers()` now uses 3-phase decision: classify → selective cancel → filtered repost (replaces blanket cancel_stale → post_quotes)
+- Adaptive fees enabled by default in config
+
+## [0.5.0] — 2026-04-03
 
 ### Added
 

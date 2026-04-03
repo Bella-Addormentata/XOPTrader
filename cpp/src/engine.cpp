@@ -458,8 +458,32 @@ void Engine::shutdown()
         // --- Cancel outstanding offers (skip in dry-run mode) ---
         if (!dry_run_) {
             try {
-                co_await offer_mgr_->cancel_all();
+                auto shutdown_cancelled = co_await offer_mgr_->cancel_all();
                 spdlog::info("[Engine] All outstanding offers cancelled");
+                // [T5-02] Persist cancellation status to database with retry.
+                // Shutdown is our last chance to update the audit trail; stale
+                // "pending" records cause ghost offers on next startup.  Retry
+                // up to 3 times with short delays before giving up.
+                for (const auto& oid : shutdown_cancelled) {
+                    bool persisted = false;
+                    for (int attempt = 0; attempt < 3 && !persisted; ++attempt) {
+                        try {
+                            db_->update_offer_status(oid, "cancelled", 0);
+                            persisted = true;
+                        } catch (const std::exception& e) {
+                            spdlog::warn("[Engine] shutdown update_offer_status "
+                                         "attempt {}/3 failed for {}: {}",
+                                         attempt + 1, oid.substr(0, 12),
+                                         e.what());
+                        }
+                    }
+                    if (!persisted) {
+                        spdlog::error("[Engine] CRITICAL: offer {} stuck as "
+                                      "'pending' in DB after 3 retries -- "
+                                      "manual cleanup required",
+                                      oid.substr(0, 12));
+                    }
+                }
             } catch (const std::exception& ex) {
                 spdlog::error("[Engine] cancel_all exception: {}", ex.what());
             }
@@ -591,15 +615,30 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         wallet_consecutive_failures_ = 0;
                         spdlog::info("[Engine] Wallet circuit breaker CLOSED "
                                      "-- wallet is reachable again");
+                        // [T5-10] Invalidate the wallet-ID cache so that
+                        // newly added CAT wallets are discovered.  The wallet
+                        // may have been restarted with additional tokens.
+                        if (offer_mgr_) {
+                            offer_mgr_->invalidate_wallet_ids();
+                        }
                         // Reconcile offers to catch any orphans from the
                         // outage period.
                         if (offer_mgr_) {
                             try {
-                                int fixed = co_await offer_mgr_->reconcile_offers();
-                                if (fixed > 0) {
+                                auto fixed = co_await offer_mgr_->reconcile_offers();
+                                if (!fixed.empty()) {
                                     spdlog::info("[Engine] Post-reconnect offer "
                                                  "reconciliation corrected {} "
-                                                 "discrepancies", fixed);
+                                                 "discrepancies", fixed.size());
+                                    for (const auto& oid : fixed) {
+                                        try {
+                                            db_->update_offer_status(oid, "cancelled", 0);
+                                        } catch (const std::exception& e) {
+                                            spdlog::debug("[Engine] reconnect update_offer_status "
+                                                         "failed for {}: {}",
+                                                         oid.substr(0, 12), e.what());
+                                        }
+                                    }
                                 }
                             } catch (const std::exception& re) {
                                 spdlog::warn("[Engine] Post-reconnect offer "
@@ -2583,16 +2622,88 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             continue;
         }
 
-        // [T1-03] co_await cancel_stale directly instead of use_future.
-        int cancelled = co_await offer_mgr_->cancel_stale(
-            pair_name, block_height, config_.strategy.offer_ttl_blocks);
-        if (cancelled > 0) {
-            spdlog::info("[Engine] Step 8: cancelled {} stale offers for {}",
-                         cancelled, pair_name);
+        // [T5-01] Selective refresh: classify existing tiers before deciding
+        // whether to do a full cancel+repost or a surgical selective refresh.
+        //
+        // Per Gao & Wang (2020), the zero-offer gap during a full cancel→
+        // repost cycle is the primary source of adverse selection for latent
+        // market makers.  By classifying each pending tier's price deviation
+        // from the current optimal, we can cancel only the mispriced tiers
+        // while keeping well-priced tiers live on the order book.
+        //
+        // Decision matrix:
+        //   - All tiers Fresh          → skip cancel+repost entirely.
+        //   - Some tiers Stale/Expired → selective_cancel stale IDs, then
+        //                                post_quotes for replacement tiers.
+        //   - All tiers Stale/Expired  → fall back to full cancel_stale
+        //                                (same as before).
+        //   - No pending tiers at all  → post new ladder from scratch.
+        auto tier_classes = offer_mgr_->classify_tier_staleness(
+            pair_name, pcs.ladder, block_height,
+            config_.strategy.offer_ttl_blocks);
+
+        bool has_pending = !tier_classes.empty();
+        int fresh_count = 0, stale_count = 0, expired_count = 0;
+        for (const auto& tc : tier_classes) {
+            switch (tc.staleness) {
+                case execution::TierStaleness::Fresh:   ++fresh_count;   break;
+                case execution::TierStaleness::Stale:   ++stale_count;   break;
+                case execution::TierStaleness::Expired: ++expired_count; break;
+            }
+        }
+
+        std::vector<std::string> cancelled_ids;
+
+        if (has_pending && fresh_count > 0 &&
+            (stale_count + expired_count) > 0 &&
+            (stale_count + expired_count) < static_cast<int>(tier_classes.size())) {
+            // Selective refresh: only cancel stale/expired tiers.
+            std::vector<std::string> stale_ids;
+            stale_ids.reserve(stale_count + expired_count);
+            for (const auto& tc : tier_classes) {
+                if (tc.staleness != execution::TierStaleness::Fresh) {
+                    stale_ids.push_back(tc.offer_id);
+                }
+            }
+            cancelled_ids = co_await offer_mgr_->selective_cancel(stale_ids);
+            if (!cancelled_ids.empty()) {
+                spdlog::info("[Engine] Step 8: selective refresh for {} -- "
+                             "cancelled {}/{} stale tiers, {} fresh tiers "
+                             "remain live",
+                             pair_name, cancelled_ids.size(),
+                             stale_count + expired_count, fresh_count);
+            }
+        } else if (has_pending && fresh_count == 0) {
+            // All tiers stale/expired: full cancel.
+            cancelled_ids = co_await offer_mgr_->cancel_stale(
+                pair_name, block_height, config_.strategy.offer_ttl_blocks);
+            if (!cancelled_ids.empty()) {
+                spdlog::info("[Engine] Step 8: full cancel for {} -- "
+                             "all {} tiers were stale/expired",
+                             pair_name, cancelled_ids.size());
+            }
+        } else if (has_pending && stale_count == 0 && expired_count == 0) {
+            // All tiers are Fresh — nothing to cancel or repost.
+            spdlog::debug("[Engine] Step 8: {} all {} tiers fresh -- "
+                          "skipping cancel+repost", pair_name, fresh_count);
+            continue;
+        }
+        // else: no pending tiers → post from scratch (cancelled_ids empty).
+
+        if (!cancelled_ids.empty()) {
+            // Persist cancellation status to database.
+            for (const auto& oid : cancelled_ids) {
+                try {
+                    db_->update_offer_status(oid, "cancelled", block_height);
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] update_offer_status failed for {}: {}",
+                                 oid.substr(0, 12), e.what());
+                }
+            }
             // T4-03: Record cancel fees in the tracker.
             if (fee_tracker_->enabled()) {
                 fee_tracker_->record_fee(
-                    static_cast<std::uint64_t>(cancelled) * recommended_fee,
+                    static_cast<std::uint64_t>(cancelled_ids.size()) * recommended_fee,
                     block_height);
             }
         }
@@ -2623,8 +2734,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (stuck_count > 0) {
                 spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
                              "attempting forced cancel", stuck_count, pair_name);
-                co_await offer_mgr_->cancel_stale(
+                auto stuck_cancelled = co_await offer_mgr_->cancel_stale(
                     pair_name, block_height, stuck_threshold);
+                for (const auto& oid : stuck_cancelled) {
+                    try {
+                        db_->update_offer_status(oid, "cancelled", block_height);
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] update_offer_status failed for {}: {}",
+                                     oid.substr(0, 12), e.what());
+                    }
+                }
             }
             metrics_->update_stuck_offers(stuck_count);
         }
@@ -2702,6 +2821,52 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             spdlog::info("[Engine] Step 8: {} all tiers filtered by "
                          "fee-vs-gain gating", pair_name);
             continue;
+        }
+
+        // [T5-01] Selective refresh filter: when we did a selective cancel
+        // (some tiers were Fresh and left live), only post replacements for
+        // the tiers that were actually cancelled.  Posting duplicates of
+        // Fresh tiers would create double-exposure at the same price level.
+        if (has_pending && fresh_count > 0 && !cancelled_ids.empty()) {
+            // Build a set of (side, tier_index) keys for cancelled tiers.
+            std::unordered_set<std::string> cancelled_keys;
+            for (const auto& tc : tier_classes) {
+                if (tc.staleness != execution::TierStaleness::Fresh) {
+                    cancelled_keys.insert(
+                        std::to_string(static_cast<int>(tc.side))
+                        + "_" + std::to_string(tc.tier_index));
+                }
+            }
+            // Also include tiers that have no pending offer at all
+            // (brand new tiers that weren't in the previous ladder).
+            std::unordered_set<std::string> pending_keys;
+            for (const auto& tc : tier_classes) {
+                pending_keys.insert(
+                    std::to_string(static_cast<int>(tc.side))
+                    + "_" + std::to_string(tc.tier_index));
+            }
+
+            std::vector<TierQuote> selective_tiers;
+            for (const auto& tq : fee_filtered_tiers) {
+                std::string key = std::to_string(static_cast<int>(tq.side))
+                                + "_" + std::to_string(tq.tier_index);
+                if (cancelled_keys.count(key) > 0 ||
+                    pending_keys.count(key) == 0) {
+                    selective_tiers.push_back(tq);
+                }
+            }
+
+            if (selective_tiers.empty()) {
+                spdlog::debug("[Engine] Step 8: {} selective refresh has no "
+                              "tiers to repost (all fresh)", pair_name);
+                continue;
+            }
+
+            spdlog::info("[Engine] Step 8: {} selective refresh -- posting "
+                         "{}/{} replacement tiers",
+                         pair_name, selective_tiers.size(),
+                         fee_filtered_tiers.size());
+            fee_filtered_tiers = std::move(selective_tiers);
         }
 
         // [T1-03] co_await post_quotes directly instead of use_future.
@@ -2782,7 +2947,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
         spdlog::info("[Engine] Step 8: posted {} offers for {} (cancelled {}, "
                      "fee {} mojos/offer)",
-                     posted, pair_name, cancelled, recommended_fee);
+                     posted, pair_name, cancelled_ids.size(), recommended_fee);
     }
 
     // -- [T4-11] Periodic offer-state reconciliation -------------------------
@@ -2793,11 +2958,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     if (recon_interval > 0 &&
         block_height >= last_reconciliation_block_ + recon_interval) {
         try {
-            int corrections = co_await offer_mgr_->reconcile_offers();
+            auto reconciled_ids = co_await offer_mgr_->reconcile_offers();
             last_reconciliation_block_ = block_height;
-            if (corrections > 0) {
+            if (!reconciled_ids.empty()) {
                 spdlog::info("[Engine] Step 8: offer reconciliation corrected "
-                             "{} discrepancies", corrections);
+                             "{} discrepancies", reconciled_ids.size());
+                // Persist reconciled cancellations to database.
+                for (const auto& oid : reconciled_ids) {
+                    try {
+                        db_->update_offer_status(oid, "cancelled", block_height);
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] reconcile update_offer_status "
+                                     "failed for {}: {}",
+                                     oid.substr(0, 12), e.what());
+                    }
+                }
             }
         } catch (const std::exception& e) {
             spdlog::warn("[Engine] Step 8: offer reconciliation failed: {}",

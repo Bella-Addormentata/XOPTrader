@@ -115,14 +115,65 @@ asio::awaitable<int> OfferManager::post_quotes(
             else                      asks.push_back(tq);
         }
 
-        int created_count = 0;
+        int bid_count = 0;
+        int ask_count = 0;
         if (!bids.empty()) {
-            created_count += co_await post_merged_side(pair, bids, block_height);
+            bid_count = co_await post_merged_side(pair, bids, block_height);
         }
         if (!asks.empty()) {
-            created_count += co_await post_merged_side(pair, asks, block_height);
+            ask_count = co_await post_merged_side(pair, asks, block_height);
         }
 
+        // [T5-08] Asymmetric ladder guard: if one side posted successfully
+        // but the other side failed completely, cancel the posted side to
+        // prevent running a one-sided book (pure adverse selection).
+        // Per Avellaneda-Stoikov (2008), a market maker with only bids
+        // (or only asks) is guaranteed to accumulate inventory directionally
+        // with no spread capture to offset the risk.
+        if (bid_count > 0 && ask_count == 0 && !asks.empty()) {
+            logger_->warn("Asymmetric ladder: {} bids posted but 0/{} asks "
+                          "-- cancelling bids to prevent one-sided book",
+                          bid_count, asks.size());
+            // Cancel the just-posted bids.
+            auto bid_offers = state_->get_all_offers();
+            for (const auto& po : bid_offers) {
+                if (po.pair_name == pair.name &&
+                    po.side == Side::Bid &&
+                    po.created_at_block == block_height) {
+                    try {
+                        co_await wallet_->cancel_offer(
+                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                        state_->remove_offer(po.offer_id);
+                        --bid_count;
+                    } catch (const rpc::ChiaRPCError& e) {
+                        logger_->error("Failed to cancel asymmetric bid {}: {}",
+                                       po.offer_id.substr(0, 12), e.what());
+                    }
+                }
+            }
+        } else if (ask_count > 0 && bid_count == 0 && !bids.empty()) {
+            logger_->warn("Asymmetric ladder: {} asks posted but 0/{} bids "
+                          "-- cancelling asks to prevent one-sided book",
+                          ask_count, bids.size());
+            auto ask_offers = state_->get_all_offers();
+            for (const auto& po : ask_offers) {
+                if (po.pair_name == pair.name &&
+                    po.side == Side::Ask &&
+                    po.created_at_block == block_height) {
+                    try {
+                        co_await wallet_->cancel_offer(
+                            po.offer_id, current_fee_mojos_, /*secure=*/true);
+                        state_->remove_offer(po.offer_id);
+                        --ask_count;
+                    } catch (const rpc::ChiaRPCError& e) {
+                        logger_->error("Failed to cancel asymmetric ask {}: {}",
+                                       po.offer_id.substr(0, 12), e.what());
+                    }
+                }
+            }
+        }
+
+        int created_count = bid_count + ask_count;
         logger_->info("post_quotes (batched): {}/{} offers created for {}",
                       created_count, quotes.size(), pair.name);
         co_return created_count;
@@ -312,8 +363,11 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 // balances.  The pair_config_map_ was added to support this
                 // lookup.
                 //
-                // ISO/IEC 5055: guard against missing pair config to prevent
-                // undefined behaviour on map miss.
+                // [T5-02] ISO/IEC 5055: position accounting failures must
+                // NOT prevent the fill from being emitted or the offer from
+                // being removed.  The wallet's confirmed fill is the
+                // authoritative record; inventory discrepancy is correctable
+                // but a missed fill is not.
                 auto pc_it = pair_config_map_.find(po.pair_name);
                 if (pc_it == pair_config_map_.end()) {
                     logger_->error(
@@ -331,7 +385,8 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                         if (!sold) {
                             logger_->error(
                                 "record_sell failed for {} (asset={}) "
-                                "-- insufficient balance",
+                                "-- insufficient balance; fill still "
+                                "recorded, inventory needs reconciliation",
                                 trade_id.substr(0, 12), pc.base_asset_id);
                         }
                     }
@@ -343,15 +398,27 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                               trade_id.substr(0, 12));
 
                 // Remove from pending offers.
-                state_->remove_offer(trade_id);
+                // [T5-02] The fill is emitted regardless of remove_offer
+                // result.  If the offer was already removed (e.g. by
+                // reconciliation), we still record the fill event.
+                if (!state_->remove_offer(trade_id)) {
+                    logger_->warn("detect_fills: offer {} already removed "
+                                  "from state", trade_id.substr(0, 12));
+                }
                 fills.push_back(std::move(fill));
 
             } else if (status == trade_status::kCancelled ||
                        status == trade_status::kFailed) {
                 // Offer was cancelled or failed -- remove from tracking.
-                state_->remove_offer(trade_id);
-                logger_->info("Offer {} removed (status={})",
-                              trade_id.substr(0, 12), status);
+                // [T5-02] Defensive: log if already removed.
+                if (!state_->remove_offer(trade_id)) {
+                    logger_->debug("Offer {} already removed from state "
+                                   "(status={})", trade_id.substr(0, 12),
+                                   status);
+                } else {
+                    logger_->info("Offer {} removed (status={})",
+                                  trade_id.substr(0, 12), status);
+                }
             }
             // Status PENDING_ACCEPT / PENDING_CONFIRM: still alive, no action.
         }
@@ -370,13 +437,13 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
 // cancel_stale -- cancel offers exceeding their block-based TTL
 // ---------------------------------------------------------------------------
 
-asio::awaitable<int> OfferManager::cancel_stale(
+asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
     const std::string& pair_name,
     BlockHeight        current_block,
     BlockHeight        ttl_blocks)
 {
     auto all_offers = state_->get_all_offers();
-    int cancelled = 0;
+    std::vector<std::string> cancelled_ids;
 
     for (const auto& po : all_offers) {
         // Filter by pair name.
@@ -394,8 +461,17 @@ asio::awaitable<int> OfferManager::cancel_stale(
             co_await wallet_->cancel_offer(
                 po.offer_id, current_fee_mojos_, /*secure=*/true);
 
-            state_->remove_offer(po.offer_id);
-            ++cancelled;
+            // Wallet cancel succeeded -- on-chain state is authoritative.
+            // Remove from in-memory tracking; the offer is dead on-chain
+            // regardless of whether remove_offer finds the ID.
+            // [T5-02] ISO/IEC 5055: never leave an offer tracked in-memory
+            //         after its on-chain cancellation is confirmed.
+            if (!state_->remove_offer(po.offer_id)) {
+                logger_->warn("cancel_stale: offer {} already removed from "
+                              "state (wallet cancel succeeded)",
+                              po.offer_id.substr(0, 12));
+            }
+            cancelled_ids.push_back(po.offer_id);
 
             logger_->info("Cancelled stale offer {} ({} tier {}, age {} blocks)",
                           po.offer_id.substr(0, 12),
@@ -407,26 +483,26 @@ asio::awaitable<int> OfferManager::cancel_stale(
         }
     }
 
-    if (cancelled > 0) {
+    if (!cancelled_ids.empty()) {
         logger_->info("cancel_stale({}): {} offers cancelled", pair_name,
-                      cancelled);
+                      cancelled_ids.size());
     }
 
-    co_return cancelled;
+    co_return cancelled_ids;
 }
 
 // ---------------------------------------------------------------------------
 // cancel_all -- shutdown: cancel every pending offer
 // ---------------------------------------------------------------------------
 
-asio::awaitable<void> OfferManager::cancel_all()
+asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
 {
     logger_->info("cancel_all: initiating bulk cancellation");
 
     auto all_offers = state_->get_all_offers();
     if (all_offers.empty()) {
         logger_->info("cancel_all: no pending offers to cancel");
-        co_return;
+        co_return std::vector<std::string>{};
     }
 
     // ISO/IEC 5055: track which offers were successfully cancelled.
@@ -479,6 +555,7 @@ asio::awaitable<void> OfferManager::cancel_all()
 
     logger_->info("cancel_all: {}/{} offers cancelled successfully",
                   cancelled_ids.size(), all_offers.size());
+    co_return cancelled_ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -701,6 +778,151 @@ std::uint64_t OfferManager::current_fee() const noexcept
 }
 
 // ---------------------------------------------------------------------------
+// invalidate_wallet_ids -- force the wallet-ID cache to be rebuilt
+// ---------------------------------------------------------------------------
+
+void OfferManager::invalidate_wallet_ids() noexcept
+{
+    wallet_ids_resolved_ = false;
+    wallet_id_map_.clear();
+    logger_->info("Wallet ID cache invalidated -- will re-query on next "
+                  "post_quotes()");
+}
+
+// ---------------------------------------------------------------------------
+// [T5-01] classify_tier_staleness -- per-tier price-deviation check
+//
+// Scholarly basis:
+//   - Gao & Wang (2020): optimal cancel threshold is a function of the
+//     fractional deviation from the current fair price.
+//   - Aït-Sahalia & Saglam (2017): stale-quote risk increases with the
+//     magnitude of price deviation, not uniformly across all tiers.
+//
+// Approach: for each pending offer, find the corresponding tier in the
+// new ladder (matched by side + tier_index) and compute the fractional
+// price difference.  If the deviation exceeds kSelectiveRefreshThreshold
+// the tier is Stale (needs cancel + re-post); if TTL-expired it is
+// Expired; otherwise Fresh (keep live).
+// ---------------------------------------------------------------------------
+
+std::vector<TierClassification> OfferManager::classify_tier_staleness(
+    const std::string&             pair_name,
+    const std::vector<TierQuote>&  new_ladder,
+    BlockHeight                    current_block,
+    BlockHeight                    ttl_blocks) const
+{
+    std::vector<TierClassification> results;
+
+    auto pending = state_->get_all_offers();
+    if (pending.empty()) return results;
+
+    // Build a lookup: (side, tier_index) -> new optimal price.
+    // This allows O(1) comparison for each pending offer.
+    std::unordered_map<std::string, Mojo> optimal_prices;
+    for (const auto& tq : new_ladder) {
+        std::string key = std::to_string(static_cast<int>(tq.side))
+                        + "_" + std::to_string(tq.tier_index);
+        optimal_prices[key] = tq.price;
+    }
+
+    for (const auto& po : pending) {
+        if (po.pair_name != pair_name) continue;
+
+        TierClassification tc;
+        tc.offer_id  = po.offer_id;
+        tc.tier_index = po.tier;
+        tc.side       = po.side;
+
+        // Check TTL first — expired offers must be cancelled regardless.
+        if (current_block >= po.created_at_block + ttl_blocks) {
+            tc.staleness       = TierStaleness::Expired;
+            tc.price_deviation = 1.0;  // maximal
+            results.push_back(std::move(tc));
+            continue;
+        }
+
+        // Look up the optimal price for this tier.
+        std::string key = std::to_string(static_cast<int>(po.side))
+                        + "_" + std::to_string(po.tier);
+        auto opt_it = optimal_prices.find(key);
+        if (opt_it == optimal_prices.end()) {
+            // Tier no longer exists in the new ladder (e.g. filtered out
+            // by fee-vs-gain gating).  Treat as stale.
+            tc.staleness       = TierStaleness::Stale;
+            tc.price_deviation = 1.0;
+            results.push_back(std::move(tc));
+            continue;
+        }
+
+        // Compute fractional price deviation.
+        const double old_p = static_cast<double>(po.price);
+        const double new_p = static_cast<double>(opt_it->second);
+        tc.price_deviation = (old_p > 0.0)
+            ? std::abs(new_p - old_p) / old_p
+            : 1.0;
+
+        tc.staleness = (tc.price_deviation > kSelectiveRefreshThreshold)
+            ? TierStaleness::Stale
+            : TierStaleness::Fresh;
+
+        results.push_back(std::move(tc));
+    }
+
+    // Log summary.
+    int fresh = 0, stale = 0, expired = 0;
+    for (const auto& tc : results) {
+        switch (tc.staleness) {
+            case TierStaleness::Fresh:   ++fresh;   break;
+            case TierStaleness::Stale:   ++stale;   break;
+            case TierStaleness::Expired: ++expired; break;
+        }
+    }
+    logger_->debug("classify_tier_staleness({}): {} fresh, {} stale, "
+                   "{} expired", pair_name, fresh, stale, expired);
+
+    return results;
+}
+
+// ---------------------------------------------------------------------------
+// [T5-01] selective_cancel -- cancel only stale/expired tiers
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
+    const std::vector<std::string>& stale_ids)
+{
+    std::vector<std::string> cancelled_ids;
+    if (stale_ids.empty()) co_return cancelled_ids;
+
+    cancelled_ids.reserve(stale_ids.size());
+
+    for (const auto& offer_id : stale_ids) {
+        try {
+            co_await wallet_->cancel_offer(
+                offer_id, current_fee_mojos_, /*secure=*/true);
+
+            if (!state_->remove_offer(offer_id)) {
+                logger_->warn("selective_cancel: offer {} already removed "
+                              "from state", offer_id.substr(0, 12));
+            }
+            cancelled_ids.push_back(offer_id);
+
+            logger_->debug("selective_cancel: cancelled {}",
+                           offer_id.substr(0, 12));
+        } catch (const rpc::ChiaRPCError& e) {
+            logger_->error("selective_cancel: failed to cancel {}: {}",
+                           offer_id.substr(0, 12), e.what());
+        }
+    }
+
+    if (!cancelled_ids.empty()) {
+        logger_->info("selective_cancel: {}/{} offers cancelled",
+                      cancelled_ids.size(), stale_ids.size());
+    }
+
+    co_return cancelled_ids;
+}
+
+// ---------------------------------------------------------------------------
 // [T4-11] reconcile_offers -- Full state reconciliation against wallet.
 //
 // Detects and corrects three classes of discrepancy:
@@ -714,13 +936,13 @@ std::uint64_t OfferManager::current_fee() const noexcept
 // should only be called periodically (e.g. every 20 blocks).
 // ---------------------------------------------------------------------------
 
-asio::awaitable<int> OfferManager::reconcile_offers()
+asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
 {
-    int corrections = 0;
+    std::vector<std::string> removed_ids;
 
     auto pending_offers = state_->get_all_offers();
     if (pending_offers.empty()) {
-        co_return 0;
+        co_return removed_ids;
     }
 
     // Build a lookup of all pending offer IDs from our state.
@@ -745,7 +967,7 @@ asio::awaitable<int> OfferManager::reconcile_offers()
                 offset, offset + kPageSize, /*file_contents=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[reconcile] get_all_offers failed: {}", e.what());
-            co_return corrections;
+            co_return removed_ids;
         }
 
         if (trade_records.empty() ||
@@ -772,7 +994,7 @@ asio::awaitable<int> OfferManager::reconcile_offers()
             if (status == trade_status::kCancelled ||
                 status == trade_status::kFailed) {
                 state_->remove_offer(trade_id);
-                ++corrections;
+                removed_ids.push_back(trade_id);
                 logger_->warn("[reconcile] Removed orphaned offer {} "
                               "(wallet status={}, was pending in State)",
                               trade_id.substr(0, 12), status);
@@ -792,21 +1014,21 @@ asio::awaitable<int> OfferManager::reconcile_offers()
     for (const auto& [offer_id, po] : pending_map) {
         if (wallet_offer_ids.find(offer_id) == wallet_offer_ids.end()) {
             state_->remove_offer(offer_id);
-            ++corrections;
+            removed_ids.push_back(offer_id);
             logger_->warn("[reconcile] Removed phantom offer {} ({}) "
                           "-- not found in wallet",
                           offer_id.substr(0, 12), po.pair_name);
         }
     }
 
-    if (corrections > 0) {
+    if (!removed_ids.empty()) {
         logger_->info("[reconcile] Corrected {} state discrepancies",
-                      corrections);
+                      removed_ids.size());
     } else {
         logger_->debug("[reconcile] State consistent -- no discrepancies");
     }
 
-    co_return corrections;
+    co_return removed_ids;
 }
 
 // ---------------------------------------------------------------------------
