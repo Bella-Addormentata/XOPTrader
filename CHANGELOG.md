@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.2] — 2026-04-02
+
+### Changed
+
+- Pre-commit icons (icon.ico, icon.png) to repo; remove runtime generation
+- Desktop shortcut enabled by default in Windows installer
+- Single installer exe for Windows releases (standalone binaries removed)
+- Release workflow deletes old assets before uploading new ones
+- Harden macOS CI with Ninja generator
+
 ## [0.2.1] — 2026-04-02
 
 ### Fixed
