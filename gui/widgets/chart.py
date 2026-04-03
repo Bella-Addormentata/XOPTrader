@@ -443,7 +443,13 @@ class ChartWidget(QWidget):
         self._price_plot.setYRange(y_min - padding, y_max + padding, padding=0)
 
     # =====================================================================
-        rapid-fire data appends are collapsed into a single redraw.
+    # Paint coalescing
+    # =====================================================================
+    def _maybe_repaint(self) -> None:
+        """Flush a pending repaint if new data arrived.
+
+        Called by a periodic timer so rapid-fire data appends are collapsed
+        into a single redraw.
         """
         if self._dirty:
             self._dirty = False
