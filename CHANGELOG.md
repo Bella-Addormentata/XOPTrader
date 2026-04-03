@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.1] — 2026-04-02
+
+### Fixed
+
+- Fix constructor initializer order in Engine (Werror reorder)
+- Add VolatilityEstimator::get_regime_duration_blocks() method
+- Fix IndentationError in gui/widgets/chart.py
+- Fix IndentationError in gui/widgets/main_window.py
+
 ## [0.2.0] — 2026-04-02
 
 ### Changed
