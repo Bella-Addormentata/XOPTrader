@@ -113,11 +113,12 @@ jobs:
 
       # ---- System dependencies (macOS) -------------------------------------
       # sqlite3 is excluded from vcpkg on macOS (sqlite.org is unreachable from
-      # macOS runners); we rely on the system SQLite3 from the Xcode SDK instead.
-      # Ninja is required for the Unix Makefiles → Ninja generator selection below.
-      - name: Install system dependencies (macOS)
+      # macOS runners); CMake's find_package(SQLite3) falls back to the system
+      # SQLite3 provided by the macOS Command Line Tools SDK (no brew install
+      # needed). Ninja is required for the generator selection below.
+      - name: Install Ninja (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja sqlite3
+        run: brew install ninja
 
       # ---- CMake configure & build -----------------------------------------
       - name: Configure CMake
