@@ -57,6 +57,7 @@
 #include <memory>
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 namespace xop::execution {
@@ -384,6 +385,25 @@ public:
      * @return Offer IDs removed from state (orphans/phantoms).
      */
     asio::awaitable<std::vector<std::string>> reconcile_offers();
+
+    /**
+     * @brief Startup reconciliation: scan wallet for orphaned offers.
+     *
+     * Queries the wallet for ALL PENDING_ACCEPT offers and cancels any
+     * that are not in the provided set of known offer IDs (typically
+     * loaded from the database's pending records).  Known offers are
+     * restored into State so the engine can manage them.
+     *
+     * This method should be called once at startup, before the main
+     * trading loop begins.  Unlike reconcile_offers() which only checks
+     * offers already tracked in State, this method discovers wallet
+     * offers that the engine has no knowledge of.
+     *
+     * @param known_offer_ids  Set of offer IDs the DB considers pending.
+     * @return Offer IDs that were cancelled as orphans.
+     */
+    asio::awaitable<std::vector<std::string>> startup_reconcile(
+        const std::unordered_set<std::string>& known_offer_ids);
 
     /**
      * @brief Resolve an asset ID to a wallet ID.

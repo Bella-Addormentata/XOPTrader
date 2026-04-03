@@ -184,6 +184,14 @@ public:
                              const std::string& new_status,
                              BlockHeight        resolved_block);
 
+    /// Return all offers with status='pending' from the offer_log table.
+    /// Used on startup to recover offers that were pending when the engine
+    /// last shut down, enabling orphan detection against the wallet.
+    ///
+    /// @return Vector of DbOfferRecord with status "pending".
+    [[nodiscard]]
+    std::vector<DbOfferRecord> query_pending_offers() const;
+
     // -- Snapshots -----------------------------------------------------------
 
     /// Insert a single analytics snapshot.
@@ -287,6 +295,9 @@ private:
 
     /// INSERT INTO offer_log
     sqlite3_stmt* stmt_insert_offer_{nullptr};
+
+    /// SELECT FROM offer_log WHERE status = 'pending'
+    sqlite3_stmt* stmt_query_pending_{nullptr};
 
     /// UPDATE offer_log SET status = ?, resolved_block = ?, resolved_at = ?
     sqlite3_stmt* stmt_update_offer_{nullptr};

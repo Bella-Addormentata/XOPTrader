@@ -150,6 +150,14 @@ INSERT INTO offer_log
 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
+constexpr const char* kQueryPendingOffers = R"SQL(
+SELECT offer_id, pair_name, side, price_mojos, size_mojos, tier,
+       status, created_block, fee_mojos
+FROM offer_log
+WHERE status = 'pending'
+ORDER BY created_block ASC;
+)SQL";
+
 constexpr const char* kUpdateOfferStatus = R"SQL(
 UPDATE offer_log
 SET status = ?, resolved_block = ?, resolved_at = CURRENT_TIMESTAMP
@@ -220,6 +228,7 @@ Database::Database(const std::string& db_path)
     stmt_query_trades_pair_  = prepare(kQueryTradesByPair);
     stmt_query_trades_all_   = prepare(kQueryTradesAll);
     stmt_insert_offer_       = prepare(kInsertOffer);
+    stmt_query_pending_      = prepare(kQueryPendingOffers);
     stmt_update_offer_       = prepare(kUpdateOfferStatus);
     stmt_insert_snapshot_    = prepare(kInsertSnapshot);
     stmt_last_snapshot_      = prepare(kLastSnapshot);
@@ -243,6 +252,7 @@ Database::~Database()
     finalize(stmt_query_trades_pair_);
     finalize(stmt_query_trades_all_);
     finalize(stmt_insert_offer_);
+    finalize(stmt_query_pending_);
     finalize(stmt_update_offer_);
     finalize(stmt_insert_snapshot_);
     finalize(stmt_last_snapshot_);
@@ -361,6 +371,34 @@ void Database::insert_offer(const DbOfferRecord& r)
 
     spdlog::debug("[Database] Inserted offer '{}' pair={} side={} tier={} fee={}",
                   r.offer_id, r.pair_name, r.side, r.tier, r.fee_mojos);
+}
+
+std::vector<DbOfferRecord> Database::query_pending_offers() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<DbOfferRecord> results;
+
+    while (sqlite3_step(stmt_query_pending_) == SQLITE_ROW) {
+        DbOfferRecord rec;
+        const char* p0 = reinterpret_cast<const char*>(sqlite3_column_text(stmt_query_pending_, 0));
+        rec.offer_id      = p0 ? p0 : "";
+        const char* p1 = reinterpret_cast<const char*>(sqlite3_column_text(stmt_query_pending_, 1));
+        rec.pair_name     = p1 ? p1 : "";
+        const char* p2 = reinterpret_cast<const char*>(sqlite3_column_text(stmt_query_pending_, 2));
+        rec.side          = p2 ? p2 : "";
+        rec.price_mojos   = sqlite3_column_int64(stmt_query_pending_, 3);
+        rec.size_mojos    = sqlite3_column_int64(stmt_query_pending_, 4);
+        rec.tier          = static_cast<int>(sqlite3_column_int64(stmt_query_pending_, 5));
+        rec.status        = "pending";
+        rec.created_block = static_cast<BlockHeight>(sqlite3_column_int64(stmt_query_pending_, 6));
+        rec.fee_mojos     = static_cast<std::uint64_t>(sqlite3_column_int64(stmt_query_pending_, 7));
+        results.push_back(std::move(rec));
+    }
+
+    sqlite3_reset(stmt_query_pending_);
+    sqlite3_clear_bindings(stmt_query_pending_);
+
+    return results;
 }
 
 void Database::update_offer_status(const std::string& offer_id,

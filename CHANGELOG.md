@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.2] — 2026-04-03
+
+### Added
+
+- **Startup offer reconciliation**: on launch, engine queries the database for pending offers and scans the wallet for all PENDING_ACCEPT offers. Known offers are restored into State for tracking; unknown orphans are automatically cancelled to free locked capital
+- `Database::query_pending_offers()` — retrieves all offer_log rows with status='pending' for startup recovery
+- `OfferManager::startup_reconcile(known_ids)` — wallet-wide scan that cancels orphaned offers not tracked in the database
+
+### Fixed
+
+- Offers orphaned by engine restarts or crashes are now detected and cancelled automatically, preventing indefinite capital lockup (previously required manual cleanup)
+
 ## [0.5.1] — 2026-04-03
 
 ### Fixed

@@ -565,6 +565,64 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // return, stopping the engine cleanly.
     co_await open_connections();
 
+    // -- Startup offer reconciliation ----------------------------------------
+    // Scan the wallet for any PENDING_ACCEPT offers left over from a
+    // previous run.  Cross-reference against the DB's pending records:
+    //   - Known offers (in DB) are restored into State for tracking.
+    //   - Unknown offers (orphans) are cancelled to free locked capital.
+    // This runs once before any trading begins.
+    if (offer_mgr_ && db_) {
+        try {
+            // Load what the DB remembers as pending.
+            auto db_pending = db_->query_pending_offers();
+            std::unordered_set<std::string> known_ids;
+            known_ids.reserve(db_pending.size());
+            for (const auto& rec : db_pending) {
+                known_ids.insert(rec.offer_id);
+            }
+            spdlog::info("[Engine] Startup reconcile: {} pending offers in DB",
+                         known_ids.size());
+
+            auto orphans = co_await offer_mgr_->startup_reconcile(known_ids);
+
+            // Mark orphans as cancelled in the DB.
+            for (const auto& oid : orphans) {
+                try {
+                    db_->update_offer_status(oid, "cancelled", 0);
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] startup_reconcile update_offer_status "
+                                 "failed for {}: {}",
+                                 oid.substr(0, 12), e.what());
+                }
+            }
+
+            // Restore known offers into State so the engine can track them.
+            for (const auto& rec : db_pending) {
+                if (!known_ids.count(rec.offer_id)) {
+                    continue;  // Was cancelled as orphan somehow.
+                }
+                PendingOffer po;
+                po.offer_id        = rec.offer_id;
+                po.pair_name       = rec.pair_name;
+                po.side            = (rec.side == "bid") ? Side::Bid : Side::Ask;
+                po.price           = rec.price_mojos;
+                po.size            = rec.size_mojos;
+                po.tier            = static_cast<std::uint8_t>(rec.tier);
+                po.created_at_block = rec.created_block;
+                po.fee_mojos       = rec.fee_mojos;
+                state_->upsert_offer(po);
+            }
+
+            if (!db_pending.empty()) {
+                spdlog::info("[Engine] Restored {} pending offers from DB into State",
+                             db_pending.size());
+            }
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Startup offer reconciliation failed: {}; "
+                         "continuing without recovery", ex.what());
+        }
+    }
+
     // -- Startup market analysis phase ---------------------------------------
     // If configured, observe the market for startup_analysis_blocks before
     // entering active trading.  The engine is in BotStatus::Analyzing during

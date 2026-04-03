@@ -1032,6 +1032,87 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
 }
 
 // ---------------------------------------------------------------------------
+// startup_reconcile -- scan wallet for orphaned offers on startup
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
+    const std::unordered_set<std::string>& known_offer_ids)
+{
+    constexpr int kPendingAccept = 0;  // Chia wallet PENDING_ACCEPT status
+
+    std::vector<std::string> cancelled_ids;
+
+    logger_->info("[startup_reconcile] Scanning wallet for orphaned offers...");
+
+    // Paginate through ALL wallet offers looking for PENDING_ACCEPT.
+    constexpr std::int64_t kPageSize = 50;
+    std::int64_t offset = 0;
+    bool more = true;
+    std::size_t total_pending = 0;
+    std::size_t restored      = 0;
+
+    while (more) {
+        std::vector<json> trade_records;
+        try {
+            trade_records = co_await wallet_->get_all_offers(
+                offset, offset + kPageSize, /*file_contents=*/false);
+        } catch (const rpc::ChiaRPCError& e) {
+            logger_->error("[startup_reconcile] get_all_offers failed: {}",
+                           e.what());
+            co_return cancelled_ids;
+        }
+
+        if (trade_records.empty() ||
+            static_cast<std::int64_t>(trade_records.size()) < kPageSize) {
+            more = false;
+        }
+
+        for (const auto& rec : trade_records) {
+            if (!rec.contains("trade_id") || !rec.contains("status")) {
+                continue;
+            }
+            std::string trade_id = rec["trade_id"].get<std::string>();
+            int status = rec["status"].get<int>();
+
+            if (status != kPendingAccept) {
+                continue;  // Only interested in live offers.
+            }
+            ++total_pending;
+
+            if (known_offer_ids.count(trade_id)) {
+                // This offer is in our DB -- it's ours.  We can restore
+                // tracking in State (the engine will do this after we return).
+                ++restored;
+                continue;
+            }
+
+            // Unknown offer -- orphan.  Cancel it securely.
+            logger_->warn("[startup_reconcile] Cancelling orphaned offer {} "
+                          "(PENDING_ACCEPT in wallet but not in DB)",
+                          trade_id.substr(0, 24));
+            try {
+                co_await wallet_->cancel_offer(trade_id, current_fee_mojos_,
+                                               /*secure=*/true);
+                cancelled_ids.push_back(trade_id);
+                logger_->info("[startup_reconcile] Cancelled orphan {}",
+                              trade_id.substr(0, 24));
+            } catch (const std::exception& e) {
+                logger_->error("[startup_reconcile] Failed to cancel {}: {}",
+                               trade_id.substr(0, 24), e.what());
+            }
+        }
+
+        offset += kPageSize;
+    }
+
+    logger_->info("[startup_reconcile] Complete: {} wallet offers scanned, "
+                  "{} known/restored, {} orphans cancelled",
+                  total_pending, restored, cancelled_ids.size());
+
+    co_return cancelled_ids;
+}
+
+// ---------------------------------------------------------------------------
 // build_offer_dict -- map a TierQuote to the wallet RPC offer_dict format
 // ---------------------------------------------------------------------------
 
