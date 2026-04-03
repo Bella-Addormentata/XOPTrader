@@ -112,9 +112,12 @@ jobs:
             libssl-dev libcurl4-openssl-dev
 
       # ---- System dependencies (macOS) -------------------------------------
-      - name: Install Ninja (macOS)
+      # sqlite3 is excluded from vcpkg on macOS (sqlite.org is unreachable from
+      # macOS runners); we rely on the system SQLite3 from the Xcode SDK instead.
+      # Ninja is required for the Unix Makefiles → Ninja generator selection below.
+      - name: Install system dependencies (macOS)
         if: runner.os == 'macOS'
-        run: brew install ninja
+        run: brew install ninja sqlite3
 
       # ---- CMake configure & build -----------------------------------------
       - name: Configure CMake
