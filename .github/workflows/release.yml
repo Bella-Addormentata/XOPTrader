@@ -111,11 +111,18 @@ jobs:
             build-essential cmake ninja-build pkg-config \
             libssl-dev libcurl4-openssl-dev
 
+      # ---- System dependencies (macOS) -------------------------------------
+      - name: Install Ninja (macOS)
+        if: runner.os == 'macOS'
+        run: brew install ninja
+
       # ---- CMake configure & build -----------------------------------------
       - name: Configure CMake
         working-directory: cpp
+        shell: bash
         run: >
           cmake -B ../build -S .
+          ${{ runner.os != 'Windows' && '-G Ninja' || '' }}
           -DCMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
           -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=${{ runner.os == 'Windows' && 'x64-windows' || runner.os == 'Linux' && 'x64-linux' || 'arm64-osx' }}
