@@ -48,6 +48,15 @@ jobs:
         shell: bash
         run: mkdir -p "$VCPKG_DOWNLOADS"
 
+      # ---- Cache vcpkg source archives to survive transient download errors --
+      - name: Cache vcpkg downloads
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.VCPKG_DOWNLOADS }}
+          key: vcpkg-downloads-${{ runner.os }}-${{ steps.vcpkg-baseline.outputs.sha }}
+          restore-keys: |
+            vcpkg-downloads-${{ runner.os }}-
+
       # ---- vcpkg setup with caching ----------------------------------------
       - name: Set up vcpkg
         uses: lukka/run-vcpkg@v11
