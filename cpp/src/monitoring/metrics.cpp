@@ -289,6 +289,12 @@ void MetricsExporter::register_metrics()
         .Help("Number of offers stuck beyond TTL + stuck_age threshold")
         .Register(*registry_)
         .Add({});
+
+    paused_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_bot_paused")
+        .Help("1 when trading is paused by GUI, 0 otherwise")
+        .Register(*registry_)
+        .Add({});
 }
 
 // ===================================================================
@@ -613,6 +619,14 @@ void MetricsExporter::update_stuck_offers(int count)
     if (!running_) return;
 
     stuck_offers_gauge_->Set(static_cast<double>(count));
+}
+
+void MetricsExporter::update_bot_paused(bool is_paused)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    paused_gauge_->Set(is_paused ? 1.0 : 0.0);
 }
 
 }  // namespace xop

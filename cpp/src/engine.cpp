@@ -340,6 +340,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         pair_config_map_[pc.name] = &pc;
     }
 
+    // -- Pause flag file path ------------------------------------------------
+    // Resolve once: place pause.flag next to the database file so the GUI
+    // (which knows the config directory) can create/remove it.
+    {
+        namespace fs = std::filesystem;
+        fs::path db_dir = fs::path(config_.database.path).parent_path();
+        if (db_dir.empty()) db_dir = fs::current_path();
+        pause_flag_path_ = db_dir / "pause.flag";
+        spdlog::info("[Engine] Pause flag path: {}", pause_flag_path_.string());
+    }
+
     state_->set_status(BotStatus::Initializing);
 
     spdlog::info("[Engine] All subsystems initialized successfully");
@@ -889,6 +900,9 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         block_cadence_->update_block_arrival(block_height, now);
     }
 
+    // Check GUI-initiated pause flag each heartbeat.
+    check_pause_flag();
+
     // Execute all 13 steps in strict sequence.
     // Each step is wrapped in a try/catch so that a failure in one step
     // does not abort the remaining steps.  The engine logs the error and
@@ -1049,9 +1063,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
     // [T3-10] Gate Step 8 during Crash/Recovery states.
-    // Also gated by the wallet circuit breaker.
+    // Also gated by the wallet circuit breaker and GUI pause flag.
     if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
+    } else if (gui_pause_active_) {
+        spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
         try {
             co_await step_manage_offers(block_height);
@@ -3092,6 +3108,9 @@ void Engine::step_export_metrics(BlockHeight block_height)
     risk.max_drawdown = total.max_drawdown;
     metrics_->update_risk(risk, {});
 
+    // Paused state gauge
+    metrics_->update_bot_paused(gui_pause_active_);
+
     spdlog::debug("[Engine] Step 12: metrics exported");
 }
 
@@ -3404,6 +3423,32 @@ void Engine::close_connections()
         coingecko_->close();
     }
     spdlog::info("[Engine] All connections closed");
+}
+
+// ---------------------------------------------------------------------------
+// check_pause_flag -- GUI-initiated pause via signal file.
+// ---------------------------------------------------------------------------
+void Engine::check_pause_flag()
+{
+    namespace fs = std::filesystem;
+    const bool flag_exists = fs::exists(pause_flag_path_);
+
+    if (flag_exists && !gui_pause_active_) {
+        // Transition Running → Paused.
+        gui_pause_active_ = true;
+        if (state_->status() == BotStatus::Running) {
+            state_->set_status(BotStatus::Paused);
+            spdlog::info("[Engine] Pause flag detected -- entering Paused state "
+                         "(Steps 1-6, 9-13 continue; Step 8 skipped)");
+        }
+    } else if (!flag_exists && gui_pause_active_) {
+        // Transition Paused → Running.
+        gui_pause_active_ = false;
+        if (state_->status() == BotStatus::Paused) {
+            state_->set_status(BotStatus::Running);
+            spdlog::info("[Engine] Pause flag removed -- resuming trading");
+        }
+    }
 }
 
 }  // namespace xop

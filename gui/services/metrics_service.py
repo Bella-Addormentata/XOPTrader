@@ -630,6 +630,21 @@ class MetricsService(QObject):
             return int(value)
         return 0
 
+    def is_paused(self) -> bool:
+        """Return whether the engine is paused by GUI flag.
+
+        Returns
+        -------
+        bool
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        inner = m.get("xop_bot_paused", {})
+        for _labels, value in inner.items():
+            return value >= 1.0
+        return False
+
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.
 

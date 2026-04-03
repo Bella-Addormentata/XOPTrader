@@ -46,6 +46,7 @@ STATUS_UNKNOWN: Final[str] = "Unknown"
 STATUS_RUNNING: Final[str] = "Running"
 STATUS_ANALYZING: Final[str] = "Analyzing"
 STATUS_STOPPED: Final[str] = "Stopped"
+STATUS_PAUSED: Final[str] = "Paused"
 STATUS_SHUTTING_DOWN: Final[str] = "ShuttingDown"
 STATUS_DISCONNECTED: Final[str] = "Disconnected"
 
@@ -339,6 +340,34 @@ class EngineBridge(QObject):
         """Gracefully stop the managed C++ engine subprocess."""
         self._stop_engine_process()
 
+    def pause_trading(self) -> None:
+        """Pause trading by creating the signal file the engine watches.
+
+        The engine continues running (market data, analytics, metrics)
+        but skips Step 8 (offer posting) while the flag file exists.
+        """
+        flag_path = self._db_path.parent / "pause.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            flag_path.touch(exist_ok=True)
+            _log.info("Pause flag created at %s", flag_path)
+        except OSError as exc:
+            _log.error("Failed to create pause flag: %s", exc)
+            self.error.emit(f"Could not pause trading: {exc}")
+
+    def resume_trading(self) -> None:
+        """Resume trading by removing the pause signal file."""
+        flag_path = self._db_path.parent / "pause.flag"
+        try:
+            if flag_path.exists():
+                flag_path.unlink()
+                _log.info("Pause flag removed at %s", flag_path)
+            else:
+                _log.debug("Pause flag not present; nothing to remove.")
+        except OSError as exc:
+            _log.error("Failed to remove pause flag: %s", exc)
+            self.error.emit(f"Could not resume trading: {exc}")
+
     def cancel_offer(self, offer_id: str) -> None:
         """Request cancellation of a single offer.
 
@@ -473,6 +502,10 @@ class EngineBridge(QObject):
         # at least one pair has not yet completed its analysis window.
         if new_status == STATUS_RUNNING and self._metrics_svc.is_analysis_active():
             new_status = STATUS_ANALYZING
+
+        # Check if the engine has been paused via GUI pause flag.
+        if new_status in (STATUS_RUNNING, STATUS_ANALYZING) and self._metrics_svc.is_paused():
+            new_status = STATUS_PAUSED
 
         self._update_status(new_status)
 

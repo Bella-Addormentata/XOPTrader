@@ -94,6 +94,7 @@
 #include <chrono>
 #include <cstdint>
 #include <deque>
+#include <filesystem>
 #include <map>
 #include <memory>
 #include <string>
@@ -726,7 +727,19 @@ private:
         Mojo confirmed{0};
         Mojo pending_change{0};
     };
-    std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;};
+    std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // -- [T4-05] GUI-requested pause via signal file ----------------------
+    // The GUI creates / removes a "pause.flag" file next to the database.
+    // The engine checks once per heartbeat and transitions between
+    // BotStatus::Running and BotStatus::Paused accordingly.
+    // Steps 1-6 & 9-13 continue; only Step 8 (offer posting) is skipped.
+    std::filesystem::path pause_flag_path_;    ///< Resolved once in constructor.
+    bool gui_pause_active_{false};             ///< Cached last-seen state.
+
+    /// Check for the pause flag file and update BotStatus accordingly.
+    void check_pause_flag();
+};
 
 }  // namespace xop
 

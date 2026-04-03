@@ -184,6 +184,7 @@ class MainWindow(QMainWindow):
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
         self._bot_running: bool = False
+        self._bot_paused: bool = False
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
         self._last_engine_start_failure: str = ""
@@ -393,17 +394,40 @@ class MainWindow(QMainWindow):
         if status in ("Running",):
             colour = LIGHT_GREEN
             self._bot_running = True
+            self._bot_paused = False
+        elif status in ("Paused",):
+            colour = _C.WARNING_YELLOW
+            self._bot_running = True
+            self._bot_paused = True
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
             self._bot_running = False
+            self._bot_paused = False
         elif status in ("Disconnected",):
             colour = LOSS_RED
             self._bot_running = False
+            self._bot_paused = False
         else:
             colour = TEXT_SECONDARY
             self._bot_running = False
+            self._bot_paused = False
         self._bot_status_label.setStyleSheet(f"color: {colour}; font-weight: bold;")
         self._style_start_stop_button()
+        self._style_pause_resume_button()
+
+        # Keep the connection indicator in sync with engine reachability.
+        if status in ("Running", "Analyzing", "Paused"):
+            self._connected = True
+            self._conn_dot.setStyleSheet(f"color: {PRIMARY_GREEN}; font-size: 18px;")
+            self._conn_label.setText("Connected")
+            self._act_connect.setEnabled(False)
+            self._act_disconnect.setEnabled(True)
+        elif status in ("Disconnected",):
+            self._connected = False
+            self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
+            self._conn_label.setText("Disconnected")
+            self._act_connect.setEnabled(True)
+            self._act_disconnect.setEnabled(False)
 
     def _on_bridge_error(self, msg: str) -> None:
         """Display bridge error in status bar briefly.
@@ -544,14 +568,35 @@ class MainWindow(QMainWindow):
         # -- File menu ------------------------------------------------------
         file_menu = menu_bar.addMenu("&File")
 
-        self._act_connect = QAction("&Connect", self)
+        self._act_connect = QAction("Connect to &Engine", self)
         self._act_connect.triggered.connect(self._on_connect)
         file_menu.addAction(self._act_connect)
 
-        self._act_disconnect = QAction("&Disconnect", self)
+        self._act_disconnect = QAction("&Disconnect from Engine", self)
         self._act_disconnect.setEnabled(False)
         self._act_disconnect.triggered.connect(self._on_disconnect)
         file_menu.addAction(self._act_disconnect)
+
+        file_menu.addSeparator()
+
+        self._act_start_trading = QAction("&Start Trading", self)
+        self._act_start_trading.triggered.connect(self._on_start_stop)
+        file_menu.addAction(self._act_start_trading)
+
+        self._act_stop_trading = QAction("S&top Trading", self)
+        self._act_stop_trading.setEnabled(False)
+        self._act_stop_trading.triggered.connect(self._on_start_stop)
+        file_menu.addAction(self._act_stop_trading)
+
+        self._act_pause_trading = QAction("&Pause Trading", self)
+        self._act_pause_trading.setEnabled(False)
+        self._act_pause_trading.triggered.connect(self._on_pause_resume)
+        file_menu.addAction(self._act_pause_trading)
+
+        self._act_resume_trading = QAction("&Resume Trading", self)
+        self._act_resume_trading.setEnabled(False)
+        self._act_resume_trading.triggered.connect(self._on_pause_resume)
+        file_menu.addAction(self._act_resume_trading)
 
         file_menu.addSeparator()
 
@@ -640,11 +685,11 @@ class MainWindow(QMainWindow):
         # Connection indicator (coloured dot + label)
         self._conn_dot = QLabel("\u25CF")  # filled circle
         self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
-        self._conn_dot.setToolTip("Connection status to CHIA full node")
+        self._conn_dot.setToolTip("Connection to the XOPTrader C++ engine")
         toolbar.addWidget(self._conn_dot)
 
         self._conn_label = QLabel("Disconnected")
-        self._conn_label.setToolTip("Connection status to CHIA full node")
+        self._conn_label.setToolTip("Connection to the XOPTrader C++ engine")
         toolbar.addWidget(self._conn_label)
 
         toolbar.addSeparator()
@@ -679,18 +724,30 @@ class MainWindow(QMainWindow):
         toolbar.addSeparator()
 
         # Start / Stop button
-        self._start_stop_btn = QPushButton("Start")
-        self._start_stop_btn.setFixedSize(100, 36)
+        self._start_stop_btn = QPushButton("Start Trading")
+        self._start_stop_btn.setFixedSize(130, 36)
         self._start_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._start_stop_btn.setToolTip("Start or stop the trading engine")
+        self._start_stop_btn.setToolTip("Start or stop live trading on the CHIA DEX")
         self._start_stop_btn.clicked.connect(self._on_start_stop)
         self._style_start_stop_button()
         toolbar.addWidget(self._start_stop_btn)
 
+        # Pause / Resume button
+        self._pause_resume_btn = QPushButton("Pause Trading")
+        self._pause_resume_btn.setFixedSize(130, 36)
+        self._pause_resume_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._pause_resume_btn.setToolTip(
+            "Pause or resume offer posting (engine keeps running)"
+        )
+        self._pause_resume_btn.clicked.connect(self._on_pause_resume)
+        self._pause_resume_btn.setEnabled(False)
+        self._style_pause_resume_button()
+        toolbar.addWidget(self._pause_resume_btn)
+
     def _style_start_stop_button(self) -> None:
         """Apply the correct colour to the start/stop button."""
         if self._bot_running:
-            self._start_stop_btn.setText("Stop")
+            self._start_stop_btn.setText("Stop Trading")
             self._start_stop_btn.setStyleSheet(
                 f"""
                 QPushButton {{
@@ -706,7 +763,7 @@ class MainWindow(QMainWindow):
                 """
             )
         else:
-            self._start_stop_btn.setText("Start")
+            self._start_stop_btn.setText("Start Trading")
             self._start_stop_btn.setStyleSheet(
                 f"""
                 QPushButton {{
@@ -721,6 +778,52 @@ class MainWindow(QMainWindow):
                 QPushButton:hover {{ background-color: {LIGHT_GREEN}; }}
                 """
             )
+
+        # Keep File menu items in sync with the toolbar button.
+        self._act_start_trading.setEnabled(not self._bot_running)
+        self._act_stop_trading.setEnabled(self._bot_running)
+
+    def _style_pause_resume_button(self) -> None:
+        """Apply the correct colour and label to the pause/resume button."""
+        if self._bot_paused:
+            self._pause_resume_btn.setText("Resume Trading")
+            self._pause_resume_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {_C.WARNING_YELLOW};
+                    color: {DARK_BG};
+                    border: none;
+                    border-radius: 8px;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{ background-color: #FFD54F; }}
+                """
+            )
+        else:
+            self._pause_resume_btn.setText("Pause Trading")
+            self._pause_resume_btn.setStyleSheet(
+                f"""
+                QPushButton {{
+                    background-color: {ELEVATED_BG};
+                    color: {TEXT_PRIMARY};
+                    border: 1px solid {BORDER};
+                    border-radius: 8px;
+                    font-weight: bold;
+                    font-size: 13px;
+                    padding: 8px 16px;
+                }}
+                QPushButton:hover {{ background-color: {PANEL_BG}; }}
+                """
+            )
+
+        # Enable pause only when the bot is running and not already paused.
+        can_pause = self._bot_running and not self._bot_paused
+        can_resume = self._bot_paused
+        self._pause_resume_btn.setEnabled(can_pause or can_resume)
+        self._act_pause_trading.setEnabled(can_pause)
+        self._act_resume_trading.setEnabled(can_resume)
 
     # ===================================================================== #
     #  Central area (sidebar + stacked widget + bottom tabs)                 #
@@ -1029,7 +1132,15 @@ class MainWindow(QMainWindow):
         self._stacked.setCurrentIndex(index)
 
     def _on_connect(self) -> None:
-        """Handle File > Connect."""
+        """Handle File > Connect to Engine.
+
+        Starts the bridge's metrics polling timer so the GUI
+        receives live data from the running C++ engine.
+        """
+        if self._bridge is not None:
+            if not self._bridge._master_timer.isActive():
+                self._bridge._master_timer.start()
+                _log.info("Reconnected to engine metrics polling.")
         self._connected = True
         self._conn_dot.setStyleSheet(f"color: {PRIMARY_GREEN}; font-size: 18px;")
         self._conn_label.setText("Connected")
@@ -1037,7 +1148,15 @@ class MainWindow(QMainWindow):
         self._act_disconnect.setEnabled(True)
 
     def _on_disconnect(self) -> None:
-        """Handle File > Disconnect."""
+        """Handle File > Disconnect from Engine.
+
+        Stops the bridge's metrics polling timer.  The C++ engine
+        continues to run independently; only the GUI feed is paused.
+        """
+        if self._bridge is not None:
+            if self._bridge._master_timer.isActive():
+                self._bridge._master_timer.stop()
+                _log.info("Disconnected from engine metrics polling.")
         self._connected = False
         self._conn_dot.setStyleSheet(f"color: {LOSS_RED}; font-size: 18px;")
         self._conn_label.setText("Disconnected")
@@ -1055,8 +1174,8 @@ class MainWindow(QMainWindow):
             # Currently running -- confirm stop
             reply = QMessageBox.question(
                 self,
-                "Stop Engine",
-                "Stop the trading engine? Active offers will be cancelled.",
+                "Stop Trading",
+                "Stop trading? Active offers will be cancelled.",
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
             )
@@ -1065,15 +1184,15 @@ class MainWindow(QMainWindow):
         else:
             # Currently stopped -- confirm start
             if self._dry_run:
-                prompt = "Start in dry-run mode?"
+                prompt = "Start trading in dry-run mode? (No real offers will be placed.)"
             else:
                 prompt = (
-                    "Start the trading engine? "
+                    "Start trading? "
                     "(Offers will be placed on the CHIA DEX.)"
                 )
             reply = QMessageBox.question(
                 self,
-                "Start Engine",
+                "Start Trading",
                 prompt,
                 QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
                 QMessageBox.StandardButton.No,
@@ -1090,7 +1209,9 @@ class MainWindow(QMainWindow):
 
         # Toggle local state for immediate visual feedback.
         self._bot_running = not self._bot_running
+        self._bot_paused = False  # Reset pause when starting/stopping.
         self._style_start_stop_button()
+        self._style_pause_resume_button()
 
         if self._bot_running:
             status_text = "Dry Run" if self._dry_run else "Running"
@@ -1103,6 +1224,38 @@ class MainWindow(QMainWindow):
         self._bot_status_label.setStyleSheet(
             f"color: {colour}; font-weight: bold;"
         )
+
+    def _on_pause_resume(self) -> None:
+        """Toggle pause/resume state for trading.
+
+        When paused, the engine keeps running (market data, analytics,
+        metrics) but skips offer posting (Step 8).  Resume removes the
+        pause flag and the engine resumes posting on the next block.
+        """
+        if self._bot_paused:
+            # Currently paused -- resume
+            if self._bridge is not None:
+                self._bridge.resume_trading()
+            self._bot_paused = False
+        else:
+            # Currently running -- pause
+            if self._bridge is not None:
+                self._bridge.pause_trading()
+            self._bot_paused = True
+
+        self._style_pause_resume_button()
+
+        if self._bot_paused:
+            self._bot_status_label.setText("Paused")
+            self._bot_status_label.setStyleSheet(
+                f"color: {_C.WARNING_YELLOW}; font-weight: bold;"
+            )
+        else:
+            status_text = "Dry Run" if self._dry_run else "Running"
+            self._bot_status_label.setText(status_text)
+            self._bot_status_label.setStyleSheet(
+                f"color: {LIGHT_GREEN}; font-weight: bold;"
+            )
 
     def _on_toggle_sidebar(self) -> None:
         """Toggle sidebar expansion via View menu or Ctrl+B."""

@@ -248,6 +248,9 @@ public:
     /// Update the count of stuck offers (beyond TTL + stuck-age threshold).
     void update_stuck_offers(int count);
 
+    /// Update the bot-paused gauge (1 = paused by GUI, 0 = running).
+    void update_bot_paused(bool is_paused);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
@@ -330,6 +333,7 @@ private:
 
     prometheus::Family<prometheus::Gauge>* spendable_reserve_family_{nullptr};
     prometheus::Gauge* stuck_offers_gauge_{nullptr};
+    prometheus::Gauge* paused_gauge_{nullptr};
 
     // -- Cardinality guard ----------------------------------------------------
     // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered

@@ -40,3 +40,16 @@ cpp/vcpkg/
 # GUI packaging artifacts
 gui/build-improved/
 gui/dist-improved/
+
+# Pause signal file (GUI↔engine IPC)
+pause.flag
+
+# Sensitive file types (defense in depth)
+*.pem
+*.key
+*.crt
+*.p12
+*.pfx
+*.env
+*.secret
+id_rsa*
