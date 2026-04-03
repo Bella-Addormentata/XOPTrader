@@ -34,7 +34,10 @@
     "nlohmann-json",
     "spdlog",
     "yaml-cpp",
-    "sqlite3",
+    {
+      "name": "sqlite3",
+      "platform": "!osx"
+    },
     {
       "name": "prometheus-cpp",
       "default-features": true,
