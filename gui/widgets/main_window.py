@@ -870,7 +870,7 @@ class MainWindow(QMainWindow):
                     scroll.setWidgetResizable(True)
                     scroll.setWidget(w)
                     scroll.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-                        return scroll
+                    return scroll
                 return w
             except Exception as exc:
                 _log.warning("Failed to create widget %s: %s", widget_class, exc)
