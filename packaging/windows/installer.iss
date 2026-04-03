@@ -52,8 +52,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 [Tasks]
 Name: "desktopicon"; \
   Description: "{cm:CreateDesktopIcon}"; \
-  GroupDescription: "{cm:AdditionalIcons}"; \
-  Flags: unchecked
+  GroupDescription: "{cm:AdditionalIcons}"
 
 [Files]
 ; GUI binary (required)
@@ -79,8 +78,9 @@ Source: "icon.ico"; DestDir: "{app}"; Flags: ignoreversion
 Name: "{group}\XOPTrader";                    Filename: "{app}\xop_trader_gui.exe"
 Name: "{group}\{cm:UninstallProgram,XOPTrader}"; Filename: "{uninstallexe}"
 
-; Desktop — only created when the user checks the box
+; Desktop — created by default (user can uncheck during install)
 Name: "{autodesktop}\XOPTrader"; Filename: "{app}\xop_trader_gui.exe"; \
+  IconFilename: "{app}\icon.ico"; \
   Tasks: desktopicon
 
 [Run]
