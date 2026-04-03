@@ -124,6 +124,7 @@ struct PendingOffer {
     std::uint8_t tier;             // which tier of the multi-tier ladder
     BlockHeight  created_at_block; // block at which the offer was broadcast
     Timestamp    created_at_ts;    // wall-clock creation time
+    std::uint64_t fee_mojos{0};    // fee attached to this offer (mojos)
 };
 
 // ---------------------------------------------------------------------------

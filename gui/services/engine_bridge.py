@@ -306,6 +306,8 @@ class EngineBridge(QObject):
             "trade_summary": self._last_data.get("trade_summary", {}),
             "config": self._config_svc.get_full_config(),
             "bot_status": self._bot_status,
+            "spendable_reserve": self._metrics_svc.get_spendable_reserve(),
+            "stuck_offers": self._metrics_svc.get_stuck_offers(),
         }
         return data
 

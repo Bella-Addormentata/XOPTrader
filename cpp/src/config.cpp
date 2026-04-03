@@ -703,6 +703,21 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.batch_offers_enabled = node["batch_offers_enabled"].as<bool>();
     }
 
+    // Spendable reserve threshold.
+    if (node["min_spendable_reserve_pct"] && node["min_spendable_reserve_pct"].IsDefined()
+        && !node["min_spendable_reserve_pct"].IsNull()) {
+        cfg.min_spendable_reserve_pct = node["min_spendable_reserve_pct"].as<double>();
+        if (cfg.min_spendable_reserve_pct < 0.0 || cfg.min_spendable_reserve_pct > 1.0) {
+            throw ConfigError("strategy.min_spendable_reserve_pct must be in [0, 1]");
+        }
+    }
+
+    // Stuck offer age (extra blocks beyond TTL).
+    if (node["stuck_offer_age_blocks"] && node["stuck_offer_age_blocks"].IsDefined()
+        && !node["stuck_offer_age_blocks"].IsNull()) {
+        cfg.stuck_offer_age_blocks = node["stuck_offer_age_blocks"].as<uint32_t>();
+    }
+
     return cfg;
 }
 
@@ -1353,7 +1368,9 @@ void log_config_summary(const AppConfig& cfg)
     // Strategy: new fields.
     out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"
         << "  reconcile  = " << cfg.strategy.reconciliation_interval_blocks << " blocks\n"
-        << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n";
+        << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n"
+        << "  spendable_reserve = " << (cfg.strategy.min_spendable_reserve_pct * 100.0) << "%\n"
+        << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n";
 
     // Volatility: new fields.
     out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";

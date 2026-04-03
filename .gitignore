@@ -27,6 +27,16 @@ build.log
 # Local runtime config (contains machine-specific values/secrets)
 config.yaml
 
+# Runtime data (databases, WAL files)
+data/
+
+# Runtime logs
+logs/
+
+# vcpkg clones (bootstrapped locally)
+vcpkg/
+cpp/vcpkg/
+
 # GUI packaging artifacts
 gui/build-improved/
 gui/dist-improved/

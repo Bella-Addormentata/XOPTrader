@@ -242,6 +242,12 @@ public:
     /// Called once after analysis completes; persists for the engine lifetime.
     void set_analysis_spread_multiplier(double mult);
 
+    /// Update per-wallet spendable reserve ratio (0–1).
+    void update_spendable_reserve(const std::string& wallet_label, double ratio);
+
+    /// Update the count of stuck offers (beyond TTL + stuck-age threshold).
+    void update_stuck_offers(int count);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
@@ -319,6 +325,11 @@ private:
 
     prometheus::Family<prometheus::Gauge>* analysis_family_{nullptr};
     prometheus::Family<prometheus::Gauge>* analysis_pair_family_{nullptr};
+
+    // -- Wallet reserve & stuck offer gauges ---------------------------------
+
+    prometheus::Family<prometheus::Gauge>* spendable_reserve_family_{nullptr};
+    prometheus::Gauge* stuck_offers_gauge_{nullptr};
 
     // -- Cardinality guard ----------------------------------------------------
     // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered

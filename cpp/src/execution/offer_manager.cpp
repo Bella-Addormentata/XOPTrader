@@ -209,6 +209,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         pending.tier             = tier.tier_index;
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
+        pending.fee_mojos        = current_fee_mojos_;
 
         state_->upsert_offer(pending);
         ++created_count;
@@ -997,6 +998,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.tier             = tier.tier_index;
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
+        pending.fee_mojos        = current_fee_mojos_;
         state_->upsert_offer(pending);
     }
 

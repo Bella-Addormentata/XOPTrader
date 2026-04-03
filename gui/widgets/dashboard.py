@@ -503,6 +503,16 @@ class DashboardWidget(QWidget):
 
         self._grid.addWidget(self._activity_list, 6, 0, 1, 3)
 
+        # -- Row 7: Wallet Balances card --------------------------------------
+        wallet_title = QLabel("Wallet Balances")
+        wallet_title.setStyleSheet(f"color: {TEXT_PRIMARY}; font-weight: bold; font-size: 14px;")
+        self._grid.addWidget(wallet_title, 7, 0, 1, 3)
+
+        self._wallet_label = QLabel("Waiting for data\u2026")
+        self._wallet_label.setWordWrap(True)
+        self._wallet_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
+        self._grid.addWidget(self._wallet_label, 8, 0, 1, 3)
+
     # =====================================================================
     # Context menu for the pairs table
     # =====================================================================
@@ -757,3 +767,56 @@ class DashboardWidget(QWidget):
         # Auto-scroll if the user is at the bottom
         if self._auto_scroll:
             self._activity_list.scrollToBottom()
+
+    def update_wallet_balances(
+        self,
+        balances: dict[str, dict[str, float]],
+        reserve: dict[str, float] | None = None,
+        stuck_offers: int = 0,
+    ) -> None:
+        """Update the wallet balances section of the dashboard.
+
+        Parameters
+        ----------
+        balances:
+            Mapping of wallet label to a dict with ``spendable``,
+            ``confirmed``, ``pending_change``, etc.
+        reserve:
+            Optional mapping of wallet label to spendable reserve ratio (0–1).
+        stuck_offers:
+            Number of stuck offers (beyond TTL + stuck-age threshold).
+        """
+        if not hasattr(self, "_wallet_label"):
+            return
+
+        lines: list[str] = []
+        for wallet, bal in balances.items():
+            spendable = bal.get("spendable", 0.0)
+            confirmed = bal.get("confirmed", 0.0)
+            pending = bal.get("pending_change", 0.0)
+
+            # Reserve percentage for this wallet.
+            res_pct = (reserve or {}).get(wallet, 1.0) * 100.0
+
+            # Color-code based on reserve level.
+            if res_pct < 10.0:
+                color = "#ff4444"
+            elif res_pct < 25.0:
+                color = "#ffaa00"
+            else:
+                color = "#44ff44"
+
+            detail = (
+                f"<span style='color:{color}'><b>{wallet}</b></span>: "
+                f"spendable={spendable:,.0f}  confirmed={confirmed:,.0f}  "
+                f"pending={pending:,.0f}  Reserve: {res_pct:.0f}%"
+            )
+            lines.append(detail)
+
+        if stuck_offers > 0:
+            lines.append(
+                f"<span style='color:#ff4444'>\u26a0 {stuck_offers} stuck offer(s) "
+                f"beyond TTL — check fee levels</span>"
+            )
+
+        self._wallet_label.setText("<br>".join(lines) if lines else "No data")

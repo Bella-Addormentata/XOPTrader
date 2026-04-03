@@ -368,6 +368,11 @@ class MainWindow(QMainWindow):
             if hasattr(dashboard, "update_block_info"):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
                 dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
+            if hasattr(dashboard, "update_wallet_balances"):
+                wallet_bals = data.get("wallet_balances", {})
+                reserve = data.get("spendable_reserve", {})
+                stuck = data.get("stuck_offers", 0)
+                dashboard.update_wallet_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)
 
         # Market analysis update -- forward analysis data to the widget.
         analysis_widget = self._unwrap(self._market_analysis)

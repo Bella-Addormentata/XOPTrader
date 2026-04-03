@@ -719,7 +719,14 @@ private:
     // Block height of the last full reconciliation run.  Compared against
     // current_block to decide when to trigger the next reconciliation.
     BlockHeight last_reconciliation_block_{0};
-};
+    // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
+    // Populated from wallet RPC each heartbeat; keyed by wallet label.
+    struct WalletBalanceEntry {
+        Mojo spendable{0};
+        Mojo confirmed{0};
+        Mojo pending_change{0};
+    };
+    std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;};
 
 }  // namespace xop
 

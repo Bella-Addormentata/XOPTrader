@@ -595,6 +595,41 @@ class MetricsService(QObject):
 
         return False
 
+    def get_spendable_reserve(self) -> dict[str, float]:
+        """Return per-wallet spendable reserve ratio from Prometheus.
+
+        Returns
+        -------
+        dict[str, float]
+            Mapping of wallet label to reserve ratio (0–1).
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        result: dict[str, float] = {}
+        inner = m.get("xop_spendable_reserve_pct", {})
+        for labels, value in inner.items():
+            label_dict = dict(labels)
+            wallet = label_dict.get("wallet", "")
+            if wallet:
+                result[wallet] = value
+        return result
+
+    def get_stuck_offers(self) -> int:
+        """Return the current count of stuck offers.
+
+        Returns
+        -------
+        int
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        inner = m.get("xop_stuck_offers", {})
+        for _labels, value in inner.items():
+            return int(value)
+        return 0
+
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.
 

@@ -2581,6 +2581,59 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+        // -- Stuck offer detection -------------------------------------------
+        // Offers older than TTL + stuck_offer_age_blocks are considered
+        // stuck (e.g. RPC cancel failed). Log them with fee info and
+        // force a second cancel pass with an extended threshold.
+        {
+            const auto all_offers = state_->get_all_offers();
+            const uint32_t stuck_threshold =
+                config_.strategy.offer_ttl_blocks +
+                config_.strategy.stuck_offer_age_blocks;
+            int stuck_count = 0;
+            for (const auto& po : all_offers) {
+                if (po.pair_name != pair_name) continue;
+                if (block_height > po.created_at_block &&
+                    (block_height - po.created_at_block) > stuck_threshold) {
+                    ++stuck_count;
+                    spdlog::warn("[Engine] Stuck offer {} pair={} side={} tier={} "
+                                 "age={} blocks fee={} mojos",
+                                 po.offer_id.substr(0, 12), po.pair_name,
+                                 to_string(po.side), po.tier,
+                                 block_height - po.created_at_block,
+                                 po.fee_mojos);
+                }
+            }
+            if (stuck_count > 0) {
+                spdlog::warn("[Engine] Step 8: {} stuck offers for {} -- "
+                             "attempting forced cancel", stuck_count, pair_name);
+                co_await offer_mgr_->cancel_stale(
+                    pair_name, block_height, stuck_threshold);
+            }
+            metrics_->update_stuck_offers(stuck_count);
+        }
+
+        // -- Spendable reserve gating ----------------------------------------
+        // Check cached wallet balances; skip posting if any wallet has
+        // too little spendable relative to confirmed balance.
+        {
+            bool reserve_ok = true;
+            for (const auto& [wlabel, bal] : cached_wallet_balances_) {
+                if (bal.confirmed == 0) continue;
+                double ratio = static_cast<double>(bal.spendable)
+                             / static_cast<double>(bal.confirmed);
+                metrics_->update_spendable_reserve(wlabel, ratio);
+                if (ratio < config_.strategy.min_spendable_reserve_pct) {
+                    spdlog::info("[Engine] Step 8: {} spendable reserve {:.1f}% "
+                                 "< {:.1f}% threshold -- skipping offer posting",
+                                 wlabel, ratio * 100.0,
+                                 config_.strategy.min_spendable_reserve_pct * 100.0);
+                    reserve_ok = false;
+                }
+            }
+            if (!reserve_ok) continue;
+        }
+
         // Find the PairConfig for this pair (O(1) map lookup).
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
@@ -2674,6 +2727,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 orec.tier          = etq.tier_index;
                 orec.status        = "pending";
                 orec.created_block = block_height;
+                orec.fee_mojos     = recommended_fee;
 
                 // Look up the actual offer_id from State.
                 std::string key = std::to_string(static_cast<int>(etq.side))

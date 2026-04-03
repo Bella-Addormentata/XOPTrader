@@ -5,6 +5,28 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0] — 2026-04-03
+
+### Added
+
+- Spendable reserve gating: engine skips offer posting when any wallet's spendable/confirmed ratio falls below configurable threshold (`min_spendable_reserve_pct`, default 25%)
+- Stuck offer detection and auto-cancellation: offers surviving beyond `offer_ttl_blocks + stuck_offer_age_blocks` are logged with fee info and cancelled
+- Per-offer fee tracking: `fee_mojos` field stored on `PendingOffer`, `DbOfferRecord`, and `offer_log` DB table for fee-to-fill-time analytics
+- Prometheus gauge `xop_spendable_reserve_pct{wallet}` — fraction of confirmed balance that is spendable (0–1)
+- Prometheus gauge `xop_stuck_offers` — count of offers stuck beyond TTL + stuck-age threshold
+- Config fields: `strategy.min_spendable_reserve_pct` (double, 0–1) and `strategy.stuck_offer_age_blocks` (uint32_t, default 30)
+- GUI dashboard: wallet balance card shows reserve percentage with color-coded thresholds (red <10%, yellow <25%) and stuck-offer warning row
+- GUI `MetricsService.get_spendable_reserve()` and `get_stuck_offers()` Prometheus parsers
+- Forward-compatible DB migration: `ALTER TABLE offer_log ADD COLUMN fee_mojos INTEGER DEFAULT 0`
+- Wallet balance Prometheus export (`xop_wallet_balance{wallet,field}`) for spendable, confirmed, unconfirmed, pending_change, pending_coin_removal, max_send
+- Pre-flight balance check in `post_quotes()` — verifies spendable balance before tier loop
+- GUI Dashboard "Wallet Balances" card with color-coded status
+
+### Changed
+
+- `resolve_wallet_id()` made public in OfferManager
+- Engine `step_manage_offers()` extended with stuck-detection pass and reserve-gating logic
+
 ## [0.3.0] — 2026-04-03
 
 ### Fixed

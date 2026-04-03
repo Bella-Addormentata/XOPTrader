@@ -274,6 +274,21 @@ void MetricsExporter::register_metrics()
         .Name("xop_analysis_pair")
         .Help("Startup market analysis per-pair observations")
         .Register(*registry_);
+
+    // ---------------------------------------------------------------
+    //  Wallet reserve & stuck offers
+    // ---------------------------------------------------------------
+
+    spendable_reserve_family_ = &prometheus::BuildGauge()
+        .Name("xop_spendable_reserve_pct")
+        .Help("Fraction of confirmed balance that is spendable (0-1)")
+        .Register(*registry_);
+
+    stuck_offers_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_stuck_offers")
+        .Help("Number of offers stuck beyond TTL + stuck_age threshold")
+        .Register(*registry_)
+        .Add({});
 }
 
 // ===================================================================
@@ -575,6 +590,29 @@ void MetricsExporter::set_analysis_spread_multiplier(double mult)
     analysis_family_
         ->Add({{"metric", "recommended_spread_multiplier"}})
         .Set(mult);
+}
+
+// ===================================================================
+//  Wallet Reserve & Stuck Offers
+// ===================================================================
+
+void MetricsExporter::update_spendable_reserve(
+    const std::string& wallet_label, double ratio)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    spendable_reserve_family_
+        ->Add({{"wallet", wallet_label}})
+        .Set(ratio);
+}
+
+void MetricsExporter::update_stuck_offers(int count)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    stuck_offers_gauge_->Set(static_cast<double>(count));
 }
 
 }  // namespace xop

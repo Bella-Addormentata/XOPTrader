@@ -306,6 +306,17 @@ public:
      */
     asio::awaitable<int> reconcile_offers();
 
+    /**
+     * @brief Resolve an asset ID to a wallet ID.
+     *
+     * "xch" maps to wallet_id 1.  CAT asset IDs are resolved by querying
+     * get_wallets() once at startup and caching the mapping.
+     *
+     * @param asset_id  Asset identifier ("xch" or 64-hex CAT ID).
+     * @return Wallet ID (positive integer), or -1 if not found.
+     */
+    std::int64_t resolve_wallet_id(const AssetId& asset_id) const;
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -356,17 +367,6 @@ private:
      * @return true if submission succeeded, false on any error.
      */
     asio::awaitable<bool> submit_to_dexie(const std::string& offer_text);
-
-    /**
-     * @brief Resolve an asset ID to a wallet ID.
-     *
-     * "xch" maps to wallet_id 1.  CAT asset IDs are resolved by querying
-     * get_wallets() once at startup and caching the mapping.
-     *
-     * @param asset_id  Asset identifier ("xch" or 64-hex CAT ID).
-     * @return Wallet ID (positive integer), or -1 if not found.
-     */
-    std::int64_t resolve_wallet_id(const AssetId& asset_id) const;
 
     /**
      * @brief One-time initialisation of the asset-to-wallet-ID cache.

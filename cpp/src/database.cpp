@@ -70,6 +70,7 @@ CREATE TABLE IF NOT EXISTS offer_log (
     status          TEXT    NOT NULL DEFAULT 'pending',
     created_block   INTEGER NOT NULL,
     resolved_block  INTEGER,
+    fee_mojos       INTEGER DEFAULT 0,
     created_at      TEXT    DEFAULT CURRENT_TIMESTAMP,
     resolved_at     TEXT
 );
@@ -145,8 +146,8 @@ ORDER BY timestamp ASC;
 constexpr const char* kInsertOffer = R"SQL(
 INSERT INTO offer_log
     (offer_id, pair_name, side, price_mojos, size_mojos, tier,
-     status, created_block)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+     status, created_block, fee_mojos)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kUpdateOfferStatus = R"SQL(
@@ -354,11 +355,12 @@ void Database::insert_offer(const DbOfferRecord& r)
     bind_int64 (stmt_insert_offer_, 6, static_cast<std::int64_t>(r.tier));
     bind_text  (stmt_insert_offer_, 7, r.status);
     bind_int64 (stmt_insert_offer_, 8, static_cast<std::int64_t>(r.created_block));
+    bind_int64 (stmt_insert_offer_, 9, static_cast<std::int64_t>(r.fee_mojos));
 
     step_and_reset(stmt_insert_offer_);
 
-    spdlog::debug("[Database] Inserted offer '{}' pair={} side={} tier={}",
-                  r.offer_id, r.pair_name, r.side, r.tier);
+    spdlog::debug("[Database] Inserted offer '{}' pair={} side={} tier={} fee={}",
+                  r.offer_id, r.pair_name, r.side, r.tier, r.fee_mojos);
 }
 
 void Database::update_offer_status(const std::string& offer_id,
@@ -623,6 +625,8 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN offer_hash TEXT;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN fee_mojos INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
 }
 

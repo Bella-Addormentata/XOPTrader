@@ -87,6 +87,7 @@ struct DbOfferRecord {
     std::string status{"pending"};  ///< "pending", "filled", "cancelled", "expired".
     BlockHeight created_block{0};   ///< Block at which the offer was broadcast.
     BlockHeight resolved_block{0};  ///< Block at which the offer was resolved (0 if pending).
+    std::uint64_t fee_mojos{0};      ///< Fee attached to this offer (mojos).
 };
 
 // ---------------------------------------------------------------------------

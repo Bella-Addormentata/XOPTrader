@@ -201,6 +201,14 @@ struct StrategyConfig {
     /// false = current behavior (one offer per tier).
     /// true  = merge same-side tiers.
     bool     batch_offers_enabled{false};
+
+    /// Minimum fraction of confirmed balance that must remain spendable
+    /// before the engine will post new offers.  Range [0, 1].  Default 0.25.
+    double   min_spendable_reserve_pct{0.25};
+
+    /// Extra blocks beyond offer_ttl_blocks before an offer is considered
+    /// "stuck" and eligible for forced cancellation + alerting.
+    uint32_t stuck_offer_age_blocks{30};
 };
 
 // ---------------------------------------------------------------------------
