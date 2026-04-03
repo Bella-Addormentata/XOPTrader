@@ -11,10 +11,9 @@
 # for v0.2.0) and bundled into XOPTrader-{slug}.zip. Each versioned binary
 # also carries the release tag in its filename.
 #
-#   xop_trader-windows-x64-{tag}.exe            C++ engine — Windows 64-bit
+#   xop_trader-installer-windows-x64-{tag}.exe  Windows installer with desktop shortcut
 #   xop_trader-linux-x64-{tag}                  C++ engine — Ubuntu 22.04 x86-64
 #   xop_trader-macos-arm64-{tag}                C++ engine — macOS 14 Apple-Silicon
-#   xop_trader-gui-windows-x64-{tag}.exe        Python GUI — Windows (PyInstaller)
 #   xop_trader-installer-windows-x64-{tag}.exe  Windows installer with desktop-shortcut prompt
 #   xop_trader-gui-linux-x64-{tag}              Python GUI — Ubuntu (PyInstaller)
 #   xop_trader-linux-bundle-{tag}.tar.gz        Linux bundle: GUI binary + icon + .desktop + install.sh
@@ -223,7 +222,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller pillow
+          pip install pyinstaller
 
       - name: Download Windows runtime bundle
         if: runner.os == 'Windows'
@@ -232,10 +231,11 @@ jobs:
           name: xop_trader-windows-runtime-x64
           path: gui/engine-runtime
 
-      # ---- Generate application icon ---------------------------------------
-      - name: Generate application icon
+      # ---- Copy pre-built application icon --------------------------------
+      - name: Copy application icon
         working-directory: gui
-        run: python resources/generate_icon.py . ${{ matrix.icon_fmt }}
+        shell: bash
+        run: cp resources/icon.${{ matrix.icon_fmt }} icon.${{ matrix.icon_fmt }}
 
       # ---- Build with PyInstaller ------------------------------------------
       - name: Build with PyInstaller (Unix)
@@ -300,15 +300,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Generate application icon
-        run: |
-          pip install pillow
-          python gui/resources/generate_icon.py gui ico
+      - name: Copy application icon
+        run: cp gui/resources/icon.ico gui/icon.ico
 
       - name: Download C++ engine artifact
         uses: actions/download-artifact@v4
@@ -375,15 +368,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up Python 3.11
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.11"
-
-      - name: Generate application icon
-        run: |
-          pip install pillow
-          python gui/resources/generate_icon.py gui png
+      - name: Copy application icon
+        run: cp gui/resources/icon.png gui/icon.png
 
       - name: Download C++ engine artifact
         uses: actions/download-artifact@v4
@@ -443,6 +429,12 @@ jobs:
           mkdir -p release-assets
           find release-assets-tmp -type f -exec mv -t release-assets/ {} +
           rm -rf release-assets-tmp
+
+      # Remove the standalone Windows GUI binary — users should use the installer
+      - name: Exclude standalone Windows binaries from release
+        run: |
+          rm -f release-assets/xop_trader-gui-windows-x64.exe
+          rm -f release-assets/xop_trader-windows-x64.exe
 
       # Resolve the tag: prefer the real git tag, fall back to workflow_dispatch input
       - name: Resolve release tag
@@ -504,11 +496,30 @@ jobs:
           # Bundle the entire RELEASE/ folder tree into a single zip archive
           zip -r "XOPTrader-${SLUG}.zip" "RELEASE/"
 
+      # Delete existing release assets so the new build replaces them
+      - name: Remove old release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="${{ steps.tag.outputs.value }}"
+          # Check if a release already exists for this tag
+          if gh release view "$TAG" --repo "${{ github.repository }}" > /dev/null 2>&1; then
+            echo "Release $TAG exists — deleting old assets…"
+            gh release view "$TAG" --repo "${{ github.repository }}" --json assets -q '.assets[].name' | while read -r asset; do
+              echo "  Deleting: $asset"
+              gh release delete-asset "$TAG" "$asset" --repo "${{ github.repository }}" --yes
+            done
+          else
+            echo "No existing release for $TAG — nothing to clean up."
+          fi
+
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.value }}
           name: "XOPTrader ${{ steps.tag.outputs.value }}"
+          make_latest: true
+          fail_on_unmatched_files: false
           body: |
             ## XOPTrader ${{ steps.tag.outputs.value }}
 
@@ -522,9 +533,7 @@ jobs:
             | File | Description |
             |------|-------------|
             | `XOPTrader-${{ steps.version.outputs.slug }}.zip` | **Full release bundle** — all artifacts inside `RELEASE/XOPTrader-${{ steps.version.outputs.slug }}/` |
-            | `xop_trader-installer-windows-x64-${{ steps.tag.outputs.value }}.exe` | **Windows installer** — prompts to create desktop shortcut |
-            | `xop_trader-gui-windows-x64-${{ steps.tag.outputs.value }}.exe` | Windows GUI standalone binary (no installer) |
-            | `xop_trader-windows-x64-${{ steps.tag.outputs.value }}.exe` | C++ engine — Windows 64-bit |
+            | `xop_trader-installer-windows-x64-${{ steps.tag.outputs.value }}.exe` | **Windows installer** — installs everything + creates desktop shortcut |
             | `xop_trader-linux-bundle-${{ steps.tag.outputs.value }}.tar.gz` | **Linux bundle** — GUI binary + icon + `.desktop` + `install.sh` |
             | `xop_trader-gui-linux-x64-${{ steps.tag.outputs.value }}` | Linux GUI standalone binary (no installer) |
             | `xop_trader-linux-x64-${{ steps.tag.outputs.value }}` | C++ engine — Ubuntu 22.04 x86-64 |
