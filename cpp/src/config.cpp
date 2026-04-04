@@ -1104,6 +1104,11 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("cross_bridge_min_edge_bps",      cfg.cross_bridge_min_edge_bps);
     read_dbl ("bridge_cost_bps",                cfg.bridge_cost_bps);
 
+    // Crossed-book (intra-DEX)
+    read_bool("crossed_book_enabled",           cfg.crossed_book_enabled);
+    read_dbl ("crossed_book_min_edge_bps",      cfg.crossed_book_min_edge_bps);
+    read_dbl ("crossed_book_max_take_xch",      cfg.crossed_book_max_take_xch, 0.001);
+
     // General
     read_dbl ("max_position_size",              cfg.max_position_size, 0.001);
     read_dbl ("default_confidence",             cfg.default_confidence, 0.01);
@@ -1393,6 +1398,9 @@ void log_config_summary(const AppConfig& cfg)
         << "  tri_min_profit_bps   = " << cfg.arbitrage.triangular_min_profit_bps << "\n"
         << "  tri_slippage_bps     = " << cfg.arbitrage.triangular_slippage_bps << "\n"
         << "  tri_fee_bps/leg      = " << cfg.arbitrage.triangular_per_leg_fee_bps << "\n"
+        << "  crossed_book         = " << (cfg.arbitrage.crossed_book_enabled ? "true" : "false") << "\n"
+        << "  crossed_min_edge_bps = " << cfg.arbitrage.crossed_book_min_edge_bps << "\n"
+        << "  crossed_max_take_xch = " << cfg.arbitrage.crossed_book_max_take_xch << "\n"
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
         << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
 

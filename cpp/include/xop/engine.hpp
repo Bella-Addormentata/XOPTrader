@@ -302,9 +302,11 @@ private:
     /// [T2-09] Captures actual wallet offer IDs and persists to DB.
     boost::asio::awaitable<void> step_manage_offers(BlockHeight block_height);
 
-    /// Step 9: Scan for CEX-DEX, cross-DEX, triangular, and cross-bridge
-    /// arbitrage opportunities.
-    void step_check_arbitrage(BlockHeight block_height);
+    /// Step 9: Scan for CEX-DEX, cross-DEX, triangular, cross-bridge, and
+    /// crossed-book arbitrage opportunities.  Takes crossed-book offers
+    /// when profitable (Dexie has no matching engine).
+    /// [T9-01] Coroutine: co_awaits wallet take_offer for crossed books.
+    boost::asio::awaitable<void> step_check_arbitrage(BlockHeight block_height);
 
     /// Step 10: Compute inventory skew adjustments, NHE, portfolio-level
     /// netting, and statistical pairs hedging suggestions.

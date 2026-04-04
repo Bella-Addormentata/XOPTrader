@@ -376,6 +376,11 @@ struct ArbitrageSettings {
     double   cross_bridge_min_edge_bps{20.0};
     double   bridge_cost_bps{15.0};
 
+    // -- Crossed-book arbitrage (intra-DEX, Dexie has no matching engine) ----
+    bool     crossed_book_enabled{true};
+    double   crossed_book_min_edge_bps{10.0};
+    double   crossed_book_max_take_xch{5.0};
+
     // -- General parameters --------------------------------------------------
     double   max_position_size{100.0};
     double   default_confidence{0.75};

@@ -57,7 +57,8 @@ enum class ArbitrageType : std::uint8_t {
     CexDex      = 0,  // CEX vs DEX price dislocation
     CrossDex    = 1,  // dexie order book vs TibetSwap AMM
     Triangular  = 2,  // multi-hop cycle (XCH -> A -> B -> XCH)
-    CrossBridge = 3   // wUSDC (ETH) vs wUSDC.b (Base)
+    CrossBridge = 3,  // wUSDC (ETH) vs wUSDC.b (Base)
+    CrossedBook = 4   // intra-DEX crossed book (bid >= ask, no matching engine)
 };
 
 /// Human-readable label for logging and metrics.
@@ -67,6 +68,7 @@ inline const char* to_string(ArbitrageType t) noexcept {
         case ArbitrageType::CrossDex:    return "CrossDex";
         case ArbitrageType::Triangular:  return "Triangular";
         case ArbitrageType::CrossBridge: return "CrossBridge";
+        case ArbitrageType::CrossedBook: return "CrossedBook";
     }
     return "Unknown";
 }
@@ -201,6 +203,21 @@ struct ArbitrageConfig {
 
     double cross_bridge_min_edge_bps{20.0}; // Minimum edge for wUSDC vs wUSDC.b.
     double bridge_cost_bps{15.0};           // warp.green bridge round-trip cost.
+
+    // -- Crossed-book arbitrage (intra-DEX) ----------------------------------
+
+    bool   crossed_book_enabled{true};      // Enable taking crossed-book offers
+                                            //   on Dexie where bid >= ask.
+
+    double crossed_book_min_edge_bps{10.0}; // Minimum edge (bps) to take a
+                                            //   crossed-book offer.  Very low
+                                            //   threshold because both legs are
+                                            //   on the same venue — zero bridge
+                                            //   risk, atomic settlement.
+
+    double crossed_book_max_take_xch{5.0};  // Maximum XCH to risk per crossed-
+                                            //   book take per block.  Limits
+                                            //   exposure to stale-data risk.
 
     // -- General parameters --------------------------------------------------
 

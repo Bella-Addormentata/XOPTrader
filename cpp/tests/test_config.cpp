@@ -210,4 +210,41 @@ TEST(ConfigParserTest, InventoryAgingDefaults_Reasonable) {
     EXPECT_GT(ia.relax_rate_bps_per_block, 0.0);
 }
 
+// ============================================================================
+// Crossed-book arbitrage config
+// ============================================================================
+
+TEST(ConfigParserTest, ArbitrageDefaults_CrossedBook) {
+    xop::ArbitrageSettings as;
+    EXPECT_TRUE(as.crossed_book_enabled);
+    EXPECT_DOUBLE_EQ(as.crossed_book_min_edge_bps, 10.0);
+    EXPECT_DOUBLE_EQ(as.crossed_book_max_take_xch, 5.0);
+}
+
+TEST(ConfigParserTest, ArbitrageSettings_CrossedBookParsed) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+arbitrage:
+  enabled: true
+  crossed_book_enabled: true
+  crossed_book_min_edge_bps: 25.0
+  crossed_book_max_take_xch: 2.5
+)";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_TRUE(cfg.arbitrage.crossed_book_enabled);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.crossed_book_min_edge_bps, 25.0);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.crossed_book_max_take_xch, 2.5);
+}
+
+TEST(ConfigParserTest, ArbitrageSettings_CrossedBookDisabled) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+arbitrage:
+  enabled: true
+  crossed_book_enabled: false
+)";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.arbitrage.crossed_book_enabled);
+}
+
 }  // namespace

@@ -245,6 +245,9 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         arb_cfg.dexie_fee_bps             = config_.arbitrage.dexie_fee_bps;
         arb_cfg.cross_bridge_min_edge_bps = config_.arbitrage.cross_bridge_min_edge_bps;
         arb_cfg.bridge_cost_bps           = config_.arbitrage.bridge_cost_bps;
+        arb_cfg.crossed_book_enabled      = config_.arbitrage.crossed_book_enabled;
+        arb_cfg.crossed_book_min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
+        arb_cfg.crossed_book_max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
         arb_cfg.max_position_size         = config_.arbitrage.max_position_size;
         arb_cfg.default_confidence        = config_.arbitrage.default_confidence;
         arb_cfg.min_confidence_threshold  = config_.arbitrage.min_confidence_threshold;
@@ -1233,7 +1236,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                      to_string(flash_crash_state_));
     }
 
-    try { step_check_arbitrage(block_height); }
+    try { co_await step_check_arbitrage(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());
     }
@@ -1772,9 +1775,11 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // flow toxicity.
         // T3-35: is_own_fill=true -- own fills excluded from VPIN to prevent
         // self-generated order flow from inflating toxicity metrics.
-        // ISO/IEC 5055: convert mojos to base-asset units for VPIN.
+        // ISO/IEC 5055: convert mojos to base-asset display units for VPIN
+        // using the pair's actual base_mojos_per_unit (CAT=10^3, XCH=10^12).
         const double fill_volume =
-            static_cast<double>(fill.size) / static_cast<double>(kMojosPerXch);
+            static_cast<double>(fill.size)
+            / static_cast<double>(fill_pair_cfg->base_mojos_per_unit);
         market_data_->ingest_trade_for_vpin(
             fill.pair_name, fill.side, fill_volume, kIsOwnFill);
 
@@ -2347,10 +2352,37 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         // quote) as the center and apply the spread optimizer's
         // half-spread around it.  The asymmetric multipliers from whale
         // detection further decompose the spread per-side.
-        // ISO/IEC 25000: preserves the mathematical intent of the strategy.
+        //
+        // SAFETY: The A-S half-spread formula (1/kappa)*ln(1+kappa/gamma)
+        // produces an ABSOLUTE price spread that does not scale with the
+        // mid-price level.  With gamma=0.01, kappa=1.5, the raw half-
+        // spread is ~3.35 price units -- wider than the mid for any pair
+        // under ~$6.70.  When the bid gets clamped to zero (mid < hs),
+        // the naive average (0 + ask)/2 pushes the reservation mid FAR
+        // above the market (e.g. 2.17 for a 0.99 pair), causing all
+        // tiers to be priced at 2x+ market and the asks to pass the
+        // order-book guard.  Clamp the reservation mid to within
+        // kMaxReservationDeviationPct of the market mid so the
+        // inventory skew is preserved but the center stays realistic.
+        // ISO/IEC 5055: bounded output prevents pathological mispricing.
         double mid = market_data_->get_mid_price(pair_name);
         double reservation_mid = (pcs.raw_quote.bid_price
                                 + pcs.raw_quote.ask_price) / 2.0;
+
+        // Clamp reservation mid: preserve inventory skew but prevent the
+        // A-S absolute-spread pathology from shifting the quote center.
+        constexpr double kMaxReservationDeviationPct = 0.02;  // 2%
+        const double max_dev = mid * kMaxReservationDeviationPct;
+        if (std::abs(reservation_mid - mid) > max_dev) {
+            const double clamped = std::clamp(
+                reservation_mid, mid - max_dev, mid + max_dev);
+            spdlog::info("[Engine] Step 6: {} reservation_mid clamped "
+                         "{:.6f} -> {:.6f} (market mid={:.6f}, max dev={:.1f}%)",
+                         pair_name, reservation_mid, clamped,
+                         mid, kMaxReservationDeviationPct * 100.0);
+            reservation_mid = clamped;
+        }
+
         double half_spread = pcs.spread_result.half_spread / 10000.0 * mid;
 
         // Apply per-side asymmetric widening from whale/OFI analysis.
@@ -2359,15 +2391,21 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         double ask_half = half_spread * asym.ask_multiplier;
 
         // ISO/IEC 5055: round instead of truncate for price/size conversions.
+        // Prices use kMojosPerXch as a uniform fixed-point scaling factor
+        // (consistent with build_offer_dict which undoes this scaling).
+        // Sizes use the pair's actual base_mojos_per_unit (XCH=10^12,
+        // CAT=10^3) since they represent real on-chain mojo amounts.
         Quote quote;
         quote.bid_price  = static_cast<Mojo>(std::llround(
             (reservation_mid - bid_half) * static_cast<double>(kMojosPerXch)));
         quote.ask_price  = static_cast<Mojo>(std::llround(
             (reservation_mid + ask_half) * static_cast<double>(kMojosPerXch)));
         quote.bid_size   = static_cast<Mojo>(std::llround(
-            pcs.raw_quote.bid_size * static_cast<double>(kMojosPerXch)));
+            pcs.raw_quote.bid_size
+            * static_cast<double>(pair_cfg->base_mojos_per_unit)));
         quote.ask_size   = static_cast<Mojo>(std::llround(
-            pcs.raw_quote.ask_size * static_cast<double>(kMojosPerXch)));
+            pcs.raw_quote.ask_size
+            * static_cast<double>(pair_cfg->base_mojos_per_unit)));
         quote.spread_bps = pcs.spread_result.total_spread_bps;
 
         // Enforce never-sell-at-loss on the ask price.
@@ -2679,8 +2717,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
         auto& liq = *liq_it->second;
 
-        // Mid-price in mojos.
-        Mojo mid_mojos = (pcs.risk_quote.bid_price + pcs.risk_quote.ask_price) / 2;
+        // Mid-price in mojos: use the market mid-price rather than the
+        // risk_quote average, which inherits the A-S reservation price
+        // skew.  The LiquidityEngine builds tiers symmetrically around
+        // this center; the reservation skew was already applied to the
+        // risk_quote sizes (bid_size / ask_size) in Step 6.
+        const double market_mid = market_data_->get_mid_price(pair_name);
+        Mojo mid_mojos = static_cast<Mojo>(std::llround(
+            market_mid * static_cast<double>(kMojosPerXch)));
 
         // Volatility.
         double sigma = 0.0;
@@ -3084,8 +3128,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // -- T4-03: Fee-vs-gain gating per tier ------------------------------
         // Estimate expected gain for each tier and filter out tiers where
         // the fee exceeds the configured ratio of expected gain.
-        // mid_price for the gain calculation.
-        const Mojo mid = (pcs.risk_quote.bid_price + pcs.risk_quote.ask_price) / 2;
+        // Use market mid for the gain calculation (avoids A-S skew bias).
+        const Mojo mid = static_cast<Mojo>(std::llround(
+            market_data_->get_mid_price(pair_name)
+            * static_cast<double>(kMojosPerXch)));
 
         std::vector<TierQuote> fee_filtered_tiers;
         if (fee_tracker_->enabled() && mid > 0) {
@@ -3243,7 +3289,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // Record rebalance baseline so the LiquidityEngine can evaluate
         // future rebalance triggers.
         auto& liq = *liquidity_engines_[pair_name];
-        Mojo mid_mojos = (pcs.risk_quote.bid_price + pcs.risk_quote.ask_price) / 2;
+        Mojo mid_mojos = static_cast<Mojo>(std::llround(
+            market_data_->get_mid_price(pair_name)
+            * static_cast<double>(kMojosPerXch)));
         double inv_ratio = 0.5;
         if (pair_cfg) {
             inv_ratio = inventory_->inventory_ratio(
@@ -3291,12 +3339,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     co_return;
 }
 
-// Step 9: Check arbitrage opportunities.
-void Engine::step_check_arbitrage([[maybe_unused]] BlockHeight block_height)
+// Step 9: Check arbitrage opportunities + execute crossed-book takes.
+// [T9-01] Now a coroutine: co_awaits dexie + wallet RPCs for crossed-book arb.
+asio::awaitable<void> Engine::step_check_arbitrage(
+    [[maybe_unused]] BlockHeight block_height)
 {
     // -- 9a: Legacy MarketDataFeed CEX-DEX signal check ----------------------
-    // The MarketDataFeed emits ArbitrageSignals for CEX-DEX divergences
-    // detected during step 1.  Log them for visibility.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
@@ -3312,65 +3360,214 @@ void Engine::step_check_arbitrage([[maybe_unused]] BlockHeight block_height)
     }
 
     // -- 9b: Full ArbitrageDetector scan -------------------------------------
-    // Feed current mid-prices and depth from this block's market data into
-    // the detector, then run all scans (CEX-DEX, cross-DEX, triangular,
-    // cross-bridge).
-    if (!config_.arbitrage.enabled || !arb_detector_) {
-        return;
-    }
+    if (config_.arbitrage.enabled && arb_detector_) {
+        PairPriceMap pair_prices;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            auto it = cycle_.find(pair.name);
+            if (it == cycle_.end() || !it->second.market_data_valid) continue;
+            const double mid = market_data_->get_mid_price(pair.name);
+            if (mid > 0.0) {
+                pair_prices[pair.name] = mid;
+            }
+        }
 
-    // Build pair-price map from the current cycle state.
-    // Depth data is not yet available from MarketDataFeed (Phase 2), so
-    // the depth map stays empty — scan_triangular will use its fallback
-    // max_position_size cap.
-    PairPriceMap pair_prices;
-    for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
+        if (!pair_prices.empty()) {
+            arb_detector_->set_pair_prices(pair_prices);
+            auto opportunities = arb_detector_->scan_all();
 
-        auto it = cycle_.find(pair.name);
-        if (it == cycle_.end() || !it->second.market_data_valid) continue;
-
-        // Get mid-price from the market data feed (double, quote-per-base).
-        const double mid = market_data_->get_mid_price(pair.name);
-        if (mid > 0.0) {
-            pair_prices[pair.name] = mid;
+            if (!opportunities.empty()) {
+                spdlog::info("[Engine] Step 9: {} arbitrage opportunities "
+                             "detected (block {})",
+                             opportunities.size(), block_height);
+                for (const auto& opp : opportunities) {
+                    spdlog::info("[Engine] Step 9: {} | edge={:.1f}bps "
+                                 "profit={:.6f} conf={:.3f} urgency={}blk | {}",
+                                 to_string(opp.type), opp.edge_bps,
+                                 opp.estimated_profit, opp.confidence,
+                                 opp.urgency_blocks, opp.description);
+                }
+            } else {
+                spdlog::debug("[Engine] Step 9: no arbitrage opportunities "
+                              "detected (block {})", block_height);
+            }
         }
     }
 
-    if (pair_prices.empty()) {
-        return;  // no valid market data this block
+    // -- 9c: Crossed-book arbitrage (intra-DEX offer taking) -----------------
+    // Dexie has no matching engine, so crossed books (bid >= ask) are normal.
+    // When we detect a cross, we can take the cheap ask offer for an instant
+    // profit equal to (bid - ask) minus blockchain fee.
+    //
+    // Flow:
+    //   1. For each pair, check if competing offers show bid >= ask
+    //   2. Identify the cheapest ask offers inside the cross
+    //   3. Fetch full offer text (bech32m) from Dexie
+    //   4. Take the offer via wallet RPC (atomic swap)
+    //
+    // Guards: dry-run mode, fee budget, max take size, wallet circuit breaker.
+
+    if (!config_.arbitrage.enabled ||
+        !config_.arbitrage.crossed_book_enabled ||
+        !dexie_ || !wallet_) {
+        co_return;
     }
 
-    // Feed data to detector.
-    arb_detector_->set_pair_prices(pair_prices);
-    // Depth data: Phase 2 will populate pair depths from dexie order book
-    // snapshots for liquidity-aware sizing.  For now the detector falls
-    // back to the max_position_size cap.
-
-    // Run all scans.
-    auto opportunities = arb_detector_->scan_all();
-
-    if (opportunities.empty()) {
-        spdlog::debug("[Engine] Step 9: no arbitrage opportunities detected "
-                      "(block {})", block_height);
-        return;
+    if (dry_run_) {
+        // In dry-run mode we still detect and log crossed-book opportunities.
     }
 
-    // Log all detected opportunities.
-    spdlog::info("[Engine] Step 9: {} arbitrage opportunities detected "
-                 "(block {})", opportunities.size(), block_height);
-
-    for (const auto& opp : opportunities) {
-        spdlog::info("[Engine] Step 9: {} | edge={:.1f}bps "
-                     "profit={:.6f} conf={:.3f} urgency={}blk | {}",
-                     to_string(opp.type), opp.edge_bps,
-                     opp.estimated_profit, opp.confidence,
-                     opp.urgency_blocks, opp.description);
-
-        // Phase 2: execute the arbitrage trade.
-        // TODO: ArbitrageExecutor that takes the top opportunity and
-        //       constructs + submits the multi-leg spend bundle.
+    if (wallet_circuit_open_) {
+        spdlog::debug("[Engine] Step 9c: crossed-book SKIPPED -- wallet "
+                      "circuit breaker open");
+        co_return;
     }
+
+    const double min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
+    const double max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
+
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+
+        // Get the competing offers (already fetched in Step 1).
+        auto comp_offers = market_data_->get_competing_offers(pair.name);
+        if (comp_offers.empty()) continue;
+
+        // Find best (highest) bid and best (lowest) ask from competing offers.
+        Mojo best_bid_price = 0;
+        Mojo best_ask_price = std::numeric_limits<Mojo>::max();
+        std::string best_ask_offer_id;
+        Mojo best_ask_size = 0;
+
+        for (const auto& co : comp_offers) {
+            if (co.side == Side::Bid && co.price > best_bid_price) {
+                best_bid_price = co.price;
+            }
+            if (co.side == Side::Ask && co.price < best_ask_price) {
+                best_ask_price = co.price;
+                best_ask_offer_id = co.offer_id;
+                best_ask_size = co.size;
+            }
+        }
+
+        // No two-sided market → nothing to cross.
+        if (best_bid_price == 0 ||
+            best_ask_price == std::numeric_limits<Mojo>::max()) {
+            continue;
+        }
+
+        // Not crossed → no opportunity.
+        if (best_bid_price < best_ask_price) continue;
+
+        // Compute edge in basis points.
+        const double ask_d = static_cast<double>(best_ask_price);
+        const double bid_d = static_cast<double>(best_bid_price);
+        const double edge_bps = (bid_d - ask_d) / ask_d * 10000.0;
+
+        if (edge_bps < min_edge_bps) {
+            spdlog::debug("[Engine] Step 9c: {} crossed book edge={:.1f}bps "
+                          "< min={:.1f}bps -- skipping",
+                          pair.name, edge_bps, min_edge_bps);
+            continue;
+        }
+
+        // Cap the take size.
+        const Mojo max_take_mojos = static_cast<Mojo>(
+            max_take_xch * static_cast<double>(kMojosPerXch));
+        const Mojo take_size = std::min(best_ask_size, max_take_mojos);
+
+        spdlog::info("[Engine] Step 9c: {} CROSSED BOOK detected -- "
+                     "bid={} ask={} edge={:.1f}bps offer_id={} size={}",
+                     pair.name, best_bid_price, best_ask_price,
+                     edge_bps, best_ask_offer_id.substr(0, 12), take_size);
+
+        if (dry_run_) {
+            spdlog::info("[Engine] Step 9c: {} DRY RUN -- would take offer "
+                         "{} for {} mojos",
+                         pair.name, best_ask_offer_id.substr(0, 12),
+                         take_size);
+            continue;
+        }
+
+        // Fetch the full offer text (bech32m) from Dexie.
+        // The competing-offers fetch uses compact=true which omits the text.
+        try {
+            auto offer_status =
+                co_await dexie_->get_offer_status(best_ask_offer_id);
+
+            if (!offer_status.success ||
+                offer_status.offer.offer_bech32.empty()) {
+                spdlog::warn("[Engine] Step 9c: {} failed to fetch offer "
+                             "text for {} -- skipping",
+                             pair.name, best_ask_offer_id.substr(0, 12));
+                continue;
+            }
+
+            // Verify offer is still active (status 0 = active on Dexie).
+            if (offer_status.offer.status != 0) {
+                spdlog::info("[Engine] Step 9c: {} offer {} no longer active "
+                             "(status={}) -- skipping",
+                             pair.name, best_ask_offer_id.substr(0, 12),
+                             offer_status.offer.status);
+                continue;
+            }
+
+            // Determine fee from the FeeTracker.
+            const std::uint64_t fee = fee_tracker_
+                ? fee_tracker_->get_recommended_fee(
+                      config_.fees.min_fee_mojos, block_height)
+                : config_.fees.min_fee_mojos;
+
+            spdlog::info("[Engine] Step 9c: {} TAKING crossed-book offer "
+                         "{} (edge={:.1f}bps, size={}, fee={})",
+                         pair.name, best_ask_offer_id.substr(0, 12),
+                         edge_bps, take_size, fee);
+
+            // Take the offer via wallet RPC (atomic swap).
+            auto result = co_await wallet_->take_offer(
+                offer_status.offer.offer_bech32, fee);
+
+            if (result.contains("success") &&
+                result["success"].get<bool>()) {
+                const std::string trade_id =
+                    result.contains("trade_record") &&
+                    result["trade_record"].contains("trade_id")
+                    ? result["trade_record"]["trade_id"].get<std::string>()
+                    : "unknown";
+
+                spdlog::info("[Engine] Step 9c: {} TOOK crossed-book offer "
+                             "-- trade_id={} edge={:.1f}bps size={}",
+                             pair.name, trade_id.substr(0, 12),
+                             edge_bps, take_size);
+
+                // Record the fee spend.
+                if (fee_tracker_) {
+                    fee_tracker_->record_fee(fee, block_height);
+                }
+
+                // Alert for visibility.
+                if (alerts_) {
+                    alerts_->send_alert(
+                        AlertRule::ArbitrageDetected,
+                        pair.name + " crossed-book arb TAKEN: edge=" +
+                        std::to_string(edge_bps) + "bps size=" +
+                        std::to_string(take_size) + " mojos");
+                }
+            } else {
+                const std::string err = result.contains("error")
+                    ? result["error"].get<std::string>()
+                    : "unknown error";
+                spdlog::warn("[Engine] Step 9c: {} take_offer failed: {}",
+                             pair.name, err);
+            }
+
+        } catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 9c: {} crossed-book take failed: {}",
+                          pair.name, e.what());
+        }
+    }
+
+    co_return;
 }
 
 // Step 10: Run hedging layer (compute skew, NHE).

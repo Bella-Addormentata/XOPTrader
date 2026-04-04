@@ -303,13 +303,16 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                                    double             best_ask,
                                    double             last_trade,
                                    double             vol_24h) {
-    // Reject crossed-book data: bid >= ask produces nonsensical mid-prices.
-    // Both sides must be positive (non-zero) for the check to apply; a zero
-    // price indicates the side was absent from the book.
+    // Dexie is a peer-to-peer atomic-swap marketplace with NO matching
+    // engine, so crossed books (bid >= ask) occur naturally when there
+    // are un-taken offers on both sides.  Unlike a centralised exchange,
+    // this does NOT indicate bad data — it just means no one has taken
+    // the arbitrage yet.  Accept the data and let the price guard in
+    // Step 7 clamp our offers safely outside the cross.
     if (best_bid > 0.0 && best_ask > 0.0 && best_bid >= best_ask) {
-        spdlog::warn("[MarketData] Crossed book for {}: bid={} >= ask={}",
+        spdlog::info("[MarketData] Crossed book for {}: bid={:.6f} >= "
+                     "ask={:.6f} (normal on Dexie — no matching engine)",
                      pair_name, best_bid, best_ask);
-        return;  // Discard this snapshot entirely.
     }
 
     std::unique_lock lock(mtx_pairs_);
@@ -726,11 +729,12 @@ double MarketDataFeed::compute_spread_bps(double best_bid, double best_ask) {
         return 0.0;
     }
 
-    // Guard against crossed book (ask < bid), which should not occur in
-    // practice but we handle defensively.
+    // Crossed book on Dexie is normal (no matching engine).  Report as
+    // zero spread since a negative spread has no useful meaning.
     if (best_ask <= best_bid) {
-        spdlog::warn("compute_spread_bps: crossed book bid={:.6f} ask={:.6f}",
-                     best_bid, best_ask);
+        spdlog::debug("compute_spread_bps: crossed book bid={:.6f} ask={:.6f}"
+                      " -- returning 0",
+                      best_bid, best_ask);
         return 0.0;
     }
 

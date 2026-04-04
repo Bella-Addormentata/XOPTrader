@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.6] — 2026-04-04
+
+### Fixed
+
+- **Critical — CAT offer size inflation (10⁹×)**: Step 6 converted GLFT display-unit sizes to mojos using `kMojosPerXch` (10¹²) instead of `pair_cfg->base_mojos_per_unit` (10³ for CAT tokens). BYC offers posted with ~2.38 billion units instead of ~2.38. Fixed by using correct per-pair mojos denominator
+- **Critical — Reservation mid-price runaway**: Avellaneda-Stoikov formula produced absolute half-spread of ~3.35 price units regardless of price level. For BYC at $0.99, reservation_mid inflated to 2.17× market. Added 2% max-deviation clamp on reservation_mid from market mid
+- **VPIN fill volume conversion**: Same `kMojosPerXch` vs `base_mojos_per_unit` bug in VPIN fill volume tracking inflated volume metrics by 10⁹× for CAT pairs
+- **Steps 7/8 mid-price source**: Tier ladder and no-loss checks now use market mid directly instead of deriving from skewed risk_quote, preventing A-S inventory skew from distorting order placement
+
+### Added
+
+- **Crossed-book arbitrage taking**: Detects and takes profitable crossed-book opportunities on Dexie (peer-to-peer DEX with no matching engine). New `ArbitrageType::CrossedBook` with configurable min edge (bps) and max take size (XCH)
+- **Dexie crossed-book data acceptance**: `ingest_dexie()` no longer discards order book data when bid > ask, which is normal for unmatched P2P offers
+
 ## [0.5.5] — 2026-04-03
 
 ### Added

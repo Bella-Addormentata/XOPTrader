@@ -223,6 +223,11 @@ arbitrage:
   cross_bridge_min_edge_bps: 20         # Min divergence for same-underlying arb
   bridge_cost_bps: 15                   # warp.green bridge round-trip cost
 
+  # Crossed-book arb (intra-DEX, Dexie has no matching engine)
+  crossed_book_enabled: true            # Take crossed-book offers for instant profit
+  crossed_book_min_edge_bps: 10         # Min edge in bps (low: zero bridge risk)
+  crossed_book_max_take_xch: 5.0        # Max XCH to risk per take per block
+
   # General
   max_position_size: 100                # Max base-asset units per arb trade
   default_confidence: 0.75              # Base confidence when depth unknown
