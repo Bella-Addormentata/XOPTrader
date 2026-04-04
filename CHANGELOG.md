@@ -5,6 +5,27 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.5] — 2026-04-03
+
+### Added
+
+- **AMM-aware mid-price blending**: 3-source mid-price computation (DEX 70% + CEX 30% + AMM 15%) with freshness-weighted re-normalisation. TibetSwap implied price feeds via `ingest_amm_mid()` so the engine tracks AMM fair value in real time
+- **Order-book gap detection**: `analyse_order_book_gaps()` scans competing offers for underserved price ranges per-side, returning gaps sorted by width for dynamic tier placement
+- **Dynamic gap-aware tier spacing**: new `compute_ladder()` overload shifts tier spacing toward detected gaps in the competing order book, with configurable blend factor and ascending-constraint enforcement
+- **Adverse-selection-aware tier sizing**: inverse-decay weighting shrinks tier 0 (most vulnerable to informed traders on Chia's 52s blocks) and redistributes capital to outer tiers. Extra-conservative sizing under high volatility
+- **Dexie price inversion fix**: Dexie API returns prices as "XCH per CAT" but the engine expected "CAT per XCH". Added inversion + bid/ask swap in `get_ticker()` to produce correct mid-price
+- **16 new liquidity tests**: `test_liquidity.cpp` covering gap detection, adverse-selection sizing, gap-aware spacing, AMM mid-price blending, and edge cases
+- 8 new config fields: `gap_aware_spacing`, `min_gap_bps`, `max_gap_scan_bps`, `gap_blend_factor`, `adverse_selection_sizing`, `adverse_selection_decay`, `adverse_selection_sigma_threshold`, `amm_blend_weight`
+
+### Fixed
+
+- **Critical — No-book guard bypass**: When Dexie returned no quotes (bid=0, ask=0), the order-book price guard silently skipped, allowing offers through without any market reference. Now clears the ladder entirely when no book reference exists
+- **Critical — Missing final sanity check**: Tiers with non-positive prices could survive all adjustments. Added remove_if sweep dropping any tier with price ≤ 0
+- **High — No-loss bypass after price guard clamp**: Price guard could clamp an ASK below cost basis, negating the `enforce_no_loss` from step 6. Added post-clamp re-check that drops ASK tiers violating the cost-basis + margin floor
+- **High — Degenerate adverse-selection sizing**: Floating-point edge cases (NaN/Inf/underflow) in tier sizing normalization. Added `isfinite` validation with fallback to baseline config
+- **Gap-aware spacing side-overwrite bug**: Per-side `for(side : {Bid, Ask})` loop mutated shared `tier_spacing_bps` — Ask overwrote Bid adjustments. Fixed by merging gap centers from both sides into one pass
+- Order-book price guard added: clamps BID ≤ dex_best_ask and ASK ≥ dex_best_bid to prevent crossing the existing spread
+
 ## [0.5.4] — 2026-04-03
 
 ### Fixed

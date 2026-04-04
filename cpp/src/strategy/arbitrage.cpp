@@ -1023,6 +1023,12 @@ bool ArbitrageDetector::tibetswap_fee_changed() const noexcept
     return tibetswap_fee_changed_;
 }
 
+const std::vector<TibetSwapReserves>&
+ArbitrageDetector::get_tibetswap_reserves() const noexcept
+{
+    return cached_tibetswap_reserves_;
+}
+
 void ArbitrageDetector::set_pair_prices(const PairPriceMap& prices)
 {
     cached_pair_prices_ = prices;

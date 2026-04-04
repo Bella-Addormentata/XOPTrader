@@ -123,6 +123,27 @@ strategy:
   # Default 20 blocks (~17 min).  0 = disabled.
   reconciliation_interval_blocks: 20     # [OPTIONAL, default: 20]
 
+  # -- Gap-aware dynamic tier spacing --
+  # Analyses the competing order book for price gaps and shifts tier
+  # spacing toward underserved ranges.  Captures spread competitors miss.
+  gap_aware_spacing: true              # [OPTIONAL, default: true]  Enable/disable
+  min_gap_bps: 50.0                    # [OPTIONAL, default: 50]    Min gap width to target
+  max_gap_scan_bps: 1500.0             # [OPTIONAL, default: 1500]  Max scan distance from mid
+  gap_blend_factor: 0.6                # [OPTIONAL, default: 0.6]   0=baseline, 1=full gap shift
+
+  # -- Adverse-selection-aware tier sizing --
+  # On slow blockchains (Chia ~52 s/block), tier 0 (tightest) is most
+  # vulnerable to informed traders.  This reduces inner-tier size and
+  # redistributes capital to safer outer tiers.
+  adverse_selection_sizing: true       # [OPTIONAL, default: true]  Enable/disable
+  adverse_selection_decay: 0.7         # [OPTIONAL, default: 0.7]   Lower = more outer-heavy
+  adverse_selection_sigma_threshold: 0.05  # [OPTIONAL, default: 0.05] Halve decay above this vol
+
+  # -- AMM blend weight --
+  # Weight of TibetSwap AMM implied price in mid-price blend.
+  # Anchors quotes to the AMM to prevent cross-venue arbitrage.
+  amm_blend_weight: 0.15               # [OPTIONAL, default: 0.15]  0 = disable AMM blending
+
 # --- risk: REQUIRED ----------------------------------------------------------
 # First 5 fields are REQUIRED; circuit breaker fields are OPTIONAL.
 risk:

@@ -215,6 +215,17 @@ struct MarketDataConfig {
     ///   w_cex = kCexWeight * max(0, 1 - age_sec / cex_freshness_threshold_sec)
     /// Default 120 s.  0 = disable freshness weighting (legacy fixed blend).
     double cex_freshness_threshold_sec{120.0};
+
+    /// Weight of the AMM implied price in the three-source blend.
+    /// When AMM data is available, the blend becomes:
+    ///   mid = w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid
+    /// with weights re-normalised to sum to 1.0.
+    /// Default 0.15 (15%).  0 = disable AMM blending.
+    double amm_blend_weight{0.15};
+
+    /// Maximum staleness (seconds) of AMM data before it is ignored.
+    /// Default 300 s (5 min).  0 = disable freshness check.
+    double amm_freshness_threshold_sec{300.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -233,6 +244,10 @@ struct PairState {
     double      dex_last_trade{0.0};// Most recent trade price on dexie
     double      volume_24h{0.0};    // Rolling 24-hour volume (base asset units)
     Timestamp   dex_updated_at{};   // When dexie data was last refreshed
+
+    // --- AMM reference (TibetSwap implied price) ---
+    double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)
+    Timestamp   amm_updated_at{};   // When AMM data was last refreshed
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
@@ -357,6 +372,12 @@ public:
     void ingest_cex_reference(const std::string& pair_name,
                               double             cex_mid);
 
+    /// Ingest the TibetSwap AMM implied mid-price for a pair.
+    /// The implied price is computed from pool reserves: output_reserve / input_reserve.
+    /// @param pair_name  Trading pair identifier.
+    /// @param amm_mid    AMM implied mid-price (quote per base).
+    void ingest_amm_mid(const std::string& pair_name, double amm_mid);
+
     // -- Typed accessors (thread-safe reads) --------------------------------
 
     /// Best available mid-price for a pair.
@@ -416,6 +437,12 @@ public:
     /// Total number of competing offers (both sides) for a pair.
     /// Returns 0 if competitor tracking is disabled or no competitors exist.
     std::size_t get_num_competing_offers(const std::string& pair_name) const;
+
+    /// Retrieve a snapshot of all competing offers for a pair.
+    /// Used by gap-detection logic to find uncovered price ranges.
+    /// Returns empty vector if competitor tracking is disabled.
+    std::vector<CompetingOffer> get_competing_offers(
+        const std::string& pair_name) const;
 
     // -- Arbitrage signal access --------------------------------------------
 

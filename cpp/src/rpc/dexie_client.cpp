@@ -786,6 +786,25 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
         co_return std::nullopt;
     }
 
+    // --- Price-direction helper ---
+    // Dexie markets are always denominated in XCH: the JSON key in
+    // markets["xch"] is the denomination currency, and each array entry
+    // is a CAT token.  Prices are "XCH per CAT" (denomination per token).
+    //
+    // Our pair convention is quote-per-base.  Two cases arise:
+    //
+    //  (A) base_asset_id matches the JSON key  (e.g. pair XCH/wUSDC.b)
+    //      → raw prices are base-per-quote (XCH per CAT) — reciprocal
+    //        of what we need.  Invert and swap bid/ask.
+    //
+    //  (B) quote_asset_id matches the JSON key  (e.g. pair wUSDC.b/XCH)
+    //      → raw prices are quote-per-base (XCH per CAT) — already the
+    //        correct direction.  No inversion needed.
+    auto invert_price = [](double v) -> double {
+        return v > 0.0 ? (1.0 / v) : 0.0;
+    };
+
+    // --- Case (A): base_asset_id == JSON key → invert ---
     for (const auto& [base_asset, market_array] : json["markets"].items()) {
         if (base_asset != base_asset_id) {
             continue;
@@ -796,16 +815,30 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
         for (const auto& m : market_array) {
             if (m.value("id", "") == quote_asset_id) {
                 auto td = parse_ticker_(m, base_asset);
-                log_->info("get_ticker -> found {} ({})", td.code, td.pair_id);
+
+                const double raw_buy  = td.price_buy;
+                const double raw_sell = td.price_sell;
+                const double raw_high = td.price_high;
+                const double raw_low  = td.price_low;
+
+                td.price_buy  = invert_price(raw_sell);
+                td.price_sell = invert_price(raw_buy);
+                td.price_last = invert_price(td.price_last);
+                td.price_high = invert_price(raw_low);
+                td.price_low  = invert_price(raw_high);
+
+                log_->info("get_ticker -> found {} ({}) [inverted: "
+                           "raw_buy={:.6f} raw_sell={:.6f} -> "
+                           "buy={:.6f} sell={:.6f}]",
+                           td.code, td.pair_id,
+                           raw_buy, raw_sell,
+                           td.price_buy, td.price_sell);
                 co_return td;
             }
         }
     }
 
-    // Some Dexie markets are only published in the opposite orientation
-    // (for example XCH/<CAT> when the configured pair is <CAT>/XCH).
-    // When we find the reverse market, invert the price fields so callers
-    // still receive values in the configured base/quote direction.
+    // --- Case (B): quote_asset_id == JSON key → direct (no inversion) ---
     for (const auto& [base_asset, market_array] : json["markets"].items()) {
         if (base_asset != quote_asset_id) {
             continue;
@@ -819,22 +852,7 @@ asio::awaitable<std::optional<TickerData>> DexieClient::get_ticker(
             }
 
             auto td = parse_ticker_(m, base_asset);
-            auto invert_price = [](double value) {
-                return value > 0.0 ? (1.0 / value) : 0.0;
-            };
-
-            const double reverse_buy = td.price_buy;
-            const double reverse_sell = td.price_sell;
-            const double reverse_high = td.price_high;
-            const double reverse_low = td.price_low;
-
-            td.price_buy = invert_price(reverse_sell);
-            td.price_sell = invert_price(reverse_buy);
-            td.price_last = invert_price(td.price_last);
-            td.price_high = invert_price(reverse_low);
-            td.price_low = invert_price(reverse_high);
-
-            log_->info("get_ticker -> found reverse market {} ({})",
+            log_->info("get_ticker -> found direct market {} ({})",
                        td.code, td.pair_id);
             co_return td;
         }

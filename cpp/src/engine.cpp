@@ -136,6 +136,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     md_cfg.competitor_alert_threshold_bps = config_.market_data.competitor_alert_threshold_bps;
     md_cfg.asymmetric_skew_factor       = config_.market_data.asymmetric_skew_factor;
     md_cfg.cex_freshness_threshold_sec  = config_.market_data.cex_freshness_threshold_sec;
+    md_cfg.amm_blend_weight             = config_.strategy.amm_blend_weight;
+    md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -204,6 +206,18 @@ Engine::Engine(const AppConfig& config, bool dry_run)
             pair.tier_size_pct_override.value_or(
                 config_.strategy.tier_size_pct);
         liq_cfg.offer_ttl_blocks = config_.strategy.offer_ttl_blocks;
+
+        // Gap-aware dynamic tier spacing.
+        liq_cfg.gap_aware_spacing  = config_.strategy.gap_aware_spacing;
+        liq_cfg.min_gap_bps        = config_.strategy.min_gap_bps;
+        liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
+        liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
+
+        // Adverse-selection-aware tier sizing.
+        liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
+        liq_cfg.adverse_selection_decay            = config_.strategy.adverse_selection_decay;
+        liq_cfg.adverse_selection_sigma_threshold  = config_.strategy.adverse_selection_sigma_threshold;
+
         liquidity_engines_[pair.name] =
             std::make_unique<LiquidityEngine>(pair.name, liq_cfg);
     }
@@ -1444,6 +1458,32 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             }
         }
 
+        // -- TibetSwap AMM implied mid-price ---------------------------------
+        // Derive the AMM implied mid-price from cached TibetSwap pool
+        // reserves using the constant-product formula.  When available, the
+        // market data feed blends this into its composite mid-price to
+        // anchor our quotes and prevent the AMM from arbitraging us.
+        if (arb_detector_) {
+            const auto& reserves = arb_detector_->get_tibetswap_reserves();
+            for (const auto& pool : reserves) {
+                if (pool.pair_name == pair.name
+                    && pool.xch_reserve > 0.0
+                    && pool.token_reserve > 0.0)
+                {
+                    const double amm_implied =
+                        tibet::get_implied_price(pool.xch_reserve,
+                                                 pool.token_reserve);
+                    if (amm_implied > 0.0) {
+                        market_data_->ingest_amm_mid(pair.name, amm_implied);
+                        spdlog::debug("[Engine] Step 1: {} Tibet AMM "
+                                      "implied_mid={:.6f}",
+                                      pair.name, amm_implied);
+                    }
+                    break;
+                }
+            }
+        }
+
         // [T3-24] Set the market_data_valid flag for this pair.
         // Steps 4-8 are gated on this flag; if Step 1 fails for a pair,
         // those steps will skip it rather than acting on stale data.
@@ -2663,10 +2703,136 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         Mojo avail_capital   = pcs.risk_quote.bid_size;
         Mojo avail_inventory = pcs.risk_quote.ask_size;
 
+        // Fetch competing offers for gap-aware dynamic tier spacing.
+        auto comp_offers = market_data_->get_competing_offers(pair_name);
+
         // Generate the tier ladder.
-        pcs.ladder = liq.compute_ladder(
-            mid_mojos, sigma, inv_ratio,
-            avail_capital, avail_inventory);
+        // When competing offers are available, uses the gap-aware overload
+        // that analyses the order book for gaps and applies adverse-
+        // selection-aware sizing.
+        if (!comp_offers.empty()) {
+            pcs.ladder = liq.compute_ladder(
+                mid_mojos, sigma, inv_ratio,
+                avail_capital, avail_inventory,
+                comp_offers, liq.config());
+        } else {
+            pcs.ladder = liq.compute_ladder(
+                mid_mojos, sigma, inv_ratio,
+                avail_capital, avail_inventory);
+        }
+
+        // -----------------------------------------------------------------
+        // Order-book price guard: clamp our offers so that we never post
+        // a BID above the book's best ASK or an ASK below the book's best
+        // BID.  This guarantees our most aggressive quote stays inside the
+        // existing spread rather than crossing it (which would be a gift
+        // to arbitrageurs).
+        //
+        // Guard rule:
+        //   BID price ≤ dex_best_ask   (never overpay beyond the cheapest seller)
+        //   ASK price ≥ dex_best_bid   (never undersell below the richest buyer)
+        //
+        // Tiers that violate the constraint are clamped; if a clamped tier
+        // would produce a zero or negative size it is dropped entirely.
+        // -----------------------------------------------------------------
+        const MarketSnapshot snap = state_->get_market(pair_name);
+
+        // SAFETY: When we have NO order-book reference at all (both sides
+        // zero), we cannot validate any prices.  Refuse to post offers
+        // rather than risk mispricing.
+        if (snap.best_bid <= 0 && snap.best_ask <= 0) {
+            spdlog::warn("[Engine] Step 7: {} no order-book reference "
+                         "(bid={} ask={}) -- clearing ladder to prevent "
+                         "unguarded offers", pair_name,
+                         snap.best_bid, snap.best_ask);
+            pcs.ladder.clear();
+        }
+
+        if (snap.best_bid > 0 || snap.best_ask > 0) {
+            int clamped_bids = 0;
+            int clamped_asks = 0;
+
+            for (auto& tq : pcs.ladder) {
+                if (tq.side == Side::Bid && snap.best_ask > 0) {
+                    if (tq.price > snap.best_ask) {
+                        spdlog::info("[Engine] Step 7: {} BID tier {} clamped "
+                                     "{} -> {} (dex best ask)",
+                                     pair_name, tq.tier_index,
+                                     tq.price, snap.best_ask);
+                        tq.price = snap.best_ask;
+                        ++clamped_bids;
+                    }
+                }
+                if (tq.side == Side::Ask && snap.best_bid > 0) {
+                    if (tq.price < snap.best_bid) {
+                        spdlog::info("[Engine] Step 7: {} ASK tier {} clamped "
+                                     "{} -> {} (dex best bid)",
+                                     pair_name, tq.tier_index,
+                                     tq.price, snap.best_bid);
+                        tq.price = snap.best_bid;
+                        ++clamped_asks;
+                    }
+                }
+            }
+
+            if (clamped_bids > 0 || clamped_asks > 0) {
+                spdlog::warn("[Engine] Step 7: {} order-book guard clamped "
+                             "{} bids, {} asks (book bid={} ask={})",
+                             pair_name, clamped_bids, clamped_asks,
+                             snap.best_bid, snap.best_ask);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Post-clamp no-loss re-check: The price guard may have pushed an
+        // ASK price below cost basis.  Re-apply the no-loss floor on each
+        // ASK tier and drop any that cannot meet the minimum.
+        // -----------------------------------------------------------------
+        if (pair_cfg && !pcs.ladder.empty()) {
+            auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
+            const Mojo cost_basis = rec.weighted_avg_cost_basis;
+
+            if (cost_basis > 0) {
+                const double margin = config_.strategy.min_profit_margin_bps
+                                    / 10'000.0;
+                const auto min_ask = static_cast<Mojo>(std::llround(
+                    static_cast<double>(cost_basis) * (1.0 + margin)));
+
+                auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
+                    [&](const TierQuote& tq) {
+                        if (tq.side == Side::Ask && tq.price < min_ask) {
+                            spdlog::warn("[Engine] Step 7: {} ASK tier {} "
+                                         "dropped: price {} < no-loss floor "
+                                         "{} (basis={} margin={:.1f}bps)",
+                                         pair_name, tq.tier_index,
+                                         tq.price, min_ask, cost_basis,
+                                         config_.strategy.min_profit_margin_bps);
+                            return true;
+                        }
+                        return false;
+                    });
+                pcs.ladder.erase(it, pcs.ladder.end());
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Final sanity: drop any tier with a non-positive price.
+        // -----------------------------------------------------------------
+        {
+            auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
+                [&](const TierQuote& tq) {
+                    if (tq.price <= 0) {
+                        spdlog::warn("[Engine] Step 7: {} {} tier {} dropped: "
+                                     "non-positive price {}",
+                                     pair_name,
+                                     (tq.side == Side::Bid) ? "BID" : "ASK",
+                                     tq.tier_index, tq.price);
+                        return true;
+                    }
+                    return false;
+                });
+            pcs.ladder.erase(it, pcs.ladder.end());
+        }
 
         spdlog::debug("[Engine] Step 7: {} generated {} tier quotes",
                       pair_name, pcs.ladder.size());

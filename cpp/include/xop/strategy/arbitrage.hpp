@@ -449,6 +449,10 @@ public:
     /// may indicate protocol upgrades that reduce arbitrage opportunity.
     void set_tibetswap_reserves(const std::vector<TibetSwapReserves>& reserves);
 
+    /// Get the cached TibetSwap pool reserves.
+    /// Returns the last vector passed to set_tibetswap_reserves().
+    const std::vector<TibetSwapReserves>& get_tibetswap_reserves() const noexcept;
+
     /// Check if any TibetSwap pool has changed its fee since first observed.
     /// Returns true if at least one pool's fee differs from baseline.
     ///

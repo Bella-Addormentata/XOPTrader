@@ -46,6 +46,39 @@ namespace xop {
 // TierQuote and RebalanceReason are defined in <xop/types.hpp> (unified).
 // Both the strategy and execution layers share the same definitions.
 
+// ---------------------------------------------------------------------------
+// OrderBookGap -- a contiguous price range with no competing offers.
+//
+// Detected by analyse_order_book_gaps() from the active dexie order book.
+// Used by compute_ladder() to dynamically shift tier spacing toward
+// underserved price levels, capturing spread that competitors miss.
+// ---------------------------------------------------------------------------
+
+struct OrderBookGap {
+    Side   side;         // Bid or Ask
+    double low_bps;      // Lower bound of the gap (bps from mid)
+    double high_bps;     // Upper bound of the gap (bps from mid)
+    double center_bps;   // Midpoint of the gap (target for tier placement)
+    double width_bps;    // Width of the gap (high - low)
+};
+
+/// Analyse competing offers to find price gaps on each side of the book.
+///
+/// For each side (bid/ask), the offers are sorted by distance from mid,
+/// and gaps larger than min_gap_bps are identified.  The function returns
+/// only gaps within the max_scan_bps range.
+///
+/// @param offers       Active competing offers (from MarketDataFeed).
+/// @param mid          Current mid-price in mojos.
+/// @param min_gap_bps  Minimum gap width to report (default 50 bps).
+/// @param max_scan_bps Maximum distance from mid to scan (default 1500 bps).
+/// @return Vector of OrderBookGap, sorted by width descending.
+std::vector<OrderBookGap> analyse_order_book_gaps(
+    const std::vector<CompetingOffer>& offers,
+    std::int64_t                       mid,
+    double                             min_gap_bps  = 50.0,
+    double                             max_scan_bps = 1500.0);
+
 /// Human-readable label for logging and Prometheus metric labels.
 inline const char* to_string(RebalanceReason r) noexcept {
     switch (r) {
@@ -120,6 +153,57 @@ struct LiquidityConfig {
     /// Volatility spike factor: rebalance if current sigma > this multiple
     /// of the 7-day average sigma.  Default 2.0x.
     double volatility_spike_factor{2.0};
+
+    // -- Dynamic tier spacing (gap-aware) -----------------------------------
+
+    /// Enable dynamic tier spacing that shifts tiers toward detected order
+    /// book gaps.  When enabled, the engine analyses competing offers to
+    /// find underserved price ranges and adjusts tier_spacing_bps to place
+    /// liquidity in those valleys.  tier_spacing_bps is still used as a
+    /// baseline/fallback when no gaps are detected.
+    /// Default: true.
+    bool gap_aware_spacing{true};
+
+    /// Minimum gap width (bps) in the competing order book to consider
+    /// worth targeting.  Gaps narrower than this are ignored.  Default 50.
+    double min_gap_bps{50.0};
+
+    /// Maximum distance from mid (bps) to scan for gaps.  Default 1500.
+    double max_gap_scan_bps{1500.0};
+
+    /// Blend factor [0,1] controlling how strongly tiers shift toward gaps.
+    /// 0.0 = use baseline tier_spacing_bps (no adjustment).
+    /// 1.0 = shift fully to gap center (subject to ascending constraint).
+    /// Default 0.6.
+    double gap_blend_factor{0.6};
+
+    // -- Adverse-selection-aware sizing -------------------------------------
+
+    /// Enable adverse-selection-aware tier sizing.  On slow blockchains
+    /// (Chia: ~52 s/block), tight quotes are picked off by informed traders
+    /// before we can cancel.  This feature reduces tier 0 (tightest) size
+    /// and redistributes capital to outer tiers where adverse selection risk
+    /// is lower.
+    /// Default: true.
+    bool adverse_selection_sizing{true};
+
+    /// Decay factor per tier for adverse-selection sizing.
+    /// tier_0 gets decay^0 = 1.0 of its base size,
+    /// tier_1 gets decay^(-1), tier_2 gets decay^(-2), etc.
+    /// Lower values = more aggressive reallocation to outer tiers.
+    /// Typical range: [0.5, 0.9].  Default 0.7.
+    ///
+    /// Example with 4 tiers and decay=0.7:
+    ///   Raw weights: [1.0, 1/0.7, 1/0.49, 1/0.343] = [1.0, 1.43, 2.04, 2.92]
+    ///   Normalised:  [0.135, 0.193, 0.275, 0.395]
+    ///   (tier 0 drops from default 0.30 to 0.135; tier 3 rises to 0.395)
+    double adverse_selection_decay{0.7};
+
+    /// Sigma (volatility) threshold above which adverse selection sizing
+    /// activates extra aggressively.  When sigma > this value, the decay
+    /// factor is halved (more conservative sizing inner tiers).
+    /// Default 0.05 (5% annualised).  0 = always use base decay.
+    double adverse_selection_sigma_threshold{0.05};
 };
 
 // ---------------------------------------------------------------------------
@@ -194,6 +278,21 @@ public:
         std::int64_t          available_capital,
         std::int64_t          available_inventory,
         const LiquidityConfig& cfg) const;
+
+    /// Overload that accepts competing offers for gap-aware dynamic spacing.
+    /// When cfg.gap_aware_spacing is true, analyses the order book for gaps
+    /// and shifts tier spacing to fill underserved price ranges.
+    /// When cfg.adverse_selection_sizing is true, redistributes tier sizes
+    /// away from the tightest tier (highest adverse-selection risk) toward
+    /// outer tiers.
+    std::vector<TierQuote> compute_ladder(
+        std::int64_t                       mid,
+        double                             sigma,
+        double                             inventory_ratio,
+        std::int64_t                       available_capital,
+        std::int64_t                       available_inventory,
+        const std::vector<CompetingOffer>& competing_offers,
+        const LiquidityConfig&             cfg) const;
 
     // -- Rebalance decision -------------------------------------------------
 

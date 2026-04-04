@@ -21,8 +21,11 @@
 
 #include "xop/strategy/liquidity.hpp"
 
+#include <spdlog/spdlog.h>
+
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <numeric>
 #include <stdexcept>
 
@@ -518,6 +521,256 @@ BlockHeight LiquidityEngine::last_rebalance_block() const noexcept {
 
 std::int64_t LiquidityEngine::last_rebalance_price() const noexcept {
     return last_rebalance_price_;
+}
+
+// ===========================================================================
+// Order book gap analysis
+// ===========================================================================
+
+std::vector<OrderBookGap> analyse_order_book_gaps(
+    const std::vector<CompetingOffer>& offers,
+    std::int64_t                       mid,
+    double                             min_gap_bps,
+    double                             max_scan_bps)
+{
+    std::vector<OrderBookGap> gaps;
+
+    if (mid <= 0 || offers.empty()) {
+        return gaps;
+    }
+
+    const double mid_f = static_cast<double>(mid);
+
+    // Analyse each side independently.
+    for (const auto side : {Side::Bid, Side::Ask}) {
+        // Collect distance-from-mid (in bps) for each offer on this side.
+        std::vector<double> levels_bps;
+        levels_bps.reserve(offers.size());
+
+        for (const auto& o : offers) {
+            if (o.side != side || o.price <= 0) continue;
+
+            const double price_f = static_cast<double>(o.price);
+            double dist_bps = 0.0;
+            if (side == Side::Bid) {
+                dist_bps = (mid_f - price_f) / mid_f * 10000.0;
+            } else {
+                dist_bps = (price_f - mid_f) / mid_f * 10000.0;
+            }
+
+            // Only consider offers within the scan range and on the
+            // correct side of mid.
+            if (dist_bps >= 0.0 && dist_bps <= max_scan_bps) {
+                levels_bps.push_back(dist_bps);
+            }
+        }
+
+        // Sort levels by distance from mid (ascending).
+        std::sort(levels_bps.begin(), levels_bps.end());
+
+        // Remove duplicate levels (within 1 bps tolerance).
+        auto it = std::unique(levels_bps.begin(), levels_bps.end(),
+            [](double a, double b) { return std::abs(a - b) < 1.0; });
+        levels_bps.erase(it, levels_bps.end());
+
+        // Check for gap from 0 (mid) to first offer.
+        double prev_bps = 0.0;
+        for (const double lvl : levels_bps) {
+            const double gap_width = lvl - prev_bps;
+            if (gap_width >= min_gap_bps) {
+                OrderBookGap g;
+                g.side       = side;
+                g.low_bps    = prev_bps;
+                g.high_bps   = lvl;
+                g.center_bps = (prev_bps + lvl) / 2.0;
+                g.width_bps  = gap_width;
+                gaps.push_back(g);
+            }
+            prev_bps = lvl;
+        }
+
+        // Check for gap from last offer to max_scan_bps.
+        if (max_scan_bps - prev_bps >= min_gap_bps) {
+            OrderBookGap g;
+            g.side       = side;
+            g.low_bps    = prev_bps;
+            g.high_bps   = max_scan_bps;
+            g.center_bps = (prev_bps + max_scan_bps) / 2.0;
+            g.width_bps  = max_scan_bps - prev_bps;
+            gaps.push_back(g);
+        }
+    }
+
+    // Sort by width descending (widest gaps first).
+    std::sort(gaps.begin(), gaps.end(),
+        [](const OrderBookGap& a, const OrderBookGap& b) {
+            return a.width_bps > b.width_bps;
+        });
+
+    return gaps;
+}
+
+// ===========================================================================
+// compute_ladder -- gap-aware + adverse-selection-aware overload
+// ===========================================================================
+
+std::vector<TierQuote> LiquidityEngine::compute_ladder(
+    std::int64_t                       mid,
+    double                             sigma,
+    double                             inventory_ratio,
+    std::int64_t                       available_capital,
+    std::int64_t                       available_inventory,
+    const std::vector<CompetingOffer>& competing_offers,
+    const LiquidityConfig&             cfg) const
+{
+    // -- Step 1: Make a mutable copy of the config for dynamic adjustments --
+    LiquidityConfig adj_cfg = cfg;
+
+    // -- Step 2: Adverse-selection-aware tier sizing -------------------------
+    // On slow blockchains (Chia: ~52 s/block), tier 0 (tightest spread) is
+    // the most vulnerable to informed traders.  We reduce its size and
+    // redistribute capital to outer tiers where adverse selection risk is
+    // lower.
+    if (adj_cfg.adverse_selection_sizing && adj_cfg.num_tiers > 1) {
+        double decay = adj_cfg.adverse_selection_decay;
+
+        // Under high volatility, apply extra conservative sizing.
+        if (adj_cfg.adverse_selection_sigma_threshold > 0.0
+            && sigma > adj_cfg.adverse_selection_sigma_threshold)
+        {
+            decay *= 0.5;  // More aggressive reallocation to outer tiers.
+            decay = std::max(decay, 0.1);  // Floor to prevent degenerate weights.
+        }
+
+        // Compute inverse-decay weights: tier i gets weight = 1/decay^i.
+        // This gives less weight to tier 0 (inner) and more to outer tiers.
+        std::vector<double> weights(adj_cfg.num_tiers);
+        double w_sum = 0.0;
+        double factor = 1.0;
+        for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+            weights[i] = 1.0 / factor;
+            w_sum += weights[i];
+            factor *= decay;
+        }
+
+        // Normalise weights so they sum to 1.0, preserving the original
+        // total allocation.
+        if (w_sum > 0.0) {
+            for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                adj_cfg.tier_size_pct[i] = weights[i] / w_sum;
+            }
+        }
+
+        // Validate: ensure no tier ended up with NaN/Inf/negative size.
+        // If any tier is degenerate, fall back to the original cfg sizes.
+        bool sizing_valid = true;
+        for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+            if (!std::isfinite(adj_cfg.tier_size_pct[i])
+                || adj_cfg.tier_size_pct[i] < 0.0) {
+                sizing_valid = false;
+                break;
+            }
+        }
+        if (!sizing_valid) {
+            spdlog::warn("[Liquidity] {} adverse-selection sizing produced "
+                         "degenerate values -- falling back to baseline",
+                         pair_name_);
+            adj_cfg.tier_size_pct = cfg.tier_size_pct;
+        }
+
+        spdlog::debug("[Liquidity] {} adverse-selection sizing: "
+                      "decay={:.2f} sigma={:.4f} sizes=[{}]",
+                      pair_name_, decay, sigma,
+                      [&]() {
+                          std::string s;
+                          for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                              if (i > 0) s += ", ";
+                              char buf[16];
+                              std::snprintf(buf, sizeof(buf), "%.3f",
+                                            adj_cfg.tier_size_pct[i]);
+                              s += buf;
+                          }
+                          return s;
+                      }());
+    }
+
+    // -- Step 3: Gap-aware dynamic tier spacing ------------------------------
+    // Analyse the competing order book for gaps and shift tier spacing
+    // toward underserved price ranges.
+    if (adj_cfg.gap_aware_spacing && !competing_offers.empty() && mid > 0) {
+        auto gaps = analyse_order_book_gaps(
+            competing_offers, mid,
+            adj_cfg.min_gap_bps, adj_cfg.max_gap_scan_bps);
+
+        if (!gaps.empty()) {
+            // Collect gap centers from BOTH sides (bid + ask) together.
+            // Since build_raw_ladder uses one tier_spacing_bps for both
+            // sides, we merge all gaps and target the widest ones
+            // regardless of side.
+            std::vector<double> gap_centers;
+            for (const auto& g : gaps) {
+                gap_centers.push_back(g.center_bps);
+                if (gap_centers.size() >= adj_cfg.num_tiers) break;
+            }
+            // gaps are already sorted by width descending, so we get
+            // the widest first.
+
+            if (!gap_centers.empty()) {
+                // Sort gap centers ascending so we can blend with the
+                // ascending baseline tier_spacing_bps.
+                std::sort(gap_centers.begin(), gap_centers.end());
+
+                // Blend each tier's spacing toward the nearest gap center.
+                for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                    // Find the closest gap center for this tier.
+                    double closest_gap = adj_cfg.tier_spacing_bps[i];
+                    double min_dist = 1e9;
+                    for (double gc : gap_centers) {
+                        const double dist = std::abs(gc - adj_cfg.tier_spacing_bps[i]);
+                        if (dist < min_dist) {
+                            min_dist = dist;
+                            closest_gap = gc;
+                        }
+                    }
+
+                    // Blend: adjusted = (1-f)*baseline + f*gap_center.
+                    const double blend = adj_cfg.gap_blend_factor;
+                    double adjusted = (1.0 - blend) * adj_cfg.tier_spacing_bps[i]
+                                    + blend * closest_gap;
+
+                    // Enforce strictly ascending constraint:
+                    // each tier must be at least prev + 10 bps.
+                    if (i > 0) {
+                        adjusted = std::max(adjusted,
+                                            adj_cfg.tier_spacing_bps[i - 1] + 10.0);
+                    }
+                    // Floor at 10 bps to prevent degenerate spreads.
+                    adjusted = std::max(adjusted, 10.0);
+
+                    adj_cfg.tier_spacing_bps[i] = adjusted;
+                }
+
+                spdlog::debug("[Liquidity] {} gap-aware spacing: "
+                              "gaps={} adjusted spacing=[{}]",
+                              pair_name_, gap_centers.size(),
+                              [&]() {
+                                  std::string s;
+                                  for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                                      if (i > 0) s += ", ";
+                                      s += std::to_string(
+                                          static_cast<int>(adj_cfg.tier_spacing_bps[i]));
+                                  }
+                                  return s;
+                              }());
+            }
+        }
+    }
+
+    // -- Step 4: Build ladder with adjusted config --------------------------
+    // Use the base compute_ladder (which does build_raw_ladder + skew) but
+    // with the adjusted config containing dynamic spacing and sizing.
+    return compute_ladder(mid, sigma, inventory_ratio,
+                          available_capital, available_inventory, adj_cfg);
 }
 
 }  // namespace xop

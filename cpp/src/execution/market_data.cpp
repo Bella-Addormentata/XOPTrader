@@ -351,6 +351,24 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
                   pair_name, cex_mid);
 }
 
+void MarketDataFeed::ingest_amm_mid(const std::string& pair_name,
+                                     double             amm_mid) {
+    if (amm_mid <= 0.0) {
+        spdlog::warn("ingest_amm_mid: pair={} invalid amm_mid={:.6f}",
+                     pair_name, amm_mid);
+        return;
+    }
+
+    std::unique_lock lock(mtx_pairs_);
+    PairState& ps = get_or_create_pair(pair_name);
+
+    ps.amm_mid        = amm_mid;
+    ps.amm_updated_at = std::chrono::system_clock::now();
+
+    spdlog::debug("ingest_amm_mid: pair={} amm_mid={:.6f}",
+                  pair_name, amm_mid);
+}
+
 // =========================================================================
 //  Typed accessors (thread-safe reads)
 // =========================================================================
@@ -633,30 +651,62 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
         dex_mid = ps.dex_last_trade;
     }
 
-    // Blending with CEX reference.
-    if (dex_mid > 0.0 && ps.cex_mid > 0.0) {
-        // [T7-12] Freshness-weighted blend.
-        // When cex_freshness_threshold_sec > 0, the CEX weight decays
-        // linearly from kCexWeight to 0 as the data ages.
-        double w_cex = kCexWeight;
+    // Determine which sources are available and compute effective weights.
+    // Base weights: DEX 70%, CEX 30%, AMM 15%.
+    // When AMM is available, we re-normalise so all active weights sum to 1.0.
+    double w_dex = kDexWeight;
+    double w_cex = kCexWeight;
+    double w_amm = config_.amm_blend_weight;
+
+    // Determine AMM availability + freshness.
+    double amm_mid = 0.0;
+    if (ps.amm_mid > 0.0 && w_amm > 0.0) {
+        const double amm_threshold = config_.amm_freshness_threshold_sec;
+        if (amm_threshold > 0.0
+            && ps.amm_updated_at != Timestamp{})
+        {
+            const auto age = std::chrono::system_clock::now() - ps.amm_updated_at;
+            const double age_sec = std::chrono::duration<double>(age).count();
+            w_amm *= std::max(0.0, 1.0 - age_sec / amm_threshold);
+        }
+        if (w_amm > 0.0) {
+            amm_mid = ps.amm_mid;
+        }
+    } else {
+        w_amm = 0.0;
+    }
+
+    // Determine CEX availability + freshness.
+    double cex_mid = 0.0;
+    if (ps.cex_mid > 0.0) {
         const double threshold = config_.cex_freshness_threshold_sec;
         if (threshold > 0.0
             && ps.cex_updated_at != Timestamp{})
         {
             const auto age = std::chrono::system_clock::now() - ps.cex_updated_at;
             const double age_sec = std::chrono::duration<double>(age).count();
-            w_cex = kCexWeight * std::max(0.0, 1.0 - age_sec / threshold);
+            w_cex *= std::max(0.0, 1.0 - age_sec / threshold);
         }
-        const double w_dex = 1.0 - w_cex;
-        return w_dex * dex_mid + w_cex * ps.cex_mid;
+        if (w_cex > 0.0) {
+            cex_mid = ps.cex_mid;
+        }
+    } else {
+        w_cex = 0.0;
     }
 
-    // Single-source fallback.
-    if (dex_mid > 0.0) {
-        return dex_mid;
-    }
-    if (ps.cex_mid > 0.0) {
-        return ps.cex_mid;
+    // Multi-source blending.
+    // Count sources and re-normalise weights so they sum to 1.0.
+    const bool has_dex = (dex_mid > 0.0);
+    const bool has_cex = (cex_mid > 0.0);
+    const bool has_amm = (amm_mid > 0.0);
+
+    if (!has_dex) w_dex = 0.0;
+    if (!has_cex) w_cex = 0.0;
+    if (!has_amm) w_amm = 0.0;
+
+    const double w_total = w_dex + w_cex + w_amm;
+    if (w_total > 0.0) {
+        return (w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid) / w_total;
     }
 
     // No data at all.
@@ -1134,6 +1184,17 @@ std::size_t MarketDataFeed::get_num_competing_offers(
         return 0;
     }
     return metrics->num_competing_offers;
+}
+
+std::vector<CompetingOffer> MarketDataFeed::get_competing_offers(
+    const std::string& pair_name) const
+{
+    std::shared_lock lock(mtx_competitors_);
+    auto it = competing_offers_.find(pair_name);
+    if (it == competing_offers_.end()) {
+        return {};
+    }
+    return it->second;
 }
 
 // =========================================================================

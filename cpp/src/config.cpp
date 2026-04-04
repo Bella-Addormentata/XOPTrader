@@ -718,6 +718,62 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.stuck_offer_age_blocks = node["stuck_offer_age_blocks"].as<uint32_t>();
     }
 
+    // -- Gap-aware dynamic tier spacing (optional, defaults in StrategyConfig) --
+    if (node["gap_aware_spacing"] && node["gap_aware_spacing"].IsDefined()
+        && !node["gap_aware_spacing"].IsNull()) {
+        cfg.gap_aware_spacing = node["gap_aware_spacing"].as<bool>();
+    }
+    if (node["min_gap_bps"] && node["min_gap_bps"].IsDefined()
+        && !node["min_gap_bps"].IsNull()) {
+        cfg.min_gap_bps = node["min_gap_bps"].as<double>();
+        if (cfg.min_gap_bps < 0.0) {
+            throw ConfigError(sec + ".min_gap_bps must be >= 0");
+        }
+    }
+    if (node["max_gap_scan_bps"] && node["max_gap_scan_bps"].IsDefined()
+        && !node["max_gap_scan_bps"].IsNull()) {
+        cfg.max_gap_scan_bps = node["max_gap_scan_bps"].as<double>();
+        if (cfg.max_gap_scan_bps <= 0.0) {
+            throw ConfigError(sec + ".max_gap_scan_bps must be > 0");
+        }
+    }
+    if (node["gap_blend_factor"] && node["gap_blend_factor"].IsDefined()
+        && !node["gap_blend_factor"].IsNull()) {
+        cfg.gap_blend_factor = node["gap_blend_factor"].as<double>();
+        if (cfg.gap_blend_factor < 0.0 || cfg.gap_blend_factor > 1.0) {
+            throw ConfigError(sec + ".gap_blend_factor must be in [0, 1]");
+        }
+    }
+
+    // -- Adverse-selection-aware tier sizing (optional, defaults in StrategyConfig) --
+    if (node["adverse_selection_sizing"] && node["adverse_selection_sizing"].IsDefined()
+        && !node["adverse_selection_sizing"].IsNull()) {
+        cfg.adverse_selection_sizing = node["adverse_selection_sizing"].as<bool>();
+    }
+    if (node["adverse_selection_decay"] && node["adverse_selection_decay"].IsDefined()
+        && !node["adverse_selection_decay"].IsNull()) {
+        cfg.adverse_selection_decay = node["adverse_selection_decay"].as<double>();
+        if (cfg.adverse_selection_decay <= 0.0 || cfg.adverse_selection_decay >= 1.0) {
+            throw ConfigError(sec + ".adverse_selection_decay must be in (0, 1)");
+        }
+    }
+    if (node["adverse_selection_sigma_threshold"] && node["adverse_selection_sigma_threshold"].IsDefined()
+        && !node["adverse_selection_sigma_threshold"].IsNull()) {
+        cfg.adverse_selection_sigma_threshold = node["adverse_selection_sigma_threshold"].as<double>();
+        if (cfg.adverse_selection_sigma_threshold < 0.0) {
+            throw ConfigError(sec + ".adverse_selection_sigma_threshold must be >= 0");
+        }
+    }
+
+    // -- AMM blend weight for market data feed (optional) --
+    if (node["amm_blend_weight"] && node["amm_blend_weight"].IsDefined()
+        && !node["amm_blend_weight"].IsNull()) {
+        cfg.amm_blend_weight = node["amm_blend_weight"].as<double>();
+        if (cfg.amm_blend_weight < 0.0 || cfg.amm_blend_weight > 1.0) {
+            throw ConfigError(sec + ".amm_blend_weight must be in [0, 1]");
+        }
+    }
+
     return cfg;
 }
 

@@ -209,6 +209,36 @@ struct StrategyConfig {
     /// Extra blocks beyond offer_ttl_blocks before an offer is considered
     /// "stuck" and eligible for forced cancellation + alerting.
     uint32_t stuck_offer_age_blocks{30};
+
+    // -- Gap-aware dynamic tier spacing -------------------------------------
+
+    /// Enable gap-aware dynamic tier spacing.
+    bool     gap_aware_spacing{true};
+
+    /// Minimum gap width (bps) in competing order book to target.
+    double   min_gap_bps{50.0};
+
+    /// Maximum distance from mid (bps) to scan for gaps.
+    double   max_gap_scan_bps{1500.0};
+
+    /// Blend factor for gap-directed spacing [0, 1].
+    double   gap_blend_factor{0.6};
+
+    // -- Adverse-selection-aware tier sizing ---------------------------------
+
+    /// Enable adverse-selection-aware tier sizing.
+    bool     adverse_selection_sizing{true};
+
+    /// Decay factor for adverse-selection sizing (lower = more outer-heavy).
+    double   adverse_selection_decay{0.7};
+
+    /// Volatility threshold above which decay is halved.
+    double   adverse_selection_sigma_threshold{0.05};
+
+    // -- AMM blend weight for market data feed ------------------------------
+
+    /// Weight of TibetSwap AMM implied price in mid-price blend.
+    double   amm_blend_weight{0.15};
 };
 
 // ---------------------------------------------------------------------------
