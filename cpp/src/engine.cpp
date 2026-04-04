@@ -198,13 +198,21 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
         LiquidityConfig liq_cfg;
-        liq_cfg.num_tiers        = config_.strategy.num_tiers;
         liq_cfg.tier_spacing_bps =
             pair.tier_spacing_bps_override.value_or(
                 config_.strategy.tier_spacing_bps);
         liq_cfg.tier_size_pct    =
             pair.tier_size_pct_override.value_or(
                 config_.strategy.tier_size_pct);
+        // When per-pair overrides provide fewer tiers than the global
+        // num_tiers, derive the count from the override vectors to
+        // prevent out-of-bounds access in build_raw_ladder.
+        liq_cfg.num_tiers = static_cast<uint32_t>(std::min(
+            liq_cfg.tier_spacing_bps.size(),
+            liq_cfg.tier_size_pct.size()));
+        if (liq_cfg.num_tiers == 0) {
+            liq_cfg.num_tiers = config_.strategy.num_tiers;
+        }
         liq_cfg.offer_ttl_blocks = config_.strategy.offer_ttl_blocks;
 
         // Gap-aware dynamic tier spacing.
@@ -217,6 +225,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
         liq_cfg.adverse_selection_decay            = config_.strategy.adverse_selection_decay;
         liq_cfg.adverse_selection_sigma_threshold  = config_.strategy.adverse_selection_sigma_threshold;
+
+        // Fill-rate-weighted adaptive tier sizing.
+        liq_cfg.fill_rate_sizing          = config_.strategy.fill_rate_sizing;
+        liq_cfg.fill_rate_blend           = config_.strategy.fill_rate_blend;
+        liq_cfg.fill_rate_lookback_hours  = config_.strategy.fill_rate_lookback_hours;
+        liq_cfg.fill_rate_min_pct         = config_.strategy.fill_rate_min_pct;
 
         liquidity_engines_[pair.name] =
             std::make_unique<LiquidityEngine>(pair.name, liq_cfg);
@@ -300,6 +314,13 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     alerts_ = std::make_unique<AlertManager>();
     alerts_->init(config_.monitoring.telegram_bot_token,
                   config_.monitoring.telegram_chat_id);
+
+    // -- On-chain reconciler (full-node ground truth verification) -----------
+    if (full_node_) {
+        on_chain_reconciler_ = std::make_unique<OnChainReconciler>(
+            full_node_, wallet_, state_);
+        spdlog::info("[Engine] On-chain reconciler initialized");
+    }
 
     // -- New strategy modules -----------------------------------------------
     order_book_tactician_ = std::make_unique<OrderBookTactician>(
@@ -485,7 +506,8 @@ void Engine::shutdown()
                     bool persisted = false;
                     for (int attempt = 0; attempt < 3 && !persisted; ++attempt) {
                         try {
-                            db_->update_offer_status(oid, "cancelled", 0);
+                            db_->update_offer_status(oid, "cancelled", 0,
+                                                    "shutdown");
                             persisted = true;
                         } catch (const std::exception& e) {
                             spdlog::warn("[Engine] shutdown update_offer_status "
@@ -605,7 +627,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // Mark orphans as cancelled in the DB.
             for (const auto& oid : orphans) {
                 try {
-                    db_->update_offer_status(oid, "cancelled", 0);
+                    db_->update_offer_status(oid, "cancelled", 0,
+                                            "startup_orphan");
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] startup_reconcile update_offer_status "
                                  "failed for {}: {}",
@@ -738,7 +761,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                  "discrepancies", fixed.size());
                                     for (const auto& oid : fixed) {
                                         try {
-                                            db_->update_offer_status(oid, "cancelled", 0);
+                                            db_->update_offer_status(oid, "cancelled", 0,
+                                                                    "reconnect_reconcile");
                                         } catch (const std::exception& e) {
                                             spdlog::debug("[Engine] reconnect update_offer_status "
                                                          "failed for {}: {}",
@@ -1392,9 +1416,14 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 co.size             = 0;
                 if (!orec.offered.empty()) {
                     // ISO/IEC 5055: round instead of truncate for size conversion.
+                    // Use the correct denomination for the offered asset (CAT = 10^3, XCH = 10^12).
+                    const std::int64_t offered_denom =
+                        (orec.offered[0].id == pair.base_asset_id)
+                        ? pair.base_mojos_per_unit
+                        : pair.quote_mojos_per_unit;
                     co.size = static_cast<Mojo>(std::llround(
                         orec.offered[0].amount *
-                        static_cast<double>(kMojosPerXch)));
+                        static_cast<double>(offered_denom)));
                 }
                 co.first_seen_block = block_height;
                 co.last_seen_block  = block_height;
@@ -1695,7 +1724,7 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         db_->insert_trade(tr);
 
         // Record the offer as filled in the offer log.
-        db_->update_offer_status(fill.offer_id, "filled", fill.block_height);
+        db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
 
         // Update the inventory tracker using the pair's actual base asset.
         auto now = std::chrono::system_clock::now();
@@ -2722,7 +2751,41 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // skew.  The LiquidityEngine builds tiers symmetrically around
         // this center; the reservation skew was already applied to the
         // risk_quote sizes (bid_size / ask_size) in Step 6.
-        const double market_mid = market_data_->get_mid_price(pair_name);
+        double market_mid = market_data_->get_mid_price(pair_name);
+
+        // -- Stablecoin peg-anchored mid ------------------------------------
+        // For stable-stable pairs the thin order book produces noisy mid
+        // estimates.  When the market mid is CLOSE to the peg (< 1%
+        // deviation), lightly anchor towards the peg (50/50 blend) to
+        // filter thin-book noise.  When the market deviates further, trust
+        // the market — a genuine discount/premium likely reflects real
+        // conditions (liquidity depth, bridge risk, etc.) and the depeg
+        // detector handles any bail-out.
+        {
+            const PairConfig* pc = find_pair_config(pair_name);
+            if (pc && pc->is_stablecoin && pc->peg_target > 0.0) {
+                const double dev = std::abs(market_mid - pc->peg_target)
+                                 / pc->peg_target;
+                if (dev < 0.01) {
+                    // Within ±1%: light 50/50 blend to filter noise.
+                    const double blended = 0.50 * pc->peg_target
+                                         + 0.50 * market_mid;
+                    spdlog::debug("[Engine] Step 7: {} peg-anchor mid: "
+                                  "market={:.6f} peg={:.4f} blended={:.6f} "
+                                  "(dev={:.2f}%)",
+                                  pair_name, market_mid, pc->peg_target,
+                                  blended, dev * 100.0);
+                    market_mid = blended;
+                } else {
+                    spdlog::debug("[Engine] Step 7: {} peg-anchor skipped: "
+                                  "market={:.6f} peg={:.4f} dev={:.2f}%"
+                                  " > 1% -- trusting market",
+                                  pair_name, market_mid, pc->peg_target,
+                                  dev * 100.0);
+                }
+            }
+        }
+
         Mojo mid_mojos = static_cast<Mojo>(std::llround(
             market_mid * static_cast<double>(kMojosPerXch)));
 
@@ -2750,19 +2813,203 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // Fetch competing offers for gap-aware dynamic tier spacing.
         auto comp_offers = market_data_->get_competing_offers(pair_name);
 
+        // Query per-tier fill rates from the offer log for adaptive sizing.
+        LiquidityConfig ladder_cfg = liq.config();
+        if (ladder_cfg.fill_rate_sizing && ladder_cfg.num_tiers > 0) {
+            auto cutoff = std::chrono::system_clock::now()
+                - std::chrono::hours(ladder_cfg.fill_rate_lookback_hours);
+            std::string cutoff_ts = PnLTracker::timestamp_to_iso(cutoff);
+            ladder_cfg.tier_fill_rates = db_->query_tier_fill_rates(
+                pair_name, cutoff_ts, ladder_cfg.num_tiers);
+        }
+
         // Generate the tier ladder.
         // When competing offers are available, uses the gap-aware overload
         // that analyses the order book for gaps and applies adverse-
-        // selection-aware sizing.
+        // selection-aware sizing and fill-rate-weighted sizing.
         if (!comp_offers.empty()) {
             pcs.ladder = liq.compute_ladder(
                 mid_mojos, sigma, inv_ratio,
                 avail_capital, avail_inventory,
-                comp_offers, liq.config());
+                comp_offers, ladder_cfg);
         } else {
             pcs.ladder = liq.compute_ladder(
                 mid_mojos, sigma, inv_ratio,
-                avail_capital, avail_inventory);
+                avail_capital, avail_inventory, ladder_cfg);
+        }
+
+        // -----------------------------------------------------------------
+        // Order-book competitive cap: ensure every tier is priced at least
+        // as aggressively as the Nth competing offer on its side.
+        //
+        // Problem: outer tiers (Tier 2–5) can end up far from mid due to
+        // large tier_spacing_bps, putting them *behind* existing competing
+        // offers.  Those tiers are dead capital — nobody takes an offer at
+        // 2.5% from mid when a competing offer sits at 1%.
+        //
+        // Fix: sort competing bids (descending) and asks (ascending).
+        // For tier i, find the competing offer at rank (i + 1).  If our
+        // tier price is worse, improve it to match that offer ± 1 tick.
+        //
+        // Safety floor: never tighten a tier closer than min_margin from
+        // mid.  This prevents TibetSwap (0.7% fee) or other AMMs from
+        // profitably arbitraging our offers.
+        // -----------------------------------------------------------------
+        if (!comp_offers.empty() && mid_mojos > 0) {
+            // Separate competing offers by side and sort by quality.
+            std::vector<Mojo> comp_bids;
+            std::vector<Mojo> comp_asks;
+            for (const auto& co : comp_offers) {
+                if (co.side == Side::Bid) comp_bids.push_back(co.price);
+                if (co.side == Side::Ask) comp_asks.push_back(co.price);
+            }
+            // Bids: best (highest) first.
+            std::sort(comp_bids.begin(), comp_bids.end(), std::greater<Mojo>());
+            // Asks: best (lowest) first.
+            std::sort(comp_asks.begin(), comp_asks.end());
+
+            // Minimum allowed spread: max(min_margin_bps, tibetswap_fee_bps).
+            // The TibetSwap fee creates a natural arbitrage boundary —
+            // any offer tighter than ~70 bps can be profitably arbed.
+            const double min_floor_bps = std::max(
+                pair_cfg ? pair_cfg->min_profit_margin_bps_override.value_or(
+                    config_.strategy.min_profit_margin_bps) : config_.strategy.min_profit_margin_bps,
+                config_.arbitrage.tibetswap_fee_bps);
+            const Mojo max_bid_floor = static_cast<Mojo>(std::llround(
+                static_cast<double>(mid_mojos) * (1.0 - min_floor_bps / 10000.0)));
+            const Mojo min_ask_ceil  = static_cast<Mojo>(std::llround(
+                static_cast<double>(mid_mojos) * (1.0 + min_floor_bps / 10000.0)));
+
+            const Mojo tick = std::max(
+                static_cast<Mojo>(1),
+                static_cast<Mojo>(std::llround(
+                    static_cast<double>(mid_mojos) / 10000.0)));
+
+            int capped_bids = 0;
+            int capped_asks = 0;
+
+            for (auto& tq : pcs.ladder) {
+                const auto rank = static_cast<std::size_t>(tq.tier_index + 1);
+
+                if (tq.side == Side::Bid && rank < comp_bids.size()) {
+                    // The competing offer at rank (tier+1) would be filled
+                    // before ours.  If our price is worse (lower), improve
+                    // it to match + 1 tick.
+                    const Mojo target = comp_bids[rank] + tick;
+                    if (tq.price < target) {
+                        // Cap: never bid above the safety floor.
+                        const Mojo capped = std::min(target, max_bid_floor);
+                        if (capped > tq.price) {
+                            spdlog::debug("[Engine] Step 7: {} BID tier {} "
+                                         "competitive cap: {} -> {} "
+                                         "(rank-{} comp={})",
+                                         pair_name, tq.tier_index,
+                                         tq.price, capped, rank,
+                                         comp_bids[rank]);
+                            tq.price = capped;
+                            ++capped_bids;
+                        }
+                    }
+                }
+
+                if (tq.side == Side::Ask && rank < comp_asks.size()) {
+                    // If our ask is worse (higher), improve it to match
+                    // the competing ask - 1 tick.
+                    const Mojo target = comp_asks[rank] - tick;
+                    if (tq.price > target) {
+                        // Floor: never ask below the safety floor.
+                        const Mojo capped = std::max(target, min_ask_ceil);
+                        if (capped < tq.price) {
+                            spdlog::debug("[Engine] Step 7: {} ASK tier {} "
+                                         "competitive cap: {} -> {} "
+                                         "(rank-{} comp={})",
+                                         pair_name, tq.tier_index,
+                                         tq.price, capped, rank,
+                                         comp_asks[rank]);
+                            tq.price = capped;
+                            ++capped_asks;
+                        }
+                    }
+                }
+            }
+
+            if (capped_bids > 0 || capped_asks > 0) {
+                spdlog::info("[Engine] Step 7: {} competitive cap adjusted "
+                             "{} bids, {} asks (floor={:.0f}bps)",
+                             pair_name, capped_bids, capped_asks,
+                             min_floor_bps);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stablecoin order-book undercutting: for the innermost tier (Tier 0)
+        // on each side, improve our price to beat the best *competing* offer
+        // by 1 bps.  This "penny ahead" strategy captures top-of-book
+        // priority on both bid and ask, while the fee-aware floor prevents
+        // us from quoting unprofitably.
+        //
+        //   Tier 0 BID: max(our_bid, best_competing_bid + 1 bps)
+        //               capped at peg * (1 - min_margin)
+        //   Tier 0 ASK: min(our_ask, best_competing_ask - 1 bps)
+        //               floored at peg * (1 + min_margin)
+        //
+        // Outer tiers are left untouched -- they provide depth and catch
+        // larger moves.  comp_offers excludes our own orders, so we never
+        // undercut ourselves.
+        // -----------------------------------------------------------------
+        if (pair_cfg && pair_cfg->is_stablecoin && pair_cfg->peg_target > 0.0
+            && !comp_offers.empty())
+        {
+            // Find best competing bid/ask from the order book.
+            Mojo best_comp_bid = 0;
+            Mojo best_comp_ask = 0;
+            for (const auto& co : comp_offers) {
+                if (co.side == Side::Bid && co.price > best_comp_bid) {
+                    best_comp_bid = co.price;
+                }
+                if (co.side == Side::Ask &&
+                    (best_comp_ask == 0 || co.price < best_comp_ask)) {
+                    best_comp_ask = co.price;
+                }
+            }
+
+            // 1 bps tick step relative to the mid.
+            const Mojo tick = std::max(
+                static_cast<Mojo>(1),
+                static_cast<Mojo>(std::llround(
+                    static_cast<double>(mid_mojos) / 10000.0)));
+
+            // Safety bounds: never push our bid above mid or our ask
+            // below mid — that would cross our own spread.  The existing
+            // no-loss floor (post-clamp) handles cost-basis protection.
+            const Mojo max_bid_ceil  = mid_mojos - tick;
+            const Mojo min_ask_floor = mid_mojos + tick;
+
+            for (auto& tq : pcs.ladder) {
+                if (tq.tier_index != 0) continue;  // only innermost
+
+                if (tq.side == Side::Bid && best_comp_bid > 0) {
+                    const Mojo improved = best_comp_bid + tick;
+                    if (improved > tq.price && improved <= max_bid_ceil) {
+                        spdlog::info("[Engine] Step 7: {} stablecoin BID "
+                                     "undercut: {} -> {} (comp_best_bid={})",
+                                     pair_name, tq.price, improved,
+                                     best_comp_bid);
+                        tq.price = improved;
+                    }
+                }
+
+                if (tq.side == Side::Ask && best_comp_ask > 0) {
+                    const Mojo improved = best_comp_ask - tick;
+                    if (improved < tq.price && improved >= min_ask_floor) {
+                        spdlog::info("[Engine] Step 7: {} stablecoin ASK "
+                                     "undercut: {} -> {} (comp_best_ask={})",
+                                     pair_name, tq.price, improved,
+                                     best_comp_ask);
+                        tq.price = improved;
+                    }
+                }
+            }
         }
 
         // -----------------------------------------------------------------
@@ -2911,6 +3158,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
 
+    bool pending_hit_this_block = false;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
 
@@ -2939,7 +3187,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //   - No pending tiers at all  → post new ladder from scratch.
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
-            config_.strategy.offer_ttl_blocks);
+            config_.strategy.offer_ttl_blocks,
+            static_cast<Mojo>(std::llround(
+                market_data_->get_mid_price(pair_name)
+                * static_cast<double>(kMojosPerXch))));
 
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;
@@ -2973,9 +3224,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              stale_count + expired_count, fresh_count);
             }
         } else if (has_pending && fresh_count == 0) {
-            // All tiers stale/expired: full cancel.
-            cancelled_ids = co_await offer_mgr_->cancel_stale(
-                pair_name, block_height, config_.strategy.offer_ttl_blocks);
+            // All tiers stale/expired: cancel all via selective_cancel
+            // (cancel_stale only handles TTL-based expiration and would
+            // miss price-deviation-stale offers within TTL).
+            std::vector<std::string> all_ids;
+            all_ids.reserve(tier_classes.size());
+            for (const auto& tc : tier_classes) {
+                all_ids.push_back(tc.offer_id);
+            }
+            cancelled_ids = co_await offer_mgr_->selective_cancel(all_ids);
             if (!cancelled_ids.empty()) {
                 spdlog::info("[Engine] Step 8: full cancel for {} -- "
                              "all {} tiers were stale/expired",
@@ -2989,11 +3246,33 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
         // else: no pending tiers → post from scratch (cancelled_ids empty).
 
+        // Build cancel-reason map from tier classifications.
+        std::unordered_map<std::string, std::string> cancel_reasons;
+        for (const auto& tc : tier_classes) {
+            if (tc.staleness == execution::TierStaleness::Expired) {
+                cancel_reasons[tc.offer_id] = "ttl_expired";
+            } else if (tc.staleness == execution::TierStaleness::Stale) {
+                if (tc.crossed) {
+                    cancel_reasons[tc.offer_id] =
+                        "crossed_mid(" + std::to_string(tc.price_deviation * 100.0)
+                        .substr(0, 5) + "%)";
+                } else {
+                    cancel_reasons[tc.offer_id] =
+                        "price_adverse(" + std::to_string(tc.price_deviation * 100.0)
+                        .substr(0, 5) + "%)";
+                }
+            }
+        }
+
         if (!cancelled_ids.empty()) {
             // Persist cancellation status to database.
             for (const auto& oid : cancelled_ids) {
                 try {
-                    db_->update_offer_status(oid, "cancelled", block_height);
+                    auto it = cancel_reasons.find(oid);
+                    const std::string reason = (it != cancel_reasons.end())
+                        ? it->second : "stale";
+                    db_->update_offer_status(oid, "cancelled", block_height,
+                                            reason);
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] update_offer_status failed for {}: {}",
                                  oid.substr(0, 12), e.what());
@@ -3008,14 +3287,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         // -- Stuck offer detection -------------------------------------------
-        // Offers older than TTL + stuck_offer_age_blocks are considered
+        // Offers older than hard TTL + stuck_offer_age_blocks are considered
         // stuck (e.g. RPC cancel failed). Log them with fee info and
         // force a second cancel pass with an extended threshold.
+        // Hard TTL = soft TTL × kHardTtlMultiplier; offers past hard TTL
+        // are already classified as Expired, so "stuck" means the cancel
+        // RPC itself failed on a previous attempt.
         {
             const auto all_offers = state_->get_all_offers();
+            const uint32_t hard_ttl =
+                config_.strategy.offer_ttl_blocks
+                * execution::OfferManager::kHardTtlMultiplier;
             const uint32_t stuck_threshold =
-                config_.strategy.offer_ttl_blocks +
-                config_.strategy.stuck_offer_age_blocks;
+                hard_ttl + config_.strategy.stuck_offer_age_blocks;
             int stuck_count = 0;
             for (const auto& po : all_offers) {
                 if (po.pair_name != pair_name) continue;
@@ -3037,7 +3321,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     pair_name, block_height, stuck_threshold);
                 for (const auto& oid : stuck_cancelled) {
                     try {
-                        db_->update_offer_status(oid, "cancelled", block_height);
+                        db_->update_offer_status(oid, "cancelled", block_height,
+                                                "stuck");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] update_offer_status failed for {}: {}",
                                      oid.substr(0, 12), e.what());
@@ -3049,26 +3334,37 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
         // -- Spendable reserve & pending-change gating ----------------------
         // Query wallet balances for each wallet involved in this pair.
-        // Skip posting if:
-        //   1. Any wallet has too little spendable relative to confirmed.
-        //   2. Any wallet has pending_change > 0, indicating prior
-        //      transactions are still confirming on-chain.  Creating new
-        //      offers while coins are in-flight risks the wallet selecting
-        //      the same unspent coin for multiple concurrent spend bundles,
-        //      producing stuck transactions that never broadcast.
+        // - pending_change > 0: hard block (skip ALL posting).
+        // - Side-aware minimum balance: suppress ASK when base < reserve,
+        //   suppress BID when quote < reserve.  When auto_rebalance is on
+        //   and an asset is below min_trading_units, only the acquisition
+        //   side is posted to restore the balance.
+        bool can_bid = true;   // need quote to bid (buy base)
+        bool can_ask = true;   // need base to ask (sell base)
         {
-            bool reserve_ok = true;
+            bool pending_block = false;
             const PairConfig* gate_pc = find_pair_config(pair_name);
             if (gate_pc) {
                 auto bwid = offer_mgr_->resolve_wallet_id(gate_pc->base_asset_id);
                 auto qwid = offer_mgr_->resolve_wallet_id(gate_pc->quote_asset_id);
-                std::vector<std::pair<std::string, std::int64_t>> wallets_to_check;
-                if (bwid > 0) wallets_to_check.emplace_back(gate_pc->base_asset_id, bwid);
-                if (qwid > 0) wallets_to_check.emplace_back(gate_pc->quote_asset_id, qwid);
 
-                for (const auto& [label, wid] : wallets_to_check) {
+                struct SideBalance {
+                    std::string label;
+                    std::int64_t wid;
+                    std::int64_t mojos_per_unit;
+                    bool is_base;
+                };
+                std::vector<SideBalance> sides;
+                if (bwid > 0)
+                    sides.push_back({gate_pc->base_asset_id, bwid,
+                                     gate_pc->base_mojos_per_unit, true});
+                if (qwid > 0)
+                    sides.push_back({gate_pc->quote_asset_id, qwid,
+                                     gate_pc->quote_mojos_per_unit, false});
+
+                for (const auto& sb : sides) {
                     try {
-                        auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                        auto bal_json = co_await wallet_->get_wallet_balance(sb.wid);
                         Mojo spendable = 0, confirmed = 0, pending = 0;
                         if (bal_json.contains("spendable_balance"))
                             spendable = bal_json["spendable_balance"].get<Mojo>();
@@ -3078,9 +3374,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             pending = bal_json["pending_change"].get<Mojo>();
 
                         // Update the cache for metrics.
-                        cached_wallet_balances_[label] = {spendable, confirmed, pending};
+                        cached_wallet_balances_[sb.label] = {spendable, confirmed, pending};
                         metrics_->update_spendable_reserve(
-                            label,
+                            sb.label,
                             (confirmed > 0)
                                 ? static_cast<double>(spendable) / static_cast<double>(confirmed)
                                 : 1.0);
@@ -3090,35 +3386,131 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             spdlog::info("[Engine] Step 8: {} wallet {} has "
                                          "pending_change={} -- skipping offer "
                                          "posting until confirmed",
-                                         pair_name, label, pending);
-                            reserve_ok = false;
+                                         pair_name, sb.label, pending);
+
+                            // Track consecutive blocks with pending_change.
+                            pending_hit_this_block = true;
+                            ++consecutive_pending_blocks_;
+
+                            // Periodic stuck-tx pruning.
+                            if (block_height >= last_stuck_tx_prune_block_
+                                                + kStuckTxPruneInterval) {
+                                last_stuck_tx_prune_block_ = block_height;
+                                try {
+                                    auto pruned = co_await
+                                        offer_mgr_->prune_stuck_transactions(
+                                            {sb.wid}, /*max_age_seconds=*/600);
+                                    if (pruned > 0) {
+                                        spdlog::info("[Engine] Step 8: pruned "
+                                                     "stuck transactions from "
+                                                     "wallet {} ({})",
+                                                     sb.label, sb.wid);
+                                    }
+                                } catch (const std::exception& e) {
+                                    spdlog::warn("[Engine] Step 8: stuck tx "
+                                                 "prune failed for {}: {}",
+                                                 sb.label, e.what());
+                                }
+                            }
+
+                            // Escalation: force-delete if stuck too long.
+                            if (consecutive_pending_blocks_ >=
+                                kForceDeletePendingBlocks) {
+                                spdlog::warn("[Engine] Step 8: pending_change "
+                                             "persisted for {} consecutive "
+                                             "blocks -- force-deleting ALL "
+                                             "unconfirmed transactions for "
+                                             "wallet {} ({})",
+                                             consecutive_pending_blocks_,
+                                             sb.label, sb.wid);
+                                try {
+                                    co_await wallet_->
+                                        delete_unconfirmed_transactions(sb.wid);
+                                    spdlog::info("[Engine] Step 8: "
+                                                 "force-deleted unconfirmed "
+                                                 "transactions for wallet "
+                                                 "{} ({})",
+                                                 sb.label, sb.wid);
+                                    consecutive_pending_blocks_ = 0;
+                                } catch (const std::exception& e) {
+                                    spdlog::warn("[Engine] Step 8: "
+                                                 "force-delete failed for "
+                                                 "{}: {}",
+                                                 sb.label, e.what());
+                                }
+                            }
+
+                            pending_block = true;
                             break;
                         }
 
-                        // Gate 2: spendable reserve too low.
+                        // Gate 2: spendable reserve too low (fractional).
                         if (confirmed > 0) {
                             double ratio = static_cast<double>(spendable)
                                          / static_cast<double>(confirmed);
                             if (ratio < config_.strategy.min_spendable_reserve_pct) {
                                 spdlog::info("[Engine] Step 8: {} spendable reserve "
                                              "{:.1f}% < {:.1f}% threshold -- "
-                                             "skipping offer posting",
-                                             label, ratio * 100.0,
-                                             config_.strategy.min_spendable_reserve_pct * 100.0);
-                                reserve_ok = false;
-                                break;
+                                             "suppressing {} side",
+                                             sb.label, ratio * 100.0,
+                                             config_.strategy.min_spendable_reserve_pct * 100.0,
+                                             sb.is_base ? "ask" : "bid");
+                                if (sb.is_base) can_ask = false;
+                                else            can_bid = false;
                             }
+                        }
+
+                        // Gate 3: minimum balance management (unit-based).
+                        const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                            config_.strategy.min_reserve_units
+                            * static_cast<double>(sb.mojos_per_unit)));
+                        const auto trading_mojos = static_cast<Mojo>(std::llround(
+                            config_.strategy.min_trading_units
+                            * static_cast<double>(sb.mojos_per_unit)));
+
+                        if (spendable < reserve_mojos) {
+                            // Below absolute reserve: suppress the sell side
+                            // for this asset to prevent full depletion.
+                            spdlog::info("[Engine] Step 8: {} balance {:.3f} < "
+                                         "reserve {:.3f} -- suppressing {} side",
+                                         sb.label,
+                                         static_cast<double>(spendable) / sb.mojos_per_unit,
+                                         config_.strategy.min_reserve_units,
+                                         sb.is_base ? "ask" : "bid");
+                            if (sb.is_base) can_ask = false;
+                            else            can_bid = false;
+                        } else if (spendable < trading_mojos
+                                   && config_.strategy.auto_rebalance_enabled) {
+                            // Below trading minimum with auto-rebalance:
+                            // still suppress sell side, keep buy side to
+                            // acquire more of this asset.
+                            spdlog::info("[Engine] Step 8: {} balance {:.3f} < "
+                                         "trading min {:.3f} -- auto-rebalance: "
+                                         "suppressing {} side to acquire more",
+                                         sb.label,
+                                         static_cast<double>(spendable) / sb.mojos_per_unit,
+                                         config_.strategy.min_trading_units,
+                                         sb.is_base ? "ask" : "bid");
+                            if (sb.is_base) can_ask = false;
+                            else            can_bid = false;
                         }
                     } catch (const std::exception& e) {
                         spdlog::warn("[Engine] Step 8: balance query failed for "
-                                     "wallet {} ({}): {}", label, wid, e.what());
-                        // On failure, skip posting conservatively.
-                        reserve_ok = false;
+                                     "wallet {} ({}): {}", sb.label, sb.wid, e.what());
+                        // On failure, suppress both sides conservatively.
+                        can_bid = false;
+                        can_ask = false;
                         break;
                     }
                 }
             }
-            if (!reserve_ok) continue;
+            // (counter reset moved to after the pair loop)
+            if (pending_block) continue;
+            if (!can_bid && !can_ask) {
+                spdlog::info("[Engine] Step 8: {} both sides suppressed -- "
+                             "skipping offer posting", pair_name);
+                continue;
+            }
         }
 
         // Find the PairConfig for this pair (O(1) map lookup).
@@ -3157,11 +3549,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     fee_filtered_tiers.push_back(tier);
                 } else {
                     spdlog::info("[Engine] Step 8: {} {} tier {} skipped "
-                                 "(fee {} > {:.0f}% of gain {})",
+                                 "(round-trip fee {}x{:.1f} > {:.0f}% of gain {})",
                                  pair_name,
                                  (tier.side == Side::Bid) ? "bid" : "ask",
                                  tier.tier_index,
                                  recommended_fee,
+                                 config_.fees.cancel_cost_multiplier,
                                  config_.fees.fee_to_gain_max_ratio * 100.0,
                                  expected_gain);
                 }
@@ -3169,6 +3562,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         } else {
             // Fee tracking disabled or mid is 0 -- pass all tiers through.
             fee_filtered_tiers = pcs.ladder;
+        }
+
+        // -- Side-aware balance filter: suppress tiers on depleted sides.
+        if (!can_bid || !can_ask) {
+            std::vector<TierQuote> side_filtered;
+            side_filtered.reserve(fee_filtered_tiers.size());
+            for (const auto& tier : fee_filtered_tiers) {
+                if (tier.side == Side::Bid && !can_bid) continue;
+                if (tier.side == Side::Ask && !can_ask) continue;
+                side_filtered.push_back(tier);
+            }
+            const auto suppressed = fee_filtered_tiers.size() - side_filtered.size();
+            if (suppressed > 0) {
+                spdlog::info("[Engine] Step 8: {} suppressed {} tiers "
+                             "(can_bid={}, can_ask={})",
+                             pair_name, suppressed, can_bid, can_ask);
+            }
+            fee_filtered_tiers = std::move(side_filtered);
         }
 
         if (fee_filtered_tiers.empty()) {
@@ -3264,6 +3675,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 orec.created_block = block_height;
                 orec.fee_mojos     = recommended_fee;
 
+                // Capture order-book context for outcome analysis.
+                {
+                    const auto book_snap = state_->get_market(pair_name);
+                    orec.book_best_bid = book_snap.best_bid;
+                    orec.book_best_ask = book_snap.best_ask;
+                }
+
                 // Look up the actual offer_id from State.
                 std::string key = std::to_string(static_cast<int>(etq.side))
                     + "_" + std::to_string(etq.tier_index);
@@ -3306,6 +3724,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                      posted, pair_name, cancelled_ids.size(), recommended_fee);
     }
 
+    // Reset consecutive pending counter only when NO pair hit Gate 1
+    // (pending_change > 0) on this entire block.  Resetting per-pair
+    // would incorrectly clear the counter whenever a clean pair processes.
+    if (!pending_hit_this_block) {
+        consecutive_pending_blocks_ = 0;
+    }
+
     // -- [T4-11] Periodic offer-state reconciliation -------------------------
     // Every reconciliation_interval_blocks, perform a full comparison of
     // the in-memory pending-offer map against the authoritative wallet RPC
@@ -3322,7 +3747,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 // Persist reconciled cancellations to database.
                 for (const auto& oid : reconciled_ids) {
                     try {
-                        db_->update_offer_status(oid, "cancelled", block_height);
+                        db_->update_offer_status(oid, "cancelled", block_height,
+                                                "periodic_reconcile");
                     } catch (const std::exception& e) {
                         spdlog::debug("[Engine] reconcile update_offer_status "
                                      "failed for {}: {}",
@@ -3333,6 +3759,82 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         } catch (const std::exception& e) {
             spdlog::warn("[Engine] Step 8: offer reconciliation failed: {}",
                          e.what());
+        }
+
+        // -- On-chain reconciliation (full node ground truth) ----------------
+        // Runs alongside the wallet reconciliation every interval.  Verifies
+        // balance consistency and detects stale offers via blockchain data.
+        if (on_chain_reconciler_) {
+            try {
+                // Build wallet ID map from enabled pairs.
+                std::unordered_map<std::string, std::int64_t> wallet_ids;
+                std::unordered_set<std::string> our_puzzle_hashes;
+
+                for (const auto& pair : config_.pairs) {
+                    if (!pair.enabled) continue;
+                    // Resolve wallet IDs via OfferManager (same as balance gating).
+                    auto bwid = offer_mgr_->resolve_wallet_id(pair.base_asset_id);
+                    auto qwid = offer_mgr_->resolve_wallet_id(pair.quote_asset_id);
+                    if (bwid > 0) wallet_ids[pair.name + "/base"] = bwid;
+                    if (qwid > 0) wallet_ids[pair.name + "/quote"] = qwid;
+                }
+
+                // Collect puzzle hashes from spendable coins for fee tracking.
+                for (const auto& [label, wid] : wallet_ids) {
+                    try {
+                        auto coins = co_await wallet_->get_spendable_coins(wid);
+                        for (const auto& cr : coins) {
+                            const auto& coin = cr.contains("coin")
+                                ? cr["coin"] : cr;
+                            if (coin.contains("puzzle_hash")) {
+                                std::string ph =
+                                    coin["puzzle_hash"].get<std::string>();
+                                if (ph.size() > 2 && ph.substr(0, 2) == "0x") {
+                                    ph = ph.substr(2);
+                                }
+                                our_puzzle_hashes.insert(ph);
+                            }
+                        }
+                    } catch (...) { /* best-effort puzzle hash collection */ }
+                }
+
+                auto [stale_ids, balance_discreps] =
+                    co_await on_chain_reconciler_->run_full_reconciliation(
+                        wallet_ids, block_height, our_puzzle_hashes);
+
+                if (!stale_ids.empty()) {
+                    spdlog::warn("[Engine] Step 8: on-chain reconciliation "
+                                 "found {} stale offers", stale_ids.size());
+                    for (const auto& oid : stale_ids) {
+                        try {
+                            db_->update_offer_status(oid, "cancelled",
+                                                    block_height,
+                                                    "on_chain_reconcile");
+                        } catch (const std::exception& e) {
+                            spdlog::debug("[Engine] on-chain reconcile "
+                                         "update_offer_status failed for "
+                                         "{}: {}",
+                                         oid.substr(0, 12), e.what());
+                        }
+                    }
+                }
+
+                if (!balance_discreps.empty()) {
+                    spdlog::warn("[Engine] Step 8: on-chain reconciliation "
+                                 "found {} balance discrepancies",
+                                 balance_discreps.size());
+                    for (const auto& d : balance_discreps) {
+                        spdlog::warn("  {} (wid={}): wallet={} on_chain={} "
+                                     "diff={}",
+                                     d.wallet_label, d.wallet_id,
+                                     d.wallet_confirmed, d.on_chain_total,
+                                     d.difference);
+                    }
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("[Engine] Step 8: on-chain reconciliation "
+                             "failed: {}", e.what());
+            }
         }
     }
 
@@ -3471,9 +3973,9 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             continue;
         }
 
-        // Cap the take size.
+        // Cap the take size (use pair denomination, not kMojosPerXch).
         const Mojo max_take_mojos = static_cast<Mojo>(
-            max_take_xch * static_cast<double>(kMojosPerXch));
+            max_take_xch * static_cast<double>(pair.base_mojos_per_unit));
         const Mojo take_size = std::min(best_ask_size, max_take_mojos);
 
         spdlog::info("[Engine] Step 9c: {} CROSSED BOOK detected -- "
@@ -3790,6 +4292,12 @@ void Engine::step_export_metrics(BlockHeight block_height)
 
     // Paused state gauge
     metrics_->update_bot_paused(gui_pause_active_);
+
+    // Dashboard 8: Rolling 24-hour blockchain fees
+    if (fee_tracker_ && fee_tracker_->enabled()) {
+        metrics_->update_fees_paid_24h(
+            fee_tracker_->get_rolling_total(block_height));
+    }
 
     spdlog::debug("[Engine] Step 12: metrics exported");
 }

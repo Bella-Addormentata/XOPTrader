@@ -268,6 +268,11 @@ class MainWindow(QMainWindow):
         if self._trade_log is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._trade_log.load_trades)
 
+        # Kick off the initial offers query so the auto-refresh loop
+        # has a set of parameters to re-issue on subsequent ticks.
+        if hasattr(db, "query_offers"):
+            db.query_offers()
+
         # -- Reports widget signal -----------------------------------------
         reports_widget = self._unwrap(self._reports)
         if reports_widget is not None and hasattr(db, "reports_loaded"):
@@ -372,6 +377,10 @@ class MainWindow(QMainWindow):
                 "24h Fill Count": {
                     "value": data.get("offers", {}).get("filled", 0),
                     "spark": data.get("offers", {}).get("filled", 0),
+                },
+                "Fees Paid 24h": {
+                    "value": mojos_to_xch_float(int(data.get("fees_paid_24h", 0))),
+                    "spark": mojos_to_xch_float(int(data.get("fees_paid_24h", 0))),
                 },
             }
             dashboard.update_metrics(card_data)

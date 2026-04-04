@@ -396,6 +396,11 @@ DexieConfig parse_dexie(const YAML::Node& root)
     cfg.api_base              = read_string(node, "api_base", sec);
     cfg.max_requests_per_10s  = read_uint32_positive(node, "max_requests_per_10s", sec);
 
+    if (node["claim_rewards"] && node["claim_rewards"].IsDefined()
+        && !node["claim_rewards"].IsNull()) {
+        cfg.claim_rewards = node["claim_rewards"].as<bool>();
+    }
+
     return cfg;
 }
 
@@ -718,6 +723,26 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.stuck_offer_age_blocks = node["stuck_offer_age_blocks"].as<uint32_t>();
     }
 
+    // -- Minimum balance management -----------------------------------------
+    if (node["min_reserve_units"] && node["min_reserve_units"].IsDefined()
+        && !node["min_reserve_units"].IsNull()) {
+        cfg.min_reserve_units = node["min_reserve_units"].as<double>();
+        if (cfg.min_reserve_units < 0.0) {
+            throw ConfigError(sec + ".min_reserve_units must be >= 0");
+        }
+    }
+    if (node["min_trading_units"] && node["min_trading_units"].IsDefined()
+        && !node["min_trading_units"].IsNull()) {
+        cfg.min_trading_units = node["min_trading_units"].as<double>();
+        if (cfg.min_trading_units < 0.0) {
+            throw ConfigError(sec + ".min_trading_units must be >= 0");
+        }
+    }
+    if (node["auto_rebalance_enabled"] && node["auto_rebalance_enabled"].IsDefined()
+        && !node["auto_rebalance_enabled"].IsNull()) {
+        cfg.auto_rebalance_enabled = node["auto_rebalance_enabled"].as<bool>();
+    }
+
     // -- Gap-aware dynamic tier spacing (optional, defaults in StrategyConfig) --
     if (node["gap_aware_spacing"] && node["gap_aware_spacing"].IsDefined()
         && !node["gap_aware_spacing"].IsNull()) {
@@ -762,6 +787,33 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.adverse_selection_sigma_threshold = node["adverse_selection_sigma_threshold"].as<double>();
         if (cfg.adverse_selection_sigma_threshold < 0.0) {
             throw ConfigError(sec + ".adverse_selection_sigma_threshold must be >= 0");
+        }
+    }
+
+    // -- Fill-rate-weighted adaptive tier sizing (optional, defaults in LiquidityConfig) --
+    if (node["fill_rate_sizing"] && node["fill_rate_sizing"].IsDefined()
+        && !node["fill_rate_sizing"].IsNull()) {
+        cfg.fill_rate_sizing = node["fill_rate_sizing"].as<bool>();
+    }
+    if (node["fill_rate_blend"] && node["fill_rate_blend"].IsDefined()
+        && !node["fill_rate_blend"].IsNull()) {
+        cfg.fill_rate_blend = node["fill_rate_blend"].as<double>();
+        if (cfg.fill_rate_blend < 0.0 || cfg.fill_rate_blend > 1.0) {
+            throw ConfigError(sec + ".fill_rate_blend must be in [0, 1]");
+        }
+    }
+    if (node["fill_rate_lookback_hours"] && node["fill_rate_lookback_hours"].IsDefined()
+        && !node["fill_rate_lookback_hours"].IsNull()) {
+        cfg.fill_rate_lookback_hours = node["fill_rate_lookback_hours"].as<int>();
+        if (cfg.fill_rate_lookback_hours <= 0) {
+            throw ConfigError(sec + ".fill_rate_lookback_hours must be > 0");
+        }
+    }
+    if (node["fill_rate_min_pct"] && node["fill_rate_min_pct"].IsDefined()
+        && !node["fill_rate_min_pct"].IsNull()) {
+        cfg.fill_rate_min_pct = node["fill_rate_min_pct"].as<double>();
+        if (cfg.fill_rate_min_pct < 0.0 || cfg.fill_rate_min_pct >= 1.0) {
+            throw ConfigError(sec + ".fill_rate_min_pct must be in [0, 1)");
         }
     }
 
@@ -1206,6 +1258,7 @@ FeeConfig parse_fees(const YAML::Node& root)
     read_bool("enabled",              cfg.enabled);
     read_u64 ("daily_budget_mojos",   cfg.daily_budget_mojos);
     read_dbl ("fee_to_gain_max_ratio", cfg.fee_to_gain_max_ratio);
+    read_dbl ("cancel_cost_multiplier", cfg.cancel_cost_multiplier);
     read_u64 ("min_fee_mojos",        cfg.min_fee_mojos);
     read_u64 ("max_fee_mojos",        cfg.max_fee_mojos);
     read_bool("adaptive_enabled",     cfg.adaptive_enabled);
@@ -1221,6 +1274,10 @@ FeeConfig parse_fees(const YAML::Node& root)
     if (cfg.fee_to_gain_max_ratio < 0.0 || cfg.fee_to_gain_max_ratio > 1.0) {
         throw ConfigError(sec + ".fee_to_gain_max_ratio must be in [0.0, 1.0]; got "
                           + std::to_string(cfg.fee_to_gain_max_ratio));
+    }
+    if (cfg.cancel_cost_multiplier < 1.0) {
+        throw ConfigError(sec + ".cancel_cost_multiplier must be >= 1.0; got "
+                          + std::to_string(cfg.cancel_cost_multiplier));
     }
     if (cfg.fee_window_blocks == 0) {
         throw ConfigError(sec + ".fee_window_blocks must be > 0");
@@ -1304,7 +1361,8 @@ void log_config_summary(const AppConfig& cfg)
     // Dexie -- no secrets.
     out << "[dexie]\n"
         << "  api_base   = " << cfg.dexie.api_base << "\n"
-        << "  rate_limit = " << cfg.dexie.max_requests_per_10s << " req/10s\n";
+        << "  rate_limit = " << cfg.dexie.max_requests_per_10s << " req/10s\n"
+        << "  claim_rewards = " << (cfg.dexie.claim_rewards ? "ON" : "off") << "\n";
 
     // Pairs -- asset IDs and names are operational data, not secrets.
     out << "[pairs] (" << cfg.pairs.size() << " configured)\n";
@@ -1424,6 +1482,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  enabled    = " << (cfg.fees.enabled ? "true" : "false") << "\n"
         << "  budget/day = " << cfg.fees.daily_budget_mojos << " mojos\n"
         << "  gain_ratio = " << cfg.fees.fee_to_gain_max_ratio << "\n"
+        << "  cancel_mul = " << cfg.fees.cancel_cost_multiplier << "\n"
         << "  min_fee    = " << cfg.fees.min_fee_mojos << " mojos\n"
         << "  max_fee    = " << cfg.fees.max_fee_mojos << " mojos\n"
         << "  adaptive   = " << (cfg.fees.adaptive_enabled ? "true" : "false") << "\n"
@@ -1434,7 +1493,10 @@ void log_config_summary(const AppConfig& cfg)
         << "  reconcile  = " << cfg.strategy.reconciliation_interval_blocks << " blocks\n"
         << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n"
         << "  spendable_reserve = " << (cfg.strategy.min_spendable_reserve_pct * 100.0) << "%\n"
-        << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n";
+        << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n"
+        << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
+        << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
+        << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n";
 
     // Volatility: new fields.
     out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";

@@ -30,7 +30,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(xop_trader
-    VERSION   0.5.6
+    VERSION   0.5.7
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )
@@ -174,6 +174,7 @@ add_library(xop_core STATIC
     src/monitoring/pnl.cpp
     src/monitoring/metrics.cpp
     src/monitoring/alerts.cpp
+    src/monitoring/on_chain_reconciler.cpp
 )
 
 target_include_directories(xop_core

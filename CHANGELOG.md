@@ -5,6 +5,21 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.7] — 2026-04-05
+
+### Added
+
+- **DBX liquidity reward auto-claim**: Every offer submitted to Dexie now includes `claim_rewards: true`, automatically claiming DBX rewards from Dexie's Liquidity Incentive Program. Rewards are batched and sent daily. Toggle via `dexie.claim_rewards` config field or GUI checkbox
+- **XCH/DBX pair template**: Added disabled XCH/DBX pair in `config.example.yaml` for users who want to farm high-APR DBX rewards (75–135% APR) on the thin DBX market
+- **DBX rewards documentation**: New `docs/dbx-liquidity-rewards.md` covering reward rates, eligibility, claiming methods, and XCH/DBX market analysis
+
+### Changed
+
+- **Cancel-reduction: soft/hard TTL split**: The configured `offer_ttl_blocks` (default 60) is now a "soft" TTL. Offers past soft TTL are only expired if they show ≥0.2% adverse deviation — well-priced old offers stay live. Hard TTL at 2× soft (120 blocks ≈ 104 min) is the absolute safety cap
+- **Cancel-reduction: tier-scaled threshold**: Outer tiers now tolerate more price movement before cancellation. Effective threshold scales by tier index: tier 0 → 0.50%, tier 1 → 0.75%, tier 2 → 1.00%, tier 3 → 1.25%. Inner tiers remain tightly monitored
+- **Cancel-reduction: minimum age guard**: Offers younger than 3 blocks (~2.6 min) are protected from price-deviation cancellation. The round-trip fee for cancel+recreate exceeds adverse selection risk at small deviations. Crossed-mid cancellation still bypasses this guard
+- **Cancel-reduction: all-stale branch fix**: When all tiers are classified as Stale (price deviation), the engine now uses `selective_cancel` instead of `cancel_stale(TTL)`. Previously, price-stale offers within TTL were missed by the TTL-only `cancel_stale` path, risking double-posting
+
 ## [0.5.6] — 2026-04-04
 
 ### Fixed

@@ -70,6 +70,7 @@
 #include "xop/monitoring/pnl.hpp"
 #include "xop/monitoring/metrics.hpp"
 #include "xop/monitoring/alerts.hpp"
+#include "xop/monitoring/on_chain_reconciler.hpp"
 
 // New strategy modules
 #include "xop/strategy/order_book_tactics.hpp"
@@ -489,6 +490,9 @@ private:
     /// Telegram alert manager.
     std::unique_ptr<AlertManager> alerts_;
 
+    /// On-chain reconciler -- verifies internal state against full node.
+    std::unique_ptr<OnChainReconciler> on_chain_reconciler_;
+
     // -- New strategy modules ------------------------------------------------
 
     /// Order book interaction tactician — gap-filling, join/improve/step-back.
@@ -722,6 +726,20 @@ private:
     // Block height of the last full reconciliation run.  Compared against
     // current_block to decide when to trigger the next reconciliation.
     BlockHeight last_reconciliation_block_{0};
+
+    // -- Stuck transaction pruning cooldown ----------------------------------
+    // Block height of the last stuck-transaction prune attempt.  Limits
+    // pruning to once every kStuckTxPruneInterval blocks to avoid
+    // hammering the wallet RPC every heartbeat.
+    BlockHeight last_stuck_tx_prune_block_{0};
+    static constexpr uint32_t kStuckTxPruneInterval{20};  // ~17 min
+
+    // Number of consecutive heartbeat blocks where pending_change > 0 was
+    // seen for any wallet.  After kForceDeletePendingBlocks consecutive
+    // blocks, unconditionally call delete_unconfirmed_transactions rather
+    // than relying on the transaction-scanning heuristic.
+    uint32_t consecutive_pending_blocks_{0};
+    static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
     // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
     // Populated from wallet RPC each heartbeat; keyed by wallet label.
     struct WalletBalanceEntry {

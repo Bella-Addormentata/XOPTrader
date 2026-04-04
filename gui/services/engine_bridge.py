@@ -225,6 +225,9 @@ class EngineBridge(QObject):
                 self._metrics_url = f"http://localhost:{prom_port}/metrics"
                 # Update the worker's URL via the public service API.
                 self._metrics_svc.set_url(self._metrics_url)
+                _log.info("Metrics URL overridden from config: %s", self._metrics_url)
+            else:
+                _log.info("Metrics URL kept (user-supplied): %s", self._metrics_url)
 
         self._metrics_svc.start()
 
@@ -315,6 +318,7 @@ class EngineBridge(QObject):
             "bot_status": self._bot_status,
             "spendable_reserve": self._metrics_svc.get_spendable_reserve(),
             "stuck_offers": self._metrics_svc.get_stuck_offers(),
+            "fees_paid_24h": self._metrics_svc.get_fees_paid_24h(),
             "wallet_balances": self._wallet_svc.get_balances(),
         }
         return data

@@ -97,6 +97,7 @@ struct ChiaConfig {
 struct DexieConfig {
     std::string api_base{"https://api.dexie.space/v1"};
     uint32_t    max_requests_per_10s{50};  // Must be >= 1.
+    bool        claim_rewards{true};       // Auto-claim DBX liquidity rewards on offer submission.
 };
 
 // ---------------------------------------------------------------------------
@@ -210,6 +211,22 @@ struct StrategyConfig {
     /// "stuck" and eligible for forced cancellation + alerting.
     uint32_t stuck_offer_age_blocks{30};
 
+    // -- Minimum balance management -----------------------------------------
+
+    /// Minimum units of each asset to keep as reserve.  Offers on the
+    /// side that would deplete an asset below this level are suppressed.
+    /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
+    double   min_reserve_units{1.0};
+
+    /// Minimum units of each asset desired for active trading.  When an
+    /// asset is below this level, the engine biases toward acquiring it
+    /// by posting only buy-side offers.  Default 10.0.
+    double   min_trading_units{10.0};
+
+    /// When true, automatically post one-sided offers to acquire
+    /// depleted assets when below min_trading_units.  Default true.
+    bool     auto_rebalance_enabled{true};
+
     // -- Gap-aware dynamic tier spacing -------------------------------------
 
     /// Enable gap-aware dynamic tier spacing.
@@ -234,6 +251,20 @@ struct StrategyConfig {
 
     /// Volatility threshold above which decay is halved.
     double   adverse_selection_sigma_threshold{0.05};
+
+    // -- Fill-rate-weighted adaptive tier sizing ----------------------------
+
+    /// Enable fill-rate-adaptive tier sizing.
+    bool     fill_rate_sizing{true};
+
+    /// Blend factor for fill-rate sizing [0, 1].
+    double   fill_rate_blend{0.30};
+
+    /// Lookback window in hours for fill-rate computation.
+    int      fill_rate_lookback_hours{24};
+
+    /// Minimum allocation fraction per tier when fill-rate sizing is active.
+    double   fill_rate_min_pct{0.05};
 
     // -- AMM blend weight for market data feed ------------------------------
 
@@ -501,6 +532,14 @@ struct FeeConfig {
     /// If fee / expected_gain > this value, the tier is skipped.
     /// Default 0.30 (30%).  0.0 disables fee-vs-gain gating.
     double   fee_to_gain_max_ratio{0.30};
+
+    /// Multiplier applied to the fee in the fee-vs-gain ratio check to
+    /// account for the round-trip cost of posting + cancelling an offer.
+    /// A value of 2.0 means the gate checks (2×fee)/gain, reflecting that
+    /// every offer that doesn't fill will also incur a cancellation fee.
+    /// With adaptive fees the cancel may cost more than the post, so
+    /// values > 2.0 provide additional margin.  Default 2.0.
+    double   cancel_cost_multiplier{2.0};
 
     /// Absolute fee floor (mojos).  The tracker will never recommend a fee
     /// below this value.  Default 50 000 000 (0.00005 XCH).

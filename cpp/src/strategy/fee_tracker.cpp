@@ -125,14 +125,20 @@ bool FeeTracker::should_post_offer(std::uint64_t expected_gain_mojos,
     }
 
     // Fee-vs-gain ratio check (skip if ratio == 0.0 meaning disabled).
+    // Apply cancel_cost_multiplier to account for the round-trip cost:
+    // every offer that doesn't fill will also incur a cancellation fee.
     if (cfg_.fee_to_gain_max_ratio > 0.0 && expected_gain_mojos > 0) {
-        const double ratio = static_cast<double>(fee_mojos)
+        const double round_trip_fee =
+            static_cast<double>(fee_mojos) * cfg_.cancel_cost_multiplier;
+        const double ratio = round_trip_fee
                            / static_cast<double>(expected_gain_mojos);
         if (ratio > cfg_.fee_to_gain_max_ratio) {
-            spdlog::info("[FeeTracker] Fee/gain ratio {:.2f} exceeds "
-                         "threshold {:.2f} (fee={} gain={}). Skipping offer.",
+            spdlog::info("[FeeTracker] Round-trip fee/gain ratio {:.2f} exceeds "
+                         "threshold {:.2f} (fee={} x{:.1f} gain={}). "
+                         "Skipping offer.",
                          ratio, cfg_.fee_to_gain_max_ratio,
-                         fee_mojos, expected_gain_mojos);
+                         fee_mojos, cfg_.cancel_cost_multiplier,
+                         expected_gain_mojos);
             return false;
         }
     }

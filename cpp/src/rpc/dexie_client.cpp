@@ -898,13 +898,18 @@ asio::awaitable<OffersPage> DexieClient::get_trades(
 // POST /v1/offers  (submit a new offer)
 // -----------------------------------------------------------------------
 asio::awaitable<SubmitResult> DexieClient::submit_offer(
-    std::string_view offer_bech32m) {
+    std::string_view offer_bech32m,
+    bool claim_rewards) {
     // Security: never log the full offer payload.
-    log_->info("submit_offer(offer={})",
-               truncate_for_log(offer_bech32m, 24));
+    log_->info("submit_offer(offer={}, claim_rewards={})",
+               truncate_for_log(offer_bech32m, 24),
+               claim_rewards);
 
     nlohmann::json body;
     body["offer"] = offer_bech32m;
+    if (claim_rewards) {
+        body["claim_rewards"] = true;
+    }
 
     const auto json = co_await http_post_("/offers", body);
 

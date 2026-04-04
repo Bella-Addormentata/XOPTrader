@@ -59,6 +59,7 @@ dexie:
   # Dexie API — rate limit 50 req / 10s
   api_base: "https://api.dexie.space/v1"         # [REQUIRED]
   max_requests_per_10s: 50                        # [REQUIRED]
+  claim_rewards: true                             # Auto-claim DBX liquidity rewards (default: true)
 
 # --- pairs: REQUIRED (at least one enabled pair) ----------------------------
 # Per-pair: base_asset_id, quote_asset_id, name are REQUIRED.
@@ -96,6 +97,12 @@ pairs:
     quote_asset_id: "xch"
     name: "wmilliETH/XCH"
     enabled: true
+  # XCH/DBX — Dexie liquidity rewards pair (135% APR bid-side, 75% APR ask-side).
+  # Thin order book; enable only if you want to farm DBX incentive rewards.
+  - base_asset_id: "xch"
+    quote_asset_id: "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"  # DBX
+    name: "XCH/DBX"
+    enabled: false
 
 # --- strategy: REQUIRED ------------------------------------------------------
 # Fields marked [REQUIRED] must be present; others use defaults if omitted.
@@ -122,6 +129,12 @@ strategy:
   # [T4-11] Offer state reconciliation: full wallet-vs-state check every N blocks.
   # Default 20 blocks (~17 min).  0 = disabled.
   reconciliation_interval_blocks: 20     # [OPTIONAL, default: 20]
+
+  # -- Minimum balance management --
+  # Prevents zero-balance lockout by reserving a minimum in each asset.
+  min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
+  min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
+  auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
 
   # -- Gap-aware dynamic tier spacing --
   # Analyses the competing order book for price gaps and shifts tier
@@ -257,7 +270,9 @@ coingecko:
 fees:
   enabled: true                       # Master switch for fee tracking
   daily_budget_mojos: 10000000000     # Max fees per 24h rolling window (0.01 XCH)
-  fee_to_gain_max_ratio: 0.30        # Skip tier if fee > 30% of expected gain
+  fee_to_gain_max_ratio: 0.30        # Skip tier if round-trip fee > 30% of expected gain
+  cancel_cost_multiplier: 2.0        # Round-trip multiplier: fee×M is used in the gain check
+                                      # (2.0 = post + cancel; >2.0 adds margin for adaptive fee spikes)
   min_fee_mojos: 50000000            # Fee floor (0.00005 XCH)
   max_fee_mojos: 500000000           # Fee ceiling (0.0005 XCH)
   adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees

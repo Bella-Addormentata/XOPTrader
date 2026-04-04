@@ -809,7 +809,7 @@ void OfferManager::invalidate_wallet_ids() noexcept
 }
 
 // ---------------------------------------------------------------------------
-// [T5-01] classify_tier_staleness -- per-tier price-deviation check
+// [T5-01] classify_tier_staleness -- direction-aware price-deviation check
 //
 // Scholarly basis:
 //   - Gao & Wang (2020): optimal cancel threshold is a function of the
@@ -817,18 +817,24 @@ void OfferManager::invalidate_wallet_ids() noexcept
 //   - Aït-Sahalia & Saglam (2017): stale-quote risk increases with the
 //     magnitude of price deviation, not uniformly across all tiers.
 //
-// Approach: for each pending offer, find the corresponding tier in the
-// new ladder (matched by side + tier_index) and compute the fractional
-// price difference.  If the deviation exceeds kSelectiveRefreshThreshold
-// the tier is Stale (needs cancel + re-post); if TTL-expired it is
-// Expired; otherwise Fresh (keep live).
+// Direction-aware approach:
+//   Only *adverse* deviations trigger cancellation.  An adverse move is
+//   one that makes our offer more generous than intended:
+//     - Bid: new optimal < old price → our bid is too high (overpaying)
+//     - Ask: new optimal > old price → our ask is too low (underselling)
+//   Favorable deviations (bid drifted below optimal, ask drifted above)
+//   make the offer more conservative and are safe to leave live.
+//
+//   Additionally, if the offer has crossed the mid-price it is flagged
+//   for urgent cancellation regardless of threshold.
 // ---------------------------------------------------------------------------
 
 std::vector<TierClassification> OfferManager::classify_tier_staleness(
     const std::string&             pair_name,
     const std::vector<TierQuote>&  new_ladder,
     BlockHeight                    current_block,
-    BlockHeight                    ttl_blocks) const
+    BlockHeight                    ttl_blocks,
+    Mojo                           mid_price) const
 {
     std::vector<TierClassification> results;
 
@@ -844,16 +850,28 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         optimal_prices[key] = tq.price;
     }
 
+    const double mid_p = static_cast<double>(mid_price);
+
+    // Precompute hard TTL: absolute safety cap beyond which all offers
+    // are expired regardless of price accuracy.
+    const BlockHeight hard_ttl = ttl_blocks * kHardTtlMultiplier;
+
     for (const auto& po : pending) {
         if (po.pair_name != pair_name) continue;
 
         TierClassification tc;
-        tc.offer_id  = po.offer_id;
+        tc.offer_id   = po.offer_id;
         tc.tier_index = po.tier;
         tc.side       = po.side;
 
-        // Check TTL first — expired offers must be cancelled regardless.
-        if (current_block >= po.created_at_block + ttl_blocks) {
+        const BlockHeight age = (current_block > po.created_at_block)
+            ? (current_block - po.created_at_block) : 0;
+        const bool past_soft_ttl = (age >= ttl_blocks);
+        const bool past_hard_ttl = (age >= hard_ttl);
+
+        // Hard TTL: absolute expiration regardless of price.
+        // Safety backstop — offers should never live indefinitely.
+        if (past_hard_ttl) {
             tc.staleness       = TierStaleness::Expired;
             tc.price_deviation = 1.0;  // maximal
             results.push_back(std::move(tc));
@@ -869,20 +887,86 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             // by fee-vs-gain gating).  Treat as stale.
             tc.staleness       = TierStaleness::Stale;
             tc.price_deviation = 1.0;
+            tc.adverse         = true;
             results.push_back(std::move(tc));
             continue;
         }
 
-        // Compute fractional price deviation.
+        // Compute signed price deviation.
         const double old_p = static_cast<double>(po.price);
         const double new_p = static_cast<double>(opt_it->second);
-        tc.price_deviation = (old_p > 0.0)
-            ? std::abs(new_p - old_p) / old_p
+        const double signed_dev = (old_p > 0.0)
+            ? (new_p - old_p) / old_p
             : 1.0;
 
-        tc.staleness = (tc.price_deviation > kSelectiveRefreshThreshold)
-            ? TierStaleness::Stale
-            : TierStaleness::Fresh;
+        tc.price_deviation = std::abs(signed_dev);
+
+        // Determine if the deviation is adverse (makes our offer
+        // more generous than intended) or favorable (more conservative).
+        //   Bid: adverse when new_p < old_p (signed_dev < 0)
+        //        → our old bid is higher than the new optimal, overpaying.
+        //   Ask: adverse when new_p > old_p (signed_dev > 0)
+        //        → our old ask is lower than the new optimal, underselling.
+        tc.adverse = (po.side == Side::Bid)
+            ? (signed_dev < 0.0)
+            : (signed_dev > 0.0);
+
+        // Crossing detection: a Bid above mid or Ask below mid is
+        // extremely dangerous (immediate adverse selection risk).
+        if (mid_price > 0) {
+            if (po.side == Side::Bid && old_p > mid_p) {
+                tc.crossed = true;
+            } else if (po.side == Side::Ask && old_p < mid_p) {
+                tc.crossed = true;
+            }
+        }
+
+        // Classification logic (cancel-reduction optimisations):
+        //
+        //   1. Crossed mid-price → always Stale (urgent cancel, no age guard).
+        //
+        //   2. Soft TTL zone (soft TTL ≤ age < hard TTL):
+        //      The offer is old.  Apply a gentler adverse threshold
+        //      (kSoftTtlAdverseThreshold = 0.2%) — even a small drift
+        //      on an aged offer should trigger a refresh.  But if the
+        //      offer is still perfectly priced, keep it.
+        //
+        //   3. Minimum age guard (age < kMinRefreshAgeBlocks):
+        //      Very young offers are protected from cancel churn because
+        //      the round-trip fee (cancel + recreate) exceeds the adverse
+        //      selection risk for small deviations.  Only crossed-mid
+        //      bypasses this.
+        //
+        //   4. Tier-scaled threshold (normal zone):
+        //      Outer tiers tolerate more movement because they are further
+        //      from mid and capture larger spreads.
+        //      threshold = kSelectiveRefreshThreshold × (1 + tier × scale)
+        //        tier 0 → 0.50%   tier 1 → 0.75%
+        //        tier 2 → 1.00%   tier 3 → 1.25%
+
+        if (tc.crossed) {
+            // (1) Urgent: offer crossed mid-price.
+            tc.staleness = TierStaleness::Stale;
+        } else if (past_soft_ttl) {
+            // (2) Soft TTL zone: gentler threshold on old offers.
+            if (tc.adverse && tc.price_deviation > kSoftTtlAdverseThreshold) {
+                tc.staleness = TierStaleness::Expired;
+            } else {
+                tc.staleness = TierStaleness::Fresh;
+            }
+        } else if (age < kMinRefreshAgeBlocks) {
+            // (3) Very young offer: protect from churn.
+            tc.staleness = TierStaleness::Fresh;
+        } else {
+            // (4) Normal zone: tier-scaled adverse threshold.
+            const double tier_threshold = kSelectiveRefreshThreshold
+                * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
+            if (tc.adverse && tc.price_deviation > tier_threshold) {
+                tc.staleness = TierStaleness::Stale;
+            } else {
+                tc.staleness = TierStaleness::Fresh;
+            }
+        }
 
         results.push_back(std::move(tc));
     }
@@ -1143,7 +1227,7 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
 
     for (const auto wid : wallet_ids) {
         try {
-            auto txs = co_await wallet_->get_transactions(wid, 0, 50);
+            auto txs = co_await wallet_->get_transactions(wid, 0, 200);
 
             int stuck_count = 0;
             for (const auto& tx : txs) {
@@ -1152,30 +1236,40 @@ asio::awaitable<int> OfferManager::prune_stuck_transactions(
                     continue;
                 }
 
-                // Check if the transaction is missing a spend bundle.
-                bool has_bundle = tx.contains("spend_bundle") &&
-                                  !tx["spend_bundle"].is_null();
-                if (has_bundle) {
-                    continue;  // Has a spend bundle -- may still confirm.
-                }
-
                 // Check age.
                 if (!tx.contains("created_at_time")) continue;
                 auto created = tx["created_at_time"].get<std::int64_t>();
                 auto age = now_epoch - created;
-                if (age < max_age_seconds) continue;
+
+                // Transactions without a spend bundle are stuck immediately
+                // after max_age_seconds (wallet failed to build the bundle).
+                // Transactions WITH a spend bundle that remain unconfirmed
+                // past 3x max_age_seconds (default 30 min) are also stuck:
+                // the mempool drops transactions after ~5 minutes, so if
+                // they haven't confirmed after 30 min they never will.
+                bool has_bundle = tx.contains("spend_bundle") &&
+                                  !tx["spend_bundle"].is_null();
+                std::int64_t threshold = has_bundle
+                    ? max_age_seconds * 3   // 30 min for broadcast-but-dropped
+                    : max_age_seconds;       // 10 min for never-broadcast
+
+                if (age < threshold) continue;
 
                 ++stuck_count;
 
                 // Log details for the first few stuck transactions.
-                if (stuck_count <= 3) {
+                if (stuck_count <= 5) {
                     std::int64_t amount = 0;
                     int tx_type = -1;
+                    std::string tx_name = "(unknown)";
                     if (tx.contains("amount")) amount = tx["amount"].get<std::int64_t>();
                     if (tx.contains("type"))   tx_type = tx["type"].get<int>();
+                    if (tx.contains("name"))   tx_name = tx["name"].get<std::string>();
                     logger_->warn("[prune_stuck_tx] wallet {} stuck tx: "
-                                  "type={} amount={} age={}s no_spend_bundle",
-                                  wid, tx_type, amount, age);
+                                  "type={} amount={} age={}s bundle={} "
+                                  "name={}",
+                                  wid, tx_type, amount, age,
+                                  has_bundle ? "yes" : "no", tx_name);
                 }
             }
 
@@ -1451,7 +1545,8 @@ asio::awaitable<bool> OfferManager::submit_to_dexie(
         // POST /v1/offers with JSON body {"offer": "<bech32m text>"}.
         // DexieClient::submit_offer handles rate limiting, retries on
         // 429/5xx, and JSON parsing internally.
-        rpc::SubmitResult result = co_await dexie_client_->submit_offer(offer_text);
+        rpc::SubmitResult result = co_await dexie_client_->submit_offer(
+            offer_text, dexie_cfg_.claim_rewards);
 
         if (result.success) {
             logger_->info("submit_to_dexie: accepted (dexie_id={})",

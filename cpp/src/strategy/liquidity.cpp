@@ -694,6 +694,102 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                       }());
     }
 
+    // -- Step 2b: Fill-rate-weighted adaptive tier sizing --------------------
+    // Blend historical per-tier fill rates with the current tier_size_pct
+    // to allocate more capital to tiers that get taken more frequently.
+    // This adapts the sizing to observed market demand without disrupting
+    // the ladder structure (min floor prevents any tier from being starved).
+    if (adj_cfg.fill_rate_sizing
+        && adj_cfg.num_tiers > 1
+        && adj_cfg.fill_rate_blend > 0.0
+        && !adj_cfg.tier_fill_rates.empty()
+        && adj_cfg.tier_fill_rates.size() >= adj_cfg.num_tiers)
+    {
+        // Check that we have meaningful fill data (at least one tier filled).
+        double total_rate = 0.0;
+        for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+            total_rate += adj_cfg.tier_fill_rates[i];
+        }
+
+        if (total_rate > 0.0) {
+            // Build fill-rate weights with minimum floor.
+            std::vector<double> fr_weights(adj_cfg.num_tiers);
+            double fr_sum = 0.0;
+            for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                fr_weights[i] = std::max(adj_cfg.tier_fill_rates[i],
+                                         adj_cfg.fill_rate_min_pct);
+                fr_sum += fr_weights[i];
+            }
+
+            // Normalise fill-rate weights to sum to 1.0.
+            if (fr_sum > 0.0) {
+                for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                    fr_weights[i] /= fr_sum;
+                }
+            }
+
+            // Blend: new_pct = (1 - blend) * current + blend * fill_rate_weight
+            const double b = adj_cfg.fill_rate_blend;
+            for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                adj_cfg.tier_size_pct[i] =
+                    (1.0 - b) * adj_cfg.tier_size_pct[i] + b * fr_weights[i];
+            }
+
+            // Re-normalise to ensure sum = 1.0 after blending.
+            double pct_sum = 0.0;
+            for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                pct_sum += adj_cfg.tier_size_pct[i];
+            }
+            if (pct_sum > 0.0) {
+                for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                    adj_cfg.tier_size_pct[i] /= pct_sum;
+                }
+            }
+
+            // Validate blended sizes.
+            bool blend_valid = true;
+            for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                if (!std::isfinite(adj_cfg.tier_size_pct[i])
+                    || adj_cfg.tier_size_pct[i] < 0.0) {
+                    blend_valid = false;
+                    break;
+                }
+            }
+            if (!blend_valid) {
+                spdlog::warn("[Liquidity] {} fill-rate sizing produced "
+                             "degenerate values -- falling back",
+                             pair_name_);
+                adj_cfg.tier_size_pct = cfg.tier_size_pct;
+            }
+
+            spdlog::debug("[Liquidity] {} fill-rate sizing: "
+                          "blend={:.2f} rates=[{}] sizes=[{}]",
+                          pair_name_, b,
+                          [&]() {
+                              std::string s;
+                              for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                                  if (i > 0) s += ", ";
+                                  char buf[16];
+                                  std::snprintf(buf, sizeof(buf), "%.3f",
+                                                adj_cfg.tier_fill_rates[i]);
+                                  s += buf;
+                              }
+                              return s;
+                          }(),
+                          [&]() {
+                              std::string s;
+                              for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
+                                  if (i > 0) s += ", ";
+                                  char buf[16];
+                                  std::snprintf(buf, sizeof(buf), "%.3f",
+                                                adj_cfg.tier_size_pct[i]);
+                                  s += buf;
+                              }
+                              return s;
+                          }());
+        }
+    }
+
     // -- Step 3: Gap-aware dynamic tier spacing ------------------------------
     // Analyse the competing order book for gaps and shift tier spacing
     // toward underserved price ranges.

@@ -630,6 +630,17 @@ class MetricsService(QObject):
             return int(value)
         return 0
 
+    def get_fees_paid_24h(self) -> float:
+        """Return the rolling 24-hour blockchain fees paid in mojos.
+
+        Returns
+        -------
+        float
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+        return _scalar(m, "xop_fees_paid_24h_mojos")
+
     def is_paused(self) -> bool:
         """Return whether the engine is paused by GUI flag.
 
@@ -715,6 +726,11 @@ class MetricsService(QObject):
         if not self._connected:
             self._connected = True
             _log.info("Metrics endpoint connected: %s", self._url)
+            _log.info(
+                "Metrics snapshot: %d families, keys=%s",
+                len(parsed),
+                ", ".join(sorted(parsed.keys())[:15]),
+            )
             self.connection_restored.emit()
 
         # Resume normal polling interval.

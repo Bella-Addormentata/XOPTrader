@@ -204,6 +204,37 @@ struct LiquidityConfig {
     /// factor is halved (more conservative sizing inner tiers).
     /// Default 0.05 (5% annualised).  0 = always use base decay.
     double adverse_selection_sigma_threshold{0.05};
+
+    // -- Fill-rate-weighted adaptive tier sizing ----------------------------
+
+    /// Enable fill-rate-adaptive tier sizing.  When enabled, historical
+    /// per-tier fill rates from the offer_log are blended with the current
+    /// tier_size_pct to allocate more capital to tiers that get taken more
+    /// frequently.  Applied after adverse-selection sizing.
+    /// Default: true.
+    bool fill_rate_sizing{true};
+
+    /// Blend factor [0,1] controlling how strongly tier sizing shifts toward
+    /// empirical fill-rate weights.
+    /// 0.0 = ignore fill rates (use adverse-selection sizing only).
+    /// 1.0 = size entirely by fill rates (subject to min floor).
+    /// Default 0.30 (30% weight on fill data, 70% on analytical sizing).
+    double fill_rate_blend{0.30};
+
+    /// Lookback window in hours for computing per-tier fill rates from
+    /// the offer_log.  Longer windows provide more stable estimates but
+    /// adapt more slowly to regime changes.  Default 24 hours.
+    int fill_rate_lookback_hours{24};
+
+    /// Minimum allocation fraction per tier when fill-rate sizing is active.
+    /// Prevents any tier from being starved of capital, which would leave
+    /// gaps in the order book.  Default 0.05 (5%).
+    double fill_rate_min_pct{0.05};
+
+    /// Per-tier fill rates from the database (runtime data, not YAML config).
+    /// Populated by the engine before calling compute_ladder.
+    /// Empty vector = no fill data available (skip fill-rate sizing).
+    std::vector<double> tier_fill_rates;
 };
 
 // ---------------------------------------------------------------------------

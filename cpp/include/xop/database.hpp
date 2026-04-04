@@ -88,6 +88,8 @@ struct DbOfferRecord {
     BlockHeight created_block{0};   ///< Block at which the offer was broadcast.
     BlockHeight resolved_block{0};  ///< Block at which the offer was resolved (0 if pending).
     std::uint64_t fee_mojos{0};      ///< Fee attached to this offer (mojos).
+    Mojo        book_best_bid{0};   ///< Best competing bid at offer creation.
+    Mojo        book_best_ask{0};   ///< Best competing ask at offer creation.
 };
 
 // ---------------------------------------------------------------------------
@@ -179,10 +181,12 @@ public:
     /// @param offer_id       The offer's unique identifier.
     /// @param new_status     New status string ("filled", "cancelled", "expired").
     /// @param resolved_block Block height at which the status changed.
+    /// @param cancel_reason  Human-readable reason for cancellation (empty for fills).
     /// @throws std::runtime_error if no row matches offer_id.
     void update_offer_status(const std::string& offer_id,
                              const std::string& new_status,
-                             BlockHeight        resolved_block);
+                             BlockHeight        resolved_block,
+                             const std::string& cancel_reason = "");
 
     /// Return all offers with status='pending' from the offer_log table.
     /// Used on startup to recover offers that were pending when the engine
@@ -229,6 +233,20 @@ public:
     /// If no resolved offers exist since the block, returns the provided default.
     [[nodiscard]] double fill_rate_since_block(BlockHeight since,
                                                double fallback = 0.30) const;
+
+    /// Query per-tier fill rates for a trading pair over a recent time window.
+    /// Returns a vector of length @p max_tiers where element [i] is the fill
+    /// rate (filled / total resolved) for tier i.  Tiers with no resolved
+    /// offers in the window return 0.0.
+    ///
+    /// @param pair_name   Trading pair to query (e.g. "XCH/wUSDC.b").
+    /// @param cutoff_ts   ISO-8601 UTC lower bound for offer created_at.
+    /// @param max_tiers   Number of tier slots to return (typically num_tiers).
+    /// @return            Vector of fill rates [0.0, 1.0] per tier index.
+    [[nodiscard]]
+    std::vector<double> query_tier_fill_rates(const std::string& pair_name,
+                                              const std::string& cutoff_ts,
+                                              std::uint32_t max_tiers) const;
 
     /// True if the database connection is open and usable.
     [[nodiscard]] bool is_open() const noexcept;
@@ -319,6 +337,9 @@ private:
 
     /// Fill rate query: filled / total resolved offers since a given block
     sqlite3_stmt* stmt_fill_rate_{nullptr};
+
+    /// Per-tier fill rate query: filled / total resolved per tier for a pair
+    sqlite3_stmt* stmt_tier_fill_rates_{nullptr};
 
     // [T8-20] Transaction control prepared statements.
     sqlite3_stmt* stmt_begin_{nullptr};

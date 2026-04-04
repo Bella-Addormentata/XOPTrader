@@ -509,6 +509,15 @@ class SettingsWidget(QWidget):
         self._dx_rate_limit.setToolTip("Maximum API requests per 10-second window")
         dx_form.addRow("Rate Limit (per 10s):", self._dx_rate_limit)
 
+        self._dx_claim_rewards = QCheckBox("Auto-claim DBX liquidity rewards")
+        self._dx_claim_rewards.setChecked(True)
+        self._dx_claim_rewards.setToolTip(
+            "When enabled, tells Dexie to automatically claim DBX liquidity\n"
+            "incentive rewards for qualifying offers (within 5% of market price).\n"
+            "Rewards are sent daily to the maker wallet address."
+        )
+        dx_form.addRow("", self._dx_claim_rewards)
+
         layout.addWidget(dx_group)
         layout.addStretch(1)
 
@@ -525,6 +534,10 @@ class SettingsWidget(QWidget):
             self._dx_rate_limit,
         ):
             widget.valueChanged.connect(lambda _v, ti=0: self._mark_dirty(ti))
+
+        self._dx_claim_rewards.stateChanged.connect(
+            lambda _s, ti=0: self._mark_dirty(ti)
+        )
 
         return page
 
@@ -682,6 +695,48 @@ class SettingsWidget(QWidget):
         tier_layout.addWidget(self._tier_sum_label)
 
         layout.addWidget(tier_group)
+
+        # -- Balance Management --
+        bal_group = QGroupBox("Balance Management")
+        bal_form = QFormLayout(bal_group)
+        bal_form.setSpacing(8)
+
+        self._min_reserve_units = QDoubleSpinBox()
+        self._min_reserve_units.setRange(0.0, 10_000.0)
+        self._min_reserve_units.setSingleStep(1.0)
+        self._min_reserve_units.setDecimals(1)
+        self._min_reserve_units.setValue(1.0)
+        self._min_reserve_units.setSuffix(" units")
+        self._min_reserve_units.setToolTip(
+            "Minimum units of each active coin to keep as reserve.  "
+            "Offers that would deplete a wallet below this level are "
+            "suppressed (sell-side only).  Prevents zero-balance lockout."
+        )
+        bal_form.addRow("Min Reserve Balance:", self._min_reserve_units)
+
+        self._min_trading_units = QDoubleSpinBox()
+        self._min_trading_units.setRange(0.0, 100_000.0)
+        self._min_trading_units.setSingleStep(1.0)
+        self._min_trading_units.setDecimals(1)
+        self._min_trading_units.setValue(10.0)
+        self._min_trading_units.setSuffix(" units")
+        self._min_trading_units.setToolTip(
+            "Desired minimum units of each coin for active trading.  "
+            "Below this, auto-rebalance posts buy-side-only offers to "
+            "acquire the depleted asset from other markets."
+        )
+        bal_form.addRow("Min Trading Balance:", self._min_trading_units)
+
+        self._auto_rebalance = QCheckBox("Enable auto-rebalance")
+        self._auto_rebalance.setChecked(True)
+        self._auto_rebalance.setToolTip(
+            "When enabled, automatically post one-sided offers to acquire "
+            "depleted assets when their balance falls below the trading "
+            "minimum.  Uses existing pair routes to shift balances."
+        )
+        bal_form.addRow("", self._auto_rebalance)
+
+        layout.addWidget(bal_group)
         layout.addStretch(1)
 
         # Wire dirty tracking (tab index 2).
@@ -690,8 +745,12 @@ class SettingsWidget(QWidget):
         for widget in (
             self._q_max, self._min_profit_bps, self._offer_ttl,
             self._num_tiers,
+            self._min_reserve_units, self._min_trading_units,
         ):
             widget.valueChanged.connect(lambda _v, ti=2: self._mark_dirty(ti))
+        self._auto_rebalance.stateChanged.connect(
+            lambda _s, ti=2: self._mark_dirty(ti)
+        )
 
         return page
 
@@ -1897,6 +1956,7 @@ class SettingsWidget(QWidget):
         cfg["dexie"] = {
             "api_base": self._dx_api_base.text(),
             "max_requests_per_10s": self._dx_rate_limit.value(),
+            "claim_rewards": self._dx_claim_rewards.isChecked(),
         }
 
         # -- pairs --
@@ -1939,6 +1999,9 @@ class SettingsWidget(QWidget):
             "num_tiers": self._num_tiers.value(),
             "tier_spacing_bps": tier_spacing,
             "tier_size_pct": tier_size,
+            "min_reserve_units": self._min_reserve_units.value(),
+            "min_trading_units": self._min_trading_units.value(),
+            "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
         }
 
         # -- risk --
@@ -2082,6 +2145,9 @@ class SettingsWidget(QWidget):
             self._dx_rate_limit.setValue(
                 int(dexie.get("max_requests_per_10s", 50))
             )
+            self._dx_claim_rewards.setChecked(
+                bool(dexie.get("claim_rewards", True))
+            )
 
             # -- pairs --
             pairs = cfg.get("pairs", [])
@@ -2104,6 +2170,16 @@ class SettingsWidget(QWidget):
             spacing = strat.get("tier_spacing_bps", [])
             sizes = strat.get("tier_size_pct", [])
             self._populate_tier_table(spacing, sizes)
+
+            self._min_reserve_units.setValue(
+                float(strat.get("min_reserve_units", 1.0))
+            )
+            self._min_trading_units.setValue(
+                float(strat.get("min_trading_units", 10.0))
+            )
+            self._auto_rebalance.setChecked(
+                bool(strat.get("auto_rebalance_enabled", True))
+            )
 
             # -- risk --
             risk = cfg.get("risk", {})
@@ -2290,6 +2366,8 @@ class SettingsWidget(QWidget):
             self._gamma, self._kappa, self._phi, self._q_max,
             self._min_profit_bps, self._offer_ttl, self._num_tiers,
             self._tier_table,
+            self._min_reserve_units, self._min_trading_units,
+            self._auto_rebalance,
             self._soft_limit, self._hard_limit, self._single_cat_cap,
             self._kelly_fraction, self._max_capital_per_pair,
             self._max_drawdown_pct, self._loss_window_blocks,

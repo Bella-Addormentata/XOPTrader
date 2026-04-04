@@ -91,8 +91,8 @@ inline bool any_trigger(RebalanceReason r) noexcept {
 ///     making."  Endogenous cancellation threshold derived from adverse
 ///     selection risk.
 enum class TierStaleness : std::uint8_t {
-    Fresh   = 0,  ///< Price deviation < 0.5% -- keep, don't cancel.
-    Stale   = 1,  ///< Price deviation > kSelectiveRefreshThreshold -- cancel & replace.
+    Fresh   = 0,  ///< Deviation is favorable or within threshold -- keep live.
+    Stale   = 1,  ///< Adverse deviation > threshold -- cancel & replace.
     Expired = 2,  ///< Age exceeds TTL -- must cancel regardless of price.
 };
 
@@ -101,6 +101,8 @@ struct TierClassification {
     std::string     offer_id;        ///< The pending offer's trade ID.
     TierStaleness   staleness;       ///< Fresh / Stale / Expired.
     double          price_deviation; ///< Absolute fractional price deviation.
+    bool            adverse{false};  ///< True when the move hurts us (bid too high / ask too low).
+    bool            crossed{false};  ///< True when the offer crossed the mid-price.
     std::uint8_t    tier_index;      ///< Tier index of this offer.
     Side            side;            ///< Bid or Ask.
 };
@@ -252,13 +254,15 @@ public:
      * @param new_ladder    The newly computed optimal tier ladder.
      * @param current_block Current block height (for TTL check).
      * @param ttl_blocks    Maximum offer age in blocks.
+     * @param mid_price     Current market mid-price in mojos (for cross detection).
      * @return Per-offer classification results.
      */
     std::vector<TierClassification> classify_tier_staleness(
         const std::string&             pair_name,
         const std::vector<TierQuote>&  new_ladder,
         BlockHeight                    current_block,
-        BlockHeight                    ttl_blocks) const;
+        BlockHeight                    ttl_blocks,
+        Mojo                           mid_price = 0) const;
 
     /**
      * @brief [T5-01] Cancel only the offers classified as Stale or Expired.
@@ -438,6 +442,15 @@ public:
      */
     std::int64_t resolve_wallet_id(const AssetId& asset_id) const;
 
+    // -- Cancel-reduction constants (public for Engine access) ---------------
+
+    /// Hard TTL multiplier.  The configured offer_ttl_blocks becomes a
+    /// "soft" TTL — offers past soft TTL are expired only if they show
+    /// adverse deviation above kSoftTtlAdverseThreshold.  The hard TTL
+    /// (soft × multiplier) is the absolute safety cap: offers past this
+    /// age are always expired regardless of price accuracy.
+    static constexpr std::uint32_t kHardTtlMultiplier = 2;
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -558,12 +571,36 @@ private:
     static constexpr double kVolSpikeMult            = 2.0;
 
     /// [T5-01] Selective refresh: fractional price deviation threshold.
-    /// Tiers with |Δprice/price| > this value are classified as Stale
-    /// and will be cancelled + replaced.  Tiers below this threshold
-    /// remain live, eliminating the zero-offer gap.
-    /// Set to 0.5% -- tight enough to catch meaningful mispricing but
-    /// wide enough to avoid unnecessary cancel/re-post churn.
+    /// Only *adverse* deviations (bid too high / ask too low) trigger
+    /// staleness.  Favorable deviations (bid drifted lower / ask drifted
+    /// higher) make the offer more conservative, not dangerous.
+    /// Set to 0.5% adverse deviation for tier 0 (innermost).  Outer
+    /// tiers apply a wider threshold scaled by kTierThresholdScale.
     static constexpr double kSelectiveRefreshThreshold = 0.005;
+
+    /// Hard crossing threshold: if an offer's *adverse* deviation is
+    /// this large the offer has likely crossed the mid-price and must
+    /// be cancelled urgently regardless of other considerations.
+    static constexpr double kCrossedMidThreshold = 0.02;
+
+    // -- Cancel-reduction parameters ------------------------------------------
+
+    /// Per-tier scaling factor for the adverse-deviation threshold.
+    /// Effective threshold = kSelectiveRefreshThreshold × (1 + tier × scale).
+    ///   tier 0 → 0.50%   tier 1 → 0.75%   tier 2 → 1.00%   tier 3 → 1.25%
+    /// Outer tiers are further from mid-price and tolerate more movement.
+    static constexpr double kTierThresholdScale = 0.5;
+
+    /// Minimum offer age (in blocks) before price-deviation cancellation
+    /// is considered.  Very young offers are protected from cancel churn
+    /// because the round-trip fee (cancel + recreate) exceeds the adverse
+    /// selection risk for small deviations.  Crossed-mid is still urgent.
+    static constexpr BlockHeight kMinRefreshAgeBlocks = 3;
+
+    /// Gentler adverse-deviation threshold applied between soft and hard
+    /// TTL.  Even a small adverse drift on an old offer should trigger
+    /// a refresh, since the offer has been live long enough.
+    static constexpr double kSoftTtlAdverseThreshold = 0.002;
 };
 
 }  // namespace xop::execution

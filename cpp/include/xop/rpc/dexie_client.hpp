@@ -396,10 +396,13 @@ public:
 
     // -- Order management ------------------------------------------------
 
-    /// POST /v1/offers  { "offer": "<bech32m>" }
+    /// POST /v1/offers  { "offer": "<bech32m>", "claim_rewards": true }
     /// Submits a new offer to the dexie.space aggregator.
+    /// When claim_rewards is true, dexie automatically claims DBX
+    /// liquidity incentive rewards for qualifying offers.
     [[nodiscard]] boost::asio::awaitable<SubmitResult> submit_offer(
-        std::string_view offer_bech32m);
+        std::string_view offer_bech32m,
+        bool claim_rewards = true);
 
     /// GET /v1/offers/{offer_id}
     /// Retrieves the current status of a previously submitted offer.

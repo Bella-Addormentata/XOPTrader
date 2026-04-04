@@ -107,6 +107,15 @@ class _DatabaseWorker(QObject):
             self._conn.execute("PRAGMA journal_mode=WAL;")
             self._conn.execute(f"PRAGMA busy_timeout={_BUSY_TIMEOUT_MS};")
             _log.info("Database opened (read-only): %s", db_path)
+            # Log available tables for debugging.
+            try:
+                cursor = self._conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+                )
+                tables = [row[0] for row in cursor.fetchall()]
+                _log.info("Database tables: %s", ", ".join(tables) if tables else "(none)")
+            except sqlite3.Error:
+                pass
         except sqlite3.Error as exc:
             msg = f"Failed to open database: {exc}"
             _log.error(msg)
@@ -550,7 +559,9 @@ class _DatabaseWorker(QObject):
         rows = self._execute_query(sql, params)
         if rows is None:
             return
-        signal.emit([dict(row) for row in rows])
+        result = [dict(row) for row in rows]
+        _log.debug("Query returned %d rows: %s", len(result), sql[:80])
+        signal.emit(result)
 
 
 # ===================================================================

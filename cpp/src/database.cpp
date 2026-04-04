@@ -146,8 +146,8 @@ ORDER BY timestamp ASC;
 constexpr const char* kInsertOffer = R"SQL(
 INSERT INTO offer_log
     (offer_id, pair_name, side, price_mojos, size_mojos, tier,
-     status, created_block, fee_mojos)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+     status, created_block, fee_mojos, book_best_bid, book_best_ask)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kQueryPendingOffers = R"SQL(
@@ -160,7 +160,7 @@ ORDER BY created_block ASC;
 
 constexpr const char* kUpdateOfferStatus = R"SQL(
 UPDATE offer_log
-SET status = ?, resolved_block = ?, resolved_at = CURRENT_TIMESTAMP
+SET status = ?, resolved_block = ?, resolved_at = CURRENT_TIMESTAMP, cancel_reason = ?
 WHERE offer_id = ?;
 )SQL";
 
@@ -190,6 +190,18 @@ SELECT
     COUNT(*)
 FROM offer_log
 WHERE created_block >= ? AND status IN ('filled', 'cancelled', 'expired');
+)SQL";
+
+constexpr const char* kTierFillRates = R"SQL(
+SELECT tier,
+       SUM(CASE WHEN status = 'filled' THEN 1 ELSE 0 END),
+       COUNT(*)
+FROM offer_log
+WHERE pair_name = ?
+  AND status IN ('filled', 'cancelled', 'expired')
+  AND created_at >= ?
+GROUP BY tier
+ORDER BY tier ASC;
 )SQL";
 
 } // anonymous namespace
@@ -236,6 +248,7 @@ Database::Database(const std::string& db_path)
     stmt_offer_count_        = prepare(kOfferCount);
     stmt_snapshot_count_     = prepare(kSnapshotCount);
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
+    stmt_tier_fill_rates_    = prepare(kTierFillRates);
 
     // [T8-20] Transaction control prepared statements.
     stmt_begin_    = prepare("BEGIN TRANSACTION");
@@ -260,6 +273,7 @@ Database::~Database()
     finalize(stmt_offer_count_);
     finalize(stmt_snapshot_count_);
     finalize(stmt_fill_rate_);
+    finalize(stmt_tier_fill_rates_);
     finalize(stmt_begin_);
     finalize(stmt_commit_);
     finalize(stmt_rollback_);
@@ -366,6 +380,8 @@ void Database::insert_offer(const DbOfferRecord& r)
     bind_text  (stmt_insert_offer_, 7, r.status);
     bind_int64 (stmt_insert_offer_, 8, static_cast<std::int64_t>(r.created_block));
     bind_int64 (stmt_insert_offer_, 9, static_cast<std::int64_t>(r.fee_mojos));
+    bind_int64 (stmt_insert_offer_, 10, static_cast<std::int64_t>(r.book_best_bid));
+    bind_int64 (stmt_insert_offer_, 11, static_cast<std::int64_t>(r.book_best_ask));
 
     step_and_reset(stmt_insert_offer_);
 
@@ -403,12 +419,14 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
 
 void Database::update_offer_status(const std::string& offer_id,
                                    const std::string& new_status,
-                                   BlockHeight        resolved_block)
+                                   BlockHeight        resolved_block,
+                                   const std::string& cancel_reason)
 {
     std::lock_guard<std::mutex> lock(mtx_);
     bind_text  (stmt_update_offer_, 1, new_status);
     bind_int64 (stmt_update_offer_, 2, static_cast<std::int64_t>(resolved_block));
-    bind_text  (stmt_update_offer_, 3, offer_id);
+    bind_text  (stmt_update_offer_, 3, cancel_reason);
+    bind_text  (stmt_update_offer_, 4, offer_id);
 
     step_and_reset(stmt_update_offer_);
 
@@ -419,8 +437,9 @@ void Database::update_offer_status(const std::string& offer_id,
             "[Database] update_offer_status: no offer found with id '" + offer_id + "'");
     }
 
-    spdlog::debug("[Database] Updated offer '{}' -> status='{}' resolved_block={}",
-                  offer_id, new_status, resolved_block);
+    spdlog::debug("[Database] Updated offer '{}' -> status='{}' resolved_block={}"
+                  " reason='{}'",
+                  offer_id, new_status, resolved_block, cancel_reason);
 }
 
 // ===========================================================================
@@ -579,6 +598,33 @@ double Database::fill_rate_since_block(BlockHeight since, double fallback) const
     return rate;
 }
 
+std::vector<double> Database::query_tier_fill_rates(
+    const std::string& pair_name,
+    const std::string& cutoff_ts,
+    std::uint32_t max_tiers) const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::vector<double> rates(max_tiers, 0.0);
+
+    bind_text(stmt_tier_fill_rates_, 1, pair_name);
+    bind_text(stmt_tier_fill_rates_, 2, cutoff_ts);
+
+    while (sqlite3_step(stmt_tier_fill_rates_) == SQLITE_ROW) {
+        auto tier  = static_cast<std::uint32_t>(sqlite3_column_int64(stmt_tier_fill_rates_, 0));
+        auto filled = sqlite3_column_int64(stmt_tier_fill_rates_, 1);
+        auto total  = sqlite3_column_int64(stmt_tier_fill_rates_, 2);
+
+        if (tier < max_tiers && total > 0) {
+            rates[tier] = static_cast<double>(filled) / static_cast<double>(total);
+        }
+    }
+
+    sqlite3_reset(stmt_tier_fill_rates_);
+    sqlite3_clear_bindings(stmt_tier_fill_rates_);
+
+    return rates;
+}
+
 bool Database::is_open() const noexcept
 {
     return db_ != nullptr;
@@ -665,6 +711,12 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE trade_log ADD COLUMN acquisition_ts TEXT;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN fee_mojos INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN cancel_reason TEXT;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_bid INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_ask INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
 }
 

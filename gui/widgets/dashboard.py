@@ -347,6 +347,7 @@ class DashboardWidget(QWidget):
             "Spread PnL",
             "Inventory PnL",
             "24h Fill Count",
+            "Fees Paid 24h",
         ]
         for col, name in enumerate(metric_defs):
             card = MetricCard(name)

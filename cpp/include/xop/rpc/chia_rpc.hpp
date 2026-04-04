@@ -396,6 +396,46 @@ public:
      */
     asio::awaitable<std::uint64_t> get_fee_estimate(
         std::uint64_t target_time_seconds = 60);
+
+    /**
+     * @brief Look up coin records by their coin names (IDs).
+     *
+     * Batch-validates whether specific coins are spent or unspent on-chain.
+     * Useful for on-chain reconciliation: verify that coins backing pending
+     * offers have not been spent externally.
+     *
+     * @param names          Vector of hex-encoded coin names (without 0x prefix).
+     * @param include_spent  If true, include already-spent coins.
+     * @return Vector of coin-record JSON objects.
+     */
+    asio::awaitable<std::vector<json>> get_coin_records_by_names(
+        const std::vector<std::string>& names,
+        bool                            include_spent = true);
+
+    /**
+     * @brief Retrieve a block record by height.
+     *
+     * Returns the block record (including header_hash) for the given height.
+     * Required to obtain the header_hash for get_additions_and_removals().
+     *
+     * @param height  Block height to query.
+     * @return JSON block_record object, or empty JSON on failure.
+     */
+    asio::awaitable<json> get_block_record_by_height(std::int64_t height);
+
+    /**
+     * @brief Retrieve additions and removals for a specific block.
+     *
+     * Returns the coins created (additions) and coins spent (removals) in
+     * the block identified by header_hash.  Core primitive for on-chain
+     * reconciliation: enables detection of fills and fee extraction by
+     * examining which coins were consumed and produced.
+     *
+     * @param header_hash  Hex-encoded header hash (from block record).
+     * @return JSON with "additions" and "removals" arrays of coin records.
+     */
+    asio::awaitable<json> get_additions_and_removals(
+        const std::string& header_hash);
 };
 
 // ---------------------------------------------------------------------------

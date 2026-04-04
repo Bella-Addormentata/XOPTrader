@@ -295,6 +295,12 @@ void MetricsExporter::register_metrics()
         .Help("1 when trading is paused by GUI, 0 otherwise")
         .Register(*registry_)
         .Add({});
+
+    fees_paid_24h_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_fees_paid_24h_mojos")
+        .Help("Rolling 24-hour blockchain fees paid in mojos")
+        .Register(*registry_)
+        .Add({});
 }
 
 // ===================================================================
@@ -627,6 +633,14 @@ void MetricsExporter::update_bot_paused(bool is_paused)
     if (!running_) return;
 
     paused_gauge_->Set(is_paused ? 1.0 : 0.0);
+}
+
+void MetricsExporter::update_fees_paid_24h(std::uint64_t total_mojos)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    fees_paid_24h_gauge_->Set(static_cast<double>(total_mojos));
 }
 
 }  // namespace xop

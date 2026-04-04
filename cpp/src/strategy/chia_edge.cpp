@@ -137,15 +137,18 @@ double ChiaEdgeOptimizer::free_cancel_multiplier() const
     // T2-02: Shared lock -- read-only access to cfg_.
     std::shared_lock lock(mtx_);
 
-    // Edge 2: Free Cancellation (zero gas cost to cancel/refresh).
+    // Edge 2: Low-Cost Cancellation.
     //
     //   m_cancel = 1.0 - cancel_savings_bps / reference_spread_bps
     //
     // On Ethereum, cancelling a resting order costs gas ($0.50-$50+), forcing
-    // makers to leave stale quotes longer than optimal.  On CHIA, cancellation
-    // is free (the offer is a local file; spending its backing coins invalidates
-    // it).  This allows aggressive per-block refresh with zero downside, saving
-    // cancel_savings_bps of effective spread.
+    // makers to leave stale quotes longer than optimal.  On CHIA, secure
+    // cancellation costs the same fee as posting (typically 50M mojos /
+    // 0.00005 XCH), but this is far cheaper than EVM gas.  The lower cost
+    // allows more aggressive quote refresh, saving cancel_savings_bps of
+    // effective spread.  Note: the fee-vs-gain gate in FeeTracker applies
+    // a cancel_cost_multiplier to account for round-trip (post + cancel)
+    // costs.
     //
     // Clamped to [cancel_mult_floor, 1.0].
     const double raw = 1.0 - cfg_.cancel_savings_bps / cfg_.reference_spread_bps;

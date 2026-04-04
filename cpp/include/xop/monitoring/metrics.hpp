@@ -251,6 +251,9 @@ public:
     /// Update the bot-paused gauge (1 = paused by GUI, 0 = running).
     void update_bot_paused(bool is_paused);
 
+    /// Update the rolling 24-hour blockchain fees gauge (mojos).
+    void update_fees_paid_24h(std::uint64_t total_mojos);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
@@ -334,6 +337,7 @@ private:
     prometheus::Family<prometheus::Gauge>* spendable_reserve_family_{nullptr};
     prometheus::Gauge* stuck_offers_gauge_{nullptr};
     prometheus::Gauge* paused_gauge_{nullptr};
+    prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Cardinality guard ----------------------------------------------------
     // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered

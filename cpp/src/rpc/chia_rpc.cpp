@@ -723,6 +723,57 @@ ChiaFullNodeRPC::get_fee_estimate(std::uint64_t target_time_seconds)
     }
 }
 
+asio::awaitable<std::vector<json>>
+ChiaFullNodeRPC::get_coin_records_by_names(
+    const std::vector<std::string>& names,
+    bool                            include_spent)
+{
+    // Chia full node expects names with 0x prefix.
+    json name_arr = json::array();
+    for (const auto& n : names) {
+        if (n.size() >= 2 && n.substr(0, 2) == "0x") {
+            name_arr.push_back(n);
+        } else {
+            name_arr.push_back("0x" + n);
+        }
+    }
+
+    json payload = {
+        {"names",               name_arr},
+        {"include_spent_coins", include_spent}
+    };
+
+    const json resp = co_await rpc_post("get_coin_records_by_names", payload);
+
+    std::vector<json> records;
+    if (resp.contains("coin_records") && resp["coin_records"].is_array()) {
+        records.reserve(resp["coin_records"].size());
+        for (auto& rec : resp["coin_records"]) {
+            records.push_back(std::move(rec));
+        }
+    }
+    co_return records;
+}
+
+asio::awaitable<json>
+ChiaFullNodeRPC::get_block_record_by_height(std::int64_t height)
+{
+    json payload = {{"height", height}};
+    const json resp = co_await rpc_post("get_block_record_by_height", payload);
+
+    if (resp.contains("block_record")) {
+        co_return resp["block_record"];
+    }
+    co_return json{};
+}
+
+asio::awaitable<json>
+ChiaFullNodeRPC::get_additions_and_removals(const std::string& header_hash)
+{
+    json payload = {{"header_hash", header_hash}};
+    co_return co_await rpc_post("get_additions_and_removals", payload);
+}
+
 // ===========================================================================
 // ChiaWalletRPC
 // ===========================================================================
