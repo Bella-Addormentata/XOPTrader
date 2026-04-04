@@ -724,6 +724,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
 
     // -- Minimum balance management -----------------------------------------
+    if (node["fee_reserve_xch"] && node["fee_reserve_xch"].IsDefined()
+        && !node["fee_reserve_xch"].IsNull()) {
+        cfg.fee_reserve_xch = node["fee_reserve_xch"].as<double>();
+        if (cfg.fee_reserve_xch < 0.0) {
+            throw ConfigError(sec + ".fee_reserve_xch must be >= 0");
+        }
+    }
     if (node["min_reserve_units"] && node["min_reserve_units"].IsDefined()
         && !node["min_reserve_units"].IsNull()) {
         cfg.min_reserve_units = node["min_reserve_units"].as<double>();
@@ -1494,6 +1501,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  batch_offers = " << (cfg.strategy.batch_offers_enabled ? "ON" : "off") << "\n"
         << "  spendable_reserve = " << (cfg.strategy.min_spendable_reserve_pct * 100.0) << "%\n"
         << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n"
+        << "  fee_reserve_xch = " << cfg.strategy.fee_reserve_xch << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n";

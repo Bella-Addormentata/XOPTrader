@@ -139,7 +139,36 @@ asio::awaitable<int> OfferManager::post_quotes(
         if (!bids.empty()) {
             bid_count = co_await post_merged_side(pair, bids, block_height);
         }
-        if (!asks.empty()) {
+
+        // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
+        // Check XCH spendable balance after bids; skip asks if below reserve.
+        bool reserve_breached = false;
+        if (bid_count > 0 && !asks.empty()
+            && strategy_cfg_.fee_reserve_xch > 0.0) {
+            try {
+                auto xch_bal = co_await wallet_->get_wallet_balance(1);
+                Mojo xch_spendable = 0;
+                if (xch_bal.contains("spendable_balance"))
+                    xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+                const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                    strategy_cfg_.fee_reserve_xch
+                    * static_cast<double>(kMojosPerXch)));
+                if (xch_spendable < reserve_mojos) {
+                    logger_->warn(
+                        "XCH fee reserve guard (batch): spendable {:.6f} XCH "
+                        "< reserve {:.3f} XCH after posting {} bids "
+                        "-- skipping ask batch",
+                        static_cast<double>(xch_spendable) / kMojosPerXch,
+                        strategy_cfg_.fee_reserve_xch, pair.name);
+                    reserve_breached = true;
+                }
+            } catch (const std::exception& e) {
+                logger_->warn("XCH fee reserve guard (batch): balance check "
+                              "failed after {} bids: {}", pair.name, e.what());
+            }
+        }
+
+        if (!asks.empty() && !reserve_breached) {
             ask_count = co_await post_merged_side(pair, asks, block_height);
         }
 
@@ -159,14 +188,27 @@ asio::awaitable<int> OfferManager::post_quotes(
                 if (po.pair_name == pair.name &&
                     po.side == Side::Bid &&
                     po.created_at_block == block_height) {
+                    bool cancel_ok = false;
+                    bool needs_emergency = false;
                     try {
                         co_await wallet_->cancel_offer(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
+                        cancel_ok = true;
+                    } catch (const rpc::ChiaRPCError& e) {
+                        const std::string_view msg{e.what()};
+                        needs_emergency =
+                            msg.find("insufficient funds") != std::string_view::npos ||
+                            msg.find("spendable balance") != std::string_view::npos;
+                        if (!needs_emergency)
+                            logger_->error("Failed to cancel asymmetric bid {}: {}",
+                                           po.offer_id.substr(0, 12), e.what());
+                    }
+                    if (needs_emergency)
+                        cancel_ok = co_await emergency_cancel(
+                            po.offer_id, "asymmetric_bid");
+                    if (cancel_ok) {
                         state_->remove_offer(po.offer_id);
                         --bid_count;
-                    } catch (const rpc::ChiaRPCError& e) {
-                        logger_->error("Failed to cancel asymmetric bid {}: {}",
-                                       po.offer_id.substr(0, 12), e.what());
                     }
                 }
             }
@@ -179,14 +221,27 @@ asio::awaitable<int> OfferManager::post_quotes(
                 if (po.pair_name == pair.name &&
                     po.side == Side::Ask &&
                     po.created_at_block == block_height) {
+                    bool cancel_ok = false;
+                    bool needs_emergency = false;
                     try {
                         co_await wallet_->cancel_offer(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
+                        cancel_ok = true;
+                    } catch (const rpc::ChiaRPCError& e) {
+                        const std::string_view msg{e.what()};
+                        needs_emergency =
+                            msg.find("insufficient funds") != std::string_view::npos ||
+                            msg.find("spendable balance") != std::string_view::npos;
+                        if (!needs_emergency)
+                            logger_->error("Failed to cancel asymmetric ask {}: {}",
+                                           po.offer_id.substr(0, 12), e.what());
+                    }
+                    if (needs_emergency)
+                        cancel_ok = co_await emergency_cancel(
+                            po.offer_id, "asymmetric_ask");
+                    if (cancel_ok) {
                         state_->remove_offer(po.offer_id);
                         --ask_count;
-                    } catch (const rpc::ChiaRPCError& e) {
-                        logger_->error("Failed to cancel asymmetric ask {}: {}",
-                                       po.offer_id.substr(0, 12), e.what());
                     }
                 }
             }
@@ -225,8 +280,9 @@ asio::awaitable<int> OfferManager::post_quotes(
             logger_->error("create_offer failed for {} {} tier {}: {}",
                            pair.name, to_string(tier.side),
                            tier.tier_index, e.what());
-            if (std::string_view{e.what()}.find("insufficient funds") !=
-                std::string_view::npos) {
+            const std::string_view msg{e.what()};
+            if (msg.find("insufficient funds") != std::string_view::npos ||
+                msg.find("spendable balance") != std::string_view::npos) {
                 if (tier.side == Side::Bid) {
                     bid_funds_exhausted = true;
                     logger_->warn("Stopping {} BID tiers -- "
@@ -289,6 +345,39 @@ asio::awaitable<int> OfferManager::post_quotes(
                       tier.price, tier.size, trade_id.substr(0, 12));
         // Full offer text at DEBUG only (ISO/IEC 27001: minimise exposure).
         logger_->debug("Offer text: {}...", offer_text.substr(0, 40));
+
+        // -- XCH fee reserve guard (UTXO-aware) ----------------------------
+        // The Chia wallet locks entire UTXOs when creating offers, not just
+        // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
+        // Even non-XCH offers lock XCH for fee coins.  Check the actual
+        // wallet spendable balance after each creation and stop if below
+        // the configured reserve.
+        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+            try {
+                auto xch_bal = co_await wallet_->get_wallet_balance(1);
+                Mojo xch_spendable = 0;
+                if (xch_bal.contains("spendable_balance"))
+                    xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+                const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                    strategy_cfg_.fee_reserve_xch
+                    * static_cast<double>(kMojosPerXch)));
+                if (xch_spendable < reserve_mojos) {
+                    logger_->warn(
+                        "XCH fee reserve guard: spendable {:.6f} XCH "
+                        "< reserve {:.3f} XCH after posting {} {} tier {} "
+                        "-- stopping further offers this heartbeat",
+                        static_cast<double>(xch_spendable) / kMojosPerXch,
+                        strategy_cfg_.fee_reserve_xch,
+                        pair.name, to_string(tier.side), tier.tier_index);
+                    bid_funds_exhausted = true;
+                    ask_funds_exhausted = true;
+                }
+            } catch (const std::exception& e) {
+                logger_->warn("XCH fee reserve guard: balance check failed "
+                              "after {} tier {}: {}",
+                              pair.name, tier.tier_index, e.what());
+            }
+        }
     }
 
     logger_->info("post_quotes complete: {}/{} offers created for {}",
@@ -476,15 +565,27 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         }
 
         // Cancel via wallet RPC (secure = true to spend the locked coin).
+        bool cancel_ok = false;
+        bool needs_emergency = false;
         try {
             co_await wallet_->cancel_offer(
                 po.offer_id, current_fee_mojos_, /*secure=*/true);
-
-            // Wallet cancel succeeded -- on-chain state is authoritative.
-            // Remove from in-memory tracking; the offer is dead on-chain
-            // regardless of whether remove_offer finds the ID.
-            // [T5-02] ISO/IEC 5055: never leave an offer tracked in-memory
-            //         after its on-chain cancellation is confirmed.
+            cancel_ok = true;
+        } catch (const rpc::ChiaRPCError& e) {
+            const std::string_view msg{e.what()};
+            needs_emergency =
+                msg.find("insufficient funds") != std::string_view::npos ||
+                msg.find("spendable balance") != std::string_view::npos;
+            if (!needs_emergency) {
+                logger_->error("Failed to cancel offer {}: {}",
+                               po.offer_id.substr(0, 12), e.what());
+            }
+        }
+        if (needs_emergency) {
+            cancel_ok = co_await emergency_cancel(
+                po.offer_id, "cancel_stale");
+        }
+        if (cancel_ok) {
             if (!state_->remove_offer(po.offer_id)) {
                 logger_->warn("cancel_stale: offer {} already removed from "
                               "state (wallet cancel succeeded)",
@@ -496,9 +597,6 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
                           po.offer_id.substr(0, 12),
                           pair_name, po.tier,
                           current_block - po.created_at_block);
-        } catch (const rpc::ChiaRPCError& e) {
-            logger_->error("Failed to cancel offer {}: {}",
-                           po.offer_id.substr(0, 12), e.what());
         }
     }
 
@@ -553,16 +651,28 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
                       "individual cancellation", bulk_err);
 
         for (const auto& po : all_offers) {
+            bool cancel_ok = false;
+            bool needs_emergency = false;
             try {
                 co_await wallet_->cancel_offer(
                     po.offer_id, current_fee_mojos_, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
-                cancelled_ids.push_back(po.offer_id);
+                cancel_ok = true;
             } catch (const rpc::ChiaRPCError& inner_e) {
-                logger_->error("Failed to cancel offer {}: {}",
-                               po.offer_id.substr(0, 12), inner_e.what());
-                // Do NOT add to cancelled_ids -- keep tracked for retry.
+                const std::string_view msg{inner_e.what()};
+                needs_emergency =
+                    msg.find("insufficient funds") != std::string_view::npos ||
+                    msg.find("spendable balance") != std::string_view::npos;
+                if (!needs_emergency) {
+                    logger_->error("Failed to cancel offer {}: {}",
+                                   po.offer_id.substr(0, 12), inner_e.what());
+                }
             }
+            if (needs_emergency)
+                cancel_ok = co_await emergency_cancel(
+                    po.offer_id, "cancel_all");
+            if (cancel_ok)
+                cancelled_ids.push_back(po.offer_id);
         }
     }
 
@@ -999,21 +1109,33 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
     cancelled_ids.reserve(stale_ids.size());
 
     for (const auto& offer_id : stale_ids) {
+        bool cancel_ok = false;
+        bool needs_emergency = false;
         try {
             co_await wallet_->cancel_offer(
                 offer_id, current_fee_mojos_, /*secure=*/true);
-
+            cancel_ok = true;
+        } catch (const rpc::ChiaRPCError& e) {
+            const std::string_view msg{e.what()};
+            needs_emergency =
+                msg.find("insufficient funds") != std::string_view::npos ||
+                msg.find("spendable balance") != std::string_view::npos;
+            if (!needs_emergency) {
+                logger_->error("selective_cancel: failed to cancel {}: {}",
+                               offer_id.substr(0, 12), e.what());
+            }
+        }
+        if (needs_emergency)
+            cancel_ok = co_await emergency_cancel(
+                offer_id, "selective_cancel");
+        if (cancel_ok) {
             if (!state_->remove_offer(offer_id)) {
                 logger_->warn("selective_cancel: offer {} already removed "
                               "from state", offer_id.substr(0, 12));
             }
             cancelled_ids.push_back(offer_id);
-
             logger_->debug("selective_cancel: cancelled {}",
                            offer_id.substr(0, 12));
-        } catch (const rpc::ChiaRPCError& e) {
-            logger_->error("selective_cancel: failed to cancel {}: {}",
-                           offer_id.substr(0, 12), e.what());
         }
     }
 
@@ -1191,15 +1313,32 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
             logger_->warn("[startup_reconcile] Cancelling orphaned offer {} "
                           "(PENDING_ACCEPT in wallet but not in DB)",
                           trade_id.substr(0, 24));
+            bool cancel_ok = false;
+            bool needs_emergency = false;
             try {
                 co_await wallet_->cancel_offer(trade_id, current_fee_mojos_,
                                                /*secure=*/true);
-                cancelled_ids.push_back(trade_id);
-                logger_->info("[startup_reconcile] Cancelled orphan {}",
-                              trade_id.substr(0, 24));
+                cancel_ok = true;
+            } catch (const rpc::ChiaRPCError& e) {
+                const std::string_view msg{e.what()};
+                needs_emergency =
+                    msg.find("insufficient funds") != std::string_view::npos ||
+                    msg.find("spendable balance") != std::string_view::npos;
+                if (!needs_emergency) {
+                    logger_->error("[startup_reconcile] Failed to cancel {}: {}",
+                                   trade_id.substr(0, 24), e.what());
+                }
             } catch (const std::exception& e) {
                 logger_->error("[startup_reconcile] Failed to cancel {}: {}",
                                trade_id.substr(0, 24), e.what());
+            }
+            if (needs_emergency)
+                cancel_ok = co_await emergency_cancel(
+                    trade_id, "startup_reconcile");
+            if (cancel_ok) {
+                cancelled_ids.push_back(trade_id);
+                logger_->info("[startup_reconcile] Cancelled orphan {}",
+                              trade_id.substr(0, 24));
             }
         }
 
@@ -1658,6 +1797,54 @@ asio::awaitable<void> OfferManager::init_wallet_id_map()
         logger_->error("Failed to initialise wallet ID map: {}", e.what());
         // Allow retry on next post_quotes() call by leaving the flag false.
     }
+}
+
+// ---------------------------------------------------------------------------
+// emergency_cancel -- reduced/zero-fee cancel fallback
+// ---------------------------------------------------------------------------
+
+asio::awaitable<bool> OfferManager::emergency_cancel(
+    const std::string& offer_id,
+    const std::string& context)
+{
+    try {
+        auto xch_bal = co_await wallet_->get_wallet_balance(1);
+        Mojo xch_spendable = 0;
+        if (xch_bal.contains("spendable_balance"))
+            xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+
+        if (xch_spendable > 0) {
+            // Use all spendable XCH minus a tiny dust margin as the fee.
+            const Mojo emergency_fee = std::max(
+                Mojo{1}, xch_spendable - Mojo{1000});
+            logger_->warn("{}: emergency cancel {} with reduced fee "
+                          "{} mojos (spendable {} mojos)",
+                          context, offer_id.substr(0, 12),
+                          emergency_fee, xch_spendable);
+            co_await wallet_->cancel_offer(
+                offer_id, static_cast<std::uint64_t>(emergency_fee),
+                /*secure=*/true);
+            logger_->info("{}: emergency-cancelled {} (fee {} mojos)",
+                          context, offer_id.substr(0, 12), emergency_fee);
+            co_return true;
+        }
+
+        // Zero spendable: last resort -- local-only cancel.
+        // No on-chain fee, drops from wallet but doesn't invalidate the
+        // offer on-chain.  Better than leaving funds locked forever.
+        logger_->warn("{}: zero XCH spendable -- local-only (insecure) "
+                      "cancel for {}", context, offer_id.substr(0, 12));
+        co_await wallet_->cancel_offer(
+            offer_id, 0, /*secure=*/false);
+        logger_->warn("{}: local-only cancelled {} "
+                      "(INSECURE -- offer may still be taken on-chain)",
+                      context, offer_id.substr(0, 12));
+        co_return true;
+    } catch (const std::exception& e) {
+        logger_->error("{}: emergency cancel also failed for {}: {}",
+                       context, offer_id.substr(0, 12), e.what());
+    }
+    co_return false;
 }
 
 }  // namespace xop::execution

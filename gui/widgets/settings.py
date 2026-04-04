@@ -701,6 +701,20 @@ class SettingsWidget(QWidget):
         bal_form = QFormLayout(bal_group)
         bal_form.setSpacing(8)
 
+        self._fee_reserve_xch = QDoubleSpinBox()
+        self._fee_reserve_xch.setRange(0.0, 100.0)
+        self._fee_reserve_xch.setSingleStep(0.5)
+        self._fee_reserve_xch.setDecimals(2)
+        self._fee_reserve_xch.setValue(1.0)
+        self._fee_reserve_xch.setSuffix(" XCH")
+        self._fee_reserve_xch.setToolTip(
+            "XCH to hold back from offer allocation for paying on-chain "
+            "fees (offer creation and cancellation).  Deducted from the "
+            "capital pool before tier sizing, so offers never lock the "
+            "last N XCH of spendable balance.  Default: 1.0 XCH."
+        )
+        bal_form.addRow("XCH Fee Reserve:", self._fee_reserve_xch)
+
         self._min_reserve_units = QDoubleSpinBox()
         self._min_reserve_units.setRange(0.0, 10_000.0)
         self._min_reserve_units.setSingleStep(1.0)
@@ -744,7 +758,7 @@ class SettingsWidget(QWidget):
             widget.valueChanged.connect(lambda _v, ti=2: self._mark_dirty(ti))
         for widget in (
             self._q_max, self._min_profit_bps, self._offer_ttl,
-            self._num_tiers,
+            self._num_tiers, self._fee_reserve_xch,
             self._min_reserve_units, self._min_trading_units,
         ):
             widget.valueChanged.connect(lambda _v, ti=2: self._mark_dirty(ti))
@@ -1237,12 +1251,12 @@ class SettingsWidget(QWidget):
         self._min_fee_mojos = QDoubleSpinBox()
         self._min_fee_mojos.setRange(0, 1_000_000_000_000)
         self._min_fee_mojos.setDecimals(0)
-        self._min_fee_mojos.setSingleStep(10_000_000)
-        self._min_fee_mojos.setValue(50_000_000)
+        self._min_fee_mojos.setSingleStep(1_000_000)
+        self._min_fee_mojos.setValue(5_000_000)
         self._min_fee_mojos.setSuffix(" mojos")
         self._min_fee_mojos.setToolTip(
             "Fee floor — never pay less than this per offer/cancel "
-            "(default 50 000 000 = 0.00005 XCH)."
+            "(default 5 000 000 = 0.000005 XCH)."
         )
         range_form.addRow("Min Fee:", self._min_fee_mojos)
 
@@ -1250,11 +1264,11 @@ class SettingsWidget(QWidget):
         self._max_fee_mojos.setRange(0, 1_000_000_000_000)
         self._max_fee_mojos.setDecimals(0)
         self._max_fee_mojos.setSingleStep(10_000_000)
-        self._max_fee_mojos.setValue(500_000_000)
+        self._max_fee_mojos.setValue(100_000_000)
         self._max_fee_mojos.setSuffix(" mojos")
         self._max_fee_mojos.setToolTip(
             "Fee ceiling — never pay more than this per offer/cancel "
-            "(default 500 000 000 = 0.0005 XCH)."
+            "(default 100 000 000 = 0.0001 XCH)."
         )
         range_form.addRow("Max Fee:", self._max_fee_mojos)
 
@@ -1999,6 +2013,7 @@ class SettingsWidget(QWidget):
             "num_tiers": self._num_tiers.value(),
             "tier_spacing_bps": tier_spacing,
             "tier_size_pct": tier_size,
+            "fee_reserve_xch": self._fee_reserve_xch.value(),
             "min_reserve_units": self._min_reserve_units.value(),
             "min_trading_units": self._min_trading_units.value(),
             "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
@@ -2171,6 +2186,9 @@ class SettingsWidget(QWidget):
             sizes = strat.get("tier_size_pct", [])
             self._populate_tier_table(spacing, sizes)
 
+            self._fee_reserve_xch.setValue(
+                float(strat.get("fee_reserve_xch", 1.0))
+            )
             self._min_reserve_units.setValue(
                 float(strat.get("min_reserve_units", 1.0))
             )
@@ -2365,7 +2383,7 @@ class SettingsWidget(QWidget):
             self._dx_api_base, self._dx_rate_limit,
             self._gamma, self._kappa, self._phi, self._q_max,
             self._min_profit_bps, self._offer_ttl, self._num_tiers,
-            self._tier_table,
+            self._tier_table, self._fee_reserve_xch,
             self._min_reserve_units, self._min_trading_units,
             self._auto_rebalance,
             self._soft_limit, self._hard_limit, self._single_cat_cap,

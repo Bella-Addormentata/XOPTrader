@@ -118,7 +118,7 @@ strategy:
   tier_spacing_bps: [60, 120, 180, 240]  # [REQUIRED] Spread per tier (bps) — must be ≤ max_half_spread_bps
   tier_size_pct: [0.30, 0.25, 0.25, 0.20] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
-  offer_fee_mojos: 100000000  # [OPTIONAL, default: 100000000] On-chain fee per offer/cancel
+  offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # Startup market analysis: observe this many blocks before trading begins.
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
@@ -132,6 +132,7 @@ strategy:
 
   # -- Minimum balance management --
   # Prevents zero-balance lockout by reserving a minimum in each asset.
+  fee_reserve_xch: 1.0                # [OPTIONAL, default: 1.0]  XCH held back for on-chain fees
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
@@ -273,8 +274,8 @@ fees:
   fee_to_gain_max_ratio: 0.30        # Skip tier if round-trip fee > 30% of expected gain
   cancel_cost_multiplier: 2.0        # Round-trip multiplier: fee×M is used in the gain check
                                       # (2.0 = post + cancel; >2.0 adds margin for adaptive fee spikes)
-  min_fee_mojos: 50000000            # Fee floor (0.00005 XCH)
-  max_fee_mojos: 500000000           # Fee ceiling (0.0005 XCH)
+  min_fee_mojos: 5000000             # Fee floor (0.000005 XCH)
+  max_fee_mojos: 100000000           # Fee ceiling (0.0001 XCH)
   adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
 

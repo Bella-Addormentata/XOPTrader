@@ -510,6 +510,22 @@ private:
      */
     asio::awaitable<void> init_wallet_id_map();
 
+    /**
+     * @brief Emergency cancel with reduced or zero fee.
+     *
+     * When the standard fee cancel fails due to insufficient XCH, this
+     * helper checks the actual spendable XCH balance and attempts:
+     *   1. Cancel with whatever XCH remains as the fee (secure).
+     *   2. If XCH is zero, cancel locally (insecure / no on-chain spend).
+     *
+     * @param offer_id   Trade ID of the offer to cancel.
+     * @param context    Log context string (e.g. "cancel_stale", "cancel_all").
+     * @return true if the emergency cancel succeeded, false otherwise.
+     */
+    asio::awaitable<bool> emergency_cancel(
+        const std::string& offer_id,
+        const std::string& context);
+
     // -- Member data --------------------------------------------------------
 
     /// Wallet RPC client (shared -- may be used by CoinManager too).

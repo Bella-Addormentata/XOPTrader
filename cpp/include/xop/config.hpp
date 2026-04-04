@@ -175,8 +175,8 @@ struct StrategyConfig {
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
 
-    /// On-chain fee per offer/cancel (mojos).  Default 0.0001 XCH.
-    std::uint64_t offer_fee_mojos{100'000'000ULL};
+    /// On-chain fee per offer/cancel (mojos).  Default 0.00001 XCH.
+    std::uint64_t offer_fee_mojos{10'000'000ULL};
 
     /// Number of blocks to observe in startup market-analysis mode before
     /// entering active trading.  0 = skip analysis.  Range [0, 1440].
@@ -212,6 +212,13 @@ struct StrategyConfig {
     uint32_t stuck_offer_age_blocks{30};
 
     // -- Minimum balance management -----------------------------------------
+
+    /// XCH to hold back from offer allocation for paying on-chain fees
+    /// (offer cancellation / creation).  Deducted from the available
+    /// capital pool in Step 7 before the tier ladder is built, so offers
+    /// never lock the last `fee_reserve_xch` of spendable XCH.
+    /// Default 1.0 XCH.
+    double   fee_reserve_xch{1.0};
 
     /// Minimum units of each asset to keep as reserve.  Offers on the
     /// side that would deplete an asset below this level are suppressed.
@@ -542,12 +549,12 @@ struct FeeConfig {
     double   cancel_cost_multiplier{2.0};
 
     /// Absolute fee floor (mojos).  The tracker will never recommend a fee
-    /// below this value.  Default 50 000 000 (0.00005 XCH).
-    std::uint64_t min_fee_mojos{50'000'000ULL};
+    /// below this value.  Default 5 000 000 (0.000005 XCH).
+    std::uint64_t min_fee_mojos{5'000'000ULL};
 
     /// Absolute fee ceiling (mojos).  The tracker will never recommend a
-    /// fee above this value.  Default 500 000 000 (0.0005 XCH).
-    std::uint64_t max_fee_mojos{500'000'000ULL};
+    /// fee above this value.  Default 100 000 000 (0.0001 XCH).
+    std::uint64_t max_fee_mojos{100'000'000ULL};
 
     /// When true, query the full node's get_fee_estimate RPC to adapt the
     /// fee dynamically based on mempool congestion.

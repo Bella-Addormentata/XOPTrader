@@ -2810,6 +2810,44 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         Mojo avail_capital   = pcs.risk_quote.bid_size;
         Mojo avail_inventory = pcs.risk_quote.ask_size;
 
+        // -- XCH fee reserve: hold back fee_reserve_xch from the pool so
+        // that enough XCH always remains spendable for on-chain fees
+        // (offer creation / cancellation).  Only applies when XCH is the
+        // base or quote asset of this pair.
+        if (pair_cfg && config_.strategy.fee_reserve_xch > 0.0) {
+            const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                config_.strategy.fee_reserve_xch
+                * static_cast<double>(kMojosPerXch)));
+            if (pair_cfg->base_asset_id == "xch" && avail_inventory > 0) {
+                const auto prev = avail_inventory;
+                avail_inventory = std::max(Mojo{0},
+                                           avail_inventory - reserve_mojos);
+                if (avail_inventory < prev) {
+                    spdlog::info("[Engine] Step 7: {} XCH fee reserve: "
+                                 "ask pool {:.6f} -> {:.6f} XCH "
+                                 "(reserved {:.3f} XCH for fees)",
+                                 pair_name,
+                                 static_cast<double>(prev) / kMojosPerXch,
+                                 static_cast<double>(avail_inventory) / kMojosPerXch,
+                                 config_.strategy.fee_reserve_xch);
+                }
+            }
+            if (pair_cfg->quote_asset_id == "xch" && avail_capital > 0) {
+                const auto prev = avail_capital;
+                avail_capital = std::max(Mojo{0},
+                                         avail_capital - reserve_mojos);
+                if (avail_capital < prev) {
+                    spdlog::info("[Engine] Step 7: {} XCH fee reserve: "
+                                 "bid pool {:.6f} -> {:.6f} XCH "
+                                 "(reserved {:.3f} XCH for fees)",
+                                 pair_name,
+                                 static_cast<double>(prev) / kMojosPerXch,
+                                 static_cast<double>(avail_capital) / kMojosPerXch,
+                                 config_.strategy.fee_reserve_xch);
+                }
+            }
+        }
+
         // Fetch competing offers for gap-aware dynamic tier spacing.
         auto comp_offers = market_data_->get_competing_offers(pair_name);
 
@@ -3509,6 +3547,38 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (!can_bid && !can_ask) {
                 spdlog::info("[Engine] Step 8: {} both sides suppressed -- "
                              "skipping offer posting", pair_name);
+                continue;
+            }
+        }
+
+        // -- XCH fee reserve gate (pre-creation, UTXO-aware) ---------------
+        // The Chia wallet locks entire UTXOs when creating offers -- a small
+        // offer can lock a large coin, and even non-XCH offers lock XCH for
+        // fee coins.  Check actual XCH spendable before posting any offers
+        // for this pair.  If already below reserve (e.g. from offers posted
+        // for a previous pair in this heartbeat), skip this pair entirely.
+        if (config_.strategy.fee_reserve_xch > 0.0) {
+            try {
+                auto xch_bal = co_await wallet_->get_wallet_balance(1);
+                Mojo xch_spendable = 0;
+                if (xch_bal.contains("spendable_balance"))
+                    xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+                const auto xch_reserve = static_cast<Mojo>(std::llround(
+                    config_.strategy.fee_reserve_xch
+                    * static_cast<double>(kMojosPerXch)));
+                if (xch_spendable < xch_reserve) {
+                    spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
+                                 "spendable {:.6f} XCH < reserve {:.3f} XCH "
+                                 "-- skipping offer posting",
+                                 pair_name,
+                                 static_cast<double>(xch_spendable) / kMojosPerXch,
+                                 config_.strategy.fee_reserve_xch);
+                    continue;
+                }
+            } catch (const std::exception& e) {
+                spdlog::warn("[Engine] Step 8: {} XCH fee reserve gate: "
+                             "balance check failed: {} -- skipping cautiously",
+                             pair_name, e.what());
                 continue;
             }
         }

@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.8] — 2026-04-04
+
+### Fixed
+
+- **UTXO-aware fee reserve enforcement**: Previous logical-deduction reserve was ineffective because Chia's UTXO model locks entire coins, not surgical amounts. Step 8 now queries actual XCH spendable balance before each pair and skips if below `fee_reserve_xch`. Post-creation guard in `post_quotes()` re-checks after each offer
+- **Emergency cancel on insufficient funds**: When a cancel fails due to insufficient fee balance, automatically retries with a reduced fee (spendable minus dust margin) or falls back to local-only insecure cancel. Applied across all 6 cancel paths: `cancel_stale`, `cancel_all`, `selective_cancel`, asymmetric bid/ask cancel, and `startup_reconcile`
+- **Broader fee-error detection**: Cancel error matching now catches both "insufficient funds" and "spendable balance" error strings from the Chia wallet RPC
+
+### Changed
+
+- **10× lower default fees**: Reduced `offer_fee_mojos` from 100M to 10M (0.00001 XCH), `min_fee_mojos` from 50M to 5M, `max_fee_mojos` from 500M to 100M. Based on blockchain research: Chia mempool is typically <1% full, fee estimate for instant inclusion is ~3.5M mojos, and most Dexie offers complete with zero blockchain fee
+
 ## [0.5.7] — 2026-04-05
 
 ### Added
