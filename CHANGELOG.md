@@ -5,6 +5,14 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.9] — 2026-04-04
+
+### Fixed
+
+- **Emergency cancel fee cap**: Previous emergency cancel used `spendable - 1000 mojos` as the fee, burning up to ~1 XCH on a single cancel. Now capped at 2× the dynamic fee (~0.02 XCH max)
+- **Emergency cancel fee retry cascade**: When wallet reports insufficient funds, emergency cancel now halves the fee and retries (2× dynamic → 1× → ½ → ¼ → ... → 1 mojo) before falling back to insecure local-only cancel. Enables cancellation even when spendable XCH is far below the configured minimum fee
+- **Batch fallback fee reserve guard**: When batch offer creation fails and falls back to per-tier, now checks spendable balance after each successful tier and stops if below reserve
+
 ## [0.5.8] — 2026-04-04
 
 ### Fixed

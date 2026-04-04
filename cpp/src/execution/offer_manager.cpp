@@ -1611,6 +1611,34 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.created_at_ts    = std::chrono::system_clock::now();
                 state_->upsert_offer(po);
                 ++fallback_count;
+
+                // -- Fee reserve guard (batch fallback, UTXO-aware) ---------
+                // Each individual creation in the fallback can lock UTXOs and
+                // eat into the fee reserve.  Check after each success.
+                if (strategy_cfg_.fee_reserve_xch > 0.0) {
+                    try {
+                        auto fb_bal = co_await wallet_->get_wallet_balance(1);
+                        Mojo fb_spendable = 0;
+                        if (fb_bal.contains("spendable_balance"))
+                            fb_spendable = fb_bal["spendable_balance"].get<Mojo>();
+                        const auto fb_reserve = static_cast<Mojo>(std::llround(
+                            strategy_cfg_.fee_reserve_xch
+                            * static_cast<double>(kMojosPerXch)));
+                        if (fb_spendable < fb_reserve) {
+                            logger_->warn(
+                                "XCH fee reserve guard (batch fallback): "
+                                "spendable {:.6f} XCH < reserve {:.3f} XCH "
+                                "after {} tier {} -- stopping fallback",
+                                static_cast<double>(fb_spendable) / kMojosPerXch,
+                                strategy_cfg_.fee_reserve_xch,
+                                pair.name, tier.tier_index);
+                            break;
+                        }
+                    } catch (const std::exception& e) {
+                        logger_->warn("XCH fee reserve guard (batch fallback): "
+                                      "balance check failed: {}", e.what());
+                    }
+                }
             }
         }
         co_return fallback_count;
@@ -1814,23 +1842,56 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
 
         if (xch_spendable > 0) {
-            // Use all spendable XCH minus a tiny dust margin as the fee.
-            const Mojo emergency_fee = std::max(
-                Mojo{1}, xch_spendable - Mojo{1000});
-            logger_->warn("{}: emergency cancel {} with reduced fee "
-                          "{} mojos (spendable {} mojos)",
-                          context, offer_id.substr(0, 12),
-                          emergency_fee, xch_spendable);
-            co_await wallet_->cancel_offer(
-                offer_id, static_cast<std::uint64_t>(emergency_fee),
-                /*secure=*/true);
-            logger_->info("{}: emergency-cancelled {} (fee {} mojos)",
-                          context, offer_id.substr(0, 12), emergency_fee);
-            co_return true;
+            // Try descending fee tiers: 2× dynamic fee, 1× dynamic fee,
+            // half, quarter, down to 1 mojo.  If the wallet reports
+            // insufficient funds at a given tier, halve and retry.
+            // This lets us cancel even when spendable is far below the
+            // configured minimum fee.
+            const auto fee_cap = static_cast<Mojo>(current_fee_mojos_ * 2);
+            Mojo attempt_fee = std::min(
+                fee_cap,
+                std::max(Mojo{1}, xch_spendable - Mojo{1000}));
+
+            while (attempt_fee >= 1) {
+                logger_->warn("{}: emergency cancel {} with fee "
+                              "{} mojos (spendable {} mojos)",
+                              context, offer_id.substr(0, 12),
+                              attempt_fee, xch_spendable);
+                bool rpc_failed = false;
+                bool insufficient = false;
+                try {
+                    co_await wallet_->cancel_offer(
+                        offer_id,
+                        static_cast<std::uint64_t>(attempt_fee),
+                        /*secure=*/true);
+                } catch (const rpc::ChiaRPCError& e) {
+                    rpc_failed = true;
+                    const std::string_view msg{e.what()};
+                    insufficient =
+                        msg.find("insufficient funds")
+                            != std::string_view::npos ||
+                        msg.find("spendable balance")
+                            != std::string_view::npos;
+                    if (!insufficient) {
+                        logger_->error(
+                            "{}: emergency cancel RPC error for {}: {}",
+                            context, offer_id.substr(0, 12), e.what());
+                    }
+                }
+                if (!rpc_failed) {
+                    logger_->info(
+                        "{}: emergency-cancelled {} (fee {} mojos)",
+                        context, offer_id.substr(0, 12), attempt_fee);
+                    co_return true;
+                }
+                if (!insufficient) break;  // non-balance error, stop retrying
+                // Halve the fee and retry.
+                attempt_fee = attempt_fee / 2;
+            }
         }
 
-        // Zero spendable: last resort -- local-only cancel.
-        // No on-chain fee, drops from wallet but doesn't invalidate the
+        // Zero spendable or all fee tiers exhausted: local-only cancel.
+        // No on-chain fee -- drops from wallet but doesn't invalidate the
         // offer on-chain.  Better than leaving funds locked forever.
         logger_->warn("{}: zero XCH spendable -- local-only (insecure) "
                       "cancel for {}", context, offer_id.substr(0, 12));
