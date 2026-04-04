@@ -406,6 +406,28 @@ public:
         const std::unordered_set<std::string>& known_offer_ids);
 
     /**
+     * @brief Prune stuck transactions from wallet transaction lists.
+     *
+     * Queries get_transactions() for each wallet involved in trading and
+     * checks for unconfirmed transactions that have been pending longer
+     * than max_age_seconds.  If found, calls
+     * delete_unconfirmed_transactions() to clear them.
+     *
+     * Stuck transactions occur when the wallet daemon creates local
+     * transaction records but fails to broadcast the spend bundle
+     * (e.g. due to a coin double-spend conflict from rapid consecutive
+     * offer creation).
+     *
+     * @param wallet_ids      Set of wallet IDs to scan for stuck transactions.
+     * @param max_age_seconds Maximum age in seconds before a pending
+     *                        transaction is considered stuck (default 600 = 10 min).
+     * @return Number of wallets that had stuck transactions cleared.
+     */
+    asio::awaitable<int> prune_stuck_transactions(
+        const std::vector<std::int64_t>& wallet_ids,
+        std::int64_t max_age_seconds = 600);
+
+    /**
      * @brief Resolve an asset ID to a wallet ID.
      *
      * "xch" maps to wallet_id 1.  CAT asset IDs are resolved by querying

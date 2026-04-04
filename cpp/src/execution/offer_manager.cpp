@@ -1113,6 +1113,80 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
 }
 
 // ---------------------------------------------------------------------------
+// prune_stuck_transactions -- detect and clear stuck wallet transactions
+// ---------------------------------------------------------------------------
+
+asio::awaitable<int> OfferManager::prune_stuck_transactions(
+    const std::vector<std::int64_t>& wallet_ids,
+    std::int64_t max_age_seconds)
+{
+    int wallets_pruned = 0;
+    const auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+
+    for (const auto wid : wallet_ids) {
+        try {
+            auto txs = co_await wallet_->get_transactions(wid, 0, 50);
+
+            int stuck_count = 0;
+            for (const auto& tx : txs) {
+                // Only examine unconfirmed transactions.
+                if (tx.contains("confirmed") && tx["confirmed"].get<bool>()) {
+                    continue;
+                }
+
+                // Check if the transaction is missing a spend bundle.
+                bool has_bundle = tx.contains("spend_bundle") &&
+                                  !tx["spend_bundle"].is_null();
+                if (has_bundle) {
+                    continue;  // Has a spend bundle -- may still confirm.
+                }
+
+                // Check age.
+                if (!tx.contains("created_at_time")) continue;
+                auto created = tx["created_at_time"].get<std::int64_t>();
+                auto age = now_epoch - created;
+                if (age < max_age_seconds) continue;
+
+                ++stuck_count;
+
+                // Log details for the first few stuck transactions.
+                if (stuck_count <= 3) {
+                    std::int64_t amount = 0;
+                    int tx_type = -1;
+                    if (tx.contains("amount")) amount = tx["amount"].get<std::int64_t>();
+                    if (tx.contains("type"))   tx_type = tx["type"].get<int>();
+                    logger_->warn("[prune_stuck_tx] wallet {} stuck tx: "
+                                  "type={} amount={} age={}s no_spend_bundle",
+                                  wid, tx_type, amount, age);
+                }
+            }
+
+            if (stuck_count > 0) {
+                logger_->warn("[prune_stuck_tx] wallet {} has {} stuck "
+                              "transactions (no spend bundle, age > {}s) "
+                              "-- clearing unconfirmed",
+                              wid, stuck_count, max_age_seconds);
+                co_await wallet_->delete_unconfirmed_transactions(wid);
+                ++wallets_pruned;
+                logger_->info("[prune_stuck_tx] wallet {} unconfirmed "
+                              "transactions cleared", wid);
+            }
+        } catch (const std::exception& e) {
+            logger_->error("[prune_stuck_tx] wallet {} failed: {}",
+                           wid, e.what());
+        }
+    }
+
+    if (wallets_pruned > 0) {
+        logger_->info("[prune_stuck_tx] Pruned stuck transactions from "
+                      "{} wallet(s)", wallets_pruned);
+    }
+
+    co_return wallets_pruned;
+}
+
+// ---------------------------------------------------------------------------
 // build_offer_dict -- map a TierQuote to the wallet RPC offer_dict format
 // ---------------------------------------------------------------------------
 

@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.3] — 2026-04-03
+
+### Added
+
+- **Stuck transaction pruning**: new `OfferManager::prune_stuck_transactions()` detects wallet transactions with no spend bundle (stuck > 10 min) and clears them via `delete_unconfirmed_transactions` RPC. Runs automatically at startup
+- **Pending-change gate**: Step 8 now queries live wallet balances before posting offers. If any wallet has `pending_change > 0` (coins in-flight from a prior transaction), offer creation is skipped until the pending transaction confirms on-chain (~1-2 blocks). Prevents the wallet daemon from reusing already-spent coins across concurrent offers
+- `ChiaWalletRPC::delete_unconfirmed_transactions()` — clears stuck unconfirmed transactions from a wallet
+- `ChiaWalletRPC::get_transactions()` — retrieves recent transactions for stuck-tx detection
+
+### Fixed
+
+- **Critical**: Wallet coin double-spend causing permanently stuck transactions. Rapid consecutive `create_offer` calls could select the same unspent coin, producing spend bundles that never broadcast. The pending-change gate and stuck-tx pruner prevent and recover from this condition
+- Spendable reserve gate was previously a dead no-op (`cached_wallet_balances_` never populated). Now queries live wallet balances per-pair before posting
+
 ## [0.5.2] — 2026-04-03
 
 ### Added

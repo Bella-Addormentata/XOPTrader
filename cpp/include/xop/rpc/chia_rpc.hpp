@@ -569,6 +569,40 @@ public:
      * ISO/IEC 5055 -- all error paths throw; caller must handle exceptions.
      */
     asio::awaitable<json> send_transaction(const json& params);
+
+    // -- Stuck transaction management ---------------------------------------
+
+    /**
+     * @brief Delete all unconfirmed (stuck) transactions for a wallet.
+     *
+     * Wraps the Chia wallet RPC "delete_unconfirmed_transactions" endpoint.
+     * This clears transactions that were created locally but never broadcast
+     * or confirmed on-chain (e.g. due to coin double-spend conflicts).
+     *
+     * @param wallet_id  Target wallet ID.
+     * @return JSON confirmation from the wallet daemon.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<json> delete_unconfirmed_transactions(
+        std::int64_t wallet_id);
+
+    /**
+     * @brief Retrieve recent transactions for a wallet.
+     *
+     * Wraps the Chia wallet RPC "get_transactions" endpoint with
+     * descending time order.  Used to detect stuck transactions
+     * that lack a spend bundle.
+     *
+     * @param wallet_id  Target wallet ID.
+     * @param start      Starting index (0-based).
+     * @param end        Ending index (exclusive).
+     * @return Vector of transaction JSON objects.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::vector<json>> get_transactions(
+        std::int64_t wallet_id,
+        std::int64_t start = 0,
+        std::int64_t end   = 50);
 };
 
 } // namespace xop::rpc

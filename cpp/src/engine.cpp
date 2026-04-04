@@ -617,6 +617,37 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::info("[Engine] Restored {} pending offers from DB into State",
                              db_pending.size());
             }
+
+            // -- Prune stuck transactions ------------------------------------
+            // After offer reconciliation, scan wallet transaction lists for
+            // transactions that were created but never broadcast (no spend
+            // bundle).  These occur when the wallet daemon selects an
+            // already-spent coin for a new offer, creating a local record
+            // that can never confirm.  Clear them to free up pending balance.
+            {
+                std::vector<std::int64_t> wallet_ids;
+                for (const auto& pair : config_.pairs) {
+                    if (!pair.enabled) continue;
+                    auto bwid = offer_mgr_->resolve_wallet_id(pair.base_asset_id);
+                    auto qwid = offer_mgr_->resolve_wallet_id(pair.quote_asset_id);
+                    if (bwid > 0) wallet_ids.push_back(bwid);
+                    if (qwid > 0) wallet_ids.push_back(qwid);
+                }
+                // Deduplicate wallet IDs.
+                std::sort(wallet_ids.begin(), wallet_ids.end());
+                wallet_ids.erase(
+                    std::unique(wallet_ids.begin(), wallet_ids.end()),
+                    wallet_ids.end());
+
+                if (!wallet_ids.empty()) {
+                    auto pruned = co_await offer_mgr_->prune_stuck_transactions(
+                        wallet_ids, 600);
+                    if (pruned > 0) {
+                        spdlog::info("[Engine] Startup: pruned stuck transactions "
+                                     "from {} wallet(s)", pruned);
+                    }
+                }
+            }
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup offer reconciliation failed: {}; "
                          "continuing without recovery", ex.what());
@@ -2806,22 +2837,75 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             metrics_->update_stuck_offers(stuck_count);
         }
 
-        // -- Spendable reserve gating ----------------------------------------
-        // Check cached wallet balances; skip posting if any wallet has
-        // too little spendable relative to confirmed balance.
+        // -- Spendable reserve & pending-change gating ----------------------
+        // Query wallet balances for each wallet involved in this pair.
+        // Skip posting if:
+        //   1. Any wallet has too little spendable relative to confirmed.
+        //   2. Any wallet has pending_change > 0, indicating prior
+        //      transactions are still confirming on-chain.  Creating new
+        //      offers while coins are in-flight risks the wallet selecting
+        //      the same unspent coin for multiple concurrent spend bundles,
+        //      producing stuck transactions that never broadcast.
         {
             bool reserve_ok = true;
-            for (const auto& [wlabel, bal] : cached_wallet_balances_) {
-                if (bal.confirmed == 0) continue;
-                double ratio = static_cast<double>(bal.spendable)
-                             / static_cast<double>(bal.confirmed);
-                metrics_->update_spendable_reserve(wlabel, ratio);
-                if (ratio < config_.strategy.min_spendable_reserve_pct) {
-                    spdlog::info("[Engine] Step 8: {} spendable reserve {:.1f}% "
-                                 "< {:.1f}% threshold -- skipping offer posting",
-                                 wlabel, ratio * 100.0,
-                                 config_.strategy.min_spendable_reserve_pct * 100.0);
-                    reserve_ok = false;
+            const PairConfig* gate_pc = find_pair_config(pair_name);
+            if (gate_pc) {
+                auto bwid = offer_mgr_->resolve_wallet_id(gate_pc->base_asset_id);
+                auto qwid = offer_mgr_->resolve_wallet_id(gate_pc->quote_asset_id);
+                std::vector<std::pair<std::string, std::int64_t>> wallets_to_check;
+                if (bwid > 0) wallets_to_check.emplace_back(gate_pc->base_asset_id, bwid);
+                if (qwid > 0) wallets_to_check.emplace_back(gate_pc->quote_asset_id, qwid);
+
+                for (const auto& [label, wid] : wallets_to_check) {
+                    try {
+                        auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                        Mojo spendable = 0, confirmed = 0, pending = 0;
+                        if (bal_json.contains("spendable_balance"))
+                            spendable = bal_json["spendable_balance"].get<Mojo>();
+                        if (bal_json.contains("confirmed_wallet_balance"))
+                            confirmed = bal_json["confirmed_wallet_balance"].get<Mojo>();
+                        if (bal_json.contains("pending_change"))
+                            pending = bal_json["pending_change"].get<Mojo>();
+
+                        // Update the cache for metrics.
+                        cached_wallet_balances_[label] = {spendable, confirmed, pending};
+                        metrics_->update_spendable_reserve(
+                            label,
+                            (confirmed > 0)
+                                ? static_cast<double>(spendable) / static_cast<double>(confirmed)
+                                : 1.0);
+
+                        // Gate 1: pending_change > 0 means coins are in-flight.
+                        if (pending > 0) {
+                            spdlog::info("[Engine] Step 8: {} wallet {} has "
+                                         "pending_change={} -- skipping offer "
+                                         "posting until confirmed",
+                                         pair_name, label, pending);
+                            reserve_ok = false;
+                            break;
+                        }
+
+                        // Gate 2: spendable reserve too low.
+                        if (confirmed > 0) {
+                            double ratio = static_cast<double>(spendable)
+                                         / static_cast<double>(confirmed);
+                            if (ratio < config_.strategy.min_spendable_reserve_pct) {
+                                spdlog::info("[Engine] Step 8: {} spendable reserve "
+                                             "{:.1f}% < {:.1f}% threshold -- "
+                                             "skipping offer posting",
+                                             label, ratio * 100.0,
+                                             config_.strategy.min_spendable_reserve_pct * 100.0);
+                                reserve_ok = false;
+                                break;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::warn("[Engine] Step 8: balance query failed for "
+                                     "wallet {} ({}): {}", label, wid, e.what());
+                        // On failure, skip posting conservatively.
+                        reserve_ok = false;
+                        break;
+                    }
                 }
             }
             if (!reserve_ok) continue;

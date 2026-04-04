@@ -953,4 +953,44 @@ ChiaWalletRPC::send_transaction(const json& params)
     co_return resp;
 }
 
+// ---------------------------------------------------------------------------
+// ChiaWalletRPC::delete_unconfirmed_transactions
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json>
+ChiaWalletRPC::delete_unconfirmed_transactions(std::int64_t wallet_id)
+{
+    const json payload = {{"wallet_id", wallet_id}};
+    co_return co_await rpc_post("delete_unconfirmed_transactions", payload);
+}
+
+// ---------------------------------------------------------------------------
+// ChiaWalletRPC::get_transactions
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::vector<json>>
+ChiaWalletRPC::get_transactions(std::int64_t wallet_id,
+                                std::int64_t start,
+                                std::int64_t end)
+{
+    const json payload = {
+        {"wallet_id", wallet_id},
+        {"start",     start},
+        {"end",       end},
+        {"sort_key",  "RELEVANCE"},
+        {"reverse",   true}
+    };
+
+    const json resp = co_await rpc_post("get_transactions", payload);
+
+    std::vector<json> txs;
+    if (resp.contains("transactions") && resp["transactions"].is_array()) {
+        txs.reserve(resp["transactions"].size());
+        for (auto& t : resp["transactions"]) {
+            txs.push_back(std::move(t));
+        }
+    }
+    co_return txs;
+}
+
 } // namespace xop::rpc
