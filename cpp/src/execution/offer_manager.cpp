@@ -32,11 +32,30 @@ namespace xop::execution {
 
 // ---------------------------------------------------------------------------
 // Chia wallet trade-record status codes (from chia-blockchain source).
+// Newer Chia wallet versions return status as a string enum; older versions
+// return an integer.  parse_trade_status() handles both.
 // ---------------------------------------------------------------------------
 namespace trade_status {
+    constexpr int kPendingAccept    = 0;
     constexpr int kCancelled        = 3;
     constexpr int kConfirmed        = 4;
     constexpr int kFailed           = 5;
+
+    inline int parse(const nlohmann::json& status_val) {
+        if (status_val.is_number_integer()) {
+            return status_val.get<int>();
+        }
+        if (status_val.is_string()) {
+            const auto& s = status_val.get_ref<const std::string&>();
+            if (s == "PENDING_ACCEPT")  return 0;
+            if (s == "PENDING_CONFIRM") return 1;
+            if (s == "PENDING_CANCEL")  return 2;
+            if (s == "CANCELLED")       return kCancelled;
+            if (s == "CONFIRMED")       return kConfirmed;
+            if (s == "FAILED")          return kFailed;
+        }
+        return -1;  // Unknown status.
+    }
 }  // namespace trade_status
 
 // ---------------------------------------------------------------------------
@@ -326,7 +345,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 continue;
             }
             std::string trade_id = rec["trade_id"].get<std::string>();
-            int status = rec["status"].get<int>();
+            int status = trade_status::parse(rec["status"]);
 
             // Only process records that are in our pending map.
             auto it = pending_map.find(trade_id);
@@ -980,7 +999,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
                 continue;
             }
             std::string trade_id = rec["trade_id"].get<std::string>();
-            int status = rec["status"].get<int>();
+            int status = trade_status::parse(rec["status"]);
 
             wallet_offer_ids.insert(trade_id);
 
@@ -1038,8 +1057,6 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
 asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
     const std::unordered_set<std::string>& known_offer_ids)
 {
-    constexpr int kPendingAccept = 0;  // Chia wallet PENDING_ACCEPT status
-
     std::vector<std::string> cancelled_ids;
 
     logger_->info("[startup_reconcile] Scanning wallet for orphaned offers...");
@@ -1072,9 +1089,9 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 continue;
             }
             std::string trade_id = rec["trade_id"].get<std::string>();
-            int status = rec["status"].get<int>();
+            int status = trade_status::parse(rec["status"]);
 
-            if (status != kPendingAccept) {
+            if (status != trade_status::kPendingAccept) {
                 continue;  // Only interested in live offers.
             }
             ++total_pending;
@@ -1207,33 +1224,51 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
 
     // Resolve the per-asset mojo denomination from the pair configuration.
     // XCH uses 10^12 mojos per unit; CAT tokens use 10^3 mojos per unit.
-    // The previous implementation always divided by kMojosPerXch (10^12),
-    // which silently truncated CAT quote amounts by a factor of 10^9.
     //
     // ISO/IEC 5055: guard against zero/negative denomination to prevent
     // division-by-zero undefined behaviour or nonsensical mojo amounts.
     const std::int64_t quote_denom = pair.quote_mojos_per_unit;
-    if (quote_denom <= 0) {
-        logger_->error("build_offer_dict: invalid quote_mojos_per_unit={} "
-                       "for pair '{}' -- must be > 0",
-                       quote_denom, pair.name);
+    const std::int64_t base_denom  = pair.base_mojos_per_unit;
+    if (quote_denom <= 0 || base_denom <= 0) {
+        logger_->error("build_offer_dict: invalid mojos_per_unit "
+                       "(base={}, quote={}) for pair '{}' -- must be > 0",
+                       base_denom, quote_denom, pair.name);
         return json::object();
     }
+
+    // tier.size  is in base-asset mojos.
+    // tier.price is the exchange rate (quote-per-base units) scaled by
+    //            kMojosPerXch (the engine multiplies the strategy's
+    //            floating-point price by kMojosPerXch for fixed-point
+    //            storage in the Quote struct).
+    //
+    // To compute the quote-asset mojo amount:
+    //   base_units  = tier.size  / base_mojos_per_unit
+    //   price_real  = tier.price / kMojosPerXch
+    //   quote_units = base_units * price_real
+    //   quote_mojos = quote_units * quote_mojos_per_unit
+    //
+    // Combined:
+    //   quote_mojos = tier.size * tier.price * quote_denom
+    //               / (base_denom * kMojosPerXch)
+    //
+    // We compute in double to avoid int64 overflow (the numerator can
+    // reach ~10^25 for typical XCH/CAT pairs).
+    const double size_d  = static_cast<double>(tier.size);
+    const double price_d = static_cast<double>(tier.price);
+    const double denom   = static_cast<double>(base_denom)
+                         * static_cast<double>(kMojosPerXch);
 
     json offer_dict = json::object();
 
     if (tier.side == Side::Bid) {
         // BID: we offer quote-asset mojos (negative), request base-asset
         // mojos (positive).
-        //
-        // Quote cost = base_size * price_per_base / denomination.
-        // The offer_dict keys must be strings of the wallet_id.
         // Round up (ceil) so that we offer at least enough quote to cover
         // the requested base amount at the stated price.
         const Mojo quote_amount = static_cast<Mojo>(
-            std::ceil(static_cast<double>(tier.size)
-                      * static_cast<double>(tier.price)
-                      / static_cast<double>(quote_denom)));
+            std::ceil(size_d * price_d
+                      * static_cast<double>(quote_denom) / denom));
 
         // Wallet RPC convention: negative = we spend, positive = we receive.
         offer_dict[std::to_string(quote_wid)] = -quote_amount;
@@ -1245,9 +1280,8 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
         // Round down (floor) so that we request conservatively, ensuring
         // the offer is attractive to takers.
         const Mojo quote_amount = static_cast<Mojo>(
-            std::floor(static_cast<double>(tier.size)
-                       * static_cast<double>(tier.price)
-                       / static_cast<double>(quote_denom)));
+            std::floor(size_d * price_d
+                       * static_cast<double>(quote_denom) / denom));
 
         offer_dict[std::to_string(base_wid)]  = -tier.size;
         offer_dict[std::to_string(quote_wid)] =  quote_amount;

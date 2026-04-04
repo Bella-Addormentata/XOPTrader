@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.4] — 2026-04-03
+
+### Fixed
+
+- **Critical**: Integer overflow in `build_offer_dict()` — the formula `tier.size * tier.price / quote_denom` overflowed int64 (product ~10²⁴), producing garbage amounts that the wallet rejected as "insufficient funds" for both BID and ASK offers. Fixed by decomposing into proper unit conversions: `(size/base_mojos_per_unit) × (price/kMojosPerXch) × quote_mojos_per_unit`, computed in double to avoid overflow
+- **Chia wallet status field compatibility**: Newer Chia wallet versions return trade-record `status` as strings (`"PENDING_ACCEPT"`, `"CONFIRMED"`, etc.) instead of integers. Three call sites in `OfferManager` crashed with `json::type_error.302`. Added `trade_status::parse()` helper that accepts both formats
+
 ## [0.5.3] — 2026-04-03
 
 ### Added
