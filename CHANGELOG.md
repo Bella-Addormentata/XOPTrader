@@ -5,6 +5,21 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.4] — 2026-04-05
+
+### Added
+
+- **Smart orphan management (CAOE)**: Cost-Aware Orphan Evaluation replaces the blind cancel-all-orphans startup logic with scholarly-grounded per-offer decision making. On startup, each orphaned wallet offer (PENDING_ACCEPT but not in the engine DB) is evaluated against the current Dexie mid-price to determine whether it should be **adopted** (re-tracked), **adopted-stale** (re-tracked but scheduled for immediate refresh), or **cancelled**
+  - Academic basis: Guéant, Lehalle & Fernandez-Tapia (2013) "Dealing with the Inventory Risk" — cancel only when expected adverse selection loss exceeds cancellation cost; Gao & Wang (2020) "Optimal market making in the presence of latency" — the zero-offer gap during cancel→repost is the primary adverse selection cost for slow-chain market makers; Aït-Sahalia & Saglam (2017) — stale-quote risk scales with price deviation, remaining lifetime, and offer size
+  - Parses wallet trade record `summary` field to extract pair, side, price, and size from each orphan's offered/requested asset maps
+  - Fetches current Dexie ticker mid-prices for all enabled pairs during startup reconciliation
+  - Computes signed price deviation and determines adverse direction (bid above mid = adverse, ask below mid = adverse)
+  - Applies inventory-aware tolerance bonus: orphans that help reduce inventory imbalance get an extra `orphan_inventory_bonus` (default 1%) added to the adverse threshold
+  - AdoptStale disposition sets the offer's `created_at_block` near the TTL boundary, triggering an immediate selective refresh on the next heartbeat — no stale offers linger
+  - Adopted orphans are persisted to the DB so they survive the next restart without re-evaluation churn
+  - New config params: `orphan_adopt_enabled` (default: true), `orphan_adverse_threshold` (default: 0.02 = 2%), `orphan_max_adopt_age_blocks` (default: 120 ≈ 104 min), `orphan_inventory_bonus` (default: 0.01 = 1%)
+  - Comprehensive per-orphan logging with disposition, deviation %, and human-readable reasons
+
 ## [0.6.3] — 2026-04-05
 
 ### Fixed

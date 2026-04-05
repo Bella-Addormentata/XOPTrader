@@ -856,6 +856,31 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Smart orphan management (optional) --
+    // Guéant, Lehalle & Fernandez-Tapia (2013): cost-aware orphan evaluation.
+    if (node["orphan_adopt_enabled"] && node["orphan_adopt_enabled"].IsDefined()
+        && !node["orphan_adopt_enabled"].IsNull()) {
+        cfg.orphan_adopt_enabled = node["orphan_adopt_enabled"].as<bool>();
+    }
+    if (node["orphan_adverse_threshold"] && node["orphan_adverse_threshold"].IsDefined()
+        && !node["orphan_adverse_threshold"].IsNull()) {
+        cfg.orphan_adverse_threshold = node["orphan_adverse_threshold"].as<double>();
+        if (cfg.orphan_adverse_threshold < 0.0 || cfg.orphan_adverse_threshold > 1.0) {
+            throw ConfigError(sec + ".orphan_adverse_threshold must be in [0, 1]");
+        }
+    }
+    if (node["orphan_max_adopt_age_blocks"] && node["orphan_max_adopt_age_blocks"].IsDefined()
+        && !node["orphan_max_adopt_age_blocks"].IsNull()) {
+        cfg.orphan_max_adopt_age_blocks = node["orphan_max_adopt_age_blocks"].as<std::uint32_t>();
+    }
+    if (node["orphan_inventory_bonus"] && node["orphan_inventory_bonus"].IsDefined()
+        && !node["orphan_inventory_bonus"].IsNull()) {
+        cfg.orphan_inventory_bonus = node["orphan_inventory_bonus"].as<double>();
+        if (cfg.orphan_inventory_bonus < 0.0 || cfg.orphan_inventory_bonus > 1.0) {
+            throw ConfigError(sec + ".orphan_inventory_bonus must be in [0, 1]");
+        }
+    }
+
     return cfg;
 }
 

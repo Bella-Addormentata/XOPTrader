@@ -300,6 +300,45 @@ struct StrategyConfig {
     /// multiplier on total_spread_bps in Step 5.  Default 0.15 = 15%
     /// wider spreads targeting the captive retail market segment.
     double   wall_niche_premium_pct{0.15};
+
+    // -- Cost-aware orphan evaluation (startup reconciliation) ---------------
+    //
+    // Scholarly basis:
+    //   Guéant, Lehalle & Fernandez-Tapia (2013) — inventory-risk-aware
+    //     cancellation: cancel cost vs. expected adverse selection loss.
+    //   Gao & Wang (2020) — zero-offer gap during cancel→repost is the
+    //     primary adverse selection cost for latent market makers.
+    //   Aït-Sahalia & Saglam (2017) — stale-quote risk scales with price
+    //     deviation, remaining lifetime, and offer size.
+    //
+    // When the engine restarts and discovers wallet offers it doesn't
+    // track ("orphans"), the default behavior was to cancel them all.
+    // This wastes fees and creates a zero-offer gap.  When enabled, the
+    // engine evaluates each orphan's current market attractiveness and
+    // adopts well-priced orphans instead of cancelling them.
+
+    /// Master switch for cost-aware orphan evaluation.  When false,
+    /// startup reconciliation cancels all orphans (legacy behavior).
+    bool     orphan_adopt_enabled{true};
+
+    /// Maximum adverse price deviation (fraction) to adopt an orphan.
+    /// An orphan whose price has drifted adversely beyond this threshold
+    /// is cancelled.  Default 0.02 (2%).  Adverse means: bid too high
+    /// relative to current mid (overpaying) or ask too low (underselling).
+    double   orphan_adverse_threshold{0.02};
+
+    /// Maximum age in blocks for an adoptable orphan.  Offers older than
+    /// this are cancelled regardless of price accuracy.  Default 120
+    /// blocks (~104 minutes).  Prevents adopting offers with very old
+    /// coin references that may fail on-chain.
+    uint32_t orphan_max_adopt_age_blocks{120};
+
+    /// Extra adverse-deviation tolerance (fraction) granted to orphans
+    /// that would reduce the current inventory imbalance.  For example,
+    /// if we are long and the orphan is an ask (sell), it helps rebalance
+    /// inventory and gets this bonus before the threshold check.
+    /// Default 0.01 (1% additional tolerance → effective 3% for helpers).
+    double   orphan_inventory_bonus{0.01};
 };
 
 // ---------------------------------------------------------------------------

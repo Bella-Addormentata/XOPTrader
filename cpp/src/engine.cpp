@@ -619,10 +619,27 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // Scan the wallet for any PENDING_ACCEPT offers left over from a
     // previous run.  Cross-reference against the DB's pending records:
     //   - Known offers (in DB) are restored into State for tracking.
-    //   - Unknown offers (orphans) are cancelled to free locked capital.
+    //   - Unknown offers (orphans) are evaluated using cost-aware analysis
+    //     (Guéant-Lehalle 2013, Gao-Wang 2020): well-priced orphans are
+    //     ADOPTED to preserve market presence; mispriced ones are cancelled.
     // This runs once before any trading begins.
     if (offer_mgr_ && db_) {
         try {
+            // Fetch current block height for orphan age evaluation.
+            BlockHeight startup_block = 0;
+            try {
+                if (full_node_) {
+                    startup_block = static_cast<BlockHeight>(
+                        co_await full_node_->get_block_height());
+                } else if (wallet_) {
+                    startup_block = static_cast<BlockHeight>(
+                        co_await wallet_->get_height_info());
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Could not fetch block height for "
+                              "orphan evaluation: {}", e.what());
+            }
+
             // Load what the DB remembers as pending.
             auto db_pending = db_->query_pending_offers();
             std::unordered_set<std::string> known_ids;
@@ -633,9 +650,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
             spdlog::info("[Engine] Startup reconcile: {} pending offers in DB",
                          known_ids.size());
 
-            auto orphans = co_await offer_mgr_->startup_reconcile(known_ids);
+            auto orphans = co_await offer_mgr_->startup_reconcile(
+                known_ids, startup_block);
 
-            // Mark orphans as cancelled in the DB.
+            // Mark cancelled orphans in the DB.  Adopted orphans were
+            // already upserted into State by startup_reconcile; persist
+            // them to the DB as well so they survive the next restart.
             for (const auto& oid : orphans) {
                 try {
                     db_->update_offer_status(oid, "cancelled", 0,
@@ -644,6 +664,33 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     spdlog::debug("[Engine] startup_reconcile update_offer_status "
                                  "failed for {}: {}",
                                  oid.substr(0, 12), e.what());
+                }
+            }
+
+            // Persist adopted orphans so they show up as DB-pending on
+            // the next restart (preventing re-evaluation churn).
+            {
+                auto adopted_offers = state_->get_all_offers();
+                for (const auto& po : adopted_offers) {
+                    // Skip offers already in the DB (they were restored above).
+                    if (known_ids.count(po.offer_id)) continue;
+                    try {
+                        DbOfferRecord rec;
+                        rec.offer_id      = po.offer_id;
+                        rec.pair_name     = po.pair_name;
+                        rec.side          = (po.side == Side::Bid) ? "bid" : "ask";
+                        rec.price_mojos   = po.price;
+                        rec.size_mojos    = po.size;
+                        rec.tier          = static_cast<int>(po.tier);
+                        rec.status        = "pending";
+                        rec.created_block = po.created_at_block;
+                        rec.fee_mojos     = po.fee_mojos;
+                        db_->insert_offer(rec);
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] Failed to persist adopted "
+                                      "orphan {}: {}",
+                                      po.offer_id.substr(0, 12), e.what());
+                    }
                 }
             }
 

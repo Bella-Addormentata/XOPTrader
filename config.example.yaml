@@ -145,6 +145,21 @@ strategy:
   wall_size_threshold_xch: 20.0        # [OPTIONAL, default: 20.0]  Offers >= this are "walls"
   wall_niche_premium_pct: 0.15         # [OPTIONAL, default: 0.15]  Spread widening factor (15%)
 
+  # -- Smart orphan management --
+  # Cost-aware evaluation of offers found in the wallet on startup that
+  # aren't in the engine's database.  Instead of blindly cancelling (wasting
+  # fees and creating a zero-offer gap), evaluates each orphan against the
+  # current market mid-price and adopts well-priced ones.
+  #
+  # Academic basis:
+  #   Guéant, Lehalle & Fernandez-Tapia (2013) "Dealing with the Inventory Risk"
+  #   Gao & Wang (2020) "Optimal market making in the presence of latency"
+  #   Aït-Sahalia & Saglam (2017) "High frequency market making"
+  orphan_adopt_enabled: true           # [OPTIONAL, default: true]   Enable cost-aware evaluation
+  orphan_adverse_threshold: 0.02       # [OPTIONAL, default: 0.02]   Max adverse deviation to adopt (2%)
+  orphan_max_adopt_age_blocks: 120     # [OPTIONAL, default: 120]    Max orphan age (~104 min)
+  orphan_inventory_bonus: 0.01         # [OPTIONAL, default: 0.01]   Extra tolerance for inventory helpers
+
   # -- Gap-aware dynamic tier spacing --
   # Analyses the competing order book for price gaps and shifts tier
   # spacing toward underserved ranges.  Captures spread competitors miss.

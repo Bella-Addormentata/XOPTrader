@@ -112,6 +112,50 @@ struct TierClassification {
 //                      used to evaluate whether a new rebalance is needed.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// OrphanDisposition -- decision outcome for a wallet offer found during
+//                      startup that the engine does not currently track.
+//
+// Scholarly basis:
+//   Guéant, Lehalle & Fernandez-Tapia (2013): cost-aware cancellation.
+//   Gao & Wang (2020): zero-offer gap is the primary adverse selection cost.
+//   Aït-Sahalia & Saglam (2017): stale-quote risk = f(deviation, lifetime).
+// ---------------------------------------------------------------------------
+enum class OrphanDisposition : std::uint8_t {
+    Adopt      = 0,  ///< Price acceptable, re-track as a PendingOffer.
+    AdoptStale = 1,  ///< Mildly mispriced but cheaper to keep than cancel.
+                     ///< Re-track and flag for early refresh next heartbeat.
+    Cancel     = 2,  ///< Dangerously mispriced or too old — cancel on-chain.
+    Unknown    = 3,  ///< Could not parse offer details — cancel defensively.
+};
+
+/// Human-readable label for logging.
+inline const char* to_string(OrphanDisposition d) noexcept {
+    switch (d) {
+        case OrphanDisposition::Adopt:      return "Adopt";
+        case OrphanDisposition::AdoptStale: return "AdoptStale";
+        case OrphanDisposition::Cancel:     return "Cancel";
+        case OrphanDisposition::Unknown:    return "Unknown";
+    }
+    return "?";
+}
+
+/// Full evaluation result for a single orphaned wallet offer.
+struct OrphanEvaluation {
+    std::string        trade_id;
+    OrphanDisposition  disposition{OrphanDisposition::Unknown};
+    std::string        pair_name;           ///< Resolved pair, "" if unknown.
+    Side               side{Side::Bid};
+    Mojo               price{0};            ///< Implied price from summary.
+    Mojo               size{0};             ///< Offered quantity.
+    double             price_deviation{0};  ///< Fractional deviation from mid.
+    bool               adverse{false};      ///< True if deviation hurts us.
+    bool               inventory_helper{false}; ///< Helps reduce imbalance.
+    Mojo               expected_loss{0};    ///< Estimated adverse selection cost.
+    Mojo               cancel_cost{0};      ///< Fee + opportunity cost.
+    std::string        reason;              ///< Human-readable explanation.
+};
+
 struct RebalanceSnapshot {
     Mojo        mid_price{0};                  ///< Mid-price at last rebalance.
     BlockHeight block_height{0};               ///< Block height at last rebalance.
@@ -393,21 +437,46 @@ public:
     /**
      * @brief Startup reconciliation: scan wallet for orphaned offers.
      *
-     * Queries the wallet for ALL PENDING_ACCEPT offers and cancels any
-     * that are not in the provided set of known offer IDs (typically
-     * loaded from the database's pending records).  Known offers are
-     * restored into State so the engine can manage them.
+     * Queries the wallet for ALL PENDING_ACCEPT offers.  Known offers
+     * (in the DB) are restored.  Unknown offers ("orphans") are evaluated
+     * using cost-aware analysis (Guéant-Lehalle 2013, Gao-Wang 2020):
      *
-     * This method should be called once at startup, before the main
-     * trading loop begins.  Unlike reconcile_offers() which only checks
-     * offers already tracked in State, this method discovers wallet
-     * offers that the engine has no knowledge of.
+     *   - Well-priced orphans are ADOPTED into State, saving the cancel
+     *     fee and preserving market presence (zero-offer gap avoidance).
+     *   - Mildly mispriced orphans are ADOPTED but flagged for early
+     *     refresh on the next heartbeat cycle.
+     *   - Dangerously mispriced or very old orphans are CANCELLED.
+     *   - Unparseable orphans are CANCELLED defensively.
      *
      * @param known_offer_ids  Set of offer IDs the DB considers pending.
+     * @param current_block    Current block height (for age computation).
+     *                         0 = skip age-based evaluation.
      * @return Offer IDs that were cancelled as orphans.
      */
     asio::awaitable<std::vector<std::string>> startup_reconcile(
-        const std::unordered_set<std::string>& known_offer_ids);
+        const std::unordered_set<std::string>& known_offer_ids,
+        BlockHeight current_block = 0);
+
+    /**
+     * @brief Evaluate a single orphaned wallet offer for adoption vs.
+     *        cancellation using cost-aware analysis.
+     *
+     * Parses the trade record's summary field to extract the pair, side,
+     * price, and size.  Compares the offer's price against the current
+     * dexie mid-price.  Applies the Gao-Wang (2020) cancel-vs-keep
+     * decision: cancel only when expected adverse selection loss exceeds
+     * the cancellation cost (fee + liquidity opportunity cost).
+     *
+     * @param trade_record   Wallet trade record JSON.
+     * @param current_block  Current block height (for age).
+     * @param mid_prices     Map of pair_name -> current mid-price (mojos).
+     *                       If the pair is missing, the orphan is Unknown.
+     * @return Full evaluation result with disposition and reasoning.
+     */
+    OrphanEvaluation evaluate_orphan(
+        const nlohmann::json& trade_record,
+        BlockHeight current_block,
+        const std::unordered_map<std::string, Mojo>& mid_prices) const;
 
     /**
      * @brief Prune stuck transactions from wallet transaction lists.
