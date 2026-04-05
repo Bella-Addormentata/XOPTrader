@@ -4229,10 +4229,13 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
     // -- 1. Check XCH spendable balance ------------------------------------
     Mojo xch_spendable = 0;
+    Mojo xch_confirmed = 0;
     try {
         auto xch_bal = co_await wallet_->get_wallet_balance(1);
         if (xch_bal.contains("spendable_balance"))
             xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+        if (xch_bal.contains("confirmed_wallet_balance"))
+            xch_confirmed = xch_bal["confirmed_wallet_balance"].get<Mojo>();
     } catch (const std::exception& e) {
         spdlog::warn("[Recovery] Failed to get XCH balance: {} -- skipping",
                      e.what());
@@ -4241,6 +4244,8 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
     const double xch_spendable_d =
         static_cast<double>(xch_spendable) / kMojosPerXch;
+    const double xch_confirmed_d =
+        static_cast<double>(xch_confirmed) / kMojosPerXch;
 
     // -- 2. Recovery mode transitions --------------------------------------
     if (!xch_recovery_mode_) {
@@ -4249,13 +4254,46 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
             co_return;  // Balance is fine.
         }
 
+        // If spendable is low but confirmed is healthy, the XCH is just
+        // locked by our own offers (UTXO locking), not truly depleted.
+        // Don't enter recovery — the offers will either fill (returning
+        // XCH) or be cancelled (freeing UTXOs).
+        if (xch_confirmed_d >= rcfg.xch_low_threshold) {
+            spdlog::debug("[Recovery] XCH spendable {:.6f} < {:.4f} but "
+                          "confirmed {:.6f} is healthy -- UTXO locking "
+                          "from own offers, not entering recovery",
+                          xch_spendable_d, rcfg.xch_low_threshold,
+                          xch_confirmed_d);
+            co_return;
+        }
+
         // Enter recovery mode.
         xch_recovery_mode_ = true;
         xch_recovery_cancelled_ = false;
         spdlog::warn("[Recovery] ENTERING recovery mode: XCH spendable "
-                     "{:.6f} < threshold {:.4f} XCH -- will cancel offers "
-                     "and seek cheap XCH asks",
-                     xch_spendable_d, rcfg.xch_low_threshold);
+                     "{:.6f} confirmed {:.6f} < threshold {:.4f} XCH "
+                     "-- will cancel offers and seek cheap XCH asks",
+                     xch_spendable_d, xch_confirmed_d,
+                    UTXO locking), not truly depleted.
+        // Don't enter recovery — the offers will either fill (returning
+        // XCH) or be cancelled (freeing UTXOs).
+        if (xch_confirmed_d >= rcfg.xch_low_threshold) {
+            spdlog::debug("[Recovery] XCH spendable {:.6f} < {:.4f} but "
+                          "confirmed {:.6f} is healthy -- UTXO locking "
+                          "from own offers, not entering recovery",
+                          xch_spendable_d, rcfg.xch_low_threshold,
+                          xch_confirmed_d);
+            co_return;
+        }
+
+        // Enter recovery mode.
+        xch_recovery_mode_ = true;
+        xch_recovery_cancelled_ = false;
+        spdlog::warn("[Recovery] ENTERING recovery mode: XCH spendable "
+                     "{:.6f} confirmed {:.6f} < threshold {:.4f} XCH "
+                     "-- will cancel offers and seek cheap XCH asks",
+                     xch_spendable_d, xch_confirmed_d,
+                     rcfg.xch_low_threshold);
 
         if (alerts_) {
             alerts_->send_alert(AlertRule::ArbitrageDetected,

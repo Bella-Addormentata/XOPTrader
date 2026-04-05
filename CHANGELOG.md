@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.2] — 2026-04-04
+
+### Fixed
+
+- **Recovery oscillation**: Recovery mode now checks `confirmed_wallet_balance` in addition to `spendable_balance`. When confirmed XCH is healthy (>= threshold) but spendable is low due to UTXO locking from our own offers, recovery is no longer triggered — eliminating the 15-second cancel/re-post oscillation cycle
+- **BYC trading enabled**: Lowered `min_trading_units` from 10.0 to 2.0 in config, unblocking XCH/BYC and BYC/wUSDC.b pairs that were suppressed because actual balances (BYC=3.0, wUSDC.b=7.5) were below the threshold
+
 ## [0.6.1] — 2026-04-04
 
 ### Fixed
