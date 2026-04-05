@@ -2180,6 +2180,52 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
             Venue::Dexie, best_competing_bps,
             hour_utc, day_of_week);
 
+        // ---------------------------------------------------------------
+        // [Wall-aware retail niche premium]
+        //
+        // On Chia DEX offers are atomic — a taker must match the full
+        // amount.  Small traders cannot take wall-sized offers (e.g. 100+
+        // XCH) and are a captive market for our smaller, accessible
+        // offers.  When wall offers dominate the competing order book, we
+        // widen our spread by a configurable niche premium to capture
+        // this retail segment rather than futilely undercutting walls
+        // we can't compete with on size.
+        //
+        // This stacks multiplicatively with subsequent whale/VPIN/OFI
+        // multipliers, which is correct: during high-risk periods we
+        // want even wider spreads on top of the niche premium.
+        // ---------------------------------------------------------------
+        {
+            auto comp_offers_s5 =
+                market_data_->get_competing_offers(pair_name);
+            if (!comp_offers_s5.empty() &&
+                config_.strategy.wall_niche_premium_pct > 0.0) {
+                const Mojo wall_thresh = static_cast<Mojo>(std::llround(
+                    config_.strategy.wall_size_threshold_xch
+                    * static_cast<double>(kMojosPerXch)));
+                bool has_wall = false;
+                for (const auto& co : comp_offers_s5) {
+                    if (co.size > wall_thresh) {
+                        has_wall = true;
+                        break;
+                    }
+                }
+                if (has_wall) {
+                    const double niche_mult =
+                        1.0 + config_.strategy.wall_niche_premium_pct;
+                    pcs.spread_result.total_spread_bps *= niche_mult;
+                    pcs.spread_result.half_spread =
+                        pcs.spread_result.total_spread_bps / 2.0;
+                    spdlog::info("[Engine] Step 5: {} wall detected — "
+                                "retail niche premium {:.0f}% "
+                                "(spread now {:.1f}bps)",
+                                pair_name,
+                                config_.strategy.wall_niche_premium_pct * 100.0,
+                                pcs.spread_result.total_spread_bps);
+                }
+            }
+        }
+
         // [T7-11] Defensive spread widening during regime detector warm-up.
         // When the regime detector has not yet accumulated min_window_size
         // observations, it defaults to Normal regime with unit multipliers.
@@ -2960,17 +3006,29 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // profitably arbitraging our offers.
         // -----------------------------------------------------------------
         if (!comp_offers.empty() && mid_mojos > 0) {
-            // Separate competing offers by side and sort by quality.
-            std::vector<Mojo> comp_bids;
-            std::vector<Mojo> comp_asks;
+            // Separate competing offers by side, retaining size for
+            // wall detection, and sort by quality.
+            struct PricedOffer { Mojo price; Mojo size; };
+            std::vector<PricedOffer> comp_bids;
+            std::vector<PricedOffer> comp_asks;
             for (const auto& co : comp_offers) {
-                if (co.side == Side::Bid) comp_bids.push_back(co.price);
-                if (co.side == Side::Ask) comp_asks.push_back(co.price);
+                if (co.side == Side::Bid) comp_bids.push_back({co.price, co.size});
+                if (co.side == Side::Ask) comp_asks.push_back({co.price, co.size});
             }
             // Bids: best (highest) first.
-            std::sort(comp_bids.begin(), comp_bids.end(), std::greater<Mojo>());
+            std::sort(comp_bids.begin(), comp_bids.end(),
+                [](const auto& a, const auto& b) { return a.price > b.price; });
             // Asks: best (lowest) first.
-            std::sort(comp_asks.begin(), comp_asks.end());
+            std::sort(comp_asks.begin(), comp_asks.end(),
+                [](const auto& a, const auto& b) { return a.price < b.price; });
+
+            // Wall detection threshold (mojos).  Competing offers above
+            // this size are "walls" — we serve a different (retail) market
+            // segment and should NOT undercut them.  On Chia DEX, offers
+            // are atomic: small traders cannot take wall-sized offers.
+            const Mojo wall_threshold_mojos = static_cast<Mojo>(std::llround(
+                config_.strategy.wall_size_threshold_xch
+                * static_cast<double>(kMojosPerXch)));
 
             // Minimum allowed spread: max(min_margin_bps, tibetswap_fee_bps).
             // The TibetSwap fee creates a natural arbitrage boundary —
@@ -2991,15 +3049,29 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
             int capped_bids = 0;
             int capped_asks = 0;
+            int wall_skips  = 0;
 
             for (auto& tq : pcs.ladder) {
                 const auto rank = static_cast<std::size_t>(tq.tier_index + 1);
 
                 if (tq.side == Side::Bid && rank < comp_bids.size()) {
+                    // Wall check: don't undercut massive competing offers.
+                    // Our small accessible offers target retail traders who
+                    // can't take the wall's atomic fill requirement.
+                    if (comp_bids[rank].size > wall_threshold_mojos) {
+                        spdlog::debug("[Engine] Step 7: {} BID tier {} "
+                                     "wall at rank {} (size={:.3f} XCH) "
+                                     "— skipping competitive cap",
+                                     pair_name, tq.tier_index, rank,
+                                     static_cast<double>(comp_bids[rank].size)
+                                         / static_cast<double>(kMojosPerXch));
+                        ++wall_skips;
+                        continue;
+                    }
                     // The competing offer at rank (tier+1) would be filled
                     // before ours.  If our price is worse (lower), improve
                     // it to match + 1 tick.
-                    const Mojo target = comp_bids[rank] + tick;
+                    const Mojo target = comp_bids[rank].price + tick;
                     if (tq.price < target) {
                         // Cap: never bid above the safety floor.
                         const Mojo capped = std::min(target, max_bid_floor);
@@ -3009,7 +3081,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                          "(rank-{} comp={})",
                                          pair_name, tq.tier_index,
                                          tq.price, capped, rank,
-                                         comp_bids[rank]);
+                                         comp_bids[rank].price);
                             tq.price = capped;
                             ++capped_bids;
                         }
@@ -3017,9 +3089,20 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
 
                 if (tq.side == Side::Ask && rank < comp_asks.size()) {
+                    // Wall check: skip undercutting wall-sized offers.
+                    if (comp_asks[rank].size > wall_threshold_mojos) {
+                        spdlog::debug("[Engine] Step 7: {} ASK tier {} "
+                                     "wall at rank {} (size={:.3f} XCH) "
+                                     "— skipping competitive cap",
+                                     pair_name, tq.tier_index, rank,
+                                     static_cast<double>(comp_asks[rank].size)
+                                         / static_cast<double>(kMojosPerXch));
+                        ++wall_skips;
+                        continue;
+                    }
                     // If our ask is worse (higher), improve it to match
                     // the competing ask - 1 tick.
-                    const Mojo target = comp_asks[rank] - tick;
+                    const Mojo target = comp_asks[rank].price - tick;
                     if (tq.price > target) {
                         // Floor: never ask below the safety floor.
                         const Mojo capped = std::max(target, min_ask_ceil);
@@ -3029,7 +3112,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                          "(rank-{} comp={})",
                                          pair_name, tq.tier_index,
                                          tq.price, capped, rank,
-                                         comp_asks[rank]);
+                                         comp_asks[rank].price);
                             tq.price = capped;
                             ++capped_asks;
                         }
@@ -3037,11 +3120,11 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
             }
 
-            if (capped_bids > 0 || capped_asks > 0) {
+            if (capped_bids > 0 || capped_asks > 0 || wall_skips > 0) {
                 spdlog::info("[Engine] Step 7: {} competitive cap adjusted "
-                             "{} bids, {} asks (floor={:.0f}bps)",
+                             "{} bids, {} asks, {} wall-skips (floor={:.0f}bps)",
                              pair_name, capped_bids, capped_asks,
-                             min_floor_bps);
+                             wall_skips, min_floor_bps);
             }
         }
 
@@ -3268,8 +3351,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // zero even though confirmed balance is healthy.  When spendable
     // falls below the fee reserve and we have pending offers, cancel the
     // oldest ones to free locked UTXOs before processing any pair.
-    // Guards: only triggers when confirmed balance proves this is a
-    // locking problem, not genuine depletion (recovery handles that).
     if (config_.strategy.fee_reserve_xch > 0.0) {
         bool liberation_needed = false;
         Mojo xch_spendable_pre = 0;
@@ -3280,15 +3361,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             auto xch_bal = co_await wallet_->get_wallet_balance(1);
             if (xch_bal.contains("spendable_balance"))
                 xch_spendable_pre = xch_bal["spendable_balance"].get<Mojo>();
-            Mojo xch_confirmed = 0;
-            if (xch_bal.contains("confirmed_wallet_balance"))
-                xch_confirmed =
-                    xch_bal["confirmed_wallet_balance"].get<Mojo>();
-            // Only liberate when spendable is below reserve but confirmed
-            // proves the XCH exists (just locked by offer UTXOs).
-            liberation_needed =
-                xch_spendable_pre < reserve_mojos &&
-                xch_confirmed >= reserve_mojos * 2;
+            // Liberate whenever spendable is below reserve.  The old
+            // guard (confirmed >= reserve*2) created a dead zone where
+            // filled offers could drain confirmed below the threshold,
+            // making liberation impossible even though tracked offers
+            // still locked the remaining XCH.
+            liberation_needed = xch_spendable_pre < reserve_mojos;
         } catch (const std::exception& e) {
             spdlog::debug("[Engine] UTXO liberation balance check failed: {}",
                           e.what());

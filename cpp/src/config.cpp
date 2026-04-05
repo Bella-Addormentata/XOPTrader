@@ -840,6 +840,22 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Wall-aware retail niche pricing (optional) --
+    if (node["wall_size_threshold_xch"] && node["wall_size_threshold_xch"].IsDefined()
+        && !node["wall_size_threshold_xch"].IsNull()) {
+        cfg.wall_size_threshold_xch = node["wall_size_threshold_xch"].as<double>();
+        if (cfg.wall_size_threshold_xch < 0.0) {
+            throw ConfigError(sec + ".wall_size_threshold_xch must be >= 0");
+        }
+    }
+    if (node["wall_niche_premium_pct"] && node["wall_niche_premium_pct"].IsDefined()
+        && !node["wall_niche_premium_pct"].IsNull()) {
+        cfg.wall_niche_premium_pct = node["wall_niche_premium_pct"].as<double>();
+        if (cfg.wall_niche_premium_pct < 0.0 || cfg.wall_niche_premium_pct > 1.0) {
+            throw ConfigError(sec + ".wall_niche_premium_pct must be in [0, 1]");
+        }
+    }
+
     return cfg;
 }
 

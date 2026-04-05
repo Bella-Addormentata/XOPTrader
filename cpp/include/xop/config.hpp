@@ -285,6 +285,21 @@ struct StrategyConfig {
 
     /// Weight of TibetSwap AMM implied price in mid-price blend.
     double   amm_blend_weight{0.15};
+
+    // -- Wall-aware retail niche pricing ------------------------------------
+
+    /// Competing offers larger than this threshold (XCH) are classified as
+    /// "walls".  The engine will not undercut walls in the competitive cap
+    /// (Step 7) and will widen spreads to capture a retail niche premium
+    /// (Step 5).  On Chia DEX, offers are atomic — small traders cannot
+    /// take wall-sized offers and must use our smaller, accessible ones.
+    /// Default 20.0 XCH.
+    double   wall_size_threshold_xch{20.0};
+
+    /// Spread widening factor when walls are detected.  Applied as a
+    /// multiplier on total_spread_bps in Step 5.  Default 0.15 = 15%
+    /// wider spreads targeting the captive retail market segment.
+    double   wall_niche_premium_pct{0.15};
 };
 
 // ---------------------------------------------------------------------------

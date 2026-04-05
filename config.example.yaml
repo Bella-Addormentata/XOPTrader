@@ -137,6 +137,14 @@ strategy:
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
 
+  # -- Wall-aware retail niche pricing --
+  # On Chia DEX, offers are atomic (all-or-nothing).  Small traders cannot
+  # take large "wall" offers (e.g. 100 XCH) and must use our smaller ones.
+  # When walls are detected, the engine widens spreads to capture a retail
+  # premium rather than futilely undercutting walls it can't match on size.
+  wall_size_threshold_xch: 20.0        # [OPTIONAL, default: 20.0]  Offers >= this are "walls"
+  wall_niche_premium_pct: 0.15         # [OPTIONAL, default: 0.15]  Spread widening factor (15%)
+
   # -- Gap-aware dynamic tier spacing --
   # Analyses the competing order book for price gaps and shifts tier
   # spacing toward underserved ranges.  Captures spread competitors miss.
