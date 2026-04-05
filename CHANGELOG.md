@@ -5,6 +5,30 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.1] — 2026-04-04
+
+### Fixed
+
+- **Step 8 pre-gate uses full reserve**: The per-pair XCH balance gate before offer posting now checks against `fee_reserve_xch` (1.0 XCH) instead of `fee_min_spendable_xch` (0.01 XCH). Previously, the second pair could drain the entire reserve through UTXO locking because 0.01 was trivially satisfied
+- **Per-offer pre-creation balance check**: `post_quotes()` now verifies XCH spendable >= `fee_reserve_xch` before each individual `create_offer()` call (both batch and non-batch modes), catching mid-cycle UTXO drain that the post-creation guard couldn't prevent
+- **Recovery cancels via wallet RPC**: Recovery mode now calls `wallet.cancel_offers(fee=0, secure=false)` directly instead of `offer_mgr->cancel_all()`, which only checked engine state (empty after restart). This cancels ALL wallet offers including those from previous engine instances, and works with 0 XCH spendable
+- **Recovery takes with zero fee**: When XCH spendable < 0.001, recovery mode uses fee=0 for `take_offer` calls, breaking the deadlock where taking XCH asks required XCH for fees
+
+## [0.6.0] — 2026-04-04
+
+### Added
+
+- **Dynamic Market Allocator**: New `MarketAllocator` scores each trading pair across 5 dimensions (spread quality, volume, competition, fill rate, triangular arb edge) and dynamically shifts capital allocation toward the most attractive markets
+- **Triangular arbitrage detection**: Computes forward and reverse cycle edges across the XCH/wUSDC ↔ XCH/BYC ↔ BYC/wUSDC triangle, net of per-leg fees, and factors the edge into allocation scoring
+- **Allocation guardrails**: Configurable min/max per-pair allocation (default 10–50%), hysteresis threshold to prevent oscillation, and EMA smoothing for gradual capital shifts
+- **`market_allocator` config section**: Full configuration for weights, intervals, fee assumptions, and allocation bounds
+- **XCH Recovery Mode**: Automatic XCH acquisition when spendable balance drops below threshold (default 0.25 XCH). Cancels all offers, gates Steps 7-8, and scans Dexie order books for reasonably-priced XCH asks to take — resuming normal trading once balance recovers above target (default 1.0 XCH). Configurable via `recovery:` section
+- **Split fee reserve**: `fee_reserve_xch` (inventory holdback) and `fee_min_spendable_xch` (fee gate) are now separate parameters, allowing fees to draw from the reserve without blocking trading
+
+### Fixed
+
+- **Dexie outlier price filter**: Reject bid/ask data from Dexie that is >10× or <0.1× the CEX reference price, preventing flash-crash triggers from garbage offers (e.g. $979M ask on a $2.38 asset)
+
 ## [0.5.9] — 2026-04-04
 
 ### Fixed

@@ -731,6 +731,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".fee_reserve_xch must be >= 0");
         }
     }
+    if (node["fee_min_spendable_xch"] && node["fee_min_spendable_xch"].IsDefined()
+        && !node["fee_min_spendable_xch"].IsNull()) {
+        cfg.fee_min_spendable_xch = node["fee_min_spendable_xch"].as<double>();
+        if (cfg.fee_min_spendable_xch < 0.0) {
+            throw ConfigError(sec + ".fee_min_spendable_xch must be >= 0");
+        }
+    }
     if (node["min_reserve_units"] && node["min_reserve_units"].IsDefined()
         && !node["min_reserve_units"].IsNull()) {
         cfg.min_reserve_units = node["min_reserve_units"].as<double>();
@@ -1502,6 +1509,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  spendable_reserve = " << (cfg.strategy.min_spendable_reserve_pct * 100.0) << "%\n"
         << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n"
         << "  fee_reserve_xch = " << cfg.strategy.fee_reserve_xch << "\n"
+        << "  fee_min_spendable = " << cfg.strategy.fee_min_spendable_xch << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n";
@@ -1515,6 +1523,24 @@ void log_config_summary(const AppConfig& cfg)
         << "  start      = " << cfg.inventory_aging.aging_start_blocks << " blocks\n"
         << "  max_relax  = " << cfg.inventory_aging.max_loss_relax_bps << " bps\n"
         << "  rate       = " << cfg.inventory_aging.relax_rate_bps_per_block << " bps/block\n";
+
+    // Market allocator -- dynamic capital allocation.
+    out << "[market_allocator]\n"
+        << "  enabled     = " << (cfg.market_allocator.enabled ? "ON" : "off") << "\n"
+        << "  eval_interval = " << cfg.market_allocator.eval_interval_blocks << " blocks\n"
+        << "  min_alloc   = " << (cfg.market_allocator.min_alloc_pct * 100.0) << "%\n"
+        << "  max_alloc   = " << (cfg.market_allocator.max_alloc_pct * 100.0) << "%\n"
+        << "  hysteresis  = " << cfg.market_allocator.hysteresis_bps << " bps\n"
+        << "  smooth_alpha = " << cfg.market_allocator.smooth_alpha << "\n";
+
+    // Recovery mode -- automatic XCH acquisition when balance low.
+    out << "[recovery]\n"
+        << "  enabled     = " << (cfg.recovery.enabled ? "ON" : "off") << "\n"
+        << "  xch_low     = " << cfg.recovery.xch_low_threshold << " XCH\n"
+        << "  xch_target  = " << cfg.recovery.xch_recovery_target << " XCH\n"
+        << "  max_take    = " << cfg.recovery.max_take_per_block_xch << " XCH/block\n"
+        << "  max_premium = " << cfg.recovery.max_premium_bps << " bps\n"
+        << "  cancel_on_enter = " << (cfg.recovery.cancel_on_enter ? "yes" : "no") << "\n";
 
     out << "======================================\n";
 
@@ -1632,6 +1658,99 @@ AdverseSelectionSettings parse_adverse_selection(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// parse_market_allocator -- optional `market_allocator:` section.
+// ---------------------------------------------------------------------------
+MarketAllocatorConfig parse_market_allocator(const YAML::Node& root)
+{
+    const std::string sec = "market_allocator";
+    MarketAllocatorConfig cfg;
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+
+    read_bool("enabled",              cfg.enabled);
+    read_u32 ("eval_interval_blocks", cfg.eval_interval_blocks);
+    read_dbl ("min_alloc_pct",        cfg.min_alloc_pct);
+    read_dbl ("max_alloc_pct",        cfg.max_alloc_pct);
+    read_dbl ("hysteresis_bps",       cfg.hysteresis_bps);
+    read_dbl ("smooth_alpha",         cfg.smooth_alpha);
+    read_dbl ("weight_spread",        cfg.weight_spread);
+    read_dbl ("weight_volume",        cfg.weight_volume);
+    read_dbl ("weight_competition",   cfg.weight_competition);
+    read_dbl ("weight_fill_rate",     cfg.weight_fill_rate);
+    read_dbl ("weight_tri_arb",       cfg.weight_tri_arb);
+    read_dbl ("tri_arb_fee_bps",      cfg.tri_arb_fee_bps);
+    read_dbl ("tri_arb_min_edge_bps", cfg.tri_arb_min_edge_bps);
+
+    // Validate.
+    if (cfg.min_alloc_pct < 0.0 || cfg.min_alloc_pct > 1.0)
+        throw ConfigError(sec + ".min_alloc_pct must be in [0, 1]");
+    if (cfg.max_alloc_pct < cfg.min_alloc_pct || cfg.max_alloc_pct > 1.0)
+        throw ConfigError(sec + ".max_alloc_pct must be in [min_alloc_pct, 1]");
+    if (cfg.smooth_alpha <= 0.0 || cfg.smooth_alpha > 1.0)
+        throw ConfigError(sec + ".smooth_alpha must be in (0, 1]");
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// parse_recovery -- optional `recovery:` section for XCH recovery mode.
+// ---------------------------------------------------------------------------
+RecoveryConfig parse_recovery(const YAML::Node& root)
+{
+    const std::string sec = "recovery";
+    RecoveryConfig cfg;
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+
+    read_bool("enabled",                cfg.enabled);
+    read_dbl ("xch_low_threshold",      cfg.xch_low_threshold);
+    read_dbl ("xch_recovery_target",    cfg.xch_recovery_target);
+    read_dbl ("max_take_per_block_xch", cfg.max_take_per_block_xch);
+    read_dbl ("max_premium_bps",        cfg.max_premium_bps);
+    read_bool("cancel_on_enter",        cfg.cancel_on_enter);
+
+    // Validate.
+    if (cfg.xch_low_threshold < 0.0)
+        throw ConfigError(sec + ".xch_low_threshold must be >= 0");
+    if (cfg.xch_recovery_target <= cfg.xch_low_threshold)
+        throw ConfigError(sec + ".xch_recovery_target must be > xch_low_threshold");
+    if (cfg.max_take_per_block_xch <= 0.0)
+        throw ConfigError(sec + ".max_take_per_block_xch must be > 0");
+    if (cfg.max_premium_bps < 0.0)
+        throw ConfigError(sec + ".max_premium_bps must be >= 0");
+
+    return cfg;
+}
+
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
@@ -1672,6 +1791,8 @@ AppConfig load_config(const std::string& path)
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.market_data = parse_market_data(root);
     cfg.adverse_selection = parse_adverse_selection(root);
+    cfg.market_allocator = parse_market_allocator(root);
+    cfg.recovery   = parse_recovery(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

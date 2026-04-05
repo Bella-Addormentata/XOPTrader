@@ -131,6 +131,12 @@ TEST(ConfigParserTest, OptionalSections_DefaultCorrectly) {
     // Inventory aging is optional; should default to disabled.
     EXPECT_FALSE(cfg.inventory_aging.enabled);
 
+    // Market allocator is optional; should default to disabled.
+    EXPECT_FALSE(cfg.market_allocator.enabled);
+    EXPECT_EQ(cfg.market_allocator.eval_interval_blocks, 50u);
+    EXPECT_NEAR(cfg.market_allocator.min_alloc_pct, 0.10, 0.001);
+    EXPECT_NEAR(cfg.market_allocator.max_alloc_pct, 0.50, 0.001);
+
     // Depeg detector enabled by default.
     EXPECT_TRUE(cfg.depeg.enabled);
 

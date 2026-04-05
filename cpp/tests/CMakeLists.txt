@@ -58,6 +58,7 @@ add_executable(xop_tests
     test_limits.cpp
     test_config.cpp
     test_liquidity.cpp
+    test_market_allocator.cpp
 )
 
 target_link_libraries(xop_tests

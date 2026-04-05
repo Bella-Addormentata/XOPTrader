@@ -342,6 +342,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     mempool_sentinel_ = std::make_unique<MempoolSentinelStrategy>(
         MempoolSentinelConfig{});
 
+    // -- Dynamic market allocator -------------------------------------------
+    market_allocator_ = std::make_unique<MarketAllocator>(
+        config_.market_allocator, market_data_.get(), db_.get());
+    if (config_.market_allocator.enabled) {
+        spdlog::info("[Engine] Market allocator enabled: eval every {} blocks, "
+                     "alloc range [{:.0f}%, {:.0f}%]",
+                     config_.market_allocator.eval_interval_blocks,
+                     config_.market_allocator.min_alloc_pct * 100.0,
+                     config_.market_allocator.max_alloc_pct * 100.0);
+    }
+
     // -- New risk modules ---------------------------------------------------
     loss_manager_ = std::make_unique<StrategicLossManager>(
         LossManagerConfig{});  // Disabled by default (enabled=false)
@@ -1225,6 +1236,39 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Step 6 (risk limits) failed: {}", e.what());
     }
 
+    // -- XCH Recovery Mode: check balance and enter/exit recovery. ---------
+    // Runs before Steps 7-8 so that recovery can gate offer posting.
+    // When active, cancels offers and takes cheap XCH asks instead.
+    if (!wallet_circuit_open_) {
+        try {
+            co_await step_xch_recovery(block_height);
+        } catch (const std::exception& e) {
+            spdlog::error("[Engine] XCH recovery failed: {}", e.what());
+        }
+    }
+
+    // -- Dynamic market allocator: re-score pairs periodically. ------------
+    // Must run before Step 7 (ladder generation) so that allocation fractions
+    // are up-to-date when capital is distributed across pairs.
+    if (market_allocator_ && market_allocator_->should_evaluate(block_height)) {
+        try {
+            std::vector<std::string> enabled_pairs;
+            for (const auto& [pn, pcs] : cycle_) {
+                if (pcs.market_data_valid) enabled_pairs.push_back(pn);
+            }
+            market_allocator_->evaluate(enabled_pairs, block_height);
+        }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Market allocator failed: {}", e.what());
+        }
+    }
+
+    // Gate Steps 7-8 when in XCH recovery mode (no market-making until
+    // XCH balance is restored).
+    if (xch_recovery_mode_) {
+        spdlog::info("[Engine] Steps 7-8 SKIPPED: XCH recovery mode active");
+    } else {
+
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 7 (ladder) failed: {}", e.what());
@@ -1259,6 +1303,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
                      "-- no new offers posted",
                      to_string(flash_crash_state_));
     }
+
+    } // end of !xch_recovery_mode_ block
 
     try { co_await step_check_arbitrage(block_height); }
     catch (const std::exception& e) {
@@ -2848,6 +2894,26 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // -- Dynamic market allocation: scale capital by scoring fraction.
+        // When enabled, the MarketAllocator assigns a [0, 1] fraction per
+        // pair (summing to 1.0 across all enabled pairs).  Multiply the
+        // available capital/inventory by (alloc_frac * num_pairs) so that
+        // the average pair gets 1.0x and the allocator redistributes.
+        if (market_allocator_ && config_.market_allocator.enabled) {
+            double alloc_frac = market_allocator_->get_allocation(pair_name);
+            double num_pairs = static_cast<double>(cycle_.size());
+            // Scale factor: alloc_frac * N so that equal allocation = 1.0x.
+            // Capped to avoid over-allocating beyond actual balance.
+            double scale = std::min(alloc_frac * num_pairs, 1.5);
+            avail_capital   = static_cast<Mojo>(
+                static_cast<double>(avail_capital) * scale);
+            avail_inventory = static_cast<Mojo>(
+                static_cast<double>(avail_inventory) * scale);
+            spdlog::debug("[Engine] Step 7: {} market alloc={:.1f}% "
+                          "scale={:.2f}x",
+                          pair_name, alloc_frac * 100.0, scale);
+        }
+
         // Fetch competing offers for gap-aware dynamic tier spacing.
         auto comp_offers = market_data_->get_competing_offers(pair_name);
 
@@ -3555,20 +3621,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // The Chia wallet locks entire UTXOs when creating offers -- a small
         // offer can lock a large coin, and even non-XCH offers lock XCH for
         // fee coins.  Check actual XCH spendable before posting any offers
-        // for this pair.  If already below reserve (e.g. from offers posted
-        // for a previous pair in this heartbeat), skip this pair entirely.
+        // for this pair.  Uses fee_reserve_xch (the full reserve) to prevent
+        // UTXO locking from draining the reserve across multiple pairs.
+        // Previously used fee_min_spendable_xch (0.01), but that was too
+        // permissive: pair 2+ could drain the reserve left by pair 1.
         if (config_.strategy.fee_reserve_xch > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                const auto xch_reserve = static_cast<Mojo>(std::llround(
+                const auto xch_min = static_cast<Mojo>(std::llround(
                     config_.strategy.fee_reserve_xch
                     * static_cast<double>(kMojosPerXch)));
-                if (xch_spendable < xch_reserve) {
+                if (xch_spendable < xch_min) {
                     spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
-                                 "spendable {:.6f} XCH < reserve {:.3f} XCH "
+                                 "spendable {:.6f} XCH < reserve {:.4f} XCH "
                                  "-- skipping offer posting",
                                  pair_name,
                                  static_cast<double>(xch_spendable) / kMojosPerXch,
@@ -4137,6 +4205,318 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             spdlog::error("[Engine] Step 9c: {} crossed-book take failed: {}",
                           pair.name, e.what());
         }
+    }
+
+    co_return;
+}
+
+// ---------------------------------------------------------------------------
+// XCH Recovery Mode
+//
+// When XCH spendable drops below recovery.xch_low_threshold:
+//   1. Enter recovery mode (cancel all offers to free locked coins).
+//   2. Scan Dexie order books for XCH-selling asks on XCH-base pairs.
+//   3. Take asks priced within max_premium_bps of CoinGecko CEX reference.
+//   4. Exit recovery when XCH spendable > xch_recovery_target.
+//
+// This ensures the engine can recover from an XCH-depleted state by
+// spending counter-assets (wUSDC, BYC) to buy cheap XCH back.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
+{
+    const auto& rcfg = config_.recovery;
+    if (!rcfg.enabled) co_return;
+
+    // -- 1. Check XCH spendable balance ------------------------------------
+    Mojo xch_spendable = 0;
+    try {
+        auto xch_bal = co_await wallet_->get_wallet_balance(1);
+        if (xch_bal.contains("spendable_balance"))
+            xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+    } catch (const std::exception& e) {
+        spdlog::warn("[Recovery] Failed to get XCH balance: {} -- skipping",
+                     e.what());
+        co_return;
+    }
+
+    const double xch_spendable_d =
+        static_cast<double>(xch_spendable) / kMojosPerXch;
+
+    // -- 2. Recovery mode transitions --------------------------------------
+    if (!xch_recovery_mode_) {
+        // Check if we need to enter recovery mode.
+        if (xch_spendable_d >= rcfg.xch_low_threshold) {
+            co_return;  // Balance is fine.
+        }
+
+        // Enter recovery mode.
+        xch_recovery_mode_ = true;
+        xch_recovery_cancelled_ = false;
+        spdlog::warn("[Recovery] ENTERING recovery mode: XCH spendable "
+                     "{:.6f} < threshold {:.4f} XCH -- will cancel offers "
+                     "and seek cheap XCH asks",
+                     xch_spendable_d, rcfg.xch_low_threshold);
+
+        if (alerts_) {
+            alerts_->send_alert(AlertRule::ArbitrageDetected,
+                "XCH Recovery Mode ENTERED: spendable " +
+                std::to_string(xch_spendable_d) + " XCH < " +
+                std::to_string(rcfg.xch_low_threshold) + " threshold");
+        }
+    } else {
+        // Check if we can exit recovery mode.
+        if (xch_spendable_d >= rcfg.xch_recovery_target) {
+            xch_recovery_mode_ = false;
+            xch_recovery_cancelled_ = false;
+            spdlog::info("[Recovery] EXITING recovery mode: XCH spendable "
+                         "{:.6f} >= target {:.4f} XCH -- resuming normal "
+                         "trading", xch_spendable_d, rcfg.xch_recovery_target);
+
+            if (alerts_) {
+                alerts_->send_alert(AlertRule::ArbitrageDetected,
+                    "XCH Recovery Mode EXITED: spendable " +
+                    std::to_string(xch_spendable_d) + " XCH -- normal "
+                    "trading resumed");
+            }
+            co_return;
+        }
+
+        spdlog::info("[Recovery] Active: XCH spendable {:.6f} "
+                     "(target: {:.4f} XCH)", xch_spendable_d,
+                     rcfg.xch_recovery_target);
+    }
+
+    // -- 3. Cancel all offers on first entry (free locked coins) -----------
+    if (rcfg.cancel_on_enter && !xch_recovery_cancelled_) {
+        spdlog::info("[Recovery] Cancelling all offers to free locked coins");
+
+        // Use wallet RPC directly (not offer_mgr_->cancel_all()) because
+        // the engine state may not track offers from previous instances.
+        // Use fee=0 and secure=false so cancellation works even with 0 XCH
+        // spendable.  Non-secure cancel invalidates offers locally and
+        // releases the locked UTXOs immediately; offers may still appear
+        // on Dexie until they expire or are taken.
+        bool cancel_ok = false;
+        try {
+            co_await wallet_->cancel_offers(/*fee=*/0, /*secure=*/false);
+            spdlog::info("[Recovery] Wallet-level cancel_offers(fee=0, "
+                         "secure=false) succeeded -- all pending offers "
+                         "invalidated locally");
+            cancel_ok = true;
+
+            // Also clear the engine's internal state to match.
+            auto tracked = state_->get_all_offers();
+            for (const auto& po : tracked) {
+                state_->remove_offer(po.offer_id);
+            }
+            spdlog::info("[Recovery] Cleared {} offers from engine state",
+                         tracked.size());
+        } catch (const std::exception& e) {
+            spdlog::error("[Recovery] wallet cancel_offers failed: {} "
+                          "-- will retry next block", e.what());
+        }
+        xch_recovery_cancelled_ = cancel_ok;
+
+        // After cancellation, coins need time to settle (pending_change).
+        // Skip acquisition this block; next block they'll be spendable.
+        if (cancel_ok) {
+            spdlog::info("[Recovery] Waiting for coins to settle after "
+                         "cancellation -- will scan for XCH asks next block");
+            co_return;
+        }
+    }
+
+    // -- 4. Derive CEX reference price for XCH/wUSDC.b --------------------
+    //    Used to evaluate whether an ask is "reasonably priced."
+    double cex_xch_usdc = 0.0;
+    {
+        auto xch_it  = coingecko_prices_.find("chia");
+        auto usdc_it = coingecko_prices_.find("usd-coin");
+        if (xch_it != coingecko_prices_.end() &&
+            usdc_it != coingecko_prices_.end() &&
+            usdc_it->second > 0.0) {
+            cex_xch_usdc = xch_it->second / usdc_it->second;
+        }
+    }
+
+    if (cex_xch_usdc <= 0.0) {
+        spdlog::warn("[Recovery] No CoinGecko CEX reference for XCH/wUSDC "
+                     "-- cannot evaluate ask prices, skipping");
+        co_return;
+    }
+
+    spdlog::info("[Recovery] CEX reference XCH/wUSDC = {:.6f}", cex_xch_usdc);
+
+    // -- 5. Scan XCH-base pairs for cheap asks to take ---------------------
+    //    An "ask" on an XCH-base pair means someone is selling XCH.
+    //    Taking it gives us XCH in exchange for the quote asset.
+    const double max_take_mojos_total =
+        rcfg.max_take_per_block_xch * static_cast<double>(kMojosPerXch);
+    double taken_mojos_this_block = 0.0;
+
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+
+        // Only process XCH-base pairs (we want to BUY XCH).
+        // XCH-base means base_asset_id is the XCH asset ID.
+        // On Dexie, XCH has no explicit asset ID (it's the native coin).
+        // We identify XCH-base pairs by checking if the pair name starts
+        // with "XCH/".
+        if (pair.name.substr(0, 4) != "XCH/") continue;
+
+        // Get competing offers for this pair.
+        auto comp_offers = market_data_->get_competing_offers(pair.name);
+        if (comp_offers.empty()) continue;
+
+        // Derive CEX reference for this specific pair.
+        // For XCH/wUSDC.b we already have cex_xch_usdc.
+        // For XCH/BYC we don't have a CEX price (BYC has no CoinGecko).
+        // Skip pairs without CEX reference to avoid overpaying.
+        double cex_ref = 0.0;
+        if (pair.name == "XCH/wUSDC.b") {
+            cex_ref = cex_xch_usdc;
+        } else {
+            // No CEX reference for this pair -- skip.
+            spdlog::debug("[Recovery] {} -- no CEX reference, skipping",
+                          pair.name);
+            continue;
+        }
+
+        // Max acceptable price = CEX + premium.
+        const double max_price_d = cex_ref * (1.0 + rcfg.max_premium_bps / 10000.0);
+        const Mojo max_price_mojos = static_cast<Mojo>(std::llround(
+            max_price_d * static_cast<double>(kMojosPerXch)));
+
+        // Filter own offers.
+        std::unordered_set<std::string> own_ids;
+        auto pending = state_->get_all_offers();
+        for (const auto& po : pending) {
+            own_ids.insert(po.offer_id);
+        }
+
+        // Find the cheapest asks (someone selling XCH) within our budget.
+        struct CandidateAsk {
+            std::string offer_id;
+            Mojo price;
+            Mojo size;
+        };
+        std::vector<CandidateAsk> candidates;
+
+        for (const auto& co : comp_offers) {
+            if (co.side != Side::Ask) continue;
+            if (own_ids.count(co.offer_id)) continue;
+            if (co.price > max_price_mojos) continue;
+            if (co.price == 0) continue;
+
+            candidates.push_back({co.offer_id, co.price, co.size});
+        }
+
+        // Sort by price ascending (cheapest first).
+        std::sort(candidates.begin(), candidates.end(),
+            [](const auto& a, const auto& b) { return a.price < b.price; });
+
+        for (const auto& cand : candidates) {
+            if (taken_mojos_this_block >= max_take_mojos_total) break;
+
+            const double price_d =
+                static_cast<double>(cand.price) / kMojosPerXch;
+            const double premium_bps =
+                (price_d - cex_ref) / cex_ref * 10000.0;
+
+            spdlog::info("[Recovery] {} candidate ask: id={} price={:.6f} "
+                         "(CEX={:.6f}, premium={:.1f}bps)",
+                         pair.name, cand.offer_id.substr(0, 12),
+                         price_d, cex_ref, premium_bps);
+
+            // Fetch full offer text (bech32m) from Dexie.
+            try {
+                auto offer_status =
+                    co_await dexie_->get_offer_status(cand.offer_id);
+
+                if (!offer_status.success ||
+                    offer_status.offer.offer_bech32.empty()) {
+                    spdlog::warn("[Recovery] {} failed to fetch offer text "
+                                 "for {} -- skipping",
+                                 pair.name, cand.offer_id.substr(0, 12));
+                    continue;
+                }
+
+                // Verify offer is still active (status 0 on Dexie).
+                if (offer_status.offer.status != 0) {
+                    spdlog::info("[Recovery] {} offer {} no longer active "
+                                 "(status={}) -- skipping",
+                                 pair.name, cand.offer_id.substr(0, 12),
+                                 offer_status.offer.status);
+                    continue;
+                }
+
+                // Use fee=0 when XCH is near-zero so the take doesn't
+                // fail due to insufficient funds.  Zero-fee transactions
+                // are valid on Chia (lower mempool priority but still
+                // processed).  The taker only needs quote-asset coins
+                // (e.g. wUSDC) plus the fee -- with fee=0, no XCH needed.
+                const std::uint64_t fee =
+                    (xch_spendable_d < 0.001) ? 0 : config_.fees.min_fee_mojos;
+
+                spdlog::info("[Recovery] {} TAKING ask {} "
+                             "(price={:.6f}, premium={:.1f}bps, fee={})",
+                             pair.name, cand.offer_id.substr(0, 12),
+                             price_d, premium_bps, fee);
+
+                auto result = co_await wallet_->take_offer(
+                    offer_status.offer.offer_bech32, fee);
+
+                if (result.contains("success") &&
+                    result["success"].get<bool>()) {
+                    const std::string trade_id =
+                        result.contains("trade_record") &&
+                        result["trade_record"].contains("trade_id")
+                        ? result["trade_record"]["trade_id"]
+                              .get<std::string>()
+                        : "unknown";
+
+                    spdlog::info("[Recovery] {} TOOK ask -- "
+                                 "trade_id={} price={:.6f} "
+                                 "premium={:.1f}bps",
+                                 pair.name, trade_id.substr(0, 12),
+                                 price_d, premium_bps);
+
+                    taken_mojos_this_block +=
+                        static_cast<double>(cand.size);
+
+                    if (fee_tracker_) {
+                        fee_tracker_->record_fee(fee, block_height);
+                    }
+
+                    if (alerts_) {
+                        alerts_->send_alert(
+                            AlertRule::ArbitrageDetected,
+                            "Recovery: TOOK " + pair.name + " ask at " +
+                            std::to_string(price_d) + " (premium " +
+                            std::to_string(premium_bps) + "bps)");
+                    }
+
+                    // Only take one offer per block to let coins settle.
+                    break;
+
+                } else {
+                    const std::string err = result.contains("error")
+                        ? result["error"].get<std::string>()
+                        : "unknown error";
+                    spdlog::warn("[Recovery] {} take_offer failed: {}",
+                                 pair.name, err);
+                }
+            } catch (const std::exception& e) {
+                spdlog::error("[Recovery] {} take failed: {}",
+                              pair.name, e.what());
+            }
+        }
+    }
+
+    if (taken_mojos_this_block == 0.0) {
+        spdlog::info("[Recovery] No acceptable XCH asks found this block "
+                     "(max premium: {:.0f}bps over CEX {:.6f})",
+                     rcfg.max_premium_bps, cex_xch_usdc);
     }
 
     co_return;

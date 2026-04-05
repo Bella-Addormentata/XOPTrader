@@ -79,6 +79,7 @@
 #include "xop/strategy/new_strategies.hpp"
 #include "xop/strategy/fee_tracker.hpp"
 #include "xop/strategy/kappa_calibrator.hpp"
+#include "xop/strategy/market_allocator.hpp"
 
 // New risk modules
 #include "xop/risk/loss_manager.hpp"
@@ -309,6 +310,10 @@ private:
     /// [T9-01] Coroutine: co_awaits wallet take_offer for crossed books.
     boost::asio::awaitable<void> step_check_arbitrage(BlockHeight block_height);
 
+    /// XCH Recovery Mode: check balance, manage mode transitions, and
+    /// scan for cheap XCH asks to take when in recovery.
+    boost::asio::awaitable<void> step_xch_recovery(BlockHeight block_height);
+
     /// Step 10: Compute inventory skew adjustments, NHE, portfolio-level
     /// netting, and statistical pairs hedging suggestions.
     void step_run_hedging(BlockHeight block_height);
@@ -513,6 +518,9 @@ private:
     /// Mempool sentinel — mempool-aware spread/skew.
     std::unique_ptr<MempoolSentinelStrategy> mempool_sentinel_;
 
+    /// Dynamic market allocator — scores pairs and shifts capital.
+    std::unique_ptr<MarketAllocator> market_allocator_;
+
     // -- New risk modules ----------------------------------------------------
 
     /// Strategic loss manager — 5-scenario EV analysis for rebalancing.
@@ -625,6 +633,14 @@ private:
     // During Crash and Recovery states, Step 8 (offer posting) is gated.
     // ISO/IEC 5055: deterministic initial state; exhaustive enum.
     FlashCrashState flash_crash_state_{FlashCrashState::Normal};
+
+    // XCH Recovery Mode -- entered when XCH spendable drops below threshold.
+    // While active: offers cancelled, Steps 7-8 skipped, engine scans for
+    // cheap XCH asks to take.  Exits when XCH > recovery_target.
+    bool xch_recovery_mode_{false};
+
+    /// True if offers were already cancelled on recovery mode entry.
+    bool xch_recovery_cancelled_{false};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).

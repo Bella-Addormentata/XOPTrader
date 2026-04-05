@@ -303,6 +303,35 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                                    double             best_ask,
                                    double             last_trade,
                                    double             vol_24h) {
+    // -- Outlier rejection against CEX reference --------------------------
+    // Dexie is a peer-to-peer marketplace with no matching engine.  Garbage
+    // asks/bids (e.g. 978 million for a $2.38 asset) can appear from
+    // mis-priced offers.  If accepted, the inflated mid poisons the price
+    // history and triggers the flash-crash circuit breaker when normal
+    // prices return.  Reject any bid/ask that is more than 10× or less
+    // than 0.1× the CEX reference (when available).
+    {
+        std::shared_lock lock(mtx_pairs_);
+        auto it = pairs_.find(pair_name);
+        if (it != pairs_.end() && it->second.cex_mid > 0.0) {
+            const double cex = it->second.cex_mid;
+            constexpr double kMaxRatio = 10.0;
+            constexpr double kMinRatio = 0.1;
+            if (best_bid > 0.0 && (best_bid > cex * kMaxRatio || best_bid < cex * kMinRatio)) {
+                spdlog::warn("[MarketData] Outlier bid rejected for {}: "
+                             "bid={:.6f} vs cex_mid={:.6f} (ratio={:.1f}×)",
+                             pair_name, best_bid, cex, best_bid / cex);
+                best_bid = 0.0;  // discard
+            }
+            if (best_ask > 0.0 && (best_ask > cex * kMaxRatio || best_ask < cex * kMinRatio)) {
+                spdlog::warn("[MarketData] Outlier ask rejected for {}: "
+                             "ask={:.6f} vs cex_mid={:.6f} (ratio={:.1f}×)",
+                             pair_name, best_ask, cex, best_ask / cex);
+                best_ask = 0.0;  // discard
+            }
+        }
+    }
+
     // Dexie is a peer-to-peer atomic-swap marketplace with NO matching
     // engine, so crossed books (bid >= ask) occur naturally when there
     // are un-taken offers on both sides.  Unlike a centralised exchange,

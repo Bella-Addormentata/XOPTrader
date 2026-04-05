@@ -220,6 +220,14 @@ struct StrategyConfig {
     /// Default 1.0 XCH.
     double   fee_reserve_xch{1.0};
 
+    /// Minimum spendable XCH required before posting offers (Step 8 gate).
+    /// Unlike fee_reserve_xch (which protects trading inventory), this is
+    /// the absolute minimum XCH the wallet must have to pay on-chain fees.
+    /// If spendable XCH drops below this, offer posting is skipped.
+    /// Set lower than fee_reserve_xch so fees can draw from the reserve
+    /// without blocking trading.  Default 0.01 XCH (~3× typical fee).
+    double   fee_min_spendable_xch{0.01};
+
     /// Minimum units of each asset to keep as reserve.  Offers on the
     /// side that would deplete an asset below this level are suppressed.
     /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
@@ -630,6 +638,55 @@ struct AdverseSelectionSettings {
 };
 
 // ---------------------------------------------------------------------------
+// Dynamic market allocator configuration.
+//
+// Scores each enabled pair on five dimensions (spread, volume, competition,
+// fill-rate, triangular-arb) and computes a target capital allocation
+// fraction per pair.  Hysteresis and EMA smoothing prevent oscillation.
+// ---------------------------------------------------------------------------
+struct MarketAllocatorConfig {
+    bool     enabled{false};                // Master switch.
+    uint32_t eval_interval_blocks{50};      // Re-score every N blocks (~43 min).
+    double   min_alloc_pct{0.10};           // Minimum per-pair (10%).
+    double   max_alloc_pct{0.50};           // Maximum per-pair (50%).
+    double   hysteresis_bps{50.0};          // Score change threshold to act.
+    double   smooth_alpha{0.20};            // EMA smoothing (0,1].
+
+    // Dimension weights (normalised internally).
+    double   weight_spread{1.0};
+    double   weight_volume{1.0};
+    double   weight_competition{1.0};
+    double   weight_fill_rate{1.0};
+    double   weight_tri_arb{1.0};
+
+    // Triangular arbitrage detection.
+    double   tri_arb_fee_bps{15.0};         // Per-leg fee for arb calc.
+    double   tri_arb_min_edge_bps{5.0};     // Minimum edge to score > 0.
+};
+
+// ---------------------------------------------------------------------------
+// XCH Recovery Mode -- automatic XCH acquisition when balance critically low.
+//
+// When XCH spendable drops below `xch_low_threshold`, the engine enters
+// recovery mode:
+//   1. Cancels all outstanding offers (freeing locked coins).
+//   2. Skips Steps 7-8 (no new market-making offers posted).
+//   3. Monitors Dexie order books for reasonable XCH-selling asks on
+//      XCH-base pairs (e.g. XCH/wUSDC.b) and takes them to acquire XCH.
+//   4. Resumes normal trading once XCH spendable > `xch_recovery_target`.
+//
+// Fees are conserved: only cancellation + recovery takes consume fees.
+// ---------------------------------------------------------------------------
+struct RecoveryConfig {
+    bool     enabled{true};                 // Master switch.
+    double   xch_low_threshold{0.25};       // Enter recovery below this (XCH).
+    double   xch_recovery_target{1.0};      // Exit recovery above this (XCH).
+    double   max_take_per_block_xch{0.5};   // Max XCH to acquire per block.
+    double   max_premium_bps{100.0};        // Max premium over CEX price to pay.
+    bool     cancel_on_enter{true};         // Cancel all offers on entry.
+};
+
+// ---------------------------------------------------------------------------
 // Top-level application configuration aggregating every section.
 // ---------------------------------------------------------------------------
 struct AppConfig {
@@ -648,6 +705,8 @@ struct AppConfig {
     InventoryAgingConfig inventory_aging;
     MarketDataSettings market_data;
     AdverseSelectionSettings adverse_selection;
+    MarketAllocatorConfig market_allocator;
+    RecoveryConfig   recovery;
 };
 
 // ---------------------------------------------------------------------------

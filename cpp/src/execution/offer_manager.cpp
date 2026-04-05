@@ -136,13 +136,40 @@ asio::awaitable<int> OfferManager::post_quotes(
 
         int bid_count = 0;
         int ask_count = 0;
-        if (!bids.empty()) {
+
+        // -- XCH fee reserve pre-check (batch mode) ------------------------
+        // Verify XCH spendable >= fee_reserve_xch before posting bids.
+        bool reserve_breached = false;
+        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+            try {
+                auto xch_bal = co_await wallet_->get_wallet_balance(1);
+                Mojo xch_spendable = 0;
+                if (xch_bal.contains("spendable_balance"))
+                    xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+                const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                    strategy_cfg_.fee_reserve_xch
+                    * static_cast<double>(kMojosPerXch)));
+                if (xch_spendable < reserve_mojos) {
+                    logger_->warn(
+                        "XCH fee reserve pre-check (batch): spendable "
+                        "{:.6f} XCH < reserve {:.3f} XCH before {} bids "
+                        "-- skipping all offers",
+                        static_cast<double>(xch_spendable) / kMojosPerXch,
+                        strategy_cfg_.fee_reserve_xch, pair.name);
+                    reserve_breached = true;
+                }
+            } catch (const std::exception& e) {
+                logger_->warn("XCH fee reserve pre-check (batch) failed "
+                              "for {}: {}", pair.name, e.what());
+            }
+        }
+
+        if (!bids.empty() && !reserve_breached) {
             bid_count = co_await post_merged_side(pair, bids, block_height);
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
         // Check XCH spendable balance after bids; skip asks if below reserve.
-        bool reserve_breached = false;
         if (bid_count > 0 && !asks.empty()
             && strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
@@ -262,6 +289,43 @@ asio::awaitable<int> OfferManager::post_quotes(
         // insufficient funds; the other side may still succeed.
         if (tier.side == Side::Bid && bid_funds_exhausted) continue;
         if (tier.side == Side::Ask && ask_funds_exhausted) continue;
+
+        // -- XCH fee reserve pre-creation guard (per-offer, UTXO-aware) ----
+        // Check XCH spendable BEFORE each individual offer creation.
+        // The Chia wallet locks entire UTXOs for fee coins -- a single
+        // create_offer can lock far more than the 5M mojo fee.  This
+        // prevents the last UTXO from being locked when the balance is
+        // already at the reserve threshold.
+        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+            try {
+                auto xch_bal = co_await wallet_->get_wallet_balance(1);
+                Mojo xch_spendable = 0;
+                if (xch_bal.contains("spendable_balance"))
+                    xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
+                const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                    strategy_cfg_.fee_reserve_xch
+                    * static_cast<double>(kMojosPerXch)));
+                if (xch_spendable < reserve_mojos) {
+                    logger_->warn(
+                        "XCH fee reserve pre-check: spendable {:.6f} XCH "
+                        "< reserve {:.3f} XCH before {} {} tier {} "
+                        "-- stopping all offers",
+                        static_cast<double>(xch_spendable) / kMojosPerXch,
+                        strategy_cfg_.fee_reserve_xch,
+                        pair.name, to_string(tier.side), tier.tier_index);
+                    bid_funds_exhausted = true;
+                    ask_funds_exhausted = true;
+                    break;
+                }
+            } catch (const std::exception& e) {
+                logger_->warn("XCH fee reserve pre-check failed before "
+                              "{} tier {}: {} -- skipping cautiously",
+                              pair.name, tier.tier_index, e.what());
+                bid_funds_exhausted = true;
+                ask_funds_exhausted = true;
+                break;
+            }
+        }
 
         // Step 1: Build the offer_dict for the wallet RPC.
         json offer_dict = build_offer_dict(pair, tier);
