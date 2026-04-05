@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.3] — 2026-04-05
+
+### Fixed
+
+- **UTXO liberation**: When all XCH spendable is consumed by offer UTXO locking (spendable=0 but confirmed balance is healthy), the engine now cancels the oldest pending offers at the start of Step 8 to free locked UTXOs. Cancels up to 3 offers per heartbeat, re-checking spendable after each. This breaks the deadlock where the engine was frozen for hours with 16+ XCH confirmed but 0 spendable
+- **Secure cancel with fee=0**: `emergency_cancel` now attempts `secure=true, fee=0` before falling back to insecure (local-only) cancel. The offer's own locked coins serve as spend bundle inputs, allowing on-chain invalidation without requiring spendable XCH for fees. UTXO liberation uses `prefer_zero_fee` mode to try fee=0 FIRST (before descending fee tiers) to avoid burning spendable XCH on cancel fees
+- **Anti-churn + cooldown**: After liberation cancels offers or finds none to cancel, the pair loop is skipped (`co_return`) to prevent creating offers that would get immediately liberated next heartbeat. A 5-heartbeat cooldown further suppresses the pair loop when spendable briefly recovers above reserve (1.0 XCH) but below 2× reserve (2.0 XCH), preventing the post→cancel residual churn cycle that wasted ~0.01 XCH/cycle
+- **Recovery mode duplicate block removed**: Fixed corrupted duplicate code block in `step_xch_recovery()` that caused compilation errors
+
 ## [0.6.2] — 2026-04-04
 
 ### Fixed

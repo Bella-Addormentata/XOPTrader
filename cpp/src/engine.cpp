@@ -3262,6 +3262,152 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
     offer_mgr_->set_dynamic_fee(recommended_fee);
 
+    // -- UTXO Liberation ------------------------------------------------
+    // The Chia wallet locks *entire* UTXOs when creating offers.  A small
+    // fee (0.005 XCH) can lock a 16 XCH UTXO, draining spendable to
+    // zero even though confirmed balance is healthy.  When spendable
+    // falls below the fee reserve and we have pending offers, cancel the
+    // oldest ones to free locked UTXOs before processing any pair.
+    // Guards: only triggers when confirmed balance proves this is a
+    // locking problem, not genuine depletion (recovery handles that).
+    if (config_.strategy.fee_reserve_xch > 0.0) {
+        bool liberation_needed = false;
+        Mojo xch_spendable_pre = 0;
+        const auto reserve_mojos = static_cast<Mojo>(std::llround(
+            config_.strategy.fee_reserve_xch
+            * static_cast<double>(kMojosPerXch)));
+        try {
+            auto xch_bal = co_await wallet_->get_wallet_balance(1);
+            if (xch_bal.contains("spendable_balance"))
+                xch_spendable_pre = xch_bal["spendable_balance"].get<Mojo>();
+            Mojo xch_confirmed = 0;
+            if (xch_bal.contains("confirmed_wallet_balance"))
+                xch_confirmed =
+                    xch_bal["confirmed_wallet_balance"].get<Mojo>();
+            // Only liberate when spendable is below reserve but confirmed
+            // proves the XCH exists (just locked by offer UTXOs).
+            liberation_needed =
+                xch_spendable_pre < reserve_mojos &&
+                xch_confirmed >= reserve_mojos * 2;
+        } catch (const std::exception& e) {
+            spdlog::debug("[Engine] UTXO liberation balance check failed: {}",
+                          e.what());
+        }
+
+        if (liberation_needed) {
+            auto all_offers = state_->get_all_offers();
+            if (all_offers.empty()) {
+                // Spendable below reserve but no tracked offers to cancel.
+                // UTXOs are locked by offers from previous sessions or
+                // pending cancel transactions.  Skip pair loop to avoid
+                // creating offers that will just get liberated next beat.
+                spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
+                             "< reserve {:.4f} XCH with 0 pending offers "
+                             "-- waiting for wallet to confirm cancellations",
+                             static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                             config_.strategy.fee_reserve_xch);
+                liberation_cooldown_ = 5;
+                co_return;
+            }
+            // Sort oldest first so we cancel stale offers first.
+            std::sort(all_offers.begin(), all_offers.end(),
+                [](const PendingOffer& a, const PendingOffer& b) {
+                    return a.created_at_block < b.created_at_block;
+                });
+            spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
+                         "< reserve {:.4f} XCH with {} pending offers "
+                         "-- cancelling oldest to free locked UTXOs",
+                         static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                         config_.strategy.fee_reserve_xch,
+                         all_offers.size());
+            constexpr int kMaxLiberate = 3;
+            int liberated = 0;
+            for (const auto& po : all_offers) {
+                if (liberated >= kMaxLiberate) break;
+                bool ok = co_await offer_mgr_->emergency_cancel(
+                    po.offer_id, "utxo_liberation",
+                    /*prefer_zero_fee=*/true);
+                if (ok) {
+                    state_->remove_offer(po.offer_id);
+                    try {
+                        db_->update_offer_status(
+                            po.offer_id, "cancelled",
+                            block_height, "utxo_liberation");
+                    } catch (const std::exception& e) {
+                        spdlog::debug("[Engine] UTXO liberation "
+                                      "update_offer_status failed for "
+                                      "{}: {}",
+                                      po.offer_id.substr(0, 12),
+                                      e.what());
+                    }
+                    ++liberated;
+                    // Re-check spendable after each cancel.
+                    try {
+                        auto xch2 = co_await
+                            wallet_->get_wallet_balance(1);
+                        if (xch2.contains("spendable_balance")) {
+                            xch_spendable_pre =
+                                xch2["spendable_balance"]
+                                    .get<Mojo>();
+                            if (xch_spendable_pre >= reserve_mojos) {
+                                spdlog::info(
+                                    "[Engine] UTXO liberation "
+                                    "complete: spendable {:.6f} XCH "
+                                    "after cancelling {} offer(s)",
+                                    static_cast<double>(
+                                        xch_spendable_pre)
+                                        / kMojosPerXch,
+                                    liberated);
+                                break;
+                            }
+                        }
+                    } catch (...) {}
+                }
+            }
+            if (liberated > 0 && xch_spendable_pre < reserve_mojos) {
+                spdlog::warn("[Engine] UTXO liberation: cancelled {} "
+                             "offer(s) but spendable still {:.6f} XCH "
+                             "< reserve {:.4f} XCH -- skipping pair "
+                             "loop to avoid churn",
+                             liberated,
+                             static_cast<double>(xch_spendable_pre)
+                                 / kMojosPerXch,
+                             config_.strategy.fee_reserve_xch);
+                // Don't enter pair loop: creating offers would just
+                // consume fees and get immediately liberated next
+                // heartbeat.  Wait for cancel txns to confirm on-chain.
+                liberation_cooldown_ = 5;
+                co_return;
+            }
+        }
+
+        // Post-liberation cooldown: after liberation cancelled offers (or
+        // found none to cancel), suppress the pair loop for several
+        // heartbeats to let cancel transactions confirm on-chain.
+        // Without this, spendable briefly recovers above reserve when a
+        // cancel confirms, the engine posts a few offers, and the next
+        // heartbeat cancels them again (residual churn).
+        if (liberation_cooldown_ > 0) {
+            if (xch_spendable_pre >= reserve_mojos * 2) {
+                spdlog::info("[Engine] UTXO liberation cooldown reset: "
+                             "spendable {:.6f} XCH >= {:.4f} XCH threshold",
+                             static_cast<double>(xch_spendable_pre)
+                                 / kMojosPerXch,
+                             config_.strategy.fee_reserve_xch * 2.0);
+                liberation_cooldown_ = 0;
+            } else {
+                --liberation_cooldown_;
+                spdlog::info("[Engine] UTXO liberation cooldown: {} "
+                             "heartbeats remaining, spendable {:.6f} "
+                             "XCH -- skipping pair loop",
+                             liberation_cooldown_,
+                             static_cast<double>(xch_spendable_pre)
+                                 / kMojosPerXch);
+                co_return;
+            }
+        }
+    }
+
     bool pending_hit_this_block = false;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
@@ -3344,9 +3490,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         } else if (has_pending && stale_count == 0 && expired_count == 0) {
             // All tiers are Fresh — nothing to cancel or repost.
+            // Still proceed to balance gates so suppressed pairs can free
+            // the capital locked by these fresh offers.
             spdlog::debug("[Engine] Step 8: {} all {} tiers fresh -- "
                           "skipping cancel+repost", pair_name, fresh_count);
-            continue;
         }
         // else: no pending tiers → post from scratch (cancelled_ids empty).
 
@@ -3611,10 +3758,43 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // (counter reset moved to after the pair loop)
             if (pending_block) continue;
             if (!can_bid && !can_ask) {
+                // Both sides suppressed — cancel any remaining tracked
+                // offers for this pair to free locked UTXOs / capital.
+                // Without this, offers continue locking coins while no
+                // new posting can occur, creating a deadlock.
+                if (has_pending) {
+                    std::vector<std::string> all_ids;
+                    all_ids.reserve(tier_classes.size());
+                    for (const auto& tc : tier_classes) {
+                        all_ids.push_back(tc.offer_id);
+                    }
+                    auto freed = co_await offer_mgr_->selective_cancel(all_ids);
+                    if (!freed.empty()) {
+                        spdlog::info("[Engine] Step 8: {} both sides suppressed "
+                                     "-- cancelled {} offers to free locked "
+                                     "capital", pair_name, freed.size());
+                        for (const auto& oid : freed) {
+                            try {
+                                db_->update_offer_status(oid, "cancelled",
+                                                        block_height,
+                                                        "suppressed_capital_free");
+                            } catch (...) {}
+                        }
+                    }
+                }
                 spdlog::info("[Engine] Step 8: {} both sides suppressed -- "
                              "skipping offer posting", pair_name);
                 continue;
             }
+        }
+
+        // All tiers fresh and nothing was cancelled → no repost needed.
+        // (The early-continue was removed so balance gates can free capital
+        //  when both sides are suppressed, but when at least one side is
+        //  active, existing fresh offers are kept as-is.)
+        if (has_pending && cancelled_ids.empty()
+            && stale_count == 0 && expired_count == 0) {
+            continue;
         }
 
         // -- XCH fee reserve gate (pre-creation, UTXO-aware) ---------------
@@ -4256,25 +4436,6 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
         // If spendable is low but confirmed is healthy, the XCH is just
         // locked by our own offers (UTXO locking), not truly depleted.
-        // Don't enter recovery — the offers will either fill (returning
-        // XCH) or be cancelled (freeing UTXOs).
-        if (xch_confirmed_d >= rcfg.xch_low_threshold) {
-            spdlog::debug("[Recovery] XCH spendable {:.6f} < {:.4f} but "
-                          "confirmed {:.6f} is healthy -- UTXO locking "
-                          "from own offers, not entering recovery",
-                          xch_spendable_d, rcfg.xch_low_threshold,
-                          xch_confirmed_d);
-            co_return;
-        }
-
-        // Enter recovery mode.
-        xch_recovery_mode_ = true;
-        xch_recovery_cancelled_ = false;
-        spdlog::warn("[Recovery] ENTERING recovery mode: XCH spendable "
-                     "{:.6f} confirmed {:.6f} < threshold {:.4f} XCH "
-                     "-- will cancel offers and seek cheap XCH asks",
-                     xch_spendable_d, xch_confirmed_d,
-                    UTXO locking), not truly depleted.
         // Don't enter recovery — the offers will either fill (returning
         // XCH) or be cancelled (freeing UTXOs).
         if (xch_confirmed_d >= rcfg.xch_low_threshold) {

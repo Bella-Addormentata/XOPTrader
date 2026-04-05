@@ -1897,9 +1897,32 @@ asio::awaitable<void> OfferManager::init_wallet_id_map()
 
 asio::awaitable<bool> OfferManager::emergency_cancel(
     const std::string& offer_id,
-    const std::string& context)
+    const std::string& context,
+    bool prefer_zero_fee)
 {
     try {
+        // When prefer_zero_fee is set (UTXO liberation), try the fee=0
+        // secure cancel FIRST so we don't burn spendable XCH on fees.
+        if (prefer_zero_fee) {
+            logger_->warn("{}: attempting zero-fee secure cancel for {}",
+                          context, offer_id.substr(0, 12));
+            bool zero_ok = false;
+            try {
+                co_await wallet_->cancel_offer(
+                    offer_id, 0, /*secure=*/true);
+                zero_ok = true;
+            } catch (const std::exception& e) {
+                logger_->debug("{}: zero-fee secure cancel failed for {}: {}",
+                               context, offer_id.substr(0, 12), e.what());
+            }
+            if (zero_ok) {
+                logger_->info("{}: secure-cancelled {} with fee=0",
+                              context, offer_id.substr(0, 12));
+                co_return true;
+            }
+            // Fall through to descending fee loop.
+        }
+
         auto xch_bal = co_await wallet_->get_wallet_balance(1);
         Mojo xch_spendable = 0;
         if (xch_bal.contains("spendable_balance"))
@@ -1954,7 +1977,33 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             }
         }
 
-        // Zero spendable or all fee tiers exhausted: local-only cancel.
+        // Zero spendable or all fee tiers exhausted: try secure cancel
+        // with fee=0.  The offer's locked coins serve as the spend
+        // bundle inputs, so no additional spendable XCH is needed.
+        // Skip if prefer_zero_fee already tried this at the top.
+        if (!prefer_zero_fee) {
+            logger_->warn("{}: attempting secure cancel with fee=0 for {}",
+                          context, offer_id.substr(0, 12));
+            bool secure_zero_ok = false;
+            try {
+                co_await wallet_->cancel_offer(
+                    offer_id, 0, /*secure=*/true);
+                secure_zero_ok = true;
+            } catch (const rpc::ChiaRPCError& e) {
+                logger_->debug("{}: secure cancel fee=0 failed for {}: {}",
+                               context, offer_id.substr(0, 12), e.what());
+            } catch (const std::exception& e) {
+                logger_->debug("{}: secure cancel fee=0 exception for {}: {}",
+                               context, offer_id.substr(0, 12), e.what());
+            }
+            if (secure_zero_ok) {
+                logger_->info("{}: secure-cancelled {} with fee=0",
+                              context, offer_id.substr(0, 12));
+                co_return true;
+            }
+        }
+
+        // Last resort: local-only cancel.
         // No on-chain fee -- drops from wallet but doesn't invalidate the
         // offer on-chain.  Better than leaving funds locked forever.
         logger_->warn("{}: zero XCH spendable -- local-only (insecure) "

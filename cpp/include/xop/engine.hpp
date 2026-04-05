@@ -642,6 +642,13 @@ private:
     /// True if offers were already cancelled on recovery mode entry.
     bool xch_recovery_cancelled_{false};
 
+    // UTXO liberation cooldown -- after liberation cancels offers or detects
+    // no offers to cancel, suppress the pair loop for this many heartbeats
+    // to let cancel transactions confirm on-chain.  Prevents the engine from
+    // posting offers that would immediately get liberated next heartbeat.
+    // Resets early if spendable recovers above 2× reserve.
+    int liberation_cooldown_{0};
+
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
     // When exceeded, engine transitions to BotStatus::Paused and alerts.

@@ -451,6 +451,30 @@ public:
     /// age are always expired regardless of price accuracy.
     static constexpr std::uint32_t kHardTtlMultiplier = 2;
 
+    /**
+     * @brief Emergency cancel with reduced or zero fee.
+     *
+     * When the standard fee cancel fails due to insufficient XCH, this
+     * helper checks the actual spendable XCH balance and attempts:
+     *   1. Cancel with whatever XCH remains as the fee (secure).
+     *   2. Secure cancel with fee=0 (offer coins are the spend inputs).
+     *   3. If all else fails, cancel locally (insecure / no on-chain spend).
+     *
+     * When @p prefer_zero_fee is true (used by UTXO liberation), step 2
+     * is tried FIRST to avoid burning spendable XCH on cancel fees.
+     *
+     * @param offer_id         Trade ID of the offer to cancel.
+     * @param context          Log context string (e.g. "cancel_stale",
+     *                         "utxo_liberation").
+     * @param prefer_zero_fee  If true, try fee=0 secure cancel before the
+     *                         descending fee loop (default: false).
+     * @return true if the emergency cancel succeeded, false otherwise.
+     */
+    asio::awaitable<bool> emergency_cancel(
+        const std::string& offer_id,
+        const std::string& context,
+        bool prefer_zero_fee = false);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -509,22 +533,6 @@ private:
      * get_wallets() and populates wallet_id_map_.
      */
     asio::awaitable<void> init_wallet_id_map();
-
-    /**
-     * @brief Emergency cancel with reduced or zero fee.
-     *
-     * When the standard fee cancel fails due to insufficient XCH, this
-     * helper checks the actual spendable XCH balance and attempts:
-     *   1. Cancel with whatever XCH remains as the fee (secure).
-     *   2. If XCH is zero, cancel locally (insecure / no on-chain spend).
-     *
-     * @param offer_id   Trade ID of the offer to cancel.
-     * @param context    Log context string (e.g. "cancel_stale", "cancel_all").
-     * @return true if the emergency cancel succeeded, false otherwise.
-     */
-    asio::awaitable<bool> emergency_cancel(
-        const std::string& offer_id,
-        const std::string& context);
 
     // -- Member data --------------------------------------------------------
 
