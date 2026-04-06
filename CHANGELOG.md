@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.1] — 2026-04-06
+
+### Fixed
+
+- **GUI shows wallet/node connected during analysis**: The engine now publishes system health metrics (block height, node synced, wallet connected) during the startup analysis phase, not only after analysis completes. Previously the GUI showed "not connected" for the entire 5+ minute analysis window even though the wallet and full node were reachable
+
 ## [0.7.0] — 2026-04-06
 
 ### Added

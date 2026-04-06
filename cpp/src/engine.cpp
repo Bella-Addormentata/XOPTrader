@@ -965,6 +965,17 @@ asio::awaitable<void> Engine::run_startup_analysis()
         last_analysis_block = current_block;
         ++total_polls;
 
+        // Publish system health during analysis so the GUI shows
+        // wallet/node connectivity immediately, not only after
+        // analysis completes and the main trading loop starts.
+        if (metrics_->is_running()) {
+            SystemHealthSnapshot health;
+            health.block_height     = current_block;
+            health.node_synced      = true;   // We just got a block → node OK.
+            health.wallet_connected = wallet_->is_open();
+            metrics_->update_system_health(health);
+        }
+
         // Fetch market data for this block.
         // Initialize per-pair cycle entries so step_update_market_state can write.
         cycle_.clear();
