@@ -812,7 +812,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         // outage period.
                         if (offer_mgr_) {
                             try {
-                                auto fixed = co_await offer_mgr_->reconcile_offers();
+                                auto fixed = co_await offer_mgr_->reconcile_offers(0);
                                 if (!fixed.empty()) {
                                     spdlog::info("[Engine] Post-reconnect offer "
                                                  "reconciliation corrected {} "
@@ -4457,7 +4457,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     if (recon_interval > 0 &&
         block_height >= last_reconciliation_block_ + recon_interval) {
         try {
-            auto reconciled_ids = co_await offer_mgr_->reconcile_offers();
+            auto reconciled_ids = co_await offer_mgr_->reconcile_offers(block_height);
             last_reconciliation_block_ = block_height;
             if (!reconciled_ids.empty()) {
                 spdlog::info("[Engine] Step 8: offer reconciliation corrected "
@@ -4471,6 +4471,32 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         spdlog::debug("[Engine] reconcile update_offer_status "
                                      "failed for {}: {}",
                                      oid.substr(0, 12), e.what());
+                    }
+                }
+            }
+
+            // Persist any newly adopted wallet offers to the DB so they
+            // survive the next restart.  reconcile_offers() upserts them
+            // into State; we mirror to the DB here.
+            {
+                auto current_offers = state_->get_all_offers();
+                for (const auto& po : current_offers) {
+                    try {
+                        // insert_offer is idempotent if the offer_id already
+                        // exists (or use upsert if available).
+                        DbOfferRecord rec;
+                        rec.offer_id      = po.offer_id;
+                        rec.pair_name     = po.pair_name;
+                        rec.side          = (po.side == Side::Bid) ? "bid" : "ask";
+                        rec.price_mojos   = po.price;
+                        rec.size_mojos    = po.size;
+                        rec.tier          = static_cast<int>(po.tier);
+                        rec.status        = "pending";
+                        rec.created_block = po.created_at_block;
+                        rec.fee_mojos     = po.fee_mojos;
+                        db_->insert_offer(rec);
+                    } catch (...) {
+                        // Already exists or DB constraint - fine.
                     }
                 }
             }

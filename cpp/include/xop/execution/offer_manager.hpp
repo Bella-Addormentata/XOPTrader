@@ -55,6 +55,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -433,7 +434,8 @@ public:
      *
      * @return Offer IDs removed from state (orphans/phantoms).
      */
-    asio::awaitable<std::vector<std::string>> reconcile_offers();
+    asio::awaitable<std::vector<std::string>> reconcile_offers(
+        BlockHeight current_block = 0);
 
     /**
      * @brief Startup reconciliation: scan wallet for orphaned offers.
@@ -544,6 +546,25 @@ public:
         const std::string& offer_id,
         const std::string& context,
         bool prefer_zero_fee = false);
+
+    /**
+     * @brief Parse a wallet trade record into a PendingOffer.
+     *
+     * Extracts pair name, side, price, and size from the record's
+     * summary field by matching offered/requested assets against
+     * pair_config_map_.  Returns std::nullopt if the record cannot
+     * be meaningfully parsed.
+     *
+     * Used by reconcile_offers() and startup_reconcile() to adopt
+     * wallet offers that are not tracked in engine State.
+     *
+     * @param trade_record   Wallet trade record JSON.
+     * @param current_block  Current block height (for age approximation).
+     * @return Populated PendingOffer, or std::nullopt.
+     */
+    std::optional<PendingOffer> try_parse_wallet_offer(
+        const nlohmann::json& trade_record,
+        BlockHeight current_block) const;
 
 private:
     // -- Internal helpers ---------------------------------------------------

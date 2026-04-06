@@ -1260,14 +1260,12 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
 // should only be called periodically (e.g. every 20 blocks).
 // ---------------------------------------------------------------------------
 
-asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
+asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
+    BlockHeight current_block)
 {
     std::vector<std::string> removed_ids;
 
     auto pending_offers = state_->get_all_offers();
-    if (pending_offers.empty()) {
-        co_return removed_ids;
-    }
 
     // Build a lookup of all pending offer IDs from our state.
     std::unordered_map<std::string, PendingOffer> pending_map;
@@ -1278,6 +1276,10 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
 
     // Collect all offer IDs found in the wallet for orphan detection.
     std::unordered_set<std::string> wallet_offer_ids;
+
+    // Also collect PENDING_ACCEPT wallet offers for reverse adoption check:
+    // wallet offers that are still pending but not tracked in State.
+    std::vector<json> unadopted_records;
 
     // Paginate through all wallet offers.
     constexpr std::int64_t kPageSize = 50;
@@ -1311,7 +1313,14 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
             // Check if this wallet offer is one we are tracking.
             auto it = pending_map.find(trade_id);
             if (it == pending_map.end()) {
-                continue;  // Not one of ours.
+                // Not tracked in State.  If PENDING_ACCEPT, this is a
+                // wallet offer the engine lost track of (e.g., removed
+                // by verify_pending_offer_coins during a wallet desync).
+                // Collect for adoption below.
+                if (status == trade_status::kPendingAccept) {
+                    unadopted_records.push_back(rec);
+                }
+                continue;
             }
 
             // Detected terminal state that we missed during normal polling.
@@ -1345,9 +1354,64 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
         }
     }
 
-    if (!removed_ids.empty()) {
-        logger_->info("[reconcile] Corrected {} state discrepancies",
-                      removed_ids.size());
+    // -----------------------------------------------------------------------
+    // Reverse adoption: wallet PENDING_ACCEPT offers not tracked in State.
+    //
+    // Root cause: verify_pending_offer_coins or a previous reconciliation
+    // removed an offer from State (e.g., during wallet desync, pagination
+    // race, or restart), but the wallet still holds it as PENDING_ACCEPT
+    // with coins locked.  Without adoption the engine sees 0 pending
+    // offers yet 0 spendable XCH — a permanent deadlock.
+    //
+    // Gao & Wang (2020): tracking an offer we created is always cheaper
+    // than leaving coins locked invisibly.  Worst case the UTXO liberation
+    // or cancel_stale path will cancel it on the next heartbeat.
+    // -----------------------------------------------------------------------
+    std::size_t adopted_count = 0;
+    for (const auto& rec : unadopted_records) {
+        const std::string trade_id = rec["trade_id"].get<std::string>();
+
+        // Skip if the offer was just removed in this reconciliation cycle
+        // (terminal state detected above).
+        bool just_removed = false;
+        for (const auto& rid : removed_ids) {
+            if (rid == trade_id) { just_removed = true; break; }
+        }
+        if (just_removed) continue;
+
+        auto parsed = try_parse_wallet_offer(rec, current_block);
+        if (parsed) {
+            state_->upsert_offer(*parsed);
+            ++adopted_count;
+            logger_->warn("[reconcile] ADOPTED untracked wallet offer {} "
+                          "({} {} on {}) — wallet has it PENDING_ACCEPT "
+                          "but engine lost tracking",
+                          trade_id.substr(0, 12),
+                          (parsed->side == Side::Bid) ? "BID" : "ASK",
+                          parsed->size, parsed->pair_name);
+        } else {
+            // Can't determine pair/side — adopt with minimal metadata.
+            // UTXO liberation can still cancel it to free locked coins.
+            PendingOffer po;
+            po.offer_id         = trade_id;
+            po.pair_name        = "UNKNOWN";
+            po.side             = Side::Bid;
+            po.price            = 0;
+            po.size             = 0;
+            po.tier             = 0;
+            po.fee_mojos        = 0;
+            po.created_at_block = 0;
+            state_->upsert_offer(po);
+            ++adopted_count;
+            logger_->warn("[reconcile] ADOPTED unparseable wallet offer {} "
+                          "— tracking to prevent coin-lock deadlock",
+                          trade_id.substr(0, 12));
+        }
+    }
+
+    if (!removed_ids.empty() || adopted_count > 0) {
+        logger_->info("[reconcile] Corrected {} removals, {} adoptions",
+                      removed_ids.size(), adopted_count);
     } else {
         logger_->debug("[reconcile] State consistent -- no discrepancies");
     }
@@ -1844,6 +1908,39 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                         ++cancelled;
                     else
                         ++unknown;
+                } else {
+                    // Cancel failed (insufficient XCH, wallet not synced,
+                    // etc.).  Force-adopt to prevent deadlock: the wallet
+                    // still holds this offer as PENDING_ACCEPT, locking
+                    // coins.  If we don't track it, the engine sees 0
+                    // pending offers but 0 spendable XCH — permanent
+                    // stall.  Adopting lets UTXO liberation or the next
+                    // cancel cycle free the locked coins.
+                    auto parsed = try_parse_wallet_offer(
+                        wo->record, current_block);
+                    if (parsed) {
+                        state_->upsert_offer(*parsed);
+                    } else {
+                        PendingOffer po;
+                        po.offer_id        = wo->trade_id;
+                        po.pair_name       = "UNKNOWN";
+                        po.side            = Side::Bid;
+                        po.price           = 0;
+                        po.size            = 0;
+                        po.tier            = 0;
+                        po.fee_mojos       = 0;
+                        po.created_at_block = 0;
+                        state_->upsert_offer(po);
+                    }
+                    ++adopted;
+                    logger_->warn(
+                        "[startup_reconcile] FORCE-ADOPTED uncancellable "
+                        "orphan {} ({} {} on {}) — cancel failed, tracking "
+                        "to prevent deadlock",
+                        wo->trade_id.substr(0, 24),
+                        (eval.side == Side::Bid) ? "BID" : "ASK",
+                        eval.size,
+                        eval.pair_name.empty() ? "UNKNOWN" : eval.pair_name);
                 }
                 break;
             }
@@ -2332,6 +2429,122 @@ asio::awaitable<void> OfferManager::init_wallet_id_map()
         logger_->error("Failed to initialise wallet ID map: {}", e.what());
         // Allow retry on next post_quotes() call by leaving the flag false.
     }
+}
+
+// ---------------------------------------------------------------------------
+// try_parse_wallet_offer -- extract PendingOffer from a wallet trade record
+//
+// Best-effort metadata extraction: parses the summary's offered/requested
+// fields and matches against pair_config_map_ to determine pair, side,
+// price, and size.  Returns std::nullopt if the record is unparseable.
+// ---------------------------------------------------------------------------
+
+std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
+    const json& trade_record,
+    BlockHeight current_block) const
+{
+    if (!trade_record.contains("trade_id") ||
+        !trade_record.contains("summary") ||
+        !trade_record["summary"].is_object()) {
+        return std::nullopt;
+    }
+
+    const std::string trade_id = trade_record["trade_id"].get<std::string>();
+    const auto& summary = trade_record["summary"];
+
+    // Parse offered and requested asset → amount maps.
+    std::unordered_map<std::string, Mojo> offered;
+    std::unordered_map<std::string, Mojo> requested;
+
+    auto parse_side = [](const json& obj,
+                         std::unordered_map<std::string, Mojo>& out) {
+        if (!obj.is_object()) return;
+        for (auto& [asset_id, amount_val] : obj.items()) {
+            if (amount_val.is_number_integer()) {
+                out[asset_id] = amount_val.get<Mojo>();
+            } else if (amount_val.is_number_unsigned()) {
+                out[asset_id] = static_cast<Mojo>(
+                    amount_val.get<std::uint64_t>());
+            } else if (amount_val.is_string()) {
+                try {
+                    out[asset_id] = static_cast<Mojo>(
+                        std::stoll(amount_val.get<std::string>()));
+                } catch (...) {}
+            }
+        }
+    };
+
+    if (summary.contains("offered"))
+        parse_side(summary["offered"], offered);
+    if (summary.contains("requested"))
+        parse_side(summary["requested"], requested);
+
+    if (offered.empty() || requested.empty()) return std::nullopt;
+
+    // Match against configured pairs.
+    PendingOffer po;
+    po.offer_id = trade_id;
+    po.tier = 0;
+    po.fee_mojos = 0;
+    bool matched = false;
+
+    for (const auto& [pname, pcfg] : pair_config_map_) {
+        const std::string& base  = pcfg.base_asset_id;
+        const std::string& quote = pcfg.quote_asset_id;
+
+        if (offered.count(base) && requested.count(quote)) {
+            po.pair_name = pname;
+            po.side      = Side::Ask;
+            po.size      = offered.at(base);
+            const double base_d  = static_cast<double>(offered.at(base));
+            const double quote_d = static_cast<double>(requested.at(quote));
+            po.price = (base_d > 0.0)
+                ? static_cast<Mojo>(std::llround(
+                    quote_d / base_d * static_cast<double>(kMojosPerXch)))
+                : 0;
+            matched = true;
+            break;
+        }
+        if (offered.count(quote) && requested.count(base)) {
+            po.pair_name = pname;
+            po.side      = Side::Bid;
+            po.size      = requested.at(base);
+            const double base_d  = static_cast<double>(requested.at(base));
+            const double quote_d = static_cast<double>(offered.at(quote));
+            po.price = (base_d > 0.0)
+                ? static_cast<Mojo>(std::llround(
+                    quote_d / base_d * static_cast<double>(kMojosPerXch)))
+                : 0;
+            matched = true;
+            break;
+        }
+    }
+
+    if (!matched) return std::nullopt;
+
+    // Extract fee.
+    if (summary.contains("fees") && summary["fees"].is_number()) {
+        po.fee_mojos = summary["fees"].get<std::uint64_t>();
+    }
+
+    // Approximate created_at_block from wall-clock time.
+    po.created_at_block = 0;
+    if (current_block > 0 && trade_record.contains("created_at_time") &&
+        trade_record["created_at_time"].is_number()) {
+        const auto now_epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+        double created_at = trade_record["created_at_time"].get<double>();
+        if (created_at > 0.0) {
+            const double age_seconds =
+                static_cast<double>(now_epoch) - created_at;
+            const BlockHeight approx_age = static_cast<BlockHeight>(
+                std::max(0.0, age_seconds / 52.0));
+            po.created_at_block = (current_block > approx_age)
+                ? (current_block - approx_age) : 0;
+        }
+    }
+
+    return po;
 }
 
 // ---------------------------------------------------------------------------

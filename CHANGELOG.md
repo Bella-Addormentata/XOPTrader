@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.2] — 2026-04-06
+
+### Fixed
+
+- **Prevent orphan-offer XCH deadlock**: Wallet offers that the engine loses track of (due to wallet desync, reconciliation race conditions, or restart) now get force-adopted back into State instead of being silently dropped. Two fixes:
+  - `startup_reconcile`: when an orphan offer cannot be cancelled (e.g., 0 spendable XCH), it is now adopted into State rather than left in limbo. Previously, uncancellable orphans locked coins indefinitely with no engine awareness
+  - `reconcile_offers`: periodic reconciliation now detects PENDING_ACCEPT wallet offers that are not tracked in engine State and adopts them. This catches mid-session orphans created when `verify_pending_offer_coins` incorrectly removes an offer during wallet desync
+- Adds `try_parse_wallet_offer()` helper that extracts pair/side/price/size from a wallet trade record for offer adoption
+
 ## [0.7.1] — 2026-04-06
 
 ### Fixed
