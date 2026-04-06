@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.8] — 2026-04-06
+
+### Added
+
+- **GUI singleton enforcement**: On startup, the GUI now terminates any previously-running GUI and engine processes before launching, ensuring only one GUI and one engine run at a time. Prevents double-posting offers, port conflicts, and wallet RPC contention. Uses WMI process scanning on Windows and `/proc` enumeration on POSIX. Protects the venv launcher parent PID from self-termination
+
 ## [0.6.7] — 2026-04-05
 
 ### Fixed

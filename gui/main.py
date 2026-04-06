@@ -3,11 +3,6 @@
 
 Entry-point script that wires together argument parsing, the
 QApplication, the main window, and service initialisation.
-
-Usage
------
-    python -m gui.main --config config.yaml --db state.sqlite
-    python -m gui.main --dry-run --font-size 2
 """
 
 from __future__ import annotations
@@ -15,6 +10,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import platform
 import shutil
 import signal
 import subprocess
@@ -27,6 +23,209 @@ from gui.services.engine_bridge import EngineBridge
 
 # Module-level logger.
 _log: logging.Logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Singleton enforcement -- kill stale GUI and engine instances
+# ---------------------------------------------------------------------------
+
+def _kill_old_instances() -> None:
+    """Terminate any previously-running GUI and engine processes.
+
+    Ensures only one GUI and one engine run at a time, preventing
+    double-posting offers, port conflicts, and wallet RPC contention.
+
+    On Windows, uses WMI via ``Get-CimInstance`` to match on command line.
+    On POSIX, reads ``/proc/<pid>/cmdline``.
+    """
+    current_pid = os.getpid()
+    # On Windows, the venv launcher spawns a child python.exe, both with
+    # the same command line.  Protect both from being killed.
+    parent_pid = os.getppid()
+    protected_pids = {current_pid, parent_pid}
+
+    if platform.system() == "Windows":
+        _kill_old_instances_win32(protected_pids)
+    else:
+        _kill_old_instances_posix(protected_pids)
+
+
+def _kill_old_instances_win32(protected_pids: set[int]) -> None:
+    """Windows implementation: kill old GUI python procs and engine exes."""
+    killed = 0
+
+    # --- Kill old GUI processes (python running gui.main) ----------------
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-CimInstance Win32_Process -Filter "
+                "\"Name = 'python.exe' OR Name = 'pythonw.exe'\" "
+                "| Select-Object ProcessId,CommandLine "
+                "| ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json
+            procs = json.loads(result.stdout)
+            if isinstance(procs, dict):
+                procs = [procs]
+            for proc in procs:
+                pid = proc.get("ProcessId", 0)
+                cmd = proc.get("CommandLine") or ""
+                if pid in protected_pids or pid == 0:
+                    continue
+                # Match processes running our GUI module.
+                if "gui.main" in cmd or "gui\\main" in cmd:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        killed += 1
+                        _log.info(
+                            "[Startup] Terminated old GUI process (PID %d)",
+                            pid,
+                        )
+                    except OSError:
+                        pass
+    except Exception as exc:
+        _log.warning("[Startup] GUI process scan failed: %s", exc)
+
+    # --- Kill old PyInstaller-bundled GUI --------------------------------
+    _kill_processes_by_name_win32(
+        ["xoptrader-gui.exe", "xoptrader_gui.exe"],
+        protected_pids,
+        "GUI",
+    )
+    killed_count = killed  # track for summary
+
+    # --- Kill old engine processes ---------------------------------------
+    killed_count += _kill_processes_by_name_win32(
+        ["xop_trader.exe"],
+        protected_pids,
+        "engine",
+    )
+
+    if killed_count > 0:
+        # Brief pause so OS can release ports and file handles.
+        import time
+        time.sleep(2)
+        _log.info(
+            "[Startup] Terminated %d old instance(s) -- ports released",
+            killed_count,
+        )
+    else:
+        _log.info("[Startup] No old GUI or engine instances found")
+
+
+def _kill_processes_by_name_win32(
+    names: list[str],
+    protected_pids: set[int],
+    label: str,
+) -> int:
+    """Kill Windows processes matching any of the given executable names."""
+    killed = 0
+    try:
+        result = subprocess.run(
+            [
+                "powershell", "-NoProfile", "-Command",
+                "Get-Process | Select-Object Id,ProcessName "
+                "| ConvertTo-Json -Compress",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            import json
+            procs = json.loads(result.stdout)
+            if isinstance(procs, dict):
+                procs = [procs]
+            name_set = {n.lower().replace(".exe", "") for n in names}
+            for proc in procs:
+                pid = proc.get("Id", 0)
+                pname = (proc.get("ProcessName") or "").lower()
+                if pid in protected_pids or pid == 0:
+                    continue
+                if pname in name_set:
+                    try:
+                        os.kill(pid, signal.SIGTERM)
+                        killed += 1
+                        _log.info(
+                            "[Startup] Terminated old %s (PID %d)",
+                            label,
+                            pid,
+                        )
+                    except OSError:
+                        pass
+    except Exception as exc:
+        _log.warning("[Startup] %s process scan failed: %s", label, exc)
+    return killed
+
+
+def _kill_old_instances_posix(protected_pids: set[int]) -> None:
+    """POSIX implementation: scan /proc for old GUI and engine processes."""
+    killed = 0
+    proc_dir = Path("/proc")
+    if not proc_dir.is_dir():
+        return
+
+    for entry in proc_dir.iterdir():
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid in protected_pids:
+            continue
+        try:
+            cmdline = (entry / "cmdline").read_text().replace("\x00", " ")
+        except OSError:
+            continue
+
+        is_gui = "gui.main" in cmdline or "gui/main" in cmdline
+        is_bundled_gui = "xoptrader-gui" in cmdline or "xoptrader_gui" in cmdline
+        is_engine = "xop_trader" in cmdline
+
+        if is_gui or is_bundled_gui or is_engine:
+            label = "GUI" if (is_gui or is_bundled_gui) else "engine"
+            try:
+                os.kill(pid, signal.SIGTERM)
+                killed += 1
+                _log.info(
+                    "[Startup] Sent SIGTERM to old %s (PID %d)", label, pid
+                )
+            except OSError:
+                pass
+
+    if killed > 0:
+        import time
+        time.sleep(2)
+        # Send SIGKILL to any stubborn survivors.
+        for entry in proc_dir.iterdir():
+            if not entry.name.isdigit():
+                continue
+            pid = int(entry.name)
+            if pid in protected_pids:
+                continue
+            try:
+                cmdline = (entry / "cmdline").read_text().replace("\x00", " ")
+            except OSError:
+                continue
+            if any(
+                s in cmdline
+                for s in ("gui.main", "gui/main", "xoptrader-gui",
+                           "xoptrader_gui", "xop_trader")
+            ):
+                try:
+                    os.kill(pid, signal.SIGKILL)
+                    _log.info("[Startup] Sent SIGKILL to PID %d", pid)
+                except OSError:
+                    pass
+        _log.info(
+            "[Startup] Terminated %d old instance(s)", killed
+        )
+    else:
+        _log.info("[Startup] No old GUI or engine instances found")
 
 
 # ---------------------------------------------------------------------------
@@ -471,6 +670,15 @@ def _start_services(
 def main() -> None:
     """Parse arguments, create the application, and enter the event loop."""
     args = _build_parser().parse_args()
+
+    # Configure basic logging early so _kill_old_instances can log.
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] [%(levelname)s] %(message)s",
+    )
+
+    # Enforce singleton: kill any old GUI and engine processes.
+    _kill_old_instances()
 
     # Build the Qt application with the user's font-size preference.
     app = XOPTraderApp(
