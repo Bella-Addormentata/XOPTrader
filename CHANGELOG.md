@@ -5,6 +5,22 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.4] — 2026-04-06
+
+### Fixed
+
+- **UTXO-lock safety margin (2× reserve floor)**: All offer creation now requires `xch_spendable >= 2 × fee_reserve_xch` (default 2.0 XCH) before any offer is created. Previously, the engine would create offers when spendable was barely above the 1× reserve (e.g. 1.29 XCH with 1.0 reserve), but Chia's UTXO model locks the *entire* coin used for fee payment — a 0.005 XCH fee can lock a 1.3 XCH UTXO, instantly draining spendable to zero. This caused a create→drain→cancel→create churn cycle that kept spendable at zero indefinitely
+- **Buy-only mode fee override raised**: In XCH-buy-only mode, the fee reserve override passed to `offer_manager::post_quotes` is now `fee_reserve_xch` (1.0) instead of `fee_min_spendable_xch` (0.01). The old 0.01 XCH threshold made offer_manager's per-offer guards ineffective, allowing offers that would lock entire UTXOs
+- **Preemptive UTXO danger zone detection**: When spendable XCH is between 1× and 2× reserve, the engine now enters XCH-buy-only mode preemptively (before UTXO liberation triggers). This prevents the scenario where cooldown expires, the engine exits buy-only mode, immediately creates offers that drain spendable to zero, and re-enters the churn cycle
+
+## [0.7.3] — 2026-04-06
+
+### Fixed
+
+- **Wallet sync gate**: `step_manage_offers` now checks `get_sync_status()` on every heartbeat and skips ALL offer management when the wallet is not fully synced. Previously, the engine would create/cancel/verify offers against an unsynced wallet, causing `verify_pending_offer_coins` to falsely mark live offers as NOT FOUND (wallet returns incomplete `get_all_offers` during sync), `cancel_offer` to fail with "Wallet needs to be fully synced", and the engine to create duplicate offers that drain XCH to zero
+- **Creation grace period in `verify_pending_offer_coins`**: Offers younger than 120 seconds are no longer marked as stale when NOT FOUND in the wallet. The Chia wallet may not immediately surface newly-created offers in `get_all_offers`, and this previously caused the engine to lose track of 15-second-old offers and re-create duplicates
+- **Startup reconcile wallet sync pre-check**: `startup_reconcile` now checks wallet sync status before attempting orphan cancellation. When wallet is not synced, orphans are immediately force-adopted instead of attempting cancel RPCs that will fail, preventing uncancellable orphan deadlock
+
 ## [0.7.2] — 2026-04-06
 
 ### Fixed

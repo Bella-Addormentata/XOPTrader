@@ -198,10 +198,30 @@ OnChainReconciler::verify_pending_offer_coins()
     }
 
     // Cross-reference pending offers against wallet state and on-chain data.
+    const auto now = std::chrono::system_clock::now();
     for (const auto& po : pending) {
         auto it = wallet_offer_status.find(po.offer_id);
 
         if (it == wallet_offer_status.end()) {
+            // Grace period: skip offers created less than 120 seconds ago.
+            // The Chia wallet may not immediately surface newly-created
+            // offers in get_all_offers, especially during sync.  Without
+            // this, verify_pending_offer_coins falsely marks 15-second-old
+            // offers as NOT FOUND, causing the engine to lose track of them
+            // and re-create duplicates that drain XCH to zero.
+            constexpr auto kCreationGracePeriod = std::chrono::seconds{120};
+            const auto age = now - po.created_at_ts;
+            if (age < kCreationGracePeriod) {
+                logger_->info("verify_pending_offer_coins: offer {} NOT FOUND "
+                              "in wallet but only {:.0f}s old -- skipping "
+                              "(grace period {}s, pair={} tier={})",
+                              po.offer_id.substr(0, 12),
+                              std::chrono::duration<double>(age).count(),
+                              kCreationGracePeriod.count(),
+                              po.pair_name, po.tier);
+                continue;
+            }
+
             // Offer not found in wallet at all -- wallet lost track of it.
             // This is a strong signal that the offer was resolved externally
             // or the wallet state was reset.

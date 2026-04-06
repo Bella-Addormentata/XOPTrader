@@ -144,9 +144,10 @@ asio::awaitable<int> OfferManager::post_quotes(
         int ask_count = 0;
 
         // -- XCH fee reserve pre-check (batch mode) ------------------------
-        // Verify XCH spendable >= fee_reserve_xch before posting.
+        // Verify XCH spendable >= 2× fee_reserve_xch before posting.
         // ALL offers lock XCH UTXOs for on-chain fees, even buy-XCH
-        // offers.  No exemptions -- UTXO locking is direction-agnostic.
+        // offers.  Use 2× reserve as the creation floor so that
+        // worst-case UTXO locking still preserves the reserve.
         bool reserve_breached = false;
         const bool bids_buy_xch = (pair.base_asset_id == "xch");
         const bool asks_buy_xch = (pair.quote_asset_id == "xch");
@@ -156,16 +157,16 @@ asio::awaitable<int> OfferManager::post_quotes(
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    effective_reserve
+                const auto creation_floor = static_cast<Mojo>(std::llround(
+                    effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
-                if (xch_spendable < reserve_mojos) {
+                if (xch_spendable < creation_floor) {
                     logger_->warn(
-                        "XCH fee reserve pre-check (batch): spendable "
-                        "{:.6f} XCH < reserve {:.3f} XCH before {} "
+                        "XCH UTXO-lock pre-check (batch): spendable "
+                        "{:.6f} XCH < 2x reserve {:.3f} XCH before {} "
                         "-- skipping all offers",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve, pair.name);
+                        effective_reserve * 2.0, pair.name);
                     reserve_breached = true;
                 }
             } catch (const std::exception& e) {
@@ -179,7 +180,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
-        // Check XCH spendable balance after bids; skip asks if below reserve.
+        // Check XCH spendable balance after bids; skip asks if below 2× reserve.
         // No buy-XCH exemption: UTXO locking is direction-agnostic.
         if (bid_count > 0 && !asks.empty()
             && effective_reserve > 0.0) {
@@ -188,16 +189,16 @@ asio::awaitable<int> OfferManager::post_quotes(
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    effective_reserve
+                const auto creation_floor = static_cast<Mojo>(std::llround(
+                    effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
-                if (xch_spendable < reserve_mojos) {
+                if (xch_spendable < creation_floor) {
                     logger_->warn(
-                        "XCH fee reserve guard (batch): spendable {:.6f} XCH "
-                        "< reserve {:.3f} XCH after posting {} bids "
+                        "XCH UTXO-lock guard (batch): spendable {:.6f} XCH "
+                        "< 2x reserve {:.3f} XCH after posting {} bids "
                         "-- skipping ask batch",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve, pair.name);
+                        effective_reserve * 2.0, pair.name);
                     reserve_breached = true;
                 }
             } catch (const std::exception& e) {
@@ -314,37 +315,37 @@ asio::awaitable<int> OfferManager::post_quotes(
         // -- XCH fee reserve pre-creation guard (per-offer, UTXO-aware) ----
         // Check XCH spendable BEFORE each individual offer creation.
         // The Chia wallet locks entire UTXOs for fee coins -- a single
-        // create_offer can lock far more than the 5M mojo fee.  This
-        // prevents the last UTXO from being locked when the balance is
-        // already at the reserve threshold.
+        // create_offer can lock far more than the 5M mojo fee.  Use 2×
+        // the reserve as the creation floor so that even after worst-case
+        // UTXO locking, the reserve is preserved.  This prevents the
+        // create → drain → cancel → create churn cycle.
         //
         // ALL offers lock XCH UTXOs for on-chain fees, even offers that
-        // buy XCH.  The buy-XCH exemption was incorrect: while filling
-        // the offer would increase XCH, creating it still drains spendable
-        // XCH via UTXO locking.
+        // buy XCH.  No exemptions -- UTXO locking is direction-agnostic.
         if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    effective_reserve
+                // 2× reserve: survive worst-case UTXO lock.
+                const auto creation_floor = static_cast<Mojo>(std::llround(
+                    effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
-                if (xch_spendable < reserve_mojos) {
+                if (xch_spendable < creation_floor) {
                     logger_->warn(
-                        "XCH fee reserve pre-check: spendable {:.6f} XCH "
-                        "< reserve {:.3f} XCH before {} {} tier {} "
+                        "XCH UTXO-lock pre-check: spendable {:.6f} XCH "
+                        "< 2x reserve {:.3f} XCH before {} {} tier {} "
                         "-- stopping all offers",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve,
+                        effective_reserve * 2.0,
                         pair.name, to_string(tier.side), tier.tier_index);
                     bid_funds_exhausted = true;
                     ask_funds_exhausted = true;
                     break;
                 }
             } catch (const std::exception& e) {
-                logger_->warn("XCH fee reserve pre-check failed before "
+                logger_->warn("XCH UTXO-lock pre-check failed before "
                               "{} tier {}: {} -- skipping cautiously",
                               pair.name, tier.tier_index, e.what());
                 bid_funds_exhausted = true;
@@ -436,29 +437,29 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Full offer text at DEBUG only (ISO/IEC 27001: minimise exposure).
         logger_->debug("Offer text: {}...", offer_text.substr(0, 40));
 
-        // -- XCH fee reserve guard (UTXO-aware) ----------------------------
+        // -- XCH UTXO-lock guard (post-creation) ---------------------------
         // The Chia wallet locks entire UTXOs when creating offers, not just
         // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
-        // the configured reserve.  Applies to ALL offers including
-        // buy-XCH tiers, since UTXO locking is direction-agnostic.
+        // the 2× reserve floor.  Applies to ALL offers including buy-XCH
+        // tiers, since UTXO locking is direction-agnostic.
         if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    effective_reserve
+                const auto creation_floor = static_cast<Mojo>(std::llround(
+                    effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
-                if (xch_spendable < reserve_mojos) {
+                if (xch_spendable < creation_floor) {
                     logger_->warn(
-                        "XCH fee reserve guard: spendable {:.6f} XCH "
-                        "< reserve {:.3f} XCH after posting {} {} tier {} "
+                        "XCH UTXO-lock guard: spendable {:.6f} XCH "
+                        "< 2x reserve {:.3f} XCH after posting {} {} tier {} "
                         "-- stopping further offers this heartbeat",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve,
+                        effective_reserve * 2.0,
                         pair.name, to_string(tier.side), tier.tier_index);
                     bid_funds_exhausted = true;
                     ask_funds_exhausted = true;
@@ -1701,6 +1702,31 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
 
     logger_->info("[startup_reconcile] Scanning wallet for orphaned offers...");
 
+    // -- Wallet sync pre-check -----------------------------------------------
+    // If the wallet is not fully synced, get_all_offers may return
+    // incomplete results and cancel_offer will fail with "Wallet needs to
+    // be fully synced".  Check sync status and set a flag; if not synced,
+    // force-adopt all orphans instead of attempting cancel (which would
+    // fail and create uncancelled/untracked orphans locking XCH).
+    bool wallet_synced = false;
+    try {
+        auto sync_status = co_await wallet_->get_sync_status();
+        if (sync_status.contains("synced"))
+            wallet_synced = sync_status["synced"].get<bool>();
+        bool syncing = false;
+        if (sync_status.contains("syncing"))
+            syncing = sync_status["syncing"].get<bool>();
+        if (syncing) wallet_synced = false;
+        if (!wallet_synced) {
+            logger_->warn("[startup_reconcile] Wallet NOT synced -- will "
+                          "force-adopt all orphans instead of cancelling "
+                          "to prevent uncancellable orphan deadlock");
+        }
+    } catch (const std::exception& e) {
+        logger_->warn("[startup_reconcile] Wallet sync check failed: {} "
+                      "-- assuming not synced, will force-adopt", e.what());
+    }
+
     // ---- Phase 1: Collect all PENDING_ACCEPT offers from wallet -----------
     struct WalletOffer {
         std::string trade_id;
@@ -1878,6 +1904,16 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                               label, wo->trade_id.substr(0, 24), eval.reason);
 
                 bool cancel_ok = false;
+
+                // Skip cancel attempt entirely when wallet is not synced.
+                // cancel_offer will fail with "Wallet needs to be fully
+                // synced" and emergency_cancel's multiple retries will
+                // also fail, wasting time.  Go straight to force-adopt.
+                if (!wallet_synced) {
+                    logger_->warn("[startup_reconcile] Skipping cancel for {} "
+                                  "-- wallet not synced, will force-adopt",
+                                  wo->trade_id.substr(0, 24));
+                } else {
                 bool needs_emergency = false;
                 try {
                     co_await wallet_->cancel_offer(wo->trade_id,
@@ -1902,6 +1938,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 if (needs_emergency)
                     cancel_ok = co_await emergency_cancel(
                         wo->trade_id, "startup_reconcile");
+                } // end wallet_synced
                 if (cancel_ok) {
                     cancelled_ids.push_back(wo->trade_id);
                     if (eval.disposition == OrphanDisposition::Cancel)
