@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.0] — 2026-04-06
+
+### Added
+
+- **Dynamic tier limiting**: Capital-budget tier limiter that automatically reduces the number of active offer tiers when XCH spendable balance cannot support the full tier ladder. Each create_offer locks ~0.25 XCH in fee UTXOs; when posting 6 tiers (3 bid + 3 ask) would exceed the spendable headroom above the fee reserve, outer tiers are pruned from the outside in (highest tier_index first) to prevent UTXO liberation churn. Based on Gueant-Lehalle-Fernandez-Tapia (2013) capital-constrained market making: fewer, well-capitalised tiers outperform many thin tiers when capital is scarce. Includes 20% safety margin above fee reserve and logs tier trimming decisions
+
 ## [0.6.9] — 2026-04-06
 
 ### Fixed

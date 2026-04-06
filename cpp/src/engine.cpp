@@ -4126,6 +4126,145 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             fee_filtered_tiers = pcs.ladder;
         }
 
+        // -----------------------------------------------------------------
+        // Dynamic tier limiting (Gueant-Lehalle-Fernandez-Tapia 2013,
+        // Cartea-Jaimungal-Penalva 2015 Ch. 10).
+        //
+        // When capital is scarce, posting N configured tiers may lock
+        // more XCH UTXOs than the spendable balance can support, which
+        // triggers UTXO liberation and creates a churn cycle.
+        //
+        // Each create_offer locks ~0.25 XCH in a fee-coin UTXO,
+        // regardless of the offer's asset type.  With fee_reserve=1.0
+        // and only 4.8 XCH spendable, 6 offers (3 bid + 3 ask) lock
+        // 1.5 XCH in fee UTXOs alone, plus the base-asset value of asks.
+        //
+        // We compute the maximum number of tiers whose cumulative UTXO
+        // cost (offer size + fee overhead) stays within the XCH budget:
+        //   xch_budget = xch_spendable - fee_reserve - safety_margin
+        //
+        // Tiers are dropped from the outside in (highest tier_index
+        // first), preserving tight tiers that have the best fill
+        // probability.  Remaining tier sizes are NOT renormalised --
+        // the ladder was already built with full allocations and
+        // renormalising would change the effective position size.
+        //
+        // Academic rationale: thin outer tiers are worse than no tiers.
+        // They increase adverse selection exposure (Gueant et al. 2013)
+        // and cancel/replace costs scale linearly with tier count, not
+        // fill probability.
+        // -----------------------------------------------------------------
+        if (pair_cfg && !fee_filtered_tiers.empty()
+            && config_.strategy.fee_reserve_xch > 0.0) {
+
+            // Estimated UTXO overhead per offer (~0.25 XCH).
+            constexpr Mojo kUtxoOverheadMojos =
+                static_cast<Mojo>(250000000000LL);  // 0.25 * 1e12
+
+            // Safety margin: 20% headroom above fee reserve.
+            constexpr double kSafetyMarginPct = 0.20;
+
+            const auto reserve_mojos = static_cast<Mojo>(std::llround(
+                config_.strategy.fee_reserve_xch
+                * static_cast<double>(kMojosPerXch)));
+            const auto safety_mojos = static_cast<Mojo>(std::llround(
+                static_cast<double>(reserve_mojos) * kSafetyMarginPct));
+
+            const Mojo xch_budget =
+                (xch_spendable_pre > reserve_mojos + safety_mojos)
+                    ? xch_spendable_pre - reserve_mojos - safety_mojos
+                    : Mojo{0};
+
+            if (xch_budget > 0) {
+                // Find the maximum tier_index across the ladder.
+                uint8_t max_tier = 0;
+                for (const auto& tq : fee_filtered_tiers)
+                    max_tier = std::max(max_tier, tq.tier_index);
+
+                // Count offers per tier and estimate XCH cost per tier.
+                // For XCH-base pairs, ask offers directly lock XCH equal
+                // to their size.  For all offers, add UTXO overhead.
+                const bool base_is_xch =
+                    pair_cfg->base_asset_id == "xch";
+
+                // Accumulate cost from tier 0 upward.  Stop when adding
+                // the next tier would exceed the budget.
+                Mojo cumulative_cost = 0;
+                uint8_t max_affordable_tier = max_tier;  // inclusive
+
+                for (uint8_t ti = 0; ti <= max_tier; ++ti) {
+                    Mojo tier_cost = 0;
+                    int tier_offer_count = 0;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.tier_index != ti) continue;
+                        ++tier_offer_count;
+                        tier_cost += kUtxoOverheadMojos;  // fee UTXO
+                        // If base is XCH and this is an ask, the offer
+                        // itself locks XCH equal to the offer size.
+                        if (base_is_xch && tq.side == Side::Ask) {
+                            tier_cost += tq.size;
+                        }
+                    }
+                    if (tier_offer_count == 0) continue;
+
+                    if (cumulative_cost + tier_cost > xch_budget) {
+                        max_affordable_tier = (ti > 0) ? ti - 1 : 0;
+                        // If even tier 0 doesn't fit, keep it anyway
+                        // (minimum 1 tier).
+                        break;
+                    }
+                    cumulative_cost += tier_cost;
+                    max_affordable_tier = ti;
+                }
+
+                // Remove tiers beyond max_affordable_tier.
+                if (max_affordable_tier < max_tier) {
+                    const auto orig_size = fee_filtered_tiers.size();
+                    std::vector<TierQuote> trimmed;
+                    trimmed.reserve(orig_size);
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.tier_index <= max_affordable_tier) {
+                            trimmed.push_back(tq);
+                        }
+                    }
+
+                    spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                 "tiers for {} (xch_budget={:.3f} "
+                                 "xch_spendable={:.3f} reserve={:.3f})",
+                                 orig_size, trimmed.size(),
+                                 pair_name,
+                                 static_cast<double>(xch_budget) / kMojosPerXch,
+                                 static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                                 config_.strategy.fee_reserve_xch);
+                    fee_filtered_tiers = std::move(trimmed);
+                }
+            } else {
+                // Zero budget -- only keep tier 0 (minimum presence).
+                const auto orig_size = fee_filtered_tiers.size();
+                if (orig_size > 0) {
+                    // Find minimum tier_index present.
+                    uint8_t min_ti = 255;
+                    for (const auto& tq : fee_filtered_tiers)
+                        min_ti = std::min(min_ti, tq.tier_index);
+
+                    std::vector<TierQuote> trimmed;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.tier_index == min_ti)
+                            trimmed.push_back(tq);
+                    }
+                    if (trimmed.size() < orig_size) {
+                        spdlog::info("[Engine] Dynamic tier limit: {} -> {} "
+                                     "tiers for {} (zero XCH budget, "
+                                     "xch_spendable={:.3f})",
+                                     orig_size, trimmed.size(), pair_name,
+                                     static_cast<double>(xch_spendable_pre)
+                                         / kMojosPerXch);
+                        fee_filtered_tiers = std::move(trimmed);
+                    }
+                }
+            }
+        }
+
         // -- Side-aware balance filter: suppress tiers on depleted sides.
         if (!can_bid || !can_ask) {
             std::vector<TierQuote> side_filtered;
