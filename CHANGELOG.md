@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.9] — 2026-04-06
+
+### Fixed
+
+- **Offer churn: UTXO liberation age guard**: UTXO liberation now skips offers younger than 5 blocks (~2.5 minutes) instead of immediately cancelling freshly-posted offers. Previously, posting 3 tiers would lock enough XCH to drop spendable below the fee reserve, triggering liberation to cancel all 3 on the very next heartbeat — creating a perpetual create-cancel cycle every ~7 heartbeats. Fresh offers now survive until they can be filled or age out, while truly stale offers are still liberated normally
+
 ## [0.6.8] — 2026-04-06
 
 ### Added

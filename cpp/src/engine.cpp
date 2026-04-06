@@ -3459,15 +3459,45 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 [](const PendingOffer& a, const PendingOffer& b) {
                     return a.created_at_block < b.created_at_block;
                 });
+
+            // Minimum age before an offer is eligible for liberation
+            // cancellation.  Without this, the engine creates offers on
+            // one heartbeat and liberation cancels them on the very next
+            // heartbeat because they locked UTXOs and dropped spendable
+            // below the fee reserve.  5 blocks ~2-3 minutes on Chia.
+            constexpr BlockHeight kMinOfferAgeBlocks = 5;
+
+            // Filter to only stale offers.
+            std::vector<PendingOffer> stale_offers;
+            for (const auto& po : all_offers) {
+                if (block_height >= po.created_at_block + kMinOfferAgeBlocks) {
+                    stale_offers.push_back(po);
+                }
+            }
+
+            if (stale_offers.empty()) {
+                // All offers are fresh -- don't cancel, just enter
+                // buy-only mode until they age or get filled.
+                spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
+                             "< reserve {:.4f} XCH but all {} offers are "
+                             "younger than {} blocks -- XCH-buy-only mode",
+                             static_cast<double>(xch_spendable_pre) / kMojosPerXch,
+                             config_.strategy.fee_reserve_xch,
+                             all_offers.size(),
+                             kMinOfferAgeBlocks);
+                xch_buy_only_mode = true;
+            } else {
             spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
-                         "< reserve {:.4f} XCH with {} pending offers "
-                         "-- cancelling oldest to free locked UTXOs",
+                         "< reserve {:.4f} XCH with {} stale offers "
+                         "(of {} total) -- cancelling oldest to free "
+                         "locked UTXOs",
                          static_cast<double>(xch_spendable_pre) / kMojosPerXch,
                          config_.strategy.fee_reserve_xch,
+                         stale_offers.size(),
                          all_offers.size());
             constexpr int kMaxLiberate = 3;
             int liberated = 0;
-            for (const auto& po : all_offers) {
+            for (const auto& po : stale_offers) {
                 if (liberated >= kMaxLiberate) break;
                 bool ok = co_await offer_mgr_->emergency_cancel(
                     po.offer_id, "utxo_liberation",
@@ -3524,6 +3554,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 liberation_cooldown_ = 5;
                 xch_buy_only_mode = true;
             }
+            } // end else (stale offers exist)
             } // end else (non-empty offers)
         }
 
