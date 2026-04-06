@@ -348,11 +348,23 @@ class MainWindow(QMainWindow):
         spreads = [v.get("spread_bps", 0.0) for v in market_data.values() if v]
         avg_spread = sum(spreads) / len(spreads) if spreads else 0.0
 
+        # Derive XCH/USD rate from the XCH/wUSDC.b mid-price.
+        # Prometheus xop_market_mid_price is in wUSDC mojos;
+        # 1000 wUSDC mojos = 1 wUSDC token = $1 USD.
+        xch_usd = 0.0
+        for pair_key in ("XCH/wUSDC.b", "XCH/wUSDC"):
+            pair_md = market_data.get(pair_key, {})
+            mid = pair_md.get("mid_price", 0.0)
+            if mid > 0:
+                xch_usd = mid / 1000.0
+                break
+
         self._status_bar.update_metrics(
             pnl_mojos=pnl_total,
             spread_bps=avg_spread,
             inventory_ratio=0.5,
             block_height=block_height,
+            xch_usd_rate=xch_usd,
         )
         self._block_label.setText(f"Block: {block_height:,}")
 
@@ -383,7 +395,7 @@ class MainWindow(QMainWindow):
                     "spark": mojos_to_xch_float(int(data.get("fees_paid_24h", 0))),
                 },
             }
-            dashboard.update_metrics(card_data)
+            dashboard.update_metrics(card_data, xch_usd_rate=xch_usd)
             if hasattr(dashboard, "update_bot_status"):
                 status = data.get("bot_status", "Unknown")
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}

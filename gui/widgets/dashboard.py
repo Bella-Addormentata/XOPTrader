@@ -150,6 +150,16 @@ class MetricCard(QFrame):
         )
         root.addWidget(self._sparkline)
 
+        # USD equivalent label (shown below sparkline for monetary cards)
+        self._usd_label = QLabel("")
+        self._usd_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY};"
+            f"font-family: {_MONO_FAMILY};"
+            f"font-size: 12px;"
+        )
+        self._usd_label.setVisible(False)
+        root.addWidget(self._usd_label)
+
         # Annotation label (e.g. "No trades yet", "Stale data")
         self._annotation_label = QLabel("")
         self._annotation_label.setStyleSheet(
@@ -213,6 +223,23 @@ class MetricCard(QFrame):
         if len(self._spark_data) > _SPARKLINE_MAX_POINTS:
             self._spark_data = self._spark_data[-_SPARKLINE_MAX_POINTS:]
         self._spark_curve.setData(self._spark_data)
+
+    def set_usd_value(self, usd: float, signed: bool = True) -> None:
+        """Show a secondary USD equivalent below the sparkline.
+
+        Parameters
+        ----------
+        usd:
+            Dollar value to display.
+        signed:
+            If True, prefix with +/- sign.
+        """
+        if signed:
+            text = f"\u2248 ${usd:+,.2f} USD"
+        else:
+            text = f"\u2248 ${usd:,.2f} USD"
+        self._usd_label.setText(text)
+        self._usd_label.setVisible(True)
 
     def set_annotation(self, text: str) -> None:
         """Set or clear the annotation text below the sparkline.
@@ -649,7 +676,11 @@ class DashboardWidget(QWidget):
     # Public update API
     # =====================================================================
 
-    def update_metrics(self, metrics: dict[str, Any]) -> None:
+    def update_metrics(
+        self,
+        metrics: dict[str, Any],
+        xch_usd_rate: float = 0.0,
+    ) -> None:
         """Refresh all metric cards from a flat dictionary.
 
         Expected keys mirror the card titles::
@@ -668,6 +699,9 @@ class DashboardWidget(QWidget):
         metrics:
             Mapping of card title to a dict with ``"value"``, optional
             ``"change_pct"``, and optional ``"spark"`` entries.
+        xch_usd_rate:
+            Current XCH price in USD for conversion display.  When > 0 the
+            cards show a secondary USD equivalent line.
         """
         fill_count = 0
         fill_data = metrics.get("24h Fill Count")
@@ -683,8 +717,14 @@ class DashboardWidget(QWidget):
             # Fill Count is always shown as an integer
             if "Fill Count" in name:
                 card.set_value(value, fmt="{:,.0f}")
+            elif "Fee" in name:
+                card.set_value(value, fmt="{:,.4f} XCH")
+                if xch_usd_rate > 0:
+                    card.set_usd_value(value * xch_usd_rate, signed=False)
             else:
-                card.set_value(value)
+                card.set_value(value, fmt="{:+,.4f} XCH")
+                if xch_usd_rate > 0:
+                    card.set_usd_value(value * xch_usd_rate)
 
             if "change_pct" in data:
                 card.set_change(data["change_pct"])
@@ -789,7 +829,11 @@ class DashboardWidget(QWidget):
             container, _, _ = _make_dot_label(p.get("name", "?"), colour)
             self._pairs_status_container.addWidget(container)
 
-    def update_pairs_table(self, pairs_data: list[dict[str, Any]]) -> None:
+    def update_pairs_table(
+        self,
+        pairs_data: list[dict[str, Any]],
+        xch_usd_rate: float = 0.0,
+    ) -> None:
         """Refresh the per-pair summary table.
 
         Parameters
@@ -798,6 +842,9 @@ class DashboardWidget(QWidget):
             Each dict must contain keys matching the table header:
             ``"pair"``, ``"mid_price"``, ``"spread_bps"``, ``"inventory"``,
             ``"bid"``, ``"ask"``, ``"fills_24h"``, ``"pnl"``.
+        xch_usd_rate:
+            Current XCH price in USD.  When > 0 the PnL column includes a
+            USD equivalent.
         """
         # Temporarily disable sorting while updating to avoid index conflicts
         self._pairs_table.setSortingEnabled(False)
@@ -812,8 +859,13 @@ class DashboardWidget(QWidget):
                 (f"{data.get('bid', 0):.6f}",       ""),
                 (f"{data.get('ask', 0):.6f}",       ""),
                 (f"{data.get('fills_24h', 0):,}",   ""),
-                (f"{data.get('pnl', 0):+,.2f}",     ""),
             ]
+            # PnL column: append USD equivalent when rate is available
+            pnl_val = data.get('pnl', 0)
+            pnl_text = f"{pnl_val:+,.4f} XCH"
+            if xch_usd_rate > 0:
+                pnl_text += f" (${pnl_val * xch_usd_rate:+,.2f})"
+            values.append((pnl_text, ""))
 
             for col, (text, _) in enumerate(values):
                 item = QTableWidgetItem(text)

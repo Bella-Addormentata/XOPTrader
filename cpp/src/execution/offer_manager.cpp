@@ -139,8 +139,8 @@ asio::awaitable<int> OfferManager::post_quotes(
 
         // -- XCH fee reserve pre-check (batch mode) ------------------------
         // Verify XCH spendable >= fee_reserve_xch before posting.
-        // Exception: buy-XCH sides are exempt (bid on XCH-base pair,
-        // ask on XCH-quote pair) to allow recovery from starvation.
+        // ALL offers lock XCH UTXOs for on-chain fees, even buy-XCH
+        // offers.  No exemptions -- UTXO locking is direction-agnostic.
         bool reserve_breached = false;
         const bool bids_buy_xch = (pair.base_asset_id == "xch");
         const bool asks_buy_xch = (pair.quote_asset_id == "xch");
@@ -156,7 +156,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                 if (xch_spendable < reserve_mojos) {
                     logger_->warn(
                         "XCH fee reserve pre-check (batch): spendable "
-                        "{:.6f} XCH < reserve {:.3f} XCH before {} bids "
+                        "{:.6f} XCH < reserve {:.3f} XCH before {} "
                         "-- skipping all offers",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
                         strategy_cfg_.fee_reserve_xch, pair.name);
@@ -168,13 +168,13 @@ asio::awaitable<int> OfferManager::post_quotes(
             }
         }
 
-        if (!bids.empty() && (!reserve_breached || bids_buy_xch)) {
+        if (!bids.empty() && !reserve_breached) {
             bid_count = co_await post_merged_side(pair, bids, block_height);
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
         // Check XCH spendable balance after bids; skip asks if below reserve.
-        // Exception: asks that buy XCH (on XCH-quote pairs) are exempt.
+        // No buy-XCH exemption: UTXO locking is direction-agnostic.
         if (bid_count > 0 && !asks.empty()
             && strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
@@ -200,7 +200,7 @@ asio::awaitable<int> OfferManager::post_quotes(
             }
         }
 
-        if (!asks.empty() && (!reserve_breached || asks_buy_xch)) {
+        if (!asks.empty() && !reserve_breached) {
             ask_count = co_await post_merged_side(pair, asks, block_height);
         }
 
@@ -312,12 +312,11 @@ asio::awaitable<int> OfferManager::post_quotes(
         // prevents the last UTXO from being locked when the balance is
         // already at the reserve threshold.
         //
-        // Exception: offers that BUY XCH are exempt -- executing them will
-        // increase XCH balance and help recover from capital starvation.
-        const bool tier_buys_xch =
-            (pair.base_asset_id == "xch" && tier.side == Side::Bid) ||
-            (pair.quote_asset_id == "xch" && tier.side == Side::Ask);
-        if (strategy_cfg_.fee_reserve_xch > 0.0 && !tier_buys_xch) {
+        // ALL offers lock XCH UTXOs for on-chain fees, even offers that
+        // buy XCH.  The buy-XCH exemption was incorrect: while filling
+        // the offer would increase XCH, creating it still drains spendable
+        // XCH via UTXO locking.
+        if (strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
@@ -436,10 +435,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
-        // the configured reserve.
-        // Exception: buy-XCH tiers are exempt (they help recover from
-        // capital starvation).
-        if (strategy_cfg_.fee_reserve_xch > 0.0 && !tier_buys_xch) {
+        // the configured reserve.  Applies to ALL offers including
+        // buy-XCH tiers, since UTXO locking is direction-agnostic.
+        if (strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;

@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.6] — 2026-04-05
+
+### Fixed
+
+- **Fee reserve enforcement for buy-XCH offers**: Removed the `tier_buys_xch` exemption that allowed buy-XCH offers to bypass spendable balance checks. All offers lock XCH UTXOs at creation time regardless of trade direction; 4 guard locations in offer_manager.cpp now enforce the reserve uniformly
+- **Hard minimum spendable floor in xch_buy_only mode**: Engine Step 8 now checks `fee_min_spendable_xch` (0.01 XCH) before creating any offer in recovery mode, preventing the last dust UTXO from being locked
+- **`xch_spendable_pre` scope**: Moved declaration to outer scope so it is accessible in the pair loop
+
+### Added
+
+- **Startup singleton enforcement**: New `kill_old_instances()` in main.cpp terminates any previously-running `xop_trader` processes before the engine starts, preventing port conflicts and double-posting. Uses `CreateToolhelp32Snapshot` on Windows, `/proc` enumeration on Linux
+- **XCH currency symbols on dashboard**: Metric cards and per-pair PnL column now display XCH symbols
+- **USD conversion on dashboard**: Live XCH/USD rate derived from XCH/wUSDC.b mid-price; PnL and fee cards show approximate USD equivalent
+
 ## [0.6.5] — 2026-04-05
 
 ### Added

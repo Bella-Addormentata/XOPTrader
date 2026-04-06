@@ -37,12 +37,26 @@
 #include "xop/version.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <filesystem>
 #include <iostream>
 #include <optional>
 #include <string>
+#include <thread>
+#include <vector>
+
+#ifdef _WIN32
+#  define WIN32_LEAN_AND_MEAN
+#  include <windows.h>
+#  include <tlhelp32.h>
+#else
+#  include <dirent.h>
+#  include <signal.h>
+#  include <unistd.h>
+#  include <fstream>
+#endif
 
 // Third-party
 #include <boost/program_options.hpp>
@@ -53,6 +67,147 @@
 
 namespace po = boost::program_options;
 namespace fs = std::filesystem;
+
+// =============================================================================
+// Singleton enforcement: kill old xop_trader instances on startup.
+//
+// When deploying a new binary, the old process may still be running and
+// holding the Prometheus port, wallet RPC connections, and pending offers.
+// This function finds all other processes named "xop_trader" (or
+// "xop_trader.exe" on Windows), terminates them, and waits for cleanup
+// so the new instance can bind its ports cleanly.
+// =============================================================================
+
+#ifdef _WIN32
+
+static void kill_old_instances() {
+    const DWORD current_pid = GetCurrentProcessId();
+
+    HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        spdlog::warn("[Startup] Failed to create process snapshot (err={})",
+                     GetLastError());
+        return;
+    }
+
+    PROCESSENTRY32W pe{};
+    pe.dwSize = sizeof(pe);
+
+    std::vector<DWORD> old_pids;
+
+    if (Process32FirstW(snapshot, &pe)) {
+        do {
+            if (pe.th32ProcessID != current_pid &&
+                _wcsicmp(pe.szExeFile, L"xop_trader.exe") == 0) {
+                old_pids.push_back(pe.th32ProcessID);
+            }
+        } while (Process32NextW(snapshot, &pe));
+    }
+    CloseHandle(snapshot);
+
+    if (old_pids.empty()) {
+        spdlog::info("[Startup] No old xop_trader instances found");
+        return;
+    }
+
+    for (const DWORD pid : old_pids) {
+        HANDLE proc = OpenProcess(
+            PROCESS_TERMINATE | SYNCHRONIZE, FALSE, pid);
+        if (proc == nullptr) {
+            spdlog::warn("[Startup] Cannot open PID {} (err={}) -- skipping",
+                         pid, GetLastError());
+            continue;
+        }
+        spdlog::info("[Startup] Terminating old xop_trader instance (PID {})",
+                     pid);
+        if (TerminateProcess(proc, 1)) {
+            // Wait up to 10 s for the process to exit and release its
+            // resources (Prometheus port, wallet RPC handles, etc.).
+            WaitForSingleObject(proc, 10000);
+        } else {
+            spdlog::warn("[Startup] TerminateProcess failed for PID {} "
+                         "(err={})", pid, GetLastError());
+        }
+        CloseHandle(proc);
+    }
+
+    spdlog::info("[Startup] Terminated {} old instance(s) -- waiting for "
+                 "port release", old_pids.size());
+    // Brief pause for the OS to fully release bound sockets.
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+}
+
+#else  // POSIX (Linux / macOS)
+
+static void kill_old_instances() {
+    const pid_t current_pid = getpid();
+    std::vector<pid_t> old_pids;
+
+    DIR* proc_dir = opendir("/proc");
+    if (proc_dir == nullptr) {
+        spdlog::warn("[Startup] Cannot open /proc -- skipping old instance "
+                     "check");
+        return;
+    }
+
+    while (struct dirent* entry = readdir(proc_dir)) {
+        // Only numeric directory names are PIDs.
+        char* endptr = nullptr;
+        const long pid_long = std::strtol(entry->d_name, &endptr, 10);
+        if (*endptr != '\0' || pid_long <= 0) continue;
+        const pid_t pid = static_cast<pid_t>(pid_long);
+        if (pid == current_pid) continue;
+
+        // Read /proc/<pid>/comm to get the process name.
+        const std::string comm_path =
+            "/proc/" + std::string(entry->d_name) + "/comm";
+        std::ifstream comm_file(comm_path);
+        if (!comm_file.is_open()) continue;
+
+        std::string name;
+        std::getline(comm_file, name);
+        if (name == "xop_trader") {
+            old_pids.push_back(pid);
+        }
+    }
+    closedir(proc_dir);
+
+    if (old_pids.empty()) {
+        spdlog::info("[Startup] No old xop_trader instances found");
+        return;
+    }
+
+    for (const pid_t pid : old_pids) {
+        spdlog::info("[Startup] Sending SIGTERM to old xop_trader "
+                     "(PID {})", pid);
+        kill(pid, SIGTERM);
+    }
+
+    // Wait up to 10 s for graceful shutdown.
+    for (int i = 0; i < 20; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+        bool any_alive = false;
+        for (const pid_t pid : old_pids) {
+            if (kill(pid, 0) == 0) { any_alive = true; break; }
+        }
+        if (!any_alive) break;
+    }
+
+    // Force-kill survivors.
+    for (const pid_t pid : old_pids) {
+        if (kill(pid, 0) == 0) {
+            spdlog::warn("[Startup] PID {} did not exit gracefully -- "
+                         "sending SIGKILL", pid);
+            kill(pid, SIGKILL);
+        }
+    }
+
+    spdlog::info("[Startup] Terminated {} old instance(s) -- waiting for "
+                 "port release", old_pids.size());
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+}
+
+#endif  // _WIN32
 
 // =============================================================================
 // Global engine pointer for signal handler access.
@@ -220,7 +375,23 @@ int main(int argc, char* argv[]) {
         return EXIT_FAILURE;
     }
 
-    spdlog::info("XOPTrader v{} starting", XOP_VERSION);
+    spdlog::info("XOPTrader v{} starting (PID {})", XOP_VERSION,
+#ifdef _WIN32
+                 GetCurrentProcessId()
+#else
+                 getpid()
+#endif
+    );
+
+    // ------------------------------------------------------------------
+    // 3a. Kill any old xop_trader instances still running.
+    //
+    //     This ensures only one engine is active at a time -- prevents
+    //     double-posting offers, port conflicts on the Prometheus
+    //     exporter, and wallet RPC contention.
+    // ------------------------------------------------------------------
+    kill_old_instances();
+
     if (cli.dry_run) {
         spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
     }

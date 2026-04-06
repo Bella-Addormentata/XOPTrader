@@ -156,6 +156,7 @@ class StatusBar(QStatusBar):
         spread_bps: float,
         inventory_ratio: float,
         block_height: int,
+        xch_usd_rate: float = 0.0,
     ) -> None:
         """Push a new set of live metrics into the status bar.
 
@@ -169,12 +170,19 @@ class StatusBar(QStatusBar):
             Inventory ratio in [0.0, 1.0] (0 = fully base, 1 = fully quote).
         block_height : int
             Latest known blockchain block height.
+        xch_usd_rate : float
+            Current XCH price in USD.  When > 0 a parenthesised USD
+            equivalent is appended to the PnL readout.
         """
         # PnL -- colour-coded
         xch_value: float = mojos_to_xch_float(pnl_mojos)
         colour = PROFIT_GREEN if pnl_mojos >= 0 else LOSS_RED
         sign = "+" if pnl_mojos > 0 else ""
-        self._pnl_label.setText(f"PnL: {sign}{xch_value:.4f} XCH")
+        pnl_text = f"PnL: {sign}{xch_value:.4f} XCH"
+        if xch_usd_rate > 0:
+            usd_value = xch_value * xch_usd_rate
+            pnl_text += f" (${usd_value:+,.2f})"
+        self._pnl_label.setText(pnl_text)
         self._pnl_label.setStyleSheet(f"color: {colour}; font-weight: bold; font-size: 13px;")
 
         # Spread
