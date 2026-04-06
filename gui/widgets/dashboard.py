@@ -952,10 +952,13 @@ class DashboardWidget(QWidget):
             else:
                 color = "#44ff44"
 
+            wallet_type = int(bal.get("wallet_type", 0))
+            fmt = ",.6f" if wallet_type == 0 else ",.3f"
+
             detail = (
                 f"<span style='color:{color}'><b>{wallet}</b></span>: "
-                f"spendable={spendable:,.0f}  confirmed={confirmed:,.0f}  "
-                f"pending={pending:,.0f}  Reserve: {res_pct:.0f}%"
+                f"spendable={spendable:{fmt}}  confirmed={confirmed:{fmt}}  "
+                f"pending={pending:{fmt}}  Reserve: {res_pct:.0f}%"
             )
             lines.append(detail)
 

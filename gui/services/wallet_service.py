@@ -194,9 +194,12 @@ class WalletService(QObject):
 
         if result:
             with QMutexLocker(self._mutex):
-                self._cached = result
+                # Merge new data into cache rather than replacing it.
+                # This prevents a single timed-out wallet RPC from
+                # erasing previously-fetched wallets from the display.
+                self._cached.update(result)
 
-        return result
+        return self._get_cached()
 
     def _get_cached(self) -> dict[str, dict[str, float]]:
         """Return the last successful balance snapshot."""
