@@ -4166,8 +4166,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         // [T1-03] co_await post_quotes directly instead of use_future.
+        // In xch_buy_only_mode, pass fee_min_spendable_xch as the reserve
+        // override so the offer_manager uses the lower threshold for
+        // recovery offers (the engine already validated the hard floor).
+        const double fee_override = xch_buy_only_mode
+            ? config_.strategy.fee_min_spendable_xch
+            : 0.0;
         int posted = co_await offer_mgr_->post_quotes(
-            *pair_cfg, fee_filtered_tiers, block_height);
+            *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
         // T4-03: Record posting fees in the tracker.
         if (fee_tracker_->enabled() && posted > 0) {

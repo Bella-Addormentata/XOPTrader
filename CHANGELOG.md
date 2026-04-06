@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.7] — 2026-04-05
+
+### Fixed
+
+- **Fee reserve recovery deadlock**: The v0.6.6 fee reserve fix blocked the engine's `xch_buy_only_mode` recovery path — the offer_manager's independent pre-check used the full 1.0 XCH threshold, overriding the engine's lower 0.01 XCH floor for recovery offers. Added `fee_reserve_override` parameter to `post_quotes()` so the engine can pass the recovery threshold when in `xch_buy_only_mode`, breaking the deadlock cycle
+
 ## [0.6.6] — 2026-04-05
 
 ### Fixed

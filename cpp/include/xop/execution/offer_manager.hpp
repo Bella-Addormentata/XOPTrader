@@ -233,7 +233,8 @@ public:
     asio::awaitable<int> post_quotes(
         const PairConfig&           pair,
         const std::vector<TierQuote>& quotes,
-        BlockHeight                 block_height);
+        BlockHeight                 block_height,
+        double                      fee_reserve_override = 0.0);
 
     // -- Fill detection -----------------------------------------------------
 

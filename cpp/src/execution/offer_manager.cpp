@@ -107,8 +107,14 @@ OfferManager::OfferManager(asio::io_context&                    /*ioc*/,
 asio::awaitable<int> OfferManager::post_quotes(
     const PairConfig&              pair,
     const std::vector<TierQuote>&  quotes,
-    BlockHeight                    block_height)
+    BlockHeight                    block_height,
+    double                         fee_reserve_override)
 {
+    // If the caller supplied a positive override (e.g. engine recovery
+    // mode), use that instead of the configured fee_reserve_xch.
+    const double effective_reserve = (fee_reserve_override > 0.0)
+        ? fee_reserve_override
+        : strategy_cfg_.fee_reserve_xch;
     // Lazy-init the wallet-ID cache on first call.
     if (!wallet_ids_resolved_) {
         co_await init_wallet_id_map();
@@ -144,14 +150,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         bool reserve_breached = false;
         const bool bids_buy_xch = (pair.base_asset_id == "xch");
         const bool asks_buy_xch = (pair.quote_asset_id == "xch");
-        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+        if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
                 const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    strategy_cfg_.fee_reserve_xch
+                    effective_reserve
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < reserve_mojos) {
                     logger_->warn(
@@ -159,7 +165,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                         "{:.6f} XCH < reserve {:.3f} XCH before {} "
                         "-- skipping all offers",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        strategy_cfg_.fee_reserve_xch, pair.name);
+                        effective_reserve, pair.name);
                     reserve_breached = true;
                 }
             } catch (const std::exception& e) {
@@ -176,14 +182,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Check XCH spendable balance after bids; skip asks if below reserve.
         // No buy-XCH exemption: UTXO locking is direction-agnostic.
         if (bid_count > 0 && !asks.empty()
-            && strategy_cfg_.fee_reserve_xch > 0.0) {
+            && effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
                 const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    strategy_cfg_.fee_reserve_xch
+                    effective_reserve
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < reserve_mojos) {
                     logger_->warn(
@@ -191,7 +197,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                         "< reserve {:.3f} XCH after posting {} bids "
                         "-- skipping ask batch",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        strategy_cfg_.fee_reserve_xch, pair.name);
+                        effective_reserve, pair.name);
                     reserve_breached = true;
                 }
             } catch (const std::exception& e) {
@@ -316,14 +322,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         // buy XCH.  The buy-XCH exemption was incorrect: while filling
         // the offer would increase XCH, creating it still drains spendable
         // XCH via UTXO locking.
-        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+        if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
                 const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    strategy_cfg_.fee_reserve_xch
+                    effective_reserve
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < reserve_mojos) {
                     logger_->warn(
@@ -331,7 +337,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                         "< reserve {:.3f} XCH before {} {} tier {} "
                         "-- stopping all offers",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        strategy_cfg_.fee_reserve_xch,
+                        effective_reserve,
                         pair.name, to_string(tier.side), tier.tier_index);
                     bid_funds_exhausted = true;
                     ask_funds_exhausted = true;
@@ -437,14 +443,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         // wallet spendable balance after each creation and stop if below
         // the configured reserve.  Applies to ALL offers including
         // buy-XCH tiers, since UTXO locking is direction-agnostic.
-        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+        if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
                 const auto reserve_mojos = static_cast<Mojo>(std::llround(
-                    strategy_cfg_.fee_reserve_xch
+                    effective_reserve
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < reserve_mojos) {
                     logger_->warn(
@@ -452,7 +458,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                         "< reserve {:.3f} XCH after posting {} {} tier {} "
                         "-- stopping further offers this heartbeat",
                         static_cast<double>(xch_spendable) / kMojosPerXch,
-                        strategy_cfg_.fee_reserve_xch,
+                        effective_reserve,
                         pair.name, to_string(tier.side), tier.tier_index);
                     bid_funds_exhausted = true;
                     ask_funds_exhausted = true;
