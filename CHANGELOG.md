@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.5] — 2026-04-06
+
+### Fixed
+
+- **Both-sides-suppressed churn fix**: When both bid and ask sides are suppressed (e.g. BYC balance is 0 and XCH spendable ratio is low after UTXO locking), the engine no longer cancels *all* pending offers. Fresh offers (recently created) are now kept live to avoid wasting creation fees and triggering a create→suppress→cancel→create churn cycle. Only stale/expired offers are cancelled to free locked capital
+
 ## [0.7.4] — 2026-04-06
 
 ### Fixed

@@ -4029,28 +4029,40 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // (counter reset moved to after the pair loop)
             if (pending_block) continue;
             if (!can_bid && !can_ask) {
-                // Both sides suppressed Ã¢â‚¬â€ cancel any remaining tracked
-                // offers for this pair to free locked UTXOs / capital.
-                // Without this, offers continue locking coins while no
-                // new posting can occur, creating a deadlock.
+                // Both sides suppressed -- cancel STALE/EXPIRED offers
+                // for this pair to free locked UTXOs / capital.
+                // IMPORTANT: do NOT cancel Fresh offers.  Creating an
+                // offer locks XCH UTXOs, which can drop the spendable
+                // reserve ratio below the threshold on the very next
+                // heartbeat.  Cancelling them would waste the creation
+                // fee and start a create->suppress->cancel->create churn
+                // cycle.  Fresh offers will naturally expire via TTL.
                 if (has_pending) {
-                    std::vector<std::string> all_ids;
-                    all_ids.reserve(tier_classes.size());
+                    std::vector<std::string> stale_ids;
                     for (const auto& tc : tier_classes) {
-                        all_ids.push_back(tc.offer_id);
+                        if (tc.staleness != execution::TierStaleness::Fresh)
+                            stale_ids.push_back(tc.offer_id);
                     }
-                    auto freed = co_await offer_mgr_->selective_cancel(all_ids);
-                    if (!freed.empty()) {
-                        spdlog::info("[Engine] Step 8: {} both sides suppressed "
-                                     "-- cancelled {} offers to free locked "
-                                     "capital", pair_name, freed.size());
-                        for (const auto& oid : freed) {
-                            try {
-                                db_->update_offer_status(oid, "cancelled",
-                                                        block_height,
-                                                        "suppressed_capital_free");
-                            } catch (...) {}
+                    if (!stale_ids.empty()) {
+                        auto freed = co_await offer_mgr_->selective_cancel(stale_ids);
+                        if (!freed.empty()) {
+                            spdlog::info("[Engine] Step 8: {} both sides suppressed "
+                                         "-- cancelled {} stale offers to free "
+                                         "locked capital ({} fresh kept live)",
+                                         pair_name, freed.size(), fresh_count);
+                            for (const auto& oid : freed) {
+                                try {
+                                    db_->update_offer_status(oid, "cancelled",
+                                                            block_height,
+                                                            "suppressed_capital_free");
+                                } catch (...) {}
+                            }
                         }
+                    } else {
+                        spdlog::info("[Engine] Step 8: {} both sides suppressed "
+                                     "but all {} offers are fresh -- keeping "
+                                     "live to prevent churn", pair_name,
+                                     fresh_count);
                     }
                 }
                 spdlog::info("[Engine] Step 8: {} both sides suppressed -- "
