@@ -91,6 +91,19 @@ CREATE TABLE IF NOT EXISTS snapshots (
 );
 )SQL";
 
+constexpr const char* kCreateStrategyQuotes = R"SQL(
+CREATE TABLE IF NOT EXISTS strategy_quotes (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_height    INTEGER NOT NULL,
+    pair_name       TEXT    NOT NULL,
+    tier            INTEGER NOT NULL,
+    side            TEXT    NOT NULL CHECK(side IN ('bid','ask')),
+    price_mojos     INTEGER NOT NULL,
+    size_mojos      INTEGER NOT NULL,
+    created_at      TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
 // -- Index DDL ----------------------------------------------------------------
 
 constexpr const char* kIndexTradeTimestamp = R"SQL(
@@ -116,6 +129,11 @@ CREATE INDEX IF NOT EXISTS idx_offer_log_pair
 constexpr const char* kIndexSnapshotPairBlock = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_snapshots_pair_block
     ON snapshots(pair_name, block_height DESC);
+)SQL";
+
+constexpr const char* kIndexStrategyQuotesPairBlock = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_strategy_quotes_pair_block
+    ON strategy_quotes(pair_name, block_height DESC);
 )SQL";
 
 // -- DML (INSERT / UPDATE / SELECT) -------------------------------------------
@@ -167,13 +185,25 @@ WHERE offer_id = ?;
 constexpr const char* kInsertSnapshot = R"SQL(
 INSERT INTO snapshots
     (block_height, pair_name, mid_price_mojos, spread_bps,
-     inventory_ratio, sigma_block, regime, pnl_total_mojos)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?);
+     inventory_ratio, sigma_block, regime, pnl_total_mojos,
+     reservation_price_mojos, half_spread_bps, kappa,
+     variance_ratio, adverse_rate, s_adverse_bps,
+     s_inventory_bps, s_cost_bps)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+)SQL";
+
+constexpr const char* kInsertStrategyQuote = R"SQL(
+INSERT INTO strategy_quotes
+    (block_height, pair_name, tier, side, price_mojos, size_mojos)
+VALUES (?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kLastSnapshot = R"SQL(
 SELECT block_height, pair_name, mid_price_mojos, spread_bps,
-       inventory_ratio, sigma_block, regime, pnl_total_mojos
+       inventory_ratio, sigma_block, regime, pnl_total_mojos,
+       reservation_price_mojos, half_spread_bps, kappa,
+       variance_ratio, adverse_rate, s_adverse_bps,
+       s_inventory_bps, s_cost_bps
 FROM snapshots
 WHERE pair_name = ?
 ORDER BY block_height DESC
@@ -249,6 +279,7 @@ Database::Database(const std::string& db_path)
     stmt_snapshot_count_     = prepare(kSnapshotCount);
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
     stmt_tier_fill_rates_    = prepare(kTierFillRates);
+    stmt_insert_strategy_quote_ = prepare(kInsertStrategyQuote);
 
     // [T8-20] Transaction control prepared statements.
     stmt_begin_    = prepare("BEGIN TRANSACTION");
@@ -274,6 +305,7 @@ Database::~Database()
     finalize(stmt_snapshot_count_);
     finalize(stmt_fill_rate_);
     finalize(stmt_tier_fill_rates_);
+    finalize(stmt_insert_strategy_quote_);
     finalize(stmt_begin_);
     finalize(stmt_commit_);
     finalize(stmt_rollback_);
@@ -457,6 +489,14 @@ void Database::insert_snapshot(const DbSnapshot& s)
     bind_double(stmt_insert_snapshot_, 6, s.sigma_block);
     bind_text  (stmt_insert_snapshot_, 7, s.regime);
     bind_int64 (stmt_insert_snapshot_, 8, s.pnl_total_mojos);
+    bind_int64 (stmt_insert_snapshot_, 9, s.reservation_price_mojos);
+    bind_double(stmt_insert_snapshot_, 10, s.half_spread_bps);
+    bind_double(stmt_insert_snapshot_, 11, s.kappa);
+    bind_double(stmt_insert_snapshot_, 12, s.variance_ratio);
+    bind_double(stmt_insert_snapshot_, 13, s.adverse_rate);
+    bind_double(stmt_insert_snapshot_, 14, s.s_adverse_bps);
+    bind_double(stmt_insert_snapshot_, 15, s.s_inventory_bps);
+    bind_double(stmt_insert_snapshot_, 16, s.s_cost_bps);
 
     step_and_reset(stmt_insert_snapshot_);
 }
@@ -483,6 +523,14 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
             bind_double(stmt_insert_snapshot_, 6, s.sigma_block);
             bind_text  (stmt_insert_snapshot_, 7, s.regime);
             bind_int64 (stmt_insert_snapshot_, 8, s.pnl_total_mojos);
+            bind_int64 (stmt_insert_snapshot_, 9, s.reservation_price_mojos);
+            bind_double(stmt_insert_snapshot_, 10, s.half_spread_bps);
+            bind_double(stmt_insert_snapshot_, 11, s.kappa);
+            bind_double(stmt_insert_snapshot_, 12, s.variance_ratio);
+            bind_double(stmt_insert_snapshot_, 13, s.adverse_rate);
+            bind_double(stmt_insert_snapshot_, 14, s.s_adverse_bps);
+            bind_double(stmt_insert_snapshot_, 15, s.s_inventory_bps);
+            bind_double(stmt_insert_snapshot_, 16, s.s_cost_bps);
             step_and_reset(stmt_insert_snapshot_);
         }
     } catch (...) {
@@ -496,6 +544,37 @@ void Database::insert_snapshots_batch(const std::vector<DbSnapshot>& batch)
     step_and_reset(stmt_commit_);
 
     spdlog::debug("[Database] Batch-inserted {} snapshots", batch.size());
+}
+
+void Database::insert_strategy_quotes_batch(const std::vector<DbStrategyQuote>& batch)
+{
+    if (batch.empty()) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    step_and_reset(stmt_begin_);
+
+    try {
+        for (const auto& q : batch) {
+            bind_int64(stmt_insert_strategy_quote_, 1, static_cast<std::int64_t>(q.block_height));
+            bind_text (stmt_insert_strategy_quote_, 2, q.pair_name);
+            bind_int64(stmt_insert_strategy_quote_, 3, static_cast<std::int64_t>(q.tier));
+            bind_text (stmt_insert_strategy_quote_, 4, q.side);
+            bind_int64(stmt_insert_strategy_quote_, 5, q.price_mojos);
+            bind_int64(stmt_insert_strategy_quote_, 6, q.size_mojos);
+            step_and_reset(stmt_insert_strategy_quote_);
+        }
+    } catch (...) {
+        sqlite3_reset(stmt_rollback_);
+        sqlite3_step(stmt_rollback_);
+        sqlite3_reset(stmt_rollback_);
+        throw;
+    }
+
+    step_and_reset(stmt_commit_);
+
+    spdlog::debug("[Database] Batch-inserted {} strategy quotes", batch.size());
 }
 
 std::optional<DbSnapshot> Database::get_last_snapshot(
@@ -524,6 +603,17 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
         }
 
         s.pnl_total_mojos = sqlite3_column_int64(stmt_last_snapshot_, 7);
+
+        // Phase 2 strategy decision fields (columns 8-15).
+        s.reservation_price_mojos = sqlite3_column_int64(stmt_last_snapshot_, 8);
+        s.half_spread_bps  = sqlite3_column_double(stmt_last_snapshot_, 9);
+        s.kappa            = sqlite3_column_double(stmt_last_snapshot_, 10);
+        s.variance_ratio   = sqlite3_column_double(stmt_last_snapshot_, 11);
+        s.adverse_rate     = sqlite3_column_double(stmt_last_snapshot_, 12);
+        s.s_adverse_bps    = sqlite3_column_double(stmt_last_snapshot_, 13);
+        s.s_inventory_bps  = sqlite3_column_double(stmt_last_snapshot_, 14);
+        s.s_cost_bps       = sqlite3_column_double(stmt_last_snapshot_, 15);
+
         result = std::move(s);
     }
 
@@ -688,11 +778,13 @@ void Database::run_migrations()
         kCreateTradeLog,
         kCreateOfferLog,
         kCreateSnapshots,
+        kCreateStrategyQuotes,
         kIndexTradeTimestamp,
         kIndexTradePair,
         kIndexOfferStatus,
         kIndexOfferPair,
-        kIndexSnapshotPairBlock
+        kIndexSnapshotPairBlock,
+        kIndexStrategyQuotesPairBlock
     };
 
     for (const char* ddl : ddl_statements) {
@@ -717,6 +809,24 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_bid INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_ask INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+
+    // Phase 2: strategy decision parameters on snapshots table.
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN reservation_price_mojos INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN half_spread_bps REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN kappa REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN variance_ratio REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN adverse_rate REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN s_adverse_bps REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN s_inventory_bps REAL DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE snapshots ADD COLUMN s_cost_bps REAL DEFAULT 0;",
                  nullptr, nullptr, nullptr);
 }
 

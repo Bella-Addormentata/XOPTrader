@@ -132,6 +132,11 @@ public:
     /// Remove a pending offer by id.  Returns true if found and removed.
     bool remove_offer(const std::string& offer_id);
 
+    /// Mark a pending offer as cancel_pending.  The offer remains in state
+    /// so that detect_fills() can still match it if the cancel loses the
+    /// on-chain race to a taker.  Returns true if the offer was found.
+    bool mark_cancel_pending(const std::string& offer_id);
+
     /// Get a single pending offer.  Returns nullptr-equivalent (empty
     /// optional) if not found.  Caller receives a copy -- no dangling refs.
     [[nodiscard]] PendingOffer get_offer(const std::string& offer_id) const;

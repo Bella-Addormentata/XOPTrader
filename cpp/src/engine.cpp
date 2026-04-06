@@ -1736,7 +1736,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         tr.side            = (fill.side == Side::Bid) ? "bid" : "ask";
         tr.price_mojos     = fill.price;
         tr.size_mojos      = fill.size;
-        tr.fee_mojos       = 0;  // Fee extraction from wallet response (Phase 2).
+        // [T9-FIX] Retrieve the offer-creation fee from State.
+        // The Chia offer protocol does not surface settlement fees, so the
+        // creation fee (paid to get the offer on-chain) is the best available
+        // approximation.  Returns 0 if the offer was already removed.
+        {
+            auto po = state_->get_offer(fill.offer_id);
+            tr.fee_mojos = po.fee_mojos;
+        }
         tr.block_height    = fill.block_height;
 
         // Look up pair config for this fill's pair (O(1) map lookup).
@@ -1814,7 +1821,13 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
         }
 
-        db_->insert_trade(tr);
+        // [T7-FIX] Removed duplicate db_->insert_trade(tr) here.
+        // PnLTracker::record_fill() (below) is the single writer for
+        // trade_log.  The prior dual-INSERT caused UNIQUE constraint
+        // violations on trade_id, which threw an exception in the
+        // PnLTracker and prevented in-memory PnL accumulators from
+        // being updated.  PnLTracker's INSERT includes all 12 columns
+        // (offer_hash, acquisition_ts) vs Database's 10-column INSERT.
 
         // Record the offer as filled in the offer log.
         db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
@@ -1868,7 +1881,10 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         nhe_total_volume_ += fill_size_d;
 
         // Feed the PnL tracker.
-        pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos);
+        // [T9-FIX] Pass the pre-computed realized_pnl so PnLTracker uses
+        // a single source of truth instead of recomputing independently.
+        pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos,
+                          tr.realized_pnl_mojos);
 
         // [T5-CR3] Notify the strategy that a fill occurred so that the
         // exponential-decay tau resets to tau_max.  Without this call,
@@ -3398,6 +3414,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // zero even though confirmed balance is healthy.  When spendable
     // falls below the fee reserve and we have pending offers, cancel the
     // oldest ones to free locked UTXOs before processing any pair.
+    //
+    // Even when liberation can't restore the reserve, we still allow the
+    // pair loop to run in "XCH-buy-only" mode: only offers that would
+    // acquire XCH (bid on XCH-base pairs, ask on XCH-quote pairs) are
+    // posted.  This prevents capital starvation from becoming permanent.
+    bool xch_buy_only_mode = false;
     if (config_.strategy.fee_reserve_xch > 0.0) {
         bool liberation_needed = false;
         Mojo xch_spendable_pre = 0;
@@ -3423,17 +3445,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             auto all_offers = state_->get_all_offers();
             if (all_offers.empty()) {
                 // Spendable below reserve but no tracked offers to cancel.
-                // UTXOs are locked by offers from previous sessions or
-                // pending cancel transactions.  Skip pair loop to avoid
-                // creating offers that will just get liberated next beat.
+                // Allow pair loop in XCH-buy-only mode so we can post
+                // offers that acquire XCH and recover from starvation.
                 spdlog::info("[Engine] UTXO liberation: spendable {:.6f} XCH "
                              "< reserve {:.4f} XCH with 0 pending offers "
-                             "-- waiting for wallet to confirm cancellations",
+                             "-- entering XCH-buy-only mode",
                              static_cast<double>(xch_spendable_pre) / kMojosPerXch,
                              config_.strategy.fee_reserve_xch);
-                liberation_cooldown_ = 5;
-                co_return;
-            }
+                xch_buy_only_mode = true;
+            } else {
             // Sort oldest first so we cancel stale offers first.
             std::sort(all_offers.begin(), all_offers.end(),
                 [](const PendingOffer& a, const PendingOffer& b) {
@@ -3453,7 +3473,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     po.offer_id, "utxo_liberation",
                     /*prefer_zero_fee=*/true);
                 if (ok) {
-                    state_->remove_offer(po.offer_id);
+                    state_->mark_cancel_pending(po.offer_id);
                     try {
                         db_->update_offer_status(
                             po.offer_id, "cancelled",
@@ -3492,18 +3512,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (liberated > 0 && xch_spendable_pre < reserve_mojos) {
                 spdlog::warn("[Engine] UTXO liberation: cancelled {} "
                              "offer(s) but spendable still {:.6f} XCH "
-                             "< reserve {:.4f} XCH -- skipping pair "
-                             "loop to avoid churn",
+                             "< reserve {:.4f} XCH -- entering "
+                             "XCH-buy-only mode",
                              liberated,
                              static_cast<double>(xch_spendable_pre)
                                  / kMojosPerXch,
                              config_.strategy.fee_reserve_xch);
-                // Don't enter pair loop: creating offers would just
-                // consume fees and get immediately liberated next
-                // heartbeat.  Wait for cancel txns to confirm on-chain.
+                // Still enter pair loop in XCH-buy-only mode so we can
+                // post offers that acquire XCH.  Set cooldown to avoid
+                // churn on non-XCH offers.
                 liberation_cooldown_ = 5;
-                co_return;
+                xch_buy_only_mode = true;
             }
+            } // end else (non-empty offers)
         }
 
         // Post-liberation cooldown: after liberation cancelled offers (or
@@ -3524,11 +3545,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 --liberation_cooldown_;
                 spdlog::info("[Engine] UTXO liberation cooldown: {} "
                              "heartbeats remaining, spendable {:.6f} "
-                             "XCH -- skipping pair loop",
+                             "XCH -- XCH-buy-only mode",
                              liberation_cooldown_,
                              static_cast<double>(xch_spendable_pre)
                                  / kMojosPerXch);
-                co_return;
+                xch_buy_only_mode = true;
             }
         }
     }
@@ -3717,6 +3738,25 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //   side is posted to restore the balance.
         bool can_bid = true;   // need quote to bid (buy base)
         bool can_ask = true;   // need base to ask (sell base)
+
+        // XCH-buy-only mode: when UTXO liberation couldn't restore the
+        // fee reserve, only allow pairs that can acquire XCH, and only
+        // on the side that buys XCH.  Skip non-XCH pairs entirely.
+        if (xch_buy_only_mode) {
+            const PairConfig* buypc = find_pair_config(pair_name);
+            const bool base_is_xch  = buypc && buypc->base_asset_id  == "xch";
+            const bool quote_is_xch = buypc && buypc->quote_asset_id == "xch";
+            if (base_is_xch) {
+                can_ask = false;  // only bid (buy XCH)
+            } else if (quote_is_xch) {
+                can_bid = false;  // only ask (receive XCH)
+            } else {
+                spdlog::debug("[Engine] Step 8: {} skipped -- XCH-buy-only "
+                              "mode (no XCH side)", pair_name);
+                continue;
+            }
+        }
+
         {
             bool pending_block = false;
             const PairConfig* gate_pc = find_pair_config(pair_name);
@@ -3930,6 +3970,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // UTXO locking from draining the reserve across multiple pairs.
         // Previously used fee_min_spendable_xch (0.01), but that was too
         // permissive: pair 2+ could drain the reserve left by pair 1.
+        //
+        // Exception: offers that BUY XCH are always allowed through, since
+        // executing them will increase the XCH balance and help recover
+        // from capital starvation.  For XCH-base pairs, bid buys XCH;
+        // for XCH-quote pairs, ask buys XCH.
         if (config_.strategy.fee_reserve_xch > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
@@ -3940,13 +3985,39 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     config_.strategy.fee_reserve_xch
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < xch_min) {
-                    spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
-                                 "spendable {:.6f} XCH < reserve {:.4f} XCH "
-                                 "-- skipping offer posting",
-                                 pair_name,
-                                 static_cast<double>(xch_spendable) / kMojosPerXch,
-                                 config_.strategy.fee_reserve_xch);
-                    continue;
+                    // Check if this pair can acquire XCH on one side.
+                    const PairConfig* fee_pc = find_pair_config(pair_name);
+                    const bool xch_is_base  = fee_pc && fee_pc->base_asset_id  == "xch";
+                    const bool xch_is_quote = fee_pc && fee_pc->quote_asset_id == "xch";
+
+                    if (xch_is_base) {
+                        // Bid buys base (XCH) — allow bids, suppress asks.
+                        can_ask = false;
+                        spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
+                                     "spendable {:.6f} XCH < reserve {:.4f} XCH "
+                                     "-- allowing buy-XCH (bid) side only",
+                                     pair_name,
+                                     static_cast<double>(xch_spendable) / kMojosPerXch,
+                                     config_.strategy.fee_reserve_xch);
+                    } else if (xch_is_quote) {
+                        // Ask sells base, receives quote (XCH) — allow asks, suppress bids.
+                        can_bid = false;
+                        spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
+                                     "spendable {:.6f} XCH < reserve {:.4f} XCH "
+                                     "-- allowing buy-XCH (ask) side only",
+                                     pair_name,
+                                     static_cast<double>(xch_spendable) / kMojosPerXch,
+                                     config_.strategy.fee_reserve_xch);
+                    } else {
+                        // Neither side acquires XCH — skip entirely.
+                        spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
+                                     "spendable {:.6f} XCH < reserve {:.4f} XCH "
+                                     "-- skipping offer posting",
+                                     pair_name,
+                                     static_cast<double>(xch_spendable) / kMojosPerXch,
+                                     config_.strategy.fee_reserve_xch);
+                        continue;
+                    }
                 }
             } catch (const std::exception& e) {
                 spdlog::warn("[Engine] Step 8: {} XCH fee reserve gate: "
@@ -4628,12 +4699,12 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                          "invalidated locally");
             cancel_ok = true;
 
-            // Also clear the engine's internal state to match.
+            // Also mark all tracked offers as cancel_pending.
             auto tracked = state_->get_all_offers();
             for (const auto& po : tracked) {
-                state_->remove_offer(po.offer_id);
+                state_->mark_cancel_pending(po.offer_id);
             }
-            spdlog::info("[Recovery] Cleared {} offers from engine state",
+            spdlog::info("[Recovery] Marked {} offers as cancel_pending",
                          tracked.size());
         } catch (const std::exception& e) {
             spdlog::error("[Recovery] wallet cancel_offers failed: {} "
@@ -4961,6 +5032,7 @@ void Engine::step_update_pnl(BlockHeight block_height)
 
     // Persist a snapshot for each enabled pair.
     std::vector<DbSnapshot> batch;
+    std::vector<DbStrategyQuote> quote_batch;
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
@@ -4990,6 +5062,48 @@ void Engine::step_update_pnl(BlockHeight block_height)
         auto pnl_summary = pnl_->get_total_pnl();
         snap.pnl_total_mojos = pnl_summary.total_pnl;
 
+        // Phase 2: strategy decision parameters for post-hoc analysis.
+        auto cycle_it = cycle_.find(pair.name);
+        if (cycle_it != cycle_.end() && cycle_it->second.quote_valid) {
+            const auto& pcs = cycle_it->second;
+
+            // Reservation price = midpoint of raw bid/ask quote (in mojos).
+            snap.reservation_price_mojos = static_cast<Mojo>(
+                (pcs.risk_quote.bid_price + pcs.risk_quote.ask_price) / 2);
+
+            // Spread decomposition from the spread optimizer.
+            snap.half_spread_bps = pcs.spread_result.half_spread;
+            snap.s_adverse_bps   = pcs.spread_result.s_adverse;
+            snap.s_inventory_bps = pcs.spread_result.s_inventory;
+            snap.s_cost_bps      = pcs.spread_result.s_cost;
+
+            // Per-tier quotes for fill probability and tier optimization.
+            for (const auto& tq : pcs.ladder) {
+                DbStrategyQuote sq;
+                sq.block_height = block_height;
+                sq.pair_name    = pair.name;
+                sq.tier         = tq.tier_index;
+                sq.side         = (tq.side == Side::Bid) ? "bid" : "ask";
+                sq.price_mojos  = tq.price;
+                sq.size_mojos   = tq.size;
+                quote_batch.push_back(std::move(sq));
+            }
+        }
+
+        // Kappa from the fill-intensity calibrator.
+        if (kappa_calibrator_) {
+            snap.kappa = kappa_calibrator_->current_kappa();
+        }
+
+        // Variance ratio from the regime detector.
+        snap.variance_ratio = regime.variance_ratio;
+
+        // Adverse selection rate from the PIN estimator.
+        auto pin_it = pin_estimators_.find(pair.name);
+        if (pin_it != pin_estimators_.end()) {
+            snap.adverse_rate = pin_it->second->get_adverse_rate();
+        }
+
         batch.push_back(std::move(snap));
     }
 
@@ -4997,8 +5111,12 @@ void Engine::step_update_pnl(BlockHeight block_height)
         db_->insert_snapshots_batch(batch);
     }
 
-    spdlog::debug("[Engine] Step 11: PnL updated and {} snapshots persisted",
-                  batch.size());
+    if (!quote_batch.empty()) {
+        db_->insert_strategy_quotes_batch(quote_batch);
+    }
+
+    spdlog::debug("[Engine] Step 11: PnL updated and {} snapshots, {} quotes persisted",
+                  batch.size(), quote_batch.size());
 }
 
 // Step 12: Export metrics to Prometheus.

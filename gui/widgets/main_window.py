@@ -402,6 +402,19 @@ class MainWindow(QMainWindow):
                 reserve = data.get("spendable_reserve", {})
                 stuck = data.get("stuck_offers", 0)
                 dashboard.update_wallet_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)
+            if hasattr(dashboard, "update_diagnostics"):
+                offers = data.get("offers", {})
+                fees_mojos = int(data.get("fees_paid_24h", 0))
+                dashboard.update_diagnostics(
+                    metrics_connected=data.get("metrics_connected", False),
+                    filled=int(offers.get("filled", 0)),
+                    cancelled=int(offers.get("cancelled", 0)),
+                    expired=int(offers.get("expired", 0)),
+                    pending=int(offers.get("pending", 0)),
+                    fees_24h_xch=mojos_to_xch_float(fees_mojos),
+                )
+            if hasattr(dashboard, "update_reserve_card"):
+                dashboard.update_reserve_card(data.get("spendable_reserve", {}))
 
         # Market analysis update -- forward analysis data to the widget.
         analysis_widget = self._unwrap(self._market_analysis)

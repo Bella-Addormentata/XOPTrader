@@ -105,6 +105,33 @@ struct DbSnapshot {
     double      sigma_block{0.0};   ///< Per-block volatility estimate.
     std::string regime;             ///< Market regime label ("MeanReverting", "Random", "Momentum").
     Mojo        pnl_total_mojos{0}; ///< Cumulative total PnL in mojos.
+
+    // -- Strategy decision parameters (Phase 2 analytics) --------------------
+    Mojo        reservation_price_mojos{0}; ///< A-S reservation price in mojos.
+    double      half_spread_bps{0.0};       ///< Optimal half-spread from spread optimizer (bps).
+    double      kappa{0.0};                 ///< Calibrated fill-intensity decay parameter.
+    double      variance_ratio{0.0};        ///< Lo-MacKinlay variance ratio (1.0 = random walk).
+    double      adverse_rate{0.0};          ///< Fraction of fills classified as adverse.
+    double      s_adverse_bps{0.0};         ///< Adverse selection spread component (bps).
+    double      s_inventory_bps{0.0};       ///< Inventory risk spread component (bps).
+    double      s_cost_bps{0.0};            ///< Transaction cost spread component (bps).
+};
+
+// ---------------------------------------------------------------------------
+// DbStrategyQuote -- maps 1:1 to a row in the strategy_quotes table.
+//
+// Persists the per-tier bid/ask quotes computed each block.  This enables
+// post-hoc analysis of which tier spacings captured the most spread PnL,
+// fill probability modelling, and optimal tier configuration tuning.
+// ---------------------------------------------------------------------------
+
+struct DbStrategyQuote {
+    BlockHeight block_height{0};    ///< Block at which quotes were computed.
+    std::string pair_name;          ///< Trading pair.
+    int         tier{0};            ///< Tier index (0 = tightest).
+    std::string side;               ///< "bid" or "ask".
+    Mojo        price_mojos{0};     ///< Quote price in mojos.
+    Mojo        size_mojos{0};      ///< Quote size in mojos.
 };
 
 // ---------------------------------------------------------------------------
@@ -216,6 +243,14 @@ public:
     /// @return           The latest DbSnapshot, or std::nullopt.
     [[nodiscard]]
     std::optional<DbSnapshot> get_last_snapshot(const std::string& pair_name) const;
+
+    // -- Strategy quotes (per-tier quote persistence) ------------------------
+
+    /// Insert a batch of per-tier strategy quotes inside a single transaction.
+    /// Called from step_update_pnl to persist all tier quotes for the block.
+    ///
+    /// @param batch  Vector of DbStrategyQuote records.
+    void insert_strategy_quotes_batch(const std::vector<DbStrategyQuote>& batch);
 
     // -- Diagnostics ---------------------------------------------------------
 
@@ -340,6 +375,9 @@ private:
 
     /// Per-tier fill rate query: filled / total resolved per tier for a pair
     sqlite3_stmt* stmt_tier_fill_rates_{nullptr};
+
+    /// INSERT INTO strategy_quotes (per-tier quote)
+    sqlite3_stmt* stmt_insert_strategy_quote_{nullptr};
 
     // [T8-20] Transaction control prepared statements.
     sqlite3_stmt* stmt_begin_{nullptr};

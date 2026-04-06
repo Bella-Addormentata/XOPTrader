@@ -138,8 +138,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         int ask_count = 0;
 
         // -- XCH fee reserve pre-check (batch mode) ------------------------
-        // Verify XCH spendable >= fee_reserve_xch before posting bids.
+        // Verify XCH spendable >= fee_reserve_xch before posting.
+        // Exception: buy-XCH sides are exempt (bid on XCH-base pair,
+        // ask on XCH-quote pair) to allow recovery from starvation.
         bool reserve_breached = false;
+        const bool bids_buy_xch = (pair.base_asset_id == "xch");
+        const bool asks_buy_xch = (pair.quote_asset_id == "xch");
         if (strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
@@ -164,12 +168,13 @@ asio::awaitable<int> OfferManager::post_quotes(
             }
         }
 
-        if (!bids.empty() && !reserve_breached) {
+        if (!bids.empty() && (!reserve_breached || bids_buy_xch)) {
             bid_count = co_await post_merged_side(pair, bids, block_height);
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
         // Check XCH spendable balance after bids; skip asks if below reserve.
+        // Exception: asks that buy XCH (on XCH-quote pairs) are exempt.
         if (bid_count > 0 && !asks.empty()
             && strategy_cfg_.fee_reserve_xch > 0.0) {
             try {
@@ -195,7 +200,7 @@ asio::awaitable<int> OfferManager::post_quotes(
             }
         }
 
-        if (!asks.empty() && !reserve_breached) {
+        if (!asks.empty() && (!reserve_breached || asks_buy_xch)) {
             ask_count = co_await post_merged_side(pair, asks, block_height);
         }
 
@@ -205,7 +210,14 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Per Avellaneda-Stoikov (2008), a market maker with only bids
         // (or only asks) is guaranteed to accumulate inventory directionally
         // with no spread capture to offset the risk.
-        if (bid_count > 0 && ask_count == 0 && !asks.empty()) {
+        //
+        // Exception: when XCH reserve is breached and the posted side buys
+        // XCH, the other side was *intentionally* suppressed.  Do not
+        // cancel in that case -- the one-sided book is by design.
+        const bool bid_side_exempt = reserve_breached && bids_buy_xch;
+        const bool ask_side_exempt = reserve_breached && asks_buy_xch;
+        if (bid_count > 0 && ask_count == 0 && !asks.empty()
+            && !bid_side_exempt) {
             logger_->warn("Asymmetric ladder: {} bids posted but 0/{} asks "
                           "-- cancelling bids to prevent one-sided book",
                           bid_count, asks.size());
@@ -214,7 +226,8 @@ asio::awaitable<int> OfferManager::post_quotes(
             for (const auto& po : bid_offers) {
                 if (po.pair_name == pair.name &&
                     po.side == Side::Bid &&
-                    po.created_at_block == block_height) {
+                    po.created_at_block == block_height &&
+                    !po.cancel_pending) {
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
@@ -234,12 +247,13 @@ asio::awaitable<int> OfferManager::post_quotes(
                         cancel_ok = co_await emergency_cancel(
                             po.offer_id, "asymmetric_bid");
                     if (cancel_ok) {
-                        state_->remove_offer(po.offer_id);
+                        state_->mark_cancel_pending(po.offer_id);
                         --bid_count;
                     }
                 }
             }
-        } else if (ask_count > 0 && bid_count == 0 && !bids.empty()) {
+        } else if (ask_count > 0 && bid_count == 0 && !bids.empty()
+                   && !ask_side_exempt) {
             logger_->warn("Asymmetric ladder: {} asks posted but 0/{} bids "
                           "-- cancelling asks to prevent one-sided book",
                           ask_count, bids.size());
@@ -247,7 +261,8 @@ asio::awaitable<int> OfferManager::post_quotes(
             for (const auto& po : ask_offers) {
                 if (po.pair_name == pair.name &&
                     po.side == Side::Ask &&
-                    po.created_at_block == block_height) {
+                    po.created_at_block == block_height &&
+                    !po.cancel_pending) {
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
@@ -267,7 +282,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                         cancel_ok = co_await emergency_cancel(
                             po.offer_id, "asymmetric_ask");
                     if (cancel_ok) {
-                        state_->remove_offer(po.offer_id);
+                        state_->mark_cancel_pending(po.offer_id);
                         --ask_count;
                     }
                 }
@@ -296,7 +311,13 @@ asio::awaitable<int> OfferManager::post_quotes(
         // create_offer can lock far more than the 5M mojo fee.  This
         // prevents the last UTXO from being locked when the balance is
         // already at the reserve threshold.
-        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+        //
+        // Exception: offers that BUY XCH are exempt -- executing them will
+        // increase XCH balance and help recover from capital starvation.
+        const bool tier_buys_xch =
+            (pair.base_asset_id == "xch" && tier.side == Side::Bid) ||
+            (pair.quote_asset_id == "xch" && tier.side == Side::Ask);
+        if (strategy_cfg_.fee_reserve_xch > 0.0 && !tier_buys_xch) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
@@ -416,7 +437,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
         // the configured reserve.
-        if (strategy_cfg_.fee_reserve_xch > 0.0) {
+        // Exception: buy-XCH tiers are exempt (they help recover from
+        // capital starvation).
+        if (strategy_cfg_.fee_reserve_xch > 0.0 && !tier_buys_xch) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
                 Mojo xch_spendable = 0;
@@ -470,8 +493,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
         pending_map.emplace(po.offer_id, std::move(po));
     }
 
-    // Poll the wallet for all trade records.
-    // Paginate in batches of 50 to avoid oversized responses.
+    // Poll the wallet for all trade records (include_completed=true
+    // so we see offers that were filled between cancel-submission and
+    // cancel-confirmation on-chain).
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
     bool more = true;
@@ -623,6 +647,11 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
             continue;
         }
 
+        // Skip offers already awaiting cancel confirmation.
+        if (po.cancel_pending) {
+            continue;
+        }
+
         // Check if the offer has exceeded its TTL.
         if (current_block < po.created_at_block + ttl_blocks) {
             continue;
@@ -650,11 +679,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
                 po.offer_id, "cancel_stale");
         }
         if (cancel_ok) {
-            if (!state_->remove_offer(po.offer_id)) {
-                logger_->warn("cancel_stale: offer {} already removed from "
-                              "state (wallet cancel succeeded)",
-                              po.offer_id.substr(0, 12));
-            }
+            state_->mark_cancel_pending(po.offer_id);
             cancelled_ids.push_back(po.offer_id);
 
             logger_->info("Cancelled stale offer {} ({} tier {}, age {} blocks)",
@@ -740,10 +765,10 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
         }
     }
 
-    // Remove only the offers whose cancellation succeeded from state.
-    // Failed cancellations remain tracked for retry on the next heartbeat.
+    // Mark offers whose cancellation succeeded as cancel_pending.
+    // detect_fills will handle final removal when the wallet confirms.
     for (const auto& id : cancelled_ids) {
-        state_->remove_offer(id);
+        state_->mark_cancel_pending(id);
     }
 
     logger_->info("cancel_all: {}/{} offers cancelled successfully",
@@ -1032,6 +1057,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
     for (const auto& po : pending) {
         if (po.pair_name != pair_name) continue;
+        if (po.cancel_pending) continue;  // Already being cancelled.
 
         TierClassification tc;
         tc.offer_id   = po.offer_id;
@@ -1173,6 +1199,11 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
     cancelled_ids.reserve(stale_ids.size());
 
     for (const auto& offer_id : stale_ids) {
+        // Skip offers already awaiting cancel confirmation.
+        auto existing = state_->get_offer(offer_id);
+        if (existing.cancel_pending) {
+            continue;
+        }
         bool cancel_ok = false;
         bool needs_emergency = false;
         try {
@@ -1193,7 +1224,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
             cancel_ok = co_await emergency_cancel(
                 offer_id, "selective_cancel");
         if (cancel_ok) {
-            if (!state_->remove_offer(offer_id)) {
+            if (!state_->mark_cancel_pending(offer_id)) {
                 logger_->warn("selective_cancel: offer {} already removed "
                               "from state", offer_id.substr(0, 12));
             }
@@ -1288,10 +1319,10 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers()
                               "(wallet status={}, was pending in State)",
                               trade_id.substr(0, 12), status);
             }
-            // Note: confirmed fills (status==4) that we missed are NOT
-            // processed here -- they are handled exclusively through
-            // detect_fills() + confirmation depth gating so that the
-            // cost-basis pipeline remains the single authoritative path.
+            // Note: confirmed fills (status==4) are not processed here --
+            // they are handled by detect_fills() which now uses
+            // include_completed=true and matches against cancel_pending
+            // offers still in State.
         }
 
         offset += kPageSize;

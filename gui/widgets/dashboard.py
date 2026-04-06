@@ -92,7 +92,7 @@ class MetricCard(QFrame):
 
         # --- frame appearance -----------------------------------------------
         self.setFrameShape(QFrame.Shape.StyledPanel)
-        self.setFixedHeight(150)
+        self.setFixedHeight(160)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.setStyleSheet(
             f"MetricCard {{"
@@ -150,8 +150,18 @@ class MetricCard(QFrame):
         )
         root.addWidget(self._sparkline)
 
+        # Annotation label (e.g. "No trades yet", "Stale data")
+        self._annotation_label = QLabel("")
+        self._annotation_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 10px; font-style: italic;"
+        )
+        self._annotation_label.setVisible(False)
+        root.addWidget(self._annotation_label)
+
         # Internal data ring buffer (list kept trimmed to _SPARKLINE_MAX_POINTS)
         self._spark_data: list[float] = []
+        # Track whether this card has ever received a non-zero value.
+        self._ever_nonzero: bool = False
 
     # -- Public API ----------------------------------------------------------
 
@@ -165,8 +175,13 @@ class MetricCard(QFrame):
         fmt:
             ``str.format`` pattern applied to *value*.
         """
+        if value != 0.0:
+            self._ever_nonzero = True
         text = fmt.format(value)
         colour = PROFIT_GREEN if value >= 0 else LOSS_RED
+        # Dim the value when it has never been non-zero to signal "no data yet".
+        if not self._ever_nonzero and value == 0.0:
+            colour = TEXT_SECONDARY
         self._value_label.setStyleSheet(
             f"color: {colour};"
             f"font-family: {_MONO_FAMILY};"
@@ -198,6 +213,20 @@ class MetricCard(QFrame):
         if len(self._spark_data) > _SPARKLINE_MAX_POINTS:
             self._spark_data = self._spark_data[-_SPARKLINE_MAX_POINTS:]
         self._spark_curve.setData(self._spark_data)
+
+    def set_annotation(self, text: str) -> None:
+        """Set or clear the annotation text below the sparkline.
+
+        Parameters
+        ----------
+        text:
+            Annotation string (e.g. "No trades yet"). Empty string hides it.
+        """
+        if text:
+            self._annotation_label.setText(text)
+            self._annotation_label.setVisible(True)
+        else:
+            self._annotation_label.setVisible(False)
 
 
 # ---------------------------------------------------------------------------
@@ -414,6 +443,48 @@ class DashboardWidget(QWidget):
         self._pairs_card.add_row(wrapper)
         self._grid.addWidget(self._pairs_card, status_row + 1, 0)
 
+        # --- Diagnostics card (grid row 3, column 1) -----------------------
+        self._diag_card = StatusCard("Data Diagnostics")
+        self._diag_metrics_dot, self._diag_metrics_label = self._add_diag_row(
+            "Metrics", "gray",
+        )
+        self._diag_offers_label = QLabel("Offers: --")
+        self._diag_offers_label.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 12px;"
+            f" font-family: {_MONO_FAMILY};"
+        )
+        self._diag_card.add_row(self._diag_offers_label)
+
+        self._diag_fills_label = QLabel("Fills: --")
+        self._diag_fills_label.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 12px;"
+            f" font-family: {_MONO_FAMILY};"
+        )
+        self._diag_card.add_row(self._diag_fills_label)
+
+        self._diag_fees_label = QLabel("Fees 24h: --")
+        self._diag_fees_label.setStyleSheet(
+            f"color: {TEXT_PRIMARY}; font-size: 12px;"
+            f" font-family: {_MONO_FAMILY};"
+        )
+        self._diag_card.add_row(self._diag_fees_label)
+
+        self._diag_last_update_label = QLabel("Last update: --")
+        self._diag_last_update_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 11px;"
+        )
+        self._diag_card.add_row(self._diag_last_update_label)
+        self._grid.addWidget(self._diag_card, status_row + 1, 1)
+
+        # --- Spendable Reserve card (grid row 3, column 2) -----------------
+        self._reserve_card = StatusCard("Spendable Reserve")
+        self._reserve_labels: dict[str, QLabel] = {}
+        self._reserve_card_container = QVBoxLayout()
+        reserve_wrapper = QWidget()
+        reserve_wrapper.setLayout(self._reserve_card_container)
+        self._reserve_card.add_row(reserve_wrapper)
+        self._grid.addWidget(self._reserve_card, status_row + 1, 2)
+
     def _build_pairs_table(self) -> None:
         """Construct the per-pair summary QTableWidget."""
         self._pairs_table = QTableWidget()
@@ -514,6 +585,14 @@ class DashboardWidget(QWidget):
         self._wallet_label.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 12px;")
         self._grid.addWidget(self._wallet_label, 8, 0, 1, 3)
 
+    def _add_diag_row(
+        self, text: str, colour: str,
+    ) -> tuple[StatusDot, QLabel]:
+        """Add a dot+label diagnostic row to the diagnostics card."""
+        container, dot, label = _make_dot_label(text, colour)
+        self._diag_card.add_row(container)
+        return dot, label
+
     # =====================================================================
     # Context menu for the pairs table
     # =====================================================================
@@ -590,6 +669,11 @@ class DashboardWidget(QWidget):
             Mapping of card title to a dict with ``"value"``, optional
             ``"change_pct"``, and optional ``"spark"`` entries.
         """
+        fill_count = 0
+        fill_data = metrics.get("24h Fill Count")
+        if fill_data is not None:
+            fill_count = fill_data.get("value", 0)
+
         for name, card in self._metric_cards.items():
             data = metrics.get(name)
             if data is None:
@@ -606,6 +690,15 @@ class DashboardWidget(QWidget):
                 card.set_change(data["change_pct"])
             if "spark" in data:
                 card.append_spark(data["spark"])
+
+            # Annotate PnL cards when no fills have occurred.
+            if "PnL" in name:
+                if fill_count == 0 and value == 0.0:
+                    card.set_annotation("No trades filled yet")
+                else:
+                    card.set_annotation("")
+            elif "Fill Count" in name and fill_count == 0:
+                card.set_annotation("Awaiting first fill")
 
     def update_bot_status(
         self, status: str, *, colour: str = "gray"
@@ -821,3 +914,101 @@ class DashboardWidget(QWidget):
             )
 
         self._wallet_label.setText("<br>".join(lines) if lines else "No data")
+
+    def update_diagnostics(
+        self,
+        *,
+        metrics_connected: bool,
+        filled: int,
+        cancelled: int,
+        expired: int,
+        pending: int,
+        fees_24h_xch: float,
+    ) -> None:
+        """Update the data diagnostics card.
+
+        Parameters
+        ----------
+        metrics_connected:
+            Whether the Prometheus metrics endpoint is reachable.
+        filled:
+            Total offers filled since engine start.
+        cancelled:
+            Total offers cancelled since engine start.
+        expired:
+            Total offers expired since engine start.
+        pending:
+            Currently pending offers.
+        fees_24h_xch:
+            Rolling 24h fees paid in XCH.
+        """
+        if not hasattr(self, "_diag_card"):
+            return
+
+        # Metrics connection dot.
+        if metrics_connected:
+            self._diag_metrics_dot.set_colour("green")
+            self._diag_metrics_label.setText("Metrics: Connected")
+        else:
+            self._diag_metrics_dot.set_colour("red")
+            self._diag_metrics_label.setText("Metrics: Disconnected")
+
+        # Offer lifecycle.
+        self._diag_offers_label.setText(
+            f"Offers: {pending} pending / {cancelled} cancelled / {expired} expired"
+        )
+
+        fill_color = PROFIT_GREEN if filled > 0 else LOSS_RED
+        self._diag_fills_label.setText(f"Fills: {filled}")
+        self._diag_fills_label.setStyleSheet(
+            f"color: {fill_color}; font-size: 12px;"
+            f" font-family: {_MONO_FAMILY};"
+        )
+
+        # Fees.
+        self._diag_fees_label.setText(f"Fees 24h: {fees_24h_xch:.6f} XCH")
+
+        # Timestamp.
+        import datetime as _dt
+
+        now_str = _dt.datetime.now().strftime("%H:%M:%S")
+        self._diag_last_update_label.setText(f"Last update: {now_str}")
+
+    def update_reserve_card(
+        self,
+        reserve: dict[str, float],
+    ) -> None:
+        """Update the spendable reserve card.
+
+        Parameters
+        ----------
+        reserve:
+            Mapping of wallet label to reserve ratio (0.0–1.0).
+        """
+        if not hasattr(self, "_reserve_card"):
+            return
+
+        # Clear previous labels.
+        for lbl in self._reserve_labels.values():
+            self._reserve_card_container.removeWidget(lbl)
+            lbl.deleteLater()
+        self._reserve_labels.clear()
+
+        for wallet, ratio in reserve.items():
+            pct = ratio * 100.0
+            if pct < 10.0:
+                colour = LOSS_RED
+            elif pct < 25.0:
+                colour = "#ffaa00"
+            else:
+                colour = PROFIT_GREEN
+
+            short_name = wallet[:8] + "\u2026" if len(wallet) > 12 else wallet
+            lbl = QLabel(f"{short_name}: {pct:.0f}%")
+            lbl.setStyleSheet(
+                f"color: {colour}; font-size: 12px;"
+                f" font-family: {_MONO_FAMILY};"
+            )
+            lbl.setToolTip(wallet)
+            self._reserve_card_container.addWidget(lbl)
+            self._reserve_labels[wallet] = lbl

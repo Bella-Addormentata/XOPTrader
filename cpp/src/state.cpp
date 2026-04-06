@@ -441,6 +441,17 @@ bool State::remove_offer(const std::string& offer_id)
     return erased > 0;
 }
 
+bool State::mark_cancel_pending(const std::string& offer_id)
+{
+    std::unique_lock lock(mtx_offers_);
+
+    auto it = pending_offers_.find(offer_id);
+    if (it == pending_offers_.end()) return false;
+    it->second.cancel_pending = true;
+    spdlog::debug("mark_cancel_pending id={}", offer_id);
+    return true;
+}
+
 PendingOffer State::get_offer(const std::string& offer_id) const
 {
     std::shared_lock lock(mtx_offers_);

@@ -175,7 +175,12 @@ public:
     /// @param fill  The Fill struct from the offer-monitoring subsystem.
     /// @param fee   Blockchain fee paid for this settlement (mojos, >= 0).
     /// @param cost_basis  Weighted-average cost basis at the time of fill.
-    void record_fill(const Fill& fill, Mojo fee, Mojo cost_basis);
+    /// @param realized_pnl  Pre-computed realized PnL for this fill (mojos).
+    ///        Computed by the engine as (price - cost_basis) * size / kMojosPerXch
+    ///        for sells, 0 for buys.  Single source of truth to avoid
+    ///        redundant computation.
+    void record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
+                     Mojo realized_pnl);
 
     /// Record a fee event that is not associated with a specific fill.
     /// Used for DBX incentive income (positive) and standalone blockchain
@@ -214,7 +219,10 @@ public:
     /// never been traded.
     [[nodiscard]] PnLSummary get_pair_pnl(const std::string& pair_name) const;
 
-    /// Summary for the current calendar day (UTC).
+    /// Lifetime PnL summary formatted as a DailySummary.
+    /// NOTE: Despite the name, this returns cumulative lifetime totals,
+    /// not a single day's figures.  Currently unused; retained for
+    /// potential future refactoring into true daily aggregation.
     [[nodiscard]] DailySummary get_daily_summary() const;
 
     // -- Trade log queries ------------------------------------------------

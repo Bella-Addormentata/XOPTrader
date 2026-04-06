@@ -885,12 +885,14 @@ ChiaWalletRPC::cancel_offers(std::uint64_t fee, bool secure)
 asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_all_offers(std::int64_t start,
                                std::int64_t end,
-                               bool         file_contents)
+                               bool         file_contents,
+                               bool         include_completed)
 {
     const json payload = {
-        {"start",         start},
-        {"end",           end},
-        {"file_contents", file_contents}
+        {"start",              start},
+        {"end",                end},
+        {"file_contents",      file_contents},
+        {"include_completed",  include_completed}
     };
     const json resp = co_await rpc_post("get_all_offers", payload);
 

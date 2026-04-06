@@ -304,6 +304,7 @@ class MetricsService(QObject):
         # -- Connection state -----------------------------------------------
         self._connected: bool = False
         self._backoff_s: float = _BACKOFF_INITIAL_S
+        self._last_scrape_time: float = 0.0  # monotonic timestamp of last success
 
         # -- Latest parsed metrics (guarded by mutex) -----------------------
         self._mutex: QMutex = QMutex()
@@ -672,6 +673,16 @@ class MetricsService(QObject):
         """Whether the last scrape was successful."""
         return self._connected
 
+    @property
+    def seconds_since_last_scrape(self) -> float:
+        """Seconds elapsed since the last successful Prometheus scrape.
+
+        Returns ``-1`` if no scrape has succeeded yet.
+        """
+        if self._last_scrape_time == 0.0:
+            return -1.0
+        return time.monotonic() - self._last_scrape_time
+
     # ===================================================================
     # Internal slots
     # ===================================================================
@@ -718,6 +729,9 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             self._latest = parsed
             self._history.append(parsed)
+
+        # Record the time of the last successful scrape.
+        self._last_scrape_time = time.monotonic()
 
         # Reset back-off on success.
         self._backoff_s = _BACKOFF_INITIAL_S

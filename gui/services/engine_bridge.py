@@ -320,6 +320,7 @@ class EngineBridge(QObject):
             "stuck_offers": self._metrics_svc.get_stuck_offers(),
             "fees_paid_24h": self._metrics_svc.get_fees_paid_24h(),
             "wallet_balances": self._wallet_svc.get_balances(),
+            "metrics_connected": self._metrics_svc.is_connected,
         }
         return data
 

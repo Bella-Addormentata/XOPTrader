@@ -5,6 +5,14 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.6.5] — 2026-04-05
+
+### Added
+
+- **Strategy analytics data collection**: Extended the `snapshots` table with 8 new strategy decision columns persisted every block: `reservation_price_mojos` (A-S reservation price), `half_spread_bps` (optimal half-spread), `kappa` (calibrated fill-intensity decay), `variance_ratio` (Lo-MacKinlay VR statistic), `adverse_rate` (fraction of adverse fills), `s_adverse_bps` / `s_inventory_bps` / `s_cost_bps` (Stoll three-component spread decomposition)
+- **Per-tier quote persistence**: New `strategy_quotes` table stores every bid/ask quote at each tier level every block (`block_height`, `pair_name`, `tier`, `side`, `price_mojos`, `size_mojos`), enabling fill probability modelling, tier spacing optimization, and quoted-vs-filled spread analysis
+- Forward-compatible ALTER TABLE migrations for existing databases
+
 ## [0.6.4] — 2026-04-05
 
 ### Added

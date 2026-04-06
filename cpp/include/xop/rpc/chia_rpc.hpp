@@ -533,9 +533,10 @@ public:
      * @return Vector of offer/trade-record JSON objects.
      */
     asio::awaitable<std::vector<json>> get_all_offers(
-        std::int64_t start         = 0,
-        std::int64_t end           = 10,
-        bool         file_contents = false);
+        std::int64_t start             = 0,
+        std::int64_t end               = 10,
+        bool         file_contents     = false,
+        bool         include_completed = true);
 
     /**
      * @brief Retrieve the wallet's synced block height.

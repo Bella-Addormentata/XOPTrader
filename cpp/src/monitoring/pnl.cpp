@@ -501,45 +501,22 @@ std::vector<TradeRecord> PnLTracker::query_trades(
 // Fill recording and PnL attribution
 // =========================================================================
 
-void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis)
+void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
+                             Mojo realized_pnl)
 {
-    // -- Step 1: Compute realised PnL for this fill -----------------------
+    // -- Step 1: Use the pre-computed realised PnL from the engine ---------
     //
-    // Spread PnL is realised only on sells (Ask side).  When we sell, the
-    // realised PnL per unit = sell_price - cost_basis.
-    //   realised = (price - cost_basis) * size   [for sells]
-    //   realised = 0                              [for buys]
+    // [T9-FIX] Realised PnL is computed once in engine.cpp (single source
+    // of truth) and passed here.  This eliminates the prior redundant
+    // computation that was fragile if either copy was modified independently.
+    //
+    // Formula (computed by engine):  (price - cost_basis) * size / kMojosPerXch
+    //   - For sells (Ask): the surplus proceeds above cost
+    //   - For buys (Bid): always 0
     //
     // Fee PnL is recorded separately for both sides.
-    //
     // Inventory PnL is not updated here -- it is recalculated by
     // mark_to_market() which uses current market prices.
-
-    Mojo realized_pnl = 0;
-    if (fill.side == Side::Ask && cost_basis > 0) {
-        // Realised spread PnL on the sell leg.
-        //
-        // The realised PnL is the surplus proceeds above the cost of
-        // the units sold.  For weighted-average costing:
-        //   proceeds     = price * size         (in quote mojos)
-        //   cost_of_sold = cost_basis * size    (in quote mojos)
-        //   realised     = proceeds - cost_of_sold
-        //
-        // Both price and cost_basis are expressed as "mojos-of-quote per
-        // mojo-of-base", and size is in mojos-of-base, so:
-        //   realised = (price - cost_basis) * size
-        //
-        // Overflow analysis: this can overflow int64 if the price spread
-        // and size are both near 10^12.  In practice per-fill sizes on
-        // Chia DEX are well under 10^9 mojos (~0.001 XCH), and price
-        // differences are much smaller than the price itself, so the
-        // product fits comfortably.  We perform the subtraction first to
-        // reduce magnitude.
-        //
-        // The never-sell-at-loss constraint should ensure realized_pnl >= 0,
-        // but we record the actual number regardless for audit accuracy.
-        realized_pnl = (fill.price - cost_basis) * fill.size;
-    }
 
     // -- Step 2: Persist to SQLite (crash-safe before in-memory update) ---
 
@@ -720,7 +697,13 @@ void PnLTracker::mark_to_market(
         const Mojo basis         = get_cost_basis(base_asset);
 
         if (basis > 0 && balance > 0) {
-            ppnl.inventory_pnl = (smoothed_price - basis) * balance;
+            // [T9-FIX] Use double intermediates to avoid mojos-squared overflow.
+            // inventory_pnl = (smoothed_price - basis) * balance / kMojosPerXch
+            // Result is in quote-mojos (same unit as spread_pnl).
+            ppnl.inventory_pnl = static_cast<Mojo>(std::llround(
+                static_cast<double>(smoothed_price - basis)
+                * static_cast<double>(balance)
+                / static_cast<double>(kMojosPerXch)));
         } else {
             ppnl.inventory_pnl = 0;
         }
@@ -831,9 +814,11 @@ double PnLTracker::compute_max_drawdown() const
             peak = snap.total_pnl;
         }
 
-        if (peak > 0) {
+        // [T9-FIX] Track drawdown even when PnL is negative.
+        // Use absolute peak value to avoid division by zero.
+        if (peak != 0) {
             const double dd = static_cast<double>(peak - snap.total_pnl)
-                            / static_cast<double>(peak);
+                            / std::abs(static_cast<double>(peak));
             if (dd > max_dd) {
                 max_dd = dd;
             }
@@ -922,7 +907,10 @@ DailySummary PnLTracker::get_daily_summary() const
     DailySummary ds{};
     ds.date = timestamp_to_date(std::chrono::system_clock::now());
 
-    // Aggregate from all pairs for today.
+    // NOTE: Returns cumulative lifetime totals, not a single day's figures.
+    // [T9-FIX] Documented as lifetime; rename deferred to avoid
+    // breaking any future callers.  A true daily implementation would
+    // need to query trade_log with date-range filters.
     ds.spread_pnl    = total_pnl_.spread_pnl;
     ds.inventory_pnl = total_pnl_.inventory_pnl;
     ds.fee_pnl       = total_pnl_.fee_pnl;
@@ -994,8 +982,16 @@ void PnLTracker::export_trades_csv(const std::string& start_date,
                 ? timestamp_to_date(rec.acquisition_ts)
                 : date_sold;
 
-        const Mojo proceeds = rec.price_mojos * rec.size_mojos;
-        const Mojo cost     = rec.cost_basis_mojos * rec.size_mojos;
+        // [T9-FIX] Use double intermediates to avoid int64 overflow
+        // (price_mojos * size_mojos can exceed 2^63 for realistic trades).
+        const auto proceeds = static_cast<Mojo>(std::llround(
+            static_cast<double>(rec.price_mojos)
+            * static_cast<double>(rec.size_mojos)
+            / static_cast<double>(kMojosPerXch)));
+        const auto cost = static_cast<Mojo>(std::llround(
+            static_cast<double>(rec.cost_basis_mojos)
+            * static_cast<double>(rec.size_mojos)
+            / static_cast<double>(kMojosPerXch)));
         const Mojo gain     = proceeds - cost;
 
         // T2-06: Determine holding period from actual acquisition date.

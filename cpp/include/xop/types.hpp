@@ -125,6 +125,7 @@ struct PendingOffer {
     BlockHeight  created_at_block; // block at which the offer was broadcast
     Timestamp    created_at_ts;    // wall-clock creation time
     std::uint64_t fee_mojos{0};    // fee attached to this offer (mojos)
+    bool         cancel_pending{false}; // cancel RPC sent; awaiting on-chain confirmation
 };
 
 // ---------------------------------------------------------------------------
