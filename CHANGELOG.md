@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.16] — 2026-04-07
+
+### Fixed
+
+- **Budget-starved offers falsely cancelled as price_adverse(100%)**: When low XCH balance causes all new tiers to be dropped by the sub-unit minimum filter or dynamic tier limiter, `classify_tier_staleness` could not find the pending offer's tier index in the (now empty) new ladder and unconditionally classified it as `Stale` with 100% adverse price deviation. This cancelled perfectly healthy offers that could not be replaced, creating a pointless cancel→0-offers→post→cancel cycle wasting fees. Fixed by falling back to a mid-price sanity check when the tier is absent from the new ladder: offers that have not crossed the mid-price are classified as `Fresh` and kept alive; only crossed-mid offers (immediate adverse selection risk) are cancelled. Hard TTL expiration is unaffected.
+
 ## [0.7.15] — 2026-04-07
 
 ### Fixed

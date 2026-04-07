@@ -1160,11 +1160,34 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                         + "_" + std::to_string(po.tier);
         auto opt_it = optimal_prices.find(key);
         if (opt_it == optimal_prices.end()) {
-            // Tier no longer exists in the new ladder (e.g. filtered out
-            // by fee-vs-gain gating).  Treat as stale.
-            tc.staleness       = TierStaleness::Stale;
-            tc.price_deviation = 1.0;
-            tc.adverse         = true;
+            // Tier no longer in the new ladder (budget constraints,
+            // sub-unit minimum, or fee gating removed it).
+            //
+            // When no replacement tier can be posted, cancelling the
+            // existing offer wastes cancel fees and removes liquidity
+            // from the book.  Fall back to a mid-price sanity check:
+            // only cancel if the offer has crossed the mid-price
+            // (immediate adverse selection risk).  Hard TTL is already
+            // handled above and takes precedence.
+            const double old_p = static_cast<double>(po.price);
+
+            if (mid_price > 0) {
+                tc.price_deviation = std::abs(old_p - mid_p) / mid_p;
+                if (po.side == Side::Bid && old_p > mid_p) {
+                    tc.crossed = true;
+                } else if (po.side == Side::Ask && old_p < mid_p) {
+                    tc.crossed = true;
+                }
+            }
+
+            if (tc.crossed) {
+                tc.staleness       = TierStaleness::Stale;
+                tc.adverse         = true;
+            } else {
+                tc.staleness       = TierStaleness::Fresh;
+                tc.adverse         = false;
+            }
+
             results.push_back(std::move(tc));
             continue;
         }
