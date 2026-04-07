@@ -187,24 +187,34 @@ OnChainReconciler::verify_pending_offer_coins()
 
             for (const auto& rec : records) {
                 if (rec.contains("trade_id") && rec.contains("status")) {
-                    // Chia wallet may return status as int or string
-                    // depending on version.  Handle both to avoid
-                    // json.exception.type_error.302.
-                    int status = 0;
+                    // Chia wallet returns status as int (older) or
+                    // string name (newer).  Map both to the canonical
+                    // integer codes used downstream.
+                    int status = -1;
                     if (rec["status"].is_number()) {
                         status = rec["status"].get<int>();
                     } else if (rec["status"].is_string()) {
-                        try {
-                            status = std::stoi(
-                                rec["status"].get<std::string>());
-                        } catch (...) {
-                            logger_->warn(
-                                "verify_pending_offer_coins: unparseable "
-                                "status '{}' for trade {}",
-                                rec["status"].get<std::string>(),
-                                rec["trade_id"].get<std::string>()
-                                    .substr(0, 12));
-                            continue;
+                        const auto& s = rec["status"].get_ref<
+                            const std::string&>();
+                        if (s == "PENDING_ACCEPT")       status = 0;
+                        else if (s == "PENDING_CONFIRM") status = 1;
+                        else if (s == "PENDING_CANCEL")  status = 2;
+                        else if (s == "CANCELLED")       status = 3;
+                        else if (s == "CONFIRMED")       status = 4;
+                        else if (s == "FAILED")          status = 5;
+                        else {
+                            // Try numeric string as last resort.
+                            try {
+                                status = std::stoi(s);
+                            } catch (...) {
+                                logger_->warn(
+                                    "verify_pending_offer_coins: "
+                                    "unparseable status '{}' for trade {}",
+                                    s,
+                                    rec["trade_id"].get<std::string>()
+                                        .substr(0, 12));
+                                continue;
+                            }
                         }
                     } else {
                         continue;

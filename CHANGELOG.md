@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.15] — 2026-04-07
+
+### Fixed
+
+- **Reconciler falsely cancels all live offers (string status regression)**: The Chia wallet (newer versions) returns offer status as string names (`"PENDING_ACCEPT"`, `"CANCELLED"`, `"CONFIRMED"`, etc.) instead of integer codes. The v0.7.12 fix handled this with `std::stoi()`, which works for `"3"` but throws on `"CANCELLED"`. The catch block skipped the offer entirely, so `PENDING_ACCEPT` offers were missing from the wallet map, falsely marked "NOT FOUND", and cancelled via `on_chain_reconcile`. Fixed by adding a proper string-name-to-integer-code lookup for all six Chia offer states.
+
 ## [0.7.14] — 2026-04-07
 
 ### Fixed
