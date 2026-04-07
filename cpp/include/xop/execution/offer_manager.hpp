@@ -713,9 +713,10 @@ private:
     static constexpr BlockHeight kMinRefreshAgeBlocks = 3;
 
     /// Gentler adverse-deviation threshold applied between soft and hard
-    /// TTL.  Even a small adverse drift on an old offer should trigger
-    /// a refresh, since the offer has been live long enough.
-    static constexpr double kSoftTtlAdverseThreshold = 0.002;
+    /// TTL.  Only refresh if the offer has adversely drifted by more than
+    /// this fraction.  Must be ≥ the reservation_mid max_deviation_pct
+    /// (typically 2%) to avoid false expiry from model+clamp noise.
+    static constexpr double kSoftTtlAdverseThreshold = 0.02;
 };
 
 }  // namespace xop::execution

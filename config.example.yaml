@@ -113,7 +113,7 @@ strategy:
   phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT)
   q_max: 1000            # [REQUIRED] Max inventory in base units
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
-  offer_ttl_blocks: 60       # [REQUIRED] Cancel stale offers after N blocks (~52 min)
+  offer_ttl_blocks: 180      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~56 min)
   num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth
   tier_spacing_bps: [60, 120, 180, 240]  # [REQUIRED] Spread per tier (bps) — must be ≤ max_half_spread_bps
   tier_size_pct: [0.30, 0.25, 0.25, 0.20] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)

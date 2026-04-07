@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.18] — 2026-04-07
+
+### Fixed
+
+- **Offer churn from overly aggressive soft TTL threshold**: The `kSoftTtlAdverseThreshold` was 0.2%, far tighter than the normal-zone threshold (0.5%) and well below the 2% reservation_mid clamp range. Normal Avellaneda-Stoikov model fluctuations within the 2% clamp produced >0.2% "adverse" deviation, causing offers to expire every 60 blocks (~18 min), get cancelled, then immediately recreated — wasting fees and blocking all offer posting during the pending_change confirmation window. Raised threshold from 0.2% to 2.0% to match the reservation_mid clamp range.
+- **Increased default offer TTL from 60 to 180 blocks** (~56 min): 60 blocks (~18 min) was too aggressive for Chia's slow DEX market, causing unnecessary churn. Hard TTL (2× soft) is now 360 blocks (~112 min).
+
 ## [0.7.17] — 2026-04-07
 
 ### Added
