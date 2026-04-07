@@ -4194,10 +4194,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     static_cast<double>(tier.price) - static_cast<double>(mid));
                 const double gain_fraction = price_diff / static_cast<double>(mid);
                 // Convert to XCH-equivalent mojos for comparison with fee.
+                // tier.size is in base-asset mojos; scale up by
+                // kMojosPerXch / base_mojos_per_unit so that CAT mojos
+                // (1e3/unit) are comparable to XCH-mojo fees (1e12/unit).
                 const double gain_mojos =
                     gain_fraction * static_cast<double>(tier.size)
-                    * static_cast<double>(pair_cfg->base_mojos_per_unit)
-                    / static_cast<double>(kMojosPerXch);
+                    * static_cast<double>(kMojosPerXch)
+                    / static_cast<double>(pair_cfg->base_mojos_per_unit);
 
                 const auto expected_gain = static_cast<std::uint64_t>(
                     std::max(0.0, gain_mojos));

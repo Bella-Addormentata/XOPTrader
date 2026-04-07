@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.8] — 2026-04-06
+
+### Fixed
+
+- **Fee-gain formula inverted for CAT/CAT pairs**: The fee gating calculation used `base_mojos_per_unit / kMojosPerXch` instead of `kMojosPerXch / base_mojos_per_unit`, causing expected gain to evaluate to 0 for CAT pairs (1e3/1e12 = ~0) and blocking all BYC/wUSDC.b offers. Corrected factor restores proper scaling (1e12/1e3 = 1e9) so gain correctly exceeds fee threshold
+
 ## [0.7.7] — 2026-04-06
 
 ### Fixed
