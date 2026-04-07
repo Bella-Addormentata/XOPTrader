@@ -933,6 +933,19 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Cross-pair correlated inventory skewing (optional) --
+    if (node["cross_pair_skew_enabled"] && node["cross_pair_skew_enabled"].IsDefined()
+        && !node["cross_pair_skew_enabled"].IsNull()) {
+        cfg.cross_pair_skew_enabled = node["cross_pair_skew_enabled"].as<bool>();
+    }
+    if (node["cross_pair_skew_phi"] && node["cross_pair_skew_phi"].IsDefined()
+        && !node["cross_pair_skew_phi"].IsNull()) {
+        cfg.cross_pair_skew_phi = node["cross_pair_skew_phi"].as<double>();
+        if (cfg.cross_pair_skew_phi < 0.0 || cfg.cross_pair_skew_phi > 1.0) {
+            throw ConfigError(sec + ".cross_pair_skew_phi must be in [0, 1]");
+        }
+    }
+
     return cfg;
 }
 
@@ -1607,7 +1620,9 @@ void log_config_summary(const AppConfig& cfg)
         << "  fee_min_spendable = " << cfg.strategy.fee_min_spendable_xch << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
-        << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n";
+        << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n"
+        << "  cross_pair_skew = " << (cfg.strategy.cross_pair_skew_enabled ? "ON" : "off") << "\n"
+        << "  cross_pair_phi  = " << cfg.strategy.cross_pair_skew_phi << "\n";
 
     // Volatility: new fields.
     out << "  candle_agg = " << cfg.volatility.candle_aggregation_blocks << " blocks\n";

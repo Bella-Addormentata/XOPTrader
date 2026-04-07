@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.13] — 2026-04-07
+
+### Added
+
+- **Cross-pair correlated inventory skewing (Guéant 2019)**: When multiple pairs share a common asset (XCH↔BYC↔wUSDC.b triangle), each pair's inventory skew now accounts for inventory pressure from other pairs. If XCH/BYC is short BYC, BYC/wUSDC.b automatically skews its bids to acquire more BYC. The adjustment is weighted by the market allocator's allocation fractions and clamped to prevent runaway skew. Configurable via `cross_pair_skew_enabled` (default: off) and `cross_pair_skew_phi` (default: 0.30).
+
+### Changed
+
+- **Inventory aging enabled** with conservative settings: positions begin relaxing the no-loss constraint after 500 blocks (~7 hours), up to 25 bps max loss, preventing capital from getting permanently locked in underwater positions.
+
+- **Circuit-breaker auto-rebalance enabled**: When inventory ratio exceeds 80% and the position has aged past the threshold, the loss manager is automatically engaged with a 100 bps loss budget to free locked capital.
+
+- **Triangular arbitrage threshold lowered** from 30 bps to 12 bps (just above the fee floor), enabling more frequent marginal rebalancing trades through the XCH↔wUSDC↔BYC triangle.
+
 ## [0.7.12] — 2026-04-07
 
 ### Fixed

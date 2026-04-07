@@ -348,6 +348,32 @@ struct StrategyConfig {
     /// inventory and gets this bonus before the threshold check.
     /// Default 0.01 (1% additional tolerance → effective 3% for helpers).
     double   orphan_inventory_bonus{0.01};
+
+    // -- Cross-pair correlated inventory skewing (Guéant 2019) --------------
+    //
+    // When multiple pairs share a common asset (e.g. XCH is base in
+    // XCH/wUSDC.b and XCH/BYC; BYC is in both XCH/BYC and BYC/wUSDC.b),
+    // each pair's inventory skew should account for inventory pressure
+    // from the other pairs.  This creates a cross-pair demand signal:
+    //
+    //   If XCH/BYC is short BYC (needs BYC), AND BYC/wUSDC.b also trades
+    //   BYC, then BYC/wUSDC.b should skew its bids UP to acquire more BYC.
+    //
+    // The adjustment is additive to the standard inventory_ratio:
+    //   effective_ratio = clamp(inv_ratio + cross_adj, 0, 1)
+    //   cross_adj = cross_pair_skew_phi * Σ(deviation_P' * weight_P')
+    //
+    // where the sum runs over all OTHER pairs sharing a base or quote asset
+    // with the current pair, deviation is (inv_ratio_P' - 0.5) normalised,
+    // and weight is the market allocator fraction (or 1/N if disabled).
+
+    /// Master switch for cross-pair correlated skewing.
+    bool     cross_pair_skew_enabled{false};
+
+    /// Strength of the cross-pair signal [0, 1].  Higher values cause
+    /// stronger coordination between pairs sharing assets.  Conservative
+    /// default 0.3 limits the adjustment to ±0.15 of the ratio.
+    double   cross_pair_skew_phi{0.30};
 };
 
 // ---------------------------------------------------------------------------

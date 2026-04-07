@@ -2987,7 +2987,81 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 AssetId{pair_cfg->base_asset_id},
                 AssetId{pair_cfg->quote_asset_id},
                 mid_mojos);
+        }
+        // -- Cross-pair correlated inventory skewing (Gueant 2019) --
+        // When enabled, adjusts inv_ratio based on inventory pressure
+        // from OTHER pairs sharing the same base or quote asset.
+        // Example: if XCH/BYC is short BYC, BYC/wUSDC.b should skew
+        // its bids UP (lower inv_ratio) to acquire more BYC.
+        if (config_.strategy.cross_pair_skew_enabled && pair_cfg) {
+            const double cphi = config_.strategy.cross_pair_skew_phi;
+            double cross_adj = 0.0;
+            double weight_sum = 0.0;
+
+            for (const auto& [other_name, other_pcs] : cycle_) {
+                if (other_name == pair_name) continue;
+                const PairConfig* other_cfg = find_pair_config(other_name);
+                if (!other_cfg) continue;
+
+                // Check if other pair shares our base or quote asset.
+                const bool shares_base =
+                    (other_cfg->base_asset_id == pair_cfg->base_asset_id) ||
+                    (other_cfg->quote_asset_id == pair_cfg->base_asset_id);
+                const bool shares_quote =
+                    (other_cfg->base_asset_id == pair_cfg->quote_asset_id) ||
+                    (other_cfg->quote_asset_id == pair_cfg->quote_asset_id);
+
+                if (!shares_base && !shares_quote) continue;
+
+                // Get the other pair's inventory ratio.
+                double other_mid = market_data_->get_mid_price(other_name);
+                if (other_mid <= 0.0) continue;
+                Mojo other_mid_mojos = static_cast<Mojo>(std::llround(
+                    other_mid * static_cast<double>(kMojosPerXch)));
+                double other_ratio = inventory_->inventory_ratio(
+                    AssetId{other_cfg->base_asset_id},
+                    AssetId{other_cfg->quote_asset_id},
+                    other_mid_mojos);
+
+                // Deviation of the other pair from balanced (0.5).
+                double other_dev = (other_ratio - 0.5) / 0.5;
+
+                // Weight: market allocator fraction, or uniform.
+                double w = 1.0 / static_cast<double>(cycle_.size());
+                if (market_allocator_ && config_.market_allocator.enabled) {
+                    w = market_allocator_->get_allocation(other_name);
+                }
+
+                // Determine the sign of the adjustment.
+                // If the shared asset is the BASE of our pair:
+                //   Other pair is long base (other_dev > 0) -> they
+                //   want to sell -> we should also try to sell base
+                //   -> push our inv_ratio UP (makes us appear longer).
+                // If the shared asset is the QUOTE of our pair:
+                //   Other pair is long its base (other_dev > 0) ->
+                //   they need quote -> we should accumulate quote
+                //   -> push our inv_ratio DOWN (sell base).
+                double sign = 0.0;
+                if (shares_base) sign += other_dev;
+                if (shares_quote) sign -= other_dev;
+
+                cross_adj += w * sign;
+                weight_sum += w;
+            }
+
+            if (weight_sum > 0.0) {
+                cross_adj = cphi * cross_adj / weight_sum;
+                const double orig_ratio = inv_ratio;
+                inv_ratio = std::clamp(inv_ratio + cross_adj, 0.0, 1.0);
+                if (std::abs(cross_adj) > 0.01) {
+                    spdlog::info("[Engine] Step 7: {} cross-pair skew: "
+                                 "ratio {:.3f} -> {:.3f} (adj={:+.3f})",
+                                 pair_name, orig_ratio, inv_ratio,
+                                 cross_adj);
+                }
+            }
         }
+
 
         // Available capital for bids (quote asset) and asks (base asset).
         Mojo avail_capital   = pcs.risk_quote.bid_size;
