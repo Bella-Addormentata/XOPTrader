@@ -175,7 +175,20 @@ std::uint64_t FeeTracker::get_recommended_fee(std::uint64_t static_fee_mojos,
     }
 
     // Clamp to configured [min, max] band.
+    const std::uint64_t pre_clamp = fee;
     fee = std::clamp(fee, cfg_.min_fee_mojos, cfg_.max_fee_mojos);
+
+    // Warn when min_fee floor significantly exceeds the mempool estimate,
+    // indicating the floor is configured too conservatively.
+    if (pre_clamp < cfg_.min_fee_mojos &&
+        cfg_.min_fee_mojos > pre_clamp * 10) {
+        spdlog::warn("[FeeTracker] min_fee_mojos ({}) is {}x higher than "
+                     "mempool estimate ({} mojos) -- consider lowering "
+                     "min_fee_mojos to reduce costs",
+                     cfg_.min_fee_mojos,
+                     (pre_clamp > 0 ? cfg_.min_fee_mojos / pre_clamp : 0),
+                     pre_clamp);
+    }
 
     // Further cap by remaining budget headroom.
     const std::uint64_t headroom = budget_remaining(current_block);

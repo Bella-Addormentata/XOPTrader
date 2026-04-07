@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.10] — 2026-04-06
+
+### Added
+
+- **Warning log when min_fee floor significantly exceeds mempool estimate**: `FeeTracker::get_recommended_fee()` now emits a `[warn]` when `min_fee_mojos` clamps the fee up by more than 10x over the mempool estimate, making silent overpaying immediately visible in logs
+- **FeeTracker unit tests** (18 tests): Covers fee selection, min/max clamping, adaptive mempool usage, budget enforcement, fee-vs-gain gating, and documents the overpay scenario that prompted v0.7.9
+
 ## [0.7.9] — 2026-04-06
 
 ### Changed
