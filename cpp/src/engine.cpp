@@ -1,4 +1,4 @@
-﻿// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
+// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
 //
 // The engine runs a single-threaded event loop driven by boost::asio.
 // A native C++20 coroutine loop polls the Chia full node for block height
@@ -40,6 +40,7 @@
 #include <chrono>
 #include <cmath>
 #include <functional>
+#include <set>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
@@ -271,6 +272,9 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         arb_cfg.crossed_book_enabled      = config_.arbitrage.crossed_book_enabled;
         arb_cfg.crossed_book_min_edge_bps = config_.arbitrage.crossed_book_min_edge_bps;
         arb_cfg.crossed_book_max_take_xch = config_.arbitrage.crossed_book_max_take_xch;
+        arb_cfg.cross_stable_arb_enabled  = config_.arbitrage.cross_stable_arb_enabled;
+        arb_cfg.cross_stable_min_edge_bps = config_.arbitrage.cross_stable_min_edge_bps;
+        arb_cfg.cross_stable_max_take_xch = config_.arbitrage.cross_stable_max_take_xch;
         arb_cfg.max_position_size         = config_.arbitrage.max_position_size;
         arb_cfg.default_confidence        = config_.arbitrage.default_confidence;
         arb_cfg.min_confidence_threshold  = config_.arbitrage.min_confidence_threshold;
@@ -2987,7 +2991,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 AssetId{pair_cfg->base_asset_id},
                 AssetId{pair_cfg->quote_asset_id},
                 mid_mojos);
-        }
+        }
+
         // -- Cross-pair correlated inventory skewing (Gueant 2019) --
         // When enabled, adjusts inv_ratio based on inventory pressure
         // from OTHER pairs sharing the same base or quote asset.
@@ -5016,6 +5021,250 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         } catch (const std::exception& e) {
             spdlog::error("[Engine] Step 9c: {} crossed-book take failed: {}",
                           pair.name, e.what());
+        }
+    }
+
+    // -- 9d: Cross-stablecoin arbitrage (Shleifer & Vishny 1997) -------------
+    // BYC and wUSDC.b are both USD-pegged stablecoins.  The XCH/BYC and
+    // XCH/wUSDC.b order books should price XCH equivalently after adjusting
+    // for the BYC/wUSDC.b cross-rate.  When one market's ask is cheaper than
+    // the other market's bid (net of fees), we take the cheap ask to capture
+    // the cross-market spread.
+    //
+    // Scholarly basis:
+    //   - Shleifer & Vishny (1997): structural frictions persist mispricings.
+    //   - Makarov & Schoar (2020): 100-300 bps persistent cross-venue spreads
+    //     in crypto, especially on fragmented DEXes without matching engines.
+    //   - Kozhan & Tham (2012): execution risk in triangular FX arbitrage
+    //     implies minimum edge thresholds proportional to settlement latency.
+    //
+    // Implementation:
+    //   For each directed pair (A, B) of XCH-base stablecoin pairs:
+    //     1. Find cheapest ask on pair A (someone selling XCH for stable A).
+    //     2. Find highest bid on pair B (someone buying XCH with stable B).
+    //     3. Normalise via BYC/wUSDC.b mid-rate to a common USD basis.
+    //     4. If normalised_bid > normalised_ask + fees => take the ask on A.
+
+    if (config_.arbitrage.enabled &&
+        config_.arbitrage.cross_stable_arb_enabled &&
+        dexie_ && wallet_ && !dry_run_ && !wallet_circuit_open_)
+    {
+        // Identify XCH-base stablecoin pairs.
+        struct XchStablePair {
+            std::string pair_name;
+            std::string quote_asset;
+            std::string quote_asset_id;
+        };
+        std::vector<XchStablePair> xch_stable_pairs;
+
+        // Collect asset IDs that appear in a stablecoin pair.
+        std::set<std::string> stablecoin_asset_ids;
+        for (const auto& pc : config_.pairs) {
+            if (pc.is_stablecoin) {
+                stablecoin_asset_ids.insert(pc.base_asset_id);
+                stablecoin_asset_ids.insert(pc.quote_asset_id);
+            }
+        }
+
+        for (const auto& pc : config_.pairs) {
+            if (!pc.enabled) continue;
+            if (pc.base_asset_id != "xch") continue;
+            if (stablecoin_asset_ids.count(pc.quote_asset_id)) {
+                const auto slash = pc.name.find('/');
+                const std::string qname = (slash != std::string::npos)
+                    ? pc.name.substr(slash + 1) : pc.quote_asset_id;
+                xch_stable_pairs.push_back({pc.name, qname,
+                                            pc.quote_asset_id});
+            }
+        }
+
+        if (xch_stable_pairs.size() >= 2) {
+            // Get the BYC/wUSDC.b cross-rate for normalisation.
+            // If no stablecoin pair exists, assume 1.0 (at peg).
+            double stable_cross_rate = 1.0;
+            std::string stable_pair_base_id;
+            for (const auto& pc : config_.pairs) {
+                if (pc.is_stablecoin && pc.enabled) {
+                    const double mid = market_data_->get_mid_price(pc.name);
+                    if (mid > 0.0) stable_cross_rate = mid;
+                    stable_pair_base_id = pc.base_asset_id;
+                    break;
+                }
+            }
+
+            const double cs_min_edge_bps =
+                config_.arbitrage.cross_stable_min_edge_bps;
+            const double cs_max_take_xch =
+                config_.arbitrage.cross_stable_max_take_xch;
+
+            for (std::size_t i = 0; i < xch_stable_pairs.size(); ++i) {
+                const auto& pair_a = xch_stable_pairs[i];
+                auto offers_a = market_data_->get_competing_offers(
+                    pair_a.pair_name);
+
+                // Find cheapest competing ask on pair A.
+                Mojo best_ask_a = std::numeric_limits<Mojo>::max();
+                std::string best_ask_a_id;
+                Mojo best_ask_a_size = 0;
+                for (const auto& co : offers_a) {
+                    if (co.side == Side::Ask && co.price < best_ask_a) {
+                        best_ask_a = co.price;
+                        best_ask_a_id = co.offer_id;
+                        best_ask_a_size = co.size;
+                    }
+                }
+                if (best_ask_a == std::numeric_limits<Mojo>::max())
+                    continue;
+
+                for (std::size_t j = 0; j < xch_stable_pairs.size(); ++j) {
+                    if (j == i) continue;
+                    const auto& pair_b = xch_stable_pairs[j];
+                    auto offers_b = market_data_->get_competing_offers(
+                        pair_b.pair_name);
+
+                    // Find highest competing bid on pair B.
+                    Mojo best_bid_b = 0;
+                    for (const auto& co : offers_b) {
+                        if (co.side == Side::Bid && co.price > best_bid_b) {
+                            best_bid_b = co.price;
+                        }
+                    }
+                    if (best_bid_b == 0) continue;
+
+                    // Normalise bid_b to pair_a's quote currency.
+                    // stable_cross_rate = mid of stable pair (base/quote).
+                    // e.g. BYC/wUSDC.b mid ~= 1.0.
+                    double normalised_bid_b = 0.0;
+                    if (pair_a.quote_asset_id == pair_b.quote_asset_id) {
+                        normalised_bid_b = static_cast<double>(best_bid_b);
+                    } else if (pair_a.quote_asset_id == stable_pair_base_id) {
+                        // A quotes in stable-base (BYC), B quotes in
+                        // stable-quote (wUSDC.b).  bid_b is wUSDC.b ->
+                        // multiply by cross_rate to get BYC.
+                        normalised_bid_b = static_cast<double>(best_bid_b)
+                                         * stable_cross_rate;
+                    } else {
+                        // A quotes in stable-quote (wUSDC.b), B quotes in
+                        // stable-base (BYC).  bid_b is BYC -> divide by
+                        // cross_rate to get wUSDC.b.
+                        normalised_bid_b = (stable_cross_rate > 0.0)
+                            ? static_cast<double>(best_bid_b)
+                              / stable_cross_rate
+                            : 0.0;
+                    }
+
+                    const double ask_a_d = static_cast<double>(best_ask_a);
+                    if (ask_a_d <= 0.0 || normalised_bid_b <= 0.0) continue;
+
+                    const double edge_bps =
+                        (normalised_bid_b - ask_a_d) / ask_a_d * 10000.0;
+
+                    if (edge_bps < cs_min_edge_bps) {
+                        spdlog::debug("[Engine] Step 9d: cross-stable "
+                            "{} ask vs {} bid -- edge={:.1f}bps "
+                            "< min={:.1f}bps",
+                            pair_a.pair_name, pair_b.pair_name,
+                            edge_bps, cs_min_edge_bps);
+                        continue;
+                    }
+
+                    spdlog::info("[Engine] Step 9d: CROSS-STABLE ARB "
+                        "detected -- buy XCH on {} (ask={}) sell on {} "
+                        "(bid={}, normalised={:.0f}) edge={:.1f}bps",
+                        pair_a.pair_name, best_ask_a,
+                        pair_b.pair_name, best_bid_b,
+                        normalised_bid_b, edge_bps);
+
+                    // Take the cheap ask on pair A.
+                    try {
+                        auto offer_status =
+                            co_await dexie_->get_offer_status(
+                                best_ask_a_id);
+
+                        if (!offer_status.success ||
+                            offer_status.offer.offer_bech32.empty()) {
+                            spdlog::warn("[Engine] Step 9d: failed to "
+                                "fetch offer {} -- skipping",
+                                best_ask_a_id.substr(0, 12));
+                            continue;
+                        }
+
+                        if (offer_status.offer.status != 0) {
+                            spdlog::info("[Engine] Step 9d: offer {} "
+                                "no longer active (status={}) -- skip",
+                                best_ask_a_id.substr(0, 12),
+                                offer_status.offer.status);
+                            continue;
+                        }
+
+                        const Mojo max_take_mojos = static_cast<Mojo>(
+                            cs_max_take_xch
+                            * static_cast<double>(kMojosPerXch));
+                        const Mojo take_size = std::min(
+                            best_ask_a_size, max_take_mojos);
+
+                        const std::uint64_t fee = fee_tracker_
+                            ? fee_tracker_->get_recommended_fee(
+                                  config_.fees.min_fee_mojos,
+                                  block_height)
+                            : config_.fees.min_fee_mojos;
+
+                        spdlog::info("[Engine] Step 9d: TAKING "
+                            "cross-stable arb on {} -- offer={} "
+                            "edge={:.1f}bps size={} fee={}",
+                            pair_a.pair_name,
+                            best_ask_a_id.substr(0, 12),
+                            edge_bps, take_size, fee);
+
+                        auto result = co_await wallet_->take_offer(
+                            offer_status.offer.offer_bech32, fee);
+
+                        if (result.contains("success") &&
+                            result["success"].get<bool>()) {
+                            const std::string trade_id =
+                                result.contains("trade_record") &&
+                                result["trade_record"].contains(
+                                    "trade_id")
+                                ? result["trade_record"]["trade_id"]
+                                      .get<std::string>()
+                                : "unknown";
+
+                            spdlog::info("[Engine] Step 9d: TOOK "
+                                "cross-stable arb -- buy {} sell {} "
+                                "trade_id={} edge={:.1f}bps size={}",
+                                pair_a.pair_name, pair_b.pair_name,
+                                trade_id.substr(0, 12),
+                                edge_bps, take_size);
+
+                            if (fee_tracker_) {
+                                fee_tracker_->record_fee(
+                                    fee, block_height);
+                            }
+
+                            if (alerts_) {
+                                alerts_->send_alert(
+                                    AlertRule::ArbitrageDetected,
+                                    "Cross-stable arb TAKEN: buy " +
+                                    pair_a.pair_name + " sell " +
+                                    pair_b.pair_name + " edge=" +
+                                    std::to_string(edge_bps) + "bps");
+                            }
+                        } else {
+                            const std::string err =
+                                result.contains("error")
+                                ? result["error"].get<std::string>()
+                                : "unknown error";
+                            spdlog::warn("[Engine] Step 9d: take_offer "
+                                "failed on {}: {}",
+                                pair_a.pair_name, err);
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::error("[Engine] Step 9d: cross-stable "
+                            "take failed on {}: {}",
+                            pair_a.pair_name, e.what());
+                    }
+                }
+            }
         }
     }
 

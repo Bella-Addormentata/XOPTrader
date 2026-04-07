@@ -1281,6 +1281,11 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("crossed_book_min_edge_bps",      cfg.crossed_book_min_edge_bps);
     read_dbl ("crossed_book_max_take_xch",      cfg.crossed_book_max_take_xch, 0.001);
 
+    // Cross-stablecoin arbitrage
+    read_bool("cross_stable_arb_enabled",       cfg.cross_stable_arb_enabled);
+    read_dbl ("cross_stable_min_edge_bps",      cfg.cross_stable_min_edge_bps);
+    read_dbl ("cross_stable_max_take_xch",      cfg.cross_stable_max_take_xch, 0.001);
+
     // General
     read_dbl ("max_position_size",              cfg.max_position_size, 0.001);
     read_dbl ("default_confidence",             cfg.default_confidence, 0.01);
@@ -1580,6 +1585,9 @@ void log_config_summary(const AppConfig& cfg)
         << "  crossed_book         = " << (cfg.arbitrage.crossed_book_enabled ? "true" : "false") << "\n"
         << "  crossed_min_edge_bps = " << cfg.arbitrage.crossed_book_min_edge_bps << "\n"
         << "  crossed_max_take_xch = " << cfg.arbitrage.crossed_book_max_take_xch << "\n"
+        << "  cross_stable_arb     = " << (cfg.arbitrage.cross_stable_arb_enabled ? "true" : "false") << "\n"
+        << "  cross_stable_edge_bps= " << cfg.arbitrage.cross_stable_min_edge_bps << "\n"
+        << "  cross_stable_max_xch = " << cfg.arbitrage.cross_stable_max_take_xch << "\n"
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
         << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
 

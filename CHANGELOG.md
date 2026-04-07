@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.17] — 2026-04-07
+
+### Added
+
+- **Cross-stablecoin arbitrage (Step 9d)**: New engine step detects and takes cross-market arbitrage between XCH/BYC and XCH/wUSDC.b order books. Since both BYC and wUSDC.b are USD-pegged stablecoins (~$1), XCH should be priced equivalently on both markets after adjusting for the BYC/wUSDC.b cross-rate. When one market's ask is cheaper than the other's bid by more than `cross_stable_min_edge_bps` (default 15 bps), the engine takes the cheap ask. Based on Shleifer & Vishny (1997) limits-to-arbitrage theory and Makarov & Schoar (2020) cross-venue crypto spreads.
+- **Spread-aware triangular arbitrage**: `scan_triangular` now uses bid/ask prices when available instead of mid prices. Selling legs use bid prices; buying legs use 1/ask. This eliminates phantom profits from ignoring half-spreads across the 3-leg route (Kozhan & Tham 2012). Falls back to mid prices when bid/ask data is unavailable.
+- **New config fields**: `cross_stable_arb_enabled`, `cross_stable_min_edge_bps`, `cross_stable_max_take_xch` under the `arbitrage:` section.
+- **`PairBidAskMap` type and `set_pair_bid_asks()` setter** for providing bid/ask data to the arbitrage detector.
+
 ## [0.7.16] — 2026-04-07
 
 ### Fixed

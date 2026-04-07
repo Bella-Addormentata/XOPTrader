@@ -608,6 +608,14 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
     // or the inverse of B/A if that exists instead.  Returns 0.0 if neither
     // direction is found.
     //
+    // get_rate_directed("A", "B") uses bid/ask data when available for
+    // conservative profit estimation (Kozhan & Tham 2012).  When we sell
+    // A to get B:
+    //   - Direct pair "A/B" exists: we sell base (A) → use bid price.
+    //   - Inverse pair "B/A" exists: we buy base (B) → use 1/ask price.
+    // Both directions yield a rate <= mid, reducing phantom profit from
+    // ignoring spreads.  Falls back to mid-price when bid/ask unavailable.
+    //
     // get_pair_key("A", "B") returns the actual pair key found in the map
     // (direct or inverse), so we can look up depth for that pair.
 
@@ -626,6 +634,25 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
             return 1.0 / it->second;
         }
         return 0.0;
+    };
+
+    // Spread-aware rate: sell `base` to buy `quote`.
+    // Direct pair "base/quote": selling base → bid price.
+    // Inverse pair "quote/base": buying base of that pair → 1/ask.
+    auto get_rate_directed = [&](const std::string& base,
+                                 const std::string& quote) -> double {
+        const std::string direct = base + "/" + quote;
+        if (auto it = cached_pair_bid_asks_.find(direct);
+            it != cached_pair_bid_asks_.end()) {
+            if (it->second.bid > 0.0) return it->second.bid;
+        }
+        const std::string inverse = quote + "/" + base;
+        if (auto it = cached_pair_bid_asks_.find(inverse);
+            it != cached_pair_bid_asks_.end()) {
+            if (it->second.ask > 0.0) return 1.0 / it->second.ask;
+        }
+        // Fall back to mid-price.
+        return get_rate(base, quote);
     };
 
     // Returns the canonical pair key that exists in the map, or "" if none.
@@ -688,7 +715,7 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
         const auto& a = asset_vec[i];
 
         // Leg 1: XCH -> A.
-        const double rate_xch_a = get_rate("XCH", a);
+        const double rate_xch_a = get_rate_directed("XCH", a);
         if (rate_xch_a <= 0.0) {
             continue;  // no XCH/A pair exists
         }
@@ -702,14 +729,14 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
             const auto& b = asset_vec[j];
 
             // Leg 2: A -> B.
-            const double rate_a_b = get_rate(a, b);
+            const double rate_a_b = get_rate_directed(a, b);
             if (rate_a_b <= 0.0) {
                 continue;  // no A/B pair exists
             }
             const std::string key_leg2 = get_pair_key(a, b);
 
             // Leg 3: B -> XCH.
-            const double rate_b_xch = get_rate(b, "XCH");
+            const double rate_b_xch = get_rate_directed(b, "XCH");
             if (rate_b_xch <= 0.0) {
                 continue;  // no B/XCH pair exists
             }
@@ -1032,6 +1059,11 @@ ArbitrageDetector::get_tibetswap_reserves() const noexcept
 void ArbitrageDetector::set_pair_prices(const PairPriceMap& prices)
 {
     cached_pair_prices_ = prices;
+}
+
+void ArbitrageDetector::set_pair_bid_asks(const PairBidAskMap& bid_asks)
+{
+    cached_pair_bid_asks_ = bid_asks;
 }
 
 void ArbitrageDetector::set_pair_depths(const PairDepthMap& depths)

@@ -516,6 +516,11 @@ struct ArbitrageSettings {
     double   crossed_book_min_edge_bps{10.0};
     double   crossed_book_max_take_xch{5.0};
 
+    // -- Cross-stablecoin arbitrage (XCH/BYC vs XCH/wUSDC.b) ----------------
+    bool     cross_stable_arb_enabled{true};
+    double   cross_stable_min_edge_bps{15.0};
+    double   cross_stable_max_take_xch{5.0};
+
     // -- General parameters --------------------------------------------------
     double   max_position_size{100.0};
     double   default_confidence{0.75};

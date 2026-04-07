@@ -149,6 +149,14 @@ struct CexPrice {
 /// Key: "BASE/QUOTE" (e.g. "XCH/SBX"), Value: mid-price (quote per base).
 using PairPriceMap = std::unordered_map<std::string, double>;
 
+/// Per-pair bid/ask prices for spread-aware triangular-arb scanning.
+/// Key: "BASE/QUOTE", Value: {bid, ask} (quote per base).
+struct BidAsk {
+    double bid{0.0};
+    double ask{0.0};
+};
+using PairBidAskMap = std::unordered_map<std::string, BidAsk>;
+
 /// Per-pair depth information for liquidity-aware arb sizing.
 /// Key: "BASE/QUOTE", Value: available depth (base-asset units) at best level.
 using PairDepthMap = std::unordered_map<std::string, double>;
@@ -218,6 +226,27 @@ struct ArbitrageConfig {
     double crossed_book_max_take_xch{5.0};  // Maximum XCH to risk per crossed-
                                             //   book take per block.  Limits
                                             //   exposure to stale-data risk.
+
+    // -- Cross-stablecoin arbitrage ------------------------------------------
+    //
+    // Detects mispriced XCH across two stablecoin-denominated pairs
+    // (e.g. XCH/wUSDC.b vs XCH/BYC) when the stablecoins are pegged
+    // near par.  If one pair's ask is cheaper than the other pair's bid
+    // (after normalising by the stablecoin cross-rate), we take the cheap
+    // ask to capture the spread.
+    //
+    // Scholarly basis:
+    //   - Shleifer & Vishny (1997): Limits of Arbitrage — structural
+    //     frictions on DEXes (no matching engine, block-time latency)
+    //     create persistent mispricings across equivalent markets.
+    //   - Makarov & Schoar (2020): Trading and Arbitrage in Cryptocurrency
+    //     Markets — documents 100-300 bps persistent cross-venue spreads
+    //     in crypto, especially on fragmented DEXes.
+
+    bool   cross_stable_arb_enabled{true};  // Enable cross-stablecoin arb.
+    double cross_stable_min_edge_bps{15.0}; // Minimum edge after fee + spread
+                                            //   to trigger a take.
+    double cross_stable_max_take_xch{5.0};  // Maximum XCH per take per block.
 
     // -- General parameters --------------------------------------------------
 
@@ -482,6 +511,9 @@ public:
     /// Set the latest pair-price map for triangular scanning.
     void set_pair_prices(const PairPriceMap& prices);
 
+    /// Set the latest per-pair bid/ask map for spread-aware triangular scanning.
+    void set_pair_bid_asks(const PairBidAskMap& bid_asks);
+
     /// Set the latest per-pair depth map for liquidity-aware sizing.
     void set_pair_depths(const PairDepthMap& depths);
 
@@ -517,6 +549,7 @@ private:
     std::vector<DexieBookSnapshot>  cached_dexie_books_;
     std::vector<TibetSwapReserves>  cached_tibetswap_reserves_;
     PairPriceMap                    cached_pair_prices_;
+    PairBidAskMap                   cached_pair_bid_asks_;
     PairDepthMap                    cached_pair_depths_;
     StablecoinPairSet               cached_stablecoin_pairs_;
     double                          cached_wusdc_price_{0.0};
