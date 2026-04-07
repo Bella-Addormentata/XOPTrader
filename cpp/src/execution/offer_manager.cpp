@@ -148,6 +148,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         // ALL offers lock XCH UTXOs for on-chain fees, even buy-XCH
         // offers.  Use 2× reserve as the creation floor so that
         // worst-case UTXO locking still preserves the reserve.
+        //
+        // Recovery zone: when spendable is between 1× and 2× reserve,
+        // allow buy-XCH offers through to escape the low-balance
+        // deadlock (can't buy XCH because can't create offers because
+        // not enough XCH).  Buy-XCH offers will net-increase XCH
+        // balance when filled, restoring normal operation.
         bool reserve_breached = false;
         const bool bids_buy_xch = (pair.base_asset_id == "xch");
         const bool asks_buy_xch = (pair.quote_asset_id == "xch");
@@ -161,13 +167,32 @@ asio::awaitable<int> OfferManager::post_quotes(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    logger_->warn(
-                        "XCH UTXO-lock pre-check (batch): spendable "
-                        "{:.6f} XCH < 2x reserve {:.3f} XCH before {} "
-                        "-- skipping all offers",
-                        static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve * 2.0, pair.name);
-                    reserve_breached = true;
+                    // Check recovery zone: 1× reserve ≤ spendable < 2×.
+                    const auto recovery_floor = static_cast<Mojo>(
+                        std::llround(effective_reserve
+                                     * static_cast<double>(kMojosPerXch)));
+                    if (xch_spendable >= recovery_floor) {
+                        // Recovery zone: allow buy-XCH side only.
+                        logger_->info(
+                            "XCH UTXO-lock recovery zone (batch): "
+                            "spendable {:.6f} XCH in [{:.3f}, {:.3f}) "
+                            "-- allowing buy-XCH offers only for {}",
+                            static_cast<double>(xch_spendable) / kMojosPerXch,
+                            effective_reserve, effective_reserve * 2.0,
+                            pair.name);
+                        if (!bids_buy_xch) bids.clear();
+                        if (!asks_buy_xch) asks.clear();
+                        if (bids.empty() && asks.empty())
+                            reserve_breached = true;
+                    } else {
+                        logger_->warn(
+                            "XCH UTXO-lock pre-check (batch): spendable "
+                            "{:.6f} XCH < reserve {:.3f} XCH before {} "
+                            "-- skipping all offers",
+                            static_cast<double>(xch_spendable) / kMojosPerXch,
+                            effective_reserve, pair.name);
+                        reserve_breached = true;
+                    }
                 }
             } catch (const std::exception& e) {
                 logger_->warn("XCH fee reserve pre-check (batch) failed "
@@ -320,8 +345,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // UTXO locking, the reserve is preserved.  This prevents the
         // create → drain → cancel → create churn cycle.
         //
-        // ALL offers lock XCH UTXOs for on-chain fees, even offers that
-        // buy XCH.  No exemptions -- UTXO locking is direction-agnostic.
+        // Recovery zone: when spendable is between 1× and 2× reserve,
+        // allow buy-XCH offers through to escape the low-balance
+        // deadlock.  Buy-XCH offers net-increase XCH when filled.
         if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
@@ -333,16 +359,46 @@ asio::awaitable<int> OfferManager::post_quotes(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    logger_->warn(
-                        "XCH UTXO-lock pre-check: spendable {:.6f} XCH "
-                        "< 2x reserve {:.3f} XCH before {} {} tier {} "
-                        "-- stopping all offers",
-                        static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve * 2.0,
-                        pair.name, to_string(tier.side), tier.tier_index);
-                    bid_funds_exhausted = true;
-                    ask_funds_exhausted = true;
-                    break;
+                    // Check recovery zone: 1× ≤ spendable < 2×.
+                    const auto recovery_floor = static_cast<Mojo>(
+                        std::llround(effective_reserve
+                                     * static_cast<double>(kMojosPerXch)));
+                    const bool tier_buys_xch =
+                        (tier.side == Side::Bid
+                         && pair.base_asset_id == "xch")
+                        || (tier.side == Side::Ask
+                            && pair.quote_asset_id == "xch");
+                    if (xch_spendable >= recovery_floor && tier_buys_xch) {
+                        logger_->info(
+                            "XCH UTXO-lock recovery: spendable {:.6f} XCH "
+                            "in [{:.3f}, {:.3f}) -- allowing {} {} tier {} "
+                            "(buys XCH)",
+                            static_cast<double>(xch_spendable) / kMojosPerXch,
+                            effective_reserve, effective_reserve * 2.0,
+                            pair.name, to_string(tier.side), tier.tier_index);
+                        // Allow this buy-XCH tier through.
+                    } else if (xch_spendable >= recovery_floor) {
+                        // Recovery zone but this tier doesn't buy XCH.
+                        logger_->debug(
+                            "XCH UTXO-lock recovery: skipping non-XCH-buy "
+                            "{} {} tier {} (spendable {:.6f})",
+                            pair.name, to_string(tier.side), tier.tier_index,
+                            static_cast<double>(xch_spendable) / kMojosPerXch);
+                        if (tier.side == Side::Bid) bid_funds_exhausted = true;
+                        else                        ask_funds_exhausted = true;
+                        continue;
+                    } else {
+                        logger_->warn(
+                            "XCH UTXO-lock pre-check: spendable {:.6f} XCH "
+                            "< reserve {:.3f} XCH before {} {} tier {} "
+                            "-- stopping all offers",
+                            static_cast<double>(xch_spendable) / kMojosPerXch,
+                            effective_reserve,
+                            pair.name, to_string(tier.side), tier.tier_index);
+                        bid_funds_exhausted = true;
+                        ask_funds_exhausted = true;
+                        break;
+                    }
                 }
             } catch (const std::exception& e) {
                 logger_->warn("XCH UTXO-lock pre-check failed before "
@@ -442,8 +498,11 @@ asio::awaitable<int> OfferManager::post_quotes(
         // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
-        // the 2× reserve floor.  Applies to ALL offers including buy-XCH
-        // tiers, since UTXO locking is direction-agnostic.
+        // the 2× reserve floor.
+        //
+        // Recovery zone: if between 1× and 2× reserve, only stop
+        // non-buy-XCH tiers.  Buy-XCH tiers are allowed through to
+        // help the engine escape the low-balance state.
         if (effective_reserve > 0.0) {
             try {
                 auto xch_bal = co_await wallet_->get_wallet_balance(1);
@@ -454,15 +513,28 @@ asio::awaitable<int> OfferManager::post_quotes(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    logger_->warn(
-                        "XCH UTXO-lock guard: spendable {:.6f} XCH "
-                        "< 2x reserve {:.3f} XCH after posting {} {} tier {} "
-                        "-- stopping further offers this heartbeat",
-                        static_cast<double>(xch_spendable) / kMojosPerXch,
-                        effective_reserve * 2.0,
-                        pair.name, to_string(tier.side), tier.tier_index);
-                    bid_funds_exhausted = true;
-                    ask_funds_exhausted = true;
+                    const auto recovery_floor = static_cast<Mojo>(
+                        std::llround(effective_reserve
+                                     * static_cast<double>(kMojosPerXch)));
+                    if (xch_spendable >= recovery_floor) {
+                        // Recovery zone: stop the sell-XCH side only.
+                        const bool bid_sells_xch =
+                            (pair.quote_asset_id == "xch");
+                        const bool ask_sells_xch =
+                            (pair.base_asset_id == "xch");
+                        if (bid_sells_xch) bid_funds_exhausted = true;
+                        if (ask_sells_xch) ask_funds_exhausted = true;
+                    } else {
+                        logger_->warn(
+                            "XCH UTXO-lock guard: spendable {:.6f} XCH "
+                            "< reserve {:.3f} XCH after posting {} {} "
+                            "tier {} -- stopping further offers",
+                            static_cast<double>(xch_spendable) / kMojosPerXch,
+                            effective_reserve,
+                            pair.name, to_string(tier.side), tier.tier_index);
+                        bid_funds_exhausted = true;
+                        ask_funds_exhausted = true;
+                    }
                 }
             } catch (const std::exception& e) {
                 logger_->warn("XCH fee reserve guard: balance check failed "

@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.11] — 2026-04-07
+
+### Fixed
+
+- **UTXO-lock deadlock when XCH balance drops between 1× and 2× reserve**: The 2× reserve UTXO-lock guard blocked ALL offers — including buy-XCH bids — when spendable XCH fell below `2× fee_reserve_xch`. This created an unrecoverable deadlock: the engine wanted to buy XCH to restore balance, but couldn't create the offers needed to do so. Added a "recovery zone" (1× ≤ spendable < 2× reserve) that allows buy-XCH offers through while still blocking sell-XCH and non-XCH offers. Applied to all three UTXO-lock checks in offer_manager (batch pre-check, per-tier pre-check, and post-creation guard)
+
 ## [0.7.10] — 2026-04-06
 
 ### Added
