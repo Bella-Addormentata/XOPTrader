@@ -621,11 +621,13 @@ class EngineBridge(QObject):
                 candidates.append(meipass_dir / "engine-runtime" / engine_name)
         else:
             cwd = Path.cwd()
-            candidates.append(cwd / engine_name)
-            # Development build output directories.
+            # Prefer the build output directory so a stale root-level
+            # copy is never chosen over a freshly-built binary.
             candidates.append(cwd / "cpp" / "build" / "Release" / engine_name)
             candidates.append(cwd / "cpp" / "build" / "Debug" / engine_name)
             candidates.append(cwd / "cpp" / "build" / engine_name)
+            # Fallback: root-level copy (e.g. deployed / manually placed).
+            candidates.append(cwd / engine_name)
 
         for candidate in candidates:
             if candidate.is_file():

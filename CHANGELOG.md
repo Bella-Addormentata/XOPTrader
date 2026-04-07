@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.20] — 2026-04-07
+
+### Fixed
+
+- **Stablecoin ask price floor (peg guard)**: Added a final safety net in Step 7 that floors all ASK prices at `peg_target × (1 + min_margin_bps)` and caps all BID prices at `peg_target × (1 − min_margin_bps)` for stablecoin pairs. Previously, when the market mid dipped below peg (e.g. BYC trading at 0.98 wUSDC), the engine would place asks below $1.00 — effectively selling a $1-pegged asset at a loss. The peg guard prevents this regardless of what upstream pricing stages compute.
+- **Stablecoin undercut bounds respect peg**: The competitive undercut logic (penny-ahead for tier 0) now enforces peg-based bounds in addition to mid-based bounds. Asks cannot undercut below `peg × (1 + margin)` and bids cannot overbid above `peg × (1 − margin)`.
+- **Peg-anchor threshold now inclusive**: Changed `dev < threshold` to `dev <= threshold` so that deviations exactly at the configured `peg_anchor_threshold_pct` (e.g. 2.0%) trigger blending rather than being skipped.
+- **GUI engine binary search order**: `engine_bridge.py` now checks `cpp/build/Release/xop_trader.exe` before the project-root copy, preventing stale root-level binaries from being launched over freshly-built ones.
+
 ## [0.7.19] — 2026-04-07
 
 ### Added

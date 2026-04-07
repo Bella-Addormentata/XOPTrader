@@ -2952,7 +2952,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                  / pc->peg_target;
                 const double peg_threshold = pc->peg_anchor_threshold_pct / 100.0;
                 const double peg_weight    = pc->peg_anchor_weight;
-                if (dev < peg_threshold) {
+                if (dev <= peg_threshold) {
                     const double blended = peg_weight * pc->peg_target
                                          + (1.0 - peg_weight) * market_mid;
                     spdlog::debug("[Engine] Step 7: {} peg-anchor mid: "
@@ -3337,10 +3337,28 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     static_cast<double>(mid_mojos) / 10000.0)));
 
             // Safety bounds: never push our bid above mid or our ask
-            // below mid Ã¢â‚¬â€ that would cross our own spread.  The existing
-            // no-loss floor (post-clamp) handles cost-basis protection.
-            const Mojo max_bid_ceil  = mid_mojos - tick;
-            const Mojo min_ask_floor = mid_mojos + tick;
+            // below mid -- that would cross our own spread.
+            // For stablecoin pairs, also enforce peg-based bounds
+            // so we never sell below peg or buy above peg.
+            Mojo max_bid_ceil  = mid_mojos - tick;
+            Mojo min_ask_floor = mid_mojos + tick;
+
+            if (pair_cfg && pair_cfg->peg_target > 0.0) {
+                const double uc_mbps =
+                    pair_cfg->min_profit_margin_bps_override
+                        .value_or(config_.strategy.min_profit_margin_bps);
+                const auto uc_peg = static_cast<Mojo>(std::llround(
+                    pair_cfg->peg_target
+                    * static_cast<double>(kMojosPerXch)));
+                const auto peg_ask_fl = static_cast<Mojo>(std::llround(
+                    static_cast<double>(uc_peg)
+                    * (1.0 + uc_mbps / 10000.0)));
+                const auto peg_bid_cl = static_cast<Mojo>(std::llround(
+                    static_cast<double>(uc_peg)
+                    * (1.0 - uc_mbps / 10000.0)));
+                min_ask_floor = std::max(min_ask_floor, peg_ask_fl);
+                max_bid_ceil  = std::min(max_bid_ceil, peg_bid_cl);
+            }
 
             for (auto& tq : pcs.ladder) {
                 // Undercut all tiers when configured, else only tier 0.
@@ -3463,6 +3481,41 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         return false;
                     });
                 pcs.ladder.erase(it, pcs.ladder.end());
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Stablecoin peg guard: for stablecoin pairs, floor all ASK
+        // prices at peg * (1 + margin) and cap all BID prices at
+        // peg * (1 - margin).  This is the final safety net that
+        // prevents selling a pegged asset below its theoretical value
+        // regardless of what happened in earlier pipeline stages.
+        // -----------------------------------------------------------------
+        if (pair_cfg && pair_cfg->is_stablecoin && pair_cfg->peg_target > 0.0) {
+            const double margin_bps = pair_cfg->min_profit_margin_bps_override.value_or(
+                config_.strategy.min_profit_margin_bps);
+            const auto peg_mojos = static_cast<Mojo>(std::llround(
+                pair_cfg->peg_target * static_cast<double>(kMojosPerXch)));
+            const auto min_peg_ask = static_cast<Mojo>(std::llround(
+                static_cast<double>(peg_mojos) * (1.0 + margin_bps / 10000.0)));
+            const auto max_peg_bid = static_cast<Mojo>(std::llround(
+                static_cast<double>(peg_mojos) * (1.0 - margin_bps / 10000.0)));
+
+            for (auto& tq : pcs.ladder) {
+                if (tq.side == Side::Ask && tq.price < min_peg_ask) {
+                    spdlog::info("[Engine] Step 7: {} ASK tier {} peg guard: "
+                                 "{} -> {} (peg={:.4f} +{:.1f}bps)",
+                                 pair_name, tq.tier_index, tq.price,
+                                 min_peg_ask, pair_cfg->peg_target, margin_bps);
+                    tq.price = min_peg_ask;
+                }
+                if (tq.side == Side::Bid && tq.price > max_peg_bid) {
+                    spdlog::info("[Engine] Step 7: {} BID tier {} peg guard: "
+                                 "{} -> {} (peg={:.4f} -{:.1f}bps)",
+                                 pair_name, tq.tier_index, tq.price,
+                                 max_peg_bid, pair_cfg->peg_target, margin_bps);
+                    tq.price = max_peg_bid;
+                }
             }
         }
 
