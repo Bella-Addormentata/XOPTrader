@@ -171,11 +171,14 @@ OnChainReconciler::verify_pending_offer_coins()
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
     bool more = true;
+    bool wallet_query_succeeded = false;
 
     while (more) {
         try {
             auto records = co_await wallet_->get_all_offers(
                 offset, offset + kPageSize, /*file_contents=*/false);
+
+            wallet_query_succeeded = true;
 
             if (records.empty() ||
                 static_cast<std::int64_t>(records.size()) < kPageSize) {
@@ -184,8 +187,30 @@ OnChainReconciler::verify_pending_offer_coins()
 
             for (const auto& rec : records) {
                 if (rec.contains("trade_id") && rec.contains("status")) {
+                    // Chia wallet may return status as int or string
+                    // depending on version.  Handle both to avoid
+                    // json.exception.type_error.302.
+                    int status = 0;
+                    if (rec["status"].is_number()) {
+                        status = rec["status"].get<int>();
+                    } else if (rec["status"].is_string()) {
+                        try {
+                            status = std::stoi(
+                                rec["status"].get<std::string>());
+                        } catch (...) {
+                            logger_->warn(
+                                "verify_pending_offer_coins: unparseable "
+                                "status '{}' for trade {}",
+                                rec["status"].get<std::string>(),
+                                rec["trade_id"].get<std::string>()
+                                    .substr(0, 12));
+                            continue;
+                        }
+                    } else {
+                        continue;
+                    }
                     wallet_offer_status[rec["trade_id"].get<std::string>()] =
-                        rec["status"].get<int>();
+                        status;
                 }
             }
 
@@ -195,6 +220,16 @@ OnChainReconciler::verify_pending_offer_coins()
                           "at offset {}: {}", offset, e.what());
             more = false;
         }
+    }
+
+    // If we couldn't retrieve any wallet offers at all, do not proceed
+    // with cross-referencing -- we'd falsely mark everything as stale.
+    if (!wallet_query_succeeded) {
+        logger_->warn("verify_pending_offer_coins: wallet query failed "
+                      "completely -- skipping stale detection to avoid "
+                      "false cancellations ({} pending offers preserved)",
+                      pending.size());
+        co_return stale_offer_ids;
     }
 
     // Cross-reference pending offers against wallet state and on-chain data.

@@ -5,6 +5,14 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.12] — 2026-04-07
+
+### Fixed
+
+- **Offers cancelled immediately after creation by on-chain reconciler**: `verify_pending_offer_coins` crashed with `json.exception.type_error.302` when the Chia wallet returned offer `status` as a string instead of an integer. After the error, the wallet offer map was empty, causing ALL pending offers to be falsely marked "NOT FOUND in wallet" and cancelled via `on_chain_reconcile`. Fixed by (1) handling `status` as either int or string, and (2) aborting stale detection entirely when the wallet query fails completely, preserving all pending offers.
+
+- **Sub-unit BYC offers wasting fee coins**: The engine created BYC/wUSDC.b offers with sizes as small as 970 mojos (0.97 BYC, < 1 full unit), which are economically insignificant and waste XCH on chain fees. Added a minimum offer size filter in Step 7 that drops any tier where `size < base_mojos_per_unit` (1000 mojos for CAT tokens, ensuring at least 1 full unit per offer). Logged as `[Engine] Step 7: dropped N sub-unit tiers`.
+
 ## [0.7.11] — 2026-04-07
 
 ### Fixed

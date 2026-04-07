@@ -3406,6 +3406,36 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             pcs.ladder.erase(it, pcs.ladder.end());
         }
 
+        // -----------------------------------------------------------------
+        // Minimum offer size: drop tiers below 1 unit of the base asset.
+        // Sub-unit offers (e.g. 0.97 BYC) are economically insignificant
+        // and waste XCH fee coins.  Each tier must offer at least 1 full
+        // unit of the base asset.
+        // -----------------------------------------------------------------
+        if (pair_cfg) {
+            const Mojo min_base_mojos = pair_cfg->base_mojos_per_unit;
+            const auto pre_count = pcs.ladder.size();
+            auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
+                [&](const TierQuote& tq) {
+                    if (tq.size < min_base_mojos) {
+                        spdlog::debug("[Engine] Step 7: {} {} tier {} dropped: "
+                                      "size {} < min {} mojos (1 unit)",
+                                      pair_name,
+                                      (tq.side == Side::Bid) ? "BID" : "ASK",
+                                      tq.tier_index, tq.size, min_base_mojos);
+                        return true;
+                    }
+                    return false;
+                });
+            pcs.ladder.erase(it, pcs.ladder.end());
+            if (pcs.ladder.size() < pre_count) {
+                spdlog::info("[Engine] Step 7: {} dropped {} sub-unit tiers "
+                             "(min {} mojos)",
+                             pair_name, pre_count - pcs.ladder.size(),
+                             min_base_mojos);
+            }
+        }
+
         spdlog::debug("[Engine] Step 7: {} generated {} tier quotes",
                       pair_name, pcs.ladder.size());
     }
