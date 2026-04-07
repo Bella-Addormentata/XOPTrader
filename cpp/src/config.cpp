@@ -464,6 +464,11 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         validate_asset_id(p.base_asset_id, "base_asset_id");
         validate_asset_id(p.quote_asset_id, "quote_asset_id");
 
+        // Auto-detect mojos-per-unit from asset type.
+        // XCH = 1e12 mojos/unit, CAT tokens = 1e3 mojos/unit.
+        p.base_mojos_per_unit  = (p.base_asset_id  == "xch") ? 1'000'000'000'000LL : 1'000LL;
+        p.quote_mojos_per_unit = (p.quote_asset_id == "xch") ? 1'000'000'000'000LL : 1'000LL;
+
         // -- Per-pair strategy overrides (all optional) ---------------------
         if (item["gamma_override"] && item["gamma_override"].IsDefined()
             && !item["gamma_override"].IsNull()) {

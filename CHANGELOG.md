@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.7] — 2026-04-06
+
+### Fixed
+
+- **Critical mojo scale bug for CAT/CAT pairs**: `base_mojos_per_unit` defaulted to 1e12 (XCH scale) for all pairs, but CAT tokens use 1e3 mojos/unit. For BYC/wUSDC.b this caused a **billion-fold pricing error** — offers requested 1.9 billion BYC for 1.9 wUSDC.b instead of correct ~1:1 ratio
+- **Auto-detect mojos-per-unit from asset type**: Config parser now sets `base_mojos_per_unit` and `quote_mojos_per_unit` based on whether asset_id is "xch" (1e12) or a CAT hex ID (1e3), eliminating the need for manual configuration
+
 ## [0.7.6] — 2026-04-06
 
 ### Added
