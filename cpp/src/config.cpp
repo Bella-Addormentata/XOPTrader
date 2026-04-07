@@ -600,6 +600,16 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             }
             p.max_half_spread_bps_override = v;
         }
+        if (item["min_offer_size_units_override"]
+            && item["min_offer_size_units_override"].IsDefined()
+            && !item["min_offer_size_units_override"].IsNull()) {
+            double v = item["min_offer_size_units_override"].as<double>();
+            if (!(v >= 0.0)) {
+                throw ConfigError(idx + ".min_offer_size_units_override must be >= 0; got "
+                                  + std::to_string(v));
+            }
+            p.min_offer_size_units_override = v;
+        }
         if (item["peg_anchor_threshold_pct"]
             && item["peg_anchor_threshold_pct"].IsDefined()
             && !item["peg_anchor_threshold_pct"].IsNull()) {
@@ -795,6 +805,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.min_reserve_units = node["min_reserve_units"].as<double>();
         if (cfg.min_reserve_units < 0.0) {
             throw ConfigError(sec + ".min_reserve_units must be >= 0");
+        }
+    }
+    if (node["min_offer_size_units"] && node["min_offer_size_units"].IsDefined()
+        && !node["min_offer_size_units"].IsNull()) {
+        cfg.min_offer_size_units = node["min_offer_size_units"].as<double>();
+        if (cfg.min_offer_size_units < 0.0) {
+            throw ConfigError(sec + ".min_offer_size_units must be >= 0");
         }
     }
     if (node["min_trading_units"] && node["min_trading_units"].IsDefined()
@@ -1627,6 +1644,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  fee_reserve_xch = " << cfg.strategy.fee_reserve_xch << "\n"
         << "  fee_min_spendable = " << cfg.strategy.fee_min_spendable_xch << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
+        << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n"
         << "  cross_pair_skew = " << (cfg.strategy.cross_pair_skew_enabled ? "ON" : "off") << "\n"

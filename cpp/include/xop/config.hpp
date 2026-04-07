@@ -134,6 +134,7 @@ struct PairConfig {
     std::optional<std::vector<double>> tier_spacing_bps_override;
     std::optional<std::vector<double>> tier_size_pct_override;
     std::optional<double>   max_half_spread_bps_override;
+    std::optional<double>   min_offer_size_units_override;
 
     // -- Stablecoin peg configuration ---------------------------------------
     // When is_stablecoin is true, the depeg detector monitors this pair
@@ -241,6 +242,11 @@ struct StrategyConfig {
     /// side that would deplete an asset below this level are suppressed.
     /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
     double   min_reserve_units{1.0};
+
+    /// Minimum offer size in base-asset units.  Tiers with a size below
+    /// this value (converted to mojos) are dropped in Step 7.  Prevents
+    /// dust-sized offers that waste fees and wallet UTXOs.  Default 1.0.
+    double   min_offer_size_units{1.0};
 
     /// Minimum units of each asset desired for active trading.  When an
     /// asset is below this level, the engine biases toward acquiring it

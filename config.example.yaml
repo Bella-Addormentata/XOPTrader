@@ -83,6 +83,7 @@ pairs:
     min_profit_margin_bps_override: 12  # Tighter margin — DBX subsidy offsets
     tier_spacing_bps_override: [15, 30, 50, 80]  # Much tighter ladder
     tier_size_pct_override: [0.30, 0.25, 0.25, 0.20]
+    min_offer_size_units_override: 10  # Drop tiers below 10 BYC (~$10) — prevents dust offers
     # Stablecoin peg monitoring — both sides are USD-pegged
     is_stablecoin: true
     peg_target: 1.0                # Both BYC and wUSDC.b should be $1
@@ -134,6 +135,7 @@ strategy:
   # Prevents zero-balance lockout by reserving a minimum in each asset.
   fee_reserve_xch: 1.0                # [OPTIONAL, default: 1.0]  XCH held back for on-chain fees
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
+  min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
 

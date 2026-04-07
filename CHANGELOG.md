@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.19] — 2026-04-07
+
+### Added
+
+- **Configurable minimum offer size (`min_offer_size_units`)**: New global strategy field (default 1.0) and per-pair override (`min_offer_size_units_override`) control the minimum tier size in base-asset units. Tiers below this threshold are dropped in Step 7 before posting. Prevents dust-sized offers (e.g. 2-3 BYC ≈ $2-3) that waste XCH fees, fragment wallet UTXOs, and clutter the DEX with economically insignificant offers.
+
+### Fixed
+
+- **BYC/wUSDC.b dust offers**: Set `min_offer_size_units_override: 10` for BYC/wUSDC.b, requiring at least 10 BYC (~$10) per tier. Previously the 1-unit (1 BYC) minimum allowed tiers as small as 2-3 BYC through, with all tiers clamped to the same price after the order-book guard — posting redundant identical-price offers worth $2-3 each.
+
 ## [0.7.18] — 2026-04-07
 
 ### Fixed
