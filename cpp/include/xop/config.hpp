@@ -133,6 +133,7 @@ struct PairConfig {
     std::optional<double>   min_profit_margin_bps_override;
     std::optional<std::vector<double>> tier_spacing_bps_override;
     std::optional<std::vector<double>> tier_size_pct_override;
+    std::optional<double>   max_half_spread_bps_override;
 
     // -- Stablecoin peg configuration ---------------------------------------
     // When is_stablecoin is true, the depeg detector monitors this pair
@@ -142,6 +143,14 @@ struct PairConfig {
     double depeg_warn_pct{2.0};           // Warn when >2% off peg.
     double depeg_bail_pct{10.0};          // Bail out (pull quotes) when >10% off peg.
     uint32_t depeg_sustained_blocks{30};  // Must persist N blocks before bail (~26 min).
+
+    // -- Stablecoin trading overrides ---------------------------------------
+    double peg_anchor_threshold_pct{1.0};   // Dev pct for peg-anchor blending.
+    double peg_anchor_weight{0.50};         // Weight of peg in blend (0-1).
+    bool   stablecoin_exempt_buyonly{false}; // Exempt from XCH-buy-only skip.
+    bool   stablecoin_undercut_all_tiers{false}; // Competitive undercut on all tiers.
+    bool   stablecoin_flat_sizing{false};    // Skip adverse-selection sizing.
+    bool   stablecoin_skip_gap_aware{false}; // Skip gap-aware spacing.
 };
 
 // ---------------------------------------------------------------------------

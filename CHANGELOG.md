@@ -5,6 +5,27 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] — 2026-04-06
+
+### Added
+
+- **Stablecoin dynamic tier system**: New per-pair PairConfig fields for competitive stablecoin trading:
+  - `max_half_spread_bps_override` — per-pair spread cap (replaces global 250 bps with e.g. 75 bps for stablecoins)
+  - `peg_anchor_threshold_pct` — configurable deviation threshold for peg-anchor blending (raised from hardcoded 1% to 2%)
+  - `peg_anchor_weight` — configurable peg weight in blend (raised from hardcoded 50% to 60%)
+  - `stablecoin_exempt_buyonly` — exempts non-XCH stablecoin pairs from XCH-buy-only mode skip
+  - `stablecoin_undercut_all_tiers` — enables competitive undercutting on all tiers (not just tier 0)
+  - `stablecoin_flat_sizing` — bypasses adverse-selection sizing that crushes inner tiers
+  - `stablecoin_skip_gap_aware` — bypasses gap-aware spacing that widens configured tight tiers
+
+### Fixed
+
+- **BYC/wUSDC.b not posting offers**: Pair was entirely skipped during XCH-buy-only mode because it has no XCH component. Now exempt via `stablecoin_exempt_buyonly`
+- **A-S model producing 3000+ bps spreads for stablecoins**: Capped to 500 bps by global limit, still 10x too wide. Per-pair `max_half_spread_bps_override: 75` now produces ~45 bps spreads
+- **Peg-anchor not activating**: BYC at 0.989 was 1.12% from peg, just outside hardcoded 1% threshold. Configurable `peg_anchor_threshold_pct: 2.0` now activates correctly
+- **Gap-aware spacing counterproductive for stablecoins**: Was widening configured tight tiers [8,15,25,40,60,80] → [40,50,60,70,80,90]. Now skipped via `stablecoin_skip_gap_aware`
+- **Adverse-selection crushing inner tiers**: Tier 0 was getting only 0.3% of capital. Now bypassed for stablecoins via `stablecoin_flat_sizing`
+
 ## [0.7.5] — 2026-04-06
 
 ### Fixed

@@ -232,6 +232,15 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.fill_rate_lookback_hours  = config_.strategy.fill_rate_lookback_hours;
         liq_cfg.fill_rate_min_pct         = config_.strategy.fill_rate_min_pct;
 
+        // Stablecoin overrides: skip adverse-selection and gap-aware
+        // adjustments that widen spreads counterproductively.
+        if (pair.stablecoin_skip_gap_aware) {
+            liq_cfg.gap_aware_spacing = false;
+        }
+        if (pair.stablecoin_flat_sizing) {
+            liq_cfg.adverse_selection_sizing = false;
+        }
+
         liquidity_engines_[pair.name] =
             std::make_unique<LiquidityEngine>(pair.name, liq_cfg);
     }
@@ -2509,7 +2518,12 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         // ISO/IEC 5055: bounded output prevents unbounded spread growth.
         // ISO/IEC 25000: configurable via strategy.max_half_spread_bps.
         // ---------------------------------------------------------------
-        const double max_hs = config_.strategy.max_half_spread_bps;
+        const double max_hs = [&]() -> double {
+            const PairConfig* spc = find_pair_config(pair_name);
+            if (spc && spc->max_half_spread_bps_override.has_value())
+                return spc->max_half_spread_bps_override.value();
+            return config_.strategy.max_half_spread_bps;
+        }();
         if (pcs.spread_result.half_spread > max_hs) {
             spdlog::warn("[step5] {} spread capped: {:.1f}bps -> {:.1f}bps "
                          "(half_spread exceeded max {}bps)",
@@ -2932,22 +2946,25 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             if (pc && pc->is_stablecoin && pc->peg_target > 0.0) {
                 const double dev = std::abs(market_mid - pc->peg_target)
                                  / pc->peg_target;
-                if (dev < 0.01) {
-                    // Within Ã‚Â±1%: light 50/50 blend to filter noise.
-                    const double blended = 0.50 * pc->peg_target
-                                         + 0.50 * market_mid;
+                const double peg_threshold = pc->peg_anchor_threshold_pct / 100.0;
+                const double peg_weight    = pc->peg_anchor_weight;
+                if (dev < peg_threshold) {
+                    const double blended = peg_weight * pc->peg_target
+                                         + (1.0 - peg_weight) * market_mid;
                     spdlog::debug("[Engine] Step 7: {} peg-anchor mid: "
                                   "market={:.6f} peg={:.4f} blended={:.6f} "
-                                  "(dev={:.2f}%)",
+                                  "(dev={:.2f}% thr={:.1f}% w={:.0f}%)",
                                   pair_name, market_mid, pc->peg_target,
-                                  blended, dev * 100.0);
+                                  blended, dev * 100.0,
+                                  peg_threshold * 100.0,
+                                  peg_weight * 100.0);
                     market_mid = blended;
                 } else {
                     spdlog::debug("[Engine] Step 7: {} peg-anchor skipped: "
                                   "market={:.6f} peg={:.4f} dev={:.2f}%"
-                                  " > 1% -- trusting market",
+                                  " > {:.1f}% -- trusting market",
                                   pair_name, market_mid, pc->peg_target,
-                                  dev * 100.0);
+                                  dev * 100.0, peg_threshold * 100.0);
                 }
             }
         }
@@ -3247,7 +3264,10 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             const Mojo min_ask_floor = mid_mojos + tick;
 
             for (auto& tq : pcs.ladder) {
-                if (tq.tier_index != 0) continue;  // only innermost
+                // Undercut all tiers when configured, else only tier 0.
+                if (!pair_cfg->stablecoin_undercut_all_tiers
+                    && tq.tier_index != 0)
+                    continue;
 
                 if (tq.side == Side::Bid && best_comp_bid > 0) {
                     const Mojo improved = best_comp_bid + tick;
@@ -3857,9 +3877,15 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             } else if (quote_is_xch) {
                 can_bid = false;  // only ask (receive XCH)
             } else {
-                spdlog::debug("[Engine] Step 8: {} skipped -- XCH-buy-only "
-                              "mode (no XCH side)", pair_name);
-                continue;
+                // Non-XCH pair: skip unless stablecoin_exempt_buyonly.
+                if (!buypc || !buypc->stablecoin_exempt_buyonly) {
+                    spdlog::debug("[Engine] Step 8: {} skipped -- XCH-buy-only "
+                                  "mode (no XCH side)", pair_name);
+                    continue;
+                }
+                // Stablecoin exempt: allow normal bid+ask posting.
+                spdlog::info("[Engine] Step 8: {} exempt from XCH-buy-only "
+                             "(stablecoin_exempt_buyonly=true)", pair_name);
             }
         }
 

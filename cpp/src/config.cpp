@@ -584,6 +584,53 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             p.depeg_sustained_blocks = item["depeg_sustained_blocks"].as<uint32_t>();
         }
 
+        // -- Stablecoin trading overrides (optional) --------------------
+        if (item["max_half_spread_bps_override"]
+            && item["max_half_spread_bps_override"].IsDefined()
+            && !item["max_half_spread_bps_override"].IsNull()) {
+            double v = item["max_half_spread_bps_override"].as<double>();
+            if (!(v > 0.0)) {
+                throw ConfigError(idx + ".max_half_spread_bps_override must be > 0; got "
+                                  + std::to_string(v));
+            }
+            p.max_half_spread_bps_override = v;
+        }
+        if (item["peg_anchor_threshold_pct"]
+            && item["peg_anchor_threshold_pct"].IsDefined()
+            && !item["peg_anchor_threshold_pct"].IsNull()) {
+            p.peg_anchor_threshold_pct = item["peg_anchor_threshold_pct"].as<double>();
+        }
+        if (item["peg_anchor_weight"]
+            && item["peg_anchor_weight"].IsDefined()
+            && !item["peg_anchor_weight"].IsNull()) {
+            double v = item["peg_anchor_weight"].as<double>();
+            if (v < 0.0 || v > 1.0) {
+                throw ConfigError(idx + ".peg_anchor_weight must be in [0,1]; got "
+                                  + std::to_string(v));
+            }
+            p.peg_anchor_weight = v;
+        }
+        if (item["stablecoin_exempt_buyonly"]
+            && item["stablecoin_exempt_buyonly"].IsDefined()
+            && !item["stablecoin_exempt_buyonly"].IsNull()) {
+            p.stablecoin_exempt_buyonly = item["stablecoin_exempt_buyonly"].as<bool>();
+        }
+        if (item["stablecoin_undercut_all_tiers"]
+            && item["stablecoin_undercut_all_tiers"].IsDefined()
+            && !item["stablecoin_undercut_all_tiers"].IsNull()) {
+            p.stablecoin_undercut_all_tiers = item["stablecoin_undercut_all_tiers"].as<bool>();
+        }
+        if (item["stablecoin_flat_sizing"]
+            && item["stablecoin_flat_sizing"].IsDefined()
+            && !item["stablecoin_flat_sizing"].IsNull()) {
+            p.stablecoin_flat_sizing = item["stablecoin_flat_sizing"].as<bool>();
+        }
+        if (item["stablecoin_skip_gap_aware"]
+            && item["stablecoin_skip_gap_aware"].IsDefined()
+            && !item["stablecoin_skip_gap_aware"].IsNull()) {
+            p.stablecoin_skip_gap_aware = item["stablecoin_skip_gap_aware"].as<bool>();
+        }
+
         // Validate: depeg_bail_pct must exceed depeg_warn_pct.
         if (p.is_stablecoin && p.depeg_bail_pct <= p.depeg_warn_pct) {
             throw ConfigError(idx + ".depeg_bail_pct ("
