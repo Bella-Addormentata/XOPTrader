@@ -634,6 +634,13 @@ struct FeeConfig {
     /// Rolling window (in blocks) over which cumulative fees are tracked
     /// for daily budget enforcement.  Default 1662 ≈ 24 h at 52 s/block.
     uint32_t fee_window_blocks{1662};
+
+    /// Target inclusion time (seconds) passed to the full node's
+    /// get_fee_estimate RPC.  Lower values request higher fees for faster
+    /// inclusion; higher values allow the node to return cheaper estimates.
+    /// Market-making offers are long-lived (offer_ttl_blocks ~60), so
+    /// urgency is low.  Default 300 s (5 min).
+    uint32_t fee_estimate_target_seconds{300};
 };
 
 // ---------------------------------------------------------------------------

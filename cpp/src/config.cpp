@@ -1370,6 +1370,7 @@ FeeConfig parse_fees(const YAML::Node& root)
     read_u64 ("max_fee_mojos",        cfg.max_fee_mojos);
     read_bool("adaptive_enabled",     cfg.adaptive_enabled);
     read_u32 ("fee_window_blocks",    cfg.fee_window_blocks);
+    read_u32 ("fee_estimate_target_seconds", cfg.fee_estimate_target_seconds);
 
     // Validate constraints.
     if (cfg.min_fee_mojos > cfg.max_fee_mojos) {
@@ -1593,7 +1594,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  min_fee    = " << cfg.fees.min_fee_mojos << " mojos\n"
         << "  max_fee    = " << cfg.fees.max_fee_mojos << " mojos\n"
         << "  adaptive   = " << (cfg.fees.adaptive_enabled ? "true" : "false") << "\n"
-        << "  window     = " << cfg.fees.fee_window_blocks << " blocks\n";
+        << "  window     = " << cfg.fees.fee_window_blocks << " blocks\n"
+        << "  estimate_target = " << cfg.fees.fee_estimate_target_seconds << "s\n";
 
     // Strategy: new fields.
     out << "  confirm    = " << cfg.strategy.confirmation_depth_blocks << " blocks\n"

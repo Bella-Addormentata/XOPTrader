@@ -301,6 +301,7 @@ fees:
   max_fee_mojos: 100000000           # Fee ceiling (0.0001 XCH)
   adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
+  fee_estimate_target_seconds: 300   # Target inclusion time for fee estimate (300=5min, low urgency)
 
 # Inventory aging (T4-09): gradually relax the no-loss floor for positions
 # held underwater for an extended period.  Capital locked in permanently-

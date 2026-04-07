@@ -1668,7 +1668,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
     if (fee_tracker_->enabled() && config_.fees.adaptive_enabled
         && !wallet_only_mode_) {
         try {
-            auto est = co_await full_node_->get_fee_estimate(/*target_time=*/60);
+            auto est = co_await full_node_->get_fee_estimate(config_.fees.fee_estimate_target_seconds);
             if (est > 0) {
                 fee_tracker_->update_mempool_estimate(est);
             }

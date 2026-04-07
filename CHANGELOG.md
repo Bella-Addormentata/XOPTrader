@@ -5,6 +5,17 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.9] — 2026-04-06
+
+### Changed
+
+- **Reduced fee estimate target from 60s to 300s**: The `get_fee_estimate` RPC was requesting fees for 60-second inclusion urgency, producing ~9.3M mojo fees on a near-empty mempool. Market-making offers are long-lived (60-block TTL) and don't need next-block priority. New configurable `fee_estimate_target_seconds` (default 300s) drops the estimate to ~5,661 mojos when the mempool is quiet
+- **Lowered `min_fee_mojos` in config.yaml from 5M to 50K**: The previous 5M floor was 880x higher than the blockchain required. Reduced to 50,000 mojos to let the adaptive fee tracker use naturally low fees during quiet periods
+
+### Added
+
+- **`fee_estimate_target_seconds` config field**: New `FeeConfig` setting controlling the target inclusion time passed to the Chia full node's `get_fee_estimate` RPC. Configurable per deployment; higher values = lower fees, lower urgency
+
 ## [0.7.8] — 2026-04-06
 
 ### Fixed
