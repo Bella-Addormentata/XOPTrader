@@ -4357,8 +4357,20 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // and cancel/replace costs scale linearly with tier count, not
         // fill probability.
         // -----------------------------------------------------------------
+        // [v0.7.14] Skip XCH budget limiter in recovery mode.
+        // When xch_buy_only_mode is active, the remaining tiers are
+        // already restricted to XCH-buying sides.  Trimming them by
+        // the tiny xch_budget causes a deadlock: no bids can be
+        // posted, so XCH can never recover.  The offer_manager's
+        // per-tier UTXO-lock recovery zone check handles safety.
+        const bool skip_xch_budget_limiter = xch_buy_only_mode
+            && pair_cfg
+            && (pair_cfg->base_asset_id == "xch"
+                || pair_cfg->quote_asset_id == "xch");
+
         if (pair_cfg && !fee_filtered_tiers.empty()
-            && config_.strategy.fee_reserve_xch > 0.0) {
+            && config_.strategy.fee_reserve_xch > 0.0
+            && !skip_xch_budget_limiter) {
 
             // Estimated UTXO overhead per offer (~0.25 XCH).
             constexpr Mojo kUtxoOverheadMojos =

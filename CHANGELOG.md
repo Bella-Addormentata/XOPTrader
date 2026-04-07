@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.14] — 2026-04-07
+
+### Fixed
+
+- **XCH-buy-only deadlock: dynamic tier limiter blocks recovery bids**: When spendable XCH is marginally above the fee reserve (e.g. 1.208 XCH with 1.0 reserve), the Step 8 dynamic tier limiter trimmed ALL tiers to zero because the `xch_budget` (0.008 XCH) couldn't cover the 0.25 XCH UTXO overhead per offer. This created a permanent deadlock: no XCH-buy bids could be posted, so XCH could never recover. Fixed by skipping the Step 8 XCH budget limiter when `xch_buy_only_mode` is active for pairs involving XCH. The offer_manager's per-tier UTXO-lock recovery zone check already handles safety correctly, allowing XCH-buy bids when spendable ≥ 1× reserve.
+
 ## [0.7.13] — 2026-04-07
 
 ### Added
