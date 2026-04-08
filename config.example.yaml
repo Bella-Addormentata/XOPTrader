@@ -274,6 +274,7 @@ arbitrage:
   peg_arb_enabled: true                 # Take offers that cross the $1 peg on stablecoin pairs
   peg_arb_min_edge_bps: 5               # Min bps above/below peg to trigger (5 = 0.05%)
   peg_arb_max_take_units: 50            # Max base-asset units per take (e.g. 50 BYC)
+  peg_arb_max_inventory_ratio: 0.70     # Suppress takes beyond 70:30 balance (0.5 = 50:50)
   cross_stable_min_edge_bps: 15         # Min edge in bps after normalisation
   cross_stable_max_take_xch: 5.0        # Max XCH to risk per take per block
 

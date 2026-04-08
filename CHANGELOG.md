@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.27] — 2026-04-08
+
+### Added
+
+- **Inventory ratio guard for Step 9e peg-crossing taker**: New config field `peg_arb_max_inventory_ratio` (default 0.70) caps how far inventory can skew before Step 9e suppresses takes. When base holdings exceed 70% of portfolio value, ASK takes (buying more base) are suppressed. When base holdings drop below 30%, BID takes (selling base) are suppressed. Prevents the engine from accumulating unlimited BYC from the ~2,500 artificially cheap sub-peg offers on the Dexie BYC/wUSDC.b book while still allowing opportunistic takes within the allowed balance range.
+
 ## [0.7.26] — 2026-04-08
 
 ### Fixed

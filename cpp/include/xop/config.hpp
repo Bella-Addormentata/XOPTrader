@@ -557,6 +557,7 @@ struct ArbitrageSettings {
     bool     peg_arb_enabled{true};
     double   peg_arb_min_edge_bps{5.0};     // min deviation from peg to take
     double   peg_arb_max_take_units{50.0};   // max base-asset units per take
+    double   peg_arb_max_inventory_ratio{0.70}; // max base ratio before suppressing buys
 
     // -- General parameters --------------------------------------------------
     double   max_position_size{100.0};

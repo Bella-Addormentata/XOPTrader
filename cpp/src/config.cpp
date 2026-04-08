@@ -1337,6 +1337,7 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_bool("peg_arb_enabled",                cfg.peg_arb_enabled);
     read_dbl ("peg_arb_min_edge_bps",           cfg.peg_arb_min_edge_bps);
     read_dbl ("peg_arb_max_take_units",         cfg.peg_arb_max_take_units, 0.001);
+    read_dbl ("peg_arb_max_inventory_ratio",    cfg.peg_arb_max_inventory_ratio, 0.01);
 
     // General
     read_dbl ("max_position_size",              cfg.max_position_size, 0.001);
@@ -1643,6 +1644,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  peg_arb              = " << (cfg.arbitrage.peg_arb_enabled ? "true" : "false") << "\n"
         << "  peg_arb_min_edge_bps = " << cfg.arbitrage.peg_arb_min_edge_bps << "\n"
         << "  peg_arb_max_units    = " << cfg.arbitrage.peg_arb_max_take_units << "\n"
+        << "  peg_arb_max_inv_ratio= " << cfg.arbitrage.peg_arb_max_inventory_ratio << "\n"
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
         << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
 

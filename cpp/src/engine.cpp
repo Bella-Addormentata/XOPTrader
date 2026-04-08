@@ -5520,6 +5520,24 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             auto comp = market_data_->get_competing_offers(pair.name);
             if (comp.empty()) continue;
 
+            // Inventory ratio guard: suppress buy-side takes that would
+            // push the base holding beyond peg_arb_max_inventory_ratio,
+            // and suppress sell-side takes that would push quote beyond
+            // the same limit (i.e. base below 1 - limit).
+            const double peg_max_ratio =
+                config_.arbitrage.peg_arb_max_inventory_ratio;
+            double inv_ratio_9e = 0.5;
+            if (inventory_) {
+                Mojo mid9e = static_cast<Mojo>(std::llround(
+                    market_data_->get_mid_price(pair.name)
+                    * static_cast<double>(kMojosPerXch)));
+                inv_ratio_9e = inventory_->inventory_ratio(
+                    AssetId{pair.base_asset_id},
+                    AssetId{pair.quote_asset_id}, mid9e);
+            }
+            const bool suppress_buy  = (inv_ratio_9e >= peg_max_ratio);
+            const bool suppress_sell = (inv_ratio_9e <= (1.0 - peg_max_ratio));
+
             // Best crossing offer per side.
             struct PegCandidate {
                 std::string id;
@@ -5641,8 +5659,20 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             };
 
             try {
-                if (best_bid) co_await take_peg(*best_bid);
-                if (best_ask) co_await take_peg(*best_ask);
+                if (best_bid && !suppress_sell) {
+                    co_await take_peg(*best_bid);
+                } else if (best_bid && suppress_sell) {
+                    spdlog::info("[Engine] Step 9e: {} SKIP BID take -- "
+                                 "inv_ratio={:.3f} <= {:.2f} (too much quote)",
+                                 pair.name, inv_ratio_9e, 1.0 - peg_max_ratio);
+                }
+                if (best_ask && !suppress_buy) {
+                    co_await take_peg(*best_ask);
+                } else if (best_ask && suppress_buy) {
+                    spdlog::info("[Engine] Step 9e: {} SKIP ASK take -- "
+                                 "inv_ratio={:.3f} >= {:.2f} (too much base)",
+                                 pair.name, inv_ratio_9e, peg_max_ratio);
+                }
             } catch (const std::exception& e) {
                 spdlog::error("[Engine] Step 9e: {} peg-arb failed: {}",
                               pair.name, e.what());
