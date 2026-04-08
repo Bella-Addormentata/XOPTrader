@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS
-from gui.utils import mojos_to_xch, mojos_per_unit_for_pair
+from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -393,7 +393,7 @@ class TradeLogWidget(QWidget):
 
             # -- Price --
             price_mojos: int = trade.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
+            item_price = QTableWidgetItem(format_price(price_mojos, pair_name))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter

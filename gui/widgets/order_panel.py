@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS
-from gui.utils import mojos_to_xch, mojos_per_unit_for_pair
+from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -402,10 +402,11 @@ class OrderPanel(QWidget):
             # -- Price (mojos -> display units) --
             # Engine stores price_mojos = price × 10^12 (kMojosPerXch) for ALL
             # pairs, so prices always divide by MOJOS_PER_XCH (the default).
+            # Stablecoin-quoted pairs get a "$" prefix.
             pair_name: str = offer.get("pair_name", "")
             base_mpu = mojos_per_unit_for_pair(pair_name, "base")
             price_mojos: int = offer.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
+            item_price = QTableWidgetItem(format_price(price_mojos, pair_name))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter

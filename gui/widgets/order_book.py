@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS as _C
-from gui.utils import MOJOS_PER_XCH, mojos_to_xch, mojos_to_xch_float, mojos_per_unit_for_pair
+from gui.utils import MOJOS_PER_XCH, mojos_to_xch, mojos_to_xch_float, mojos_per_unit_for_pair, format_price, is_stablecoin_quoted
 
 # ---------------------------------------------------------------------------
 # pyqtgraph defaults matching the CHIA dark theme
@@ -825,17 +825,20 @@ class OrderBookWidget(QWidget):
                 color_price=_C.LOSS_RED,
                 color_bar=_C.LOSS_RED,
                 base_mpu=base_mpu,
+                pair_name=snap.pair_name,
             )
 
         # --- Mid-price row (separator) ---
         mid_row = ask_count
         spread_val = mojos_to_xch_float(snap.mid_price_mojos) * (snap.spread_bps / 10_000.0)
+        mid_price_text = format_price(snap.mid_price_mojos, snap.pair_name)
+        spread_display = format_price(int(round(spread_val * MOJOS_PER_XCH)), snap.pair_name)
         spread_text = (
             f"Spread: {snap.spread_bps:.0f} bps "
-            f"({mojos_to_xch(int(round(spread_val * MOJOS_PER_XCH)), decimals=4)})"
+            f"({spread_display})"
         )
         mid_item = QTableWidgetItem(
-            f"  Mid: {mojos_to_xch(snap.mid_price_mojos, decimals=6)}  |  {spread_text}"
+            f"  Mid: {mid_price_text}  |  {spread_text}"
         )
         mid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         mid_item.setForeground(QColor(_C.TEXT_PRIMARY))
@@ -859,6 +862,7 @@ class OrderBookWidget(QWidget):
                 color_price=_C.PROFIT_GREEN,
                 color_bar=_C.PROFIT_GREEN,
                 base_mpu=base_mpu,
+                pair_name=snap.pair_name,
             )
 
         # Scroll so that the mid-price row is visible.
@@ -879,6 +883,7 @@ class OrderBookWidget(QWidget):
         color_price: str,
         color_bar: str,
         base_mpu: int = MOJOS_PER_XCH,
+        pair_name: str = "",
     ) -> None:
         """Fill a single table row with level data.
 
@@ -898,10 +903,13 @@ class OrderBookWidget(QWidget):
             Background tint CSS colour for the size bar fill.
         base_mpu:
             Mojos-per-unit for the base asset.
+        pair_name:
+            Trading pair label for stablecoin formatting.
         """
         # -- Price column --
         # Engine stores price_mojos = price × 10^12 regardless of token type.
-        price_item = _mono_item(mojos_to_xch(level.price_mojos, decimals=6), fg=color_price)
+        price_text = format_price(level.price_mojos, pair_name) if pair_name else mojos_to_xch(level.price_mojos, decimals=6)
+        price_item = _mono_item(price_text, fg=color_price)
         # Store price and side for level_clicked signal.
         price_item.setData(Qt.ItemDataRole.UserRole, level.price_mojos)
         price_item.setData(Qt.ItemDataRole.UserRole + 1, side)

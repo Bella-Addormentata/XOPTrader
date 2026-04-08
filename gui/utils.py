@@ -36,6 +36,31 @@ def mojos_per_unit_for_pair(pair_name: str, which: str = "base") -> int:
     return MOJOS_PER_XCH if token == "XCH" else MOJOS_PER_CAT
 
 
+# Recognised stablecoin symbols whose quote prices map 1 : 1 to USD.
+_STABLECOINS: frozenset[str] = frozenset({
+    "WUSDC.B", "WUSDC", "USDS", "USDT",
+})
+
+
+def is_stablecoin_quoted(pair_name: str) -> bool:
+    """Return ``True`` when the quote asset of *pair_name* is a stablecoin."""
+    parts = pair_name.split("/")
+    quote = parts[1].strip().upper() if len(parts) > 1 else ""
+    return quote in _STABLECOINS
+
+
+def format_price(price_mojos: int, pair_name: str) -> str:
+    """Format a price for display, using ``$`` notation for stablecoin pairs.
+
+    For stablecoin-quoted pairs the value is shown as ``$X.XXXX``.
+    For other pairs the standard mojo-to-XCH conversion is used.
+    """
+    value: float = price_mojos / MOJOS_PER_XCH
+    if is_stablecoin_quoted(pair_name):
+        return f"${value:,.4f}"
+    return f"{value:,.4f}"
+
+
 def mojos_to_xch(mojos: int, decimals: int = 4,
                  mojos_per_unit: int = MOJOS_PER_XCH) -> str:
     """Convert mojos to a formatted display string with thousand separators.
