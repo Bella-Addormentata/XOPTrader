@@ -38,7 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS as _C
-from gui.utils import MOJOS_PER_XCH, mojos_to_xch, mojos_to_xch_float
+from gui.utils import MOJOS_PER_XCH, mojos_to_xch, mojos_to_xch_float, mojos_per_unit_for_pair
 
 # ---------------------------------------------------------------------------
 # pyqtgraph defaults matching the CHIA dark theme
@@ -705,6 +705,7 @@ class OrderBookWidget(QWidget):
         bps: int,
         *,
         is_bid: bool,
+        quote_mpu: int = MOJOS_PER_XCH,
     ) -> list[OrderBookLevel]:
         """Aggregate raw levels into coarser price buckets.
 
@@ -731,7 +732,7 @@ class OrderBookWidget(QWidget):
         buckets: dict[int, OrderBookLevel] = {}
         for lvl in levels:
             # Compute bucket boundary price in mojos.
-            price_xch = mojos_to_xch_float(lvl.price_mojos)
+            price_xch = mojos_to_xch_float(lvl.price_mojos, mojos_per_unit=quote_mpu)
             if price_xch <= 0:
                 continue
             # Round to the nearest bucket boundary.
@@ -746,7 +747,7 @@ class OrderBookWidget(QWidget):
                 bucket_xch = math.ceil(price_xch / bucket_width_xch) * bucket_width_xch
 
             # Convert bucket boundary back to mojos (integer key).
-            bucket_mojos = int(round(bucket_xch * MOJOS_PER_XCH))
+            bucket_mojos = int(round(bucket_xch * quote_mpu))
 
             if bucket_mojos not in buckets:
                 buckets[bucket_mojos] = OrderBookLevel(
@@ -791,9 +792,13 @@ class OrderBookWidget(QWidget):
         agg_bps = self._selected_agg_bps()
         depth = self._depth_levels
 
+        # Resolve mojos-per-unit for the current pair.
+        base_mpu = mojos_per_unit_for_pair(snap.pair_name, "base")
+        quote_mpu = mojos_per_unit_for_pair(snap.pair_name, "quote")
+
         # Aggregate and trim to visible depth.
-        bids = self._aggregate_levels(snap.bids, agg_bps, is_bid=True)[:depth]
-        asks = self._aggregate_levels(snap.asks, agg_bps, is_bid=False)[:depth]
+        bids = self._aggregate_levels(snap.bids, agg_bps, is_bid=True, quote_mpu=quote_mpu)[:depth]
+        asks = self._aggregate_levels(snap.asks, agg_bps, is_bid=False, quote_mpu=quote_mpu)[:depth]
 
         # Total rows = asks (top, reversed so worst ask is row 0) + 1 mid-row + bids (bottom).
         ask_count = len(asks)
@@ -806,6 +811,10 @@ class OrderBookWidget(QWidget):
         all_sizes = [lvl.size_mojos for lvl in bids + asks]
         max_size = max(all_sizes) if all_sizes else 1
 
+        # Resolve mojos-per-unit for the current pair.
+        base_mpu = mojos_per_unit_for_pair(snap.pair_name, "base")
+        quote_mpu = mojos_per_unit_for_pair(snap.pair_name, "quote")
+
         # --- Asks (top section, worst -> best = reversed) ---
         # Display asks in reverse order: worst (highest price) at top, best (lowest) near mid.
         for display_row, lvl in enumerate(reversed(asks)):
@@ -816,17 +825,19 @@ class OrderBookWidget(QWidget):
                 max_size=max_size,
                 color_price=_C.LOSS_RED,
                 color_bar=_C.LOSS_RED,
+                base_mpu=base_mpu,
+                quote_mpu=quote_mpu,
             )
 
         # --- Mid-price row (separator) ---
         mid_row = ask_count
-        spread_xch = mojos_to_xch_float(snap.mid_price_mojos) * (snap.spread_bps / 10_000.0)
+        spread_val = mojos_to_xch_float(snap.mid_price_mojos, mojos_per_unit=quote_mpu) * (snap.spread_bps / 10_000.0)
         spread_text = (
             f"Spread: {snap.spread_bps:.0f} bps "
-            f"({mojos_to_xch(int(round(spread_xch * 1_000_000_000_000)), decimals=4)} XCH)"
+            f"({mojos_to_xch(int(round(spread_val * quote_mpu)), decimals=4, mojos_per_unit=quote_mpu)})"
         )
         mid_item = QTableWidgetItem(
-            f"  Mid: {mojos_to_xch(snap.mid_price_mojos, decimals=6)}  |  {spread_text}"
+            f"  Mid: {mojos_to_xch(snap.mid_price_mojos, decimals=6, mojos_per_unit=quote_mpu)}  |  {spread_text}"
         )
         mid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         mid_item.setForeground(QColor(_C.TEXT_PRIMARY))
@@ -849,6 +860,8 @@ class OrderBookWidget(QWidget):
                 max_size=max_size,
                 color_price=_C.PROFIT_GREEN,
                 color_bar=_C.PROFIT_GREEN,
+                base_mpu=base_mpu,
+                quote_mpu=quote_mpu,
             )
 
         # Scroll so that the mid-price row is visible.
@@ -868,6 +881,8 @@ class OrderBookWidget(QWidget):
         max_size: int,
         color_price: str,
         color_bar: str,
+        base_mpu: int = MOJOS_PER_XCH,
+        quote_mpu: int = MOJOS_PER_XCH,
     ) -> None:
         """Fill a single table row with level data.
 
@@ -885,16 +900,20 @@ class OrderBookWidget(QWidget):
             Foreground CSS colour for the price column.
         color_bar:
             Background tint CSS colour for the size bar fill.
+        base_mpu:
+            Mojos-per-unit for the base asset.
+        quote_mpu:
+            Mojos-per-unit for the quote asset (used for price display).
         """
         # -- Price column --
-        price_item = _mono_item(mojos_to_xch(level.price_mojos, decimals=6), fg=color_price)
+        price_item = _mono_item(mojos_to_xch(level.price_mojos, decimals=6, mojos_per_unit=quote_mpu), fg=color_price)
         # Store price and side for level_clicked signal.
         price_item.setData(Qt.ItemDataRole.UserRole, level.price_mojos)
         price_item.setData(Qt.ItemDataRole.UserRole + 1, side)
         self._table.setItem(row, _COL_PRICE, price_item)
 
         # -- Size column (with inline proportional bar) --
-        size_item = _mono_item(mojos_to_xch(level.size_mojos, decimals=4))
+        size_item = _mono_item(mojos_to_xch(level.size_mojos, decimals=4, mojos_per_unit=base_mpu))
         # Compute proportional bar fill as background gradient.
         fill_ratio = level.size_mojos / max_size if max_size > 0 else 0.0
         bar_color = QColor(color_bar)
@@ -903,13 +922,13 @@ class OrderBookWidget(QWidget):
         self._table.setItem(row, _COL_SIZE, size_item)
 
         # -- Cumulative column --
-        cum_item = _mono_item(mojos_to_xch(level.cumulative_mojos, decimals=4))
+        cum_item = _mono_item(mojos_to_xch(level.cumulative_mojos, decimals=4, mojos_per_unit=base_mpu))
         self._table.setItem(row, _COL_CUMULATIVE, cum_item)
 
         # -- My Size column --
         if self._show_own and level.is_own and level.own_size_mojos > 0:
             my_item = _mono_item(
-                mojos_to_xch(level.own_size_mojos, decimals=4),
+                mojos_to_xch(level.own_size_mojos, decimals=4, mojos_per_unit=base_mpu),
                 fg=_C.PRIMARY_GREEN,
             )
             my_item.setBackground(QBrush(QColor(_C.PRIMARY_GREEN).lighter(150)))

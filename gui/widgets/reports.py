@@ -35,7 +35,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS as _C
-from gui.utils import mojos_to_xch, mojos_to_xch_float
+from gui.utils import mojos_to_xch, mojos_to_xch_float, mojos_per_unit_for_pair
 
 # ---------------------------------------------------------------------------
 # Palette aliases
@@ -556,7 +556,7 @@ class ReportsWidget(QWidget):
             else:
                 color = TEXT_SECONDARY
 
-            labels["pnl"].setText(f"{pnl_text} XCH")
+            labels["pnl"].setText(f"{pnl_text}")
             labels["pnl"].setStyleSheet(
                 f"color: {color}; font-size: 20px; font-weight: bold; "
                 f"font-family: {_MONO}; border: none;"
@@ -609,7 +609,7 @@ class ReportsWidget(QWidget):
 
         for key in ("short_term", "long_term", "total", "fees_deductible"):
             val = int(cg.get(key, 0))
-            text = mojos_to_xch(val, 4) + " XCH"
+            text = mojos_to_xch(val, 4)
             if val > 0 and key != "fees_deductible":
                 text = "+" + text
             self._cg_labels[key].setText(text)

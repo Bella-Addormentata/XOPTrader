@@ -31,7 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS
-from gui.utils import mojos_to_xch
+from gui.utils import mojos_to_xch, mojos_per_unit_for_pair
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -265,13 +265,16 @@ class TradeLogWidget(QWidget):
                 "cost_basis_xch", "realized_pnl_xch", "block",
             ])
             for trade in visible:
+                pn = trade.get("pair_name", "")
+                b_mpu = mojos_per_unit_for_pair(pn, "base")
+                q_mpu = mojos_per_unit_for_pair(pn, "quote")
                 writer.writerow([
                     trade.get("timestamp", ""),
                     trade.get("trade_id", ""),
-                    trade.get("pair_name", ""),
+                    pn,
                     trade.get("side", ""),
-                    mojos_to_xch(trade.get("price_mojos", 0), 12),
-                    mojos_to_xch(trade.get("size_mojos", 0), 12),
+                    mojos_to_xch(trade.get("price_mojos", 0), 12, mojos_per_unit=q_mpu),
+                    mojos_to_xch(trade.get("size_mojos", 0), 12, mojos_per_unit=b_mpu),
                     mojos_to_xch(trade.get("fee_mojos", 0), 12),
                     mojos_to_xch(trade.get("cost_basis_mojos", 0), 12),
                     mojos_to_xch(trade.get("realized_pnl_mojos", 0), 12),
@@ -372,8 +375,9 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 1, item_tid)
 
             # -- Pair --
+            pair_name: str = trade.get("pair_name", "")
             self._table.setItem(
-                row_idx, 2, QTableWidgetItem(trade.get("pair_name", ""))
+                row_idx, 2, QTableWidgetItem(pair_name)
             )
 
             # -- Side (coloured) --
@@ -383,9 +387,13 @@ class TradeLogWidget(QWidget):
             item_side.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
             self._table.setItem(row_idx, 3, item_side)
 
+            # Resolve mojos-per-unit for the pair.
+            base_mpu = mojos_per_unit_for_pair(pair_name, "base")
+            quote_mpu = mojos_per_unit_for_pair(pair_name, "quote")
+
             # -- Price --
             price_mojos: int = trade.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
+            item_price = QTableWidgetItem(mojos_to_xch(price_mojos, mojos_per_unit=quote_mpu))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -395,7 +403,7 @@ class TradeLogWidget(QWidget):
 
             # -- Size --
             size_mojos: int = trade.get("size_mojos", 0)
-            item_size = QTableWidgetItem(mojos_to_xch(size_mojos))
+            item_size = QTableWidgetItem(mojos_to_xch(size_mojos, mojos_per_unit=base_mpu))
             item_size.setFont(mono_font)
             item_size.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -476,13 +484,13 @@ class TradeLogWidget(QWidget):
         # Colour the PnL label to reflect overall performance.
         pnl_colour = COLORS.PROFIT_GREEN if total_pnl >= 0 else COLORS.LOSS_RED
         self._lbl_total_pnl.setText(
-            f"Total realized PnL: {mojos_to_xch(total_pnl)} XCH"
+            f"Total realized PnL: {mojos_to_xch(total_pnl)}"
         )
         self._lbl_total_pnl.setStyleSheet(
             f"color: {pnl_colour}; font-size: 9pt;"
         )
 
-        self._lbl_avg_size.setText(f"Avg fill size: {mojos_to_xch(avg_size)} XCH")
+        self._lbl_avg_size.setText(f"Avg fill size: {mojos_to_xch(avg_size)}")
         self._lbl_win_rate.setText(f"Win rate: {win_rate:.1f}%")
 
     # ------------------------------------------------------------------

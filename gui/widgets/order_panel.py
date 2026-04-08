@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS
-from gui.utils import mojos_to_xch
+from gui.utils import mojos_to_xch, mojos_per_unit_for_pair
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -53,6 +53,7 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Size",          140),
     ("Tier",           80),
     ("Status",         80),
+    ("Filled At",     145),
     ("Created Block", 100),
     ("Age (blocks)",   90),
     ("Actions",        80),
@@ -398,9 +399,12 @@ class OrderPanel(QWidget):
             item_side.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
             self._table.setItem(row_idx, 2, item_side)
 
-            # -- Price (mojos -> XCH) --
+            # -- Price (mojos -> display units) --
+            pair_name: str = offer.get("pair_name", "")
+            quote_mpu = mojos_per_unit_for_pair(pair_name, "quote")
+            base_mpu = mojos_per_unit_for_pair(pair_name, "base")
             price_mojos: int = offer.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
+            item_price = QTableWidgetItem(mojos_to_xch(price_mojos, mojos_per_unit=quote_mpu))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -409,9 +413,9 @@ class OrderPanel(QWidget):
             item_price.setData(Qt.ItemDataRole.UserRole, price_mojos)
             self._table.setItem(row_idx, 3, item_price)
 
-            # -- Size (mojos -> XCH) --
+            # -- Size (mojos -> display units) --
             size_mojos: int = offer.get("size_mojos", 0)
-            item_size = QTableWidgetItem(mojos_to_xch(size_mojos))
+            item_size = QTableWidgetItem(mojos_to_xch(size_mojos, mojos_per_unit=base_mpu))
             item_size.setFont(mono_font)
             item_size.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -431,6 +435,12 @@ class OrderPanel(QWidget):
             item_status.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
             self._table.setItem(row_idx, 6, item_status)
 
+            # -- Filled At (datetime for resolved offers) --
+            resolved_at: str = offer.get("resolved_at", "") or ""
+            item_filled_at = QTableWidgetItem(resolved_at)
+            item_filled_at.setForeground(QColor(COLORS.TEXT_SECONDARY))
+            self._table.setItem(row_idx, 7, item_filled_at)
+
             # -- Created Block --
             created_block: int = offer.get("created_block", 0)
             item_block = QTableWidgetItem(str(created_block))
@@ -438,7 +448,7 @@ class OrderPanel(QWidget):
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
             )
             item_block.setData(Qt.ItemDataRole.UserRole, created_block)
-            self._table.setItem(row_idx, 7, item_block)
+            self._table.setItem(row_idx, 8, item_block)
 
             # -- Age (blocks) --
             age: int = max(0, self._current_block - created_block) if created_block else 0
@@ -452,7 +462,7 @@ class OrderPanel(QWidget):
                 item_age.setForeground(QColor(COLORS.LOSS_RED))
             elif age > int(self._offer_ttl * 0.8):
                 item_age.setForeground(QColor(COLORS.WARNING_YELLOW))
-            self._table.setItem(row_idx, 8, item_age)
+            self._table.setItem(row_idx, 9, item_age)
 
             # -- Actions (cancel button for pending offers) --
             if status.lower() == "pending":
@@ -463,9 +473,9 @@ class OrderPanel(QWidget):
                 btn_cancel.clicked.connect(
                     lambda checked=False, oid_=oid: self._on_cancel_single(oid_)
                 )
-                self._table.setCellWidget(row_idx, 9, btn_cancel)
+                self._table.setCellWidget(row_idx, 10, btn_cancel)
             else:
-                self._table.setItem(row_idx, 9, QTableWidgetItem(""))
+                self._table.setItem(row_idx, 10, QTableWidgetItem(""))
 
         self._table.setSortingEnabled(True)
 
@@ -490,7 +500,7 @@ class OrderPanel(QWidget):
         self._lbl_pending.setText(f"Pending: {pending}")
         self._lbl_filled.setText(f"Filled: {filled}")
         self._lbl_fill_rate.setText(f"Fill rate: {fill_rate:.1f}%")
-        self._lbl_locked.setText(f"Locked: {mojos_to_xch(locked_mojos)} XCH")
+        self._lbl_locked.setText(f"Locked: {mojos_to_xch(locked_mojos)}")
 
     # ------------------------------------------------------------------
     # Context menu
