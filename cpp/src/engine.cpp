@@ -3512,37 +3512,58 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         }
 
         // -----------------------------------------------------------------
-        // Stablecoin peg guard: for stablecoin pairs, floor all ASK
-        // prices at peg * (1 + margin) and cap all BID prices at
-        // peg * (1 - margin).  This is the final safety net that
-        // prevents selling a pegged asset below its theoretical value
-        // regardless of what happened in earlier pipeline stages.
+        // Stablecoin peg guard: hard cap BID prices below the peg and
+        // floor ASK prices above the peg.  This prevents the engine from
+        // ever bidding >= $1.00 (or whatever peg_target is) on a
+        // stablecoin pair -- even when a crossed or noisy order-book
+        // produces a mid above peg.
         // -----------------------------------------------------------------
-        if (pair_cfg && pair_cfg->is_stablecoin && pair_cfg->peg_target > 0.0) {
+        if (pair_cfg && pair_cfg->is_stablecoin && pair_cfg->peg_target > 0.0
+            && !pcs.ladder.empty())
+        {
             const double margin_bps = pair_cfg->min_profit_margin_bps_override.value_or(
                 config_.strategy.min_profit_margin_bps);
             const auto peg_mojos = static_cast<Mojo>(std::llround(
                 pair_cfg->peg_target * static_cast<double>(kMojosPerXch)));
             const auto min_peg_ask = static_cast<Mojo>(std::llround(
-                static_cast<double>(peg_mojos) * (1.0 + margin_bps / 10000.0)));
-            const auto max_peg_bid = static_cast<Mojo>(std::llround(
-                static_cast<double>(peg_mojos) * (1.0 - margin_bps / 10000.0)));
+                static_cast<double>(peg_mojos) * (1.0 + margin_bps / 10'000.0)));
 
-            for (auto& tq : pcs.ladder) {
-                if (tq.side == Side::Ask && tq.price < min_peg_ask) {
-                    spdlog::info("[Engine] Step 7: {} ASK tier {} peg guard: "
-                                 "{} -> {} (peg={:.4f} +{:.1f}bps)",
-                                 pair_name, tq.tier_index, tq.price,
-                                 min_peg_ask, pair_cfg->peg_target, margin_bps);
-                    tq.price = min_peg_ask;
-                }
-                if (tq.side == Side::Bid && tq.price > max_peg_bid) {
-                    spdlog::info("[Engine] Step 7: {} BID tier {} peg guard: "
-                                 "{} -> {} (peg={:.4f} -{:.1f}bps)",
-                                 pair_name, tq.tier_index, tq.price,
-                                 max_peg_bid, pair_cfg->peg_target, margin_bps);
-                    tq.price = max_peg_bid;
-                }
+            int dropped_bids = 0;
+            int floored_asks = 0;
+
+            auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
+                [&](TierQuote& tq) {
+                    // Hard rule: never bid at or above peg on a stablecoin.
+                    if (tq.side == Side::Bid && tq.price >= peg_mojos) {
+                        spdlog::warn("[Engine] Step 7: {} BID tier {} peg-guard "
+                                     "dropped: price {} >= peg {} "
+                                     "(never bid at-or-above peg on stablecoin)",
+                                     pair_name, tq.tier_index,
+                                     tq.price, peg_mojos);
+                        ++dropped_bids;
+                        return true;  // remove
+                    }
+                    // Floor ASK at peg + margin.
+                    if (tq.side == Side::Ask && tq.price < min_peg_ask) {
+                        spdlog::info("[Engine] Step 7: {} ASK tier {} peg-guard "
+                                     "clamped {} -> {} (peg={:.4f} +{:.1f}bps)",
+                                     pair_name, tq.tier_index,
+                                     tq.price, min_peg_ask,
+                                     pair_cfg->peg_target, margin_bps);
+                        tq.price = min_peg_ask;
+                        ++floored_asks;
+                        return false; // keep, with clamped price
+                    }
+                    return false;
+                });
+            pcs.ladder.erase(it, pcs.ladder.end());
+
+            if (dropped_bids > 0 || floored_asks > 0) {
+                spdlog::warn("[Engine] Step 7: {} peg-guard: dropped {} bids "
+                             ">= peg {}, floored {} asks to {} "
+                             "(margin={:.1f}bps)",
+                             pair_name, dropped_bids, peg_mojos,
+                             floored_asks, min_peg_ask, margin_bps);
             }
         }
 

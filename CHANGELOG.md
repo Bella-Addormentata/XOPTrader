@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.23] — 2026-04-08
+
+### Fixed
+
+- **Stablecoin peg guard for BID prices**: Added hard cap in Step 7 that drops any BID tier priced at or above `peg_target` on stablecoin pairs. Prevents the engine from ever bidding >= $1.00 on a stablecoin — even when a crossed or noisy order-book pushes the computed mid above peg. ASK tiers are also floored at `peg_target × (1 + margin_bps)` using per-pair `min_profit_margin_bps_override` (or global fallback). Fixes issue where BYC/wUSDC.b BID tiers were placed above market mid due to crossed-book normalization.
+
 ## [0.7.22] — 2026-04-08
 
 ### Added
