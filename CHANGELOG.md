@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.28] — 2026-04-08
+
+### Added
+
+- **Dust-filtered mid-price from competing offers**: The Dexie ticker API reports top-of-book prices regardless of offer size, so a 5-mojo dust offer can set the "best bid" or "best ask" and poison the mid-price used by the Avellaneda-Stoikov model. After ingesting competing offers (already filtered by `min_competitor_offer_size`), the engine now recomputes BBO from only non-dust offers and overrides the ticker-derived `dex_best_bid`/`dex_best_ask`. This ensures mid-price calculations reflect meaningful liquidity, not spam.
+
+- **Pre-balance check in Step 9e peg-crossing taker**: Before calling `take_offer()`, the engine now queries the spendable balance of the relevant wallet (quote wallet for ASK takes, base wallet for BID takes) and skips the take with a warning if funds are insufficient. Prevents doomed RPCs that produce "Can't select amount higher than our spendable balance" errors and the associated "peg-arb failed" log noise.
+
+- **Wallet sync gating before startup inventory seeding**: Added a sync-wait loop before the startup inventory seeding block. The engine polls `get_sync_status()` up to 30 times (~5 minutes) waiting for the wallet to report fully synced before querying balances. Prevents unreliable balance data from a partially-synced wallet from seeding incorrect inventory positions and causing the A-S model to generate bad quotes on the first tick.
+
 ## [0.7.27] — 2026-04-08
 
 ### Added

@@ -775,6 +775,38 @@ asio::awaitable<void> Engine::poll_loop_coro()
                          "continuing without splitting", ex.what());
         }
     }
+    // -- Wait for wallet sync before seeding inventory -----------------------
+    // Wallet balance queries return unreliable data when the wallet is
+    // still syncing.  Poll sync status until fully synced, with a
+    // timeout to avoid blocking forever on a stuck wallet.
+    if (wallet_) {
+        constexpr int kMaxSyncWaitBlocks = 30;  // ~26 min at 52s/block
+        for (int attempt = 0; attempt < kMaxSyncWaitBlocks; ++attempt) {
+            try {
+                auto ss = co_await wallet_->get_sync_status();
+                bool synced  = ss.value("synced", false);
+                bool syncing = ss.value("syncing", true);
+                if (synced && !syncing) {
+                    spdlog::info("[Engine] Wallet fully synced -- "
+                                 "proceeding with inventory seed");
+                    break;
+                }
+                spdlog::info("[Engine] Waiting for wallet sync "
+                             "(synced={}, syncing={}, attempt {}/{})",
+                             synced, syncing, attempt + 1,
+                             kMaxSyncWaitBlocks);
+            } catch (const std::exception& e) {
+                spdlog::warn("[Engine] Wallet sync check failed: {}",
+                             e.what());
+            }
+            // Wait ~10 seconds between probes.
+            co_await asio::steady_timer(
+                co_await asio::this_coro::executor,
+                std::chrono::seconds(10)).async_wait(asio::use_awaitable);
+            if (stop_requested_.load(std::memory_order_relaxed)) break;
+        }
+    }
+
     // -- Seed inventory from wallet balances ---------------------------------
     // Query on-chain balances for each configured pair's base and quote
     // assets and seed the InventoryTracker so that inventory_ratio()
@@ -5613,6 +5645,56 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     ? fee_tracker_->get_recommended_fee(
                           config_.fees.min_fee_mojos, block_height)
                     : config_.fees.min_fee_mojos;
+
+                // Pre-balance check: verify we have enough spendable
+                // balance before sending a doomed take_offer RPC.
+                // For ASK takes (buying base) we need quote balance;
+                // for BID takes (selling base) we need base balance.
+                if (offer_mgr_) {
+                    const std::string& spend_asset =
+                        (c.side == Side::Ask)
+                            ? pair.quote_asset_id
+                            : pair.base_asset_id;
+                    auto spend_wid =
+                        offer_mgr_->resolve_wallet_id(spend_asset);
+                    if (spend_wid > 0) {
+                        try {
+                            auto bal = co_await
+                                wallet_->get_wallet_balance(spend_wid);
+                            Mojo spendable = bal.value(
+                                "spendable_balance",
+                                static_cast<Mojo>(0));
+
+                            // Estimate cost: for ASK take we pay
+                            // take_sz * price / kMojosPerXch in quote
+                            // mojos; for BID take we deliver take_sz
+                            // base mojos.
+                            const Mojo cost =
+                                (c.side == Side::Ask)
+                                    ? static_cast<Mojo>(
+                                          static_cast<double>(take_sz)
+                                          * static_cast<double>(c.price)
+                                          / static_cast<double>(
+                                                kMojosPerXch))
+                                    : take_sz;
+
+                            if (spendable < cost) {
+                                spdlog::warn(
+                                    "[Engine] Step 9e: {} SKIP {} "
+                                    "take -- insufficient balance: "
+                                    "need {} spendable {} (wallet {})",
+                                    pair.name, to_string(c.side),
+                                    cost, spendable, spend_wid);
+                                co_return;
+                            }
+                        } catch (const std::exception& be) {
+                            spdlog::debug(
+                                "[Engine] Step 9e: {} balance check "
+                                "failed: {} -- proceeding cautiously",
+                                pair.name, be.what());
+                        }
+                    }
+                }
 
                 spdlog::info("[Engine] Step 9e: {} TAKING peg-cross "
                              "{} offer {} (edge={:.1f}bps size={} "

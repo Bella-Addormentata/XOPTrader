@@ -1019,10 +1019,51 @@ void MarketDataFeed::ingest_competing_offers(
     const auto ingested_count = filtered.size();
     const bool is_empty = (ingested_count == 0);
 
-    // Store the filtered list under lock.
+    // Store the filtered list under lock, and also update the dex
+    // best bid/ask from dust-filtered offers.  The Dexie ticker API
+    // reports top-of-book prices regardless of offer size, so a 5-mojo
+    // dust offer can set the "best bid" or "best ask".  By recomputing
+    // BBO from the filtered (non-dust) offers we ensure mid-price
+    // calculations reflect only meaningful liquidity.
     {
+        // Compute best bid/ask from filtered offers BEFORE move.
+        double filtered_best_bid = 0.0;
+        double filtered_best_ask = 0.0;
+        for (const auto& fo : filtered) {
+            const double px = static_cast<double>(fo.price)
+                              / static_cast<double>(kMojosPerXch);
+            if (fo.side == Side::Bid) {
+                if (px > filtered_best_bid)
+                    filtered_best_bid = px;
+            } else {  // Ask
+                if (filtered_best_ask <= 0.0 || px < filtered_best_ask)
+                    filtered_best_ask = px;
+            }
+        }
+
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
+
+        // Override dex BBO when the filtered book has meaningful offers.
+        // This requires mtx_pairs_ -- we can't nest it under mtx_competitors_
+        // (lock ordering), so we release competitors lock first and
+        // acquire pairs lock separately.
+        lock.unlock();
+
+        if (filtered_best_bid > 0.0 || filtered_best_ask > 0.0) {
+            std::unique_lock plk(mtx_pairs_);
+            PairState& ps = get_or_create_pair(pair_name);
+            if (filtered_best_bid > 0.0) {
+                ps.dex_best_bid = filtered_best_bid;
+            }
+            if (filtered_best_ask > 0.0) {
+                ps.dex_best_ask = filtered_best_ask;
+            }
+            ps.dex_updated_at = std::chrono::system_clock::now();
+            spdlog::debug("[MarketData] Dust-filtered BBO for {}: "
+                          "bid={:.6f} ask={:.6f}",
+                          pair_name, filtered_best_bid, filtered_best_ask);
+        }
     }
 
     // Update competitor metrics based on the newly ingested offers.
