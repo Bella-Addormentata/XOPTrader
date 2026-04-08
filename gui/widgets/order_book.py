@@ -705,7 +705,6 @@ class OrderBookWidget(QWidget):
         bps: int,
         *,
         is_bid: bool,
-        quote_mpu: int = MOJOS_PER_XCH,
     ) -> list[OrderBookLevel]:
         """Aggregate raw levels into coarser price buckets.
 
@@ -732,7 +731,7 @@ class OrderBookWidget(QWidget):
         buckets: dict[int, OrderBookLevel] = {}
         for lvl in levels:
             # Compute bucket boundary price in mojos.
-            price_xch = mojos_to_xch_float(lvl.price_mojos, mojos_per_unit=quote_mpu)
+            price_xch = mojos_to_xch_float(lvl.price_mojos)
             if price_xch <= 0:
                 continue
             # Round to the nearest bucket boundary.
@@ -747,7 +746,7 @@ class OrderBookWidget(QWidget):
                 bucket_xch = math.ceil(price_xch / bucket_width_xch) * bucket_width_xch
 
             # Convert bucket boundary back to mojos (integer key).
-            bucket_mojos = int(round(bucket_xch * quote_mpu))
+            bucket_mojos = int(round(bucket_xch * MOJOS_PER_XCH))
 
             if bucket_mojos not in buckets:
                 buckets[bucket_mojos] = OrderBookLevel(
@@ -792,13 +791,14 @@ class OrderBookWidget(QWidget):
         agg_bps = self._selected_agg_bps()
         depth = self._depth_levels
 
-        # Resolve mojos-per-unit for the current pair.
+        # Resolve mojos-per-unit for sizes (base asset).
+        # Engine stores price_mojos = price × 10^12 always, so prices
+        # use the default MOJOS_PER_XCH divisor.
         base_mpu = mojos_per_unit_for_pair(snap.pair_name, "base")
-        quote_mpu = mojos_per_unit_for_pair(snap.pair_name, "quote")
 
         # Aggregate and trim to visible depth.
-        bids = self._aggregate_levels(snap.bids, agg_bps, is_bid=True, quote_mpu=quote_mpu)[:depth]
-        asks = self._aggregate_levels(snap.asks, agg_bps, is_bid=False, quote_mpu=quote_mpu)[:depth]
+        bids = self._aggregate_levels(snap.bids, agg_bps, is_bid=True)[:depth]
+        asks = self._aggregate_levels(snap.asks, agg_bps, is_bid=False)[:depth]
 
         # Total rows = asks (top, reversed so worst ask is row 0) + 1 mid-row + bids (bottom).
         ask_count = len(asks)
@@ -811,9 +811,8 @@ class OrderBookWidget(QWidget):
         all_sizes = [lvl.size_mojos for lvl in bids + asks]
         max_size = max(all_sizes) if all_sizes else 1
 
-        # Resolve mojos-per-unit for the current pair.
+        # Resolve mojos-per-unit for sizes (base asset only).
         base_mpu = mojos_per_unit_for_pair(snap.pair_name, "base")
-        quote_mpu = mojos_per_unit_for_pair(snap.pair_name, "quote")
 
         # --- Asks (top section, worst -> best = reversed) ---
         # Display asks in reverse order: worst (highest price) at top, best (lowest) near mid.
@@ -826,18 +825,17 @@ class OrderBookWidget(QWidget):
                 color_price=_C.LOSS_RED,
                 color_bar=_C.LOSS_RED,
                 base_mpu=base_mpu,
-                quote_mpu=quote_mpu,
             )
 
         # --- Mid-price row (separator) ---
         mid_row = ask_count
-        spread_val = mojos_to_xch_float(snap.mid_price_mojos, mojos_per_unit=quote_mpu) * (snap.spread_bps / 10_000.0)
+        spread_val = mojos_to_xch_float(snap.mid_price_mojos) * (snap.spread_bps / 10_000.0)
         spread_text = (
             f"Spread: {snap.spread_bps:.0f} bps "
-            f"({mojos_to_xch(int(round(spread_val * quote_mpu)), decimals=4, mojos_per_unit=quote_mpu)})"
+            f"({mojos_to_xch(int(round(spread_val * MOJOS_PER_XCH)), decimals=4)})"
         )
         mid_item = QTableWidgetItem(
-            f"  Mid: {mojos_to_xch(snap.mid_price_mojos, decimals=6, mojos_per_unit=quote_mpu)}  |  {spread_text}"
+            f"  Mid: {mojos_to_xch(snap.mid_price_mojos, decimals=6)}  |  {spread_text}"
         )
         mid_item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
         mid_item.setForeground(QColor(_C.TEXT_PRIMARY))
@@ -861,7 +859,6 @@ class OrderBookWidget(QWidget):
                 color_price=_C.PROFIT_GREEN,
                 color_bar=_C.PROFIT_GREEN,
                 base_mpu=base_mpu,
-                quote_mpu=quote_mpu,
             )
 
         # Scroll so that the mid-price row is visible.
@@ -882,7 +879,6 @@ class OrderBookWidget(QWidget):
         color_price: str,
         color_bar: str,
         base_mpu: int = MOJOS_PER_XCH,
-        quote_mpu: int = MOJOS_PER_XCH,
     ) -> None:
         """Fill a single table row with level data.
 
@@ -902,11 +898,10 @@ class OrderBookWidget(QWidget):
             Background tint CSS colour for the size bar fill.
         base_mpu:
             Mojos-per-unit for the base asset.
-        quote_mpu:
-            Mojos-per-unit for the quote asset (used for price display).
         """
         # -- Price column --
-        price_item = _mono_item(mojos_to_xch(level.price_mojos, decimals=6, mojos_per_unit=quote_mpu), fg=color_price)
+        # Engine stores price_mojos = price × 10^12 regardless of token type.
+        price_item = _mono_item(mojos_to_xch(level.price_mojos, decimals=6), fg=color_price)
         # Store price and side for level_clicked signal.
         price_item.setData(Qt.ItemDataRole.UserRole, level.price_mojos)
         price_item.setData(Qt.ItemDataRole.UserRole + 1, side)

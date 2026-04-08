@@ -267,13 +267,12 @@ class TradeLogWidget(QWidget):
             for trade in visible:
                 pn = trade.get("pair_name", "")
                 b_mpu = mojos_per_unit_for_pair(pn, "base")
-                q_mpu = mojos_per_unit_for_pair(pn, "quote")
                 writer.writerow([
                     trade.get("timestamp", ""),
                     trade.get("trade_id", ""),
                     pn,
                     trade.get("side", ""),
-                    mojos_to_xch(trade.get("price_mojos", 0), 12, mojos_per_unit=q_mpu),
+                    mojos_to_xch(trade.get("price_mojos", 0), 12),
                     mojos_to_xch(trade.get("size_mojos", 0), 12, mojos_per_unit=b_mpu),
                     mojos_to_xch(trade.get("fee_mojos", 0), 12),
                     mojos_to_xch(trade.get("cost_basis_mojos", 0), 12),
@@ -387,13 +386,14 @@ class TradeLogWidget(QWidget):
             item_side.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
             self._table.setItem(row_idx, 3, item_side)
 
-            # Resolve mojos-per-unit for the pair.
+            # Resolve mojos-per-unit for sizes (base asset).
+            # Engine stores price_mojos = price × 10^12 (kMojosPerXch) for ALL
+            # pairs, so prices always divide by MOJOS_PER_XCH (the default).
             base_mpu = mojos_per_unit_for_pair(pair_name, "base")
-            quote_mpu = mojos_per_unit_for_pair(pair_name, "quote")
 
             # -- Price --
             price_mojos: int = trade.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos, mojos_per_unit=quote_mpu))
+            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter

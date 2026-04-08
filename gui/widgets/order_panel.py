@@ -400,11 +400,12 @@ class OrderPanel(QWidget):
             self._table.setItem(row_idx, 2, item_side)
 
             # -- Price (mojos -> display units) --
+            # Engine stores price_mojos = price × 10^12 (kMojosPerXch) for ALL
+            # pairs, so prices always divide by MOJOS_PER_XCH (the default).
             pair_name: str = offer.get("pair_name", "")
-            quote_mpu = mojos_per_unit_for_pair(pair_name, "quote")
             base_mpu = mojos_per_unit_for_pair(pair_name, "base")
             price_mojos: int = offer.get("price_mojos", 0)
-            item_price = QTableWidgetItem(mojos_to_xch(price_mojos, mojos_per_unit=quote_mpu))
+            item_price = QTableWidgetItem(mojos_to_xch(price_mojos))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
