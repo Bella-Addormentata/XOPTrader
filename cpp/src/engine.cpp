@@ -5374,6 +5374,169 @@ asio::awaitable<void> Engine::step_check_arbitrage(
         }
     }
 
+    // -- 9e: Peg-crossing offer taker ----------------------------------
+    // On stablecoin pairs (BYC/wUSDC.b), competing offers that cross
+    // the $1 peg are mispriced when the peg is trusted (Normal depeg
+    // status).  BIDs above peg = free premium to sell into; ASKs below
+    // peg = discounted buys.  Only fires when depeg detector says Normal
+    // (no peg-loss alert), preventing us from buying into a real depeg.
+
+    if (config_.arbitrage.enabled &&
+        config_.arbitrage.peg_arb_enabled &&
+        dexie_ && wallet_ && depeg_detector_ && !wallet_circuit_open_) {
+
+        const double peg_min_edge = config_.arbitrage.peg_arb_min_edge_bps;
+        const double peg_max_units = config_.arbitrage.peg_arb_max_take_units;
+
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled || !pair.is_stablecoin) continue;
+
+            // Only take when peg is trusted (Normal state).
+            const auto* ds = depeg_detector_->get_state(pair.name);
+            if (!ds || ds->status != DepegStatus::Normal) {
+                spdlog::debug("[Engine] Step 9e: {} depeg status={} "
+                              "-- skipping peg-arb",
+                              pair.name,
+                              ds ? static_cast<int>(ds->status) : -1);
+                continue;
+            }
+
+            const Mojo peg_mojos = static_cast<Mojo>(
+                pair.peg_target * static_cast<double>(kMojosPerXch));
+
+            auto comp = market_data_->get_competing_offers(pair.name);
+            if (comp.empty()) continue;
+
+            // Best crossing offer per side.
+            struct PegCandidate {
+                std::string id;
+                Mojo price{0};
+                Mojo size{0};
+                Side side{Side::Bid};
+                double edge_bps{0.0};
+            };
+            std::optional<PegCandidate> best_bid;  // BID > peg
+            std::optional<PegCandidate> best_ask;  // ASK < peg
+
+            for (const auto& co : comp) {
+                if (co.side == Side::Bid && co.price > peg_mojos) {
+                    const double e = (static_cast<double>(co.price) -
+                                      static_cast<double>(peg_mojos))
+                                     / static_cast<double>(peg_mojos) * 10000.0;
+                    if (e >= peg_min_edge &&
+                        (!best_bid || co.price > best_bid->price)) {
+                        best_bid = PegCandidate{co.offer_id, co.price,
+                                               co.size, co.side, e};
+                    }
+                }
+                if (co.side == Side::Ask && co.price < peg_mojos) {
+                    const double e = (static_cast<double>(peg_mojos) -
+                                      static_cast<double>(co.price))
+                                     / static_cast<double>(peg_mojos) * 10000.0;
+                    if (e >= peg_min_edge &&
+                        (!best_ask || co.price < best_ask->price)) {
+                        best_ask = PegCandidate{co.offer_id, co.price,
+                                               co.size, co.side, e};
+                    }
+                }
+            }
+
+            // Lambda to take a single peg-crossing offer.
+            auto take_peg = [&](const PegCandidate& c)
+                -> asio::awaitable<void> {
+                const Mojo max_mojos = static_cast<Mojo>(
+                    peg_max_units
+                    * static_cast<double>(pair.base_mojos_per_unit));
+                const Mojo take_sz = std::min(c.size, max_mojos);
+
+                spdlog::info("[Engine] Step 9e: {} PEG-CROSS {} "
+                             "price={} peg={} edge={:.1f}bps "
+                             "offer={} size={}",
+                             pair.name, to_string(c.side),
+                             c.price, peg_mojos, c.edge_bps,
+                             c.id.substr(0, 12), take_sz);
+
+                if (dry_run_) {
+                    spdlog::info("[Engine] Step 9e: {} DRY RUN -- "
+                                 "would take peg-cross {}",
+                                 pair.name, c.id.substr(0, 12));
+                    co_return;
+                }
+
+                auto os = co_await dexie_->get_offer_status(c.id);
+                if (!os.success || os.offer.offer_bech32.empty()) {
+                    spdlog::warn("[Engine] Step 9e: {} fetch failed "
+                                 "for {} -- skip",
+                                 pair.name, c.id.substr(0, 12));
+                    co_return;
+                }
+                if (os.offer.status != 0) {
+                    spdlog::info("[Engine] Step 9e: {} offer {} "
+                                 "no longer active (status={})",
+                                 pair.name, c.id.substr(0, 12),
+                                 os.offer.status);
+                    co_return;
+                }
+
+                const std::uint64_t fee = fee_tracker_
+                    ? fee_tracker_->get_recommended_fee(
+                          config_.fees.min_fee_mojos, block_height)
+                    : config_.fees.min_fee_mojos;
+
+                spdlog::info("[Engine] Step 9e: {} TAKING peg-cross "
+                             "{} offer {} (edge={:.1f}bps size={} "
+                             "fee={})",
+                             pair.name, to_string(c.side),
+                             c.id.substr(0, 12), c.edge_bps,
+                             take_sz, fee);
+
+                auto result = co_await wallet_->take_offer(
+                    os.offer.offer_bech32, fee);
+
+                if (result.contains("success") &&
+                    result["success"].get<bool>()) {
+                    const std::string tid =
+                        result.contains("trade_record") &&
+                        result["trade_record"].contains("trade_id")
+                        ? result["trade_record"]["trade_id"]
+                              .get<std::string>()
+                        : "unknown";
+
+                    spdlog::info("[Engine] Step 9e: {} TOOK peg-cross "
+                                 "{} -- trade={} edge={:.1f}bps "
+                                 "size={}",
+                                 pair.name, to_string(c.side),
+                                 tid.substr(0, 12), c.edge_bps,
+                                 take_sz);
+
+                    if (fee_tracker_)
+                        fee_tracker_->record_fee(fee, block_height);
+                    if (alerts_) {
+                        alerts_->send_alert(
+                            AlertRule::ArbitrageDetected,
+                            pair.name + " peg-cross " +
+                            to_string(c.side) + " TAKEN: edge=" +
+                            std::to_string(c.edge_bps) + "bps");
+                    }
+                } else {
+                    const std::string err = result.contains("error")
+                        ? result["error"].get<std::string>()
+                        : "unknown error";
+                    spdlog::warn("[Engine] Step 9e: {} take failed: {}",
+                                 pair.name, err);
+                }
+            };
+
+            try {
+                if (best_bid) co_await take_peg(*best_bid);
+                if (best_ask) co_await take_peg(*best_ask);
+            } catch (const std::exception& e) {
+                spdlog::error("[Engine] Step 9e: {} peg-arb failed: {}",
+                              pair.name, e.what());
+            }
+        }
+    }
+
     co_return;
 }
 

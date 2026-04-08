@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.24] — 2026-04-08
+
+### Added
+
+- **Step 9e — Peg-crossing offer taker**: Automatically takes competing offers that cross the $1 peg on stablecoin pairs when the depeg detector reports Normal status (peg trusted). BIDs above peg are free premium to sell into; ASKs below peg are discounted buys. Guarded by depeg detector — will not fire during Warning, Bailed, or SuspectedFailure states, preventing the engine from buying into a real depeg event. New config fields: `peg_arb_enabled`, `peg_arb_min_edge_bps` (default 5 bps), `peg_arb_max_take_units` (default 50 units).
+
 ## [0.7.23] — 2026-04-08
 
 ### Fixed

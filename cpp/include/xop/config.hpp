@@ -551,6 +551,13 @@ struct ArbitrageSettings {
     double   cross_stable_min_edge_bps{15.0};
     double   cross_stable_max_take_xch{5.0};
 
+    // -- Peg-crossing offer taker (stablecoin pair direct arb) ---------------
+    // Takes competing offers that cross the $1 peg on stablecoin pairs
+    // when the depeg detector reports Normal (peg is trusted).
+    bool     peg_arb_enabled{true};
+    double   peg_arb_min_edge_bps{5.0};     // min deviation from peg to take
+    double   peg_arb_max_take_units{50.0};   // max base-asset units per take
+
     // -- General parameters --------------------------------------------------
     double   max_position_size{100.0};
     double   default_confidence{0.75};
