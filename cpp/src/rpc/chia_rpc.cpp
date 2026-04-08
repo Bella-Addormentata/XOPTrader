@@ -1007,6 +1007,57 @@ ChiaWalletRPC::send_transaction(const json& params)
 }
 
 // ---------------------------------------------------------------------------
+// ChiaWalletRPC::split_coins -- split one coin into many atomically
+// ---------------------------------------------------------------------------
+// Wraps the Chia wallet daemon "split_coins" endpoint (available since v2.4).
+// Creates number_of_coins new outputs of amount_per_coin mojos each from the
+// specified target coin.  All outputs are created in a single spend bundle --
+// one block confirmation, one fee.
+//
+// Required payload: wallet_id, target_coin_id, number_of_coins,
+//                   amount_per_coin, fee, push=true.
+//
+// ISO/IEC 5055 -- response validated; transport errors thrown.
+// ---------------------------------------------------------------------------
+
+asio::awaitable<json>
+ChiaWalletRPC::split_coins(
+    std::int64_t       wallet_id,
+    const std::string& target_coin_id,
+    int                number_of_coins,
+    std::int64_t       amount_per_coin,
+    std::int64_t       fee)
+{
+    // Ensure the coin ID has the "0x" prefix that the Chia RPC expects.
+    std::string coin_id = target_coin_id;
+    if (coin_id.size() >= 2 && coin_id.substr(0, 2) != "0x") {
+        coin_id = "0x" + coin_id;
+    }
+
+    const json payload = {
+        {"wallet_id",       wallet_id},
+        {"target_coin_id",  coin_id},
+        {"number_of_coins", number_of_coins},
+        {"amount_per_coin", amount_per_coin},
+        {"fee",             fee},
+        {"push",            true}
+    };
+
+    const json resp = co_await rpc_post("split_coins", payload);
+
+    if (resp.contains("success") && resp["success"].is_boolean() &&
+        !resp["success"].get<bool>()) {
+        std::string err_msg = resp.contains("error")
+                              ? resp["error"].get<std::string>()
+                              : "unknown error";
+        throw ChiaRPCApplicationError(
+            "split_coins rejected: " + err_msg, resp);
+    }
+
+    co_return resp;
+}
+
+// ---------------------------------------------------------------------------
 // ChiaWalletRPC::get_next_address -- get a receive address for self-sends
 // ---------------------------------------------------------------------------
 

@@ -611,6 +611,29 @@ public:
      */
     asio::awaitable<json> send_transaction(const json& params);
 
+    /**
+     * @brief Split a single coin into multiple smaller coins atomically.
+     *
+     * Wraps the Chia wallet RPC "split_coins" endpoint.  Creates
+     * number_of_coins new outputs of amount_per_coin mojos each from
+     * the specified target coin, all in a single spend bundle (one block,
+     * one fee).  Any remainder is returned as a change coin.
+     *
+     * @param wallet_id       Wallet identifier (1 = main XCH wallet).
+     * @param target_coin_id  Hex coin ID (with or without 0x prefix) to split.
+     * @param number_of_coins Number of new coins to create (max 500).
+     * @param amount_per_coin Denomination of each new coin in mojos.
+     * @param fee             Transaction fee in mojos.
+     * @return JSON response from the Chia wallet daemon.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<json> split_coins(
+        std::int64_t       wallet_id,
+        const std::string& target_coin_id,
+        int                number_of_coins,
+        std::int64_t       amount_per_coin,
+        std::int64_t       fee);
+
     // -- Address management -------------------------------------------------
 
     /**

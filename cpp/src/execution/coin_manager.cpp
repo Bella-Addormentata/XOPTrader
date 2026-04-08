@@ -233,96 +233,84 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         co_return result;
     }
 
-    // Step 4: Execute the split as a series of send_transaction calls.
+    // Step 4: Execute the split as a single atomic transaction.
     //
-    // The Chia wallet RPC send_transaction endpoint sends XCH to a target
-    // address.  By sending target_amount_mojos to our own address multiple
-    // times in separate transactions, we create individual coins of the
-    // desired denomination.
+    // Uses the Chia wallet RPC "split_coins" endpoint to create all
+    // needed coins in one spend bundle -- one block confirmation, one fee.
+    // This replaces the previous sequential send_transaction approach which
+    // suffered from change-coin locking (each send locks the change output,
+    // so only ~1 coin could be created per block).
     //
-    // Batching strategy: send at most 10 coins per transaction to avoid
-    // mempool congestion and ensure prompt confirmation.
-    constexpr int kBatchSize = 10;
-    int coins_created = 0;
-    Mojo total_fee = 0;
+    // Strategy: find the largest free coin that can fund the entire split,
+    // then call split_coins with that coin's ID.
+    constexpr int kMaxCoinsPerSplit = 500;  // Chia wallet limit
+    int batch = std::min(needed, kMaxCoinsPerSplit);
 
-    while (coins_created < needed) {
-        int batch = std::min(kBatchSize, needed - coins_created);
+    // Sort free coins by amount descending to find best candidate.
+    std::sort(free_coins.begin(), free_coins.end(),
+              [](const CoinInfo& a, const CoinInfo& b) {
+                  return a.amount > b.amount;
+              });
 
-        for (int j = 0; j < batch; ++j) {
-            try {
-                // Build the send_transaction request per the Chia wallet
-                // RPC specification.  Each call creates one output coin
-                // of the target denomination at our own receive address.
-                json send_params;
-                send_params["wallet_id"] = wallet_id;
-                send_params["amount"]    = target_amount_mojos;
-                send_params["address"]   = address;
-                send_params["fee"]       = fee;
-
-                // Execute the send_transaction RPC call.
-                // The Chia wallet daemon creates a spend bundle that
-                // consumes one or more input coins and produces:
-                //   1. An output of target_amount_mojos to our address.
-                //   2. A change output for any remainder.
-                // The transaction enters the mempool and confirms within
-                // ~52 seconds (one block time) under normal conditions.
-                //
-                // ISO/IEC 5055 -- exceptions from send_transaction are
-                // caught below; partial results are still returned.
-                json tx_resp = co_await wallet_->send_transaction(send_params);
-
-                ++coins_created;
-                total_fee += fee;
-
-                // Extract and log the transaction ID if present.
-                std::string tx_id = "(unknown)";
-                if (tx_resp.contains("transaction_id")) {
-                    tx_id = tx_resp["transaction_id"].get<std::string>();
-                }
-
-                logger_->debug("Split coin {}/{}: {} mojos to {} [tx={}]",
-                               coins_created, needed, target_amount_mojos,
-                               address.substr(0, 20), tx_id.substr(0, 16));
-
-                // Capture the transaction ID from the last successful send
-                // into the result for caller inspection.
-                if (tx_resp.contains("transaction_id")) {
-                    result.tx_id = tx_id;
-                }
-
-            } catch (const rpc::ChiaRPCError& e) {
-                // RPC-level error (transport, application rejection, etc.).
-                // Log and return partial results -- partial splits are
-                // still useful for concurrency.
-                logger_->error("ensure_split: send_transaction RPC error at "
-                               "coin {}/{}: {}",
-                               coins_created + 1, needed, e.what());
-                result.coins_created = coins_created;
-                result.fee_paid      = total_fee;
-                result.success       = (coins_created > 0);
-                co_return result;
-
-            } catch (const std::exception& e) {
-                // Unexpected non-RPC error (JSON parse failure, etc.).
-                logger_->error("ensure_split: unexpected error at "
-                               "coin {}/{}: {}",
-                               coins_created + 1, needed, e.what());
-                result.coins_created = coins_created;
-                result.fee_paid      = total_fee;
-                result.success       = (coins_created > 0);
-                co_return result;
-            }
+    // Find a coin large enough: batch * target_amount_mojos + fee <= coin.amount
+    Mojo split_cost = static_cast<Mojo>(batch) * target_amount_mojos + fee;
+    const CoinInfo* source_coin = nullptr;
+    for (const auto& c : free_coins) {
+        if (c.amount >= split_cost && !c.coin_name.empty()) {
+            source_coin = &c;
+            break;
         }
     }
 
-    result.coins_created = coins_created;
-    result.fee_paid      = total_fee;
-    result.success       = true;
+    if (!source_coin) {
+        logger_->error("ensure_split: no single coin large enough for "
+                       "split ({} mojos needed for {} x {} + {} fee)",
+                       split_cost, batch, target_amount_mojos, fee);
+        result.success = false;
+        co_return result;
+    }
 
-    logger_->info("ensure_split: created {} coins of {} mojos each "
-                  "(fee {} mojos total)",
-                  coins_created, target_amount_mojos, total_fee);
+    logger_->info("ensure_split: splitting coin {} ({} mojos) into {} "
+                  "coins of {} mojos each (fee={})",
+                  source_coin->coin_name.substr(0, 16),
+                  source_coin->amount,
+                  batch, target_amount_mojos, fee);
+
+    try {
+        json split_resp = co_await wallet_->split_coins(
+            wallet_id,
+            source_coin->coin_name,
+            batch,
+            target_amount_mojos,
+            fee);
+
+        result.coins_created = batch;
+        result.fee_paid      = fee;
+        result.success       = true;
+
+        // Extract transaction ID if available.
+        if (split_resp.contains("transaction") &&
+            split_resp["transaction"].contains("name")) {
+            result.tx_id = split_resp["transaction"]["name"]
+                           .get<std::string>();
+        }
+
+        logger_->info("ensure_split: created {} coins of {} mojos each "
+                      "(fee {} mojos, tx={})",
+                      batch, target_amount_mojos, fee,
+                      result.tx_id.empty() ? "(none)" :
+                      result.tx_id.substr(0, 16));
+
+    } catch (const rpc::ChiaRPCError& e) {
+        logger_->error("ensure_split: split_coins RPC error: {}", e.what());
+        result.success = false;
+        co_return result;
+
+    } catch (const std::exception& e) {
+        logger_->error("ensure_split: unexpected error: {}", e.what());
+        result.success = false;
+        co_return result;
+    }
 
     co_return result;
 }
