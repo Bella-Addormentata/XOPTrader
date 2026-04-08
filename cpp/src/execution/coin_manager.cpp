@@ -235,16 +235,16 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
     // Step 4: Execute the split as a single atomic transaction.
     //
-    // Uses the Chia wallet RPC "split_coins" endpoint to create all
-    // needed coins in one spend bundle -- one block confirmation, one fee.
+    // Uses the Chia wallet RPC "split_coins" endpoint to create coins
+    // in one spend bundle -- one block confirmation, one fee.
     // This replaces the previous sequential send_transaction approach which
     // suffered from change-coin locking (each send locks the change output,
     // so only ~1 coin could be created per block).
     //
-    // Strategy: find the largest free coin that can fund the entire split,
-    // then call split_coins with that coin's ID.
+    // Strategy: sort free coins by amount descending, pick the largest one,
+    // and split it into as many target-denomination coins as it can fund
+    // (up to the number needed and the Chia 500-coin-per-tx limit).
     constexpr int kMaxCoinsPerSplit = 500;  // Chia wallet limit
-    int batch = std::min(needed, kMaxCoinsPerSplit);
 
     // Sort free coins by amount descending to find best candidate.
     std::sort(free_coins.begin(), free_coins.end(),
@@ -252,29 +252,38 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
                   return a.amount > b.amount;
               });
 
-    // Find a coin large enough: batch * target_amount_mojos + fee <= coin.amount
-    Mojo split_cost = static_cast<Mojo>(batch) * target_amount_mojos + fee;
+    // Find the largest coin that can produce at least 1 new coin.
     const CoinInfo* source_coin = nullptr;
+    int batch = 0;
     for (const auto& c : free_coins) {
-        if (c.amount >= split_cost && !c.coin_name.empty()) {
-            source_coin = &c;
-            break;
+        if (c.coin_name.empty() || c.amount < target_amount_mojos + fee) {
+            continue;
         }
+        // How many target-denomination coins can this coin produce?
+        int max_from_coin = static_cast<int>(
+            (c.amount - fee) / target_amount_mojos);
+        if (max_from_coin < 1) continue;
+
+        batch = std::min({needed, max_from_coin, kMaxCoinsPerSplit});
+        source_coin = &c;
+        break;  // Largest coin first -- best candidate.
     }
 
-    if (!source_coin) {
-        logger_->error("ensure_split: no single coin large enough for "
-                       "split ({} mojos needed for {} x {} + {} fee)",
-                       split_cost, batch, target_amount_mojos, fee);
+    if (!source_coin || batch < 1) {
+        logger_->error("ensure_split: no coin large enough to produce "
+                       "even 1 coin of {} mojos (+ {} fee). "
+                       "Largest free coin: {} mojos",
+                       target_amount_mojos, fee,
+                       free_coins.empty() ? 0 : free_coins[0].amount);
         result.success = false;
         co_return result;
     }
 
     logger_->info("ensure_split: splitting coin {} ({} mojos) into {} "
-                  "coins of {} mojos each (fee={})",
+                  "coins of {} mojos each (need {}, fee={})",
                   source_coin->coin_name.substr(0, 16),
                   source_coin->amount,
-                  batch, target_amount_mojos, fee);
+                  batch, target_amount_mojos, needed, fee);
 
     try {
         json split_resp = co_await wallet_->split_coins(
