@@ -185,6 +185,11 @@ struct StrategyConfig {
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
 
+    /// High-volatility regime multiplier for spread widening.
+    /// Applied multiplicatively to the base spread when the regime
+    /// detector flags high volatility.  Default 1.80 (80% wider).
+    double   high_vol_multiplier{1.80};
+
     /// On-chain fee per offer/cancel (mojos).  Default 0.00001 XCH.
     std::uint64_t offer_fee_mojos{10'000'000ULL};
 

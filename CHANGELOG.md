@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.21] — 2026-04-08
+
+### Changed
+
+- **Proportional DEX/CEX divergence response**: Replaced the binary 1.5× spread multiplier (triggered at >200 bps divergence) with a linear ramp: `mult = 1.0 + min(divergence_bps / 1000, 0.5)`. At 200 bps divergence the multiplier is now 1.2× instead of 1.5×, scaling up to max 1.5× at 500+ bps. Eliminates the cliff-edge that caused uncompetitive pricing.
+- **Reservation mid clamp tightened 2% → 1%**: Bids and asks now stay within 1% of market mid instead of 2%, keeping quotes competitive when the Avellaneda-Stoikov reservation price diverges.
+- **`high_vol_multiplier` now configurable**: Exposed the high-volatility regime multiplier (previously hardcoded at 1.80) as a YAML parameter in `strategy.high_vol_multiplier`. Set to 1.3 (30% widen vs 80%).
+- **Config tuning for competitiveness**: `gamma` 0.01→0.005 (halves adverse selection base), `max_half_spread_bps` 250→150 (300 bps round-trip cap), `wall_size_threshold_xch` 20→50, `wall_niche_premium_pct` 15%→5%.
+- **Circuit breakers tightened**: `max_drawdown_pct` 10%→5%, `loss_window_blocks` 1152→576 (16h→8h), `max_window_loss_bps` 500→250 (5%→2.5%). Engine pauses earlier if trades are losing money.
+
 ## [0.7.20] — 2026-04-07
 
 ### Fixed

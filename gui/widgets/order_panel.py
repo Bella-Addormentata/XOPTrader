@@ -369,12 +369,22 @@ class OrderPanel(QWidget):
         for row_idx, offer in enumerate(offers):
             self._table.insertRow(row_idx)
 
-            # -- Offer ID (truncated for readability) --
+            # -- Offer ID (clickable link to Dexie) --
             oid: str = offer.get("offer_id", "")
-            item_id = QTableWidgetItem(oid[:16] + "..." if len(oid) > 16 else oid)
-            item_id.setToolTip(oid)
-            item_id.setData(Qt.ItemDataRole.UserRole, oid)  # Store full ID.
+            display_oid = oid[:16] + "..." if len(oid) > 16 else oid
+            dexie_url = f"https://dexie.space/offers/{oid}"
+            link_label = QLabel(
+                f'<a href="{dexie_url}" style="color:{COLORS.INFO_BLUE};">'
+                f"{display_oid}</a>"
+            )
+            link_label.setToolTip(oid)
+            link_label.setOpenExternalLinks(True)
+            link_label.setContentsMargins(4, 0, 4, 0)
+            # Also keep a plain item for sorting / UserRole data lookup.
+            item_id = QTableWidgetItem(display_oid)
+            item_id.setData(Qt.ItemDataRole.UserRole, oid)
             self._table.setItem(row_idx, 0, item_id)
+            self._table.setCellWidget(row_idx, 0, link_label)
 
             # -- Pair --
             self._table.setItem(

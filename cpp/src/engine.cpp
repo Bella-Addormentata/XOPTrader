@@ -193,6 +193,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     SpreadConfig sp_cfg;
     sp_cfg.gamma = config_.strategy.gamma;
     sp_cfg.s_floor_bps = config_.strategy.min_profit_margin_bps;
+    sp_cfg.high_vol_multiplier = config_.strategy.high_vol_multiplier;
     spread_opt_ = std::make_unique<SpreadOptimizer>(sp_cfg);
 
     // Per-pair liquidity engines Ã¢â‚¬â€ use per-pair tier overrides when present.
@@ -2409,21 +2410,26 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         // [T8-05] DEX/CEX divergence spread widening.
         // When the DEX mid price diverges significantly from the CEX
-        // reference, widen spreads to avoid adverse selection from
-        // cross-venue arbitrageurs.
+        // reference, widen spreads proportionally to avoid adverse
+        // selection from cross-venue arbitrageurs.
+        //
+        // Linear ramp: mult = 1.0 + min(divergence_bps / 1000, 0.5)
+        // At 200 bps: 1.2x.  At 500+ bps: 1.5x (max).
         if (auto cex_ref = market_data_->get_cex_reference(pair_name)) {
             double dex_mid = market_data_->get_mid_price(pair_name);
             if (dex_mid > 0.0 && *cex_ref > 0.0) {
                 double divergence_bps =
                     std::abs(dex_mid - *cex_ref) / dex_mid * 10000.0;
-                constexpr double kDexCexDivergenceThresholdBps = 200.0;
-                if (divergence_bps > kDexCexDivergenceThresholdBps) {
-                    constexpr double kDivergenceMult = 1.5;
-                    pcs.spread_result.total_spread_bps *= kDivergenceMult;
+                constexpr double kDivergenceScaleBps = 1000.0;
+                constexpr double kMaxDivergenceMult  = 0.5;
+                const double divergence_mult =
+                    1.0 + std::min(divergence_bps / kDivergenceScaleBps,
+                                   kMaxDivergenceMult);
+                if (divergence_mult > 1.01) {
+                    pcs.spread_result.total_spread_bps *= divergence_mult;
                     spdlog::warn("[Engine] Step 5: {} DEX/CEX divergence={:.0f}bps "
-                                 "> {:.0f}bps -- spread widened by {:.1f}x",
-                                 pair_name, divergence_bps,
-                                 kDexCexDivergenceThresholdBps, kDivergenceMult);
+                                 "-- spread widened by {:.2f}x",
+                                 pair_name, divergence_bps, divergence_mult);
                 }
             }
         }
@@ -2584,7 +2590,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 
         // Clamp reservation mid: preserve inventory skew but prevent the
         // A-S absolute-spread pathology from shifting the quote center.
-        constexpr double kMaxReservationDeviationPct = 0.02;  // 2%
+        constexpr double kMaxReservationDeviationPct = 0.01;  // 1%
         const double max_dev = mid * kMaxReservationDeviationPct;
         if (std::abs(reservation_mid - mid) > max_dev) {
             const double clamped = std::clamp(

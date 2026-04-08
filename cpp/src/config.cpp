@@ -732,6 +732,16 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     // else: default from StrategyConfig{} is used (250.0 bps).
 
+    // Optional: high-volatility regime multiplier.  Default 1.80.
+    if (node["high_vol_multiplier"] && node["high_vol_multiplier"].IsDefined()
+        && !node["high_vol_multiplier"].IsNull()) {
+        cfg.high_vol_multiplier = node["high_vol_multiplier"].as<double>();
+        if (cfg.high_vol_multiplier < 1.0) {
+            throw ConfigError(sec + ".high_vol_multiplier must be >= 1.0; got "
+                              + std::to_string(cfg.high_vol_multiplier));
+        }
+    }
+
     // Optional: on-chain fee per offer/cancel (mojos).  Default 0.0001 XCH.
     if (node["offer_fee_mojos"] && node["offer_fee_mojos"].IsDefined()
         && !node["offer_fee_mojos"].IsNull()) {
