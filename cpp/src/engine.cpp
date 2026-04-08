@@ -1511,23 +1511,64 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // so the competitor detector can filter them out.
         // ISO/IEC 27001:2022: no secret data exposed in offers.
         try {
-            const std::string dexie_pair_id =
-                ticker ? ticker->pair_id : pair.base_asset_id;
+            // For XCH/CAT pairs, pair_id works correctly (returns only
+            // that pair's offers).  For CAT/CAT pairs (like BYC/wUSDC.b),
+            // pair_id == the denomination token, which returns ALL offers
+            // involving that token (584K+ for wUSDC.b), drowning the
+            // target pair in page_size=100.  Fix: fetch each direction
+            // separately using offered/requested asset IDs.
+            const bool is_xch_pair =
+                (pair.base_asset_id == "xch" ||
+                 pair.quote_asset_id == "xch");
 
-            auto offers_page = co_await dexie_->get_offers(
-                dexie_pair_id,
-                /*offered=*/   {},
-                /*requested=*/ {},
-                /*page=*/      1,
-                /*page_size=*/ 100,
-                /*sort=*/      "price_asc",
-                /*compact=*/   true,
-                /*status=*/    0);  // status 0 = active offers
+            std::vector<rpc::OfferRecord> all_dexie_offers;
+            if (is_xch_pair) {
+                const std::string dexie_pair_id =
+                    ticker ? ticker->pair_id : pair.base_asset_id;
+                auto page = co_await dexie_->get_offers(
+                    dexie_pair_id,
+                    /*offered=*/   {},
+                    /*requested=*/ {},
+                    /*page=*/      1,
+                    /*page_size=*/ 100,
+                    /*sort=*/      "price_asc",
+                    /*compact=*/   true,
+                    /*status=*/    0);
+                all_dexie_offers = std::move(page.offers);
+            } else {
+                // CAT/CAT pair: two targeted fetches (asks + bids).
+                auto asks = co_await dexie_->get_offers(
+                    /*pair_id=*/   {},
+                    /*offered=*/   pair.base_asset_id,
+                    /*requested=*/ pair.quote_asset_id,
+                    /*page=*/      1,
+                    /*page_size=*/ 50,
+                    /*sort=*/      "price_asc",
+                    /*compact=*/   true,
+                    /*status=*/    0);
+                auto bids = co_await dexie_->get_offers(
+                    /*pair_id=*/   {},
+                    /*offered=*/   pair.quote_asset_id,
+                    /*requested=*/ pair.base_asset_id,
+                    /*page=*/      1,
+                    /*page_size=*/ 50,
+                    /*sort=*/      "price_asc",
+                    /*compact=*/   true,
+                    /*status=*/    0);
+                all_dexie_offers.reserve(
+                    asks.offers.size() + bids.offers.size());
+                all_dexie_offers.insert(all_dexie_offers.end(),
+                    std::make_move_iterator(asks.offers.begin()),
+                    std::make_move_iterator(asks.offers.end()));
+                all_dexie_offers.insert(all_dexie_offers.end(),
+                    std::make_move_iterator(bids.offers.begin()),
+                    std::make_move_iterator(bids.offers.end()));
+            }
 
             // Build CompetingOffer vector from dexie OfferRecord data.
             std::vector<CompetingOffer> comp_offers;
-            comp_offers.reserve(offers_page.offers.size());
-            for (const auto& orec : offers_page.offers) {
+            comp_offers.reserve(all_dexie_offers.size());
+            for (const auto& orec : all_dexie_offers) {
                 if (orec.offered.empty() || orec.requested.empty()) {
                     continue;
                 }
@@ -1549,9 +1590,18 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 co.side             = (!orec.offered.empty() &&
                                        orec.offered[0].id == pair.base_asset_id)
                                       ? Side::Ask : Side::Bid;
-                // ISO/IEC 5055: round instead of truncate for price conversion.
+                // Dexie price = requested_amount / offered_amount.
+                // For ASK (offered=base, requested=quote): price = quote/base
+                //   = market convention (correct).
+                // For BID (offered=quote, requested=base): price = base/quote
+                //   = reciprocal.  Invert to market convention so downstream
+                //   code (competitive cap, peg-crossing, spread analysis) can
+                //   compare prices consistently.
+                const double market_price =
+                    (co.side == Side::Bid && orec.price > 0.0)
+                    ? (1.0 / orec.price) : orec.price;
                 co.price            = static_cast<Mojo>(std::llround(
-                    orec.price * static_cast<double>(kMojosPerXch)));
+                    market_price * static_cast<double>(kMojosPerXch)));
                 co.size             = 0;
                 if (!orec.offered.empty()) {
                     // ISO/IEC 5055: round instead of truncate for size conversion.
@@ -1578,7 +1628,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             }
 
             market_data_->ingest_competing_offers(
-                pair.name, comp_offers, own_ids);
+                pair.name, comp_offers, own_ids,
+                pair.base_mojos_per_unit);
         } catch (const std::exception& ex) {
             // Transient dexie errors should not abort the cycle.
             // ISO/IEC 5055: checked error handling with logging.

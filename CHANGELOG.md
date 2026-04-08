@@ -5,6 +5,14 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.25] — 2026-04-08
+
+### Fixed
+
+- **Competing offer fetch for CAT/CAT pairs**: The Dexie API `pair_id` parameter for non-XCH denomination tokens (e.g. wUSDC.b) returns ALL 584K+ offers involving that token — not just the target pair. With `page_size=100`, BYC/wUSDC.b offers were never found. Fix: for CAT/CAT pairs, fetch each direction separately using `offered`/`requested` asset ID parameters, yielding precise per-pair results. XCH/CAT pairs continue using the faster `pair_id` path unchanged.
+- **Dust threshold scaling for CAT pairs**: `min_competitor_offer_size` (default 1 trillion mojos = 1 XCH) rejected all BYC offers because BYC uses 1000 mojos/unit. Fix: scale the threshold proportionally by `base_mojos_per_unit / kMojosPerXch`, with a floor of 1 unit. For BYC (1000 mpu), effective threshold = 1000 mojos (1 BYC). For XCH, unchanged.
+- **BID-side competing offer price normalization**: Dexie API always reports `price = requested/offered`. For ASK offers (offered=base) this matches market convention. For BID offers (offered=quote) it's the reciprocal. Fix: invert BID prices to market convention at ingestion, fixing Step 9e peg comparison, competitive cap (Step 7), and spread analysis for all pairs.
+
 ## [0.7.24] — 2026-04-08
 
 ### Added

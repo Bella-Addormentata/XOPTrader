@@ -358,7 +358,8 @@ public:
     void ingest_competing_offers(
         const std::string&                 pair_name,
         const std::vector<CompetingOffer>& competing_offers,
-        const std::unordered_set<std::string>& own_offer_ids);
+        const std::unordered_set<std::string>& own_offer_ids,
+        std::int64_t base_mojos_per_unit = 1'000'000'000'000LL);
 
     /// Ingest the current block height from the Chia full node.
     ///

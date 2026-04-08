@@ -979,7 +979,8 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
 void MarketDataFeed::ingest_competing_offers(
     const std::string&                 pair_name,
     const std::vector<CompetingOffer>& competing_offers,
-    const std::unordered_set<std::string>& own_offer_ids)
+    const std::unordered_set<std::string>& own_offer_ids,
+    std::int64_t base_mojos_per_unit)
 {
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
@@ -999,7 +1000,15 @@ void MarketDataFeed::ingest_competing_offers(
         }
 
         // Skip dust offers (not from serious market makers).
-        if (offer.size < cfg.min_competitor_offer_size) {
+        // Scale threshold proportionally for non-XCH denominations:
+        //   XCH (1e12 mpu): effective_min = max(1e12, 1e12*1e12/1e12) = 1e12
+        //   BYC (1e3  mpu): effective_min = max(1e3,  1e12*1e3/1e12 ) = 1e3
+        const Mojo effective_min = std::max(
+            static_cast<Mojo>(base_mojos_per_unit),
+            static_cast<Mojo>(
+                cfg.min_competitor_offer_size * base_mojos_per_unit
+                / kMojosPerXch));
+        if (offer.size < effective_min) {
             continue;
         }
 
