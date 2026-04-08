@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.22] — 2026-04-08
+
+### Added
+
+- **Automatic coin pool maintenance**: New `step_maintain_coin_pool()` runs at engine startup and every `coin_pool_interval_blocks` (default 50) to self-send XCH and maintain a pool of pre-split coins. Prevents the large-coin-locking problem where a single UTXO (e.g. 135 XCH) gets locked by a small offer, starving all other offers of capital.
+- **`get_next_address` RPC method**: Added to `ChiaWalletRPC` for obtaining wallet receive addresses (used by coin splitting).
+- **Coin pool config**: New `strategy` fields: `coin_pool_target_count` (default 20), `coin_pool_target_xch` (default 5.0), `coin_pool_interval_blocks` (default 50). Set `coin_pool_target_count: 0` to disable.
+- **Zero-fee coin splitting**: Splits use fee=0 by default since Chia mainnet mempool is rarely congested.
+
 ## [0.7.21] — 2026-04-08
 
 ### Changed

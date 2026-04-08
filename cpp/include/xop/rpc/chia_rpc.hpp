@@ -611,6 +611,24 @@ public:
      */
     asio::awaitable<json> send_transaction(const json& params);
 
+    // -- Address management -------------------------------------------------
+
+    /**
+     * @brief Get a receive address for a wallet (for self-send splits).
+     *
+     * Wraps the Chia wallet RPC "get_next_address" endpoint.  When
+     * new_address is false, returns the current unused address without
+     * generating a new derivation.
+     *
+     * @param wallet_id    Target wallet ID.
+     * @param new_address  If true, derive a fresh address.
+     * @return bech32m address string.
+     * @throws ChiaRPCError on transport or application-level failure.
+     */
+    asio::awaitable<std::string> get_next_address(
+        std::int64_t wallet_id,
+        bool         new_address = false);
+
     // -- Stuck transaction management ---------------------------------------
 
     /**

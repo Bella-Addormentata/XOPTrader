@@ -836,6 +836,26 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.auto_rebalance_enabled = node["auto_rebalance_enabled"].as<bool>();
     }
 
+    // -- Coin pool management -----------------------------------------------
+    if (node["coin_pool_target_count"] && node["coin_pool_target_count"].IsDefined()
+        && !node["coin_pool_target_count"].IsNull()) {
+        cfg.coin_pool_target_count = node["coin_pool_target_count"].as<int>();
+        if (cfg.coin_pool_target_count < 0) {
+            throw ConfigError(sec + ".coin_pool_target_count must be >= 0");
+        }
+    }
+    if (node["coin_pool_target_xch"] && node["coin_pool_target_xch"].IsDefined()
+        && !node["coin_pool_target_xch"].IsNull()) {
+        cfg.coin_pool_target_xch = node["coin_pool_target_xch"].as<double>();
+        if (cfg.coin_pool_target_xch <= 0.0) {
+            throw ConfigError(sec + ".coin_pool_target_xch must be > 0");
+        }
+    }
+    if (node["coin_pool_interval_blocks"] && node["coin_pool_interval_blocks"].IsDefined()
+        && !node["coin_pool_interval_blocks"].IsNull()) {
+        cfg.coin_pool_interval_blocks = node["coin_pool_interval_blocks"].as<uint32_t>();
+    }
+
     // -- Gap-aware dynamic tier spacing (optional, defaults in StrategyConfig) --
     if (node["gap_aware_spacing"] && node["gap_aware_spacing"].IsDefined()
         && !node["gap_aware_spacing"].IsNull()) {

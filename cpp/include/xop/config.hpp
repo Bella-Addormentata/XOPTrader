@@ -262,6 +262,25 @@ struct StrategyConfig {
     /// depleted assets when below min_trading_units.  Default true.
     bool     auto_rebalance_enabled{true};
 
+    // -- Coin pool management -----------------------------------------------
+
+    /// Target number of spendable XCH coins to maintain.  The engine
+    /// periodically self-sends to split large coins into this many
+    /// chunks, ensuring enough UTXOs for concurrent multi-tier offers.
+    /// 0 = disabled (no automatic coin splitting).
+    /// Default: 20 (sufficient for 3 pairs x 6 tiers x 2 sides = 36,
+    /// with some headroom from change outputs).
+    int      coin_pool_target_count{20};
+
+    /// Target denomination for each split coin, in XCH.
+    /// The engine creates coins of this size when splitting.
+    /// Default: 5.0 XCH.
+    double   coin_pool_target_xch{5.0};
+
+    /// How often (in blocks) to run coin pool maintenance.
+    /// Default: 50 blocks (~43 minutes).  0 = only at startup.
+    uint32_t coin_pool_interval_blocks{50};
+
     // -- Gap-aware dynamic tier spacing -------------------------------------
 
     /// Enable gap-aware dynamic tier spacing.

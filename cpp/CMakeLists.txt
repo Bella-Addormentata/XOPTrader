@@ -30,7 +30,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(xop_trader
-    VERSION   0.7.21
+    VERSION   0.7.22
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )

@@ -1007,6 +1007,24 @@ ChiaWalletRPC::send_transaction(const json& params)
 }
 
 // ---------------------------------------------------------------------------
+// ChiaWalletRPC::get_next_address -- get a receive address for self-sends
+// ---------------------------------------------------------------------------
+
+asio::awaitable<std::string>
+ChiaWalletRPC::get_next_address(std::int64_t wallet_id, bool new_address)
+{
+    const json payload = {
+        {"wallet_id",   wallet_id},
+        {"new_address", new_address}
+    };
+    const json resp = co_await rpc_post("get_next_address", payload);
+    if (!resp.contains("address") || !resp["address"].is_string()) {
+        throw ChiaRPCError("get_next_address: response missing 'address' field");
+    }
+    co_return resp["address"].get<std::string>();
+}
+
+// ---------------------------------------------------------------------------
 // ChiaWalletRPC::delete_unconfirmed_transactions
 // ---------------------------------------------------------------------------
 

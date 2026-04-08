@@ -766,6 +766,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
     }
 
+    // -- Coin pool maintenance at startup ------------------------------------
+    if (!wallet_circuit_open_ && config_.strategy.coin_pool_target_count > 0) {
+        try {
+            co_await step_maintain_coin_pool(0);
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Startup coin pool maintenance failed: {}; "
+                         "continuing without splitting", ex.what());
+        }
+    }
     // -- Startup market analysis phase ---------------------------------------
     // If configured, observe the market for startup_analysis_blocks before
     // entering active trading.  The engine is in BotStatus::Analyzing during
@@ -1188,6 +1197,18 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::debug("[Engine] Step 2 SKIPPED: wallet circuit breaker open");
     }
 
+    // -- Periodic coin pool maintenance ------------------------------------
+    if (!wallet_circuit_open_
+        && config_.strategy.coin_pool_target_count > 0
+        && config_.strategy.coin_pool_interval_blocks > 0
+        && block_height >= coin_pool_last_block_
+                           + config_.strategy.coin_pool_interval_blocks) {
+        try {
+            co_await step_maintain_coin_pool(block_height);
+        } catch (const std::exception& e) {
+            spdlog::warn("[Engine] Coin pool maintenance failed: {}", e.what());
+        }
+    }
     try { step_update_analytics(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 3 (analytics) failed: {}", e.what());
@@ -6280,4 +6301,91 @@ void Engine::check_pause_flag()
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// step_maintain_coin_pool -- ensure enough pre-split XCH coins for trading
+// ---------------------------------------------------------------------------
+
+asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
+{
+    const int target_count = config_.strategy.coin_pool_target_count;
+    if (target_count <= 0) {
+        co_return;
+    }
+
+    const double target_xch = config_.strategy.coin_pool_target_xch;
+    const auto target_mojos = static_cast<Mojo>(
+        std::llround(target_xch * static_cast<double>(kMojosPerXch)));
+
+    // Skip if prior splits are still confirming.
+    try {
+        auto bal = co_await wallet_->get_wallet_balance(1);
+        Mojo pending_change = 0;
+        if (bal.contains("pending_change"))
+            pending_change = bal["pending_change"].get<Mojo>();
+        if (pending_change > 0) {
+            spdlog::debug("[Engine] Coin pool: pending_change={} mojos, "
+                          "waiting for prior splits to confirm",
+                          pending_change);
+            co_return;
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("[Engine] Coin pool: balance check failed: {}", e.what());
+        co_return;
+    }
+
+    int free_count = 0;
+    try {
+        free_count = co_await coin_mgr_->count_free_coins(1);
+    } catch (const std::exception& e) {
+        spdlog::warn("[Engine] Coin pool: count_free_coins failed: {}", e.what());
+        co_return;
+    }
+
+    if (free_count >= target_count) {
+        spdlog::debug("[Engine] Coin pool: {} free coins >= target {} -- OK",
+                      free_count, target_count);
+        coin_pool_last_block_ = block_height;
+        co_return;
+    }
+
+    spdlog::info("[Engine] Coin pool: {} free coins < target {} -- "
+                 "splitting to create {} more coins of {:.2f} XCH each",
+                 free_count, target_count,
+                 target_count - free_count, target_xch);
+
+    std::string address;
+    try {
+        address = co_await wallet_->get_next_address(1, false);
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] Coin pool: get_next_address failed: {}", e.what());
+        co_return;
+    }
+
+    constexpr Mojo split_fee = 0;
+
+    try {
+        auto result = co_await coin_mgr_->ensure_split(
+            1, target_count, target_mojos, address, split_fee);
+
+        if (result.success) {
+            spdlog::info("[Engine] Coin pool: created {} new coins "
+                         "(fee={} mojos total)",
+                         result.coins_created, result.fee_paid);
+        } else if (result.coins_created > 0) {
+            spdlog::warn("[Engine] Coin pool: partial split -- created "
+                         "{} of {} needed coins",
+                         result.coins_created,
+                         target_count - free_count);
+        } else {
+            spdlog::error("[Engine] Coin pool: split failed "
+                          "(insufficient balance or RPC error)");
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] Coin pool: ensure_split failed: {}", e.what());
+    }
+
+    coin_pool_last_block_ = block_height;
+    co_return;
+}
 }  // namespace xop

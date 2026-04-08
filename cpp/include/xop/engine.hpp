@@ -329,6 +329,12 @@ private:
     /// alerts to Telegram.
     void step_check_alerts(BlockHeight block_height);
 
+    /// Coin pool maintenance: ensure enough pre-split XCH coins exist
+    /// for concurrent multi-tier offer creation.  Called at startup and
+    /// periodically (every coin_pool_interval_blocks).  Uses CoinManager
+    /// ensure_split() to self-send if the free coin count is too low.
+    boost::asio::awaitable<void> step_maintain_coin_pool(BlockHeight block_height);
+
     // -- Connection management -----------------------------------------------
 
     /// [CRITICAL-1] Open connections to the Chia full node, wallet, and dexie
@@ -428,6 +434,9 @@ private:
 
     /// Coin-set (UTXO) manager for pre-splitting and locking.
     std::unique_ptr<execution::CoinManager> coin_mgr_;
+
+    /// Last block at which coin pool maintenance ran.
+    BlockHeight coin_pool_last_block_{0};
 
     /// Offer lifecycle manager (create, monitor, cancel).
     std::unique_ptr<execution::OfferManager> offer_mgr_;
