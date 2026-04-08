@@ -264,6 +264,17 @@ public:
     /// Update the total capital (e.g. after PnL recalculation).
     void set_total_capital(Mojo new_total);
 
+    /// Seed the opening position for an asset from wallet balance data.
+    /// Sets total_quantity to `qty` mojos and uses `estimated_price` as the
+    /// synthetic cost basis (typically the current mid-price).
+    /// Used at engine startup to initialize inventory from on-chain balances
+    /// so that inventory_ratio() reflects actual holdings from the start.
+    /// If the asset already has a non-zero position, this is a no-op to
+    /// avoid overwriting fill-based tracking.
+    void seed_position(const AssetId& asset_id,
+                       Mojo           qty,
+                       Mojo           estimated_price);
+
     // -- Accessors ----------------------------------------------------------
 
     /// Read a copy of the asset record.  Returns a default (zero) record if

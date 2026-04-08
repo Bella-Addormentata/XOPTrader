@@ -404,6 +404,10 @@ public:
     /// (e.g. after a token airdrop or wallet recovery).
     void invalidate_wallet_ids() noexcept;
 
+    /// Ensure the asset-to-wallet-ID cache is populated.  Safe to call
+    /// multiple times; only the first call performs the RPC query.
+    asio::awaitable<void> ensure_wallet_ids();
+
     // -- Dynamic fee control ------------------------------------------------
 
     /// Set the per-transaction fee used by subsequent post_quotes(),

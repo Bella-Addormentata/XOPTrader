@@ -775,6 +775,68 @@ asio::awaitable<void> Engine::poll_loop_coro()
                          "continuing without splitting", ex.what());
         }
     }
+    // -- Seed inventory from wallet balances ---------------------------------
+    // Query on-chain balances for each configured pair's base and quote
+    // assets and seed the InventoryTracker so that inventory_ratio()
+    // reflects actual holdings from the first tick.  Without this, the
+    // tracker starts at zero for both sides and reports 0.5 (perfectly
+    // balanced), causing the Avellaneda-Stoikov model to ignore real
+    // portfolio skew and place symmetric quotes regardless of actual
+    // wallet composition.
+    if (inventory_ && offer_mgr_ && wallet_) {
+        try {
+            // Ensure the wallet-ID cache is populated so that
+            // resolve_wallet_id() returns real IDs for CAT assets.
+            co_await offer_mgr_->ensure_wallet_ids();
+
+            // Collect unique asset IDs across all enabled pairs.
+            std::unordered_set<std::string> seed_asset_ids;
+            for (const auto& pair : config_.pairs) {
+                if (!pair.enabled) continue;
+                seed_asset_ids.insert(pair.base_asset_id);
+                seed_asset_ids.insert(pair.quote_asset_id);
+            }
+
+            Mojo total_seeded = 0;
+            for (const auto& aid : seed_asset_ids) {
+                auto wid = offer_mgr_->resolve_wallet_id(aid);
+                if (wid <= 0) continue;
+
+                try {
+                    auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                    Mojo spendable = bal_json.value("spendable_balance",
+                                                    static_cast<Mojo>(0));
+                    if (spendable <= 0) continue;
+
+                    // Use 1 as synthetic cost basis — the actual value
+                    // doesn't affect inventory_ratio because that method
+                    // uses the live mid-price to convert base→quote.
+                    // What matters is that total_quantity reflects the
+                    // real mojos held.
+                    inventory_->seed_position(AssetId{aid}, spendable,
+                                              Mojo{1});
+                    total_seeded += spendable;
+
+                    spdlog::info("[Engine] Seeded inventory for asset {} "
+                                 "(wallet {}): {} mojos",
+                                 aid.substr(0, 12), wid, spendable);
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] Could not query balance for "
+                                  "wallet {}: {}", wid, e.what());
+                }
+            }
+
+            if (total_seeded > 0) {
+                spdlog::info("[Engine] Inventory seeded from wallet: "
+                             "total {} mojos across {} assets",
+                             total_seeded, seed_asset_ids.size());
+            }
+        } catch (const std::exception& ex) {
+            spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
+                         "continuing with zero inventory", ex.what());
+        }
+    }
+
     // -- Startup market analysis phase ---------------------------------------
     // If configured, observe the market for startup_analysis_blocks before
     // entering active trading.  The engine is in BotStatus::Analyzing during

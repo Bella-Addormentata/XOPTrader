@@ -5,6 +5,13 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.26] — 2026-04-08
+
+### Fixed
+
+- **Inventory seeding from wallet balances at startup**: The `InventoryTracker` started at zero for all assets and only updated from recorded fills. With no fill history, `inventory_ratio()` permanently returned 0.5 (perfectly balanced), causing the Avellaneda-Stoikov model to place symmetric quotes regardless of actual wallet composition. This led to buying BYC and selling wUSDC.b without any rebalancing pressure. Fix: at engine startup (after wallet connection and offer reconciliation), query on-chain spendable balances for each configured pair's assets and call the new `seed_position()` method. The inventory skew model now reflects real holdings from the first tick, generating appropriate bid/ask asymmetry to rebalance towards target allocation.
+- **`ensure_wallet_ids()` public method on OfferManager**: The asset-to-wallet-ID cache (`init_wallet_id_map()`) was only populated lazily inside `post_quotes()`. Inventory seeding at startup needed wallet IDs before any quotes were posted. Added a public `ensure_wallet_ids()` coroutine that populates the cache on demand — safe to call multiple times (no-op after first initialization).
+
 ## [0.7.25] — 2026-04-08
 
 ### Fixed

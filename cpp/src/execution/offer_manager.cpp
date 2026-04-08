@@ -1085,6 +1085,17 @@ void OfferManager::invalidate_wallet_ids() noexcept
 }
 
 // ---------------------------------------------------------------------------
+// ensure_wallet_ids -- public one-shot cache population
+// ---------------------------------------------------------------------------
+
+asio::awaitable<void> OfferManager::ensure_wallet_ids()
+{
+    if (!wallet_ids_resolved_) {
+        co_await init_wallet_id_map();
+    }
+}
+
+// ---------------------------------------------------------------------------
 // [T5-01] classify_tier_staleness -- direction-aware price-deviation check
 //
 // Scholarly basis:

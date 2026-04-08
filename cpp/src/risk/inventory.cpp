@@ -583,6 +583,34 @@ void InventoryTracker::set_total_capital(Mojo new_total)
     total_capital_ = new_total;
 }
 
+void InventoryTracker::seed_position(const AssetId& asset_id,
+                                     Mojo           qty,
+                                     Mojo           estimated_price)
+{
+    if (qty <= 0 || estimated_price <= 0) {
+        return;
+    }
+
+    std::unique_lock lock(mtx_records_);
+
+    // If this asset already has a real position (from fill tracking or a
+    // previous seed), do not overwrite it.
+    auto it = records_.find(asset_id);
+    if (it != records_.end() && it->second.total_quantity > 0) {
+        return;
+    }
+
+    // Insert or find the record.
+    auto [ins_it, inserted] = records_.try_emplace(asset_id, asset_id);
+    AssetRecord& rec = ins_it->second;
+
+    // Use wide arithmetic for cost = qty * estimated_price.
+    const Wide cost = static_cast<Wide>(qty) * static_cast<Wide>(estimated_price);
+    rec.total_quantity = qty;
+    rec.total_cost     = static_cast<Mojo>(cost);
+    recompute_basis(rec);
+}
+
 // ===========================================================================
 // Accessors
 // ===========================================================================
