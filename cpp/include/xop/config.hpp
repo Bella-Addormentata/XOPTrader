@@ -243,6 +243,12 @@ struct StrategyConfig {
     /// without blocking trading.  Default 0.01 XCH (~3× typical fee).
     double   fee_min_spendable_xch{0.01};
 
+    /// Number of spendable coins to keep unallocated as "dry powder" for
+    /// opportunistic trades (arbitrage, crossed-book takes).  Step 7
+    /// deducts this from the XCH UTXO headroom calculation so the tier
+    /// ladder never locks the last N coins.  Default 2.
+    int      arb_reserve_coins{2};
+
     /// Minimum units of each asset to keep as reserve.  Offers on the
     /// side that would deplete an asset below this level are suppressed.
     /// Uses the pair's mojos_per_unit for conversion.  Default 1.0.
@@ -547,6 +553,9 @@ struct ArbitrageSettings {
     double   cex_dex_max_edge_bps{500.0};
     double   cex_fee_bps{10.0};
     double   bridge_fee_bps{0.0};
+    double   cex_dex_confidence_cap{0.25};   // Hard cap on CEX-DEX confidence.
+                                             //   CoinGecko data is aggregated/delayed
+                                             //   and vulnerable to manipulation.
 
     // -- Cross-DEX arbitrage -------------------------------------------------
     double   cross_dex_min_edge_bps{15.0};
@@ -561,6 +570,11 @@ struct ArbitrageSettings {
     bool     crossed_book_enabled{true};
     double   crossed_book_min_edge_bps{10.0};
     double   crossed_book_max_take_xch{5.0};
+
+    /// When true, Step 9c will cancel the least competitive pending offer
+    /// to free a locked coin before executing a crossed-book take, if no
+    /// spendable coins are available.  Default true.
+    bool     cancel_worst_to_free{true};
 
     // -- Cross-stablecoin arbitrage (XCH/BYC vs XCH/wUSDC.b) ----------------
     bool     cross_stable_arb_enabled{true};
@@ -869,8 +883,14 @@ struct AppConfig {
 // AppConfig.  Throws xop::ConfigError on any structural or domain error.
 //
 // Tilde (~) prefixes in filesystem paths are expanded to the user's HOME.
+//
+// When `secrets_path` is non-empty, the file is loaded and deep-merged onto
+// the base config tree before parsing.  This allows sensitive values (wallet
+// fingerprint, SSL paths, API keys) to live in a gitignored secrets.yaml
+// while the operational config.yaml remains version-controlled.
 // ---------------------------------------------------------------------------
-AppConfig load_config(const std::string& path);
+AppConfig load_config(const std::string& path,
+                      const std::string& secrets_path = {});
 
 } // namespace xop
 

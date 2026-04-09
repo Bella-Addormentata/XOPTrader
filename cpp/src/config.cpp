@@ -810,6 +810,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".fee_min_spendable_xch must be >= 0");
         }
     }
+    if (node["arb_reserve_coins"] && node["arb_reserve_coins"].IsDefined()
+        && !node["arb_reserve_coins"].IsNull()) {
+        cfg.arb_reserve_coins = node["arb_reserve_coins"].as<int>();
+        if (cfg.arb_reserve_coins < 0) {
+            throw ConfigError(sec + ".arb_reserve_coins must be >= 0");
+        }
+    }
     if (node["min_reserve_units"] && node["min_reserve_units"].IsDefined()
         && !node["min_reserve_units"].IsNull()) {
         cfg.min_reserve_units = node["min_reserve_units"].as<double>();
@@ -1327,6 +1334,7 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("cex_dex_max_edge_bps",           cfg.cex_dex_max_edge_bps);
     read_dbl ("cex_fee_bps",                    cfg.cex_fee_bps);
     read_dbl ("bridge_fee_bps",                 cfg.bridge_fee_bps);
+    read_dbl ("cex_dex_confidence_cap",         cfg.cex_dex_confidence_cap);
 
     // Cross-DEX
     read_dbl ("cross_dex_min_edge_bps",         cfg.cross_dex_min_edge_bps);
@@ -1341,6 +1349,7 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_bool("crossed_book_enabled",           cfg.crossed_book_enabled);
     read_dbl ("crossed_book_min_edge_bps",      cfg.crossed_book_min_edge_bps);
     read_dbl ("crossed_book_max_take_xch",      cfg.crossed_book_max_take_xch, 0.001);
+    read_bool("cancel_worst_to_free",           cfg.cancel_worst_to_free);
 
     // Cross-stablecoin arbitrage
     read_bool("cross_stable_arb_enabled",       cfg.cross_stable_arb_enabled);
@@ -1652,6 +1661,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  crossed_book         = " << (cfg.arbitrage.crossed_book_enabled ? "true" : "false") << "\n"
         << "  crossed_min_edge_bps = " << cfg.arbitrage.crossed_book_min_edge_bps << "\n"
         << "  crossed_max_take_xch = " << cfg.arbitrage.crossed_book_max_take_xch << "\n"
+        << "  cancel_worst_to_free = " << (cfg.arbitrage.cancel_worst_to_free ? "true" : "false") << "\n"
         << "  cross_stable_arb     = " << (cfg.arbitrage.cross_stable_arb_enabled ? "true" : "false") << "\n"
         << "  cross_stable_edge_bps= " << cfg.arbitrage.cross_stable_min_edge_bps << "\n"
         << "  cross_stable_max_xch = " << cfg.arbitrage.cross_stable_max_take_xch << "\n"
@@ -1660,7 +1670,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  peg_arb_max_units    = " << cfg.arbitrage.peg_arb_max_take_units << "\n"
         << "  peg_arb_max_inv_ratio= " << cfg.arbitrage.peg_arb_max_inventory_ratio << "\n"
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
-        << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n";
+        << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n"
+        << "  cex_dex_conf_cap     = " << cfg.arbitrage.cex_dex_confidence_cap << "\n";
 
     // CoinGecko external price reference -- api_key is secret.
     out << "[coingecko]\n"
@@ -1701,6 +1712,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n"
+        << "  arb_reserve_coins = " << cfg.strategy.arb_reserve_coins << "\n"
         << "  cross_pair_skew = " << (cfg.strategy.cross_pair_skew_enabled ? "ON" : "off") << "\n"
         << "  cross_pair_phi  = " << cfg.strategy.cross_pair_skew_phi << "\n";
 
@@ -1944,10 +1956,29 @@ RecoveryConfig parse_recovery(const YAML::Node& root)
 } // anonymous namespace
 
 // ---------------------------------------------------------------------------
+// YAML deep-merge: recursively overlay `src` onto `dst` (maps merge, scalars
+// and sequences in `src` replace `dst`).  Used to layer secrets.yaml onto
+// the main config tree.
+// ---------------------------------------------------------------------------
+static void deep_merge(YAML::Node dst, const YAML::Node& src)
+{
+    if (!src.IsMap()) return;
+    for (auto it = src.begin(); it != src.end(); ++it) {
+        const auto key = it->first.as<std::string>();
+        if (it->second.IsMap() && dst[key] && dst[key].IsMap()) {
+            deep_merge(dst[key], it->second);
+        } else {
+            dst[key] = YAML::Clone(it->second);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
-AppConfig load_config(const std::string& path)
+AppConfig load_config(const std::string& path,
+                      const std::string& secrets_path)
 {
     // Attempt to load the YAML file.  yaml-cpp throws on I/O or parse errors;
     // wrap them in ConfigError for a uniform exception type.
@@ -1961,6 +1992,20 @@ AppConfig load_config(const std::string& path)
 
     if (!root.IsMap()) {
         throw ConfigError("Top-level YAML structure must be a map in '" + path + "'");
+    }
+
+    // Layer secrets on top of the base config (deep merge).
+    if (!secrets_path.empty()) {
+        try {
+            YAML::Node secrets = YAML::LoadFile(secrets_path);
+            if (secrets.IsMap()) {
+                deep_merge(root, secrets);
+                spdlog::info("Merged secrets from '{}'", secrets_path);
+            }
+        } catch (const YAML::Exception& e) {
+            throw ConfigError("Failed to load secrets from '" + secrets_path
+                              + "': " + std::string(e.what()));
+        }
     }
 
     // Parse each required section.  Individual parsers throw ConfigError on

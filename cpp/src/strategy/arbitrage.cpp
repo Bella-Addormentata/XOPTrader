@@ -345,8 +345,14 @@ ArbitrageDetector::scan_cex_dex(
                                   + cfg_.cex_settlement_seconds;
 
         // Confidence and urgency.
-        const double confidence = compute_confidence(
+        double confidence = compute_confidence(
             available_depth, trade_size, settlement_s);
+
+        // Cap CEX-DEX confidence: CoinGecko/aggregated prices are delayed
+        // and potentially manipulable.  Keep CEX-DEX signals informational
+        // unless the edge is very large and depth is excellent.
+        confidence = std::min(confidence, cfg_.cex_dex_confidence_cap);
+
         const std::uint32_t urgency = compute_urgency(
             exec_edge, kDefaultVolPerBlockBps);
 

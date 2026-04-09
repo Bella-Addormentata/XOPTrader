@@ -5,6 +5,32 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.31] — 2026-04-09
+
+### Changed
+
+- **Offer TTL increased** (`offer_ttl_blocks` 180 → 600): Reduces cancel/repost churn from every ~90 min to every ~5 hours. Fewer blockchain transactions, lower fee spend, and less pending_change downtime between cycles.
+
+- **Fee floor lowered** (`min_fee_mojos` 50000 → 5000): Previous 50K floor was 20× the mempool estimate. 5K is still ~2× the current mempool rate, saving ~45K mojos per on-chain transaction.
+
+- **CAT coin pool disabled** (`cat_coin_pool_target_count` 10 → 0): BYC and wUSDC.b have near-zero spendable balances (most locked in offers). Splitting was failing every cycle, wasting logs. Disabled until CAT inventory recovers.
+
+- **Spendable reserve threshold lowered** (`min_spendable_reserve_pct` 0.25 → 0.10): The 25% spendable/confirmed ratio gate was permanently suppressing both sides of BYC/wUSDC.b (only 11.9% free). Lowered to 10% to allow quoting when most inventory is locked in offers.
+
+### Added
+
+- **CEX-DEX data wiring for ArbitrageDetector**: Step 9b now builds `DexieBookSnapshot` vectors from MarketDataFeed mid/spread and `CexPrice` vectors from CoinGecko-derived references, then calls `set_dex_snapshots()` + `set_cex_prices()` before `scan_all()`. The CEX-DEX and Cross-DEX scans that were previously blind (empty caches) now receive data and can detect divergences.
+
+- **CEX-DEX confidence cap** (`cex_dex_confidence_cap`, default 0.25): Hard ceiling on confidence assigned to CEX-DEX arbitrage opportunities. CoinGecko prices are aggregated, delayed, and vulnerable to manipulation — capping at 0.25 (below the 0.40 min_confidence_threshold) means CEX-DEX signals are logged for visibility but not acted upon unless the operator explicitly lowers the confidence threshold. Prevents the engine from making aggressive trades based on potentially manipulated CEX data.
+
+## [0.7.30] — 2026-04-08
+
+### Added
+
+- **Dry-powder arbitrage reserve** (`arb_reserve_coins`, default 2): Step 7's XCH UTXO headroom calculation now deducts N coins from the available budget, ensuring they remain unallocated and instantly available for opportunistic trades (crossed-book takes, peg arb). Prevents the tier ladder from locking every spendable coin.
+
+- **Cancel-worst-to-free for arb** (`cancel_worst_to_free`, default true): Step 9c now checks XCH spendable before the crossed-book scan. If below 0.25 XCH and no free coins exist, the engine cancels the least competitive pending offer (highest tier, oldest) via `emergency_cancel` to liberate a UTXO, then proceeds with the arb take. Works in tandem with dry-powder reserve as a fallback when all reserved coins have been consumed.
+
 ## [0.7.29] — 2026-04-08
 
 ### Added

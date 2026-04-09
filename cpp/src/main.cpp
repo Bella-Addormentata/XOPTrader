@@ -255,6 +255,7 @@ static void signal_handler(int signum) {
 /// Parsed command-line arguments.
 struct CliArgs {
     std::string config_path;   ///< Path to YAML configuration file.
+    std::string secrets_path;  ///< Path to secrets YAML (optional overlay).
     bool        dry_run;       ///< Compute quotes without submitting offers.
     bool        verbose;       ///< Enable DEBUG-level logging.
 };
@@ -267,6 +268,9 @@ static std::optional<CliArgs> parse_cli(int argc, char* argv[]) {
         ("help,h",    "Show this help message and exit")
         ("config,c",  po::value<std::string>()->default_value("config.yaml"),
                        "Path to YAML configuration file")
+        ("secrets,s", po::value<std::string>()->default_value("secrets.yaml"),
+                       "Path to secrets YAML (wallet, API keys). "
+                       "Merged on top of config. Ignored if file does not exist.")
         ("dry-run,d", po::bool_switch()->default_value(false),
                        "Compute quotes without submitting offers to the network")
         ("verbose,v", po::bool_switch()->default_value(false),
@@ -286,10 +290,18 @@ static std::optional<CliArgs> parse_cli(int argc, char* argv[]) {
         return std::nullopt;
     }
 
+    // Resolve secrets path: default "secrets.yaml" is only used if the file
+    // actually exists; otherwise pass empty to skip secrets loading.
+    std::string secrets = vm["secrets"].as<std::string>();
+    if (!std::filesystem::exists(secrets)) {
+        secrets.clear();
+    }
+
     return CliArgs{
-        .config_path = vm["config"].as<std::string>(),
-        .dry_run     = vm["dry-run"].as<bool>(),
-        .verbose     = vm["verbose"].as<bool>(),
+        .config_path  = vm["config"].as<std::string>(),
+        .secrets_path = std::move(secrets),
+        .dry_run      = vm["dry-run"].as<bool>(),
+        .verbose      = vm["verbose"].as<bool>(),
     };
 }
 
@@ -405,7 +417,7 @@ int main(int argc, char* argv[]) {
     // ------------------------------------------------------------------
     xop::AppConfig app_config;
     try {
-        app_config = xop::load_config(cli.config_path);
+        app_config = xop::load_config(cli.config_path, cli.secrets_path);
     } catch (const xop::ConfigError& e) {
         spdlog::critical("Configuration error: {}", e.what());
         spdlog::shutdown();

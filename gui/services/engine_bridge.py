@@ -667,6 +667,11 @@ class EngineBridge(QObject):
         if self._config_path.is_file():
             cmd.extend(["--config", str(self._config_path)])
 
+        # Pass secrets file if it exists next to the config file.
+        secrets_path = self._config_path.parent / "secrets.yaml"
+        if secrets_path.is_file():
+            cmd.extend(["--secrets", str(secrets_path)])
+
         try:
             launch_dir = self._determine_engine_launch_dir(engine_path)
             self._ensure_engine_runtime_dirs(launch_dir)

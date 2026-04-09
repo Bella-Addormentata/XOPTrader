@@ -1,28 +1,38 @@
-# XOPTrader Configuration
-# Copy to config.yaml and fill in your values.
+# XOPTrader Configuration (public / version-controlled)
+#
+# This file contains all operational tuning parameters.  It is safe to
+# commit to version control.
+#
+# Sensitive values (wallet fingerprint, SSL paths, API keys, Telegram
+# tokens, database path) belong in secrets.yaml which is gitignored.
+# At startup the engine deep-merges secrets.yaml on top of this file,
+# so you only need to put secret overrides there.
+#
+# See secrets.example.yaml for a template.
 #
 # Environment variable substitution:
 #   Any string value may contain ${VAR} or ${VAR:-default} references.
 #   ${VAR}           — replaced with the env var's value; error if unset.
 #   ${VAR:-default}  — replaced with the env var's value, or "default" if unset.
-#   This keeps secrets (tokens, fingerprints, API keys) out of plaintext YAML.
-#   Example:  telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
 #
 # --- Required vs Optional Sections -------------------------------------------
 #
 # REQUIRED sections (engine will not start without them):
-#   chia, dexie, pairs, strategy, risk, volatility, monitoring, database
+#   chia, dexie, pairs, strategy, risk, volatility, monitoring
+#
+# REQUIRED in secrets.yaml:
+#   chia.wallet_fingerprint, chia.ssl_*_path, database.path
 #
 # OPTIONAL sections (omit entirely to use defaults):
 #   depeg, arbitrage, coingecko, fees, inventory_aging, market_data,
-#   adverse_selection
+#   adverse_selection, market_allocator, recovery
 #
 # Within required sections, individual fields are marked [REQUIRED] or
 # [OPTIONAL] (with their default value) in comments below.
 # ---------------------------------------------------------------------------
 
 # --- chia: REQUIRED ----------------------------------------------------------
-# All fields in this section are REQUIRED.
+# Connection settings only.  Wallet fingerprint and SSL paths are in secrets.yaml.
 chia:
   # Node operating mode: auto | full_node | wallet_only
   #   auto        - try full node first, fall back to wallet-only (default)
@@ -33,25 +43,12 @@ chia:
   mode: auto
 
   # Chia RPC endpoints (local full node + wallet)
-  # In wallet_only mode, full_node_host/port and ssl_cert/key are not required.
   full_node_host: "localhost"
   full_node_port: 8555
   wallet_host: "localhost"
   wallet_port: 9256
-  # Path to SSL certs (~/.chia/mainnet/config/ssl/)
-  ssl_cert_path: "~/.chia/mainnet/config/ssl/full_node/private_full_node.crt"
-  ssl_key_path: "~/.chia/mainnet/config/ssl/full_node/private_full_node.key"
-  wallet_cert_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.crt"
-  wallet_key_path: "~/.chia/mainnet/config/ssl/wallet/private_wallet.key"
-  # CA certificate for verifying the Chia daemon (required for mTLS)
-  ca_cert_path: "~/.chia/mainnet/config/ssl/ca/chia_ca.crt"
   # SSL verification for Chia RPC certificates.
-  # Keep true in normal operation; set false only for trusted localhost
-  # troubleshooting when certificate chain validation fails.
   verify_ssl: true
-  # Wallet fingerprint (integer — get yours from `chia keys show`)
-  # Supports env vars: wallet_fingerprint: ${XOP_WALLET_FINGERPRINT}
-  wallet_fingerprint: 1234567890
 
 # --- dexie: REQUIRED ---------------------------------------------------------
 # All fields are REQUIRED.
@@ -78,18 +75,26 @@ pairs:
     name: "BYC/wUSDC.b"
     enabled: true
     # Per-pair strategy overrides for stablecoin-vs-stablecoin pair
-    gamma_override: 0.003          # Lower risk aversion — tight spreads are safe
-    phi_override: 0.15             # Hold ~50/50 balance, don't shed inventory
-    min_profit_margin_bps_override: 12  # Tighter margin — DBX subsidy offsets
-    tier_spacing_bps_override: [15, 30, 50, 80]  # Much tighter ladder
-    tier_size_pct_override: [0.30, 0.25, 0.25, 0.20]
-    min_offer_size_units_override: 10  # Drop tiers below 10 BYC (~$10) — prevents dust offers
+    gamma_override: 0.001          # Lower risk aversion — tight spreads are safe
+    min_profit_margin_bps_override: 5    # Very tight — DBX subsidy offsets
+    max_half_spread_bps_override: 75     # Cap spread for stablecoin pair
+    tier_spacing_bps_override: [3, 5, 8, 15, 25, 40]  # Much tighter ladder
+    tier_size_pct_override: [0.30, 0.25, 0.20, 0.12, 0.08, 0.05]
+    min_offer_size_units_override: 1    # Drop tiers below 1 unit — prevents dust offers
     # Stablecoin peg monitoring — both sides are USD-pegged
     is_stablecoin: true
     peg_target: 1.0                # Both BYC and wUSDC.b should be $1
     depeg_warn_pct: 2.0            # Warn at 2% deviation
     depeg_bail_pct: 10.0           # Pull all quotes at 10% deviation
     depeg_sustained_blocks: 30     # Must persist ~26 min before bail
+    # Stablecoin peg-anchoring: blend mid-price toward the peg target
+    peg_anchor_threshold_pct: 2.0  # [OPTIONAL] Only anchor when within 2% of peg
+    peg_anchor_weight: 0.60        # [OPTIONAL] Blend weight toward peg (0=ignore, 1=force to peg)
+    # Stablecoin quoting modes
+    stablecoin_exempt_buyonly: true       # [OPTIONAL] Don't suppress buy-only during imbalance
+    stablecoin_undercut_all_tiers: true   # [OPTIONAL] Undercut competitors on all tiers
+    stablecoin_flat_sizing: true          # [OPTIONAL] Equal-weight tiers instead of tapered
+    stablecoin_skip_gap_aware: true       # [OPTIONAL] Skip gap-aware spacing (tight spread matters more)
   - base_asset_id: "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6"  # wmilliETH.b
     quote_asset_id: "xch"
     name: "wmilliETH.b/XCH"
@@ -114,10 +119,11 @@ strategy:
   phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT)
   q_max: 1000            # [REQUIRED] Max inventory in base units
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
-  offer_ttl_blocks: 180      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~56 min)
-  num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth
-  tier_spacing_bps: [60, 120, 180, 240]  # [REQUIRED] Spread per tier (bps) — must be ≤ max_half_spread_bps
-  tier_size_pct: [0.30, 0.25, 0.25, 0.20] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
+  high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
+  offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
+  num_tiers: 6               # [REQUIRED] Multi-tier offer ladder depth
+  tier_spacing_bps: [35, 60, 120, 180, 240, 300]  # [REQUIRED] Spread per tier (bps)
+  tier_size_pct: [0.05, 0.10, 0.25, 0.25, 0.20, 0.15] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # Startup market analysis: observe this many blocks before trading begins.
@@ -134,6 +140,10 @@ strategy:
   # -- Minimum balance management --
   # Prevents zero-balance lockout by reserving a minimum in each asset.
   fee_reserve_xch: 1.0                # [OPTIONAL, default: 1.0]  XCH held back for on-chain fees
+  fee_min_spendable_xch: 0.01          # [OPTIONAL, default: 0.01] Minimum XCH that must remain spendable
+  min_spendable_reserve_pct: 0.10      # [OPTIONAL, default: 0.25] Suppress side when spendable/confirmed < this
+                                       #   Lower if most inventory is locked in offers (e.g. depleted CATs).
+  arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
@@ -178,6 +188,21 @@ strategy:
   adverse_selection_decay: 0.7         # [OPTIONAL, default: 0.7]   Lower = more outer-heavy
   adverse_selection_sigma_threshold: 0.05  # [OPTIONAL, default: 0.05] Halve decay above this vol
 
+  # -- Cross-pair correlated inventory skewing (Guéant 2019) --
+  # When multiple pairs share a common asset (e.g. XCH appears in XCH/BYC and
+  # XCH/wUSDC.b), the skew from one pair's inventory can bleed into the other.
+  cross_pair_skew_enabled: true         # [OPTIONAL, default: true]
+  cross_pair_skew_phi: 0.30             # [OPTIONAL, default: 0.30]  Cross-pair skew strength
+
+  # -- Coin pool: pre-split XCH into smaller UTXOs for concurrent offers --
+  coin_pool_target_count: 12            # [OPTIONAL, default: 12]   Target number of XCH coins
+  coin_pool_target_xch: 2.0             # [OPTIONAL, default: 2.0]  Target XCH per coin
+  coin_pool_interval_blocks: 5          # [OPTIONAL, default: 5]    Check interval (~4 min)
+
+  # -- CAT coin pool: pre-split BYC, wUSDC.b etc. for concurrent offers --
+  cat_coin_pool_target_count: 0          # [OPTIONAL, default: 10]  Target coins per CAT (0=disabled)
+  cat_coin_pool_target_units: 10.0       # [OPTIONAL, default: 50.0] Target display units per coin
+
   # -- AMM blend weight --
   # Weight of TibetSwap AMM implied price in mid-price blend.
   # Anchors quotes to the AMM to prevent cross-venue arbitrage.
@@ -198,6 +223,18 @@ risk:
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
   max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 
+  # Circuit-breaker auto-rebalance (enables loss manager for stuck positions)
+  circuit_breaker_enabled: true          # [OPTIONAL, default: true]
+  circuit_breaker_hard_limit_ratio: 0.80 # [OPTIONAL, default: 0.80]
+  circuit_breaker_age_multiplier: 2.0    # [OPTIONAL, default: 2.0]
+  circuit_breaker_max_loss_bps: 100      # [OPTIONAL, default: 100]
+
+  # Circuit-breaker auto-rebalance (enables loss manager for stuck positions)
+  circuit_breaker_enabled: true          # [OPTIONAL, default: true]
+  circuit_breaker_hard_limit_ratio: 0.80 # [OPTIONAL, default: 0.80]
+  circuit_breaker_age_multiplier: 2.0    # [OPTIONAL, default: 2.0]
+  circuit_breaker_max_loss_bps: 100      # [OPTIONAL, default: 100]
+
 # --- volatility: REQUIRED ----------------------------------------------------
 volatility:
   # Yang-Zhang hybrid estimator
@@ -209,20 +246,10 @@ volatility:
   candle_aggregation_blocks: 10  # [OPTIONAL, default: 10]
 
 # --- monitoring: REQUIRED ----------------------------------------------------
-# prometheus_port is REQUIRED; telegram fields are OPTIONAL (pair or omit both).
+# prometheus_port is REQUIRED.  Telegram tokens belong in secrets.yaml.
 monitoring:
   # Prometheus
   prometheus_port: 9090             # [REQUIRED]
-  # Alerts (optional — use env vars to keep tokens out of config files)
-  # telegram_bot_token: "${TELEGRAM_BOT_TOKEN}"
-  # telegram_chat_id: "${TELEGRAM_CHAT_ID}"
-  telegram_bot_token: ""
-  telegram_chat_id: ""
-
-# --- database: REQUIRED ------------------------------------------------------
-database:
-  # SQLite for Phase 1, PostgreSQL later
-  path: "data/xop_trader.db"       # [REQUIRED]
 
 # --- depeg: OPTIONAL (omit section to disable depeg monitoring) --------------
 # Stablecoin depeg detection — global settings.
@@ -247,12 +274,20 @@ arbitrage:
   # Triangular arb (XCH -> A -> B -> XCH)
   triangular_min_profit_bps: 30         # Min net profit after all fees/slippage
   triangular_slippage_bps: 10           # Per-leg slippage estimate
+  cex_dex_confidence_cap: 0.25          # [OPTIONAL, default: 0.25] Hard cap on CEX-DEX confidence.
+                                        #   CoinGecko data is aggregated/delayed and vulnerable to
+                                        #   manipulation.  Capped below min_confidence_threshold so
+                                        #   CEX-DEX signals are logged but not acted upon by default.
   triangular_per_leg_fee_bps: 5         # Blockchain settlement fee per hop
 
   # CEX-DEX arb (dexie vs OKX/MEXC/Gate)
   cex_dex_min_edge_bps: 50              # Min raw edge to flag opportunity
   cex_dex_max_edge_bps: 500             # Reject edges above this (stale data)
   cex_fee_bps: 10                       # CEX taker fee (OKX VIP0 = 10)
+  cex_dex_confidence_cap: 0.25          # [OPTIONAL, default: 0.25] Hard cap on CEX-DEX confidence.
+                                        #   CoinGecko data is aggregated/delayed and vulnerable to
+                                        #   manipulation.  Capped below min_confidence_threshold so
+                                        #   CEX-DEX signals are logged but not acted upon by default.
 
   # Cross-DEX arb (dexie order book vs TibetSwap AMM)
   cross_dex_min_edge_bps: 15            # Lower — both legs are on-chain atomic
@@ -266,6 +301,7 @@ arbitrage:
   crossed_book_enabled: true            # Take crossed-book offers for instant profit
   crossed_book_min_edge_bps: 10         # Min edge in bps (low: zero bridge risk)
   crossed_book_max_take_xch: 5.0        # Max XCH to risk per take per block
+  cancel_worst_to_free: true            # [OPTIONAL, default: true] Cancel worst offer to free coin for arb
 
   # Cross-stablecoin arb (BYC ~= wUSDC.b ~= $1; compare XCH/BYC vs XCH/wUSDC.b)
   cross_stable_arb_enabled: true        # Take offers when cross-market edge found
@@ -298,9 +334,8 @@ coingecko:
   # rate_limit_max_requests: 10                     # 10 req per 60 s window
   # rate_limit_window_ms: 60000
   # curl_thread_pool_size: 2
-  # api_key: "${COINGECKO_API_KEY:-}"    # Empty = free tier; set env var for Demo plan
-  api_key: ""                                       # Empty = free tier; set for Demo plan
-
+  # api_key belongs in secrets.yaml
+                 # Fee floor (5K mojos, ~2x typical mempool estimate
 # --- fees: OPTIONAL (omit section to use static offer_fee_mojos) -------------
 # Fee budget tracking and dynamic fee selection (T4-03).
 # All fields are OPTIONAL with defaults.
@@ -310,7 +345,7 @@ fees:
   fee_to_gain_max_ratio: 0.30        # Skip tier if round-trip fee > 30% of expected gain
   cancel_cost_multiplier: 2.0        # Round-trip multiplier: fee×M is used in the gain check
                                       # (2.0 = post + cancel; >2.0 adds margin for adaptive fee spikes)
-  min_fee_mojos: 5000000             # Fee floor (0.000005 XCH)
+  min_fee_mojos: 5000                 # Fee floor (5K mojos, ~2x typical mempool estimate)
   max_fee_mojos: 100000000           # Fee ceiling (0.0001 XCH)
   adaptive_enabled: true             # Query full node get_fee_estimate for mempool-aware fees
   fee_window_blocks: 1662            # Rolling window for budget (~24h at 52s/block)
@@ -371,10 +406,42 @@ market_data:
   # CEX data freshness: seconds before CEX weight decays to zero
   cex_freshness_threshold_sec: 120.0
 
-# --- adverse_selection: OPTIONAL (omit section to use defaults) ---------------\n# Bayesian PIN estimator parameters.  All fields are OPTIONAL.\nadverse_selection:
+# --- adverse_selection: OPTIONAL (omit section to use defaults) ---------------
+# Bayesian PIN estimator parameters.  All fields are OPTIONAL.
+adverse_selection:
   prior_alpha: 2.0                       # Adverse fill pseudo-count (E[PIN] = α/(α+β))
   prior_beta: 8.0                        # Non-adverse fill pseudo-count
   observation_blocks: 10                 # Post-fill observation window (~8.7 min)
   adverse_threshold: 0.003               # 30 bps adverse classification
   max_history: 500                       # Rolling fill window
   decay_factor: 0.0                      # Exponential decay in posterior (0 = none)
+
+# --- market_allocator: OPTIONAL (omit section to use defaults) ----------------
+# Dynamic capital allocation across pairs based on spread, volume, competition,
+# fill rate, and triangular arb opportunity.  All fields are OPTIONAL.
+market_allocator:
+  enabled: true                          # Master switch
+  eval_interval_blocks: 50               # Re-evaluate every 50 blocks (~43 min)
+  min_alloc_pct: 0.10                    # Minimum allocation per pair (10%)
+  max_alloc_pct: 0.50                    # Maximum allocation per pair (50%)
+  hysteresis_bps: 50                     # Don't reallocate unless score changes by 50 bps
+  smooth_alpha: 0.20                     # EMA smoothing for allocation changes
+  weight_spread: 1.0                     # Scoring weight for spread attractiveness
+  weight_volume: 1.0                     # Scoring weight for 24h volume
+  weight_competition: 1.0                # Scoring weight for competitor density
+  weight_fill_rate: 1.0                  # Scoring weight for historical fill rate
+  weight_tri_arb: 1.0                    # Scoring weight for triangular arb opportunity
+  tri_arb_fee_bps: 15                    # Fee estimate for tri-arb scoring
+  tri_arb_min_edge_bps: 5               # Min edge for tri-arb to score positively
+
+# --- recovery: OPTIONAL (omit section to use defaults) -----------------------
+# XCH recovery mode: when XCH balance drops below threshold, the engine
+# enters recovery mode — cancels all offers and aggressively acquires XCH
+# by taking market offers at up to max_premium_bps above CEX price.
+recovery:
+  enabled: true                          # Master switch for recovery mode
+  xch_low_threshold: 0.50               # [OPTIONAL, default: 0.50] Enter recovery below this XCH
+  xch_recovery_target: 1.0              # [OPTIONAL, default: 1.0]  Exit recovery above this XCH
+  max_take_per_block_xch: 0.5           # [OPTIONAL, default: 0.5]  Max XCH to acquire per block
+  max_premium_bps: 100                   # [OPTIONAL, default: 100]  Max premium over CEX price to pay
+  cancel_on_enter: true                  # [OPTIONAL, default: true] Cancel all offers when entering recovery

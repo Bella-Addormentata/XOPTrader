@@ -317,6 +317,8 @@ def _install_signal_handlers(app: XOPTraderApp) -> None:
 
 _DEFAULT_CONFIG_NAME: Final[str] = "config.yaml"
 _EXAMPLE_CONFIG_NAME: Final[str] = "config.example.yaml"
+_DEFAULT_SECRETS_NAME: Final[str] = "secrets.yaml"
+_EXAMPLE_SECRETS_NAME: Final[str] = "secrets.example.yaml"
 
 
 def _bootstrap_config(config_path: Optional[Path]) -> None:
@@ -411,6 +413,21 @@ def _bootstrap_config_info(config_path: Optional[Path]) -> tuple[Path, bool]:
     existed_before = target.is_file()
     _bootstrap_config(config_path)
     created = (not existed_before) and target.is_file()
+
+    # Also bootstrap secrets.yaml from secrets.example.yaml if it doesn't exist.
+    secrets_target = target.parent / _DEFAULT_SECRETS_NAME
+    if not secrets_target.is_file():
+        for candidate_dir in [target.parent, Path.cwd(), Path(__file__).resolve().parent.parent]:
+            example = candidate_dir / _EXAMPLE_SECRETS_NAME
+            if example.is_file():
+                try:
+                    shutil.copyfile(example, secrets_target)
+                    os.chmod(secrets_target, 0o600)
+                except (OSError, NotImplementedError):
+                    pass
+                _log.info("First-run: copied %s → %s", example, secrets_target)
+                break
+
     return target, created
 
 

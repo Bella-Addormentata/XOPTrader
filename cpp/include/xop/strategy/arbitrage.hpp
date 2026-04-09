@@ -187,6 +187,12 @@ struct ArbitrageConfig {
                                            //   XCH-native, but non-zero for bridged
                                            //   tokens.
 
+    double cex_dex_confidence_cap{0.25};   // Hard cap on CEX-DEX confidence.
+                                           //   CoinGecko data is aggregated and
+                                           //   delayed — vulnerable to manipulation.
+                                           //   Cap low so CEX-DEX opps are logged
+                                           //   but rarely pass the confidence filter.
+
     // -- Cross-DEX arbitrage -------------------------------------------------
 
     double cross_dex_min_edge_bps{15.0};   // Lower threshold than CEX-DEX because
