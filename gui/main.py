@@ -538,9 +538,10 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
     if chia_root is None and fingerprint is None:
         return False
 
+    from gui.services.config_split import load_merged, split_and_save  # noqa: WPS433
+
     try:
-        with open(config_path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
+        data = load_merged(config_path)
     except OSError as exc:
         _log.warning("Could not read config for auto-patching: %s", exc)
         return False
@@ -599,8 +600,7 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
 
     data["chia"] = chia_section
     try:
-        with open(config_path, "w", encoding="utf-8") as fh:
-            yaml.dump(data, fh, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        split_and_save(config_path, data)
     except OSError as exc:
         _log.warning("Could not write auto-patched config: %s", exc)
         return False

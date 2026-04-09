@@ -2769,6 +2769,20 @@ class SettingsWidget(QWidget):
             )
             return
 
+        # Merge secrets.yaml so that SSL paths, fingerprint, API keys etc.
+        # are populated in the widgets.
+        from gui.services.config_split import deep_merge  # noqa: WPS433
+
+        secrets_path = resolved.parent / "secrets.yaml"
+        if secrets_path.is_file():
+            try:
+                with open(secrets_path, encoding="utf-8") as fh:
+                    secrets = yaml.safe_load(fh) or {}
+                if isinstance(secrets, dict):
+                    deep_merge(raw, secrets)
+            except Exception as exc:
+                log.warning("Failed to merge secrets.yaml into settings: %s", exc)
+
         self._config_path = str(resolved)
         self._populate_from_dict(raw)
 
@@ -2822,14 +2836,9 @@ class SettingsWidget(QWidget):
         try:
             # Ensure parent directory exists.
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            with open(resolved, "w", encoding="utf-8") as fh:
-                yaml.safe_dump(
-                    cfg,
-                    fh,
-                    default_flow_style=False,
-                    sort_keys=False,
-                    allow_unicode=True,
-                )
+            from gui.services.config_split import split_and_save  # noqa: WPS433
+
+            split_and_save(resolved, cfg)
         except OSError as exc:
             QMessageBox.critical(
                 self,

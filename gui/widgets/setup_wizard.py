@@ -172,8 +172,9 @@ class FirstRunSetupDialog(QDialog):
     def _read_telegram_from_config(self) -> Optional[str]:
         """Return the telegram_bot_token if it is non-empty in the config."""
         try:
-            with open(self._config_path, "r", encoding="utf-8") as fh:
-                data = yaml.safe_load(fh) or {}
+            from gui.services.config_split import load_merged  # noqa: WPS433
+
+            data = load_merged(self._config_path)
             token = data.get("monitoring", {}).get("telegram_bot_token", "")
             return token if token else None
         except Exception:
@@ -191,22 +192,27 @@ class FirstRunSetupDialog(QDialog):
             btn.setText("Hide" if checked else "Show")
 
     def _on_save(self) -> None:
-        """Patch optional Telegram values into config.yaml if provided."""
+        """Patch optional Telegram values into secrets.yaml."""
         token = self._tg_token.text().strip()
         chat_id = self._tg_chat.text().strip()
 
         if token or chat_id:
             try:
-                with open(self._config_path, "r", encoding="utf-8") as fh:
-                    data = yaml.safe_load(fh) or {}
-                mon = data.setdefault("monitoring", {})
+                from gui.services.config_split import deep_merge  # noqa: WPS433
+
+                secrets_path = self._config_path.parent / "secrets.yaml"
+                existing: dict = {}
+                if secrets_path.is_file():
+                    with open(secrets_path, "r", encoding="utf-8") as fh:
+                        existing = yaml.safe_load(fh) or {}
+                mon = existing.setdefault("monitoring", {})
                 if token:
                     mon["telegram_bot_token"] = token
                 if chat_id:
                     mon["telegram_chat_id"] = chat_id
-                with open(self._config_path, "w", encoding="utf-8") as fh:
+                with open(secrets_path, "w", encoding="utf-8") as fh:
                     yaml.dump(
-                        data,
+                        existing,
                         fh,
                         default_flow_style=False,
                         allow_unicode=True,

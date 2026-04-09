@@ -156,6 +156,21 @@ class ConfigService(QObject):
             self.config_error.emit(msg)
             return False
 
+        # Deep-merge secrets.yaml (wallet fingerprint, SSL paths, API keys)
+        # on top of the base config, mirroring what the C++ engine does.
+        secrets_path = self._path.parent / "secrets.yaml"
+        if secrets_path.is_file():
+            try:
+                from gui.services.config_split import deep_merge  # noqa: WPS433
+
+                secrets_text = secrets_path.read_text(encoding="utf-8")
+                secrets = yaml.safe_load(secrets_text)
+                if isinstance(secrets, dict):
+                    deep_merge(parsed, secrets)
+                    _log.info("Merged secrets from %s", secrets_path)
+            except Exception as exc:
+                _log.warning("Failed to load secrets.yaml: %s", exc)
+
         # Validate before accepting into the live config.
         errors: list[str] = self._validate(parsed)
         if errors:
