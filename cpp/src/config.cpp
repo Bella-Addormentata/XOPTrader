@@ -855,6 +855,20 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["coin_pool_interval_blocks"].IsNull()) {
         cfg.coin_pool_interval_blocks = node["coin_pool_interval_blocks"].as<uint32_t>();
     }
+    if (node["cat_coin_pool_target_count"] && node["cat_coin_pool_target_count"].IsDefined()
+        && !node["cat_coin_pool_target_count"].IsNull()) {
+        cfg.cat_coin_pool_target_count = node["cat_coin_pool_target_count"].as<int>();
+        if (cfg.cat_coin_pool_target_count < 0) {
+            throw ConfigError(sec + ".cat_coin_pool_target_count must be >= 0");
+        }
+    }
+    if (node["cat_coin_pool_target_units"] && node["cat_coin_pool_target_units"].IsDefined()
+        && !node["cat_coin_pool_target_units"].IsNull()) {
+        cfg.cat_coin_pool_target_units = node["cat_coin_pool_target_units"].as<double>();
+        if (cfg.cat_coin_pool_target_units <= 0.0) {
+            throw ConfigError(sec + ".cat_coin_pool_target_units must be > 0");
+        }
+    }
 
     // -- Gap-aware dynamic tier spacing (optional, defaults in StrategyConfig) --
     if (node["gap_aware_spacing"] && node["gap_aware_spacing"].IsDefined()

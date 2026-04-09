@@ -438,6 +438,10 @@ private:
     /// Last block at which coin pool maintenance ran.
     BlockHeight coin_pool_last_block_{0};
 
+    /// True while a split transaction is pending confirmation.
+    /// Prevents overlapping splits that would fail or waste fees.
+    bool coin_pool_split_pending_{false};
+
     /// Offer lifecycle manager (create, monitor, cancel).
     std::unique_ptr<execution::OfferManager> offer_mgr_;
 

@@ -281,6 +281,22 @@ struct StrategyConfig {
     /// Default: 50 blocks (~43 minutes).  0 = only at startup.
     uint32_t coin_pool_interval_blocks{50};
 
+    // -- CAT coin pool management -------------------------------------------
+
+    /// Target number of spendable coins for each CAT wallet (BYC, wUSDC.b,
+    /// etc.).  Works identically to coin_pool_target_count but applies to
+    /// every CAT asset referenced by an enabled pair.
+    /// 0 = disabled (no CAT coin splitting).
+    /// Default: 10.
+    int      cat_coin_pool_target_count{10};
+
+    /// Target denomination for each split CAT coin, in display units
+    /// (NOT mojos).  Converted to mojos using the pair's mojos_per_unit.
+    /// For wUSDC.b (1000 mojos/unit), a value of 50.0 → 50,000 mojos.
+    /// For BYC (1000 mojos/unit), a value of 50.0 → 50,000 mojos.
+    /// Default: 50.0 units.
+    double   cat_coin_pool_target_units{50.0};
+
     // -- Gap-aware dynamic tier spacing -------------------------------------
 
     /// Enable gap-aware dynamic tier spacing.

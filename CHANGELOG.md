@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.29] — 2026-04-08
+
+### Added
+
+- **Universal coin pool management (XCH + CAT tokens)**: The existing `step_maintain_coin_pool()` was declared but only handled XCH (wallet 1). Rewrote to support all asset types. Phase 1 splits XCH coins as before. Phase 2 automatically discovers every unique CAT wallet referenced by enabled pairs (BYC, wUSDC.b, wmilliETH.b, etc.), resolves wallet IDs via `resolve_wallet_id()`, converts the target denomination using each asset's `mojos_per_unit`, and calls `ensure_split()` for each. New config fields `cat_coin_pool_target_count` (default 10) and `cat_coin_pool_target_units` (default 50.0) control CAT splitting independently from XCH. Each wallet's `pending_change` is checked before splitting to avoid overlapping transactions. Startup and heartbeat triggers updated to fire when either XCH or CAT pool is configured.
+
+### Fixed
+
+- **Coin pool heartbeat activation**: The heartbeat and startup coin pool triggers only checked `coin_pool_target_count > 0` (XCH). Updated both conditions to also trigger when `cat_coin_pool_target_count > 0`, ensuring CAT splitting runs even if XCH splitting is disabled.
+
 ## [0.7.28] — 2026-04-08
 
 ### Added
