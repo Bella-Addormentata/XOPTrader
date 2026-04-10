@@ -1,9 +1,9 @@
 # Comprehensive Fix Plan: Spread Explosion & Inventory Spiral
 
 **Date**: 2026-04-11 (implemented 2026-04-10)
-**Status**: ✅ DEPLOYED — all fixes live
-**Commits**: `5b9e9c0` (Fixes 1–5), `131ac4c` (Fix 7: MarketAllocator)
-**Trader PID**: 35996 (started 2026-04-10 13:42)
+**Status**: ✅ DEPLOYED — all fixes live, v0.7.34
+**Commits**: `5b9e9c0` (Fixes 1–5), `131ac4c` (Fix 7: MarketAllocator), `5e35cac` (§3.22 docs), `f158eb2` (v0.7.34 bump)
+**Trader PID**: 27852 (started 2026-04-10 17:49, v0.7.34)
 **Prerequisite**: [2026-04-10 Wall Detection & Spread Analysis](2026-04-10-wall-detection-and-spread-analysis.md)
 
 ---
@@ -37,6 +37,8 @@ where annual is expected), making historical backtests unrealistically optimisti
 | 5 | Backtest sigma scale fix | **LOW** | Low | Code change (non-live) | ✅ Deployed |
 | 6 | Add sigma Prometheus metrics | **LOW** | None | Monitoring | ⏸️ Deferred |
 | 7 | MarketAllocator surplus redistribution | **MEDIUM** | Low | Code change | ✅ Deployed |
+| 8 | BYC/wUSDC.b peg_target 0.985 → 1.000 | **HIGH** | Low | Config change | ✅ Deployed |
+| 9 | min_profit_margin_bps 5 → 25 | **MEDIUM** | Low | Config change | ✅ Deployed |
 
 Fixes 1–2 are code changes that address the root causes. Fix 3–4 are config
 tweaks. Fix 5 is non-live-path. Fix 6 is observability.
@@ -480,11 +482,62 @@ and log analysis:
    that's expected only for extremely volatile pairs (e.g., XCH/DBX at 519%
    annual vol).
 
+### BYC/wUSDC.b Peg & Competitive Analysis (Post-Deployment Discovery)
+
+During live monitoring after Fixes 1–7 were deployed, Dexie orderbook analysis
+revealed an additional configuration error and monopolist pricing insight:
+
+**Peg Misconfiguration:**
+- `peg_target: 0.985` was incorrect — BYC (Bytecash) is a CircuitDAO
+  dollar-pegged stablecoin (XCH-collateralized, same mechanism as DAI).
+  The correct peg target is **1.000**, not 0.985.
+- Our asks were flooring at 0.9855 (`peg + 5bps`), selling a $1 stablecoin
+  at $0.987 while competitors correctly asked ≥1.001.
+- Fixed: `peg_target: 1.000`, `min_profit_margin_bps_override: 25`.
+  Asks now floor at 1.0025.
+
+**Monopolist Spread:**
+- XOPTrader provides **80%+ of BYC/wUSDC.b liquidity** (51.6 BYC at best
+  ask vs. competitors' 5 BYC each at 1.001+).
+- Our spread was 20 bps while competitors operated at 200 bps — we were
+  10× tighter as the dominant provider.
+- Academic literature confirms monopolist optimal spread is wider than
+  competitive spread (Teeple 2023, Bellia et al. 2025).
+- Raised `min_profit_margin_bps_override` from 5 to 25 to capture more
+  of the monopolist premium.
+
+**Competitive Pricing Logic:**
+- Investigation confirmed 3 layers of competitive undercutting already
+  built into the engine:
+  1. Spread-level competition cap (spread.cpp: `best_competitor - epsilon_bps`)
+  2. Competitive cap per tier (engine.cpp Step 7: auto-tighten to Nth competitor)
+  3. Penny-ahead undercut (engine.cpp Step 7: stablecoin tier 0, 1 bps inside
+     best competitor)
+- These don't trigger when competitors are 200 bps away — the model/peg
+  dominates. No code change needed; config adjustment was sufficient.
+
+**Scholarly Research Added:**
+Six papers were added to `docs/trading-strategies.md` (§10 References, 55–60)
+and a new **§3.22 Pegged-Asset / Stablecoin Market Making** strategy section
+was created documenting:
+- Bergault, Bertucci, Bouba & Guéant (2024) — pegged-asset AMM optimal control
+- Mohanty & Krishnamachari (2026) — mean-field game peg restoration
+- Kozhan & Viswanath-Natraj (2021) — collateral-backed stablecoin peg deviations
+- Teeple (2023) — monopolist market maker optimal spread
+- Egorov / Curve Finance (2021) — dynamic peg AMM design
+- Bellia, Pelizzon & Subrahmanyam (2025) — market maker competition
+
 ### Deferred Items
 
 - **Fix 6 (Prometheus sigma_daily metric + integration test)**: Not implemented
   in this deployment. Low priority — can verify sigma conversion via existing
   spread metrics. Add when next refactoring monitoring.
+- **Monopolist spread dynamic widening**: When nearest competitor is >N bps
+  away, dynamically widen spread (current competitive logic only tightens).
+- **Depeg risk premium from on-chain collateral ratio**: Monitor CircuitDAO
+  BYC collateral health to adjust peg target risk premium.
+- **Integrate Bergault & Guéant (2024)**: Replace heuristic peg-guard with
+  formal optimal control framework for stablecoin spread derivation.
 
 ---
 
@@ -534,7 +587,16 @@ All fixes deployed together on 2026-04-10:
 
 - **Build**: Clean (0 errors, 0 warnings) — xop_core.lib, xop_tests.exe, xop_trader.exe
 - **Tests**: 281/281 pass (100%), including previously-failing MinMaxGuardrails
-- **Trader**: Restarted as PID 35996 at 2026-04-10 13:42
+- **Trader**: Started as PID 35996 at 2026-04-10 13:42 (initial deployment)
+
+4. **Commit `5e35cac`** (Docs):
+   - ✅ §3.22 Pegged-Asset / Stablecoin Market Making (docs/trading-strategies.md)
+   - ✅ 6 scholarly references added (refs 55–60)
+
+5. **Commit `f158eb2`** (Version bump):
+   - ✅ Version 0.7.33 → 0.7.34
+   - ✅ CHANGELOG.md updated
+   - **Trader**: Rebuilt and restarted as PID 27852 at 2026-04-10 17:49
 
 ### Rollback Plan
 

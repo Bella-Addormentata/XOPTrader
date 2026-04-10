@@ -2,7 +2,7 @@
 
 **Date:** April 10, 2026  
 **Revisit By:** April 12, 2026  
-**Status:** Active — analysis complete, changes pending  
+**Status:** ✅ Resolved — all root causes fixed in v0.7.34 (see [comprehensive fix plan](2026-04-11-comprehensive-fix-plan.md))  
 
 ---
 
