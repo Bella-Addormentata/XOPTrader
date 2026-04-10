@@ -1,7 +1,9 @@
 # Comprehensive Fix Plan: Spread Explosion & Inventory Spiral
 
-**Date**: 2026-04-11
-**Status**: Validated — ready for implementation
+**Date**: 2026-04-11 (implemented 2026-04-10)
+**Status**: ✅ DEPLOYED — all fixes live
+**Commits**: `5b9e9c0` (Fixes 1–5), `131ac4c` (Fix 7: MarketAllocator)
+**Trader PID**: 35996 (started 2026-04-10 13:42)
 **Prerequisite**: [2026-04-10 Wall Detection & Spread Analysis](2026-04-10-wall-detection-and-spread-analysis.md)
 
 ---
@@ -26,14 +28,15 @@ where annual is expected), making historical backtests unrealistically optimisti
 
 ## Fix Priority & Sequencing
 
-| # | Fix | Severity | Risk | Deploy |
-|---|-----|----------|------|--------|
-| 1 | Sigma annual→daily conversion | **CRITICAL** | Low | Code change |
-| 2 | Clamp `skew_frac` to [0, 1] | **HIGH** | Low | Code change |
-| 3 | Increase `q_max` 10 → 100 | **MEDIUM** | Low | Config change |
-| 4 | Reduce `fee_reserve_xch` 1.0 → 0.1 | **MEDIUM** | Medium | Config change |
-| 5 | Backtest sigma scale fix | **LOW** | Low | Code change (non-live) |
-| 6 | Add sigma Prometheus metrics | **LOW** | None | Monitoring |
+| # | Fix | Severity | Risk | Deploy | Status |
+|---|-----|----------|------|--------|--------|
+| 1 | Sigma annual→daily conversion | **CRITICAL** | Low | Code change | ✅ Deployed |
+| 2 | Clamp `skew_frac` to [0, 1] | **HIGH** | Low | Code change | ✅ Deployed |
+| 3 | Increase `q_max` 10 → 100 | **MEDIUM** | Low | Config change | ✅ Deployed |
+| 4 | Reduce `fee_reserve_xch` 1.0 → 0.1 | **MEDIUM** | Medium | Config change | ✅ Deployed |
+| 5 | Backtest sigma scale fix | **LOW** | Low | Code change (non-live) | ✅ Deployed |
+| 6 | Add sigma Prometheus metrics | **LOW** | None | Monitoring | ⏸️ Deferred |
+| 7 | MarketAllocator surplus redistribution | **MEDIUM** | Low | Code change | ✅ Deployed |
 
 Fixes 1–2 are code changes that address the root causes. Fix 3–4 are config
 tweaks. Fix 5 is non-live-path. Fix 6 is observability.
@@ -383,6 +386,108 @@ exercises.
 
 ---
 
+## Fix 7: MarketAllocator Surplus Redistribution (MEDIUM)
+
+### Root Cause
+
+Discovered during deployment testing — pre-existing bug, not caused by our
+sigma/skew changes. `MarketAllocatorTest.MinMaxGuardrails` was the sole
+failing test (280/281).
+
+In `apply_allocation()` (`market_allocator.cpp:345-360`), the iterative
+projection loop freezes pairs at their min/max bounds and redistributes
+the remainder to free pairs. **Bug**: When all pairs freeze in one iteration
+(e.g., 3 pairs at 15% + 45% + 15% = 75%), `free_count == 0` but
+`remaining = 0.25` — the surplus was silently dropped.
+
+### Code Change
+
+**File**: `market_allocator.cpp`, in `apply_allocation()`:
+
+Added an `else if (remaining > 1e-9)` branch after the `free_count > 0`
+block that distributes surplus proportionally to each pair's headroom
+(`max_alloc_pct - current_allocation`):
+
+```cpp
+} else if (remaining > 1e-9) {
+    double headroom_sum = 0.0;
+    for (std::size_t i = 0; i < n; ++i) {
+        headroom_sum += cfg_.max_alloc_pct - scores[i].allocation;
+    }
+    if (headroom_sum > 1e-12) {
+        for (std::size_t i = 0; i < n; ++i) {
+            double hr = cfg_.max_alloc_pct - scores[i].allocation;
+            scores[i].allocation += remaining * (hr / headroom_sum);
+        }
+    } else {
+        double each = remaining / static_cast<double>(n);
+        for (auto& ps : scores) ps.allocation += each;
+    }
+}
+```
+
+### Effect
+
+```
+Before: 3 pairs → 15% + 45% + 15% = 75%, missing 25%
+After:  redistributed to headroom → allocations sum to 100%
+```
+
+### Risk Assessment
+
+- **Low risk**: Only activates when all pairs are frozen and sum < 1.0.
+- **Test result**: 281/281 pass (including MinMaxGuardrails, previously failing).
+
+---
+
+## Expected Outcomes Post-Deployment
+
+With all fixes live, we expect the following changes observable via Prometheus
+and log analysis:
+
+### Spread Behavior
+
+| Metric | Before (broken) | Expected After |
+|--------|-----------------|----------------|
+| `xop_spread_bps` most pairs | 300 bps (hitting `max_half_spread_bps` cap) | 35–200 bps (pair-dependent, vol-driven) |
+| Spread regime classification | Always HighVol (annual σ > 0.065) | Normal/Low for most pairs |
+| Skew multiplier | Up to 5.4× (unbounded) | Max 1.30× (design cap) |
+| Inventory pressure | Always maxed (q/q_max = 6.47) | Proportional (q/q_max = 0.647) |
+
+### Quoting & Trading
+
+| Metric | Before | Expected After |
+|--------|--------|----------------|
+| Quote direction | Buy-only (UTXO crisis) | Two-sided (bid + ask) |
+| `xop_spendable_reserve_pct` | < 0.0 (spendable < reserve) | > 0.80 (0.81 - 0.1 reserve) |
+| Offer cancellation pressure | Constant (trying to free UTXOs) | Minimal (reserve headroom) |
+| XCH inventory drift | Accumulating (ask-only fills) | Mean-reverting (two-sided fills) |
+
+### Allocation
+
+| Metric | Before | Expected After |
+|--------|--------|----------------|
+| Allocation sum-to-one | Could drop surplus (75% of 100%) | Always sums to ~100% |
+| MinMaxGuardrails compliance | Failing | Passing |
+
+### What to Watch For
+
+1. **First 30 minutes**: Confirm both bid and ask offers appear for all pairs.
+2. **First 2 hours**: Verify `xop_spread_bps` settles into 35–200 bps range.
+3. **First 24 hours**: Check inventory drift direction — should see XCH
+   balance oscillate rather than monotonically increase.
+4. **Ongoing**: If any pair consistently hits `max_half_spread_bps` (150 bps),
+   that's expected only for extremely volatile pairs (e.g., XCH/DBX at 519%
+   annual vol).
+
+### Deferred Items
+
+- **Fix 6 (Prometheus sigma_daily metric + integration test)**: Not implemented
+  in this deployment. Low priority — can verify sigma conversion via existing
+  spread metrics. Add when next refactoring monitoring.
+
+---
+
 ## What NOT To Change
 
 ### 1. Spread Optimizer Formulas (Dimensional Mix)
@@ -408,26 +513,28 @@ immediate change needed — revisit if spread variance remains high post-fix.
 
 ---
 
-## Deployment Order
+## Deployment Order (Actual)
 
-1. **Stage 1** (code changes, deploy together):
-   - Fix 1: Sigma conversion in engine.cpp
-   - Fix 2: Skew clamp in spread.cpp
-   
-2. **Stage 2** (config changes, deploy together):
-   - Fix 3: q_max = 100
-   - Fix 4: fee_reserve_xch = 0.1
+All fixes deployed together on 2026-04-10:
 
-3. **Stage 3** (non-urgent):
-   - Fix 5: Backtest sigma
-   - Fix 6: Monitoring
+1. **Commit `5b9e9c0`** (Fixes 1–5):
+   - ✅ Fix 1: Sigma conversion in engine.cpp
+   - ✅ Fix 2: Skew clamp in spread.cpp
+   - ✅ Fix 3: q_max = 100 (config.yaml, gitignored)
+   - ✅ Fix 4: fee_reserve_xch = 0.1 (config.yaml, gitignored)
+   - ✅ Fix 5: Backtest sigma in backtest.cpp
 
-### Verification After Stage 1+2
+2. **Commit `131ac4c`** (Fix 7):
+   - ✅ Fix 7: MarketAllocator surplus redistribution
 
-Check Prometheus metrics for:
-- `xop_spread_bps` should drop from 300 (capped) to 35–200 depending on pair
-- `xop_spendable_reserve_pct` should rise above 0.10 (no longer in buy-only mode)
-- Both bid and ask offers appearing for all pairs
+3. **Deferred**:
+   - ⏸️ Fix 6: Prometheus sigma_daily metric + integration test
+
+### Build & Test Results
+
+- **Build**: Clean (0 errors, 0 warnings) — xop_core.lib, xop_tests.exe, xop_trader.exe
+- **Tests**: 281/281 pass (100%), including previously-failing MinMaxGuardrails
+- **Trader**: Restarted as PID 35996 at 2026-04-10 13:42
 
 ### Rollback Plan
 
@@ -436,6 +543,7 @@ Each fix is independently revertible:
 - Fix 2: Remove `std::min(..., 1.0)` wrapper
 - Fix 3–4: Change config.yaml values back
 - Fix 5: Revert backtest.cpp line/s
+- Fix 7: Remove else-if branch in market_allocator.cpp
 
 ---
 
