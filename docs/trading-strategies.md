@@ -50,6 +50,7 @@
    - [3.19 CAT Ecosystem Correlation Trading](#319-cat-ecosystem-correlation-trading)
    - [3.20 Chialisp Programmable Offer Conditions](#320-chialisp-programmable-offer-conditions)
    - [3.21 Blockchain Transparency Competitor Intelligence](#321-blockchain-transparency-competitor-intelligence)
+   - [3.22 Pegged-Asset / Stablecoin Market Making](#322-pegged-asset--stablecoin-market-making)
 4. [Chia-Specific Competitive Advantages](#4-chia-specific-competitive-advantages)
 5. [On Deliberate Loss-Taking and Inventory Balance](#5-on-deliberate-loss-taking-and-inventory-balance)
 6. [Implementation Priority Ranking](#6-implementation-priority-ranking)
@@ -1331,6 +1332,98 @@ if competitor_avg_ttl = 5 blocks and current_ttl = 4:
   defeat behavioral fingerprinting.
 - Requires blockchain indexing infrastructure to process offer history at scale.
 - Model accuracy degrades when competitors change strategies.
+
+---
+
+### 3.22 Pegged-Asset / Stablecoin Market Making
+
+| Priority | **High (partially implemented)** |
+|----------|----------------------------------|
+| **Effort** | Medium |
+| **Status** | BYC/wUSDC.b pair live with `is_stablecoin: true`; peg-guard and penny-ahead undercut logic active. Awaiting full integration of Guéant (2024) pegged-asset optimal control framework. |
+
+**Description.**
+Market making between two assets pegged to the same reference value (e.g., two
+USD-denominated stablecoins) differs fundamentally from volatile-pair market
+making.  The key characteristics are:
+
+1. **Near-zero adverse selection** — both assets anchor to the same value, so
+   informed-trading risk is minimal under normal conditions.
+2. **Tail depeg risk** — the primary risk is one asset losing its peg, which
+   creates sudden large inventory losses.  This replaces the continuous
+   inventory risk of volatile pairs.
+3. **Monopolist pricing power** — thin stablecoin DEX markets often have one
+   dominant liquidity provider.  Academic models show the monopolist optimal
+   spread is significantly wider than the competitive spread (Teeple 2023,
+   ref. 58; Bellia et al. 2025, ref. 60).
+
+**Scholarly Foundations.**
+
+| Paper | Key Result | Application to XOPTrader |
+|-------|------------|--------------------------|
+| Bergault, Bertucci, Bouba & **Guéant** (2024), ref. 55 | Optimal control framework for AMM between pegged assets; spread should incorporate depeg tail risk, not just inventory | Directly applicable to BYC/wUSDC.b — same Guéant who developed GLFT model we already use; provides formal optimal spread for stablecoin pairs |
+| Mohanty & Krishnamachari (2026), ref. 56 | Mean-field game model: peg restoration is a coordination game; arbitrageurs require a premium to cross | A taker willing to buy BYC at 0.985 will also buy at 0.995 — no need to give edge away |
+| Kozhan & Viswanath-Natraj (2021), ref. 57 | DAI (collateralized stablecoin like BYC) has persistent peg deviations driven by collateral risk; deviations are *normal*, not anomalous | A risk premium in the peg target (e.g., 0.995 instead of 1.000) is empirically justified for XCH-collateralized BYC |
+| Teeple (2023), ref. 58 | Monopolist market maker's optimal spread is wider than the competitive spread | Our 20 bps spread was far too tight for a market where we provide 80%+ of liquidity; 50–100 bps is more appropriate |
+| Egorov / Curve Finance (2021), ref. 59 | Concentrated AMM liquidity around peg enables tight spreads — but even Curve charges positive fees (4 bps) for pegged pairs | Even the most liquid stablecoin AMMs maintain a fee floor; our DEX should not be tighter than Curve |
+| Bellia, Pelizzon & Subrahmanyam (2025), ref. 60 | Monopolist designated market maker charges wider spreads; competition narrows them | Confirms we should widen spreads when no meaningful competitor exists within 100+ bps |
+
+**Current Implementation.**
+
+XOPTrader already implements several stablecoin-specific features:
+
+- **Peg-guard**: Floors asks at `peg_target + min_profit_margin_bps` and caps
+  bids at `peg_target - min_profit_margin_bps` to prevent trading through the
+  peg at a loss.
+- **Peg-anchor blending**: Blends the observed market mid with the configured
+  peg target (weight controlled by `peg_anchor_weight`) to stabilize quoting
+  when the market mid deviates from peg.
+- **Penny-ahead undercut**: Tier 0 (innermost) quotes are tightened to beat
+  the best competing offer by 1 tick (stablecoin pairs only).
+- **Depeg circuit breakers**: `depeg_warn_pct` and `depeg_bail_pct` trigger
+  spread widening or full withdrawal if the market price deviates significantly
+  from peg.
+
+**Lessons Learned (2026-04-10 Incident).**
+
+A misconfigured `peg_target: 0.985` for BYC/wUSDC.b (both USD-pegged) caused
+XOPTrader to floor asks at 0.9855, selling a \$1 stablecoin for \$0.987 while
+competitors correctly asked 1.001.  Combined with a 5 bps `min_profit_margin`
+and monopolist-level liquidity dominance (80%+ of book), this gave away
+significant edge.  Fixed by setting `peg_target: 1.000` and
+`min_profit_margin_bps_override: 25`.
+
+Key insight: for stablecoin pairs on thin DEX markets, **the peg target and
+minimum margin are the binding constraints**, not the spread model.  The spread
+optimizer computes a model spread of ~52 bps, but the peg-guard overrides it
+down to `margin_bps` above peg — making the peg config parameters far more
+impactful than gamma or sigma tuning.
+
+**Future Work.**
+
+- [ ] Integrate Bergault & Guéant (2024) optimal control framework for formal
+  stablecoin spread derivation, replacing the current heuristic peg-guard.
+- [ ] Add depeg risk premium to peg target based on collateral ratio monitoring
+  (CircuitDAO on-chain data for BYC).
+- [ ] Implement monopolist spread adjustment: dynamically widen spread when
+  the nearest competitor is > N bps away (current competitive cap only
+  *tightens* but never *widens* based on competitive distance).
+- [ ] Add stablecoin-specific Prometheus metrics: `deviation_from_peg_bps`,
+  `depeg_risk_score`, `spread_vs_competitor_ratio`.
+
+**Pros:**
+- Stablecoin pairs offer reliable income with low adverse selection under
+  normal conditions.
+- Peg anchoring provides a strong prior on fair value, reducing model risk.
+- Monopolist position allows wider spreads without losing fills.
+- Low correlation with volatile-pair P&L diversifies the book.
+
+**Cons:**
+- Tail risk from depeg events can wipe out months of spread income.
+- Thin markets mean large orders can move the price significantly.
+- Collateral-backed stablecoins (BYC) carry smart contract risk that
+  fiat-backed stablecoins (wUSDC.b) do not.
+- Misconfigured peg parameters can cause systematic loss (2026-04-10 lesson).
 
 ---
 
@@ -2777,6 +2870,18 @@ new evidence and the resulting confidence change.
 53. Gatheral, J. (2010). "No-dynamic-arbitrage and market impact." *Quantitative Finance*, 10(7), 749–759. *(Counter-research to ref. 24: Kyle (1985) linear permanent-impact model violates no-dynamic-arbitrage; square-root impact preferred.)*
 
 54. Almgren, R., Thum, C., Hauptmann, E. & Li, H. (2005). "Direct estimation of equity market impact." *Risk*, 18(7), 57–62. *(Counter-research to ref. 24: empirical square-root market-impact law in lieu of Kyle's linear lambda.)*
+
+55. Bergault, P., Bertucci, L., Bouba, D. & Guéant, O. (2024). "Automated market making: the case of pegged assets." *arXiv:2411.08145*. *(Optimal control framework for market making between two intrinsically pegged cryptoassets; derives spread incorporating depeg tail risk.)*
+
+56. Mohanty, H. & Krishnamachari, B. (2026). "Who Restores the Peg? A Mean-Field Game Approach to Model Stablecoin Market Dynamics." *arXiv:2601.18991*. *(Models peg restoration as a coordination game where arbitrageurs require a premium to cross the peg deviation.)*
+
+57. Kozhan, R. & Viswanath-Natraj, G. (2021). "Decentralized stablecoins and collateral risk." *WBS Finance Group Research Paper*. SSRN:4420816. *(Empirical analysis of DAI peg deviations driven by collateral risk; persistent deviations are normal for collateral-backed stablecoins.)*
+
+58. Teeple, K. (2023). "The optimal shape and horizon of the price impact function." SSRN:4487376. *(Market maker as monopolist: optimal spread is wider than competitive spread; no incentive to tighten beyond the profit-maximizing level.)*
+
+59. Egorov, M. (2021). "Automatic market-making with dynamic peg." *Curve Finance Whitepaper*. *(Concentrated AMM design for pegged assets; even optimal AMMs maintain positive fee floor ~4 bps for stablecoin pairs.)*
+
+60. Bellia, M., Pelizzon, L. & Subrahmanyam, M. G. (2025). "Market liquidity and competition among designated market makers." *Management Science*. *(Monopolist designated market maker charges wider spreads than competitive equilibrium; competition intensity determines spread level.)*
 
 55. Besbes, O., Gur, Y. & Zeevi, A. (2014). "Stochastic multi-armed-bandit problem with non-stationary rewards." *Advances in Neural Information Processing Systems*, 27. *(Counter-research to refs. 1 & 31: Thompson Sampling regret guarantees fail under non-stationarity; discounted posteriors recommended.)*
 
