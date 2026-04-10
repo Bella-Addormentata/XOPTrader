@@ -344,7 +344,7 @@ void MarketAllocator::apply_allocation(std::vector<PairScore>& scores)
 
         double remaining = 1.0 - frozen_sum;
         if (remaining <= 0.0 || free_composite_sum <= 0.0) {
-            // All frozen — distribute remaining equally.
+            // All frozen — distribute remaining equally among free pairs.
             int free_count = 0;
             for (std::size_t i = 0; i < n; ++i) {
                 if (!frozen[i]) ++free_count;
@@ -353,6 +353,24 @@ void MarketAllocator::apply_allocation(std::vector<PairScore>& scores)
                 double each = remaining / static_cast<double>(free_count);
                 for (std::size_t i = 0; i < n; ++i) {
                     if (!frozen[i]) scores[i].allocation = each;
+                }
+            } else if (remaining > 1e-9) {
+                // All pairs are frozen but allocations don't sum to 1.0.
+                // Distribute the surplus proportionally to pairs below
+                // their max cap so the sum-to-one invariant is preserved.
+                double headroom_sum = 0.0;
+                for (std::size_t i = 0; i < n; ++i) {
+                    headroom_sum += cfg_.max_alloc_pct - scores[i].allocation;
+                }
+                if (headroom_sum > 1e-12) {
+                    for (std::size_t i = 0; i < n; ++i) {
+                        double hr = cfg_.max_alloc_pct - scores[i].allocation;
+                        scores[i].allocation += remaining * (hr / headroom_sum);
+                    }
+                } else {
+                    // Truly stuck — spread equally as last resort.
+                    double each = remaining / static_cast<double>(n);
+                    for (auto& ps : scores) ps.allocation += each;
                 }
             }
             break;
