@@ -5,6 +5,28 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.34] — 2026-04-10
+
+### Fixed
+
+- **Spread explosion from annual→daily sigma mismatch** (engine.cpp): `compute_spread()` was receiving annual sigma (~1.2) instead of daily sigma (~0.07), inflating the Avellaneda–Stoikov optimal spread by ~16×. Added `sigma / std::sqrt(365.0)` conversion before passing to the spread calculator.
+
+- **Unclamped inventory skew multiplier** (spread.cpp): `skew_frac` (inventory fraction) was unbounded, allowing extreme inventory imbalance to produce multi-hundred-percent spread skew. Clamped to [−1, +1].
+
+- **`fee_reserve_xch: 1.0` permanent buy-only mode** (engine.cpp): A 1.0 XCH fee reserve consumed the entire XCH balance, suppressing all asks. The reserve is now reasonable relative to actual fee costs.
+
+- **Backtest sigma scale mismatch** (backtest.cpp): Backtest engine was using raw annualized sigma instead of converting to the per-step scale, causing backtested spreads to diverge from live behavior.
+
+- **MarketAllocator surplus redistribution** (market_allocator.cpp): When all pairs were frozen at their min/max bounds, surplus XCH was not redistributed, leaving capital idle. Fixed redistribution logic to handle the all-frozen edge case.
+
+### Changed
+
+- **BYC/wUSDC.b peg target corrected** (config): `peg_target` changed from 0.985 to 1.000 (BYC is a dollar-pegged stablecoin, not a 98.5¢ token). `min_profit_margin_bps_override` raised from 5 to 25 to capture monopolist spread.
+
+### Added
+
+- **§3.22 Pegged-Asset / Stablecoin Market Making** (docs/trading-strategies.md): New strategy section documenting stablecoin MM theory, lessons learned from peg misconfiguration, and future work. Added 6 scholarly references (55–60) including Bergault & Guéant (2024), Teeple (2023), and Bellia et al. (2025).
+
 ## [0.7.33] — 2026-04-09
 
 ### Fixed
