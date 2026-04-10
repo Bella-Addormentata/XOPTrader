@@ -226,7 +226,12 @@ void BacktestEngine::load_data(const std::string& dexie_json_path,
 
         for (const auto& blk : blocks_) {
             // Feed the CEX mid as a flat candle to the estimator.
-            const double sigma = estimator.update(blk.cex_mid);
+            // update() returns sigma_block; convert to annual for
+            // compute_quotes() which expects annualised volatility.
+            estimator.update(blk.cex_mid);
+            const double sigma = estimator.is_ready()
+                ? estimator.get_sigma_annual()
+                : 0.0;
             historical_sigmas_.push_back(sigma);
         }
 

@@ -2406,7 +2406,10 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         double sigma = 0.0;
         auto vol_it = vol_estimators_.find(pair_name);
         if (vol_it != vol_estimators_.end() && vol_it->second->is_ready()) {
-            sigma = vol_it->second->get_sigma_annual();
+            // SpreadOptimizer::compute_spread() expects daily sigma, but
+            // the estimator provides annualised sigma.  Convert:
+            //   sigma_daily = sigma_annual / sqrt(365)
+            sigma = vol_it->second->get_sigma_annual() / std::sqrt(365.0);
         }
 
         // Inventory for spread sizing -- use the pair's actual base asset.

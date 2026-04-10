@@ -639,10 +639,11 @@ SpreadResult SpreadOptimizer::compute_spread(
         // threshold to the full overweight multiplier at 100% capacity.
         const double skew_range =
             1.0 - cfg_.inventory_skew_threshold;  // e.g. 0.40
-        const double skew_frac =
+        const double skew_frac = std::min(
             (skew_range > 0.0)
                 ? (inventory_ratio - cfg_.inventory_skew_threshold) / skew_range
-                : 1.0;
+                : 1.0,
+            1.0);
         const double skew_mult =
             1.0 + skew_frac * (cfg_.inventory_overweight_multiplier - 1.0);
         total_spread_bps *= skew_mult;

@@ -5,6 +5,15 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.33] — 2026-04-09
+
+### Fixed
+
+- **Depleted-side offer cancellation** (engine.cpp Step 8): When an asset's balance drops below the reserve threshold, existing offers that sell that asset are now cancelled immediately — even if they are Fresh.  Previously, the anti-churn logic kept all fresh offers alive when both sides were suppressed, reasoning that they would expire naturally via TTL.  However, counterparties could fill those asks before expiry, draining the asset to zero (BYC went from 0.878 → 0.000 while the engine logged "keeping live to prevent churn").  The fix introduces `base_depleted` / `quote_depleted` tracking at Gate 2 (reserve-ratio) and Gate 3 (min-balance) suppression points, then:
+  - **Both sides suppressed**: cancels fresh offers on the depleted side (asks for depleted base, bids for depleted quote) while preserving anti-churn behavior for the non-depleted side.
+  - **Single side suppressed**: cancels existing offers on the depleted side before the early-continue, allowing the active side to repost normally.
+  - XCH UTXO-lock anti-churn is preserved when neither side is truly depleted (the scenario it was designed for).
+
 ## [0.7.31] — 2026-04-09
 
 ### Changed
