@@ -117,7 +117,7 @@ strategy:
   gamma: 0.01            # [REQUIRED] Risk aversion coefficient
   kappa: 1.5             # [REQUIRED] Fill intensity decay
   phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT). Higher = more aggressive rebalancing. Recommended: 0.8 for skewed portfolios
-  q_max: 1000            # [REQUIRED] Max inventory in base units
+  q_max: 5               # [REQUIRED] Max inventory in base units (should match actual tradeable balance)
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
   sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)

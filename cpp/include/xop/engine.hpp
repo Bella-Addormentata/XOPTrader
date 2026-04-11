@@ -655,6 +655,11 @@ private:
     /// True if offers were already cancelled on recovery mode entry.
     bool xch_recovery_cancelled_{false};
 
+    // [v0.7.38] Cached XCH confirmed balance (mojos), queried once per
+    // heartbeat before Step 7.  Used by step_generate_ladder to hard-cap
+    // avail_inventory against actual wallet balance.
+    Mojo xch_confirmed_balance_{0};
+
     // UTXO liberation cooldown -- after liberation cancels offers or detects
     // no offers to cancel, suppress the pair loop for this many heartbeats
     // to let cancel transactions confirm on-chain.  Prevents the engine from

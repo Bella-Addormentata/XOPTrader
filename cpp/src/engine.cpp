@@ -1473,6 +1473,23 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::info("[Engine] Steps 7-8 SKIPPED: XCH recovery mode active");
     } else {
 
+    // [v0.7.38] Query XCH confirmed balance once before Step 7 so the
+    // ladder generator can hard-cap avail_inventory against reality.
+    // step_generate_ladder is synchronous (non-coroutine) so it cannot
+    // co_await the wallet RPC itself.
+    if (!wallet_circuit_open_) {
+        try {
+            auto xch_bal = co_await wallet_->get_wallet_balance(1);
+            if (xch_bal.contains("confirmed_wallet_balance"))
+                xch_confirmed_balance_ =
+                    xch_bal["confirmed_wallet_balance"].get<Mojo>();
+        } catch (const std::exception& e) {
+            spdlog::debug("[Engine] XCH balance query for Step 7 cap failed: {}",
+                          e.what());
+            // Keep previous cached value; do not zero out.
+        }
+    }
+
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 7 (ladder) failed: {}", e.what());
@@ -3341,6 +3358,34 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // -- [v0.7.38] Hard wallet-balance cap: prevent the Avellaneda model
+        // from sizing offers beyond what the wallet actually holds.
+        // q_max drives ask_size = q_max*(1+q/q_max) which can vastly exceed
+        // the confirmed XCH balance.  Without this cap, oversized sell offers
+        // drain XCH far faster than buy offers can replenish it.
+        if (pair_cfg && xch_confirmed_balance_ > 0) {
+            if (pair_cfg->base_asset_id == "xch"
+                && avail_inventory > xch_confirmed_balance_)
+            {
+                spdlog::warn("[Engine] Step 7: {} ask pool {:.6f} XCH > "
+                             "confirmed {:.6f} XCH -- CAPPED",
+                             pair_name,
+                             static_cast<double>(avail_inventory) / kMojosPerXch,
+                             static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
+                avail_inventory = xch_confirmed_balance_;
+            }
+            if (pair_cfg->quote_asset_id == "xch"
+                && avail_capital > xch_confirmed_balance_)
+            {
+                spdlog::warn("[Engine] Step 7: {} bid pool {:.6f} XCH > "
+                             "confirmed {:.6f} XCH -- CAPPED",
+                             pair_name,
+                             static_cast<double>(avail_capital) / kMojosPerXch,
+                             static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
+                avail_capital = xch_confirmed_balance_;
+            }
+        }
+
         // -- Dynamic market allocation: scale capital by scoring fraction.
         // When enabled, the MarketAllocator assigns a [0, 1] fraction per
         // pair (summing to 1.0 across all enabled pairs).  Multiply the
@@ -4412,6 +4457,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         }
 
                         // Gate 2: spendable reserve too low (fractional).
+                        // [v0.7.38] Now applies to ALL wallets including XCH.
+                        // The old exemption (sb.wid != 1) allowed the engine
+                        // to keep posting sell-side offers until XCH was nearly
+                        // depleted.  The Step 7 wallet-balance cap prevents
+                        // oversized offers, and this gate provides the ratio-
+                        // based suppression for all assets uniformly.
                         if (confirmed > 0) {
                             double ratio = static_cast<double>(spendable)
                                          / static_cast<double>(confirmed);

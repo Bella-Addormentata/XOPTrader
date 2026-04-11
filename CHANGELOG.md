@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.38] — 2026-04-12
+
+### Fixed
+
+- **Phantom liquidity: Avellaneda ask pool vastly exceeded wallet balance** (engine.cpp, config.yaml): The Avellaneda-Stoikov formula `ask_size = q_max × (1 + q/q_max)` with `q_max=100` computed an ask pool of ~106 XCH when the wallet only held ~10 XCH. Each inner-tier offer (~69 XCH) exceeded total balance, enabling takers to drain XCH far faster than bid-side could replenish. Reduced `q_max` from 100 to 3 (matching actual per-pair tradeable balance).
+
+- **No wallet-balance cap in sizing pipeline** (engine.cpp, engine.hpp): The Avellaneda raw quote flowed through risk limits and ladder generation with no check against the actual confirmed XCH balance. Added `xch_confirmed_balance_` member queried via `wallet_->get_wallet_balance(1)` each heartbeat before Step 7, then hard-capped `avail_inventory` and `avail_capital` against it in `step_generate_ladder`. Prevents the model from ever offering more XCH than exists.
+
+- **XCH exempted from spendable reserve gate** (engine.cpp): Step 8 Gate 2 (`if (confirmed > 0 && sb.wid != 1)`) skipped wallet_id=1 (XCH), allowing sell-side offers to continue posting even when spendable-to-confirmed ratio was dangerously low. Removed the `wid != 1` exemption — the new Step 7 wallet-balance cap prevents the deadlock scenario the exemption was designed to avoid.
+
 ## [0.7.37] — 2026-04-11
 
 ### Added
