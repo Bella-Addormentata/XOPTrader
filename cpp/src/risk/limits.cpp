@@ -452,32 +452,18 @@ Mojo PreTradeCheck::mark_to_xch(const Position& pos,
         return 0;
     }
 
-    // Probe ordering (1): "<asset>/xch" -- mid is mojos-of-xch per mojo-of-base.
-    {
-        const MarketSnapshot snap = state.get_market(pos.asset_id + "/xch");
-        if (snap.mid_price > 0) {
-            // xch_value = balance * mid_price.
-            // Use double for the multiplication to avoid int64 overflow on
-            // large balances, then round back to Mojo.
-            const auto xch_val = static_cast<double>(pos.balance)
-                               * static_cast<double>(snap.mid_price);
-            // Clamp to Mojo range to prevent undefined behaviour on cast.
-            if (xch_val >= static_cast<double>(std::numeric_limits<Mojo>::max())) {
-                return std::numeric_limits<Mojo>::max();
-            }
-            return static_cast<Mojo>(std::llround(xch_val));
+    // Use pre-computed XCH rate (xch_mojos per asset_mojo) set by the
+    // engine from market data and pair config (mojos_per_unit).  This
+    // correctly converts CAT mojo balances to XCH-equivalent mojos
+    // without needing to know the price scaling convention here.
+    const double rate = state.get_asset_xch_rate(pos.asset_id);
+    if (rate > 0.0) {
+        const auto xch_val = static_cast<double>(pos.balance) * rate;
+        // Clamp to Mojo range to prevent undefined behaviour on cast.
+        if (xch_val >= static_cast<double>(std::numeric_limits<Mojo>::max())) {
+            return std::numeric_limits<Mojo>::max();
         }
-    }
-
-    // Probe ordering (2): "xch/<asset>" -- mid is mojos-of-asset per mojo-of-xch.
-    {
-        const MarketSnapshot snap = state.get_market("xch/" + pos.asset_id);
-        if (snap.mid_price > 0) {
-            // xch_value = balance / mid_price.
-            const auto xch_val = static_cast<double>(pos.balance)
-                               / static_cast<double>(snap.mid_price);
-            return static_cast<Mojo>(std::llround(xch_val));
-        }
+        return static_cast<Mojo>(std::llround(xch_val));
     }
 
     // Fallback: no price available.  Return raw balance (conservative --

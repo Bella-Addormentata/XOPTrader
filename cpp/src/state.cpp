@@ -482,6 +482,19 @@ std::size_t State::offer_count() const
 
 // -- market snapshots -------------------------------------------------
 
+void State::register_pair_asset_keys(const std::string& base_asset_id,
+                                     const std::string& quote_asset_id,
+                                     const std::string& pair_name)
+{
+    std::unique_lock lock(mtx_markets_);
+    // Only register the natural ordering (base/quote) to preserve
+    // price-direction semantics in mark_to_xch probes.
+    asset_pair_index_[base_asset_id + "/" + quote_asset_id] = pair_name;
+    spdlog::debug("register_pair_asset_keys {}/{} -> {}",
+                   base_asset_id.substr(0, 12), quote_asset_id.substr(0, 12),
+                   pair_name);
+}
+
 void State::update_market(const MarketSnapshot& snap)
 {
     std::unique_lock lock(mtx_markets_);
@@ -492,13 +505,23 @@ void State::update_market(const MarketSnapshot& snap)
                    snap.best_bid, snap.best_ask, snap.spread_bps);
 }
 
-MarketSnapshot State::get_market(const std::string& pair_name) const
+MarketSnapshot State::get_market(const std::string& key) const
 {
     std::shared_lock lock(mtx_markets_);
 
-    if (auto it = markets_.find(pair_name); it != markets_.end()) {
+    // Primary lookup: by human-readable pair name (e.g. "XCH/wUSDC.b").
+    if (auto it = markets_.find(key); it != markets_.end()) {
         return it->second;  // copy
     }
+
+    // Secondary lookup: resolve asset-ID-based key (e.g. "xch/<hex>")
+    // to the registered pair name, then fetch the snapshot.
+    if (auto idx = asset_pair_index_.find(key); idx != asset_pair_index_.end()) {
+        if (auto it = markets_.find(idx->second); it != markets_.end()) {
+            return it->second;  // copy
+        }
+    }
+
     return MarketSnapshot{};
 }
 
@@ -512,6 +535,23 @@ std::vector<MarketSnapshot> State::get_all_markets() const
         out.push_back(snap);
     }
     return out;
+}
+
+// ===========================================================================
+// Asset XCH rates
+// ===========================================================================
+
+void State::set_asset_xch_rate(const AssetId& asset_id, double xch_mojos_per_asset_mojo)
+{
+    std::unique_lock lock(mtx_xch_rates_);
+    xch_rates_[asset_id] = xch_mojos_per_asset_mojo;
+}
+
+double State::get_asset_xch_rate(const AssetId& asset_id) const
+{
+    std::shared_lock lock(mtx_xch_rates_);
+    auto it = xch_rates_.find(asset_id);
+    return (it != xch_rates_.end()) ? it->second : 0.0;
 }
 
 // ===========================================================================

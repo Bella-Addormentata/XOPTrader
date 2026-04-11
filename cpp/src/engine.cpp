@@ -196,7 +196,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     sp_cfg.high_vol_multiplier = config_.strategy.high_vol_multiplier;
     spread_opt_ = std::make_unique<SpreadOptimizer>(sp_cfg);
 
-    // Per-pair liquidity engines Ã¢â‚¬â€ use per-pair tier overrides when present.
+    // Per-pair liquidity engines ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â use per-pair tier overrides when present.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
         LiquidityConfig liq_cfg;
@@ -343,7 +343,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     strategy_portfolio_ = std::make_unique<StrategyPortfolio>(
         PortfolioConfig{});  // Default config with beta=2.0
 
-    // ChiaEdgeOptimizer implements StrategyBase Ã¢â‚¬â€ construct with default config
+    // ChiaEdgeOptimizer implements StrategyBase ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â construct with default config
     chia_edge_ = std::make_unique<ChiaEdgeOptimizer>(
         ChiaEdgeConfig{});
 
@@ -634,7 +634,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // previous run.  Cross-reference against the DB's pending records:
     //   - Known offers (in DB) are restored into State for tracking.
     //   - Unknown offers (orphans) are evaluated using cost-aware analysis
-    //     (GuÃƒÂ©ant-Lehalle 2013, Gao-Wang 2020): well-priced orphans are
+    //     (GuÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â©ant-Lehalle 2013, Gao-Wang 2020): well-priced orphans are
     //     ADOPTED to preserve market presence; mispriced ones are cancelled.
     // This runs once before any trading begins.
     if (offer_mgr_ && db_) {
@@ -808,6 +808,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
         }
     }
 
+    // -- Register pair asset-ID keys with State for mark-to-xch lookup ---
+    // Each pair's base/quote asset IDs are mapped to the pair's human-
+    // readable name so that mark_to_xch() can resolve market snapshots.
+    if (state_) {
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            state_->register_pair_asset_keys(
+                pair.base_asset_id, pair.quote_asset_id, pair.name);
+        }
+    }
+
     // -- Seed inventory from wallet balances ---------------------------------
     // Query on-chain balances for each configured pair's base and quote
     // assets and seed the InventoryTracker so that inventory_ratio()
@@ -841,13 +852,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     if (spendable <= 0) continue;
 
-                    // Use 1 as synthetic cost basis — the actual value
+                    // Use 1 as synthetic cost basis ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the actual value
                     // doesn't affect inventory_ratio because that method
-                    // uses the live mid-price to convert base→quote.
+                    // uses the live mid-price to convert baseÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢quote.
                     // What matters is that total_quantity reflects the
                     // real mojos held.
                     inventory_->seed_position(AssetId{aid}, spendable,
                                               Mojo{1});
+                    // Also seed State positions so that apply_limits()
+                    // has accurate balances from the start (not just
+                    // from detected fills).
+                    state_->record_buy(AssetId{aid}, spendable, Mojo{1});
                     total_seeded += spendable;
 
                     spdlog::info("[Engine] Seeded inventory for asset {} "
@@ -915,7 +930,7 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     wallet_last_probe_ = now;
                     try {
                         co_await wallet_->get_sync_status();
-                        // Success Ã¢â‚¬â€ wallet is back.
+                        // Success ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â wallet is back.
                         wallet_circuit_open_       = false;
                         wallet_consecutive_failures_ = 0;
                         spdlog::info("[Engine] Wallet circuit breaker CLOSED "
@@ -1059,7 +1074,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
             co_return;  // Shutdown requested.
         }
         if (ec) {
-            // Non-shutdown timer error Ã¢â‚¬â€ log and fall through to
+            // Non-shutdown timer error ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â log and fall through to
             // complete analysis with whatever data we have.
             spdlog::warn("[Engine] Analysis timer error: {}; ending analysis early",
                          ec.message());
@@ -1089,7 +1104,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (metrics_->is_running()) {
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            health.node_synced      = true;   // We just got a block â†’ node OK.
+            health.node_synced      = true;   // We just got a block ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â ÃƒÂ¢Ã¢â€šÂ¬Ã¢â€žÂ¢ node OK.
             health.wallet_connected = wallet_->is_open();
             metrics_->update_system_health(health);
         }
@@ -1193,9 +1208,9 @@ asio::awaitable<void> Engine::run_startup_analysis()
     // The multiplier is stored both locally (for step_apply_spread_optimizer)
     // and in State (for GUI/monitoring accessibility).
     //
-    // Conservative Ã¢â€ â€™ 1.5  (50% wider spreads: protect against adverse selection)
-    // Normal       Ã¢â€ â€™ 1.0  (no change from configured defaults)
-    // Aggressive   Ã¢â€ â€™ 0.8  (20% tighter: capture spread in stable markets)
+    // Conservative ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 1.5  (50% wider spreads: protect against adverse selection)
+    // Normal       ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 1.0  (no change from configured defaults)
+    // Aggressive   ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 0.8  (20% tighter: capture spread in stable markets)
     //
     // Compute overall_recommendation() once and derive the multiplier from
     // it, avoiding a second full traversal of all pair summaries.
@@ -1206,7 +1221,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
         default:                                   analysis_spread_mult_ = 1.0; break;
     }
 
-    spdlog::info("[Engine] Analysis recommendation: {} Ã¢â€ â€™ spread multiplier {:.2f}x",
+    spdlog::info("[Engine] Analysis recommendation: {} ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ spread multiplier {:.2f}x",
                  to_string(overall), analysis_spread_mult_);
 
     // Persist summaries and multiplier in State for GUI/monitoring.
@@ -1851,7 +1866,36 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
     }
 
-    spdlog::debug("[Engine] Step 1 complete: market state updated for {} pairs",
+    // -- Compute XCH conversion rates for risk mark-to-market ---------------
+    // For each non-XCH asset that has an XCH pair, compute the XCH-mojo
+    // value of one asset mojo.  Used by PreTradeCheck::mark_to_xch() in the
+    // risk system so that inventory concentration, CAT cap, and pair-capital
+    // checks reflect real economic values instead of raw mojo counts.
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        double mid = market_data_->get_mid_price(pair.name);
+        if (mid <= 0.0) continue;
+
+        if (pair.base_asset_id == "xch" && pair.quote_asset_id != "xch") {
+            // Pair is XCH/<CAT>: mid = display_price (get_mid_price returns display)
+            // 1 CAT mojo = kMojosPerXch / (mid * quote_mojos_per_unit) XCH mojos
+            double rate = static_cast<double>(kMojosPerXch)
+                        / (mid * static_cast<double>(pair.quote_mojos_per_unit));
+            state_->set_asset_xch_rate(AssetId{pair.quote_asset_id}, rate);
+            spdlog::debug("[Engine] XCH rate: {} -> {:.2f} XCH mojos/asset mojo (mid={:.6f})",
+                          pair.quote_asset_id.substr(0, 12), rate, mid);
+        } else if (pair.quote_asset_id == "xch" && pair.base_asset_id != "xch") {
+            // Pair is <CAT>/XCH: mid = display_price
+            // 1 base mojo = mid * kMojosPerXch / base_mojos_per_unit XCH mojos
+            double rate = mid * static_cast<double>(kMojosPerXch)
+                        / static_cast<double>(pair.base_mojos_per_unit);
+            state_->set_asset_xch_rate(AssetId{pair.base_asset_id}, rate);
+            spdlog::debug("[Engine] XCH rate: {} -> {:.2f} XCH mojos/asset mojo (mid={:.6f})",
+                          pair.base_asset_id.substr(0, 12), rate, mid);
+        }
+    }
+
+        spdlog::debug("[Engine] Step 1 complete: market state updated for {} pairs",
                   enabled.size());
     co_return;
 }
@@ -2258,7 +2302,7 @@ void Engine::step_update_analytics(BlockHeight block_height)
         // -- Stablecoin depeg monitoring ------------------------------------
         // Feed the current mid-price to the depeg detector for any pair
         // flagged as a stablecoin.  The detector tracks sustained deviations
-        // and transitions through Normal Ã¢â€ â€™ Warning Ã¢â€ â€™ Bailed states.
+        // and transitions through Normal ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Warning ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Bailed states.
         if (pair.is_stablecoin && depeg_detector_) {
             auto depeg_status = depeg_detector_->update(
                 pair.name, mid, block_height);
@@ -2442,7 +2486,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         // ---------------------------------------------------------------
         // [Wall-aware retail niche premium]
         //
-        // On Chia DEX offers are atomic Ã¢â‚¬â€ a taker must match the full
+        // On Chia DEX offers are atomic ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â a taker must match the full
         // amount.  Small traders cannot take wall-sized offers (e.g. 100+
         // XCH) and are a captive market for our smaller, accessible
         // offers.  When wall offers dominate the competing order book, we
@@ -2475,7 +2519,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                     pcs.spread_result.total_spread_bps *= niche_mult;
                     pcs.spread_result.half_spread =
                         pcs.spread_result.total_spread_bps / 2.0;
-                    spdlog::info("[Engine] Step 5: {} wall detected Ã¢â‚¬â€ "
+                    spdlog::info("[Engine] Step 5: {} wall detected ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â "
                                 "retail niche premium {:.0f}% "
                                 "(spread now {:.1f}bps)",
                                 pair_name,
@@ -2498,7 +2542,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                 constexpr double kWarmupDefensiveMultiplier = 1.3;
                 pcs.spread_result.total_spread_bps *= kWarmupDefensiveMultiplier;
                 spdlog::debug("[Engine] Step 5: {} regime warm-up defense "
-                              "Ã¢â‚¬â€ spread widened by {:.1f}x",
+                              "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â spread widened by {:.1f}x",
                               pair_name, kWarmupDefensiveMultiplier);
             }
         }
@@ -2520,14 +2564,14 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         //   fill follows within kVpinValidationWindow blocks.  Precision
         //   is logged every cycle in Step 10.  If precision < vpin_min_
         //   precision_ after 100+ activations, a warning is emitted.
-        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, Ã‚Â§7.
+        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§7.
         //
         // COUNTER-RESEARCH NOTE (CR-2, Xu, Lehalle & Alfonsi 2023):
         //   OFI is computed from best-level bid/ask only.  Multi-level
-        //   OFI (top 5Ã¢â‚¬â€œ10 levels) explains 10Ã¢â‚¬â€œ30% more return variance.
+        //   OFI (top 5ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“10 levels) explains 10ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“30% more return variance.
         //   TODO: extend ingest_book_snapshot_for_ofi() to accept
         //   multiple book levels for a stronger directional signal.
-        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, Ã‚Â§8.
+        //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â§8.
         //
         // ISO/IEC 27001:2022: no secret data; all signals are market-derived.
         // ISO/IEC 5055: multipliers are clamped via their source methods.
@@ -2543,7 +2587,7 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
         // widen the spread by effectively zero, which would dilute the
         // precision metric.  Deduplicate by block: only record one
         // activation per block_height across all pairs to prevent
-        // multi-pair inflation (N pairs Ãƒâ€” 1 block = 1 activation, not N).
+        // multi-pair inflation (N pairs ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â 1 block = 1 activation, not N).
         // ISO/IEC 27001:2022: audit-quality signal tracking.
         // ISO/IEC 5055: bounded container via kMaxPendingActivations cap.
         static constexpr double kVpinActivationThreshold = 0.01;
@@ -2559,9 +2603,9 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
 
         // Apply startup-analysis spread multiplier.
         // This adjusts initial quoting based on the pre-trading observation:
-        //   Conservative Ã¢â€ â€™ 1.5x (wider spreads)
-        //   Normal       Ã¢â€ â€™ 1.0x (no change)
-        //   Aggressive   Ã¢â€ â€™ 0.8x (tighter spreads)
+        //   Conservative ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 1.5x (wider spreads)
+        //   Normal       ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 1.0x (no change)
+        //   Aggressive   ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ 0.8x (tighter spreads)
         if (analysis_spread_mult_ != 1.0) {
             pcs.spread_result.total_spread_bps *= analysis_spread_mult_;
         }
@@ -3119,7 +3163,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // estimates.  When the market mid is CLOSE to the peg (< 1%
         // deviation), lightly anchor towards the peg (50/50 blend) to
         // filter thin-book noise.  When the market deviates further, trust
-        // the market Ã¢â‚¬â€ a genuine discount/premium likely reflects real
+        // the market ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â a genuine discount/premium likely reflects real
         // conditions (liquidity depth, bridge risk, etc.) and the depeg
         // detector handles any bail-out.
         {
@@ -3339,14 +3383,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // Order-book competitive cap: ensure every tier is priced at least
         // as aggressively as the Nth competing offer on its side.
         //
-        // Problem: outer tiers (Tier 2Ã¢â‚¬â€œ5) can end up far from mid due to
+        // Problem: outer tiers (Tier 2ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã¢â‚¬Å“5) can end up far from mid due to
         // large tier_spacing_bps, putting them *behind* existing competing
-        // offers.  Those tiers are dead capital Ã¢â‚¬â€ nobody takes an offer at
+        // offers.  Those tiers are dead capital ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â nobody takes an offer at
         // 2.5% from mid when a competing offer sits at 1%.
         //
         // Fix: sort competing bids (descending) and asks (ascending).
         // For tier i, find the competing offer at rank (i + 1).  If our
-        // tier price is worse, improve it to match that offer Ã‚Â± 1 tick.
+        // tier price is worse, improve it to match that offer ÃƒÆ’Ã†â€™ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â± 1 tick.
         //
         // Safety floor: never tighten a tier closer than min_margin from
         // mid.  This prevents TibetSwap (0.7% fee) or other AMMs from
@@ -3370,7 +3414,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 [](const auto& a, const auto& b) { return a.price < b.price; });
 
             // Wall detection threshold (mojos).  Competing offers above
-            // this size are "walls" Ã¢â‚¬â€ we serve a different (retail) market
+            // this size are "walls" ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â we serve a different (retail) market
             // segment and should NOT undercut them.  On Chia DEX, offers
             // are atomic: small traders cannot take wall-sized offers.
             const Mojo wall_threshold_mojos = static_cast<Mojo>(std::llround(
@@ -3378,7 +3422,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 * static_cast<double>(kMojosPerXch)));
 
             // Minimum allowed spread: max(min_margin_bps, tibetswap_fee_bps).
-            // The TibetSwap fee creates a natural arbitrage boundary Ã¢â‚¬â€
+            // The TibetSwap fee creates a natural arbitrage boundary ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â
             // any offer tighter than ~70 bps can be profitably arbed.
             const double min_floor_bps = std::max(
                 pair_cfg ? pair_cfg->min_profit_margin_bps_override.value_or(
@@ -3408,7 +3452,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     if (comp_bids[rank].size > wall_threshold_mojos) {
                         spdlog::debug("[Engine] Step 7: {} BID tier {} "
                                      "wall at rank {} (size={:.3f} XCH) "
-                                     "Ã¢â‚¬â€ skipping competitive cap",
+                                     "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â skipping competitive cap",
                                      pair_name, tq.tier_index, rank,
                                      static_cast<double>(comp_bids[rank].size)
                                          / static_cast<double>(kMojosPerXch));
@@ -3440,7 +3484,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     if (comp_asks[rank].size > wall_threshold_mojos) {
                         spdlog::debug("[Engine] Step 7: {} ASK tier {} "
                                      "wall at rank {} (size={:.3f} XCH) "
-                                     "Ã¢â‚¬â€ skipping competitive cap",
+                                     "ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â skipping competitive cap",
                                      pair_name, tq.tier_index, rank,
                                      static_cast<double>(comp_asks[rank].size)
                                          / static_cast<double>(kMojosPerXch));
@@ -3575,8 +3619,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // to arbitrageurs).
         //
         // Guard rule:
-        //   BID price Ã¢â€°Â¤ dex_best_ask   (never overpay beyond the cheapest seller)
-        //   ASK price Ã¢â€°Â¥ dex_best_bid   (never undersell below the richest buyer)
+        //   BID price ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¤ dex_best_ask   (never overpay beyond the cheapest seller)
+        //   ASK price ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â°ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¥ dex_best_bid   (never undersell below the richest buyer)
         //
         // Tiers that violate the constraint are clamped; if a clamped tier
         // would produce a zero or negative size it is dropped entirely.
@@ -4042,19 +4086,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // [T5-01] Selective refresh: classify existing tiers before deciding
         // whether to do a full cancel+repost or a surgical selective refresh.
         //
-        // Per Gao & Wang (2020), the zero-offer gap during a full cancelÃ¢â€ â€™
+        // Per Gao & Wang (2020), the zero-offer gap during a full cancelÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢
         // repost cycle is the primary source of adverse selection for latent
         // market makers.  By classifying each pending tier's price deviation
         // from the current optimal, we can cancel only the mispriced tiers
         // while keeping well-priced tiers live on the order book.
         //
         // Decision matrix:
-        //   - All tiers Fresh          Ã¢â€ â€™ skip cancel+repost entirely.
-        //   - Some tiers Stale/Expired Ã¢â€ â€™ selective_cancel stale IDs, then
+        //   - All tiers Fresh          ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ skip cancel+repost entirely.
+        //   - Some tiers Stale/Expired ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ selective_cancel stale IDs, then
         //                                post_quotes for replacement tiers.
-        //   - All tiers Stale/Expired  Ã¢â€ â€™ fall back to full cancel_stale
+        //   - All tiers Stale/Expired  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ fall back to full cancel_stale
         //                                (same as before).
-        //   - No pending tiers at all  Ã¢â€ â€™ post new ladder from scratch.
+        //   - No pending tiers at all  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ post new ladder from scratch.
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
             config_.strategy.offer_ttl_blocks,
@@ -4109,13 +4153,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              pair_name, cancelled_ids.size());
             }
         } else if (has_pending && stale_count == 0 && expired_count == 0) {
-            // All tiers are Fresh Ã¢â‚¬â€ nothing to cancel or repost.
+            // All tiers are Fresh ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â nothing to cancel or repost.
             // Still proceed to balance gates so suppressed pairs can free
             // the capital locked by these fresh offers.
             spdlog::debug("[Engine] Step 8: {} all {} tiers fresh -- "
                           "skipping cancel+repost", pair_name, fresh_count);
         }
-        // else: no pending tiers Ã¢â€ â€™ post from scratch (cancelled_ids empty).
+        // else: no pending tiers ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ post from scratch (cancelled_ids empty).
 
         // Build cancel-reason map from tier classifications.
         std::unordered_map<std::string, std::string> cancel_reasons;
@@ -4161,7 +4205,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // Offers older than hard TTL + stuck_offer_age_blocks are considered
         // stuck (e.g. RPC cancel failed). Log them with fee info and
         // force a second cancel pass with an extended threshold.
-        // Hard TTL = soft TTL Ãƒâ€” kHardTtlMultiplier; offers past hard TTL
+        // Hard TTL = soft TTL ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â kHardTtlMultiplier; offers past hard TTL
         // are already classified as Expired, so "stuck" means the cancel
         // RPC itself failed on a previous attempt.
         {
@@ -4462,7 +4506,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
-        // All tiers fresh and nothing was cancelled Ã¢â€ â€™ no repost needed.
+        // All tiers fresh and nothing was cancelled ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ no repost needed.
         // (The early-continue was removed so balance gates can free capital
         //  when both sides are suppressed, but when at least one side is
         //  active, existing fresh offers are kept as-is.)
@@ -4500,7 +4544,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     const bool xch_is_quote = fee_pc && fee_pc->quote_asset_id == "xch";
 
                     if (xch_is_base) {
-                        // Bid buys base (XCH) Ã¢â‚¬â€ allow bids, suppress asks.
+                        // Bid buys base (XCH) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â allow bids, suppress asks.
                         can_ask = false;
                         spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
                                      "spendable {:.6f} XCH < reserve {:.4f} XCH "
@@ -4509,7 +4553,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                      static_cast<double>(xch_spendable) / kMojosPerXch,
                                      config_.strategy.fee_reserve_xch);
                     } else if (xch_is_quote) {
-                        // Ask sells base, receives quote (XCH) Ã¢â‚¬â€ allow asks, suppress bids.
+                        // Ask sells base, receives quote (XCH) ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â allow asks, suppress bids.
                         can_bid = false;
                         spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
                                      "spendable {:.6f} XCH < reserve {:.4f} XCH "
@@ -4518,7 +4562,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                      static_cast<double>(xch_spendable) / kMojosPerXch,
                                      config_.strategy.fee_reserve_xch);
                     } else {
-                        // Neither side acquires XCH Ã¢â‚¬â€ skip entirely.
+                        // Neither side acquires XCH ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â skip entirely.
                         spdlog::info("[Engine] Step 8: {} XCH fee reserve gate: "
                                      "spendable {:.6f} XCH < reserve {:.4f} XCH "
                                      "-- skipping offer posting",
@@ -5163,13 +5207,13 @@ asio::awaitable<void> Engine::step_check_arbitrage(
             }
         }
 
-        // No two-sided market Ã¢â€ â€™ nothing to cross.
+        // No two-sided market ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ nothing to cross.
         if (best_bid_price == 0 ||
             best_ask_price == std::numeric_limits<Mojo>::max()) {
             continue;
         }
 
-        // Not crossed Ã¢â€ â€™ no opportunity.
+        // Not crossed ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ no opportunity.
         if (best_bid_price < best_ask_price) continue;
 
         // Compute edge in basis points.
@@ -5816,7 +5860,7 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
         // If spendable is low but confirmed is healthy, the XCH is just
         // locked by our own offers (UTXO locking), not truly depleted.
-        // Don't enter recovery Ã¢â‚¬â€ the offers will either fill (returning
+        // Don't enter recovery ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â the offers will either fill (returning
         // XCH) or be cancelled (freeing UTXOs).
         if (xch_confirmed_d >= rcfg.xch_low_threshold) {
             spdlog::debug("[Recovery] XCH spendable {:.6f} < {:.4f} but "
@@ -6653,7 +6697,7 @@ asio::awaitable<void> Engine::open_connections()
                              "block heights may be stale until sync completes");
             }
             auto height = co_await wallet_->get_height_info();
-            spdlog::info("[Engine] Wallet-only mode active Ã¢â‚¬â€ wallet synced "
+            spdlog::info("[Engine] Wallet-only mode active ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â wallet synced "
                          "height: {}", height);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Could not verify wallet sync status: {}",
@@ -6698,7 +6742,7 @@ void Engine::check_pause_flag()
     const bool flag_exists = fs::exists(pause_flag_path_);
 
     if (flag_exists && !gui_pause_active_) {
-        // Transition Running Ã¢â€ â€™ Paused.
+        // Transition Running ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Paused.
         gui_pause_active_ = true;
         if (state_->status() == BotStatus::Running) {
             state_->set_status(BotStatus::Paused);
@@ -6706,7 +6750,7 @@ void Engine::check_pause_flag()
                          "(Steps 1-6, 9-13 continue; Step 8 skipped)");
         }
     } else if (!flag_exists && gui_pause_active_) {
-        // Transition Paused Ã¢â€ â€™ Running.
+        // Transition Paused ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ Running.
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
             state_->set_status(BotStatus::Running);

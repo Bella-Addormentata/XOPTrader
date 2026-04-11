@@ -5,6 +5,22 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.36] — 2026-04-10
+
+### Fixed
+
+- **Risk limits mark-to-XCH always falls back to raw mojos** (limits.cpp): `mark_to_xch()` constructed asset-ID-based lookup keys (`"<hex>/xch"`) but `State::markets_` stores snapshots by pair name (`"XCH/BYC"`), so every lookup failed and returned raw mojo balances — making 1 CAT mojo (0.001 CAT) appear equal to 1 XCH mojo (10⁻¹² XCH). Replaced broken market snapshot probes with pre-computed XCH exchange rates stored in State.
+
+- **State positions never seeded from wallet** (engine.cpp): `State::positions_` was only populated from detected fills in `offer_manager.cpp`, not from wallet balances at startup. Risk checks saw empty/partial position data, causing wildly incorrect concentration calculations (0.5 default or 100% for the single-fill asset). Added `state_->record_buy()` alongside `inventory_->seed_position()` in the engine seeding block.
+
+- **XCH rate computation for risk system** (engine.cpp, state.hpp, state.cpp): Added per-heartbeat XCH rate computation at end of Step 1 — for each enabled pair with XCH on one side, computes `kMojosPerXch / (mid_price × quote_mojos_per_unit)` and stores via `State::set_asset_xch_rate()`. Added `register_pair_asset_keys()` for asset-ID to pair-name secondary index in State.
+
+### Changed
+
+- **Raised `max_capital_per_pair_pct`** (config.yaml): 40% → 85%. With wUSDC.b at 77% of portfolio, the XCH/wUSDC.b pair was permanently blocked at 40%, preventing the system from selling wUSDC.b for XCH to rebalance.
+
+- **Reduced coin pool targets** (config.yaml): `coin_pool_target_count` 12 → 3, `coin_pool_target_xch` 2.0 → 0.5 XCH. Previous targets required 24 XCH but only 2.04 XCH was available.
+
 ## [0.7.35] — 2026-04-10
 
 ### Fixed

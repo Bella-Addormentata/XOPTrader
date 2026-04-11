@@ -149,15 +149,37 @@ public:
 
     // -- market snapshots -------------------------------------------------
 
+    /// Register asset-ID-based key aliases so that lookups like
+    /// "xch/<hex_id>" resolve to the human-readable pair name used as
+    /// the primary key in the markets_ map.  Called once at startup for
+    /// each configured pair.
+    void register_pair_asset_keys(const std::string& base_asset_id,
+                                  const std::string& quote_asset_id,
+                                  const std::string& pair_name);
+
     /// Insert or replace a market snapshot keyed by pair_name.
     void update_market(const MarketSnapshot& snap);
 
-    /// Get the latest snapshot for a pair.  Returns a default (zeroed)
-    /// MarketSnapshot if the pair has not yet been observed.
-    MarketSnapshot get_market(const std::string& pair_name) const;
+    /// Get the latest snapshot for a pair.  Accepts either a human-readable
+    /// pair name (primary key, e.g. "XCH/wUSDC.b") or an asset-ID-based
+    /// key (e.g. "xch/<hex>").  Returns a default (zeroed) MarketSnapshot
+    /// if the pair has not yet been observed.
+    MarketSnapshot get_market(const std::string& key) const;
 
     /// Get all market snapshots under a single shared lock.
     std::vector<MarketSnapshot> get_all_markets() const;
+
+    // -- asset XCH rates ---------------------------------------------------
+
+    /// Store the XCH-equivalent value (in XCH mojos) per single asset mojo.
+    /// For example, if 1 BYC mojo ≈ 435,000,000 XCH mojos, store 4.35e8.
+    /// Called by the engine whenever market data is refreshed.
+    void set_asset_xch_rate(const AssetId& asset_id, double xch_mojos_per_asset_mojo);
+
+    /// Retrieve the XCH-equivalent rate for an asset.  Returns 0.0 if the
+    /// asset has never been registered (mark_to_xch will fall back to raw
+    /// mojo balance in that case).
+    double get_asset_xch_rate(const AssetId& asset_id) const;
 
     // -- analysis summaries -----------------------------------------------
 
@@ -187,6 +209,10 @@ private:
 
     mutable std::shared_mutex                              mtx_markets_;
     std::unordered_map<std::string, MarketSnapshot>        markets_;
+    std::unordered_map<std::string, std::string>           asset_pair_index_;  // "base/quote" -> pair_name
+
+    mutable std::shared_mutex                              mtx_xch_rates_;
+    std::unordered_map<AssetId, double>                    xch_rates_;  // xch_mojos per asset_mojo
 
     mutable std::shared_mutex                              mtx_analysis_;
     std::vector<PairAnalysisSummary>                       analysis_summaries_;
