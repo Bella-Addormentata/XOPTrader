@@ -116,7 +116,7 @@ strategy:
   # Avellaneda-Stoikov / GLFT parameters
   gamma: 0.01            # [REQUIRED] Risk aversion coefficient
   kappa: 1.5             # [REQUIRED] Fill intensity decay
-  phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT)
+  phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT). Higher = more aggressive rebalancing. Recommended: 0.8 for skewed portfolios
   q_max: 1000            # [REQUIRED] Max inventory in base units
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
@@ -192,11 +192,11 @@ strategy:
   # When multiple pairs share a common asset (e.g. XCH appears in XCH/BYC and
   # XCH/wUSDC.b), the skew from one pair's inventory can bleed into the other.
   cross_pair_skew_enabled: true         # [OPTIONAL, default: true]
-  cross_pair_skew_phi: 0.30             # [OPTIONAL, default: 0.30]  Cross-pair skew strength
+  cross_pair_skew_phi: 0.30             # [OPTIONAL, default: 0.30]  Cross-pair skew strength. Recommended: 0.50 for portfolios with shared assets across pairs
 
   # -- Coin pool: pre-split XCH into smaller UTXOs for concurrent offers --
-  coin_pool_target_count: 12            # [OPTIONAL, default: 12]   Target number of XCH coins
-  coin_pool_target_xch: 2.0             # [OPTIONAL, default: 2.0]  Target XCH per coin
+  coin_pool_target_count: 12            # [OPTIONAL, default: 12]   Target number of XCH coins. Lower (e.g., 3) for small portfolios
+  coin_pool_target_xch: 2.0             # [OPTIONAL, default: 2.0]  Target XCH per coin. Lower (e.g., 0.5) for small portfolios
   coin_pool_interval_blocks: 5          # [OPTIONAL, default: 5]    Check interval (~4 min)
 
   # -- CAT coin pool: pre-split BYC, wUSDC.b etc. for concurrent offers --
@@ -217,7 +217,7 @@ risk:
   single_cat_cap_pct: 0.12  # [REQUIRED] Max portfolio % in one CAT
   # Position sizing
   kelly_fraction: 0.5    # [REQUIRED] Half-Kelly
-  max_capital_per_pair_pct: 0.20  # [REQUIRED]
+  max_capital_per_pair_pct: 0.20  # [REQUIRED] Max fraction of total portfolio value for any pair. Raise to 0.85 if one asset dominates and needs selling
   # Circuit breakers (all OPTIONAL -- defaults shown)
   max_drawdown_pct: 0.10        # [OPTIONAL, default: 0.10]
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]

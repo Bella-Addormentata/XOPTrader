@@ -185,7 +185,7 @@ bid = S - half_spread - skew * q
 ask = S + half_spread - skew * q
 ```
 
-Where `skew = phi * q / q_max` continuously nudges both quotes in the inventory-shedding direction.
+Where `skew = phi * q / q_max` continuously nudges both quotes in the inventory-shedding direction. The `phi` parameter controls how aggressively the model rebalances — higher values (e.g., 0.8) produce stronger quote skewing for faster inventory recovery. When `cross_pair_skew_enabled` is set, skew from related pairs (those sharing an asset) is blended via `cross_pair_skew_phi`, enabling coordinated rebalancing across pairs like XCH/BYC + BYC/wUSDC.b.
 
 ### Regime Detection
 
@@ -272,6 +272,7 @@ Each tier is a separate on-chain CHIA offer. Tier spacing and size allocation ar
 | Underwater position | cost > market | Hold; only offer above cost basis |
 | Position aging > 24h | Stale inventory | Widen ask spread (never force exit) |
 | Single CAT cap | 12% of portfolio | Never exceed regardless of opportunity |
+| Max capital per pair | 85% (configurable) | Prevents any single pair from monopolizing capital |
 
 ### Position Sizing (Half-Kelly)
 
@@ -280,6 +281,15 @@ f* = kelly_fraction * (spread - sigma * sqrt(tau)) / (sigma^2 * tau)
 ```
 
 Practical cap: ~2% of capital per pair per price level. This ensures no single fill can materially impact the portfolio.
+
+### Mark-to-XCH Valuation
+
+All risk calculations value positions in a common XCH numeraire. Per-heartbeat, the engine computes XCH exchange rates for each enabled pair:
+
+- **XCH/CAT pairs**: `rate = kMojosPerXch / (mid_price × quote_mojos_per_unit)`
+- **CAT/XCH pairs**: `rate = mid × kMojosPerXch / base_mojos_per_unit`
+
+Rates are cached in `State::xch_rates_` and consumed by `PreTradeCheck::mark_to_xch()` for inventory concentration and max-capital-per-pair checks. This avoids the fragile pattern of probing market snapshots at risk-check time.
 
 ### Cost Basis Tracking
 
@@ -623,13 +633,14 @@ Key sections to configure before first run:
 |-----------|---------|-------------|
 | `gamma` | 0.01 | Risk aversion — higher = wider spreads, more conservative |
 | `kappa` | 1.5 | Fill intensity decay — higher = expects fills at wider spreads |
-| `phi` | 0.5 | GLFT inventory skew strength — higher = more aggressive rebalancing |
+| `phi` | 0.5 | GLFT inventory skew strength — higher = more aggressive rebalancing (recommended: 0.8 for skewed portfolios) |
 | `q_max` | 1000 | Maximum inventory in base units before hard limit |
 | `min_profit_margin_bps` | 35 | Minimum margin above cost basis for asks (when no-loss enabled) |
 | `offer_ttl_blocks` | 60 | Cancel and refresh offers after N blocks (~52 minutes) |
 | `num_tiers` | 4 | Number of price tiers per side |
 | `tier_spacing_bps` | [60, 200, 500, 1000] | Spread per tier in basis points from mid |
 | `tier_size_pct` | [0.30, 0.25, 0.25, 0.20] | Capital fraction allocated to each tier |
+| `cross_pair_skew_phi` | 0.30 | Cross-pair inventory skew coordination strength (0–1.0). When pairs share an asset, skew from other pairs influences quotes. Higher = stronger cross-pair rebalancing |
 
 ### Risk Parameters
 
@@ -639,7 +650,7 @@ Key sections to configure before first run:
 | `hard_limit_pct` | 0.80 | Pull quotes on overweight side |
 | `single_cat_cap_pct` | 0.12 | Maximum portfolio allocation to any single CAT |
 | `kelly_fraction` | 0.5 | Half-Kelly position sizing (conservative) |
-| `max_capital_per_pair_pct` | 0.20 | Maximum capital deployed to any single pair |
+| `max_capital_per_pair_pct` | 0.85 | Maximum capital deployed to any single pair (set high to allow rebalancing when one asset dominates) |
 | `max_drawdown_pct` | 0.10 | All-time HWM drawdown fraction that pauses the engine (circuit breaker) |
 | `loss_window_blocks` | 1152 | Rolling window for time-windowed loss circuit breaker (~10 h at 52 s/block) |
 | `max_window_loss_bps` | 500 | Maximum loss in basis points within the rolling window; 0 = disabled |

@@ -21,6 +21,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Reduced coin pool targets** (config.yaml): `coin_pool_target_count` 12 → 3, `coin_pool_target_xch` 2.0 → 0.5 XCH. Previous targets required 24 XCH but only 2.04 XCH was available.
 
+- **Tuned GLFT skew for aggressive rebalancing** (config.yaml): `phi` 0.5 → 0.8 (stronger single-pair inventory skew) and `cross_pair_skew_phi` 0.30 → 0.50 (stronger cross-pair rebalancing coordination). Portfolio was heavily skewed toward wUSDC.b; increased skew parameters allow the GLFT model to rebalance more aggressively.
+
 ## [0.7.35] — 2026-04-10
 
 ### Fixed

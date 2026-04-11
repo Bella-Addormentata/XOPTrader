@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-04-10 (T9-01 through T9-03: half-spread cap, Gate 2 XCH exemption, dust threshold fix)
+**Last Updated:** 2026-04-10 (T9-01 through T9-08: v0.7.35 half-spread/Gate2/dust fixes + v0.7.36 risk system mark-to-XCH/position seeding/GLFT skew tuning)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -223,7 +223,7 @@ These are blocking production bugs or severe logic errors identified by multiple
 - **Files:** `cpp/src/risk/limits.cpp`
 - **Issue:** `compute_concentration()` sums raw mojo balances across different assets. Not economically comparable.
 - **Fix:** Mark positions to common numeraire using latest mid/mark prices.
-- **Status:** `[x]` — mark_to_xch() converts positions to XCH numeraire via mid prices from State. Conservative fallback when price unavailable.
+- **Status:** `[x]` — mark_to_xch() rewritten in v0.7.36 to use pre-computed XCH exchange rates from `State::get_asset_xch_rate()`, computed per-heartbeat in engine Step 1. Replaced broken asset-ID-based market snapshot probes. Conservative fallback when price unavailable.
 
 ### T2-17: Fix record_sell() return value ignored during fill processing
 - **Source:** LOGICREVIEW-GPT-5.4 §C.3
@@ -1293,18 +1293,53 @@ Items from live trading diagnosis session. Root cause: one-sided quoting (no XCH
 - **Files:** `cpp/src/strategy/avellaneda.cpp`, `cpp/src/strategy/glft.cpp`, `cpp/include/xop/strategy/glft.hpp`
 - **Issue:** A-S formula `(1/κ)·ln(1+κ/γ)` with γ=0.005, κ=1.5 produces half-spread of 3.806 (absolute units), exceeding mid price ~2.30. Bid = mid − 3.806 = negative → clamped to 0. Reservation mid pushed far above market, preventing any bid offers.
 - **Fix:** Added `max_half_spread_pct{0.49}` to `GlftConfig`. Cap applied BEFORE regime multiplier to preserve regime differentiation (mean-revert ×0.8, momentum ×1.5). Both `avellaneda.cpp` and `glft.cpp` updated.
-- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.
+- **Status:** `[x]` — Deployed in v0.7.35 (commit dea71f2). 281/281 tests pass.
 
 ### T9-02: Exempt XCH (wallet_id 1) from Gate 2 fractional reserve check
 - **Source:** Live trading diagnosis — ask side suppressed by spendable reserve ratio
 - **Files:** `cpp/src/engine.cpp` (Step 8 Gate 2)
 - **Issue:** 91% of XCH locked in pending offers → spendable/confirmed = 9% < 10% threshold → ask side permanently suppressed. Creates deadlock: offers lock UTXOs → ratio drops → can't post → offers expire → briefly unlocks → re-locks.
 - **Fix:** Changed `if (confirmed > 0)` to `if (confirmed > 0 && sb.wid != 1)`. XCH already guarded by `OfferManager`'s UTXO-lock pre-check at the coin level.
-- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.
+- **Status:** `[x]` — Deployed in v0.7.35 (commit dea71f2). 281/281 tests pass.
 
 ### T9-03: Lower min_offer_size_units from 1.0 to 0.1
 - **Source:** Live trading diagnosis — all tiers dropped as dust
 - **Files:** `cpp/include/xop/config.hpp`, `config.yaml`
 - **Issue:** With ~2 XCH free across 6 tiers, each tier = ~0.33 XCH. Default min_offer_size_units=1.0 drops all tiers as dust, producing zero offers even when half-spread and Gate 2 are fixed.
 - **Fix:** Default lowered to 0.1 in config.hpp. Explicit `min_offer_size_units: 0.1` added to config.yaml.
-- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.
+- **Status:** `[x]` — Deployed in v0.7.35 (commit dea71f2). 281/281 tests pass.
+
+### T9-04: Fix mark_to_xch() asset-ID key mismatch (always returns raw mojos)
+- **Source:** Live trading diagnosis — risk limits computing incorrect concentrations
+- **Files:** `cpp/src/risk/limits.cpp`, `cpp/include/xop/state.hpp`, `cpp/src/state.cpp`
+- **Issue:** `mark_to_xch()` constructed asset-ID-based lookup keys (`"<hex>/xch"`) but `State::markets_` stores snapshots by `pair_name` (`"XCH/BYC"`). Every lookup failed, returning raw mojo balances — 1 CAT mojo (0.001 CAT) appeared equal to 1 XCH mojo (10⁻¹² XCH). Risk checks saw wildly incorrect portfolio concentrations.
+- **Fix:** Replaced broken market snapshot probes with pre-computed XCH exchange rates. Added `State::set_asset_xch_rate()` / `get_asset_xch_rate()` with dedicated `xch_rates_` map and mutex. `mark_to_xch()` now reads cached rates instead of probing market data.
+- **Status:** `[x]` — Deployed in v0.7.36 (commit 9d8de20). Verified: wUSDC.b rate ≈437M, BYC rate ≈435M, DBX rate ≈7M XCH mojos per asset mojo.
+
+### T9-05: Seed State::positions_ from wallet balances at startup
+- **Source:** Live trading diagnosis — risk concentrations empty/incorrect on startup
+- **Files:** `cpp/src/engine.cpp`
+- **Issue:** `State::positions_` was only populated from detected fills in `offer_manager.cpp`, not from wallet balances at startup. Risk checks saw empty/partial position data, causing 0.5 default concentration or 100% for a single-fill asset.
+- **Fix:** Added `state_->record_buy()` alongside `inventory_->seed_position()` in the engine seeding block so State tracks positions from first heartbeat.
+- **Status:** `[x]` — Deployed in v0.7.36 (commit 9d8de20). 281/281 tests pass.
+
+### T9-06: Add per-heartbeat XCH rate computation in engine Step 1
+- **Source:** Live trading diagnosis — risk system needs XCH exchange rates
+- **Files:** `cpp/src/engine.cpp`, `cpp/include/xop/state.hpp`, `cpp/src/state.cpp`
+- **Issue:** Risk limits `mark_to_xch()` needed reliable mid-price-derived XCH rates, but no component computed them.
+- **Fix:** At end of Step 1, for each enabled pair with XCH on one side, compute `kMojosPerXch / (mid_price × quote_mojos_per_unit)` (for XCH/CAT pairs) or `mid × kMojosPerXch / base_mojos_per_unit` (for CAT/XCH pairs) and store via `State::set_asset_xch_rate()`. Added `register_pair_asset_keys()` for asset-ID to pair-name secondary index.
+- **Status:** `[x]` — Deployed in v0.7.36 (commit 9d8de20). Debug logging confirms correct rates per heartbeat.
+
+### T9-07: Raise max_capital_per_pair_pct from 40% to 85%
+- **Source:** Live trading diagnosis — XCH/wUSDC.b pair permanently blocked
+- **Files:** `config.yaml`
+- **Issue:** With wUSDC.b at 77% of portfolio, the XCH/wUSDC.b pair was permanently blocked at the 40% max-capital gate, preventing the system from selling wUSDC.b for XCH to rebalance.
+- **Fix:** Raised `max_capital_per_pair_pct` from 0.40 to 0.85. Also reduced `coin_pool_target_count` 12→3 and `coin_pool_target_xch` 2.0→0.5 (previous targets required 24 XCH but only ~2 XCH was available).
+- **Status:** `[x]` — Config-only change (gitignored). 3 of 4 pairs now actively quoting.
+
+### T9-08: Tune GLFT phi for more aggressive inventory rebalancing
+- **Source:** Live trading analysis — portfolio skewed toward wUSDC.b, slow rebalancing
+- **Files:** `config.yaml`
+- **Issue:** Default `phi: 0.5` and `cross_pair_skew_phi: 0.30` provided insufficient rebalancing pressure for heavily skewed portfolio. The GLFT model's inventory skew was not aggressive enough to rebalance toward target allocation.
+- **Fix:** Raised `phi` from 0.5 to 0.8 (more aggressive single-pair rebalancing) and `cross_pair_skew_phi` from 0.30 to 0.50 (stronger cross-pair coordination when shared assets are imbalanced).
+- **Status:** `[x]` — Config-only change (gitignored). Strategy quotes now show clear directional skew toward rebalancing.
