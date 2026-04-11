@@ -117,14 +117,14 @@ strategy:
   gamma: 0.01            # [REQUIRED] Risk aversion coefficient
   kappa: 1.5             # [REQUIRED] Fill intensity decay
   phi: 0.5               # [REQUIRED] Inventory skew strength (GLFT). Higher = more aggressive rebalancing. Recommended: 0.8 for skewed portfolios
-  q_max: 5               # [REQUIRED] Max inventory in base units (should match actual tradeable balance)
+  q_max: 30              # [REQUIRED] Max inventory in base units. Wallet cap (v0.7.38) prevents ask overcommit.
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
   sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)
   offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
-  num_tiers: 6               # [REQUIRED] Multi-tier offer ladder depth
-  tier_spacing_bps: [35, 60, 120, 180, 240, 300]  # [REQUIRED] Spread per tier (bps)
-  tier_size_pct: [0.05, 0.10, 0.25, 0.25, 0.20, 0.15] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
+  num_tiers: 4               # [REQUIRED] Multi-tier offer ladder depth (4 recommended: fewer, larger tiers)
+  tier_spacing_bps: [35, 100, 200, 300]  # [REQUIRED] Spread per tier (bps)
+  tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
   # Startup market analysis: observe this many blocks before trading begins.

@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.39] — 2026-04-12
+
+### Changed
+
+- **Tier sizing rebalance: q_max 8→30, num_tiers 6→4** (config.yaml, config.example.yaml): Deep analysis of five option combinations (pure q_max, huge q_max, reduced tiers, combined, flat decay). Selected Option C for best long-term balance of bid size, inventory sensitivity, and fill quality. Outermost bid tier now ~12 XCH (was 1.7), tightest tier ~4.5 XCH (was 0.3). Inventory signal preserved at 6% (meaningful rebalancing as XCH recovers). Ask side remains safe via v0.7.38 wallet cap.
+
+- **Updated tier_spacing_bps and tier_size_pct for 4-tier ladder**: [35, 100, 200, 300] bps spacing with [0.15, 0.20, 0.30, 0.35] allocation. Fewer, larger tiers mean each fill buys more XCH and saves on-chain fees.
+
+- **BYC/wUSDC.b stablecoin overrides reduced from 6 to 4 tiers**: [3, 8, 20, 40] bps spacing with [0.30, 0.25, 0.25, 0.20] allocation.
+
 ## [0.7.38] — 2026-04-12
 
 ### Fixed
