@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-03-29 (T3-03, T3-31, T4-05, T4-13, T4-19, T4-24 implemented; remaining open items researched with recommendations)
+**Last Updated:** 2026-04-10 (T9-01 through T9-03: half-spread cap, Gate 2 XCH exemption, dust threshold fix)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
@@ -1226,7 +1226,7 @@ Items from [CODEREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 
 ## Summary Statistics
 
-**Last verification:** 2026-04-02
+**Last verification:** 2026-04-10
 
 | Tier | Total | Done | Partial | Open | Description |
 |------|-------|------|---------|------|-------------|
@@ -1238,7 +1238,8 @@ Items from [CODEREVIEW-20260402-GitHubCopilot-Claude-Opus-4.6](docs/CODE%20REVIE
 | **Tier 6 (New 2026-03-25)** | 10 | 10 | 0 | 0 | Build, packaging, config, code quality |
 | **Tier 7 (New 2026-03-29)** | 13 | 13 | 0 | 0 | Fresh review findings |
 | **Tier 8 (New 2026-04-02)** | 29 | 24 | 0 | 5 | Code review + logic review findings |
-| **Total** | **163** | **149** | **0** | **14** | |
+| **Tier 9 (New 2026-04-10)** | 3 | 3 | 0 | 0 | Live trading: half-spread cap + deadlock fixes |
+| **Total** | **166** | **152** | **0** | **14** | |
 | **Already Fixed (pre-TODO)** | ~50 | — | — | — | From Claude Code 3-pass cycle |
 
 ### Blocking Items for Live Trading
@@ -1280,3 +1281,30 @@ None — all critical items resolved. T1-10 documentation gap closed.
 27. T8-27: DexieClient/ChiaRPC mock tests.
 28. T8-28: GUI service tests.
 29. T8-29: Consolidate databases — architectural decision.
+
+---
+
+## Tier 9 — Findings from 2026-04-10 Live Trading Session
+
+Items from live trading diagnosis session. Root cause: one-sided quoting (no XCH bids) due to three interacting bugs. See [strategy notes](strategy_notes/2026-04-10-half-spread-cap-and-deadlock-fixes.md).
+
+### T9-01: Cap A-S/GLFT half-spread at 49% of mid price
+- **Source:** Live trading diagnosis — zero bid offers posted
+- **Files:** `cpp/src/strategy/avellaneda.cpp`, `cpp/src/strategy/glft.cpp`, `cpp/include/xop/strategy/glft.hpp`
+- **Issue:** A-S formula `(1/κ)·ln(1+κ/γ)` with γ=0.005, κ=1.5 produces half-spread of 3.806 (absolute units), exceeding mid price ~2.30. Bid = mid − 3.806 = negative → clamped to 0. Reservation mid pushed far above market, preventing any bid offers.
+- **Fix:** Added `max_half_spread_pct{0.49}` to `GlftConfig`. Cap applied BEFORE regime multiplier to preserve regime differentiation (mean-revert ×0.8, momentum ×1.5). Both `avellaneda.cpp` and `glft.cpp` updated.
+- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.
+
+### T9-02: Exempt XCH (wallet_id 1) from Gate 2 fractional reserve check
+- **Source:** Live trading diagnosis — ask side suppressed by spendable reserve ratio
+- **Files:** `cpp/src/engine.cpp` (Step 8 Gate 2)
+- **Issue:** 91% of XCH locked in pending offers → spendable/confirmed = 9% < 10% threshold → ask side permanently suppressed. Creates deadlock: offers lock UTXOs → ratio drops → can't post → offers expire → briefly unlocks → re-locks.
+- **Fix:** Changed `if (confirmed > 0)` to `if (confirmed > 0 && sb.wid != 1)`. XCH already guarded by `OfferManager`'s UTXO-lock pre-check at the coin level.
+- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.
+
+### T9-03: Lower min_offer_size_units from 1.0 to 0.1
+- **Source:** Live trading diagnosis — all tiers dropped as dust
+- **Files:** `cpp/include/xop/config.hpp`, `config.yaml`
+- **Issue:** With ~2 XCH free across 6 tiers, each tier = ~0.33 XCH. Default min_offer_size_units=1.0 drops all tiers as dust, producing zero offers even when half-spread and Gate 2 are fixed.
+- **Fix:** Default lowered to 0.1 in config.hpp. Explicit `min_offer_size_units: 0.1` added to config.yaml.
+- **Status:** `[x]` — 281/281 tests pass. Awaiting commit/deploy.

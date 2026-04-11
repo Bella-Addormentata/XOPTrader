@@ -256,8 +256,8 @@ struct StrategyConfig {
 
     /// Minimum offer size in base-asset units.  Tiers with a size below
     /// this value (converted to mojos) are dropped in Step 7.  Prevents
-    /// dust-sized offers that waste fees and wallet UTXOs.  Default 1.0.
-    double   min_offer_size_units{1.0};
+    /// dust-sized offers that waste fees and wallet UTXOs.  Default 0.1.
+    double   min_offer_size_units{0.1};
 
     /// Minimum units of each asset desired for active trading.  When an
     /// asset is below this level, the engine biases toward acquiring it

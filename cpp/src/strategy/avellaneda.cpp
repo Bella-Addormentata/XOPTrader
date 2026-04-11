@@ -187,6 +187,30 @@ QuoteResult AvellanedaStoikov::compute_quotes(double mid,
     //     avoid adverse selection and shed inventory aggressively.
     //   - Random (else): no adjustment.
     // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // Step 5a: Cap half-spread relative to mid price.
+    //
+    // The A-S/GLFT formula (1/kappa)*ln(1+kappa/gamma) produces an
+    // ABSOLUTE spread independent of the price level.  With gamma=0.005,
+    // kappa=1.5, term1=3.806 price units — wider than the mid for any
+    // pair priced below ~$7.60.  When delta > mid, bid = r - delta < 0
+    // and is floored to zero, destroying the reservation-price signal
+    // and pushing reservation_mid far above market mid.
+    //
+    // Cap delta to 49% of mid so that bid stays positive and the
+    // inventory-dependent reservation price r remains effective.
+    // Applied BEFORE the regime multiplier so that regime-dependent
+    // spread scaling (e.g., 0.8× in mean-revert) still differentiates.
+    // The engine's Step 5 spread cap (max_half_spread_bps) provides
+    // the final refinement; this cap prevents the upstream pathology.
+    // -------------------------------------------------------------------
+    if (mid > 0.0) {
+        const double max_delta = mid * 0.49;
+        if (delta > max_delta) {
+            delta = max_delta;
+        }
+    }
+
     delta *= regime_.spread_mult;
 
     // -------------------------------------------------------------------

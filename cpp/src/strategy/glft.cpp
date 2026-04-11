@@ -163,6 +163,33 @@ QuoteResult GlftStrategy::compute_quotes(double mid,
     // Mean-reverting: 0.8x (safe to tighten -- prices bounce back).
     // Momentum:       1.5x (widen to avoid adverse selection from trends).
     // -------------------------------------------------------------------
+    // -------------------------------------------------------------------
+    // Step 2b: Cap half-spread relative to mid price.
+    //
+    // The A-S formula (1/kappa)*ln(1+kappa/gamma) produces an ABSOLUTE
+    // spread that is independent of the price level.  With gamma=0.005,
+    // kappa=1.5, term1=3.806 price units — wider than the mid for any
+    // pair priced below ~$7.60.  When hs > mid, bid = mid - hs < 0 and
+    // is floored to zero, which:
+    //   (a) destroys the inventory-skew signal (reservation_mid shifts
+    //       far above market mid);
+    //   (b) makes spread_bps = 10000*(ask-0)/mid absurdly large;
+    //   (c) results in pathological reservation_mid in Step 6.
+    //
+    // Cap hs to max_half_spread_pct of mid (default 49%) so that bid
+    // always stays positive and the inventory skew remains effective.
+    // Applied BEFORE the regime multiplier so that regime-dependent
+    // spread scaling (e.g., 0.8× in mean-revert) still differentiates.
+    // The engine's Step 5 spread cap (max_half_spread_bps) provides the
+    // final refinement; this cap prevents the upstream pathology.
+    // -------------------------------------------------------------------
+    if (mid > 0.0) {
+        const double max_hs = mid * cfg_.max_half_spread_pct;
+        if (hs > max_hs) {
+            hs = max_hs;
+        }
+    }
+
     hs *= regime_.spread_mult;
 
     // -------------------------------------------------------------------

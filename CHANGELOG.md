@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.35] — 2026-04-10
+
+### Fixed
+
+- **Half-spread explosion destroys bids** (avellaneda.cpp, glft.cpp): The A-S/GLFT formula `(1/κ)·ln(1+κ/γ)` produces an absolute spread (~3.81 price units with γ=0.005, κ=1.5) that exceeds the mid price for any pair under ~$7.60, flooring bids to zero. Added a 49% mid-price cap on delta BEFORE the regime multiplier so bids stay positive and regime differentiation is preserved.
+
+- **Gate 2 XCH deadlock** (engine.cpp): XCH spendable-reserve ratio (spendable/confirmed) was artificially low (~9%) because 91% of XCH was locked in the trader's own pending offers. Gate 2 suppressed the ask side, preventing offers from cycling. Exempted XCH (wallet_id 1) from Gate 2 since the offer_manager's UTXO-lock pre-check already guards XCH spendable.
+
+- **Dust filter drops all tiers** (config.hpp, config.yaml): `min_offer_size_units` defaulted to 1.0 XCH, but with ~27 XCH split across 4 pairs × 6 tiers × 2 sides, each tier was ~0.33 XCH — all dropped as dust. Lowered default to 0.1.
+
 ## [0.7.34] — 2026-04-10
 
 ### Fixed

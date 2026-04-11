@@ -92,6 +92,15 @@ struct GlftConfig {
 
     double q_max{1000.0};  // Maximum tolerated inventory in base-asset units.
 
+    // -- Half-spread price-level cap ----------------------------------------
+
+    double max_half_spread_pct{0.49}; // Maximum half-spread as a fraction of mid.
+                                      //   The A-S term1 (1/kappa)*ln(1+kappa/gamma)
+                                      //   is price-level-independent.  For low-price
+                                      //   pairs it can exceed mid, making bid <= 0.
+                                      //   Cap hs to mid * max_half_spread_pct so the
+                                      //   bid stays positive.  Default 0.49 (49%).
+
     // -- Horizon (used only for the gamma * sigma^2 * tau term) -------------
 
     uint32_t horizon_blocks{120};     // Rolling N-block horizon for the spread
