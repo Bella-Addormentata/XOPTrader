@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.37] — 2026-04-11
+
+### Added
+
+- **Sigma floor for GLFT formula** (config.hpp, engine.cpp): When the Yang-Zhang volatility estimator returns zero (flat market with no price movement), the GLFT raw half-spread degenerates to `(1/κ)ln(1+κ/γ)` and the volatility-driven position-sizing term vanishes entirely. Added `sigma_floor` config parameter (default 0.001) applied in Steps 4 and 6, keeping the formula well-behaved and producing meaningful inventory-aware quotes even in flat markets.
+
+- **Size-based staleness detection** (offer_manager.cpp): The selective-refresh classification previously only checked price deviation — existing offers whose sizes became a mismatch after the market allocator reshuffled capital fractions would stay "Fresh" indefinitely, preventing right-sizing. Now checks if a pending offer's size exceeds 2× the new optimal size (`kSizeStaleThreshold = 2.0`) and marks it Stale, triggering a cancel+repost with correct allocation-scaled sizing.
+
+### Changed
+
+- **Lowered `min_trading_units`** (config.yaml): 0.5 → 0.1 XCH. The previous threshold blocked ask-side offers whenever XCH spendable dropped below 0.5 (common after pending offers lock XCH), suppressing half the order book. At 0.1, the engine can post ask-side offers with as little as 0.1 XCH spendable.
+
 ## [0.7.36] — 2026-04-10
 
 ### Fixed

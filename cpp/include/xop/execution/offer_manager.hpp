@@ -721,6 +721,12 @@ private:
     /// this fraction.  Must be ≥ the reservation_mid max_deviation_pct
     /// (typically 2%) to avoid false expiry from model+clamp noise.
     static constexpr double kSoftTtlAdverseThreshold = 0.02;
+
+    /// [v0.7.37] Size-based staleness: if a pending offer's size is more
+    /// than kSizeStaleThreshold × the new optimal size, treat it as stale.
+    /// This catches over-allocation after the market allocator reshuffles
+    /// capital fractions.  2.0 = pending offer is ≥ 2× the new optimal.
+    static constexpr double kSizeStaleThreshold = 2.0;
 };
 
 }  // namespace xop::execution

@@ -2395,6 +2395,12 @@ void Engine::step_compute_quotes(BlockHeight block_height)
             sigma = vol_it->second->get_sigma_annual();
         }
 
+        // [v0.7.37] Sigma floor: prevent degenerate GLFT when Yang-Zhang
+        // returns zero (flat market).  The floor keeps the volatility-driven
+        // position-sizing term alive and avoids extreme raw half-spreads.
+        if (config_.strategy.sigma_floor > 0.0) {
+            sigma = std::max(sigma, config_.strategy.sigma_floor);
+        }
         // Compute inventory (signed net position in the pair's base asset).
         // Convert from mojos to base-asset display units so that q and q_max
         // are in the same units (T1-12 fix: prevents ~10^12 ratio error).
@@ -3204,6 +3210,10 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             sigma = vol_it->second->get_sigma_annual();
         }
 
+        // [v0.7.37] Sigma floor (same as Step 4).
+        if (config_.strategy.sigma_floor > 0.0) {
+            sigma = std::max(sigma, config_.strategy.sigma_floor);
+        }
         // Inventory ratio for skew (O(1) pair config lookup).
         double inv_ratio = 0.5;
         const PairConfig* pair_cfg = find_pair_config(pair_name);

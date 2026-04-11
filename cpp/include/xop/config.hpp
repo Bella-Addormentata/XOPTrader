@@ -185,6 +185,13 @@ struct StrategyConfig {
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
 
+    /// Minimum annualized sigma passed to the GLFT/A-S formula.
+    /// When the Yang-Zhang estimator returns zero (flat market), the
+    /// raw half-spread degenerates to (1/kappa)*ln(1+kappa/gamma) and
+    /// the volatility-driven position-sizing term vanishes.  A small
+    /// floor keeps the formula well-behaved.  Default 0.001 (~0.1%).
+    double   sigma_floor{0.001};
+
     /// High-volatility regime multiplier for spread widening.
     /// Applied multiplicatively to the base spread when the regime
     /// detector flags high volatility.  Default 1.80 (80% wider).

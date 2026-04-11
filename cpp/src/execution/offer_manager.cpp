@@ -1128,13 +1128,15 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     auto pending = state_->get_all_offers();
     if (pending.empty()) return results;
 
-    // Build a lookup: (side, tier_index) -> new optimal price.
+    // Build lookups: (side, tier_index) -> new optimal price/size.
     // This allows O(1) comparison for each pending offer.
     std::unordered_map<std::string, Mojo> optimal_prices;
+    std::unordered_map<std::string, Mojo> optimal_sizes;
     for (const auto& tq : new_ladder) {
         std::string key = std::to_string(static_cast<int>(tq.side))
                         + "_" + std::to_string(tq.tier_index);
         optimal_prices[key] = tq.price;
+        optimal_sizes[key]  = tq.size;
     }
 
     const double mid_p = static_cast<double>(mid_price);
@@ -1276,6 +1278,30 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                 tc.staleness = TierStaleness::Stale;
             } else {
                 tc.staleness = TierStaleness::Fresh;
+            }
+        }
+
+        // [v0.7.37] Size-based staleness override.
+        // When the market allocator changes allocation fractions, existing
+        // offers may be significantly oversized relative to the new optimal.
+        // If the pending offer's size is > 2x the new ladder's optimal size,
+        // override Fresh→Stale to trigger a cancel+repost with correct sizing.
+        // Respects the minimum age guard: only apply past kMinRefreshAgeBlocks.
+        if (tc.staleness == TierStaleness::Fresh
+            && age >= kMinRefreshAgeBlocks) {
+            auto sz_it = optimal_sizes.find(key);
+            if (sz_it != optimal_sizes.end() && sz_it->second > 0) {
+                const double size_ratio =
+                    static_cast<double>(po.size)
+                    / static_cast<double>(sz_it->second);
+                if (size_ratio > kSizeStaleThreshold) {
+                    tc.staleness = TierStaleness::Stale;
+                    logger_->debug("classify_tier_staleness({}): tier {} {} "
+                                   "size oversized {:.1f}x ({}→{}) -- marking "
+                                   "stale", pair_name, po.tier,
+                                   to_string(po.side), size_ratio,
+                                   po.size, sz_it->second);
+                }
             }
         }
 

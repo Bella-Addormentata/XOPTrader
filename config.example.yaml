@@ -120,6 +120,7 @@ strategy:
   q_max: 1000            # [REQUIRED] Max inventory in base units
   min_profit_margin_bps: 35  # [REQUIRED] Never post ask below cost_basis + this margin
   high_vol_multiplier: 1.3   # [OPTIONAL, default: 1.3] Spread widening multiplier during high-vol regimes
+  sigma_floor: 0.001         # [OPTIONAL, default: 0.001] Minimum annualized sigma for GLFT formula (prevents degenerate spreads when market is flat)
   offer_ttl_blocks: 600      # [REQUIRED] Soft TTL: cancel stale offers after N blocks (~5 hours at 600)
   num_tiers: 6               # [REQUIRED] Multi-tier offer ladder depth
   tier_spacing_bps: [35, 60, 120, 180, 240, 300]  # [REQUIRED] Spread per tier (bps)

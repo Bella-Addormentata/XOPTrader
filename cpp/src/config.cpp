@@ -673,6 +673,15 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     cfg.kappa                = read_positive_double(node, "kappa", sec);
     cfg.phi                  = read_positive_double(node, "phi", sec);
     cfg.q_max                = read_positive_double(node, "q_max", sec);
+
+    // [v0.7.37] sigma_floor: minimum annualized sigma for GLFT formula.
+    if (node["sigma_floor"] && node["sigma_floor"].IsDefined()
+        && !node["sigma_floor"].IsNull()) {
+        cfg.sigma_floor = node["sigma_floor"].as<double>();
+        if (cfg.sigma_floor < 0.0) {
+            throw ConfigError(sec + ".sigma_floor must be >= 0");
+        }
+    }
     cfg.min_profit_margin_bps = read_positive_double(node, "min_profit_margin_bps", sec);
     cfg.offer_ttl_blocks     = read_uint32_positive(node, "offer_ttl_blocks", sec);
     cfg.num_tiers            = read_uint32_positive(node, "num_tiers", sec);
@@ -1606,7 +1615,8 @@ void log_config_summary(const AppConfig& cfg)
         out << cfg.strategy.tier_size_pct[i];
     }
     out << "]\n"
-        << "  max_hs_cap = " << cfg.strategy.max_half_spread_bps << " bps\n";
+        << "  max_hs_cap = " << cfg.strategy.max_half_spread_bps << " bps\n"
+        << "  sigma_floor = " << cfg.strategy.sigma_floor << "\n";
 
     // Risk -- all fields are tuning parameters.
     out << "[risk]\n"
