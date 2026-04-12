@@ -1043,6 +1043,49 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         }
     }
 
+    // -- Post-adjustment invariant: our own bids must never >= our own asks ---
+    // The competitive anchor and strategy adjustments are applied independently
+    // to each side.  When the microprice sits near the best competing bid
+    // (asymmetric orderbook depth), the bid can spike above the ask, producing
+    // a negative spread.  The crossed_mid guard in Step 8 papers over this by
+    // cancelling the bid retroactively, but the ask may have already been filled
+    // (providing an immediate fill at best_bid -- observed at blocks 8578907 and
+    // 8579104 for XCH/DBX, 0.010% crossing, asks filled by competitor bids).
+    //
+    // Drop any tier that would create a cross:
+    //   - Bids with price >= min_ask (they'd cross or match an ask on our book)
+    //   - Asks with price <= max_bid (they'd cross or match a bid on our book)
+    {
+        std::int64_t max_bid = 0;
+        std::int64_t min_ask = std::numeric_limits<std::int64_t>::max();
+        bool has_bids = false;
+        bool has_asks = false;
+        for (const auto& tq : ladder) {
+            if (tq.side == Side::Bid) {
+                max_bid = std::max(max_bid, tq.price);
+                has_bids = true;
+            }
+            if (tq.side == Side::Ask) {
+                min_ask = std::min(min_ask, tq.price);
+                has_asks = true;
+            }
+        }
+        if (has_bids && has_asks && max_bid >= min_ask) {
+            const std::size_t before = ladder.size();
+            ladder.erase(
+                std::remove_if(ladder.begin(), ladder.end(),
+                    [min_ask, max_bid](const TierQuote& t) {
+                        return (t.side == Side::Bid && t.price >= min_ask)
+                            || (t.side == Side::Ask && t.price <= max_bid);
+                    }),
+                ladder.end());
+            spdlog::warn("[Liquidity] {} post-adjustment cross: "
+                         "max_bid={} >= min_ask={} -- dropped {}/{} tiers",
+                         pair_name_, max_bid, min_ask,
+                         before - ladder.size(), before);
+        }
+    }
+
     return ladder;
 }
 
