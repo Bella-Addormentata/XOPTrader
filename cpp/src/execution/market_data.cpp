@@ -47,6 +47,86 @@
 namespace xop {
 
 // =========================================================================
+//  Anonymous helpers
+// =========================================================================
+
+namespace {
+
+// -------------------------------------------------------------------------
+// compute_orderbook_mid_impl -- depth-weighted VWAP micro-price
+//
+// Computes a fair mid-price from competing offers using:
+//   1. VWAP across the top `depth` levels per side (bid / ask).
+//   2. Micro-price weighting: weight each side's VWAP by the *opposite*
+//      side's total depth.  This shifts the fair price toward the side
+//      with more liquidity (the side less likely to move).
+//
+// When only one side has offers, returns that side's VWAP.
+// Returns 0.0 if no offers are available.
+//
+// Reference: Stoikov (2018), "The Micro-Price -- a high-frequency
+//            estimator of future prices".
+// -------------------------------------------------------------------------
+
+double compute_orderbook_mid_impl(
+    const std::vector<CompetingOffer>& offers,
+    std::size_t                        depth)
+{
+    if (offers.empty() || depth == 0) return 0.0;
+
+    // Separate bids and asks with (price, size) in double.
+    struct Level { double price; double size; };
+    std::vector<Level> bids, asks;
+    bids.reserve(offers.size());
+    asks.reserve(offers.size());
+
+    for (const auto& o : offers) {
+        const double px = static_cast<double>(o.price)
+                          / static_cast<double>(kMojosPerXch);
+        const double sz = static_cast<double>(o.size);  // raw mojos, units cancel in VWAP
+        if (o.side == Side::Bid) {
+            bids.push_back({px, sz});
+        } else {
+            asks.push_back({px, sz});
+        }
+    }
+
+    // Sort: bids descending (best first), asks ascending (best first).
+    std::sort(bids.begin(), bids.end(),
+              [](const Level& a, const Level& b) { return a.price > b.price; });
+    std::sort(asks.begin(), asks.end(),
+              [](const Level& a, const Level& b) { return a.price < b.price; });
+
+    // VWAP across top N levels per side.
+    auto vwap = [](const std::vector<Level>& levels,
+                   std::size_t n) -> std::pair<double, double> {
+        double num = 0.0, den = 0.0;
+        const std::size_t limit = std::min(levels.size(), n);
+        for (std::size_t i = 0; i < limit; ++i) {
+            num += levels[i].price * levels[i].size;
+            den += levels[i].size;
+        }
+        return {den > 0.0 ? num / den : 0.0, den};
+    };
+
+    const auto [bid_vwap, bid_depth] = vwap(bids, depth);
+    const auto [ask_vwap, ask_depth] = vwap(asks, depth);
+
+    // Two-sided: micro-price (opposite-side depth weighting).
+    if (bid_vwap > 0.0 && ask_vwap > 0.0) {
+        return (ask_depth * bid_vwap + bid_depth * ask_vwap)
+               / (bid_depth + ask_depth);
+    }
+
+    // One-sided fallback.
+    if (bid_vwap > 0.0) return bid_vwap;
+    if (ask_vwap > 0.0) return ask_vwap;
+    return 0.0;
+}
+
+}  // anonymous namespace
+
+// =========================================================================
 //  Construction / destruction / move
 // =========================================================================
 
@@ -648,6 +728,7 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // compute_mid -- multi-source price aggregation
 //
 // Priority cascade:
+//   0. Order-book VWAP micro-price (depth-weighted, when enabled)
 //   1. Dexie two-sided quotes -> dex_mid = (bid + ask) / 2
 //   2. Dexie one-sided (bid-only or ask-only) -> dex_mid = available side
 //   3. Dexie last trade (no live quotes) -> dex_mid = last_trade
@@ -665,10 +746,21 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // -------------------------------------------------------------------------
 
 double MarketDataFeed::compute_mid(const PairState& ps) const {
+    // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+
     double dex_mid = 0.0;
 
+    // Case 0: Prefer order-book-derived VWAP micro-price when available.
+    // This is computed from the top N levels of dust-filtered competing
+    // offers and weights by depth — more robust than simple BBO midpoint.
+    if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0) {
+        dex_mid = ps.orderbook_mid;
+        spdlog::debug("[MarketData] {} using orderbook_mid={:.6f}",
+                      ps.pair_name, dex_mid);
+    }
     // Case 1: Two-sided dexie order book.
-    if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0) {
+    else if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0) {
         dex_mid = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
     }
     // Case 2: One-sided dexie (unusual but possible in thin markets).
@@ -693,7 +785,7 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // Determine AMM availability + freshness.
     double amm_mid = 0.0;
     if (ps.amm_mid > 0.0 && w_amm > 0.0) {
-        const double amm_threshold = config_.amm_freshness_threshold_sec;
+        const double amm_threshold = cfg.amm_freshness_threshold_sec;
         if (amm_threshold > 0.0
             && ps.amm_updated_at != Timestamp{})
         {
@@ -711,7 +803,7 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // Determine CEX availability + freshness.
     double cex_mid = 0.0;
     if (ps.cex_mid > 0.0) {
-        const double threshold = config_.cex_freshness_threshold_sec;
+        const double threshold = cfg.cex_freshness_threshold_sec;
         if (threshold > 0.0
             && ps.cex_updated_at != Timestamp{})
         {
@@ -1041,6 +1133,12 @@ void MarketDataFeed::ingest_competing_offers(
             }
         }
 
+        // Compute depth-weighted VWAP micro-price from the filtered book.
+        // This must happen BEFORE the move into competing_offers_.
+        const double ob_mid = cfg.orderbook_mid_enabled
+            ? compute_orderbook_mid_impl(filtered, cfg.orderbook_mid_depth)
+            : 0.0;
+
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
 
@@ -1050,7 +1148,7 @@ void MarketDataFeed::ingest_competing_offers(
         // acquire pairs lock separately.
         lock.unlock();
 
-        if (filtered_best_bid > 0.0 || filtered_best_ask > 0.0) {
+        if (filtered_best_bid > 0.0 || filtered_best_ask > 0.0 || ob_mid > 0.0) {
             std::unique_lock plk(mtx_pairs_);
             PairState& ps = get_or_create_pair(pair_name);
             if (filtered_best_bid > 0.0) {
@@ -1059,10 +1157,14 @@ void MarketDataFeed::ingest_competing_offers(
             if (filtered_best_ask > 0.0) {
                 ps.dex_best_ask = filtered_best_ask;
             }
+            if (ob_mid > 0.0) {
+                ps.orderbook_mid = ob_mid;
+            }
             ps.dex_updated_at = std::chrono::system_clock::now();
             spdlog::debug("[MarketData] Dust-filtered BBO for {}: "
-                          "bid={:.6f} ask={:.6f}",
-                          pair_name, filtered_best_bid, filtered_best_ask);
+                          "bid={:.6f} ask={:.6f} ob_mid={:.6f}",
+                          pair_name, filtered_best_bid, filtered_best_ask,
+                          ob_mid);
         }
     }
 

@@ -407,6 +407,12 @@ market_data:
   # CEX data freshness: seconds before CEX weight decays to zero
   cex_freshness_threshold_sec: 120.0
 
+  # Order-book-derived mid-price: use depth-weighted VWAP micro-price from
+  # competing offers instead of simple BBO midpoint.  Gives more authority
+  # over price determination by analyzing actual liquidity depth.
+  orderbook_mid_enabled: true            # true = use depth-weighted orderbook mid
+  orderbook_mid_depth: 5                 # Number of levels per side for VWAP
+
 # --- adverse_selection: OPTIONAL (omit section to use defaults) ---------------
 # Bayesian PIN estimator parameters.  All fields are OPTIONAL.
 adverse_selection:

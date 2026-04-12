@@ -139,6 +139,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     md_cfg.cex_freshness_threshold_sec  = config_.market_data.cex_freshness_threshold_sec;
     md_cfg.amm_blend_weight             = config_.strategy.amm_blend_weight;
     md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
+    md_cfg.orderbook_mid_enabled        = config_.market_data.orderbook_mid_enabled;
+    md_cfg.orderbook_mid_depth          = config_.market_data.orderbook_mid_depth;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -233,6 +235,9 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.fill_rate_blend           = config_.strategy.fill_rate_blend;
         liq_cfg.fill_rate_lookback_hours  = config_.strategy.fill_rate_lookback_hours;
         liq_cfg.fill_rate_min_pct         = config_.strategy.fill_rate_min_pct;
+
+        // Inventory skew strength -- must be wired from config.
+        liq_cfg.phi = config_.strategy.phi;
 
         // Stablecoin overrides: skip adverse-selection and gap-aware
         // adjustments that widen spreads counterproductively.

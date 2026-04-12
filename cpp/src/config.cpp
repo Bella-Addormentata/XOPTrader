@@ -1817,6 +1817,10 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     // CEX freshness.
     read_dbl ("cex_freshness_threshold_sec",   cfg.cex_freshness_threshold_sec);
 
+    // Order-book-derived mid-price.
+    read_bool("orderbook_mid_enabled",         cfg.orderbook_mid_enabled);
+    read_u32 ("orderbook_mid_depth",           cfg.orderbook_mid_depth);
+
     // Validate ranges.
     if (cfg.whale_volume_fraction < 0.0 || cfg.whale_volume_fraction > 1.0) {
         throw ConfigError(sec + ".whale_volume_fraction must be in [0, 1]");
@@ -1829,6 +1833,9 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     }
     if (cfg.asymmetric_skew_factor < 0.0 || cfg.asymmetric_skew_factor > 1.0) {
         throw ConfigError(sec + ".asymmetric_skew_factor must be in [0, 1]");
+    }
+    if (cfg.orderbook_mid_depth == 0) {
+        throw ConfigError(sec + ".orderbook_mid_depth must be > 0");
     }
 
     return cfg;

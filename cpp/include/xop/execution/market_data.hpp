@@ -226,6 +226,21 @@ struct MarketDataConfig {
     /// Maximum staleness (seconds) of AMM data before it is ignored.
     /// Default 300 s (5 min).  0 = disable freshness check.
     double amm_freshness_threshold_sec{300.0};
+
+    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+
+    /// When true, compute_mid() prefers an order-book-derived mid-price
+    /// (depth-weighted VWAP micro-price) over the simple Dexie BBO midpoint.
+    /// The order-book mid is computed from the top `orderbook_mid_depth` levels
+    /// per side of the dust-filtered competing offers.
+    /// Default: true.
+    bool orderbook_mid_enabled{true};
+
+    /// Number of order book levels per side to include in the VWAP
+    /// micro-price computation.  Higher values give a more robust estimate
+    /// at the cost of including offers further from fair value.
+    /// Default: 5 levels per side.
+    std::size_t orderbook_mid_depth{5};
 };
 
 // ---------------------------------------------------------------------------
@@ -248,6 +263,9 @@ struct PairState {
     // --- AMM reference (TibetSwap implied price) ---
     double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)
     Timestamp   amm_updated_at{};   // When AMM data was last refreshed
+
+    // --- Order-book-derived mid (depth-weighted VWAP micro-price) ---
+    double      orderbook_mid{0.0}; // VWAP micro-price from competing offers
 
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)

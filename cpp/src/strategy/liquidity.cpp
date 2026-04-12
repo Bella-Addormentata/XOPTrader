@@ -816,6 +816,15 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                 // ascending baseline tier_spacing_bps.
                 std::sort(gap_centers.begin(), gap_centers.end());
 
+                // Scale the blend factor by order book depth.  With very
+                // few competing offers (e.g. 2) the gaps are statistical
+                // noise; with 10+ offers the analysis is meaningful.
+                // depth_scale ramps linearly from 0 at 0 offers to 1.0
+                // at 10 offers.
+                const double depth_scale = std::min(
+                    1.0,
+                    static_cast<double>(competing_offers.size()) / 10.0);
+
                 // Blend each tier's spacing toward the nearest gap center.
                 for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {
                     // Find the closest gap center for this tier.
@@ -829,8 +838,11 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                         }
                     }
 
-                    // Blend: adjusted = (1-f)*baseline + f*gap_center.
-                    const double blend = adj_cfg.gap_blend_factor;
+                    // Blend: adjusted = (1-f)*baseline + f*gap_center,
+                    // where f is depth-scaled to avoid over-reacting to
+                    // thin books.
+                    const double blend =
+                        adj_cfg.gap_blend_factor * depth_scale;
                     double adjusted = (1.0 - blend) * adj_cfg.tier_spacing_bps[i]
                                     + blend * closest_gap;
 
@@ -847,8 +859,10 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                 }
 
                 spdlog::debug("[Liquidity] {} gap-aware spacing: "
-                              "gaps={} adjusted spacing=[{}]",
+                              "gaps={} depth={} blend={:.2f} adjusted spacing=[{}]",
                               pair_name_, gap_centers.size(),
+                              competing_offers.size(),
+                              adj_cfg.gap_blend_factor * depth_scale,
                               [&]() {
                                   std::string s;
                                   for (std::uint32_t i = 0; i < adj_cfg.num_tiers; ++i) {

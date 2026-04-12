@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.40] — 2026-04-12
+
+### Added
+
+- **Order-book-derived mid-price (depth-weighted VWAP micro-price)**: Instead of relying solely on the Dexie ticker BBO midpoint, the market data aggregator now computes a depth-weighted VWAP micro-price from the top N levels of dust-filtered competing offers. The micro-price weights each side's VWAP by the opposite side's total depth (Stoikov 2018), giving the engine its own independent fair-price estimate. This replaces the simple `(best_bid + best_ask) / 2` as the DEX component of the 70/30 blend with CEX. Configurable via `market_data.orderbook_mid_enabled` (default: true) and `market_data.orderbook_mid_depth` (default: 5 levels per side).
+
+### Fixed
+
+- **LiquidityConfig phi never wired from config** (engine.cpp): The `phi` (inventory skew strength) field in `LiquidityConfig` defaulted to 1.5 in the struct definition but was never set from the parsed `config.yaml` value (0.8). This caused `bid_mult = 1 + 1.5 × deviation` instead of `1 + 0.8 × deviation`, pushing all bid tiers ~40% further from mid than intended. Now wired as `liq_cfg.phi = config_.strategy.phi`.
+
+- **Thread safety in compute_mid()** (market_data.cpp): Replaced two unsynchronised accesses to `config_.amm_freshness_threshold_sec` and `config_.cex_freshness_threshold_sec` with a properly locked config snapshot, consistent with the `[MEDIUM-1]` pattern used elsewhere.
+
+- **Gap-aware spacing depth scaling** (liquidity.cpp): The gap_blend_factor is now scaled by order book depth (linear ramp from 0 at 0 competing offers to 1.0 at 10 offers). On thin books (e.g. only 2 competing offers), the gap analysis was pulling ALL tiers far from mid to fill desert gaps, inflating spacing from [35, 100, 200, 300] to [464, 490, 530, 570] bps. With depth scaling, a 2-offer book yields effective blend of 0.12 instead of 0.60, keeping tiers close to their configured baseline.
+
 ## [0.7.39] — 2026-04-12
 
 ### Changed

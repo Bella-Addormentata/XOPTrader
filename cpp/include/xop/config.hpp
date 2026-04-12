@@ -799,6 +799,16 @@ struct MarketDataSettings {
     // -- CEX freshness ------------------------------------------------------
     /// Seconds before CEX data weight decays to zero.
     double cex_freshness_threshold_sec{120.0};
+
+    // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
+
+    /// When true, the aggregator prefers a depth-weighted VWAP micro-price
+    /// from competing offers over the simple Dexie BBO midpoint.
+    bool orderbook_mid_enabled{true};
+
+    /// Number of order book levels per side to include in the VWAP
+    /// micro-price computation.  Default: 5.
+    uint32_t orderbook_mid_depth{5};
 };
 
 // ---------------------------------------------------------------------------
