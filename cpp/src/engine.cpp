@@ -4957,7 +4957,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
             if (has_bbo && !fee_filtered_tiers.empty()) {
                 const Mojo bbo_mid_m = (best_bid + best_ask) / 2;
-                constexpr double kMaxBboDeviation = 0.15;  // 15%
+                constexpr double kMaxBboDeviation = 0.10;  // 10% -- matches microprice clamp
 
                 // Check 1: Model mid vs BBO sanity
                 if (mid > 0) {
