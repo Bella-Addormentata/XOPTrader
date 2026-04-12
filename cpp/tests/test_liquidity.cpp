@@ -516,4 +516,286 @@ TEST(LiquidityEdgeTest, GetCompetingOffers_EmptyWhenNone) {
     EXPECT_TRUE(offers.empty());
 }
 
+// ============================================================================
+// 6. Competitive Anchor Pricing
+// ============================================================================
+
+// Helper: make a LiquidityConfig suitable for competitive anchor tests.
+LiquidityConfig make_anchor_config(uint32_t tiers = 3) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = tiers;
+    cfg.tier_spacing_bps.resize(tiers);
+    cfg.tier_size_pct.resize(tiers);
+    for (uint32_t i = 0; i < tiers; ++i) {
+        cfg.tier_spacing_bps[i] = 50.0 + i * 50.0;
+        cfg.tier_size_pct[i] = 1.0 / static_cast<double>(tiers);
+    }
+    cfg.competitive_anchor_enabled = true;
+    cfg.competitive_anchor_stride_bps = 65.0;
+    cfg.competitive_anchor_max_distance_bps = 500.0;
+    cfg.gap_aware_spacing = false;
+    cfg.adverse_selection_sizing = false;
+    cfg.fill_rate_sizing = false;
+    return cfg;
+}
+
+TEST(CompetitiveAnchorTest, BothSidesAnchored) {
+    // Setup: mid=2.0, best_comp_bid=1.99, best_comp_ask=2.01
+    constexpr Mojo mid = 2'000'000'000'000LL;
+    constexpr Mojo comp_bid = 1'990'000'000'000LL;
+    constexpr Mojo comp_ask = 2'010'000'000'000LL;
+
+    auto cfg = make_anchor_config(3);
+    LiquidityEngine engine("T/Q", cfg);
+
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, comp_bid, 1'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, comp_ask, 1'000'000'000'000LL));
+
+    auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5,
+        10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    ASSERT_FALSE(ladder.empty());
+
+    // Tier 0 bid should be 1 tick above comp_bid (i.e., closer to mid).
+    auto bid_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Bid && tq.tier_index == 0; });
+    ASSERT_NE(bid_t0, ladder.end());
+    EXPECT_GT(bid_t0->price, comp_bid);
+    EXPECT_LE(bid_t0->price, mid);
+
+    // Tier 0 ask should be 1 tick below comp_ask (i.e., closer to mid).
+    auto ask_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Ask && tq.tier_index == 0; });
+    ASSERT_NE(ask_t0, ladder.end());
+    EXPECT_LT(ask_t0->price, comp_ask);
+    EXPECT_GE(ask_t0->price, mid);
+}
+
+TEST(CompetitiveAnchorTest, AskSide_MidAboveBestAsk) {
+    // Scenario: model mid (2.30) sits above best competing ask (2.28).
+    // This is the exact bug scenario -- with the fix, ask-side anchoring
+    // should still work because the BBO reference is used for safety.
+    constexpr Mojo mid       = 2'300'000'000'000LL;
+    constexpr Mojo comp_bid  = 2'270'000'000'000LL;
+    constexpr Mojo comp_ask  = 2'280'000'000'000LL;
+    // BBO ref = (2.27 + 2.28) / 2 = 2.275
+
+    auto cfg = make_anchor_config(3);
+    LiquidityEngine engine("T/Q", cfg);
+
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, comp_bid, 2'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, comp_ask, 2'000'000'000'000LL));
+
+    auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5,
+        10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    ASSERT_FALSE(ladder.empty());
+
+    // Ask Tier 0: anchor = comp_ask - 1tick = ~2.2798
+    // Safety: new_price >= bbo_ref (2.275), which 2.2798 satisfies.
+    auto ask_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Ask && tq.tier_index == 0; });
+    ASSERT_NE(ask_t0, ladder.end());
+    // The ask should be near 2.28, NOT stuck at 2.30+ (the old bug).
+    EXPECT_LT(ask_t0->price, mid);
+    EXPECT_GE(ask_t0->price, comp_bid);  // never below best bid
+}
+
+TEST(CompetitiveAnchorTest, DistanceTooFar_FallsBack) {
+    // When the best competing offer is > max_distance_bps from mid,
+    // anchoring should be skipped (offers remain at original positions).
+    constexpr Mojo mid      = 2'000'000'000'000LL;
+    constexpr Mojo far_bid  = 1'800'000'000'000LL;  // 1000bps from mid
+    constexpr Mojo far_ask  = 2'200'000'000'000LL;  // 1000bps from mid
+
+    auto cfg = make_anchor_config(2);
+    cfg.competitive_anchor_max_distance_bps = 500.0;
+    LiquidityEngine engine("T/Q", cfg);
+
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, far_bid, 1'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, far_ask, 1'000'000'000'000LL));
+
+    auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5,
+        10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    ASSERT_FALSE(ladder.empty());
+
+    // Tier 0 bid should NOT be near far_bid (not anchored).
+    auto bid_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Bid && tq.tier_index == 0; });
+    ASSERT_NE(bid_t0, ladder.end());
+    // Un-anchored bid should be closer to mid than far_bid.
+    EXPECT_GT(bid_t0->price, far_bid + 100'000'000'000LL);
+}
+
+TEST(CompetitiveAnchorTest, OneSidedCompetition_BidOnly) {
+    // Only bid-side competing offers exist; ask side should fall back.
+    constexpr Mojo mid      = 2'000'000'000'000LL;
+    constexpr Mojo comp_bid = 1'990'000'000'000LL;
+
+    auto cfg = make_anchor_config(2);
+    LiquidityEngine engine("T/Q", cfg);
+
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, comp_bid, 1'000'000'000'000LL));
+
+    auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5,
+        10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    ASSERT_FALSE(ladder.empty());
+
+    // Bid should be anchored (near comp_bid + tick).
+    auto bid_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Bid && tq.tier_index == 0; });
+    ASSERT_NE(bid_t0, ladder.end());
+    EXPECT_GT(bid_t0->price, comp_bid);
+    EXPECT_LT(bid_t0->price, comp_bid + 1'000'000'000LL);
+
+    // Ask should NOT be anchored (no competing asks).
+    // It should be at the model-derived position (above mid).
+    auto ask_t0 = std::find_if(ladder.begin(), ladder.end(),
+        [](const TierQuote& tq) { return tq.side == Side::Ask && tq.tier_index == 0; });
+    ASSERT_NE(ask_t0, ladder.end());
+    EXPECT_GE(ask_t0->price, mid);
+}
+
+TEST(CompetitiveAnchorTest, TierStride_Descends) {
+    // Verify that bid tiers step DOWN from the anchor by stride_bps.
+    constexpr Mojo mid      = 2'000'000'000'000LL;
+    constexpr Mojo comp_bid = 1'990'000'000'000LL;
+    constexpr Mojo comp_ask = 2'010'000'000'000LL;
+
+    auto cfg = make_anchor_config(3);
+    cfg.competitive_anchor_stride_bps = 100.0;  // 100bps per tier
+    LiquidityEngine engine("T/Q", cfg);
+
+    std::vector<CompetingOffer> offers;
+    offers.push_back(make_offer(Side::Bid, comp_bid, 1'000'000'000'000LL));
+    offers.push_back(make_offer(Side::Ask, comp_ask, 1'000'000'000'000LL));
+
+    auto ladder = engine.compute_ladder(
+        mid, 0.03, 0.5,
+        10'000'000'000'000LL, 10'000'000'000'000LL,
+        offers, cfg);
+
+    // Collect bid tier prices sorted by tier_index.
+    std::vector<Mojo> bid_prices;
+    for (const auto& tq : ladder) {
+        if (tq.side == Side::Bid) bid_prices.push_back(tq.price);
+    }
+    std::sort(bid_prices.begin(), bid_prices.end(), std::greater<>());
+
+    ASSERT_GE(bid_prices.size(), 2u);
+    // Each subsequent bid tier should be lower (further from mid).
+    for (size_t i = 1; i < bid_prices.size(); ++i) {
+        EXPECT_LT(bid_prices[i], bid_prices[i - 1])
+            << "Bid tier " << i << " should be lower than tier " << (i - 1);
+    }
+}
+
+// ============================================================================
+// 7. Dust Filter Denomination Awareness
+// ============================================================================
+
+TEST(DustFilterTest, BidSideNotFilteredWithCorrectDenom) {
+    // Verify that bid-side competing offers denominated in a small-mpu
+    // quote asset (e.g. wUSDC with 1e3 mojos/unit) are NOT filtered
+    // when quote_mojos_per_unit is provided correctly.
+    State state;
+    MarketDataConfig md_cfg;
+    md_cfg.enable_competitor_tracking = true;
+    md_cfg.min_competitor_offer_size = 100'000'000'000LL;  // 0.1 XCH
+    MarketDataFeed feed(md_cfg, state);
+
+    constexpr Mojo xch_mpu  = 1'000'000'000'000LL;
+    constexpr Mojo usdc_mpu = 1'000LL;  // wUSDC.b
+
+    std::vector<CompetingOffer> offers;
+    // A bid offering 2.28 wUSDC (= 2280 mojos in wUSDC denomination).
+    // This is ~1 XCH worth — a legitimate offer, not dust.
+    CompetingOffer bid;
+    bid.offer_id = "bid1";
+    bid.pair_name = "XCH/wUSDC.b";
+    bid.side = Side::Bid;
+    bid.price = 2'280'000'000'000LL;
+    bid.size = 2280;  // 2.28 wUSDC * 1000 mojos/wUSDC
+    bid.first_seen_block = 100;
+    bid.last_seen_block = 100;
+    bid.last_seen_ts = std::chrono::system_clock::now();
+    offers.push_back(bid);
+
+    // An ask offering 1 XCH (= 1e12 mojos).
+    CompetingOffer ask;
+    ask.offer_id = "ask1";
+    ask.pair_name = "XCH/wUSDC.b";
+    ask.side = Side::Ask;
+    ask.price = 2'280'000'000'000LL;
+    ask.size = 1'000'000'000'000LL;
+    ask.first_seen_block = 100;
+    ask.last_seen_block = 100;
+    ask.last_seen_ts = std::chrono::system_clock::now();
+    offers.push_back(ask);
+
+    std::unordered_set<std::string> own_ids;
+
+    // With correct denomination: both offers should survive dust filter.
+    feed.ingest_competing_offers("XCH/wUSDC.b", offers, own_ids,
+                                  xch_mpu, usdc_mpu);
+    auto result = feed.get_competing_offers("XCH/wUSDC.b");
+    EXPECT_EQ(result.size(), 2u)
+        << "Both bid and ask should survive with correct denomination";
+
+    // Verify bid is present.
+    bool has_bid = false;
+    bool has_ask = false;
+    for (const auto& o : result) {
+        if (o.side == Side::Bid) has_bid = true;
+        if (o.side == Side::Ask) has_ask = true;
+    }
+    EXPECT_TRUE(has_bid) << "Bid should NOT be filtered as dust";
+    EXPECT_TRUE(has_ask) << "Ask should NOT be filtered as dust";
+}
+
+TEST(DustFilterTest, BidSideFilteredWithOldDefault) {
+    // Demonstrate the OLD bug: with default base_mojos_per_unit only,
+    // the bid-side offer (2280 mojos) would be filtered as dust
+    // against the 1e12 threshold.
+    State state;
+    MarketDataConfig md_cfg;
+    md_cfg.enable_competitor_tracking = true;
+    md_cfg.min_competitor_offer_size = 100'000'000'000LL;
+    MarketDataFeed feed(md_cfg, state);
+
+    std::vector<CompetingOffer> offers;
+    CompetingOffer bid;
+    bid.offer_id = "bid1";
+    bid.pair_name = "XCH/wUSDC.b";
+    bid.side = Side::Bid;
+    bid.price = 2'280'000'000'000LL;
+    bid.size = 2280;  // 2.28 wUSDC in cat mojos — tiny vs 1e12 threshold
+    bid.first_seen_block = 100;
+    bid.last_seen_block = 100;
+    bid.last_seen_ts = std::chrono::system_clock::now();
+    offers.push_back(bid);
+
+    std::unordered_set<std::string> own_ids;
+
+    // With both params defaulting to 1e12 — bid size 2280 < 1e12 → filtered.
+    feed.ingest_competing_offers("XCH/wUSDC.b", offers, own_ids);
+    auto result = feed.get_competing_offers("XCH/wUSDC.b");
+    EXPECT_EQ(result.size(), 0u)
+        << "With default denomination, tiny bid should be filtered";
+}
+
 }  // namespace

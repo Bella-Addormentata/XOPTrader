@@ -1767,7 +1767,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 
             market_data_->ingest_competing_offers(
                 pair.name, comp_offers, own_ids,
-                pair.base_mojos_per_unit);
+                pair.base_mojos_per_unit, pair.quote_mojos_per_unit);
         } catch (const std::exception& ex) {
             // Transient dexie errors should not abort the cycle.
             // ISO/IEC 5055: checked error handling with logging.
@@ -4169,7 +4169,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
-                * static_cast<double>(kMojosPerXch))));
+                * static_cast<double>(kMojosPerXch))),
+            config_.strategy.competitive_anchor_enabled);
 
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;

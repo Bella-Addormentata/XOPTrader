@@ -5,6 +5,20 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.42] — 2026-04-12
+
+### Fixed
+
+- **Dust filter denomination awareness** (market_data.hpp, market_data.cpp, engine.cpp): The competing-offer dust filter used `base_mojos_per_unit` (1e12 for XCH) for ALL offers regardless of side. Bid-side offers are denominated in the quote asset (e.g. wUSDC.b at 1e3 mojos/unit), so their sizes of ~2,280 mojos were well below the 1e12 effective minimum and were silently discarded as dust. Added a `quote_mojos_per_unit` parameter and made the dust filter side-aware: bids use `quote_mojos_per_unit`, asks use `base_mojos_per_unit`.
+
+- **Anchor distance uses abs() and BBO reference** (liquidity.cpp): The anchor distance check computed `(best_comp - mid) / mid` without absolute value, producing a negative result when the model mid drifted past the best competing ask. This caused the ask-side anchor to never fire. Additionally, the safety check (`new_price >= mid` for asks) blocked anchoring when mid > best_ask. Now uses `std::abs()` for distance and a BBO midpoint reference (`(best_bid + best_ask) / 2`) for safety bounds instead of the model mid.
+
+- **Bidirectional staleness for anchor repricing** (offer_manager.hpp, offer_manager.cpp, engine.cpp): The staleness classifier only triggered on adverse deviations (new optimal price worse than pending). When competitive anchor pricing moved offers in the "favorable" direction (e.g. bid UP toward BBO), the deviation was positive and classified as Fresh, preventing the old deep-in-book offers from being replaced. Added an anchor-active override: when `competitive_anchor_enabled`, any price deviation exceeding the tier threshold triggers Stale regardless of direction.
+
+### Added
+
+- **Competitive anchor test coverage** (test_liquidity.cpp): 7 new tests covering both-sides anchoring, mid-above-best-ask scenario (the specific bug), distance-too-far fallback, one-sided competition, tier stride ordering, and dust filter denomination awareness (correct and legacy behavior).
+
 ## [0.7.41] — 2026-04-12
 
 ### Added

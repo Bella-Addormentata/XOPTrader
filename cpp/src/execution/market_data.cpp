@@ -1072,7 +1072,8 @@ void MarketDataFeed::ingest_competing_offers(
     const std::string&                 pair_name,
     const std::vector<CompetingOffer>& competing_offers,
     const std::unordered_set<std::string>& own_offer_ids,
-    std::int64_t base_mojos_per_unit)
+    std::int64_t base_mojos_per_unit,
+    std::int64_t quote_mojos_per_unit)
 {
     // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055 -- CWE-362).
     const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
@@ -1092,13 +1093,17 @@ void MarketDataFeed::ingest_competing_offers(
         }
 
         // Skip dust offers (not from serious market makers).
-        // Scale threshold proportionally for non-XCH denominations:
-        //   XCH (1e12 mpu): effective_min = max(1e12, 1e12*1e12/1e12) = 1e12
-        //   BYC (1e3  mpu): effective_min = max(1e3,  1e12*1e3/1e12 ) = 1e3
+        // Scale threshold proportionally for non-XCH denominations.
+        // Bid-side offers are denominated in the QUOTE asset, so use
+        // quote_mojos_per_unit; ask-side offers are in the BASE asset.
+        //   Ask (offered=base): XCH 1e12 mpu → min ~1 XCH = 1e12 mojos
+        //   Bid (offered=quote): wUSDC 1e3 mpu → min ~1 wUSDC = 1e3 mojos
+        const std::int64_t side_mpu = (offer.side == Side::Bid)
+            ? quote_mojos_per_unit : base_mojos_per_unit;
         const Mojo effective_min = std::max(
-            static_cast<Mojo>(base_mojos_per_unit),
+            static_cast<Mojo>(side_mpu),
             static_cast<Mojo>(
-                cfg.min_competitor_offer_size * base_mojos_per_unit
+                cfg.min_competitor_offer_size * side_mpu
                 / kMojosPerXch));
         if (offer.size < effective_min) {
             continue;

@@ -922,16 +922,38 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
             static_cast<std::int64_t>(1),
             static_cast<std::int64_t>(std::llround(mid_f / 10000.0)));
 
+        // [v0.7.42] BBO-derived reference for safety checks.
+        // The model mid (CEX/DEX blend, VWAP) can sit above the best ask
+        // or below the best bid when the CEX price diverges from the DEX
+        // order book.  Using model mid for the "never cross spread" safety
+        // check would then block ALL competitively-priced offers on the
+        // side where mid has drifted past the BBO.
+        //
+        // Instead, derive a reference price from the competing BBO:
+        //   - When both sides present: simple midpoint of best bids/asks
+        //   - When one side missing: use the model mid as fallback
+        //
+        // Safety rules become:
+        //   BID: never bid above bbo_ref (don't cross the spread)
+        //   ASK: never ask below bbo_ref (don't cross the spread)
+        const double bbo_ref_f = (best_comp_bid > 0 && best_comp_ask > 0)
+            ? (static_cast<double>(best_comp_bid)
+               + static_cast<double>(best_comp_ask)) / 2.0
+            : mid_f;
+        const std::int64_t bbo_ref = static_cast<std::int64_t>(
+            std::llround(bbo_ref_f));
+
         int anchored_bids = 0;
         int anchored_asks = 0;
 
         // --- Bid-side anchoring ---
         if (best_comp_bid > 0) {
-            // Check anchor distance from mid.
-            const double bid_dist_bps =
-                (mid_f - static_cast<double>(best_comp_bid)) / mid_f * 10000.0;
+            // [v0.7.42] Use absolute distance — the model mid may sit
+            // below the best bid when the CEX price is lower than DEX.
+            const double bid_dist_bps = std::abs(
+                mid_f - static_cast<double>(best_comp_bid)) / mid_f * 10000.0;
 
-            if (bid_dist_bps >= 0.0 && bid_dist_bps <= max_dist) {
+            if (bid_dist_bps <= max_dist) {
                 // Anchor: 1 tick better than competition.
                 const std::int64_t anchor = best_comp_bid + tick;
 
@@ -943,9 +965,9 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                             * mid_f / 10000.0));
                     const std::int64_t new_price = anchor - tier_offset_mojos;
 
-                    // Safety: never bid above mid (that crosses the spread).
-                    // Never go below 1 mojo.
-                    if (new_price > 0 && new_price <= mid) {
+                    // Safety: never bid above the BBO reference (crosses
+                    // the spread).  Never go below 1 mojo.
+                    if (new_price > 0 && new_price <= bbo_ref) {
                         tq.price = new_price;
                         tq.spread_bps =
                             (mid_f - static_cast<double>(new_price))
@@ -953,15 +975,21 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                         ++anchored_bids;
                     }
                 }
+            } else {
+                spdlog::debug("[Liquidity] {} anchor bid skipped: "
+                              "comp_best={} dist={:.1f}bps > max={:.0f}bps",
+                              pair_name_, best_comp_bid, bid_dist_bps,
+                              max_dist);
             }
         }
 
         // --- Ask-side anchoring ---
         if (best_comp_ask > 0) {
-            const double ask_dist_bps =
-                (static_cast<double>(best_comp_ask) - mid_f) / mid_f * 10000.0;
+            // [v0.7.42] Use absolute distance.
+            const double ask_dist_bps = std::abs(
+                static_cast<double>(best_comp_ask) - mid_f) / mid_f * 10000.0;
 
-            if (ask_dist_bps >= 0.0 && ask_dist_bps <= max_dist) {
+            if (ask_dist_bps <= max_dist) {
                 const std::int64_t anchor = best_comp_ask - tick;
 
                 for (auto& tq : ladder) {
@@ -972,8 +1000,9 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                             * mid_f / 10000.0));
                     const std::int64_t new_price = anchor + tier_offset_mojos;
 
-                    // Safety: never ask below mid (crosses spread).
-                    if (new_price >= mid) {
+                    // Safety: never ask below the BBO reference (crosses
+                    // the spread).
+                    if (new_price >= bbo_ref) {
                         tq.price = new_price;
                         tq.spread_bps =
                             (static_cast<double>(new_price) - mid_f)
@@ -981,16 +1010,27 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                         ++anchored_asks;
                     }
                 }
+            } else {
+                spdlog::debug("[Liquidity] {} anchor ask skipped: "
+                              "comp_best={} dist={:.1f}bps > max={:.0f}bps",
+                              pair_name_, best_comp_ask, ask_dist_bps,
+                              max_dist);
             }
         }
 
         if (anchored_bids > 0 || anchored_asks > 0) {
             spdlog::info("[Liquidity] {} competitive anchor: "
                          "anchored {} bids (comp_best={}) {} asks (comp_best={}) "
-                         "stride={:.0f}bps mid={}",
+                         "stride={:.0f}bps mid={} bbo_ref={}",
                          pair_name_, anchored_bids, best_comp_bid,
                          anchored_asks, best_comp_ask,
-                         stride, mid);
+                         stride, mid, bbo_ref);
+        } else {
+            spdlog::debug("[Liquidity] {} competitive anchor: "
+                          "0 anchored (comp_bid={} comp_ask={} mid={} "
+                          "bbo_ref={})",
+                          pair_name_, best_comp_bid, best_comp_ask,
+                          mid, bbo_ref);
         }
     }
 

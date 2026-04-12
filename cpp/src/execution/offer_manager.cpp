@@ -1121,7 +1121,8 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     const std::vector<TierQuote>&  new_ladder,
     BlockHeight                    current_block,
     BlockHeight                    ttl_blocks,
-    Mojo                           mid_price) const
+    Mojo                           mid_price,
+    bool                           anchor_active) const
 {
     std::vector<TierClassification> results;
 
@@ -1302,6 +1303,29 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                                    to_string(po.side), size_ratio,
                                    po.size, sz_it->second);
                 }
+            }
+        }
+
+        // [v0.7.42] Competitive anchor repricing override.
+        // When competitive anchor pricing is active, the anchor repositions
+        // offers to track the BBO.  A "favorable" drift (bid drifted low,
+        // ask drifted high) is normally safe, but under anchor mode it
+        // means we're deep in the book instead of near the top.  Override
+        // Fresh→Stale when the ABSOLUTE deviation exceeds the tier-scaled
+        // threshold, regardless of direction.
+        if (anchor_active
+            && tc.staleness == TierStaleness::Fresh
+            && age >= kMinRefreshAgeBlocks) {
+            const double tier_threshold = kSelectiveRefreshThreshold
+                * (1.0 + static_cast<double>(po.tier) * kTierThresholdScale);
+            if (tc.price_deviation > tier_threshold) {
+                tc.staleness = TierStaleness::Stale;
+                logger_->debug("classify_tier_staleness({}): tier {} {} "
+                               "anchor repricing dev={:.3f}% > {:.3f}% -- "
+                               "marking stale",
+                               pair_name, po.tier, to_string(po.side),
+                               tc.price_deviation * 100.0,
+                               tier_threshold * 100.0);
             }
         }
 

@@ -373,11 +373,16 @@ public:
     /// @param pair_name     Trading pair identifier.
     /// @param competing_offers Vector of competing offers parsed from API response.
     /// @param own_offer_ids Set of our own offer IDs to exclude from competitor analysis.
+    /// @param base_mojos_per_unit  Mojos per unit of the pair's base asset.
+    /// @param quote_mojos_per_unit Mojos per unit of the pair's quote asset.
+    ///        Bid-side offers are denominated in the quote asset; without
+    ///        the correct denomination, the dust filter falsely rejects them.
     void ingest_competing_offers(
         const std::string&                 pair_name,
         const std::vector<CompetingOffer>& competing_offers,
         const std::unordered_set<std::string>& own_offer_ids,
-        std::int64_t base_mojos_per_unit = 1'000'000'000'000LL);
+        std::int64_t base_mojos_per_unit  = 1'000'000'000'000LL,
+        std::int64_t quote_mojos_per_unit = 1'000'000'000'000LL);
 
     /// Ingest the current block height from the Chia full node.
     ///
