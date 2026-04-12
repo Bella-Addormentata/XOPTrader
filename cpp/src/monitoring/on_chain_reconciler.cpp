@@ -153,10 +153,17 @@ asio::awaitable<std::vector<std::string>>
 OnChainReconciler::verify_pending_offer_coins()
 {
     std::vector<std::string> stale_offer_ids;
+    std::unordered_set<std::string> current_pending_ids;
 
     auto pending = state_->get_all_offers();
     if (pending.empty()) {
+        not_found_counts_.clear();
         co_return stale_offer_ids;
+    }
+
+    current_pending_ids.reserve(pending.size());
+    for (const auto& po : pending) {
+        current_pending_ids.insert(po.offer_id);
     }
 
     // For each pending offer, query its wallet trade record to find the
@@ -254,8 +261,12 @@ OnChainReconciler::verify_pending_offer_coins()
             // this, verify_pending_offer_coins falsely marks 15-second-old
             // offers as NOT FOUND, causing the engine to lose track of them
             // and re-create duplicates that drain XCH to zero.
-            constexpr auto kCreationGracePeriod = std::chrono::seconds{120};
+            constexpr auto kCreationGracePeriod = std::chrono::seconds{600};
+            constexpr std::uint32_t kRequiredConsecutiveMisses = 3;
             const auto age = now - po.created_at_ts;
+            auto& miss_count = not_found_counts_[po.offer_id];
+            ++miss_count;
+
             if (age < kCreationGracePeriod) {
                 logger_->info("verify_pending_offer_coins: offer {} NOT FOUND "
                               "in wallet but only {:.0f}s old -- skipping "
@@ -264,6 +275,20 @@ OnChainReconciler::verify_pending_offer_coins()
                               std::chrono::duration<double>(age).count(),
                               kCreationGracePeriod.count(),
                               po.pair_name, po.tier);
+                continue;
+            }
+
+            // Require multiple consecutive misses before declaring stale.
+            // Wallet get_all_offers can transiently omit entries during
+            // sync/refresh windows; a single miss is not authoritative.
+            if (miss_count < kRequiredConsecutiveMisses) {
+                logger_->info("verify_pending_offer_coins: offer {} NOT FOUND "
+                              "(miss {}/{}) -- preserving for now "
+                              "(pair={} tier={}, age={:.0f}s)",
+                              po.offer_id.substr(0, 12),
+                              miss_count, kRequiredConsecutiveMisses,
+                              po.pair_name, po.tier,
+                              std::chrono::duration<double>(age).count());
                 continue;
             }
 
@@ -276,6 +301,9 @@ OnChainReconciler::verify_pending_offer_coins()
             stale_offer_ids.push_back(po.offer_id);
             continue;
         }
+
+        // Offer present in wallet: clear any prior NOT FOUND misses.
+        not_found_counts_.erase(po.offer_id);
 
         // Status codes from Chia:
         //   0 = PENDING_ACCEPT (our offer is out, waiting for a taker)
@@ -293,6 +321,16 @@ OnChainReconciler::verify_pending_offer_coins()
                           "wallet status {} but still in State (pair={})",
                           po.offer_id.substr(0, 12), status, po.pair_name);
             stale_offer_ids.push_back(po.offer_id);
+            not_found_counts_.erase(po.offer_id);
+        }
+    }
+
+    // Drop counters for offers no longer pending in State.
+    for (auto it = not_found_counts_.begin(); it != not_found_counts_.end(); ) {
+        if (current_pending_ids.find(it->first) == current_pending_ids.end()) {
+            it = not_found_counts_.erase(it);
+        } else {
+            ++it;
         }
     }
 

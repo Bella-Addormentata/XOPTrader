@@ -166,6 +166,11 @@ private:
     /// Block height of the last successful full reconciliation.
     BlockHeight last_reconciled_block_{0};
 
+    // Consecutive reconcile cycles where a pending offer was not found in
+    // wallet get_all_offers().  Used to avoid false stale detection when
+    // wallet RPC lags or briefly omits new offers.
+    std::unordered_map<std::string, std::uint32_t> not_found_counts_;
+
     /// Logger instance.
     std::shared_ptr<spdlog::logger> logger_;
 };
