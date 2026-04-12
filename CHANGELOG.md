@@ -5,6 +5,12 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.41] — 2026-04-12
+
+### Added
+
+- **Competitive anchor pricing** (liquidity.cpp, engine.cpp, config.cpp): New pricing mode that anchors Tier 0 to the best competing offer on each side (bid/ask) and strides outward for subsequent tiers, ensuring top-of-book placement. When enabled, the engine places bids 1 tick above the best competing bid and asks 1 tick below the best competing ask, with configurable inter-tier stride (default 65 bps). Falls back to mid-based spacing when no competing offers exist or the anchor exceeds `competitive_anchor_max_distance_bps` (default 500 bps) from mid. Mutually exclusive with gap-aware spacing (anchor takes priority). Configurable via `strategy.competitive_anchor_enabled`, `strategy.competitive_anchor_max_distance_bps`, and `strategy.competitive_anchor_stride_bps`.
+
 ## [0.7.40] — 2026-04-12
 
 ### Added

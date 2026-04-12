@@ -793,7 +793,11 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
     // -- Step 3: Gap-aware dynamic tier spacing ------------------------------
     // Analyse the competing order book for gaps and shift tier spacing
     // toward underserved price ranges.
-    if (adj_cfg.gap_aware_spacing && !competing_offers.empty() && mid > 0) {
+    // Skipped when competitive anchor pricing is active (the two approaches
+    // are mutually exclusive: anchor places tiers relative to best competing
+    // offer; gap-aware places tiers in empty zones).
+    if (adj_cfg.gap_aware_spacing && !adj_cfg.competitive_anchor_enabled
+        && !competing_offers.empty() && mid > 0) {
         auto gaps = analyse_order_book_gaps(
             competing_offers, mid,
             adj_cfg.min_gap_bps, adj_cfg.max_gap_scan_bps);
@@ -879,8 +883,118 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
     // -- Step 4: Build ladder with adjusted config --------------------------
     // Use the base compute_ladder (which does build_raw_ladder + skew) but
     // with the adjusted config containing dynamic spacing and sizing.
-    return compute_ladder(mid, sigma, inventory_ratio,
-                          available_capital, available_inventory, adj_cfg);
+    auto ladder = compute_ladder(mid, sigma, inventory_ratio,
+                                 available_capital, available_inventory, adj_cfg);
+
+    // -- Step 5: Competitive anchor pricing ---------------------------------
+    // When enabled, re-price each side's tiers relative to the best
+    // competing offer rather than the mid-price.  This ensures we're always
+    // at or near top-of-book.
+    //
+    // Bid Tier 0 → best_competing_bid + 1 tick  (top of book)
+    // Bid Tier i → anchor - i * stride_bps      (step outward)
+    //
+    // Ask Tier 0 → best_competing_ask - 1 tick  (top of book)
+    // Ask Tier i → anchor + i * stride_bps      (step outward)
+    //
+    // Falls back to existing prices when:
+    //   - No competing offers on that side
+    //   - Anchor would be further than competitive_anchor_max_distance_bps from mid
+    if (adj_cfg.competitive_anchor_enabled && !competing_offers.empty() && mid > 0) {
+        // Find best competing bid (highest) and ask (lowest).
+        std::int64_t best_comp_bid = 0;
+        std::int64_t best_comp_ask = 0;
+        for (const auto& co : competing_offers) {
+            if (co.side == Side::Bid && co.price > best_comp_bid) {
+                best_comp_bid = co.price;
+            }
+            if (co.side == Side::Ask
+                && (best_comp_ask == 0 || co.price < best_comp_ask)) {
+                best_comp_ask = co.price;
+            }
+        }
+
+        const double mid_f = static_cast<double>(mid);
+        const double max_dist = adj_cfg.competitive_anchor_max_distance_bps;
+        const double stride   = adj_cfg.competitive_anchor_stride_bps;
+        // 1 tick ≈ 1 bps of mid.
+        const std::int64_t tick = std::max(
+            static_cast<std::int64_t>(1),
+            static_cast<std::int64_t>(std::llround(mid_f / 10000.0)));
+
+        int anchored_bids = 0;
+        int anchored_asks = 0;
+
+        // --- Bid-side anchoring ---
+        if (best_comp_bid > 0) {
+            // Check anchor distance from mid.
+            const double bid_dist_bps =
+                (mid_f - static_cast<double>(best_comp_bid)) / mid_f * 10000.0;
+
+            if (bid_dist_bps >= 0.0 && bid_dist_bps <= max_dist) {
+                // Anchor: 1 tick better than competition.
+                const std::int64_t anchor = best_comp_bid + tick;
+
+                for (auto& tq : ladder) {
+                    if (tq.side != Side::Bid) continue;
+                    const std::int64_t tier_offset_mojos =
+                        static_cast<std::int64_t>(std::llround(
+                            static_cast<double>(tq.tier_index) * stride
+                            * mid_f / 10000.0));
+                    const std::int64_t new_price = anchor - tier_offset_mojos;
+
+                    // Safety: never bid above mid (that crosses the spread).
+                    // Never go below 1 mojo.
+                    if (new_price > 0 && new_price <= mid) {
+                        tq.price = new_price;
+                        tq.spread_bps =
+                            (mid_f - static_cast<double>(new_price))
+                            / mid_f * 10000.0;
+                        ++anchored_bids;
+                    }
+                }
+            }
+        }
+
+        // --- Ask-side anchoring ---
+        if (best_comp_ask > 0) {
+            const double ask_dist_bps =
+                (static_cast<double>(best_comp_ask) - mid_f) / mid_f * 10000.0;
+
+            if (ask_dist_bps >= 0.0 && ask_dist_bps <= max_dist) {
+                const std::int64_t anchor = best_comp_ask - tick;
+
+                for (auto& tq : ladder) {
+                    if (tq.side != Side::Ask) continue;
+                    const std::int64_t tier_offset_mojos =
+                        static_cast<std::int64_t>(std::llround(
+                            static_cast<double>(tq.tier_index) * stride
+                            * mid_f / 10000.0));
+                    const std::int64_t new_price = anchor + tier_offset_mojos;
+
+                    // Safety: never ask below mid (crosses spread).
+                    if (new_price >= mid) {
+                        tq.price = new_price;
+                        tq.spread_bps =
+                            (static_cast<double>(new_price) - mid_f)
+                            / mid_f * 10000.0;
+                        ++anchored_asks;
+                    }
+                }
+            }
+        }
+
+        if (anchored_bids > 0 || anchored_asks > 0) {
+            spdlog::info("[Liquidity] {} competitive anchor: "
+                         "anchored {} bids (comp_best={}) {} asks (comp_best={}) "
+                         "stride={:.0f}bps mid={}",
+                         pair_name_, anchored_bids, best_comp_bid,
+                         anchored_asks, best_comp_ask,
+                         stride, mid);
+        }
+    }
+
+    return ladder;
 }
 
 }  // namespace xop

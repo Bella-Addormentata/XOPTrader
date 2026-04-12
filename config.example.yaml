@@ -181,6 +181,15 @@ strategy:
   max_gap_scan_bps: 1500.0             # [OPTIONAL, default: 1500]  Max scan distance from mid
   gap_blend_factor: 0.6                # [OPTIONAL, default: 0.6]   0=baseline, 1=full gap shift
 
+  # -- Competitive anchor pricing --
+  # Instead of spacing tiers from mid, anchor Tier 0 to the best competing
+  # offer on each side and step outward.  Ensures top-of-book placement.
+  # Mutually exclusive with gap-aware spacing (anchor takes priority).
+  # Falls back to mid-based spacing when no competing offers exist.
+  competitive_anchor_enabled: false     # [OPTIONAL, default: false] Enable anchor pricing
+  competitive_anchor_max_distance_bps: 500.0  # [OPTIONAL, default: 500] Max anchor dist from mid
+  competitive_anchor_stride_bps: 65.0   # [OPTIONAL, default: 65]  Inter-tier spacing from anchor
+
   # -- Adverse-selection-aware tier sizing --
   # On slow blockchains (Chia ~52 s/block), tier 0 (tightest) is most
   # vulnerable to informed traders.  This reduces inner-tier size and

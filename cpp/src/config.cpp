@@ -913,6 +913,26 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Competitive anchor pricing (optional, defaults in StrategyConfig) --
+    if (node["competitive_anchor_enabled"] && node["competitive_anchor_enabled"].IsDefined()
+        && !node["competitive_anchor_enabled"].IsNull()) {
+        cfg.competitive_anchor_enabled = node["competitive_anchor_enabled"].as<bool>();
+    }
+    if (node["competitive_anchor_max_distance_bps"] && node["competitive_anchor_max_distance_bps"].IsDefined()
+        && !node["competitive_anchor_max_distance_bps"].IsNull()) {
+        cfg.competitive_anchor_max_distance_bps = node["competitive_anchor_max_distance_bps"].as<double>();
+        if (cfg.competitive_anchor_max_distance_bps <= 0.0) {
+            throw ConfigError(sec + ".competitive_anchor_max_distance_bps must be > 0");
+        }
+    }
+    if (node["competitive_anchor_stride_bps"] && node["competitive_anchor_stride_bps"].IsDefined()
+        && !node["competitive_anchor_stride_bps"].IsNull()) {
+        cfg.competitive_anchor_stride_bps = node["competitive_anchor_stride_bps"].as<double>();
+        if (cfg.competitive_anchor_stride_bps <= 0.0) {
+            throw ConfigError(sec + ".competitive_anchor_stride_bps must be > 0");
+        }
+    }
+
     // -- Adverse-selection-aware tier sizing (optional, defaults in StrategyConfig) --
     if (node["adverse_selection_sizing"] && node["adverse_selection_sizing"].IsDefined()
         && !node["adverse_selection_sizing"].IsNull()) {

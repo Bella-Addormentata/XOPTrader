@@ -235,6 +235,26 @@ struct LiquidityConfig {
     /// Populated by the engine before calling compute_ladder.
     /// Empty vector = no fill data available (skip fill-rate sizing).
     std::vector<double> tier_fill_rates;
+
+    // -- Competitive anchor pricing -----------------------------------------
+
+    /// When enabled, anchor Tier 0 on each side to the best competing
+    /// offer (bid/ask) and space subsequent tiers outward from there,
+    /// rather than spacing symmetrically around mid.  Falls back to
+    /// mid-based spacing when no competing offers exist on a side.
+    /// Default: false (use traditional mid-based spacing).
+    bool competitive_anchor_enabled{false};
+
+    /// Maximum distance (bps) the anchor point may deviate from mid.
+    /// If the best competing offer is further than this, fall back to
+    /// mid-based spacing.  Prevents anchoring to stale/garbage offers.
+    /// Default: 500 bps.
+    double competitive_anchor_max_distance_bps{500.0};
+
+    /// Inter-tier stride (bps) when competitive anchor is active.
+    /// Tier 0 lands at the anchor; Tier i lands at anchor ± i*stride.
+    /// Default: 65 bps.
+    double competitive_anchor_stride_bps{65.0};
 };
 
 // ---------------------------------------------------------------------------

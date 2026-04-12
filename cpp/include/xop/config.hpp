@@ -324,6 +324,21 @@ struct StrategyConfig {
     /// Blend factor for gap-directed spacing [0, 1].
     double   gap_blend_factor{0.6};
 
+    // -- Competitive anchor pricing -----------------------------------------
+
+    /// Anchor Tier 0 to the best competing offer instead of mid ± spacing.
+    /// When the order book has competing offers, this places our tightest
+    /// tier 1 tick better than the best competitor, making us top-of-book.
+    /// Subsequent tiers step outward by competitive_anchor_stride_bps.
+    /// Falls back to mid-based spacing when no competing offers exist.
+    bool     competitive_anchor_enabled{false};
+
+    /// Max distance (bps) from mid for a valid anchor.  Default 500.
+    double   competitive_anchor_max_distance_bps{500.0};
+
+    /// Inter-tier stride (bps) from the anchor point.  Default 65.
+    double   competitive_anchor_stride_bps{65.0};
+
     // -- Adverse-selection-aware tier sizing ---------------------------------
 
     /// Enable adverse-selection-aware tier sizing.

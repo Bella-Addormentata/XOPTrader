@@ -225,6 +225,11 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         liq_cfg.max_gap_scan_bps   = config_.strategy.max_gap_scan_bps;
         liq_cfg.gap_blend_factor   = config_.strategy.gap_blend_factor;
 
+        // Competitive anchor pricing.
+        liq_cfg.competitive_anchor_enabled           = config_.strategy.competitive_anchor_enabled;
+        liq_cfg.competitive_anchor_max_distance_bps  = config_.strategy.competitive_anchor_max_distance_bps;
+        liq_cfg.competitive_anchor_stride_bps        = config_.strategy.competitive_anchor_stride_bps;
+
         // Adverse-selection-aware tier sizing.
         liq_cfg.adverse_selection_sizing           = config_.strategy.adverse_selection_sizing;
         liq_cfg.adverse_selection_decay            = config_.strategy.adverse_selection_decay;
