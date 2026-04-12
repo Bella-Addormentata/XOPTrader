@@ -118,6 +118,25 @@ struct DbSnapshot {
 };
 
 // ---------------------------------------------------------------------------
+// DbSanityFailure -- maps 1:1 to a row in the sanity_failures table.
+//
+// Records every offer that failed the pre-posting sanity checks, for
+// post-hoc analysis and debugging of pricing anomalies.
+// ---------------------------------------------------------------------------
+
+struct DbSanityFailure {
+    BlockHeight block_height{0};       ///< Block height when failure was detected.
+    std::string pair_name;             ///< Trading pair, e.g. "XCH/wUSDC.b".
+    std::string side;                  ///< "bid" or "ask".
+    int         tier{-1};              ///< Tier index (-1 for pair-level failures).
+    Mojo        proposed_price_mojos{0}; ///< Price that was rejected in mojos.
+    Mojo        reference_price_mojos{0}; ///< Reference price (BBO mid, best_bid, etc.) in mojos.
+    double      deviation_pct{0.0};    ///< Deviation as percentage (e.g., 25.5 for 25.5%).
+    std::string failure_reason;        ///< Reason for rejection (e.g., "bbo_deviation_pair_level").
+    std::string details;               ///< Additional context (JSON-friendly format).
+};
+
+// ---------------------------------------------------------------------------
 // DbStrategyQuote -- maps 1:1 to a row in the strategy_quotes table.
 //
 // Persists the per-tier bid/ask quotes computed each block.  This enables
@@ -235,6 +254,14 @@ public:
     ///
     /// @param batch  Vector of DbSnapshot records.
     void insert_snapshots_batch(const std::vector<DbSnapshot>& batch);
+
+    // -- Sanity failures log -------------------------------------------------
+
+    /// Insert a sanity failure record for post-hoc analysis.
+    /// Used when offers fail pre-posting sanity checks (BBO proximity, etc.).
+    ///
+    /// @param record  Fully populated DbSanityFailure.
+    void insert_sanity_failure(const DbSanityFailure& record);
 
     /// Retrieve the most recent snapshot for a given trading pair.
     /// Returns std::nullopt if no snapshot exists for the pair.
@@ -357,6 +384,9 @@ private:
 
     /// INSERT INTO snapshots
     sqlite3_stmt* stmt_insert_snapshot_{nullptr};
+
+    /// INSERT INTO sanity_failures
+    sqlite3_stmt* stmt_insert_sanity_failure_{nullptr};
 
     /// SELECT FROM snapshots WHERE pair_name = ? ORDER BY block_height DESC LIMIT 1
     sqlite3_stmt* stmt_last_snapshot_{nullptr};

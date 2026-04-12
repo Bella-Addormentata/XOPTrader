@@ -934,14 +934,23 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         //   - When one side missing: use the model mid as fallback
         //
         // Safety rules become:
-        //   BID: never bid above bbo_ref (don't cross the spread)
-        //   ASK: never ask below bbo_ref (don't cross the spread)
+        //   BID: never bid above min(bbo_ref, mid) — prevents crossing
+        //        both the BBO spread AND the model mid (depth-weighted
+        //        VWAP micro-price / CEX blend).  The model mid can sit
+        //        well below the BBO midpoint when order-book depth is
+        //        asymmetric, causing offers that pass the BBO check to
+        //        be immediately cancelled by classify_tier_staleness.
+        //   ASK: never ask below bbo_ref — when model mid sits ABOVE
+        //        the best ask (CEX > DEX), we trust the DEX BBO for
+        //        competitive ask placement.
         const double bbo_ref_f = (best_comp_bid > 0 && best_comp_ask > 0)
             ? (static_cast<double>(best_comp_bid)
                + static_cast<double>(best_comp_ask)) / 2.0
             : mid_f;
         const std::int64_t bbo_ref = static_cast<std::int64_t>(
             std::llround(bbo_ref_f));
+        // Bid cap: tighter of BBO ref and model mid — prevents crossed-mid.
+        const std::int64_t bid_cap  = std::min(bbo_ref, mid);
 
         int anchored_bids = 0;
         int anchored_asks = 0;
@@ -965,9 +974,9 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
                             * mid_f / 10000.0));
                     const std::int64_t new_price = anchor - tier_offset_mojos;
 
-                    // Safety: never bid above the BBO reference (crosses
-                    // the spread).  Never go below 1 mojo.
-                    if (new_price > 0 && new_price <= bbo_ref) {
+                    // Safety: never bid above bid_cap (the tighter of
+                    // BBO reference and model mid).  Never go below 1 mojo.
+                    if (new_price > 0 && new_price <= bid_cap) {
                         tq.price = new_price;
                         tq.spread_bps =
                             (mid_f - static_cast<double>(new_price))
@@ -1021,16 +1030,16 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
         if (anchored_bids > 0 || anchored_asks > 0) {
             spdlog::info("[Liquidity] {} competitive anchor: "
                          "anchored {} bids (comp_best={}) {} asks (comp_best={}) "
-                         "stride={:.0f}bps mid={} bbo_ref={}",
+                         "stride={:.0f}bps mid={} bbo_ref={} bid_cap={}",
                          pair_name_, anchored_bids, best_comp_bid,
                          anchored_asks, best_comp_ask,
-                         stride, mid, bbo_ref);
+                         stride, mid, bbo_ref, bid_cap);
         } else {
             spdlog::debug("[Liquidity] {} competitive anchor: "
                           "0 anchored (comp_bid={} comp_ask={} mid={} "
-                          "bbo_ref={})",
+                          "bbo_ref={} bid_cap={})",
                           pair_name_, best_comp_bid, best_comp_ask,
-                          mid, bbo_ref);
+                          mid, bbo_ref, bid_cap);
         }
     }
 

@@ -104,6 +104,22 @@ CREATE TABLE IF NOT EXISTS strategy_quotes (
 );
 )SQL";
 
+constexpr const char* kCreateSanityFailures = R"SQL(
+CREATE TABLE IF NOT EXISTS sanity_failures (
+    id                     INTEGER PRIMARY KEY AUTOINCREMENT,
+    block_height           INTEGER NOT NULL,
+    pair_name              TEXT    NOT NULL,
+    side                   TEXT    NOT NULL CHECK(side IN ('bid','ask')),
+    tier                   INTEGER NOT NULL,
+    proposed_price_mojos   INTEGER NOT NULL,
+    reference_price_mojos  INTEGER NOT NULL,
+    deviation_pct          REAL    NOT NULL,
+    failure_reason         TEXT    NOT NULL,
+    details                TEXT,
+    created_at             TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
 // -- Index DDL ----------------------------------------------------------------
 
 constexpr const char* kIndexTradeTimestamp = R"SQL(
@@ -134,6 +150,11 @@ CREATE INDEX IF NOT EXISTS idx_snapshots_pair_block
 constexpr const char* kIndexStrategyQuotesPairBlock = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_strategy_quotes_pair_block
     ON strategy_quotes(pair_name, block_height DESC);
+)SQL";
+
+constexpr const char* kIndexSanityFailuresPair = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_sanity_failures_pair
+    ON sanity_failures(pair_name, block_height DESC);
 )SQL";
 
 // -- DML (INSERT / UPDATE / SELECT) -------------------------------------------
@@ -196,6 +217,13 @@ constexpr const char* kInsertStrategyQuote = R"SQL(
 INSERT INTO strategy_quotes
     (block_height, pair_name, tier, side, price_mojos, size_mojos)
 VALUES (?, ?, ?, ?, ?, ?);
+)SQL";
+
+constexpr const char* kInsertSanityFailure = R"SQL(
+INSERT INTO sanity_failures
+    (block_height, pair_name, side, tier, proposed_price_mojos,
+     reference_price_mojos, deviation_pct, failure_reason, details)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kLastSnapshot = R"SQL(
@@ -280,6 +308,7 @@ Database::Database(const std::string& db_path)
     stmt_fill_rate_          = prepare(kFillRateSinceBlock);
     stmt_tier_fill_rates_    = prepare(kTierFillRates);
     stmt_insert_strategy_quote_ = prepare(kInsertStrategyQuote);
+    stmt_insert_sanity_failure_ = prepare(kInsertSanityFailure);
 
     // [T8-20] Transaction control prepared statements.
     stmt_begin_    = prepare("BEGIN TRANSACTION");
@@ -577,6 +606,25 @@ void Database::insert_strategy_quotes_batch(const std::vector<DbStrategyQuote>& 
     spdlog::debug("[Database] Batch-inserted {} strategy quotes", batch.size());
 }
 
+void Database::insert_sanity_failure(const DbSanityFailure& r)
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    bind_int64 (stmt_insert_sanity_failure_, 1, static_cast<std::int64_t>(r.block_height));
+    bind_text  (stmt_insert_sanity_failure_, 2, r.pair_name);
+    bind_text  (stmt_insert_sanity_failure_, 3, r.side);
+    bind_int64 (stmt_insert_sanity_failure_, 4, static_cast<std::int64_t>(r.tier));
+    bind_int64 (stmt_insert_sanity_failure_, 5, r.proposed_price_mojos);
+    bind_int64 (stmt_insert_sanity_failure_, 6, r.reference_price_mojos);
+    bind_double(stmt_insert_sanity_failure_, 7, r.deviation_pct);
+    bind_text  (stmt_insert_sanity_failure_, 8, r.failure_reason);
+    bind_text  (stmt_insert_sanity_failure_, 9, r.details);
+
+    step_and_reset(stmt_insert_sanity_failure_);
+
+    spdlog::debug("[Database] Logged sanity failure: pair={} side={} tier={} reason={}",
+                  r.pair_name, r.side, r.tier, r.failure_reason);
+}
+
 std::optional<DbSnapshot> Database::get_last_snapshot(
     const std::string& pair_name) const
 {
@@ -779,12 +827,14 @@ void Database::run_migrations()
         kCreateOfferLog,
         kCreateSnapshots,
         kCreateStrategyQuotes,
+        kCreateSanityFailures,
         kIndexTradeTimestamp,
         kIndexTradePair,
         kIndexOfferStatus,
         kIndexOfferPair,
         kIndexSnapshotPairBlock,
-        kIndexStrategyQuotesPairBlock
+        kIndexStrategyQuotesPairBlock,
+        kIndexSanityFailuresPair
     };
 
     for (const char* ddl : ddl_statements) {

@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.43] — 2026-04-12
+
+### Added
+
+- **Sanity failure audit log** (database.hpp, database.cpp): Added `sanity_failures` table and `DbSanityFailure` record path to persist every rejected quote from sanity filters. Captures block, pair, side, tier, proposed price, reference price, deviation, reason, and free-form details for post-mortem analysis.
+
+### Fixed
+
+- **Microprice divergence clamp** (market_data.cpp): Added a 10% clamp that snaps depth-weighted orderbook microprice back to simple BBO midpoint when the order book is highly asymmetric and microprice drifts too far from executable market reality.
+
+- **Pre-post BBO sanity suppression** (engine.cpp): Added Step 8 sanity guards to suppress quote tiers that deviate excessively from current BBO references, reducing irrational quote placement during transient book distortions.
+
 ## [0.7.42] — 2026-04-12
 
 ### Fixed

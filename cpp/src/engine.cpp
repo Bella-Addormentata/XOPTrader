@@ -39,6 +39,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
 #include <functional>
 #include <set>
 #include <stdexcept>
@@ -3897,12 +3898,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
-    // -- Wallet sync gate ---------------------------------------------------
+    // -- Wallet sync gate with auto-recovery ----------------------------------
     // The Chia wallet returns unreliable data when not fully synced:
     // get_all_offers may return incomplete lists (causing
     // verify_pending_offer_coins to falsely mark live offers as NOT FOUND),
     // and cancel_offer will fail outright.  Block ALL offer management
     // until the wallet reports synced=true.
+    //
+    // Auto-recovery: if the wallet stays unsynced for kWalletRestartThreshold
+    // consecutive blocks (~3 min), restart the wallet service.  This breaks
+    // the deadlock where pending_change prevents sync and the sync gate
+    // prevents the force-delete escalation from ever firing.
     try {
         auto sync_status = co_await wallet_->get_sync_status();
         bool synced = false;
@@ -3913,12 +3919,42 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             syncing = sync_status["syncing"].get<bool>();
 
         if (!synced || syncing) {
+            ++consecutive_unsynced_blocks_;
             spdlog::warn("[Engine] Step 8: wallet not fully synced "
-                         "(synced={}, syncing={}) -- skipping all offer "
-                         "management to prevent false stale detection "
-                         "and orphan creation",
-                         synced, syncing);
+                         "(synced={}, syncing={}, unsynced_blocks={}/{}) "
+                         "-- skipping all offer management",
+                         synced, syncing,
+                         consecutive_unsynced_blocks_,
+                         kWalletRestartThreshold);
+
+            // Escalation: restart wallet service after prolonged unsync.
+            if (consecutive_unsynced_blocks_ >= kWalletRestartThreshold) {
+                spdlog::warn("[Engine] Wallet unsynced for {} consecutive "
+                             "blocks (~{} sec) -- restarting wallet service "
+                             "to force clean resync",
+                             consecutive_unsynced_blocks_,
+                             consecutive_unsynced_blocks_ * 9);
+#ifdef _WIN32
+                int rc = std::system("chia stop wallet & chia start wallet");
+#else
+                int rc = std::system("chia stop wallet && chia start wallet");
+#endif
+                if (rc == 0) {
+                    spdlog::info("[Engine] Wallet service restart initiated");
+                } else {
+                    spdlog::error("[Engine] Wallet service restart failed "
+                                  "(rc={})", rc);
+                }
+                consecutive_unsynced_blocks_ = 0;
+            }
             co_return;
+        }
+
+        // Wallet is synced -- reset the unsync counter.
+        if (consecutive_unsynced_blocks_ > 0) {
+            spdlog::info("[Engine] Wallet re-synced after {} blocks",
+                         consecutive_unsynced_blocks_);
+            consecutive_unsynced_blocks_ = 0;
         }
     } catch (const std::exception& e) {
         spdlog::warn("[Engine] Step 8: wallet sync check failed: {} "
@@ -4137,7 +4173,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
     }
 
-    bool pending_hit_this_block = false;
+    std::set<std::int64_t> pending_wallets_this_block;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
 
@@ -4412,7 +4448,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          pair_name, sb.label, pending);
 
                             // Track consecutive blocks with pending_change.
-                            pending_hit_this_block = true;
+                            pending_wallets_this_block.insert(sb.wid);
                             ++consecutive_pending_blocks_;
 
                             // Periodic stuck-tx pruning.
@@ -4437,30 +4473,36 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             }
 
                             // Escalation: force-delete if stuck too long.
+                            // Iterate ALL wallets with pending_change this
+                            // block, not just the current one.  A single
+                            // global counter can fire while examining any
+                            // wallet; clearing only that wallet leaves the
+                            // others stuck indefinitely.
                             if (consecutive_pending_blocks_ >=
                                 kForceDeletePendingBlocks) {
                                 spdlog::warn("[Engine] Step 8: pending_change "
                                              "persisted for {} consecutive "
                                              "blocks -- force-deleting ALL "
                                              "unconfirmed transactions for "
-                                             "wallet {} ({})",
+                                             "{} pending wallets",
                                              consecutive_pending_blocks_,
-                                             sb.label, sb.wid);
-                                try {
-                                    co_await wallet_->
-                                        delete_unconfirmed_transactions(sb.wid);
-                                    spdlog::info("[Engine] Step 8: "
-                                                 "force-deleted unconfirmed "
-                                                 "transactions for wallet "
-                                                 "{} ({})",
-                                                 sb.label, sb.wid);
-                                    consecutive_pending_blocks_ = 0;
-                                } catch (const std::exception& e) {
-                                    spdlog::warn("[Engine] Step 8: "
-                                                 "force-delete failed for "
-                                                 "{}: {}",
-                                                 sb.label, e.what());
+                                             pending_wallets_this_block.size());
+                                for (auto pw : pending_wallets_this_block) {
+                                    try {
+                                        co_await wallet_->
+                                            delete_unconfirmed_transactions(pw);
+                                        spdlog::info("[Engine] Step 8: "
+                                                     "force-deleted unconfirmed "
+                                                     "transactions for wallet "
+                                                     "id {}", pw);
+                                    } catch (const std::exception& e) {
+                                        spdlog::warn("[Engine] Step 8: "
+                                                     "force-delete failed for "
+                                                     "wallet id {}: {}",
+                                                     pw, e.what());
+                                    }
                                 }
+                                consecutive_pending_blocks_ = 0;
                             }
 
                             pending_block = true;
@@ -4857,6 +4899,118 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             }
         }
 
+                // -- Crossed-mid pre-post guard -------------------------------------
+        // Defense-in-depth: filter out any tier that would cross the
+        // current model mid-price BEFORE posting on-chain.
+        //
+        // The competitive anchor in liquidity.cpp already clamps to
+        // min(bbo_ref, mid), but the model mid can change between Step 7
+        // (ladder generation) and Step 8 (posting).  Without this guard,
+        // crossed offers are posted on-chain (wasting 5000 mojo fee each)
+        // and then cancelled the next cycle by classify_tier_staleness.
+        //
+        // 267 crossed_mid cancellations in the current session wasted
+        // ~10M mojos and exposed us to adverse selection for one block
+        // per offer before cancellation.
+        if (mid > 0) {
+            std::vector<TierQuote> mid_safe;
+            mid_safe.reserve(fee_filtered_tiers.size());
+            std::size_t suppressed_count = 0;
+            for (const auto& tier : fee_filtered_tiers) {
+                if (tier.side == Side::Bid && tier.price > mid) {
+                    spdlog::info("[Engine] Step 8: {} bid tier {} suppressed "
+                                 "-- price {} > mid {} (crossed)",
+                                 pair_name, tier.tier_index,
+                                 tier.price, mid);
+                    ++suppressed_count;
+                    continue;
+                }
+                if (tier.side == Side::Ask && tier.price < mid) {
+                    spdlog::info("[Engine] Step 8: {} ask tier {} suppressed "
+                                 "-- price {} < mid {} (crossed)",
+                                 pair_name, tier.tier_index,
+                                 tier.price, mid);
+                    ++suppressed_count;
+                    continue;
+                }
+                mid_safe.push_back(tier);
+            }
+            if (suppressed_count > 0) {
+                spdlog::warn("[Engine] Step 8: {} crossed-mid guard removed "
+                             "{}/{} tiers",
+                             pair_name, suppressed_count,
+                             fee_filtered_tiers.size());
+            }
+            fee_filtered_tiers = std::move(mid_safe);
+        }
+
+        // -- BBO proximity sanity check -----------------------------------
+        // Defense-in-depth: reject any tier whose price is unreasonably
+        // far from the current Dexie BBO.  This catches cases where the
+        // model mid diverges from actual market prices (e.g. asymmetric
+        // depth pulling the microprice 40% below BBO).
+        {
+            const auto book_snap = state_->get_market(pair_name);
+            const Mojo best_bid = book_snap.best_bid;
+            const Mojo best_ask = book_snap.best_ask;
+            const bool has_bbo  = (best_bid > 0 && best_ask > 0);
+
+            if (has_bbo && !fee_filtered_tiers.empty()) {
+                const Mojo bbo_mid_m = (best_bid + best_ask) / 2;
+                constexpr double kMaxBboDeviation = 0.15;  // 15%
+
+                // Check 1: Model mid vs BBO sanity
+                if (mid > 0) {
+                    const double mid_dev = std::abs(
+                        static_cast<double>(mid) - static_cast<double>(bbo_mid_m))
+                        / static_cast<double>(bbo_mid_m);
+                    if (mid_dev > kMaxBboDeviation) {
+                        spdlog::warn("[Engine] Step 8: {} model mid {} deviates "
+                                     "{:.1f}% from BBO mid {} -- suppressing ALL "
+                                     "offers this block",
+                                     pair_name, mid, mid_dev * 100.0, bbo_mid_m);
+                        fee_filtered_tiers.clear();
+                    }
+                }
+
+                // Check 2: Per-tier BBO proximity
+                if (!fee_filtered_tiers.empty()) {
+                    std::vector<TierQuote> bbo_safe;
+                    bbo_safe.reserve(fee_filtered_tiers.size());
+                    std::size_t bbo_suppressed = 0;
+
+                    for (const auto& tier : fee_filtered_tiers) {
+                        const Mojo ref = (tier.side == Side::Bid)
+                            ? best_bid : best_ask;
+                        const double dev = std::abs(
+                            static_cast<double>(tier.price)
+                            - static_cast<double>(ref))
+                            / static_cast<double>(ref);
+
+                        if (dev > kMaxBboDeviation) {
+                            spdlog::warn("[Engine] Step 8: {} {} tier {} price {} "
+                                         "deviates {:.1f}% from BBO {} -- "
+                                         "suppressed",
+                                         pair_name,
+                                         (tier.side == Side::Bid) ? "bid" : "ask",
+                                         tier.tier_index, tier.price,
+                                         dev * 100.0, ref);
+                            ++bbo_suppressed;
+                            continue;
+                        }
+                        bbo_safe.push_back(tier);
+                    }
+                    if (bbo_suppressed > 0) {
+                        spdlog::warn("[Engine] Step 8: {} BBO sanity check "
+                                     "removed {}/{} tiers",
+                                     pair_name, bbo_suppressed,
+                                     fee_filtered_tiers.size());
+                    }
+                    fee_filtered_tiers = std::move(bbo_safe);
+                }
+            }
+        }
+
         // -- Side-aware balance filter: suppress tiers on depleted sides.
         if (!can_bid || !can_ask) {
             std::vector<TierQuote> side_filtered;
@@ -5028,7 +5182,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     // Reset consecutive pending counter only when NO pair hit Gate 1
     // (pending_change > 0) on this entire block.  Resetting per-pair
     // would incorrectly clear the counter whenever a clean pair processes.
-    if (!pending_hit_this_block) {
+    if (pending_wallets_this_block.empty()) {
         consecutive_pending_blocks_ = 0;
     }
 

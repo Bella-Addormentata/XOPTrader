@@ -781,6 +781,16 @@ private:
     // than relying on the transaction-scanning heuristic.
     uint32_t consecutive_pending_blocks_{0};
     static constexpr uint32_t kForceDeletePendingBlocks{12};  // ~10 min
+
+    // -- Wallet unsync auto-recovery -------------------------------------
+    // When the Chia wallet stays unsynced for kWalletRestartThreshold
+    // consecutive blocks, the engine restarts the wallet service to
+    // force a clean resync from the trusted full node.  This breaks the
+    // deadlock where pending_change prevents sync and the sync gate
+    // prevents the force-delete from ever firing.
+    uint32_t consecutive_unsynced_blocks_{0};
+    static constexpr uint32_t kWalletRestartThreshold{20};  // ~3 min
+
     // -- [T4-04] Cached wallet balances for spendable-reserve gating ------
     // Populated from wallet RPC each heartbeat; keyed by wallet label.
     struct WalletBalanceEntry {

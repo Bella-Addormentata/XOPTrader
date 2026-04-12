@@ -1140,9 +1140,31 @@ void MarketDataFeed::ingest_competing_offers(
 
         // Compute depth-weighted VWAP micro-price from the filtered book.
         // This must happen BEFORE the move into competing_offers_.
-        const double ob_mid = cfg.orderbook_mid_enabled
+        double ob_mid = cfg.orderbook_mid_enabled
             ? compute_orderbook_mid_impl(filtered, cfg.orderbook_mid_depth)
             : 0.0;
+
+        // Sanity check: clamp microprice within max deviation of simple
+        // BBO midpoint.  When the order book is extremely asymmetric the
+        // depth-weighted microprice can diverge wildly (e.g. 40% below
+        // BBO on XCH/BYC) making all subsequent pricing unusable.
+        if (ob_mid > 0.0
+            && filtered_best_bid > 0.0
+            && filtered_best_ask > 0.0)
+        {
+            const double simple_bbo_mid =
+                (filtered_best_bid + filtered_best_ask) / 2.0;
+            const double deviation =
+                std::abs(ob_mid - simple_bbo_mid) / simple_bbo_mid;
+            constexpr double kMaxMicroPriceDeviation = 0.10;  // 10%
+            if (deviation > kMaxMicroPriceDeviation) {
+                spdlog::warn("[MarketData] {} microprice {:.6f} deviates "
+                             "{:.1f}% from BBO mid {:.6f} -- clamping to BBO",
+                             pair_name, ob_mid,
+                             deviation * 100.0, simple_bbo_mid);
+                ob_mid = simple_bbo_mid;
+            }
+        }
 
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
