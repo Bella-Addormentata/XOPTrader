@@ -1,0 +1,212 @@
+# Sensitive fields (wallet_fingerprint, SSL paths, API keys, tokens)
+# live in secrets.yaml which is gitignored and deep-merged at startup.
+
+chia:
+  mode: auto
+  full_node_host: localhost
+  full_node_port: 8555
+  wallet_host: localhost
+  wallet_port: 9256
+  verify_ssl: false
+dexie:
+  api_base: https://api.dexie.space/v1
+  max_requests_per_10s: 50
+  claim_rewards: true
+pairs:
+- name: XCH/wUSDC.b
+  base_asset_id: xch
+  quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  enabled: true
+- name: XCH/BYC
+  base_asset_id: xch
+  quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
+  enabled: true
+- name: BYC/wUSDC.b
+  base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
+  quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  enabled: true
+  is_stablecoin: true
+  peg_target: 1.000
+  depeg_warn_pct: 2.0
+  depeg_bail_pct: 10.0
+  depeg_sustained_blocks: 30
+  gamma_override: 0.001
+  min_profit_margin_bps_override: 25
+  max_half_spread_bps_override: 75
+  tier_spacing_bps_override: [3, 8, 20, 40]
+  tier_size_pct_override: [0.30, 0.25, 0.25, 0.20]
+  peg_anchor_threshold_pct: 2.0
+  peg_anchor_weight: 0.60
+  stablecoin_exempt_buyonly: true
+  stablecoin_undercut_all_tiers: true
+  stablecoin_flat_sizing: true
+  stablecoin_skip_gap_aware: true
+  min_offer_size_units_override: 1
+- name: XCH/DBX
+  base_asset_id: xch
+  quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
+  enabled: true
+- name: wmilliETH.b/XCH
+  base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
+  quote_asset_id: xch
+  enabled: false
+- name: wmilliETH/XCH
+  base_asset_id: 4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f
+  quote_asset_id: xch
+  enabled: false
+strategy:
+  gamma: 0.005
+  kappa: 1.5
+  phi: 0.8                           # Raised from 0.5 -- aggressive rebalancing skew for extreme inventory imbalance
+  q_max: 30                           # [v0.7.39] Raised from 8 for ~10 XCH outermost tier. Wallet cap (v0.7.38) protects ask side.
+  min_profit_margin_bps: 35
+  max_half_spread_bps: 150
+  high_vol_multiplier: 1.3
+  offer_ttl_blocks: 600           # ~5 hours; reduces cancel+repost churn
+  num_tiers: 4                        # [v0.7.39] Reduced from 6: fewer, larger tiers -- each fill buys more XCH
+  tier_spacing_bps:
+  - 35.0
+  - 100.0
+  - 200.0
+  - 300.0
+  tier_size_pct:                      # Fallback when adverse-selection sizing is off
+  - 0.15
+  - 0.20
+  - 0.30
+  - 0.35
+  startup_analysis_blocks: 5
+  fee_reserve_xch: 0.1
+  fee_min_spendable_xch: 0.01
+  min_spendable_reserve_pct: 0.10   # Was 0.25 default; lowered to stop suppressing depleted CATs
+  arb_reserve_coins: 2            # Dry-powder: keep 2 coins unallocated for arb takes
+  min_reserve_units: 0.1
+  min_offer_size_units: 0.1       # Minimum offer size per tier (XCH units); default was 1.0
+  min_trading_units: 0.1          # Lowered from 0.5: unblocks ask-side when XCH > 0.1
+  auto_rebalance_enabled: true
+  sigma_floor: 0.001              # Minimum annualized sigma — prevents degenerate GLFT when Yang-Zhang returns 0
+
+  # Coin pool: pre-split XCH into smaller coins for concurrent offers
+  coin_pool_target_count: 3       # Fits ~2 XCH spendable balance
+  coin_pool_target_xch: 0.5       # Each coin ~0.5 XCH (3×0.5=1.5 XCH)
+  coin_pool_interval_blocks: 5    # Check every ~4.3 minutes
+
+  # CAT coin pool: pre-split BYC, wUSDC.b etc. for concurrent offers
+  cat_coin_pool_target_count: 0   # Disabled until CAT inventory recovers
+  cat_coin_pool_target_units: 10.0  # Each coin ~10 display units (10 BYC, 10 USDC etc.)
+
+  wall_size_threshold_xch: 50.0
+  wall_niche_premium_pct: 0.05
+
+  # Competitive anchor pricing -- anchor tiers to best competing offer
+  competitive_anchor_enabled: true       # [v0.7.41] Anchor T0 to best competitor
+  competitive_anchor_max_distance_bps: 500.0  # Max anchor distance from mid
+  competitive_anchor_stride_bps: 65.0    # Inter-tier spacing from anchor point
+
+  # Smart orphan management (Guéant-Lehalle 2013, Gao-Wang 2020)
+  orphan_adopt_enabled: true
+  orphan_adverse_threshold: 0.02
+  orphan_max_adopt_age_blocks: 120
+  orphan_inventory_bonus: 0.01
+
+  # Cross-pair correlated inventory skewing (Guéant 2019)
+  cross_pair_skew_enabled: true
+  cross_pair_skew_phi: 0.50          # Raised from 0.30 -- stronger coordinated cross-pair rebalancing
+risk:
+  soft_limit_pct: 0.6
+  hard_limit_pct: 0.8
+  single_cat_cap_pct: 0.12
+  kelly_fraction: 0.5
+  max_capital_per_pair_pct: 0.85  # Raised from 0.40 -- wUSDC.b dominates portfolio (77%), XCH/wUSDC.b pair needs >40% to trade
+  max_drawdown_pct: 0.05
+  loss_window_blocks: 576
+  max_window_loss_bps: 250
+
+  # Circuit-breaker auto-rebalance (enables loss manager for stuck positions)
+  circuit_breaker_enabled: true
+  circuit_breaker_hard_limit_ratio: 0.80
+  circuit_breaker_age_multiplier: 2.0
+  circuit_breaker_max_loss_bps: 100
+volatility:
+  lookback_blocks: 200
+  yz_alpha: 0.34
+  candle_aggregation_blocks: 10
+monitoring:
+  prometheus_port: 19090
+depeg:
+  enabled: true
+  default_warn_pct: 2.0
+  default_bail_pct: 10.0
+  default_sustained_blocks: 30
+  auto_disable_pair: true
+  alert_on_warn: true
+  alert_on_bail: true
+arbitrage:
+  enabled: true
+  triangular_min_profit_bps: 12
+  triangular_slippage_bps: 10
+  triangular_per_leg_fee_bps: 5
+  cex_dex_min_edge_bps: 50
+  cex_dex_max_edge_bps: 500
+  cex_fee_bps: 10
+  cross_dex_min_edge_bps: 15
+  tibetswap_fee_bps: 70
+  cross_bridge_min_edge_bps: 20
+  bridge_cost_bps: 15
+  crossed_book_enabled: true
+  crossed_book_min_edge_bps: 10
+  crossed_book_max_take_xch: 5.0
+  cancel_worst_to_free: true       # Cancel worst offer to free coin for arb
+  cross_stable_arb_enabled: true
+  cross_stable_min_edge_bps: 15
+  cross_stable_max_take_xch: 5.0
+  peg_arb_enabled: true
+  peg_arb_min_edge_bps: 5
+  peg_arb_max_take_units: 50
+  peg_arb_max_inventory_ratio: 0.60  # suppress takes beyond 60:40 balance
+  max_position_size: 100
+  default_confidence: 0.75
+  min_confidence_threshold: 0.4
+coingecko:
+  enabled: true
+  coin_ids:
+  - chia
+  - ethereum
+  - usd-coin
+  - dexie-bucks
+  polling_interval_ms: 30000
+fees:
+  enabled: true
+  daily_budget_mojos: 10000000000
+  fee_to_gain_max_ratio: 0.3
+  min_fee_mojos: 5000             # Was 50K (20x mempool); 5K still 2x estimate
+  max_fee_mojos: 100000000
+  adaptive_enabled: true
+  fee_window_blocks: 1662
+  fee_estimate_target_seconds: 300
+inventory_aging:
+  enabled: true
+  aging_start_blocks: 500
+  max_loss_relax_bps: 25
+  relax_rate_bps_per_block: 0.05
+# database.path is in secrets.yaml (machine-specific)
+market_allocator:
+  enabled: true
+  eval_interval_blocks: 50
+  min_alloc_pct: 0.10
+  max_alloc_pct: 0.50
+  hysteresis_bps: 50
+  smooth_alpha: 0.20
+  weight_spread: 1.0
+  weight_volume: 1.0
+  weight_competition: 1.0
+  weight_fill_rate: 1.0
+  weight_tri_arb: 1.0
+  tri_arb_fee_bps: 15
+  tri_arb_min_edge_bps: 5
+recovery:
+  enabled: true
+  xch_low_threshold: 0.15       # Enter recovery below this XCH (lowered for small portfolio)
+  xch_recovery_target: 1.0      # Exit recovery above this XCH
+  max_take_per_block_xch: 0.5   # Max XCH to acquire per block
+  max_premium_bps: 100           # Max premium over CEX price to pay
+  cancel_on_enter: true          # Cancel all offers when entering recovery
