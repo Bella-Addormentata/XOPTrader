@@ -98,6 +98,51 @@ int score_offer_competitiveness(Side side,
     return 2;
 }
 
+Mojo compute_queue_ahead_mojos(Side side,
+                               Mojo price,
+                               const std::vector<CompetingOffer>& competing_offers)
+{
+    Mojo queue_ahead_mojos = 0;
+    for (const auto& offer : competing_offers) {
+        if (offer.side != side) continue;
+
+        const bool ahead_of_us =
+            (side == Side::Bid) ? (offer.price >= price) : (offer.price <= price);
+        if (ahead_of_us) {
+            queue_ahead_mojos += offer.size;
+        }
+    }
+    return queue_ahead_mojos;
+}
+
+int score_queue_position(Mojo queue_ahead_mojos, Mojo our_size_mojos)
+{
+    if (our_size_mojos <= 0) return 0;
+    if (queue_ahead_mojos <= 0) return 10;
+
+    const double queue_ratio = static_cast<double>(queue_ahead_mojos)
+        / static_cast<double>(our_size_mojos);
+    if (queue_ratio <= 0.25) return 9;
+    if (queue_ratio <= 0.50) return 8;
+    if (queue_ratio <= 1.00) return 7;
+    if (queue_ratio <= 2.00) return 6;
+    if (queue_ratio <= 4.00) return 5;
+    if (queue_ratio <= 8.00) return 4;
+    if (queue_ratio <= 12.00) return 3;
+    if (queue_ratio <= 20.00) return 2;
+    return 1;
+}
+
+int score_execution_quality(int competitiveness_score, int queue_ahead_score)
+{
+    if (competitiveness_score <= 0) return queue_ahead_score;
+    if (queue_ahead_score <= 0) return competitiveness_score;
+
+    const double weighted_score = 0.7 * static_cast<double>(competitiveness_score)
+        + 0.3 * static_cast<double>(queue_ahead_score);
+    return std::clamp(static_cast<int>(std::lround(weighted_score)), 1, 10);
+}
+
 }  // namespace
 
 // [H9] Fallback XCH/USD rate when CEX feed is unavailable (Phase 2).
@@ -5083,6 +5128,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         {
             constexpr int kMinCompetitivenessScore = 3;
             const auto book_snap = state_->get_market(pair_name);
+            const auto competing_offers = market_data_->get_competing_offers(pair_name);
             std::vector<TierQuote> competitive_tiers;
             competitive_tiers.reserve(fee_filtered_tiers.size());
 
@@ -5092,17 +5138,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     tier.price,
                     book_snap.best_bid,
                     book_snap.best_ask);
+                const Mojo queue_ahead_mojos = compute_queue_ahead_mojos(
+                    tier.side,
+                    tier.price,
+                    competing_offers);
+                const int queue_ahead_score = score_queue_position(
+                    queue_ahead_mojos,
+                    tier.size);
                 if (score >= kMinCompetitivenessScore) {
                     competitive_tiers.push_back(tier);
                     continue;
                 }
 
                 spdlog::info("[Engine] Step 8: {} {} tier {} suppressed -- "
-                             "competitiveness {}/10 (price={} bbo={}/{})",
+                             "competitiveness {}/10 queue {}/10 ahead={} (price={} bbo={}/{})",
                              pair_name,
                              (tier.side == Side::Bid ? "bid" : "ask"),
                              tier.tier_index,
                              score,
+                             queue_ahead_score,
+                             queue_ahead_mojos,
                              tier.price,
                              book_snap.best_bid,
                              book_snap.best_ask);
@@ -5118,8 +5173,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     failure.deviation_pct = 0.0;
                     failure.failure_reason = "competitiveness_too_low";
                     failure.details = fmt::format(
-                        "{{score:{}, best_bid:{}, best_ask:{}}}",
+                        "{{score:{}, queue_ahead_mojos:{}, queue_ahead_score:{}, best_bid:{}, best_ask:{}}}",
                         score,
+                        queue_ahead_mojos,
+                        queue_ahead_score,
                         book_snap.best_bid,
                         book_snap.best_ask);
                     db_->insert_sanity_failure(failure);
@@ -5219,6 +5276,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             auto pending_offers = state_->get_all_offers();
             int competitiveness_sum = 0;
             int competitiveness_count = 0;
+            int queue_ahead_sum = 0;
+            int execution_quality_sum = 0;
+            const auto competing_offers = market_data_->get_competing_offers(pair_name);
             // Build a lookup from (pair, side, tier) to the real offer_id.
             std::unordered_map<std::string, std::string> tier_to_id;
             for (const auto& po : pending_offers) {
@@ -5251,6 +5311,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         etq.price,
                         orec.book_best_bid,
                         orec.book_best_ask);
+                    orec.queue_ahead_mojos = compute_queue_ahead_mojos(
+                        etq.side,
+                        etq.price,
+                        competing_offers);
+                    orec.queue_ahead_score = score_queue_position(
+                        orec.queue_ahead_mojos,
+                        etq.size);
+                    orec.execution_quality_score = score_execution_quality(
+                        orec.competitiveness_score,
+                        orec.queue_ahead_score);
                 }
 
                 // Look up the actual offer_id from State.
@@ -5273,13 +5343,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
                 db_->insert_offer(orec);
                 competitiveness_sum += orec.competitiveness_score;
+                queue_ahead_sum += orec.queue_ahead_score;
+                execution_quality_sum += orec.execution_quality_score;
                 ++competitiveness_count;
             }
 
             if (competitiveness_count > 0) {
-                spdlog::info("[Engine] Step 8: {} competitiveness avg={:.1f}/10 over {} posted offers",
+                spdlog::info("[Engine] Step 8: {} price avg={:.1f}/10 queue avg={:.1f}/10 execution avg={:.1f}/10 over {} posted offers",
                              pair_name,
                              static_cast<double>(competitiveness_sum)
+                                 / static_cast<double>(competitiveness_count),
+                             static_cast<double>(queue_ahead_sum)
+                                 / static_cast<double>(competitiveness_count),
+                             static_cast<double>(execution_quality_sum)
                                  / static_cast<double>(competitiveness_count),
                              competitiveness_count);
             }

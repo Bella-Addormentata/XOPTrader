@@ -85,6 +85,9 @@ struct DbOfferRecord {
     Mojo        size_mojos{0};      ///< Offered quantity in mojos.
     int         tier{0};            ///< Tier index (0 = tightest).
     int         competitiveness_score{0}; ///< 1-10 score vs current competing BBO.
+    Mojo        queue_ahead_mojos{0}; ///< Same-side competing size priced ahead of this offer.
+    int         queue_ahead_score{0}; ///< 1-10 score for queue position vs same-side depth.
+    int         execution_quality_score{0}; ///< Weighted 70/30 blend of price competitiveness and queue position.
     std::string status{"pending"};  ///< "pending", "filled", "cancelled", "expired".
     BlockHeight created_block{0};   ///< Block at which the offer was broadcast.
     BlockHeight resolved_block{0};  ///< Block at which the offer was resolved (0 if pending).

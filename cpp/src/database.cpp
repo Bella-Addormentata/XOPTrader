@@ -68,6 +68,9 @@ CREATE TABLE IF NOT EXISTS offer_log (
     size_mojos      INTEGER NOT NULL,
     tier            INTEGER DEFAULT 0,
     competitiveness_score INTEGER DEFAULT 0,
+    queue_ahead_mojos INTEGER DEFAULT 0,
+    queue_ahead_score INTEGER DEFAULT 0,
+    execution_quality_score INTEGER DEFAULT 0,
     status          TEXT    NOT NULL DEFAULT 'pending',
     created_block   INTEGER NOT NULL,
     resolved_block  INTEGER,
@@ -186,9 +189,10 @@ ORDER BY timestamp ASC;
 constexpr const char* kInsertOffer = R"SQL(
 INSERT INTO offer_log
     (offer_id, pair_name, side, price_mojos, size_mojos, tier,
-    competitiveness_score, status, created_block, fee_mojos,
+    competitiveness_score, queue_ahead_mojos, queue_ahead_score,
+    execution_quality_score, status, created_block, fee_mojos,
     book_best_bid, book_best_ask)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kQueryPendingOffers = R"SQL(
@@ -441,17 +445,21 @@ void Database::insert_offer(const DbOfferRecord& r)
     bind_int64 (stmt_insert_offer_, 5, r.size_mojos);
     bind_int64 (stmt_insert_offer_, 6, static_cast<std::int64_t>(r.tier));
     bind_int64 (stmt_insert_offer_, 7, static_cast<std::int64_t>(r.competitiveness_score));
-    bind_text  (stmt_insert_offer_, 8, r.status);
-    bind_int64 (stmt_insert_offer_, 9, static_cast<std::int64_t>(r.created_block));
-    bind_int64 (stmt_insert_offer_, 10, static_cast<std::int64_t>(r.fee_mojos));
-    bind_int64 (stmt_insert_offer_, 11, static_cast<std::int64_t>(r.book_best_bid));
-    bind_int64 (stmt_insert_offer_, 12, static_cast<std::int64_t>(r.book_best_ask));
+    bind_int64 (stmt_insert_offer_, 8, static_cast<std::int64_t>(r.queue_ahead_mojos));
+    bind_int64 (stmt_insert_offer_, 9, static_cast<std::int64_t>(r.queue_ahead_score));
+    bind_int64 (stmt_insert_offer_, 10, static_cast<std::int64_t>(r.execution_quality_score));
+    bind_text  (stmt_insert_offer_, 11, r.status);
+    bind_int64 (stmt_insert_offer_, 12, static_cast<std::int64_t>(r.created_block));
+    bind_int64 (stmt_insert_offer_, 13, static_cast<std::int64_t>(r.fee_mojos));
+    bind_int64 (stmt_insert_offer_, 14, static_cast<std::int64_t>(r.book_best_bid));
+    bind_int64 (stmt_insert_offer_, 15, static_cast<std::int64_t>(r.book_best_ask));
 
     step_and_reset(stmt_insert_offer_);
 
-    spdlog::debug("[Database] Inserted offer '{}' pair={} side={} tier={} fee={} competitiveness={}",
+    spdlog::debug("[Database] Inserted offer '{}' pair={} side={} tier={} fee={} competitiveness={} queue_ahead={} queue_score={} execution_quality={}",
                   r.offer_id, r.pair_name, r.side, r.tier, r.fee_mojos,
-                  r.competitiveness_score);
+                  r.competitiveness_score, r.queue_ahead_mojos,
+                  r.queue_ahead_score, r.execution_quality_score);
 }
 
 std::vector<DbOfferRecord> Database::query_pending_offers() const
@@ -861,6 +869,12 @@ void Database::run_migrations()
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN cancel_reason TEXT;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN competitiveness_score INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN queue_ahead_mojos INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN queue_ahead_score INTEGER DEFAULT 0;",
+                 nullptr, nullptr, nullptr);
+    sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN execution_quality_score INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
     sqlite3_exec(db_, "ALTER TABLE offer_log ADD COLUMN book_best_bid INTEGER DEFAULT 0;",
                  nullptr, nullptr, nullptr);
