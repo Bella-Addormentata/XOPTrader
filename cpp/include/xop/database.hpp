@@ -84,6 +84,7 @@ struct DbOfferRecord {
     Mojo        price_mojos{0};     ///< Offer price in mojos.
     Mojo        size_mojos{0};      ///< Offered quantity in mojos.
     int         tier{0};            ///< Tier index (0 = tightest).
+    int         competitiveness_score{0}; ///< 1-10 score vs current competing BBO.
     std::string status{"pending"};  ///< "pending", "filled", "cancelled", "expired".
     BlockHeight created_block{0};   ///< Block at which the offer was broadcast.
     BlockHeight resolved_block{0};  ///< Block at which the offer was resolved (0 if pending).

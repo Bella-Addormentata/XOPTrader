@@ -50,6 +50,56 @@ namespace xop {
 
 namespace asio = boost::asio;
 
+namespace {
+
+int score_offer_competitiveness(Side side,
+                                Mojo price,
+                                Mojo best_bid,
+                                Mojo best_ask)
+{
+    if (price <= 0) return 0;
+
+    if (best_bid > 0 && best_ask > best_bid) {
+        if (side == Side::Bid && price >= best_ask) return 1;
+        if (side == Side::Ask && price <= best_bid) return 1;
+
+        const double spread = static_cast<double>(best_ask - best_bid);
+        if (side == Side::Bid) {
+            if (price >= best_bid) return 10;
+            const double widths_below_best =
+                static_cast<double>(best_bid - price) / spread;
+            return std::clamp(
+                10 - static_cast<int>(std::llround(widths_below_best * 4.0)),
+                1, 10);
+        }
+
+        if (price <= best_ask) return 10;
+        const double widths_above_best =
+            static_cast<double>(price - best_ask) / spread;
+        return std::clamp(
+            10 - static_cast<int>(std::llround(widths_above_best * 4.0)),
+            1, 10);
+    }
+
+    const Mojo same_side_best = (side == Side::Bid) ? best_bid : best_ask;
+    if (same_side_best <= 0) return 0;
+    if ((side == Side::Bid && price >= same_side_best)
+        || (side == Side::Ask && price <= same_side_best)) {
+        return 9;
+    }
+
+    const double bps_off_best =
+        std::abs(static_cast<double>(price - same_side_best))
+        / static_cast<double>(same_side_best) * 10000.0;
+    if (bps_off_best <= 5.0) return 8;
+    if (bps_off_best <= 10.0) return 7;
+    if (bps_off_best <= 25.0) return 6;
+    if (bps_off_best <= 50.0) return 4;
+    return 2;
+}
+
+}  // namespace
+
 // [H9] Fallback XCH/USD rate when CEX feed is unavailable (Phase 2).
 // ISO/IEC 5055: no magic numbers in financial calculations.
 static constexpr double kFallbackXchUsdRate = 2.70;
@@ -5029,6 +5079,65 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             fee_filtered_tiers = std::move(side_filtered);
         }
 
+        // -- Competitiveness guard -----------------------------------------
+        {
+            constexpr int kMinCompetitivenessScore = 3;
+            const auto book_snap = state_->get_market(pair_name);
+            std::vector<TierQuote> competitive_tiers;
+            competitive_tiers.reserve(fee_filtered_tiers.size());
+
+            for (const auto& tier : fee_filtered_tiers) {
+                const int score = score_offer_competitiveness(
+                    tier.side,
+                    tier.price,
+                    book_snap.best_bid,
+                    book_snap.best_ask);
+                if (score >= kMinCompetitivenessScore) {
+                    competitive_tiers.push_back(tier);
+                    continue;
+                }
+
+                spdlog::info("[Engine] Step 8: {} {} tier {} suppressed -- "
+                             "competitiveness {}/10 (price={} bbo={}/{})",
+                             pair_name,
+                             (tier.side == Side::Bid ? "bid" : "ask"),
+                             tier.tier_index,
+                             score,
+                             tier.price,
+                             book_snap.best_bid,
+                             book_snap.best_ask);
+                try {
+                    xop::DbSanityFailure failure;
+                    failure.block_height = block_height;
+                    failure.pair_name = pair_name;
+                    failure.side = (tier.side == Side::Bid) ? "bid" : "ask";
+                    failure.tier = static_cast<int>(tier.tier_index);
+                    failure.proposed_price_mojos = static_cast<Mojo>(tier.price);
+                    failure.reference_price_mojos =
+                        (tier.side == Side::Bid) ? book_snap.best_bid : book_snap.best_ask;
+                    failure.deviation_pct = 0.0;
+                    failure.failure_reason = "competitiveness_too_low";
+                    failure.details = fmt::format(
+                        "{{score:{}, best_bid:{}, best_ask:{}}}",
+                        score,
+                        book_snap.best_bid,
+                        book_snap.best_ask);
+                    db_->insert_sanity_failure(failure);
+                } catch (const std::exception& e) {
+                    spdlog::debug("[Engine] Failed to log competitiveness failure: {}",
+                                  e.what());
+                }
+            }
+
+            if (competitive_tiers.size() != fee_filtered_tiers.size()) {
+                spdlog::warn("[Engine] Step 8: {} competitiveness guard suppressed {}/{} tiers",
+                             pair_name,
+                             fee_filtered_tiers.size() - competitive_tiers.size(),
+                             fee_filtered_tiers.size());
+            }
+            fee_filtered_tiers = std::move(competitive_tiers);
+        }
+
         if (fee_filtered_tiers.empty()) {
             spdlog::info("[Engine] Step 8: {} all tiers filtered by "
                          "fee-vs-gain gating", pair_name);
@@ -5108,6 +5217,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // ISO/IEC 5055: no orphaned placeholder IDs in the audit trail.
         {
             auto pending_offers = state_->get_all_offers();
+            int competitiveness_sum = 0;
+            int competitiveness_count = 0;
             // Build a lookup from (pair, side, tier) to the real offer_id.
             std::unordered_map<std::string, std::string> tier_to_id;
             for (const auto& po : pending_offers) {
@@ -5135,6 +5246,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     const auto book_snap = state_->get_market(pair_name);
                     orec.book_best_bid = book_snap.best_bid;
                     orec.book_best_ask = book_snap.best_ask;
+                    orec.competitiveness_score = score_offer_competitiveness(
+                        etq.side,
+                        etq.price,
+                        orec.book_best_bid,
+                        orec.book_best_ask);
                 }
 
                 // Look up the actual offer_id from State.
@@ -5156,6 +5272,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     continue;
                 }
                 db_->insert_offer(orec);
+                competitiveness_sum += orec.competitiveness_score;
+                ++competitiveness_count;
+            }
+
+            if (competitiveness_count > 0) {
+                spdlog::info("[Engine] Step 8: {} competitiveness avg={:.1f}/10 over {} posted offers",
+                             pair_name,
+                             static_cast<double>(competitiveness_sum)
+                                 / static_cast<double>(competitiveness_count),
+                             competitiveness_count);
             }
         }
 
