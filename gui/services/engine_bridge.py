@@ -512,11 +512,10 @@ class EngineBridge(QObject):
         node_synced = health.get("node_synced", 0.0)
         wallet_connected = health.get("wallet_connected", 0.0)
 
-        # Infer running status: if both node and wallet are up, the
-        # engine is running.  If the endpoint is reachable but the
-        # node is not synced, we report it as running (degraded) --
-        # the status bar can show the detail.
-        if node_synced >= 1.0 or wallet_connected >= 1.0:
+        # Some engine builds can temporarily report xop_node gauges as
+        # zero even while the process is healthy and exporting metrics.
+        # If the metrics endpoint is live, treat the bot as running.
+        if self._metrics_svc.is_connected or node_synced >= 1.0 or wallet_connected >= 1.0:
             new_status = STATUS_RUNNING
         else:
             new_status = STATUS_STOPPED
@@ -590,13 +589,11 @@ class EngineBridge(QObject):
     # Engine subprocess management
     # ===================================================================
 
-    def _find_engine_binary(self) -> Path | None:
-        """Locate the C++ engine binary relative to the GUI executable.
+    def _engine_binary_candidates(self) -> list[Path]:
+        """Return ordered engine binary candidates.
 
-        When running from a PyInstaller bundle the binary is expected
-        next to ``sys.executable``.  For one-file bundles, fallback to
-        ``sys._MEIPASS`` where PyInstaller extracts bundled binaries.
-        In development mode the current working directory is checked.
+        Candidates are ordered by preference. Only existing files are
+        included in the returned list.
         """
         engine_name = "xop_trader.exe" if sys.platform == "win32" else "xop_trader"
 
@@ -605,7 +602,7 @@ class EngineBridge(QObject):
         if override_path:
             candidate = Path(override_path).resolve()
             if candidate.is_file():
-                return candidate
+                return [candidate]
 
         candidates: list[Path] = []
 
@@ -629,11 +626,20 @@ class EngineBridge(QObject):
             # Fallback: root-level copy (e.g. deployed / manually placed).
             candidates.append(cwd / engine_name)
 
-        for candidate in candidates:
-            if candidate.is_file():
-                return candidate
+        return [candidate for candidate in candidates if candidate.is_file()]
 
-        return None
+    def _find_engine_binary(self) -> Path | None:
+        """Locate the preferred C++ engine binary.
+
+        When running from a PyInstaller bundle the binary is expected
+        next to ``sys.executable``.  For one-file bundles, fallback to
+        ``sys._MEIPASS`` where PyInstaller extracts bundled binaries.
+        In development mode the current working directory is checked.
+        """
+        candidates = self._engine_binary_candidates()
+        if not candidates:
+            return None
+        return candidates[0]
 
     def _is_engine_reachable(self) -> bool:
         """Return True if the Prometheus metrics endpoint already responds.
@@ -659,60 +665,87 @@ class EngineBridge(QObject):
         the binary so users can inspect output without a console window.
         Returns *True* on success.
         """
-        engine_path = self._find_engine_binary()
-        if engine_path is None:
+        engine_candidates = self._engine_binary_candidates()
+        if not engine_candidates:
             return False
 
-        cmd: list[str] = [str(engine_path)]
+        launch_args: list[str] = []
         if self._config_path.is_file():
-            cmd.extend(["--config", str(self._config_path)])
+            launch_args.extend(["--config", str(self._config_path)])
 
-        # Pass secrets file if it exists next to the config file.
-        secrets_path = self._config_path.parent / "secrets.yaml"
-        if secrets_path.is_file():
-            cmd.extend(["--secrets", str(secrets_path)])
+        for engine_path in engine_candidates:
+            candidate_args = list(launch_args)
 
+            # Pass secrets file only when the selected engine supports it.
+            secrets_path = self._config_path.parent / "secrets.yaml"
+            if secrets_path.is_file() and self._engine_supports_flag(engine_path, "--secrets"):
+                candidate_args.extend(["--secrets", str(secrets_path)])
+
+            cmd: list[str] = [str(engine_path), *candidate_args]
+            try:
+                launch_dir = self._determine_engine_launch_dir(engine_path)
+                self._ensure_engine_runtime_dirs(launch_dir)
+
+                # Keep logs next to the GUI executable when frozen.  This avoids
+                # writing logs into ephemeral extraction directories.
+                if getattr(sys, "frozen", False):
+                    log_path = Path(sys.executable).parent / "engine.log"
+                else:
+                    log_path = engine_path.parent / "engine.log"
+                log_path.parent.mkdir(parents=True, exist_ok=True)
+                self._engine_log_fh = open(log_path, "a")  # noqa: SIM115
+                self._engine_log_path = log_path
+                self._engine_launch_dir = launch_dir
+
+                kwargs: dict[str, Any] = {}
+                if sys.platform == "win32":
+                    kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+                kwargs["cwd"] = str(launch_dir)
+
+                self._engine_process = subprocess.Popen(
+                    cmd,
+                    stdout=self._engine_log_fh,
+                    stderr=subprocess.STDOUT,
+                    **kwargs,
+                )
+                _log.info(
+                    "Started C++ engine (PID %d): %s  log → %s",
+                    self._engine_process.pid,
+                    cmd,
+                    log_path,
+                )
+                QTimer.singleShot(3_000, self._check_engine_startup_result)
+                return True
+            except Exception:
+                _log.exception(
+                    "Failed to start C++ engine subprocess with candidate: %s",
+                    engine_path,
+                )
+                if self._engine_log_fh is not None:
+                    self._engine_log_fh.close()
+                    self._engine_log_fh = None
+                self._engine_log_path = None
+                self._engine_launch_dir = None
+                self._engine_process = None
+
+        return False
+
+    def _engine_supports_flag(self, engine_path: Path, flag: str) -> bool:
+        """Return True if the engine binary advertises a CLI flag in --help."""
         try:
-            launch_dir = self._determine_engine_launch_dir(engine_path)
-            self._ensure_engine_runtime_dirs(launch_dir)
-
-            # Keep logs next to the GUI executable when frozen.  This avoids
-            # writing logs into ephemeral extraction directories.
-            if getattr(sys, "frozen", False):
-                log_path = Path(sys.executable).parent / "engine.log"
-            else:
-                log_path = engine_path.parent / "engine.log"
-            log_path.parent.mkdir(parents=True, exist_ok=True)
-            self._engine_log_fh = open(log_path, "a")  # noqa: SIM115
-            self._engine_log_path = log_path
-            self._engine_launch_dir = launch_dir
-
-            kwargs: dict[str, Any] = {}
+            kwargs: dict[str, Any] = {
+                "stdout": subprocess.PIPE,
+                "stderr": subprocess.STDOUT,
+                "text": True,
+                "timeout": 2,
+            }
             if sys.platform == "win32":
                 kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
-            kwargs["cwd"] = str(launch_dir)
 
-            self._engine_process = subprocess.Popen(
-                cmd,
-                stdout=self._engine_log_fh,
-                stderr=subprocess.STDOUT,
-                **kwargs,
-            )
-            _log.info(
-                "Started C++ engine (PID %d): %s  log → %s",
-                self._engine_process.pid,
-                cmd,
-                log_path,
-            )
-            QTimer.singleShot(3_000, self._check_engine_startup_result)
-            return True
+            result = subprocess.run([str(engine_path), "--help"], **kwargs)
+            output = result.stdout or ""
+            return flag in output
         except Exception:
-            _log.exception("Failed to start C++ engine subprocess.")
-            if self._engine_log_fh is not None:
-                self._engine_log_fh.close()
-                self._engine_log_fh = None
-            self._engine_log_path = None
-            self._engine_launch_dir = None
             return False
 
     def _stop_engine_process(self) -> None:

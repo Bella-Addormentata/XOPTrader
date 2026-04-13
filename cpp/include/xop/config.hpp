@@ -275,6 +275,25 @@ struct StrategyConfig {
     /// depleted assets when below min_trading_units.  Default true.
     bool     auto_rebalance_enabled{true};
 
+    // -- XCH inventory-preservation throttle -------------------------------
+
+    /// When enabled, XCH-base asks become progressively less competitive as
+    /// confirmed XCH falls through the configured thresholds.
+    bool     xch_ask_throttle_enabled{true};
+
+    /// Confirmed XCH level where ask throttling begins.
+    double   xch_ask_throttle_caution_xch{2.0};
+
+    /// Confirmed XCH level where ask throttling becomes materially stronger.
+    double   xch_ask_throttle_low_xch{1.0};
+
+    /// Confirmed XCH level where only a defensive outer ask is kept.
+    double   xch_ask_throttle_critical_xch{0.35};
+
+    /// Global aggressiveness multiplier for ask widening / size reduction.
+    /// 1.0 = baseline, <1 = gentler, >1 = more protective.
+    double   xch_ask_throttle_aggressiveness{1.0};
+
     // -- Coin pool management -----------------------------------------------
 
     /// Target number of spendable XCH coins to maintain.  The engine
@@ -448,6 +467,53 @@ struct StrategyConfig {
     /// stronger coordination between pairs sharing assets.  Conservative
     /// default 0.3 limits the adjustment to ±0.15 of the ratio.
     double   cross_pair_skew_phi{0.30};
+
+    // -- PID adaptive spread controller -------------------------------------
+    //
+    // Feedback loop that tightens spreads when offers aren't filling and
+    // widens when fills become frequent.  Operates per-pair using an EMA
+    // of a per-block binary fill signal (1 = any fill this block, 0 = none).
+    //
+    // PID output drives a spread multiplier:
+    //   error = target_fill_rate - ema_fill_rate
+    //   output = Kp*e + Ki*∫e + Kd*de/dt
+    //   mult = clamp(1.0 - output, pid_min_mult, pid_max_mult)
+    //
+    // Positive error (underfilling) -> mult < 1.0 -> tighter spreads.
+    // Negative error (overfilling)  -> mult > 1.0 -> wider spreads.
+
+    /// Master switch for PID adaptive spread controller.
+    bool     pid_spread_enabled{true};
+
+    /// Target fill rate: fraction of blocks where at least one fill occurs.
+    /// 0.10 = target one fill per ~10 blocks (~8.7 minutes).
+    double   pid_target_fill_rate{0.10};
+
+    /// Proportional gain.  Controls immediate response to fill-rate error.
+    double   pid_kp{0.8};
+
+    /// Integral gain.  Addresses persistent underfilling/overfilling.
+    double   pid_ki{0.05};
+
+    /// Derivative gain.  Dampens oscillation from rapid error changes.
+    double   pid_kd{0.2};
+
+    /// EMA smoothing factor for fill-rate signal.  Lower = smoother.
+    /// 0.02 gives an effective window of ~50 blocks (~43 minutes).
+    double   pid_ema_alpha{0.02};
+
+    /// Minimum spread multiplier (maximum tightening).  0.70 = tighten 30%.
+    double   pid_min_mult{0.70};
+
+    /// Maximum spread multiplier (maximum widening).  1.30 = widen 30%.
+    double   pid_max_mult{1.30};
+
+    /// Anti-windup clamp for the integral error accumulator.
+    double   pid_integral_max{2.0};
+
+    /// Number of blocks before the PID controller activates (warm-up period).
+    /// During warm-up the controller observes but does not adjust spreads.
+    uint32_t pid_warmup_blocks{50};
 };
 
 // ---------------------------------------------------------------------------

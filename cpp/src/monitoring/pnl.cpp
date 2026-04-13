@@ -338,7 +338,8 @@ void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
     sqlite3_clear_bindings(stmt_insert_);
 
     const std::string ts_str = timestamp_to_iso(record.timestamp);
-    const char* side_str = to_string(record.side);
+    // Normalise side to lowercase to match DB CHECK(side IN ('bid','ask')).
+    const char* side_str = (record.side == Side::Bid) ? "bid" : "ask";
 
     // Bind all parameters.  Text uses SQLITE_TRANSIENT so SQLite copies
     // the string -- safe because ts_str and side_str may go out of scope.
@@ -401,8 +402,12 @@ TradeRecord read_row(sqlite3_stmt* stmt)
     rec.pair_name = pair ? pair : "";
 
     const char* side_text = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 3));
-    rec.side = (side_text && std::strcmp(side_text, "Ask") == 0)
-                   ? Side::Ask : Side::Bid;
+    if (side_text &&
+        (std::strcmp(side_text, "ask") == 0 || std::strcmp(side_text, "Ask") == 0)) {
+        rec.side = Side::Ask;
+    } else {
+        rec.side = Side::Bid;
+    }
 
     rec.price_mojos        = sqlite3_column_int64(stmt, 4);
     rec.size_mojos         = sqlite3_column_int64(stmt, 5);

@@ -2286,6 +2286,11 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                      (fill.side == Side::Bid) ? "BUY" : "SELL",
                      fill.size, fill.price, fill.block_height);
 
+        // PID adaptive spread: count fills per pair for this heartbeat.
+        if (config_.strategy.pid_spread_enabled) {
+            spread_pid_state_[fill.pair_name].fills_this_cycle++;
+        }
+
         // [T4-16] Feed the kappa calibrator with each fill's half-spread.
         if (kappa_calibrator_) {
             double mid = market_data_->get_mid_price(fill.pair_name);
@@ -2776,6 +2781,64 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                                  pair_name, divergence_bps, divergence_mult);
                 }
             }
+        }
+
+        // -- PID adaptive spread controller --------------------------------
+        // Adjusts spread based on fill-rate feedback: tightens when offers
+        // don't fill, widens when fills become frequent.
+        if (config_.strategy.pid_spread_enabled) {
+            auto& pid = spread_pid_state_[pair_name];
+
+            // Increment blocks-active counter whenever we reach Step 5.
+            ++pid.blocks_active;
+
+            // Binary fill signal: 1 if any fill this block, 0 otherwise.
+            const double fill_signal = (pid.fills_this_cycle > 0) ? 1.0 : 0.0;
+
+            // Update EMA fill rate.
+            const double alpha = config_.strategy.pid_ema_alpha;
+            pid.ema_fill_rate = alpha * fill_signal
+                              + (1.0 - alpha) * pid.ema_fill_rate;
+
+            // Compute PID only after warm-up period.
+            if (pid.blocks_active > config_.strategy.pid_warmup_blocks) {
+                const double error =
+                    config_.strategy.pid_target_fill_rate - pid.ema_fill_rate;
+
+                const double p_term = config_.strategy.pid_kp * error;
+                const double i_term = config_.strategy.pid_ki * pid.integral_error;
+                const double d_term = config_.strategy.pid_kd
+                                    * (error - pid.prev_error);
+
+                const double output = p_term + i_term + d_term;
+
+                // Convert to multiplier: positive output -> tighten (< 1.0)
+                pid.current_mult = std::clamp(
+                    1.0 - output,
+                    config_.strategy.pid_min_mult,
+                    config_.strategy.pid_max_mult);
+
+                // Update integral with anti-windup clamp.
+                pid.integral_error = std::clamp(
+                    pid.integral_error + error,
+                    -config_.strategy.pid_integral_max,
+                    config_.strategy.pid_integral_max);
+
+                pid.prev_error = error;
+            }
+
+            // Reset per-cycle fill counter (consumed).
+            pid.fills_this_cycle = 0;
+
+            // Apply the PID multiplier.
+            pcs.spread_result.total_spread_bps *= pid.current_mult;
+
+            spdlog::debug("[Engine] Step 5: {} PID mult={:.3f} "
+                          "(ema_fill={:.4f} target={:.4f} blocks={})",
+                          pair_name, pid.current_mult,
+                          pid.ema_fill_rate,
+                          config_.strategy.pid_target_fill_rate,
+                          pid.blocks_active);
         }
 
         pcs.spread_result.half_spread =
@@ -3835,6 +3898,213 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         }
 
         // -----------------------------------------------------------------
+        // Smooth inventory throttle (all assets, both sides): when the asset
+        // consumed by a side is running low, progressively make that side
+        // less competitive (wider price, smaller size) instead of waiting for
+        // hard suppression in Step 8.
+        //
+        // Side spending map:
+        //   ASK spends base asset
+        //   BID spends quote asset
+        //
+        // Threshold policy:
+        //   - XCH: use explicit xch_ask_throttle_* config levels.
+        //   - Other assets: derive levels from min_trading_units /
+        //     min_reserve_units to keep behavior consistent across wallets.
+        // -----------------------------------------------------------------
+        if (pair_cfg
+            && config_.strategy.xch_ask_throttle_enabled
+            && !pcs.ladder.empty())
+        {
+            const double aggressiveness = std::clamp(
+                config_.strategy.xch_ask_throttle_aggressiveness,
+                0.1, 3.0);
+
+            auto get_confirmed_balance = [&](const std::string& asset) -> Mojo {
+                if (asset == "xch") {
+                    return xch_confirmed_balance_;
+                }
+                auto it = cached_wallet_balances_.find(asset);
+                if (it != cached_wallet_balances_.end()) {
+                    return it->second.confirmed;
+                }
+                return 0;
+            };
+
+            auto apply_side_throttle = [&](Side side,
+                                           const std::string& spend_asset,
+                                           Mojo spend_asset_confirmed,
+                                           Mojo spend_mojos_per_unit) {
+                if (spend_asset_confirmed <= 0 || spend_mojos_per_unit <= 0) {
+                    return;
+                }
+
+                double caution_threshold = 0.0;
+                double low_threshold = 0.0;
+                double critical_threshold = 0.0;
+
+                if (spend_asset == "xch") {
+                    caution_threshold = std::max(
+                        config_.strategy.xch_ask_throttle_caution_xch, 0.01);
+                    low_threshold = std::max(
+                        config_.strategy.xch_ask_throttle_low_xch, 0.01);
+                    critical_threshold = std::max(
+                        config_.strategy.xch_ask_throttle_critical_xch, 0.0);
+                } else {
+                    critical_threshold = std::max(
+                        config_.strategy.min_reserve_units, 0.0);
+                    low_threshold = std::max(
+                        config_.strategy.min_trading_units,
+                        critical_threshold + 0.01);
+                    caution_threshold = std::max(
+                        config_.strategy.min_trading_units * 2.0,
+                        low_threshold + 0.01);
+                }
+
+                if (!(caution_threshold > low_threshold
+                      && low_threshold > critical_threshold)) {
+                    return;
+                }
+
+                const double balance_units =
+                    static_cast<double>(spend_asset_confirmed)
+                    / static_cast<double>(spend_mojos_per_unit);
+
+                double size_scale = 1.0;
+                double extra_bps = 0.0;
+                const char* throttle_stage = "healthy";
+                bool critical_mode = false;
+
+                if (balance_units >= caution_threshold) {
+                    return;
+                }
+
+                if (balance_units >= low_threshold) {
+                    const double denom = std::max(
+                        caution_threshold - low_threshold, 1e-9);
+                    const double t = std::clamp(
+                        (caution_threshold - balance_units) / denom,
+                        0.0, 1.0);
+                    size_scale = std::clamp(
+                        1.0 - (0.10 + 0.15 * t) * aggressiveness,
+                        0.25, 1.0);
+                    extra_bps = (15.0 + 35.0 * t) * aggressiveness;
+                    throttle_stage = "caution";
+                } else if (balance_units >= critical_threshold) {
+                    const double denom = std::max(
+                        low_threshold - critical_threshold, 1e-9);
+                    const double t = std::clamp(
+                        (low_threshold - balance_units) / denom,
+                        0.0, 1.0);
+                    size_scale = std::clamp(
+                        1.0 - (0.30 + 0.25 * t) * aggressiveness,
+                        0.10, 1.0);
+                    extra_bps = (60.0 + 80.0 * t) * aggressiveness;
+                    throttle_stage = "low";
+                } else {
+                    const double denom = std::max(critical_threshold, 1e-9);
+                    const double t = 1.0 - std::clamp(
+                        balance_units / denom, 0.0, 1.0);
+                    size_scale = std::clamp(
+                        1.0 - (0.65 + 0.20 * t) * aggressiveness,
+                        0.05, 1.0);
+                    extra_bps = (160.0 + 140.0 * t) * aggressiveness;
+                    throttle_stage = "critical";
+                    critical_mode = true;
+                }
+
+                std::uint8_t max_side_tier = 0;
+                for (const auto& tq : pcs.ladder) {
+                    if (tq.side == side) {
+                        max_side_tier = std::max(max_side_tier, tq.tier_index);
+                    }
+                }
+
+                int repriced = 0;
+                int resized = 0;
+                int dropped = 0;
+                auto it = std::remove_if(
+                    pcs.ladder.begin(), pcs.ladder.end(),
+                    [&](TierQuote& tq) {
+                        if (tq.side != side) return false;
+
+                        if (critical_mode && tq.tier_index < max_side_tier) {
+                            ++dropped;
+                            return true;
+                        }
+
+                        const Mojo old_size = tq.size;
+
+                        if (side == Side::Ask) {
+                            const Mojo widened_price = static_cast<Mojo>(
+                                std::llround(
+                                    static_cast<double>(tq.price)
+                                    * (1.0 + extra_bps / 10000.0)));
+                            if (widened_price > tq.price) {
+                                tq.price = widened_price;
+                                ++repriced;
+                            }
+                        } else {
+                            const Mojo reduced_price = static_cast<Mojo>(
+                                std::llround(
+                                    static_cast<double>(tq.price)
+                                    * (1.0 - extra_bps / 10000.0)));
+                            const Mojo clamped_price = std::max(
+                                static_cast<Mojo>(1), reduced_price);
+                            if (clamped_price < tq.price) {
+                                tq.price = clamped_price;
+                                ++repriced;
+                            }
+                        }
+
+                        tq.size = std::max(
+                            static_cast<Mojo>(1),
+                            static_cast<Mojo>(std::llround(
+                                static_cast<double>(tq.size) * size_scale)));
+                        if (tq.size != old_size) {
+                            ++resized;
+                        }
+
+                        if (mid_mojos > 0) {
+                            tq.spread_bps =
+                                (static_cast<double>(tq.price)
+                                 - static_cast<double>(mid_mojos))
+                                / static_cast<double>(mid_mojos) * 10000.0;
+                        }
+
+                        return false;
+                    });
+                pcs.ladder.erase(it, pcs.ladder.end());
+
+                if (repriced > 0 || resized > 0 || dropped > 0) {
+                    spdlog::info("[Engine] Step 7: {} {}-side throttle asset={} "
+                                 "stage={} balance={:.3f} caution={:.3f} low={:.3f} critical={:.3f} "
+                                 "bps={:.0f} size_scale={:.2f} repriced={} resized={} dropped={}",
+                                 pair_name,
+                                 (side == Side::Ask) ? "ask" : "bid",
+                                 spend_asset,
+                                 throttle_stage,
+                                 balance_units,
+                                 caution_threshold, low_threshold, critical_threshold,
+                                 extra_bps, size_scale,
+                                 repriced, resized, dropped);
+                }
+            };
+
+            apply_side_throttle(
+                Side::Ask,
+                pair_cfg->base_asset_id,
+                get_confirmed_balance(pair_cfg->base_asset_id),
+                pair_cfg->base_mojos_per_unit);
+
+            apply_side_throttle(
+                Side::Bid,
+                pair_cfg->quote_asset_id,
+                get_confirmed_balance(pair_cfg->quote_asset_id),
+                pair_cfg->quote_mojos_per_unit);
+        }
+
+        // -----------------------------------------------------------------
         // Post-clamp no-loss re-check: The price guard may have pushed an
         // ASK price below cost basis.  Re-apply the no-loss floor on each
         // ASK tier and drop any that cannot meet the minimum.
@@ -3990,8 +4260,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 {
     if (dry_run_) {
         spdlog::debug("[Engine] Step 8: dry-run mode -- skipping offer management");
+        metrics_->update_stuck_offers(0);
         co_return;
     }
+
+    int total_stuck_offers = 0;
 
     // -- Wallet sync gate with auto-recovery ----------------------------------
     // The Chia wallet returns unreliable data when not fully synced:
@@ -4441,7 +4714,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     }
                 }
             }
-            metrics_->update_stuck_offers(stuck_count);
+            total_stuck_offers += stuck_count;
         }
 
         // -- Spendable reserve & pending-change gating ----------------------
@@ -5387,6 +5660,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
     if (pending_wallets_this_block.empty()) {
         consecutive_pending_blocks_ = 0;
     }
+
+    // Report the aggregate stuck-offer count across all pairs for this cycle.
+    metrics_->update_stuck_offers(total_stuck_offers);
 
     // -- [T4-11] Periodic offer-state reconciliation -------------------------
     // Every reconciliation_interval_blocks, perform a full comparison of

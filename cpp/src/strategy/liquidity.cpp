@@ -949,8 +949,13 @@ std::vector<TierQuote> LiquidityEngine::compute_ladder(
             : mid_f;
         const std::int64_t bbo_ref = static_cast<std::int64_t>(
             std::llround(bbo_ref_f));
-        // Bid cap: tighter of BBO ref and model mid — prevents crossed-mid.
-        const std::int64_t bid_cap  = std::min(bbo_ref, mid);
+        // Bid cap: BBO midpoint — prevents bidding above the spread midpoint.
+        // Using min(bbo_ref, mid) was too conservative: when CEX price sits
+        // below the DEX best bid the blended mid falls below best_bid,
+        // making bid_cap < comp_best and anchoring 0 bids every cycle.
+        // The BBO midpoint alone is the correct spread-crossing guard;
+        // classify_tier_staleness guards against truly crossed offers.
+        const std::int64_t bid_cap  = bbo_ref;
 
         int anchored_bids = 0;
         int anchored_asks = 0;

@@ -763,6 +763,19 @@ private:
     // reverse, protecting cost-basis integrity.
     std::vector<Fill> pending_unconfirmed_fills_;
 
+    // -- PID adaptive spread controller state (per-pair) ------------------
+    // Tracks fill-rate EMA and PID accumulators for each trading pair.
+    // Updated in Step 2 (fill counting) and Step 5 (PID update + apply).
+    struct SpreadPidState {
+        double   ema_fill_rate{0.0};     ///< Exponential moving average of fill signal.
+        double   integral_error{0.0};    ///< Accumulated integral error.
+        double   prev_error{0.0};        ///< Previous error for derivative term.
+        double   current_mult{1.0};      ///< Current output spread multiplier.
+        uint32_t blocks_active{0};       ///< Blocks since first offer was posted.
+        int      fills_this_cycle{0};    ///< Fills counted this heartbeat.
+    };
+    std::unordered_map<std::string, SpreadPidState> spread_pid_state_;
+
     // -- [T4-11] Offer reconciliation tracking -----------------------------
     // Block height of the last full reconciliation run.  Compared against
     // current_block to decide when to trigger the next reconciliation.

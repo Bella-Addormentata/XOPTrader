@@ -401,16 +401,25 @@ class MainWindow(QMainWindow):
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
                 dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
             if hasattr(dashboard, "update_connection_status"):
+                wallet_bals = data.get("wallet_balances", {})
+                full_node_connected = (
+                    health.get("node_synced", 0.0) >= 1.0
+                    or block_height > 0
+                    or bool(data.get("metrics_connected", False))
+                )
+                wallet_connected = (
+                    health.get("wallet_connected", 0.0) >= 1.0
+                    or bool(wallet_bals)
+                )
                 dashboard.update_connection_status({
-                    "Full Node": health.get("node_synced", 0.0) >= 1.0,
-                    "Wallet": health.get("wallet_connected", 0.0) >= 1.0,
+                    "Full Node": full_node_connected,
+                    "Wallet": wallet_connected,
                     "Dexie": True,
                 })
             if hasattr(dashboard, "update_block_info"):
                 # Use 0 timestamp as sentinel; dashboard handles it gracefully.
                 dashboard.update_block_info(block_height, time.time() if block_height > 0 else 0.0)
             if hasattr(dashboard, "update_wallet_balances"):
-                wallet_bals = data.get("wallet_balances", {})
                 reserve = data.get("spendable_reserve", {})
                 stuck = data.get("stuck_offers", 0)
                 dashboard.update_wallet_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)

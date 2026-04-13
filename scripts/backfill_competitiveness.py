@@ -163,7 +163,20 @@ def fetch_competing_offers(pair_name: str, own_offer_ids: set[str]) -> list[dict
             offers.append(
                 {
                     "side": "ask" if offered_id == cfg["base_id"] else "bid",
-                    "price": int(round(float(offer.get("price") or 0.0) * XCH_MOJOS)),
+                    "price": int(
+                        round(
+                            (
+                                float(offer.get("price") or 0.0)
+                                if offered_id == cfg["base_id"]
+                                else (
+                                    1.0 / float(offer.get("price") or 0.0)
+                                    if float(offer.get("price") or 0.0) > 0.0
+                                    else 0.0
+                                )
+                            )
+                            * XCH_MOJOS
+                        )
+                    ),
                     "size": int(
                         round(float(offered_assets[0].get("amount") or 0.0) * offered_denom)
                     ),

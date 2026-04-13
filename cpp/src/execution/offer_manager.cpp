@@ -1187,10 +1187,25 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
             if (mid_price > 0) {
                 tc.price_deviation = std::abs(old_p - mid_p) / mid_p;
-                if (po.side == Side::Bid && old_p > mid_p) {
-                    tc.crossed = true;
-                } else if (po.side == Side::Ask && old_p < mid_p) {
-                    tc.crossed = true;
+            }
+            {
+                // Use BBO for crossing check (same logic as main branch).
+                const auto bbo_snap  = state_->get_market(pair_name);
+                const double bbo_ask = static_cast<double>(bbo_snap.best_ask);
+                const double bbo_bid = static_cast<double>(bbo_snap.best_bid);
+                if (bbo_ask > 0.0 && bbo_bid > 0.0) {
+                    if (po.side == Side::Bid && old_p >= bbo_ask) {
+                        tc.crossed = true;
+                    } else if (po.side == Side::Ask && old_p <= bbo_bid) {
+                        tc.crossed = true;
+                    }
+                } else if (mid_price > 0) {
+                    constexpr double kCrossBuffer = 0.05;
+                    if (po.side == Side::Bid && old_p > mid_p * (1.0 + kCrossBuffer)) {
+                        tc.crossed = true;
+                    } else if (po.side == Side::Ask && old_p < mid_p * (1.0 - kCrossBuffer)) {
+                        tc.crossed = true;
+                    }
                 }
             }
 
@@ -1225,13 +1240,31 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
             ? (signed_dev < 0.0)
             : (signed_dev > 0.0);
 
-        // Crossing detection: a Bid above mid or Ask below mid is
-        // extremely dangerous (immediate adverse selection risk).
-        if (mid_price > 0) {
-            if (po.side == Side::Bid && old_p > mid_p) {
-                tc.crossed = true;
-            } else if (po.side == Side::Ask && old_p < mid_p) {
-                tc.crossed = true;
+        // Crossing detection: a Bid at or above best_ask (or Ask at or below
+        // best_bid) faces immediate adverse selection and must be cancelled
+        // urgently.  Using model mid as the threshold is too conservative —
+        // a bid between mid and best_ask is a valid competitive bid, not a
+        // crossed offer.  When BBO is unavailable, fall back to mid with a
+        // generous buffer (5%) to avoid false positives.
+        {
+            const auto bbo_snap  = state_->get_market(pair_name);
+            const double bbo_ask = static_cast<double>(bbo_snap.best_ask);
+            const double bbo_bid = static_cast<double>(bbo_snap.best_bid);
+            if (bbo_ask > 0.0 && bbo_bid > 0.0) {
+                // Full BBO available: real crossing check.
+                if (po.side == Side::Bid && old_p >= bbo_ask) {
+                    tc.crossed = true;
+                } else if (po.side == Side::Ask && old_p <= bbo_bid) {
+                    tc.crossed = true;
+                }
+            } else if (mid_price > 0) {
+                // BBO unavailable: fall back to mid ±5% buffer.
+                constexpr double kCrossBuffer = 0.05;
+                if (po.side == Side::Bid && old_p > mid_p * (1.0 + kCrossBuffer)) {
+                    tc.crossed = true;
+                } else if (po.side == Side::Ask && old_p < mid_p * (1.0 - kCrossBuffer)) {
+                    tc.crossed = true;
+                }
             }
         }
 

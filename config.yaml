@@ -8,6 +8,12 @@ chia:
   wallet_host: localhost
   wallet_port: 9256
   verify_ssl: false
+  wallet_fingerprint: 481655774
+  ssl_cert_path: "C:/Users/dorkm/.chia/mainnet/config/ssl/full_node/private_full_node.crt"
+  ssl_key_path: "C:/Users/dorkm/.chia/mainnet/config/ssl/full_node/private_full_node.key"
+  wallet_cert_path: "C:/Users/dorkm/.chia/mainnet/config/ssl/wallet/private_wallet.crt"
+  wallet_key_path: "C:/Users/dorkm/.chia/mainnet/config/ssl/wallet/private_wallet.key"
+  ca_cert_path: "C:/Users/dorkm/.chia/mainnet/config/ssl/ca/chia_ca.crt"
 dexie:
   api_base: https://api.dexie.space/v1
   max_requests_per_10s: 50
@@ -77,12 +83,17 @@ strategy:
   startup_analysis_blocks: 5
   fee_reserve_xch: 0.1
   fee_min_spendable_xch: 0.01
-  min_spendable_reserve_pct: 0.10   # Was 0.25 default; lowered to stop suppressing depleted CATs
+  min_spendable_reserve_pct: 0.05   # Lowered so bids recover sooner when coins are mostly locked, not truly depleted
   arb_reserve_coins: 2            # Dry-powder: keep 2 coins unallocated for arb takes
   min_reserve_units: 0.1
   min_offer_size_units: 0.1       # Minimum offer size per tier (XCH units); default was 1.0
   min_trading_units: 0.1          # Lowered from 0.5: unblocks ask-side when XCH > 0.1
   auto_rebalance_enabled: true
+  xch_ask_throttle_enabled: true
+  xch_ask_throttle_caution_xch: 2.0
+  xch_ask_throttle_low_xch: 1.0
+  xch_ask_throttle_critical_xch: 0.35
+  xch_ask_throttle_aggressiveness: 1.15
   sigma_floor: 0.001              # Minimum annualized sigma — prevents degenerate GLFT when Yang-Zhang returns 0
 
   # Coin pool: pre-split XCH into smaller coins for concurrent offers
@@ -111,6 +122,18 @@ strategy:
   # Cross-pair correlated inventory skewing (Guéant 2019)
   cross_pair_skew_enabled: true
   cross_pair_skew_phi: 0.50          # Raised from 0.30 -- stronger coordinated cross-pair rebalancing
+
+  # PID adaptive spread controller -- tightens when offers don't fill,
+  # widens when fills become frequent.  Per-pair feedback loop.
+  pid_spread_enabled: true
+  pid_target_fill_rate: 0.10         # Target: fill on ~10% of blocks (~1 per 9 min)
+  pid_kp: 0.8                        # Proportional gain
+  pid_ki: 0.05                       # Integral gain
+  pid_kd: 0.2                        # Derivative gain
+  pid_ema_alpha: 0.02                # EMA smoothing (lower = smoother, ~50 block window)
+  pid_min_mult: 0.70                 # Max tightening: 30%
+  pid_max_mult: 1.30                 # Max widening: 30%
+  pid_warmup_blocks: 50              # Observe for ~43 min before adjusting
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -210,3 +233,6 @@ recovery:
   max_take_per_block_xch: 0.5   # Max XCH to acquire per block
   max_premium_bps: 100           # Max premium over CEX price to pay
   cancel_on_enter: true          # Cancel all offers when entering recovery
+
+database:
+  path: "data/xop_trader.db"

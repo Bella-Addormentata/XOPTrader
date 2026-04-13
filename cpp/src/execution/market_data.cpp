@@ -68,6 +68,13 @@ namespace {
 //            estimator of future prices".
 // -------------------------------------------------------------------------
 
+// Maximum price deviation (in bps) for a competing offer to be considered
+// non-outlier.  Offers further than this from the current reference price
+// are rejected before they can influence ob_mid, filtered_best_bid/ask, or
+// the competitive anchor.  Catches fat-finger / erroneous 10x-priced offers
+// (e.g. $22.38 bid when market is $2.24 = ~8900 bps off).
+constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
+
 double compute_orderbook_mid_impl(
     const std::vector<CompetingOffer>& offers,
     std::size_t                        depth)
@@ -1082,6 +1089,19 @@ void MarketDataFeed::ingest_competing_offers(
         return;  // Feature disabled; no-op.
     }
 
+    // Snapshot the current reference price for outlier detection.
+    // Prefer CEX mid (pure external reference, unaffected by DEX noise);
+    // fall back to aggregated mid_price when CEX is unavailable (BYC, DBX).
+    // Zero means no reference yet (first cycle) — outlier filter is skipped.
+    const double ref_price = [&] {
+        std::shared_lock plk(mtx_pairs_);
+        auto it = pairs_.find(pair_name);
+        if (it == pairs_.end()) return 0.0;
+        const PairState& ps = it->second;
+        if (ps.cex_mid > 0.0) return ps.cex_mid;
+        return ps.mid_price;
+    }();
+
     // Filter out own offers and offers below minimum size threshold.
     std::vector<CompetingOffer> filtered;
     filtered.reserve(competing_offers.size());
@@ -1107,6 +1127,25 @@ void MarketDataFeed::ingest_competing_offers(
                 / kMojosPerXch));
         if (offer.size < effective_min) {
             continue;
+        }
+
+        // Outlier price filter: reject offers whose price deviates more than
+        // kOutlierPriceThresholdBps from the reference mid.  Prevents
+        // fat-finger / erroneous high-priced offers (e.g. a $22.38 bid when
+        // market is $2.24) from corrupting ob_mid or the competitive anchor.
+        if (ref_price > 0.0) {
+            const double offer_price = static_cast<double>(offer.price)
+                                       / static_cast<double>(kMojosPerXch);
+            const double dev_bps = std::abs(offer_price - ref_price)
+                                   / ref_price * 10000.0;
+            if (dev_bps > kOutlierPriceThresholdBps) {
+                spdlog::debug("[MarketData] {} outlier offer {}: "
+                              "price={:.6f} deviates {:.0f}bps from "
+                              "ref={:.6f} -- skipping",
+                              pair_name, offer.offer_id,
+                              offer_price, dev_bps, ref_price);
+                continue;
+            }
         }
 
         filtered.push_back(offer);
@@ -1163,6 +1202,25 @@ void MarketDataFeed::ingest_competing_offers(
                              pair_name, ob_mid,
                              deviation * 100.0, simple_bbo_mid);
                 ob_mid = simple_bbo_mid;
+            }
+        }
+
+        // Hard-clamp ob_mid to the interior of the spread.  The Stoikov
+        // micro-price can legitimately fall below best_bid when ask depth
+        // dominates (predicting downward price movement), but using a
+        // sub-best-bid value for bid_cap blocks all competitive bids on
+        // that cycle.  Fair price must sit within [best_bid, best_ask].
+        if (ob_mid > 0.0) {
+            if (filtered_best_bid > 0.0 && ob_mid < filtered_best_bid) {
+                spdlog::debug("[MarketData] {} ob_mid={:.6f} below "
+                              "best_bid={:.6f} -- flooring to best_bid",
+                              pair_name, ob_mid, filtered_best_bid);
+                ob_mid = filtered_best_bid;
+            } else if (filtered_best_ask > 0.0 && ob_mid > filtered_best_ask) {
+                spdlog::debug("[MarketData] {} ob_mid={:.6f} above "
+                              "best_ask={:.6f} -- capping to best_ask",
+                              pair_name, ob_mid, filtered_best_ask);
+                ob_mid = filtered_best_ask;
             }
         }
 

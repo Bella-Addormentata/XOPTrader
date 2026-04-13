@@ -149,6 +149,11 @@ strategy:
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
+  xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
+  xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
+  xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this
+  xch_ask_throttle_critical_xch: 0.35  # [OPTIONAL, default: 0.35] Keep only defensive outer ask below this
+  xch_ask_throttle_aggressiveness: 1.0 # [OPTIONAL, default: 1.0] <1 gentler, >1 more protective
 
   # -- Wall-aware retail niche pricing --
   # On Chia DEX, offers are atomic (all-or-nothing).  Small traders cannot

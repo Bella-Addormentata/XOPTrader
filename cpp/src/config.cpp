@@ -851,6 +851,43 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["auto_rebalance_enabled"].IsNull()) {
         cfg.auto_rebalance_enabled = node["auto_rebalance_enabled"].as<bool>();
     }
+    if (node["xch_ask_throttle_enabled"] && node["xch_ask_throttle_enabled"].IsDefined()
+        && !node["xch_ask_throttle_enabled"].IsNull()) {
+        cfg.xch_ask_throttle_enabled = node["xch_ask_throttle_enabled"].as<bool>();
+    }
+    if (node["xch_ask_throttle_caution_xch"] && node["xch_ask_throttle_caution_xch"].IsDefined()
+        && !node["xch_ask_throttle_caution_xch"].IsNull()) {
+        cfg.xch_ask_throttle_caution_xch = node["xch_ask_throttle_caution_xch"].as<double>();
+    }
+    if (node["xch_ask_throttle_low_xch"] && node["xch_ask_throttle_low_xch"].IsDefined()
+        && !node["xch_ask_throttle_low_xch"].IsNull()) {
+        cfg.xch_ask_throttle_low_xch = node["xch_ask_throttle_low_xch"].as<double>();
+    }
+    if (node["xch_ask_throttle_critical_xch"] && node["xch_ask_throttle_critical_xch"].IsDefined()
+        && !node["xch_ask_throttle_critical_xch"].IsNull()) {
+        cfg.xch_ask_throttle_critical_xch = node["xch_ask_throttle_critical_xch"].as<double>();
+    }
+    if (node["xch_ask_throttle_aggressiveness"] && node["xch_ask_throttle_aggressiveness"].IsDefined()
+        && !node["xch_ask_throttle_aggressiveness"].IsNull()) {
+        cfg.xch_ask_throttle_aggressiveness = node["xch_ask_throttle_aggressiveness"].as<double>();
+    }
+    if (cfg.xch_ask_throttle_caution_xch <= 0.0) {
+        throw ConfigError(sec + ".xch_ask_throttle_caution_xch must be > 0");
+    }
+    if (cfg.xch_ask_throttle_low_xch <= 0.0) {
+        throw ConfigError(sec + ".xch_ask_throttle_low_xch must be > 0");
+    }
+    if (cfg.xch_ask_throttle_critical_xch < 0.0) {
+        throw ConfigError(sec + ".xch_ask_throttle_critical_xch must be >= 0");
+    }
+    if (!(cfg.xch_ask_throttle_caution_xch > cfg.xch_ask_throttle_low_xch
+          && cfg.xch_ask_throttle_low_xch > cfg.xch_ask_throttle_critical_xch)) {
+        throw ConfigError(sec + ".xch_ask_throttle thresholds must satisfy caution > low > critical");
+    }
+    if (cfg.xch_ask_throttle_aggressiveness <= 0.0
+        || cfg.xch_ask_throttle_aggressiveness > 3.0) {
+        throw ConfigError(sec + ".xch_ask_throttle_aggressiveness must be in (0, 3]");
+    }
 
     // -- Coin pool management -----------------------------------------------
     if (node["coin_pool_target_count"] && node["coin_pool_target_count"].IsDefined()
@@ -1041,6 +1078,72 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         if (cfg.cross_pair_skew_phi < 0.0 || cfg.cross_pair_skew_phi > 1.0) {
             throw ConfigError(sec + ".cross_pair_skew_phi must be in [0, 1]");
         }
+    }
+
+    // -- PID adaptive spread controller (optional, defaults in StrategyConfig) --
+    if (node["pid_spread_enabled"] && node["pid_spread_enabled"].IsDefined()
+        && !node["pid_spread_enabled"].IsNull()) {
+        cfg.pid_spread_enabled = node["pid_spread_enabled"].as<bool>();
+    }
+    if (node["pid_target_fill_rate"] && node["pid_target_fill_rate"].IsDefined()
+        && !node["pid_target_fill_rate"].IsNull()) {
+        cfg.pid_target_fill_rate = node["pid_target_fill_rate"].as<double>();
+        if (cfg.pid_target_fill_rate <= 0.0 || cfg.pid_target_fill_rate >= 1.0) {
+            throw ConfigError(sec + ".pid_target_fill_rate must be in (0, 1)");
+        }
+    }
+    if (node["pid_kp"] && node["pid_kp"].IsDefined()
+        && !node["pid_kp"].IsNull()) {
+        cfg.pid_kp = node["pid_kp"].as<double>();
+        if (cfg.pid_kp < 0.0) {
+            throw ConfigError(sec + ".pid_kp must be >= 0");
+        }
+    }
+    if (node["pid_ki"] && node["pid_ki"].IsDefined()
+        && !node["pid_ki"].IsNull()) {
+        cfg.pid_ki = node["pid_ki"].as<double>();
+        if (cfg.pid_ki < 0.0) {
+            throw ConfigError(sec + ".pid_ki must be >= 0");
+        }
+    }
+    if (node["pid_kd"] && node["pid_kd"].IsDefined()
+        && !node["pid_kd"].IsNull()) {
+        cfg.pid_kd = node["pid_kd"].as<double>();
+        if (cfg.pid_kd < 0.0) {
+            throw ConfigError(sec + ".pid_kd must be >= 0");
+        }
+    }
+    if (node["pid_ema_alpha"] && node["pid_ema_alpha"].IsDefined()
+        && !node["pid_ema_alpha"].IsNull()) {
+        cfg.pid_ema_alpha = node["pid_ema_alpha"].as<double>();
+        if (cfg.pid_ema_alpha <= 0.0 || cfg.pid_ema_alpha >= 1.0) {
+            throw ConfigError(sec + ".pid_ema_alpha must be in (0, 1)");
+        }
+    }
+    if (node["pid_min_mult"] && node["pid_min_mult"].IsDefined()
+        && !node["pid_min_mult"].IsNull()) {
+        cfg.pid_min_mult = node["pid_min_mult"].as<double>();
+        if (cfg.pid_min_mult <= 0.0 || cfg.pid_min_mult > 1.0) {
+            throw ConfigError(sec + ".pid_min_mult must be in (0, 1]");
+        }
+    }
+    if (node["pid_max_mult"] && node["pid_max_mult"].IsDefined()
+        && !node["pid_max_mult"].IsNull()) {
+        cfg.pid_max_mult = node["pid_max_mult"].as<double>();
+        if (cfg.pid_max_mult < 1.0 || cfg.pid_max_mult > 5.0) {
+            throw ConfigError(sec + ".pid_max_mult must be in [1, 5]");
+        }
+    }
+    if (node["pid_integral_max"] && node["pid_integral_max"].IsDefined()
+        && !node["pid_integral_max"].IsNull()) {
+        cfg.pid_integral_max = node["pid_integral_max"].as<double>();
+        if (cfg.pid_integral_max <= 0.0) {
+            throw ConfigError(sec + ".pid_integral_max must be > 0");
+        }
+    }
+    if (node["pid_warmup_blocks"] && node["pid_warmup_blocks"].IsDefined()
+        && !node["pid_warmup_blocks"].IsNull()) {
+        cfg.pid_warmup_blocks = node["pid_warmup_blocks"].as<uint32_t>();
     }
 
     return cfg;
@@ -1742,6 +1845,12 @@ void log_config_summary(const AppConfig& cfg)
         << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n"
+        << "  xch_ask_throttle = " << (cfg.strategy.xch_ask_throttle_enabled ? "ON" : "off") << "\n"
+        << "  xch_ask_throttle_levels = ["
+        << cfg.strategy.xch_ask_throttle_caution_xch << ", "
+        << cfg.strategy.xch_ask_throttle_low_xch << ", "
+        << cfg.strategy.xch_ask_throttle_critical_xch << "] XCH\n"
+        << "  xch_ask_throttle_aggr = " << cfg.strategy.xch_ask_throttle_aggressiveness << "\n"
         << "  arb_reserve_coins = " << cfg.strategy.arb_reserve_coins << "\n"
         << "  cross_pair_skew = " << (cfg.strategy.cross_pair_skew_enabled ? "ON" : "off") << "\n"
         << "  cross_pair_phi  = " << cfg.strategy.cross_pair_skew_phi << "\n";
