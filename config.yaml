@@ -99,8 +99,8 @@ strategy:
   sigma_floor: 0.001              # Minimum annualized sigma — prevents degenerate GLFT when Yang-Zhang returns 0
 
   # Coin pool: pre-split XCH into smaller coins for concurrent offers
-  coin_pool_target_count: 3       # Fits ~2 XCH spendable balance
-  coin_pool_target_xch: 0.5       # Each coin ~0.5 XCH (3×0.5=1.5 XCH)
+  coin_pool_target_count: 12      # Restore a deeper XCH working pool for multi-tier asks
+  coin_pool_target_xch: 2.0       # Keep XCH denominations large enough to avoid excessive input fan-in
   coin_pool_interval_blocks: 5    # Check every ~4.3 minutes
 
   # CAT coin pool: pre-split BYC, wUSDC.b etc. for concurrent offers

@@ -164,12 +164,54 @@ public:
     /**
      * @brief Count of unlocked spendable coins for a wallet.
      *
-     * Convenience wrapper around get_spendable_coins().size().
+      * Convenience wrapper around get_spendable_coins().size(). For wallet 1,
+      * when the XCH coin pool is configured, this counts only pool-ready XCH
+      * denominations so the engine does not treat tiny change or oversized
+      * UTXOs as healthy trading inventory.
      *
      * @param wallet_id  Wallet identifier.
      * @return Number of free (unlocked) coins.
      */
     asio::awaitable<int> count_free_coins(std::int64_t wallet_id);
+
+    /**
+     * @brief Check whether a coin is already close to the target pool size.
+     *
+     * Coins below half the target denomination are too small to be useful
+     * pre-split inventory. Coins above 2x the target denomination still
+     * lock excess capital and should remain split candidates.
+     *
+     * @param coin_amount_mojos    Coin value in mojos.
+     * @param target_amount_mojos  Desired pool denomination in mojos.
+     * @return true if the coin is within the pool-ready size band.
+     */
+    static bool is_pool_ready_coin(Mojo coin_amount_mojos,
+                                   Mojo target_amount_mojos);
+
+    /**
+     * @brief Count how many coins are already near the target pool size.
+     *
+     * @param coins                Candidate spendable coins.
+     * @param target_amount_mojos  Desired pool denomination in mojos.
+     * @return Number of pool-ready coins.
+     */
+    static std::size_t count_pool_ready_coins(
+        const std::vector<CoinInfo>& coins,
+        Mojo                         target_amount_mojos);
+
+    /**
+     * @brief Count pool-ready spendable coins for a wallet.
+     *
+     * Convenience wrapper around get_spendable_coins() combined with the
+     * target-size band used by ensure_split().
+     *
+     * @param wallet_id            Wallet identifier.
+     * @param target_amount_mojos  Desired pool denomination in mojos.
+     * @return Number of pool-ready free coins.
+     */
+    asio::awaitable<int> count_pool_ready_coins(
+        std::int64_t wallet_id,
+        Mojo         target_amount_mojos);
 
     // -- Coin splitting -----------------------------------------------------
 
@@ -307,6 +349,9 @@ private:
 
     /// Minimum coin size to consider useful (filters dust).  Mojos.
     Mojo dust_threshold_{1'000'000};  // 0.000001 XCH
+
+    /// Target XCH coin-pool denomination in mojos (wallet 1 only).
+    Mojo xch_pool_target_mojos_{0};
 
     /// Mutex protecting the locked-coin set.
     mutable std::mutex mtx_locked_;

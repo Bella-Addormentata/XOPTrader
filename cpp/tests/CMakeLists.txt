@@ -50,6 +50,7 @@ add_executable(xop_tests
     test_glft.cpp
     test_spread.cpp
     test_inventory.cpp
+    test_coin_manager.cpp
     test_volatility.cpp
     test_regime.cpp
     test_competitor_detection.cpp

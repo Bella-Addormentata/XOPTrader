@@ -45,6 +45,13 @@
 
 namespace xop::execution {
 
+namespace {
+
+constexpr Mojo kPoolReadyMinDivisor = 2;
+constexpr Mojo kPoolReadyMaxMultiple = 2;
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // Constructor
 // ---------------------------------------------------------------------------
@@ -56,6 +63,12 @@ CoinManager::CoinManager(asio::io_context&                    /*ioc*/,
     , logger_(spdlog::default_logger()->clone("CoinMgr"))
 {
     default_split_fee_ = static_cast<Mojo>(config.strategy.offer_fee_mojos);
+    if (config.strategy.coin_pool_target_count > 0
+        && config.strategy.coin_pool_target_xch > 0.0) {
+        xch_pool_target_mojos_ = static_cast<Mojo>(std::llround(
+            config.strategy.coin_pool_target_xch
+            * static_cast<double>(kMojosPerXch)));
+    }
 
     // Dust threshold: coins smaller than 1,000,000 mojos (0.000001 XCH)
     // are ignored to avoid unnecessary UTXO bloat.
@@ -161,7 +174,49 @@ asio::awaitable<std::vector<CoinInfo>> CoinManager::get_spendable_coins(
 asio::awaitable<int> CoinManager::count_free_coins(std::int64_t wallet_id)
 {
     auto coins = co_await get_spendable_coins(wallet_id);
+    if (wallet_id == 1 && xch_pool_target_mojos_ > 0) {
+        co_return static_cast<int>(count_pool_ready_coins(
+            coins, xch_pool_target_mojos_));
+    }
     co_return static_cast<int>(coins.size());
+}
+
+bool CoinManager::is_pool_ready_coin(Mojo coin_amount_mojos,
+                                     Mojo target_amount_mojos)
+{
+    if (coin_amount_mojos <= 0 || target_amount_mojos <= 0) {
+        return false;
+    }
+
+    const Mojo min_amount = target_amount_mojos / kPoolReadyMinDivisor
+                          + (target_amount_mojos % kPoolReadyMinDivisor);
+    const Mojo max_amount =
+        target_amount_mojos > std::numeric_limits<Mojo>::max()
+                                / kPoolReadyMaxMultiple
+            ? std::numeric_limits<Mojo>::max()
+            : target_amount_mojos * kPoolReadyMaxMultiple;
+
+    return coin_amount_mojos >= min_amount && coin_amount_mojos <= max_amount;
+}
+
+std::size_t CoinManager::count_pool_ready_coins(
+    const std::vector<CoinInfo>& coins,
+    Mojo                         target_amount_mojos)
+{
+    return static_cast<std::size_t>(std::count_if(
+        coins.begin(), coins.end(),
+        [target_amount_mojos](const CoinInfo& coin) {
+            return is_pool_ready_coin(coin.amount, target_amount_mojos);
+        }));
+}
+
+asio::awaitable<int> CoinManager::count_pool_ready_coins(
+    std::int64_t wallet_id,
+    Mojo         target_amount_mojos)
+{
+    auto coins = co_await get_spendable_coins(wallet_id);
+    co_return static_cast<int>(count_pool_ready_coins(coins,
+                                                      target_amount_mojos));
 }
 
 // ---------------------------------------------------------------------------
@@ -177,13 +232,16 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 {
     SplitResult result;
 
-    // Step 1: Count current free coins.
+    // Step 1: Count current pool-ready coins.
     auto free_coins = co_await get_spendable_coins(wallet_id);
-    int current_count = static_cast<int>(free_coins.size());
+    const int current_count = static_cast<int>(count_pool_ready_coins(
+        free_coins, target_amount_mojos));
 
     if (current_count >= target_count) {
-        logger_->info("ensure_split: already have {} free coins (target {}), "
-                      "no split needed", current_count, target_count);
+        logger_->info("ensure_split: already have {} pool-ready coins for "
+                      "target {} mojos ({} free total), no split needed",
+                      current_count, target_amount_mojos,
+                      free_coins.size());
         result.success = true;
         result.coins_created = 0;
         co_return result;
@@ -208,8 +266,6 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
                        needed, target_amount_mojos, fee);
         co_return SplitResult{.success = false, .tx_id = "overflow in total_needed calculation"};
     }
-    Mojo total_needed = static_cast<Mojo>(needed) * target_amount_mojos + fee;
-
     // Step 3: Verify we have sufficient balance.
     //
     // HIGH-3 FIX: Overflow guard on cumulative summation -- if a wallet
@@ -225,10 +281,10 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
         total_available += c.amount;
     }
 
-    if (total_available < total_needed) {
-        logger_->error("ensure_split: insufficient balance for split. "
-                       "Need {} mojos, have {} mojos",
-                       total_needed, total_available);
+    if (total_available < target_amount_mojos + fee) {
+        logger_->error("ensure_split: insufficient balance to create even 1 "
+                       "coin of {} mojos (+ {} fee). Have {} mojos total",
+                       target_amount_mojos, fee, total_available);
         result.success = false;
         co_return result;
     }
