@@ -250,6 +250,16 @@ struct StrategyConfig {
     /// without blocking trading.  Default 0.01 XCH (~3× typical fee).
     double   fee_min_spendable_xch{0.01};
 
+    /// Minimum spendable XCH required before executing take_offer-based
+    /// strategies (crossed-book, midpoint recycling, buyer).  This is
+    /// intentionally higher than fee_min_spendable_xch to leave enough headroom
+    /// for Chia UTXO coin-selection quirks during taker flows.
+    double   taker_min_spendable_xch{0.25};
+
+    /// Expected mean CHIA inter-block interval in seconds.  Used by runtime
+    /// freshness checks that convert block-age limits into wall-clock time.
+    double   block_time_seconds{52.0};
+
     /// Number of spendable coins to keep unallocated as "dry powder" for
     /// opportunistic trades (arbitrage, crossed-book takes).  Step 7
     /// deducts this from the XCH UTXO headroom calculation so the tier
@@ -664,6 +674,30 @@ struct ArbitrageSettings {
     /// spendable coins are available.  Default true.
     bool     cancel_worst_to_free{true};
 
+    // -- Midpoint recycling (Step 9d) --------------------------------------
+    bool     midpoint_recycling_enabled{false};
+    std::vector<std::string> midpoint_recycling_pairs;
+    // Actionable slack above the derived minimum discount floor.
+    double   midpoint_recycling_band_bps{20.0};
+    double   midpoint_recycling_max_take_xch{0.25};
+    double   midpoint_recycling_min_take_xch{0.10};
+    uint32_t midpoint_recycling_cooldown_blocks{4};
+    uint32_t midpoint_recycling_max_takes_per_block{1};
+    double   midpoint_recycling_daily_take_xch_cap{2.0};
+    uint32_t midpoint_recycling_epoch_blocks{4608};
+    double   midpoint_recycling_min_expected_edge_bps{5.0};
+    double   midpoint_recycling_fee_buffer_bps{2.0};
+    double   midpoint_recycling_toxicity_buffer_bps{6.0};
+    double   midpoint_recycling_slippage_buffer_bps{2.0};
+    double   midpoint_recycling_inventory_ratio_cap{0.60};
+    bool     midpoint_recycling_require_cex_ref{true};
+    uint32_t midpoint_recycling_max_cex_age_blocks{10};
+    double   midpoint_recycling_vpin_max{0.70};
+
+    /// Synthetic half-spread used when building a conservative CEX bid/ask
+    /// around a single CoinGecko mid-price reference.
+    double   cex_reference_half_spread_bps{10.0};
+
     // -- Cross-stablecoin arbitrage (XCH/BYC vs XCH/wUSDC.b) ----------------
     bool     cross_stable_arb_enabled{true};
     double   cross_stable_min_edge_bps{15.0};
@@ -951,6 +985,60 @@ struct RecoveryConfig {
     double   max_take_per_block_xch{0.5};   // Max XCH to acquire per block.
     double   max_premium_bps{100.0};        // Max premium over CEX price to pay.
     bool     cancel_on_enter{true};         // Cancel all offers on entry.
+    double   zero_fee_below_xch{0.001};     // Skip fee when balance is effectively dust.
+    std::vector<std::string> pair_allowlist; // Optional XCH-base recovery universe.
+};
+
+// ---------------------------------------------------------------------------
+// Buyer configuration -- dedicated opportunistic offer-taker flow.
+//
+// Loaded from a separate buyer.yaml file (path specified in buyer_config_path).
+// The buyer runs as its own heartbeat step (Step 9e) and is designed to
+// accept/take offers from the Dexie order book when they meet profitability
+// criteria.  It is aware of (but does not modify) the maker config settings:
+// inventory limits, recovery mode, wallet health, and fee budgets are all
+// respected.
+//
+// Key differences from crossed-book arb (Step 9c):
+//   - 9c requires a crossed book (bid >= ask); buyer does not.
+//   - 9c is reactive; buyer proactively seeks underpriced offers.
+//   - Buyer has its own per-pair rules, caps, and scoring formula.
+//   - Buyer config lives in a separate file for independent tuning.
+// ---------------------------------------------------------------------------
+struct BuyerPairRule {
+    std::string pair_name;                  // e.g. "XCH/wUSDC.b"
+    bool        enabled{true};
+    std::string side{"ask"};                // "ask" = buy base, "bid" = sell base
+    double      band_bps{30.0};             // Actionable slack above derived minimum discount floor.
+    double      min_edge_bps{12.0};         // Minimum net edge after all costs.
+    double      max_take_units{0.25};       // Max size per take (base units).
+    double      min_take_units{0.05};       // Min size (avoid micro-takes).
+    double      daily_cap_units{5.0};       // Daily take cap (base units).
+    double      max_premium_over_cex_bps{50.0}; // Max premium over CEX ref.
+    double      inventory_ratio_cap{0.65};  // Max inventory ratio before suppressing.
+};
+
+struct BuyerConfig {
+    bool        enabled{false};             // Master switch (disabled by default).
+    std::string config_path;                // Path to buyer.yaml (empty = inline).
+
+    // -- Global settings (apply to all pairs) --------------------------------
+    double      fee_budget_pct{0.3};        // Max pct of daily fee budget for buyer.
+    uint32_t    cooldown_blocks{3};         // Min blocks between takes on same pair.
+    uint32_t    epoch_blocks{4608};         // Daily cap reset period (~24h).
+    double      vpin_max{0.70};             // Global VPIN ceiling.
+    double      slippage_buffer_bps{3.0};   // Slippage deduction from edge.
+    double      toxicity_buffer_bps{8.0};   // Adverse-selection deduction.
+    bool        require_cex_ref{true};      // Require CoinGecko reference.
+    uint32_t    max_cex_age_blocks{10};     // Max staleness of CEX ref (~3 min).
+    uint32_t    max_takes_per_block{1};     // Global per-block cap.
+    bool        respect_recovery_mode{true};// Suppress when recovery active.
+    bool        respect_flash_crash{true};  // Suppress during crash states.
+    bool        include_relist_credit{true};// Include expected relist profit in edge.
+    double      relist_fill_probability{0.5}; // Assumed fill prob for relist credit.
+
+    // -- Per-pair rules (from buyer.yaml pairs section) ----------------------
+    std::vector<BuyerPairRule> pair_rules;
 };
 
 // ---------------------------------------------------------------------------
@@ -974,6 +1062,7 @@ struct AppConfig {
     AdverseSelectionSettings adverse_selection;
     MarketAllocatorConfig market_allocator;
     RecoveryConfig   recovery;
+    BuyerConfig      buyer;
 };
 
 // ---------------------------------------------------------------------------

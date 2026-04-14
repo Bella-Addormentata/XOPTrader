@@ -819,6 +819,20 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".fee_min_spendable_xch must be >= 0");
         }
     }
+    if (node["taker_min_spendable_xch"] && node["taker_min_spendable_xch"].IsDefined()
+        && !node["taker_min_spendable_xch"].IsNull()) {
+        cfg.taker_min_spendable_xch = node["taker_min_spendable_xch"].as<double>();
+        if (cfg.taker_min_spendable_xch < 0.0) {
+            throw ConfigError(sec + ".taker_min_spendable_xch must be >= 0");
+        }
+    }
+    if (node["block_time_seconds"] && node["block_time_seconds"].IsDefined()
+        && !node["block_time_seconds"].IsNull()) {
+        cfg.block_time_seconds = node["block_time_seconds"].as<double>();
+        if (cfg.block_time_seconds <= 0.0) {
+            throw ConfigError(sec + ".block_time_seconds must be > 0");
+        }
+    }
     if (node["arb_reserve_coins"] && node["arb_reserve_coins"].IsDefined()
         && !node["arb_reserve_coins"].IsNull()) {
         cfg.arb_reserve_coins = node["arb_reserve_coins"].as<int>();
@@ -1467,6 +1481,7 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("cex_fee_bps",                    cfg.cex_fee_bps);
     read_dbl ("bridge_fee_bps",                 cfg.bridge_fee_bps);
     read_dbl ("cex_dex_confidence_cap",         cfg.cex_dex_confidence_cap);
+    read_dbl ("cex_reference_half_spread_bps",  cfg.cex_reference_half_spread_bps);
 
     // Cross-DEX
     read_dbl ("cross_dex_min_edge_bps",         cfg.cross_dex_min_edge_bps);
@@ -1482,6 +1497,30 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("crossed_book_min_edge_bps",      cfg.crossed_book_min_edge_bps);
     read_dbl ("crossed_book_max_take_xch",      cfg.crossed_book_max_take_xch, 0.001);
     read_bool("cancel_worst_to_free",           cfg.cancel_worst_to_free);
+
+    // Midpoint recycling
+    read_bool("midpoint_recycling_enabled",             cfg.midpoint_recycling_enabled);
+    read_dbl ("midpoint_recycling_band_bps",            cfg.midpoint_recycling_band_bps);
+    read_dbl ("midpoint_recycling_max_take_xch",        cfg.midpoint_recycling_max_take_xch, 0.001);
+    read_dbl ("midpoint_recycling_min_take_xch",        cfg.midpoint_recycling_min_take_xch, 0.001);
+    read_u32 ("midpoint_recycling_cooldown_blocks",     cfg.midpoint_recycling_cooldown_blocks);
+    read_u32 ("midpoint_recycling_max_takes_per_block", cfg.midpoint_recycling_max_takes_per_block);
+    read_dbl ("midpoint_recycling_daily_take_xch_cap",  cfg.midpoint_recycling_daily_take_xch_cap, 0.001);
+    read_u32 ("midpoint_recycling_epoch_blocks",        cfg.midpoint_recycling_epoch_blocks);
+    read_dbl ("midpoint_recycling_min_expected_edge_bps", cfg.midpoint_recycling_min_expected_edge_bps);
+    read_dbl ("midpoint_recycling_fee_buffer_bps",      cfg.midpoint_recycling_fee_buffer_bps);
+    read_dbl ("midpoint_recycling_toxicity_buffer_bps", cfg.midpoint_recycling_toxicity_buffer_bps);
+    read_dbl ("midpoint_recycling_slippage_buffer_bps", cfg.midpoint_recycling_slippage_buffer_bps);
+    read_dbl ("midpoint_recycling_inventory_ratio_cap", cfg.midpoint_recycling_inventory_ratio_cap, 0.01);
+    read_bool("midpoint_recycling_require_cex_ref",     cfg.midpoint_recycling_require_cex_ref);
+    read_u32 ("midpoint_recycling_max_cex_age_blocks",  cfg.midpoint_recycling_max_cex_age_blocks);
+    read_dbl ("midpoint_recycling_vpin_max",            cfg.midpoint_recycling_vpin_max, 0.01);
+    if (node["midpoint_recycling_pairs"] && node["midpoint_recycling_pairs"].IsSequence()) {
+        cfg.midpoint_recycling_pairs.clear();
+        for (const auto& item : node["midpoint_recycling_pairs"]) {
+            cfg.midpoint_recycling_pairs.push_back(item.as<std::string>());
+        }
+    }
 
     // Cross-stablecoin arbitrage
     read_bool("cross_stable_arb_enabled",       cfg.cross_stable_arb_enabled);
@@ -1499,6 +1538,37 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("default_confidence",             cfg.default_confidence, 0.01);
     read_dbl ("min_confidence_threshold",       cfg.min_confidence_threshold);
     read_u32 ("default_urgency_blocks",         cfg.default_urgency_blocks);
+
+    if (cfg.cex_reference_half_spread_bps < 0.0) {
+        throw ConfigError(sec + ".cex_reference_half_spread_bps must be >= 0");
+    }
+    if (cfg.midpoint_recycling_enabled && cfg.midpoint_recycling_pairs.empty()) {
+        throw ConfigError(sec + ".midpoint_recycling_pairs must not be empty when midpoint_recycling_enabled=true");
+    }
+    if (cfg.midpoint_recycling_band_bps <= 0.0) {
+        throw ConfigError(sec + ".midpoint_recycling_band_bps must be > 0");
+    }
+    if (cfg.midpoint_recycling_min_take_xch >= cfg.midpoint_recycling_max_take_xch) {
+        throw ConfigError(sec + ".midpoint_recycling_min_take_xch must be < midpoint_recycling_max_take_xch");
+    }
+    if (cfg.midpoint_recycling_max_takes_per_block == 0) {
+        throw ConfigError(sec + ".midpoint_recycling_max_takes_per_block must be >= 1");
+    }
+    if (cfg.midpoint_recycling_epoch_blocks != 0 && cfg.midpoint_recycling_epoch_blocks < 100) {
+        throw ConfigError(sec + ".midpoint_recycling_epoch_blocks must be >= 100");
+    }
+    if (cfg.midpoint_recycling_inventory_ratio_cap <= 0.0
+        || cfg.midpoint_recycling_inventory_ratio_cap > 1.0) {
+        throw ConfigError(sec + ".midpoint_recycling_inventory_ratio_cap must be in (0, 1]");
+    }
+    if (cfg.midpoint_recycling_vpin_max <= 0.0 || cfg.midpoint_recycling_vpin_max > 1.0) {
+        throw ConfigError(sec + ".midpoint_recycling_vpin_max must be in (0, 1]");
+    }
+    for (const auto& pair_name : cfg.midpoint_recycling_pairs) {
+        if (pair_name.empty()) {
+            throw ConfigError(sec + ".midpoint_recycling_pairs entries must be non-empty");
+        }
+    }
 
     return cfg;
 }
@@ -1791,10 +1861,37 @@ void log_config_summary(const AppConfig& cfg)
         << "  tri_min_profit_bps   = " << cfg.arbitrage.triangular_min_profit_bps << "\n"
         << "  tri_slippage_bps     = " << cfg.arbitrage.triangular_slippage_bps << "\n"
         << "  tri_fee_bps/leg      = " << cfg.arbitrage.triangular_per_leg_fee_bps << "\n"
+        << "  cex_ref_half_spread  = " << cfg.arbitrage.cex_reference_half_spread_bps << "\n"
         << "  crossed_book         = " << (cfg.arbitrage.crossed_book_enabled ? "true" : "false") << "\n"
         << "  crossed_min_edge_bps = " << cfg.arbitrage.crossed_book_min_edge_bps << "\n"
         << "  crossed_max_take_xch = " << cfg.arbitrage.crossed_book_max_take_xch << "\n"
         << "  cancel_worst_to_free = " << (cfg.arbitrage.cancel_worst_to_free ? "true" : "false") << "\n"
+        << "  midpoint_recycling   = " << (cfg.arbitrage.midpoint_recycling_enabled ? "true" : "false") << "\n";
+    if (cfg.arbitrage.midpoint_recycling_enabled) {
+        out << "  midpoint_slack_bps   = " << cfg.arbitrage.midpoint_recycling_band_bps << "\n"
+            << "  midpoint_take_range  = ["
+            << cfg.arbitrage.midpoint_recycling_min_take_xch << ", "
+            << cfg.arbitrage.midpoint_recycling_max_take_xch << "] XCH\n"
+            << "  midpoint_edge_bps    = " << cfg.arbitrage.midpoint_recycling_min_expected_edge_bps << "\n"
+            << "  midpoint_buffers     = fee " << cfg.arbitrage.midpoint_recycling_fee_buffer_bps
+            << ", tox " << cfg.arbitrage.midpoint_recycling_toxicity_buffer_bps
+            << ", slip " << cfg.arbitrage.midpoint_recycling_slippage_buffer_bps << " bps\n"
+            << "  midpoint_cooldown    = " << cfg.arbitrage.midpoint_recycling_cooldown_blocks << " blocks\n"
+            << "  midpoint_caps        = " << cfg.arbitrage.midpoint_recycling_max_takes_per_block
+            << "/block, " << cfg.arbitrage.midpoint_recycling_daily_take_xch_cap << " XCH/day\n"
+            << "  midpoint_vpin_max    = " << cfg.arbitrage.midpoint_recycling_vpin_max << "\n"
+            << "  midpoint_inv_cap     = " << cfg.arbitrage.midpoint_recycling_inventory_ratio_cap << "\n"
+            << "  midpoint_cex_ref     = " << (cfg.arbitrage.midpoint_recycling_require_cex_ref ? "required" : "optional") << "\n";
+        if (!cfg.arbitrage.midpoint_recycling_pairs.empty()) {
+            out << "  midpoint_pairs       = ";
+            for (std::size_t index = 0; index < cfg.arbitrage.midpoint_recycling_pairs.size(); ++index) {
+                if (index > 0) out << ", ";
+                out << cfg.arbitrage.midpoint_recycling_pairs[index];
+            }
+            out << "\n";
+        }
+    }
+    out
         << "  cross_stable_arb     = " << (cfg.arbitrage.cross_stable_arb_enabled ? "true" : "false") << "\n"
         << "  cross_stable_edge_bps= " << cfg.arbitrage.cross_stable_min_edge_bps << "\n"
         << "  cross_stable_max_xch = " << cfg.arbitrage.cross_stable_max_take_xch << "\n"
@@ -1841,6 +1938,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  stuck_age  = " << cfg.strategy.stuck_offer_age_blocks << " blocks\n"
         << "  fee_reserve_xch = " << cfg.strategy.fee_reserve_xch << "\n"
         << "  fee_min_spendable = " << cfg.strategy.fee_min_spendable_xch << "\n"
+        << "  taker_min_spendable = " << cfg.strategy.taker_min_spendable_xch << "\n"
+        << "  block_time_seconds = " << cfg.strategy.block_time_seconds << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
         << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
@@ -1881,7 +1980,40 @@ void log_config_summary(const AppConfig& cfg)
         << "  xch_target  = " << cfg.recovery.xch_recovery_target << " XCH\n"
         << "  max_take    = " << cfg.recovery.max_take_per_block_xch << " XCH/block\n"
         << "  max_premium = " << cfg.recovery.max_premium_bps << " bps\n"
+        << "  zero_fee_below = " << cfg.recovery.zero_fee_below_xch << " XCH\n"
         << "  cancel_on_enter = " << (cfg.recovery.cancel_on_enter ? "yes" : "no") << "\n";
+    if (!cfg.recovery.pair_allowlist.empty()) {
+        out << "  pair_allowlist = ";
+        for (std::size_t index = 0; index < cfg.recovery.pair_allowlist.size(); ++index) {
+            if (index > 0) out << ", ";
+            out << cfg.recovery.pair_allowlist[index];
+        }
+        out << "\n";
+    }
+
+    // Buyer -- dedicated offer-taker flow.
+    out << "[buyer]\n"
+        << "  enabled     = " << (cfg.buyer.enabled ? "ON" : "off") << "\n";
+    if (cfg.buyer.enabled) {
+        if (!cfg.buyer.config_path.empty())
+            out << "  config_path = " << cfg.buyer.config_path << "\n";
+        out << "  fee_budget  = " << cfg.buyer.fee_budget_pct * 100.0 << "%\n"
+            << "  cooldown    = " << cfg.buyer.cooldown_blocks << " blocks\n"
+            << "  epoch       = " << cfg.buyer.epoch_blocks << " blocks\n"
+            << "  vpin_max    = " << cfg.buyer.vpin_max << "\n"
+            << "  max_takes   = " << cfg.buyer.max_takes_per_block << "/block\n"
+            << "  relist_credit = " << (cfg.buyer.include_relist_credit ? "ON" : "off")
+            << " (p_fill=" << cfg.buyer.relist_fill_probability << ")\n"
+            << "  pairs       = " << cfg.buyer.pair_rules.size() << " rules\n";
+        for (const auto& pr : cfg.buyer.pair_rules) {
+            out << "    " << pr.pair_name
+                << (pr.enabled ? " [enabled]" : " [disabled]")
+                << " side=" << pr.side
+                << " slack=" << pr.band_bps << "bps"
+                << " edge>=" << pr.min_edge_bps << "bps"
+                << " cap=" << pr.daily_cap_units << "/day\n";
+        }
+    }
 
     out << "======================================\n";
 
@@ -2085,6 +2217,13 @@ RecoveryConfig parse_recovery(const YAML::Node& root)
     read_dbl ("max_take_per_block_xch", cfg.max_take_per_block_xch);
     read_dbl ("max_premium_bps",        cfg.max_premium_bps);
     read_bool("cancel_on_enter",        cfg.cancel_on_enter);
+    read_dbl ("zero_fee_below_xch",     cfg.zero_fee_below_xch);
+    if (node["pair_allowlist"] && node["pair_allowlist"].IsSequence()) {
+        cfg.pair_allowlist.clear();
+        for (const auto& item : node["pair_allowlist"]) {
+            cfg.pair_allowlist.push_back(item.as<std::string>());
+        }
+    }
 
     // Validate.
     if (cfg.xch_low_threshold < 0.0)
@@ -2095,6 +2234,174 @@ RecoveryConfig parse_recovery(const YAML::Node& root)
         throw ConfigError(sec + ".max_take_per_block_xch must be > 0");
     if (cfg.max_premium_bps < 0.0)
         throw ConfigError(sec + ".max_premium_bps must be >= 0");
+    if (cfg.zero_fee_below_xch < 0.0)
+        throw ConfigError(sec + ".zero_fee_below_xch must be >= 0");
+    for (const auto& pair_name : cfg.pair_allowlist) {
+        if (pair_name.empty())
+            throw ConfigError(sec + ".pair_allowlist entries must be non-empty");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
+// parse_buyer -- optional `buyer:` section or external buyer.yaml.
+//
+// The buyer config can be:
+//   1. Inline in config.yaml under `buyer:` key.
+//   2. In a separate file specified by `buyer.config_path`.
+//   3. Absent / disabled (returns defaults with enabled=false).
+// ---------------------------------------------------------------------------
+BuyerConfig parse_buyer(const YAML::Node& root)
+{
+    const std::string sec = "buyer";
+    BuyerConfig cfg;
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;  // disabled by default
+    }
+    const YAML::Node& node = root[sec];
+
+    // Helper lambdas matching the pattern used throughout config.cpp.
+    auto read_bool = [&](const YAML::Node& n, const char* key, bool& out) {
+        if (n[key] && n[key].IsDefined() && !n[key].IsNull())
+            out = n[key].as<bool>();
+    };
+    auto read_dbl = [&](const YAML::Node& n, const char* key, double& out) {
+        if (n[key] && n[key].IsDefined() && !n[key].IsNull())
+            out = n[key].as<double>();
+    };
+    auto read_u32 = [&](const YAML::Node& n, const char* key, uint32_t& out) {
+        if (n[key] && n[key].IsDefined() && !n[key].IsNull())
+            out = n[key].as<uint32_t>();
+    };
+    auto read_str = [&](const YAML::Node& n, const char* key, std::string& out) {
+        if (n[key] && n[key].IsDefined() && !n[key].IsNull())
+            out = n[key].as<std::string>();
+    };
+
+    // Check if an external buyer.yaml is specified.
+    read_str(node, "config_path", cfg.config_path);
+
+    // If external file specified, load and deep-merge it over the inline
+    // node. Accept either a bare buyer section body or a wrapped top-level
+    // `buyer:` map for operator convenience.
+    YAML::Node buyer_root = YAML::Clone(node);
+    if (!cfg.config_path.empty()) {
+        try {
+            YAML::Node external = YAML::LoadFile(cfg.config_path);
+            if (external.IsMap()) {
+                const YAML::Node external_body =
+                    (external[sec] && external[sec].IsMap())
+                        ? external[sec]
+                        : external;
+
+                for (auto it = external_body.begin(); it != external_body.end(); ++it) {
+                    const auto key = it->first.as<std::string>();
+                    buyer_root[key] = YAML::Clone(it->second);
+                }
+                spdlog::info("Buyer config loaded from '{}'", cfg.config_path);
+            }
+        } catch (const YAML::BadFile&) {
+            spdlog::warn("Buyer config_path '{}' not found -- using inline defaults",
+                         cfg.config_path);
+        } catch (const YAML::Exception& e) {
+            throw ConfigError("Failed to load buyer config from '" + cfg.config_path
+                              + "': " + std::string(e.what()));
+        }
+    }
+
+    // Parse global settings from the (possibly merged) buyer_root.
+    read_bool(buyer_root, "enabled",                cfg.enabled);
+    read_dbl (buyer_root, "fee_budget_pct",         cfg.fee_budget_pct);
+    read_u32 (buyer_root, "cooldown_blocks",        cfg.cooldown_blocks);
+    read_u32 (buyer_root, "epoch_blocks",           cfg.epoch_blocks);
+    read_dbl (buyer_root, "vpin_max",               cfg.vpin_max);
+    read_dbl (buyer_root, "slippage_buffer_bps",    cfg.slippage_buffer_bps);
+    read_dbl (buyer_root, "toxicity_buffer_bps",    cfg.toxicity_buffer_bps);
+    read_bool(buyer_root, "require_cex_ref",        cfg.require_cex_ref);
+    read_u32 (buyer_root, "max_cex_age_blocks",     cfg.max_cex_age_blocks);
+    read_u32 (buyer_root, "max_takes_per_block",    cfg.max_takes_per_block);
+    read_bool(buyer_root, "respect_recovery_mode",  cfg.respect_recovery_mode);
+    read_bool(buyer_root, "respect_flash_crash",    cfg.respect_flash_crash);
+    read_bool(buyer_root, "include_relist_credit",  cfg.include_relist_credit);
+    read_dbl (buyer_root, "relist_fill_probability", cfg.relist_fill_probability);
+
+    // Parse per-pair rules. Support both `pair_rules:` and the older `pairs:`
+    // spelling, plus both `pair_name` and `name` for the pair key.
+    YAML::Node pair_rules;
+    if (buyer_root["pair_rules"] && buyer_root["pair_rules"].IsSequence()) {
+        pair_rules = buyer_root["pair_rules"];
+    } else if (buyer_root["pairs"] && buyer_root["pairs"].IsSequence()) {
+        pair_rules = buyer_root["pairs"];
+    }
+
+    if (pair_rules && pair_rules.IsSequence()) {
+        for (const auto& pnode : pair_rules) {
+            BuyerPairRule rule;
+            read_str (pnode, "name",                   rule.pair_name);
+            if (rule.pair_name.empty()) {
+                read_str(pnode, "pair_name",          rule.pair_name);
+            }
+            read_bool(pnode, "enabled",                rule.enabled);
+            read_str (pnode, "side",                   rule.side);
+            read_dbl (pnode, "band_bps",               rule.band_bps);
+            read_dbl (pnode, "min_edge_bps",           rule.min_edge_bps);
+            read_dbl (pnode, "max_take_units",         rule.max_take_units);
+            read_dbl (pnode, "min_take_units",         rule.min_take_units);
+            read_dbl (pnode, "daily_cap_units",        rule.daily_cap_units);
+            read_dbl (pnode, "max_premium_over_cex_bps", rule.max_premium_over_cex_bps);
+            read_dbl (pnode, "inventory_ratio_cap",    rule.inventory_ratio_cap);
+
+            if (rule.pair_name.empty()) {
+                throw ConfigError(sec + ".pair_rules[]: 'pair_name' (or legacy 'name') is required");
+            }
+            if (rule.side != "ask" && rule.side != "bid") {
+                throw ConfigError(sec + ".pair_rules[" + rule.pair_name
+                                  + "].side must be 'ask' or 'bid'");
+            }
+            if (rule.min_take_units >= rule.max_take_units) {
+                throw ConfigError(sec + ".pair_rules[" + rule.pair_name
+                                  + "]: min_take_units must be < max_take_units");
+            }
+            if (rule.inventory_ratio_cap <= 0.0 || rule.inventory_ratio_cap > 1.0) {
+                throw ConfigError(sec + ".pair_rules[" + rule.pair_name
+                                  + "]: inventory_ratio_cap must be in (0, 1]");
+            }
+            if (rule.band_bps <= 0.0 || rule.min_edge_bps < 0.0) {
+                throw ConfigError(sec + ".pair_rules[" + rule.pair_name
+                                  + "]: band_bps must be > 0 and min_edge_bps must be >= 0");
+            }
+            if (rule.daily_cap_units <= 0.0) {
+                throw ConfigError(sec + ".pair_rules[" + rule.pair_name
+                                  + "]: daily_cap_units must be > 0");
+            }
+            cfg.pair_rules.push_back(std::move(rule));
+        }
+    }
+
+    // Validate global settings.
+    if (cfg.enabled && cfg.pair_rules.empty()) {
+        throw ConfigError(sec + ": enabled=true but no pair rules defined");
+    }
+    if (cfg.fee_budget_pct < 0.0 || cfg.fee_budget_pct > 1.0) {
+        throw ConfigError(sec + ".fee_budget_pct must be in [0, 1]");
+    }
+    if (cfg.epoch_blocks < 100) {
+        throw ConfigError(sec + ".epoch_blocks must be >= 100");
+    }
+    if (cfg.max_takes_per_block == 0) {
+        throw ConfigError(sec + ".max_takes_per_block must be >= 1");
+    }
+    if (cfg.vpin_max <= 0.0 || cfg.vpin_max > 1.0) {
+        throw ConfigError(sec + ".vpin_max must be in (0, 1]");
+    }
+    if (cfg.relist_fill_probability < 0.0 || cfg.relist_fill_probability > 1.0) {
+        throw ConfigError(sec + ".relist_fill_probability must be in [0, 1]");
+    }
+    if (cfg.slippage_buffer_bps < 0.0 || cfg.toxicity_buffer_bps < 0.0) {
+        throw ConfigError(sec + ".slippage_buffer_bps and .toxicity_buffer_bps must be >= 0");
+    }
 
     return cfg;
 }
@@ -2174,6 +2481,7 @@ AppConfig load_config(const std::string& path,
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
+    cfg.buyer      = parse_buyer(root);
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

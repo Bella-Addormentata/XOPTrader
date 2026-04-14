@@ -301,6 +301,11 @@ void MetricsExporter::register_metrics()
         .Help("Rolling 24-hour blockchain fees paid in mojos")
         .Register(*registry_)
         .Add({});
+
+    trade_decision_counter_family_ = &prometheus::BuildCounter()
+        .Name("xop_trade_decision_total")
+        .Help("Cumulative trade decision-tree branch events")
+        .Register(*registry_);
 }
 
 // ===================================================================
@@ -641,6 +646,35 @@ void MetricsExporter::update_fees_paid_24h(std::uint64_t total_mojos)
     if (!running_) return;
 
     fees_paid_24h_gauge_->Set(static_cast<double>(total_mojos));
+}
+
+void MetricsExporter::increment_trade_decision(
+    std::string_view strategy,
+    std::string_view scenario_id,
+    std::string_view result)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_ || !trade_decision_counter_family_) return;
+
+    std::string key;
+    key.reserve(strategy.size() + scenario_id.size() + result.size() + 3);
+    key.append(strategy);
+    key.push_back('\x1f');
+    key.append(scenario_id);
+    key.push_back('\x1f');
+    key.append(result);
+
+    auto it = trade_decision_counters_.find(key);
+    if (it == trade_decision_counters_.end()) {
+        auto& counter = trade_decision_counter_family_->Add({
+            {"strategy", std::string(strategy)},
+            {"scenario_id", std::string(scenario_id)},
+            {"result", std::string(result)},
+        });
+        it = trade_decision_counters_.emplace(std::move(key), &counter).first;
+    }
+
+    it->second->Increment();
 }
 
 }  // namespace xop

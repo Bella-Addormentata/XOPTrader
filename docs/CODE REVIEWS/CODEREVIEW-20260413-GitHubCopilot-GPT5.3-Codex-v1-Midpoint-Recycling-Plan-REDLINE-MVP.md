@@ -68,21 +68,31 @@ For XCH/wUSDC.b only:
 
 Net edge formula for MVP:
 
-net_edge_bps = raw_edge_bps - fee_bps - toxicity_buffer_bps - slippage_buffer_bps
+```
+take_discount_bps = (fair_price - ask_price) / fair_price × 10000
+fee_bps_take      = take_fee_mojos / notional_mojos × 10000
+fee_bps_relist    = relist_fee_mojos / notional_mojos × 10000
+net_edge_bps      = take_discount_bps - fee_bps_take - fee_bps_relist - toxicity_buffer_bps - slippage_buffer_bps
+```
 
-where:
-1. raw_edge_bps = (fair_price - ask_price) / fair_price * 10000
-2. fee_bps is estimated from recommended fee and intended notional
-3. toxicity_buffer_bps and slippage_buffer_bps are fixed config buffers
+CRITICAL: The round-trip requires TWO blockchain fees — one for take_offer, one for the relist create_offer. For a 0.15 XCH trade at 100M mojo fee, each leg costs ~6.6 bps, totaling ~13 bps. This nearly doubles the profitability threshold versus a single-fee model.
+
+Where:
+1. fair_price is the blended mid from market data, validated against CEX reference
+2. ask_price is the candidate offer's price
+3. fee_bps_take and fee_bps_relist each convert the absolute mojo fee to bps relative to trade notional
+4. toxicity_buffer_bps and slippage_buffer_bps are fixed config buffers
 
 Take condition:
 1. net_edge_bps >= min_expected_edge_bps
 2. cooldown not active
 3. daily cap not exceeded
-4. inventory ratio below cap
+4. inventory ratio (xch_value / total_value for pair) below cap
 5. VPIN below cap
 6. wallet circuit open is false
 7. recovery mode is false
+8. pending_change == 0 for XCH wallet (critical: prevents takes with locked funds)
+9. xch_ask_throttle not at caution or above (prevents XCH over-accumulation)
 
 ---
 
@@ -94,22 +104,28 @@ Add these fields to ArbitrageSettings in [config.hpp](../../cpp/include/xop/conf
 2. midpoint_recycling_pairs: ["XCH/wUSDC.b"]
 3. midpoint_recycling_band_bps: 20
 4. midpoint_recycling_max_take_xch: 0.15
-5. midpoint_recycling_max_takes_per_block: 1
-6. midpoint_recycling_daily_take_xch_cap: 2.0
-7. midpoint_recycling_min_expected_edge_bps: 15
-8. midpoint_recycling_fee_buffer_bps: 8
-9. midpoint_recycling_toxicity_buffer_bps: 12
-10. midpoint_recycling_slippage_buffer_bps: 5
-11. midpoint_recycling_cooldown_blocks: 4
-12. midpoint_recycling_inventory_ratio_cap: 0.60
-13. midpoint_recycling_require_cex_ref: true
-14. midpoint_recycling_vpin_max: 0.70
+5. midpoint_recycling_min_take_xch: 0.05
+6. midpoint_recycling_max_takes_per_block: 1
+7. midpoint_recycling_daily_take_xch_cap: 2.0
+8. midpoint_recycling_epoch_blocks: 4608
+9. midpoint_recycling_min_expected_edge_bps: 20
+10. midpoint_recycling_fee_buffer_bps: 15
+11. midpoint_recycling_toxicity_buffer_bps: 12
+12. midpoint_recycling_slippage_buffer_bps: 5
+13. midpoint_recycling_cooldown_blocks: 4
+14. midpoint_recycling_inventory_ratio_cap: 0.60
+15. midpoint_recycling_require_cex_ref: true
+16. midpoint_recycling_max_cex_age_blocks: 10
+17. midpoint_recycling_vpin_max: 0.70
 
 Validation rules:
 1. Non-negative bps and caps.
 2. max_takes_per_block >= 1.
 3. inventory_ratio_cap in (0, 1].
 4. midpoint_recycling_pairs must not be empty when enabled.
+5. min_take_xch < max_take_xch.
+6. epoch_blocks >= 100.
+7. fee_buffer_bps should cover round-trip: at least 2 × (typical_fee_mojos / min_take_mojos × 10000).
 
 ---
 
@@ -155,7 +171,12 @@ Execution sequence:
 1. arbitrage enabled and midpoint_recycling_enabled
 2. wallet circuit breaker closed
 3. not in xch_recovery_mode
-4. not dry-run unless in instrumentation phase
+4. not dry-run unless in instrumentation phase (Step 9d must respect dry_run_ flag)
+5. wallet sync check: wallet_->get_sync_status() returns synced=true
+6. pending_change == 0 for XCH wallet (critical after Step 9c may have taken in same heartbeat)
+7. XCH spendable >= fee_mojos (re-fetch after Step 9c returns; do not use stale pre-step balance)
+
+Note: Step 9d MUST execute strictly after Step 9c returns within the same coroutine. Balance state from before 9c is not reliable.
 
 2. Pair filter:
 1. process only configured midpoint_recycling_pairs
@@ -164,26 +185,30 @@ Execution sequence:
 3. Candidate discovery:
 1. fetch competing offers
 2. keep external asks only
-3. keep size <= midpoint_recycling_max_take_xch
+3. keep min_take_xch <= size <= midpoint_recycling_max_take_xch
 4. keep abs((ask - fair)/fair) <= midpoint_recycling_band_bps
+5. require CEX reference age <= max_cex_age_blocks (~3 min staleness ceiling)
+6. verify spendable quote currency >= candidate_size × candidate_price
 
 4. Candidate scoring:
-1. compute raw edge versus fair value
-2. estimate fee_bps from current recommended fee and candidate notional
-3. net_edge_bps = raw - fee - toxicity - slippage
+1. compute take_discount_bps = (fair - ask) / fair × 10000
+2. compute fee_bps_take and fee_bps_relist from current recommended fee and candidate notional
+3. net_edge_bps = take_discount_bps - fee_bps_take - fee_bps_relist - toxicity - slippage
 
 5. Risk gates:
 1. net_edge_bps gate
 2. VPIN gate
-3. inventory ratio gate
+3. inventory ratio gate (defined as xch_value / total_value for pair)
 4. cooldown gate
-5. daily cap gate
+5. daily cap gate (reset every epoch_blocks, default 4608 ≈ 24h)
+6. xch_ask_throttle gate (suppress takes when throttle is at caution or above)
 
 6. Take path:
 1. fetch full offer text via current Dexie offer_status path
-2. verify offer still active
-3. take via wallet take_offer
-4. update midpoint_last_take_block and midpoint_daily_taken_xch
+2. verify offer still active (status == 0)
+3. take via wallet take_offer with fee from fee_tracker
+4. on success: record fee via fee_tracker_->record_fee(), send alert, update midpoint_last_take_block and midpoint_daily_taken_xch
+5. on failure: log and continue (do not retry)
 
 7. Exit condition:
 1. stop after midpoint_recycling_max_takes_per_block successful takes
@@ -238,21 +263,39 @@ Mitigation: pair-only labels in MVP.
 8. Overfitting to one market regime.
 Mitigation: run instrumentation and dry-run over multiple volatility regimes before live.
 
+9. Step 9c and 9d wallet state conflict.
+Mitigation: Step 9d must re-fetch wallet balances after 9c returns. Hard gate on pending_change == 0. Sequential ordering within the coroutine is mandatory.
+
+10. XCH ask-throttle interaction.
+Mitigation: gate midpoint takes when xch_ask_throttle is at caution or above. Check XCH balance against throttle thresholds before allowing takes.
+
+11. CEX reference staleness.
+Mitigation: enforce max_cex_age_blocks (default 10, ~3 min). Reject candidates when reference is older.
+
+12. Double-fee round-trip cost underestimation.
+Mitigation: edge formula must include fee_bps_take + fee_bps_relist. Default fee_buffer_bps raised to 15 to cover round-trip.
+
 ---
 
 ## 8. MVP Test Plan
 
 ## Unit tests
-1. Net edge calculation and fee_bps conversion.
-2. Candidate filtering by size and band.
-3. Cooldown and daily-cap gating.
-4. Config parser validation boundaries.
+1. Net edge calculation with double-fee accounting (fee_bps_take + fee_bps_relist).
+2. Fee_bps conversion from absolute mojos to bps at different notional sizes.
+3. Candidate filtering by min/max size, band, and CEX age.
+4. Cooldown, daily-cap, and epoch-reset gating.
+5. Inventory ratio computation (xch_value / total_value).
+6. Config parser validation boundaries (new fields: min_take, epoch_blocks, max_cex_age_blocks).
 
 ## Integration tests
 1. Synthetic near-mid asks with positive edge produce takes.
-2. High-fee scenario suppresses takes.
+2. High-fee scenario suppresses takes (double-fee drag exceeds edge).
 3. Recovery mode active suppresses Step 9d.
-4. Existing Step 9c behavior unchanged when midpoint mode toggled.
+4. Pending_change > 0 suppresses Step 9d.
+5. xch_ask_throttle at caution suppresses Step 9d.
+6. Step 9c take followed by Step 9d in same heartbeat: verify 9d re-fetches balance.
+7. Existing Step 9c behavior unchanged when midpoint mode toggled.
+8. Dry-run mode: verify candidates are logged but no take_offer RPC executed.
 
 ## Regression tests
 1. Build and runtime unchanged when midpoint_recycling_enabled is false.

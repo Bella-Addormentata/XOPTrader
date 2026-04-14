@@ -421,6 +421,11 @@ public:
     /// or if the CEX data is stale.
     std::optional<double> get_cex_reference(const std::string& pair_name) const;
 
+    /// Age of the current CEX reference in seconds.
+    /// Returns std::nullopt if no CEX reference exists for the pair.
+    std::optional<double> get_cex_reference_age_seconds(
+        const std::string& pair_name) const;
+
     /// Whether the data for a pair is considered stale.
     /// Returns true if the pair is unknown.
     bool is_stale(const std::string& pair_name) const;

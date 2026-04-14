@@ -41,6 +41,7 @@
 #include <memory>
 #include <shared_mutex>
 #include <string>
+#include <string_view>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -254,6 +255,11 @@ public:
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
 
+    /// Increment a trade decision-tree counter.
+    void increment_trade_decision(std::string_view strategy,
+                                  std::string_view scenario_id,
+                                  std::string_view result);
+
 private:
     /// Register all metric families with the prometheus registry.
     /// Called once during init().
@@ -338,6 +344,11 @@ private:
     prometheus::Gauge* stuck_offers_gauge_{nullptr};
     prometheus::Gauge* paused_gauge_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
+
+    // -- Trade decision-tree counters ---------------------------------------
+
+    prometheus::Family<prometheus::Counter>* trade_decision_counter_family_{nullptr};
+    std::unordered_map<std::string, prometheus::Counter*> trade_decision_counters_;
 
     // -- Cardinality guard ----------------------------------------------------
     // ISO/IEC 5055: bounded resource allocation -- only asset IDs registered

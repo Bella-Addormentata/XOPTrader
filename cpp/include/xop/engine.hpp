@@ -310,9 +310,20 @@ private:
     /// [T9-01] Coroutine: co_awaits wallet take_offer for crossed books.
     boost::asio::awaitable<void> step_check_arbitrage(BlockHeight block_height);
 
+    /// Step 9d helper: opportunistically recycle near-mid asks into maker
+    /// inventory when they are discounted enough to cover round-trip costs.
+    boost::asio::awaitable<void> step_run_midpoint_recycling(
+        BlockHeight block_height);
+
     /// XCH Recovery Mode: check balance, manage mode transitions, and
     /// scan for cheap XCH asks to take when in recovery.
     boost::asio::awaitable<void> step_xch_recovery(BlockHeight block_height);
+
+    /// Step 9e: Buyer -- dedicated opportunistic offer-taker flow.
+    /// Scans Dexie order books for offers meeting profitability criteria
+    /// defined in a separate buyer.yaml config.  Aware of maker settings
+    /// (inventory limits, recovery mode, wallet health, fee budgets).
+    boost::asio::awaitable<void> step_run_buyer(BlockHeight block_height);
 
     /// Step 10: Compute inventory skew adjustments, NHE, portfolio-level
     /// netting, and statistical pairs hedging suggestions.
@@ -387,6 +398,11 @@ private:
         auto it = pair_config_map_.find(pair_name);
         return (it != pair_config_map_.end()) ? it->second : nullptr;
     }
+
+    /// Emit a trade decision-tree metric when the Prometheus exporter exists.
+    void record_trade_decision_metric(const char* strategy,
+                                      const char* scenario_id,
+                                      const char* result);
 
     // -- Boost.Asio event loop -----------------------------------------------
 
@@ -666,6 +682,28 @@ private:
     // posting offers that would immediately get liberated next heartbeat.
     // Resets early if spendable recovers above 2× reserve.
     int liberation_cooldown_{0};
+
+    // -- Buyer (Step 9e) state -----------------------------------------------
+    // Per-pair last take block for cooldown enforcement.
+    std::unordered_map<std::string, BlockHeight> buyer_last_take_block_;
+
+    // Per-pair accumulated take volume in current epoch for daily cap.
+    std::unordered_map<std::string, double> buyer_epoch_taken_;
+
+    // Block at which the current epoch started (for daily cap reset).
+    BlockHeight buyer_epoch_start_{0};
+
+    // Count of successful takes this block (for per-block cap).
+    uint32_t buyer_takes_this_block_{0};
+
+    // -- Midpoint recycling (Step 9d) state ---------------------------------
+    std::unordered_map<std::string, BlockHeight> midpoint_last_take_block_;
+    std::unordered_map<std::string, double> midpoint_epoch_taken_xch_;
+    BlockHeight midpoint_epoch_start_{0};
+    uint32_t midpoint_takes_this_block_{0};
+
+    // True when Step 9c successfully took at least one offer on this block.
+    bool crossed_book_take_this_block_{false};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
     // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).

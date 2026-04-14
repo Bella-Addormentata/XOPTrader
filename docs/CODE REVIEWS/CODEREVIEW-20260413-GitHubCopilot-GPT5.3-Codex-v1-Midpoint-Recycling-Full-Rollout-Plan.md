@@ -204,7 +204,7 @@ Canary parameters:
 1. Pair: XCH/wUSDC.b only.
 2. max_takes_per_block: 1.
 3. daily_take_cap_xch: 1.0 to 2.0.
-4. near_mid_band_bps: conservative.
+4. midpoint band slack above the derived actionable floor: conservative.
 5. strict cooldown and inventory cap.
 
 Live KPIs:
@@ -303,7 +303,7 @@ Exit criteria:
 ## 7. Parameter Evolution Plan
 
 Start values:
-1. band_bps 20
+1. band_bps 20 (slack above derived actionable floor)
 2. min_expected_edge_bps 15
 3. fee_buffer_bps 8
 4. toxicity_buffer_bps 12

@@ -1,0 +1,55 @@
+# ============================================================================
+# buyer.yaml -- Dedicated offer-taker (buyer) configuration for XOPTrader.
+#
+# This file is loaded when buyer.config_path is set in config.yaml.
+# Values here overlay / merge with any inline buyer: section in config.yaml.
+# ============================================================================
+
+buyer:
+  enabled: true                  # Master switch
+
+  # --- Fee & risk budget ---------------------------------------------------
+  fee_budget_pct: 0.30           # Max fraction of rolling fee budget reserved for buyer
+  cooldown_blocks: 3             # Min blocks between takes on same pair
+  epoch_blocks: 4608             # Epoch length for daily cap reset (~1 day)
+  max_takes_per_block: 1         # Safety: max takes across all pairs per block
+
+  # --- Market quality gates ------------------------------------------------
+  vpin_max: 0.70                 # Skip if VPIN > threshold (toxic flow)
+  require_cex_ref: true          # Require valid CEX reference price
+  max_cex_age_blocks: 10         # Approximate max CEX age in block-equivalent units
+
+  # --- Edge buffers --------------------------------------------------------
+  slippage_buffer_bps: 3.0       # Deducted from raw edge for slippage risk
+  toxicity_buffer_bps: 8.0       # Deducted from raw edge for adverse selection
+
+  # --- Relist credit -------------------------------------------------------
+  include_relist_credit: true    # Add expected relist revenue to edge calc
+  relist_fill_probability: 0.50  # P(fill) on the relisted maker order
+
+  # --- Maker-awareness flags -----------------------------------------------
+  respect_recovery_mode: true    # Pause buyer when XCH recovery mode active
+  respect_flash_crash: true      # Pause buyer during flash crash state
+
+  # --- Per-pair rules ------------------------------------------------------
+  pair_rules:
+    - pair_name: "XCH/wUSDC.b"
+      enabled: true
+      side: "ask"
+      band_bps: 40
+      min_edge_bps: 12
+      max_take_units: 0.25
+      min_take_units: 0.05
+      daily_cap_units: 5.0
+      max_premium_over_cex_bps: 50
+      inventory_ratio_cap: 0.65
+    - pair_name: "XCH/wUSDC.b"
+      enabled: true
+      side: "bid"
+      band_bps: 40
+      min_edge_bps: 12
+      max_take_units: 0.25
+      min_take_units: 0.05
+      daily_cap_units: 5.0
+      max_premium_over_cex_bps: 50
+      inventory_ratio_cap: 0.65

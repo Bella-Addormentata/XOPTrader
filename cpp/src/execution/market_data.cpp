@@ -544,6 +544,24 @@ std::optional<double> MarketDataFeed::get_cex_reference(
     return ps.cex_mid;
 }
 
+std::optional<double> MarketDataFeed::get_cex_reference_age_seconds(
+        const std::string& pair_name) const {
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return std::nullopt;
+    }
+
+    const PairState& ps = it->second;
+    if (ps.cex_mid <= 0.0 || ps.cex_updated_at == Timestamp{}) {
+        return std::nullopt;
+    }
+
+    const auto age = std::chrono::system_clock::now() - ps.cex_updated_at;
+    return std::chrono::duration<double>(age).count();
+}
+
 bool MarketDataFeed::is_stale(const std::string& pair_name) const {
     std::shared_lock lock(mtx_pairs_);
 

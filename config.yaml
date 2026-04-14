@@ -83,6 +83,8 @@ strategy:
   startup_analysis_blocks: 5
   fee_reserve_xch: 0.1
   fee_min_spendable_xch: 0.01
+  taker_min_spendable_xch: 0.25
+  block_time_seconds: 52.0
   min_spendable_reserve_pct: 0.05   # Lowered so bids recover sooner when coins are mostly locked, not truly depleted
   arb_reserve_coins: 2            # Dry-powder: keep 2 coins unallocated for arb takes
   min_reserve_units: 0.1
@@ -171,6 +173,7 @@ arbitrage:
   cex_dex_min_edge_bps: 50
   cex_dex_max_edge_bps: 500
   cex_fee_bps: 10
+  cex_reference_half_spread_bps: 10
   cross_dex_min_edge_bps: 15
   tibetswap_fee_bps: 70
   cross_bridge_min_edge_bps: 20
@@ -179,6 +182,23 @@ arbitrage:
   crossed_book_min_edge_bps: 10
   crossed_book_max_take_xch: 5.0
   cancel_worst_to_free: true       # Cancel worst offer to free coin for arb
+  midpoint_recycling_enabled: true
+  midpoint_recycling_pairs: ["XCH/wUSDC.b"]
+  midpoint_recycling_band_bps: 20
+  midpoint_recycling_min_take_xch: 0.10
+  midpoint_recycling_max_take_xch: 0.25
+  midpoint_recycling_cooldown_blocks: 4
+  midpoint_recycling_max_takes_per_block: 1
+  midpoint_recycling_daily_take_xch_cap: 1.0
+  midpoint_recycling_epoch_blocks: 4608
+  midpoint_recycling_min_expected_edge_bps: 5
+  midpoint_recycling_fee_buffer_bps: 2
+  midpoint_recycling_toxicity_buffer_bps: 6
+  midpoint_recycling_slippage_buffer_bps: 2
+  midpoint_recycling_inventory_ratio_cap: 0.60
+  midpoint_recycling_require_cex_ref: true
+  midpoint_recycling_max_cex_age_blocks: 10
+  midpoint_recycling_vpin_max: 0.70
   cross_stable_arb_enabled: true
   cross_stable_min_edge_bps: 15
   cross_stable_max_take_xch: 5.0
@@ -232,7 +252,14 @@ recovery:
   xch_recovery_target: 1.0      # Exit recovery above this XCH
   max_take_per_block_xch: 0.5   # Max XCH to acquire per block
   max_premium_bps: 100           # Max premium over CEX price to pay
-  cancel_on_enter: true          # Cancel all offers when entering recovery
+  cancel_on_enter: false         # Allow same-block recovery takes on entry
+  zero_fee_below_xch: 0.001      # Fee-free recovery when XCH spendable is effectively dust
+  pair_allowlist: ["XCH/wUSDC.b"]  # Limit recovery takes to pairs with a trusted anchor
+
+# Buyer: dedicated offer-taker flow (see buyer.example.yaml for full options).
+buyer:
+  enabled: true
+  config_path: "buyer.yaml"      # External file with full buyer settings
 
 database:
   path: "data/xop_trader.db"

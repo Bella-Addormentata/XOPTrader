@@ -142,6 +142,8 @@ strategy:
   # Prevents zero-balance lockout by reserving a minimum in each asset.
   fee_reserve_xch: 1.0                # [OPTIONAL, default: 1.0]  XCH held back for on-chain fees
   fee_min_spendable_xch: 0.01          # [OPTIONAL, default: 0.01] Minimum XCH that must remain spendable
+  taker_min_spendable_xch: 0.25        # [OPTIONAL, default: 0.25] Preflight floor for take_offer-based strategies
+  block_time_seconds: 52.0             # [OPTIONAL, default: 52.0] CHIA block-time assumption for freshness checks
   min_spendable_reserve_pct: 0.10      # [OPTIONAL, default: 0.25] Suppress side when spendable/confirmed < this
                                        #   Lower if most inventory is locked in offers (e.g. depleted CATs).
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
@@ -293,6 +295,24 @@ arbitrage:
                                         #   CoinGecko data is aggregated/delayed and vulnerable to
                                         #   manipulation.  Capped below min_confidence_threshold so
                                         #   CEX-DEX signals are logged but not acted upon by default.
+  cex_reference_half_spread_bps: 10     # [OPTIONAL, default: 10] Synthetic half-spread around CoinGecko mid
+  midpoint_recycling_enabled: false     # [EXPERIMENTAL] Near-mid ask taker for inventory recycling
+  midpoint_recycling_pairs: ["XCH/wUSDC.b"]
+  midpoint_recycling_band_bps: 20      # [OPTIONAL, default: 20] Slack above the derived minimum discount floor
+  midpoint_recycling_min_take_xch: 0.10
+  midpoint_recycling_max_take_xch: 0.25
+  midpoint_recycling_cooldown_blocks: 4
+  midpoint_recycling_max_takes_per_block: 1
+  midpoint_recycling_daily_take_xch_cap: 2.0
+  midpoint_recycling_epoch_blocks: 4608
+  midpoint_recycling_min_expected_edge_bps: 5
+  midpoint_recycling_fee_buffer_bps: 2
+  midpoint_recycling_toxicity_buffer_bps: 6
+  midpoint_recycling_slippage_buffer_bps: 2
+  midpoint_recycling_inventory_ratio_cap: 0.60
+  midpoint_recycling_require_cex_ref: true
+  midpoint_recycling_max_cex_age_blocks: 10
+  midpoint_recycling_vpin_max: 0.70
   triangular_per_leg_fee_bps: 5         # Blockchain settlement fee per hop
 
   # CEX-DEX arb (dexie vs OKX/MEXC/Gate)
@@ -466,3 +486,12 @@ recovery:
   max_take_per_block_xch: 0.5           # [OPTIONAL, default: 0.5]  Max XCH to acquire per block
   max_premium_bps: 100                   # [OPTIONAL, default: 100]  Max premium over CEX price to pay
   cancel_on_enter: true                  # [OPTIONAL, default: true] Cancel all offers when entering recovery
+  zero_fee_below_xch: 0.001             # [OPTIONAL, default: 0.001] Fee-free recovery when XCH is effectively dust
+  # pair_allowlist: ["XCH/wUSDC.b"]      # [OPTIONAL] Restrict recovery takes to supported XCH-base pairs
+
+# --- buyer: OPTIONAL (omit section to use defaults) -------------------------
+# Dedicated opportunistic offer-taker flow. Full per-pair settings can live in
+# a separate buyer.yaml file referenced by config_path.
+buyer:
+  enabled: false                         # [OPTIONAL, default: false]
+  config_path: "buyer.yaml"             # [OPTIONAL] external buyer config

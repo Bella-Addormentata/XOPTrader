@@ -196,6 +196,25 @@ TEST(ConfigParserTest, StrategyDefaults_AreReasonable) {
     EXPECT_GE(s.min_profit_margin_bps, 0.0);
     EXPECT_EQ(s.confirmation_depth_blocks, 6u);
     EXPECT_EQ(s.reconciliation_interval_blocks, 20u);
+    EXPECT_DOUBLE_EQ(s.taker_min_spendable_xch, 0.25);
+    EXPECT_DOUBLE_EQ(s.block_time_seconds, 52.0);
+}
+
+TEST(ConfigParserTest, StrategyConfig_TakerFloorAndBlockTimeParsed) {
+    std::string yaml = kMinimalValidYaml;
+    const std::string marker = "  tier_size_pct: [0.6, 0.4]\n";
+    const auto marker_pos = yaml.find(marker);
+    ASSERT_NE(marker_pos, std::string::npos);
+    yaml.insert(
+        marker_pos + marker.size(),
+        "  taker_min_spendable_xch: 0.30\n"
+        "  block_time_seconds: 60.0\n");
+
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_DOUBLE_EQ(cfg.strategy.taker_min_spendable_xch, 0.30);
+    EXPECT_DOUBLE_EQ(cfg.strategy.block_time_seconds, 60.0);
 }
 
 TEST(ConfigParserTest, RiskDefaults_SoftLeHard) {
@@ -251,6 +270,183 @@ arbitrage:
     TempYaml tmp(yaml);
     auto cfg = xop::load_config(tmp.path());
     EXPECT_FALSE(cfg.arbitrage.crossed_book_enabled);
+}
+
+TEST(ConfigParserTest, ArbitrageSettings_MidpointRecyclingParsed) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+arbitrage:
+  enabled: true
+  crossed_book_enabled: true
+  cex_reference_half_spread_bps: 7.5
+  midpoint_recycling_enabled: true
+  midpoint_recycling_pairs: ["XCH/TEST"]
+  midpoint_recycling_band_bps: 18
+  midpoint_recycling_min_take_xch: 0.10
+  midpoint_recycling_max_take_xch: 0.20
+  midpoint_recycling_cooldown_blocks: 6
+  midpoint_recycling_max_takes_per_block: 2
+  midpoint_recycling_daily_take_xch_cap: 1.5
+  midpoint_recycling_epoch_blocks: 2304
+  midpoint_recycling_min_expected_edge_bps: 4
+  midpoint_recycling_fee_buffer_bps: 1.5
+  midpoint_recycling_toxicity_buffer_bps: 5
+  midpoint_recycling_slippage_buffer_bps: 1.0
+  midpoint_recycling_inventory_ratio_cap: 0.55
+  midpoint_recycling_require_cex_ref: false
+  midpoint_recycling_max_cex_age_blocks: 8
+  midpoint_recycling_vpin_max: 0.65
+)";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_TRUE(cfg.arbitrage.midpoint_recycling_enabled);
+    ASSERT_EQ(cfg.arbitrage.midpoint_recycling_pairs.size(), 1u);
+    EXPECT_EQ(cfg.arbitrage.midpoint_recycling_pairs[0], "XCH/TEST");
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.cex_reference_half_spread_bps, 7.5);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_band_bps, 18.0);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_min_take_xch, 0.10);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_max_take_xch, 0.20);
+    EXPECT_EQ(cfg.arbitrage.midpoint_recycling_cooldown_blocks, 6u);
+    EXPECT_EQ(cfg.arbitrage.midpoint_recycling_max_takes_per_block, 2u);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_daily_take_xch_cap, 1.5);
+    EXPECT_EQ(cfg.arbitrage.midpoint_recycling_epoch_blocks, 2304u);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_min_expected_edge_bps, 4.0);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_fee_buffer_bps, 1.5);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_toxicity_buffer_bps, 5.0);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_slippage_buffer_bps, 1.0);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_inventory_ratio_cap, 0.55);
+    EXPECT_FALSE(cfg.arbitrage.midpoint_recycling_require_cex_ref);
+    EXPECT_EQ(cfg.arbitrage.midpoint_recycling_max_cex_age_blocks, 8u);
+    EXPECT_DOUBLE_EQ(cfg.arbitrage.midpoint_recycling_vpin_max, 0.65);
+}
+
+TEST(ConfigParserTest, ArbitrageSettings_MidpointRecyclingZeroSlackRejected) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+arbitrage:
+  enabled: true
+  midpoint_recycling_enabled: true
+  midpoint_recycling_pairs: ["XCH/TEST"]
+  midpoint_recycling_band_bps: 0
+)";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, BuyerConfig_ExternalWrappedFileParses) {
+    TempYaml buyer_tmp(R"(
+buyer:
+  enabled: true
+  cooldown_blocks: 7
+  max_takes_per_block: 2
+  pair_rules:
+    - pair_name: "XCH/TEST"
+      enabled: true
+      side: "ask"
+      band_bps: 35
+      min_edge_bps: 14
+      min_take_units: 0.05
+      max_take_units: 0.50
+      daily_cap_units: 3.0
+      max_premium_over_cex_bps: 40
+      inventory_ratio_cap: 0.60
+)");
+
+    std::string yaml = std::string(kMinimalValidYaml) + "\n" + R"(
+buyer:
+  enabled: true
+  config_path: ")" + buyer_tmp.path() + R"("
+)";
+
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+
+    ASSERT_TRUE(cfg.buyer.enabled);
+    EXPECT_EQ(cfg.buyer.cooldown_blocks, 7u);
+    EXPECT_EQ(cfg.buyer.max_takes_per_block, 2u);
+    ASSERT_EQ(cfg.buyer.pair_rules.size(), 1u);
+    EXPECT_EQ(cfg.buyer.pair_rules[0].pair_name, "XCH/TEST");
+    EXPECT_EQ(cfg.buyer.pair_rules[0].side, "ask");
+}
+
+TEST(ConfigParserTest, BuyerConfig_LegacyPairsFormatStillParses) {
+    TempYaml buyer_tmp(R"(
+enabled: true
+pairs:
+  - name: "XCH/TEST"
+    enabled: true
+    side: "bid"
+    band_bps: 25
+    min_edge_bps: 10
+    min_take_units: 0.10
+    max_take_units: 0.40
+    daily_cap_units: 2.0
+    max_premium_over_cex_bps: 30
+    inventory_ratio_cap: 0.55
+)");
+
+    std::string yaml = std::string(kMinimalValidYaml) + "\n" + R"(
+buyer:
+  enabled: true
+  config_path: ")" + buyer_tmp.path() + R"("
+)";
+
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+
+    ASSERT_TRUE(cfg.buyer.enabled);
+    ASSERT_EQ(cfg.buyer.pair_rules.size(), 1u);
+    EXPECT_EQ(cfg.buyer.pair_rules[0].pair_name, "XCH/TEST");
+    EXPECT_EQ(cfg.buyer.pair_rules[0].side, "bid");
+    EXPECT_DOUBLE_EQ(cfg.buyer.pair_rules[0].inventory_ratio_cap, 0.55);
+}
+
+TEST(ConfigParserTest, BuyerConfig_ZeroSlackRejected) {
+    TempYaml buyer_tmp(R"(
+buyer:
+  enabled: true
+  pair_rules:
+    - pair_name: "XCH/TEST"
+      enabled: true
+      side: "ask"
+      band_bps: 0
+      min_edge_bps: 10
+      min_take_units: 0.05
+      max_take_units: 0.25
+      daily_cap_units: 1.0
+      max_premium_over_cex_bps: 50
+      inventory_ratio_cap: 0.60
+    )" );
+
+    std::string yaml = std::string(kMinimalValidYaml) + "\n" + R"(
+buyer:
+  enabled: true
+  config_path: ")" + buyer_tmp.path() + R"("
+)";
+
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, RecoveryConfig_PairAllowlistParses) {
+    std::string yaml = std::string(kMinimalValidYaml) +
+        "\nrecovery:\n"
+        "  enabled: true\n"
+        "  xch_low_threshold: 0.10\n"
+        "  xch_recovery_target: 0.75\n"
+        "  max_take_per_block_xch: 0.25\n"
+        "  max_premium_bps: 80\n"
+        "  cancel_on_enter: false\n"
+        "  zero_fee_below_xch: 0.002\n"
+        "  pair_allowlist:\n"
+        "    - \"XCH/wUSDC.b\"\n";
+
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+
+    ASSERT_EQ(cfg.recovery.pair_allowlist.size(), 1u);
+    EXPECT_EQ(cfg.recovery.pair_allowlist[0], "XCH/wUSDC.b");
+    EXPECT_FALSE(cfg.recovery.cancel_on_enter);
+    EXPECT_DOUBLE_EQ(cfg.recovery.zero_fee_below_xch, 0.002);
 }
 
 }  // namespace

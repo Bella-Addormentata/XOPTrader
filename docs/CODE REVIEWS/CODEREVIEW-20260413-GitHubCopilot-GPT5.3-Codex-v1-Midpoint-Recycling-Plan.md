@@ -96,23 +96,37 @@ Add to `ArbitrageSettings` in [config.hpp](../../cpp/include/xop/config.hpp#L630
 3. `midpoint_recycling_band_bps: 25`  
 Candidate ask/bid must be within this distance of fair value.
 4. `midpoint_recycling_max_take_xch: 0.25`
-5. `midpoint_recycling_max_takes_per_block: 1`
-6. `midpoint_recycling_daily_take_xch_cap: 5.0`
-7. `midpoint_recycling_min_expected_edge_bps: 12`
-8. `midpoint_recycling_fee_buffer_bps: 5`
-9. `midpoint_recycling_toxicity_buffer_bps: 10`
-10. `midpoint_recycling_relist_markup_bps: 15`
-11. `midpoint_recycling_relist_size_decay: 0.7`
-12. `midpoint_recycling_cooldown_blocks: 3`
-13. `midpoint_recycling_inventory_ratio_cap: 0.65`
-14. `midpoint_recycling_require_cex_ref: true`
-15. `midpoint_recycling_vpin_max: 0.75`
+5. `midpoint_recycling_min_take_xch: 0.05`  
+Minimum size filter to avoid micro-takes where fee drag dominates.
+6. `midpoint_recycling_max_takes_per_block: 1`
+7. `midpoint_recycling_daily_take_xch_cap: 5.0`
+8. `midpoint_recycling_epoch_blocks: 4608`  
+Block window for daily cap reset (~24 hours at 18.75s per block).
+9. `midpoint_recycling_min_expected_edge_bps: 20`  
+Raised from original 12 to account for double-fee round-trip.
+10. `midpoint_recycling_fee_buffer_bps: 15`  
+Must cover TWO blockchain fees: one for take_offer, one for the relist create_offer.
+11. `midpoint_recycling_toxicity_buffer_bps: 10`
+12. `midpoint_recycling_slippage_buffer_bps: 5`  
+Accounts for fair-value estimation error and offer staleness.
+13. `midpoint_recycling_relist_markup_bps: 15`
+14. `midpoint_recycling_relist_size_decay: 0.7`
+15. `midpoint_recycling_cooldown_blocks: 3`
+16. `midpoint_recycling_inventory_ratio_cap: 0.65`  
+Defined as xch_value / (xch_value + quote_value) for XCH-base pairs.
+17. `midpoint_recycling_require_cex_ref: true`
+18. `midpoint_recycling_max_cex_age_blocks: 10`  
+Reject CEX reference older than ~3 minutes to prevent stale fair-value.
+19. `midpoint_recycling_vpin_max: 0.75`
 
 Validation rules:
 1. Non-negative bps and caps.
 2. `max_takes_per_block >= 1`.
 3. `inventory_ratio_cap` in `(0,1]`.
 4. `relist_size_decay` in `(0,1]`.
+5. `min_take_xch < max_take_xch`.
+6. `epoch_blocks >= 100`.
+7. `fee_buffer_bps` should be at least `2 × (typical_fee_mojos / min_take_mojos × 10000)` to cover the round-trip.
 
 Also add to [config.example.yaml](../../config.example.yaml).
 
@@ -145,8 +159,10 @@ Also add to [config.example.yaml](../../config.example.yaml).
 Add state containers:
 1. `std::unordered_map<std::string, BlockHeight> midpoint_last_take_block_;`
 2. `std::unordered_map<std::string, double> midpoint_daily_taken_xch_;`
-3. `struct MidpointRelistBias { double extra_markup_bps; double size_mult; BlockHeight expires_at; };`
-4. `std::unordered_map<std::string, MidpointRelistBias> midpoint_relist_bias_;`
+3. `BlockHeight midpoint_epoch_start_block_{0};`  
+   Tracks the start of the current daily cap window. Resets `midpoint_daily_taken_xch_` when `block_height - epoch_start >= epoch_blocks`.
+4. `struct MidpointRelistBias { double extra_markup_bps; double size_mult; BlockHeight expires_at; };`
+5. `std::unordered_map<std::string, MidpointRelistBias> midpoint_relist_bias_;`
 
 Helper declarations:
 1. `bool midpoint_recycling_allowed_for_pair(const PairConfig&) const;`
@@ -164,29 +180,52 @@ Inside `step_check_arbitrage(...)` (same region as Step 9c around [engine.cpp](.
 2. Guards:
 1. `config_.arbitrage.enabled && midpoint_recycling_enabled`
 2. `!wallet_circuit_open_`
-3. Not in `xch_recovery_mode_`
-4. Pair allowlist check.
+3. `!dry_run_` (unless in instrumentation-only phase, then log without executing)
+4. Not in `xch_recovery_mode_`
+5. Wallet sync check: `wallet_->get_sync_status()` returns synced=true
+6. Pending-change check: `pending_change == 0` for XCH wallet (critical after Step 9c takes)
+7. XCH spendable pre-check: `xch_spendable >= fee_mojos` (re-fetch after Step 9c)
+8. Pair allowlist check.
+
+Note: Step 9d MUST run strictly after Step 9c returns. Must re-fetch wallet balances because 9c may have consumed spendable coins.
 
 3. Candidate extraction (phase 1: asks only on XCH-base pair):
 1. Pull competing offers via existing `market_data_->get_competing_offers(pair.name)`.
-2. Keep only active external asks with `size <= max_take`.
+2. Keep only active external asks with `min_take <= size <= max_take`.
 3. Keep only offers within `band_bps` of fair value.
 4. Require CEX reference if configured.
+5. Require CEX reference age <= `max_cex_age_blocks`.
+6. Quote-currency spendable gate: verify `spendable_quote >= candidate_size × candidate_price`.
 
 4. Edge scoring:
 
-`expected_edge_bps = relist_markup_bps - fee_buffer_bps - toxicity_buffer_bps - slippage_penalty_bps`
+```
+take_discount_bps = (fair_value - ask_price) / fair_value × 10000
+fee_bps_take      = take_fee_mojos / notional_mojos × 10000
+fee_bps_relist    = relist_fee_mojos / notional_mojos × 10000
+net_edge_bps      = take_discount_bps - fee_bps_take - fee_bps_relist - toxicity_buffer_bps - slippage_buffer_bps
+```
+
+CRITICAL: The round-trip requires TWO blockchain fees — one to take the offer and one when the relist offer is created. Both must be accounted for. For a 0.15 XCH trade at 100M mojo fee, each leg costs ~6.6 bps, totaling ~13 bps round-trip.
 
 Only proceed when:
-1. `expected_edge_bps >= min_expected_edge_bps`
+1. `net_edge_bps >= min_expected_edge_bps`
 2. VPIN/toxicity under threshold.
-3. Inventory ratio below cap.
+3. Inventory ratio (xch_value / total_value) below cap.
 4. Cooldown and daily cap not violated.
+5. Fee budget not exhausted.
+6. xch_ask_throttle not in caution or above (prevents XCH over-accumulation).
 
 5. Execution:
 1. Fetch bech32 text with current Dexie status fetch pattern.
-2. Take with fee from `fee_tracker_->get_recommended_fee(...)`.
-3. On success, record counters and install relist bias for pair.
+2. Verify offer still active (status == 0).
+3. Take with fee from `fee_tracker_->get_recommended_fee(...)`.
+4. On success:
+   a. Record fee via `fee_tracker_->record_fee(fee, block_height)`.
+   b. Update `midpoint_last_take_block_[pair]` and `midpoint_daily_taken_xch_[pair]`.
+   c. Send alert via `alerts_->send_alert(...)` for operational visibility.
+   d. Install relist bias for pair.
+5. On failure: log and continue to next candidate (do not retry).
 
 6. Relist bias interaction:
 1. `midpoint_relist_bias_[pair] = {markup, size_mult, block + cooldown}`.
@@ -244,21 +283,26 @@ Add metrics:
 ## 7. Exact Decision Logic (Phase 1)
 
 For each allowed pair and block:
-1. Fetch fair value and CEX reference.
-2. Enumerate candidate asks near fair value.
-3. Reject candidate when any condition fails:
+1. Verify global gates: wallet circuit closed, not in recovery, wallet synced, pending_change == 0.
+2. Re-fetch wallet balances (mandatory after Step 9c may have taken).
+3. Verify XCH spendable covers fee and quote currency covers candidate notional.
+4. Fetch fair value and CEX reference; reject if CEX age > max_cex_age_blocks.
+5. Enumerate candidate asks near fair value.
+6. Reject candidate when any condition fails:
 1. stale or inactive offer
 2. outside near-mid band
-3. size above cap
-4. expected edge below threshold
+3. size below minimum or above cap
+4. expected net edge below threshold (using double-fee formula)
 5. VPIN above cap
-6. inventory ratio above cap
-7. cooldown active
-8. daily take cap reached
-9. fee budget exhausted
+6. inventory ratio (xch_value / total_value) above cap
+7. xch_ask_throttle at caution or above
+8. cooldown active
+9. daily take cap reached (epoch-based reset)
+10. fee budget exhausted
 
-4. Execute at most `max_takes_per_block` successful takes.
-5. Install relist bias for subsequent maker cycles.
+7. Execute at most `max_takes_per_block` successful takes.
+8. Record fee via fee_tracker, send alert, update counters.
+9. Install relist bias for subsequent maker cycles.
 
 ---
 
@@ -292,21 +336,46 @@ Mitigation: explicit compliance guardrails and KPI focus on net PnL, not spread 
 Risk: accumulating XCH on one pair can worsen risk on others.  
 Mitigation: global inventory ratio caps and market-allocator-aware limits.
 
+### 8.8 Hidden Pitfall: Step 9c and 9d wallet state conflict
+Risk: Step 9c takes consume spendable coins and create pending_change. Step 9d runs immediately after and may attempt takes with stale balance state.  
+Mitigation: Step 9d must re-fetch wallet balances after 9c returns. Hard gate on `pending_change == 0`. Sequential ordering within the coroutine is mandatory.
+
+### 8.9 Hidden Pitfall: XCH ask-throttle interaction
+Risk: midpoint recycling on XCH-base asks accumulates XCH, pushing into the xch_ask_throttle caution/low/critical zones (config: 2.0 / 1.0 / 0.35 XCH). The throttle then suppresses ask competitiveness, degrading maker performance on other tiers.  
+Mitigation: gate midpoint takes when xch_ask_throttle is at caution or stronger. Check XCH balance against throttle thresholds before allowing takes.
+
+### 8.10 Hidden Pitfall: CEX reference staleness
+Risk: CoinGecko prices can lag 1–5 minutes. A stale reference makes fair-value inaccurate, leading to takes against the wrong side of true mid.  
+Mitigation: enforce `max_cex_age_blocks` (default 10, ~3 min). Reject candidates when reference is older.
+
+### 8.11 Hidden Pitfall: Double-fee round-trip cost
+Risk: each midpoint recycle requires TWO blockchain fees — one to take, one for the relist offer. Plans that budget only a single fee undercount friction by ~50%.  
+Mitigation: edge formula must include `fee_bps_take + fee_bps_relist`. Default `fee_buffer_bps` raised to 15 to cover round-trip.
+
 ---
 
 ## 9. Test Plan (Must Pass Before Enable)
 
 ## 9.1 Unit Tests
-1. Edge calculation correctness (fees, buffers, min edge).
-2. Candidate filter behavior by band/size/cooldown/cap.
-3. Inventory and VPIN gate logic.
-4. Config parsing and boundary validation.
+1. Edge calculation correctness with double-fee round-trip (fee_bps_take + fee_bps_relist).
+2. Fee_bps conversion from absolute mojos to bps at different notional sizes (especially tiny takes where fee dominates).
+3. Candidate filter behavior by band/min-size/max-size/cooldown/cap.
+4. Inventory ratio computation (xch_value / total_value for pair) and cap logic.
+5. VPIN gate logic with boundary values.
+6. Config parsing and boundary validation (including new fields: min_take_xch, epoch_blocks, max_cex_age_blocks).
+7. Daily cap reset at epoch boundary.
 
 ## 9.2 Integration Tests
 1. Synthetic order book with near-mid small asks; verify take/relist sequence.
-2. High-fee environment; verify strategy suppresses itself.
+2. High-fee environment; verify strategy suppresses itself (double-fee drag exceeds edge).
 3. Pending-change stress; verify no uncontrolled churn.
-4. Recovery-mode coexistence (midpoint recycling must stay off in recovery).
+4. Pending_change > 0 blocks Step 9d takes.
+5. Recovery-mode coexistence (midpoint recycling must stay off in recovery).
+6. Step 9c take followed by Step 9d in same heartbeat: verify 9d re-fetches wallet balance.
+7. xch_ask_throttle at caution/low/critical: verify Step 9d suppressed.
+8. CEX reference older than max_cex_age_blocks: verify candidate rejected.
+9. Quote currency insufficient: verify take not attempted.
+10. Dry-run mode: verify candidates logged but no take_offer RPC executed.
 
 ## 9.3 Regression Tests
 1. Existing crossed-book arb unchanged when midpoint mode disabled.
@@ -375,17 +444,21 @@ The implementation is accepted only if all are true:
 2. `midpoint_recycling_pairs: ["XCH/wUSDC.b"]`
 3. `midpoint_recycling_band_bps: 20`
 4. `midpoint_recycling_max_take_xch: 0.15`
-5. `midpoint_recycling_max_takes_per_block: 1`
-6. `midpoint_recycling_daily_take_xch_cap: 2.0`
-7. `midpoint_recycling_min_expected_edge_bps: 15`
-8. `midpoint_recycling_fee_buffer_bps: 8`
-9. `midpoint_recycling_toxicity_buffer_bps: 12`
-10. `midpoint_recycling_relist_markup_bps: 20`
-11. `midpoint_recycling_relist_size_decay: 0.6`
-12. `midpoint_recycling_cooldown_blocks: 4`
-13. `midpoint_recycling_inventory_ratio_cap: 0.60`
-14. `midpoint_recycling_require_cex_ref: true`
-15. `midpoint_recycling_vpin_max: 0.70`
+5. `midpoint_recycling_min_take_xch: 0.05`
+6. `midpoint_recycling_max_takes_per_block: 1`
+7. `midpoint_recycling_daily_take_xch_cap: 2.0`
+8. `midpoint_recycling_epoch_blocks: 4608`
+9. `midpoint_recycling_min_expected_edge_bps: 20`
+10. `midpoint_recycling_fee_buffer_bps: 15`
+11. `midpoint_recycling_toxicity_buffer_bps: 12`
+12. `midpoint_recycling_slippage_buffer_bps: 5`
+13. `midpoint_recycling_relist_markup_bps: 20`
+14. `midpoint_recycling_relist_size_decay: 0.6`
+15. `midpoint_recycling_cooldown_blocks: 4`
+16. `midpoint_recycling_inventory_ratio_cap: 0.60`
+17. `midpoint_recycling_require_cex_ref: true`
+18. `midpoint_recycling_max_cex_age_blocks: 10`
+19. `midpoint_recycling_vpin_max: 0.70`
 
 ---
 
