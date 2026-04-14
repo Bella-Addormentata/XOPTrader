@@ -184,12 +184,22 @@ public:
     /// Inventory ratio for a base/quote pair.
     ///   Returns a value in [0.0, 1.0] where 0.5 means perfectly balanced.
     ///   0.0 = all value is in quote, 1.0 = all value is in base.
-    ///   `base_price` is the current market price of base in quote terms
-    ///   (mojos), used to make the two sides commensurable.
+    ///   `base_price` is the engine's quote-per-base fixed-point price,
+    ///   scaled by `kMojosPerXch`. This overload infers mojos-per-unit from
+    ///   asset IDs (`xch` => `kMojosPerXch`, CAT => 1000), which matches the
+    ///   live engine convention.
     /// Returns 0.5 if neither side has holdings (no data = balanced).
     double inventory_ratio(const AssetId& base_id,
                            const AssetId& quote_id,
                            Mojo           base_price) const;
+
+    /// Explicit-denominator overload for tests and any callers that need to
+    /// override the default XCH/CAT denomination inference.
+    double inventory_ratio(const AssetId& base_id,
+                           const AssetId& quote_id,
+                           Mojo           base_price,
+                           Mojo           base_mojos_per_unit,
+                           Mojo           quote_mojos_per_unit) const;
 
     /// True when the weighted-average cost basis of `asset_id` exceeds
     /// `current_price`.  Always false when there are no holdings.

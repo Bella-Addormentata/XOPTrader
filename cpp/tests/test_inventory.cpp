@@ -317,6 +317,64 @@ TEST_F(CostBasisTest, UnderwaterTrumpsOtherStatuses) {
 }
 
 // ============================================================================
+// TEST: inventory_ratio normalizes mismatched denominations
+// ============================================================================
+
+TEST_F(CostBasisTest, InventoryRatioNormalizesPairDenominations) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL, false);
+
+    // Use scaled-down synthetic denominations so the test exercises the
+    // normalization math without hitting unrelated cost-basis overflow limits.
+    constexpr xop::Mojo kBaseMojosPerUnit  = 100;
+    constexpr xop::Mojo kQuoteMojosPerUnit = 10;
+
+    tracker.record_buy("base", 5'000, 400'000'000'000LL, 1, now_); // 50 base units
+    tracker.record_buy("quote", 200, 10, 1, now_);                 // 20 quote units
+
+    const double ratio = tracker.inventory_ratio(
+        "base",
+        "quote",
+        400'000'000'000LL,
+        kBaseMojosPerUnit,
+        kQuoteMojosPerUnit);
+
+    EXPECT_NEAR(ratio, 0.5, 1e-12);
+}
+
+TEST_F(CostBasisTest, InventoryRatioReturnsBaseShareInQuoteUnits) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL, false);
+
+    constexpr xop::Mojo kBaseMojosPerUnit  = 100;
+    constexpr xop::Mojo kQuoteMojosPerUnit = 10;
+
+    tracker.record_buy("base", 5'000, 400'000'000'000LL, 1, now_); // 50 base units
+    tracker.record_buy("quote", 600, 10, 1, now_);                 // 60 quote units
+
+    const double ratio = tracker.inventory_ratio(
+        "base",
+        "quote",
+        400'000'000'000LL,
+        kBaseMojosPerUnit,
+        kQuoteMojosPerUnit);
+
+    EXPECT_NEAR(ratio, 0.25, 1e-12);
+}
+
+TEST_F(CostBasisTest, InventoryRatioInfersXchAndCatDenominations) {
+    xop::InventoryTracker tracker(risk_cfg_, 10'000'000'000'000LL, false);
+
+    tracker.record_buy("xch", xop::kMojosPerXch, 1, 1, now_); // 1 XCH
+    tracker.record_buy("cat", 2'000, 1, 1, now_);             // 2 CAT units
+
+    const double ratio = tracker.inventory_ratio(
+        "xch",
+        "cat",
+        2 * xop::kMojosPerXch);
+
+    EXPECT_NEAR(ratio, 0.5, 1e-12);
+}
+
+// ============================================================================
 // TEST: Kelly sizing
 // ============================================================================
 //

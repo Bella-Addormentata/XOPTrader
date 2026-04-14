@@ -513,36 +513,15 @@ LossDecision StrategicLossManager::should_rebalance_at_loss(
     }
 
     // -----------------------------------------------------------------------
-    // 4. Compute current inventory ratio via InventoryTracker.
+    // 4. Compute current inventory imbalance.
     //
-    //    inventory_ratio() returns a value in [0, 1] where 0.5 is balanced.
-    //    We need a quote asset to compute the ratio.  Identify it as the
-    //    first asset in price_map that differs from asset_id.  If the map
-    //    contains only the current asset, fall back to portfolio_concentration
-    //    as a proxy.
+    //    inventory_ratio() requires per-pair denomination metadata to
+    //    normalize base and quote holdings consistently. This generic loss
+    //    evaluation path only has an asset-local price map, so use
+    //    portfolio_concentration as the stable proxy for one-sided exposure.
     // -----------------------------------------------------------------------
-    double current_ratio = 0.5;   // Default: balanced.
-
-    // Pick the quote asset deterministically (sorted by name) to ensure
-    // consistent behavior across runs.  Non-deterministic iteration of
-    // unordered_map would produce unstable inventory ratio readings.
-    // ISO/IEC 5055 -- CWE-330: deterministic asset selection for reproducibility.
-    AssetId quote_id;
-    for (const auto& [aid, aprice] : price_map) {
-        if (aid != asset_id && (quote_id.empty() || aid < quote_id)) {
-            quote_id = aid;
-        }
-    }
-
-    if (!quote_id.empty()) {
-        // We have a base/quote pair -- use the tracker's inventory_ratio.
-        current_ratio = inventory.inventory_ratio(
-            asset_id, quote_id, current_price);
-    } else {
-        // Single-asset price map -- fall back to portfolio concentration.
-        current_ratio = inventory.portfolio_concentration(
-            asset_id, price_map);
-    }
+    const double current_ratio = inventory.portfolio_concentration(
+        asset_id, price_map);
 
     // Compute locked capital fraction from portfolio concentration.
     d.locked_capital_frac = inventory.portfolio_concentration(

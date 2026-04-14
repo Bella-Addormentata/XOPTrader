@@ -61,6 +61,17 @@
 
 namespace xop {
 
+namespace {
+
+constexpr Mojo kCatMojosPerUnit = 1'000LL;
+
+Mojo inferred_mojos_per_unit(const AssetId& asset_id) noexcept
+{
+    return asset_id == "xch" ? kMojosPerXch : kCatMojosPerUnit;
+}
+
+} // namespace
+
 // ===========================================================================
 // RiskStatus helpers
 // ===========================================================================
@@ -271,24 +282,46 @@ double InventoryTracker::inventory_ratio(const AssetId& base_id,
                                          const AssetId& quote_id,
                                          Mojo           base_price) const
 {
+    return inventory_ratio(base_id,
+                           quote_id,
+                           base_price,
+                           inferred_mojos_per_unit(base_id),
+                           inferred_mojos_per_unit(quote_id));
+}
+
+double InventoryTracker::inventory_ratio(const AssetId& base_id,
+                                         const AssetId& quote_id,
+                                         Mojo           base_price,
+                                         Mojo           base_mojos_per_unit,
+                                         Mojo           quote_mojos_per_unit) const
+{
+    if (base_price <= 0 || base_mojos_per_unit <= 0 || quote_mojos_per_unit <= 0) {
+        return 0.5;
+    }
+
     std::shared_lock lock(mtx_records_);
 
     const AssetRecord* base_rec  = find_record_locked(base_id);
     const AssetRecord* quote_rec = find_record_locked(quote_id);
 
-    // Value of base holdings in quote terms.
-    // Use double to avoid overflow: base_qty * base_price could exceed int64.
-    const double base_value  = base_rec
+    // Normalize both holdings into display units first. Prices are carried in
+    // the engine's kMojosPerXch fixed-point format even for CAT quotes, so the
+    // pair-specific mojos-per-unit values must be applied here to avoid
+    // overstating base exposure on mixed-denomination pairs.
+    const double base_units = base_rec
         ? static_cast<double>(base_rec->total_quantity)
-          * static_cast<double>(base_price)
+          / static_cast<double>(base_mojos_per_unit)
         : 0.0;
-
-    // Quote holdings are already denominated in quote mojos.
-    const double quote_value = quote_rec
+    const double quote_units = quote_rec
         ? static_cast<double>(quote_rec->total_quantity)
+          / static_cast<double>(quote_mojos_per_unit)
         : 0.0;
 
-    const double total = base_value + quote_value;
+    const double quote_per_base = static_cast<double>(base_price)
+        / static_cast<double>(kMojosPerXch);
+    const double base_value = base_units * quote_per_base;
+
+    const double total = base_value + quote_units;
     if (total <= 0.0) {
         // No capital deployed -- report balanced.
         return 0.5;
