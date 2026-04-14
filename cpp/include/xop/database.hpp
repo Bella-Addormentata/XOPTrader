@@ -1,11 +1,13 @@
 // database.hpp -- SQLite persistence layer for XOPTrader CHIA DEX market-maker.
 //
-// Provides crash-safe, append-only storage for the three core data streams:
+// Provides crash-safe, append-only storage for the core data streams:
 //
 //   1. trade_log   -- every settled fill, forming the authoritative audit trail
 //                     (ISO/IEC 27001:2022 Section 15 compliance).
-//   2. offer_log   -- full lifecycle of every offer (create -> fill/cancel).
-//   3. snapshots   -- periodic per-block market/risk state for analytics.
+//   2. offer_log   -- current lifecycle state of every offer.
+//   3. offer_closure_events -- append-only resolution/observation history for
+//                     offers, preserving the first close cause.
+//   4. snapshots   -- periodic per-block market/risk state for analytics.
 //
 // Implementation notes:
 //   - Uses the sqlite3 C API directly (no ORM).
@@ -228,6 +230,10 @@ public:
     /// Also records the block at which the offer was resolved and a
     /// resolution timestamp.
     ///
+    /// When a later reconciliation pass observes an already-resolved offer,
+    /// the current offer_log row preserves the original close cause while the
+    /// later observation is appended to offer_closure_events.
+    ///
     /// @param offer_id       The offer's unique identifier.
     /// @param new_status     New status string ("filled", "cancelled", "expired").
     /// @param resolved_block Block height at which the status changed.
@@ -320,7 +326,7 @@ public:
 private:
     // -- Schema management ---------------------------------------------------
 
-    /// Run CREATE TABLE IF NOT EXISTS for all three tables and their indices.
+    /// Run CREATE TABLE IF NOT EXISTS for all tables and their indices.
     /// Called once from the constructor.
     void run_migrations();
 
@@ -383,8 +389,14 @@ private:
     /// SELECT FROM offer_log WHERE status = 'pending'
     sqlite3_stmt* stmt_query_pending_{nullptr};
 
+    /// SELECT pair_name, status, resolved_block, cancel_reason FROM offer_log
+    sqlite3_stmt* stmt_query_offer_status_{nullptr};
+
     /// UPDATE offer_log SET status = ?, resolved_block = ?, resolved_at = ?
     sqlite3_stmt* stmt_update_offer_{nullptr};
+
+    /// INSERT INTO offer_closure_events
+    sqlite3_stmt* stmt_insert_offer_closure_event_{nullptr};
 
     /// INSERT INTO snapshots
     sqlite3_stmt* stmt_insert_snapshot_{nullptr};

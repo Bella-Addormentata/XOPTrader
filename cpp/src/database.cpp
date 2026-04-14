@@ -3,7 +3,9 @@
 // Schema design rationale:
 //   - trade_log is append-only with a UNIQUE constraint on trade_id to prevent
 //     duplicate fills from being recorded (idempotent fill processing).
-//   - offer_log tracks the full lifecycle: pending -> filled/cancelled/expired.
+//   - offer_log tracks the current lifecycle state of each offer.
+//   - offer_closure_events preserves append-only resolution history so later
+//     reconciliation does not overwrite the original cancel cause.
 //   - snapshots are indexed by (pair_name, block_height) for efficient
 //     time-series queries by the Grafana dashboards.
 //
@@ -36,6 +38,20 @@ namespace xop {
 // ===========================================================================
 
 namespace {
+
+bool is_reconcile_reason(const std::string& reason)
+{
+    return reason == "periodic_reconcile"
+        || reason == "on_chain_reconcile"
+        || reason == "reconnect_reconcile";
+}
+
+bool is_terminal_status(const std::string& status)
+{
+    return status == "filled"
+        || status == "cancelled"
+        || status == "expired";
+}
 
 // -- Schema DDL (idempotent via IF NOT EXISTS) --------------------------------
 
@@ -75,8 +91,25 @@ CREATE TABLE IF NOT EXISTS offer_log (
     created_block   INTEGER NOT NULL,
     resolved_block  INTEGER,
     fee_mojos       INTEGER DEFAULT 0,
+    cancel_reason   TEXT,
+    book_best_bid   INTEGER DEFAULT 0,
+    book_best_ask   INTEGER DEFAULT 0,
     created_at      TEXT    DEFAULT CURRENT_TIMESTAMP,
     resolved_at     TEXT
+);
+)SQL";
+
+constexpr const char* kCreateOfferClosureEvents = R"SQL(
+CREATE TABLE IF NOT EXISTS offer_closure_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    offer_id        TEXT    NOT NULL,
+    pair_name       TEXT    NOT NULL,
+    event_type      TEXT    NOT NULL,
+    previous_status TEXT,
+    observed_status TEXT    NOT NULL,
+    closure_reason  TEXT,
+    resolved_block  INTEGER,
+    created_at      TEXT    DEFAULT CURRENT_TIMESTAMP
 );
 )SQL";
 
@@ -146,6 +179,16 @@ CREATE INDEX IF NOT EXISTS idx_offer_log_pair
     ON offer_log(pair_name);
 )SQL";
 
+constexpr const char* kIndexOfferClosureEventsOffer = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_offer_closure_events_offer
+    ON offer_closure_events(offer_id, id);
+)SQL";
+
+constexpr const char* kIndexOfferClosureEventsPair = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_offer_closure_events_pair
+    ON offer_closure_events(pair_name, id DESC);
+)SQL";
+
 constexpr const char* kIndexSnapshotPairBlock = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_snapshots_pair_block
     ON snapshots(pair_name, block_height DESC);
@@ -203,10 +246,27 @@ WHERE status = 'pending'
 ORDER BY created_block ASC;
 )SQL";
 
+constexpr const char* kQueryOfferStatus = R"SQL(
+SELECT pair_name,
+       status,
+       COALESCE(resolved_block, 0),
+       COALESCE(cancel_reason, '')
+FROM offer_log
+WHERE offer_id = ?
+LIMIT 1;
+)SQL";
+
 constexpr const char* kUpdateOfferStatus = R"SQL(
 UPDATE offer_log
 SET status = ?, resolved_block = ?, resolved_at = CURRENT_TIMESTAMP, cancel_reason = ?
 WHERE offer_id = ?;
+)SQL";
+
+constexpr const char* kInsertOfferClosureEvent = R"SQL(
+INSERT INTO offer_closure_events
+    (offer_id, pair_name, event_type, previous_status, observed_status,
+     closure_reason, resolved_block)
+VALUES (?, ?, ?, ?, ?, ?, ?);
 )SQL";
 
 constexpr const char* kInsertSnapshot = R"SQL(
@@ -305,7 +365,9 @@ Database::Database(const std::string& db_path)
     stmt_query_trades_all_   = prepare(kQueryTradesAll);
     stmt_insert_offer_       = prepare(kInsertOffer);
     stmt_query_pending_      = prepare(kQueryPendingOffers);
+    stmt_query_offer_status_ = prepare(kQueryOfferStatus);
     stmt_update_offer_       = prepare(kUpdateOfferStatus);
+    stmt_insert_offer_closure_event_ = prepare(kInsertOfferClosureEvent);
     stmt_insert_snapshot_    = prepare(kInsertSnapshot);
     stmt_last_snapshot_      = prepare(kLastSnapshot);
     stmt_trade_count_        = prepare(kTradeCount);
@@ -332,7 +394,9 @@ Database::~Database()
     finalize(stmt_query_trades_all_);
     finalize(stmt_insert_offer_);
     finalize(stmt_query_pending_);
+    finalize(stmt_query_offer_status_);
     finalize(stmt_update_offer_);
+    finalize(stmt_insert_offer_closure_event_);
     finalize(stmt_insert_snapshot_);
     finalize(stmt_last_snapshot_);
     finalize(stmt_trade_count_);
@@ -496,23 +560,116 @@ void Database::update_offer_status(const std::string& offer_id,
                                    const std::string& cancel_reason)
 {
     std::lock_guard<std::mutex> lock(mtx_);
-    bind_text  (stmt_update_offer_, 1, new_status);
-    bind_int64 (stmt_update_offer_, 2, static_cast<std::int64_t>(resolved_block));
-    bind_text  (stmt_update_offer_, 3, cancel_reason);
-    bind_text  (stmt_update_offer_, 4, offer_id);
+    bind_text(stmt_query_offer_status_, 1, offer_id);
 
-    step_and_reset(stmt_update_offer_);
-
-    // Verify that at least one row was modified.
-    int changes = sqlite3_changes(db_);
-    if (changes == 0) {
+    int rc = sqlite3_step(stmt_query_offer_status_);
+    if (rc != SQLITE_ROW) {
+        sqlite3_reset(stmt_query_offer_status_);
+        sqlite3_clear_bindings(stmt_query_offer_status_);
         throw std::runtime_error(
             "[Database] update_offer_status: no offer found with id '" + offer_id + "'");
     }
 
-    spdlog::debug("[Database] Updated offer '{}' -> status='{}' resolved_block={}"
-                  " reason='{}'",
-                  offer_id, new_status, resolved_block, cancel_reason);
+    const char* pair_name_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 0));
+    const char* current_status_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 1));
+    const auto current_resolved_block = static_cast<BlockHeight>(
+        sqlite3_column_int64(stmt_query_offer_status_, 2));
+    const char* current_reason_text = reinterpret_cast<const char*>(
+        sqlite3_column_text(stmt_query_offer_status_, 3));
+
+    const std::string pair_name = pair_name_text ? pair_name_text : "";
+    const std::string current_status = current_status_text ? current_status_text : "";
+    const std::string current_reason = current_reason_text ? current_reason_text : "";
+
+    sqlite3_reset(stmt_query_offer_status_);
+    sqlite3_clear_bindings(stmt_query_offer_status_);
+
+    std::string stored_status = current_status;
+    BlockHeight stored_resolved_block = current_resolved_block;
+    std::string stored_reason = current_reason;
+    bool should_update_offer_row = false;
+
+    std::string event_type = "status_observation";
+    const bool new_reason_is_reconcile = is_reconcile_reason(cancel_reason);
+    const bool current_reason_is_reconcile = is_reconcile_reason(current_reason);
+
+    if (current_status == "filled") {
+        event_type = new_reason_is_reconcile
+            ? "reconcile_observation"
+            : "status_observation";
+    } else if (new_status == "filled") {
+        stored_status = new_status;
+        stored_resolved_block = resolved_block;
+        stored_reason.clear();
+        should_update_offer_row = true;
+        event_type = "status_update";
+    } else if (!is_terminal_status(current_status)) {
+        stored_status = new_status;
+        stored_resolved_block = resolved_block;
+        stored_reason = cancel_reason;
+        should_update_offer_row = true;
+        event_type = "status_update";
+    } else if (current_status == new_status
+               && (new_status == "cancelled" || new_status == "expired")) {
+        if (stored_reason.empty() && !cancel_reason.empty()) {
+            stored_reason = cancel_reason;
+            should_update_offer_row = true;
+            event_type = "status_update";
+        } else if (current_reason_is_reconcile
+                   && !new_reason_is_reconcile
+                   && !cancel_reason.empty()) {
+            stored_reason = cancel_reason;
+            should_update_offer_row = true;
+            event_type = "status_update";
+        } else if (stored_resolved_block == 0 && resolved_block != 0) {
+            stored_resolved_block = resolved_block;
+            should_update_offer_row = true;
+            event_type = "status_update";
+        } else {
+            event_type = new_reason_is_reconcile
+                ? "reconcile_observation"
+                : "status_observation";
+        }
+
+        if (should_update_offer_row && current_resolved_block != 0) {
+            stored_resolved_block = current_resolved_block;
+        }
+    } else {
+        event_type = new_reason_is_reconcile
+            ? "reconcile_observation"
+            : "status_observation";
+    }
+
+    if (should_update_offer_row) {
+        bind_text  (stmt_update_offer_, 1, stored_status);
+        bind_int64 (stmt_update_offer_, 2, static_cast<std::int64_t>(stored_resolved_block));
+        bind_text  (stmt_update_offer_, 3, stored_reason);
+        bind_text  (stmt_update_offer_, 4, offer_id);
+
+        step_and_reset(stmt_update_offer_);
+
+        int changes = sqlite3_changes(db_);
+        if (changes == 0) {
+            throw std::runtime_error(
+                "[Database] update_offer_status: no offer found with id '" + offer_id + "'");
+        }
+    }
+
+    bind_text  (stmt_insert_offer_closure_event_, 1, offer_id);
+    bind_text  (stmt_insert_offer_closure_event_, 2, pair_name);
+    bind_text  (stmt_insert_offer_closure_event_, 3, event_type);
+    bind_text  (stmt_insert_offer_closure_event_, 4, current_status);
+    bind_text  (stmt_insert_offer_closure_event_, 5, new_status);
+    bind_text  (stmt_insert_offer_closure_event_, 6, cancel_reason);
+    bind_int64 (stmt_insert_offer_closure_event_, 7, static_cast<std::int64_t>(resolved_block));
+    step_and_reset(stmt_insert_offer_closure_event_);
+
+    spdlog::debug("[Database] Offer '{}' status='{}' -> '{}' event='{}' "
+                  "stored_reason='{}' observed_reason='{}'",
+                  offer_id, current_status, stored_status, event_type,
+                  stored_reason, cancel_reason);
 }
 
 // ===========================================================================
@@ -837,6 +994,7 @@ void Database::run_migrations()
     const char* ddl_statements[] = {
         kCreateTradeLog,
         kCreateOfferLog,
+        kCreateOfferClosureEvents,
         kCreateSnapshots,
         kCreateStrategyQuotes,
         kCreateSanityFailures,
@@ -844,6 +1002,8 @@ void Database::run_migrations()
         kIndexTradePair,
         kIndexOfferStatus,
         kIndexOfferPair,
+        kIndexOfferClosureEventsOffer,
+        kIndexOfferClosureEventsPair,
         kIndexSnapshotPairBlock,
         kIndexStrategyQuotesPairBlock,
         kIndexSanityFailuresPair

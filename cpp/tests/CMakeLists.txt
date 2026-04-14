@@ -45,6 +45,7 @@ endif()
 # Test executable -- links against the xop_core library and GTest.
 # ---------------------------------------------------------------------------
 add_executable(xop_tests
+    test_database.cpp
     test_avellaneda.cpp
     test_glft.cpp
     test_spread.cpp

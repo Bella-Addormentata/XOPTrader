@@ -394,6 +394,8 @@ Exposed on configurable HTTP port (default 9090), organized into 6 Grafana dashb
 
 Every offer lifecycle event and trade settlement is recorded in an append-only SQLite database (WAL mode for concurrent safety). Full trade log with cost basis at time of execution, realized PnL, and Form 8949-compatible CSV export for tax reporting.
 
+`offer_log` stores the current state of each offer, while `offer_closure_events` preserves the append-only closure history used for cancel-cause analytics. After the updated trader binary has run migrations against the target database, use `python scripts/report_offer_closure_events.py --top 15` for a compact breakdown of primary close causes, reconcile follow-ups, and recent closure observations.
+
 ---
 
 ## Backtesting
