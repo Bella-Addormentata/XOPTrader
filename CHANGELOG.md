@@ -5,6 +5,16 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.44] — 2026-04-15
+
+### Fixed
+
+- **Confirmed sell accounting now bypasses no-loss enforcement** (engine.cpp, inventory.cpp, inventory.hpp): `InventoryTracker::record_sell()` was rejecting already-confirmed on-chain sells when the tracked cost basis was above the fill price. That left XCH holdings overstated after real sells, keeping `inventory_ratio()` artificially neutral and letting the balance equalizer continue quoting as if inventory were still balanced. Added an explicit `enforce_no_loss` control so post-fill accounting always reflects confirmed chain state.
+
+- **Wallet-balance inventory recovery after startup seed failures** (engine.cpp): When wallet balance RPC calls timed out during startup seeding, both `InventoryTracker` and `State` could remain empty for live assets. The engine then reported `inventory_ratio = 0.5` across XCH pairs even while the wallet was materially imbalanced. Startup seeding now prefers `confirmed_wallet_balance`, and Step 8 backfills empty tracked positions from the live wallet cache when confirmed balances are available.
+
+- **Regression coverage for confirmed below-basis sells** (test_inventory.cpp): Added a unit test proving confirmed sells must still decrement inventory when the no-loss rule would block a pre-trade order.
+
 ## [0.7.43] — 2026-04-12
 
 ### Added

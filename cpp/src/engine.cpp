@@ -956,24 +956,27 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     auto bal_json = co_await wallet_->get_wallet_balance(wid);
                     Mojo spendable = bal_json.value("spendable_balance",
                                                     static_cast<Mojo>(0));
-                    if (spendable <= 0) continue;
+                    Mojo confirmed = bal_json.value("confirmed_wallet_balance",
+                                                    static_cast<Mojo>(0));
+                    const Mojo seed_qty = (confirmed > 0) ? confirmed : spendable;
+                    if (seed_qty <= 0) continue;
 
                     // Use 1 as synthetic cost basis ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the actual value
                     // doesn't affect inventory_ratio because that method
                     // uses the live mid-price to convert baseÃƒÂ¢Ã¢â‚¬Â Ã¢â‚¬â„¢quote.
                     // What matters is that total_quantity reflects the
                     // real mojos held.
-                    inventory_->seed_position(AssetId{aid}, spendable,
+                    inventory_->seed_position(AssetId{aid}, seed_qty,
                                               Mojo{1});
                     // Also seed State positions so that apply_limits()
                     // has accurate balances from the start (not just
                     // from detected fills).
-                    state_->record_buy(AssetId{aid}, spendable, Mojo{1});
-                    total_seeded += spendable;
+                    state_->record_buy(AssetId{aid}, seed_qty, Mojo{1});
+                    total_seeded += seed_qty;
 
                     spdlog::info("[Engine] Seeded inventory for asset {} "
                                  "(wallet {}): {} mojos",
-                                 aid.substr(0, 12), wid, spendable);
+                                 aid.substr(0, 12), wid, seed_qty);
                 } catch (const std::exception& e) {
                     spdlog::debug("[Engine] Could not query balance for "
                                   "wallet {}: {}", wid, e.what());
@@ -2200,22 +2203,19 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             inventory_->record_buy(fill_base, fill.size, fill.price,
                                    fill.block_height, now);
         } else {
-            // [T2-17] Check record_sell() return value.  record_sell()
-            // returns false when the no-loss constraint rejects the sell
-            // (sell_price < cost_basis).  This should not happen for
-            // confirmed on-chain fills, but if it does, it indicates a
-            // state inconsistency between the offer manager's pricing and
-            // the inventory tracker's cost basis.
+            // Confirmed fills must always reduce tracked inventory. The
+            // never-sell-at-loss rule is a pre-trade control, so bypass it
+            // here and only fail on missing or insufficient tracked quantity.
             // ISO/IEC 5055: checked return value on every code path.
             bool sell_ok = inventory_->record_sell(
                 fill_base, fill.size, fill.price,
-                fill.block_height, now);
+                fill.block_height, now, /*enforce_no_loss=*/false);
             if (!sell_ok) {
                 spdlog::error("[Engine] Step 2: record_sell() REJECTED fill "
                               "for {} {} @ {} mojos (block {}) -- "
-                              "no-loss constraint violation or state "
-                              "inconsistency.  Fill was confirmed on-chain "
-                              "but inventory tracker refused it.",
+                              "tracked inventory missing or insufficient.  "
+                              "Fill was confirmed on-chain but inventory "
+                              "tracker refused it.",
                               fill.pair_name, fill.size, fill.price,
                               fill.block_height);
                 // Alert on the inconsistency so the operator can investigate.
@@ -4802,6 +4802,26 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
                         // Update the cache for metrics.
                         cached_wallet_balances_[sb.label] = {spendable, confirmed, pending};
+                        const AssetId tracked_asset{sb.label};
+                        if (confirmed > 0 && inventory_
+                            && inventory_->net_inventory(tracked_asset) == 0)
+                        {
+                            inventory_->seed_position(tracked_asset, confirmed,
+                                                      Mojo{1});
+                            spdlog::warn("[Engine] Step 8: recovered inventory "
+                                         "seed for asset {} from wallet "
+                                         "confirmed balance {} mojos",
+                                         sb.label, confirmed);
+                        }
+                        if (confirmed > 0 && state_
+                            && state_->get_position(tracked_asset).balance == 0)
+                        {
+                            state_->record_buy(tracked_asset, confirmed, Mojo{1});
+                            spdlog::warn("[Engine] Step 8: recovered state "
+                                         "position for asset {} from wallet "
+                                         "confirmed balance {} mojos",
+                                         sb.label, confirmed);
+                        }
                         metrics_->update_spendable_reserve(
                             sb.label,
                             (confirmed > 0)

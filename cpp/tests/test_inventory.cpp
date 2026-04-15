@@ -150,6 +150,20 @@ TEST_F(CostBasisTest, SellAtLossAllowedWhenDisabled) {
     EXPECT_EQ(rec.total_quantity, 50);
 }
 
+TEST_F(CostBasisTest, ConfirmedSellBypassesNoLossConstraint) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL, true);
+
+    tracker.record_buy("xch", 100, 2'700'000, 1, now_);
+
+    bool ok = tracker.record_sell(
+        "xch", 50, 2'500'000, 2, now_, /*enforce_no_loss=*/false);
+    EXPECT_TRUE(ok) << "Confirmed fills must update inventory even below basis";
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, 50);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'700'000);
+}
+
 // ============================================================================
 // TEST: Full liquidation resets cost basis to zero
 // ============================================================================

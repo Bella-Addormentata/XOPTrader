@@ -161,7 +161,8 @@ public:
     ///   new_total_cost = old_total_cost * (1 - qty / old_qty)
     ///
     /// If no_loss_constraint is enabled and sell_price < cost_basis, the sell
-    /// is REJECTED and the method returns false.
+    /// is REJECTED and the method returns false unless enforce_no_loss is
+    /// false (used for already-confirmed on-chain fills).
     ///
     /// Returns false (and does nothing) if:
     ///   - qty > current holdings
@@ -171,7 +172,8 @@ public:
                                    Mojo           qty,
                                    Mojo           sell_price,
                                    BlockHeight    block,
-                                   Timestamp      ts);
+                                   Timestamp      ts,
+                                   bool           enforce_no_loss = true);
 
     // -- Risk Metrics -------------------------------------------------------
 

@@ -203,7 +203,8 @@ bool InventoryTracker::record_sell(const AssetId& asset_id,
                                    Mojo           qty,
                                    Mojo           sell_price,
                                    BlockHeight    block,
-                                   Timestamp      ts)
+                                   Timestamp      ts,
+                                   bool           enforce_no_loss)
 {
     // Defensive: reject invalid inputs.
     if (qty <= 0 || sell_price <= 0) {
@@ -229,7 +230,10 @@ bool InventoryTracker::record_sell(const AssetId& asset_id,
     // Compare sell_price against weighted_avg_cost_basis.  If the sell would
     // realise a loss and the constraint is active, reject the trade.
     // ISO/IEC 5055: atomic load for thread-safe flag access.
-    if (no_loss_constraint_.load(std::memory_order_acquire) && rec.total_quantity > 0) {
+    if (enforce_no_loss
+        && no_loss_constraint_.load(std::memory_order_acquire)
+        && rec.total_quantity > 0)
+    {
         if (sell_price < rec.weighted_avg_cost_basis) {
             return false;
         }
