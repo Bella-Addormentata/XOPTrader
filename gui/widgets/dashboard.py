@@ -150,15 +150,15 @@ class MetricCard(QFrame):
         )
         root.addWidget(self._sparkline)
 
-        # USD equivalent label (shown below sparkline for monetary cards)
-        self._usd_label = QLabel("")
-        self._usd_label.setStyleSheet(
+        # Secondary value label (currency/context line shown below sparkline)
+        self._secondary_label = QLabel("")
+        self._secondary_label.setStyleSheet(
             f"color: {TEXT_SECONDARY};"
             f"font-family: {_MONO_FAMILY};"
             f"font-size: 12px;"
         )
-        self._usd_label.setVisible(False)
-        root.addWidget(self._usd_label)
+        self._secondary_label.setVisible(False)
+        root.addWidget(self._secondary_label)
 
         # Annotation label (e.g. "No trades yet", "Stale data")
         self._annotation_label = QLabel("")
@@ -192,6 +192,32 @@ class MetricCard(QFrame):
         # Dim the value when it has never been non-zero to signal "no data yet".
         if not self._ever_nonzero and value == 0.0:
             colour = TEXT_SECONDARY
+        self._value_label.setStyleSheet(
+            f"color: {colour};"
+            f"font-family: {_MONO_FAMILY};"
+            f"font-size: 22px;"
+            f"font-weight: 700;"
+        )
+        self._value_label.setText(text)
+
+    def set_value_text(
+        self,
+        text: str,
+        *,
+        sign_value: float | None = None,
+    ) -> None:
+        """Update the main readout using a preformatted string."""
+        if sign_value is None:
+            colour = TEXT_PRIMARY
+        elif sign_value > 0:
+            colour = PROFIT_GREEN
+            self._ever_nonzero = True
+        elif sign_value < 0:
+            colour = LOSS_RED
+            self._ever_nonzero = True
+        else:
+            colour = TEXT_SECONDARY if not self._ever_nonzero else TEXT_PRIMARY
+
         self._value_label.setStyleSheet(
             f"color: {colour};"
             f"font-family: {_MONO_FAMILY};"
@@ -238,8 +264,15 @@ class MetricCard(QFrame):
             text = f"\u2248 ${usd:+,.2f} USD"
         else:
             text = f"\u2248 ${usd:,.2f} USD"
-        self._usd_label.setText(text)
-        self._usd_label.setVisible(True)
+        self.set_secondary_text(text)
+
+    def set_secondary_text(self, text: str) -> None:
+        """Set or clear the secondary label under the sparkline."""
+        if text:
+            self._secondary_label.setText(text)
+            self._secondary_label.setVisible(True)
+        else:
+            self._secondary_label.setVisible(False)
 
     def set_annotation(self, text: str) -> None:
         """Set or clear the annotation text below the sparkline.
@@ -714,8 +747,11 @@ class DashboardWidget(QWidget):
                 continue
             value = data.get("value", 0.0)
 
+            if "display_text" in data:
+                sign_value = value if "PnL" in name else None
+                card.set_value_text(str(data.get("display_text", "—")), sign_value=sign_value)
             # Fill Count is always shown as an integer
-            if "Fill Count" in name:
+            elif "Fill Count" in name:
                 card.set_value(value, fmt="{:,.0f}")
             elif "Fee" in name:
                 card.set_value(value, fmt="{:,.4f} XCH")
@@ -725,6 +761,8 @@ class DashboardWidget(QWidget):
                 card.set_value(value, fmt="{:+,.4f} XCH")
                 if xch_usd_rate > 0:
                     card.set_usd_value(value * xch_usd_rate)
+
+            card.set_secondary_text(str(data.get("secondary_text", "")))
 
             if "change_pct" in data:
                 card.set_change(data["change_pct"])
@@ -864,7 +902,7 @@ class DashboardWidget(QWidget):
             pnl_val = data.get('pnl', 0)
             pnl_text = f"{pnl_val:+,.4f} XCH"
             if xch_usd_rate > 0:
-                pnl_text += f" (${pnl_val * xch_usd_rate:+,.2f})"
+                pnl_text = f"${pnl_val * xch_usd_rate:+,.2f} ({pnl_val:+,.4f} XCH)"
             values.append((pnl_text, ""))
 
             for col, (text, _) in enumerate(values):
@@ -979,6 +1017,7 @@ class DashboardWidget(QWidget):
         expired: int,
         pending: int,
         fees_24h_xch: float,
+        fees_24h_usdc: float = 0.0,
     ) -> None:
         """Update the data diagnostics card.
 
@@ -1021,7 +1060,12 @@ class DashboardWidget(QWidget):
         )
 
         # Fees.
-        self._diag_fees_label.setText(f"Fees 24h: {fees_24h_xch:.6f} XCH")
+        if fees_24h_usdc > 0.0:
+            self._diag_fees_label.setText(
+                f"Fees 24h: ${fees_24h_usdc:,.2f} ({fees_24h_xch:.6f} XCH)"
+            )
+        else:
+            self._diag_fees_label.setText(f"Fees 24h: {fees_24h_xch:.6f} XCH")
 
         # Timestamp.
         import datetime as _dt

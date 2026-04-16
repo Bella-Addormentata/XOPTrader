@@ -359,6 +359,15 @@ class MainWindow(QMainWindow):
                 xch_usd = mid / 1000.0
                 break
 
+        reports_widget = self._unwrap(self._reports)
+        if reports_widget is not None and hasattr(reports_widget, "set_live_context"):
+            reports_widget.set_live_context(
+                xch_usd_rate=xch_usd,
+                market_data=market_data,
+                wallet_balances=data.get("wallet_balances", {}),
+                pnl=pnl,
+            )
+
         self._status_bar.update_metrics(
             pnl_mojos=pnl_total,
             spread_bps=avg_spread,
@@ -374,25 +383,60 @@ class MainWindow(QMainWindow):
             # Convert PnL values from raw mojos (int) to XCH (float) so
             # that MetricCard's {:+,.2f} formatter shows human-readable
             # amounts rather than 12-digit mojo integers.
+            wallet_balances = data.get("wallet_balances", {})
+            offers = data.get("offers", {})
             total_xch = mojos_to_xch_float(int(pnl.get("total", 0)))
             realized_xch = mojos_to_xch_float(int(pnl.get("realized", 0)))
             unrealized_xch = mojos_to_xch_float(int(pnl.get("unrealized", 0)))
             spread_xch = mojos_to_xch_float(int(pnl.get("spread", 0)))
             inventory_xch = mojos_to_xch_float(int(pnl.get("inventory", 0)))
+            total_usdc = total_xch * xch_usd
+            realized_usdc = realized_xch * xch_usd
+            unrealized_usdc = unrealized_xch * xch_usd
+            spread_usdc = spread_xch * xch_usd
+            inventory_usdc = inventory_xch * xch_usd
+            fees_xch = mojos_to_xch_float(int(data.get("fees_paid_24h", 0)))
+            fees_usdc = fees_xch * xch_usd
+
+            def _fmt_usdc(value: float) -> str:
+                sign = "+" if value > 0 else ""
+                return f"{sign}${value:,.2f}"
+
+            def _fmt_xch(value: float, *, signed: bool = True) -> str:
+                sign = "+" if signed and value > 0 else ""
+                return f"{sign}{value:,.4f} XCH"
+
+            def _metric_payload(xch_value: float) -> dict[str, float | str]:
+                if xch_usd > 0:
+                    usdc_value = xch_value * xch_usd
+                    return {
+                        "value": usdc_value,
+                        "spark": usdc_value,
+                        "display_text": _fmt_usdc(usdc_value),
+                        "secondary_text": _fmt_xch(xch_value),
+                    }
+                return {
+                    "value": xch_value,
+                    "spark": xch_value,
+                    "display_text": _fmt_xch(xch_value),
+                    "secondary_text": "",
+                }
 
             card_data = {
-                "Total PnL": {"value": total_xch, "spark": total_xch},
-                "Realized PnL": {"value": realized_xch, "spark": realized_xch},
-                "Unrealized PnL": {"value": unrealized_xch, "spark": unrealized_xch},
-                "Spread PnL": {"value": spread_xch, "spark": spread_xch},
-                "Inventory PnL": {"value": inventory_xch, "spark": inventory_xch},
+                "Total PnL": _metric_payload(total_xch),
+                "Realized PnL": _metric_payload(realized_xch),
+                "Unrealized PnL": _metric_payload(unrealized_xch),
+                "Spread PnL": _metric_payload(spread_xch),
+                "Inventory PnL": _metric_payload(inventory_xch),
                 "24h Fill Count": {
-                    "value": data.get("offers", {}).get("filled", 0),
-                    "spark": data.get("offers", {}).get("filled", 0),
+                    "value": offers.get("filled", 0),
+                    "spark": offers.get("filled", 0),
                 },
                 "Fees Paid 24h": {
-                    "value": mojos_to_xch_float(int(data.get("fees_paid_24h", 0))),
-                    "spark": mojos_to_xch_float(int(data.get("fees_paid_24h", 0))),
+                    "value": fees_usdc if xch_usd > 0 else fees_xch,
+                    "spark": fees_usdc if xch_usd > 0 else fees_xch,
+                    "display_text": f"${fees_usdc:,.2f}" if xch_usd > 0 else f"{fees_xch:,.4f} XCH",
+                    "secondary_text": f"{fees_xch:,.4f} XCH" if xch_usd > 0 else "",
                 },
             }
             dashboard.update_metrics(card_data, xch_usd_rate=xch_usd)
@@ -401,7 +445,6 @@ class MainWindow(QMainWindow):
                 colour_map = {"Running": "green", "Stopped": "red", "Disconnected": "red"}
                 dashboard.update_bot_status(status, colour=colour_map.get(status, "gray"))
             if hasattr(dashboard, "update_connection_status"):
-                wallet_bals = data.get("wallet_balances", {})
                 full_node_connected = (
                     health.get("node_synced", 0.0) >= 1.0
                     or block_height > 0
@@ -409,7 +452,7 @@ class MainWindow(QMainWindow):
                 )
                 wallet_connected = (
                     health.get("wallet_connected", 0.0) >= 1.0
-                    or bool(wallet_bals)
+                    or bool(wallet_balances)
                 )
                 dashboard.update_connection_status({
                     "Full Node": full_node_connected,
@@ -422,17 +465,20 @@ class MainWindow(QMainWindow):
             if hasattr(dashboard, "update_wallet_balances"):
                 reserve = data.get("spendable_reserve", {})
                 stuck = data.get("stuck_offers", 0)
-                dashboard.update_wallet_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)
+                dashboard.update_wallet_balances(
+                    wallet_balances,
+                    reserve=reserve,
+                    stuck_offers=stuck,
+                )
             if hasattr(dashboard, "update_diagnostics"):
-                offers = data.get("offers", {})
-                fees_mojos = int(data.get("fees_paid_24h", 0))
                 dashboard.update_diagnostics(
                     metrics_connected=data.get("metrics_connected", False),
                     filled=int(offers.get("filled", 0)),
                     cancelled=int(offers.get("cancelled", 0)),
                     expired=int(offers.get("expired", 0)),
                     pending=int(offers.get("pending", 0)),
-                    fees_24h_xch=mojos_to_xch_float(fees_mojos),
+                    fees_24h_xch=fees_xch,
+                    fees_24h_usdc=fees_usdc,
                 )
             if hasattr(dashboard, "update_reserve_card"):
                 dashboard.update_reserve_card(data.get("spendable_reserve", {}))

@@ -210,6 +210,38 @@ std::size_t CoinManager::count_pool_ready_coins(
         }));
 }
 
+bool CoinManager::split_improves_pool_ready_count(Mojo source_amount_mojos,
+                                                  int  batch,
+                                                  Mojo target_amount_mojos,
+                                                  Mojo fee)
+{
+    if (source_amount_mojos <= 0 || batch <= 0
+        || target_amount_mojos <= 0 || fee < 0) {
+        return false;
+    }
+
+    if (static_cast<Mojo>(batch) >
+        (std::numeric_limits<std::int64_t>::max() - fee) / target_amount_mojos) {
+        return false;
+    }
+
+    const Mojo spend = static_cast<Mojo>(batch) * target_amount_mojos + fee;
+    if (spend > source_amount_mojos) {
+        return false;
+    }
+
+    const Mojo remainder = source_amount_mojos - spend;
+    const int current_ready =
+        is_pool_ready_coin(source_amount_mojos, target_amount_mojos) ? 1 : 0;
+
+    int future_ready = batch;
+    if (remainder > 0 && is_pool_ready_coin(remainder, target_amount_mojos)) {
+        ++future_ready;
+    }
+
+    return future_ready > current_ready;
+}
+
 asio::awaitable<int> CoinManager::count_pool_ready_coins(
     std::int64_t wallet_id,
     Mojo         target_amount_mojos)
@@ -320,14 +352,25 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
             (c.amount - fee) / target_amount_mojos);
         if (max_from_coin < 1) continue;
 
-        batch = std::min({needed, max_from_coin, kMaxCoinsPerSplit});
+        int candidate_batch = std::min({needed, max_from_coin, kMaxCoinsPerSplit});
+        while (candidate_batch > 0
+               && !split_improves_pool_ready_count(
+                   c.amount, candidate_batch, target_amount_mojos, fee)) {
+            --candidate_batch;
+        }
+
+        if (candidate_batch < 1) {
+            continue;
+        }
+
+        batch = candidate_batch;
         source_coin = &c;
         break;  // Largest coin first -- best candidate.
     }
 
     if (!source_coin || batch < 1) {
-        logger_->error("ensure_split: no coin large enough to produce "
-                       "even 1 coin of {} mojos (+ {} fee). "
+        logger_->error("ensure_split: no coin can improve the pool-ready "
+                       "count for target {} mojos (+ {} fee). "
                        "Largest free coin: {} mojos",
                        target_amount_mojos, fee,
                        free_coins.empty() ? 0 : free_coins[0].amount);

@@ -202,6 +202,73 @@ TEST_F(LimitsTestFixture, CongestionMultiplier_Congested) {
 }
 
 // ============================================================================
+// apply_limits
+// ============================================================================
+
+TEST_F(LimitsTestFixture, ApplyLimitsHardBaseOverweightKeepsTinyBid) {
+    risk_cfg.max_capital_per_pair_pct = 0.95;
+    xop::PreTradeCheck ptc(risk_cfg, strat_cfg);
+    xop::State state;
+
+    state.record_buy("xch", 80, 1);
+    state.record_buy("wusdc", 20, 1);
+    state.record_buy("dbx", 100, 1);
+    state.set_asset_xch_rate("wusdc", 1.0);
+    state.set_asset_xch_rate("dbx", 1.0);
+
+    xop::Quote q{};
+    q.bid_size = 1000;
+    q.ask_size = 1000;
+
+    auto result = ptc.apply_limits(q, "XCH/wUSDC.b", "xch", "wusdc", state);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GT(result->bid_size, 0);
+    EXPECT_LT(result->bid_size, q.bid_size);
+    EXPECT_EQ(result->ask_size, q.ask_size);
+}
+
+TEST_F(LimitsTestFixture, ApplyLimitsSingleCatCapKeepsTinyBid) {
+    risk_cfg.max_capital_per_pair_pct = 0.95;
+    xop::PreTradeCheck ptc(risk_cfg, strat_cfg);
+    xop::State state;
+
+    state.record_buy("cat", 50, 1);
+    state.record_buy("xch", 50, 1);
+    state.record_buy("wusdc", 150, 1);
+    state.set_asset_xch_rate("cat", 1.0);
+    state.set_asset_xch_rate("wusdc", 1.0);
+
+    xop::Quote q{};
+    q.bid_size = 1000;
+    q.ask_size = 1000;
+
+    auto result = ptc.apply_limits(q, "CAT/XCH", "cat", "xch", state);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_GT(result->bid_size, 0);
+    EXPECT_LT(result->bid_size, q.bid_size);
+    EXPECT_EQ(result->ask_size, q.ask_size);
+}
+
+TEST_F(LimitsTestFixture, ApplyLimitsExtremeBaseOverweightStillBlocksBid) {
+    risk_cfg.max_capital_per_pair_pct = 0.95;
+    xop::PreTradeCheck ptc(risk_cfg, strat_cfg);
+    xop::State state;
+
+    state.record_buy("xch", 100, 1);
+    state.record_buy("dbx", 100, 1);
+    state.set_asset_xch_rate("dbx", 1.0);
+
+    xop::Quote q{};
+    q.bid_size = 1000;
+    q.ask_size = 1000;
+
+    auto result = ptc.apply_limits(q, "XCH/wUSDC.b", "xch", "wusdc", state);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->bid_size, 0);
+    EXPECT_EQ(result->ask_size, q.ask_size);
+}
+
+// ============================================================================
 // Construction validation
 // ============================================================================
 

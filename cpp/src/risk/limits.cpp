@@ -24,6 +24,25 @@
 
 namespace xop {
 
+namespace {
+
+constexpr double kHardLimitContinuityFloorPct = 0.05;
+constexpr double kCatCapContinuityFloorPct = 0.05;
+constexpr double kCatCapFullBlockMultiple = 2.0;
+
+Mojo scale_size_with_floor(Mojo size, double keep_fraction) noexcept
+{
+    if (size <= 0 || !(keep_fraction > 0.0)) {
+        return 0;
+    }
+
+    const auto kept = static_cast<Mojo>(
+        std::llround(static_cast<double>(size) * keep_fraction));
+    return std::max<Mojo>(1, kept);
+}
+
+}  // namespace
+
 // ---------------------------------------------------------------------------
 // EmergencyRule stringification
 // ---------------------------------------------------------------------------
@@ -172,35 +191,50 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 
     // Base overweight?
     if (base_conc >= risk_cfg_.hard_limit_pct) {
-        // Hard limit breach: pull bids entirely -- do not accumulate more base.
-        quote.bid_size = 0;
+        // Hard limit breach: leave only a tiny continuity quote so the bot
+        // does not collapse into a permanently one-sided book.  The size
+        // tapers to zero only as concentration approaches 100%.
+        const double taper = std::clamp(
+            1.0 - (base_conc - risk_cfg_.hard_limit_pct)
+                / std::max(1.0 - risk_cfg_.hard_limit_pct, 1e-9),
+            0.0, 1.0);
+        quote.bid_size = scale_size_with_floor(
+            quote.bid_size,
+            kHardLimitContinuityFloorPct * taper);
     } else if (base_conc >= risk_cfg_.soft_limit_pct) {
         // Soft limit: apply graduated proportional reduction instead of
-        // zeroing.  Linearly interpolate from full size at soft_limit to
-        // zero at hard_limit, so the transition is smooth rather than a
-        // cliff that behaves identically to the hard limit.
+        // zeroing.  Linearly interpolate from full size at soft_limit to a
+        // tiny continuity quote at the hard limit, so the transition remains
+        // smooth without eliminating the side entirely.
         // ISO/IEC 5055: clamped to [0.0, 1.0] to guard against config
         // where soft_pct == hard_pct (division by zero yields 0.0 via clamp).
         const double reduction = std::clamp(
             (base_conc - risk_cfg_.soft_limit_pct)
                 / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
             0.0, 1.0);
-        quote.bid_size = static_cast<Mojo>(
-            static_cast<double>(quote.bid_size) * (1.0 - reduction));
+        const double keep_fraction =
+            1.0 - reduction * (1.0 - kHardLimitContinuityFloorPct);
+        quote.bid_size = scale_size_with_floor(quote.bid_size, keep_fraction);
     }
 
     // Quote overweight?
     if (quote_conc >= risk_cfg_.hard_limit_pct) {
-        // Hard limit breach: pull asks entirely -- do not sell more base.
-        quote.ask_size = 0;
+        const double taper = std::clamp(
+            1.0 - (quote_conc - risk_cfg_.hard_limit_pct)
+                / std::max(1.0 - risk_cfg_.hard_limit_pct, 1e-9),
+            0.0, 1.0);
+        quote.ask_size = scale_size_with_floor(
+            quote.ask_size,
+            kHardLimitContinuityFloorPct * taper);
     } else if (quote_conc >= risk_cfg_.soft_limit_pct) {
         // Soft limit: graduated proportional reduction (mirror of bid logic).
         const double reduction = std::clamp(
             (quote_conc - risk_cfg_.soft_limit_pct)
                 / (risk_cfg_.hard_limit_pct - risk_cfg_.soft_limit_pct),
             0.0, 1.0);
-        quote.ask_size = static_cast<Mojo>(
-            static_cast<double>(quote.ask_size) * (1.0 - reduction));
+        const double keep_fraction =
+            1.0 - reduction * (1.0 - kHardLimitContinuityFloorPct);
+        quote.ask_size = scale_size_with_floor(quote.ask_size, keep_fraction);
     }
 
     // ---- 2. Single-CAT cap (12% of total portfolio) ----------------------
@@ -215,7 +249,16 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     if (base_id != "xch") {
         const double cat_frac = compute_portfolio_fraction(base_pos, all_positions, state);
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
-            quote.bid_size = 0;  // stop accumulating this CAT
+            const double taper = std::clamp(
+                1.0 - (cat_frac - risk_cfg_.single_cat_cap_pct)
+                    / std::max(
+                        risk_cfg_.single_cat_cap_pct
+                            * (kCatCapFullBlockMultiple - 1.0),
+                        1e-9),
+                0.0, 1.0);
+            quote.bid_size = scale_size_with_floor(
+                quote.bid_size,
+                kCatCapContinuityFloorPct * taper);
         }
     }
 
@@ -223,7 +266,16 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     if (quote_id != "xch") {
         const double cat_frac = compute_portfolio_fraction(quote_pos, all_positions, state);
         if (cat_frac >= risk_cfg_.single_cat_cap_pct) {
-            quote.ask_size = 0;  // stop accumulating quote CAT (i.e., stop selling base)
+            const double taper = std::clamp(
+                1.0 - (cat_frac - risk_cfg_.single_cat_cap_pct)
+                    / std::max(
+                        risk_cfg_.single_cat_cap_pct
+                            * (kCatCapFullBlockMultiple - 1.0),
+                        1e-9),
+                0.0, 1.0);
+            quote.ask_size = scale_size_with_floor(
+                quote.ask_size,
+                kCatCapContinuityFloorPct * taper);
         }
     }
 

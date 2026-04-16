@@ -19,8 +19,10 @@ Compliant with:
 
 from __future__ import annotations
 
+import math
 import logging
 import sqlite3
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -337,10 +339,38 @@ class _DatabaseWorker(QObject):
             "top_trades": [],
             "worst_trades": [],
             "daily_pnl": [],
+            "forecast": {},
         }
 
+        snapshot_fx_available = self._snapshot_has_xch_usd_rate()
+        fallback_xch_usd = self._get_latest_snapshot_xch_usd_rate() if snapshot_fx_available else 0.0
+        if snapshot_fx_available:
+            usd_rate_cte = """
+                WITH daily_rates AS (
+                    SELECT
+                        DATE(created_at) AS rate_date,
+                        AVG(CASE WHEN xch_usd_rate > 0 THEN xch_usd_rate END) AS xch_usd_rate
+                    FROM snapshots
+                    GROUP BY DATE(created_at)
+                ),
+                fallback_rate AS (
+                    SELECT ? AS xch_usd_rate
+                )
+            """
+        else:
+            usd_rate_cte = """
+                WITH daily_rates AS (
+                    SELECT NULL AS rate_date, NULL AS xch_usd_rate
+                    WHERE 0
+                ),
+                fallback_rate AS (
+                    SELECT NULL AS xch_usd_rate
+                )
+            """
+        usd_rate_expr = "COALESCE(dr.xch_usd_rate, fr.xch_usd_rate, 0.0)"
+
         # -- Period-based P&L -------------------------------------------------
-        period_sql = """
+        period_sql = usd_rate_cte + f"""
             SELECT
                 COUNT(*)                                                    AS trade_count,
                 COALESCE(SUM(realized_pnl_mojos), 0)                       AS total_pnl,
@@ -350,27 +380,42 @@ class _DatabaseWorker(QObject):
                 COALESCE(SUM(fee_mojos), 0)                                AS total_fees,
                 COALESCE(AVG(realized_pnl_mojos), 0)                       AS avg_pnl,
                 COALESCE(MAX(realized_pnl_mojos), 0)                       AS best_trade,
-                COALESCE(MIN(realized_pnl_mojos), 0)                       AS worst_trade
-            FROM trade_log
-            WHERE timestamp >= ?
+                COALESCE(MIN(realized_pnl_mojos), 0)                       AS worst_trade,
+                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_pnl_usdc,
+                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_fees_usdc,
+                COALESCE(AVG((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS avg_pnl_usdc,
+                COALESCE(MAX((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS best_trade_usdc,
+                COALESCE(MIN((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS worst_trade_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            WHERE t.timestamp >= ?
         """
 
-        import datetime as _dt
-        now = _dt.datetime.utcnow()
+        now = datetime.utcnow()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
 
         periods = {
             "today": today_start.isoformat(),
-            "7d": (now - _dt.timedelta(days=7)).isoformat(),
-            "30d": (now - _dt.timedelta(days=30)).isoformat(),
-            "90d": (now - _dt.timedelta(days=90)).isoformat(),
+            "7d": (now - timedelta(days=7)).isoformat(),
+            "30d": (now - timedelta(days=30)).isoformat(),
+            "90d": (now - timedelta(days=90)).isoformat(),
             "ytd": now.replace(month=1, day=1, hour=0, minute=0, second=0, microsecond=0).isoformat(),
-            "1y": (now - _dt.timedelta(days=365)).isoformat(),
+            "1y": (now - timedelta(days=365)).isoformat(),
             "all": "2000-01-01T00:00:00",
         }
 
         for label, since_ts in periods.items():
-            rows = self._execute_query(period_sql, [since_ts])
+            params = [since_ts]
+            if snapshot_fx_available:
+                params.insert(0, fallback_xch_usd)
+
+            rows = self._execute_query(period_sql, params)
             if rows and rows[0]:
                 r = rows[0]
                 result["periods"][label] = {
@@ -383,48 +428,80 @@ class _DatabaseWorker(QObject):
                     "avg_pnl": r["avg_pnl"],
                     "best_trade": r["best_trade"],
                     "worst_trade": r["worst_trade"],
+                    "total_pnl_usdc": r["total_pnl_usdc"] if snapshot_fx_available else None,
+                    "total_fees_usdc": r["total_fees_usdc"] if snapshot_fx_available else None,
+                    "avg_pnl_usdc": r["avg_pnl_usdc"] if snapshot_fx_available else None,
+                    "best_trade_usdc": r["best_trade_usdc"] if snapshot_fx_available else None,
+                    "worst_trade_usdc": r["worst_trade_usdc"] if snapshot_fx_available else None,
                 }
 
         # -- Per-pair breakdown -----------------------------------------------
-        pair_sql = """
+        pair_sql = usd_rate_cte + f"""
             SELECT
-                pair_name,
+                t.pair_name,
                 COUNT(*)                                                    AS trade_count,
                 COALESCE(SUM(realized_pnl_mojos), 0)                       AS total_pnl,
                 COALESCE(SUM(CASE WHEN realized_pnl_mojos > 0 THEN 1 ELSE 0 END), 0) AS wins,
                 COALESCE(SUM(CASE WHEN realized_pnl_mojos < 0 THEN 1 ELSE 0 END), 0) AS losses,
                 COALESCE(SUM(size_mojos), 0)                               AS total_volume,
                 COALESCE(SUM(fee_mojos), 0)                                AS total_fees,
-                COALESCE(AVG(cost_basis_mojos), 0)                         AS avg_cost_basis
-            FROM trade_log
-            GROUP BY pair_name
+                COALESCE(AVG(cost_basis_mojos), 0)                         AS avg_cost_basis,
+                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_pnl_usdc,
+                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_fees_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            GROUP BY t.pair_name
             ORDER BY total_pnl DESC
         """
-        rows = self._execute_query(pair_sql, [])
+        rows = self._execute_query(pair_sql, [fallback_xch_usd] if snapshot_fx_available else [])
         if rows:
-            result["per_pair"] = [dict(r) for r in rows]
+            pair_rows = [dict(r) for r in rows]
+            if not snapshot_fx_available:
+                for row in pair_rows:
+                    row["total_pnl_usdc"] = None
+                    row["total_fees_usdc"] = None
+            result["per_pair"] = pair_rows
 
         # -- Capital gains (short-term vs long-term) --------------------------
         # Short-term: held < 365 days.  Long-term: held >= 365 days.
         # Since trades are fills (not lot-matching), we estimate using
         # timestamp-based age of realized PnL.
-        one_year_ago = (now - _dt.timedelta(days=365)).isoformat()
+        one_year_ago = (now - timedelta(days=365)).isoformat()
         current_year_start = now.replace(
             month=1, day=1, hour=0, minute=0, second=0, microsecond=0
         ).isoformat()
 
-        cg_sql = """
+        cg_sql = usd_rate_cte + f"""
             SELECT
-                COALESCE(SUM(CASE WHEN timestamp >= ? THEN realized_pnl_mojos ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN t.timestamp >= ? THEN realized_pnl_mojos ELSE 0 END), 0)
                     AS short_term_pnl,
-                COALESCE(SUM(CASE WHEN timestamp <  ? THEN realized_pnl_mojos ELSE 0 END), 0)
+                COALESCE(SUM(CASE WHEN t.timestamp <  ? THEN realized_pnl_mojos ELSE 0 END), 0)
                     AS long_term_pnl,
                 COALESCE(SUM(realized_pnl_mojos), 0) AS total_pnl,
-                COALESCE(SUM(fee_mojos), 0)          AS total_fees
-            FROM trade_log
-            WHERE timestamp >= ?
+                COALESCE(SUM(fee_mojos), 0)          AS total_fees,
+                COALESCE(SUM(CASE WHEN t.timestamp >= ?
+                                  THEN (t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}
+                                  ELSE 0 END), 0.0) AS short_term_pnl_usdc,
+                COALESCE(SUM(CASE WHEN t.timestamp <  ?
+                                  THEN (t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}
+                                  ELSE 0 END), 0.0) AS long_term_pnl_usdc,
+                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_pnl_usdc,
+                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS total_fees_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            WHERE t.timestamp >= ?
         """
-        rows = self._execute_query(cg_sql, [one_year_ago, one_year_ago, current_year_start])
+        cg_params: list[Any] = [one_year_ago, one_year_ago, one_year_ago, one_year_ago, current_year_start]
+        if snapshot_fx_available:
+            cg_params.insert(0, fallback_xch_usd)
+
+        rows = self._execute_query(cg_sql, cg_params)
         if rows and rows[0]:
             r = rows[0]
             result["capital_gains"] = {
@@ -432,6 +509,10 @@ class _DatabaseWorker(QObject):
                 "long_term": r["long_term_pnl"],
                 "total": r["total_pnl"],
                 "fees_deductible": r["total_fees"],
+                "short_term_usdc": r["short_term_pnl_usdc"] if snapshot_fx_available else None,
+                "long_term_usdc": r["long_term_pnl_usdc"] if snapshot_fx_available else None,
+                "total_usdc": r["total_pnl_usdc"] if snapshot_fx_available else None,
+                "fees_deductible_usdc": r["total_fees_usdc"] if snapshot_fx_available else None,
                 "year": now.year,
             }
 
@@ -459,46 +540,270 @@ class _DatabaseWorker(QObject):
             }
 
         # -- Top 5 best and worst trades --------------------------------------
-        best_sql = """
-            SELECT timestamp, pair_name, side, price_mojos, size_mojos,
-                   realized_pnl_mojos, cost_basis_mojos
-            FROM trade_log
-            WHERE realized_pnl_mojos > 0
-            ORDER BY realized_pnl_mojos DESC LIMIT 5
+        best_sql = usd_rate_cte + f"""
+            SELECT t.timestamp, t.pair_name, t.side, t.price_mojos, t.size_mojos,
+                   t.realized_pnl_mojos, t.cost_basis_mojos,
+                   ((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}) AS realized_pnl_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            WHERE t.realized_pnl_mojos > 0
+            ORDER BY t.realized_pnl_mojos DESC LIMIT 5
         """
-        rows = self._execute_query(best_sql, [])
+        rows = self._execute_query(best_sql, [fallback_xch_usd] if snapshot_fx_available else [])
         if rows:
-            result["top_trades"] = [dict(r) for r in rows]
+            top_rows = [dict(r) for r in rows]
+            if not snapshot_fx_available:
+                for row in top_rows:
+                    row["realized_pnl_usdc"] = None
+            result["top_trades"] = top_rows
 
-        worst_sql = """
-            SELECT timestamp, pair_name, side, price_mojos, size_mojos,
-                   realized_pnl_mojos, cost_basis_mojos
-            FROM trade_log
-            WHERE realized_pnl_mojos < 0
-            ORDER BY realized_pnl_mojos ASC LIMIT 5
+        worst_sql = usd_rate_cte + f"""
+            SELECT t.timestamp, t.pair_name, t.side, t.price_mojos, t.size_mojos,
+                   t.realized_pnl_mojos, t.cost_basis_mojos,
+                   ((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}) AS realized_pnl_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            WHERE t.realized_pnl_mojos < 0
+            ORDER BY t.realized_pnl_mojos ASC LIMIT 5
         """
-        rows = self._execute_query(worst_sql, [])
+        rows = self._execute_query(worst_sql, [fallback_xch_usd] if snapshot_fx_available else [])
         if rows:
-            result["worst_trades"] = [dict(r) for r in rows]
+            worst_rows = [dict(r) for r in rows]
+            if not snapshot_fx_available:
+                for row in worst_rows:
+                    row["realized_pnl_usdc"] = None
+            result["worst_trades"] = worst_rows
 
         # -- Daily P&L (last 30 days) -----------------------------------------
-        daily_sql = """
+        daily_sql = usd_rate_cte + f"""
             SELECT
-                DATE(timestamp) AS trade_date,
+                DATE(t.timestamp) AS trade_date,
                 COUNT(*)        AS trade_count,
-                COALESCE(SUM(realized_pnl_mojos), 0) AS daily_pnl,
-                COALESCE(SUM(fee_mojos), 0)          AS daily_fees
-            FROM trade_log
-            WHERE timestamp >= ?
-            GROUP BY DATE(timestamp)
+                COALESCE(SUM(t.realized_pnl_mojos), 0) AS daily_pnl,
+                COALESCE(SUM(t.fee_mojos), 0)          AS daily_fees,
+                AVG({usd_rate_expr})                  AS xch_usd_rate,
+                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS daily_pnl_usdc,
+                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS daily_fees_usdc,
+                COALESCE(SUM(((t.realized_pnl_mojos - t.fee_mojos) / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                    AS daily_net_usdc
+            FROM trade_log t
+            LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
+            CROSS JOIN fallback_rate fr
+            WHERE t.timestamp >= ?
+            GROUP BY DATE(t.timestamp)
             ORDER BY trade_date ASC
         """
-        thirty_days_ago = (now - _dt.timedelta(days=30)).isoformat()
-        rows = self._execute_query(daily_sql, [thirty_days_ago])
+        thirty_days_ago = (now - timedelta(days=30)).isoformat()
+        daily_params: list[Any] = [thirty_days_ago]
+        if snapshot_fx_available:
+            daily_params.insert(0, fallback_xch_usd)
+
+        rows = self._execute_query(daily_sql, daily_params)
         if rows:
-            result["daily_pnl"] = [dict(r) for r in rows]
+            daily_pnl_rows = [dict(r) for r in rows]
+            if not snapshot_fx_available:
+                for row in daily_pnl_rows:
+                    row["xch_usd_rate"] = None
+                    row["daily_pnl_usdc"] = None
+                    row["daily_fees_usdc"] = None
+                    row["daily_net_usdc"] = None
+            result["daily_pnl"] = daily_pnl_rows
+
+        # -- Forecast inputs (trailing calendar-day net P&L) ------------------
+        first_trade_sql = "SELECT MIN(DATE(timestamp)) AS first_trade_date FROM trade_log"
+        rows = self._execute_query(first_trade_sql, [])
+        first_trade_date: Optional[date] = None
+        if rows and rows[0] and rows[0]["first_trade_date"]:
+            try:
+                first_trade_date = date.fromisoformat(rows[0]["first_trade_date"])
+            except ValueError:
+                first_trade_date = None
+
+        if first_trade_date is not None:
+            forecast_start = max(first_trade_date, now.date() - timedelta(days=89))
+            forecast_params: list[Any] = [forecast_start.isoformat()]
+            if snapshot_fx_available:
+                forecast_params.insert(0, fallback_xch_usd)
+
+            rows = self._execute_query(daily_sql, forecast_params)
+            if rows:
+                result["forecast"] = self._build_income_forecast(
+                    rows,
+                    now_date=now.date(),
+                    first_trade_date=first_trade_date,
+                    use_usdc=snapshot_fx_available,
+                )
 
         self.reports_ready.emit(result)
+
+    def _build_income_forecast(
+        self,
+        daily_rows: list[sqlite3.Row],
+        *,
+        now_date: date,
+        first_trade_date: date,
+        use_usdc: bool,
+    ) -> dict[str, Any]:
+        """Estimate forward net income from trailing calendar-day P&L.
+
+        The model intentionally stays conservative and transparent:
+        it uses daily net realised P&L (realised P&L minus fees), fills
+        missing calendar days with zero, and extrapolates the mean with a
+        normal approximation for uncertainty bands.
+        """
+        lookback_start = max(first_trade_date, now_date - timedelta(days=89))
+
+        history_by_day: dict[date, dict[str, float | int]] = {}
+        for row in daily_rows:
+            trade_date_raw = row["trade_date"]
+            if not trade_date_raw:
+                continue
+            try:
+                trade_day = date.fromisoformat(str(trade_date_raw))
+            except ValueError:
+                continue
+
+            gross_pnl = int(row["daily_pnl"] or 0)
+            fees = int(row["daily_fees"] or 0)
+            net_usdc = row["daily_net_usdc"]
+            if net_usdc is None:
+                net_usdc = 0.0
+            history_by_day[trade_day] = {
+                "net_usdc": float(net_usdc),
+                "trades": int(row["trade_count"] or 0),
+                "net_mojos": gross_pnl - fees,
+            }
+
+        if not history_by_day:
+            return {}
+
+        daily_values: list[float] = []
+        active_days = 0
+        profitable_days = 0
+        total_trades = 0
+
+        cursor = lookback_start
+        while cursor <= now_date:
+            entry = history_by_day.get(
+                cursor,
+                {"net_usdc": 0.0, "trades": 0, "net_mojos": 0},
+            )
+            if use_usdc:
+                net_value = float(entry["net_usdc"])
+            else:
+                net_value = float(entry["net_mojos"])
+            trade_count = int(entry["trades"])
+
+            daily_values.append(net_value)
+            total_trades += trade_count
+            if trade_count > 0 or net_value != 0.0:
+                active_days += 1
+            if net_value > 0.0:
+                profitable_days += 1
+
+            cursor += timedelta(days=1)
+
+        sample_days = len(daily_values)
+        if sample_days == 0:
+            return {}
+
+        mean_daily = sum(daily_values) / float(sample_days)
+        if sample_days > 1:
+            variance = sum(
+                (value - mean_daily) ** 2 for value in daily_values
+            ) / float(sample_days - 1)
+            stdev_daily = math.sqrt(max(variance, 0.0))
+        else:
+            stdev_daily = 0.0
+
+        def horizon_stats(days: int) -> dict[str, float]:
+            expected = mean_daily * float(days)
+            sigma = stdev_daily * math.sqrt(float(days))
+            lower = expected - 1.96 * sigma
+            upper = expected + 1.96 * sigma
+
+            if sigma > 0.0:
+                z_score = expected / sigma
+                prob_positive = 0.5 * (1.0 + math.erf(z_score / math.sqrt(2.0)))
+            elif expected > 0.0:
+                prob_positive = 1.0
+            elif expected < 0.0:
+                prob_positive = 0.0
+            else:
+                prob_positive = 0.5
+
+            horizon = {"prob_positive_pct": prob_positive * 100.0}
+            if use_usdc:
+                horizon.update({
+                    "expected_usdc": expected,
+                    "low_95_usdc": lower,
+                    "high_95_usdc": upper,
+                })
+            else:
+                horizon.update({
+                    "expected": expected,
+                    "low_95": lower,
+                    "high_95": upper,
+                })
+            return horizon
+
+        if sample_days >= 60 and active_days >= 20:
+            confidence = "medium"
+        elif sample_days >= 30 and active_days >= 10:
+            confidence = "low"
+        else:
+            confidence = "very low"
+
+        result = {
+            "method": "calendar_day_net_realized_pnl_minus_fees",
+            "unit": "USDC" if use_usdc else "XCH-mojos",
+            "lookback_days": sample_days,
+            "active_days": active_days,
+            "total_trades": total_trades,
+            "profit_day_rate_pct": (
+                profitable_days / float(sample_days) * 100.0
+            ),
+            "confidence": confidence,
+            "next_1d": horizon_stats(1),
+            "next_7d": horizon_stats(7),
+            "next_30d": horizon_stats(30),
+        }
+        if use_usdc:
+            result["mean_daily_net_usdc"] = mean_daily
+            result["daily_net_volatility_usdc"] = stdev_daily
+        else:
+            result["mean_daily_net_pnl"] = mean_daily
+            result["daily_net_volatility"] = stdev_daily
+        return result
+
+    def _get_latest_snapshot_xch_usd_rate(self) -> float:
+        """Return the latest non-zero XCH/USD mark persisted in snapshots."""
+        if not self._snapshot_has_xch_usd_rate():
+            return 0.0
+        rows = self._execute_query(
+            """
+            SELECT xch_usd_rate
+            FROM snapshots
+            WHERE xch_usd_rate > 0
+            ORDER BY block_height DESC
+            LIMIT 1
+            """,
+            [],
+        )
+        if rows and rows[0]:
+            return float(rows[0]["xch_usd_rate"] or 0.0)
+        return 0.0
+
+    def _snapshot_has_xch_usd_rate(self) -> bool:
+        """Return ``True`` when the snapshots table has the FX-rate column."""
+        rows = self._execute_query("PRAGMA table_info(snapshots)", [])
+        if not rows:
+            return False
+        return any(str(row["name"]) == "xch_usd_rate" for row in rows)
 
     # -- Internal helpers ---------------------------------------------------
 

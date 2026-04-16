@@ -111,6 +111,8 @@ struct DbSnapshot {
     double      sigma_block{0.0};   ///< Per-block volatility estimate.
     std::string regime;             ///< Market regime label ("MeanReverting", "Random", "Momentum").
     Mojo        pnl_total_mojos{0}; ///< Cumulative total PnL in mojos.
+    double      xch_usd_rate{0.0};  ///< Live XCH/USD mark used for conversion.
+    double      pnl_total_usd{0.0}; ///< Cumulative total PnL converted to USD.
 
     // -- Strategy decision parameters (Phase 2 analytics) --------------------
     Mojo        reservation_price_mojos{0}; ///< A-S reservation price in mojos.

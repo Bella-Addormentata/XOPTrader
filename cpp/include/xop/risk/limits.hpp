@@ -130,12 +130,11 @@ public:
     /// hard limit is breached on BOTH sides (which means no safe quote exists).
     ///
     /// Modifications when limits are breached:
-    ///   - Soft limit (60%): zero the size on the overweight side to begin
-    ///     aggressive skewing (strategy should already be skewing; this is
-    ///     the backstop).
-    ///   - Hard limit (80%): zero the size on the overweight side.
-    ///   - Single CAT cap: if the base asset is a CAT above 12% of
-    ///     portfolio, zero the bid size (stop accumulating).
+    ///   - Soft limit (60%): progressively reduce the overweight side.
+    ///   - Hard limit (80%): reduce the overweight side to a tiny continuity
+    ///     quote, tapering to zero only as concentration approaches 100%.
+    ///   - Single CAT cap: if a CAT exceeds the configured portfolio cap,
+    ///     reduce the accumulation side to a tiny continuity quote.
     ///   - Max capital per pair: zero both sizes if pair capital exceeds
     ///     the configured cap.
     ///

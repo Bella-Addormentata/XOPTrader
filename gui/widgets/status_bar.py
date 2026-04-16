@@ -181,7 +181,7 @@ class StatusBar(QStatusBar):
         pnl_text = f"PnL: {sign}{xch_value:.4f} XCH"
         if xch_usd_rate > 0:
             usd_value = xch_value * xch_usd_rate
-            pnl_text += f" (${usd_value:+,.2f})"
+            pnl_text = f"PnL: ${usd_value:+,.2f} ({sign}{xch_value:.4f} XCH)"
         self._pnl_label.setText(pnl_text)
         self._pnl_label.setStyleSheet(f"color: {colour}; font-weight: bold; font-size: 13px;")
 

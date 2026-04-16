@@ -33,4 +33,25 @@ TEST(CoinManagerTest, CountPoolReadyCoinsIgnoresTinyAndOversizedCoins) {
     EXPECT_EQ(CoinManager::count_pool_ready_coins(coins, target), 4U);
 }
 
+TEST(CoinManagerTest, SplitImprovesPoolReadyCountRejectsNoOpExactTargetSplit) {
+    const Mojo target = 2'000'000'000'000LL;
+
+    EXPECT_FALSE(CoinManager::split_improves_pool_ready_count(
+        target, 1, target, 0));
+}
+
+TEST(CoinManagerTest, SplitImprovesPoolReadyCountAcceptsPoolReadyChange) {
+    const Mojo target = 500'000'000'000LL;
+
+    EXPECT_TRUE(CoinManager::split_improves_pool_ready_count(
+        750'000'000'000LL, 1, target, 0));
+}
+
+TEST(CoinManagerTest, SplitImprovesPoolReadyCountRejectsDustChange) {
+    const Mojo target = 500'000'000'000LL;
+
+    EXPECT_FALSE(CoinManager::split_improves_pool_ready_count(
+        600'000'000'000LL, 1, target, 0));
+}
+
 }  // namespace

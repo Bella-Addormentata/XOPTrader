@@ -200,6 +200,25 @@ public:
         Mojo                         target_amount_mojos);
 
     /**
+     * @brief Return true when a split would increase the number of pool-ready coins.
+     *
+     * This guards against no-op splits such as taking a coin that is already
+     * at the target denomination and "splitting" it into one identical output,
+     * which only creates pending_change without improving trading inventory.
+     *
+     * @param source_amount_mojos   Value of the source coin being split.
+     * @param batch                 Number of target-sized outputs to create.
+     * @param target_amount_mojos   Desired pool denomination in mojos.
+     * @param fee                   Split transaction fee in mojos.
+     * @return true if the resulting outputs contain more pool-ready coins than
+     *         the original source coin.
+     */
+    static bool split_improves_pool_ready_count(Mojo source_amount_mojos,
+                                                int  batch,
+                                                Mojo target_amount_mojos,
+                                                Mojo fee);
+
+    /**
      * @brief Count pool-ready spendable coins for a wallet.
      *
      * Convenience wrapper around get_spendable_coins() combined with the
