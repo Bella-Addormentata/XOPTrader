@@ -1,12 +1,20 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last Updated:** 2026-04-10 (T9-01 through T9-08: v0.7.35 half-spread/Gate2/dust fixes + v0.7.36 risk system mark-to-XCH/position seeding/GLFT skew tuning)
+**Last Updated:** 2026-04-21 (v0.7.46: PnL helper centralization, sentinel cost-basis fix, BYC competitiveness threshold, deviation-gap widening, schema docs, stuck metrics)
 **Source:** Consolidated from all code reviews, logic reviews, and counter-research review in `docs/CODE REVIEWS/`
 
 This document tracks all findings from the review cycle that have **not yet been implemented**. Items already fixed by the Claude Code 3-pass review (commits `d18d396`, `b76ec65`, `18e67f8`) are excluded.
 
 **Status Key:** `[ ]` = Not started | `[~]` = In progress | `[x]` = Complete
+
+---
+
+## Deferred from v0.7.46 sweep — schedule for v0.7.47
+
+- [ ] **#6 Stronger inventory rebalance pull**: Tighten the inventory_ratio → quote-skew gain so that the engine actively rebalances aged underweight legs (e.g. low BYC after a sell streak) instead of letting them drift indefinitely. Needs a small simulation harness on captured snapshots before tuning to avoid over-correction.
+- [ ] **#9 Persist cost basis across restarts**: New `inventory_state` SQLite table written on shutdown / periodic snapshot and reloaded by `InventoryTracker::seed_position` at startup with `estimated_price = persisted_basis` (sentinel flag = false). Removes the dependence on the Mojo{1} sentinel for any pair that has at least one persisted snapshot. Schema is purely additive (CREATE TABLE IF NOT EXISTS) so it is safe alongside existing DBs.
+- [ ] **#11 Split `fee_mojos` into `fee_create` / `fee_cancel`**: Additive columns on `trade_log` and `offer_log` (default 0). Lets the GUI distinguish between fees actually paid for posting an offer vs. fees burned cancelling it; today they are combined and bias adverse-selection cost analysis.
 
 ---
 

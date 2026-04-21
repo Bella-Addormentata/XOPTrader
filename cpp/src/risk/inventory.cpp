@@ -111,6 +111,7 @@ AssetRecord::AssetRecord()
     , weighted_avg_cost_basis{0}
     , last_fill_block{0}
     , last_fill_time{}
+    , basis_is_seed_sentinel{false}
 {}
 
 AssetRecord::AssetRecord(const AssetId& id)
@@ -120,6 +121,7 @@ AssetRecord::AssetRecord(const AssetId& id)
     , weighted_avg_cost_basis{0}
     , last_fill_block{0}
     , last_fill_time{}
+    , basis_is_seed_sentinel{false}
 {}
 
 // ===========================================================================
@@ -170,26 +172,41 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
     auto [it, inserted] = records_.try_emplace(asset_id, asset_id);
     AssetRecord& rec = it->second;
 
-    // Weighted-average cost basis update:
-    //   new_total_cost = old_total_cost + fill_price * qty
-    //   new_total_qty  = old_qty + qty
-    //   new_basis      = new_total_cost / new_total_qty
-    //
-    // Use wide arithmetic to prevent overflow in the multiplication.
-    const Wide cost_increment = static_cast<Wide>(fill_price)
-                              * static_cast<Wide>(qty);
-    const Wide new_total_cost = static_cast<Wide>(rec.total_cost)
-                              + cost_increment;
     const Mojo new_total_qty  = rec.total_quantity + qty;
-
-    // Guard against quantity overflow (should never happen at realistic scale).
     if (new_total_qty < rec.total_quantity) {
         // Overflow detected -- reject silently rather than corrupt state.
         return;
     }
 
-    rec.total_cost     = static_cast<Mojo>(new_total_cost);
-    rec.total_quantity  = new_total_qty;
+    if (rec.basis_is_seed_sentinel) {
+        // [v0.7.46 #1] First real fill after a synthetic seed.
+        // Replace the sentinel basis (Mojo{1}) with the observed fill
+        // price instead of weighted-averaging.  The seeded quantity was
+        // acquired off-chain at an unknown price; the most defensible
+        // estimate is the first observed fill price for this asset.
+        // Without this replacement, weighted-averaging a large seeded
+        // quantity at basis=1 with a small real fill at basis=P keeps
+        // basis ~= 1, causing realized PnL to wildly overstate gains
+        // on subsequent sells (XOPTRADER-PNL-COST-BASIS-SENTINEL).
+        const Wide new_total_cost = static_cast<Wide>(fill_price)
+                                  * static_cast<Wide>(new_total_qty);
+        rec.total_cost              = static_cast<Mojo>(new_total_cost);
+        rec.total_quantity          = new_total_qty;
+        rec.basis_is_seed_sentinel  = false;
+    } else {
+        // Weighted-average cost basis update:
+        //   new_total_cost = old_total_cost + fill_price * qty
+        //   new_total_qty  = old_qty + qty
+        //   new_basis      = new_total_cost / new_total_qty
+        //
+        // Use wide arithmetic to prevent overflow in the multiplication.
+        const Wide cost_increment = static_cast<Wide>(fill_price)
+                                  * static_cast<Wide>(qty);
+        const Wide new_total_cost = static_cast<Wide>(rec.total_cost)
+                                  + cost_increment;
+        rec.total_cost     = static_cast<Mojo>(new_total_cost);
+        rec.total_quantity = new_total_qty;
+    }
 
     // Recompute weighted average cost basis.
     recompute_basis(rec);
@@ -645,6 +662,12 @@ void InventoryTracker::seed_position(const AssetId& asset_id,
     const Wide cost = static_cast<Wide>(qty) * static_cast<Wide>(estimated_price);
     rec.total_quantity = qty;
     rec.total_cost     = static_cast<Mojo>(cost);
+    // [v0.7.46 #1] Mark the basis as a synthetic seed so that the first
+    // real record_buy() replaces (not blends) it with the observed fill
+    // price.  Only treat estimated_price <= 1 as a sentinel; callers that
+    // pass a real estimate (e.g. cost-basis restore from DB) still get
+    // standard weighted-average behaviour.
+    rec.basis_is_seed_sentinel = (estimated_price <= 1);
     recompute_basis(rec);
 }
 

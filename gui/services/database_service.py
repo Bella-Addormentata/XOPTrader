@@ -369,6 +369,37 @@ class _DatabaseWorker(QObject):
             """
         usd_rate_expr = "COALESCE(dr.xch_usd_rate, fr.xch_usd_rate, 0.0)"
 
+        # [PNL-UNIT-FIX] Per-pair USDC conversion for realized_pnl_mojos.
+        #
+        # The engine stores realized_pnl_mojos in QUOTE-asset mojos (the
+        # currency the seller receives), not in XCH mojos.  The previous
+        # SQL treated the value as XCH mojos and multiplied by xch_usd_rate,
+        # which produced numbers ~1e9x too large for CAT-quoted pairs
+        # ("billions of dollars" in the GUI).
+        #
+        # We convert per-pair using the quote-asset's mojos-per-unit and
+        # USD-per-unit:
+        #   wUSDC.b / wUSDC : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
+        #   BYC             : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
+        #                     (BYC is a Chia-native USD stablecoin; treated
+        #                      as 1:1 for accounting until a feed is added)
+        #   DBX             : not USD-pegged and no on-DB rate -> 0.0 (will
+        #                     be reported as "USD value unknown")
+        #   anything else   : 0.0 (future pairs require an explicit mapping)
+        #
+        # Fees are paid on-chain in XCH mojos, so the fee_usdc_expr below
+        # keeps the legacy XCH/USD conversion.
+        pnl_usdc_expr = (
+            "CASE "
+            "WHEN t.pair_name LIKE '%/wUSDC%' THEN t.realized_pnl_mojos / 1000.0 "
+            "WHEN t.pair_name LIKE '%/BYC%'   THEN t.realized_pnl_mojos / 1000.0 "
+            "WHEN t.pair_name LIKE '%/USDS%'  THEN t.realized_pnl_mojos / 1000.0 "
+            "ELSE 0.0 END"
+        )
+        fee_usdc_expr = (
+            f"({fee_usdc_expr})"
+        )
+
         # -- Period-based P&L -------------------------------------------------
         period_sql = usd_rate_cte + f"""
             SELECT
@@ -381,15 +412,15 @@ class _DatabaseWorker(QObject):
                 COALESCE(AVG(realized_pnl_mojos), 0)                       AS avg_pnl,
                 COALESCE(MAX(realized_pnl_mojos), 0)                       AS best_trade,
                 COALESCE(MIN(realized_pnl_mojos), 0)                       AS worst_trade,
-                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({pnl_usdc_expr}), 0.0)
                     AS total_pnl_usdc,
-                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({fee_usdc_expr}), 0.0)
                     AS total_fees_usdc,
-                COALESCE(AVG((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(AVG({pnl_usdc_expr}), 0.0)
                     AS avg_pnl_usdc,
-                COALESCE(MAX((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(MAX({pnl_usdc_expr}), 0.0)
                     AS best_trade_usdc,
-                COALESCE(MIN((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(MIN({pnl_usdc_expr}), 0.0)
                     AS worst_trade_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
@@ -446,9 +477,9 @@ class _DatabaseWorker(QObject):
                 COALESCE(SUM(size_mojos), 0)                               AS total_volume,
                 COALESCE(SUM(fee_mojos), 0)                                AS total_fees,
                 COALESCE(AVG(cost_basis_mojos), 0)                         AS avg_cost_basis,
-                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({pnl_usdc_expr}), 0.0)
                     AS total_pnl_usdc,
-                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({fee_usdc_expr}), 0.0)
                     AS total_fees_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
@@ -483,14 +514,14 @@ class _DatabaseWorker(QObject):
                 COALESCE(SUM(realized_pnl_mojos), 0) AS total_pnl,
                 COALESCE(SUM(fee_mojos), 0)          AS total_fees,
                 COALESCE(SUM(CASE WHEN t.timestamp >= ?
-                                  THEN (t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}
+                                  THEN {pnl_usdc_expr}
                                   ELSE 0 END), 0.0) AS short_term_pnl_usdc,
                 COALESCE(SUM(CASE WHEN t.timestamp <  ?
-                                  THEN (t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}
+                                  THEN {pnl_usdc_expr}
                                   ELSE 0 END), 0.0) AS long_term_pnl_usdc,
-                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({pnl_usdc_expr}), 0.0)
                     AS total_pnl_usdc,
-                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({fee_usdc_expr}), 0.0)
                     AS total_fees_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
@@ -543,7 +574,7 @@ class _DatabaseWorker(QObject):
         best_sql = usd_rate_cte + f"""
             SELECT t.timestamp, t.pair_name, t.side, t.price_mojos, t.size_mojos,
                    t.realized_pnl_mojos, t.cost_basis_mojos,
-                   ((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}) AS realized_pnl_usdc
+                   ({pnl_usdc_expr}) AS realized_pnl_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
             CROSS JOIN fallback_rate fr
@@ -561,7 +592,7 @@ class _DatabaseWorker(QObject):
         worst_sql = usd_rate_cte + f"""
             SELECT t.timestamp, t.pair_name, t.side, t.price_mojos, t.size_mojos,
                    t.realized_pnl_mojos, t.cost_basis_mojos,
-                   ((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}) AS realized_pnl_usdc
+                   ({pnl_usdc_expr}) AS realized_pnl_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)
             CROSS JOIN fallback_rate fr
@@ -584,11 +615,11 @@ class _DatabaseWorker(QObject):
                 COALESCE(SUM(t.realized_pnl_mojos), 0) AS daily_pnl,
                 COALESCE(SUM(t.fee_mojos), 0)          AS daily_fees,
                 AVG({usd_rate_expr})                  AS xch_usd_rate,
-                COALESCE(SUM((t.realized_pnl_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({pnl_usdc_expr}), 0.0)
                     AS daily_pnl_usdc,
-                COALESCE(SUM((t.fee_mojos / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM({fee_usdc_expr}), 0.0)
                     AS daily_fees_usdc,
-                COALESCE(SUM(((t.realized_pnl_mojos - t.fee_mojos) / 1000000000000.0) * {usd_rate_expr}), 0.0)
+                COALESCE(SUM(({pnl_usdc_expr}) - ({fee_usdc_expr})), 0.0)
                     AS daily_net_usdc
             FROM trade_log t
             LEFT JOIN daily_rates dr ON dr.rate_date = DATE(t.timestamp)

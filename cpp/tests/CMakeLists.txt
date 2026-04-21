@@ -62,6 +62,7 @@ add_executable(xop_tests
     test_liquidity.cpp
     test_market_allocator.cpp
     test_fee_tracker.cpp
+    test_pnl_units.cpp
 )
 
 target_link_libraries(xop_tests

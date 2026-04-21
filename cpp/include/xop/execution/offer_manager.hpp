@@ -718,7 +718,10 @@ private:
     /// is considered.  Very young offers are protected from cancel churn
     /// because the round-trip fee (cancel + recreate) exceeds the adverse
     /// selection risk for small deviations.  Crossed-mid is still urgent.
-    static constexpr BlockHeight kMinRefreshAgeBlocks = 3;
+    /// [v0.7.46 #7] Raised 3 -> 6 (~5 min @ 52s blocks) to further damp
+    /// price-adverse cancel churn observed in 0.7.45 (41/44 cancels were
+    /// price_adverse on a quiet block series).
+    static constexpr BlockHeight kMinRefreshAgeBlocks = 6;
 
     /// Gentler adverse-deviation threshold applied between soft and hard
     /// TTL.  Only refresh if the offer has adversely drifted by more than

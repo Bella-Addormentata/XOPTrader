@@ -659,7 +659,8 @@ void PnLTracker::mark_to_market(
     const std::function<Mojo(const std::string&, const std::string&)>& get_price,
     const std::function<Mojo(const std::string&)>& get_balance,
     const std::function<Mojo(const std::string&)>& get_cost_basis,
-    double xch_usd_price)
+    double xch_usd_price,
+    const std::function<double(const std::string&)>& get_pair_unit_factor)
 {
     std::lock_guard<std::mutex> lock(mtx_);
 
@@ -702,12 +703,26 @@ void PnLTracker::mark_to_market(
         const Mojo basis         = get_cost_basis(base_asset);
 
         if (basis > 0 && balance > 0) {
-            // [T9-FIX] Use double intermediates to avoid mojos-squared overflow.
-            // inventory_pnl = (smoothed_price - basis) * balance / kMojosPerXch
-            // Result is in quote-mojos (same unit as spread_pnl).
+            // [PNL-UNIT-FIX] Inventory PnL in quote-asset mojos.
+            // Uses the canonical xop::quote_mojos_for helper from types.hpp
+            // so this stays in lock-step with offer_manager.cpp and engine.cpp.
+            // The unit_factor below is (quote_denom / base_denom) supplied
+            // by the caller via get_pair_unit_factor; when absent we fall
+            // back to 1.0 for legacy callers / tests.
+            double unit_factor = 1.0;
+            if (get_pair_unit_factor) {
+                const double f = get_pair_unit_factor(pair_name);
+                if (f > 0.0) {
+                    unit_factor = f;
+                }
+            }
+            // Equivalent to quote_mojos_for(balance, smoothed_price - basis,
+            //                               base_denom, quote_denom)
+            // with quote_denom/base_denom collapsed into unit_factor.
             ppnl.inventory_pnl = static_cast<Mojo>(std::llround(
                 static_cast<double>(smoothed_price - basis)
                 * static_cast<double>(balance)
+                * unit_factor
                 / static_cast<double>(kMojosPerXch)));
         } else {
             ppnl.inventory_pnl = 0;

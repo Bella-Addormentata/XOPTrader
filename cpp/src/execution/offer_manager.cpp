@@ -2305,13 +2305,7 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
     //            floating-point price by kMojosPerXch for fixed-point
     //            storage in the Quote struct).
     //
-    // To compute the quote-asset mojo amount:
-    //   base_units  = tier.size  / base_mojos_per_unit
-    //   price_real  = tier.price / kMojosPerXch
-    //   quote_units = base_units * price_real
-    //   quote_mojos = quote_units * quote_mojos_per_unit
-    //
-    // Combined:
+    // Canonical formula in xop::quote_mojos_for (types.hpp):
     //   quote_mojos = tier.size * tier.price * quote_denom
     //               / (base_denom * kMojosPerXch)
     //
@@ -2319,8 +2313,8 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
     // reach ~10^25 for typical XCH/CAT pairs).
     const double size_d  = static_cast<double>(tier.size);
     const double price_d = static_cast<double>(tier.price);
-    const double denom   = static_cast<double>(base_denom)
-                         * static_cast<double>(kMojosPerXch);
+    const double base_d  = static_cast<double>(base_denom);
+    const double quote_d = static_cast<double>(quote_denom);
 
     json offer_dict = json::object();
 
@@ -2330,8 +2324,7 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
         // Round up (ceil) so that we offer at least enough quote to cover
         // the requested base amount at the stated price.
         const Mojo quote_amount = static_cast<Mojo>(
-            std::ceil(size_d * price_d
-                      * static_cast<double>(quote_denom) / denom));
+            std::ceil(quote_mojos_for(size_d, price_d, base_d, quote_d)));
 
         // Wallet RPC convention: negative = we spend, positive = we receive.
         offer_dict[std::to_string(quote_wid)] = -quote_amount;
@@ -2343,8 +2336,7 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
         // Round down (floor) so that we request conservatively, ensuring
         // the offer is attractive to takers.
         const Mojo quote_amount = static_cast<Mojo>(
-            std::floor(size_d * price_d
-                       * static_cast<double>(quote_denom) / denom));
+            std::floor(quote_mojos_for(size_d, price_d, base_d, quote_d)));
 
         offer_dict[std::to_string(base_wid)]  = -tier.size;
         offer_dict[std::to_string(quote_wid)] =  quote_amount;

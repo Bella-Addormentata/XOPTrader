@@ -5,6 +5,42 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.46] — 2026-04-21
+
+### Added
+
+- **Canonical `xop::quote_mojos_for()` helper** (`cpp/include/xop/types.hpp`): Single source of truth for the `quote_mojos = size * price * quote_denom / (base_denom * kMojosPerXch)` formula that was triplicated in `offer_manager.cpp::build_offer_dict`, `engine.cpp` realised-PnL, and `pnl.cpp::mark_to_market`. All three call sites now go through the helper, defending against the v0.7.45 1e9-inflation bug recurring after a refactor.
+- **PnL-unit regression tests** (`cpp/tests/test_pnl_units.cpp`): Locks in the `quote_mojos_for` contract with XCH/wUSDC.b, CAT/CAT (BYC/wUSDC.b), and symmetric-denom round-trips plus defensive non-positive-denominator coverage.
+- **Database schema documentation** (`db/schema.md`): Authoritative human-readable reference for `trade_log`, `offer_log`, `offer_closure_events`, `snapshots`, `strategy_quotes`, and `sanity_failures`. Documents the engine pseudo-unit price encoding and the per-pair quote-mojo PnL convention so future contributors do not re-introduce the v0.7.45 bug.
+- **Stuck-offer Prometheus visibility** (`cpp/src/monitoring/metrics.cpp`): Added `xop_stuck_offers_peak` (max concurrent observed within the process lifetime) and `xop_stuck_offers_total` (lifetime counter, suitable for `rate()[1h]`). The pre-existing `xop_stuck_offers` instantaneous gauge is unchanged.
+
+### Fixed
+
+- **Cost-basis seed sentinel collapses correctly on first real fill** (`cpp/src/risk/inventory.cpp`, `cpp/include/xop/risk/inventory.hpp`): `seed_position()` now marks the bootstrapped record with a `basis_is_seed_sentinel` flag when the synthetic `Mojo{1}` placeholder is used. The next `record_buy()` after a sentinel **replaces** the basis with the observed fill price instead of weighted-averaging it. Without this, a large seeded inventory diluted incoming real fills back to a near-zero basis, which then drove the realized-PnL guard (`tr.cost_basis_mojos <= 1`) to suppress every subsequent ASK PnL forever.
+- **BYC quoting unblocked** (`cpp/src/engine.cpp`): The fixed competitiveness threshold of `3/10` was rejecting 100% of BYC/wUSDC.b tiers (148 of 151 sanity rejections in the 0.7.45 audit) because stable-stable pairs trade in a sub-1% range and never score 3+. Lowered to `1/10` for pairs flagged `is_stablecoin: true`. Non-stablecoin pairs keep the original threshold.
+
+### Changed
+
+- **`kMinRefreshAgeBlocks` raised 3 → 6** (`cpp/include/xop/execution/offer_manager.hpp`): A quiet block series in 0.7.45 produced 41 of 44 cancels with reason `price_adverse`, indicating the cancel-recreate cycle was firing faster than the round-trip fee could amortize. Doubling the minimum protection window damps the churn while still allowing crossed-mid offers to be cancelled urgently.
+
+### Repository hygiene
+
+- Moved `_patch_*.py` one-shot migration scripts from the repo root into `scripts/migrations/` to declutter root and signal that they are legacy.
+
+## [0.7.45] — 2026-04-20
+
+### Fixed
+
+- **PnL unit dimensional bug** (engine.cpp, monitoring/pnl.cpp, monitoring/pnl.hpp): Realized fill PnL and `mark_to_market` inventory PnL formulas were missing the `quote_denom / base_denom` factor that `offer_manager.cpp::build_offer_dict` uses everywhere else. For XCH/wUSDC.b that omitted factor is `1e3 / 1e12 = 1e-9`, which caused realized PnL values to be inflated by roughly 1e9. The engine path now matches the canonical formula `pnl_quote_mojos = (price - cost_basis) * size * quote_denom / (base_denom * kMojosPerXch)`. `mark_to_market` gained an optional `get_pair_unit_factor` callback so per-pair denominator ratios can be supplied without changing existing callers.
+
+- **GUI now reports realized PnL in USDC dollars per pair** (gui/services/database_service.py): `fetch_reports` previously divided `realized_pnl_mojos` by `1e12` and multiplied by the XCH/USD rate, which compounded the engine bug and produced display values in the billions. Replaced the SQL aggregations with per-pair USD conversions: stablecoin quotes (wUSDC, wUSDC.b, BYC, USDS) divide by `1e3`; non-stable quotes contribute `0` until a USD rate is wired in. Fee aggregation continues to use the XCH-mojo path.
+
+- **Historical trade_log backfill** (scripts/backfill_pnl_units.py): Recomputes `trade_log.realized_pnl_mojos` for legacy rows using the corrected denom math, preserving the cost-basis sentinel rule. Writes a timestamped backup of `data/xop_trader.db` before mutating any rows.
+
+### Added
+
+- **Actual P&L reconstruction script** (scripts/compute_actual_pnl.py): Stand-alone read-only tool that bypasses the unusable `realized_pnl_mojos` column (every historical fill had a sentineled cost basis) and reports cash-flow PnL plus an XCH inventory mark in USDC, auto-detecting the legacy-vs-current `price_mojos` encoding.
+
 ## [0.7.44] — 2026-04-15
 
 ### Fixed
@@ -413,6 +449,12 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   - `startup_reconcile`: when an orphan offer cannot be cancelled (e.g., 0 spendable XCH), it is now adopted into State rather than left in limbo. Previously, uncancellable orphans locked coins indefinitely with no engine awareness
   - `reconcile_offers`: periodic reconciliation now detects PENDING_ACCEPT wallet offers that are not tracked in engine State and adopts them. This catches mid-session orphans created when `verify_pending_offer_coins` incorrectly removes an offer during wallet desync
 - Adds `try_parse_wallet_offer()` helper that extracts pair/side/price/size from a wallet trade record for offer adoption
+
+## [0.7.1] — 2026-04-06
+
+### Fixed
+
+- **GUI shows wallet/node connected during analysis**: The engine now publishes system health metrics (block height, node synced, wallet connected) during the startup analysis phase, not only after analysis completes. Previously the GUI showed "not connected" for the entire 5+ minute analysis window even though the wallet and full node were reachable
 
 ## [0.7.1] — 2026-04-06
 

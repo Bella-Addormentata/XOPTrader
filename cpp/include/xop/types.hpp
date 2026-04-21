@@ -29,6 +29,40 @@ using Mojo = std::int64_t;
 /// Conversion constant: mojos per whole XCH.
 inline constexpr Mojo kMojosPerXch = 1'000'000'000'000LL;
 
+// ---------------------------------------------------------------------------
+// quote_mojos_for -- canonical conversion from (size_base_mojos, price_pseudo)
+//                    to quote-asset mojos.
+//
+// Engine pseudo-unit convention (must stay in sync with
+// offer_manager.cpp::build_offer_dict and engine.cpp realised-PnL):
+//
+//   price_pseudo = (quote_units_per_base_unit) * kMojosPerXch
+//   size_base    = base_units * base_mojos_per_unit
+//
+// Therefore the corresponding quote-asset mojo amount is:
+//
+//   quote_mojos = size_base * price_pseudo * quote_denom
+//               / (base_denom * kMojosPerXch)
+//
+// This single helper is the ONLY place this formula should be written so
+// that the v0.7.45 1e9-inflation bug (missing quote_denom / base_denom
+// factor) cannot recur.  Test coverage lives in tests/test_pnl_units.cpp.
+//
+// Returns 0 when any denominator is non-positive (defensive).
+// Computation is in double to avoid int64 overflow at realistic scales
+// (numerator can reach ~1e25 for XCH/CAT pairs).
+// ---------------------------------------------------------------------------
+inline double quote_mojos_for(double size_base_mojos,
+                              double price_pseudo,
+                              double base_denom,
+                              double quote_denom) noexcept
+{
+    if (base_denom <= 0.0 || quote_denom <= 0.0) return 0.0;
+    const double denom = base_denom * static_cast<double>(kMojosPerXch);
+    if (denom <= 0.0) return 0.0;
+    return size_base_mojos * price_pseudo * quote_denom / denom;
+}
+
 /// Asset identifier.
 /// "xch" for the native coin; 64-character lower-case hex string for CATs
 /// (e.g. wUSDC, SBX, DBX).

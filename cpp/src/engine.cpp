@@ -2129,19 +2129,62 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 ? AssetId{fill_pair_cfg->base_asset_id}
                 : AssetId{fill_pair_cfg->quote_asset_id});
         tr.cost_basis_mojos   = asset_rec.weighted_avg_cost_basis;
-        // [C2] PnL unit normalization -- prevent mojos-squared overflow.
-        // Price is in "mojos per XCH" (i.e. mojos_quote per kMojosPerXch
-        // mojos_base).  To obtain PnL in quote mojos:
-        //   pnl = (sell_price - cost_basis) * size / kMojosPerXch
-        // We use double intermediates to avoid int64 overflow on the
-        // multiply (two 1e12-scale values can exceed 2^63).
-        // ISO/IEC 5055: explicit unit normalization for financial calc.
-        tr.realized_pnl_mojos = (fill.side == Side::Ask)
-            ? static_cast<Mojo>(std::llround(
-                  static_cast<double>(fill.price - asset_rec.weighted_avg_cost_basis)
-                  * static_cast<double>(fill.size)
-                  / static_cast<double>(kMojosPerXch)))
-            : 0;
+        // [C2/PNL-UNIT-FIX] PnL unit normalization in QUOTE-asset mojos.
+        //
+        // Engine pseudo-units convention (see offer_manager.cpp build_offer_dict):
+        //   fill.price = quote_units_per_base_unit * kMojosPerXch
+        //   fill.size  = base_mojos = base_units * base_mojos_per_unit
+        //
+        // Realized PnL on a sell, in quote-asset mojos, is:
+        //   pnl_quote_mojos = (sell_price_real - cost_basis_real)
+        //                   * size_base_units * quote_mojos_per_unit
+        //                   = (fill.price - cost_basis) * fill.size
+        //                     * quote_denom
+        //                     / (base_denom * kMojosPerXch)
+        //
+        // The previous formula omitted the (quote_denom / base_denom)
+        // factor, which inflated XCH/wUSDC.b PnL by 1e9 ("billions of
+        // dollars" in the GUI). Doubles avoid int64 overflow.
+        //
+        // Guard: a cost basis of 0/1 is the startup-seed sentinel in some
+        // inventory bootstraps, not a real acquisition price. Counting sells
+        // against that sentinel massively inflates realized PnL. In this case
+        // treat realized PnL as unknown and record 0 for this fill.
+        const bool basis_unknown = (tr.cost_basis_mojos <= 1);
+        if (fill.side == Side::Ask && basis_unknown) {
+            tr.realized_pnl_mojos = 0;
+            spdlog::warn(
+                "[Engine] Fill {} {} uses unknown cost basis {} -- "
+                "realized_pnl forced to 0",
+                fill.offer_id, fill.pair_name, tr.cost_basis_mojos);
+        } else if (fill.side == Side::Ask) {
+            const double quote_denom = static_cast<double>(
+                fill_pair_cfg->quote_mojos_per_unit);
+            const double base_denom  = static_cast<double>(
+                fill_pair_cfg->base_mojos_per_unit);
+            // Use the canonical helper to keep this site in lock-step
+            // with offer_manager and pnl. See xop::quote_mojos_for in
+            // types.hpp and tests/test_pnl_units.cpp.
+            const double pnl_quote_mojos = quote_mojos_for(
+                static_cast<double>(fill.size),
+                static_cast<double>(fill.price - tr.cost_basis_mojos),
+                base_denom,
+                quote_denom);
+            if (base_denom > 0.0 && quote_denom > 0.0) {
+                tr.realized_pnl_mojos = static_cast<Mojo>(
+                    std::llround(pnl_quote_mojos));
+            } else {
+                tr.realized_pnl_mojos = 0;
+                spdlog::error(
+                    "[Engine] Fill {} {} invalid denom (base={}, quote={})"
+                    " -- realized_pnl forced to 0",
+                    fill.offer_id, fill.pair_name,
+                    fill_pair_cfg->base_mojos_per_unit,
+                    fill_pair_cfg->quote_mojos_per_unit);
+            }
+        } else {
+            tr.realized_pnl_mojos = 0;
+        }
 
         // [T5-CR1] VPIN validation: check if this fill is adverse.
         // An adverse fill is one where the maker sold below cost basis
@@ -5419,7 +5462,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
         // -- Competitiveness guard -----------------------------------------
         {
-            constexpr int kMinCompetitivenessScore = 3;
+            // [v0.7.46 #5] Stablecoin pairs (BYC/wUSDC.b etc.) trade
+            // inside a sub-1% range and rarely score 3+ on the 0-10
+            // competitiveness scale, which historically caused 100% of
+            // BYC tiers to be suppressed (151 sanity rejections in
+            // 0.7.45 audit).  Use a lower threshold for stablecoin pairs.
+            const PairConfig* pair_cfg_comp = find_pair_config(pair_name);
+            const int kMinCompetitivenessScore =
+                (pair_cfg_comp && pair_cfg_comp->is_stablecoin) ? 1 : 3;
             const auto book_snap = state_->get_market(pair_name);
             const auto competing_offers = market_data_->get_competing_offers(pair_name);
             std::vector<TierQuote> competitive_tiers;
@@ -6980,7 +7030,17 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // [H9] XCH/USD rate -- use named constant instead of magic number.
         // TODO: fetch from CEX feed (Phase 2).
         // ISO/IEC 5055: no magic numbers in financial calculations.
-        kFallbackXchUsdRate);
+        kFallbackXchUsdRate,
+        // [PNL-UNIT-FIX] Per-pair unit factor (quote_denom/base_denom).
+        // Without this the inventory PnL is overstated by 1e9 for
+        // CAT-quoted pairs like XCH/wUSDC.b (kMojosPerXch / 1e3).
+        [this](const std::string& pair) -> double {
+            const PairConfig* pc = find_pair_config(pair);
+            if (!pc) return 1.0;
+            const double q = static_cast<double>(pc->quote_mojos_per_unit);
+            const double b = static_cast<double>(pc->base_mojos_per_unit);
+            return (b > 0.0) ? (q / b) : 1.0;
+        });
 
     // Persist a snapshot for each enabled pair.
     std::vector<DbSnapshot> batch;

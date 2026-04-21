@@ -110,6 +110,13 @@ struct AssetRecord {
                                          // or 0 when total_quantity == 0.
     BlockHeight last_fill_block;  // Block height of the most recent fill.
     Timestamp   last_fill_time;   // Wall-clock time of the most recent fill.
+    bool        basis_is_seed_sentinel{false}; // True when total_cost was set
+                                               // by seed_position with a
+                                               // synthetic price (Mojo{1}).
+                                               // The next real record_buy()
+                                               // replaces the basis with the
+                                               // observed fill price instead
+                                               // of weighted-averaging it.
 
     AssetRecord();
     explicit AssetRecord(const AssetId& id);

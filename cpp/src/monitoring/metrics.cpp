@@ -290,6 +290,20 @@ void MetricsExporter::register_metrics()
         .Register(*registry_)
         .Add({});
 
+    // [v0.7.46 #8] Peak concurrent stuck offers in this process lifetime.
+    stuck_offers_peak_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_stuck_offers_peak")
+        .Help("Max concurrent stuck offers seen since process start")
+        .Register(*registry_)
+        .Add({});
+
+    // [v0.7.46 #8] Lifetime counter of new stuck offers detected.
+    stuck_offers_total_counter_ = &prometheus::BuildCounter()
+        .Name("xop_stuck_offers_total")
+        .Help("Lifetime count of new stuck offers detected (use rate()[1h])")
+        .Register(*registry_)
+        .Add({});
+
     paused_gauge_ = &prometheus::BuildGauge()
         .Name("xop_bot_paused")
         .Help("1 when trading is paused by GUI, 0 otherwise")
@@ -630,6 +644,19 @@ void MetricsExporter::update_stuck_offers(int count)
     if (!running_) return;
 
     stuck_offers_gauge_->Set(static_cast<double>(count));
+
+    // [v0.7.46 #8] Track peak concurrent and lifetime delta.
+    if (count > stuck_offers_peak_observed_) {
+        stuck_offers_peak_observed_ = count;
+        if (stuck_offers_peak_gauge_) {
+            stuck_offers_peak_gauge_->Set(static_cast<double>(count));
+        }
+    }
+    if (count > stuck_offers_last_observed_ && stuck_offers_total_counter_) {
+        stuck_offers_total_counter_->Increment(
+            static_cast<double>(count - stuck_offers_last_observed_));
+    }
+    stuck_offers_last_observed_ = count;
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

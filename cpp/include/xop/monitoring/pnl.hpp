@@ -203,12 +203,21 @@ public:
     ///                       weighted-average cost basis in mojos.
     /// @param xch_usd_price  Current XCH/USD rate expressed as a double
     ///                       (e.g. 2.70).  Used for USD conversion only.
+    /// @param get_pair_unit_factor  Optional callback: given (pair_name)
+    ///                       returns quote_mojos_per_unit / base_mojos_per_unit
+    ///                       as a double.  Required to compute inventory PnL
+    ///                       in correct quote-asset mojos for non-XCH-quoted
+    ///                       pairs.  If null or returns <= 0, falls back to
+    ///                       1.0 (legacy behaviour) and the result is in
+    ///                       legacy "pseudo" units.
     void mark_to_market(
         const std::function<Mojo(const std::string& /*pair*/,
                                   const std::string& /*asset*/)>& get_price,
         const std::function<Mojo(const std::string& /*asset*/)>& get_balance,
         const std::function<Mojo(const std::string& /*asset*/)>& get_cost_basis,
-        double xch_usd_price);
+        double xch_usd_price,
+        const std::function<double(const std::string& /*pair*/)>&
+            get_pair_unit_factor = nullptr);
 
     // -- PnL queries ------------------------------------------------------
 

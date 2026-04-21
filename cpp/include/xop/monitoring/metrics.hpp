@@ -342,6 +342,15 @@ private:
 
     prometheus::Family<prometheus::Gauge>* spendable_reserve_family_{nullptr};
     prometheus::Gauge* stuck_offers_gauge_{nullptr};
+    // [v0.7.46 #8] Peak concurrent stuck offers observed within the
+    // current process lifetime.  Only ever increases.  Reset on restart.
+    prometheus::Gauge* stuck_offers_peak_gauge_{nullptr};
+    // [v0.7.46 #8] Counter of new stuck offers detected.  Increments by
+    // delta whenever update_stuck_offers() is called with a value higher
+    // than the previous call.  Operators graph rate()[1h] for per-hour.
+    prometheus::Counter* stuck_offers_total_counter_{nullptr};
+    int stuck_offers_last_observed_{0};
+    int stuck_offers_peak_observed_{0};
     prometheus::Gauge* paused_gauge_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 

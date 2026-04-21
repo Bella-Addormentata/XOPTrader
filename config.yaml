@@ -88,7 +88,7 @@ strategy:
   min_spendable_reserve_pct: 0.05   # Lowered so bids recover sooner when coins are mostly locked, not truly depleted
   arb_reserve_coins: 2            # Dry-powder: keep 2 coins unallocated for arb takes
   min_reserve_units: 0.1
-  min_offer_size_units: 0.1       # Minimum offer size per tier (XCH units); default was 1.0
+  min_offer_size_units: 1.0       # Minimum offer size per tier (XCH units)
   min_trading_units: 0.1          # Lowered from 0.5: unblocks ask-side when XCH > 0.1
   auto_rebalance_enabled: true
   xch_ask_throttle_enabled: true
