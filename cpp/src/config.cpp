@@ -1160,6 +1160,76 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.pid_warmup_blocks = node["pid_warmup_blocks"].as<uint32_t>();
     }
 
+    // -- Adaptive competitiveness-threshold PID (v0.7.48) ---------------------
+    if (node["comp_pid_enabled"] && node["comp_pid_enabled"].IsDefined()
+        && !node["comp_pid_enabled"].IsNull()) {
+        cfg.comp_pid_enabled = node["comp_pid_enabled"].as<bool>();
+    }
+    if (node["comp_pid_target_fill_rate"] && node["comp_pid_target_fill_rate"].IsDefined()
+        && !node["comp_pid_target_fill_rate"].IsNull()) {
+        cfg.comp_pid_target_fill_rate = node["comp_pid_target_fill_rate"].as<double>();
+        if (cfg.comp_pid_target_fill_rate <= 0.0
+            || cfg.comp_pid_target_fill_rate >= 1.0) {
+            throw ConfigError(sec + ".comp_pid_target_fill_rate must be in (0, 1)");
+        }
+    }
+    if (node["comp_pid_kp"] && node["comp_pid_kp"].IsDefined()
+        && !node["comp_pid_kp"].IsNull()) {
+        cfg.comp_pid_kp = node["comp_pid_kp"].as<double>();
+        if (cfg.comp_pid_kp < 0.0) {
+            throw ConfigError(sec + ".comp_pid_kp must be >= 0");
+        }
+    }
+    if (node["comp_pid_ki"] && node["comp_pid_ki"].IsDefined()
+        && !node["comp_pid_ki"].IsNull()) {
+        cfg.comp_pid_ki = node["comp_pid_ki"].as<double>();
+        if (cfg.comp_pid_ki < 0.0) {
+            throw ConfigError(sec + ".comp_pid_ki must be >= 0");
+        }
+    }
+    if (node["comp_pid_kd"] && node["comp_pid_kd"].IsDefined()
+        && !node["comp_pid_kd"].IsNull()) {
+        cfg.comp_pid_kd = node["comp_pid_kd"].as<double>();
+        if (cfg.comp_pid_kd < 0.0) {
+            throw ConfigError(sec + ".comp_pid_kd must be >= 0");
+        }
+    }
+    if (node["comp_pid_ema_alpha"] && node["comp_pid_ema_alpha"].IsDefined()
+        && !node["comp_pid_ema_alpha"].IsNull()) {
+        cfg.comp_pid_ema_alpha = node["comp_pid_ema_alpha"].as<double>();
+        if (cfg.comp_pid_ema_alpha <= 0.0 || cfg.comp_pid_ema_alpha >= 1.0) {
+            throw ConfigError(sec + ".comp_pid_ema_alpha must be in (0, 1)");
+        }
+    }
+    if (node["comp_pid_integral_max"] && node["comp_pid_integral_max"].IsDefined()
+        && !node["comp_pid_integral_max"].IsNull()) {
+        cfg.comp_pid_integral_max = node["comp_pid_integral_max"].as<double>();
+        if (cfg.comp_pid_integral_max <= 0.0) {
+            throw ConfigError(sec + ".comp_pid_integral_max must be > 0");
+        }
+    }
+    if (node["comp_pid_warmup_blocks"] && node["comp_pid_warmup_blocks"].IsDefined()
+        && !node["comp_pid_warmup_blocks"].IsNull()) {
+        cfg.comp_pid_warmup_blocks = node["comp_pid_warmup_blocks"].as<uint32_t>();
+    }
+    if (node["comp_pid_min_offset"] && node["comp_pid_min_offset"].IsDefined()
+        && !node["comp_pid_min_offset"].IsNull()) {
+        cfg.comp_pid_min_offset = node["comp_pid_min_offset"].as<int>();
+        if (cfg.comp_pid_min_offset < -10 || cfg.comp_pid_min_offset > 0) {
+            throw ConfigError(sec + ".comp_pid_min_offset must be in [-10, 0]");
+        }
+    }
+    if (node["comp_pid_max_offset"] && node["comp_pid_max_offset"].IsDefined()
+        && !node["comp_pid_max_offset"].IsNull()) {
+        cfg.comp_pid_max_offset = node["comp_pid_max_offset"].as<int>();
+        if (cfg.comp_pid_max_offset < 0 || cfg.comp_pid_max_offset > 10) {
+            throw ConfigError(sec + ".comp_pid_max_offset must be in [0, 10]");
+        }
+    }
+    if (cfg.comp_pid_min_offset > cfg.comp_pid_max_offset) {
+        throw ConfigError(sec + ".comp_pid_min_offset must be <= comp_pid_max_offset");
+    }
+
     return cfg;
 }
 

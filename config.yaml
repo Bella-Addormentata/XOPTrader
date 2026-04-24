@@ -136,6 +136,21 @@ strategy:
   pid_min_mult: 0.70                 # Max tightening: 30%
   pid_max_mult: 1.30                 # Max widening: 30%
   pid_warmup_blocks: 50              # Observe for ~43 min before adjusting
+
+  # [v0.7.48] Adaptive competitiveness-threshold PID controller.
+  # Adjusts the integer competitiveness gate (Step 8) based on observed
+  # fill rate.  Underfilling -> lower the gate (more aggressive posting);
+  # overfilling -> raise it (more selective).
+  comp_pid_enabled: true
+  comp_pid_target_fill_rate: 0.05    # ~1 fill per 17 min @ 18.75s blocks
+  comp_pid_kp: 8.0
+  comp_pid_ki: 0.5
+  comp_pid_kd: 2.0
+  comp_pid_ema_alpha: 0.02           # ~50-block window (~16 min)
+  comp_pid_integral_max: 4.0
+  comp_pid_warmup_blocks: 50
+  comp_pid_min_offset: -3            # Max gate reduction (more aggressive)
+  comp_pid_max_offset: 3             # Max gate increase (more selective)
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8

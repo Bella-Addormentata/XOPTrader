@@ -2333,6 +2333,11 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         if (config_.strategy.pid_spread_enabled) {
             spread_pid_state_[fill.pair_name].fills_this_cycle++;
         }
+        // [v0.7.48] PID adaptive competitiveness-threshold: also count
+        // this fill so observe_block() can fold it into the EMA.
+        if (config_.strategy.comp_pid_enabled) {
+            comp_pid_fills_this_block_[fill.pair_name]++;
+        }
 
         // [T4-16] Feed the kappa calibrator with each fill's half-spread.
         if (kappa_calibrator_) {
@@ -2882,6 +2887,42 @@ void Engine::step_apply_spread_optimizer(BlockHeight block_height)
                           pid.ema_fill_rate,
                           config_.strategy.pid_target_fill_rate,
                           pid.blocks_active);
+        }
+
+        // -- [v0.7.48] PID adaptive competitiveness-threshold controller --
+        // Tick the per-pair competitiveness PID exactly once per heartbeat
+        // here in Step 5.  The Step 8 gate below reads current_offset()
+        // synchronously after this update.  fills counter is consumed.
+        if (config_.strategy.comp_pid_enabled) {
+            // Lazily create per-pair PID with current strategy config.
+            auto pid_it = comp_pid_state_.find(pair_name);
+            if (pid_it == comp_pid_state_.end()) {
+                xop::strategy::CompetitivenessPidConfig cpc;
+                cpc.enabled           = config_.strategy.comp_pid_enabled;
+                cpc.target_fill_rate  = config_.strategy.comp_pid_target_fill_rate;
+                cpc.kp                = config_.strategy.comp_pid_kp;
+                cpc.ki                = config_.strategy.comp_pid_ki;
+                cpc.kd                = config_.strategy.comp_pid_kd;
+                cpc.ema_alpha         = config_.strategy.comp_pid_ema_alpha;
+                cpc.integral_max      = config_.strategy.comp_pid_integral_max;
+                cpc.warmup_blocks     = config_.strategy.comp_pid_warmup_blocks;
+                cpc.min_offset        = config_.strategy.comp_pid_min_offset;
+                cpc.max_offset        = config_.strategy.comp_pid_max_offset;
+                pid_it = comp_pid_state_.emplace(
+                    pair_name,
+                    xop::strategy::CompetitivenessPid{cpc}).first;
+            }
+            const int fills = comp_pid_fills_this_block_[pair_name];
+            pid_it->second.observe_block(fills > 0);
+            comp_pid_fills_this_block_[pair_name] = 0;
+
+            spdlog::debug("[Engine] Step 5: {} comp-PID offset={} "
+                          "(ema_fill={:.4f} target={:.4f} blocks={})",
+                          pair_name,
+                          pid_it->second.current_offset(),
+                          pid_it->second.ema_fill_rate(),
+                          config_.strategy.comp_pid_target_fill_rate,
+                          pid_it->second.blocks_active());
         }
 
         pcs.spread_result.half_spread =
@@ -5468,8 +5509,30 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             // BYC tiers to be suppressed (151 sanity rejections in
             // 0.7.45 audit).  Use a lower threshold for stablecoin pairs.
             const PairConfig* pair_cfg_comp = find_pair_config(pair_name);
-            const int kMinCompetitivenessScore =
+            const int kBaseCompetitivenessScore =
                 (pair_cfg_comp && pair_cfg_comp->is_stablecoin) ? 1 : 3;
+
+            // [v0.7.48] Apply PID offset to the base threshold.  Negative
+            // offset (underfilling) lowers the gate so more tiers post;
+            // positive offset (overfilling) raises it.  Final value is
+            // clamped to the legal 0-10 range.
+            int kMinCompetitivenessScore = kBaseCompetitivenessScore;
+            if (config_.strategy.comp_pid_enabled) {
+                auto pid_it = comp_pid_state_.find(pair_name);
+                if (pid_it != comp_pid_state_.end()) {
+                    const int offset = pid_it->second.current_offset();
+                    kMinCompetitivenessScore = std::clamp(
+                        kBaseCompetitivenessScore + offset, 0, 10);
+                    if (offset != 0) {
+                        spdlog::debug("[Engine] Step 8: {} comp gate base={} "
+                                      "PID-offset={} -> effective={}",
+                                      pair_name,
+                                      kBaseCompetitivenessScore,
+                                      offset,
+                                      kMinCompetitivenessScore);
+                    }
+                }
+            }
             const auto book_snap = state_->get_market(pair_name);
             const auto competing_offers = market_data_->get_competing_offers(pair_name);
             std::vector<TierQuote> competitive_tiers;

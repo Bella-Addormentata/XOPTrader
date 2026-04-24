@@ -524,6 +524,49 @@ struct StrategyConfig {
     /// Number of blocks before the PID controller activates (warm-up period).
     /// During warm-up the controller observes but does not adjust spreads.
     uint32_t pid_warmup_blocks{50};
+
+    // -- Adaptive competitiveness-threshold PID controller -----------------
+    // Companion to the spread PID above.  Where the spread PID adjusts the
+    // half-spread of newly posted offers, this controller adjusts the
+    // *competitiveness gate* (Step 8 of the engine pipeline) -- the integer
+    // 0-10 score below which a tier is suppressed before posting.
+    //
+    // Rationale (v0.7.47 audit): even at 8/10 competitiveness, fills can
+    // dry up in trending markets when the static gate keeps weak tiers
+    // suppressed.  The PID monitors the binary fill signal per block and
+    // lowers the effective gate when fills fall below target, raising it
+    // when we are over-trading.  Output is an integer offset added to the
+    // pair's base threshold (1 for stablecoin pairs, 3 otherwise as of
+    // v0.7.46), clamped to [comp_pid_min_offset, comp_pid_max_offset] and
+    // then to the legal gate range [0, 10].
+    //
+    // See cpp/include/xop/strategy/competitiveness_pid.hpp for the
+    // controller implementation and its unit tests.
+
+    /// Master switch for the competitiveness-threshold PID controller.
+    bool     comp_pid_enabled{true};
+
+    /// Target fill rate in blocks-with-fills / total-blocks units.
+    /// 0.05 ~= one fill per ~17 minutes at 52 s blocks.
+    double   comp_pid_target_fill_rate{0.05};
+
+    /// PID gains (output is in *integer offset units*).
+    double   comp_pid_kp{8.0};
+    double   comp_pid_ki{0.5};
+    double   comp_pid_kd{2.0};
+
+    /// EMA smoothing alpha for the per-block fill signal.
+    double   comp_pid_ema_alpha{0.02};
+
+    /// Anti-windup clamp on the integral accumulator.
+    double   comp_pid_integral_max{4.0};
+
+    /// Warm-up window before the controller emits non-zero offsets.
+    uint32_t comp_pid_warmup_blocks{50};
+
+    /// Output offset bounds.  Negative = lower gate (more aggressive).
+    int      comp_pid_min_offset{-3};
+    int      comp_pid_max_offset{+3};
 };
 
 // ---------------------------------------------------------------------------

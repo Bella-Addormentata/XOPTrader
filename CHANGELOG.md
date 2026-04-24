@@ -5,6 +5,23 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.48] — 2026-04-25
+
+### Added
+
+- **Adaptive competitiveness-threshold PID controller** (`cpp/include/xop/strategy/competitiveness_pid.hpp`, wired into `cpp/src/engine.cpp` Step 5/8):
+  - Companion to the existing spread PID. Where the spread PID tunes half-spread, this controller tunes the integer 0-10 *competitiveness gate* used in the Step 8 sanity filter.
+  - Per-pair, integer-output, with anti-windup, configurable warm-up, and `[min_offset, max_offset]` clamp (defaults `[-3, +3]`).
+  - Sign convention: underfilling (EMA fill rate below `comp_pid_target_fill_rate`) drives the offset NEGATIVE → effective gate lowers → more tiers post. Overfilling drives it POSITIVE → fewer, more aggressive tiers.
+  - New config knobs in `strategy:` block: `comp_pid_enabled`, `comp_pid_target_fill_rate`, `comp_pid_kp/ki/kd`, `comp_pid_ema_alpha`, `comp_pid_integral_max`, `comp_pid_warmup_blocks`, `comp_pid_min_offset`, `comp_pid_max_offset`. All validated in `parse_strategy()` (`cpp/src/config.cpp`).
+  - Defaults enabled in `config.yaml` with `target_fill_rate=0.05` (≈ 1 fill / 17 min @ 18.75 s blocks).
+  - Six unit tests in `cpp/tests/test_competitiveness_pid.cpp`: warm-up zero-output, underfill→negative, overfill→positive, bounds clamping, on-target convergence, disabled-pinning, and reconfigure-resets.
+
+- **Fill-history monitor script** (`scripts/monitor_fill_history.py`):
+  - Rolling fill-rate report per pair across 1h / 6h / 24h / 7d windows, comparable to the PID input signal.
+  - Shows fills, cancels, posted, average competitiveness, and the gap to `comp_pid_target_fill_rate`.
+  - Supports one-shot, `--watch N` polling, and `--json` modes for cross-checking the controller's behaviour after a deploy.
+
 ## [0.7.47] — 2026-04-24
 
 ### Changed

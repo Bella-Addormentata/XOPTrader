@@ -80,6 +80,7 @@
 #include "xop/strategy/fee_tracker.hpp"
 #include "xop/strategy/kappa_calibrator.hpp"
 #include "xop/strategy/market_allocator.hpp"
+#include "xop/strategy/competitiveness_pid.hpp"
 
 // New risk modules
 #include "xop/risk/loss_manager.hpp"
@@ -813,6 +814,18 @@ private:
         int      fills_this_cycle{0};    ///< Fills counted this heartbeat.
     };
     std::unordered_map<std::string, SpreadPidState> spread_pid_state_;
+
+    // -- PID adaptive competitiveness-threshold controller (per-pair) -----
+    // Companion to spread_pid_state_.  Adjusts the integer score required
+    // by the Step 8 competitiveness gate based on observed fill rate.
+    // See cpp/include/xop/strategy/competitiveness_pid.hpp.
+    //
+    // Per-pair entries are lazily created on first observe in Step 5.
+    // The pid_fills_this_block_ counter is incremented on each confirmed
+    // fill (Step 2) and reset by observe_block() at end of heartbeat.
+    std::unordered_map<std::string, xop::strategy::CompetitivenessPid>
+        comp_pid_state_;
+    std::unordered_map<std::string, int> comp_pid_fills_this_block_;
 
     // -- [T4-11] Offer reconciliation tracking -----------------------------
     // Block height of the last full reconciliation run.  Compared against
