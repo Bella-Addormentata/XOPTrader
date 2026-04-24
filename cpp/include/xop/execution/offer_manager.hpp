@@ -697,9 +697,13 @@ private:
     /// Only *adverse* deviations (bid too high / ask too low) trigger
     /// staleness.  Favorable deviations (bid drifted lower / ask drifted
     /// higher) make the offer more conservative, not dangerous.
-    /// Set to 0.5% adverse deviation for tier 0 (innermost).  Outer
+    /// Set to 1.0% adverse deviation for tier 0 (innermost).  Outer
     /// tiers apply a wider threshold scaled by kTierThresholdScale.
-    static constexpr double kSelectiveRefreshThreshold = 0.005;
+    /// [v0.7.47] Raised 0.005 -> 0.010 after live audit showed 49/50
+    /// XCH/wUSDC.b offers cancelled at 1.26-1.54% deviation while
+    /// competitiveness averaged 8.2/10 -- offers were dying just before
+    /// they could fill in a trending market (XCH +12% over 3 days).
+    static constexpr double kSelectiveRefreshThreshold = 0.010;
 
     /// Hard crossing threshold: if an offer's *adverse* deviation is
     /// this large the offer has likely crossed the mid-price and must
@@ -710,7 +714,7 @@ private:
 
     /// Per-tier scaling factor for the adverse-deviation threshold.
     /// Effective threshold = kSelectiveRefreshThreshold × (1 + tier × scale).
-    ///   tier 0 → 0.50%   tier 1 → 0.75%   tier 2 → 1.00%   tier 3 → 1.25%
+    ///   tier 0 → 1.00%   tier 1 → 1.50%   tier 2 → 2.00%   tier 3 → 2.50%
     /// Outer tiers are further from mid-price and tolerate more movement.
     static constexpr double kTierThresholdScale = 0.5;
 
@@ -718,10 +722,10 @@ private:
     /// is considered.  Very young offers are protected from cancel churn
     /// because the round-trip fee (cancel + recreate) exceeds the adverse
     /// selection risk for small deviations.  Crossed-mid is still urgent.
-    /// [v0.7.46 #7] Raised 3 -> 6 (~5 min @ 52s blocks) to further damp
-    /// price-adverse cancel churn observed in 0.7.45 (41/44 cancels were
-    /// price_adverse on a quiet block series).
-    static constexpr BlockHeight kMinRefreshAgeBlocks = 6;
+    /// [v0.7.47] Raised 6 -> 12 (~10 min @ 52s blocks) so newly posted
+    /// offers have a real chance to fill before adverse-cancel logic
+    /// pulls them.
+    static constexpr BlockHeight kMinRefreshAgeBlocks = 12;
 
     /// Gentler adverse-deviation threshold applied between soft and hard
     /// TTL.  Only refresh if the offer has adversely drifted by more than

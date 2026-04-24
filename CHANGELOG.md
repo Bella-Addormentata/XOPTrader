@@ -5,6 +5,18 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.47] — 2026-04-24
+
+### Changed
+
+- **Adverse-cancel thresholds widened so offers stay alive long enough to fill** (`cpp/include/xop/execution/offer_manager.hpp`):
+  - `kSelectiveRefreshThreshold` 0.5% → **1.0%** (tier-scaled: tier 0=1.0%, tier 1=1.5%, tier 2=2.0%, tier 3=2.5%)
+  - `kMinRefreshAgeBlocks` 6 → **12** (~10 min protection window before any adverse-cancel can fire)
+  
+  Diagnosed from live data on 0.7.46: in the 24h window of Apr 23–24, 49/50 `XCH/wUSDC.b` offers were cancelled with `price_adverse(1.26%–1.54%)` while `competitiveness_score` averaged **8.2/10** (i.e. we were already at or near the top of book). The cancels were chasing a strongly trending market (XCH +12% over three days), not protecting us from real adverse selection — every cycle burned cancel fees and posted into the new mid, only to be killed again.
+  
+  Net effect: makers now hold price during normal intraday volatility (up to ~1% mid drift on inner tier, ~2.5% on outer tier) and survive long enough for takers to actually hit them. Outer tiers were already designed to be stickier; this brings inner tiers into the same regime.
+
 ## [0.7.46] — 2026-04-21
 
 ### Added
