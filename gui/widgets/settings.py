@@ -1974,6 +1974,9 @@ class SettingsWidget(QWidget):
         }
 
         # -- pairs --
+        # Merge edited values onto the original per-pair dict (stashed in
+        # the name item's UserRole) so extras like is_stablecoin,
+        # peg_target, depeg_*, *_override, etc. survive a Save.
         pairs_list: list[dict[str, Any]] = []
         for row in range(self._pairs_table.rowCount()):
             cb_container = self._pairs_table.cellWidget(row, 0)
@@ -1982,12 +1985,22 @@ class SettingsWidget(QWidget):
             name_item = self._pairs_table.item(row, 1)
             base_item = self._pairs_table.item(row, 2)
             quote_item = self._pairs_table.item(row, 3)
-            pairs_list.append({
-                "name": name_item.text() if name_item else "",
-                "base_asset_id": base_item.text() if base_item else "xch",
-                "quote_asset_id": quote_item.text() if quote_item else "",
-                "enabled": enabled,
-            })
+            original = (
+                name_item.data(Qt.ItemDataRole.UserRole)
+                if name_item is not None else None
+            )
+            merged: dict[str, Any] = (
+                copy.deepcopy(original) if isinstance(original, dict) else {}
+            )
+            merged["name"] = name_item.text() if name_item else ""
+            merged["base_asset_id"] = (
+                base_item.text() if base_item else "xch"
+            )
+            merged["quote_asset_id"] = (
+                quote_item.text() if quote_item else ""
+            )
+            merged["enabled"] = enabled
+            pairs_list.append(merged)
         cfg["pairs"] = pairs_list
 
         # -- strategy --
@@ -2450,11 +2463,15 @@ class SettingsWidget(QWidget):
         cb_layout.addWidget(cb)
         self._pairs_table.setCellWidget(row, 0, cb_container)
 
-        # Name.
+        # Name.  Stash the full original pair dict on the name item so
+        # we can preserve per-pair extras (is_stablecoin, peg_target,
+        # depeg_*, *_override, etc.) that the table doesn't expose.
+        # Without this, _collect_config_dict() would silently drop them.
         name_item = QTableWidgetItem(str(pair.get("name", "")))
         name_item.setFlags(
             name_item.flags() | Qt.ItemFlag.ItemIsEditable
         )
+        name_item.setData(Qt.ItemDataRole.UserRole, copy.deepcopy(pair))
         self._pairs_table.setItem(row, 1, name_item)
 
         # Base asset.
@@ -2830,14 +2847,25 @@ class SettingsWidget(QWidget):
             )
             return False
 
-        cfg = self._collect_config_dict()
+        # Deep-merge edited values onto the last-known-good on-disk
+        # snapshot so any keys the GUI doesn't expose (e.g. strategy
+        # tunables like sigma_floor, coin_pool_*, competitive_anchor_*,
+        # comp_pid_*, risk.circuit_breaker_*, arbitrage.crossed_book_*,
+        # etc.) survive a Save.  Without this merge, every Save would
+        # silently drop dozens of fields.
+        from gui.services.config_split import (  # noqa: WPS433
+            deep_merge,
+            split_and_save,
+        )
+
+        cfg_edits = self._collect_config_dict()
+        cfg = copy.deepcopy(self._clean_snapshot) if self._clean_snapshot else {}
+        deep_merge(cfg, cfg_edits)
 
         resolved = Path(dest).expanduser().resolve()
         try:
             # Ensure parent directory exists.
             resolved.parent.mkdir(parents=True, exist_ok=True)
-            from gui.services.config_split import split_and_save  # noqa: WPS433
-
             split_and_save(resolved, cfg)
         except OSError as exc:
             QMessageBox.critical(
@@ -2850,7 +2878,8 @@ class SettingsWidget(QWidget):
         # Persist GUI-only appearance settings separately.
         self._save_appearance_settings()
 
-        # Update state.
+        # Update state.  Stash the merged dict (what actually hit disk)
+        # so subsequent saves keep preserving unmanaged keys.
         self._config_path = str(resolved)
         self._clean_snapshot = copy.deepcopy(cfg)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
