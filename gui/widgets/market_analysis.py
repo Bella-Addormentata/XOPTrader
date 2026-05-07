@@ -436,6 +436,13 @@ class MarketAnalysisWidget(QWidget):
 
         self._analysis_data = analysis_data
 
+        # Drop panels for pairs no longer present in the incoming analysis
+        # payload (for example, pairs disabled in config).
+        stale_pairs = set(self._pair_panels) - set(analysis_data)
+        for pair_name in stale_pairs:
+            panel = self._pair_panels.pop(pair_name)
+            panel.deleteLater()
+
         # Compute overall progress (minimum blocks across pairs).
         blocks_target    = 0
         min_collected    = None

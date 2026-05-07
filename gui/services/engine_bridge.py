@@ -299,7 +299,14 @@ class EngineBridge(QObject):
         # xop_analysis / xop_analysis_pair metrics throughout the analysis
         # window and retains them after completion, so always fetch them
         # when pair names are available.
-        pair_names = [p.get("name", "") for p in pairs if p.get("name")]
+        # Only enabled pairs participate in startup analysis on the engine
+        # side; querying disabled pairs here fabricates default "incomplete"
+        # entries and can keep the GUI stuck in analysis mode.
+        pair_names = [
+            p.get("name", "")
+            for p in pairs
+            if p.get("name") and p.get("enabled", True)
+        ]
         if pair_names:
             analysis_data = self._metrics_svc.get_analysis(pair_names)
         else:

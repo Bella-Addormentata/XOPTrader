@@ -3410,8 +3410,29 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
             pcs.quote_valid = true;
         } else {
             pcs.quote_valid = false;
-            spdlog::warn("[Engine] Step 6: {} -- both sides blocked by risk limits",
-                         pair_name);
+            const auto limits = pre_trade_->get_limit_status(
+                AssetId{pair_cfg->base_asset_id},
+                AssetId{pair_cfg->quote_asset_id},
+                *state_);
+
+            spdlog::warn(
+                "[Engine] Step 6: {} -- both sides blocked by risk limits "
+                "(base_conc={:.3f} soft_breach={} hard_breach={} "
+                "cat_pct={:.3f} cat_breach={} pair_pct={:.3f} "
+                "pair_breach={} cfg_soft={:.3f} cfg_hard={:.3f} "
+                "cfg_cat={:.3f} cfg_pair={:.3f})",
+                pair_name,
+                limits.base_concentration,
+                limits.soft_limit_breached,
+                limits.hard_limit_breached,
+                limits.cat_portfolio_pct,
+                limits.cat_cap_breached,
+                limits.pair_capital_pct,
+                limits.pair_cap_breached,
+                config_.risk.soft_limit_pct,
+                config_.risk.hard_limit_pct,
+                config_.risk.single_cat_cap_pct,
+                config_.risk.max_capital_per_pair_pct);
         }
     }
 }
@@ -4803,7 +4824,8 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
 
         // -- Spendable reserve & pending-change gating ----------------------
         // Query wallet balances for each wallet involved in this pair.
-        // - pending_change > 0: hard block (skip ALL posting).
+        // - pending_change > 0: suppress the side backed by that wallet.
+        //   If both sides are pending, posting is skipped for this pair.
         // - Side-aware minimum balance: suppress ASK when base < reserve,
         //   suppress BID when quote < reserve.  When auto_rebalance is on
         //   and an asset is below min_trading_units, only the acquisition
@@ -4853,7 +4875,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
 
         {
-            bool pending_block = false;
+            bool saw_pending_change = false;
             const PairConfig* gate_pc = find_pair_config(pair_name);
             if (gate_pc) {
                 auto bwid = offer_mgr_->resolve_wallet_id(gate_pc->base_asset_id);
@@ -4913,15 +4935,21 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 : 1.0);
 
                         // Gate 1: pending_change > 0 means coins are in-flight.
+                        // Suppress only the side that spends this wallet's
+                        // asset, allowing the opposite side to keep quoting.
                         if (pending > 0) {
                             spdlog::info("[Engine] Step 8: {} wallet {} has "
-                                         "pending_change={} -- skipping offer "
-                                         "posting until confirmed",
-                                         pair_name, sb.label, pending);
+                                         "pending_change={} -- suppressing {} "
+                                         "side until confirmed",
+                                         pair_name, sb.label, pending,
+                                         sb.is_base ? "ask" : "bid");
 
                             // Track consecutive blocks with pending_change.
                             pending_wallets_this_block.insert(sb.wid);
-                            ++consecutive_pending_blocks_;
+                            if (!saw_pending_change) {
+                                ++consecutive_pending_blocks_;
+                                saw_pending_change = true;
+                            }
 
                             // Periodic stuck-tx pruning.
                             if (block_height >= last_stuck_tx_prune_block_
@@ -4977,8 +5005,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 consecutive_pending_blocks_ = 0;
                             }
 
-                            pending_block = true;
-                            break;
+                            if (sb.is_base) can_ask = false;
+                            else            can_bid = false;
+                            continue;
                         }
 
                         // Gate 2: spendable reserve too low (fractional).
@@ -5048,7 +5077,6 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
             // (counter reset moved to after the pair loop)
-            if (pending_block) continue;
             if (!can_bid && !can_ask) {
                 // Both sides suppressed -- cancel STALE/EXPIRED offers
                 // for this pair to free locked UTXOs / capital.
@@ -5218,6 +5246,38 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         } else {
             // Fee tracking disabled or mid is 0 -- pass all tiers through.
             fee_filtered_tiers = pcs.ladder;
+        }
+
+        // In one-sided posting mode (e.g. pending_change on one wallet side),
+        // the fee gate can occasionally filter out every remaining tier,
+        // creating a no-quote gap on the only allowed side. Keep the tightest
+        // eligible tier as a continuity fallback instead of withdrawing fully.
+        if (fee_tracker_->enabled() && mid > 0
+            && fee_filtered_tiers.empty()
+            && (can_bid != can_ask)) {
+            auto fallback_it = pcs.ladder.end();
+            for (auto it = pcs.ladder.begin(); it != pcs.ladder.end(); ++it) {
+                const bool side_allowed =
+                    (it->side == Side::Bid && can_bid)
+                    || (it->side == Side::Ask && can_ask);
+                if (!side_allowed) {
+                    continue;
+                }
+                if (fallback_it == pcs.ladder.end()
+                    || it->tier_index < fallback_it->tier_index) {
+                    fallback_it = it;
+                }
+            }
+            if (fallback_it != pcs.ladder.end()) {
+                fee_filtered_tiers.push_back(*fallback_it);
+                spdlog::warn("[Engine] Step 8: {} fee-vs-gain fallback kept {} "
+                             "tier {} in one-sided mode (can_bid={}, can_ask={})",
+                             pair_name,
+                             (fallback_it->side == Side::Bid) ? "bid" : "ask",
+                             fallback_it->tier_index,
+                             can_bid,
+                             can_ask);
+            }
         }
 
         // -----------------------------------------------------------------

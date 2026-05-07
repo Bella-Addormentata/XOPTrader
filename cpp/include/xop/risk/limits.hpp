@@ -135,8 +135,8 @@ public:
     ///     quote, tapering to zero only as concentration approaches 100%.
     ///   - Single CAT cap: if a CAT exceeds the configured portfolio cap,
     ///     reduce the accumulation side to a tiny continuity quote.
-    ///   - Max capital per pair: zero both sizes if pair capital exceeds
-    ///     the configured cap.
+    ///   - Max capital per pair: taper both sizes to a tiny continuity quote
+    ///     when pair capital exceeds the configured cap.
     ///
     /// @param quote      Two-sided quote.
     /// @param pair_name  Human-readable pair label for logging.

@@ -29,6 +29,7 @@ namespace {
 constexpr double kHardLimitContinuityFloorPct = 0.05;
 constexpr double kCatCapContinuityFloorPct = 0.05;
 constexpr double kCatCapFullBlockMultiple = 2.0;
+constexpr double kPairCapContinuityFloorPct = 0.05;
 
 Mojo scale_size_with_floor(Mojo size, double keep_fraction) noexcept
 {
@@ -282,13 +283,25 @@ std::optional<Quote> PreTradeCheck::apply_limits(
     // ---- 3. Max capital per pair ------------------------------------------
     //
     //   If this pair consumes more than max_capital_per_pair_pct of total
-    //   capital, block both sides to prevent further concentration.
+    //   capital, taper both sides towards a continuity quote. This avoids a
+    //   hard deadlock when only one pair is enabled while still preserving a
+    //   strong cap as concentration approaches 100%.
 
     const double pair_frac = compute_pair_capital_fraction(base_pos, quote_pos,
                                                            all_positions, state);
     if (pair_frac >= risk_cfg_.max_capital_per_pair_pct) {
-        quote.bid_size = 0;
-        quote.ask_size = 0;
+        const double reduction = std::clamp(
+            (pair_frac - risk_cfg_.max_capital_per_pair_pct)
+                / std::max(1.0 - risk_cfg_.max_capital_per_pair_pct, 1e-9),
+            0.0, 1.0);
+        const double keep_fraction =
+            1.0 - reduction * (1.0 - kPairCapContinuityFloorPct);
+        quote.bid_size = scale_size_with_floor(
+            quote.bid_size,
+            keep_fraction);
+        quote.ask_size = scale_size_with_floor(
+            quote.ask_size,
+            keep_fraction);
     }
 
     // ---- Result -----------------------------------------------------------
