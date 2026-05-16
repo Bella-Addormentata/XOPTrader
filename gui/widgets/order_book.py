@@ -574,7 +574,13 @@ class OrderBookWidget(QWidget):
         # Determine which pair is currently active in the selector.
         current_pair: str = self._combo_pair.currentText()
         if not current_pair:
-            return
+            # First payload can arrive before the pair selector is
+            # populated; pick the first available pair deterministically.
+            first_pair = next(iter(data.keys()), "")
+            if not first_pair:
+                return
+            self.set_pair(first_pair)
+            current_pair = first_pair
 
         pair_data: dict = data.get(current_pair, {})
         if not pair_data:
@@ -610,6 +616,11 @@ class OrderBookWidget(QWidget):
                 tier=int(raw_lvl.get("tier", -1)),
             ))
 
+        # Bridge payloads may not include full depth arrays. In that case,
+        # synthesize a minimal book from own pending offers + top-of-book.
+        if not bids and not asks:
+            bids, asks = self._synth_book_levels(current_pair, pair_data)
+
         snapshot = OrderBookSnapshot(
             pair_name=current_pair,
             mid_price_mojos=mid_price,
@@ -619,6 +630,114 @@ class OrderBookWidget(QWidget):
             timestamp=float(pair_data.get("timestamp", 0.0)),
         )
         self.update_book(snapshot)
+
+    def _synth_book_levels(
+        self,
+        pair_name: str,
+        pair_data: dict,
+    ) -> tuple[list[OrderBookLevel], list[OrderBookLevel]]:
+        """Build a minimal order book when market depth arrays are absent.
+
+        Uses only already-available data from the bridge payload and
+        cached own pending offers. No external API calls are made.
+        """
+        mid_price = int(pair_data.get("mid_price", 0))
+        spread_bps = float(pair_data.get("spread_bps", 0.0))
+
+        best_bid = int(pair_data.get("best_bid", 0) or 0)
+        best_ask = int(pair_data.get("best_ask", 0) or 0)
+
+        # Derive top-of-book from mid/spread when explicit BBO is missing.
+        if mid_price > 0 and spread_bps > 0.0 and (best_bid <= 0 or best_ask <= 0):
+            half_frac = spread_bps / 20_000.0
+            best_bid = int(round(mid_price * (1.0 - half_frac)))
+            best_ask = int(round(mid_price * (1.0 + half_frac)))
+
+        bid_levels: dict[int, OrderBookLevel] = {}
+        ask_levels: dict[int, OrderBookLevel] = {}
+
+        for order in self._own_orders:
+            if order.get("pair_name") != pair_name:
+                continue
+
+            price = int(order.get("price_mojos", 0) or 0)
+            size = int(order.get("size_mojos", 0) or 0)
+            side = str(order.get("side", "")).lower()
+            tier = int(order.get("tier", -1) or -1)
+
+            if price <= 0 or size <= 0:
+                continue
+
+            if side == "bid":
+                lvl = bid_levels.get(price)
+                if lvl is None:
+                    bid_levels[price] = OrderBookLevel(
+                        price_mojos=price,
+                        size_mojos=size,
+                        cumulative_mojos=0,
+                        is_own=True,
+                        own_size_mojos=size,
+                        tier=tier,
+                    )
+                else:
+                    lvl.size_mojos += size
+                    lvl.own_size_mojos += size
+                    lvl.is_own = True
+                    if lvl.tier < 0 or (tier >= 0 and tier < lvl.tier):
+                        lvl.tier = tier
+            elif side == "ask":
+                lvl = ask_levels.get(price)
+                if lvl is None:
+                    ask_levels[price] = OrderBookLevel(
+                        price_mojos=price,
+                        size_mojos=size,
+                        cumulative_mojos=0,
+                        is_own=True,
+                        own_size_mojos=size,
+                        tier=tier,
+                    )
+                else:
+                    lvl.size_mojos += size
+                    lvl.own_size_mojos += size
+                    lvl.is_own = True
+                    if lvl.tier < 0 or (tier >= 0 and tier < lvl.tier):
+                        lvl.tier = tier
+
+        # Keep at least one level per side when BBO is known so the book
+        # does not appear blank between depth payload updates.
+        if best_bid > 0 and best_bid not in bid_levels:
+            bid_levels[best_bid] = OrderBookLevel(
+                price_mojos=best_bid,
+                size_mojos=0,
+                cumulative_mojos=0,
+                is_own=False,
+                own_size_mojos=0,
+                tier=-1,
+            )
+        if best_ask > 0 and best_ask not in ask_levels:
+            ask_levels[best_ask] = OrderBookLevel(
+                price_mojos=best_ask,
+                size_mojos=0,
+                cumulative_mojos=0,
+                is_own=False,
+                own_size_mojos=0,
+                tier=-1,
+            )
+
+        bids = sorted(bid_levels.values(), key=lambda l: l.price_mojos, reverse=True)
+        asks = sorted(ask_levels.values(), key=lambda l: l.price_mojos)
+
+        running = 0
+        for lvl in bids:
+            running += lvl.size_mojos
+            lvl.cumulative_mojos = running
+
+        running = 0
+        for lvl in asks:
+            running += lvl.size_mojos
+            lvl.cumulative_mojos = running
+
+        return bids, asks
 
     # -----------------------------------------------------------------
     # Internal: slot handlers

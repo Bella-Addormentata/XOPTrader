@@ -12,6 +12,8 @@ Compliant with:
 
 from __future__ import annotations
 
+from collections import deque
+from datetime import datetime
 import logging
 import time
 from typing import Any, Final, Optional
@@ -200,6 +202,10 @@ class MainWindow(QMainWindow):
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
         self._last_engine_start_failure: str = ""
+        self._chart_last_block_by_pair: dict[str, int] = {}
+        self._chart_volume_by_pair_block: dict[tuple[str, int], tuple[float, float]] = {}
+        self._chart_seen_trade_keys: set[tuple] = set()
+        self._chart_seen_trade_fifo: deque[tuple] = deque(maxlen=10_000)
 
         # -- Child widget references (populated in _build_central_area) -----
         self._dashboard: Optional[QWidget] = None
@@ -267,11 +273,17 @@ class MainWindow(QMainWindow):
             db.offers_loaded.connect(self._tab_order_panel.update_offers)
         if self._trade_log is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._trade_log.load_trades)
+        if self._chart is not None and hasattr(db, "trades_loaded"):
+            db.trades_loaded.connect(self._on_trades_for_chart)
 
         # Kick off the initial offers query so the auto-refresh loop
         # has a set of parameters to re-issue on subsequent ticks.
         if hasattr(db, "query_offers"):
             db.query_offers()
+        if hasattr(db, "query_trades"):
+            # Seed trade auto-refresh so charts can build per-block
+            # volume/fill overlays from existing DB snapshots.
+            db.query_trades(limit=1000)
 
         # -- Reports widget signal -----------------------------------------
         reports_widget = self._unwrap(self._reports)
@@ -358,6 +370,57 @@ class MainWindow(QMainWindow):
             if mid > 0:
                 xch_usd = mid / 1000.0
                 break
+
+        # Charts update -- feed pair-aware snapshots with timestamp X-axis.
+        chart = self._unwrap(self._chart)
+        if chart is not None and market_data:
+            pair_names = [p for p in market_data.keys() if p]
+            if hasattr(chart, "add_pairs"):
+                chart.add_pairs(pair_names)
+
+            ts_now = time.time()
+            total_pnl = float(pnl.get("total", 0.0))
+            realized_pnl = float(pnl.get("realized", 0.0))
+
+            for pair_name, md in market_data.items():
+                if not md:
+                    continue
+
+                last_block = self._chart_last_block_by_pair.get(pair_name, -1)
+                if block_height <= 0 or block_height == last_block:
+                    continue
+
+                mid_v = float(md.get("mid_price", 0.0))
+                spread_bps_v = float(md.get("spread_bps", 0.0))
+                if mid_v <= 0:
+                    continue
+
+                best_bid = float(md.get("best_bid", 0.0) or 0.0)
+                best_ask = float(md.get("best_ask", 0.0) or 0.0)
+                if best_bid <= 0.0 or best_ask <= 0.0:
+                    half_frac = spread_bps_v / 20000.0
+                    best_bid = mid_v * (1.0 - half_frac)
+                    best_ask = mid_v * (1.0 + half_frac)
+
+                if hasattr(chart, "append_price_data_for_pair"):
+                    chart.append_price_data_for_pair(
+                        pair_name,
+                        block_height,
+                        mid_v,
+                        best_bid,
+                        best_ask,
+                        ts_now,
+                    )
+                if hasattr(chart, "append_pnl_data_for_pair"):
+                    chart.append_pnl_data_for_pair(
+                        pair_name,
+                        block_height,
+                        total_pnl,
+                        realized_pnl,
+                        ts_now,
+                    )
+
+                self._chart_last_block_by_pair[pair_name] = block_height
 
         reports_widget = self._unwrap(self._reports)
         if reports_widget is not None and hasattr(reports_widget, "set_live_context"):
@@ -647,6 +710,92 @@ class MainWindow(QMainWindow):
         ob_data = data.get("order_book", data.get("market_data", {}))
         if hasattr(self._order_book, "update_market_data"):
             self._order_book.update_market_data(ob_data)
+
+    @staticmethod
+    def _parse_trade_timestamp(value: Any) -> float:
+        """Best-effort conversion of DB trade timestamp to Unix seconds."""
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            try:
+                ts = value.replace("Z", "+00:00")
+                return datetime.fromisoformat(ts).timestamp()
+            except ValueError:
+                return time.time()
+        return time.time()
+
+    def _remember_chart_trade_key(self, key: tuple) -> None:
+        """Track seen trade keys with bounded memory."""
+        if key in self._chart_seen_trade_keys:
+            return
+        self._chart_seen_trade_keys.add(key)
+        self._chart_seen_trade_fifo.append(key)
+
+        # deque maxlen auto-evicts oldest; keep set in sync lazily.
+        if len(self._chart_seen_trade_keys) > self._chart_seen_trade_fifo.maxlen + 500:
+            self._chart_seen_trade_keys = set(self._chart_seen_trade_fifo)
+
+    def _on_trades_for_chart(self, trades: list) -> None:
+        """Feed chart volume bars and fill markers from DB trades."""
+        chart = self._unwrap(self._chart)
+        if chart is None or not trades:
+            return
+
+        for tr in reversed(trades):
+            pair_name = str(tr.get("pair_name", "") or "")
+            side_raw = str(tr.get("side", "") or "").lower()
+            block_height = int(tr.get("block_height", 0) or 0)
+            price_mojos = float(tr.get("price_mojos", 0.0) or 0.0)
+            size_mojos = float(tr.get("size_mojos", 0.0) or 0.0)
+
+            if not pair_name or block_height <= 0 or price_mojos <= 0.0 or size_mojos <= 0.0:
+                continue
+
+            side = "buy" if side_raw == "bid" else "sell" if side_raw == "ask" else ""
+            if not side:
+                continue
+
+            ts = self._parse_trade_timestamp(tr.get("timestamp"))
+            sig = (
+                pair_name,
+                block_height,
+                side,
+                int(price_mojos),
+                int(size_mojos),
+                str(tr.get("timestamp", "")),
+            )
+            if sig in self._chart_seen_trade_keys:
+                continue
+            self._remember_chart_trade_key(sig)
+
+            # Fill marker (price in mojos/XCH, matching chart scale).
+            if hasattr(chart, "add_fill_marker_for_pair"):
+                chart.add_fill_marker_for_pair(
+                    pair_name,
+                    block_height,
+                    float(price_mojos),
+                    side,
+                    float(size_mojos),
+                )
+
+            # Per-block volume bars (values in base units ~= XCH).
+            size_units = float(size_mojos) / 1_000_000_000_000.0
+            key = (pair_name, block_height)
+            buy_prev, sell_prev = self._chart_volume_by_pair_block.get(key, (0.0, 0.0))
+            if side == "buy":
+                buy_prev += size_units
+            else:
+                sell_prev += size_units
+            self._chart_volume_by_pair_block[key] = (buy_prev, sell_prev)
+
+            if hasattr(chart, "append_volume_data_for_pair"):
+                chart.append_volume_data_for_pair(
+                    pair_name,
+                    block_height,
+                    buy_prev,
+                    sell_prev,
+                    ts,
+                )
 
     # ===================================================================== #
     #  Menu bar                                                              #

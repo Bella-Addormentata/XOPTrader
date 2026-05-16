@@ -728,6 +728,38 @@ class ChartWidget(QWidget):
             self._block_ts_counts[pair] = len(pair_keys) - excess
         self._dirty = True
 
+    def append_price_data_for_pair(
+        self,
+        pair_name: str,
+        block_height: int,
+        mid: float,
+        bid: float,
+        ask: float,
+        timestamp: float,
+    ) -> None:
+        """Append a price snapshot for a specific pair without changing selection."""
+        store = self._ensure_pair_store(pair_name)
+        store["price"].append(
+            PriceTick(block=block_height, timestamp=timestamp,
+                      mid=mid, bid=bid, ask=ask)
+        )
+
+        key = (pair_name, block_height)
+        if key not in self._block_ts_map:
+            self._block_ts_counts[pair_name] = self._block_ts_counts.get(pair_name, 0) + 1
+        self._block_ts_map[key] = timestamp
+
+        if self._block_ts_counts.get(pair_name, 0) > _MAX_DATA_POINTS:
+            pair_keys = sorted(
+                (k for k in self._block_ts_map if k[0] == pair_name),
+                key=lambda k: k[1],
+            )
+            excess = len(pair_keys) - _MAX_DATA_POINTS
+            for evict_key in pair_keys[:excess]:
+                del self._block_ts_map[evict_key]
+            self._block_ts_counts[pair_name] = len(pair_keys) - excess
+        self._dirty = True
+
     def append_pnl_data(
         self,
         block_height: int,
@@ -750,6 +782,23 @@ class ChartWidget(QWidget):
         """
         ts = timestamp if timestamp is not None else time.time()
         store = self._ensure_pair_store(self._current_pair)
+        store["pnl"].append(
+            PnLTick(block=block_height, timestamp=ts,
+                    total_pnl=total_pnl, realized_pnl=realized_pnl)
+        )
+        self._dirty = True
+
+    def append_pnl_data_for_pair(
+        self,
+        pair_name: str,
+        block_height: int,
+        total_pnl: float,
+        realized_pnl: float,
+        timestamp: float | None = None,
+    ) -> None:
+        """Append a PnL snapshot for a specific pair without changing selection."""
+        ts = timestamp if timestamp is not None else time.time()
+        store = self._ensure_pair_store(pair_name)
         store["pnl"].append(
             PnLTick(block=block_height, timestamp=ts,
                     total_pnl=total_pnl, realized_pnl=realized_pnl)
@@ -784,6 +833,38 @@ class ChartWidget(QWidget):
         )
         self._dirty = True
 
+    def append_volume_data_for_pair(
+        self,
+        pair_name: str,
+        block_height: int,
+        buy_volume: float,
+        sell_volume: float,
+        timestamp: float | None = None,
+    ) -> None:
+        """Append or update a volume point for a specific pair.
+
+        If the latest point is for the same block, update it in-place so
+        late fills in that block adjust the existing bar instead of adding
+        duplicate X-axis entries.
+        """
+        ts = timestamp if timestamp is not None else time.time()
+        store = self._ensure_pair_store(pair_name)
+        vol_store = store["volume"]
+
+        if vol_store and vol_store[-1].block == block_height:
+            vol_store[-1] = VolumeTick(
+                block=block_height,
+                timestamp=ts,
+                buy_vol=buy_volume,
+                sell_vol=sell_volume,
+            )
+        else:
+            vol_store.append(
+                VolumeTick(block=block_height, timestamp=ts,
+                           buy_vol=buy_volume, sell_vol=sell_volume)
+            )
+        self._dirty = True
+
     def add_fill_marker(
         self,
         block_height: int,
@@ -805,6 +886,21 @@ class ChartWidget(QWidget):
             Fill size in base units (stored for tooltip use).
         """
         store = self._ensure_pair_store(self._current_pair)
+        store["fills"].append(
+            FillMarker(block=block_height, price=price, side=side, size=size)
+        )
+        self._dirty = True
+
+    def add_fill_marker_for_pair(
+        self,
+        pair_name: str,
+        block_height: int,
+        price: float,
+        side: str,
+        size: float,
+    ) -> None:
+        """Add a fill marker to a specific pair without changing selection."""
+        store = self._ensure_pair_store(pair_name)
         store["fills"].append(
             FillMarker(block=block_height, price=price, side=side, size=size)
         )
@@ -866,11 +962,18 @@ class ChartWidget(QWidget):
         pairs:
             Ordered list of pair names to appear in the dropdown.
         """
+        prev_pair = self._current_pair or self._pair_combo.currentText()
+
         self._pair_combo.blockSignals(True)
         self._pair_combo.clear()
         for p in pairs:
             self._pair_combo.addItem(p)
         self._pair_combo.blockSignals(False)
 
-        if pairs:
+        if not pairs:
+            return
+
+        if prev_pair and prev_pair in pairs:
+            self.set_pair(prev_pair)
+        else:
             self.set_pair(pairs[0])

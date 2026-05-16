@@ -55,6 +55,9 @@ _BUSY_TIMEOUT_MS: Final[int] = 3_000
 # Retry delay after a locked-DB error (milliseconds).
 _RETRY_DELAY_MS: Final[int] = 2_000
 
+# Approximate blocks per hour on Chia (52s block target).
+_BLOCKS_PER_HOUR: Final[int] = 69
+
 
 # ===================================================================
 # Worker -- runs queries on a background QThread
@@ -242,11 +245,37 @@ class _DatabaseWorker(QObject):
         to_block : int
             End block (inclusive).
         """
-        sql = (
-            "SELECT * FROM snapshots "
-            "WHERE pair_name = ? AND block_height >= ? AND block_height <= ? "
-            "ORDER BY block_height ASC"
-        )
+        if from_block > to_block:
+            from_block, to_block = to_block, from_block
+
+        block_span = max(0, to_block - from_block)
+        table = self._select_snapshot_source_table(block_span)
+
+        if table == "snapshots":
+            sql = (
+                "SELECT * FROM snapshots "
+                "WHERE pair_name = ? AND block_height >= ? AND block_height <= ? "
+                "ORDER BY block_height ASC"
+            )
+        else:
+            sql = (
+                f"SELECT "
+                f"source_last_block AS block_height, "
+                f"pair_name, "
+                f"close_mid_price_mojos AS mid_price_mojos, "
+                f"avg_spread_bps AS spread_bps, "
+                f"avg_inventory_ratio AS inventory_ratio, "
+                f"avg_sigma_block AS sigma_block, "
+                f"close_regime AS regime, "
+                f"close_pnl_total_mojos AS pnl_total_mojos, "
+                f"avg_xch_usd_rate AS xch_usd_rate, "
+                f"close_pnl_total_usd AS pnl_total_usd, "
+                f"bucket_start_iso AS created_at "
+                f"FROM {table} "
+                "WHERE pair_name = ? AND source_last_block >= ? AND source_last_block <= ? "
+                "ORDER BY source_last_block ASC"
+            )
+
         self._execute_and_emit(sql, [pair, from_block, to_block], self.snapshots_ready)
 
     @Slot()
@@ -835,6 +864,32 @@ class _DatabaseWorker(QObject):
         if not rows:
             return False
         return any(str(row["name"]) == "xch_usd_rate" for row in rows)
+
+    def _select_snapshot_source_table(self, block_span: int) -> str:
+        """Pick raw snapshots or a rollup table based on requested span.
+
+        The returned table always preserves the public snapshots payload
+        shape via column aliases in :meth:`fetch_snapshots`.
+        """
+        one_day_blocks = 24 * _BLOCKS_PER_HOUR
+        seven_day_blocks = 7 * one_day_blocks
+        thirty_day_blocks = 30 * one_day_blocks
+
+        if block_span >= thirty_day_blocks and self._table_exists("snapshots_1h"):
+            return "snapshots_1h"
+        if block_span >= seven_day_blocks and self._table_exists("snapshots_15m"):
+            return "snapshots_15m"
+        if block_span >= one_day_blocks and self._table_exists("snapshots_1m"):
+            return "snapshots_1m"
+        return "snapshots"
+
+    def _table_exists(self, table_name: str) -> bool:
+        """Return ``True`` if a table exists in this database."""
+        rows = self._execute_query(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+            [table_name],
+        )
+        return bool(rows)
 
     # -- Internal helpers ---------------------------------------------------
 

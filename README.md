@@ -784,6 +784,70 @@ The codebase follows:
 
 ---
 
+## Database Retention and Rollups
+
+For long-term chart history without unbounded growth, run:
+
+```bash
+python scripts/maintain_snapshot_rollups.py --db data/xop_trader.db --backup
+```
+
+What it does:
+
+- Builds/updates `snapshots_1m`, `snapshots_15m`, `snapshots_1h`, `snapshots_1d`
+  from raw `snapshots`.
+- Prunes old high-frequency rows from `snapshots` and `strategy_quotes`
+  (default raw retention: 120 days).
+- Keeps rollups for long-horizon chart queries.
+
+Useful flags:
+
+- `--dry-run`: show expected changes without writing.
+- `--raw-retention-days N`: change high-frequency retention window.
+- `--no-prune-strategy-quotes`: keep all `strategy_quotes` rows.
+- `--vacuum`: reclaim on-disk space after pruning.
+
+Note: run maintenance when the engine is idle when possible.
+
+### Cross-Platform Scheduled Backups (No OS Scheduler Required)
+
+To keep backups + rollups running on a fixed cadence across Linux/macOS/Windows,
+run the built-in Python scheduler loop:
+
+```bash
+python scripts/scheduled_db_maintenance.py \
+  --db data/xop_trader.db \
+  --backup-dir data/backups \
+  --interval-minutes 360 \
+  --keep-last 30 \
+  --keep-days 30 \
+  --raw-retention-days 120 \
+  --compress-backups
+```
+
+This process is platform-neutral and performs, each cycle:
+
+- crash-consistent SQLite backup copy
+- backup rotation (`keep-last` and `keep-days`)
+- rollup/prune maintenance via `maintain_snapshot_rollups.py`
+- status JSON update for monitoring
+- single-instance lockfile enforcement
+
+Useful options:
+
+- `--once`: run one cycle and exit (good for validation)
+- `--vacuum-every N`: run VACUUM every N cycles
+- `--no-prune-strategy-quotes`: preserve all strategy quote history
+- `--compress-backups`: store backups as `.sqlite3.gz`
+- `--status-file PATH`: write machine-readable cycle health output
+- `--lock-file PATH`: choose lockfile location
+- `--stale-lock-minutes N`: auto-recover stale lockfiles
+
+Status file fields include `status`, `exit_code`, `started_at`,
+`completed_at`, `duration_seconds`, and backup/retention metadata.
+
+---
+
 ## Roadmap
 
 ### Phase 1: Foundation (Current)

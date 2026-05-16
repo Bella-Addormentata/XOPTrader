@@ -116,6 +116,36 @@ already emitted here via `update_offer_status(..., "stuck")`.
 
 ---
 
+## `snapshots_1m` / `snapshots_15m` / `snapshots_1h` / `snapshots_1d` — long-horizon chart rollups
+
+Built by `scripts/maintain_snapshot_rollups.py` for fast long-range chart
+queries and bounded database growth.
+
+| Column                  | Type    | Notes                                            |
+|-------------------------|---------|--------------------------------------------------|
+| `pair_name`             | TEXT    |                                                  |
+| `bucket_start_unix`     | INTEGER | UTC bucket start (seconds since epoch)           |
+| `bucket_start_iso`      | TEXT    | UTC ISO-8601 bucket start                        |
+| `open_mid_price_mojos`  | INTEGER | First mid in bucket                              |
+| `high_mid_price_mojos`  | INTEGER | Max mid in bucket                                |
+| `low_mid_price_mojos`   | INTEGER | Min mid in bucket                                |
+| `close_mid_price_mojos` | INTEGER | Last mid in bucket                               |
+| `avg_spread_bps`        | REAL    | Mean spread across samples                       |
+| `avg_inventory_ratio`   | REAL    | Mean inventory ratio across samples              |
+| `avg_sigma_block`       | REAL    | Mean per-block sigma across samples              |
+| `close_regime`          | TEXT    | Last observed regime in bucket                   |
+| `close_pnl_total_mojos` | INTEGER | Last PnL mark in quote-asset mojos               |
+| `avg_xch_usd_rate`      | REAL    | Mean XCH/USD mark for bucket                     |
+| `close_pnl_total_usd`   | REAL    | Last USD PnL mark in bucket                      |
+| `sample_count`          | INTEGER | Number of raw `snapshots` rows in bucket         |
+| `source_first_block`    | INTEGER | First block represented in bucket                |
+| `source_last_block`     | INTEGER | Last block represented in bucket                 |
+| `updated_at`            | TEXT    | Last rollup update timestamp                     |
+
+Primary key: `(pair_name, bucket_start_unix)`.
+
+---
+
 ## `strategy_quotes` — every tier the strategy proposed (pre-suppression)
 
 | Column         | Type    | Notes                       |
