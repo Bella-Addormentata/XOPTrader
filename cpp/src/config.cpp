@@ -865,6 +865,28 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         && !node["auto_rebalance_enabled"].IsNull()) {
         cfg.auto_rebalance_enabled = node["auto_rebalance_enabled"].as<bool>();
     }
+    if (node["quote_recovery_enabled"] && node["quote_recovery_enabled"].IsDefined()
+        && !node["quote_recovery_enabled"].IsNull()) {
+        cfg.quote_recovery_enabled = node["quote_recovery_enabled"].as<bool>();
+    }
+    if (node["quote_recovery_ratio_threshold"] && node["quote_recovery_ratio_threshold"].IsDefined()
+        && !node["quote_recovery_ratio_threshold"].IsNull()) {
+        cfg.quote_recovery_ratio_threshold =
+            node["quote_recovery_ratio_threshold"].as<double>();
+        if (cfg.quote_recovery_ratio_threshold <= 0.0
+            || cfg.quote_recovery_ratio_threshold > 1.0) {
+            throw ConfigError(sec + ".quote_recovery_ratio_threshold must be in (0, 1]");
+        }
+    }
+    if (node["quote_recovery_undercut_bps"] && node["quote_recovery_undercut_bps"].IsDefined()
+        && !node["quote_recovery_undercut_bps"].IsNull()) {
+        cfg.quote_recovery_undercut_bps =
+            node["quote_recovery_undercut_bps"].as<double>();
+        if (cfg.quote_recovery_undercut_bps < 0.0
+            || cfg.quote_recovery_undercut_bps > 500.0) {
+            throw ConfigError(sec + ".quote_recovery_undercut_bps must be in [0, 500]");
+        }
+    }
     if (node["xch_ask_throttle_enabled"] && node["xch_ask_throttle_enabled"].IsDefined()
         && !node["xch_ask_throttle_enabled"].IsNull()) {
         cfg.xch_ask_throttle_enabled = node["xch_ask_throttle_enabled"].as<bool>();

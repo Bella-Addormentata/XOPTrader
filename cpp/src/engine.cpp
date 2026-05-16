@@ -1,4 +1,4 @@
-// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
+﻿// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
 //
 // The engine runs a single-threaded event loop driven by boost::asio.
 // A native C++20 coroutine loop polls the Chia full node for block height
@@ -5559,6 +5559,69 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              pair_name, suppressed, can_bid, can_ask);
             }
             fee_filtered_tiers = std::move(side_filtered);
+        }
+
+        // -- Quote-asset recovery pricing ----------------------------------
+        // When the quote asset is depleted (can_bid=false) and the
+        // inventory ratio is extreme, reprice the single tightest ask
+        // to just below the current DEX best ask.  This makes us the
+        // cheapest seller on the DEX so buyers prefer our offer over the
+        // wall, accelerating inventory rebalancing.
+        if (!can_bid && can_ask
+            && config_.strategy.auto_rebalance_enabled
+            && config_.strategy.quote_recovery_enabled
+            && !fee_filtered_tiers.empty()) {
+            const PairConfig* pair_cfg_qr = find_pair_config(pair_name);
+            const double qr_mid = market_data_->get_mid_price(pair_name);
+            const Mojo qr_mid_mojos = static_cast<Mojo>(std::llround(
+                qr_mid * static_cast<double>(kMojosPerXch)));
+            const double inv_ratio_qr = (pair_cfg_qr && qr_mid_mojos > 0)
+                ? std::abs(inventory_->inventory_ratio(
+                      AssetId{pair_cfg_qr->base_asset_id},
+                      AssetId{pair_cfg_qr->quote_asset_id},
+                      qr_mid_mojos))
+                : 0.0;
+            if (inv_ratio_qr >= config_.strategy.quote_recovery_ratio_threshold) {
+                const auto mkt_qr = state_->get_market(pair_name);
+                if (mkt_qr.best_ask > 0) {
+                    // Find the tightest (lowest tier_index) ask tier.
+                    int min_tier_idx = -1;
+                    for (const auto& tq : fee_filtered_tiers) {
+                        if (tq.side == Side::Ask) {
+                            if (min_tier_idx < 0 || tq.tier_index < min_tier_idx)
+                                min_tier_idx = tq.tier_index;
+                        }
+                    }
+                    if (min_tier_idx >= 0) {
+                        const double undercut_frac =
+                            config_.strategy.quote_recovery_undercut_bps / 10000.0;
+                        const Mojo recovery_price = static_cast<Mojo>(std::llround(
+                            static_cast<double>(mkt_qr.best_ask)
+                            * (1.0 - undercut_frac)));
+                        for (auto& tq : fee_filtered_tiers) {
+                            if (tq.side == Side::Ask
+                                && tq.tier_index == min_tier_idx
+                                && tq.price > recovery_price) {
+                                spdlog::info(
+                                    "[Engine] Step 8: {} quote-recovery mode "
+                                    "(inv_ratio={:.3f} >= threshold={:.3f}) -- "
+                                    "repricing ask tier {} from {:.6f} to {:.6f} "
+                                    "({:.1f} bps below best-ask)",
+                                    pair_name,
+                                    inv_ratio_qr,
+                                    config_.strategy.quote_recovery_ratio_threshold,
+                                    min_tier_idx,
+                                    static_cast<double>(tq.price)
+                                        / static_cast<double>(kMojosPerXch),
+                                    static_cast<double>(recovery_price)
+                                        / static_cast<double>(kMojosPerXch),
+                                    config_.strategy.quote_recovery_undercut_bps);
+                                tq.price = recovery_price;
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // -- Competitiveness guard -----------------------------------------

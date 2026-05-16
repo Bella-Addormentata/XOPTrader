@@ -285,6 +285,25 @@ struct StrategyConfig {
     /// depleted assets when below min_trading_units.  Default true.
     bool     auto_rebalance_enabled{true};
 
+    /// When true (and auto_rebalance_enabled is also true), the engine
+    /// reprices the tightest ask tier to just below the current DEX
+    /// best ask when the quote asset is depleted and the inventory
+    /// ratio exceeds quote_recovery_ratio_threshold.  This makes the
+    /// engine the cheapest seller on the DEX so buyers prefer our
+    /// offer, accelerating the rebalance.  Default true.
+    bool     quote_recovery_enabled{true};
+
+    /// Inventory ratio threshold that activates quote-recovery pricing.
+    /// When abs(inventory_ratio) >= this value with the quote asset
+    /// depleted, the tightest ask tier is undercut aggressively.
+    /// Default: 0.75 (75% base-heavy triggers recovery).
+    double   quote_recovery_ratio_threshold{0.75};
+
+    /// Basis points below the current best ask to price the recovery
+    /// ask tier.  Smaller = less slippage; larger = fills faster.
+    /// Default: 5.0 bps (0.05% undercut).
+    double   quote_recovery_undercut_bps{5.0};
+
     // -- XCH inventory-preservation throttle -------------------------------
 
     /// When enabled, XCH-base asks become progressively less competitive as
