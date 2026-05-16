@@ -323,6 +323,7 @@ class MarketAnalysisWidget(QWidget):
 
         self._pair_panels: dict[str, PairAnalysisPanel] = {}
         self._analysis_data: dict[str, Any] = {}
+        self._engine_status: str = ""
 
         self._build_ui()
 
@@ -494,6 +495,17 @@ class MarketAnalysisWidget(QWidget):
 
         # Update status label.
         if blocks_target == 0:
+            if self._engine_status == "Analyzing":
+                self._overall_progress.setValue(0)
+                self._overall_progress.setFormat("Initializing…")
+                self._status_label.setText(
+                    "Analysis initializing — waiting for first metrics"
+                )
+                self._status_label.setStyleSheet(
+                    f"color: {WARNING}; font-size: 13px;"
+                )
+                return
+
             self._overall_progress.setValue(100)
             self._overall_progress.setFormat("N/A")
             self._status_label.setText(
@@ -510,6 +522,47 @@ class MarketAnalysisWidget(QWidget):
         else:
             self._status_label.setText(
                 f"Collecting data… {min_collected or 0}/{blocks_target} blocks"
+            )
+            self._status_label.setStyleSheet(
+                f"color: {WARNING}; font-size: 13px;"
+            )
+
+    @Slot(str)
+    def set_engine_status(self, status: str) -> None:
+        """Inform the widget of the current engine status.
+
+        This allows the UI to avoid showing a false "analysis disabled"
+        state while analysis metrics are still initializing.
+        """
+        self._engine_status = status
+
+        if status != "Analyzing":
+            return
+
+        # During analysis startup there can be a short window where
+        # xop_analysis metrics have not yet published blocks_target.
+        if not self._analysis_data:
+            self._overall_progress.setValue(0)
+            self._overall_progress.setFormat("Initializing…")
+            self._status_label.setText(
+                "Analysis initializing — waiting for first metrics"
+            )
+            self._status_label.setStyleSheet(
+                f"color: {WARNING}; font-size: 13px;"
+            )
+            return
+
+        blocks_target = 0
+        for data in self._analysis_data.values():
+            target = data.get("blocks_target", 0)
+            if target > blocks_target:
+                blocks_target = target
+
+        if blocks_target == 0:
+            self._overall_progress.setValue(0)
+            self._overall_progress.setFormat("Initializing…")
+            self._status_label.setText(
+                "Analysis initializing — waiting for first metrics"
             )
             self._status_label.setStyleSheet(
                 f"color: {WARNING}; font-size: 13px;"

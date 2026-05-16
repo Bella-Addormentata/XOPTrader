@@ -485,6 +485,10 @@ class MainWindow(QMainWindow):
 
         # Market analysis update -- forward analysis data to the widget.
         analysis_widget = self._unwrap(self._market_analysis)
+        if analysis_widget is not None:
+            if hasattr(analysis_widget, "set_engine_status"):
+                analysis_widget.set_engine_status(data.get("bot_status", ""))
+
         if analysis_widget is not None and hasattr(analysis_widget, "update_analysis"):
             analysis_data = data.get("analysis", {})
             if analysis_data:
