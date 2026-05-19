@@ -160,24 +160,63 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
     const std::int64_t cap = std::max(available_capital,    static_cast<std::int64_t>(0));
     const std::int64_t inv = std::max(available_inventory,  static_cast<std::int64_t>(0));
 
+    // -- [v0.7.50] Symmetric bid/ask sizing: matching sizes at each tier ------
+    // New approach: instead of independent capital/inventory pools, use a single
+    // unified "liquidity pool" that funds BOTH bids and asks equally at each tier.
+    //
+    // Problem solved:
+    // - When ask-side is suppressed, bids alone don't provide liquidity presence
+    // - Current asymmetric approach (cap for bids, inv for asks) doesn't handle
+    //   one-sided suppression well
+    //
+    // Solution:
+    // - Pool size = min(available_capital, available_inventory)
+    // - Allocate pool size equally to bids and asks at each tier
+    // - Price (spread_bps) is the ONLY variable for risk/competitiveness
+    // - Ensures symmetric liquidity presence: if one side posts, other can too
+    //
+    // Benefit: When ask-side is suppressed at Step 8, at least the tier-0 bid
+    // was sized correctly and can post. When both sides are enabled, we have
+    // perfect balance - tier-0 bid size == tier-0 ask size.
+    //
+    // The pool can shrink due to:
+    // - Pending changes reducing XCH (available_capital decreases)
+    // - Inventory skew (available_inventory decreases)
+    // But both sides scale together, maintaining symmetry.
+    
+    // Use the smaller of capital and inventory to ensure both sides can post
+    // at the same size.  This is the fundamental "liquidity pool" available
+    // for paired bid/ask posting.
+    const std::int64_t unified_pool = std::min(cap, inv);
+    
+    // Minimum pool size: tier-0 must have at least 1 XCH funding (split between bid and ask)
+    const std::int64_t min_pool_per_tier = 1000000000000LL;  // 1.0 XCH
+
     for (std::uint32_t i = 0; i < cfg.num_tiers; ++i) {
         const double spread_bps = cfg.tier_spacing_bps[i];
         const double size_frac  = cfg.tier_size_pct[i];
 
+        // Unified tier size from the shared pool
+        auto tier_size =
+            static_cast<std::int64_t>(
+                std::floor(static_cast<double>(unified_pool) * size_frac));
+
+        // [v0.7.50] Enforce minimum tier-0 pool allocation for both sides
+        // Tier-0 is critical; ensure it's funded adequately
+        if (i == 0 && tier_size < min_pool_per_tier && unified_pool > 0) {
+            tier_size = std::min(min_pool_per_tier, unified_pool);
+        }
+
         // -- Bid tier --
         // bid_price = mid * (1 - spread_bps / 10000)
-        // Computed in floating point then rounded to int64 (mojos).
         // Rounding DOWN for bids is conservative (we pay less).
         const double bid_price_f =
             static_cast<double>(mid) * (1.0 - spread_bps / 10000.0);
         const auto   bid_price   =
             static_cast<std::int64_t>(std::floor(bid_price_f));
 
-        // bid_size = available_capital * size_fraction
-        // Capital is in quote-asset mojos.  Each bid tier gets a fraction.
-        const auto bid_size =
-            static_cast<std::int64_t>(
-                std::floor(static_cast<double>(cap) * size_frac));
+        // Bid size is the unified tier size
+        const auto bid_size = tier_size;
 
         if (bid_price > 0 && bid_size > 0) {
             TierQuote tq;
@@ -197,11 +236,9 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         const auto   ask_price   =
             static_cast<std::int64_t>(std::ceil(ask_price_f));
 
-        // ask_size = available_inventory * size_fraction
-        // Inventory is in base-asset mojos.  Each ask tier gets a fraction.
-        const auto ask_size =
-            static_cast<std::int64_t>(
-                std::floor(static_cast<double>(inv) * size_frac));
+        // Ask size MATCHES bid size: same tier_size from unified pool
+        const auto ask_size = tier_size;
+
 
         if (ask_price > 0 && ask_size > 0) {
             TierQuote tq;

@@ -12,6 +12,7 @@ dexie:
 pairs:
 - base_asset_id: xch
   enabled: true
+  min_offer_size_units_override: 0.01
   name: XCH/wUSDC.b
   quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
 - base_asset_id: xch
@@ -63,7 +64,7 @@ strategy:
   gamma: 0.005
   kappa: 1.5
   phi: 0.35
-  q_max: 160
+  q_max: 500
   min_profit_margin_bps: 35
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
@@ -134,9 +135,9 @@ strategy:
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
-  single_cat_cap_pct: 0.12
+  single_cat_cap_pct: 0.25
   kelly_fraction: 0.5
-  max_capital_per_pair_pct: 0.995
+  max_capital_per_pair_pct: 1.0
   max_drawdown_pct: 0.05
   loss_window_blocks: 576
   max_window_loss_bps: 250

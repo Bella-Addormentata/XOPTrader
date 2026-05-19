@@ -4321,17 +4321,91 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // the base asset.  Sub-unit / dust offers are economically
         // insignificant and waste XCH fee coins + wallet UTXOs.
         // Per-pair override takes precedence over global default (1.0).
+        //
+        // [v0.7.49+] Emergency top-tier preservation: keep tier-0 alive
+        // regardless of size so the book can still show a matched top-of-
+        // ladder pair when the risk model sizes below the dust threshold.
+        // Step 8 still side-gates asks or bids when a wallet side is not
+        // safe to post.
         // -----------------------------------------------------------------
         if (pair_cfg) {
-            const double eff_min_units =
-                pair_cfg->min_offer_size_units_override.value_or(
-                    config_.strategy.min_offer_size_units);
+            const bool xch_base_pair =
+                (pair_cfg->base_asset_id == "xch"
+                 || pair_cfg->base_asset_id == "XCH");
+
+            // Hard band for XCH-base pairs: each tier must be in [1, 10] XCH.
+            // This prevents emergency posting of sub-1-XCH dust tiers and
+            // caps oversized tiers that over-concentrate inventory.
+            const double eff_min_units = xch_base_pair
+                ? 1.0
+                : pair_cfg->min_offer_size_units_override.value_or(
+                      config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+            const double eff_max_units = xch_base_pair ? 10.0 : 0.0;
+            const Mojo max_base_mojos = xch_base_pair
+                ? static_cast<Mojo>(std::llround(
+                      eff_max_units
+                      * static_cast<double>(pair_cfg->base_mojos_per_unit)))
+                : 0;
+
+            if (xch_base_pair && max_base_mojos > 0) {
+                int capped_tiers = 0;
+                for (auto& tq : pcs.ladder) {
+                    if (tq.size > max_base_mojos) {
+                        spdlog::info("[Engine] Step 7: {} {} tier {} capped: "
+                                     "size {} -> {} mojos ({:.1f} XCH max)",
+                                     pair_name,
+                                     (tq.side == Side::Bid) ? "BID" : "ASK",
+                                     tq.tier_index,
+                                     tq.size,
+                                     max_base_mojos,
+                                     eff_max_units);
+                        tq.size = max_base_mojos;
+                        ++capped_tiers;
+                    }
+                }
+                if (capped_tiers > 0) {
+                    spdlog::info("[Engine] Step 7: {} capped {} tiers to "
+                                 "the XCH max size ({:.1f} XCH)",
+                                 pair_name, capped_tiers, eff_max_units);
+                }
+            }
+
+            // Diagnostic: show what's in ladder before dust filtering
+            uint32_t pre_bids = 0, pre_asks = 0;
+            for (const auto& tq : pcs.ladder) {
+                if (tq.side == Side::Bid) {
+                    pre_bids++;
+                } else {
+                    pre_asks++;
+                }
+            }
+            spdlog::info("[Engine] Step 7: {} PRE-DUST ladder has {} bids, {} asks (total {})",
+                         pair_name, pre_bids, pre_asks, pcs.ladder.size());
+
             const auto pre_count = pcs.ladder.size();
             auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
                 [&](const TierQuote& tq) {
                     if (tq.size < min_base_mojos) {
+                        // Emergency: never drop tier-0. Preserve the top
+                        // quote on both sides so matched ladders survive the
+                        // dust filter; Step 8 applies the final side gate.
+                        if (!xch_base_pair && tq.tier_index == 0) {
+                            const char* side =
+                                (tq.side == Side::Bid) ? "BID" : "ASK";
+                            const char* reason =
+                                (tq.side == Side::Bid)
+                                    ? "keeping to prevent buy deadlock"
+                                    : "keeping to preserve sell presence";
+                            spdlog::warn("[Engine] Step 7: {} {} tier 0 "
+                                         "PRESERVED (emergency): size {} << min {} -- "
+                                         "{}",
+                                         pair_name, side, tq.size,
+                                         min_base_mojos, reason);
+                            return false;
+                        }
+
                         spdlog::debug("[Engine] Step 7: {} {} tier {} dropped: "
                                       "size {} < min {} mojos ({:.1f} units)",
                                       pair_name,
@@ -4344,10 +4418,17 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 });
             pcs.ladder.erase(it, pcs.ladder.end());
             if (pcs.ladder.size() < pre_count) {
-                spdlog::info("[Engine] Step 7: {} dropped {} dust tiers "
-                             "(min {:.1f} units = {} mojos)",
-                             pair_name, pre_count - pcs.ladder.size(),
-                             eff_min_units, min_base_mojos);
+                if (xch_base_pair) {
+                    spdlog::info("[Engine] Step 7: {} dropped {} tiers below "
+                                 "XCH min size ({:.1f} XCH = {} mojos)",
+                                 pair_name, pre_count - pcs.ladder.size(),
+                                 eff_min_units, min_base_mojos);
+                } else {
+                    spdlog::info("[Engine] Step 7: {} dropped {} dust tiers "
+                                 "(min {:.1f} units = {} mojos)",
+                                 pair_name, pre_count - pcs.ladder.size(),
+                                 eff_min_units, min_base_mojos);
+                }
             }
         }
 
@@ -5722,6 +5803,57 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                              fee_filtered_tiers.size());
             }
             fee_filtered_tiers = std::move(competitive_tiers);
+        }
+
+        // Keep one safe bid alive when ask-side is intentionally suppressed
+        // and competitiveness filtering removed every remaining bid tier.
+        // Candidate tiers have already passed price/BBO/mid guards.
+        if (fee_filtered_tiers.empty() && can_bid && !can_ask) {
+            const TierQuote* fallback_bid = nullptr;
+            for (const auto& tier : pcs.ladder) {
+                if (tier.side != Side::Bid) {
+                    continue;
+                }
+                if (fallback_bid == nullptr
+                    || tier.tier_index < fallback_bid->tier_index
+                    || (tier.tier_index == fallback_bid->tier_index
+                        && tier.price > fallback_bid->price)) {
+                    fallback_bid = &tier;
+                }
+            }
+
+            if (fallback_bid != nullptr) {
+                fee_filtered_tiers.push_back(*fallback_bid);
+                spdlog::warn("[Engine] Step 8: {} competitiveness/fee fallback "
+                             "kept BID tier {} (price={}, size={}) while "
+                             "ask-side suppressed",
+                             pair_name,
+                             fallback_bid->tier_index,
+                             fallback_bid->price,
+                             fallback_bid->size);
+            }
+        }
+
+        {
+            int requested_bids = 0;
+            int requested_asks = 0;
+            int emitted_bids = 0;
+            int emitted_asks = 0;
+            for (const auto& tq : pcs.ladder) {
+                if (tq.side == Side::Bid) ++requested_bids;
+                else                      ++requested_asks;
+            }
+            for (const auto& tq : fee_filtered_tiers) {
+                if (tq.side == Side::Bid) ++emitted_bids;
+                else                      ++emitted_asks;
+            }
+            spdlog::info("[Engine] Step 8: {} tier_summary requested={} "
+                         "(bids={}, asks={}) emitted={} (bids={}, asks={}) "
+                         "can_bid={} can_ask={}",
+                         pair_name,
+                         pcs.ladder.size(), requested_bids, requested_asks,
+                         fee_filtered_tiers.size(), emitted_bids, emitted_asks,
+                         can_bid, can_ask);
         }
 
         if (fee_filtered_tiers.empty()) {
