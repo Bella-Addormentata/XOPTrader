@@ -63,20 +63,20 @@ pairs:
   name: wmilliETH/XCH
   quote_asset_id: xch
 strategy:
-  gamma: 0.005
+  gamma: 0.002
   kappa: 1.5
   phi: 0.35
   q_max: 500
-  min_profit_margin_bps: 35
+  min_profit_margin_bps: 25
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
   offer_ttl_blocks: 1200
   num_tiers: 4
   tier_spacing_bps:
-  - 35.0
-  - 100.0
-  - 200.0
-  - 300.0
+  - 25.0
+  - 75.0
+  - 150.0
+  - 250.0
   tier_size_pct:
   - 0.15
   - 0.2
