@@ -238,9 +238,11 @@ private:
     /// @param pos    Position whose balance is being valued.
     /// @param state  Current bot state (provides market snapshots).
     /// @return       Balance expressed in XCH-equivalent mojos.
+public:
     [[nodiscard]]
     static Mojo mark_to_xch(const Position& pos,
                              const State&    state) noexcept;
+private:
 
     /// Compute the concentration of base value relative to the sum of
     /// base and quote values (mark-to-market in XCH), returning [0, 1].

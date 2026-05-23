@@ -18,6 +18,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 #include <stdexcept>
 
@@ -276,6 +277,24 @@ struct StrategyConfig {
     /// dust-sized offers that waste fees and wallet UTXOs.  Default 0.1.
     double   min_offer_size_units{0.1};
 
+    /// When true, Step 7 caps the bid pool (avail_capital) at the quote-
+    /// asset wallet's confirmed balance, and the ask pool (avail_inventory)
+    /// at the base-asset wallet's confirmed balance, for CAT assets.  XCH
+    /// is already capped unconditionally via xch_confirmed_balance_ above.
+    /// Prevents oversized offers when the wallet does not actually hold
+    /// enough to back the Avellaneda/risk-sized pool.  Default true.
+    bool     wallet_balance_caps_enabled{true};
+
+    /// When true, Step 7 ensures the bid pool is large enough to emit at
+    /// least one tier above min_offer_size_units when the quote wallet has
+    /// sufficient balance (and likewise for the ask pool / base wallet).
+    /// Counteracts aggressive risk/allocator shrinking that would otherwise
+    /// produce zero tier quotes despite ample wallet capacity to trade.
+    /// Respects ratio-rebalance mode: only floors the side being acquired
+    /// (bids in AcquireBase, asks in AcquireQuote, both in Neutral).
+    /// Default true.
+    bool     deploy_idle_inventory_enabled{true};
+
     /// Minimum units of each asset desired for active trading.  When an
     /// asset is below this level, the engine biases toward acquiring it
     /// by posting only buy-side offers.  Default 10.0.
@@ -284,6 +303,81 @@ struct StrategyConfig {
     /// When true, automatically post one-sided offers to acquire
     /// depleted assets when below min_trading_units.  Default true.
     bool     auto_rebalance_enabled{true};
+
+    /// Enable target-ratio inventory rebalancing around ratio_target.
+    /// When enabled, Step 8 can force one-sided posting based on the
+    /// pair's value ratio using hysteresis thresholds.
+    bool     ratio_rebalance_enabled{true};
+
+    /// Target base-value ratio for each pair in [0, 1].
+    /// 0.5 = equal base/quote value split.
+    double   ratio_target{0.50};
+
+    /// Optional per-pair target base-value ratio override.
+    /// Key is pair name (e.g. "XCH/wUSDC.b"), value in (0, 1).
+    std::unordered_map<std::string, double> ratio_target_by_pair;
+
+    /// Enter rebalance mode when ratio deviates beyond this band from
+    /// ratio_target. Example with target=0.5 and enter=0.1:
+    ///   ratio >= 0.6 -> acquire quote, ratio <= 0.4 -> acquire base.
+    double   ratio_band_enter{0.10};
+
+    /// Optional per-pair enter-band override (deadband half-width in ratio
+    /// space, in (0, 0.5)).  When set for a pair, replaces the global
+    /// ratio_band_enter for that pair.  Allows the GUI to expose a "Target
+    /// % +/-" tolerance per asset that gets mapped to a wider/narrower
+    /// rebalance deadband on each pair the asset participates in.
+    /// The corresponding exit band is derived as min(global exit, this/2).
+    std::unordered_map<std::string, double> ratio_band_enter_by_pair;
+
+    /// Optional per-asset portfolio target weight (fraction in [0, 1]).
+    /// Keys are upper-cased asset symbols ("XCH", "BYC", "WUSDC.B", ...).
+    /// Sum across keys should approximate 1.0 but is not enforced here.
+    /// Consumed by the soft drift guard in Step 7 (see
+    /// `asset_drift_guard_enabled`) and *not* by ratio rebalancing.
+    std::unordered_map<std::string, double> asset_target_allocations;
+
+    /// Optional per-asset tolerance around the target weight (fraction).
+    /// Same upper-cased keys as `asset_target_allocations`.  The soft
+    /// drift guard treats `[target - tol, target + tol]` as the no-action
+    /// zone; outside that band, the relevant side of every pair touching
+    /// the asset is tapered linearly toward zero, hitting zero at
+    /// `target +/- asset_drift_guard_max_factor * tol`.
+    std::unordered_map<std::string, double> asset_target_tolerances;
+
+    /// When true, Step 7 applies an asset-level soft drift guard:
+    /// once an asset's actual portfolio fraction exceeds
+    /// `target + tol`, the bid pool of every pair where that asset is
+    /// base (and the ask pool of every pair where it is quote) is
+    /// scaled by `max(0, 1 - (excess - tol) / ((max_factor-1) * tol))`.
+    /// Symmetric behaviour when an asset falls below `target - tol`.
+    /// Stops e.g. arbitrage / cross-pair skew from accumulating an asset
+    /// well past its target even when one pair's ratio controller is
+    /// already in AcquireQuote.  Default true.
+    bool     asset_drift_guard_enabled{true};
+
+    /// Multiplier on tolerance defining the "hard taper" point.  At
+    /// `excess = (max_factor - 1) * tol` the soft cap reaches zero.
+    /// Default 2.0, meaning drift up to `target + tol` is unaffected,
+    /// drift to `target + 2*tol` is fully suppressed on the acquiring
+    /// side.  Must be > 1.0.
+    double   asset_drift_guard_max_factor{2.0};
+
+    /// Exit rebalance mode when ratio returns inside this tighter band
+    /// around ratio_target (hysteresis to avoid side-flip churn).
+    double   ratio_band_exit{0.05};
+
+    /// When true, Step 8 suppresses one side entirely while in ratio
+    /// rebalance mode. When false, ratio mode is advisory only.
+    bool     ratio_force_one_sided{true};
+
+    /// Minimum side scaling multiplier used by ratio-mode sizing in Step 7.
+    /// The overweight side is reduced toward this value.
+    double   ratio_tier_size_scale_min{0.35};
+
+    /// Maximum side scaling multiplier used by ratio-mode sizing in Step 7.
+    /// The underweight side is boosted up to this value.
+    double   ratio_tier_size_scale_max{1.15};
 
     /// When true (and auto_rebalance_enabled is also true), the engine
     /// reprices the tightest ask tier to just below the current DEX

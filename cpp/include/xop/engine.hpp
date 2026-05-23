@@ -641,6 +641,14 @@ private:
     /// Per-pair cycle state for the current block.
     std::unordered_map<std::string, PairCycleState> cycle_;
 
+    // -- Ratio-based inventory rebalance mode (per pair) -------------------
+    enum class RatioRebalanceMode : std::uint8_t {
+        Neutral      = 0,
+        AcquireBase  = 1,
+        AcquireQuote = 2
+    };
+    std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
+
     // [H6] PnL high-water mark for drawdown detection in step 13 alerts.
     // Monotonically non-decreasing; updated each cycle in step_check_alerts.
     // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.

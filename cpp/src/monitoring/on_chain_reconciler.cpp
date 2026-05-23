@@ -317,6 +317,21 @@ OnChainReconciler::verify_pending_offer_coins()
         if (status >= 3) {
             // Terminal state (cancelled, confirmed/filled, or failed) that
             // our normal fill detection or reconciliation missed.
+            //
+            // IMPORTANT: status 4 = CONFIRMED (filled).  Do NOT mark filled
+            // offers as stale here -- engine.cpp records stale_offer_ids
+            // with cancel_reason="on_chain_reconcile", which would mislabel
+            // a fill as a cancellation in the DB (corrupts fill-rate
+            // analytics).  detect_fills() runs on the next poll cycle with
+            // include_completed=true and will correctly attribute the fill.
+            if (status == 4) {
+                logger_->info("verify_pending_offer_coins: offer {} has "
+                              "CONFIRMED (filled) status -- deferring to "
+                              "fill detector, not marking stale (pair={})",
+                              po.offer_id.substr(0, 12), po.pair_name);
+                not_found_counts_.erase(po.offer_id);
+                continue;
+            }
             logger_->warn("verify_pending_offer_coins: offer {} has terminal "
                           "wallet status {} but still in State (pair={})",
                           po.offer_id.substr(0, 12), status, po.pair_name);

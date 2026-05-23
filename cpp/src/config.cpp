@@ -854,6 +854,14 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".min_offer_size_units must be >= 0");
         }
     }
+    if (node["wallet_balance_caps_enabled"] && node["wallet_balance_caps_enabled"].IsDefined()
+        && !node["wallet_balance_caps_enabled"].IsNull()) {
+        cfg.wallet_balance_caps_enabled = node["wallet_balance_caps_enabled"].as<bool>();
+    }
+    if (node["deploy_idle_inventory_enabled"] && node["deploy_idle_inventory_enabled"].IsDefined()
+        && !node["deploy_idle_inventory_enabled"].IsNull()) {
+        cfg.deploy_idle_inventory_enabled = node["deploy_idle_inventory_enabled"].as<bool>();
+    }
     if (node["min_trading_units"] && node["min_trading_units"].IsDefined()
         && !node["min_trading_units"].IsNull()) {
         cfg.min_trading_units = node["min_trading_units"].as<double>();
@@ -864,6 +872,132 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["auto_rebalance_enabled"] && node["auto_rebalance_enabled"].IsDefined()
         && !node["auto_rebalance_enabled"].IsNull()) {
         cfg.auto_rebalance_enabled = node["auto_rebalance_enabled"].as<bool>();
+    }
+    if (node["ratio_rebalance_enabled"] && node["ratio_rebalance_enabled"].IsDefined()
+        && !node["ratio_rebalance_enabled"].IsNull()) {
+        cfg.ratio_rebalance_enabled = node["ratio_rebalance_enabled"].as<bool>();
+    }
+    if (node["ratio_target"] && node["ratio_target"].IsDefined()
+        && !node["ratio_target"].IsNull()) {
+        cfg.ratio_target = node["ratio_target"].as<double>();
+    }
+    if (node["ratio_target_by_pair"] && node["ratio_target_by_pair"].IsDefined()
+        && !node["ratio_target_by_pair"].IsNull()) {
+        const auto rtp = node["ratio_target_by_pair"];
+        if (!rtp.IsMap()) {
+            throw ConfigError(sec + ".ratio_target_by_pair must be a mapping");
+        }
+        cfg.ratio_target_by_pair.clear();
+        for (const auto& kv : rtp) {
+            const std::string pair_name = kv.first.as<std::string>();
+            const double pair_target = kv.second.as<double>();
+            if (pair_target <= 0.0 || pair_target >= 1.0) {
+                throw ConfigError(sec + ".ratio_target_by_pair['" + pair_name
+                                  + "'] must be in (0, 1)");
+            }
+            cfg.ratio_target_by_pair[pair_name] = pair_target;
+        }
+    }
+    if (node["ratio_band_enter"] && node["ratio_band_enter"].IsDefined()
+        && !node["ratio_band_enter"].IsNull()) {
+        cfg.ratio_band_enter = node["ratio_band_enter"].as<double>();
+    }
+    if (node["ratio_band_enter_by_pair"] && node["ratio_band_enter_by_pair"].IsDefined()
+        && !node["ratio_band_enter_by_pair"].IsNull()) {
+        const auto rbp = node["ratio_band_enter_by_pair"];
+        if (!rbp.IsMap()) {
+            throw ConfigError(sec + ".ratio_band_enter_by_pair must be a mapping");
+        }
+        cfg.ratio_band_enter_by_pair.clear();
+        for (const auto& kv : rbp) {
+            const std::string pair_name = kv.first.as<std::string>();
+            const double band = kv.second.as<double>();
+            if (band <= 0.0 || band >= 0.5) {
+                throw ConfigError(sec + ".ratio_band_enter_by_pair['" + pair_name
+                                  + "'] must be in (0, 0.5)");
+            }
+            cfg.ratio_band_enter_by_pair[pair_name] = band;
+        }
+    }
+    if (node["asset_target_allocations"] && node["asset_target_allocations"].IsDefined()
+        && !node["asset_target_allocations"].IsNull()) {
+        const auto ata = node["asset_target_allocations"];
+        if (!ata.IsMap()) {
+            throw ConfigError(sec + ".asset_target_allocations must be a mapping");
+        }
+        cfg.asset_target_allocations.clear();
+        for (const auto& kv : ata) {
+            std::string key = kv.first.as<std::string>();
+            const double v = kv.second.as<double>();
+            if (v < 0.0 || v > 1.0) {
+                throw ConfigError(sec + ".asset_target_allocations['" + key
+                                  + "'] must be in [0, 1]");
+            }
+            // Normalize to upper-case to match engine lookups.
+            for (auto& c : key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            cfg.asset_target_allocations[key] = v;
+        }
+    }
+    if (node["asset_target_tolerances"] && node["asset_target_tolerances"].IsDefined()
+        && !node["asset_target_tolerances"].IsNull()) {
+        const auto att = node["asset_target_tolerances"];
+        if (!att.IsMap()) {
+            throw ConfigError(sec + ".asset_target_tolerances must be a mapping");
+        }
+        cfg.asset_target_tolerances.clear();
+        for (const auto& kv : att) {
+            std::string key = kv.first.as<std::string>();
+            const double v = kv.second.as<double>();
+            if (v < 0.0 || v > 1.0) {
+                throw ConfigError(sec + ".asset_target_tolerances['" + key
+                                  + "'] must be in [0, 1]");
+            }
+            for (auto& c : key) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            cfg.asset_target_tolerances[key] = v;
+        }
+    }
+    if (node["asset_drift_guard_enabled"] && node["asset_drift_guard_enabled"].IsDefined()
+        && !node["asset_drift_guard_enabled"].IsNull()) {
+        cfg.asset_drift_guard_enabled = node["asset_drift_guard_enabled"].as<bool>();
+    }
+    if (node["asset_drift_guard_max_factor"] && node["asset_drift_guard_max_factor"].IsDefined()
+        && !node["asset_drift_guard_max_factor"].IsNull()) {
+        const double f = node["asset_drift_guard_max_factor"].as<double>();
+        if (f <= 1.0) {
+            throw ConfigError(sec + ".asset_drift_guard_max_factor must be > 1.0");
+        }
+        cfg.asset_drift_guard_max_factor = f;
+    }
+    if (node["ratio_band_exit"] && node["ratio_band_exit"].IsDefined()
+        && !node["ratio_band_exit"].IsNull()) {
+        cfg.ratio_band_exit = node["ratio_band_exit"].as<double>();
+    }
+    if (node["ratio_force_one_sided"] && node["ratio_force_one_sided"].IsDefined()
+        && !node["ratio_force_one_sided"].IsNull()) {
+        cfg.ratio_force_one_sided = node["ratio_force_one_sided"].as<bool>();
+    }
+    if (node["ratio_tier_size_scale_min"] && node["ratio_tier_size_scale_min"].IsDefined()
+        && !node["ratio_tier_size_scale_min"].IsNull()) {
+        cfg.ratio_tier_size_scale_min = node["ratio_tier_size_scale_min"].as<double>();
+    }
+    if (node["ratio_tier_size_scale_max"] && node["ratio_tier_size_scale_max"].IsDefined()
+        && !node["ratio_tier_size_scale_max"].IsNull()) {
+        cfg.ratio_tier_size_scale_max = node["ratio_tier_size_scale_max"].as<double>();
+    }
+    if (cfg.ratio_target <= 0.0 || cfg.ratio_target >= 1.0) {
+        throw ConfigError(sec + ".ratio_target must be in (0, 1)");
+    }
+    if (cfg.ratio_band_enter <= 0.0 || cfg.ratio_band_enter >= 0.5) {
+        throw ConfigError(sec + ".ratio_band_enter must be in (0, 0.5)");
+    }
+    if (cfg.ratio_band_exit <= 0.0 || cfg.ratio_band_exit > cfg.ratio_band_enter) {
+        throw ConfigError(sec + ".ratio_band_exit must be in (0, ratio_band_enter]");
+    }
+    if (cfg.ratio_tier_size_scale_min <= 0.0 || cfg.ratio_tier_size_scale_min > 1.0) {
+        throw ConfigError(sec + ".ratio_tier_size_scale_min must be in (0, 1]");
+    }
+    if (cfg.ratio_tier_size_scale_max < 1.0 || cfg.ratio_tier_size_scale_max > 3.0) {
+        throw ConfigError(sec + ".ratio_tier_size_scale_max must be in [1, 3]");
     }
     if (node["quote_recovery_enabled"] && node["quote_recovery_enabled"].IsDefined()
         && !node["quote_recovery_enabled"].IsNull()) {

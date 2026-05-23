@@ -20,8 +20,10 @@ from __future__ import annotations
 
 import logging
 import os
+import sqlite3
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -31,6 +33,7 @@ from gui.services.config_service import ConfigService
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
+from gui.services.config_split import split_and_save
 
 # ---------------------------------------------------------------------------
 # Module-level logger and constants
@@ -55,6 +58,12 @@ STATUS_DISCONNECTED: Final[str] = "Disconnected"
 _DEFAULT_CONFIG_PATH: Final[str] = "config.yaml"
 _DEFAULT_DB_PATH: Final[str] = "data/xop_trader.db"
 _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
+
+# How long the per-pair last-trade-price cache stays warm before we
+# re-query trade_log.  Trades arrive at human pace (seconds to minutes),
+# so a 30 s window keeps the wallet allocation panel responsive while
+# avoiding redundant SQLite hits on every master tick.
+_LAST_TRADE_CACHE_TTL_S: Final[float] = 30.0
 
 
 class EngineBridge(QObject):
@@ -144,6 +153,14 @@ class EngineBridge(QObject):
         self._engine_log_path: Path | None = None
         self._engine_launch_dir: Path | None = None
         self._tick_count: int = 0
+
+        # Cache for the most recent price_mojos per pair, looked up from
+        # trade_log on demand.  Refreshed every _LAST_TRADE_CACHE_TTL_S
+        # seconds so the wallet allocation widget has a price source even
+        # when xop_market_mid_price is 0 (engine just restarted, market
+        # is quiet, or metrics endpoint is briefly unreachable).
+        self._last_trade_prices: dict[str, float] = {}
+        self._last_trade_cache_ts: float = 0.0
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
@@ -269,6 +286,52 @@ class EngineBridge(QObject):
         """
         return self._bot_status
 
+    def _get_last_trade_prices(self) -> dict[str, float]:
+        """Return ``{pair_name: price_mojos}`` from the most recent fill per pair.
+
+        Results are cached for ``_LAST_TRADE_CACHE_TTL_S`` seconds.  On any
+        SQLite error (DB missing, locked, schema mismatch) the previously
+        cached value is returned so callers always get a usable dict.
+        """
+        now = time.monotonic()
+        if (
+            self._last_trade_prices
+            and (now - self._last_trade_cache_ts) < _LAST_TRADE_CACHE_TTL_S
+        ):
+            return self._last_trade_prices
+
+        if not self._db_path.exists():
+            return self._last_trade_prices
+
+        prices: dict[str, float] = {}
+        try:
+            # Use a short timeout so a contended writer never stalls the UI
+            # thread.  read-only URI avoids accidentally creating the file.
+            uri = f"file:{self._db_path.as_posix()}?mode=ro"
+            with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
+                cur = conn.execute(
+                    "SELECT pair_name, price_mojos "
+                    "FROM trade_log t "
+                    "WHERE id = ("
+                    "  SELECT id FROM trade_log "
+                    "  WHERE pair_name = t.pair_name "
+                    "  ORDER BY block_height DESC, id DESC LIMIT 1"
+                    ")"
+                )
+                for pair_name, price_mojos in cur.fetchall():
+                    if pair_name and price_mojos is not None:
+                        try:
+                            prices[str(pair_name)] = float(price_mojos)
+                        except (TypeError, ValueError):
+                            continue
+        except sqlite3.Error as exc:
+            _log.debug("last-trade-price query failed: %s", exc)
+            return self._last_trade_prices
+
+        self._last_trade_prices = prices
+        self._last_trade_cache_ts = now
+        return prices
+
     def get_all_data(self) -> dict[str, Any]:
         """Aggregate the latest data from all services into one dict.
 
@@ -283,10 +346,24 @@ class EngineBridge(QObject):
         # Collect per-pair market data from configured pairs.
         pairs = self._config_svc.get_pairs()
         market_data: dict[str, dict[str, float]] = {}
+        last_trade_prices = self._get_last_trade_prices()
         for pair_cfg in pairs:
             pair_name = pair_cfg.get("name", "")
             if pair_name:
-                market_data[pair_name] = self._metrics_svc.get_market_data(pair_name)
+                pair_md = self._metrics_svc.get_market_data(pair_name)
+                last_px = last_trade_prices.get(pair_name, 0.0)
+                if last_px > 0.0:
+                    # Always expose so downstream widgets can pick the best
+                    # available signal.
+                    pair_md["last_trade_price"] = last_px
+                    # Backfill mid_price when the live metric hasn't
+                    # published yet so anything reading mid_price (e.g. the
+                    # USD price graph in wallet_balances) still gets a
+                    # sensible value derived from the most recent fill.
+                    if float(pair_md.get("mid_price", 0.0) or 0.0) <= 0.0:
+                        pair_md["mid_price"] = last_px
+                        pair_md["mid_price_source"] = "last_trade"
+                market_data[pair_name] = pair_md
 
         # Build per-pair order book data from the latest market-data
         # snapshots.  This provides the depth information that the
@@ -465,6 +542,73 @@ class EngineBridge(QObject):
             self.error.emit(
                 f"Could not load config from {resolved}. "
                 "See logs for details."
+            )
+
+    @Slot(dict, dict, dict, dict)
+    def apply_wallet_allocation_targets(
+        self,
+        asset_targets: dict[str, float],
+        pair_targets: dict[str, float],
+        asset_tolerances: dict[str, float] | None = None,
+        pair_band_enters: dict[str, float] | None = None,
+    ) -> None:
+        """Persist wallet allocation targets to strategy config and reload.
+
+        Parameters
+        ----------
+        asset_targets : dict[str, float]
+            Asset symbol -> fraction of portfolio value (0..1).
+        pair_targets : dict[str, float]
+            Pair name -> base-value target ratio (0..1).
+        asset_tolerances : dict[str, float] | None
+            Asset symbol -> +/- tolerance as fraction (0..0.5).  Recorded
+            on the strategy config for diagnostic purposes; the C++ engine
+            consumes the derived per-pair bands below.
+        pair_band_enters : dict[str, float] | None
+            Pair name -> per-pair ratio-band-enter override (0..0.5).
+            Replaces ``strategy.ratio_band_enter`` for that specific pair,
+            implementing a deadband where the asset is "close enough" to
+            its target and rebalancing is not influenced.
+        """
+        try:
+            cfg = self._config_svc.get_full_config()
+            strategy = cfg.setdefault("strategy", {})
+            strategy["ratio_rebalance_enabled"] = True
+            strategy["asset_target_allocations"] = {
+                str(k): float(v) for k, v in asset_targets.items()
+            }
+            strategy["ratio_target_by_pair"] = {
+                str(k): float(v) for k, v in pair_targets.items()
+                if 0.0 < float(v) < 1.0
+            }
+            if asset_tolerances:
+                strategy["asset_target_tolerances"] = {
+                    str(k): float(v) for k, v in asset_tolerances.items()
+                    if float(v) > 0.0
+                }
+            else:
+                strategy.pop("asset_target_tolerances", None)
+            if pair_band_enters:
+                strategy["ratio_band_enter_by_pair"] = {
+                    str(k): float(v) for k, v in pair_band_enters.items()
+                    if 0.0 < float(v) < 0.5
+                }
+            else:
+                strategy.pop("ratio_band_enter_by_pair", None)
+
+            split_and_save(self._config_path, cfg)
+            _log.info(
+                "Applied wallet allocation targets: %d assets, %d pairs, "
+                "%d pair band overrides",
+                len(strategy["asset_target_allocations"]),
+                len(strategy["ratio_target_by_pair"]),
+                len(strategy.get("ratio_band_enter_by_pair", {})),
+            )
+            self.update_config_path(str(self._config_path))
+        except Exception as exc:
+            _log.error("Failed to apply wallet allocation targets: %s", exc)
+            self.error.emit(
+                f"Failed to apply wallet allocation targets: {exc}"
             )
 
     # ===================================================================

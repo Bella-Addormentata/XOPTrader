@@ -1170,11 +1170,13 @@ class ReportsWidget(QWidget):
                 base_key = base_asset.upper()
                 quote_key = quote_asset.upper()
 
-                quote_divisor = mojos_per_unit_for_pair(pair_name, "quote")
-                if quote_divisor <= 0:
-                    continue
-
-                price_in_quote_units = mid_price / float(quote_divisor)
+                # The engine encodes `mid_price` as `display_price * 1e12`
+                # for every pair regardless of which side is XCH (see
+                # cpp/src/execution/market_data.cpp publish_snapshot).
+                # The quote asset's mojo-per-unit scale is NOT used here
+                # -- always divide by 1e12 to recover the display price
+                # (quote-units per base-unit).
+                price_in_quote_units = mid_price / 1_000_000_000_000.0
                 if price_in_quote_units <= 0.0:
                     continue
 

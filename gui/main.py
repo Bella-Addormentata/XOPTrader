@@ -689,10 +689,30 @@ def main() -> None:
     args = _build_parser().parse_args()
 
     # Configure basic logging early so _kill_old_instances can log.
+    # When launched via pythonw.exe stderr is discarded, so also attach a
+    # rotating file handler under logs/ so INFO/DEBUG messages remain
+    # accessible for post-hoc diagnostics.
     logging.basicConfig(
         level=logging.INFO,
         format="[%(asctime)s] [%(levelname)s] %(message)s",
     )
+    try:
+        from logging.handlers import RotatingFileHandler
+        logs_dir = Path(__file__).resolve().parent.parent / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        _fh = RotatingFileHandler(
+            logs_dir / "gui.log",
+            maxBytes=2_000_000,
+            backupCount=3,
+            encoding="utf-8",
+        )
+        _fh.setLevel(logging.INFO)
+        _fh.setFormatter(
+            logging.Formatter("[%(asctime)s] [%(levelname)s] [%(name)s] %(message)s")
+        )
+        logging.getLogger().addHandler(_fh)
+    except Exception:
+        pass
 
     # Enforce singleton: kill any old GUI and engine processes.
     _kill_old_instances()

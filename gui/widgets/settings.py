@@ -563,19 +563,26 @@ class SettingsWidget(QWidget):
         layout.addLayout(toolbar)
 
         # -- Pairs table --
-        self._pairs_table = QTableWidget(0, 5)
+        self._pairs_table = QTableWidget(0, 6)
         self._pairs_table.setHorizontalHeaderLabels(
-            ["Enabled", "Name", "Base Asset", "Quote Asset", "Actions"]
+            [
+                "Enabled", "Name", "Base Asset", "Quote Asset",
+                "Ratio Target Override (%)", "Actions",
+            ]
         )
         header = self._pairs_table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         header.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        header.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         self._pairs_table.setAlternatingRowColors(True)
         self._pairs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
+        )
+        self._pairs_table.cellChanged.connect(
+            lambda _r, _c, ti=1: self._mark_dirty(ti)
         )
         self._pairs_table.verticalHeader().setVisible(False)
         layout.addWidget(self._pairs_table, stretch=1)
@@ -1978,6 +1985,7 @@ class SettingsWidget(QWidget):
         # the name item's UserRole) so extras like is_stablecoin,
         # peg_target, depeg_*, *_override, etc. survive a Save.
         pairs_list: list[dict[str, Any]] = []
+        ratio_target_by_pair: dict[str, float] = {}
         for row in range(self._pairs_table.rowCount()):
             cb_container = self._pairs_table.cellWidget(row, 0)
             cb = cb_container.findChild(QCheckBox) if cb_container else None
@@ -1985,6 +1993,7 @@ class SettingsWidget(QWidget):
             name_item = self._pairs_table.item(row, 1)
             base_item = self._pairs_table.item(row, 2)
             quote_item = self._pairs_table.item(row, 3)
+            ratio_item = self._pairs_table.item(row, 4)
             original = (
                 name_item.data(Qt.ItemDataRole.UserRole)
                 if name_item is not None else None
@@ -2000,6 +2009,25 @@ class SettingsWidget(QWidget):
                 quote_item.text() if quote_item else ""
             )
             merged["enabled"] = enabled
+
+            ratio_text = ratio_item.text().strip() if ratio_item else ""
+            ratio_text = ratio_text.replace("%", "")
+            if ratio_text:
+                try:
+                    ratio_pct = float(ratio_text)
+                except ValueError:
+                    ratio_pct = -1.0
+                if 0.0 < ratio_pct < 100.0:
+                    ratio_fraction = ratio_pct / 100.0
+                    merged["ratio_target_override"] = ratio_fraction
+                    pair_name = merged["name"]
+                    if pair_name:
+                        ratio_target_by_pair[pair_name] = ratio_fraction
+                else:
+                    merged.pop("ratio_target_override", None)
+            else:
+                merged.pop("ratio_target_override", None)
+
             pairs_list.append(merged)
         cfg["pairs"] = pairs_list
 
@@ -2030,6 +2058,7 @@ class SettingsWidget(QWidget):
             "min_reserve_units": self._min_reserve_units.value(),
             "min_trading_units": self._min_trading_units.value(),
             "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
+            "ratio_target_by_pair": ratio_target_by_pair,
         }
 
         # -- risk --
@@ -2177,14 +2206,30 @@ class SettingsWidget(QWidget):
                 bool(dexie.get("claim_rewards", True))
             )
 
+            strat = cfg.get("strategy", {})
+            ratio_target_by_pair = strat.get("ratio_target_by_pair", {})
+            if not isinstance(ratio_target_by_pair, dict):
+                ratio_target_by_pair = {}
+
             # -- pairs --
             pairs = cfg.get("pairs", [])
             self._pairs_table.setRowCount(0)
             for pair in pairs:
-                self._insert_pair_row(pair)
+                pair_row = copy.deepcopy(pair)
+                pair_name = str(pair_row.get("name", ""))
+                if (
+                    "ratio_target_override" not in pair_row
+                    and pair_name in ratio_target_by_pair
+                ):
+                    try:
+                        ratio_value = float(ratio_target_by_pair[pair_name])
+                    except (TypeError, ValueError):
+                        ratio_value = 0.0
+                    if 0.0 < ratio_value < 1.0:
+                        pair_row["ratio_target_override"] = ratio_value
+                self._insert_pair_row(pair_row)
 
             # -- strategy --
-            strat = cfg.get("strategy", {})
             self._gamma.setValue(float(strat.get("gamma", 0.01)))
             self._kappa.setValue(float(strat.get("kappa", 1.5)))
             self._phi.setValue(float(strat.get("phi", 0.5)))
@@ -2394,6 +2439,7 @@ class SettingsWidget(QWidget):
             self._wl_host, self._wl_port, self._wl_cert, self._wl_key,
             self._wl_fingerprint,
             self._dx_api_base, self._dx_rate_limit,
+            self._pairs_table,
             self._gamma, self._kappa, self._phi, self._q_max,
             self._min_profit_bps, self._offer_ttl, self._num_tiers,
             self._tier_table, self._fee_reserve_xch,
@@ -2488,6 +2534,25 @@ class SettingsWidget(QWidget):
         )
         self._pairs_table.setItem(row, 3, quote_item)
 
+        # Optional per-pair ratio target override as percent.
+        ratio_override = pair.get("ratio_target_override")
+        ratio_text = ""
+        try:
+            ratio_val = float(ratio_override)
+            if 0.0 < ratio_val < 1.0:
+                ratio_text = f"{ratio_val * 100.0:.2f}"
+        except (TypeError, ValueError):
+            ratio_text = ""
+        ratio_item = QTableWidgetItem(ratio_text)
+        ratio_item.setFlags(
+            ratio_item.flags() | Qt.ItemFlag.ItemIsEditable
+        )
+        ratio_item.setToolTip(
+            "Optional override percent for this pair only. "
+            "Leave blank to use portfolio/global ratio target."
+        )
+        self._pairs_table.setItem(row, 4, ratio_item)
+
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
@@ -2507,7 +2572,7 @@ class SettingsWidget(QWidget):
             )
         )
         actions_layout.addWidget(remove_btn)
-        self._pairs_table.setCellWidget(row, 4, actions)
+        self._pairs_table.setCellWidget(row, 5, actions)
 
     def _on_add_pair(self) -> None:
         """Open the Add Pair dialog and append the result to the table."""
@@ -2752,6 +2817,38 @@ class SettingsWidget(QWidget):
                 "but must equal 1.0."
             )
 
+        # -- Pair ratio overrides must be numeric percent in (0, 100) --
+        ratio_errors: list[str] = []
+        for row in range(self._pairs_table.rowCount()):
+            name_item = self._pairs_table.item(row, 1)
+            ratio_item = self._pairs_table.item(row, 4)
+            pair_name = (
+                name_item.text().strip()
+                if name_item and name_item.text()
+                else f"row {row + 1}"
+            )
+            ratio_text = ratio_item.text().strip() if ratio_item else ""
+            ratio_text = ratio_text.replace("%", "")
+            if not ratio_text:
+                continue
+            try:
+                ratio_pct = float(ratio_text)
+            except ValueError:
+                ratio_errors.append(
+                    f"Pair '{pair_name}' ratio override must be a number."
+                )
+                continue
+            if not (0.0 < ratio_pct < 100.0):
+                ratio_errors.append(
+                    f"Pair '{pair_name}' ratio override must be >0 and <100."
+                )
+        _set_valid(
+            self._pairs_table,
+            len(ratio_errors) == 0,
+            "One or more pair ratio overrides are invalid.",
+        )
+        errors.extend(ratio_errors)
+
         return errors
 
     # ===================================================================
@@ -2861,6 +2958,16 @@ class SettingsWidget(QWidget):
         cfg_edits = self._collect_config_dict()
         cfg = copy.deepcopy(self._clean_snapshot) if self._clean_snapshot else {}
         deep_merge(cfg, cfg_edits)
+
+        # Deep-merge keeps old dict keys, which can leave stale pair ratio
+        # overrides behind after users clear/remove them. Replace this map
+        # explicitly with the current table-derived value.
+        strategy_edits = cfg_edits.get("strategy", {})
+        if isinstance(strategy_edits, dict) and "ratio_target_by_pair" in strategy_edits:
+            cfg.setdefault("strategy", {})
+            cfg["strategy"]["ratio_target_by_pair"] = copy.deepcopy(
+                strategy_edits["ratio_target_by_pair"]
+            )
 
         resolved = Path(dest).expanduser().resolve()
         try:

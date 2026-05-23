@@ -1136,13 +1136,25 @@ void MarketDataFeed::ingest_competing_offers(
         // quote_mojos_per_unit; ask-side offers are in the BASE asset.
         //   Ask (offered=base): XCH 1e12 mpu → min ~1 XCH = 1e12 mojos
         //   Bid (offered=quote): wUSDC 1e3 mpu → min ~1 wUSDC = 1e3 mojos
+        //
+        // NOTE: The lower-bound floor used to be `side_mpu` (one full unit),
+        // but that masked the `min_competitor_offer_size` config knob on
+        // low-volume pairs like XCH/BYC where typical ask sizes are
+        // 0.1-0.5 XCH.  Floor is now 1/10 of a unit so the configured
+        // threshold actually controls filtering for thin pairs.
         const std::int64_t side_mpu = (offer.side == Side::Bid)
             ? quote_mojos_per_unit : base_mojos_per_unit;
+        // NOTE: use double for the intermediate multiplication.  With the
+        // default 1 XCH threshold (1e12) and XCH side_mpu (1e12), the
+        // integer product 1e12 * 1e12 = 1e24 overflows int64; the prior
+        // `max(side_mpu, ...)` floor masked the garbage, but with the
+        // lowered floor below the overflow would let dust through.
+        const double scaled = static_cast<double>(cfg.min_competitor_offer_size)
+                            * static_cast<double>(side_mpu)
+                            / static_cast<double>(kMojosPerXch);
         const Mojo effective_min = std::max(
-            static_cast<Mojo>(side_mpu),
-            static_cast<Mojo>(
-                cfg.min_competitor_offer_size * side_mpu
-                / kMojosPerXch));
+            static_cast<Mojo>(side_mpu / 10),
+            static_cast<Mojo>(scaled));
         if (offer.size < effective_min) {
             continue;
         }

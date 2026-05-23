@@ -12,6 +12,7 @@ Compliant with:
 from __future__ import annotations
 
 import logging
+import re
 import ssl
 from pathlib import Path
 from typing import Any, Final, Optional
@@ -29,6 +30,11 @@ _MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
 # Well-known wallet type IDs from Chia.
 _WALLET_TYPE_STANDARD: Final[int] = 0
 _WALLET_TYPE_CAT: Final[int] = 6
+
+# 64-char hex asset id (Chia CAT TAIL hash).  Used to extract an
+# asset_id from the wallet's "data" field or its display name when the
+# user hasn't renamed the wallet.
+_ASSET_ID_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64}")
 
 
 class WalletService(QObject):
@@ -148,6 +154,7 @@ class WalletService(QObject):
             wallet_id = wallet.get("id")
             wallet_name = wallet.get("name", f"Wallet {wallet_id}")
             wallet_type = wallet.get("type", _WALLET_TYPE_STANDARD)
+            wallet_data_field = str(wallet.get("data", "") or "")
 
             if wallet_id is None:
                 continue
@@ -171,6 +178,48 @@ class WalletService(QObject):
 
             balance = bal_data.get("wallet_balance", {})
 
+            # For CAT wallets, resolve the on-chain asset id so callers
+            # can map the wallet to a pair config regardless of the
+            # user-assigned wallet name (Chia defaults to "CAT abcd...").
+            # Try, in order: the "data" field returned by get_wallets,
+            # a 64-char hex token embedded in the wallet's display name,
+            # then the dedicated cat_get_asset_id RPC as a last resort.
+            asset_id: str = ""
+            if wallet_type == _WALLET_TYPE_CAT:
+                m = _ASSET_ID_RE.search(wallet_data_field)
+                if m:
+                    asset_id = m.group(0).lower()
+                if not asset_id:
+                    m = _ASSET_ID_RE.search(wallet_name)
+                    if m:
+                        asset_id = m.group(0).lower()
+                if not asset_id:
+                    try:
+                        aid_resp = requests.post(
+                            f"{base_url}/cat_get_asset_id",
+                            json={"wallet_id": wallet_id},
+                            cert=(str(self._cert_path), str(self._key_path)),
+                            verify=False,
+                            timeout=_RPC_TIMEOUT_S,
+                        )
+                        aid_resp.raise_for_status()
+                        aid_data = aid_resp.json()
+                        if aid_data.get("success"):
+                            asset_id = str(
+                                aid_data.get("asset_id", "") or ""
+                            ).lower()
+                    except requests.RequestException as exc:
+                        _log.debug(
+                            "cat_get_asset_id failed for wallet %s: %s",
+                            wallet_id, exc,
+                        )
+                if not asset_id:
+                    _log.warning(
+                        "Could not resolve asset_id for CAT wallet %s (%r); "
+                        "target-allocation row will be missing",
+                        wallet_id, wallet_name,
+                    )
+
             # Convert mojos to display units for standard (XCH) wallets.
             # CAT wallets use 1000 mojos per unit.
             if wallet_type == _WALLET_TYPE_STANDARD:
@@ -190,6 +239,7 @@ class WalletService(QObject):
                 "unconfirmed": unconfirmed,
                 "wallet_id": float(wallet_id),
                 "wallet_type": float(wallet_type),
+                "asset_id": asset_id,
             }
 
         if result:

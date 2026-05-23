@@ -307,6 +307,13 @@ class MainWindow(QMainWindow):
             self._tab_order_panel.cancel_all_requested.connect(bridge.cancel_all_offers)
         if self._settings_widget is not None and hasattr(self._settings_widget, "config_saved"):
             self._settings_widget.config_saved.connect(bridge.update_config_path)
+        wallet_widget = self._unwrap(self._wallet_balances)
+        if (wallet_widget is not None
+            and hasattr(wallet_widget, "allocation_targets_applied")
+            and hasattr(bridge, "apply_wallet_allocation_targets")):
+            wallet_widget.allocation_targets_applied.connect(
+                bridge.apply_wallet_allocation_targets
+            )
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
@@ -361,14 +368,17 @@ class MainWindow(QMainWindow):
         avg_spread = sum(spreads) / len(spreads) if spreads else 0.0
 
         # Derive XCH/USD rate from the XCH/wUSDC.b mid-price.
-        # Prometheus xop_market_mid_price is in wUSDC mojos;
-        # 1000 wUSDC mojos = 1 wUSDC token = $1 USD.
+        # The engine publishes `mid_price` as `display_price * 1e12` for
+        # every pair (see cpp/src/execution/market_data.cpp,
+        # MarketDataFeed::publish_snapshot's `to_mojos` lambda), where
+        # display_price is quote-units per base-unit.  Since wUSDC.b is
+        # a $1 stablecoin, dividing by 1e12 yields USD per XCH directly.
         xch_usd = 0.0
         for pair_key in ("XCH/wUSDC.b", "XCH/wUSDC"):
             pair_md = market_data.get(pair_key, {})
             mid = pair_md.get("mid_price", 0.0)
             if mid > 0:
-                xch_usd = mid / 1000.0
+                xch_usd = mid / 1_000_000_000_000.0
                 break
 
         # Charts update -- feed pair-aware snapshots with timestamp X-axis.
@@ -562,8 +572,16 @@ class MainWindow(QMainWindow):
         if wallet_widget is not None and hasattr(wallet_widget, "update_balances"):
             wallet_bals = data.get("wallet_balances", {})
             reserve = data.get("spendable_reserve", {})
+            market_data = data.get("market_data", {})
             stuck = data.get("stuck_offers", 0)
-            wallet_widget.update_balances(wallet_bals, reserve=reserve, stuck_offers=stuck)
+            pairs_cfg = data.get("config", {}).get("pairs", []) or []
+            wallet_widget.update_balances(
+                wallet_bals,
+                reserve=reserve,
+                market_data=market_data,
+                stuck_offers=stuck,
+                pairs=pairs_cfg,
+            )
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.

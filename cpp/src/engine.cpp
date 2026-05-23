@@ -3440,6 +3440,34 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 // Step 7: Generate multi-tier offer ladder.
 void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 {
+    // -- Per-asset portfolio percentages (for asset-level drift guard) ----
+    // Computed once per cycle: XCH-equivalent value of each asset divided
+    // by total XCH-equivalent portfolio value.  Keys are upper-cased
+    // asset symbols to match config keys ("XCH", "BYC", "WUSDC.B", ...).
+    std::unordered_map<std::string, double> portfolio_pct_by_asset;
+    if (config_.strategy.asset_drift_guard_enabled
+        && !config_.strategy.asset_target_allocations.empty())
+    {
+        auto upper = [](std::string s) {
+            for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return s;
+        };
+        const auto positions = state_->get_all_positions();
+        double total_xch = 0.0;
+        std::unordered_map<std::string, double> asset_xch;
+        for (const auto& p : positions) {
+            const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
+            if (v <= 0.0) continue;
+            asset_xch[upper(p.asset_id)] += v;
+            total_xch += v;
+        }
+        if (total_xch > 0.0) {
+            for (const auto& [k, v] : asset_xch) {
+                portfolio_pct_by_asset[k] = v / total_xch;
+            }
+        }
+    }
+
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid) continue;
 
@@ -3550,8 +3578,21 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     AssetId{other_cfg->quote_asset_id},
                     other_mid_mojos);
 
-                // Deviation of the other pair from balanced (0.5).
-                double other_dev = (other_ratio - 0.5) / 0.5;
+                // Deviation of the other pair from its TARGET ratio (per
+                // ratio_target_by_pair, falling back to the global
+                // ratio_target).  Using the per-pair target rather than
+                // a hardcoded 0.5 prevents the skew from interpreting an
+                // intentionally-skewed allocation (e.g. BYC=5% / wUSDC.b=30%
+                // -> BYC/wUSDC.b target ratio ~0.14) as inventory pressure
+                // to acquire more of the overweight asset.
+                double other_target = config_.strategy.ratio_target;
+                if (auto it_t = config_.strategy.ratio_target_by_pair.find(other_name);
+                    it_t != config_.strategy.ratio_target_by_pair.end()) {
+                    other_target = it_t->second;
+                }
+                const double other_denom = std::max(other_target, 1.0 - other_target);
+                double other_dev = (other_ratio - other_target)
+                                 / std::max(other_denom, 1e-6);
 
                 // Weight: market allocator fraction, or uniform.
                 double w = 1.0 / static_cast<double>(cycle_.size());
@@ -3660,6 +3701,74 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // -- Symmetric CAT wallet-balance caps (mirrors the XCH cap above
+        // for non-XCH base/quote assets).  The ask pool consumes the BASE
+        // asset; the bid pool consumes the QUOTE asset.  Without these
+        // caps, an Avellaneda+risk-sized pool can exceed what the CAT
+        // wallet actually holds, producing offers the wallet can't back.
+        if (pair_cfg && config_.strategy.wallet_balance_caps_enabled) {
+            auto cat_confirmed = [&](const std::string& asset_id) -> Mojo {
+                auto it = cached_wallet_balances_.find(asset_id);
+                return (it != cached_wallet_balances_.end())
+                           ? it->second.confirmed
+                           : Mojo{0};
+            };
+
+            // Ask side: convert base wallet (in base mojos) directly.
+            if (pair_cfg->base_asset_id != "xch") {
+                const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
+                if (base_bal > 0 && avail_inventory > base_bal) {
+                    spdlog::warn("[Engine] Step 7: {} ask pool {:.4f} {} > "
+                                 "confirmed {:.4f} {} -- CAPPED (CAT wallet)",
+                                 pair_name,
+                                 static_cast<double>(avail_inventory)
+                                     / static_cast<double>(pair_cfg->base_mojos_per_unit),
+                                 pair_cfg->base_asset_id,
+                                 static_cast<double>(base_bal)
+                                     / static_cast<double>(pair_cfg->base_mojos_per_unit),
+                                 pair_cfg->base_asset_id);
+                    avail_inventory = base_bal;
+                }
+            }
+
+            // Bid side: convert quote wallet (in quote mojos) into the
+            // maximum base mojos we could buy at the current mid price.
+            //   max_base_units  = quote_units / mid
+            //   max_base_mojos  = max_base_units * base_mojos_per_unit
+            if (pair_cfg->quote_asset_id != "xch"
+                && market_mid > 0.0
+                && pair_cfg->quote_mojos_per_unit > 0
+                && pair_cfg->base_mojos_per_unit > 0)
+            {
+                const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
+                if (quote_bal > 0) {
+                    const double quote_units =
+                        static_cast<double>(quote_bal)
+                        / static_cast<double>(pair_cfg->quote_mojos_per_unit);
+                    const Mojo bid_cap_base = static_cast<Mojo>(std::llround(
+                        (quote_units / market_mid)
+                        * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+                    if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                        spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
+                                     "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "
+                                     "-- CAPPED (CAT wallet)",
+                                     pair_name,
+                                     static_cast<double>(avail_capital)
+                                         / static_cast<double>(pair_cfg->base_mojos_per_unit),
+                                     pair_cfg->base_asset_id,
+                                     static_cast<double>(avail_capital)
+                                         / static_cast<double>(pair_cfg->base_mojos_per_unit)
+                                         * market_mid,
+                                     pair_cfg->quote_asset_id,
+                                     market_mid,
+                                     quote_units,
+                                     pair_cfg->quote_asset_id);
+                        avail_capital = bid_cap_base;
+                    }
+                }
+            }
+        }
+
         // -- Dynamic market allocation: scale capital by scoring fraction.
         // When enabled, the MarketAllocator assigns a [0, 1] fraction per
         // pair (summing to 1.0 across all enabled pairs).  Multiply the
@@ -3678,6 +3787,274 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             spdlog::debug("[Engine] Step 7: {} market alloc={:.1f}% "
                           "scale={:.2f}x",
                           pair_name, alloc_frac * 100.0, scale);
+        }
+
+        // -- Ratio rebalance sizing (hysteresis-aware) ---------------------
+        // Scale bid/ask pools based on target-ratio mode so the underweight
+        // side receives more capital while the overweight side is tapered.
+        if (pair_cfg && config_.strategy.ratio_rebalance_enabled) {
+            auto it_mode = ratio_rebalance_modes_.find(pair_name);
+            if (it_mode == ratio_rebalance_modes_.end()) {
+                it_mode = ratio_rebalance_modes_.emplace(
+                    pair_name, RatioRebalanceMode::Neutral).first;
+            }
+
+            const RatioRebalanceMode prev_mode = it_mode->second;
+            double target = config_.strategy.ratio_target;
+            if (auto it_target = config_.strategy.ratio_target_by_pair.find(pair_name);
+                it_target != config_.strategy.ratio_target_by_pair.end()) {
+                target = it_target->second;
+            }
+            double enter_band = config_.strategy.ratio_band_enter;
+            double exit_band = config_.strategy.ratio_band_exit;
+            if (auto it_band = config_.strategy.ratio_band_enter_by_pair.find(pair_name);
+                it_band != config_.strategy.ratio_band_enter_by_pair.end()) {
+                enter_band = it_band->second;
+                // Keep exit_band <= enter_band so hysteresis stays consistent.
+                exit_band = std::min(exit_band, enter_band * 0.5);
+                if (exit_band <= 0.0) {
+                    exit_band = enter_band * 0.5;
+                }
+            }
+            const double upper_enter = target + enter_band;
+            const double lower_enter = target - enter_band;
+            const double upper_exit = target + exit_band;
+            const double lower_exit = target - exit_band;
+
+            RatioRebalanceMode next_mode = prev_mode;
+            if (prev_mode == RatioRebalanceMode::Neutral) {
+                if (inv_ratio >= upper_enter) {
+                    next_mode = RatioRebalanceMode::AcquireQuote;
+                } else if (inv_ratio <= lower_enter) {
+                    next_mode = RatioRebalanceMode::AcquireBase;
+                }
+            } else if (inv_ratio >= lower_exit && inv_ratio <= upper_exit) {
+                next_mode = RatioRebalanceMode::Neutral;
+            }
+
+            if (next_mode != prev_mode) {
+                it_mode->second = next_mode;
+                auto mode_name = [](RatioRebalanceMode m) {
+                    switch (m) {
+                        case RatioRebalanceMode::Neutral: return "Neutral";
+                        case RatioRebalanceMode::AcquireBase: return "AcquireBase";
+                        case RatioRebalanceMode::AcquireQuote: return "AcquireQuote";
+                    }
+                    return "Unknown";
+                };
+                spdlog::info("[Engine] Step 7: {} ratio mode {} -> {} "
+                             "(ratio={:.3f} target={:.3f})",
+                             pair_name,
+                             mode_name(prev_mode),
+                             mode_name(next_mode),
+                             inv_ratio,
+                             target);
+            }
+
+            const RatioRebalanceMode active_mode = it_mode->second;
+            if (active_mode != RatioRebalanceMode::Neutral) {
+                const double ratio_delta = std::abs(inv_ratio - target);
+                const double norm = std::clamp(
+                    ratio_delta / std::max(enter_band, 1e-6), 0.0, 1.0);
+                const double min_scale = config_.strategy.ratio_tier_size_scale_min;
+                const double max_scale = config_.strategy.ratio_tier_size_scale_max;
+                const double overweight_scale =
+                    std::clamp(1.0 - (1.0 - min_scale) * norm, min_scale, 1.0);
+                const double underweight_scale =
+                    std::clamp(1.0 + (max_scale - 1.0) * norm, 1.0, max_scale);
+
+                const Mojo old_bid_pool = avail_capital;
+                const Mojo old_ask_pool = avail_inventory;
+
+                if (active_mode == RatioRebalanceMode::AcquireBase) {
+                    // Boost bids (buy base), taper asks.
+                    avail_capital = static_cast<Mojo>(std::llround(
+                        static_cast<double>(avail_capital) * underweight_scale));
+                    avail_inventory = static_cast<Mojo>(std::llround(
+                        static_cast<double>(avail_inventory) * overweight_scale));
+                } else {
+                    // Boost asks (acquire quote), taper bids.
+                    avail_capital = static_cast<Mojo>(std::llround(
+                        static_cast<double>(avail_capital) * overweight_scale));
+                    avail_inventory = static_cast<Mojo>(std::llround(
+                        static_cast<double>(avail_inventory) * underweight_scale));
+                }
+
+                spdlog::info("[Engine] Step 7: {} ratio size scaling mode={} "
+                             "bid_pool {} -> {} ask_pool {} -> {} "
+                             "(ratio={:.3f}, overweight_scale={:.2f}, "
+                             "underweight_scale={:.2f})",
+                             pair_name,
+                             (active_mode == RatioRebalanceMode::AcquireBase)
+                                 ? "AcquireBase" : "AcquireQuote",
+                             old_bid_pool,
+                             avail_capital,
+                             old_ask_pool,
+                             avail_inventory,
+                             inv_ratio,
+                             overweight_scale,
+                             underweight_scale);
+            }
+        }
+
+        // -- Asset-level soft drift guard ---------------------------------
+        // Acts as a "soft wall" on top of pair-level ratio rebalancing:
+        // when an asset's actual portfolio fraction is more than `tol`
+        // outside its target, taper the side of every pair that would
+        // accumulate more of that asset.  The taper is linear from 1.0
+        // at the edge of the band down to 0.0 at
+        //   target +/- (asset_drift_guard_max_factor) * tol
+        // so by the time an asset has drifted "twice the tolerance" past
+        // its band, no further acquisition pressure remains.  Stops the
+        // cross-pair skew / triangular-arb path from accumulating an asset
+        // far past its target while one pair's ratio controller is already
+        // pushing it back the other way.
+        if (pair_cfg
+            && config_.strategy.asset_drift_guard_enabled
+            && !portfolio_pct_by_asset.empty()
+            && !config_.strategy.asset_target_allocations.empty())
+        {
+            auto upper2 = [](std::string s) {
+                for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                return s;
+            };
+            const double max_factor = std::max(
+                config_.strategy.asset_drift_guard_max_factor, 1.0001);
+
+            // Returns a scale in [0, 1] for the side that *acquires* `asset_key`.
+            // 1.0 when the asset is within or below its band; tapers to 0
+            // as the asset rises above `target + max_factor * tol`.
+            auto acquire_scale = [&](const std::string& asset_key) -> double {
+                auto it_tgt = config_.strategy.asset_target_allocations.find(asset_key);
+                if (it_tgt == config_.strategy.asset_target_allocations.end()) return 1.0;
+                auto it_pct = portfolio_pct_by_asset.find(asset_key);
+                if (it_pct == portfolio_pct_by_asset.end()) return 1.0;
+                const double target = it_tgt->second;
+                double tol = 0.0;
+                if (auto it_tol = config_.strategy.asset_target_tolerances.find(asset_key);
+                    it_tol != config_.strategy.asset_target_tolerances.end()) {
+                    tol = it_tol->second;
+                }
+                // Without a tolerance, treat 25% of target (min 1pp) as the
+                // implicit deadband so a zero-tolerance entry still produces
+                // a soft, not infinite, taper window.
+                if (tol <= 0.0) tol = std::max(0.01, target * 0.25);
+                const double excess = it_pct->second - (target + tol);
+                if (excess <= 0.0) return 1.0;
+                const double taper_window = (max_factor - 1.0) * tol;
+                if (taper_window <= 0.0) return 0.0;
+                return std::clamp(1.0 - excess / taper_window, 0.0, 1.0);
+            };
+
+            const std::string base_key  = upper2(pair_cfg->base_asset_id);
+            const std::string quote_key = upper2(pair_cfg->quote_asset_id);
+
+            // Bid acquires base, spends quote.  Ask acquires quote, spends base.
+            const double bid_scale = acquire_scale(base_key);
+            const double ask_scale = acquire_scale(quote_key);
+
+            if (bid_scale < 0.999 || ask_scale < 0.999) {
+                const Mojo old_bid = avail_capital;
+                const Mojo old_ask = avail_inventory;
+                avail_capital = static_cast<Mojo>(std::llround(
+                    static_cast<double>(avail_capital) * bid_scale));
+                avail_inventory = static_cast<Mojo>(std::llround(
+                    static_cast<double>(avail_inventory) * ask_scale));
+                auto pct_or = [&](const std::string& k) {
+                    auto it = portfolio_pct_by_asset.find(k);
+                    return it != portfolio_pct_by_asset.end() ? it->second : 0.0;
+                };
+                spdlog::info("[Engine] Step 7: {} drift-guard scale "
+                             "bid x{:.2f} ask x{:.2f} "
+                             "(base {}={:.1f}% ask-acquires {}={:.1f}%) "
+                             "bid_pool {} -> {} ask_pool {} -> {}",
+                             pair_name,
+                             bid_scale, ask_scale,
+                             base_key, pct_or(base_key) * 100.0,
+                             quote_key, pct_or(quote_key) * 100.0,
+                             old_bid, avail_capital,
+                             old_ask, avail_inventory);
+            }
+        }
+
+        // -- Deploy-idle-inventory floor: when risk/allocator scaling has
+        // collapsed a side's pool below `min_offer_size_units` despite the
+        // wallet holding ample balance to back at least one full tier,
+        // raise that pool up to the minimum so the ladder is not silently
+        // suppressed downstream by the dust filter.  Respects ratio
+        // rebalance mode: only the "acquire" side is floored in non-neutral
+        // modes (matches the intent of one-sided ratio rebalancing).
+        if (pair_cfg
+            && config_.strategy.deploy_idle_inventory_enabled
+            && pair_cfg->base_mojos_per_unit > 0
+            && config_.strategy.min_offer_size_units > 0.0)
+        {
+            const Mojo min_pool = static_cast<Mojo>(std::llround(
+                config_.strategy.min_offer_size_units
+                * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+
+            // Determine ratio mode (Neutral by default if rebalancing off).
+            RatioRebalanceMode mode = RatioRebalanceMode::Neutral;
+            if (config_.strategy.ratio_rebalance_enabled) {
+                auto it_m = ratio_rebalance_modes_.find(pair_name);
+                if (it_m != ratio_rebalance_modes_.end()) {
+                    mode = it_m->second;
+                }
+            }
+            const bool floor_bid = (mode != RatioRebalanceMode::AcquireQuote);
+            const bool floor_ask = (mode != RatioRebalanceMode::AcquireBase);
+
+            auto cat_confirmed = [&](const std::string& asset_id) -> Mojo {
+                if (asset_id == "xch") return xch_confirmed_balance_;
+                auto it = cached_wallet_balances_.find(asset_id);
+                return (it != cached_wallet_balances_.end())
+                           ? it->second.confirmed
+                           : Mojo{0};
+            };
+
+            // Bid floor: requires quote-asset wallet to cover min_pool in base
+            // units at the current mid.
+            if (floor_bid && min_pool > 0 && avail_capital < min_pool && market_mid > 0.0
+                && pair_cfg->quote_mojos_per_unit > 0)
+            {
+                const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
+                const double quote_units =
+                    static_cast<double>(quote_bal)
+                    / static_cast<double>(pair_cfg->quote_mojos_per_unit);
+                const double required_quote_units =
+                    config_.strategy.min_offer_size_units * market_mid;
+                if (quote_units >= required_quote_units) {
+                    spdlog::info("[Engine] Step 7: {} bid pool floored "
+                                 "{} -> {} base mojos (wallet has {:.4f} {}, "
+                                 "needs {:.4f} for min {} units)",
+                                 pair_name,
+                                 avail_capital,
+                                 min_pool,
+                                 quote_units,
+                                 pair_cfg->quote_asset_id,
+                                 required_quote_units,
+                                 config_.strategy.min_offer_size_units);
+                    avail_capital = min_pool;
+                }
+            }
+
+            // Ask floor: requires base-asset wallet to cover min_pool directly.
+            if (floor_ask && min_pool > 0 && avail_inventory < min_pool) {
+                const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
+                if (base_bal >= min_pool) {
+                    spdlog::info("[Engine] Step 7: {} ask pool floored "
+                                 "{} -> {} base mojos (wallet has {:.4f} {} "
+                                 ">= min {} units)",
+                                 pair_name,
+                                 avail_inventory,
+                                 min_pool,
+                                 static_cast<double>(base_bal)
+                                     / static_cast<double>(pair_cfg->base_mojos_per_unit),
+                                 pair_cfg->base_asset_id,
+                                 config_.strategy.min_offer_size_units);
+                    avail_inventory = min_pool;
+                }
+            }
         }
 
         // Fetch competing offers for gap-aware dynamic tier spacing.
@@ -4333,13 +4710,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 (pair_cfg->base_asset_id == "xch"
                  || pair_cfg->base_asset_id == "XCH");
 
-            // Hard band for XCH-base pairs: each tier must be in [1, 10] XCH.
-            // This prevents emergency posting of sub-1-XCH dust tiers and
+            // Hard band for XCH-base pairs: each tier must be in [min_size, 10] XCH.
+            // This prevents emergency posting of sub-min dust tiers and
             // caps oversized tiers that over-concentrate inventory.
-            const double eff_min_units = xch_base_pair
-                ? 1.0
-                : pair_cfg->min_offer_size_units_override.value_or(
-                      config_.strategy.min_offer_size_units);
+            // Per-pair override takes precedence over default.
+            const double eff_min_units = pair_cfg->min_offer_size_units_override.value_or(
+                xch_base_pair ? 1.0 : config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
             const double eff_max_units = xch_base_pair ? 10.0 : 0.0;
@@ -4372,6 +4748,21 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
             }
 
+            // Up-scale smaller tiers to min_base_mojos to support minimum offer size
+            // without reducing the number of active offers (never dropping them).
+            int bumped_tiers = 0;
+            for (auto& tq : pcs.ladder) {
+                if (tq.size < min_base_mojos) {
+                    const Mojo old_size = tq.size;
+                    tq.size = min_base_mojos;
+                    spdlog::info("[Engine] Step 7: {} {} tier {} up-scaled to minimum size: "
+                                 "{} -> {} mojos ({:.2f} units)",
+                                 pair_name, (tq.side == Side::Bid) ? "BID" : "ASK",
+                                 tq.tier_index, old_size, min_base_mojos, eff_min_units);
+                    ++bumped_tiers;
+                }
+            }
+
             // Diagnostic: show what's in ladder before dust filtering
             uint32_t pre_bids = 0, pre_asks = 0;
             for (const auto& tq : pcs.ladder) {
@@ -4391,7 +4782,9 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         // Emergency: never drop tier-0. Preserve the top
                         // quote on both sides so matched ladders survive the
                         // dust filter; Step 8 applies the final side gate.
-                        if (!xch_base_pair && tq.tier_index == 0) {
+                        // We also preserve tier-0 for XCH base pairs to avoid
+                        // deadlock when capital/inventory drops below the floor.
+                        if (tq.tier_index == 0) {
                             const char* side =
                                 (tq.side == Side::Bid) ? "BID" : "ASK";
                             const char* reason =
@@ -5278,6 +5671,114 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         // Find the PairConfig for this pair (O(1) map lookup).
         const PairConfig* pair_cfg = find_pair_config(pair_name);
         if (!pair_cfg) continue;
+
+        // -- Ratio rebalance mode (hysteresis) -----------------------------
+        // Target-ratio controller around strategy.ratio_target.
+        // - AcquireBase  => only post bids (buy base)
+        // - AcquireQuote => only post asks (sell base / receive quote)
+        if (config_.strategy.ratio_rebalance_enabled) {
+            const double rb_mid = market_data_->get_mid_price(pair_name);
+            if (rb_mid > 0.0) {
+                const Mojo rb_mid_mojos = static_cast<Mojo>(std::llround(
+                    rb_mid * static_cast<double>(kMojosPerXch)));
+                const double inv_ratio_rb = inventory_->inventory_ratio(
+                    AssetId{pair_cfg->base_asset_id},
+                    AssetId{pair_cfg->quote_asset_id},
+                    rb_mid_mojos);
+
+                auto it_mode = ratio_rebalance_modes_.find(pair_name);
+                if (it_mode == ratio_rebalance_modes_.end()) {
+                    it_mode = ratio_rebalance_modes_.emplace(
+                        pair_name, RatioRebalanceMode::Neutral).first;
+                }
+                const RatioRebalanceMode prev_mode = it_mode->second;
+
+                double target = config_.strategy.ratio_target;
+                if (auto it_target = config_.strategy.ratio_target_by_pair.find(pair_name);
+                    it_target != config_.strategy.ratio_target_by_pair.end()) {
+                    target = it_target->second;
+                }
+                double enter_band = config_.strategy.ratio_band_enter;
+                double exit_band = config_.strategy.ratio_band_exit;
+                if (auto it_band = config_.strategy.ratio_band_enter_by_pair.find(pair_name);
+                    it_band != config_.strategy.ratio_band_enter_by_pair.end()) {
+                    enter_band = it_band->second;
+                    exit_band = std::min(exit_band, enter_band * 0.5);
+                    if (exit_band <= 0.0) {
+                        exit_band = enter_band * 0.5;
+                    }
+                }
+
+                const double upper_enter = target + enter_band;
+                const double lower_enter = target - enter_band;
+                const double upper_exit = target + exit_band;
+                const double lower_exit = target - exit_band;
+
+                RatioRebalanceMode next_mode = prev_mode;
+                if (prev_mode == RatioRebalanceMode::Neutral) {
+                    if (inv_ratio_rb >= upper_enter) {
+                        next_mode = RatioRebalanceMode::AcquireQuote;
+                    } else if (inv_ratio_rb <= lower_enter) {
+                        next_mode = RatioRebalanceMode::AcquireBase;
+                    }
+                } else if (inv_ratio_rb >= lower_exit && inv_ratio_rb <= upper_exit) {
+                    next_mode = RatioRebalanceMode::Neutral;
+                }
+
+                if (next_mode != prev_mode) {
+                    it_mode->second = next_mode;
+                    auto mode_name = [](RatioRebalanceMode m) {
+                        switch (m) {
+                            case RatioRebalanceMode::Neutral:
+                                return "Neutral";
+                            case RatioRebalanceMode::AcquireBase:
+                                return "AcquireBase";
+                            case RatioRebalanceMode::AcquireQuote:
+                                return "AcquireQuote";
+                        }
+                        return "Unknown";
+                    };
+                    spdlog::info("[Engine] Step 8: {} ratio mode {} -> {} "
+                                 "(ratio={:.3f} target={:.3f} enter=+/-{:.3f} "
+                                 "exit=+/-{:.3f})",
+                                 pair_name,
+                                 mode_name(prev_mode),
+                                 mode_name(next_mode),
+                                 inv_ratio_rb,
+                                 target,
+                                 enter_band,
+                                 exit_band);
+                }
+
+                if (config_.strategy.ratio_force_one_sided) {
+                    const RatioRebalanceMode active_mode = it_mode->second;
+                    auto mode_name = [](RatioRebalanceMode m) {
+                        switch (m) {
+                            case RatioRebalanceMode::Neutral:
+                                return "Neutral";
+                            case RatioRebalanceMode::AcquireBase:
+                                return "AcquireBase";
+                            case RatioRebalanceMode::AcquireQuote:
+                                return "AcquireQuote";
+                        }
+                        return "Unknown";
+                    };
+                    if (active_mode == RatioRebalanceMode::AcquireBase) {
+                        can_ask = false;
+                    } else if (active_mode == RatioRebalanceMode::AcquireQuote) {
+                        can_bid = false;
+                    }
+                    if (active_mode != RatioRebalanceMode::Neutral) {
+                        spdlog::info("[Engine] Step 8: {} ratio mode {} "
+                                     "enforced (can_bid={}, can_ask={})",
+                                     pair_name,
+                                     mode_name(active_mode),
+                                     can_bid,
+                                     can_ask);
+                    }
+                }
+            }
+        }
 
         // -- T4-03: Fee-vs-gain gating per tier ------------------------------
         // Estimate expected gain for each tier and filter out tiers where

@@ -12,18 +12,19 @@ dexie:
 pairs:
 - base_asset_id: xch
   enabled: true
-  min_offer_size_units_override: 0.01
+  min_offer_size_units_override: 1.0
   name: XCH/wUSDC.b
   quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
 - base_asset_id: xch
-  enabled: false
+  enabled: true
+  min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30
   depeg_warn_pct: 2.0
-  enabled: false
+  enabled: true
   gamma_override: 0.001
   is_stablecoin: true
   max_half_spread_bps_override: 75
@@ -49,7 +50,8 @@ pairs:
   - 20
   - 40
 - base_asset_id: xch
-  enabled: false
+  enabled: true
+  min_offer_size_units_override: 1.0
   name: XCH/DBX
   quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
 - base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
@@ -68,7 +70,7 @@ strategy:
   min_profit_margin_bps: 35
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
-  offer_ttl_blocks: 600
+  offer_ttl_blocks: 1200
   num_tiers: 4
   tier_spacing_bps:
   - 35.0
@@ -90,7 +92,16 @@ strategy:
   min_reserve_units: 0.1
   min_offer_size_units: 1.0
   min_trading_units: 0.1
+  wallet_balance_caps_enabled: true
+  deploy_idle_inventory_enabled: true
   auto_rebalance_enabled: true
+  ratio_rebalance_enabled: true
+  ratio_target: 0.5
+  ratio_band_enter: 0.1
+  ratio_band_exit: 0.05
+  ratio_force_one_sided: true
+  ratio_tier_size_scale_min: 0.35
+  ratio_tier_size_scale_max: 1.15
   xch_ask_throttle_enabled: true
   xch_ask_throttle_caution_xch: 2.0
   xch_ask_throttle_low_xch: 1.0
@@ -106,7 +117,7 @@ strategy:
   wall_niche_premium_pct: 0.05
   competitive_anchor_enabled: true
   competitive_anchor_max_distance_bps: 250.0
-  competitive_anchor_stride_bps: 65.0
+  competitive_anchor_stride_bps: 25.0
   orphan_adopt_enabled: true
   orphan_adverse_threshold: 0.02
   orphan_max_adopt_age_blocks: 120
@@ -123,7 +134,7 @@ strategy:
   pid_max_mult: 1.3
   pid_warmup_blocks: 50
   comp_pid_enabled: true
-  comp_pid_target_fill_rate: 0.05
+  comp_pid_target_fill_rate: 0.15
   comp_pid_kp: 8.0
   comp_pid_ki: 0.5
   comp_pid_kd: 2.0
@@ -132,6 +143,26 @@ strategy:
   comp_pid_warmup_blocks: 8
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
+  asset_target_allocations:
+    BYC: 0.05
+    DBX: 0.05
+    WUSDC.B: 0.3
+    XCH: 0.6
+  ratio_target_by_pair:
+    BYC/wUSDC.b: 0.14285714285714285
+    XCH/BYC: 0.9230769230769231
+    XCH/DBX: 0.9230769230769231
+    XCH/wUSDC.b: 0.6666666666666666
+  asset_target_tolerances:
+    BYC: 0.04
+    DBX: 0.04
+    WUSDC.B: 0.2
+    XCH: 0.2
+  ratio_band_enter_by_pair:
+    BYC/wUSDC.b: 0.3308270676691729
+    XCH/BYC: 0.10675039246467821
+    XCH/DBX: 0.10675039246467821
+    XCH/wUSDC.b: 0.2222222222222222
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -149,6 +180,11 @@ volatility:
   lookback_blocks: 200
   yz_alpha: 0.34
   candle_aggregation_blocks: 10
+market_data:
+  # XCH-equivalent mojos. Default 1e12 (1 XCH) was too strict for low-volume
+  # pairs like XCH/BYC where typical ask sizes are 0.1-0.5 XCH; set to 0.1 XCH
+  # so we can see and undercut competitors on thin pairs.
+  min_competitor_offer_size: 100000000000
 monitoring:
   prometheus_port: 19090
 depeg:

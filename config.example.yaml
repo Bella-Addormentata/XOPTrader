@@ -151,6 +151,17 @@ strategy:
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
+  ratio_rebalance_enabled: true        # [OPTIONAL, default: true] Enforce target-ratio balancing with hysteresis
+  ratio_target: 0.50                   # [OPTIONAL, default: 0.50] Target base value ratio (0.5 = balanced)
+  # Optional per-pair overrides (base-value ratio for each pair)
+  # ratio_target_by_pair:
+  #   XCH/wUSDC.b: 0.62
+  #   DBX/wUSDC.b: 0.40
+  ratio_band_enter: 0.10               # [OPTIONAL, default: 0.10] Enter rebalance outside target +/- this
+  ratio_band_exit: 0.05                # [OPTIONAL, default: 0.05] Exit rebalance once back inside target +/- this
+  ratio_force_one_sided: true          # [OPTIONAL, default: true] Force one-sided posting while rebalancing
+  ratio_tier_size_scale_min: 0.35      # [OPTIONAL, default: 0.35] Overweight side minimum size multiplier
+  ratio_tier_size_scale_max: 1.15      # [OPTIONAL, default: 1.15] Underweight side maximum size multiplier
   xch_ask_throttle_enabled: true       # [OPTIONAL, default: true] Enable smooth XCH ask throttling
   xch_ask_throttle_caution_xch: 2.0    # [OPTIONAL, default: 2.0] Start mild ask throttling below this
   xch_ask_throttle_low_xch: 1.0        # [OPTIONAL, default: 1.0] Stronger ask throttling below this
