@@ -3448,17 +3448,43 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
     if (config_.strategy.asset_drift_guard_enabled
         && !config_.strategy.asset_target_allocations.empty())
     {
-        auto upper = [](std::string s) {
-            for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        auto to_lower = [](std::string s) {
+            for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
             return s;
         };
+        auto resolve_symbol = [&](const std::string& asset_id) -> std::string {
+            std::string lid = to_lower(asset_id);
+            if (lid == "xch") return "XCH";
+            for (const auto& pair : config_.pairs) {
+                if (to_lower(pair.base_asset_id) == lid) {
+                    auto pos = pair.name.find('/');
+                    if (pos != std::string::npos) {
+                        auto sym = pair.name.substr(0, pos);
+                        for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        return sym;
+                    }
+                }
+                if (to_lower(pair.quote_asset_id) == lid) {
+                    auto pos = pair.name.find('/');
+                    if (pos != std::string::npos) {
+                        auto sym = pair.name.substr(pos + 1);
+                        for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                        return sym;
+                    }
+                }
+            }
+            auto uid = asset_id;
+            for (char& c : uid) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            return uid;
+        };
+
         const auto positions = state_->get_all_positions();
         double total_xch = 0.0;
         std::unordered_map<std::string, double> asset_xch;
         for (const auto& p : positions) {
             const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
             if (v <= 0.0) continue;
-            asset_xch[upper(p.asset_id)] += v;
+            asset_xch[resolve_symbol(p.asset_id)] += v;
             total_xch += v;
         }
         if (total_xch > 0.0) {
@@ -3914,10 +3940,36 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             && !portfolio_pct_by_asset.empty()
             && !config_.strategy.asset_target_allocations.empty())
         {
-            auto upper2 = [](std::string s) {
-                for (auto& c : s) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+            auto to_lower2 = [](std::string s) {
+                for (auto& c : s) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
                 return s;
             };
+            auto resolve_symbol2 = [&](const std::string& asset_id) -> std::string {
+                std::string lid = to_lower2(asset_id);
+                if (lid == "xch") return "XCH";
+                for (const auto& pair : config_.pairs) {
+                    if (to_lower2(pair.base_asset_id) == lid) {
+                        auto pos = pair.name.find('/');
+                        if (pos != std::string::npos) {
+                            auto sym = pair.name.substr(0, pos);
+                            for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                            return sym;
+                        }
+                    }
+                    if (to_lower2(pair.quote_asset_id) == lid) {
+                        auto pos = pair.name.find('/');
+                        if (pos != std::string::npos) {
+                            auto sym = pair.name.substr(pos + 1);
+                            for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                            return sym;
+                        }
+                    }
+                }
+                auto uid = asset_id;
+                for (char& c : uid) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                return uid;
+            };
+
             const double max_factor = std::max(
                 config_.strategy.asset_drift_guard_max_factor, 1.0001);
 
@@ -3946,8 +3998,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 return std::clamp(1.0 - excess / taper_window, 0.0, 1.0);
             };
 
-            const std::string base_key  = upper2(pair_cfg->base_asset_id);
-            const std::string quote_key = upper2(pair_cfg->quote_asset_id);
+            const std::string base_key  = resolve_symbol2(pair_cfg->base_asset_id);
+            const std::string quote_key = resolve_symbol2(pair_cfg->quote_asset_id);
 
             // Bid acquires base, spends quote.  Ask acquires quote, spends base.
             const double bid_scale = acquire_scale(base_key);
@@ -7401,6 +7453,359 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                 spdlog::error("[Engine] Step 9e: {} peg-arb failed: {}",
                               pair.name, e.what());
             }
+        }
+    }
+
+    co_return;
+}
+
+// ---------------------------------------------------------------------------
+// Step 9f: Drift corrector -- active asset rebalancer.
+//
+// Periodically inspect the portfolio's per-asset XCH-equivalent share.
+// For any asset whose share is outside target +/- trigger_factor*tolerance,
+// scan Dexie for competitively-priced offers that move us back toward
+// target.  Hysteresis: stop taking once the share is back within
+// target +/- exit_factor*tolerance.
+//
+//   * Overweight base: look for BIDs (sell base for quote).
+//   * Underweight base: look for ASKs (buy base with quote).
+//
+// Safety:
+//   * Disabled by default; requires arbitrage.drift_corrector_enabled=true
+//     AND strategy.asset_drift_guard_enabled=true.
+//   * Per-block cooldown (drift_corrector_cooldown_blocks).
+//   * Rolling 24h trade quota (drift_corrector_max_trades_per_day).
+//   * Respects wallet circuit breaker, dry_run_, and the unified pre-take
+//     balance check.
+//   * Price must be within drift_corrector_max_premium_bps of mid.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
+{
+    const auto& acfg = config_.arbitrage;
+    const auto& scfg = config_.strategy;
+
+    if (!acfg.enabled || !acfg.drift_corrector_enabled) co_return;
+    if (!scfg.asset_drift_guard_enabled) co_return;
+    if (scfg.asset_target_allocations.empty()) co_return;
+    if (!dexie_ || !wallet_ || !market_data_) co_return;
+    if (wallet_circuit_open_) co_return;
+
+    // -- Cooldown ----------------------------------------------------------
+    if (last_drift_correction_block_ != 0 &&
+        block_height < last_drift_correction_block_ +
+                       acfg.drift_corrector_cooldown_blocks) {
+        co_return;
+    }
+
+    // -- Daily quota: trim history older than 24h --------------------------
+    const auto now = std::chrono::system_clock::now();
+    const auto day_ago = now - std::chrono::hours(24);
+    while (!drift_correction_history_.empty() &&
+           drift_correction_history_.front() < day_ago) {
+        drift_correction_history_.pop_front();
+    }
+    if (drift_correction_history_.size() >=
+        acfg.drift_corrector_max_trades_per_day) {
+        spdlog::debug("[Engine] Step 9f: daily quota reached ({}/{})",
+                      drift_correction_history_.size(),
+                      acfg.drift_corrector_max_trades_per_day);
+        co_return;
+    }
+
+    // -- Compute per-asset portfolio percentages (XCH-equivalent) ----------
+    auto upper = [](std::string s) {
+        for (auto& c : s)
+            c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return s;
+    };
+    auto to_lower = [](std::string s) {
+        for (auto& c : s)
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        return s;
+    };
+    auto resolve_symbol = [&](const std::string& asset_id) -> std::string {
+        std::string lid = to_lower(asset_id);
+        if (lid == "xch") return "XCH";
+        for (const auto& pair : config_.pairs) {
+            if (to_lower(pair.base_asset_id) == lid) {
+                auto pos = pair.name.find('/');
+                if (pos != std::string::npos) {
+                    auto sym = pair.name.substr(0, pos);
+                    for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    return sym;
+                }
+            }
+            if (to_lower(pair.quote_asset_id) == lid) {
+                auto pos = pair.name.find('/');
+                if (pos != std::string::npos) {
+                    auto sym = pair.name.substr(pos + 1);
+                    for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+                    return sym;
+                }
+            }
+        }
+        auto uid = asset_id;
+        for (char& c : uid) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        return uid;
+    };
+
+    std::unordered_map<std::string, double> portfolio_pct_by_asset;
+    {
+        const auto positions = state_->get_all_positions();
+        double total_xch = 0.0;
+        std::unordered_map<std::string, double> asset_xch;
+        for (const auto& p : positions) {
+            const double v = static_cast<double>(
+                PreTradeCheck::mark_to_xch(p, *state_));
+            if (v <= 0.0) continue;
+            asset_xch[resolve_symbol(p.asset_id)] += v;
+            total_xch += v;
+        }
+        if (total_xch <= 0.0) co_return;
+        for (const auto& [k, v] : asset_xch) {
+            portfolio_pct_by_asset[k] = v / total_xch;
+        }
+    }
+
+    // -- Classify each configured asset as Overweight / Underweight / OK --
+    enum class DriftState { Ok, Overweight, Underweight };
+    auto classify = [&](const std::string& asset_upper) -> DriftState {
+        auto it_t = scfg.asset_target_allocations.find(asset_upper);
+        if (it_t == scfg.asset_target_allocations.end())
+            return DriftState::Ok;
+        auto it_tol = scfg.asset_target_tolerances.find(asset_upper);
+        const double target = it_t->second;
+        const double tol = (it_tol != scfg.asset_target_tolerances.end())
+                           ? it_tol->second : 0.0;
+        if (tol <= 0.0) return DriftState::Ok;
+
+        auto it_p = portfolio_pct_by_asset.find(asset_upper);
+        const double pct = (it_p != portfolio_pct_by_asset.end())
+                           ? it_p->second : 0.0;
+
+        const double trigger = tol * acfg.drift_corrector_trigger_factor;
+        if (pct > target + trigger) return DriftState::Overweight;
+        if (pct < target - trigger) return DriftState::Underweight;
+        return DriftState::Ok;
+    };
+
+    // Exit-state check (hysteresis): once we're inside the exit band the
+    // caller is expected to stop taking.  Used after a candidate take to
+    // avoid overshoot when multiple offers are queued in one block.
+    auto in_exit_band = [&](const std::string& asset_upper) -> bool {
+        auto it_t = scfg.asset_target_allocations.find(asset_upper);
+        if (it_t == scfg.asset_target_allocations.end()) return true;
+        auto it_tol = scfg.asset_target_tolerances.find(asset_upper);
+        const double target = it_t->second;
+        const double tol = (it_tol != scfg.asset_target_tolerances.end())
+                           ? it_tol->second : 0.0;
+        const double exit_band = tol * acfg.drift_corrector_exit_factor;
+        auto it_p = portfolio_pct_by_asset.find(asset_upper);
+        const double pct = (it_p != portfolio_pct_by_asset.end())
+                           ? it_p->second : 0.0;
+        return std::abs(pct - target) <= exit_band;
+    };
+
+    // -- Walk pairs; for each, see if taking helps a breached asset -------
+    const double max_prem_bps = acfg.drift_corrector_max_premium_bps;
+    const double max_units = acfg.drift_corrector_max_take_units;
+    bool took_any = false;
+
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        if (took_any) break;  // one take per block
+
+        const std::string base_u = resolve_symbol(pair.base_asset_id);
+        const std::string quote_u = resolve_symbol(pair.quote_asset_id);
+        const DriftState base_state = classify(base_u);
+        const DriftState quote_state = classify(quote_u);
+
+        // Determine helpful side(s) for this pair.
+        //   ASK take -> base UP, quote DOWN
+        //   BID take -> base DOWN, quote UP
+        const bool want_ask = (base_state == DriftState::Underweight) ||
+                              (quote_state == DriftState::Overweight);
+        const bool want_bid = (base_state == DriftState::Overweight) ||
+                              (quote_state == DriftState::Underweight);
+        if (!want_ask && !want_bid) continue;
+
+        // Don't actively swap an already-OK asset away from target.
+        // Require at least one side of the pair to be breached.
+        if (base_state == DriftState::Ok && quote_state == DriftState::Ok) {
+            continue;
+        }
+
+        auto comp = market_data_->get_competing_offers(pair.name);
+        if (comp.empty()) continue;
+
+        const Mojo mid = static_cast<Mojo>(std::llround(
+            market_data_->get_mid_price(pair.name)
+            * static_cast<double>(kMojosPerXch)));
+        if (mid == 0) continue;
+
+        // Pick best ASK (lowest price) and best BID (highest price) that
+        // fall within max_premium_bps of mid.
+        struct Cand {
+            std::string id;
+            Mojo price{0};
+            Mojo size{0};
+            Side side{Side::Bid};
+            double premium_bps{0.0};
+        };
+        std::optional<Cand> best_ask;
+        std::optional<Cand> best_bid;
+
+        for (const auto& co : comp) {
+            if (co.size == 0 || co.price == 0) continue;
+            const double mid_d = static_cast<double>(mid);
+            const double price_d = static_cast<double>(co.price);
+            if (co.side == Side::Ask && want_ask) {
+                // premium = how much above mid we'd pay
+                const double prem = (price_d - mid_d) / mid_d * 10000.0;
+                if (prem <= max_prem_bps &&
+                    (!best_ask || co.price < best_ask->price)) {
+                    best_ask = Cand{co.offer_id, co.price, co.size,
+                                    co.side, prem};
+                }
+            } else if (co.side == Side::Bid && want_bid) {
+                // premium = how much below mid we'd accept
+                const double prem = (mid_d - price_d) / mid_d * 10000.0;
+                if (prem <= max_prem_bps &&
+                    (!best_bid || co.price > best_bid->price)) {
+                    best_bid = Cand{co.offer_id, co.price, co.size,
+                                    co.side, prem};
+                }
+            }
+        }
+
+        // Prefer the side that addresses the more-breached asset.  If both
+        // are candidates, take whichever has the better (lower) premium.
+        std::optional<Cand> chosen;
+        if (best_ask && best_bid) {
+            chosen = (best_ask->premium_bps <= best_bid->premium_bps)
+                     ? best_ask : best_bid;
+        } else if (best_ask) {
+            chosen = best_ask;
+        } else if (best_bid) {
+            chosen = best_bid;
+        }
+        if (!chosen) continue;
+
+        const Mojo max_mojos = static_cast<Mojo>(
+            max_units * static_cast<double>(pair.base_mojos_per_unit));
+        const Mojo take_sz = std::min(chosen->size, max_mojos);
+        if (take_sz == 0) continue;
+
+        spdlog::info("[Engine] Step 9f: {} DRIFT-CORRECT {} "
+                     "base={}({}) quote={}({}) price={} mid={} "
+                     "prem={:.1f}bps offer={} size={}",
+                     pair.name, to_string(chosen->side),
+                     base_u,
+                     base_state == DriftState::Overweight ? "OW" :
+                     base_state == DriftState::Underweight ? "UW" : "ok",
+                     quote_u,
+                     quote_state == DriftState::Overweight ? "OW" :
+                     quote_state == DriftState::Underweight ? "UW" : "ok",
+                     chosen->price, mid, chosen->premium_bps,
+                     chosen->id.substr(0, 12), take_sz);
+
+        if (dry_run_) {
+            spdlog::info("[Engine] Step 9f: {} DRY RUN -- would take {}",
+                         pair.name, chosen->id.substr(0, 12));
+            continue;
+        }
+
+        // Fetch live offer bech32 from Dexie.
+        auto os = co_await dexie_->get_offer_status(chosen->id);
+        if (!os.success || os.offer.offer_bech32.empty()) {
+            spdlog::warn("[Engine] Step 9f: {} fetch failed for {} -- skip",
+                         pair.name, chosen->id.substr(0, 12));
+            continue;
+        }
+        if (os.offer.status != 0) {
+            spdlog::info("[Engine] Step 9f: {} offer {} no longer active "
+                         "(status={})",
+                         pair.name, chosen->id.substr(0, 12),
+                         os.offer.status);
+            continue;
+        }
+
+        // Pre-balance check (mirrors Step 9e).
+        if (offer_mgr_) {
+            const std::string& spend_asset =
+                (chosen->side == Side::Ask)
+                    ? pair.quote_asset_id : pair.base_asset_id;
+            auto spend_wid = offer_mgr_->resolve_wallet_id(spend_asset);
+            if (spend_wid > 0) {
+                try {
+                    auto bal = co_await
+                        wallet_->get_wallet_balance(spend_wid);
+                    Mojo spendable = bal.value(
+                        "spendable_balance", static_cast<Mojo>(0));
+                    const Mojo cost = (chosen->side == Side::Ask)
+                        ? static_cast<Mojo>(
+                              static_cast<double>(take_sz)
+                              * static_cast<double>(chosen->price)
+                              / static_cast<double>(kMojosPerXch))
+                        : take_sz;
+                    if (spendable < cost) {
+                        spdlog::warn("[Engine] Step 9f: {} SKIP -- "
+                                     "insufficient balance: need {} "
+                                     "spendable {} (wallet {})",
+                                     pair.name, cost, spendable,
+                                     spend_wid);
+                        continue;
+                    }
+                } catch (const std::exception& be) {
+                    spdlog::debug("[Engine] Step 9f: {} balance check "
+                                  "failed: {}", pair.name, be.what());
+                }
+            }
+        }
+
+        const std::uint64_t fee = fee_tracker_
+            ? fee_tracker_->get_recommended_fee(
+                  config_.fees.min_fee_mojos, block_height)
+            : config_.fees.min_fee_mojos;
+
+        spdlog::info("[Engine] Step 9f: {} TAKING drift-corr {} offer {} "
+                     "(prem={:.1f}bps size={} fee={})",
+                     pair.name, to_string(chosen->side),
+                     chosen->id.substr(0, 12), chosen->premium_bps,
+                     take_sz, fee);
+
+        auto result = co_await wallet_->take_offer(
+            os.offer.offer_bech32, fee);
+
+        if (result.contains("success") && result["success"].get<bool>()) {
+            const std::string tid =
+                result.contains("trade_record") &&
+                result["trade_record"].contains("trade_id")
+                ? result["trade_record"]["trade_id"].get<std::string>()
+                : "unknown";
+            spdlog::info("[Engine] Step 9f: {} TOOK drift-corr {} -- "
+                         "trade={} prem={:.1f}bps size={}",
+                         pair.name, to_string(chosen->side),
+                         tid.substr(0, 12), chosen->premium_bps, take_sz);
+            if (fee_tracker_)
+                fee_tracker_->record_fee(fee, block_height);
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::ArbitrageDetected,
+                    pair.name + " drift-correct " +
+                    to_string(chosen->side) + " TAKEN: prem=" +
+                    std::to_string(chosen->premium_bps) + "bps");
+            }
+            last_drift_correction_block_ = block_height;
+            drift_correction_history_.push_back(now);
+            took_any = true;
+            (void)in_exit_band;  // hysteresis tracked across blocks
+        } else {
+            const std::string err = result.contains("error")
+                ? result["error"].get<std::string>() : "unknown error";
+            spdlog::warn("[Engine] Step 9f: {} take failed: {}",
+                         pair.name, err);
         }
     }
 

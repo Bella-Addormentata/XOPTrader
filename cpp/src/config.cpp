@@ -1759,6 +1759,15 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_dbl ("peg_arb_max_take_units",         cfg.peg_arb_max_take_units, 0.001);
     read_dbl ("peg_arb_max_inventory_ratio",    cfg.peg_arb_max_inventory_ratio, 0.01);
 
+    // Drift corrector (Step 9f)
+    read_bool("drift_corrector_enabled",             cfg.drift_corrector_enabled);
+    read_dbl ("drift_corrector_trigger_factor",      cfg.drift_corrector_trigger_factor, 0.01);
+    read_dbl ("drift_corrector_exit_factor",         cfg.drift_corrector_exit_factor, 0.01);
+    read_dbl ("drift_corrector_max_take_units",      cfg.drift_corrector_max_take_units, 0.001);
+    read_dbl ("drift_corrector_max_premium_bps",     cfg.drift_corrector_max_premium_bps, 0.1);
+    read_u32 ("drift_corrector_cooldown_blocks",     cfg.drift_corrector_cooldown_blocks);
+    read_u32 ("drift_corrector_max_trades_per_day",  cfg.drift_corrector_max_trades_per_day);
+
     // General
     read_dbl ("max_position_size",              cfg.max_position_size, 0.001);
     read_dbl ("default_confidence",             cfg.default_confidence, 0.01);
@@ -1793,6 +1802,21 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     for (const auto& pair_name : cfg.midpoint_recycling_pairs) {
         if (pair_name.empty()) {
             throw ConfigError(sec + ".midpoint_recycling_pairs entries must be non-empty");
+        }
+    }
+
+    if (cfg.drift_corrector_enabled) {
+        if (cfg.drift_corrector_trigger_factor <= cfg.drift_corrector_exit_factor) {
+            throw ConfigError(sec + ".drift_corrector_trigger_factor must be > drift_corrector_exit_factor (hysteresis)");
+        }
+        if (cfg.drift_corrector_exit_factor < 0.0) {
+            throw ConfigError(sec + ".drift_corrector_exit_factor must be >= 0");
+        }
+        if (cfg.drift_corrector_max_take_units <= 0.0) {
+            throw ConfigError(sec + ".drift_corrector_max_take_units must be > 0");
+        }
+        if (cfg.drift_corrector_max_premium_bps < 0.0) {
+            throw ConfigError(sec + ".drift_corrector_max_premium_bps must be >= 0");
         }
     }
 
@@ -2125,6 +2149,13 @@ void log_config_summary(const AppConfig& cfg)
         << "  peg_arb_min_edge_bps = " << cfg.arbitrage.peg_arb_min_edge_bps << "\n"
         << "  peg_arb_max_units    = " << cfg.arbitrage.peg_arb_max_take_units << "\n"
         << "  peg_arb_max_inv_ratio= " << cfg.arbitrage.peg_arb_max_inventory_ratio << "\n"
+        << "  drift_corrector      = " << (cfg.arbitrage.drift_corrector_enabled ? "true" : "false") << "\n"
+        << "  drift_trigger_factor = " << cfg.arbitrage.drift_corrector_trigger_factor << "\n"
+        << "  drift_exit_factor    = " << cfg.arbitrage.drift_corrector_exit_factor << "\n"
+        << "  drift_max_take_units = " << cfg.arbitrage.drift_corrector_max_take_units << "\n"
+        << "  drift_max_premium_bps= " << cfg.arbitrage.drift_corrector_max_premium_bps << "\n"
+        << "  drift_cooldown_blocks= " << cfg.arbitrage.drift_corrector_cooldown_blocks << "\n"
+        << "  drift_max_per_day    = " << cfg.arbitrage.drift_corrector_max_trades_per_day << "\n"
         << "  max_position_size    = " << cfg.arbitrage.max_position_size << "\n"
         << "  min_confidence       = " << cfg.arbitrage.min_confidence_threshold << "\n"
         << "  cex_dex_conf_cap     = " << cfg.arbitrage.cex_dex_confidence_cap << "\n";

@@ -326,6 +326,13 @@ private:
     /// (inventory limits, recovery mode, wallet health, fee budgets).
     boost::asio::awaitable<void> step_run_buyer(BlockHeight block_height);
 
+    /// Step 9f: Drift corrector -- active asset rebalancer.  When an asset's
+    /// portfolio share is outside target +/- trigger_factor*tolerance, scan
+    /// Dexie for competitively-priced offers that, if taken, push the
+    /// portfolio back toward target allocations.  Hysteresis: stop taking
+    /// once back inside target +/- exit_factor*tolerance.
+    boost::asio::awaitable<void> step_run_drift_corrector(BlockHeight block_height);
+
     /// Step 10: Compute inventory skew adjustments, NHE, portfolio-level
     /// netting, and statistical pairs hedging suggestions.
     void step_run_hedging(BlockHeight block_height);
@@ -710,6 +717,13 @@ private:
     std::unordered_map<std::string, double> midpoint_epoch_taken_xch_;
     BlockHeight midpoint_epoch_start_{0};
     uint32_t midpoint_takes_this_block_{0};
+
+    // -- Drift corrector (Step 9f) state ------------------------------------
+    // Last block at which the corrector successfully took an offer (for
+    // cooldown enforcement) and a rolling 24h history of take timestamps
+    // (for the daily-trade quota).
+    BlockHeight last_drift_correction_block_{0};
+    std::deque<std::chrono::system_clock::time_point> drift_correction_history_;
 
     // True when Step 9c successfully took at least one offer on this block.
     bool crossed_book_take_this_block_{false};

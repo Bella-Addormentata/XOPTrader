@@ -867,6 +867,19 @@ struct ArbitrageSettings {
     double   peg_arb_max_take_units{50.0};   // max base-asset units per take
     double   peg_arb_max_inventory_ratio{0.70}; // max base ratio before suppressing buys
 
+    // -- Drift corrector (Step 9f: active asset rebalancing taker) -----------
+    // Scans DEX for competitive offers that, if taken, move the portfolio
+    // back toward the asset_target_allocations.  Triggered when an asset's
+    // share is outside target +/- trigger_factor*tolerance; stops at
+    // target +/- exit_factor*tolerance (hysteresis).
+    bool     drift_corrector_enabled{false};
+    double   drift_corrector_trigger_factor{2.0};
+    double   drift_corrector_exit_factor{1.0};
+    double   drift_corrector_max_take_units{10.0};   // max base units per take
+    double   drift_corrector_max_premium_bps{50.0};  // max deviation from mid
+    uint32_t drift_corrector_cooldown_blocks{3};
+    uint32_t drift_corrector_max_trades_per_day{10};
+
     // -- General parameters --------------------------------------------------
     double   max_position_size{100.0};
     double   default_confidence{0.75};

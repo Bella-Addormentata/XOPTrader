@@ -103,6 +103,8 @@ strategy:
   ratio_band_enter: 0.04
   ratio_band_exit: 0.02
   ratio_force_one_sided: true
+  asset_drift_guard_enabled: true
+  asset_drift_guard_max_factor: 1.5
   ratio_tier_size_scale_min: 0.35
   ratio_tier_size_scale_max: 1.15
   xch_ask_throttle_enabled: true
@@ -240,6 +242,15 @@ arbitrage:
   peg_arb_min_edge_bps: 5
   peg_arb_max_take_units: 50
   peg_arb_max_inventory_ratio: 0.6
+  # Step 9f: drift corrector -- active asset rebalancer.
+  # Conservative defaults; flip drift_corrector_enabled to activate.
+  drift_corrector_enabled: true
+  drift_corrector_trigger_factor: 2.0   # take when |pct-target| > trigger * tol
+  drift_corrector_exit_factor: 1.0      # stop when |pct-target| <= exit * tol
+  drift_corrector_max_take_units: 10.0  # max base-asset units per take
+  drift_corrector_max_premium_bps: 50.0 # max deviation from mid to accept
+  drift_corrector_cooldown_blocks: 3
+  drift_corrector_max_trades_per_day: 10
   max_position_size: 100
   default_confidence: 0.75
   min_confidence_threshold: 0.4
