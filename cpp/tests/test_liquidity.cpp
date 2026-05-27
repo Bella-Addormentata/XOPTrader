@@ -507,6 +507,103 @@ TEST(LiquidityEdgeTest, ZeroMid_EmptyLadder) {
     EXPECT_TRUE(ladder.empty());
 }
 
+TEST(LiquidityEdgeTest, ZeroAskPoolStillGeneratesBids) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 2;
+    cfg.tier_spacing_bps = {50.0, 100.0};
+    cfg.tier_size_pct = {0.40, 0.60};
+    cfg.gap_aware_spacing = false;
+    cfg.adverse_selection_sizing = false;
+    cfg.fill_rate_sizing = false;
+    LiquidityEngine engine("T/P", cfg);
+
+    const Mojo capital = 10'000'000'000'000LL;
+    auto ladder = engine.compute_ladder(
+        1'000'000'000'000LL, 0.03, 0.5,
+        capital, 0,
+        {}, cfg);
+
+    std::size_t bid_count = 0;
+    std::size_t ask_count = 0;
+    Mojo total_bid = 0;
+    for (const auto& quote : ladder) {
+        if (quote.side == Side::Bid) {
+            ++bid_count;
+            total_bid += quote.size;
+        } else {
+            ++ask_count;
+        }
+    }
+
+    EXPECT_EQ(bid_count, 2u);
+    EXPECT_EQ(ask_count, 0u);
+    EXPECT_EQ(total_bid, capital);
+}
+
+TEST(LiquidityEdgeTest, ZeroBidPoolStillGeneratesAsks) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 2;
+    cfg.tier_spacing_bps = {50.0, 100.0};
+    cfg.tier_size_pct = {0.40, 0.60};
+    cfg.gap_aware_spacing = false;
+    cfg.adverse_selection_sizing = false;
+    cfg.fill_rate_sizing = false;
+    LiquidityEngine engine("T/P", cfg);
+
+    const Mojo inventory = 10'000'000'000'000LL;
+    auto ladder = engine.compute_ladder(
+        1'000'000'000'000LL, 0.03, 0.5,
+        0, inventory,
+        {}, cfg);
+
+    std::size_t bid_count = 0;
+    std::size_t ask_count = 0;
+    Mojo total_ask = 0;
+    for (const auto& quote : ladder) {
+        if (quote.side == Side::Bid) {
+            ++bid_count;
+        } else {
+            ++ask_count;
+            total_ask += quote.size;
+        }
+    }
+
+    EXPECT_EQ(bid_count, 0u);
+    EXPECT_EQ(ask_count, 2u);
+    EXPECT_EQ(total_ask, inventory);
+}
+
+TEST(LiquidityEdgeTest, BothSidesUseSmallerSymmetricPool) {
+    LiquidityConfig cfg;
+    cfg.num_tiers = 2;
+    cfg.tier_spacing_bps = {50.0, 100.0};
+    cfg.tier_size_pct = {0.40, 0.60};
+    cfg.gap_aware_spacing = false;
+    cfg.adverse_selection_sizing = false;
+    cfg.fill_rate_sizing = false;
+    LiquidityEngine engine("T/P", cfg);
+
+    const Mojo capital = 10'000'000'000'000LL;
+    const Mojo inventory = 4'000'000'000'000LL;
+    auto ladder = engine.compute_ladder(
+        1'000'000'000'000LL, 0.03, 0.5,
+        capital, inventory,
+        {}, cfg);
+
+    Mojo total_bid = 0;
+    Mojo total_ask = 0;
+    for (const auto& quote : ladder) {
+        if (quote.side == Side::Bid) {
+            total_bid += quote.size;
+        } else {
+            total_ask += quote.size;
+        }
+    }
+
+    EXPECT_EQ(total_bid, inventory);
+    EXPECT_EQ(total_ask, inventory);
+}
+
 TEST(LiquidityEdgeTest, GetCompetingOffers_EmptyWhenNone) {
     State state;
     MarketDataConfig md_cfg;

@@ -160,34 +160,18 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
     const std::int64_t cap = std::max(available_capital,    static_cast<std::int64_t>(0));
     const std::int64_t inv = std::max(available_inventory,  static_cast<std::int64_t>(0));
 
-    // -- [v0.7.50] Symmetric bid/ask sizing: matching sizes at each tier ------
-    // New approach: instead of independent capital/inventory pools, use a single
-    // unified "liquidity pool" that funds BOTH bids and asks equally at each tier.
-    //
-    // Problem solved:
-    // - When ask-side is suppressed, bids alone don't provide liquidity presence
-    // - Current asymmetric approach (cap for bids, inv for asks) doesn't handle
-    //   one-sided suppression well
-    //
-    // Solution:
-    // - Pool size = min(available_capital, available_inventory)
-    // - Allocate pool size equally to bids and asks at each tier
-    // - Price (spread_bps) is the ONLY variable for risk/competitiveness
-    // - Ensures symmetric liquidity presence: if one side posts, other can too
-    //
-    // Benefit: When ask-side is suppressed at Step 8, at least the tier-0 bid
-    // was sized correctly and can post. When both sides are enabled, we have
-    // perfect balance - tier-0 bid size == tier-0 ask size.
-    //
-    // The pool can shrink due to:
-    // - Pending changes reducing XCH (available_capital decreases)
-    // - Inventory skew (available_inventory decreases)
-    // But both sides scale together, maintaining symmetry.
-    
-    // Use the smaller of capital and inventory to ensure both sides can post
-    // at the same size.  This is the fundamental "liquidity pool" available
-    // for paired bid/ask posting.
-    const std::int64_t unified_pool = std::min(cap, inv);
+    // -- Symmetric bid/ask sizing with one-sided recovery -------------------
+    // When both sides are available, use the smaller pool so paired bid/ask
+    // tiers match in size.  When an upstream guard intentionally suppresses
+    // one side to zero, keep sizing the remaining side from its own pool so
+    // rebalancing quotes can correct the inventory drift instead of deadlocking.
+    const bool has_bid_pool = cap > 0;
+    const bool has_ask_pool = inv > 0;
+    const std::int64_t paired_pool = (has_bid_pool && has_ask_pool)
+        ? std::min(cap, inv)
+        : static_cast<std::int64_t>(0);
+    const std::int64_t bid_pool = has_ask_pool ? paired_pool : cap;
+    const std::int64_t ask_pool = has_bid_pool ? paired_pool : inv;
     
     // Minimum pool size: tier-0 must have at least 1 XCH funding (split between bid and ask)
     const std::int64_t min_pool_per_tier = 1000000000000LL;  // 1.0 XCH
@@ -196,16 +180,14 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         const double spread_bps = cfg.tier_spacing_bps[i];
         const double size_frac  = cfg.tier_size_pct[i];
 
-        // Unified tier size from the shared pool
-        auto tier_size =
-            static_cast<std::int64_t>(
-                std::floor(static_cast<double>(unified_pool) * size_frac));
-
-        // [v0.7.50] Enforce minimum tier-0 pool allocation for both sides
-        // Tier-0 is critical; ensure it's funded adequately
-        if (i == 0 && tier_size < min_pool_per_tier && unified_pool > 0) {
-            tier_size = std::min(min_pool_per_tier, unified_pool);
-        }
+        auto tier_size_for_pool = [&](std::int64_t pool) {
+            auto tier_size = static_cast<std::int64_t>(
+                std::floor(static_cast<double>(pool) * size_frac));
+            if (i == 0 && tier_size < min_pool_per_tier && pool > 0) {
+                tier_size = std::min(min_pool_per_tier, pool);
+            }
+            return tier_size;
+        };
 
         // -- Bid tier --
         // bid_price = mid * (1 - spread_bps / 10000)
@@ -215,8 +197,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         const auto   bid_price   =
             static_cast<std::int64_t>(std::floor(bid_price_f));
 
-        // Bid size is the unified tier size
-        const auto bid_size = tier_size;
+        const auto bid_size = tier_size_for_pool(bid_pool);
 
         if (bid_price > 0 && bid_size > 0) {
             TierQuote tq;
@@ -236,8 +217,7 @@ std::vector<TierQuote> LiquidityEngine::build_raw_ladder(
         const auto   ask_price   =
             static_cast<std::int64_t>(std::ceil(ask_price_f));
 
-        // Ask size MATCHES bid size: same tier_size from unified pool
-        const auto ask_size = tier_size;
+        const auto ask_size = tier_size_for_pool(ask_pool);
 
 
         if (ask_price > 0 && ask_size > 0) {
