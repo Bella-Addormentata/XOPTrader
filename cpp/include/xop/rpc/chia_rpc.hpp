@@ -525,6 +525,16 @@ public:
                                         bool          secure = true);
 
     /**
+     * @brief Retrieve a single offer/trade record by trade ID.
+     *
+     * @param trade_id       Hex-encoded trade identifier.
+     * @param file_contents  If true, include the raw offer bech32 text.
+     * @return Offer/trade-record JSON object.
+     */
+    asio::awaitable<json> get_offer(const std::string& trade_id,
+                                    bool               file_contents = false);
+
+    /**
      * @brief Retrieve offers with pagination.
      *
      * @param start          Starting index (0-based).

@@ -41,6 +41,7 @@
 #include <cmath>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -1604,6 +1605,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Step 7 (ladder) failed: {}", e.what());
     }
 
+    // Give active drift correction first use of spendable balances before
+    // passive market-making offers lock those coins in new pending offers.
+    if (!wallet_circuit_open_) {
+        try { co_await step_run_drift_corrector(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
+        }
+    }
+
     // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
     // [T3-10] Gate Step 8 during Crash/Recovery states.
     // Also gated by the wallet circuit breaker and GUI pause flag.
@@ -1748,59 +1758,37 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         // so the competitor detector can filter them out.
         // ISO/IEC 27001:2022: no secret data exposed in offers.
         try {
-            // For XCH/CAT pairs, pair_id works correctly (returns only
-            // that pair's offers).  For CAT/CAT pairs (like BYC/wUSDC.b),
-            // pair_id == the denomination token, which returns ALL offers
-            // involving that token (584K+ for wUSDC.b), drowning the
-            // target pair in page_size=100.  Fix: fetch each direction
-            // separately using offered/requested asset IDs.
-            const bool is_xch_pair =
-                (pair.base_asset_id == "xch" ||
-                 pair.quote_asset_id == "xch");
+            // Fetch both sides directly.  Broad pair_id queries return the
+            // first page of a denomination-wide book and can miss the target
+            // pair's opposite side on thin CAT markets such as XCH/DBX.
+            auto asks = co_await dexie_->get_offers(
+                /*pair_id=*/   {},
+                /*offered=*/   pair.base_asset_id,
+                /*requested=*/ pair.quote_asset_id,
+                /*page=*/      1,
+                /*page_size=*/ 50,
+                /*sort=*/      "price_asc",
+                /*compact=*/   true,
+                /*status=*/    0);
+            auto bids = co_await dexie_->get_offers(
+                /*pair_id=*/   {},
+                /*offered=*/   pair.quote_asset_id,
+                /*requested=*/ pair.base_asset_id,
+                /*page=*/      1,
+                /*page_size=*/ 50,
+                /*sort=*/      "price_asc",
+                /*compact=*/   true,
+                /*status=*/    0);
 
             std::vector<rpc::OfferRecord> all_dexie_offers;
-            if (is_xch_pair) {
-                const std::string dexie_pair_id =
-                    ticker ? ticker->pair_id : pair.base_asset_id;
-                auto page = co_await dexie_->get_offers(
-                    dexie_pair_id,
-                    /*offered=*/   {},
-                    /*requested=*/ {},
-                    /*page=*/      1,
-                    /*page_size=*/ 100,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                all_dexie_offers = std::move(page.offers);
-            } else {
-                // CAT/CAT pair: two targeted fetches (asks + bids).
-                auto asks = co_await dexie_->get_offers(
-                    /*pair_id=*/   {},
-                    /*offered=*/   pair.base_asset_id,
-                    /*requested=*/ pair.quote_asset_id,
-                    /*page=*/      1,
-                    /*page_size=*/ 50,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                auto bids = co_await dexie_->get_offers(
-                    /*pair_id=*/   {},
-                    /*offered=*/   pair.quote_asset_id,
-                    /*requested=*/ pair.base_asset_id,
-                    /*page=*/      1,
-                    /*page_size=*/ 50,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                all_dexie_offers.reserve(
-                    asks.offers.size() + bids.offers.size());
-                all_dexie_offers.insert(all_dexie_offers.end(),
-                    std::make_move_iterator(asks.offers.begin()),
-                    std::make_move_iterator(asks.offers.end()));
-                all_dexie_offers.insert(all_dexie_offers.end(),
-                    std::make_move_iterator(bids.offers.begin()),
-                    std::make_move_iterator(bids.offers.end()));
-            }
+            all_dexie_offers.reserve(
+                asks.offers.size() + bids.offers.size());
+            all_dexie_offers.insert(all_dexie_offers.end(),
+                std::make_move_iterator(asks.offers.begin()),
+                std::make_move_iterator(asks.offers.end()));
+            all_dexie_offers.insert(all_dexie_offers.end(),
+                std::make_move_iterator(bids.offers.begin()),
+                std::make_move_iterator(bids.offers.end()));
 
             // Build CompetingOffer vector from dexie OfferRecord data.
             std::vector<CompetingOffer> comp_offers;
@@ -7570,6 +7558,14 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
     // -- Classify each configured asset as Overweight / Underweight / OK --
     enum class DriftState { Ok, Overweight, Underweight };
+    auto drift_state_name = [](DriftState s) -> const char* {
+        switch (s) {
+            case DriftState::Overweight:  return "OW";
+            case DriftState::Underweight: return "UW";
+            case DriftState::Ok:          return "ok";
+        }
+        return "ok";
+    };
     auto classify = [&](const std::string& asset_upper) -> DriftState {
         auto it_t = scfg.asset_target_allocations.find(asset_upper);
         if (it_t == scfg.asset_target_allocations.end())
@@ -7637,19 +7633,73 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         }
 
         auto comp = market_data_->get_competing_offers(pair.name);
-        if (comp.empty()) continue;
+        if (comp.empty()) {
+            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
+                          "(base={} {} quote={} {}, want_ask={} want_bid={}) "
+                          "but has no competing offers",
+                          pair.name, base_u, drift_state_name(base_state),
+                          quote_u, drift_state_name(quote_state),
+                          want_ask, want_bid);
+            continue;
+        }
 
-        const Mojo mid = static_cast<Mojo>(std::llround(
-            market_data_->get_mid_price(pair.name)
-            * static_cast<double>(kMojosPerXch)));
-        if (mid == 0) continue;
+        Mojo mid = 0;
+        const auto snap = state_->get_market(pair.name);
+        if (snap.best_bid > 0 && snap.best_ask > 0) {
+            mid = (snap.best_bid + snap.best_ask) / 2;
+        }
+        if (mid == 0) {
+            mid = static_cast<Mojo>(std::llround(
+                market_data_->get_mid_price(pair.name)
+                * static_cast<double>(kMojosPerXch)));
+        }
+        if (mid == 0) {
+            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
+                          "but has no usable mid price",
+                          pair.name);
+            continue;
+        }
 
         // Pick best ASK (lowest price) and best BID (highest price) that
         // fall within max_premium_bps of mid.
+        const Mojo max_mojos = static_cast<Mojo>(
+            max_units * static_cast<double>(pair.base_mojos_per_unit));
+        auto ceil_to_mojo = [](long double value) -> Mojo {
+            if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
+                return 0;
+            }
+            const long double cap = static_cast<long double>(
+                std::numeric_limits<Mojo>::max());
+            if (value >= cap) {
+                return std::numeric_limits<Mojo>::max();
+            }
+            return static_cast<Mojo>(std::ceil(value));
+        };
+        const long double base_mpu = static_cast<long double>(
+            pair.base_mojos_per_unit > 0 ? pair.base_mojos_per_unit : 1);
+        const long double quote_mpu = static_cast<long double>(
+            pair.quote_mojos_per_unit > 0 ? pair.quote_mojos_per_unit : 1);
+        const long double price_scale = static_cast<long double>(kMojosPerXch);
+        auto quote_cost_for_ask = [&](Mojo base_size, Mojo price) -> Mojo {
+            return ceil_to_mojo(
+                static_cast<long double>(base_size)
+                * static_cast<long double>(price)
+                * quote_mpu / (base_mpu * price_scale));
+        };
+        auto base_cost_for_bid = [&](Mojo quote_size, Mojo price) -> Mojo {
+            if (price <= 0) return static_cast<Mojo>(0);
+            return ceil_to_mojo(
+                static_cast<long double>(quote_size)
+                * price_scale * base_mpu
+                / (static_cast<long double>(price) * quote_mpu));
+        };
+
         struct Cand {
             std::string id;
             Mojo price{0};
             Mojo size{0};
+            Mojo base_size{0};
+            Mojo spend_cost{0};
             Side side{Side::Bid};
             double premium_bps{0.0};
         };
@@ -7661,20 +7711,29 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             const double mid_d = static_cast<double>(mid);
             const double price_d = static_cast<double>(co.price);
             if (co.side == Side::Ask && want_ask) {
+                const Mojo base_size = co.size;
+                const Mojo spend_cost = quote_cost_for_ask(co.size, co.price);
+                if (base_size == 0 || spend_cost == 0 || base_size > max_mojos) {
+                    continue;
+                }
                 // premium = how much above mid we'd pay
                 const double prem = (price_d - mid_d) / mid_d * 10000.0;
                 if (prem <= max_prem_bps &&
                     (!best_ask || co.price < best_ask->price)) {
                     best_ask = Cand{co.offer_id, co.price, co.size,
-                                    co.side, prem};
+                                    base_size, spend_cost, co.side, prem};
                 }
             } else if (co.side == Side::Bid && want_bid) {
+                const Mojo base_size = base_cost_for_bid(co.size, co.price);
+                if (base_size == 0 || base_size > max_mojos) {
+                    continue;
+                }
                 // premium = how much below mid we'd accept
                 const double prem = (mid_d - price_d) / mid_d * 10000.0;
                 if (prem <= max_prem_bps &&
                     (!best_bid || co.price > best_bid->price)) {
                     best_bid = Cand{co.offer_id, co.price, co.size,
-                                    co.side, prem};
+                                    base_size, base_size, co.side, prem};
                 }
             }
         }
@@ -7690,11 +7749,18 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         } else if (best_bid) {
             chosen = best_bid;
         }
-        if (!chosen) continue;
+        if (!chosen) {
+            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
+                          "(base={} {} quote={} {}, want_ask={} want_bid={}) "
+                          "but no offer passed max_premium={}bps "
+                          "among {} competing offers",
+                          pair.name, base_u, drift_state_name(base_state),
+                          quote_u, drift_state_name(quote_state),
+                          want_ask, want_bid, max_prem_bps, comp.size());
+            continue;
+        }
 
-        const Mojo max_mojos = static_cast<Mojo>(
-            max_units * static_cast<double>(pair.base_mojos_per_unit));
-        const Mojo take_sz = std::min(chosen->size, max_mojos);
+        const Mojo take_sz = chosen->base_size;
         if (take_sz == 0) continue;
 
         spdlog::info("[Engine] Step 9f: {} DRIFT-CORRECT {} "
@@ -7743,12 +7809,7 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                         wallet_->get_wallet_balance(spend_wid);
                     Mojo spendable = bal.value(
                         "spendable_balance", static_cast<Mojo>(0));
-                    const Mojo cost = (chosen->side == Side::Ask)
-                        ? static_cast<Mojo>(
-                              static_cast<double>(take_sz)
-                              * static_cast<double>(chosen->price)
-                              / static_cast<double>(kMojosPerXch))
-                        : take_sz;
+                      const Mojo cost = chosen->spend_cost;
                     if (spendable < cost) {
                         spdlog::warn("[Engine] Step 9f: {} SKIP -- "
                                      "insufficient balance: need {} "

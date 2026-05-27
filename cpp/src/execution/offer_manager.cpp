@@ -570,46 +570,40 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
         pending_map.emplace(po.offer_id, std::move(po));
     }
 
-    // Poll the wallet for all trade records (include_completed=true
-    // so we see offers that were filled between cancel-submission and
-    // cancel-confirmation on-chain).
-    constexpr std::int64_t kPageSize = 50;
-    std::int64_t offset = 0;
-    bool more = true;
-
-    while (more) {
-        std::vector<json> trade_records;
+    // Query only offers we currently track.  Scanning get_all_offers with
+    // include_completed=true can walk the entire historical offer archive
+    // before every ladder cycle.
+    std::vector<json> trade_records;
+    trade_records.reserve(pending_map.size());
+    for (const auto& entry : pending_map) {
+        const auto& trade_id = entry.first;
         try {
-            trade_records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false);
+            trade_records.push_back(
+                co_await wallet_->get_offer(trade_id,
+                                            /*file_contents=*/false));
         } catch (const rpc::ChiaRPCError& e) {
-            logger_->error("get_all_offers failed during fill detection: {}",
-                           e.what());
-            break;
+            logger_->error("get_offer failed during fill detection for {}: {}",
+                           trade_id.substr(0, 12), e.what());
+        }
+    }
+
+    for (const auto& rec : trade_records) {
+        // Extract trade_id and status from the record.
+        if (!rec.contains("trade_id") || !rec.contains("status")) {
+            continue;
+        }
+        std::string trade_id = rec["trade_id"].get<std::string>();
+        int status = trade_status::parse(rec["status"]);
+
+        // Only process records that are in our pending map.
+        auto it = pending_map.find(trade_id);
+        if (it == pending_map.end()) {
+            continue;
         }
 
-        if (trade_records.empty() ||
-            static_cast<std::int64_t>(trade_records.size()) < kPageSize) {
-            more = false;
-        }
+        const PendingOffer& po = it->second;
 
-        for (const auto& rec : trade_records) {
-            // Extract trade_id and status from the record.
-            if (!rec.contains("trade_id") || !rec.contains("status")) {
-                continue;
-            }
-            std::string trade_id = rec["trade_id"].get<std::string>();
-            int status = trade_status::parse(rec["status"]);
-
-            // Only process records that are in our pending map.
-            auto it = pending_map.find(trade_id);
-            if (it == pending_map.end()) {
-                continue;
-            }
-
-            const PendingOffer& po = it->second;
-
-            if (status == trade_status::kConfirmed) {
+        if (status == trade_status::kConfirmed) {
                 // Offer was taken and settled -- this is a fill.
                 Fill fill;
                 fill.offer_id     = trade_id;
@@ -694,9 +688,6 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 }
             }
             // Status PENDING_ACCEPT / PENDING_CONFIRM: still alive, no action.
-        }
-
-        offset += kPageSize;
     }
 
     if (!fills.empty()) {
@@ -1932,7 +1923,8 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         std::vector<json> trade_records;
         try {
             trade_records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false);
+                offset, offset + kPageSize, /*file_contents=*/false,
+                /*include_completed=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[startup_reconcile] get_all_offers failed: {}",
                            e.what());

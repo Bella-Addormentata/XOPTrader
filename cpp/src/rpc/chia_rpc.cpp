@@ -882,6 +882,22 @@ ChiaWalletRPC::cancel_offers(std::uint64_t fee, bool secure)
     co_return co_await rpc_post("cancel_offers", payload);
 }
 
+asio::awaitable<json>
+ChiaWalletRPC::get_offer(const std::string& trade_id, bool file_contents)
+{
+    const json payload = {
+        {"trade_id",      trade_id},
+        {"file_contents", file_contents}
+    };
+    const json resp = co_await rpc_post("get_offer", payload);
+
+    if (!resp.contains("trade_record") || resp["trade_record"].is_null()) {
+        throw ChiaRPCError("get_offer: response missing trade_record");
+    }
+
+    co_return resp["trade_record"];
+}
+
 asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_all_offers(std::int64_t start,
                                std::int64_t end,

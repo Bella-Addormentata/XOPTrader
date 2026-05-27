@@ -248,7 +248,7 @@ arbitrage:
   drift_corrector_trigger_factor: 2.0   # take when |pct-target| > trigger * tol
   drift_corrector_exit_factor: 1.0      # stop when |pct-target| <= exit * tol
   drift_corrector_max_take_units: 10.0  # max base-asset units per take
-  drift_corrector_max_premium_bps: 50.0 # max deviation from mid to accept
+  drift_corrector_max_premium_bps: 100.0 # max deviation from mid to accept
   drift_corrector_cooldown_blocks: 3
   drift_corrector_max_trades_per_day: 10
   max_position_size: 100
