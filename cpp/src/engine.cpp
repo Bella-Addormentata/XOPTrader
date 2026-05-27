@@ -1750,57 +1750,36 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         try {
             // For XCH/CAT pairs, pair_id works correctly (returns only
             // that pair's offers).  For CAT/CAT pairs (like BYC/wUSDC.b),
-            // pair_id == the denomination token, which returns ALL offers
-            // involving that token (584K+ for wUSDC.b), drowning the
-            // target pair in page_size=100.  Fix: fetch each direction
-            // separately using offered/requested asset IDs.
-            const bool is_xch_pair =
-                (pair.base_asset_id == "xch" ||
-                 pair.quote_asset_id == "xch");
-
+            // To prevent drowning the target pair's offers in the global order book
+            // (which can contain 500K+ unrelated offers for XCH or other base assets), we fetch
+            // each direction separately using offered/requested asset IDs.
             std::vector<rpc::OfferRecord> all_dexie_offers;
-            if (is_xch_pair) {
-                const std::string dexie_pair_id =
-                    ticker ? ticker->pair_id : pair.base_asset_id;
-                auto page = co_await dexie_->get_offers(
-                    dexie_pair_id,
-                    /*offered=*/   {},
-                    /*requested=*/ {},
-                    /*page=*/      1,
-                    /*page_size=*/ 100,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                all_dexie_offers = std::move(page.offers);
-            } else {
-                // CAT/CAT pair: two targeted fetches (asks + bids).
-                auto asks = co_await dexie_->get_offers(
-                    /*pair_id=*/   {},
-                    /*offered=*/   pair.base_asset_id,
-                    /*requested=*/ pair.quote_asset_id,
-                    /*page=*/      1,
-                    /*page_size=*/ 50,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                auto bids = co_await dexie_->get_offers(
-                    /*pair_id=*/   {},
-                    /*offered=*/   pair.quote_asset_id,
-                    /*requested=*/ pair.base_asset_id,
-                    /*page=*/      1,
-                    /*page_size=*/ 50,
-                    /*sort=*/      "price_asc",
-                    /*compact=*/   true,
-                    /*status=*/    0);
-                all_dexie_offers.reserve(
-                    asks.offers.size() + bids.offers.size());
-                all_dexie_offers.insert(all_dexie_offers.end(),
-                    std::make_move_iterator(asks.offers.begin()),
-                    std::make_move_iterator(asks.offers.end()));
-                all_dexie_offers.insert(all_dexie_offers.end(),
-                    std::make_move_iterator(bids.offers.begin()),
-                    std::make_move_iterator(bids.offers.end()));
-            }
+            auto asks = co_await dexie_->get_offers(
+                /*pair_id=*/   {},
+                /*offered=*/   pair.base_asset_id,
+                /*requested=*/ pair.quote_asset_id,
+                /*page=*/      1,
+                /*page_size=*/ 50,
+                /*sort=*/      "price_asc",
+                /*compact=*/   true,
+                /*status=*/    0);
+            auto bids = co_await dexie_->get_offers(
+                /*pair_id=*/   {},
+                /*offered=*/   pair.quote_asset_id,
+                /*requested=*/ pair.base_asset_id,
+                /*page=*/      1,
+                /*page_size=*/ 50,
+                /*sort=*/      "price_asc",
+                /*compact=*/   true,
+                /*status=*/    0);
+            all_dexie_offers.reserve(
+                asks.offers.size() + bids.offers.size());
+            all_dexie_offers.insert(all_dexie_offers.end(),
+                std::make_move_iterator(asks.offers.begin()),
+                std::make_move_iterator(asks.offers.end()));
+            all_dexie_offers.insert(all_dexie_offers.end(),
+                std::make_move_iterator(bids.offers.begin()),
+                std::make_move_iterator(bids.offers.end()));
 
             // Build CompetingOffer vector from dexie OfferRecord data.
             std::vector<CompetingOffer> comp_offers;
@@ -7362,14 +7341,14 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                             // Estimate cost: for ASK take we pay
                             // take_sz * price / kMojosPerXch in quote
                             // mojos; for BID take we deliver take_sz
-                            // base mojos.
+                            // base mojos. Handles CAT decimals correctly.
                             const Mojo cost =
                                 (c.side == Side::Ask)
-                                    ? static_cast<Mojo>(
-                                          static_cast<double>(take_sz)
-                                          * static_cast<double>(c.price)
-                                          / static_cast<double>(
-                                                kMojosPerXch))
+                                    ? static_cast<Mojo>(std::llround(quote_mojos_for(
+                                          static_cast<double>(take_sz),
+                                          static_cast<double>(c.price),
+                                          static_cast<double>(pair.base_mojos_per_unit),
+                                          static_cast<double>(pair.quote_mojos_per_unit))))
                                     : take_sz;
 
                             if (spendable < cost) {
@@ -7454,6 +7433,12 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                               pair.name, e.what());
             }
         }
+    }
+
+    try {
+        co_await step_run_drift_corrector(block_height);
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
     }
 
     co_return;
@@ -7743,11 +7728,13 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                         wallet_->get_wallet_balance(spend_wid);
                     Mojo spendable = bal.value(
                         "spendable_balance", static_cast<Mojo>(0));
+                    // Handles CAT decimals correctly.
                     const Mojo cost = (chosen->side == Side::Ask)
-                        ? static_cast<Mojo>(
-                              static_cast<double>(take_sz)
-                              * static_cast<double>(chosen->price)
-                              / static_cast<double>(kMojosPerXch))
+                        ? static_cast<Mojo>(std::llround(quote_mojos_for(
+                              static_cast<double>(take_sz),
+                              static_cast<double>(chosen->price),
+                              static_cast<double>(pair.base_mojos_per_unit),
+                              static_cast<double>(pair.quote_mojos_per_unit))))
                         : take_sz;
                     if (spendable < cost) {
                         spdlog::warn("[Engine] Step 9f: {} SKIP -- "
