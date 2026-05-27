@@ -82,7 +82,7 @@ strategy:
   - 0.2
   - 0.3
   - 0.35
-  startup_analysis_blocks: 0
+  startup_analysis_blocks: 5
   fee_reserve_xch: 0.1
   fee_min_spendable_xch: 0.01
   taker_min_spendable_xch: 0.25

@@ -1932,7 +1932,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
         std::vector<json> trade_records;
         try {
             trade_records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false, /*include_completed=*/false);
+                offset, offset + kPageSize, /*file_contents=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[startup_reconcile] get_all_offers failed: {}",
                            e.what());
