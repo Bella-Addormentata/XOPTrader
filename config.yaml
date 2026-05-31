@@ -149,25 +149,25 @@ strategy:
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
-    BYC: 0.05
+    BYC: 0.1
     DBX: 0.05
-    WUSDC.B: 0.3
-    XCH: 0.6
+    WUSDC.B: 0.35
+    XCH: 0.5
   ratio_target_by_pair:
-    BYC/wUSDC.b: 0.14285714285714285
-    XCH/BYC: 0.9230769230769231
-    XCH/DBX: 0.9230769230769231
-    XCH/wUSDC.b: 0.6666666666666666
+    BYC/wUSDC.b: 0.2222222222222222
+    XCH/BYC: 0.8333333333333334
+    XCH/DBX: 0.9090909090909091
+    XCH/wUSDC.b: 0.5882352941176471
   asset_target_tolerances:
     BYC: 0.04
     DBX: 0.04
     WUSDC.B: 0.2
     XCH: 0.2
   ratio_band_enter_by_pair:
-    BYC/wUSDC.b: 0.3308270676691729
-    XCH/BYC: 0.10675039246467821
-    XCH/DBX: 0.10675039246467821
-    XCH/wUSDC.b: 0.2222222222222222
+    BYC/wUSDC.b: 0.260536398467433
+    XCH/BYC: 0.1515151515151516
+    XCH/DBX: 0.1398601398601398
+    XCH/wUSDC.b: 0.23529411764705882
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -186,9 +186,6 @@ volatility:
   yz_alpha: 0.34
   candle_aggregation_blocks: 10
 market_data:
-  # XCH-equivalent mojos. Default 1e12 (1 XCH) was too strict for low-volume
-  # pairs like XCH/BYC where typical ask sizes are 0.1-0.5 XCH; set to 0.1 XCH
-  # so we can see and undercut competitors on thin pairs.
   min_competitor_offer_size: 100000000000
 monitoring:
   prometheus_port: 19090
@@ -242,13 +239,11 @@ arbitrage:
   peg_arb_min_edge_bps: 5
   peg_arb_max_take_units: 50
   peg_arb_max_inventory_ratio: 0.6
-  # Step 9f: drift corrector -- active asset rebalancer.
-  # Conservative defaults; flip drift_corrector_enabled to activate.
   drift_corrector_enabled: true
-  drift_corrector_trigger_factor: 2.0   # take when |pct-target| > trigger * tol
-  drift_corrector_exit_factor: 1.0      # stop when |pct-target| <= exit * tol
-  drift_corrector_max_take_units: 10.0  # max base-asset units per take
-  drift_corrector_max_premium_bps: 100.0 # max deviation from mid to accept
+  drift_corrector_trigger_factor: 2.0
+  drift_corrector_exit_factor: 1.0
+  drift_corrector_max_take_units: 10.0
+  drift_corrector_max_premium_bps: 100.0
   drift_corrector_cooldown_blocks: 3
   drift_corrector_max_trades_per_day: 10
   max_position_size: 100

@@ -7495,9 +7495,9 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
     }
     if (drift_correction_history_.size() >=
         acfg.drift_corrector_max_trades_per_day) {
-        spdlog::debug("[Engine] Step 9f: daily quota reached ({}/{})",
-                      drift_correction_history_.size(),
-                      acfg.drift_corrector_max_trades_per_day);
+        spdlog::info("[Engine] Step 9f: daily quota reached ({}/{})",
+                     drift_correction_history_.size(),
+                     acfg.drift_corrector_max_trades_per_day);
         co_return;
     }
 
@@ -7632,14 +7632,49 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             continue;
         }
 
+        double recent_ask_share = 0.5;
+        std::size_t recent_fill_count = 0;
+        double recent_fill_bias_bps = 0.0;
+        if (db_) {
+            try {
+                const auto recent_since = now - std::chrono::hours(24);
+                const auto recent_trades = db_->query_trades(
+                    pair.name,
+                    PnLTracker::timestamp_to_iso(recent_since),
+                    PnLTracker::timestamp_to_iso(now));
+                std::size_t ask_fills = 0;
+                std::size_t bid_fills = 0;
+                for (const auto& tr : recent_trades) {
+                    if (tr.side == "ask") {
+                        ++ask_fills;
+                    } else if (tr.side == "bid") {
+                        ++bid_fills;
+                    }
+                }
+                recent_fill_count = ask_fills + bid_fills;
+                if (recent_fill_count > 0) {
+                    recent_ask_share = static_cast<double>(ask_fills)
+                                     / static_cast<double>(recent_fill_count);
+                    recent_fill_bias_bps = std::clamp(
+                        (recent_ask_share - 0.5) * 80.0,
+                        -30.0,
+                        30.0);
+                }
+            } catch (const std::exception& e) {
+                spdlog::debug("[Engine] Step 9f: {} recent fill skew lookup "
+                              "failed: {}",
+                              pair.name, e.what());
+            }
+        }
+
         auto comp = market_data_->get_competing_offers(pair.name);
         if (comp.empty()) {
-            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
-                          "(base={} {} quote={} {}, want_ask={} want_bid={}) "
-                          "but has no competing offers",
-                          pair.name, base_u, drift_state_name(base_state),
-                          quote_u, drift_state_name(quote_state),
-                          want_ask, want_bid);
+            spdlog::info("[Engine] Step 9f: {} wants drift correction "
+                         "(base={} {} quote={} {}, want_ask={} want_bid={}) "
+                         "but has no competing offers",
+                         pair.name, base_u, drift_state_name(base_state),
+                         quote_u, drift_state_name(quote_state),
+                         want_ask, want_bid);
             continue;
         }
 
@@ -7654,9 +7689,9 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                 * static_cast<double>(kMojosPerXch)));
         }
         if (mid == 0) {
-            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
-                          "but has no usable mid price",
-                          pair.name);
+            spdlog::info("[Engine] Step 9f: {} wants drift correction "
+                         "but has no usable mid price",
+                         pair.name);
             continue;
         }
 
@@ -7741,8 +7776,17 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
         // Prefer the side that addresses the more-breached asset.  If both
         // are candidates, take whichever has the better (lower) premium.
         std::optional<Cand> chosen;
+        auto adjusted_premium = [&](const Cand& cand) -> double {
+            if (recent_fill_count < 10) {
+                return cand.premium_bps;
+            }
+            const double bias = (cand.side == Side::Ask)
+                ? recent_fill_bias_bps
+                : -recent_fill_bias_bps;
+            return cand.premium_bps + bias;
+        };
         if (best_ask && best_bid) {
-            chosen = (best_ask->premium_bps <= best_bid->premium_bps)
+            chosen = (adjusted_premium(*best_ask) <= adjusted_premium(*best_bid))
                      ? best_ask : best_bid;
         } else if (best_ask) {
             chosen = best_ask;
@@ -7750,13 +7794,15 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             chosen = best_bid;
         }
         if (!chosen) {
-            spdlog::debug("[Engine] Step 9f: {} wants drift correction "
-                          "(base={} {} quote={} {}, want_ask={} want_bid={}) "
-                          "but no offer passed max_premium={}bps "
-                          "among {} competing offers",
-                          pair.name, base_u, drift_state_name(base_state),
-                          quote_u, drift_state_name(quote_state),
-                          want_ask, want_bid, max_prem_bps, comp.size());
+            spdlog::info("[Engine] Step 9f: {} wants drift correction "
+                         "(base={} {} quote={} {}, want_ask={} want_bid={}) "
+                         "but no offer passed max_premium={}bps among {} "
+                         "competing offers (recent_ask_share={:.2f}, "
+                         "bias={:+.1f}bps)",
+                         pair.name, base_u, drift_state_name(base_state),
+                         quote_u, drift_state_name(quote_state),
+                         want_ask, want_bid, max_prem_bps, comp.size(),
+                         recent_ask_share, recent_fill_bias_bps);
             continue;
         }
 
@@ -7765,7 +7811,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
         spdlog::info("[Engine] Step 9f: {} DRIFT-CORRECT {} "
                      "base={}({}) quote={}({}) price={} mid={} "
-                     "prem={:.1f}bps offer={} size={}",
+                     "prem={:.1f}bps offer={} size={} recent_ask_share={:.2f} "
+                     "bias={:+.1f}bps",
                      pair.name, to_string(chosen->side),
                      base_u,
                      base_state == DriftState::Overweight ? "OW" :
@@ -7774,7 +7821,8 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                      quote_state == DriftState::Overweight ? "OW" :
                      quote_state == DriftState::Underweight ? "UW" : "ok",
                      chosen->price, mid, chosen->premium_bps,
-                     chosen->id.substr(0, 12), take_sz);
+                     chosen->id.substr(0, 12), take_sz,
+                     recent_ask_share, recent_fill_bias_bps);
 
         if (dry_run_) {
             spdlog::info("[Engine] Step 9f: {} DRY RUN -- would take {}",
