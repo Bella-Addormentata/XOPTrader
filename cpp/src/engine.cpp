@@ -5346,6 +5346,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //   side is posted to restore the balance.
         bool can_bid = true;   // need quote to bid (buy base)
         bool can_ask = true;   // need base to ask (sell base)
+        Mojo pair_base_spendable = 0;
+        Mojo pair_quote_spendable = 0;
+        bool pair_base_balance_known = false;
+        bool pair_quote_balance_known = false;
+        Mojo pair_base_pending_spend = 0;
+        Mojo pair_quote_pending_spend = 0;
+        Mojo pair_base_reserve_mojos = 0;
+        Mojo pair_quote_reserve_mojos = 0;
 
         // XCH-buy-only mode: when UTXO liberation couldn't restore the
         // fee reserve, only allow pairs that can acquire XCH, and only
@@ -5419,6 +5427,14 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             confirmed = bal_json["confirmed_wallet_balance"].get<Mojo>();
                         if (bal_json.contains("pending_change"))
                             pending = bal_json["pending_change"].get<Mojo>();
+
+                        if (sb.is_base) {
+                            pair_base_spendable = spendable;
+                            pair_base_balance_known = true;
+                        } else {
+                            pair_quote_spendable = spendable;
+                            pair_quote_balance_known = true;
+                        }
 
                         // Update the cache for metrics.
                         cached_wallet_balances_[sb.label] = {spendable, confirmed, pending};
@@ -5580,6 +5596,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             if (sb.is_base) can_ask = false;
                             else            can_bid = false;
                         }
+
+                        if (sb.is_base) {
+                            pair_base_reserve_mojos = reserve_mojos;
+                        } else {
+                            pair_quote_reserve_mojos = reserve_mojos;
+                        }
                     } catch (const std::exception& e) {
                         spdlog::warn("[Engine] Step 8: balance query failed for "
                                      "wallet {} ({}): {}", sb.label, sb.wid, e.what());
@@ -5587,6 +5609,211 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         can_bid = false;
                         can_ask = false;
                         break;
+                    }
+                }
+
+                // Pending exposure guard (existing offers): if all currently
+                // pending same-side offers were filled, do we dip below reserve?
+                // If yes, proactively cancel the least competitive offers first.
+                if (config_.strategy.auto_rebalance_enabled) {
+                    struct ExposureCandidate {
+                        std::string offer_id;
+                        Mojo spend_cost{0};
+                        std::uint8_t tier{0};
+                        int staleness_rank{2};
+                        Mojo price{0};
+                    };
+                    auto ceil_to_mojo = [](long double value) -> Mojo {
+                        if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
+                            return 0;
+                        }
+                        const long double cap = static_cast<long double>(
+                            std::numeric_limits<Mojo>::max());
+                        if (value >= cap) {
+                            return std::numeric_limits<Mojo>::max();
+                        }
+                        return static_cast<Mojo>(std::ceil(value));
+                    };
+                    auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
+                        const long double base_mpu = static_cast<long double>(
+                            gate_pc->base_mojos_per_unit > 0 ? gate_pc->base_mojos_per_unit : 1);
+                        const long double quote_mpu = static_cast<long double>(
+                            gate_pc->quote_mojos_per_unit > 0 ? gate_pc->quote_mojos_per_unit : 1);
+                        const long double price_scale = static_cast<long double>(kMojosPerXch);
+                        return ceil_to_mojo(
+                            static_cast<long double>(base_size)
+                            * static_cast<long double>(price)
+                            * quote_mpu / (base_mpu * price_scale));
+                    };
+
+                    std::unordered_map<std::string, execution::TierClassification> tc_by_id;
+                    tc_by_id.reserve(tier_classes.size());
+                    for (const auto& tc : tier_classes) {
+                        tc_by_id.emplace(tc.offer_id, tc);
+                    }
+
+                    std::vector<ExposureCandidate> ask_candidates;
+                    std::vector<ExposureCandidate> bid_candidates;
+                    const auto all_pending = state_->get_all_offers();
+                    for (const auto& po : all_pending) {
+                        if (po.pair_name != pair_name || po.cancel_pending) {
+                            continue;
+                        }
+
+                        int staleness_rank = 2;
+                        Mojo class_price = po.price;
+                        auto tc_it = tc_by_id.find(po.offer_id);
+                        if (tc_it != tc_by_id.end()) {
+                            switch (tc_it->second.staleness) {
+                                case execution::TierStaleness::Expired:
+                                    staleness_rank = 0;
+                                    break;
+                                case execution::TierStaleness::Stale:
+                                    staleness_rank = 1;
+                                    break;
+                                case execution::TierStaleness::Fresh:
+                                default:
+                                    staleness_rank = 2;
+                                    break;
+                            }
+                        }
+
+                        if (po.side == Side::Ask) {
+                            const Mojo spend = po.size;
+                            if (spend > 0) {
+                                pair_base_pending_spend += spend;
+                                ask_candidates.push_back(
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                            }
+                        } else {
+                            const Mojo spend = quote_cost_for_base_size(po.size, po.price);
+                            if (spend > 0) {
+                                pair_quote_pending_spend += spend;
+                                bid_candidates.push_back(
+                                    {po.offer_id, spend, po.tier, staleness_rank, class_price});
+                            }
+                        }
+                    }
+
+                    const Mojo ex_mid = static_cast<Mojo>(std::llround(
+                        market_data_->get_mid_price(pair_name)
+                        * static_cast<double>(kMojosPerXch)));
+                    auto farther_from_mid = [&](Side side, Mojo price_a, Mojo price_b) {
+                        if (ex_mid == 0) {
+                            if (side == Side::Ask) {
+                                return price_a > price_b;
+                            }
+                            return price_a < price_b;
+                        }
+                        const Mojo da = (price_a > ex_mid) ? (price_a - ex_mid) : (ex_mid - price_a);
+                        const Mojo db = (price_b > ex_mid) ? (price_b - ex_mid) : (ex_mid - price_b);
+                        return da > db;
+                    };
+                    auto sort_candidates = [&](std::vector<ExposureCandidate>& cands, Side side) {
+                        std::sort(cands.begin(), cands.end(),
+                                  [&](const ExposureCandidate& a, const ExposureCandidate& b) {
+                            if (a.staleness_rank != b.staleness_rank)
+                                return a.staleness_rank < b.staleness_rank;
+                            if (a.tier != b.tier)
+                                return a.tier > b.tier;
+                            if (a.price != b.price)
+                                return farther_from_mid(side, a.price, b.price);
+                            return a.offer_id < b.offer_id;
+                        });
+                    };
+
+                    if (pair_base_balance_known && pair_base_reserve_mojos > 0
+                        && pair_base_spendable > 0 && pair_base_pending_spend > 0) {
+                        const Mojo projected_after_fill =
+                            (pair_base_spendable > pair_base_pending_spend)
+                                ? (pair_base_spendable - pair_base_pending_spend)
+                                : Mojo{0};
+                        if (projected_after_fill < pair_base_reserve_mojos) {
+                            Mojo need_to_free = pair_base_reserve_mojos - projected_after_fill;
+                            sort_candidates(ask_candidates, Side::Ask);
+                            std::vector<std::string> cancel_ids;
+                            Mojo freed = 0;
+                            for (const auto& cand : ask_candidates) {
+                                cancel_ids.push_back(cand.offer_id);
+                                freed += cand.spend_cost;
+                                if (freed >= need_to_free) {
+                                    break;
+                                }
+                            }
+                            if (!cancel_ids.empty()) {
+                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
+                                if (!cancelled.empty()) {
+                                    pair_base_pending_spend = (pair_base_pending_spend > freed)
+                                        ? (pair_base_pending_spend - freed)
+                                        : Mojo{0};
+                                    can_ask = false;
+                                    spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
+                                                 "breached reserve (spendable={} pending={} "
+                                                 "reserve={}) -- cancelled {} ask offers "
+                                                 "to rebalance exposure",
+                                                 pair_name,
+                                                 gate_pc->base_asset_id,
+                                                 pair_base_spendable,
+                                                 pair_base_pending_spend,
+                                                 pair_base_reserve_mojos,
+                                                 cancelled.size());
+                                    for (const auto& oid : cancelled) {
+                                        try {
+                                            db_->update_offer_status(
+                                                oid, "cancelled", block_height,
+                                                "exposure_floor_rebalance");
+                                        } catch (...) {}
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if (pair_quote_balance_known && pair_quote_reserve_mojos > 0
+                        && pair_quote_spendable > 0 && pair_quote_pending_spend > 0) {
+                        const Mojo projected_after_fill =
+                            (pair_quote_spendable > pair_quote_pending_spend)
+                                ? (pair_quote_spendable - pair_quote_pending_spend)
+                                : Mojo{0};
+                        if (projected_after_fill < pair_quote_reserve_mojos) {
+                            Mojo need_to_free = pair_quote_reserve_mojos - projected_after_fill;
+                            sort_candidates(bid_candidates, Side::Bid);
+                            std::vector<std::string> cancel_ids;
+                            Mojo freed = 0;
+                            for (const auto& cand : bid_candidates) {
+                                cancel_ids.push_back(cand.offer_id);
+                                freed += cand.spend_cost;
+                                if (freed >= need_to_free) {
+                                    break;
+                                }
+                            }
+                            if (!cancel_ids.empty()) {
+                                auto cancelled = co_await offer_mgr_->selective_cancel(cancel_ids);
+                                if (!cancelled.empty()) {
+                                    pair_quote_pending_spend = (pair_quote_pending_spend > freed)
+                                        ? (pair_quote_pending_spend - freed)
+                                        : Mojo{0};
+                                    can_bid = false;
+                                    spdlog::warn("[Engine] Step 8: {} pending exposure on {} "
+                                                 "breached reserve (spendable={} pending={} "
+                                                 "reserve={}) -- cancelled {} bid offers "
+                                                 "to rebalance exposure",
+                                                 pair_name,
+                                                 gate_pc->quote_asset_id,
+                                                 pair_quote_spendable,
+                                                 pair_quote_pending_spend,
+                                                 pair_quote_reserve_mojos,
+                                                 cancelled.size());
+                                    for (const auto& oid : cancelled) {
+                                        try {
+                                            db_->update_offer_status(
+                                                oid, "cancelled", block_height,
+                                                "exposure_floor_rebalance");
+                                        } catch (...) {}
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -6400,6 +6627,101 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         if (fee_filtered_tiers.empty()) {
             spdlog::info("[Engine] Step 8: {} all tiers filtered by "
                          "fee-vs-gain gating", pair_name);
+            continue;
+        }
+
+        // Pending exposure guard (pre-post projection): include currently
+        // pending offers plus candidate new tiers and suppress any side that
+        // would breach reserve if all accepted.
+        {
+            auto ceil_to_mojo = [](long double value) -> Mojo {
+                if (!std::isfinite(static_cast<double>(value)) || value <= 0.0L) {
+                    return 0;
+                }
+                const long double cap = static_cast<long double>(
+                    std::numeric_limits<Mojo>::max());
+                if (value >= cap) {
+                    return std::numeric_limits<Mojo>::max();
+                }
+                return static_cast<Mojo>(std::ceil(value));
+            };
+            auto quote_cost_for_base_size = [&](Mojo base_size, Mojo price) -> Mojo {
+                const long double base_mpu = static_cast<long double>(
+                    pair_cfg->base_mojos_per_unit > 0 ? pair_cfg->base_mojos_per_unit : 1);
+                const long double quote_mpu = static_cast<long double>(
+                    pair_cfg->quote_mojos_per_unit > 0 ? pair_cfg->quote_mojos_per_unit : 1);
+                const long double price_scale = static_cast<long double>(kMojosPerXch);
+                return ceil_to_mojo(
+                    static_cast<long double>(base_size)
+                    * static_cast<long double>(price)
+                    * quote_mpu / (base_mpu * price_scale));
+            };
+
+            Mojo pending_plus_new_ask = pair_base_pending_spend;
+            Mojo pending_plus_new_bid = pair_quote_pending_spend;
+            for (const auto& tq : fee_filtered_tiers) {
+                if (tq.side == Side::Ask) {
+                    pending_plus_new_ask += tq.size;
+                } else {
+                    pending_plus_new_bid += quote_cost_for_base_size(tq.size, tq.price);
+                }
+            }
+
+            bool suppress_ask_projection = false;
+            bool suppress_bid_projection = false;
+            if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0) {
+                const Mojo projected_after_fill =
+                    (pair_base_spendable > pending_plus_new_ask)
+                        ? (pair_base_spendable - pending_plus_new_ask)
+                        : Mojo{0};
+                if (projected_after_fill < pair_base_reserve_mojos) {
+                    suppress_ask_projection = true;
+                    can_ask = false;
+                    spdlog::info("[Engine] Step 8: {} projected ask exposure "
+                                 "would breach reserve on {} (spendable={} "
+                                 "pending+new={} reserve={}) -- suppressing ask",
+                                 pair_name,
+                                 pair_cfg->base_asset_id,
+                                 pair_base_spendable,
+                                 pending_plus_new_ask,
+                                 pair_base_reserve_mojos);
+                }
+            }
+            if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0) {
+                const Mojo projected_after_fill =
+                    (pair_quote_spendable > pending_plus_new_bid)
+                        ? (pair_quote_spendable - pending_plus_new_bid)
+                        : Mojo{0};
+                if (projected_after_fill < pair_quote_reserve_mojos) {
+                    suppress_bid_projection = true;
+                    can_bid = false;
+                    spdlog::info("[Engine] Step 8: {} projected bid exposure "
+                                 "would breach reserve on {} (spendable={} "
+                                 "pending+new={} reserve={}) -- suppressing bid",
+                                 pair_name,
+                                 pair_cfg->quote_asset_id,
+                                 pair_quote_spendable,
+                                 pending_plus_new_bid,
+                                 pair_quote_reserve_mojos);
+                }
+            }
+
+            if (suppress_ask_projection || suppress_bid_projection) {
+                std::vector<TierQuote> projected_safe_tiers;
+                projected_safe_tiers.reserve(fee_filtered_tiers.size());
+                for (const auto& tq : fee_filtered_tiers) {
+                    if ((tq.side == Side::Bid && can_bid)
+                        || (tq.side == Side::Ask && can_ask)) {
+                        projected_safe_tiers.push_back(tq);
+                    }
+                }
+                fee_filtered_tiers = std::move(projected_safe_tiers);
+            }
+        }
+
+        if (fee_filtered_tiers.empty()) {
+            spdlog::info("[Engine] Step 8: {} all tiers filtered by pending "
+                         "exposure projection", pair_name);
             continue;
         }
 
