@@ -83,7 +83,7 @@ strategy:
   - 0.3
   - 0.35
   startup_analysis_blocks: 5
-  fee_reserve_xch: 0.1
+  fee_reserve_xch: 1.0
   fee_min_spendable_xch: 0.01
   taker_min_spendable_xch: 0.25
   block_time_seconds: 52.0
@@ -113,8 +113,8 @@ strategy:
   xch_ask_throttle_critical_xch: 0.35
   xch_ask_throttle_aggressiveness: 1.15
   sigma_floor: 0.001
-  coin_pool_target_count: 12
-  coin_pool_target_xch: 2.0
+  coin_pool_target_count: 3
+  coin_pool_target_xch: 0.5
   coin_pool_interval_blocks: 5
   cat_coin_pool_target_count: 0
   cat_coin_pool_target_units: 10.0

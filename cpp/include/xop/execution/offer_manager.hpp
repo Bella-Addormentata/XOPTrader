@@ -304,6 +304,8 @@ public:
      * @param anchor_active When true (competitive anchor pricing), large
      *                      deviations in EITHER direction trigger staleness,
      *                      not just adverse deviations.
+     * @param can_bid       Whether bid (buy base) offers are currently allowed on this pair.
+     * @param can_ask       Whether ask (sell base) offers are currently allowed on this pair.
      * @return Per-offer classification results.
      */
     std::vector<TierClassification> classify_tier_staleness(
@@ -312,7 +314,9 @@ public:
         BlockHeight                    current_block,
         BlockHeight                    ttl_blocks,
         Mojo                           mid_price = 0,
-        bool                           anchor_active = false) const;
+        bool                           anchor_active = false,
+        bool                           can_bid = true,
+        bool                           can_ask = true) const;
 
     /**
      * @brief [T5-01] Cancel only the offers classified as Stale or Expired.

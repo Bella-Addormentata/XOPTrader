@@ -1113,7 +1113,9 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
     BlockHeight                    current_block,
     BlockHeight                    ttl_blocks,
     Mojo                           mid_price,
-    bool                           anchor_active) const
+    bool                           anchor_active,
+    bool                           can_bid,
+    bool                           can_ask) const
 {
     std::vector<TierClassification> results;
 
@@ -1145,6 +1147,22 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         tc.offer_id   = po.offer_id;
         tc.tier_index = po.tier;
         tc.side       = po.side;
+
+        // [v0.7.48] Side-aware balance/rebalance check.
+        // If a side is completely forbidden due to one-sided rebalancing
+        // (xch_buy_only_mode or ratio_force_one_sided), we must cancel
+        // active offers on that side immediately to prevent sudden market
+        // swings from filling them and further worsening the imbalance.
+        if ((!can_bid && po.side == Side::Bid) || (!can_ask && po.side == Side::Ask)) {
+            tc.staleness       = TierStaleness::Stale;
+            tc.price_deviation = 1.0;  // maximal to represent forced rebalance
+            results.push_back(std::move(tc));
+            logger_->info("classify_tier_staleness({}): tier {} {} "
+                          "side forbidden because the trade type/amount violates "
+                          "balance rebalancing constraints -- marking stale for cancellation",
+                          pair_name, po.tier, to_string(po.side));
+            continue;
+        }
 
         const BlockHeight age = (current_block > po.created_at_block)
             ? (current_block - po.created_at_block) : 0;

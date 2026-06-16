@@ -5187,13 +5187,49 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         //   - All tiers Stale/Expired  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ fall back to full cancel_stale
         //                                (same as before).
         //   - No pending tiers at all  ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â‚¬Å¾Ã‚Â¢ post new ladder from scratch.
+        // Determine if any side is forbidden due to rebalancing filters
+        // (xch_buy_only_mode or ratio_force_one_sided).
+        bool can_bid_rebalance = true;
+        bool can_ask_rebalance = true;
+
+        if (xch_buy_only_mode) {
+            const PairConfig* buypc = find_pair_config(pair_name);
+            const bool base_is_xch  = buypc && buypc->base_asset_id  == "xch";
+            const bool quote_is_xch = buypc && buypc->quote_asset_id == "xch";
+            if (base_is_xch) {
+                can_ask_rebalance = false;  // only bid (buy XCH), ask is forbidden
+            } else if (quote_is_xch) {
+                can_bid_rebalance = false;  // only ask (receive XCH), bid is forbidden
+            } else {
+                // Non-XCH pair: skip unless stablecoin_exempt_buyonly.
+                if (!buypc || !buypc->stablecoin_exempt_buyonly) {
+                    can_bid_rebalance = false;
+                    can_ask_rebalance = false;
+                }
+            }
+        }
+
+        if (config_.strategy.ratio_rebalance_enabled && config_.strategy.ratio_force_one_sided) {
+            auto it_mode = ratio_rebalance_modes_.find(pair_name);
+            if (it_mode != ratio_rebalance_modes_.end()) {
+                const RatioRebalanceMode active_mode = it_mode->second;
+                if (active_mode == RatioRebalanceMode::AcquireBase) {
+                    can_ask_rebalance = false;
+                } else if (active_mode == RatioRebalanceMode::AcquireQuote) {
+                    can_bid_rebalance = false;
+                }
+            }
+        }
+
         auto tier_classes = offer_mgr_->classify_tier_staleness(
             pair_name, pcs.ladder, block_height,
             config_.strategy.offer_ttl_blocks,
             static_cast<Mojo>(std::llround(
                 market_data_->get_mid_price(pair_name)
                 * static_cast<double>(kMojosPerXch))),
-            config_.strategy.competitive_anchor_enabled);
+            config_.strategy.competitive_anchor_enabled,
+            can_bid_rebalance,
+            can_ask_rebalance);
 
         bool has_pending = !tier_classes.empty();
         int fresh_count = 0, stale_count = 0, expired_count = 0;
