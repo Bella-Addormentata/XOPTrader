@@ -854,6 +854,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
             throw ConfigError(sec + ".min_offer_size_units must be >= 0");
         }
     }
+    if (node["max_offer_size_units"] && node["max_offer_size_units"].IsDefined()
+        && !node["max_offer_size_units"].IsNull()) {
+        cfg.max_offer_size_units = node["max_offer_size_units"].as<double>();
+        if (cfg.max_offer_size_units < 0.0) {
+            throw ConfigError(sec + ".max_offer_size_units must be >= 0");
+        }
+    }
     if (node["wallet_balance_caps_enabled"] && node["wallet_balance_caps_enabled"].IsDefined()
         && !node["wallet_balance_caps_enabled"].IsNull()) {
         cfg.wallet_balance_caps_enabled = node["wallet_balance_caps_enabled"].as<bool>();
@@ -2199,6 +2206,7 @@ void log_config_summary(const AppConfig& cfg)
         << "  block_time_seconds = " << cfg.strategy.block_time_seconds << "\n"
         << "  min_reserve_units = " << cfg.strategy.min_reserve_units << "\n"
         << "  min_offer_size_units = " << cfg.strategy.min_offer_size_units << "\n"
+        << "  max_offer_size_units = " << cfg.strategy.max_offer_size_units << "\n"
         << "  min_trading_units = " << cfg.strategy.min_trading_units << "\n"
         << "  auto_rebalance = " << (cfg.strategy.auto_rebalance_enabled ? "ON" : "off") << "\n"
         << "  xch_ask_throttle = " << (cfg.strategy.xch_ask_throttle_enabled ? "ON" : "off") << "\n"

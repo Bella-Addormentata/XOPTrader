@@ -277,6 +277,10 @@ struct StrategyConfig {
     /// dust-sized offers that waste fees and wallet UTXOs.  Default 0.1.
     double   min_offer_size_units{0.1};
 
+    /// Maximum offer size per tier in base-asset units for XCH-base pairs.
+    /// Tiers larger than this are capped down.  0 = no cap.  Default 5.0.
+    double   max_offer_size_units{5.0};
+
     /// When true, Step 7 caps the bid pool (avail_capital) at the quote-
     /// asset wallet's confirmed balance, and the ask pool (avail_inventory)
     /// at the base-asset wallet's confirmed balance, for CAT assets.  XCH

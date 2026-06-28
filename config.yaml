@@ -63,27 +63,31 @@ pairs:
   name: wmilliETH/XCH
   quote_asset_id: xch
 strategy:
-  gamma: 0.002
+  gamma: 0.003
   kappa: 1.5
-  phi: 0.35
-  q_max: 500
-  min_profit_margin_bps: 25
+  phi: 0.5
+  q_max: 20
+  min_profit_margin_bps: 30
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
-  offer_ttl_blocks: 120
-  num_tiers: 4
+  offer_ttl_blocks: 400
+  num_tiers: 6
   tier_spacing_bps:
-  - 25.0
-  - 75.0
-  - 150.0
-  - 250.0
+  - 30.0
+  - 60.0
+  - 100.0
+  - 160.0
+  - 230.0
+  - 300.0
   tier_size_pct:
+  - 0.10
+  - 0.12
   - 0.15
-  - 0.2
-  - 0.3
-  - 0.35
+  - 0.18
+  - 0.22
+  - 0.23
   startup_analysis_blocks: 5
-  fee_reserve_xch: 1.0
+  fee_reserve_xch: 0.5
   fee_min_spendable_xch: 0.01
   taker_min_spendable_xch: 0.25
   block_time_seconds: 52.0
@@ -91,6 +95,7 @@ strategy:
   arb_reserve_coins: 2
   min_reserve_units: 0.1
   min_offer_size_units: 1.0
+  max_offer_size_units: 5.0
   min_trading_units: 0.1
   adverse_selection_sizing: true
   adverse_selection_decay: 0.85
@@ -100,9 +105,9 @@ strategy:
   auto_rebalance_enabled: true
   ratio_rebalance_enabled: true
   ratio_target: 0.5
-  ratio_band_enter: 0.04
-  ratio_band_exit: 0.02
-  ratio_force_one_sided: true
+  ratio_band_enter: 0.08
+  ratio_band_exit: 0.04
+  ratio_force_one_sided: false
   asset_drift_guard_enabled: true
   asset_drift_guard_max_factor: 1.5
   ratio_tier_size_scale_min: 0.35
@@ -113,22 +118,22 @@ strategy:
   xch_ask_throttle_critical_xch: 0.35
   xch_ask_throttle_aggressiveness: 1.15
   sigma_floor: 0.001
-  coin_pool_target_count: 3
-  coin_pool_target_xch: 0.5
+  coin_pool_target_count: 10
+  coin_pool_target_xch: 1.5
   coin_pool_interval_blocks: 5
   cat_coin_pool_target_count: 0
   cat_coin_pool_target_units: 10.0
   wall_size_threshold_xch: 50.0
   wall_niche_premium_pct: 0.05
   competitive_anchor_enabled: true
-  competitive_anchor_max_distance_bps: 125.0
-  competitive_anchor_stride_bps: 25.0
+  competitive_anchor_max_distance_bps: 350.0
+  competitive_anchor_stride_bps: 45.0
   orphan_adopt_enabled: true
   orphan_adverse_threshold: 0.02
   orphan_max_adopt_age_blocks: 120
   orphan_inventory_bonus: 0.01
   cross_pair_skew_enabled: true
-  cross_pair_skew_phi: 0.15
+  cross_pair_skew_phi: 0.35
   pid_spread_enabled: true
   pid_target_fill_rate: 0.1
   pid_kp: 0.8
@@ -145,7 +150,7 @@ strategy:
   comp_pid_kd: 2.0
   comp_pid_ema_alpha: 0.02
   comp_pid_integral_max: 4.0
-  comp_pid_warmup_blocks: 8
+  comp_pid_warmup_blocks: 30
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
@@ -173,7 +178,7 @@ risk:
   hard_limit_pct: 0.8
   single_cat_cap_pct: 0.25
   kelly_fraction: 0.5
-  max_capital_per_pair_pct: 1.0
+  max_capital_per_pair_pct: 0.85
   max_drawdown_pct: 0.05
   loss_window_blocks: 576
   max_window_loss_bps: 250
@@ -242,10 +247,10 @@ arbitrage:
   drift_corrector_enabled: true
   drift_corrector_trigger_factor: 2.0
   drift_corrector_exit_factor: 1.0
-  drift_corrector_max_take_units: 10.0
-  drift_corrector_max_premium_bps: 100.0
-  drift_corrector_cooldown_blocks: 3
-  drift_corrector_max_trades_per_day: 10
+  drift_corrector_max_take_units: 2.0
+  drift_corrector_max_premium_bps: 75.0
+  drift_corrector_cooldown_blocks: 5
+  drift_corrector_max_trades_per_day: 6
   max_position_size: 100
   default_confidence: 0.75
   min_confidence_threshold: 0.4

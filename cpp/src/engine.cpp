@@ -1,4 +1,4 @@
-﻿// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
+// engine.cpp -- Top-level orchestrator implementation for XOPTrader.
 //
 // The engine runs a single-threaded event loop driven by boost::asio.
 // A native C++20 coroutine loop polls the Chia full node for block height
@@ -4750,7 +4750,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 (pair_cfg->base_asset_id == "xch"
                  || pair_cfg->base_asset_id == "XCH");
 
-            // Hard band for XCH-base pairs: each tier must be in [min_size, 10] XCH.
+            // Configurable band for XCH-base pairs: each tier must be in [min_size, max_offer_size_units].
             // This prevents emergency posting of sub-min dust tiers and
             // caps oversized tiers that over-concentrate inventory.
             // Per-pair override takes precedence over default.
@@ -4758,7 +4758,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 xch_base_pair ? 1.0 : config_.strategy.min_offer_size_units);
             const Mojo min_base_mojos = static_cast<Mojo>(std::llround(
                 eff_min_units * static_cast<double>(pair_cfg->base_mojos_per_unit)));
-            const double eff_max_units = xch_base_pair ? 10.0 : 0.0;
+            const double eff_max_units = (xch_base_pair && config_.strategy.max_offer_size_units > 0.0) ? config_.strategy.max_offer_size_units : 0.0;
             const Mojo max_base_mojos = xch_base_pair
                 ? static_cast<Mojo>(std::llround(
                       eff_max_units
@@ -4783,7 +4783,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 }
                 if (capped_tiers > 0) {
                     spdlog::info("[Engine] Step 7: {} capped {} tiers to "
-                                 "the XCH max size ({:.1f} XCH)",
+                                 "the max offer size ({:.1f} units)",
                                  pair_name, capped_tiers, eff_max_units);
                 }
             }

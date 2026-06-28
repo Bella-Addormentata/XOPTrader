@@ -149,6 +149,7 @@ strategy:
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
+  max_offer_size_units: 5.0            # [OPTIONAL, default: 5.0]  Max offer size per tier for XCH-base pairs; 0 = no cap
   min_trading_units: 10.0              # [OPTIONAL, default: 10.0] Desired minimum for active trading
   auto_rebalance_enabled: true         # [OPTIONAL, default: true] Post buy-side-only to acquire depleted assets
   ratio_rebalance_enabled: true        # [OPTIONAL, default: true] Enforce target-ratio balancing with hysteresis
