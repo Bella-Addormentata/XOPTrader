@@ -4842,17 +4842,47 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     static_cast<double>(cost_basis)
                     * (1.0 + margin_bps / 10'000.0)));
 
-                int lifted = 0;
+                // Walk ask tiers in ladder order, holding a running minimum
+                // that steps up after each lift.  Without the step every
+                // sub-floor tier collapses onto the SAME price: observed
+                // live on 2026-07-30, six XCH/BYC asks all posted at
+                // 1282305412741 -- six creation fees and six locked UTXOs
+                // for what is economically one price level, and no ladder
+                // left to capture a rally.  Stepping keeps them distinct so
+                // outer tiers still earn more if the market comes to us.
+                constexpr double kCollapsedTierStepBps = 10.0;
+
+                std::vector<TierQuote*> ask_tiers;
+                ask_tiers.reserve(pcs.ladder.size());
                 for (auto& tq : pcs.ladder) {
-                    if (tq.side != Side::Ask || tq.price >= min_ask) continue;
+                    if (tq.side == Side::Ask) ask_tiers.push_back(&tq);
+                }
+                std::sort(ask_tiers.begin(), ask_tiers.end(),
+                          [](const TierQuote* a, const TierQuote* b) {
+                              return a->tier_index < b->tier_index;
+                          });
+
+                int lifted = 0;
+                Mojo next_min = min_ask;
+                for (TierQuote* tqp : ask_tiers) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price >= next_min) {
+                        // Already clears the floor -- leave it, but keep the
+                        // running minimum monotone for the tiers after it.
+                        next_min = std::max(next_min, tq.price);
+                        continue;
+                    }
 
                     spdlog::info("[Engine] Step 7: {} ASK tier {} lifted to "
                                  "no-loss floor: {} -> {} "
                                  "(basis={} margin={:.1f}bps)",
-                                 pair_name, tq.tier_index, tq.price, min_ask,
+                                 pair_name, tq.tier_index, tq.price, next_min,
                                  cost_basis, margin_bps);
-                    tq.price = min_ask;
+                    tq.price = next_min;
                     ++lifted;
+                    next_min = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_min)
+                        * (1.0 + kCollapsedTierStepBps / 10'000.0)));
 
                     // Keep the reported spread consistent with the new price.
                     const double floor_mid =
