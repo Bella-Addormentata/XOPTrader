@@ -165,6 +165,17 @@ struct PendingOffer {
     Timestamp    created_at_ts;    // wall-clock creation time
     std::uint64_t fee_mojos{0};    // fee attached to this offer (mojos)
     bool         cancel_pending{false}; // cancel RPC sent; awaiting on-chain confirmation
+
+    // Dexie's own id for this offer, returned by POST /v1/offers.
+    //
+    // A DIFFERENT ID SPACE from offer_id: offer_id is the wallet trade id
+    // ("0x" + 64 hex), while dexie ids are short base58 ("4zXHdGXizmGT").
+    // The dexie orderbook feed reports our resting offers under THIS id, so
+    // own-offer exclusion must match on it.  Comparing dexie ids against
+    // wallet trade ids can never match, which let the arbitrage taker treat
+    // the bot's own resting offers as counterparties (2026-07-30).
+    // Empty when dexie submission failed or was skipped.
+    std::string  dexie_id;
 };
 
 // ---------------------------------------------------------------------------

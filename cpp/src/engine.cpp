@@ -1903,10 +1903,14 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             }
 
             // Collect own offer IDs from shared State for exclusion.
+            // BOTH id spaces: the dexie feed reports our offers under
+            // dexie's id, while State keys them by wallet trade id.  Adding
+            // only the trade id made this filter a no-op (2026-07-30).
             std::unordered_set<std::string> own_ids;
             auto pending = state_->get_all_offers();
             for (const auto& po : pending) {
                 own_ids.insert(po.offer_id);
+                if (!po.dexie_id.empty()) own_ids.insert(po.dexie_id);
             }
 
             market_data_->ingest_competing_offers(
@@ -8759,11 +8763,13 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
         const Mojo max_price_mojos = static_cast<Mojo>(std::llround(
             max_price_d * static_cast<double>(kMojosPerXch)));
 
-        // Filter own offers.
+        // Filter own offers -- BOTH id spaces (see Step 1).  Matching only
+        // the wallet trade id let this taker buy the bot's own resting asks.
         std::unordered_set<std::string> own_ids;
         auto pending = state_->get_all_offers();
         for (const auto& po : pending) {
             own_ids.insert(po.offer_id);
+            if (!po.dexie_id.empty()) own_ids.insert(po.dexie_id);
         }
 
         // Find the cheapest asks (someone selling XCH) within our budget.

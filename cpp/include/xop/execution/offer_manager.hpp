@@ -625,9 +625,14 @@ private:
      * (the offer is already valid on-chain).
      *
      * @param offer_text  Bech32m-encoded offer string.
-     * @return true if submission succeeded, false on any error.
+     * @return Dexie's offer id on success, empty string on any error.
+     *         The id MUST be retained on the PendingOffer: the dexie
+     *         orderbook reports our resting offers under it, and own-offer
+     *         exclusion in the arbitrage taker matches on it.  Discarding it
+     *         (as this did until 2026-07-30) leaves the taker able to trade
+     *         against the bot's own offers.
      */
-    asio::awaitable<bool> submit_to_dexie(const std::string& offer_text);
+    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text);
 
     /**
      * @brief One-time initialisation of the asset-to-wallet-ID cache.
