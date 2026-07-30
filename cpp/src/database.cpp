@@ -186,6 +186,31 @@ CREATE TABLE IF NOT EXISTS ledger_entries (
 );
 )SQL";
 
+constexpr const char* kCreateArbEdgeLog = R"SQL(
+CREATE TABLE IF NOT EXISTS arb_edge_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at    TEXT    NOT NULL,
+    block_height   INTEGER NOT NULL,
+    direction      TEXT    NOT NULL,
+    ask_a_mojos    INTEGER NOT NULL,
+    bid_b_mojos    INTEGER NOT NULL,
+    cross_rate     REAL    NOT NULL,
+    gross_edge_bps REAL    NOT NULL,
+    net_edge_bps   REAL    NOT NULL,
+    ask_size_mojos INTEGER NOT NULL,
+    bid_size_mojos INTEGER NOT NULL,
+    state          TEXT    NOT NULL,
+    armed          INTEGER NOT NULL DEFAULT 0,
+    executed       INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
+constexpr const char* kIndexArbEdgeDirTime = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_arb_edge_log_dir_time
+    ON arb_edge_log(direction, observed_at);
+)SQL";
+
 constexpr const char* kIndexLedgerAsset = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_ledger_entries_asset
     ON ledger_entries(asset_id);
@@ -1200,6 +1225,52 @@ std::int64_t Database::ledger_entry_count() const
 }
 
 // ===========================================================================
+// Arbitrage edge history (2026-07-30)
+// ===========================================================================
+
+void Database::insert_arb_edge(const DbArbEdgeObservation& obs) noexcept
+{
+    static constexpr const char* kInsert = R"SQL(
+        INSERT INTO arb_edge_log
+            (observed_at, block_height, direction, ask_a_mojos, bid_b_mojos,
+             cross_rate, gross_edge_bps, net_edge_bps, ask_size_mojos,
+             bid_size_mojos, state, armed, executed)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::warn("[Database] insert_arb_edge prepare failed: {}",
+                         sqlite3_errmsg(db_));
+            return;
+        }
+        sqlite3_bind_text  (stmt, 1, obs.observed_at.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (stmt, 2, static_cast<std::int64_t>(obs.block_height));
+        sqlite3_bind_text  (stmt, 3, obs.direction.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (stmt, 4, obs.ask_a_mojos);
+        sqlite3_bind_int64 (stmt, 5, obs.bid_b_mojos);
+        sqlite3_bind_double(stmt, 6, obs.cross_rate);
+        sqlite3_bind_double(stmt, 7, obs.gross_edge_bps);
+        sqlite3_bind_double(stmt, 8, obs.net_edge_bps);
+        sqlite3_bind_int64 (stmt, 9, obs.ask_size_mojos);
+        sqlite3_bind_int64 (stmt, 10, obs.bid_size_mojos);
+        sqlite3_bind_text  (stmt, 11, obs.state.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int   (stmt, 12, obs.armed ? 1 : 0);
+        sqlite3_bind_int   (stmt, 13, obs.executed ? 1 : 0);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            spdlog::warn("[Database] insert_arb_edge step failed: {}",
+                         sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        spdlog::warn("[Database] insert_arb_edge: unexpected exception");
+    }
+}
+
+// ===========================================================================
 // Diagnostics
 // ===========================================================================
 
@@ -1372,6 +1443,8 @@ void Database::run_migrations()
         kCreateInventoryState,
         kCreateLedgerEntries,
         kIndexLedgerAsset,
+        kCreateArbEdgeLog,
+        kIndexArbEdgeDirTime,
         kIndexTradeTimestamp,
         kIndexTradePair,
         kIndexOfferStatus,

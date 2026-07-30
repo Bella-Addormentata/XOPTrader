@@ -1759,6 +1759,20 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_bool("cross_stable_arb_enabled",       cfg.cross_stable_arb_enabled);
     read_dbl ("cross_stable_min_edge_bps",      cfg.cross_stable_min_edge_bps);
     read_dbl ("cross_stable_max_take_xch",      cfg.cross_stable_max_take_xch, 0.001);
+    read_dbl ("cross_stable_arm_edge_bps",      cfg.cross_stable_arm_edge_bps);
+    read_dbl ("cross_stable_disarm_edge_bps",   cfg.cross_stable_disarm_edge_bps);
+    read_u32 ("cross_stable_arm_observations",  cfg.cross_stable_arm_observations);
+    read_bool("cross_stable_execute_when_armed",
+              cfg.cross_stable_execute_when_armed);
+
+    if (cfg.cross_stable_disarm_edge_bps >= cfg.cross_stable_arm_edge_bps) {
+        throw ConfigError(sec + ".cross_stable_disarm_edge_bps must be < "
+                                ".cross_stable_arm_edge_bps, or the state "
+                                "machine has no hysteresis and will flap");
+    }
+    if (cfg.cross_stable_arm_observations == 0) {
+        throw ConfigError(sec + ".cross_stable_arm_observations must be >= 1");
+    }
 
     // Peg-crossing offer taker
     read_bool("peg_arb_enabled",                cfg.peg_arb_enabled);
@@ -2238,6 +2252,12 @@ void log_config_summary(const AppConfig& cfg)
         << "  cross_stable_arb     = " << (cfg.arbitrage.cross_stable_arb_enabled ? "true" : "false") << "\n"
         << "  cross_stable_edge_bps= " << cfg.arbitrage.cross_stable_min_edge_bps << "\n"
         << "  cross_stable_max_xch = " << cfg.arbitrage.cross_stable_max_take_xch << "\n"
+        << "  cross_stable_arm     = " << cfg.arbitrage.cross_stable_arm_edge_bps
+        << " bps x " << cfg.arbitrage.cross_stable_arm_observations
+        << " obs, disarm " << cfg.arbitrage.cross_stable_disarm_edge_bps << " bps\n"
+        << "  cross_stable_execute = "
+        << (cfg.arbitrage.cross_stable_execute_when_armed
+                ? "ARMED->TRADE" : "monitor only") << "\n"
         << "  peg_arb              = " << (cfg.arbitrage.peg_arb_enabled ? "true" : "false") << "\n"
         << "  peg_arb_min_edge_bps = " << cfg.arbitrage.peg_arb_min_edge_bps << "\n"
         << "  peg_arb_max_units    = " << cfg.arbitrage.peg_arb_max_take_units << "\n"

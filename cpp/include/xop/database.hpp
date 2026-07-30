@@ -215,6 +215,32 @@ struct DbLedgerEntry {
 };
 
 // ---------------------------------------------------------------------------
+// DbArbEdgeObservation -- one sample of an arbitrage leg-pair's economics.
+//
+// Written every scan whether or not a trade is taken, so the strategy's
+// viability can be measured from live data instead of assumed.  Spreads on
+// this venue are extremely volatile (XCH/BYC ranges 0-1247 bps), so a
+// point-in-time edge cannot distinguish a real opportunity from a stale
+// quote -- the history is what separates them.
+// ---------------------------------------------------------------------------
+
+struct DbArbEdgeObservation {
+    std::string observed_at;        ///< ISO-8601 UTC.
+    BlockHeight block_height{0};
+    std::string direction;          ///< "buy@XCH/BYC -> sell@XCH/wUSDC.b".
+    Mojo        ask_a_mojos{0};     ///< Price paid on the buy leg.
+    Mojo        bid_b_mojos{0};     ///< Price received on the sell leg.
+    double      cross_rate{0.0};    ///< Stable cross used to normalise.
+    double      gross_edge_bps{0.0};
+    double      net_edge_bps{0.0};  ///< After fees and costs.
+    Mojo        ask_size_mojos{0};  ///< Counterparty size (takes are all-or-nothing).
+    Mojo        bid_size_mojos{0};
+    std::string state;              ///< dormant | watching | armed.
+    bool        armed{false};
+    bool        executed{false};
+};
+
+// ---------------------------------------------------------------------------
 // Database -- SQLite wrapper providing structured persistence for the bot.
 //
 // Lifecycle:
@@ -387,6 +413,11 @@ public:
 
     /// Total number of legs (diagnostics / first-run detection).
     [[nodiscard]] std::int64_t ledger_entry_count() const;
+
+    // -- Arbitrage edge history ----------------------------------------------
+
+    /// Record one arbitrage leg-pair observation.  Never throws.
+    void insert_arb_edge(const DbArbEdgeObservation& obs) noexcept;
 
     // -- Diagnostics ---------------------------------------------------------
 

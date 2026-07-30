@@ -240,8 +240,40 @@ arbitrage:
   midpoint_recycling_require_cex_ref: true
   midpoint_recycling_max_cex_age_blocks: 10
   midpoint_recycling_vpin_max: 0.7
-  # DISABLED 2026-07-30 after analysis found this strategy unsafe. Do not
-  # re-enable until every item below is fixed and verified:
+  # ===================================================================
+  # VERDICT 2026-07-30: THIS STRATEGY IS NOT VIABLE. Do not re-enable.
+  #
+  # The "edge" is denominated in the BYC/wUSDC.b MID, a price you cannot
+  # trade at. The arb ends short BYC and long wUSDC.b, so closing it means
+  # lifting that book's ask -- and its spread has run 290-1519 bps against
+  # gross edges of ~186 bps.
+  #
+  # Measured over 14,003 historical observations, correctly netted:
+  #     median net edge      -313 bps
+  #     positive              13.5% of the time
+  # Over the 215 scans the engine actually logged, it believed a median
+  # +2093 bps; the truth after the return leg was -775 bps.
+  # The single real trade found by audit nets -64.9 bps.
+  #
+  # The gap is a STALE-QUOTE ARTIFACT, not a premium. XCH/wUSDC.b reprices
+  # on 100% of observations; XCH/BYC on 9.1%; BYC/wUSDC.b on 3.0% (longest
+  # run: 398 identical readings). The "opportunity" is the liquid book
+  # drifting since the illiquid ones last updated, and it closes by the
+  # liquid leg coming back -- nothing is captured. It is widest exactly
+  # when BYC is least tradeable.
+  #
+  # Even gating on all three books being <=50 bps wide (4.1% of the time)
+  # clears +15 bps on only 0.7% of observations, at a mean edge smaller
+  # than one standard deviation of the price move during the 3-6 blocks
+  # three non-atomic takes require. Negative Sharpe before adverse
+  # selection.
+  #
+  # The monitor still runs and records every observation to arb_edge_log so
+  # this conclusion keeps being tested against live data. Only EXECUTION is
+  # off (cross_stable_execute_when_armed: false).
+  # ===================================================================
+  #
+  # Original defect list (1-2 fixed, 3-6 moot while execution is off):
   #   1. [FIXED] Inverted cross-rate conversion manufactured ~1138 bps of
   #      phantom edge on every scan (r^2 = 1.1138). A logged 1345.7 bps
   #      "opportunity" was really 186.2 bps gross.
@@ -257,9 +289,18 @@ arbitrage:
   #      slippage, no second-leg spread, no third leg to convert back.
   #   6. [OPEN] Takes write nothing to trade_log, offer_log or the ledger,
   #      so the strategy's P&L is unmeasurable.
-  cross_stable_arb_enabled: false
+  # Monitor ON (records edge history to arb_edge_log), EXECUTION OFF.
+  cross_stable_arb_enabled: true
   cross_stable_min_edge_bps: 15
   cross_stable_max_take_xch: 5.0
+  # Arm/disarm state machine: an edge must PERSIST to be considered real,
+  # because a single-tick edge is usually a stale quote (the scanner's
+  # chosen offer came back status=3, already gone, on 2026-07-30).
+  cross_stable_arm_edge_bps: 50.0
+  cross_stable_disarm_edge_bps: 20.0
+  cross_stable_arm_observations: 3
+  # THE TRADING SWITCH. Leave false -- see the verdict above.
+  cross_stable_execute_when_armed: false
   peg_arb_enabled: true
   peg_arb_min_edge_bps: 5
   peg_arb_max_take_units: 50

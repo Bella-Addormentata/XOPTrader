@@ -1016,6 +1016,32 @@ private:
     /// name.  DEX-vs-CEX basis spikes are transient; a real depeg persists.
     std::unordered_map<std::string, int> peg_breach_;
 
+    // -- Arbitrage leg-pair state machine (ARB-ARMING 2026-07-30) ----------
+    //
+    // Spreads on this venue swing by an order of magnitude between
+    // heartbeats, so a single reading cannot separate a real opportunity
+    // from a stale quote -- and stale is the common case (a chosen offer
+    // came back status=3, already gone, on 2026-07-30).  Execution is
+    // therefore gated on an edge that PERSISTS, with a lower disarm
+    // threshold so the state cannot flap at the boundary.
+    struct ArbLegState {
+        int         consecutive_above{0};  ///< Observations above arm threshold.
+        bool        armed{false};
+        double      last_net_edge_bps{0.0};
+        BlockHeight armed_since_block{0};
+    };
+    /// Keyed by direction, e.g. "buy@XCH/BYC -> sell@XCH/wUSDC.b".
+    std::unordered_map<std::string, ArbLegState> arb_leg_state_;
+
+    /// Update the arm/disarm machine for one leg pair and persist the
+    /// observation.  Returns true when execution is permitted right now
+    /// (armed AND the execute switch is on).
+    bool update_arb_leg_state(const std::string& direction,
+                              BlockHeight block_height,
+                              Mojo ask_a, Mojo bid_b, double cross_rate,
+                              double gross_edge_bps, double net_edge_bps,
+                              Mojo ask_size, Mojo bid_size);
+
     /// Chain height observed during startup reconcile; the anchor for
     /// genesis so downtime fills are not counted twice.
     BlockHeight startup_block_{0};

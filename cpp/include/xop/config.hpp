@@ -859,9 +859,34 @@ struct ArbitrageSettings {
     double   cex_reference_half_spread_bps{10.0};
 
     // -- Cross-stablecoin arbitrage (XCH/BYC vs XCH/wUSDC.b) ----------------
-    bool     cross_stable_arb_enabled{true};
-    double   cross_stable_min_edge_bps{15.0};
-    double   cross_stable_max_take_xch{5.0};
+    //
+    // Execution is gated by a STATE MACHINE over observed edge history, not
+    // by a single point-in-time reading.  Spreads here are wildly volatile
+    // (XCH/BYC has ranged 0-1247 bps, XCH/wUSDC.b 7-615 bps), so one sample
+    // cannot tell a genuine opportunity from a stale quote -- and a stale
+    // quote is the common case: on 2026-07-30 the scanner's chosen offer came
+    // back status=3 (already gone) when it tried to take it.
+    //
+    // An edge that PERSISTS across observations is far more likely to be
+    // executable.  The monitor therefore runs continuously and records every
+    // observation to arb_edge_log, arming only after sustained evidence and
+    // disarming on a lower threshold so it cannot flap at the boundary.
+    bool     cross_stable_arb_enabled{true};   ///< Run the monitor at all.
+    double   cross_stable_min_edge_bps{15.0};  ///< Legacy floor; still applied.
+    double   cross_stable_max_take_xch{5.0};   ///< Candidate size filter (see below).
+
+    /// Net edge (bps) that must be sustained to ARM the leg pair.
+    double   cross_stable_arm_edge_bps{50.0};
+    /// Net edge (bps) below which it DISARMS.  Must be < arm to give
+    /// hysteresis; between the two the current state is held.
+    double   cross_stable_disarm_edge_bps{20.0};
+    /// Consecutive observations above the arm threshold before arming.
+    uint32_t cross_stable_arm_observations{3};
+
+    /// Master switch for ACTUALLY TRADING when armed.  Default false: the
+    /// monitor measures viability first, and capital is only ever at risk
+    /// after that data says the edge is real and repeatable.
+    bool     cross_stable_execute_when_armed{false};
 
     // -- Peg-crossing offer taker (stablecoin pair direct arb) ---------------
     // Takes competing offers that cross the $1 peg on stablecoin pairs
