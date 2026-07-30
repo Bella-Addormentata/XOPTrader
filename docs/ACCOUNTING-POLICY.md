@@ -143,6 +143,39 @@ Peg assumptions: wUSDC/wUSDC.b/USDS are treated as exactly $1. BYC is a
 CDP-backed stablecoin that trades off peg and uses its live cross rate. DBX is
 not pegged and is cross-derived from the XCH rate.
 
+### Why the fiat wrappers are pinned rather than floated
+
+wUSDC.b is the **numeraire** — the unit everything else is measured in. BYC can
+float because there is a `BYC/wUSDC.b` market to price it *in*; floating the
+numeraire itself would require an external anchor and would make every
+historical figure move whenever that feed twitched.
+
+More decisively: a live rate inside a **persisted** cost basis is the exact
+failure removed in v0.8.0, where a hardcoded 2.70 XCH rate was baked into
+stored basis and ran ~2x wrong for months. A feed glitch would write a
+permanently wrong basis to `inventory_state`.
+
+The exposure is nonetheless real, so it is **monitored** (`accounting.peg_*`):
+
+| signal | catches | threshold |
+|---|---|---|
+| CoinGecko `usd-coin` vs par | native USDC depeg | 1% |
+| implied wUSDC.b = `usdc × cex_mid / dex_mid` | **bridge** depeg | 3% |
+
+The second exists because native USDC can hold $1.00 while the Chia bridge
+breaks — the feed alone cannot see that. Its 3% threshold clears this venue's
+structural DEX-vs-CEX basis (217 logged samples: p50 78 bps, p90 118 bps, max
+218 bps), so a 2% threshold would fire on ordinary basis. Both require 4
+consecutive breaches and stay silent on missing data.
+
+> ⚠️  The separate `depeg:` detector does **not** cover this. It compares a
+> pair's own mid against a config constant and is registered only for
+> BYC/wUSDC.b, so it cannot see wUSDC.b move — wUSDC.b is that pair's quote
+> unit. Its `auto_disable_pair`, `alert_on_warn` and `alert_on_bail` settings
+> are parsed and printed but **never read by any code path**; a bail only sets
+> `quote_valid = false` for one cycle. It has bailed 172 times and sent zero
+> alerts.
+
 ## 7. Revenue recognition
 
 Realized P&L is recognized **on disposal**, not on holding — the realization
