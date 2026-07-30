@@ -240,7 +240,24 @@ arbitrage:
   midpoint_recycling_require_cex_ref: true
   midpoint_recycling_max_cex_age_blocks: 10
   midpoint_recycling_vpin_max: 0.7
-  cross_stable_arb_enabled: true
+  # DISABLED 2026-07-30 after analysis found this strategy unsafe. Do not
+  # re-enable until every item below is fixed and verified:
+  #   1. [FIXED] Inverted cross-rate conversion manufactured ~1138 bps of
+  #      phantom edge on every scan (r^2 = 1.1138). A logged 1345.7 bps
+  #      "opportunity" was really 186.2 bps gross.
+  #   2. [FIXED] Own-offer exclusion compared dexie ids to wallet trade ids
+  #      and never matched; the scanner targeted our own resting asks seven
+  #      times on 2026-07-30, stopped only by the counterparty wallet.
+  #   3. [OPEN] Only the BUY leg executes. The code logs "buy X sell Y" but
+  #      never places the sell, so this is an unhedged directional take, not
+  #      an arbitrage.
+  #   4. [OPEN] cross_stable_max_take_xch is cosmetic: take_offer() has no
+  #      size parameter and consumes the ENTIRE counterparty offer.
+  #   5. [OPEN] min_edge is compared against a GROSS edge -- no fees, no
+  #      slippage, no second-leg spread, no third leg to convert back.
+  #   6. [OPEN] Takes write nothing to trade_log, offer_log or the ledger,
+  #      so the strategy's P&L is unmeasurable.
+  cross_stable_arb_enabled: false
   cross_stable_min_edge_bps: 15
   cross_stable_max_take_xch: 5.0
   peg_arb_enabled: true

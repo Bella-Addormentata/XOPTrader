@@ -7687,26 +7687,39 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                     }
                     if (best_bid_b == 0) continue;
 
-                    // Normalise bid_b to pair_a's quote currency.
-                    // stable_cross_rate = mid of stable pair (base/quote).
-                    // e.g. BYC/wUSDC.b mid ~= 1.0.
+                    // Normalise bid_b into pair_a's quote currency.
+                    //
+                    // [ARB-CROSS-RATE-FIX 2026-07-30] Both branches were
+                    // INVERTED.  stable_cross_rate is the BYC/wUSDC.b mid,
+                    // i.e. wUSDC.b PER BYC (~1.0554, not ~1.0).  Converting
+                    // a wUSDC.b amount into BYC therefore DIVIDES by it; the
+                    // old code multiplied, and the mirror branch divided
+                    // where it should multiply.  Net effect was a constant
+                    // r^2 = 1.1138 overstatement -- about +1138 bps of
+                    // phantom edge on every scan, in one fixed direction.
+                    //
+                    // Measured against the real 15:46:44 event: ask_a
+                    // 1.25550 BYC, bid_b 1.349706 wUSDC.b.  Old: 1.349706 *
+                    // 1.055383 = 1.424457 -> 1345.7 bps (exactly what was
+                    // logged and traded on).  Correct: 1.349706 / 1.055383 =
+                    // 1.278877 -> 186.2 bps gross.  86% of the "edge" was
+                    // manufactured by this line.
                     double normalised_bid_b = 0.0;
                     if (pair_a.quote_asset_id == pair_b.quote_asset_id) {
                         normalised_bid_b = static_cast<double>(best_bid_b);
                     } else if (pair_a.quote_asset_id == stable_pair_base_id) {
-                        // A quotes in stable-base (BYC), B quotes in
-                        // stable-quote (wUSDC.b).  bid_b is wUSDC.b ->
-                        // multiply by cross_rate to get BYC.
-                        normalised_bid_b = static_cast<double>(best_bid_b)
-                                         * stable_cross_rate;
-                    } else {
-                        // A quotes in stable-quote (wUSDC.b), B quotes in
-                        // stable-base (BYC).  bid_b is BYC -> divide by
-                        // cross_rate to get wUSDC.b.
+                        // A quotes in stable-BASE (BYC), B in stable-QUOTE
+                        // (wUSDC.b).  bid_b is wUSDC.b; BYC = wUSDC.b / rate.
                         normalised_bid_b = (stable_cross_rate > 0.0)
                             ? static_cast<double>(best_bid_b)
                               / stable_cross_rate
                             : 0.0;
+                    } else {
+                        // A quotes in stable-QUOTE (wUSDC.b), B in
+                        // stable-BASE (BYC).  bid_b is BYC;
+                        // wUSDC.b = BYC * rate.
+                        normalised_bid_b = static_cast<double>(best_bid_b)
+                                         * stable_cross_rate;
                     }
 
                     const double ask_a_d = static_cast<double>(best_ask_a);
