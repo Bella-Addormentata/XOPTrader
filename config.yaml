@@ -67,7 +67,10 @@ strategy:
   kappa: 1.5
   phi: 0.5
   q_max: 20
-  min_profit_margin_bps: 30
+  # Raised 30 -> 50 bps on 2026-07-30, once realized P&L became measurable.
+  # Asks below cost+margin are now LIFTED to this floor rather than dropped,
+  # so raising it widens the ask side instead of withdrawing it.
+  min_profit_margin_bps: 50
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
   offer_ttl_blocks: 400

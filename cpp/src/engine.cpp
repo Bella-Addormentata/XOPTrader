@@ -4809,9 +4809,16 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         }
 
         // -----------------------------------------------------------------
-        // Post-clamp no-loss re-check: The price guard may have pushed an
-        // ASK price below cost basis.  Re-apply the no-loss floor on each
-        // ASK tier and drop any that cannot meet the minimum.
+        // Post-clamp no-loss re-check: the price guard may have pushed an
+        // ASK price below cost basis.
+        //
+        // [TWO-SIDED 2026-07-30] LIFT such tiers to the floor rather than
+        // dropping them.  Dropping removed the ask side of a pair entirely
+        // whenever the market sat below cost -- on 2026-07-30 that silently
+        // turned XCH/BYC bid-only, because XCH trades ~3.7% cheaper on the
+        // BYC book than on wUSDC.b.  Keeping the tier at the floor preserves
+        // two-sided presence and still never sells at a loss: the offer
+        // simply rests above the market until the gap closes.
         // -----------------------------------------------------------------
         if (pair_cfg && !pcs.ladder.empty()) {
             auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
@@ -4824,25 +4831,48 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     : from_usd_pseudo(rec.weighted_avg_cost_basis, *pair_cfg);
 
             if (cost_basis > 0) {
-                const double margin = config_.strategy.min_profit_margin_bps
-                                    / 10'000.0;
+                // Honour the pair's own margin override; the other no-loss
+                // site (step 4, strategy.set_cost_basis) already does, so
+                // using the global here made BYC/wUSDC.b quote against 30 bps
+                // when its config asks for 25.
+                const double margin_bps =
+                    pair_cfg->min_profit_margin_bps_override.value_or(
+                        config_.strategy.min_profit_margin_bps);
                 const auto min_ask = static_cast<Mojo>(std::llround(
-                    static_cast<double>(cost_basis) * (1.0 + margin)));
+                    static_cast<double>(cost_basis)
+                    * (1.0 + margin_bps / 10'000.0)));
 
-                auto it = std::remove_if(pcs.ladder.begin(), pcs.ladder.end(),
-                    [&](const TierQuote& tq) {
-                        if (tq.side == Side::Ask && tq.price < min_ask) {
-                            spdlog::warn("[Engine] Step 7: {} ASK tier {} "
-                                         "dropped: price {} < no-loss floor "
-                                         "{} (basis={} margin={:.1f}bps)",
-                                         pair_name, tq.tier_index,
-                                         tq.price, min_ask, cost_basis,
-                                         config_.strategy.min_profit_margin_bps);
-                            return true;
-                        }
-                        return false;
-                    });
-                pcs.ladder.erase(it, pcs.ladder.end());
+                int lifted = 0;
+                for (auto& tq : pcs.ladder) {
+                    if (tq.side != Side::Ask || tq.price >= min_ask) continue;
+
+                    spdlog::info("[Engine] Step 7: {} ASK tier {} lifted to "
+                                 "no-loss floor: {} -> {} "
+                                 "(basis={} margin={:.1f}bps)",
+                                 pair_name, tq.tier_index, tq.price, min_ask,
+                                 cost_basis, margin_bps);
+                    tq.price = min_ask;
+                    ++lifted;
+
+                    // Keep the reported spread consistent with the new price.
+                    const double floor_mid =
+                        market_data_->get_mid_price(pair_name);
+                    const Mojo floor_mid_mojos = static_cast<Mojo>(std::llround(
+                        floor_mid * static_cast<double>(kMojosPerXch)));
+                    if (floor_mid_mojos > 0) {
+                        tq.spread_bps =
+                            (static_cast<double>(tq.price)
+                           - static_cast<double>(floor_mid_mojos))
+                            / static_cast<double>(floor_mid_mojos) * 10'000.0;
+                    }
+                }
+
+                if (lifted > 0) {
+                    spdlog::warn("[Engine] Step 7: {} lifted {} ASK tier(s) to "
+                                 "the no-loss floor -- the ask side stays "
+                                 "quoted above cost instead of being withdrawn",
+                                 pair_name, lifted);
+                }
             }
         }
 
@@ -9137,11 +9167,30 @@ void Engine::post_ledger_genesis(
         }
     }
 
-    // Cache each asset's genesis anchor (including assets opened by an
-    // earlier run) so fills that predate it can be suppressed.
-    for (const auto& [asset, balance] : balances) {
-        (void)balance;
-        ledger_genesis_block_[asset] = db_->ledger_opening_block(asset);
+    // Record which assets actually have an opening leg, and each one's
+    // anchor block.  Scan EVERY configured asset, not just the ones queried
+    // successfully this run: an asset opened by an earlier run must keep
+    // posting legs even if its balance query happened to fail this time.
+    ledger_opened_assets_.clear();
+    ledger_genesis_block_.clear();
+    std::unordered_set<std::string> all_assets;
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        all_assets.insert(pair.base_asset_id);
+        all_assets.insert(pair.quote_asset_id);
+    }
+    for (const auto& asset : all_assets) {
+        if (db_->has_ledger_opening(AssetId{asset})) {
+            ledger_opened_assets_.insert(asset);
+            ledger_genesis_block_[asset] =
+                db_->ledger_opening_block(AssetId{asset});
+        } else {
+            spdlog::warn("[Engine] Ledger: asset {} has NO opening balance "
+                         "(its startup balance query likely failed) -- its "
+                         "fills will NOT be posted and it will not be "
+                         "checked, until a restart opens it cleanly",
+                         asset.substr(0, 12));
+        }
     }
 
     ledger_genesis_done_ = true;
@@ -9159,6 +9208,22 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
 
     auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
         if (delta == 0) return;
+
+        // Never post a leg for an asset with no opening balance.  Its ledger
+        // would have movement but no baseline, and the next restart would
+        // open it at a wallet balance that already includes this flow --
+        // permanently embedding it as divergence.  Skipping keeps the two
+        // consistent: the eventual opening captures the resulting balance
+        // correctly.  The cost is audit detail for one session, which is far
+        // cheaper than corrupting the measurement.
+        if (!ledger_opened_assets_.count(asset)) {
+            spdlog::warn("[Engine] Ledger: skipping {} leg for fill {} -- "
+                         "asset {} has no opening balance this session",
+                         leg_name, fill.offer_id.substr(0, 12),
+                         asset.substr(0, 12));
+            return;
+        }
+
         // Suppress fills already inside the opening balance.  An offer
         // restored from a previous run can settle while the engine is down;
         // the wallet balance captured at genesis already reflects it, and
