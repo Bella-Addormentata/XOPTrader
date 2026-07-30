@@ -1995,6 +1995,71 @@ InventoryAgingConfig parse_inventory_aging(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_accounting -- optional `accounting:` section (2026-07-30).
+// Double-entry ledger and its wallet reconciliation control.
+// ---------------------------------------------------------------------------
+AccountingConfig parse_accounting(const YAML::Node& root)
+{
+    const std::string sec = "accounting";
+    AccountingConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+    auto read_i64 = [&](const char* key, std::int64_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::int64_t>();
+    };
+
+    read_bool("ledger_enabled",         cfg.ledger_enabled);
+    read_dbl ("alert_pct",              cfg.alert_pct);
+    read_u32 ("alert_observations",     cfg.alert_observations);
+    read_dbl ("pause_pct",              cfg.pause_pct);
+    read_u32 ("pause_observations",     cfg.pause_observations);
+    read_bool("pause_enabled",          cfg.pause_enabled);
+    read_i64 ("floor_xch_mojos",        cfg.floor_xch_mojos);
+    read_i64 ("floor_cat_mojos",        cfg.floor_cat_mojos);
+    read_i64 ("fee_slack_mojos",        cfg.fee_slack_mojos);
+    read_u32 ("max_balance_age_blocks", cfg.max_balance_age_blocks);
+
+    if (cfg.alert_pct < 0.0 || cfg.alert_pct > 1.0) {
+        throw ConfigError(sec + ".alert_pct must be in [0,1]; got "
+                          + std::to_string(cfg.alert_pct));
+    }
+    if (cfg.pause_pct < 0.0 || cfg.pause_pct > 1.0) {
+        throw ConfigError(sec + ".pause_pct must be in [0,1]; got "
+                          + std::to_string(cfg.pause_pct));
+    }
+    if (cfg.pause_pct < cfg.alert_pct) {
+        throw ConfigError(sec + ".pause_pct must be >= alert_pct");
+    }
+    if (cfg.alert_observations == 0 || cfg.pause_observations == 0) {
+        throw ConfigError(sec + ".alert_observations and .pause_observations "
+                                "must be >= 1");
+    }
+    if (cfg.floor_xch_mojos < 0 || cfg.floor_cat_mojos < 0
+        || cfg.fee_slack_mojos < 0) {
+        throw ConfigError(sec + " mojo floors must be >= 0");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // Redacted summary printer.  Emits every operationally useful field while
 // suppressing all classified secrets (SSL paths, fingerprint, tokens).
 // ---------------------------------------------------------------------------
@@ -2228,6 +2293,15 @@ void log_config_summary(const AppConfig& cfg)
         << "  start      = " << cfg.inventory_aging.aging_start_blocks << " blocks\n"
         << "  max_relax  = " << cfg.inventory_aging.max_loss_relax_bps << " bps\n"
         << "  rate       = " << cfg.inventory_aging.relax_rate_bps_per_block << " bps/block\n";
+
+    // Accounting -- double-entry ledger and reconciliation control.
+    out << "[accounting]\n"
+        << "  ledger     = " << (cfg.accounting.ledger_enabled ? "ON" : "off") << "\n"
+        << "  alert      = " << (cfg.accounting.alert_pct * 100.0) << "% x "
+        << cfg.accounting.alert_observations << " obs\n"
+        << "  pause      = " << (cfg.accounting.pause_pct * 100.0) << "% x "
+        << cfg.accounting.pause_observations << " obs "
+        << (cfg.accounting.pause_enabled ? "(ENABLED)" : "(alert-only)") << "\n";
 
     // Market allocator -- dynamic capital allocation.
     out << "[market_allocator]\n"
@@ -2742,6 +2816,7 @@ AppConfig load_config(const std::string& path,
     cfg.coingecko  = parse_coingecko(root);
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
+    cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);

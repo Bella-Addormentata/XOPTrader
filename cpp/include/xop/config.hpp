@@ -974,6 +974,56 @@ struct CoinGeckoConfig {
 // The effective margin is never allowed to go below -max_loss_relax_bps
 // (i.e. the bot will never accept a loss larger than the configured cap).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// AccountingConfig -- double-entry ledger and its reconciliation control.
+//
+// The control ties the ledger's implied per-asset balance to the wallet's
+// CONFIRMED balance.  Thresholds are flow-based rather than a flat
+// percentage, because the CAT wallets are tiny (a single heartbeat of fills
+// can move 20-75% of the wUSDC.b balance) while 1% of the XCH wallet would
+// swallow an entire missed 1-XCH fill.
+//
+// Tolerance for asset a:
+//     live_offer_exposure(a)              -- only live offers can settle
+//   + fee_slack (XCH only)                -- observed dust is 5,000-mojo steps
+//   + max(floor_a, pct * confirmed_a)
+// ---------------------------------------------------------------------------
+
+struct AccountingConfig {
+    /// Master switch for ledger posting and the invariant check.
+    bool     ledger_enabled{true};
+
+    /// Divergence beyond the ALERT tolerance, sustained for
+    /// `alert_observations` consecutive same-sign checks, raises an alert.
+    double   alert_pct{0.005};              ///< 0.5% of confirmed balance.
+    uint32_t alert_observations{2};
+
+    /// Divergence beyond the PAUSE tolerance for `pause_observations`
+    /// consecutive same-sign checks pauses quoting.
+    double   pause_pct{0.02};               ///< 2% of confirmed balance.
+    uint32_t pause_observations{3};
+
+    /// OFF by default.  Several real balance movements have no ledger event
+    /// yet (taker fills from the arbitrage/drift steps, external deposits and
+    /// withdrawals), so auto-pausing would halt trading on legitimate
+    /// activity.  Turn this on only once the ledger runs clean.
+    bool     pause_enabled{false};
+
+    /// Absolute noise floors, in mojos.  XCH: 0.001 XCH covers fee dust.
+    /// CAT: 100 mojos = 0.1 unit, 100x the 1-mojo per-leg rounding error.
+    std::int64_t floor_xch_mojos{1'000'000'000LL};
+    std::int64_t floor_cat_mojos{100LL};
+
+    /// Extra XCH slack for accumulated per-offer fee dust between checks.
+    /// Observed worst case was 55,000 mojos per heartbeat; 200,000 covers
+    /// ~40 offer events.
+    std::int64_t fee_slack_mojos{200'000LL};
+
+    /// Skip the check when the balance snapshot is older than this many
+    /// blocks (the wallet reader is skipped in several engine modes).
+    uint32_t max_balance_age_blocks{10};
+};
+
 struct InventoryAgingConfig {
     bool     enabled{false};                   // Master switch.
 
@@ -1231,6 +1281,7 @@ struct AppConfig {
     CoinGeckoConfig  coingecko;
     FeeConfig        fees;
     InventoryAgingConfig inventory_aging;
+    AccountingConfig accounting;
     MarketDataSettings market_data;
     AdverseSelectionSettings adverse_selection;
     MarketAllocatorConfig market_allocator;

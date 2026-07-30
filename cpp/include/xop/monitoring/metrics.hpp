@@ -63,6 +63,14 @@ struct MetricsPnlSnapshot {
     Mojo unrealized;  // Mark-to-market PnL on open positions.
     Mojo spread;      // PnL attributed to spread capture.
     Mojo inventory;   // PnL attributed to inventory mark-to-market.
+    // [PNL-UNITS 2026-07-30] USD components, per-pair quote-normalized.
+    // The mojo fields above are a raw sum across pairs with DIFFERENT quote
+    // currencies (wUSDC.b / BYC / DBX mojos) plus an XCH-mojo fee leg, so no
+    // single divisor converts them -- a display layer must use these instead.
+    double usd{0.0};            // total (realized + unrealized + fees)
+    double usd_realized{0.0};   // spread capture
+    double usd_unrealized{0.0}; // inventory mark-to-market
+    double usd_fees{0.0};       // blockchain fees (negative = cost)
 };
 
 // ---------------------------------------------------------------------------
@@ -284,6 +292,12 @@ private:
     prometheus::Gauge* pnl_unrealized_{nullptr};
     prometheus::Gauge* pnl_spread_{nullptr};
     prometheus::Gauge* pnl_inventory_{nullptr};
+    // xop_pnl_usd{component=total|realized|unrealized|fees} (PNL-UNITS).
+    prometheus::Family<prometheus::Gauge>* pnl_usd_family_{nullptr};
+    prometheus::Gauge* pnl_usd_{nullptr};
+    prometheus::Gauge* pnl_usd_realized_{nullptr};
+    prometheus::Gauge* pnl_usd_unrealized_{nullptr};
+    prometheus::Gauge* pnl_usd_fees_{nullptr};
 
     // -- Dashboard 2: Inventory gauges (label-keyed) -------------------------
 

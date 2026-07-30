@@ -441,12 +441,16 @@ class MainWindow(QMainWindow):
                 pnl=pnl,
             )
 
+        # [PNL-UNITS 2026-07-30] Prefer the engine's quote-normalized USD
+        # gauge; the raw mojo total mixes per-pair quote currencies and the
+        # legacy /1e12 conversion understated P&L by ~1e9.
         self._status_bar.update_metrics(
             pnl_mojos=pnl_total,
             spread_bps=avg_spread,
             inventory_ratio=0.5,
             block_height=block_height,
             xch_usd_rate=xch_usd,
+            pnl_usd=pnl.get("usd"),
         )
         self._block_label.setText(f"Block: {block_height:,}")
 
@@ -458,16 +462,13 @@ class MainWindow(QMainWindow):
             # amounts rather than 12-digit mojo integers.
             wallet_balances = data.get("wallet_balances", {})
             offers = data.get("offers", {})
-            total_xch = mojos_to_xch_float(int(pnl.get("total", 0)))
-            realized_xch = mojos_to_xch_float(int(pnl.get("realized", 0)))
-            unrealized_xch = mojos_to_xch_float(int(pnl.get("unrealized", 0)))
-            spread_xch = mojos_to_xch_float(int(pnl.get("spread", 0)))
-            inventory_xch = mojos_to_xch_float(int(pnl.get("inventory", 0)))
-            total_usdc = total_xch * xch_usd
-            realized_usdc = realized_xch * xch_usd
-            unrealized_usdc = unrealized_xch * xch_usd
-            spread_usdc = spread_xch * xch_usd
-            inventory_usdc = inventory_xch * xch_usd
+            # [PNL-UNITS 2026-07-30] Render the engine's USD gauges directly.
+            # The xop_pnl_mojos components are a raw sum across pairs with
+            # different quote currencies plus an XCH-mojo fee leg, so no
+            # divisor the GUI could apply is correct (the old /1e12 * xch_usd
+            # understated everything by ~1e9 and the dashboard sat at $0.00).
+            # The usd_* values are None on engines predating the gauges, in
+            # which case the card shows a dash rather than a wrong number.
             fees_xch = mojos_to_xch_float(int(data.get("fees_paid_24h", 0)))
             fees_usdc = fees_xch * xch_usd
 
@@ -475,32 +476,30 @@ class MainWindow(QMainWindow):
                 sign = "+" if value > 0 else ""
                 return f"{sign}${value:,.2f}"
 
-            def _fmt_xch(value: float, *, signed: bool = True) -> str:
-                sign = "+" if signed and value > 0 else ""
-                return f"{sign}{value:,.4f} XCH"
-
-            def _metric_payload(xch_value: float) -> dict[str, float | str]:
-                if xch_usd > 0:
-                    usdc_value = xch_value * xch_usd
+            def _metric_payload(usd_value: float | None) -> dict[str, float | str]:
+                if usd_value is None:
                     return {
-                        "value": usdc_value,
-                        "spark": usdc_value,
-                        "display_text": _fmt_usdc(usdc_value),
-                        "secondary_text": _fmt_xch(xch_value),
+                        "value": 0.0,
+                        "spark": 0.0,
+                        "display_text": "—",
+                        "secondary_text": "engine predates USD gauges",
                     }
                 return {
-                    "value": xch_value,
-                    "spark": xch_value,
-                    "display_text": _fmt_xch(xch_value),
+                    "value": usd_value,
+                    "spark": usd_value,
+                    "display_text": _fmt_usdc(usd_value),
                     "secondary_text": "",
                 }
 
             card_data = {
-                "Total PnL": _metric_payload(total_xch),
-                "Realized PnL": _metric_payload(realized_xch),
-                "Unrealized PnL": _metric_payload(unrealized_xch),
-                "Spread PnL": _metric_payload(spread_xch),
-                "Inventory PnL": _metric_payload(inventory_xch),
+                "Total PnL": _metric_payload(pnl.get("usd")),
+                "Realized PnL": _metric_payload(pnl.get("usd_realized")),
+                "Unrealized PnL": _metric_payload(pnl.get("usd_unrealized")),
+                # Spread capture and realized P&L are the same quantity in
+                # this engine (realized := spread); Inventory mirrors
+                # unrealized.  Kept as separate cards for continuity.
+                "Spread PnL": _metric_payload(pnl.get("usd_realized")),
+                "Inventory PnL": _metric_payload(pnl.get("usd_unrealized")),
                 "24h Fill Count": {
                     "value": offers.get("filled", 0),
                     "spark": offers.get("filled", 0),

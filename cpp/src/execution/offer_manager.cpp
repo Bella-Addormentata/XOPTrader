@@ -612,6 +612,13 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 fill.price        = po.price;
                 fill.size         = po.size;
                 fill.timestamp    = std::chrono::system_clock::now();
+                // [FEE-FIX 2026-07-30] Capture the offer-creation fee NOW,
+                // while the PendingOffer is still tracked.  The engine used
+                // to look the fee up from State after this function had
+                // already called remove_offer(), which always returned a
+                // default (fee 0) -- trade_log.fee_mojos was silently 0 for
+                // every fill since June 2026.
+                fill.fee_mojos    = static_cast<Mojo>(po.fee_mojos);
 
                 // Extract confirmed block height if available.
                 if (rec.contains("confirmed_at_index")) {
@@ -643,11 +650,31 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                         po.pair_name, trade_id.substr(0, 12));
                 } else {
                     const auto& pc = pc_it->second;
+                    const double quote_mojos_dbl = quote_mojos_for(
+                        static_cast<double>(po.size),
+                        static_cast<double>(po.price),
+                        static_cast<double>(pc.base_mojos_per_unit),
+                        static_cast<double>(pc.quote_mojos_per_unit));
+                    const Mojo quote_mojos = static_cast<Mojo>(std::llround(quote_mojos_dbl));
+
                     if (po.side == Side::Bid) {
-                        // Bid fill: we BOUGHT base asset.
+                        // Bid fill: we BOUGHT base asset (pc.base_asset_id) and SOLD quote asset (pc.quote_asset_id).
                         state_->record_buy(pc.base_asset_id, po.size, po.price);
+                        // [GUARD-FIX 2026-07-30] The prior condition
+                        // (quote != "xch" || base != "xch") was a tautology
+                        // (no pair has xch on both legs), so the intended
+                        // XCH-leg exclusion never applied.  Guard per-leg.
+                        if (pc.quote_asset_id != "xch") {
+                            bool sold_quote = state_->record_sell(pc.quote_asset_id, quote_mojos);
+                            if (!sold_quote) {
+                                logger_->warn(
+                                    "detect_fills: record_sell failed for quote asset {} "
+                                    "(size={}) representing spent quote",
+                                    pc.quote_asset_id, quote_mojos);
+                            }
+                        }
                     } else {
-                        // Ask fill: we SOLD base asset.
+                        // Ask fill: we SOLD base asset (pc.base_asset_id) and BOUGHT quote asset (pc.quote_asset_id).
                         bool sold = state_->record_sell(pc.base_asset_id, po.size);
                         if (!sold) {
                             logger_->error(
@@ -655,6 +682,11 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                                 "-- insufficient balance; fill still "
                                 "recorded, inventory needs reconciliation",
                                 trade_id.substr(0, 12), pc.base_asset_id);
+                        }
+                        // [GUARD-FIX 2026-07-30] Same tautology fix as the
+                        // bid branch: guard the quote leg only.
+                        if (pc.quote_asset_id != "xch") {
+                            state_->record_buy(pc.quote_asset_id, quote_mojos, Mojo{1});
                         }
                     }
                 }

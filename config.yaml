@@ -276,6 +276,24 @@ inventory_aging:
   aging_start_blocks: 500
   max_loss_relax_bps: 25
   relax_rate_bps_per_block: 0.05
+# Double-entry ledger and its wallet reconciliation control.
+# See docs/ACCOUNTING-POLICY.md for the rationale behind every number here.
+accounting:
+  ledger_enabled: true
+  # Divergence beyond tolerance for N consecutive same-signed checks.
+  # Tolerance = live offer exposure + fee slack + max(floor, pct * confirmed).
+  alert_pct: 0.005          # 0.5% -- above all observed dust, below one 1-XCH offer
+  alert_observations: 2
+  pause_pct: 0.02           # 2%   -- roughly three offers' worth
+  pause_observations: 3
+  # OFF until the ledger runs clean: taker fills (Steps 9d/9f) and external
+  # deposits/withdrawals have no ledger event yet, so auto-pausing would halt
+  # trading on legitimate activity.  Alerts still fire either way.
+  pause_enabled: false
+  floor_xch_mojos: 1000000000   # 0.001 XCH -- covers fee dust
+  floor_cat_mojos: 100          # 0.1 unit  -- 100x the per-leg rounding error
+  fee_slack_mojos: 200000       # ~40 offer events at 5,000 mojos
+  max_balance_age_blocks: 10
 market_allocator:
   enabled: true
   eval_interval_blocks: 50

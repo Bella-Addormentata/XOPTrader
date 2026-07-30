@@ -149,6 +149,19 @@ void MetricsExporter::register_metrics()
     pnl_spread_     = &pnl_family_->Add({{"component", "spread"}});
     pnl_inventory_  = &pnl_family_->Add({{"component", "inventory"}});
 
+    // [PNL-UNITS 2026-07-30] USD-normalized components.  The mojo gauges
+    // above mix per-pair quote currencies and an XCH-mojo fee leg, so these
+    // are the only display-safe values.
+    pnl_usd_family_ = &prometheus::BuildGauge()
+        .Name("xop_pnl_usd")
+        .Help("PnL components in USD (per-pair quote-normalized)")
+        .Register(*registry_);
+
+    pnl_usd_            = &pnl_usd_family_->Add({{"component", "total"}});
+    pnl_usd_realized_   = &pnl_usd_family_->Add({{"component", "realized"}});
+    pnl_usd_unrealized_ = &pnl_usd_family_->Add({{"component", "unrealized"}});
+    pnl_usd_fees_       = &pnl_usd_family_->Add({{"component", "fees"}});
+
     // ---------------------------------------------------------------
     //  Dashboard 2: Inventory
     // ---------------------------------------------------------------
@@ -341,6 +354,10 @@ void MetricsExporter::update_pnl(const MetricsPnlSnapshot& summary)
     pnl_unrealized_->Set(static_cast<double>(summary.unrealized));
     pnl_spread_->Set(static_cast<double>(summary.spread));
     pnl_inventory_->Set(static_cast<double>(summary.inventory));
+    if (pnl_usd_)            pnl_usd_->Set(summary.usd);
+    if (pnl_usd_realized_)   pnl_usd_realized_->Set(summary.usd_realized);
+    if (pnl_usd_unrealized_) pnl_usd_unrealized_->Set(summary.usd_unrealized);
+    if (pnl_usd_fees_)       pnl_usd_fees_->Set(summary.usd_fees);
 }
 
 // ===================================================================

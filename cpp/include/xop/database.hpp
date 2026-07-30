@@ -40,6 +40,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Forward-declare the opaque sqlite3 handles to avoid pulling the full
@@ -159,6 +160,58 @@ struct DbStrategyQuote {
     std::string side;               ///< "bid" or "ask".
     Mojo        price_mojos{0};     ///< Quote price in mojos.
     Mojo        size_mojos{0};      ///< Quote size in mojos.
+};
+
+// ---------------------------------------------------------------------------
+// DbInventoryState -- maps 1:1 to a row in the inventory_state table.
+//
+// Persists the InventoryTracker's per-asset cost-basis accounting so that
+// realized-P&L attribution survives engine restarts (PNL-BASIS-PERSIST,
+// TODO #9).  Before this table existed, every restart re-seeded all assets
+// at a sentinel basis and realized P&L was recorded as 0 until the next
+// buy fill in the same process lifetime.
+//
+// total_cost is a REAL: it holds sum(fill_price * qty) where fill_price is a
+// USD-normalized pseudo-price (~1e12) and qty is in base mojos, so the value
+// (~1e24+) exceeds int64 range by design.
+// ---------------------------------------------------------------------------
+
+struct DbInventoryState {
+    AssetId asset_id;                    ///< "xch" or 64-hex CAT id.
+    Mojo    total_quantity{0};           ///< Tracked holdings in mojos.
+    double  total_cost{0.0};             ///< Cumulative cost of open holdings.
+    bool    basis_is_seed_sentinel{false}; ///< True when basis is synthetic.
+};
+
+// ---------------------------------------------------------------------------
+// DbLedgerEntry -- one leg of a double-entry accounting event.
+//
+// Every event that changes what the bot believes it holds posts a BALANCED
+// set of legs (e.g. an ask fill posts base -size, quote +proceeds, xch -fee).
+// Summing delta_mojos per asset gives the ledger's implied balance, which is
+// then tied to the wallet's confirmed balance by the reconciliation control.
+//
+// The ledger records what the bot BELIEVES happened, from its own event
+// stream.  That is deliberate: the gap between belief and the wallet is the
+// diagnostic signal.  trade_log was shown on 2026-07-30 to claim a ~604 XCH
+// outflow across a period when the wallet actually gained 61 XCH, and nothing
+// in the system noticed for three months because no invariant tied the two
+// together.
+//
+// Idempotency: (event_id, leg, asset_id) is UNIQUE.  A fill re-detected after
+// a crash re-posts identical legs, which are ignored rather than doubled.
+// ---------------------------------------------------------------------------
+
+struct DbLedgerEntry {
+    std::string entry_time;         ///< ISO-8601 UTC of the event.
+    std::string event_type;         ///< opening | fill | fee | take | adjust.
+    std::string event_id;           ///< trade_id, or a synthetic unique id.
+    std::string leg;                ///< base | quote | fee | opening | adjust.
+    AssetId     asset_id;           ///< Canonical id ("xch" or 64-hex).
+    Mojo        delta_mojos{0};     ///< Signed: + inflow, - outflow.
+    std::string pair_name;          ///< Context (may be empty).
+    BlockHeight block_height{0};    ///< Settlement block, 0 if not applicable.
+    std::string note;               ///< Free-form provenance.
 };
 
 // ---------------------------------------------------------------------------
@@ -290,6 +343,39 @@ public:
     ///
     /// @param batch  Vector of DbStrategyQuote records.
     void insert_strategy_quotes_batch(const std::vector<DbStrategyQuote>& batch);
+
+    // -- Inventory state (cost-basis persistence) ----------------------------
+
+    /// Upsert the full set of inventory records inside one transaction.
+    /// Called by the engine after every fill / seed / reconcile so the
+    /// cost basis survives restarts.  Never throws: persistence failures
+    /// are logged and must not disrupt live trading.
+    void save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
+
+    /// Load all persisted inventory records.  Returns an empty vector when
+    /// the table is empty (first run) or on error.
+    [[nodiscard]] std::vector<DbInventoryState> load_inventory_state() const;
+
+    // -- Double-entry ledger -------------------------------------------------
+
+    /// Append ledger legs inside one transaction.  Uses INSERT OR IGNORE on
+    /// the (event_id, leg, asset_id) uniqueness key, so re-posting the legs
+    /// of an already-recorded event is a no-op rather than a double count.
+    /// Never throws: accounting must not disrupt live trading.
+    /// @return number of legs actually inserted (0 = all were duplicates).
+    std::size_t append_ledger_entries(
+        const std::vector<DbLedgerEntry>& legs) noexcept;
+
+    /// Sum of delta_mojos per asset across the whole ledger, i.e. the
+    /// ledger's implied current balance for each asset.
+    [[nodiscard]] std::unordered_map<AssetId, Mojo> ledger_balances() const;
+
+    /// True when an 'opening' leg already exists for this asset, so genesis
+    /// balances are established exactly once in the ledger's lifetime.
+    [[nodiscard]] bool has_ledger_opening(const AssetId& asset_id) const;
+
+    /// Total number of legs (diagnostics / first-run detection).
+    [[nodiscard]] std::int64_t ledger_entry_count() const;
 
     // -- Diagnostics ---------------------------------------------------------
 

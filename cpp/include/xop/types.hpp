@@ -125,6 +125,11 @@ struct Fill {
     Mojo         size;          // filled quantity (mojos of base asset)
     BlockHeight  block_height;  // settlement block
     Timestamp    timestamp;     // wall-clock time of detection
+    Mojo         fee_mojos{0};  // offer-creation fee (XCH mojos).  Captured at
+                                // detection time from the tracked PendingOffer;
+                                // the offer is removed from State immediately
+                                // after detection, so a later State lookup
+                                // always returns 0 (bug fixed 2026-07-30).
 };
 
 // ---------------------------------------------------------------------------

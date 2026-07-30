@@ -64,7 +64,8 @@ TEST_F(CostBasisTest, WeightedAverageTwoBuys) {
 
     auto rec = tracker.get_record("xch");
     EXPECT_EQ(rec.total_quantity, 150);
-    EXPECT_EQ(rec.total_cost, 410'000'000LL);
+    // total_cost is a double since PNL-BASIS-OVERFLOW (2026-07-30).
+    EXPECT_DOUBLE_EQ(rec.total_cost, 410'000'000.0);
 
     // Weighted average: 410000000 / 150 = 2733333 (truncated).
     EXPECT_EQ(rec.weighted_avg_cost_basis, 2'733'333);
@@ -177,7 +178,7 @@ TEST_F(CostBasisTest, FullLiquidationResetsBasis) {
 
     auto rec = tracker.get_record("xch");
     EXPECT_EQ(rec.total_quantity, 0);
-    EXPECT_EQ(rec.total_cost, 0);
+    EXPECT_DOUBLE_EQ(rec.total_cost, 0.0);
     EXPECT_EQ(rec.weighted_avg_cost_basis, 0);
 }
 
@@ -554,6 +555,223 @@ TEST_F(CostBasisTest, RuntimeConstraintToggle) {
     // Now selling below cost should be blocked again.
     ok = tracker.record_sell("xch", 25, 2'500'000, 3, now_);
     EXPECT_FALSE(ok);
+}
+
+// ============================================================================
+// TEST: XCH-scale fills do not overflow the cost accumulator
+// (PNL-BASIS-OVERFLOW regression, 2026-07-30)
+// ============================================================================
+//
+// Live-scale numbers: buy 1 XCH (1e12 base mojos) at pseudo-price 1.39e12
+// (=$1.39/XCH in USD-normalized pseudo-units).  The cost product is
+// ~1.39e24, which cannot fit int64.  The old int64 total_cost saturated to
+// INT64_MIN on MSVC and the basis clamped to 0 -- every later ask then hit
+// the basis-unknown guard and recorded realized_pnl = 0 forever.
+
+TEST_F(CostBasisTest, XchScaleFillDoesNotOverflowBasis) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo one_xch = 1'000'000'000'000LL;      // 1e12 base mojos
+    const xop::Mojo price   = 1'390'000'000'000LL;      // 1.39e12 pseudo
+
+    tracker.record_buy("xch", one_xch, price, 1, now_);
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, one_xch);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, price)
+        << "basis must equal the fill price, not collapse to 0 via overflow";
+    EXPECT_GT(rec.total_cost, 0.0);
+
+    // Weighted average across two XCH-scale fills stays exact.
+    const xop::Mojo price2 = 1'410'000'000'000LL;
+    tracker.record_buy("xch", one_xch, price2, 2, now_);
+    rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.weighted_avg_cost_basis, (price + price2) / 2);
+}
+
+// ============================================================================
+// TEST: Sentinel seed replaced by first real fill at XCH scale
+// ============================================================================
+
+TEST_F(CostBasisTest, SentinelSeedReplacedAtXchScale) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo seeded  = 5'000'000'000'000LL;      // 5 XCH from wallet
+    const xop::Mojo one_xch = 1'000'000'000'000LL;
+    const xop::Mojo price   = 1'390'000'000'000LL;
+
+    tracker.seed_position("xch", seeded, xop::Mojo{1});
+    auto rec = tracker.get_record("xch");
+    EXPECT_TRUE(rec.basis_is_seed_sentinel);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 1);
+
+    tracker.record_buy("xch", one_xch, price, 1, now_);
+    rec = tracker.get_record("xch");
+    EXPECT_FALSE(rec.basis_is_seed_sentinel);
+    EXPECT_EQ(rec.total_quantity, seeded + one_xch);
+    // Sentinel replacement: whole holding re-marked at the fill price.
+    EXPECT_EQ(rec.weighted_avg_cost_basis, price);
+}
+
+// ============================================================================
+// TEST: restore_record round-trips persisted state
+// (PNL-BASIS-PERSIST, 2026-07-30)
+// ============================================================================
+
+TEST_F(CostBasisTest, RestoreRecordRoundTrip) {
+    xop::InventoryTracker a(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo one_xch = 1'000'000'000'000LL;
+    const xop::Mojo price   = 1'390'000'000'000LL;
+    a.record_buy("xch", one_xch, price, 1, now_);
+    auto before = a.get_record("xch");
+
+    // Simulate restart: a fresh tracker restored from persisted fields.
+    xop::InventoryTracker b(risk_cfg_, 1'000'000'000LL);
+    b.restore_record("xch", before.total_quantity, before.total_cost,
+                     before.basis_is_seed_sentinel);
+
+    auto after = b.get_record("xch");
+    EXPECT_EQ(after.total_quantity, before.total_quantity);
+    EXPECT_DOUBLE_EQ(after.total_cost, before.total_cost);
+    EXPECT_EQ(after.weighted_avg_cost_basis, before.weighted_avg_cost_basis);
+    EXPECT_EQ(after.basis_is_seed_sentinel, before.basis_is_seed_sentinel);
+}
+
+// ============================================================================
+// TEST: reseed_basis upgrades a sentinel basis in place
+// ============================================================================
+
+TEST_F(CostBasisTest, ReseedBasisUpgradesSentinel) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo seeded = 5'000'000'000'000LL;
+    const xop::Mojo mark   = 1'400'000'000'000LL;
+
+    tracker.seed_position("xch", seeded, xop::Mojo{1});
+    tracker.reseed_basis("xch", mark);
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_FALSE(rec.basis_is_seed_sentinel);
+    EXPECT_EQ(rec.total_quantity, seeded);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, mark);
+}
+
+// ============================================================================
+// TEST: adjust_quantity -- withdrawal preserves basis, deposit marks at price
+// ============================================================================
+
+TEST_F(CostBasisTest, AdjustQuantityWithdrawalPreservesBasis) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.record_buy("xch", 100, 2'700'000, 1, now_);
+
+    // External withdrawal of 40 units observed via wallet reconcile.
+    tracker.adjust_quantity("xch", 60, /*price_for_additions=*/0);
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, 60);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'700'000);
+}
+
+TEST_F(CostBasisTest, AdjustQuantityDepositMarksAtPrice) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.record_buy("xch", 100, 2'000'000, 1, now_);
+
+    // External deposit of 100 units, marked at the current price 3'000'000.
+    tracker.adjust_quantity("xch", 200, /*price_for_additions=*/3'000'000);
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, 200);
+    // Blended: (100*2e6 + 100*3e6) / 200 = 2.5e6.
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'500'000);
+}
+
+// ============================================================================
+// TEST: unpriced fills never fabricate a cost basis
+// (PNL-BASIS-USD regression, 2026-07-30)
+// ============================================================================
+//
+// When no USD valuation is available for a pair, the engine must NOT pass a
+// placeholder price to record_buy: the sentinel branch would re-mark the
+// ENTIRE holding at that price and clear the sentinel flag, permanently
+// destroying the basis with no way for the mark-at-first-observation upgrade
+// to repair it.  record_fill_unpriced tracks quantity and leaves the basis
+// (and its repairability) intact.
+
+TEST_F(CostBasisTest, UnpricedBuyPreservesSentinelForLaterRepair) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo seeded  = 155'180'569'865'578LL;  // 155.18 XCH wallet seed
+    const xop::Mojo one_xch = 1'000'000'000'000LL;
+
+    tracker.seed_position("xch", seeded, xop::Mojo{1});
+    ASSERT_TRUE(tracker.get_record("xch").basis_is_seed_sentinel);
+
+    EXPECT_TRUE(tracker.record_fill_unpriced("xch", one_xch, /*is_buy=*/true,
+                                             10, now_));
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, seeded + one_xch) << "quantity must track";
+    EXPECT_TRUE(rec.basis_is_seed_sentinel)
+        << "sentinel must survive so Step 11 can still repair the basis";
+
+    // The repair still works afterwards, marking the whole holding.
+    const xop::Mojo mark = 1'347'000'000'000LL;
+    tracker.reseed_basis("xch", mark);
+    rec = tracker.get_record("xch");
+    EXPECT_FALSE(rec.basis_is_seed_sentinel);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, mark);
+}
+
+TEST_F(CostBasisTest, UnpricedBuyOnFreshRecordBecomesRepairable) {
+    // A record that does not exist yet (e.g. wallet seeding failed at
+    // startup) must also end up repairable -- otherwise it sits at basis 0
+    // with the sentinel flag clear and nothing ever fixes it.
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+
+    const xop::Mojo one_xch = 1'000'000'000'000LL;
+    EXPECT_TRUE(tracker.record_fill_unpriced("xch", one_xch, /*is_buy=*/true,
+                                             10, now_));
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, one_xch);
+    EXPECT_TRUE(rec.basis_is_seed_sentinel)
+        << "unknown-cost quantity must be flagged for later repair";
+}
+
+TEST_F(CostBasisTest, UnpricedSellDrawsDownAndPreservesBasis) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.record_buy("xch", 100, 2'700'000, 1, now_);
+
+    EXPECT_TRUE(tracker.record_fill_unpriced("xch", 40, /*is_buy=*/false,
+                                             2, now_));
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, 60);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'700'000)
+        << "proportional drawdown must preserve the weighted average";
+}
+
+TEST_F(CostBasisTest, UnpricedSellBeyondHoldingsIsRejected) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.record_buy("xch", 100, 2'700'000, 1, now_);
+
+    EXPECT_FALSE(tracker.record_fill_unpriced("xch", 500, /*is_buy=*/false,
+                                              2, now_));
+    EXPECT_EQ(tracker.get_record("xch").total_quantity, 100);
+}
+
+TEST_F(CostBasisTest, AdjustQuantityDepositWithoutPriceIsNoop) {
+    xop::InventoryTracker tracker(risk_cfg_, 1'000'000'000LL);
+    tracker.record_buy("xch", 100, 2'000'000, 1, now_);
+
+    // Deposit observed but no usable mark price yet: leave untouched so the
+    // caller can retry when market data is warm.
+    tracker.adjust_quantity("xch", 200, /*price_for_additions=*/0);
+
+    auto rec = tracker.get_record("xch");
+    EXPECT_EQ(rec.total_quantity, 100);
+    EXPECT_EQ(rec.weighted_avg_cost_basis, 2'000'000);
 }
 
 }  // namespace

@@ -145,6 +145,80 @@ TEST(ConfigParserTest, OptionalSections_DefaultCorrectly) {
 
     // Strategy confirmation depth defaults to 6.
     EXPECT_EQ(cfg.strategy.confirmation_depth_blocks, 6u);
+
+    // [LEDGER 2026-07-30] The accounting section is optional.  An existing
+    // deployment whose config.yaml predates it must still boot -- a throw
+    // here would stop the engine from starting at all.
+    EXPECT_TRUE(cfg.accounting.ledger_enabled);
+    EXPECT_FALSE(cfg.accounting.pause_enabled)
+        << "auto-pause must be opt-in, never a default";
+    EXPECT_NEAR(cfg.accounting.alert_pct, 0.005, 1e-9);
+    EXPECT_NEAR(cfg.accounting.pause_pct, 0.02, 1e-9);
+    EXPECT_EQ(cfg.accounting.alert_observations, 2u);
+    EXPECT_EQ(cfg.accounting.pause_observations, 3u);
+}
+
+// ============================================================================
+// accounting: -- ledger / reconciliation control (LEDGER 2026-07-30)
+// ============================================================================
+
+TEST(ConfigParserTest, AccountingSection_Parses) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  ledger_enabled: true
+  alert_pct: 0.01
+  alert_observations: 3
+  pause_pct: 0.05
+  pause_observations: 4
+  pause_enabled: true
+  floor_xch_mojos: 2000000000
+  floor_cat_mojos: 250
+  fee_slack_mojos: 300000
+  max_balance_age_blocks: 20
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_TRUE(cfg.accounting.ledger_enabled);
+    EXPECT_NEAR(cfg.accounting.alert_pct, 0.01, 1e-9);
+    EXPECT_EQ(cfg.accounting.alert_observations, 3u);
+    EXPECT_NEAR(cfg.accounting.pause_pct, 0.05, 1e-9);
+    EXPECT_EQ(cfg.accounting.pause_observations, 4u);
+    EXPECT_TRUE(cfg.accounting.pause_enabled);
+    EXPECT_EQ(cfg.accounting.floor_xch_mojos, 2'000'000'000LL);
+    EXPECT_EQ(cfg.accounting.floor_cat_mojos, 250LL);
+    EXPECT_EQ(cfg.accounting.fee_slack_mojos, 300'000LL);
+    EXPECT_EQ(cfg.accounting.max_balance_age_blocks, 20u);
+}
+
+TEST(ConfigParserTest, AccountingPauseBelowAlert_Throws) {
+    // A pause threshold tighter than the alert threshold would pause before
+    // ever alerting -- reject it rather than silently mis-escalate.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_pct: 0.05
+  pause_pct: 0.01
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, AccountingZeroObservations_Throws) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_observations: 0
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, AccountingOutOfRangePct_Throws) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_pct: 1.5
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
 // ============================================================================

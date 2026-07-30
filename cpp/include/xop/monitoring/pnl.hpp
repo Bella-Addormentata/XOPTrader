@@ -84,7 +84,14 @@ struct PnLSummary {
     Mojo   inventory_pnl;           ///< Current mark-to-market on inventory.
     Mojo   fee_pnl;                 ///< Net fees: income minus costs (mojos).
     Mojo   total_pnl;               ///< spread + inventory + fee (mojos).
-    double total_pnl_usd;           ///< total_pnl converted at XCH/USD rate.
+    // [PNL-UNITS 2026-07-30] The mojo fields above mix per-pair quote
+    // currencies (and an XCH-mojo fee leg), so they cannot be converted by a
+    // consumer.  These are normalized per pair via the registered quote-USD
+    // factors and are the only figures safe to display as money.
+    double total_pnl_usd;           ///< realized + unrealized + fees, in USD.
+    double realized_pnl_usd;        ///< spread capture, in USD.
+    double unrealized_pnl_usd;      ///< inventory mark-to-market, in USD.
+    double fee_pnl_usd;             ///< fees (negative = cost), in USD.
     double sharpe_ratio;            ///< Annualised Sharpe ratio.
     double max_drawdown;            ///< Maximum peak-to-trough decline [0,1].
     double profit_factor;           ///< gross_profit / gross_loss (>1 good).
@@ -162,7 +169,35 @@ public:
     /// Create or verify the trade_log table and its indices.
     /// Safe to call repeatedly (IF NOT EXISTS).  Must be called before
     /// any other method that touches the database.
+    ///
+    /// [PNL-REHYDRATE 2026-07-30] Also rebuilds the in-memory per-pair and
+    /// total accumulators from the existing trade_log rows so that realized
+    /// P&L, fees, and fill statistics survive engine restarts.  Previously
+    /// every restart silently reset all cumulative P&L to zero.
     void init_database();
+
+    // -- Pair conversion registry (PNL-UNITS 2026-07-30) -------------------
+
+    /// Register (or refresh) the unit/denomination info for a pair so the
+    /// tracker can (a) key mark-to-market balance lookups by the canonical
+    /// base asset id instead of the display symbol -- the prior symbol
+    /// keying missed every lookup and pinned unrealized P&L at exactly 0 --
+    /// and (b) normalize per-pair quote-mojo P&L into USD for aggregation.
+    ///
+    /// @param pair_name            e.g. "XCH/wUSDC.b".
+    /// @param base_asset_id        canonical id ("xch" or 64-hex CAT id).
+    /// @param base_mojos_per_unit  1e12 for XCH, 1e3 for CATs.
+    /// @param quote_mojos_per_unit same convention for the quote asset.
+    /// @param usd_per_quote_unit   USD value of one quote display unit
+    ///                             (1.0 for USD-pegged stables; cross-derived
+    ///                             for DBX; 0 = unknown -> pair excluded
+    ///                             from USD totals and mark-to-market).
+    /// Called from the engine each heartbeat; cheap, lock-protected.
+    void set_pair_conversion(const std::string& pair_name,
+                             const std::string& base_asset_id,
+                             double base_mojos_per_unit,
+                             double quote_mojos_per_unit,
+                             double usd_per_quote_unit);
 
     // -- Fill recording ---------------------------------------------------
 
@@ -176,10 +211,17 @@ public:
     /// @param fee   Blockchain fee paid for this settlement (mojos, >= 0).
     /// @param cost_basis  Weighted-average cost basis at the time of fill.
     /// @param realized_pnl  Pre-computed realized PnL for this fill (mojos).
-    ///        Computed by the engine as (price - cost_basis) * size / kMojosPerXch
-    ///        for sells, 0 for buys.  Single source of truth to avoid
-    ///        redundant computation.
-    void record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
+    ///        Computed by the engine via quote_mojos_for for sells, 0 for
+    ///        buys.  Single source of truth to avoid redundant computation.
+    ///
+    /// @return true when the fill was newly recorded; false when a row with
+    ///         the same trade_id already exists (duplicate re-detection after
+    ///         a crash between the insert and the engine's side effects).
+    ///         On false, accumulators and the trade-history file are NOT
+    ///         touched -- the fill was already counted -- but the caller
+    ///         should still complete its own side effects (offer status,
+    ///         inventory) which may not have run before the crash.
+    bool record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
                      Mojo realized_pnl);
 
     /// Record a fee event that is not associated with a specific fill.
@@ -338,9 +380,34 @@ private:
     [[nodiscard]] PnLSummary build_summary(const PairPnL& ppnl,
                                             double xch_usd) const;
 
+    /// USD value of a quote-asset-mojo amount for a pair, using its
+    /// registered conversion (or the retired-pair peg fallback).  Returns 0
+    /// when the pair's quote has no known USD value.  Caller must hold mtx_.
+    /// Fees are NOT convertible here -- they are XCH-denominated and go
+    /// through xch_usd_rate_ instead (PNL-UNITS 2026-07-30).
+    [[nodiscard]] double quote_mojos_to_usd_locked(
+        const std::string& pair_name, Mojo quote_mojos) const;
+
+    /// Fill in the USD component fields of a summary.  Caller must hold mtx_.
+    /// @param pair_name  Empty to aggregate every pair (the global total).
+    void fill_usd_components_locked(PnLSummary& s,
+                                    const std::string& pair_name) const;
+
     /// Lock-free insert helper; caller must already hold mtx_.
     /// ISO/IEC 5055 -- CWE-362: separated to avoid deadlock with record_fill.
-    void insert_trade_unlocked(const TradeRecord& record);
+    /// @return true when the row was inserted; false when trade_id already
+    ///         exists (UNIQUE constraint -- idempotent replay support).
+    bool insert_trade_unlocked(const TradeRecord& record);
+
+    /// Rebuild the in-memory accumulators from trade_log (called once at the
+    /// end of init_database, before any live fills).  Caller must NOT hold
+    /// mtx_.  PNL-REHYDRATE 2026-07-30.
+    void rehydrate_from_db();
+
+    /// Append one fill to the durable trade-history CSV
+    /// (<db_dir>/trade_history/trades_live.csv).  Best-effort: failures are
+    /// logged, never thrown.  Caller must hold mtx_ (reads pair_conv_).
+    void append_history_csv(const TradeRecord& record, Mojo realized_pnl);
 
     /// Finalise and null-out a prepared statement, ignoring errors.
     static void finalize_stmt(sqlite3_stmt*& stmt) noexcept;
@@ -371,6 +438,24 @@ private:
 
     /// Current XCH/USD rate for USD conversion.  Updated by mark_to_market().
     double xch_usd_rate_ = 0.0;
+
+    // -- Per-pair unit conversions (PNL-UNITS 2026-07-30) ------------------
+
+    /// Denomination and USD-normalization info per pair, registered by the
+    /// engine.  Used for canonical-asset-id keying in mark_to_market and for
+    /// converting per-pair quote-mojo P&L into USD before cross-pair
+    /// aggregation (the raw mojo totals mix incompatible quote currencies).
+    struct PairConversion {
+        std::string base_asset_id;          ///< "xch" or 64-hex CAT id.
+        double      base_mojos_per_unit{1e12};
+        double      quote_mojos_per_unit{1e3};
+        double      usd_per_quote_unit{0.0}; ///< 0 = unknown.
+    };
+    std::unordered_map<std::string, PairConversion> pair_conv_;
+
+    /// Durable trade-history CSV path (<db_dir>/trade_history/trades_live.csv).
+    /// Empty when the directory could not be created.
+    std::string history_csv_path_;
 
     // [T8-21] EMA-smoothed mid-prices per pair for unrealized PnL.
     // Reduces mark-to-market noise from volatile spot prices.

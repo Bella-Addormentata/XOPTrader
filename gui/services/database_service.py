@@ -425,8 +425,15 @@ class _DatabaseWorker(QObject):
             "WHEN t.pair_name LIKE '%/USDS%'  THEN t.realized_pnl_mojos / 1000.0 "
             "ELSE 0.0 END"
         )
+        # [REPORTS-CRASH-FIX 2026-07-30] This line previously read
+        # `fee_usdc_expr = (f"({fee_usdc_expr})")` -- a self-reference before
+        # assignment introduced in the v0.7.46 refactor.  Every fetch_reports
+        # call since 2026-04-21 died here with UnboundLocalError before
+        # running any SQL, so the Reports page silently showed placeholders
+        # for three months.  Fees are on-chain XCH mojos; convert via the
+        # daily XCH/USD rate (0 when no rate row exists for that day).
         fee_usdc_expr = (
-            f"({fee_usdc_expr})"
+            f"((t.fee_mojos / 1000000000000.0) * {usd_rate_expr})"
         )
 
         # -- Period-based P&L -------------------------------------------------

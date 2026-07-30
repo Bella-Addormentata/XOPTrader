@@ -934,6 +934,27 @@ asio::awaitable<void> Engine::poll_loop_coro()
     // balanced), causing the Avellaneda-Stoikov model to ignore real
     // portfolio skew and place symmetric quotes regardless of actual
     // wallet composition.
+    // [PNL-BASIS-PERSIST 2026-07-30] Restore persisted cost-basis records
+    // BEFORE wallet seeding.  seed_position() is a no-op for assets that
+    // already have a position, so restored assets keep their real basis and
+    // only never-before-seen assets get the sentinel seed below.  Without
+    // this restore, every restart wiped the basis and realized P&L was
+    // recorded as 0 until the next buy fill (the root cause of "P&L never
+    // worked": 368 of 549 lifetime sells carried the sentinel).
+    if (inventory_ && db_) {
+        const auto persisted = db_->load_inventory_state();
+        for (const auto& row : persisted) {
+            inventory_->restore_record(AssetId{row.asset_id},
+                                       row.total_quantity,
+                                       row.total_cost,
+                                       row.basis_is_seed_sentinel);
+        }
+        if (!persisted.empty()) {
+            spdlog::info("[Engine] Restored {} inventory cost-basis records "
+                         "from inventory_state", persisted.size());
+        }
+    }
+
     if (inventory_ && offer_mgr_ && wallet_) {
         try {
             // Ensure the wallet-ID cache is populated so that
@@ -949,6 +970,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             }
 
             Mojo total_seeded = 0;
+            // [LEDGER] Collect confirmed balances so opening entries can be
+            // posted once, from wallet truth, at ledger genesis.
+            std::unordered_map<AssetId, Mojo> genesis_balances;
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
                 if (wid <= 0) continue;
@@ -961,6 +985,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     const Mojo seed_qty = (confirmed > 0) ? confirmed : spendable;
                     if (seed_qty <= 0) continue;
+
+                    // [LEDGER] Opening balance must come from CONFIRMED
+                    // specifically -- that is the figure the invariant ties
+                    // to, and it is the only one unaffected by offer escrow.
+                    if (confirmed > 0) {
+                        genesis_balances[AssetId{aid}] = confirmed;
+                    }
 
                     // Use 1 as synthetic cost basis ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â the actual value
                     // doesn't affect inventory_ratio because that method
@@ -989,6 +1020,14 @@ asio::awaitable<void> Engine::poll_loop_coro()
                              "total {} mojos across {} assets",
                              total_seeded, seed_asset_ids.size());
             }
+
+            // [PNL-BASIS-PERSIST] Persist the post-restore/post-seed state
+            // so a crash before the first fill still round-trips cleanly.
+            persist_inventory_state();
+
+            // [LEDGER] Establish opening balances (no-op after the first
+            // run -- the 'opening' legs already exist).
+            post_ledger_genesis(genesis_balances);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
@@ -1661,6 +1700,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Step 11 (PnL) failed: {}", e.what());
     }
 
+    // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
+    // has posted this cycle's fill legs and after Step 8 refreshed the
+    // balance snapshot, so intra-cycle ordering never manufactures
+    // divergence.
+    try { step_check_ledger_invariant(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Ledger invariant check failed: {}", e.what());
+    }
+
     try { step_export_metrics(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 12 (metrics) failed: {}", e.what());
@@ -2087,14 +2135,13 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         tr.side            = (fill.side == Side::Bid) ? "bid" : "ask";
         tr.price_mojos     = fill.price;
         tr.size_mojos      = fill.size;
-        // [T9-FIX] Retrieve the offer-creation fee from State.
-        // The Chia offer protocol does not surface settlement fees, so the
-        // creation fee (paid to get the offer on-chain) is the best available
-        // approximation.  Returns 0 if the offer was already removed.
-        {
-            auto po = state_->get_offer(fill.offer_id);
-            tr.fee_mojos = po.fee_mojos;
-        }
+        // [FEE-FIX 2026-07-30] The creation fee now travels ON the Fill,
+        // captured by detect_fills while the PendingOffer was still tracked.
+        // The previous State lookup here always returned 0 because
+        // detect_fills removes the offer before the engine processes the
+        // fill -- trade_log.fee_mojos was silently 0 for every fill since
+        // June 2026 while real fees kept being paid.
+        tr.fee_mojos = fill.fee_mojos;
         tr.block_height    = fill.block_height;
 
         // Look up pair config for this fill's pair (O(1) map lookup).
@@ -2112,11 +2159,33 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         // Retrieve cost basis from the inventory tracker for PnL calculation.
         // For asks (sells), use the pair's base asset; for bids (buys),
         // use the pair's quote asset.
-        auto asset_rec = inventory_->get_record(
-            (fill.side == Side::Ask)
-                ? AssetId{fill_pair_cfg->base_asset_id}
-                : AssetId{fill_pair_cfg->quote_asset_id});
-        tr.cost_basis_mojos   = asset_rec.weighted_avg_cost_basis;
+        // [PNL-BASIS-USD 2026-07-30] The tracker stores basis in
+        // USD-normalized pseudo-units (one coherent basis per asset across
+        // pairs with different quote currencies).  trade_log rows keep the
+        // pair's own quote pseudo-units so (price - basis) stays
+        // dimensionally sound per row -- convert on the way out.  Sentinel /
+        // unknown bases pass through unconverted so the basis_unknown guard
+        // below still fires (from_usd_pseudo(1) could otherwise exceed 1
+        // for sub-dollar quotes like DBX and dodge the guard).
+        //
+        // Only the SELL side has a meaningful cost basis.  Buys previously
+        // persisted the QUOTE asset's basis, which no code path ever
+        // updated and which is denominated differently from the row's
+        // price_mojos -- a value no reader could interpret.  Buys now
+        // record 0, matching their unconditional realized_pnl of 0.
+        if (fill.side == Side::Ask) {
+            auto asset_rec = inventory_->get_record(
+                AssetId{fill_pair_cfg->base_asset_id});
+            if (!asset_rec.basis_is_seed_sentinel
+                && asset_rec.weighted_avg_cost_basis > 1) {
+                tr.cost_basis_mojos = from_usd_pseudo(
+                    asset_rec.weighted_avg_cost_basis, *fill_pair_cfg);
+            } else {
+                tr.cost_basis_mojos = asset_rec.weighted_avg_cost_basis;
+            }
+        } else {
+            tr.cost_basis_mojos = 0;
+        }
         // [C2/PNL-UNIT-FIX] PnL unit normalization in QUOTE-asset mojos.
         //
         // Engine pseudo-units convention (see offer_manager.cpp build_offer_dict):
@@ -2174,6 +2243,116 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             tr.realized_pnl_mojos = 0;
         }
 
+        // [PNL-DURABILITY 2026-07-30] Journal-first: persist the fill to
+        // trade_log (and the trade-history CSV) BEFORE any side effects.
+        // Previously the offer was marked 'filled' and inventory mutated
+        // first, so an insert failure dropped the fill from the audit trail
+        // permanently.  Now a throw leaves the offer 'pending' in offer_log,
+        // so it is recovered -- but only at the NEXT ENGINE START, not on
+        // the next poll: detect_fills removed the offer from State when it
+        // emitted this Fill, and State is repopulated from offer_log only
+        // during startup recovery.  There is no in-process retry.
+        //
+        // A duplicate journal entry (crash after the insert, before the
+        // side effects) returns false.  The side effects below still run --
+        // correct, because reaching this branch means offer_log was still
+        // 'pending', which means the inventory mutation had NOT been
+        // applied.  P&L accumulators and market-signal feeds are skipped to
+        // avoid double counting.  Note this correctness depends on
+        // update_offer_status running BEFORE the inventory mutation: it is
+        // the gate that decides whether a fill can be re-detected at all.
+        const bool fill_newly_recorded =
+            pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos,
+                              tr.realized_pnl_mojos);
+
+        // Record the offer as filled in the offer log.
+        db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
+
+        // Update the inventory tracker using the pair's actual base asset.
+        auto now = std::chrono::system_clock::now();
+        // [H3] fill_pair_cfg is guaranteed non-null (guarded above).
+        const std::string& fill_base = fill_pair_cfg->base_asset_id;
+        // [PNL-BASIS-USD] The tracker's basis is USD-normalized, so fills
+        // enter at their USD-normalized price.  Resolve it in two steps:
+        // this pair's own quote-USD factor, then the asset's price from any
+        // other enabled pair (an XCH/DBX fill can still be valued via
+        // XCH/wUSDC.b when the DBX book is momentarily empty).
+        Mojo fill_price_usd = to_usd_pseudo(fill.price, *fill_pair_cfg);
+        if (fill_price_usd <= 0) {
+            fill_price_usd = asset_usd_pseudo_price(AssetId{fill_base});
+        }
+
+        // If BOTH fail there is no defensible cost for this lot.  Do NOT
+        // substitute a placeholder price: record_buy's sentinel branch would
+        // re-mark the ENTIRE holding at that price and clear the sentinel
+        // flag, permanently destroying the basis with no way for the
+        // mark-at-first-observation upgrade to repair it -- exactly the
+        // failure this change set exists to eliminate.  Track the quantity
+        // and leave the basis (and its provenance) untouched instead.
+        bool inventory_ok = true;
+        if (fill_price_usd <= 0) {
+            spdlog::warn("[Engine] Step 2: no USD valuation available for {} "
+                         "({}) -- applying fill to quantity only, cost basis "
+                         "left intact for later repair",
+                         fill.pair_name, fill_base.substr(0, 12));
+            inventory_ok = inventory_->record_fill_unpriced(
+                fill_base, fill.size, /*is_buy=*/fill.side == Side::Bid,
+                fill.block_height, now);
+        } else if (fill.side == Side::Bid) {
+            inventory_->record_buy(fill_base, fill.size, fill_price_usd,
+                                   fill.block_height, now);
+        } else {
+            // Confirmed fills must always reduce tracked inventory. The
+            // never-sell-at-loss rule is a pre-trade control, so bypass it
+            // here and only fail on missing or insufficient tracked quantity.
+            // ISO/IEC 5055: checked return value on every code path.
+            inventory_ok = inventory_->record_sell(
+                fill_base, fill.size, fill_price_usd,
+                fill.block_height, now, /*enforce_no_loss=*/false);
+        }
+
+        if (!inventory_ok) {
+            spdlog::error("[Engine] Step 2: inventory update REJECTED fill "
+                          "for {} {} @ {} mojos (block {}) -- "
+                          "tracked inventory missing or insufficient.  "
+                          "Fill was confirmed on-chain but the inventory "
+                          "tracker refused it.",
+                          fill.pair_name, fill.size, fill.price,
+                          fill.block_height);
+            // Alert on the inconsistency so the operator can investigate.
+            alerts_->send_alert(AlertRule::ExposureBreach,
+                "inventory update rejected confirmed fill for " +
+                fill.pair_name + " at block " +
+                std::to_string(fill.block_height) +
+                " -- state inconsistency");
+        }
+
+        // [PNL-BASIS-PERSIST] Durable basis: snapshot after every mutation.
+        persist_inventory_state();
+
+        // [LEDGER 2026-07-30] Post the balanced legs for this fill.  Safe to
+        // call on the duplicate path too: the legs carry the same
+        // (event_id, leg, asset) key and are ignored on re-post.  The
+        // quantities are the bot's OWN belief about the fill -- the whole
+        // point is for the invariant to surface where that belief and the
+        // wallet disagree.
+        {
+            const Mojo quote_mojos = static_cast<Mojo>(std::llround(
+                quote_mojos_for(
+                    static_cast<double>(fill.size),
+                    static_cast<double>(fill.price),
+                    static_cast<double>(fill_pair_cfg->base_mojos_per_unit),
+                    static_cast<double>(fill_pair_cfg->quote_mojos_per_unit))));
+            post_ledger_fill(fill, *fill_pair_cfg, quote_mojos);
+        }
+
+        if (!fill_newly_recorded) {
+            spdlog::warn("[Engine] Step 2: fill {} was already journalled -- "
+                         "side effects completed, signal feeds skipped",
+                         fill.offer_id.substr(0, 12));
+            continue;
+        }
+
         // [T5-CR1] VPIN validation: check if this fill is adverse.
         // An adverse fill is one where the maker sold below cost basis
         // (realized_pnl < 0) or bought at a price that immediately moved
@@ -2215,49 +2394,6 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
         }
 
-        // [T7-FIX] Removed duplicate db_->insert_trade(tr) here.
-        // PnLTracker::record_fill() (below) is the single writer for
-        // trade_log.  The prior dual-INSERT caused UNIQUE constraint
-        // violations on trade_id, which threw an exception in the
-        // PnLTracker and prevented in-memory PnL accumulators from
-        // being updated.  PnLTracker's INSERT includes all 12 columns
-        // (offer_hash, acquisition_ts) vs Database's 10-column INSERT.
-
-        // Record the offer as filled in the offer log.
-        db_->update_offer_status(fill.offer_id, "filled", fill.block_height, "");
-
-        // Update the inventory tracker using the pair's actual base asset.
-        auto now = std::chrono::system_clock::now();
-        // [H3] fill_pair_cfg is guaranteed non-null (guarded above).
-        const std::string& fill_base = fill_pair_cfg->base_asset_id;
-        if (fill.side == Side::Bid) {
-            inventory_->record_buy(fill_base, fill.size, fill.price,
-                                   fill.block_height, now);
-        } else {
-            // Confirmed fills must always reduce tracked inventory. The
-            // never-sell-at-loss rule is a pre-trade control, so bypass it
-            // here and only fail on missing or insufficient tracked quantity.
-            // ISO/IEC 5055: checked return value on every code path.
-            bool sell_ok = inventory_->record_sell(
-                fill_base, fill.size, fill.price,
-                fill.block_height, now, /*enforce_no_loss=*/false);
-            if (!sell_ok) {
-                spdlog::error("[Engine] Step 2: record_sell() REJECTED fill "
-                              "for {} {} @ {} mojos (block {}) -- "
-                              "tracked inventory missing or insufficient.  "
-                              "Fill was confirmed on-chain but inventory "
-                              "tracker refused it.",
-                              fill.pair_name, fill.size, fill.price,
-                              fill.block_height);
-                // Alert on the inconsistency so the operator can investigate.
-                alerts_->send_alert(AlertRule::ExposureBreach,
-                    "record_sell() rejected confirmed fill for " +
-                    fill.pair_name + " at block " +
-                    std::to_string(fill.block_height) +
-                    " -- state inconsistency");
-            }
-        }
-
         // [T3-08] Accumulate NHE (Natural Hedge Efficiency) data from fills.
         // Buys add positive inventory change; sells subtract.
         // Total volume accumulates the absolute fill size.
@@ -2270,12 +2406,6 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             nhe_net_inventory_change_ -= fill_size_d;
         }
         nhe_total_volume_ += fill_size_d;
-
-        // Feed the PnL tracker.
-        // [T9-FIX] Pass the pre-computed realized_pnl so PnLTracker uses
-        // a single source of truth instead of recomputing independently.
-        pnl_->record_fill(fill, tr.fee_mojos, tr.cost_basis_mojos,
-                          tr.realized_pnl_mojos);
 
         // [T5-CR3] Notify the strategy that a fill occurred so that the
         // exponential-decay tau resets to tau_max.  Without this call,
@@ -2574,8 +2704,20 @@ void Engine::step_compute_quotes(BlockHeight block_height)
 
         // Set cost basis on the per-pair strategy for the never-sell-at-loss
         // constraint.  Uses per-pair min_profit_margin_bps if overridden.
+        // [PNL-BASIS-USD] The stored basis is USD-normalized pseudo-units;
+        // strategies compare cost_basis_ against DISPLAY-unit prices (the
+        // same scale as `mid` passed to compute_quotes), so convert to this
+        // pair's quote currency AND divide out the kMojosPerXch fixed-point
+        // scale.  Passing pseudo-units here would overstate the floor by
+        // 1e12 and suppress every ask.  0 = unknown, which disables the
+        // floor exactly as an unknown basis did before.
         auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
-        double cost_basis = static_cast<double>(rec.weighted_avg_cost_basis);
+        double cost_basis = (rec.basis_is_seed_sentinel
+                             || rec.weighted_avg_cost_basis <= 1)
+            ? 0.0
+            : static_cast<double>(from_usd_pseudo(
+                  rec.weighted_avg_cost_basis, *pair_cfg))
+              / static_cast<double>(kMojosPerXch);
         double margin_bps = pair_cfg->min_profit_margin_bps_override.value_or(
             config_.strategy.min_profit_margin_bps);
         strategy.set_cost_basis(cost_basis, margin_bps);
@@ -3108,7 +3250,14 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
 
         // Enforce never-sell-at-loss on the ask price.
         // Use the pair's base asset (not hardcoded "xch") for cost-basis lookup.
+        // [PNL-BASIS-USD] Convert the USD-normalized basis into this pair's
+        // quote pseudo-units before comparing against pair prices; unknown
+        // (sentinel) bases map to 0, leaving the controls inert as before.
         auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
+        const Mojo basis_pair_units =
+            (rec.basis_is_seed_sentinel || rec.weighted_avg_cost_basis <= 1)
+                ? 0
+                : from_usd_pseudo(rec.weighted_avg_cost_basis, *pair_cfg);
 
         // [T4-09] Inventory aging: for positions that have been underwater
         // for an extended period, gradually relax the no-loss floor so that
@@ -3124,7 +3273,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
         //
         // The no-loss constraint is then applied against the lowered basis,
         // effectively allowing a controlled loss on the ask side.
-        Mojo effective_cost_basis = rec.weighted_avg_cost_basis;
+        Mojo effective_cost_basis = basis_pair_units;
         const auto& aging_cfg = config_.inventory_aging;
 
         if (aging_cfg.enabled && effective_cost_basis > 0) {
@@ -3134,11 +3283,16 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
             if (pos_age > 0 &&
                 static_cast<uint32_t>(pos_age) > aging_cfg.aging_start_blocks) {
                 // Position is old enough -- check if it is underwater.
+                // [PNL-BASIS-USD] is_underwater compares against the stored
+                // (USD-normalized) basis, so the mid must be USD-normalized
+                // too before the comparison.
                 Mojo mid_mojos_age = static_cast<Mojo>(std::llround(
                     mid * static_cast<double>(kMojosPerXch)));
+                const Mojo mid_usd_age =
+                    to_usd_pseudo(mid_mojos_age, *pair_cfg);
 
-                if (inventory_->is_underwater(
-                        AssetId{pair_cfg->base_asset_id}, mid_mojos_age)) {
+                if (mid_usd_age > 0 && inventory_->is_underwater(
+                        AssetId{pair_cfg->base_asset_id}, mid_usd_age)) {
                     uint32_t age_past_start =
                         static_cast<uint32_t>(pos_age) - aging_cfg.aging_start_blocks;
                     double discount_bps = std::min(
@@ -3147,7 +3301,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                             * aging_cfg.relax_rate_bps_per_block);
 
                     effective_cost_basis = static_cast<Mojo>(std::llround(
-                        static_cast<double>(rec.weighted_avg_cost_basis)
+                        static_cast<double>(basis_pair_units)
                         * (1.0 - discount_bps / 10'000.0)));
 
                     if (discount_bps > 0.0) {
@@ -3155,7 +3309,7 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
                             "age={} blocks, discount={:.1f} bps, "
                             "basis {} -> {} mojos",
                             pair_name, pos_age, discount_bps,
-                            rec.weighted_avg_cost_basis, effective_cost_basis);
+                            basis_pair_units, effective_cost_basis);
                     }
                 }
             }
@@ -3466,14 +3620,38 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             return uid;
         };
 
-        const auto positions = state_->get_all_positions();
         double total_xch = 0.0;
         std::unordered_map<std::string, double> asset_xch;
-        for (const auto& p : positions) {
-            const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
-            if (v <= 0.0) continue;
-            asset_xch[resolve_symbol(p.asset_id)] += v;
-            total_xch += v;
+        if (!cached_wallet_balances_.empty()) {
+            Mojo xch_bal = xch_confirmed_balance_;
+            auto xch_it = cached_wallet_balances_.find("xch");
+            if (xch_it != cached_wallet_balances_.end()) {
+                xch_bal = xch_it->second.confirmed;
+            }
+            if (xch_bal > 0) {
+                asset_xch["XCH"] = static_cast<double>(xch_bal);
+                total_xch += static_cast<double>(xch_bal);
+            }
+            for (const auto& [asset_id, bal_entry] : cached_wallet_balances_) {
+                if (asset_id == "xch" || asset_id == "XCH") continue;
+                Mojo confirmed = bal_entry.confirmed;
+                if (confirmed <= 0) continue;
+                double rate = state_->get_asset_xch_rate(AssetId{asset_id});
+                if (rate > 0.0) {
+                    double xch_val = static_cast<double>(confirmed) * rate;
+                    asset_xch[resolve_symbol(asset_id)] += xch_val;
+                    total_xch += xch_val;
+                }
+            }
+        }
+        if (total_xch <= 0.0) {
+            const auto positions = state_->get_all_positions();
+            for (const auto& p : positions) {
+                const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
+                if (v <= 0.0) continue;
+                asset_xch[resolve_symbol(p.asset_id)] += v;
+                total_xch += v;
+            }
         }
         if (total_xch > 0.0) {
             for (const auto& [k, v] : asset_xch) {
@@ -4633,7 +4811,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // -----------------------------------------------------------------
         if (pair_cfg && !pcs.ladder.empty()) {
             auto rec = inventory_->get_record(AssetId{pair_cfg->base_asset_id});
-            const Mojo cost_basis = rec.weighted_avg_cost_basis;
+            // [PNL-BASIS-USD] Convert the USD-normalized basis into this
+            // pair's quote pseudo-units; sentinel/unknown -> 0 (floor off).
+            const Mojo cost_basis =
+                (rec.basis_is_seed_sentinel
+                 || rec.weighted_avg_cost_basis <= 1)
+                    ? 0
+                    : from_usd_pseudo(rec.weighted_avg_cost_basis, *pair_cfg);
 
             if (cost_basis > 0) {
                 const double margin = config_.strategy.min_profit_margin_bps
@@ -5472,8 +5656,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             pair_quote_balance_known = true;
                         }
 
-                        // Update the cache for metrics.
-                        cached_wallet_balances_[sb.label] = {spendable, confirmed, pending};
+                        // Update the cache for metrics.  Stamp the block so
+                        // consumers can reject stale snapshots (Step 8 is
+                        // skipped in several engine modes while Step 2 keeps
+                        // mutating inventory).
+                        cached_wallet_balances_[sb.label] =
+                            {spendable, confirmed, pending, block_height};
                         const AssetId tracked_asset{sb.label};
                         if (confirmed > 0 && inventory_
                             && inventory_->net_inventory(tracked_asset) == 0)
@@ -5484,6 +5672,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                          "seed for asset {} from wallet "
                                          "confirmed balance {} mojos",
                                          sb.label, confirmed);
+                            // [PNL-BASIS-PERSIST] Step 11 upgrades this
+                            // sentinel to a market mark next heartbeat;
+                            // persist so a crash in between round-trips.
+                            persist_inventory_state();
                         }
                         if (confirmed > 0 && state_
                             && state_->get_position(tracked_asset).balance == 0)
@@ -7898,15 +8090,38 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
 
     std::unordered_map<std::string, double> portfolio_pct_by_asset;
     {
-        const auto positions = state_->get_all_positions();
         double total_xch = 0.0;
         std::unordered_map<std::string, double> asset_xch;
-        for (const auto& p : positions) {
-            const double v = static_cast<double>(
-                PreTradeCheck::mark_to_xch(p, *state_));
-            if (v <= 0.0) continue;
-            asset_xch[resolve_symbol(p.asset_id)] += v;
-            total_xch += v;
+        if (!cached_wallet_balances_.empty()) {
+            Mojo xch_bal = xch_confirmed_balance_;
+            auto xch_it = cached_wallet_balances_.find("xch");
+            if (xch_it != cached_wallet_balances_.end()) {
+                xch_bal = xch_it->second.confirmed;
+            }
+            if (xch_bal > 0) {
+                asset_xch["XCH"] = static_cast<double>(xch_bal);
+                total_xch += static_cast<double>(xch_bal);
+            }
+            for (const auto& [asset_id, bal_entry] : cached_wallet_balances_) {
+                if (asset_id == "xch" || asset_id == "XCH") continue;
+                Mojo confirmed = bal_entry.confirmed;
+                if (confirmed <= 0) continue;
+                double rate = state_->get_asset_xch_rate(AssetId{asset_id});
+                if (rate > 0.0) {
+                    double xch_val = static_cast<double>(confirmed) * rate;
+                    asset_xch[resolve_symbol(asset_id)] += xch_val;
+                    total_xch += xch_val;
+                }
+            }
+        }
+        if (total_xch <= 0.0) {
+            const auto positions = state_->get_all_positions();
+            for (const auto& p : positions) {
+                const double v = static_cast<double>(PreTradeCheck::mark_to_xch(p, *state_));
+                if (v <= 0.0) continue;
+                asset_xch[resolve_symbol(p.asset_id)] += v;
+                total_xch += v;
+            }
         }
         if (total_xch <= 0.0) co_return;
         for (const auto& [k, v] : asset_xch) {
@@ -8698,9 +8913,518 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
                   "NHE={:.3f}", positions.size(), nhe);
 }
 
+// ---------------------------------------------------------------------------
+// USD normalization helpers (PNL-BASIS-USD 2026-07-30) -- see engine.hpp for
+// the design rationale.  Peg assumptions mirror the GUI's pnl_usdc_expr
+// (gui/services/database_service.py): wUSDC/wUSDC.b/USDS/BYC = $1 per unit,
+// DBX cross-derived, XCH from a live stable-quoted mid.
+// ---------------------------------------------------------------------------
+
+double Engine::usd_per_xch() const
+{
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled || pair.base_asset_id != "xch") continue;
+        const auto slash = pair.name.find('/');
+        if (slash == std::string::npos) continue;
+        const std::string quote = pair.name.substr(slash + 1);
+        if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+            auto snap = state_->get_market(pair.name);
+            if (snap.mid_price > 0) {
+                return static_cast<double>(snap.mid_price)
+                     / static_cast<double>(kMojosPerXch);
+            }
+        }
+    }
+
+    // [PNL-BASIS-USD 2026-07-30] Return 0 ("unknown"), NOT the historical
+    // kFallbackXchUsdRate constant.  That constant is 2.70 while XCH has
+    // traded near $1.35, so using it would silently value fills at ~2x and
+    // -- now that cost basis is PERSISTED -- bake that error in permanently
+    // instead of it evaporating at the next restart.  Callers treat 0 as
+    // "no USD valuation": quote_usd_factor returns 0, the fill takes the
+    // unpriced path that leaves the basis intact, and the pair is excluded
+    // from USD totals until real market data arrives.
+    return 0.0;
+}
+
+double Engine::quote_usd_factor(const PairConfig& pc) const
+{
+    const auto slash = pc.name.find('/');
+    const std::string quote = (slash == std::string::npos)
+        ? std::string{}
+        : pc.name.substr(slash + 1);
+
+    // Fiat-collateralised wrappers hold their peg tightly enough to treat
+    // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
+    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+        return 1.0;
+    }
+
+    // BYC is a Chia-native CDP stablecoin that trades OFF peg (live
+    // BYC/wUSDC.b mid was $1.0554 on 2026-07-30).  Because one XCH cost
+    // basis is now shared across quote currencies, assuming $1 here would
+    // inject that error into every XCH/BYC fill.  Prefer the live cross,
+    // and fall back to par only when that market has no mid yet.
+    if (quote == "BYC") {
+        for (const auto& other : config_.pairs) {
+            if (!other.enabled) continue;
+            if (other.base_asset_id != pc.quote_asset_id) continue;
+            const auto oslash = other.name.find('/');
+            if (oslash == std::string::npos) continue;
+            const std::string oquote = other.name.substr(oslash + 1);
+            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
+                continue;
+            }
+            auto snap = state_->get_market(other.name);
+            if (snap.mid_price > 0) {
+                return static_cast<double>(snap.mid_price)
+                     / static_cast<double>(kMojosPerXch);
+            }
+        }
+        return 1.0;
+    }
+
+    if (pc.quote_asset_id == "xch") {
+        return usd_per_xch();
+    }
+
+    // Non-pegged quote (DBX): derive via this pair's own cross rate when the
+    // base is XCH:  usd_per_quote = usd_per_xch / quote_per_xch.
+    if (pc.base_asset_id == "xch") {
+        auto snap = state_->get_market(pc.name);
+        if (snap.mid_price > 0) {
+            const double quote_per_xch =
+                static_cast<double>(snap.mid_price)
+                / static_cast<double>(kMojosPerXch);
+            if (quote_per_xch > 0.0) {
+                return usd_per_xch() / quote_per_xch;
+            }
+        }
+    }
+
+    return 0.0;
+}
+
+Mojo Engine::to_usd_pseudo(Mojo pair_price, const PairConfig& pc) const
+{
+    if (pair_price <= 0) return 0;
+    const double f = quote_usd_factor(pc);
+    if (f <= 0.0) return 0;
+    return static_cast<Mojo>(std::llround(
+        static_cast<double>(pair_price) * f));
+}
+
+Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
+{
+    if (usd_price <= 0) return 0;
+    const double f = quote_usd_factor(pc);
+    if (f <= 0.0) return 0;
+    return static_cast<Mojo>(std::llround(
+        static_cast<double>(usd_price) / f));
+}
+
+Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
+{
+    // Prefer pricing the asset as the BASE of an enabled pair (live mid).
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled || pair.base_asset_id != asset_id) continue;
+        auto snap = state_->get_market(pair.name);
+        const double f = quote_usd_factor(pair);
+        if (snap.mid_price > 0 && f > 0.0) {
+            return static_cast<Mojo>(std::llround(
+                static_cast<double>(snap.mid_price) * f));
+        }
+    }
+    // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled || pair.quote_asset_id != asset_id) continue;
+        const double f = quote_usd_factor(pair);
+        if (f > 0.0) {
+            return static_cast<Mojo>(std::llround(
+                f * static_cast<double>(kMojosPerXch)));
+        }
+    }
+    return 0;
+}
+
+void Engine::persist_inventory_state() noexcept
+{
+    if (!inventory_ || !db_) return;
+    try {
+        std::vector<DbInventoryState> rows;
+        for (const auto& rec : inventory_->get_all_records()) {
+            DbInventoryState row;
+            row.asset_id               = rec.asset_id;
+            row.total_quantity         = rec.total_quantity;
+            row.total_cost             = rec.total_cost;
+            row.basis_is_seed_sentinel = rec.basis_is_seed_sentinel;
+            rows.push_back(std::move(row));
+        }
+        if (!rows.empty()) {
+            db_->save_inventory_state(rows);
+        }
+    } catch (...) {
+        spdlog::warn("[Engine] persist_inventory_state: unexpected failure");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Double-entry accounting (LEDGER 2026-07-30)
+//
+// Design notes, all empirically grounded (see docs/ACCOUNTING-POLICY.md):
+//
+//  * The ledger ties to confirmed_wallet_balance, never spendable.  Posting
+//    an offer locks WHOLE UTXOs, so spendable can drop by many XCH for a
+//    0.005 XCH fee -- tying to it would show a phantom outflow on every
+//    quote and a phantom inflow on every cancel.  confirmed is invariant
+//    across post/cancel cycles because the coins are still unspent.
+//
+//  * It does NOT tie to OnChainReconciler's on_chain figure.  That value is
+//    summed from get_spendable_coins, which excludes offer-reserved coins,
+//    making it structurally biased low: 1,599 of 1,599 samples over 2.9 days
+//    were negative, median -11.5 XCH, correlating +0.88 with open offer count.
+//
+//  * The ledger records what the bot BELIEVES happened, from its own event
+//    stream.  The gap against the wallet is the diagnostic signal, so the
+//    legs deliberately use the bot's own figures rather than being
+//    "corrected" from the wallet.
+// ---------------------------------------------------------------------------
+
+void Engine::post_ledger_genesis(
+    const std::unordered_map<AssetId, Mojo>& balances)
+{
+    if (!config_.accounting.ledger_enabled || !db_) return;
+
+    std::vector<DbLedgerEntry> legs;
+    const std::string now_iso =
+        PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+
+    for (const auto& [asset, balance] : balances) {
+        if (balance <= 0) continue;
+        if (db_->has_ledger_opening(asset)) continue;   // once, ever
+
+        DbLedgerEntry e;
+        e.entry_time  = now_iso;
+        e.event_type  = "opening";
+        e.event_id    = "genesis:" + asset;
+        e.leg         = "opening";
+        e.asset_id    = asset;
+        e.delta_mojos = balance;
+        e.note        = "opening balance from wallet confirmed_wallet_balance";
+        legs.push_back(std::move(e));
+    }
+
+    if (!legs.empty()) {
+        const std::size_t n = db_->append_ledger_entries(legs);
+        spdlog::info("[Engine] Ledger: posted {} opening balance legs "
+                     "(genesis)", n);
+    }
+    ledger_genesis_done_ = true;
+}
+
+void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
+                              Mojo quote_mojos)
+{
+    if (!config_.accounting.ledger_enabled || !db_) return;
+
+    const std::string ts = PnLTracker::timestamp_to_iso(fill.timestamp);
+    const bool is_bid = (fill.side == Side::Bid);
+
+    std::vector<DbLedgerEntry> legs;
+
+    auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
+        if (delta == 0) return;
+        DbLedgerEntry e;
+        e.entry_time   = ts;
+        e.event_type   = "fill";
+        e.event_id     = fill.offer_id;
+        e.leg          = leg_name;
+        e.asset_id     = asset;
+        e.delta_mojos  = delta;
+        e.pair_name    = fill.pair_name;
+        e.block_height = fill.block_height;
+        legs.push_back(std::move(e));
+    };
+
+    // Base leg: bought base on a bid, sold it on an ask.
+    add("base", pc.base_asset_id, is_bid ? fill.size : -fill.size);
+    // Quote leg: paid quote on a bid, received it on an ask.
+    add("quote", pc.quote_asset_id, is_bid ? -quote_mojos : quote_mojos);
+    // Fee leg: the creation fee rides in the offer's spend bundle and is
+    // actually paid only when the offer settles -- which is now.  (Booking
+    // it at post time would manufacture a phantom outflow for the ~94% of
+    // offers that are cancelled rather than filled.)
+    if (fill.fee_mojos > 0) {
+        add("fee", AssetId{"xch"}, -fill.fee_mojos);
+    }
+
+    db_->append_ledger_entries(legs);
+}
+
+Mojo Engine::live_offer_exposure(const AssetId& asset_id) const
+{
+    if (!state_) return 0;
+
+    Mojo exposure = 0;
+    for (const auto& po : state_->get_all_offers()) {
+        const PairConfig* pc = find_pair_config(po.pair_name);
+        if (!pc) continue;
+
+        if (po.side == Side::Ask) {
+            // Selling base: the base leg can leave at any moment.
+            if (pc->base_asset_id == asset_id) {
+                exposure += po.size;
+            } else if (pc->quote_asset_id == asset_id) {
+                exposure += static_cast<Mojo>(std::llround(quote_mojos_for(
+                    static_cast<double>(po.size), static_cast<double>(po.price),
+                    static_cast<double>(pc->base_mojos_per_unit),
+                    static_cast<double>(pc->quote_mojos_per_unit))));
+            }
+        } else {
+            // Buying base: the quote leg can leave, the base can arrive.
+            if (pc->quote_asset_id == asset_id) {
+                exposure += static_cast<Mojo>(std::llround(quote_mojos_for(
+                    static_cast<double>(po.size), static_cast<double>(po.price),
+                    static_cast<double>(pc->base_mojos_per_unit),
+                    static_cast<double>(pc->quote_mojos_per_unit))));
+            } else if (pc->base_asset_id == asset_id) {
+                exposure += po.size;
+            }
+        }
+    }
+    return exposure;
+}
+
+void Engine::step_check_ledger_invariant(BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !db_ || !inventory_) return;
+    if (!ledger_genesis_done_) return;
+
+    const auto ledger = db_->ledger_balances();
+    if (ledger.empty()) return;
+
+    for (const auto& [asset, cached] : cached_wallet_balances_) {
+        // -- Gates.  Each of these produces divergence that is NOT a
+        // bookkeeping error, so the check is skipped rather than alarmed.
+        if (cached.pending_change != 0) continue;      // coins in flight
+        if (cached.as_of_block == 0
+            || block_height < cached.as_of_block
+            || block_height - cached.as_of_block > acc.max_balance_age_blocks) {
+            continue;                                   // stale snapshot
+        }
+        if (cached.confirmed <= 0) continue;
+
+        auto lit = ledger.find(asset);
+        if (lit == ledger.end()) continue;              // no legs at all
+
+        // An asset can acquire FILL legs without ever having received an
+        // opening balance -- startup seeding is per-asset and a wallet RPC
+        // timeout skips one (observed 2026-07-26T08:46, both balance queries
+        // timed out).  Its ledger balance would then be short by the entire
+        // opening amount and breach on every check.  Require the opening leg;
+        // the next restart posts it and the asset starts being checked.
+        if (!db_->has_ledger_opening(AssetId{asset})) {
+            spdlog::debug("[Engine] Ledger: {} has no opening balance yet -- "
+                          "skipping invariant until genesis completes",
+                          asset.substr(0, 12));
+            continue;
+        }
+
+        const Mojo ledger_balance = lit->second;
+        const Mojo divergence     = ledger_balance - cached.confirmed;
+        const Mojo abs_div        = std::abs(divergence);
+
+        // -- Tolerance: what the wallet could legitimately have moved that
+        // the ledger has not seen yet.  The exposure term dominates while
+        // the book is live and collapses to 0 when it is empty, which is
+        // when this control becomes tight enough to catch a single fill.
+        const bool is_xch = (asset == "xch");
+        const Mojo floor  = is_xch ? acc.floor_xch_mojos : acc.floor_cat_mojos;
+        const Mojo fee_slack = is_xch ? acc.fee_slack_mojos : 0;
+        const Mojo exposure  = live_offer_exposure(AssetId{asset});
+
+        const Mojo alert_tol = exposure + fee_slack
+            + std::max(floor, static_cast<Mojo>(
+                  acc.alert_pct * static_cast<double>(cached.confirmed)));
+        const Mojo pause_tol = exposure + fee_slack
+            + std::max(floor, static_cast<Mojo>(
+                  acc.pause_pct * static_cast<double>(cached.confirmed)));
+
+        auto& st = ledger_breach_[asset];
+        const int sign = (divergence > 0) ? 1 : -1;
+
+        if (abs_div <= alert_tol) {
+            if (st.consecutive != 0) {
+                spdlog::debug("[Engine] Ledger: {} back within tolerance "
+                              "(divergence={} tol={})",
+                              asset.substr(0, 12), divergence, alert_tol);
+            }
+            st.consecutive = 0;
+            st.sign = 0;
+            continue;
+        }
+
+        // Sustained AND same-signed: latency self-heals, a real gap does not.
+        if (st.sign == sign) {
+            st.consecutive += 1;
+        } else {
+            st.consecutive = 1;
+            st.sign = sign;
+        }
+        st.last_divergence = divergence;
+
+        const double div_units = static_cast<double>(divergence)
+            / (is_xch ? 1e12 : 1e3);
+
+        spdlog::warn("[Engine] Ledger invariant breach: asset={} "
+                     "ledger={} wallet_confirmed={} divergence={} ({:.6f} units) "
+                     "tol={} exposure={} consecutive={}",
+                     asset.substr(0, 12), ledger_balance, cached.confirmed,
+                     divergence, div_units, alert_tol, exposure,
+                     st.consecutive);
+
+        const bool pause_breach =
+            (abs_div > pause_tol)
+            && (st.consecutive >= static_cast<int>(acc.pause_observations));
+
+        if (pause_breach) {
+            const std::string msg =
+                "Ledger/wallet divergence on " + asset.substr(0, 12) + ": books say "
+                + std::to_string(ledger_balance) + " mojos, wallet says "
+                + std::to_string(cached.confirmed) + " (gap "
+                + std::to_string(divergence) + " mojos = "
+                + std::to_string(div_units) + " units) sustained over "
+                + std::to_string(st.consecutive) + " checks. Balance-affecting "
+                "events are occurring that the bot is not recording.";
+
+            if (acc.pause_enabled) {
+                spdlog::error("[Engine] LEDGER CONTROL: {} -- PAUSING", msg);
+                state_->set_status(BotStatus::Paused);
+                alerts_->send_alert(AlertRule::CircuitBreaker,
+                    msg + " Engine PAUSED. Manual reconciliation required.");
+            } else {
+                // Default: report but keep trading.  Several real movements
+                // still have no ledger event (taker fills in Steps 9d/9f,
+                // external deposits and withdrawals), so auto-pausing would
+                // halt on legitimate activity.  Enable accounting.pause_enabled
+                // once the ledger runs clean.
+                spdlog::error("[Engine] LEDGER CONTROL: {} "
+                              "(pause disabled -- alert only)", msg);
+                alerts_->send_alert(AlertRule::ExposureBreach, msg);
+            }
+            st.consecutive = 0;  // avoid alert storms; re-arm from scratch
+        } else if (st.consecutive == static_cast<int>(acc.alert_observations)) {
+            alerts_->send_alert(AlertRule::ExposureBreach,
+                "Ledger/wallet divergence on " + asset.substr(0, 12) + ": "
+                + std::to_string(div_units) + " units unaccounted for over "
+                + std::to_string(st.consecutive) + " consecutive checks.");
+        }
+    }
+}
+
 // Step 11: Update PnL attribution.
 void Engine::step_update_pnl(BlockHeight block_height)
 {
+    if (pnl_first_block_ == 0) {
+        pnl_first_block_ = block_height;
+    }
+
+    const double xch_usd = usd_per_xch();
+
+    // [PNL-UNITS 2026-07-30] Register/refresh per-pair conversions so the
+    // tracker can key mark-to-market lookups by canonical asset id and
+    // normalize per-quote-currency P&L into USD.  Refreshing every
+    // heartbeat keeps the DBX cross-rate current.
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        pnl_->set_pair_conversion(
+            pair.name,
+            pair.base_asset_id,
+            static_cast<double>(pair.base_mojos_per_unit),
+            static_cast<double>(pair.quote_mojos_per_unit),
+            quote_usd_factor(pair));
+    }
+
+    // [PNL-BASIS-USD] Upgrade any remaining sentinel bases to the current
+    // market price ("mark at first observation").  With persistence this
+    // normally happens once per asset ever; it also absorbs Step-8
+    // zero-inventory re-seeds.
+    {
+        bool mutated = false;
+        std::unordered_set<std::string> tracked_assets;
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            tracked_assets.insert(pair.base_asset_id);
+            tracked_assets.insert(pair.quote_asset_id);
+        }
+
+        for (const auto& aid : tracked_assets) {
+            auto rec = inventory_->get_record(AssetId{aid});
+            if (rec.basis_is_seed_sentinel && rec.total_quantity > 0) {
+                const Mojo usd_price = asset_usd_pseudo_price(AssetId{aid});
+                if (usd_price > 1) {
+                    inventory_->reseed_basis(AssetId{aid}, usd_price);
+                    mutated = true;
+                    spdlog::info("[Engine] Step 11: upgraded sentinel cost "
+                                 "basis for {} to USD-pseudo {} "
+                                 "(mark-at-first-observation)",
+                                 aid.substr(0, 12), usd_price);
+                }
+            }
+        }
+
+        // One-shot-per-asset wallet reconcile (deposits/withdrawals while
+        // the engine was down).  Wait for the confirmation buffer to drain
+        // and a grace period to pass so downtime fills replay through the
+        // normal path first, otherwise the wallet delta double-applies.
+        constexpr BlockHeight kReconcileGraceBlocks = 20;
+        // A balance snapshot older than this cannot be trusted against a
+        // tracker that Step 2 has kept updating (Step 8, the only writer of
+        // cached_wallet_balances_, is skipped in several engine modes).
+        constexpr BlockHeight kBalanceMaxAgeBlocks = 10;
+
+        if (pending_unconfirmed_fills_.empty()
+            && block_height >= pnl_first_block_ + kReconcileGraceBlocks) {
+            for (const auto& [aid, bal] : cached_wallet_balances_) {
+                if (inventory_reconciled_assets_.count(aid)) continue;
+                if (tracked_assets.find(aid) == tracked_assets.end()) continue;
+                if (bal.pending_change != 0) continue;  // coins in flight
+                // Stale snapshot: skip WITHOUT consuming the one-shot so it
+                // is retried once Step 8 refreshes the balance.
+                if (bal.as_of_block == 0
+                    || block_height < bal.as_of_block
+                    || block_height - bal.as_of_block > kBalanceMaxAgeBlocks) {
+                    continue;
+                }
+
+                const Mojo tracked = inventory_->net_inventory(AssetId{aid});
+                if (bal.confirmed >= 0 && bal.confirmed != tracked) {
+                    const Mojo usd_price =
+                        asset_usd_pseudo_price(AssetId{aid});
+                    // An increase needs a price to cost the new lot; without
+                    // one adjust_quantity no-ops, so leave the asset
+                    // unreconciled and retry when a mark is available.
+                    if (bal.confirmed > tracked && usd_price <= 0) {
+                        continue;
+                    }
+                    inventory_->adjust_quantity(AssetId{aid}, bal.confirmed,
+                                                usd_price);
+                    mutated = true;
+                    spdlog::warn("[Engine] Step 11: reconciled {} inventory "
+                                 "{} -> {} mojos against wallet "
+                                 "(deposit/withdrawal while down?)",
+                                 aid.substr(0, 12), tracked, bal.confirmed);
+                }
+                inventory_reconciled_assets_.insert(aid);
+            }
+        }
+
+        if (mutated) {
+            persist_inventory_state();
+        }
+    }
+
     // Mark-to-market all positions.
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
@@ -8716,12 +9440,22 @@ void Engine::step_update_pnl(BlockHeight block_height)
         // get_cost_basis callback.
         [this](const std::string& asset) -> Mojo {
             auto rec = inventory_->get_record(AssetId{asset});
+            // [PNL-BASIS-USD 2026-07-30] Report an unknown basis as 0, the
+            // same convention the realized-P&L path uses (engine.cpp
+            // basis_unknown).  Marking a position against the 1-mojo
+            // sentinel would book the position's entire market value as
+            // "unrealized profit" -- e.g. 155 XCH at a $1.35 mid shows
+            // ~$209 of pure fiction.  mark_to_market skips a 0 basis.
+            if (rec.basis_is_seed_sentinel
+                || rec.weighted_avg_cost_basis <= 1) {
+                return 0;
+            }
             return rec.weighted_avg_cost_basis;
         },
-        // [H9] XCH/USD rate -- use named constant instead of magic number.
-        // TODO: fetch from CEX feed (Phase 2).
-        // ISO/IEC 5055: no magic numbers in financial calculations.
-        kFallbackXchUsdRate,
+        // [PNL-UNITS 2026-07-30] Live XCH/USD from an enabled stable-quoted
+        // pair's mid (falls back to kFallbackXchUsdRate only before the
+        // first market snapshot).  Previously hard-coded 2.70 forever.
+        xch_usd,
         // [PNL-UNIT-FIX] Per-pair unit factor (quote_denom/base_denom).
         // Without this the inventory PnL is overstated by 1e9 for
         // CAT-quoted pairs like XCH/wUSDC.b (kMojosPerXch / 1e3).
@@ -8762,8 +9496,14 @@ void Engine::step_update_pnl(BlockHeight block_height)
             : RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
         snap.regime = to_string(regime.regime);
 
-        auto pnl_summary = pnl_->get_total_pnl();
+        // [PNL-UNITS 2026-07-30] Store THIS pair's P&L, not the global
+        // total.  The prior get_total_pnl() stamped one identical global
+        // value onto every pair's row, and xch_usd_rate / pnl_total_usd
+        // were never populated (0 in all 136k historical rows).
+        auto pnl_summary = pnl_->get_pair_pnl(pair.name);
         snap.pnl_total_mojos = pnl_summary.total_pnl;
+        snap.pnl_total_usd   = pnl_summary.total_pnl_usd;
+        snap.xch_usd_rate    = xch_usd;
 
         // Phase 2: strategy decision parameters for post-hoc analysis.
         auto cycle_it = cycle_.find(pair.name);
@@ -8835,6 +9575,13 @@ void Engine::step_export_metrics(BlockHeight block_height)
     ps.unrealized = total.inventory_pnl;
     ps.spread     = total.spread_pnl;
     ps.inventory  = total.inventory_pnl;
+    // [PNL-UNITS 2026-07-30] USD-normalized components for display layers.
+    // The mojo fields above mix quote currencies and cannot be converted
+    // downstream; these are the values the GUI renders as money.
+    ps.usd            = total.total_pnl_usd;
+    ps.usd_realized   = total.realized_pnl_usd;
+    ps.usd_unrealized = total.unrealized_pnl_usd;
+    ps.usd_fees       = total.fee_pnl_usd;
     metrics_->update_pnl(ps);
 
     // Dashboard 2: Inventory

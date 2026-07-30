@@ -407,6 +407,72 @@ private:
         return (it != pair_config_map_.end()) ? it->second : nullptr;
     }
 
+    // -- USD normalization helpers (PNL-BASIS-USD 2026-07-30) ----------------
+    //
+    // The InventoryTracker keeps ONE cost-basis record per asset, but the
+    // engine's pseudo-prices are denominated per-pair in that pair's QUOTE
+    // currency.  XCH trades against wUSDC.b (~1.4e12), BYC (~1.2e12) and DBX
+    // (~1.4e14) simultaneously, so feeding raw pair prices into one shared
+    // record blended incompatible currencies.  All basis values are now
+    // stored in USD-normalized pseudo-units (USD-per-base-unit * 1e12):
+    // fills convert pair price -> USD on the way in (to_usd_pseudo) and
+    // basis -> pair price on the way out (from_usd_pseudo).  Mirrors the
+    // GUI's per-quote conversion in database_service.py::pnl_usdc_expr.
+
+    /// Live USD value of 1 XCH, derived from an enabled XCH/<usd-stable>
+    /// pair's mid price.  Falls back to kFallbackXchUsdRate when no such
+    /// market snapshot is available yet.
+    [[nodiscard]] double usd_per_xch() const;
+
+    /// USD value of one QUOTE display unit for the pair.  1.0 for
+    /// USD-pegged stables (wUSDC/wUSDC.b/USDS) and BYC; cross-derived for
+    /// DBX (usd_per_xch / dbx_per_xch); usd_per_xch for XCH-quoted pairs.
+    /// Returns 0.0 when unknown (pair excluded from USD accounting).
+    [[nodiscard]] double quote_usd_factor(const PairConfig& pc) const;
+
+    /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
+    /// Returns 0 when the quote's USD value is unknown.
+    [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
+                                     const PairConfig& pc) const;
+
+    /// Convert a USD-normalized pseudo-price back into the pair's quote
+    /// pseudo-price.  Returns 0 when the quote's USD value is unknown.
+    [[nodiscard]] Mojo from_usd_pseudo(Mojo usd_price,
+                                       const PairConfig& pc) const;
+
+    /// USD-normalized pseudo-price for one display unit of an asset,
+    /// resolved from any enabled pair that trades it (base: mid * factor;
+    /// quote: factor * kMojosPerXch).  0 when no market data yet.
+    [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// Snapshot all InventoryTracker records into the inventory_state table
+    /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
+    void persist_inventory_state() noexcept;
+
+    // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
+
+    /// Establish opening balances once, from the wallet's confirmed balances.
+    /// The ledger deliberately does NOT replay trade_log: that table was shown
+    /// to disagree with the wallet by ~665 XCH, so replaying it would import
+    /// the very corruption the ledger exists to detect.
+    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances);
+
+    /// Post the balanced legs of a settled fill (base, quote and fee).
+    /// Idempotent on the fill's trade id.
+    void post_ledger_fill(const Fill& fill, const PairConfig& pc,
+                          Mojo quote_mojos);
+
+    /// Notional of asset @p asset_id currently committed to live offers.
+    /// This bounds how much the wallet can legitimately move before the
+    /// ledger sees it, and collapses to 0 when the book is empty -- which is
+    /// what lets the control tighten to near-exact between quoting cycles.
+    [[nodiscard]] Mojo live_offer_exposure(const AssetId& asset_id) const;
+
+    /// Tie the ledger's implied balances to the wallet's confirmed balances
+    /// and escalate on sustained, unexplained divergence.  Alert-only unless
+    /// accounting.pause_enabled is set.
+    void step_check_ledger_invariant(BlockHeight block_height);
+
     /// Emit a trade decision-tree metric when the Prometheus exporter exists.
     void record_trade_decision_metric(const char* strategy,
                                       const char* scenario_id,
@@ -883,8 +949,51 @@ private:
         Mojo spendable{0};
         Mojo confirmed{0};
         Mojo pending_change{0};
+        // Block at which this snapshot was taken.  Step 8 (the only writer)
+        // is skipped during GUI pause, flash-crash, XCH-recovery and
+        // wallet-circuit-open, while Step 2 keeps processing fills -- so a
+        // consumer must check freshness or it may reconcile against a
+        // pre-fill balance and undo the fill (PNL-BASIS-PERSIST 2026-07-30).
+        BlockHeight as_of_block{0};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
+    // After restart the restored inventory quantities can drift from the
+    // wallet (deposits/withdrawals while the engine was down; fills settled
+    // during downtime are replayed via restored pending offers instead).
+    // Once cached_wallet_balances_ and market mids are warm, tracked
+    // quantities are reconciled to wallet truth exactly once per process:
+    // decreases draw cost down proportionally, increases are added at the
+    // current mid (mark-at-receipt).  Gated on an empty confirmation buffer
+    // plus a grace period so downtime fills replay through the normal path
+    // first (otherwise the wallet delta would be double-applied).
+    //
+    // Tracked PER ASSET, not as a single flag: an asset can be skipped on a
+    // given heartbeat (coins in flight, stale balance, no market mark), and
+    // a single flag would burn the one-shot for every other asset too.  A
+    // market maker reposting a ladder each block leaves XCH with
+    // pending_change != 0 most of the time, so the single-flag version
+    // almost never reconciled XCH -- the asset that needed it most.
+    std::unordered_set<std::string> inventory_reconciled_assets_;
+
+    /// First block height observed by step_update_pnl (0 = none yet).
+    /// Anchors the wallet-reconcile grace period above.
+    BlockHeight pnl_first_block_{0};
+
+    // -- Ledger invariant control state (LEDGER 2026-07-30) ---------------
+    // Consecutive same-sign breaches per asset.  A divergence caused by
+    // detection latency self-heals on the next observation; a real one does
+    // not, so escalation requires persistence rather than a single sample.
+    struct LedgerBreachState {
+        int  consecutive{0};
+        int  sign{0};          // +1 ledger above wallet, -1 below.
+        Mojo last_divergence{0};
+    };
+    std::unordered_map<std::string, LedgerBreachState> ledger_breach_;
+
+    /// True once opening balances have been established this process.
+    bool ledger_genesis_done_{false};
 
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.

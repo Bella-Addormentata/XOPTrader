@@ -1249,10 +1249,17 @@ class ReportsWidget(QWidget):
         confirmed_value, spendable_value, priced_wallets, total_wallets = (
             self._portfolio_values_usdc()
         )
-        live_total = int(self._live_pnl.get("total", 0) or 0)
-        live_realized = int(self._live_pnl.get("realized", 0) or 0)
-        live_unrealized = int(self._live_pnl.get("unrealized", 0) or 0)
-        live_inventory = int(self._live_pnl.get("inventory", 0) or 0)
+        # [PNL-UNITS 2026-07-30] Use the engine's per-pair quote-normalized
+        # USD gauges.  The xop_pnl_mojos components sum different quote
+        # currencies plus an XCH-mojo fee leg, so no divisor applied here
+        # would be correct (the old _money_text_from_mojos(/1e12 * rate)
+        # rendered a permanent $0.00).  None => engine predates the gauges.
+        total_usd = self._live_pnl.get("usd")
+        realized_usd = self._live_pnl.get("usd_realized")
+        unrealized_usd = self._live_pnl.get("usd_unrealized")
+
+        def _usd_text(value: float | None) -> str:
+            return "—" if value is None else _format_usdc(value, signed=True)
 
         self._set_metric_value(
             self._portfolio_labels["confirmed_value"],
@@ -1266,23 +1273,25 @@ class ReportsWidget(QWidget):
         )
         self._set_metric_value(
             self._portfolio_labels["total_pnl"],
-            _money_text_from_mojos(live_total, self._xch_usd_rate, signed=True),
-            live_total,
+            _usd_text(total_usd),
+            total_usd or 0.0,
         )
+        # Inventory P&L is the mark-to-market on open positions, i.e. the
+        # same quantity the engine exports as "unrealized".
         self._set_metric_value(
             self._portfolio_labels["inventory_pnl"],
-            _money_text_from_mojos(live_inventory, self._xch_usd_rate, signed=True),
-            live_inventory,
+            _usd_text(unrealized_usd),
+            unrealized_usd or 0.0,
         )
         self._set_metric_value(
             self._portfolio_labels["realized_pnl"],
-            _money_text_from_mojos(live_realized, self._xch_usd_rate, signed=True),
-            live_realized,
+            _usd_text(realized_usd),
+            realized_usd or 0.0,
         )
         self._set_metric_value(
             self._portfolio_labels["unrealized_pnl"],
-            _money_text_from_mojos(live_unrealized, self._xch_usd_rate, signed=True),
-            live_unrealized,
+            _usd_text(unrealized_usd),
+            unrealized_usd or 0.0,
         )
 
         if total_wallets > 0:

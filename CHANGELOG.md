@@ -5,6 +5,171 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-07-30 — P&L overhaul (unreleased; requires engine restart to take effect)
+
+Root-cause fix set for "P&L never worked".  A multi-agent audit against the
+live DB (774 fills, Apr 3–Jul 30) found realized P&L was recorded for only
+14 of 774 fills; every layer of the pipeline had an independent fault.
+
+### Fixed
+
+- **Cost-basis int64 overflow (the core bug)** (`cpp/src/risk/inventory.cpp`):
+  `total_cost = fill_price × qty` (~1e24 for XCH fills) was stored into an
+  int64; MSVC's out-of-range double→int64 cast saturated to INT64_MIN and the
+  basis clamped to 0 on the *first* XCH bid fill after every restart.  Every
+  later ask then hit the `basis <= 1` sentinel guard → `realized_pnl = 0`.
+  `AssetRecord::total_cost` is now a `double` end-to-end.
+- **Cost basis now survives restarts** (TODO #9): new `inventory_state` table
+  (`Database::save/load_inventory_state`), persisted after every fill/seed/
+  reconcile and restored at startup before wallet seeding.  Sentinel-seeded
+  assets are upgraded to a market mark ("mark at first observation") on the
+  first heartbeat with live mids (Step 11), and a one-shot wallet reconcile
+  classifies downtime deposits/withdrawals (`InventoryTracker::adjust_quantity`).
+- **PnLTracker rehydration**: `init_database()` now rebuilds per-pair
+  spread/fee/fill-count/gross accumulators from `trade_log`, so cumulative
+  P&L no longer resets to zero on every restart (snapshots proved it had
+  re-accumulated from 0 after each of ~20 restarts).
+- **Cross-currency basis blending**: one shared XCH basis was fed pseudo-
+  prices from wUSDC.b-, BYC- and DBX-quoted pairs (~1.2e12 vs ~1.4e14 scales).
+  Basis is now stored in USD-normalized pseudo-units, converted per pair via
+  `Engine::quote_usd_factor` (wUSDC*/USDS/BYC = $1/unit, DBX cross-derived);
+  `trade_log.cost_basis_mojos` keeps the pair's own quote units (converted on
+  write).
+- **Unrealized P&L was hardwired to zero**: `mark_to_market` looked up
+  balances/basis by display symbol ("XCH") while stores are keyed by
+  canonical asset id ("xch"/64-hex); every lookup missed.  It now resolves
+  the canonical id from the registered pair conversion.
+- **Fees silently 0 since June 2026**: the engine read the offer-creation fee
+  from `State` *after* `detect_fills` had removed the offer.  The fee now
+  travels on the `Fill` itself, captured at detection time.
+- **USD totals were unit soup**: quote-CAT mojos (1e3/unit) summed with XCH-
+  mojo fees (1e12/unit) then divided by 1e12 × hardcoded 2.70 — a $1 profit
+  rendered as ~$0.00.  `PnLTracker` now aggregates USD per pair via
+  registered conversions; new Prometheus gauge `xop_pnl_usd`; the XCH/USD
+  rate comes from a live stable-quoted mid instead of the 2.70 constant.
+- **GUI Reports page crashed on every refresh since 2026-04-21**:
+  `fetch_reports` died with `UnboundLocalError` (`fee_usdc_expr` assigned
+  from itself in the v0.7.46 refactor) before running any SQL.  Restored a
+  real definition; status bar and dashboard cards now use the engine's USD
+  gauge / per-quote conversions instead of dividing quote mojos by 1e12.
+- **Fill durability**: fill processing is journal-first (trade_log insert
+  before offer-status/inventory side effects) with idempotent duplicate
+  handling on `trade_id`, and both SQLite connections set
+  `PRAGMA busy_timeout=5000` — previously a transient lock during fill
+  processing lost the audit row forever.
+- **Per-pair snapshots**: `snapshots.pnl_total_mojos` stored the *global*
+  total on every pair's row and `xch_usd_rate`/`pnl_total_usd` were never
+  populated (0 in all 136k rows).  Now per-pair values + live rate.
+- **Stale tax export**: `export_trades_csv` still used the pre-v0.7.45
+  formula (missed by the v0.7.46 centralization); now routed through
+  `quote_mojos_for`.
+- **Uncommitted `detect_fills` guard**: `quote != "xch" || base != "xch"`
+  was a tautology; per-leg guard now as intended.
+
+Found by adversarial review of the fixes above, before deployment:
+
+- **Second int64 overflow, in `State::Position`** (`cpp/src/state.cpp`): the
+  identical `qty × price ≈ 1.3e24` overflow made `Position::add` **reject
+  every XCH buy** ("[Position] Overflow in cost basis -- addition rejected",
+  20 occurrences in the live log on 2026-07-29 alone), so State's XCH balance
+  could only ever decrease.  Latent until the keying fix above made
+  mark-to-market depend on that balance.  `total_cost` is now a `double`.
+- **Unpriced fills no longer fabricate a basis**: when a pair has no USD
+  valuation the engine used to pass a placeholder price of 1 to `record_buy`,
+  whose sentinel branch re-marks the *entire* holding at that price **and
+  clears the sentinel flag** — permanently destroying the basis with no way
+  for the mark-at-first-observation upgrade to repair it.  New
+  `InventoryTracker::record_fill_unpriced` tracks quantity and leaves the
+  basis and its repairability intact (and flags unknown-cost quantity as a
+  sentinel so it *is* repaired later).
+- **`usd_per_xch` no longer falls back to the hard-coded 2.70** — XCH has
+  traded near $1.35, so that constant valued fills at ~2× and, now that basis
+  is persisted, would have baked the error in permanently.  It reports 0
+  ("unknown") instead, which routes fills to the unpriced path.
+- **Shared base asset marked once**: XCH is the base of three enabled pairs,
+  and `mark_to_market` loops per pair while balances are per asset — the
+  whole XCH holding was valued three times and summed.
+- **BYC no longer assumed to be exactly $1.00**: it is a CDP stablecoin that
+  trades off peg (live `BYC/wUSDC.b` mid was $1.0554), and with one shared
+  XCH basis that error contaminated every `XCH/BYC` fill.  The live cross is
+  used when available.
+- **Sentinel basis excluded from mark-to-market**: marking a position against
+  the 1-mojo sentinel booked its entire market value as unrealized profit
+  (~$209 of fiction on a 155 XCH position).
+- **`query_pending_offers` column indices** (`cpp/src/database.cpp`): read
+  `created_block` into `fee_mojos`, so restored offers carried a *block
+  height* (~9e6) as their fee.  Pre-existing, but the fee fix above would
+  have written those into `trade_log` for every downtime fill.
+- **Wallet reconcile hardened**: tracked per asset instead of one global
+  flag (a market maker reposting each block leaves XCH with coins in flight,
+  so the single flag was consumed before XCH was ever reconciled), and
+  balance snapshots are now block-stamped and rejected when stale.
+- **Per-component USD gauges**: `xop_pnl_usd{component=total|realized|
+  unrealized|fees}` replaces the GUI's guesswork — it had been dividing
+  mixed-quote-currency mojos by 1e3, which overstates the DBX contribution
+  ~74× and the fee leg ~1e9×.  Absent gauges render as "—" rather than a
+  wrong number.
+- **Strategy cost-basis units**: `set_cost_basis` was handed fixed-point
+  pseudo-units while strategies compare against display-unit prices — a
+  latent 1e12 mismatch (dormant only because the strategy-level no-loss
+  constraint defaults off).
+- **Buy rows no longer persist a meaningless cost basis**: they stored the
+  *quote* asset's basis, which nothing ever updated and which is denominated
+  differently from the row's own price.
+
+### Added
+
+- **Double-entry ledger + reconciliation control** (`ledger_entries` table;
+  `docs/ACCOUNTING-POLICY.md`).  Every fill posts balanced legs (base, quote,
+  fee) keyed idempotently on `(event_id, leg, asset_id)`, so a re-detected
+  fill cannot double-post.  Opening balances come from the wallet at genesis
+  — the ledger deliberately does **not** replay `trade_log`, which would
+  import the ~665 XCH corruption it exists to detect.  Each heartbeat the
+  per-asset sum is tied to the wallet's **confirmed** balance.
+
+  The design is empirically grounded rather than assumed:
+  - Ties to `confirmed_wallet_balance`, never `spendable` — posting an offer
+    locks whole UTXOs, so spendable swings up to 100% of a wallet from the
+    bot's own quoting while confirmed is unchanged.
+  - Does **not** reuse `OnChainReconciler`'s `on_chain` figure, which is
+    summed from `get_spendable_coins` and therefore structurally biased low
+    (1,599 of 1,599 samples negative over 2.9 days, median −11.5 XCH,
+    correlating +0.88 with open-offer count) and triple-counts the XCH wallet.
+  - Tolerance is flow-based — live offer exposure + fee dust + a floor —
+    because the CAT wallets are small enough that one heartbeat of fills moves
+    20–75% of them, while 1% of the XCH wallet would hide a whole missed fill.
+  - Escalation requires consecutive **same-signed** breaches: the ledger can
+    only lag the wallet, so latency divergence self-heals and a real gap does
+    not.  Backtested over 205 heartbeats it is silent on all 134 dust/fill
+    intervals and fires on all 22 genuinely unexplained whole-XCH intervals.
+
+  Alert-only by default (`accounting.pause_enabled: false`) because taker
+  fills and external deposits still have no ledger event; auto-pausing would
+  halt on legitimate activity.
+
+- **Written accounting policy** (`docs/ACCOUNTING-POLICY.md`): chart of
+  accounts, double-entry rules, the control account, tolerance derivation,
+  cost-basis method (weighted average, IAS 2 / ASC 330), revenue recognition,
+  fee treatment, and the unresolved FIFO-vs-weighted-average gap for US tax
+  reporting.
+
+- **Durable local trade history** in `data/trade_history/` (see its README):
+  the engine appends every fill to `trades_live.csv`
+  (`PnLTracker::append_history_csv`); `scripts/export_trade_history.py`
+  regenerates `trades_full.csv` from the whole `trade_log` (dual price-era
+  aware, fees joined from `offer_log`); all 774 historical fills exported.
+- `cpp/tests/test_pnl_tracker.cpp`: first direct PnLTracker coverage
+  (rehydration, duplicate idempotency, USD conversion, canonical-id keying,
+  CSV mirror) plus XCH-scale overflow/persistence regression tests in
+  `test_inventory.cpp`.
+
+### Retired
+
+- `scripts/backfill_pnl.py` and `scripts/backfill_pnl_units.py` now refuse to
+  run (both corrupt `trade_log` if re-run; see their headers).
+  `scripts/compute_actual_pnl.py` (cash-flow method) remains the ground-truth
+  tool for pre-2026-07-30 history.
+
 ## [0.7.48] — 2026-04-25
 
 ### Added
