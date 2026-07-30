@@ -2037,6 +2037,10 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     read_u32 ("max_balance_age_blocks", cfg.max_balance_age_blocks);
     read_u32 ("observation_window",     cfg.observation_window);
     read_bool("auto_adjust_enabled",    cfg.auto_adjust_enabled);
+    read_bool("peg_monitor_enabled",    cfg.peg_monitor_enabled);
+    read_dbl ("peg_external_warn_pct",  cfg.peg_external_warn_pct);
+    read_dbl ("peg_implied_warn_pct",   cfg.peg_implied_warn_pct);
+    read_u32 ("peg_observations",       cfg.peg_observations);
 
     if (cfg.alert_pct < 0.0 || cfg.alert_pct > 1.0) {
         throw ConfigError(sec + ".alert_pct must be in [0,1]; got "
@@ -2055,6 +2059,12 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     }
     if (cfg.observation_window == 0) {
         throw ConfigError(sec + ".observation_window must be >= 1");
+    }
+    if (cfg.peg_external_warn_pct <= 0.0 || cfg.peg_implied_warn_pct <= 0.0) {
+        throw ConfigError(sec + " peg warn thresholds must be > 0");
+    }
+    if (cfg.peg_observations == 0) {
+        throw ConfigError(sec + ".peg_observations must be >= 1");
     }
     if (cfg.pause_observations > cfg.observation_window
         || cfg.alert_observations > cfg.observation_window) {

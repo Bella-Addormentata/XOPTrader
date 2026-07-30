@@ -1042,6 +1042,38 @@ struct AccountingConfig {
     /// both proper accounting treatment and the measurement wanted:
     ///   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
     bool     auto_adjust_enabled{true};
+
+    // -- Stablecoin peg monitor (2026-07-30) -------------------------------
+    //
+    // Accounting values wUSDC.b / wUSDC / USDS at exactly $1.00 -- they are
+    // the numeraire, and feeding a live rate into a PERSISTED cost basis
+    // recreates the bug class removed in v0.8.0 (a hardcoded 2.70 XCH rate
+    // baked into stored basis).  The exposure to an actual depeg is real
+    // though, so it is MONITORED instead of being priced in.
+    //
+    // Note this is not covered by the existing `depeg:` detector, which
+    // compares a pair's own mid against a config constant and is registered
+    // only for BYC/wUSDC.b -- it can never see wUSDC.b itself move, because
+    // wUSDC.b is that pair's quote unit.
+    bool     peg_monitor_enabled{true};
+
+    /// CoinGecko `usd-coin` vs $1.00.  Catches a NATIVE USDC depeg.  Clean,
+    /// low-noise signal, so a tight threshold is appropriate.
+    double   peg_external_warn_pct{1.0};
+
+    /// Implied wUSDC.b value from cex_mid / dex_mid on XCH/wUSDC.b.  Catches
+    /// a BRIDGE depeg, which the CoinGecko feed cannot see (native USDC can
+    /// hold $1.00 while the wrapper breaks).
+    ///
+    /// Threshold must clear the structural DEX-vs-CEX basis on this venue.
+    /// The engine's existing arbitrage signal is algebraically the same
+    /// quantity; across 217 logged samples it ran p50 78 bps, p90 118 bps,
+    /// max 218 bps.  3% sits above that observed noise floor.
+    double   peg_implied_warn_pct{3.0};
+
+    /// Consecutive breaching observations before alerting.  DEX-vs-CEX basis
+    /// spikes are transient; a real depeg persists.
+    uint32_t peg_observations{4};
 };
 
 struct InventoryAgingConfig {

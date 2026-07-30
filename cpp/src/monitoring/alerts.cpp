@@ -78,6 +78,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::NewPairVolume:        return "NewPairVolume";
         case AlertRule::ArbitrageDetected:    return "ArbitrageDetected";
         case AlertRule::LedgerDivergence:     return "LedgerDivergence";
+        case AlertRule::StablecoinDepeg:      return "StablecoinDepeg";
     }
     return "UNKNOWN";
 }
@@ -104,6 +105,11 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // with auto-adjust on, it does not by itself endanger capital.
         case AlertRule::LedgerDivergence:
             return AlertTier::WARNING;
+
+        // A quote stablecoin leaving its peg mis-values the entire book and
+        // every USD figure derived from it -- treat as critical.
+        case AlertRule::StablecoinDepeg:
+            return AlertTier::CRITICAL;
 
         // INFO (rules 12-15).
         case AlertRule::HourlyPnl:

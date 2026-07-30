@@ -479,6 +479,11 @@ private:
     /// accounting.pause_enabled is set.
     void step_check_ledger_invariant(BlockHeight block_height);
 
+    /// Alert when a quote stablecoin leaves its peg.  Accounting keeps
+    /// valuing wUSDC.b/wUSDC/USDS at $1.00 either way -- this makes the
+    /// exposure visible rather than silently priced in.
+    void step_check_stablecoin_peg(BlockHeight block_height);
+
     /// Emit a trade decision-tree metric when the Prometheus exporter exists.
     void record_trade_decision_metric(const char* strategy,
                                       const char* scenario_id,
@@ -1007,6 +1012,10 @@ private:
     /// True once opening balances have been established this process.
     bool ledger_genesis_done_{false};
 
+    /// Consecutive breaching observations per peg signal, keyed by signal
+    /// name.  DEX-vs-CEX basis spikes are transient; a real depeg persists.
+    std::unordered_map<std::string, int> peg_breach_;
+
     /// Chain height observed during startup reconcile; the anchor for
     /// genesis so downtime fills are not counted twice.
     BlockHeight startup_block_{0};
@@ -1015,6 +1024,16 @@ private:
     /// A fill at or below an asset's genesis block is already inside its
     /// opening balance and must not post a leg.
     std::unordered_map<std::string, BlockHeight> ledger_genesis_block_;
+
+    /// Assets that actually have an `opening` leg.  Legs are posted ONLY for
+    /// these.  A per-asset wallet RPC timeout at startup (observed on this
+    /// deployment 2026-07-26 for the XCH wallet) leaves an asset unopened;
+    /// posting its fills anyway would put legs in the ledger with no opening
+    /// balance, and the NEXT restart would then open at a wallet balance that
+    /// already reflects them -- baking in a permanent divergence equal to the
+    /// whole session's flow, carrying the same signature as the phantom-fill
+    /// bug this control exists to measure.
+    std::unordered_set<std::string> ledger_opened_assets_;
 
     /// Set when a ledger write FAILED (not merely duplicated).  The ledger
     /// is then known-incomplete, so the invariant control stands down rather

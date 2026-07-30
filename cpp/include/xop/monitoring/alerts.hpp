@@ -99,6 +99,7 @@ enum class AlertRule : std::uint8_t {
     ArbitrageDetected    = 15, // Cross-venue or cross-bridge arb opportunity.
 
     // Accounting (rule 16)
+    StablecoinDepeg      = 17, // A quote stablecoin has left its peg.
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,

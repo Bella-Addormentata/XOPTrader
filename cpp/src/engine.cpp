@@ -1713,6 +1713,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::error("[Engine] Ledger invariant check failed: {}", e.what());
     }
 
+    try { step_check_stablecoin_peg(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Stablecoin peg check failed: {}", e.what());
+    }
+
     try { step_export_metrics(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 12 (metrics) failed: {}", e.what());
@@ -9538,6 +9543,76 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
                 spdlog::error("[Engine] Ledger: failed to post adjusting entry "
                               "for {} -- control disabled", asset.substr(0, 12));
             }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Stablecoin peg monitor (2026-07-30)
+//
+// Accounting deliberately keeps valuing wUSDC.b / wUSDC / USDS at exactly
+// $1.00: they are the numeraire, and putting a live rate into a PERSISTED
+// cost basis recreates the failure removed in v0.8.0 (a hardcoded 2.70 XCH
+// rate baked into stored basis, then 2x wrong for months).  The exposure to
+// a genuine depeg is real, so it is surfaced here instead of priced in.
+//
+// The existing `depeg:` detector does NOT cover this.  It compares a pair's
+// own mid against a config constant and is registered only for BYC/wUSDC.b,
+// so it structurally cannot see wUSDC.b move -- wUSDC.b is that pair's quote
+// unit, and if both legs fell together it would read 0.00% forever.
+// ---------------------------------------------------------------------------
+void Engine::step_check_stablecoin_peg([[maybe_unused]] BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.peg_monitor_enabled) return;
+
+    // Score a signal: count consecutive breaches, alert once on crossing.
+    auto score = [&](const std::string& key, double deviation_pct,
+                     double threshold_pct, const std::string& detail) {
+        if (deviation_pct <= threshold_pct) {
+            peg_breach_[key] = 0;
+            return;
+        }
+        const int n = ++peg_breach_[key];
+        spdlog::warn("[Engine] Peg watch: {} deviation {:.3f}% > {:.3f}% "
+                     "({}) [{}/{}]",
+                     key, deviation_pct, threshold_pct, detail, n,
+                     acc.peg_observations);
+        if (n == static_cast<int>(acc.peg_observations)) {
+            spdlog::error("[Engine] STABLECOIN DEPEG: {} -- {}", key, detail);
+            alerts_->send_alert(AlertRule::StablecoinDepeg,
+                "Stablecoin peg alert (" + key + "): " + detail
+                + ". Accounting still values it at $1.00, so every USD figure "
+                  "is overstated by this amount until it recovers.");
+        }
+    };
+
+    // -- Signal 1: native USDC vs par (CoinGecko) --------------------------
+    // Silent when the feed is empty or stale rather than alarming on it.
+    auto usdc_it = coingecko_prices_.find("usd-coin");
+    if (usdc_it != coingecko_prices_.end() && usdc_it->second > 0.0) {
+        const double usdc = usdc_it->second;
+        const double dev  = std::abs(usdc - 1.0) * 100.0;
+        score("usd-coin/external", dev, acc.peg_external_warn_pct,
+              "CoinGecko USDC = $" + std::to_string(usdc));
+    }
+
+    // -- Signal 2: implied wUSDC.b from the DEX/CEX ratio ------------------
+    // implied = cg_usdc * (cex_xch_per_usdc / dex_xch_per_wusdcb).  A wrapper
+    // trading BELOW par makes XCH look expensive on-chain, so dex > cex and
+    // implied < 1.  This is the only available signal for BRIDGE failure.
+    auto xch_it = coingecko_prices_.find("chia");
+    if (xch_it != coingecko_prices_.end() && usdc_it != coingecko_prices_.end()
+        && xch_it->second > 0.0 && usdc_it->second > 0.0) {
+        const double dex_mid = market_data_->get_mid_price("XCH/wUSDC.b");
+        if (dex_mid > 0.0) {
+            const double cex_mid = xch_it->second / usdc_it->second;
+            const double implied = usdc_it->second * (cex_mid / dex_mid);
+            const double dev     = std::abs(implied - 1.0) * 100.0;
+            score("wUSDC.b/implied", dev, acc.peg_implied_warn_pct,
+                  "implied wUSDC.b = $" + std::to_string(implied)
+                  + " (dex " + std::to_string(dex_mid)
+                  + " vs cex " + std::to_string(cex_mid) + ")");
         }
     }
 }
