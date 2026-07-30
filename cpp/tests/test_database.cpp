@@ -1,4 +1,4 @@
-#include <gtest/gtest.h>
+﻿#include <gtest/gtest.h>
 #include <sqlite3.h>
 
 #include <xop/database.hpp>
@@ -413,14 +413,14 @@ TEST(DatabaseTest, LedgerBalancesSumSignedLegs) {
     ASSERT_EQ(db.append_ledger_entries({
         leg("genesis:xch", "opening", "xch", 100'000'000'000'000LL, "opening"),
         leg("genesis:usdc", "opening", "usdc", 500'000LL, "opening"),
-    }), 2u);
+    }).value_or(999), 2u);
 
     // An ask fill: sold 1 XCH for 1,350 wUSDC.b mojos, paid a 5,000 mojo fee.
     ASSERT_EQ(db.append_ledger_entries({
         leg("trade-1", "base",  "xch",  -1'000'000'000'000LL),
         leg("trade-1", "quote", "usdc",  1'350LL),
         leg("trade-1", "fee",   "xch",  -5'000LL),
-    }), 3u);
+    }).value_or(999), 3u);
 
     const auto bal = db.ledger_balances();
     ASSERT_EQ(bal.size(), 2u);
@@ -438,10 +438,13 @@ TEST(DatabaseTest, LedgerRePostingSameEventIsIdempotent) {
         leg("trade-dup", "quote", "usdc",  1'350LL),
     };
 
-    EXPECT_EQ(db.append_ledger_entries(legs), 2u);
-    // A fill re-detected after a crash re-posts identical legs.
-    EXPECT_EQ(db.append_ledger_entries(legs), 0u)
-        << "re-posting an existing event must insert nothing";
+    EXPECT_EQ(db.append_ledger_entries(legs).value_or(999), 2u);
+    // A fill re-detected after a crash re-posts identical legs.  This is a
+    // SUCCESSFUL write that inserted nothing -- distinct from a failure,
+    // which returns nullopt.
+    const auto replay = db.append_ledger_entries(legs);
+    ASSERT_TRUE(replay.has_value()) << "a duplicate replay is not a failure";
+    EXPECT_EQ(*replay, 0u) << "re-posting an existing event must insert nothing";
 
     const auto bal = db.ledger_balances();
     EXPECT_EQ(bal.at("xch"), -1'000'000'000'000LL)
@@ -457,14 +460,14 @@ TEST(DatabaseTest, LedgerOpeningRecordedOncePerAsset) {
     EXPECT_FALSE(db.has_ledger_opening("xch"));
     ASSERT_EQ(db.append_ledger_entries({
         leg("genesis:xch", "opening", "xch", 61'685'000'000'000LL, "opening"),
-    }), 1u);
+    }).value_or(999), 1u);
     EXPECT_TRUE(db.has_ledger_opening("xch"));
     EXPECT_FALSE(db.has_ledger_opening("usdc"));
 
     // A second genesis attempt (e.g. a later restart) must not re-open.
     EXPECT_EQ(db.append_ledger_entries({
         leg("genesis:xch", "opening", "xch", 99'999'000'000'000LL, "opening"),
-    }), 0u);
+    }).value_or(999), 0u);
     EXPECT_EQ(db.ledger_balances().at("xch"), 61'685'000'000'000LL);
 }
 
@@ -472,10 +475,10 @@ TEST(DatabaseTest, LedgerSurvivesReopen) {
     TempDbPath temp("ledger_reopen");
     {
         xop::Database db(temp.path().string());
-        db.append_ledger_entries({
+        ASSERT_TRUE(db.append_ledger_entries({
             leg("genesis:xch", "opening", "xch", 10'000'000'000'000LL, "opening"),
             leg("trade-a", "base", "xch", -2'000'000'000'000LL),
-        });
+        }).has_value());
     }
     xop::Database db2(temp.path().string());
     EXPECT_EQ(db2.ledger_balances().at("xch"), 8'000'000'000'000LL);
@@ -489,14 +492,14 @@ TEST(DatabaseTest, LedgerRevealsPhantomFillAsDivergence) {
     xop::Database db(temp.path().string());
 
     const xop::Mojo opening = 61'685'000'000'000LL;   // 61.685 XCH observed
-    db.append_ledger_entries({
+    ASSERT_TRUE(db.append_ledger_entries({
         leg("genesis:xch", "opening", "xch", opening, "opening"),
-    });
+    }).has_value());
 
     // The bot believes it sold 5 XCH, but the wallet balance never moved.
-    db.append_ledger_entries({
+    ASSERT_TRUE(db.append_ledger_entries({
         leg("phantom-1", "base", "xch", -5'000'000'000'000LL),
-    });
+    }).has_value());
 
     const xop::Mojo ledger_balance = db.ledger_balances().at("xch");
     const xop::Mojo wallet_confirmed = opening;   // unchanged on chain
@@ -505,3 +508,4 @@ TEST(DatabaseTest, LedgerRevealsPhantomFillAsDivergence) {
     EXPECT_EQ(divergence, -5'000'000'000'000LL)
         << "the books should be short by exactly the phantom fill size";
 }
+

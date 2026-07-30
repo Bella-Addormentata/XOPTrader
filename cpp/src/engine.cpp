@@ -760,6 +760,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 spdlog::debug("[Engine] Could not fetch block height for "
                               "orphan evaluation: {}", e.what());
             }
+            // [LEDGER] Anchor for genesis: fills that settled at or below
+            // this height are already inside the opening wallet balance.
+            startup_block_ = startup_block;
 
             // Load what the DB remembers as pending.
             auto db_pending = db_->query_pending_offers();
@@ -1026,8 +1029,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
             persist_inventory_state();
 
             // [LEDGER] Establish opening balances (no-op after the first
-            // run -- the 'opening' legs already exist).
-            post_ledger_genesis(genesis_balances);
+            // run -- the 'opening' legs already exist).  Anchored to the
+            // startup block so downtime fills are not counted twice.
+            post_ledger_genesis(genesis_balances, startup_block_);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
@@ -9091,7 +9095,8 @@ void Engine::persist_inventory_state() noexcept
 // ---------------------------------------------------------------------------
 
 void Engine::post_ledger_genesis(
-    const std::unordered_map<AssetId, Mojo>& balances)
+    const std::unordered_map<AssetId, Mojo>& balances,
+    BlockHeight at_block)
 {
     if (!config_.accounting.ledger_enabled || !db_) return;
 
@@ -9100,25 +9105,45 @@ void Engine::post_ledger_genesis(
         PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
 
     for (const auto& [asset, balance] : balances) {
+        // An asset with no opening leg is simply not checked (see
+        // step_check_ledger_invariant), so skipping a zero balance here is
+        // safe -- but it must still be anchored when it IS opened later,
+        // which the at_block stamp below provides.
         if (balance <= 0) continue;
         if (db_->has_ledger_opening(asset)) continue;   // once, ever
 
         DbLedgerEntry e;
-        e.entry_time  = now_iso;
-        e.event_type  = "opening";
-        e.event_id    = "genesis:" + asset;
-        e.leg         = "opening";
-        e.asset_id    = asset;
-        e.delta_mojos = balance;
-        e.note        = "opening balance from wallet confirmed_wallet_balance";
+        e.entry_time   = now_iso;
+        e.event_type   = "opening";
+        e.event_id     = "genesis:" + asset;
+        e.leg          = "opening";
+        e.asset_id     = asset;
+        e.delta_mojos  = balance;
+        e.block_height = at_block;
+        e.note         = "opening balance from wallet confirmed_wallet_balance";
         legs.push_back(std::move(e));
     }
 
     if (!legs.empty()) {
-        const std::size_t n = db_->append_ledger_entries(legs);
-        spdlog::info("[Engine] Ledger: posted {} opening balance legs "
-                     "(genesis)", n);
+        const auto n = db_->append_ledger_entries(legs);
+        if (n) {
+            spdlog::info("[Engine] Ledger: posted {} opening balance legs "
+                         "(genesis at block {})", *n, at_block);
+        } else {
+            spdlog::error("[Engine] Ledger: FAILED to post opening balances -- "
+                          "invariant control will stay down until a restart "
+                          "establishes them");
+            return;   // leave ledger_genesis_done_ false: control stays off
+        }
     }
+
+    // Cache each asset's genesis anchor (including assets opened by an
+    // earlier run) so fills that predate it can be suppressed.
+    for (const auto& [asset, balance] : balances) {
+        (void)balance;
+        ledger_genesis_block_[asset] = db_->ledger_opening_block(asset);
+    }
+
     ledger_genesis_done_ = true;
 }
 
@@ -9134,6 +9159,21 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
 
     auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
         if (delta == 0) return;
+        // Suppress fills already inside the opening balance.  An offer
+        // restored from a previous run can settle while the engine is down;
+        // the wallet balance captured at genesis already reflects it, and
+        // detect_fills reports it afterwards.  Posting a leg for it would
+        // double-count and leave a permanent, unrepairable divergence.
+        auto git = ledger_genesis_block_.find(asset);
+        if (git != ledger_genesis_block_.end() && git->second > 0
+            && fill.block_height > 0 && fill.block_height <= git->second) {
+            spdlog::info("[Engine] Ledger: fill {} on {} settled at block {} "
+                         "at/below genesis block {} -- already in the opening "
+                         "balance, leg suppressed",
+                         fill.offer_id.substr(0, 12), asset.substr(0, 12),
+                         fill.block_height, git->second);
+            return;
+        }
         DbLedgerEntry e;
         e.entry_time   = ts;
         e.event_type   = "fill";
@@ -9158,7 +9198,26 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
         add("fee", AssetId{"xch"}, -fill.fee_mojos);
     }
 
-    db_->append_ledger_entries(legs);
+    if (legs.empty()) return;
+
+    // A dropped fill leg is UNRECOVERABLE: the fill is not re-processed, so
+    // the ledger stays permanently short and the invariant would report a
+    // divergence of our own making.  Stand the control down instead, and log
+    // the legs so they can be replayed by hand.
+    if (!db_->append_ledger_entries(legs)) {
+        ledger_incomplete_ = true;
+        spdlog::error("[Engine] Ledger: FAILED to post legs for fill {} ({} {} "
+                      "size={} price={}) -- ledger is now INCOMPLETE and the "
+                      "invariant control is disabled for this process. "
+                      "Replay these legs manually or restart to re-baseline.",
+                      fill.offer_id, fill.pair_name,
+                      (fill.side == Side::Bid) ? "bid" : "ask",
+                      fill.size, fill.price);
+        alerts_->send_alert(AlertRule::ExposureBreach,
+            "Ledger write failed for fill " + fill.offer_id.substr(0, 16)
+            + " on " + fill.pair_name
+            + " -- accounting is incomplete until the engine is restarted.");
+    }
 }
 
 Mojo Engine::live_offer_exposure(const AssetId& asset_id) const
@@ -9199,21 +9258,47 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
     if (!acc.ledger_enabled || !db_ || !inventory_) return;
-    if (!ledger_genesis_done_) return;
+
+    // Say so out loud when the control is not running -- a silent no-op is
+    // indistinguishable from "all clear", which is the worst failure mode a
+    // safety check can have.
+    if (!ledger_genesis_done_) {
+        spdlog::warn("[Engine] Ledger invariant NOT running: opening balances "
+                     "were never established (startup wallet query failed?). "
+                     "Restart to establish them.");
+        return;
+    }
+    if (ledger_incomplete_) {
+        spdlog::warn("[Engine] Ledger invariant NOT running: a ledger write "
+                     "failed earlier, so the books are known-incomplete. "
+                     "Restart to re-baseline.");
+        return;
+    }
 
     const auto ledger = db_->ledger_balances();
     if (ledger.empty()) return;
 
     for (const auto& [asset, cached] : cached_wallet_balances_) {
-        // -- Gates.  Each of these produces divergence that is NOT a
-        // bookkeeping error, so the check is skipped rather than alarmed.
-        if (cached.pending_change != 0) continue;      // coins in flight
+        // -- Gates.  A stale snapshot is genuinely unusable, so skip it.
         if (cached.as_of_block == 0
             || block_height < cached.as_of_block
             || block_height - cached.as_of_block > acc.max_balance_age_blocks) {
             continue;                                   // stale snapshot
         }
         if (cached.confirmed <= 0) continue;
+
+        // NOTE: coins in flight are ACCOUNTED FOR, not skipped.  An earlier
+        // draft skipped the asset whenever pending_change != 0 -- but a
+        // market maker reposting a ladder every block leaves XCH with coins
+        // in flight most of the time, so that gate would have blinded the
+        // control on the very asset it exists to watch, while looking
+        // healthy.  An unconfirmed spend removes its input coin from
+        // `confirmed` and parks the change in `pending_change`, so the
+        // wallet's true holding is the sum of the two; the magnitude is also
+        // added to the tolerance because the split between them is only
+        // settled once the spend confirms.
+        const Mojo wallet_total = cached.confirmed + cached.pending_change;
+        const Mojo inflight_slack = std::abs(cached.pending_change);
 
         auto lit = ledger.find(asset);
         if (lit == ledger.end()) continue;              // no legs at all
@@ -9232,7 +9317,7 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         }
 
         const Mojo ledger_balance = lit->second;
-        const Mojo divergence     = ledger_balance - cached.confirmed;
+        const Mojo divergence     = ledger_balance - wallet_total;
         const Mojo abs_div        = std::abs(divergence);
 
         // -- Tolerance: what the wallet could legitimately have moved that
@@ -9244,81 +9329,114 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         const Mojo fee_slack = is_xch ? acc.fee_slack_mojos : 0;
         const Mojo exposure  = live_offer_exposure(AssetId{asset});
 
-        const Mojo alert_tol = exposure + fee_slack
+        const Mojo alert_tol = exposure + fee_slack + inflight_slack
             + std::max(floor, static_cast<Mojo>(
                   acc.alert_pct * static_cast<double>(cached.confirmed)));
-        const Mojo pause_tol = exposure + fee_slack
+        const Mojo pause_tol = exposure + fee_slack + inflight_slack
             + std::max(floor, static_cast<Mojo>(
                   acc.pause_pct * static_cast<double>(cached.confirmed)));
 
-        auto& st = ledger_breach_[asset];
-        const int sign = (divergence > 0) ? 1 : -1;
-
-        if (abs_div <= alert_tol) {
-            if (st.consecutive != 0) {
-                spdlog::debug("[Engine] Ledger: {} back within tolerance "
-                              "(divergence={} tol={})",
-                              asset.substr(0, 12), divergence, alert_tol);
-            }
-            st.consecutive = 0;
-            st.sign = 0;
-            continue;
-        }
-
-        // Sustained AND same-signed: latency self-heals, a real gap does not.
-        if (st.sign == sign) {
-            st.consecutive += 1;
-        } else {
-            st.consecutive = 1;
-            st.sign = sign;
-        }
-        st.last_divergence = divergence;
-
         const double div_units = static_cast<double>(divergence)
             / (is_xch ? 1e12 : 1e3);
+        const int sign = (abs_div <= alert_tol) ? 0
+                       : ((divergence > 0) ? 1 : -1);
 
-        spdlog::warn("[Engine] Ledger invariant breach: asset={} "
-                     "ledger={} wallet_confirmed={} divergence={} ({:.6f} units) "
-                     "tol={} exposure={} consecutive={}",
-                     asset.substr(0, 12), ledger_balance, cached.confirmed,
-                     divergence, div_units, alert_tol, exposure,
-                     st.consecutive);
+        // Score over a sliding window rather than demanding consecutive
+        // breaches.
+        auto& obs = ledger_observations_[asset];
+        obs.push_back({sign, divergence});
+        while (obs.size() > acc.observation_window) {
+            obs.pop_front();
+        }
 
-        const bool pause_breach =
-            (abs_div > pause_tol)
-            && (st.consecutive >= static_cast<int>(acc.pause_observations));
+        if (sign == 0) {
+            continue;   // within tolerance this heartbeat
+        }
 
-        if (pause_breach) {
-            const std::string msg =
-                "Ledger/wallet divergence on " + asset.substr(0, 12) + ": books say "
-                + std::to_string(ledger_balance) + " mojos, wallet says "
-                + std::to_string(cached.confirmed) + " (gap "
-                + std::to_string(divergence) + " mojos = "
-                + std::to_string(div_units) + " units) sustained over "
-                + std::to_string(st.consecutive) + " checks. Balance-affecting "
-                "events are occurring that the bot is not recording.";
-
-            if (acc.pause_enabled) {
-                spdlog::error("[Engine] LEDGER CONTROL: {} -- PAUSING", msg);
-                state_->set_status(BotStatus::Paused);
-                alerts_->send_alert(AlertRule::CircuitBreaker,
-                    msg + " Engine PAUSED. Manual reconciliation required.");
-            } else {
-                // Default: report but keep trading.  Several real movements
-                // still have no ledger event (taker fills in Steps 9d/9f,
-                // external deposits and withdrawals), so auto-pausing would
-                // halt on legitimate activity.  Enable accounting.pause_enabled
-                // once the ledger runs clean.
-                spdlog::error("[Engine] LEDGER CONTROL: {} "
-                              "(pause disabled -- alert only)", msg);
-                alerts_->send_alert(AlertRule::ExposureBreach, msg);
+        int same_sign = 0;
+        Mojo min_abs_same_sign = std::numeric_limits<Mojo>::max();
+        for (const auto& o : obs) {
+            if (o.sign == sign) {
+                ++same_sign;
+                min_abs_same_sign =
+                    std::min(min_abs_same_sign, std::abs(o.divergence));
             }
-            st.consecutive = 0;  // avoid alert storms; re-arm from scratch
-        } else if (st.consecutive == static_cast<int>(acc.alert_observations)) {
-            alerts_->send_alert(AlertRule::ExposureBreach,
-                "Ledger/wallet divergence on " + asset.substr(0, 12) + ": "
-                + std::to_string(div_units) + " units unaccounted for over "
-                + std::to_string(st.consecutive) + " consecutive checks.");
+        }
+
+        spdlog::warn("[Engine] Ledger invariant breach: asset={} ledger={} "
+                     "wallet={} (confirmed={} pending_change={}) divergence={} "
+                     "({:.6f} units) tol={} exposure={} breaches={}/{}",
+                     asset.substr(0, 12), ledger_balance, wallet_total,
+                     cached.confirmed, cached.pending_change,
+                     divergence, div_units, alert_tol, exposure,
+                     same_sign, obs.size());
+
+        if (same_sign < static_cast<int>(acc.alert_observations)) {
+            continue;   // not yet persistent enough to act on
+        }
+
+        const bool severe = (abs_div > pause_tol)
+            && (same_sign >= static_cast<int>(acc.pause_observations));
+
+        const std::string msg =
+            "Ledger/wallet divergence on " + asset.substr(0, 12) + ": books say "
+            + std::to_string(ledger_balance) + " mojos, wallet says "
+            + std::to_string(wallet_total) + " (gap "
+            + std::to_string(divergence) + " mojos = "
+            + std::to_string(div_units) + " units) on "
+            + std::to_string(same_sign) + " of the last "
+            + std::to_string(obs.size()) + " checks. Balance-affecting events "
+            "are occurring that the bot is not recording.";
+
+        spdlog::error("[Engine] LEDGER CONTROL: {}", msg);
+        alerts_->send_alert(AlertRule::LedgerDivergence, msg);
+
+        if (severe && acc.pause_enabled) {
+            spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
+                          asset.substr(0, 12));
+            state_->set_status(BotStatus::Paused);
+            alerts_->send_alert(AlertRule::CircuitBreaker,
+                msg + " Engine PAUSED. Manual reconciliation required.");
+        }
+
+        // Re-baseline by RECORDING the unexplained amount as an adjusting
+        // entry, rather than letting the gap persist.  Every known
+        // unrecorded flow here is one-directional, so without this the
+        // divergence only grows and the control's sole end state is being
+        // switched off.  Posting the adjustment keeps the books tied AND
+        // turns each unexplained movement into a discrete, queryable fact:
+        //   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
+        // is exactly the "how much is unaccounted for" measurement wanted.
+        //
+        // Adjust by the smallest same-signed divergence seen in the window,
+        // so the part explainable by a transiently large book is not baked in.
+        if (acc.auto_adjust_enabled) {
+            const Mojo adjust_by =
+                (sign > 0) ? -min_abs_same_sign : min_abs_same_sign;
+
+            DbLedgerEntry e;
+            e.entry_time   = PnLTracker::timestamp_to_iso(
+                                 std::chrono::system_clock::now());
+            e.event_type   = "adjust";
+            e.event_id     = "adjust:" + asset + ":"
+                           + std::to_string(block_height);
+            e.leg          = "adjust";
+            e.asset_id     = asset;
+            e.delta_mojos  = adjust_by;
+            e.block_height = block_height;
+            e.note         = "unexplained divergence reconciled to wallet";
+
+            if (db_->append_ledger_entries({e})) {
+                spdlog::warn("[Engine] Ledger: posted adjusting entry {} mojos "
+                             "for {} -- books re-tied to wallet; the gap is "
+                             "now recorded rather than accumulating",
+                             adjust_by, asset.substr(0, 12));
+                obs.clear();   // re-arm for the NEXT unexplained movement
+            } else {
+                ledger_incomplete_ = true;
+                spdlog::error("[Engine] Ledger: failed to post adjusting entry "
+                              "for {} -- control disabled", asset.substr(0, 12));
+            }
         }
     }
 }

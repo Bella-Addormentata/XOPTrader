@@ -455,7 +455,13 @@ private:
     /// The ledger deliberately does NOT replay trade_log: that table was shown
     /// to disagree with the wallet by ~665 XCH, so replaying it would import
     /// the very corruption the ledger exists to detect.
-    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances);
+    /// @param at_block  Chain height when the balances were observed.  Fills
+    ///                  that settled at or below it are ALREADY inside the
+    ///                  opening balance (offers restored from a prior run can
+    ///                  settle during downtime and are detected afterwards),
+    ///                  so their legs must be suppressed or they double-count.
+    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances,
+                             BlockHeight at_block);
 
     /// Post the balanced legs of a settled fill (base, quote and fee).
     /// Idempotent on the fill's trade id.
@@ -985,15 +991,35 @@ private:
     // Consecutive same-sign breaches per asset.  A divergence caused by
     // detection latency self-heals on the next observation; a real one does
     // not, so escalation requires persistence rather than a single sample.
-    struct LedgerBreachState {
-        int  consecutive{0};
-        int  sign{0};          // +1 ledger above wallet, -1 below.
-        Mojo last_divergence{0};
+    // Recent observations per asset, newest last.  Breaches are scored over
+    // this window rather than requiring strict consecutiveness: the
+    // tolerance includes live offer exposure, which swings ~100x between
+    // heartbeats as the book is re-quoted, so a genuine constant divergence
+    // would otherwise keep having a consecutive counter reset by whichever
+    // heartbeats happen to carry a large book.
+    struct LedgerObservation {
+        int  sign{0};             // +1 ledger above wallet, -1 below, 0 clean.
+        Mojo divergence{0};
     };
-    std::unordered_map<std::string, LedgerBreachState> ledger_breach_;
+    std::unordered_map<std::string, std::deque<LedgerObservation>>
+        ledger_observations_;
 
     /// True once opening balances have been established this process.
     bool ledger_genesis_done_{false};
+
+    /// Chain height observed during startup reconcile; the anchor for
+    /// genesis so downtime fills are not counted twice.
+    BlockHeight startup_block_{0};
+
+    /// Per-asset genesis block, cached from the ledger's `opening` legs.
+    /// A fill at or below an asset's genesis block is already inside its
+    /// opening balance and must not post a leg.
+    std::unordered_map<std::string, BlockHeight> ledger_genesis_block_;
+
+    /// Set when a ledger write FAILED (not merely duplicated).  The ledger
+    /// is then known-incomplete, so the invariant control stands down rather
+    /// than reporting a divergence it caused itself.
+    bool ledger_incomplete_{false};
 
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.

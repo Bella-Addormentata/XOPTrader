@@ -1027,11 +1027,11 @@ std::vector<DbInventoryState> Database::load_inventory_state() const
 // Double-entry ledger (2026-07-30)
 // ===========================================================================
 
-std::size_t Database::append_ledger_entries(
+std::optional<std::size_t> Database::append_ledger_entries(
     const std::vector<DbLedgerEntry>& legs) noexcept
 {
     if (legs.empty()) {
-        return 0;
+        return std::size_t{0};
     }
 
     // INSERT OR IGNORE against UNIQUE(event_id, leg, asset_id): re-posting an
@@ -1053,7 +1053,7 @@ std::size_t Database::append_ledger_entries(
         if (rc != SQLITE_OK) {
             spdlog::error("[Database] append_ledger_entries prepare failed: {}",
                           sqlite3_errmsg(db_));
-            return 0;
+            return std::nullopt;
         }
 
         // All-or-nothing: a half-posted event would permanently unbalance the
@@ -1061,10 +1061,9 @@ std::size_t Database::append_ledger_entries(
         rc = sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
         if (rc != SQLITE_OK) {
             spdlog::error("[Database] append_ledger_entries: BEGIN failed "
-                          "({}): {} -- legs dropped, will re-post on the next "
-                          "event", rc, sqlite3_errmsg(db_));
+                          "({}): {}", rc, sqlite3_errmsg(db_));
             sqlite3_finalize(stmt);
-            return 0;
+            return std::nullopt;
         }
 
         bool ok = true;
@@ -1103,20 +1102,41 @@ std::size_t Database::append_ledger_entries(
             if (!sqlite3_get_autocommit(db_)) {
                 sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
             }
-            return 0;
+            return std::nullopt;
         }
         if (!ok) {
-            return 0;
+            return std::nullopt;
         }
     } catch (...) {
         if (!sqlite3_get_autocommit(db_)) {
             sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
         }
         spdlog::error("[Database] append_ledger_entries: unexpected exception");
-        return 0;
+        return std::nullopt;
     }
 
     return inserted;
+}
+
+BlockHeight Database::ledger_opening_block(const AssetId& asset_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT COALESCE(block_height, 0) FROM ledger_entries
+        WHERE asset_id = ?1 AND leg = 'opening' LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+    BlockHeight h = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        h = static_cast<BlockHeight>(sqlite3_column_int64(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return h;
 }
 
 std::unordered_map<AssetId, Mojo> Database::ledger_balances() const

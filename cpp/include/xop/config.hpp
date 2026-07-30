@@ -1022,6 +1022,26 @@ struct AccountingConfig {
     /// Skip the check when the balance snapshot is older than this many
     /// blocks (the wallet reader is skipped in several engine modes).
     uint32_t max_balance_age_blocks{10};
+
+    /// Observations retained per asset for breach scoring.  Breaches are
+    /// counted over this window rather than required to be strictly
+    /// consecutive: the tolerance includes live offer exposure, which swings
+    /// by two orders of magnitude between heartbeats as the book is
+    /// re-quoted, so a real constant divergence would otherwise keep having
+    /// its consecutive counter reset and might never escalate.
+    uint32_t observation_window{6};
+
+    /// On sustained divergence, post an `adjust` leg that brings the ledger
+    /// back in line and RECORDS the unexplained amount as a discrete entry.
+    ///
+    /// Without this the ledger drifts monotonically -- the known-unrecorded
+    /// flows (taker fills, DBX rewards, external transfers) are all
+    /// one-directional -- so the first breach becomes permanent and the only
+    /// remaining operator action is to switch the control off.  With it, each
+    /// unexplained movement becomes a queryable adjusting entry, which is
+    /// both proper accounting treatment and the measurement wanted:
+    ///   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
+    bool     auto_adjust_enabled{true};
 };
 
 struct InventoryAgingConfig {

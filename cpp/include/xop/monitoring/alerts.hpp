@@ -96,7 +96,14 @@ enum class AlertRule : std::uint8_t {
     HourlyPnl           = 12, // Hourly PnL summary.
     DailyPnl            = 13, // Daily PnL summary.
     NewPairVolume        = 14, // Volume detected on a newly listed pair.
-    ArbitrageDetected    = 15  // Cross-venue or cross-bridge arb opportunity.
+    ArbitrageDetected    = 15, // Cross-venue or cross-bridge arb opportunity.
+
+    // Accounting (rule 16)
+    LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
+                               // Its own rule so accounting noise can never
+                               // rate-limit or masquerade as ExposureBreach,
+                               // which is CRITICAL tier and already carries
+                               // three unrelated risk conditions.
 };
 
 /// Human-readable label for logging.

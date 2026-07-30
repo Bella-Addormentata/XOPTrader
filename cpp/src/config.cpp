@@ -2035,6 +2035,8 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     read_i64 ("floor_cat_mojos",        cfg.floor_cat_mojos);
     read_i64 ("fee_slack_mojos",        cfg.fee_slack_mojos);
     read_u32 ("max_balance_age_blocks", cfg.max_balance_age_blocks);
+    read_u32 ("observation_window",     cfg.observation_window);
+    read_bool("auto_adjust_enabled",    cfg.auto_adjust_enabled);
 
     if (cfg.alert_pct < 0.0 || cfg.alert_pct > 1.0) {
         throw ConfigError(sec + ".alert_pct must be in [0,1]; got "
@@ -2050,6 +2052,15 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     if (cfg.alert_observations == 0 || cfg.pause_observations == 0) {
         throw ConfigError(sec + ".alert_observations and .pause_observations "
                                 "must be >= 1");
+    }
+    if (cfg.observation_window == 0) {
+        throw ConfigError(sec + ".observation_window must be >= 1");
+    }
+    if (cfg.pause_observations > cfg.observation_window
+        || cfg.alert_observations > cfg.observation_window) {
+        throw ConfigError(sec + ".observation_window must be >= both "
+                                "alert_observations and pause_observations, "
+                                "or escalation can never trigger");
     }
     if (cfg.floor_xch_mojos < 0 || cfg.floor_cat_mojos < 0
         || cfg.fee_slack_mojos < 0) {

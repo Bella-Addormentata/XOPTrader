@@ -77,6 +77,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::DailyPnl:            return "DailyPnl";
         case AlertRule::NewPairVolume:        return "NewPairVolume";
         case AlertRule::ArbitrageDetected:    return "ArbitrageDetected";
+        case AlertRule::LedgerDivergence:     return "LedgerDivergence";
     }
     return "UNKNOWN";
 }
@@ -99,6 +100,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         case AlertRule::ConcentrationBreach:
         case AlertRule::PnlDrawdown:
         case AlertRule::OfferCreationFail:
+        // Accounting divergence is a WARNING: it needs investigation but,
+        // with auto-adjust on, it does not by itself endanger capital.
+        case AlertRule::LedgerDivergence:
             return AlertTier::WARNING;
 
         // INFO (rules 12-15).

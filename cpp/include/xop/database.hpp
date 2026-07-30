@@ -362,9 +362,20 @@ public:
     /// the (event_id, leg, asset_id) uniqueness key, so re-posting the legs
     /// of an already-recorded event is a no-op rather than a double count.
     /// Never throws: accounting must not disrupt live trading.
-    /// @return number of legs actually inserted (0 = all were duplicates).
-    std::size_t append_ledger_entries(
+    ///
+    /// @return number of legs actually inserted (0 = all were duplicates),
+    ///         or std::nullopt when the write FAILED.  Callers must
+    ///         distinguish these: a dropped fill leg is unrecoverable (the
+    ///         fill is never re-processed) and leaves the ledger permanently
+    ///         short, which would put the invariant control into a permanent
+    ///         false breach.
+    [[nodiscard]] std::optional<std::size_t> append_ledger_entries(
         const std::vector<DbLedgerEntry>& legs) noexcept;
+
+    /// Block height recorded on an asset's `opening` leg, or 0 if it has
+    /// none.  Fills at or below this height are already reflected in the
+    /// opening balance and must not be posted again.
+    [[nodiscard]] BlockHeight ledger_opening_block(const AssetId& asset_id) const;
 
     /// Sum of delta_mojos per asset across the whole ledger, i.e. the
     /// ledger's implied current balance for each asset.
