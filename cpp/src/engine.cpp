@@ -9352,17 +9352,23 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         }
         if (cached.confirmed <= 0) continue;
 
-        // NOTE: coins in flight are ACCOUNTED FOR, not skipped.  An earlier
-        // draft skipped the asset whenever pending_change != 0 -- but a
-        // market maker reposting a ladder every block leaves XCH with coins
-        // in flight most of the time, so that gate would have blinded the
-        // control on the very asset it exists to watch, while looking
-        // healthy.  An unconfirmed spend removes its input coin from
-        // `confirmed` and parks the change in `pending_change`, so the
-        // wallet's true holding is the sum of the two; the magnitude is also
-        // added to the tolerance because the split between them is only
-        // settled once the spend confirms.
-        const Mojo wallet_total = cached.confirmed + cached.pending_change;
+        // Coins in flight widen UNCERTAINTY; they do not move the target.
+        //
+        // An earlier draft skipped the asset whenever pending_change != 0,
+        // which would have blinded the control on XCH (a market maker
+        // reposting a ladder leaves coins in flight most of the time) while
+        // looking healthy.  The first correction over-shot: it ADDED
+        // pending_change to the comparison target, which double-counts.
+        // `confirmed_wallet_balance` counts on-chain UNSPENT coins, and a
+        // coin inside an unconfirmed spend is still unspent, so it is
+        // already in `confirmed`; `pending_change` is a forecast of the
+        // change due back, not additional holdings.  Adding it produced the
+        // first live false breach (BYC, 2026-07-30 15:23: reported -4,827
+        // when the true gap was -1,223, comfortably inside tolerance).
+        //
+        // Compare against `confirmed`, and carry the pending magnitude as
+        // tolerance slack, since the eventual split is genuinely unsettled.
+        const Mojo wallet_total = cached.confirmed;
         const Mojo inflight_slack = std::abs(cached.pending_change);
 
         auto lit = ledger.find(asset);
