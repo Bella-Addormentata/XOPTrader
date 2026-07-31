@@ -1580,14 +1580,63 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
     // Detect orphans: offers in State that no longer exist in the wallet.
     // This can happen if the wallet was restarted or the offer expired
     // server-side without a cancel call.
+    //
+    // [SETTLE-FIX 2026-07-31] Absence from the paginated scan above is NOT
+    // proof the offer is gone.  Offers settle while the loop walks pages, so
+    // records get skipped.  Previously a skipped CONFIRMED offer was deleted
+    // from State here and stamped "cancelled/periodic_reconcile" by the
+    // caller -- which DESTROYED the fill, because detect_fills() only
+    // inspects offers still tracked in State.  A read-only wallet probe on
+    // 2026-07-31 found 6 XCH/BYC asks the wallet reported CONFIRMED that we
+    // had recorded as cancels (6 XCH and its BYC proceeds off the books).
+    //
+    // Verify each candidate directly before destroying tracking state.  We
+    // deliberately do NOT emit the Fill from here: leaving a confirmed offer
+    // in State lets detect_fills() handle it through the normal path, which
+    // captures the creation fee and updates position accounting correctly.
     for (const auto& [offer_id, po] : pending_map) {
-        if (wallet_offer_ids.find(offer_id) == wallet_offer_ids.end()) {
-            state_->remove_offer(offer_id);
-            removed_ids.push_back(offer_id);
-            logger_->warn("[reconcile] Removed phantom offer {} ({}) "
-                          "-- not found in wallet",
-                          offer_id.substr(0, 12), po.pair_name);
+        if (wallet_offer_ids.find(offer_id) != wallet_offer_ids.end()) {
+            continue;
         }
+
+        int status = -1;
+        try {
+            const json rec = co_await wallet_->get_offer(
+                offer_id, /*file_contents=*/false);
+            if (rec.contains("status")) {
+                status = trade_status::parse(rec["status"]);
+            }
+        } catch (const rpc::ChiaRPCError& e) {
+            // Fail safe: never destroy tracking on an RPC error.  The offer
+            // stays in State and is re-examined next cycle.
+            logger_->warn("[reconcile] get_offer failed for {} ({}) -- "
+                          "keeping tracked, will retry: {}",
+                          offer_id.substr(0, 12), po.pair_name, e.what());
+            continue;
+        }
+
+        if (status == trade_status::kConfirmed) {
+            logger_->info("[reconcile] Offer {} ({}) missing from scan but "
+                          "wallet reports CONFIRMED -- keeping tracked so "
+                          "detect_fills records the fill",
+                          offer_id.substr(0, 12), po.pair_name);
+            continue;
+        }
+
+        if (status != trade_status::kCancelled &&
+            status != trade_status::kFailed) {
+            // Still live, pending, or unrecognised -- not ours to remove.
+            logger_->debug("[reconcile] Offer {} ({}) missing from scan, "
+                           "wallet status={} -- keeping tracked",
+                           offer_id.substr(0, 12), po.pair_name, status);
+            continue;
+        }
+
+        state_->remove_offer(offer_id);
+        removed_ids.push_back(offer_id);
+        logger_->warn("[reconcile] Removed phantom offer {} ({}) "
+                      "-- wallet status={}",
+                      offer_id.substr(0, 12), po.pair_name, status);
     }
 
     // -----------------------------------------------------------------------
