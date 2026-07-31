@@ -241,6 +241,33 @@ struct DbArbEdgeObservation {
 };
 
 // ---------------------------------------------------------------------------
+// DbTakerFill -- a trade where WE crossed the spread and took someone's offer.
+//
+// Distinct from trade_log, which records OUR offers being filled by others.
+// Taker trades used to write nothing anywhere: 70 of them across the
+// retained logs, invisible to trade_log, offer_log and P&L alike. The ledger
+// catches the aggregate as an `adjust` leg, but that only says "N units
+// unaccounted" -- it cannot say which trade, at what price, or whether the
+// strategy that placed it makes money.
+// ---------------------------------------------------------------------------
+
+struct DbTakerFill {
+    std::string taken_at;              ///< ISO-8601 UTC.
+    BlockHeight block_height{0};
+    std::string strategy;              ///< crossed_book | cross_stable | peg_arb | drift | xch_recovery.
+    std::string trade_id;              ///< Wallet trade id returned by take_offer.
+    std::string counterparty_offer_id; ///< The offer we lifted.
+    std::string pair_name;
+    bool        we_bought_base{false}; ///< True = we acquired base, paid quote.
+    AssetId     base_asset;
+    Mojo        base_delta_mojos{0};   ///< Signed, our perspective.
+    AssetId     quote_asset;
+    Mojo        quote_delta_mojos{0};  ///< Signed, our perspective.
+    Mojo        price_mojos{0};
+    Mojo        fee_mojos{0};
+};
+
+// ---------------------------------------------------------------------------
 // Database -- SQLite wrapper providing structured persistence for the bot.
 //
 // Lifecycle:
@@ -418,6 +445,10 @@ public:
 
     /// Record one arbitrage leg-pair observation.  Never throws.
     void insert_arb_edge(const DbArbEdgeObservation& obs) noexcept;
+
+    /// Record a taker trade (we crossed the spread).  Idempotent on
+    /// trade_id.  Never throws: accounting must not disrupt trading.
+    void insert_taker_fill(const DbTakerFill& fill) noexcept;
 
     // -- Diagnostics ---------------------------------------------------------
 

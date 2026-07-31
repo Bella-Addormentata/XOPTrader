@@ -206,6 +206,31 @@ CREATE TABLE IF NOT EXISTS arb_edge_log (
 );
 )SQL";
 
+constexpr const char* kCreateTakerFills = R"SQL(
+CREATE TABLE IF NOT EXISTS taker_fills (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    taken_at              TEXT    NOT NULL,
+    block_height          INTEGER NOT NULL,
+    strategy              TEXT    NOT NULL,
+    trade_id              TEXT    UNIQUE,
+    counterparty_offer_id TEXT,
+    pair_name             TEXT    NOT NULL,
+    we_bought_base        INTEGER NOT NULL,
+    base_asset            TEXT    NOT NULL,
+    base_delta_mojos      INTEGER NOT NULL,
+    quote_asset           TEXT    NOT NULL,
+    quote_delta_mojos     INTEGER NOT NULL,
+    price_mojos           INTEGER NOT NULL,
+    fee_mojos             INTEGER NOT NULL,
+    created_at            TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
+constexpr const char* kIndexTakerFillsTime = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_taker_fills_time
+    ON taker_fills(taken_at);
+)SQL";
+
 constexpr const char* kIndexArbEdgeDirTime = R"SQL(
 CREATE INDEX IF NOT EXISTS idx_arb_edge_log_dir_time
     ON arb_edge_log(direction, observed_at);
@@ -1270,6 +1295,50 @@ void Database::insert_arb_edge(const DbArbEdgeObservation& obs) noexcept
     }
 }
 
+void Database::insert_taker_fill(const DbTakerFill& f) noexcept
+{
+    static constexpr const char* kInsert = R"SQL(
+        INSERT OR IGNORE INTO taker_fills
+            (taken_at, block_height, strategy, trade_id,
+             counterparty_offer_id, pair_name, we_bought_base,
+             base_asset, base_delta_mojos, quote_asset, quote_delta_mojos,
+             price_mojos, fee_mojos)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] insert_taker_fill prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return;
+        }
+        sqlite3_bind_text (stmt, 1, f.taken_at.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, static_cast<std::int64_t>(f.block_height));
+        sqlite3_bind_text (stmt, 3, f.strategy.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 4, f.trade_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 5, f.counterparty_offer_id.c_str(), -1,
+                           SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 6, f.pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (stmt, 7, f.we_bought_base ? 1 : 0);
+        sqlite3_bind_text (stmt, 8, f.base_asset.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 9, f.base_delta_mojos);
+        sqlite3_bind_text (stmt, 10, f.quote_asset.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 11, f.quote_delta_mojos);
+        sqlite3_bind_int64(stmt, 12, f.price_mojos);
+        sqlite3_bind_int64(stmt, 13, f.fee_mojos);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            spdlog::error("[Database] insert_taker_fill step failed: {}",
+                          sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        spdlog::error("[Database] insert_taker_fill: unexpected exception");
+    }
+}
+
 // ===========================================================================
 // Diagnostics
 // ===========================================================================
@@ -1445,6 +1514,8 @@ void Database::run_migrations()
         kIndexLedgerAsset,
         kCreateArbEdgeLog,
         kIndexArbEdgeDirTime,
+        kCreateTakerFills,
+        kIndexTakerFillsTime,
         kIndexTradeTimestamp,
         kIndexTradePair,
         kIndexOfferStatus,

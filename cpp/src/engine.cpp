@@ -7553,6 +7553,16 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              pair.name, trade_id.substr(0, 12),
                              edge_bps, take_size);
 
+                // [TAKER-RECORDING 2026-07-30] We lifted an ASK, so we
+                // bought base and paid quote.
+                if (const PairConfig* tpc = find_pair_config(pair.name)) {
+                    record_taker_fill("crossed_book", trade_id,
+                                      best_ask_offer_id, *tpc,
+                                      /*we_bought_base=*/true,
+                                      take_size, best_ask_price, fee,
+                                      block_height);
+                }
+
                 // Record the fee spend.
                 if (fee_tracker_) {
                     fee_tracker_->record_fee(fee, block_height);
@@ -7891,6 +7901,19 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                 trade_id.substr(0, 12),
                                 net_edge_bps, take_size);
 
+                            // [TAKER-RECORDING] Only the BUY leg on pair A
+                            // actually executes (the sell leg is never
+                            // placed -- see the config verdict), so record
+                            // exactly that: base in, quote out.
+                            if (const PairConfig* tpc =
+                                    find_pair_config(pair_a.pair_name)) {
+                                record_taker_fill("cross_stable", trade_id,
+                                                  best_ask_a_id, *tpc,
+                                                  /*we_bought_base=*/true,
+                                                  take_size, best_ask_a, fee,
+                                                  block_height);
+                            }
+
                             if (fee_tracker_) {
                                 fee_tracker_->record_fee(
                                     fee, block_height);
@@ -8125,6 +8148,16 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                                  pair.name, to_string(c.side),
                                  tid.substr(0, 12), c.edge_bps,
                                  take_sz);
+
+                    // [TAKER-RECORDING] Lifting an ASK means we bought base;
+                    // hitting a BID means we sold it.
+                    if (const PairConfig* tpc = find_pair_config(pair.name)) {
+                        record_taker_fill("peg_arb", tid, c.id, *tpc,
+                                          /*we_bought_base=*/c.side == Side::Ask,
+                                          take_sz, c.price,
+                                          static_cast<std::uint64_t>(fee),
+                                          block_height);
+                    }
 
                     if (fee_tracker_)
                         fee_tracker_->record_fee(fee, block_height);
@@ -8642,6 +8675,17 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                          "trade={} prem={:.1f}bps size={}",
                          pair.name, to_string(chosen->side),
                          tid.substr(0, 12), chosen->premium_bps, take_sz);
+
+            // [TAKER-RECORDING] Lifting an ASK buys base; hitting a BID
+            // sells it.
+            if (const PairConfig* tpc = find_pair_config(pair.name)) {
+                record_taker_fill("drift_correct", tid, chosen->id, *tpc,
+                                  /*we_bought_base=*/chosen->side == Side::Ask,
+                                  take_sz, chosen->price,
+                                  static_cast<std::uint64_t>(fee),
+                                  block_height);
+            }
+
             if (fee_tracker_)
                 fee_tracker_->record_fee(fee, block_height);
             if (alerts_) {
@@ -8960,6 +9004,17 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
 
                     taken_mojos_this_block +=
                         static_cast<double>(cand.size);
+
+                    // [TAKER-RECORDING] Recovery lifts asks, so we bought
+                    // base and paid quote.
+                    if (const PairConfig* tpc = find_pair_config(pair.name)) {
+                        record_taker_fill("xch_recovery", trade_id,
+                                          cand.offer_id, *tpc,
+                                          /*we_bought_base=*/true,
+                                          cand.size, cand.price,
+                                          static_cast<std::uint64_t>(fee),
+                                          block_height);
+                    }
 
                     if (fee_tracker_) {
                         fee_tracker_->record_fee(fee, block_height);
@@ -9422,6 +9477,88 @@ void Engine::post_ledger_fill(const Fill& fill, const PairConfig& pc,
             "Ledger write failed for fill " + fill.offer_id.substr(0, 16)
             + " on " + fill.pair_name
             + " -- accounting is incomplete until the engine is restarted.");
+    }
+}
+
+void Engine::record_taker_fill(const std::string& strategy,
+                               const std::string& trade_id,
+                               const std::string& counterparty_offer_id,
+                               const PairConfig& pc,
+                               bool we_bought_base,
+                               Mojo base_mojos,
+                               Mojo price_mojos,
+                               std::uint64_t fee_mojos,
+                               BlockHeight block_height) noexcept
+{
+    if (!db_ || base_mojos <= 0) return;
+
+    try {
+        const Mojo quote_mojos = static_cast<Mojo>(std::llround(
+            quote_mojos_for(static_cast<double>(base_mojos),
+                            static_cast<double>(price_mojos),
+                            static_cast<double>(pc.base_mojos_per_unit),
+                            static_cast<double>(pc.quote_mojos_per_unit))));
+
+        // Signs from OUR perspective: buying base means base in, quote out.
+        const Mojo base_delta  = we_bought_base ?  base_mojos  : -base_mojos;
+        const Mojo quote_delta = we_bought_base ? -quote_mojos :  quote_mojos;
+
+        const std::string ts =
+            PnLTracker::timestamp_to_iso(std::chrono::system_clock::now());
+
+        DbTakerFill f;
+        f.taken_at              = ts;
+        f.block_height          = block_height;
+        f.strategy              = strategy;
+        f.trade_id              = trade_id;
+        f.counterparty_offer_id = counterparty_offer_id;
+        f.pair_name             = pc.name;
+        f.we_bought_base        = we_bought_base;
+        f.base_asset            = pc.base_asset_id;
+        f.base_delta_mojos      = base_delta;
+        f.quote_asset           = pc.quote_asset_id;
+        f.quote_delta_mojos     = quote_delta;
+        f.price_mojos           = price_mojos;
+        f.fee_mojos             = static_cast<Mojo>(fee_mojos);
+        db_->insert_taker_fill(f);
+
+        // Ledger legs, keyed on the trade id so a retry cannot double-post.
+        std::vector<DbLedgerEntry> legs;
+        auto add = [&](const char* leg_name, const AssetId& asset, Mojo delta) {
+            if (delta == 0) return;
+            if (!ledger_opened_assets_.count(asset)) return;
+            DbLedgerEntry e;
+            e.entry_time   = ts;
+            e.event_type   = "take";
+            e.event_id     = "take:" + trade_id;
+            e.leg          = leg_name;
+            e.asset_id     = asset;
+            e.delta_mojos  = delta;
+            e.pair_name    = pc.name;
+            e.block_height = block_height;
+            e.note         = strategy;
+            legs.push_back(std::move(e));
+        };
+        add("base",  pc.base_asset_id,  base_delta);
+        add("quote", pc.quote_asset_id, quote_delta);
+        if (fee_mojos > 0) {
+            add("fee", AssetId{"xch"}, -static_cast<Mojo>(fee_mojos));
+        }
+
+        if (!legs.empty() && !db_->append_ledger_entries(legs)) {
+            ledger_incomplete_ = true;
+            spdlog::error("[Engine] Ledger: failed to post legs for {} take {} "
+                          "-- ledger now INCOMPLETE", strategy, trade_id);
+        }
+
+        spdlog::info("[Engine] Recorded {} take: {} {} base={} quote={} "
+                     "fee={} trade_id={}",
+                     strategy, pc.name, we_bought_base ? "BUY" : "SELL",
+                     base_delta, quote_delta, fee_mojos,
+                     trade_id.substr(0, std::min<std::size_t>(12, trade_id.size())));
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] record_taker_fill failed for {}: {}",
+                      strategy, e.what());
     }
 }
 

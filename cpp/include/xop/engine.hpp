@@ -468,6 +468,30 @@ private:
     void post_ledger_fill(const Fill& fill, const PairConfig& pc,
                           Mojo quote_mojos);
 
+    /// Record a TAKER trade -- one where we crossed the spread and lifted
+    /// someone else's offer.  Writes both the ledger legs (so the books
+    /// balance) and a taker_fills row (so the trade is attributable to the
+    /// strategy that placed it).
+    ///
+    /// Every take_offer() success site must call this.  Before 2026-07-30
+    /// none of them did: 70 taker trades across the retained logs wrote
+    /// nothing to trade_log, offer_log or the ledger, which is why the
+    /// strategies placing them had no measurable P&L.
+    ///
+    /// @param we_bought_base true when we acquired the base asset and paid
+    ///                       quote; false for the reverse.
+    /// @param base_mojos     Absolute size of the base leg.
+    /// @param price_mojos    Execution price in engine pseudo-units.
+    void record_taker_fill(const std::string& strategy,
+                           const std::string& trade_id,
+                           const std::string& counterparty_offer_id,
+                           const PairConfig& pc,
+                           bool we_bought_base,
+                           Mojo base_mojos,
+                           Mojo price_mojos,
+                           std::uint64_t fee_mojos,
+                           BlockHeight block_height) noexcept;
+
     /// Notional of asset @p asset_id currently committed to live offers.
     /// This bounds how much the wallet can legitimately move before the
     /// ledger sees it, and collapses to 0 when the book is empty -- which is
