@@ -523,4 +523,61 @@ TEST(ConfigParserTest, RecoveryConfig_PairAllowlistParses) {
     EXPECT_DOUBLE_EQ(cfg.recovery.zero_fee_below_xch, 0.002);
 }
 
+// ============================================================================
+// Micro-price blend schedule
+//
+// Both knobs are absent from the shipped config.yaml on purpose: the defaults
+// have to protect an unconfigured deployment, because an unconfigured
+// deployment is exactly what the BYC mispricing reached.
+// ============================================================================
+
+namespace {
+
+/// kMinimalValidYaml with extra keys spliced into the [strategy] block.
+std::string with_strategy_keys(const std::string& extra) {
+    std::string y = kMinimalValidYaml;
+    const std::string anchor = "  tier_size_pct: [0.6, 0.4]";
+    const auto pos = y.find(anchor);
+    if (pos == std::string::npos) return y;
+    y.insert(pos + anchor.size(), extra);
+    return y;
+}
+
+}  // namespace
+
+TEST(ConfigParserTest, MicropriceBandDefaultsWithoutAnyConfig) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_narrow_bps, 200.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_wide_bps,   800.0);
+}
+
+TEST(ConfigParserTest, MicropriceBandIsOverridable) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 150\n  microprice_wide_bps: 1200"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_narrow_bps,  150.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_wide_bps,   1200.0);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsAnInvertedBand) {
+    // wide <= narrow leaves no interior to interpolate across, so the blend
+    // would silently collapse into the discontinuous step this schedule
+    // exists to replace.  Refuse it rather than quietly degrade.
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 800\n  microprice_wide_bps: 200"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsEqualEdges) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 400\n  microprice_wide_bps: 400"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsNegativeEdges) {
+    TempYaml tmp(with_strategy_keys("\n  microprice_narrow_bps: -1"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
 }  // namespace

@@ -237,12 +237,45 @@ struct StrategyConfig {
     /// solve.  Default 100 bps, from that measured agreement.
     double   fair_value_feed_sigma_bps{100.0};
 
-    /// 1-sigma of an AMM implied price, in bps.  A constant-product pool is
-    /// held to fair value by arbitrage rather than by anyone's willingness to
-    /// quote, which makes it a much better observation than a thin order book;
-    /// the residual error is pool fee plus the arbitrage band.  Default 50 bps
-    /// (TibetSwap's 0.7% fee implies roughly half that band each side).
+    /// FLOOR (bps) on the 1-sigma of an AMM implied price: the uncertainty a
+    /// pool deep enough to be genuinely arbitrage-pinned still carries, which
+    /// is the swap fee plus the arbitrage band.  Default 50 bps (TibetSwap's
+    /// 0.7% fee implies roughly half that band each side).
+    ///
+    /// This was formerly the WHOLE sigma, applied flat to every pool.  That
+    /// gave a $500 pool weight 1/(50e-4)^2 = 4.0e4 against ~242 for the book
+    /// it was outvoting -- about 166:1 -- on the strength of an arbitrage
+    /// argument that does not hold at $500.  The actual sigma is now derived
+    /// from pool depth (see fair_value_amm_depth_k_bps) and this value is only
+    /// its best-case asymptote.
     double   fair_value_amm_sigma_bps{50.0};
+
+    /// Calibration constant for the depth-weighted AMM sigma, in bps:
+    ///
+    ///     sigma_bps = max(fair_value_amm_sigma_bps,
+    ///                     fair_value_amm_depth_k_bps / sqrt(pool_usd))
+    ///
+    /// Numerically it is the sigma a $1 pool would carry; operationally it is
+    /// set by the crossover point where an AMM stops outvoting a mediocre
+    /// order book.  Default 15000 bps, calibrated so the live BYC pool lands
+    /// just ABOVE the book it competes with rather than 16,500x below it:
+    ///
+    ///     pool             pool_usd    AMM sigma   competing book sigma
+    ///     BYC              ~$501        670 bps    643 bps  (BYC/wUSDC.b)
+    ///     wUSDC.b          ~$1,125      447 bps    130 bps  (XCH/wUSDC.b)
+    ///     100x BYC pool    ~$50,100      67 bps    -- (approaches the floor)
+    ///     ~$90,000+                      50 bps    -- (at the floor)
+    ///
+    /// In weight terms the BYC pool goes from 166x the book it was outvoting
+    /// to 0.92x it -- a peer rather than a dictator -- while the wUSDC.b pool
+    /// sits an order of magnitude below the tight book it competes with, which
+    /// is correct for $1,125 of depth against a live two-sided market.
+    ///
+    /// The one out-of-sample check available agrees: at the 2026-08-01 sweep
+    /// the BYC pool was wrong by ~550 bps (implied 1.4917, truth ~1.414), so
+    /// 670 bps is the right order of magnitude and the old flat 50 bps
+    /// understated the real error by roughly 11x.
+    double   fair_value_amm_depth_k_bps{15000.0};
 
     /// Maximum age (seconds) of an AMM sample before it stops contributing.
     double   fair_value_amm_max_age_sec{300.0};
@@ -300,6 +333,64 @@ struct StrategyConfig {
     /// Books never agree to the basis point; only a real disagreement should
     /// move quotes.  Default 150 bps.
     double   fair_value_residual_widen_floor_bps{150.0};
+
+    // -- Order-book micro-price blend schedule -------------------------------
+    // The order-book mid is a Stoikov micro-price: each side's top-N VWAP is
+    // weighted by the OPPOSITE side's depth, so the estimate leans toward the
+    // thin side -- the side that moves next.  That is genuinely the right
+    // estimator on a tight two-sided book and it is why it is still here.
+    //
+    // Its information content collapses as the book widens.  "Which side is
+    // thinner" is a statement about the next tick; on a 1259 bps book there is
+    // no next tick to speak of, and the answer says essentially nothing about
+    // fair value.  Worse, each side's VWAP lies OUTSIDE the BBO by
+    // construction (bid_vwap <= best_bid, ask_vwap >= best_ask), so once one
+    // side's depth dominates the estimate is dragged out of the book entirely:
+    // BYC/wUSDC.b (~65 deep bids vs ~9 thin asks) published a "mid" of
+    // 1.144728 sitting EXACTLY on its own best ask at block 9087661, against a
+    // true BYC value of ~$1.01 corroborated five independent ways.
+    //
+    // So the micro-price weight is degraded continuously with relative spread:
+    //
+    //     w_micro = clamp(1 - (spread_bps - narrow) / (wide - narrow), 0, 1)
+    //     mid     = w_micro * microprice + (1 - w_micro) * BBO midpoint
+    //
+    // Both knobs are ABSENT from the shipped config.yaml on purpose: the
+    // defaults below must work unedited, because an operator who never touches
+    // config.yaml is exactly the operator this defect reached.
+
+    /// At or below this relative spread (bps), the micro-price is used whole.
+    ///
+    /// Default 200 bps, chosen against MEASURED snapshot spread distributions
+    /// over the seven days to 2026-08-01:
+    ///
+    ///     pair            p10    p50    p90     n
+    ///     XCH/wUSDC.b     130    237    315     509
+    ///     XCH/DBX          41     63    123     489
+    ///     XCH/BYC          58    794   2549     440
+    ///     BYC/wUSDC.b     290   1163   1452     509
+    ///
+    /// XCH/DBX (p90 = 123) sits entirely inside the narrow band and keeps the
+    /// micro-price in full.  XCH/wUSDC.b -- the healthy, profitable pair the
+    /// fix must not disturb -- straddles it: at its p50 of 237 bps the weight
+    /// is 0.94, and at its p90 of 315 bps still 0.81, so substantially all of
+    /// its micro-price behaviour survives.  Setting narrow at its p50 instead
+    /// would have cut the healthy pair's weight to 0.5 for no reason; setting
+    /// it wider would have started trusting XCH/BYC's 794 bps p50.
+    double   microprice_narrow_bps{200.0};
+
+    /// At or above this relative spread (bps), the micro-price is discarded
+    /// entirely and the plain BBO midpoint is used.
+    ///
+    /// Default 800 bps.  Same measured distributions.  This is set just above
+    /// XCH/BYC's p50 (794) and far below BYC/wUSDC.b's p10 (290 -> w = 0.85)
+    /// and p50 (1163 -> w = 0), so the pathological pair lands essentially at
+    /// the plain midpoint in its normal state while XCH/wUSDC.b never comes
+    /// close to reaching zero weight (its p99 of 365 bps still carries 0.73).
+    /// The band 200..800 is also wide enough that the weight moves smoothly
+    /// rather than snapping -- a discontinuity here is what made the old
+    /// "deviates >10% from BBO midpoint, clamp to it" guard useless.
+    double   microprice_wide_bps{800.0};
 
     /// Minimum annualized sigma passed to the GLFT/A-S formula.
     /// When the Yang-Zhang estimator returns zero (flat market), the
@@ -640,8 +731,26 @@ struct StrategyConfig {
 
     // -- AMM blend weight for market data feed ------------------------------
 
-    /// Weight of TibetSwap AMM implied price in mid-price blend.
-    double   amm_blend_weight{0.15};
+    /// Weight of the TibetSwap AMM implied price in the composite mid-price.
+    ///
+    /// DEFAULT 0.0 -- THE AMM IS A VALIDATOR, NOT A PRICE INPUT.
+    ///
+    /// The AMM sample feeds two consumers: this blend (composite mid ->
+    /// market_mid -> centre of every ladder) and the fair-value solve that
+    /// checks those ladder prices.  Letting it do both makes the guard's
+    /// reference the same number that moved the thing being checked -- the
+    /// solve would "confirm" a price it had itself set, and the deviation
+    /// band would measure nothing.  This weight was inert until the TibetSwap
+    /// client gave it a producer; wiring that client is what made the cycle
+    /// real, so the cycle is broken here at the input side.
+    ///
+    /// Validation is the more valuable of the two roles: as a price input the
+    /// AMM would move quotes by at most its blend share, while as an
+    /// independent edge it is what turns a leg priced only by one wide frozen
+    /// book from Unavailable into a usable clamp.  So the blend gives way.
+    ///
+    /// Setting this above 0 re-creates the cycle and is not supported.
+    double   amm_blend_weight{0.0};
 
     // -- Wall-aware retail niche pricing ------------------------------------
 

@@ -251,6 +251,21 @@ double combine_sigma_bps(const std::vector<double>& terms) {
     return std::sqrt(sum_sq);
 }
 
+double amm_sigma_bps(double pool_usd, double floor_bps, double depth_k_bps) {
+    // An observation whose depth we cannot measure is an observation we cannot
+    // weight.  Say so rather than substituting an optimistic constant -- that
+    // substitution is precisely the defect this function replaces.
+    if (!std::isfinite(pool_usd) || pool_usd <= 0.0) return 0.0;
+    if (!std::isfinite(depth_k_bps) || depth_k_bps <= 0.0) return 0.0;
+
+    const double floor_ok = (std::isfinite(floor_bps) && floor_bps > 0.0)
+                          ? floor_bps : 0.0;
+    const double derived  = depth_k_bps / std::sqrt(pool_usd);
+    if (!std::isfinite(derived)) return 0.0;
+
+    return std::max(floor_ok, derived);
+}
+
 Solution solve_pair(const std::vector<Anchor>& anchors,
                     const std::vector<Edge>&   edges,
                     const std::string&         base,

@@ -590,6 +590,20 @@ private:
     /// first heartbeat fetches immediately instead of waiting a full interval.
     bool tibetswap_fetch_attempted_{false};
 
+    /// Wall-clock time of the last SUCCESSFUL TibetSwap reserve fetch, i.e.
+    /// when the cached reserves were actually read from the chain.  This is
+    /// what MarketDataFeed::ingest_amm_mid() is given as the observation time,
+    /// so amm_age_seconds measures real staleness.  Default-constructed means
+    /// "never fetched", and no AMM sample is published in that state.
+    Timestamp tibetswap_reserves_at_{};
+
+    /// True when tibetswap_reserves_at_ advanced on THIS heartbeat and the new
+    /// reserves have not been published to the market data feed yet.  Step 1
+    /// publishes once per successful fetch and then clears this; without it the
+    /// cache was re-ingested every heartbeat, re-stamping a stale sample as
+    /// fresh and making every AMM freshness gate unreachable.
+    bool tibetswap_reserves_pending_{false};
+
     // -- Execution layer -----------------------------------------------------
 
     /// Coin-set (UTXO) manager for pre-splitting and locking.

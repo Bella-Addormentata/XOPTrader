@@ -160,6 +160,7 @@ add_library(xop_core STATIC
     src/execution/offer_manager.cpp
     src/execution/coin_manager.cpp
     src/execution/market_data.cpp
+    src/execution/orderbook_mid.cpp
     src/execution/fair_value_solver.cpp
 
     # -- RPC / networking ------------------------------------------------------

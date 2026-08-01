@@ -35,6 +35,8 @@
 
 #include "xop/execution/market_data.hpp"
 
+#include "xop/execution/orderbook_mid.hpp"
+
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
@@ -53,19 +55,12 @@ namespace xop {
 namespace {
 
 // -------------------------------------------------------------------------
-// compute_orderbook_mid_impl -- depth-weighted VWAP micro-price
-//
-// Computes a fair mid-price from competing offers using:
-//   1. VWAP across the top `depth` levels per side (bid / ask).
-//   2. Micro-price weighting: weight each side's VWAP by the *opposite*
-//      side's total depth.  This shifts the fair price toward the side
-//      with more liquidity (the side less likely to move).
-//
-// When only one side has offers, returns that side's VWAP.
-// Returns 0.0 if no offers are available.
-//
-// Reference: Stoikov (2018), "The Micro-Price -- a high-frequency
-//            estimator of future prices".
+// The depth-weighted VWAP micro-price now lives in orderbook_mid.cpp as
+// xop::compute_orderbook_mid().  It moved out of this anonymous namespace so
+// that the invariant (best_bid <= mid <= best_ask), the spread-dependent
+// blend toward the plain midpoint, and the degenerate/one-sided handling can
+// be tested directly against adversarial books without standing up a feed.
+// See xop/execution/orderbook_mid.hpp for the full rationale.
 // -------------------------------------------------------------------------
 
 // Maximum price deviation (in bps) for a competing offer to be considered
@@ -74,62 +69,6 @@ namespace {
 // the competitive anchor.  Catches fat-finger / erroneous 10x-priced offers
 // (e.g. $22.38 bid when market is $2.24 = ~8900 bps off).
 constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
-
-double compute_orderbook_mid_impl(
-    const std::vector<CompetingOffer>& offers,
-    std::size_t                        depth)
-{
-    if (offers.empty() || depth == 0) return 0.0;
-
-    // Separate bids and asks with (price, size) in double.
-    struct Level { double price; double size; };
-    std::vector<Level> bids, asks;
-    bids.reserve(offers.size());
-    asks.reserve(offers.size());
-
-    for (const auto& o : offers) {
-        const double px = static_cast<double>(o.price)
-                          / static_cast<double>(kMojosPerXch);
-        const double sz = static_cast<double>(o.size);  // raw mojos, units cancel in VWAP
-        if (o.side == Side::Bid) {
-            bids.push_back({px, sz});
-        } else {
-            asks.push_back({px, sz});
-        }
-    }
-
-    // Sort: bids descending (best first), asks ascending (best first).
-    std::sort(bids.begin(), bids.end(),
-              [](const Level& a, const Level& b) { return a.price > b.price; });
-    std::sort(asks.begin(), asks.end(),
-              [](const Level& a, const Level& b) { return a.price < b.price; });
-
-    // VWAP across top N levels per side.
-    auto vwap = [](const std::vector<Level>& levels,
-                   std::size_t n) -> std::pair<double, double> {
-        double num = 0.0, den = 0.0;
-        const std::size_t limit = std::min(levels.size(), n);
-        for (std::size_t i = 0; i < limit; ++i) {
-            num += levels[i].price * levels[i].size;
-            den += levels[i].size;
-        }
-        return {den > 0.0 ? num / den : 0.0, den};
-    };
-
-    const auto [bid_vwap, bid_depth] = vwap(bids, depth);
-    const auto [ask_vwap, ask_depth] = vwap(asks, depth);
-
-    // Two-sided: micro-price (opposite-side depth weighting).
-    if (bid_vwap > 0.0 && ask_vwap > 0.0) {
-        return (ask_depth * bid_vwap + bid_depth * ask_vwap)
-               / (bid_depth + ask_depth);
-    }
-
-    // One-sided fallback.
-    if (bid_vwap > 0.0) return bid_vwap;
-    if (ask_vwap > 0.0) return ask_vwap;
-    return 0.0;
-}
 
 }  // anonymous namespace
 
@@ -471,7 +410,9 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
 }
 
 void MarketDataFeed::ingest_amm_mid(const std::string& pair_name,
-                                     double             amm_mid) {
+                                     double             amm_mid,
+                                     double             pool_usd,
+                                     Timestamp          observed_at) {
     if (amm_mid <= 0.0) {
         spdlog::warn("ingest_amm_mid: pair={} invalid amm_mid={:.6f}",
                      pair_name, amm_mid);
@@ -481,11 +422,20 @@ void MarketDataFeed::ingest_amm_mid(const std::string& pair_name,
     std::unique_lock lock(mtx_pairs_);
     PairState& ps = get_or_create_pair(pair_name);
 
-    ps.amm_mid        = amm_mid;
-    ps.amm_updated_at = std::chrono::system_clock::now();
+    ps.amm_mid = amm_mid;
+    ps.amm_pool_usd = (std::isfinite(pool_usd) && pool_usd > 0.0)
+                    ? pool_usd : 0.0;
+    // Stored VERBATIM.  Stamping now() here is what pinned amm_age_seconds at
+    // ~0 forever: the engine re-read the reserves cache every heartbeat, so a
+    // sample fetched once an hour ago looked brand new on every single one.
+    // A default-constructed timestamp means "never observed" downstream, so
+    // reject it rather than let it read as the epoch.
+    ps.amm_updated_at = (observed_at != Timestamp{})
+                      ? observed_at
+                      : std::chrono::system_clock::now();
 
-    spdlog::debug("ingest_amm_mid: pair={} amm_mid={:.6f}",
-                  pair_name, amm_mid);
+    spdlog::debug("ingest_amm_mid: pair={} amm_mid={:.6f} pool_usd={:.0f}",
+                  pair_name, amm_mid, ps.amm_pool_usd);
 }
 
 void MarketDataFeed::ingest_fair_value(const std::string& pair_name,
@@ -695,7 +645,10 @@ FairValueObservation MarketDataFeed::get_fair_value_inputs(
     out.print_age = ps.dex_print_age;
 
     if (ps.amm_mid > 0.0 && ps.amm_updated_at != Timestamp{}) {
-        out.amm_mid = ps.amm_mid;
+        out.amm_mid      = ps.amm_mid;
+        out.amm_pool_usd = ps.amm_pool_usd;
+        // Measured from the last SUCCESSFUL pool read, so this genuinely grows
+        // while the AMM feed is down and the freshness gates can fire.
         out.amm_age_seconds = std::chrono::duration<double>(
             std::chrono::system_clock::now() - ps.amm_updated_at).count();
     }
@@ -968,14 +921,21 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     else if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0) {
         dex_mid = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
     }
-    // Case 2: One-sided dexie (unusual but possible in thin markets).
-    else if (ps.dex_best_bid > 0.0) {
-        dex_mid = ps.dex_best_bid;
-    }
-    else if (ps.dex_best_ask > 0.0) {
-        dex_mid = ps.dex_best_ask;
-    }
-    // Case 3: No live quotes -- fall back to last trade.
+    // Case 2: One-sided dexie -- NO dex mid.
+    //
+    // This used to publish the surviving side AS the mid.  A lone resting bid
+    // at 1.00 bounds fair value from below; calling it "the mid" asserts a
+    // location the observation does not contain, and after 5e1ceb4 an empty
+    // side specifically means "no THIRD-PARTY offer here", which is precisely
+    // the state in which the surviving side is most likely to be a reflection
+    // of our own quoting.  Refusing here costs nothing measured: across 3 632
+    // recorded book observations spanning 2026-04-03 to 2026-08-01, exactly
+    // ZERO were one-sided (books were either two-sided or wholly empty), so
+    // this branch removes a fabrication path rather than a data path.
+    //
+    // Falls through to the last trade below, which is a real print rather
+    // than half a book.
+    // Case 3: No usable two-sided quotes -- fall back to last trade.
     else if (ps.dex_last_trade > 0.0) {
         dex_mid = ps.dex_last_trade;
     }
@@ -1387,52 +1347,34 @@ void MarketDataFeed::ingest_competing_offers(
             }
         }
 
-        // Compute depth-weighted VWAP micro-price from the filtered book.
+        // Compute the order-book mid from the filtered book.
         // This must happen BEFORE the move into competing_offers_.
-        double ob_mid = cfg.orderbook_mid_enabled
-            ? compute_orderbook_mid_impl(filtered, cfg.orderbook_mid_depth)
-            : 0.0;
-
-        // Sanity check: clamp microprice within max deviation of simple
-        // BBO midpoint.  When the order book is extremely asymmetric the
-        // depth-weighted microprice can diverge wildly (e.g. 40% below
-        // BBO on XCH/BYC) making all subsequent pricing unusable.
-        if (ob_mid > 0.0
-            && filtered_best_bid > 0.0
-            && filtered_best_ask > 0.0)
-        {
-            const double simple_bbo_mid =
-                (filtered_best_bid + filtered_best_ask) / 2.0;
-            const double deviation =
-                std::abs(ob_mid - simple_bbo_mid) / simple_bbo_mid;
-            constexpr double kMaxMicroPriceDeviation = 0.10;  // 10%
-            if (deviation > kMaxMicroPriceDeviation) {
-                spdlog::warn("[MarketData] {} microprice {:.6f} deviates "
-                             "{:.1f}% from BBO mid {:.6f} -- clamping to BBO",
-                             pair_name, ob_mid,
-                             deviation * 100.0, simple_bbo_mid);
-                ob_mid = simple_bbo_mid;
-            }
-        }
-
-        // Hard-clamp ob_mid to the interior of the spread.  The Stoikov
-        // micro-price can legitimately fall below best_bid when ask depth
-        // dominates (predicting downward price movement), but using a
-        // sub-best-bid value for bid_cap blocks all competitive bids on
-        // that cycle.  Fair price must sit within [best_bid, best_ask].
-        if (ob_mid > 0.0) {
-            if (filtered_best_bid > 0.0 && ob_mid < filtered_best_bid) {
-                spdlog::debug("[MarketData] {} ob_mid={:.6f} below "
-                              "best_bid={:.6f} -- flooring to best_bid",
-                              pair_name, ob_mid, filtered_best_bid);
-                ob_mid = filtered_best_bid;
-            } else if (filtered_best_ask > 0.0 && ob_mid > filtered_best_ask) {
-                spdlog::debug("[MarketData] {} ob_mid={:.6f} above "
-                              "best_ask={:.6f} -- capping to best_ask",
-                              pair_name, ob_mid, filtered_best_ask);
-                ob_mid = filtered_best_ask;
-            }
-        }
+        //
+        // Layers 1-3 all live inside compute_orderbook_mid():
+        //   1. the invariant best_bid <= mid <= best_ask, enforced last and
+        //      logged at warning level when it binds;
+        //   2. a continuous blend from the Stoikov micro-price toward the
+        //      plain BBO midpoint as the relative spread widens;
+        //   3. one-sided (-> no mid), degenerate and zero-depth books.
+        //
+        // Two ad-hoc guards used to sit here instead and neither was
+        // sufficient.  The first clamped the micro-price to the BBO midpoint
+        // once it deviated more than 10% from it -- a discontinuity that fired
+        // on the wide books and did nothing on the merely-bad ones.  The
+        // second floored/capped to the BBO but only at debug level, so
+        // BYC/wUSDC.b published a "mid" sitting EXACTLY on its best ask
+        // (1.144728, block 9087661) for over a day without a single warning.
+        // Capping to the ask is not a fix for a mid that wanted to be above
+        // the ask; the weighting itself had to degrade, which is Layer 2.
+        const OrderbookMidParams ob_params{
+            cfg.orderbook_mid_depth,
+            cfg.microprice_narrow_bps,
+            cfg.microprice_wide_bps,
+        };
+        const OrderbookMid ob = cfg.orderbook_mid_enabled
+            ? compute_orderbook_mid(filtered, ob_params, pair_name)
+            : OrderbookMid{};
+        const double ob_mid = ob.mid;
 
         std::unique_lock lock(mtx_competitors_);
         competing_offers_[pair_name] = std::move(filtered);
@@ -1472,7 +1414,15 @@ void MarketDataFeed::ingest_competing_offers(
             }
             ps.dex_best_bid = filtered_best_bid > 0.0 ? filtered_best_bid : 0.0;
             ps.dex_best_ask = filtered_best_ask > 0.0 ? filtered_best_ask : 0.0;
-            if (ob_mid > 0.0) {
+            // Publish unconditionally, INCLUDING the "no usable mid" zero.
+            // The old `if (ob_mid > 0.0)` made this field sticky: once a book
+            // went one-sided or empty the last good mid stayed in place and
+            // compute_mid() kept serving it indefinitely.  Harmless while a
+            // one-sided book still produced a number; actively worse now that
+            // Layer 3 refuses to invent one, because the refusal would be
+            // silently converted into a frozen price -- the exact failure
+            // dex_print_age was added to detect.
+            if (cfg.orderbook_mid_enabled) {
                 ps.orderbook_mid = ob_mid;
             }
             ps.dex_updated_at = std::chrono::system_clock::now();

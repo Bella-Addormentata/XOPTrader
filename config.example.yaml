@@ -152,6 +152,19 @@ strategy:
   # fair_value_sigma_band_mult: 1.0      # band = max_dev + mult * solved sigma
   # fair_value_residual_widen_ratio: 0.5      # Widen on book-vs-graph disagreement
   # fair_value_residual_widen_floor_bps: 150  # Ignore disagreements below this
+  #
+  # Order-book micro-price blend schedule.  The order-book mid weights each
+  # side's VWAP by the OPPOSITE side's depth (Stoikov), which is right on a
+  # tight book and pathological on a wide one -- the weighted estimate can be
+  # dragged clean outside the BBO, which is how BYC/wUSDC.b came to publish a
+  # "mid" sitting exactly on its own best ask.  The micro-price weight
+  # therefore falls linearly from 1 to 0 as the relative spread travels from
+  # narrow to wide, after which the plain BBO midpoint is used.  Measured
+  # snapshot spread p50s for the week to 2026-08-01: XCH/DBX 63, XCH/wUSDC.b
+  # 237, XCH/BYC 794, BYC/wUSDC.b 1163 bps.  Commented out on purpose -- the
+  # defaults must protect an unconfigured deployment.  wide must exceed narrow.
+  # microprice_narrow_bps: 200           # At or below: micro-price used whole
+  # microprice_wide_bps: 800             # At or above: plain BBO midpoint only
   # Startup market analysis: observe this many blocks before trading begins.
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
@@ -258,9 +271,13 @@ strategy:
   cat_coin_pool_target_units: 10.0       # [OPTIONAL, default: 50.0] Target display units per coin
 
   # -- AMM blend weight --
-  # Weight of TibetSwap AMM implied price in mid-price blend.
-  # Anchors quotes to the AMM to prevent cross-venue arbitrage.
-  amm_blend_weight: 0.15               # [OPTIONAL, default: 0.15]  0 = disable AMM blending
+  # Weight of the TibetSwap AMM implied price in the composite mid-price.
+  #
+  # KEEP THIS AT 0.  The same AMM sample is the independent reference the
+  # fair-value guard measures every ladder tier against.  Giving it weight
+  # here would let it move the ladder centre it is supposed to be checking,
+  # so the guard would be validating a price it had itself set.
+  amm_blend_weight: 0.0                # [OPTIONAL, default: 0.0]  >0 re-creates the validation cycle
 
 # --- risk: REQUIRED ----------------------------------------------------------
 # First 5 fields are REQUIRED; circuit breaker fields are OPTIONAL.

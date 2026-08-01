@@ -199,6 +199,56 @@ Solution solve_pair(const std::vector<Anchor>& anchors,
 // ---------------------------------------------------------------------------
 double combine_sigma_bps(const std::vector<double>& terms);
 
+// ---------------------------------------------------------------------------
+// amm_sigma_bps -- uncertainty of an AMM implied price, from POOL DEPTH.
+//
+// WHY A FLAT CONSTANT WAS WRONG
+// -----------------------------
+// The claim that justifies trusting an AMM quote is "arbitrage holds it to
+// fair value".  That claim is a statement about MONEY, not about the formula:
+// it holds only when correcting a dislocation pays more than it costs.  A
+// constant-product pool moves by roughly the fraction of its reserves that a
+// trade consumes, so on a $500 pool a 10% dislocation is corrected by pushing
+// ~$25 through it -- and nobody watches an obscure pool to earn a few dollars
+// minus fees and two on-chain transactions.  The live pools are dust:
+//
+//     wUSDC.b   393.868 XCH / 564.862 wUSDC.b   ~ $1,125 total
+//     BYC       175.406 XCH / 261.655 BYC       ~ $500   total
+//
+// At that size the pool is not an arbitrage-pinned oracle, it is one stale
+// LP's last trade.  A flat 50 bps sigma gave it weight 1/(50e-4)^2 = 4.0e4
+// against ~242 for the competing BYC/wUSDC.b book -- roughly 166:1 -- so a
+// $500 pool silently outvoted every other observation in the graph.
+//
+// That ratio is not a theoretical worry.  At the 2026-08-01 sweep the BYC
+// pool implied 1.4917 XCH/BYC while the truth was ~1.414: an error of ~550
+// bps, against the 50 bps it was claiming.  The depth-derived sigma for that
+// pool is 670 bps -- the same order as its ACTUAL error, which is the whole
+// point of deriving it.
+//
+// THE FORM
+// --------
+//     sigma_bps = max(floor_bps, depth_k_bps / sqrt(pool_usd))
+//
+// The 1/sqrt(depth) shape is the usual price-impact scaling and, more to the
+// point, it is the shape that makes weight (1/sigma^2) grow LINEARLY in pool
+// size: doubling the money defending the price doubles its vote.  That is the
+// property being modelled -- influence proportional to capital at risk -- and
+// no other simple form has it.
+//
+// floor_bps stops a very deep pool from claiming more certainty than the swap
+// fee and arbitrage band allow, so the old 50 bps survives as the BEST case
+// rather than the assumed case.
+//
+// @param pool_usd      Total USD value of BOTH pool sides.  Must be > 0 and
+//                      finite; anything else returns 0.0, meaning "this
+//                      observation cannot be weighted, so do not use it".
+// @param floor_bps     Lower bound on the result (deep-pool asymptote).
+// @param depth_k_bps   Calibration constant: the sigma of a $1 pool.  See
+//                      StrategyConfig::fair_value_amm_depth_k_bps.
+// ---------------------------------------------------------------------------
+double amm_sigma_bps(double pool_usd, double floor_bps, double depth_k_bps);
+
 }  // namespace fv
 }  // namespace xop
 

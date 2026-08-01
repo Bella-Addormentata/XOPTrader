@@ -250,6 +250,11 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
     md_cfg.orderbook_mid_enabled        = config_.market_data.orderbook_mid_enabled;
     md_cfg.orderbook_mid_depth          = config_.market_data.orderbook_mid_depth;
+    // Micro-price blend schedule.  Lives in [strategy] because it is a
+    // pricing-policy decision (how far to trust a depth signal), not a feed
+    // parameter, but it is consumed here where the book is turned into a mid.
+    md_cfg.microprice_narrow_bps        = config_.strategy.microprice_narrow_bps;
+    md_cfg.microprice_wide_bps          = config_.strategy.microprice_wide_bps;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -1829,6 +1834,15 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                                 config_.arbitrage.tibetswap_fee_bps / 10.0));
 
                         arb_detector_->set_tibetswap_reserves(reserves);
+
+                        // The ONLY place these two advance.  Everything
+                        // downstream dates the AMM sample from here, so a
+                        // failed or skipped fetch leaves the previous sample
+                        // ageing honestly instead of being re-stamped.
+                        tibetswap_reserves_at_ =
+                            std::chrono::system_clock::now();
+                        tibetswap_reserves_pending_ = true;
+
                         spdlog::debug("[Engine] Step 1: TibetSwap reserves "
                                       "updated for {} pair(s) from {} pool(s)",
                                       reserves.size(), pools.size());
@@ -2044,11 +2058,17 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
 
         // -- TibetSwap AMM implied mid-price ---------------------------------
-        // Derive the AMM implied mid-price from cached TibetSwap pool
-        // reserves using the constant-product formula.  When available, the
-        // market data feed blends this into its composite mid-price to
-        // anchor our quotes and prevent the AMM from arbitraging us.
-        if (arb_detector_) {
+        // Derive the AMM implied mid-price from the TibetSwap pool reserves
+        // using the constant-product formula, and publish it as an INDEPENDENT
+        // observation for the fair-value solve.  It is deliberately NOT blended
+        // into the composite mid (amm_blend_weight defaults to 0): a reference
+        // that moves the ladder cannot also be the thing that validates it.
+        //
+        // Gated on tibetswap_reserves_pending_ so this runs once per SUCCESSFUL
+        // fetch.  It used to run every heartbeat straight off the cache, which
+        // re-stamped the sample's observation time and pinned amm_age_seconds
+        // at ~0 no matter how long the API had been down.
+        if (arb_detector_ && tibetswap_reserves_pending_) {
             const auto& reserves = arb_detector_->get_tibetswap_reserves();
             for (const auto& pool : reserves) {
                 if (pool.pair_name == pair.name
@@ -2074,11 +2094,38 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                                                    pool.xch_reserve,
                                                    pair.base_mojos_per_unit,
                                                    pair.quote_mojos_per_unit);
-                    if (amm_implied > 0.0) {
-                        market_data_->ingest_amm_mid(pair.name, amm_implied);
+                    // POOL DEPTH IN USD -- what the AMM edge's weight is made
+                    // of.  Both sides of a constant-product pool carry equal
+                    // value, so the total is twice the XCH side.  Without a
+                    // USD mark for XCH the depth is unknown, and an
+                    // observation that cannot be weighted is not published at
+                    // all: guessing its weight is the defect being fixed, and
+                    // the same missing feed also removes the XCH anchor, so
+                    // the solve correctly degrades to Unavailable and Step 7
+                    // widens rather than clamping to a number nobody checked.
+                    double pool_usd = 0.0;
+                    const auto xch_usd_it = coingecko_prices_.find("chia");
+                    if (xch_usd_it != coingecko_prices_.end()
+                        && xch_usd_it->second > 0.0
+                        && pool.xch_mojos_per_unit > 0)
+                    {
+                        const double xch_units =
+                            static_cast<double>(pool.xch_reserve)
+                            / static_cast<double>(pool.xch_mojos_per_unit);
+                        pool_usd = 2.0 * xch_units * xch_usd_it->second;
+                    }
+
+                    if (amm_implied > 0.0 && pool_usd > 0.0) {
+                        market_data_->ingest_amm_mid(pair.name, amm_implied,
+                                                     pool_usd,
+                                                     tibetswap_reserves_at_);
                         spdlog::debug("[Engine] Step 1: {} Tibet AMM "
-                                      "implied_mid={:.6f}",
-                                      pair.name, amm_implied);
+                                      "implied_mid={:.6f} pool_usd={:.0f}",
+                                      pair.name, amm_implied, pool_usd);
+                    } else if (amm_implied > 0.0) {
+                        spdlog::warn("[Engine] Step 1: {} Tibet AMM sample "
+                                     "dropped -- pool depth unknown (no XCH "
+                                     "USD mark)", pair.name);
                     }
                     break;
                 }
@@ -2104,6 +2151,13 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                           pair.name, ex.what());
         }
     }
+
+    // Every pair has now had its chance to publish the latest reserves, so the
+    // fetch is fully consumed.  Cleared here rather than inside the loop
+    // because the flag covers the whole batch, and cleared unconditionally so
+    // a pair whose ingest threw cannot pin it true and resurrect the
+    // every-heartbeat re-stamping this replaces.
+    tibetswap_reserves_pending_ = false;
 
     // Build a list of enabled pair names for the refresh call.
     std::vector<std::string> enabled;
@@ -3878,15 +3932,43 @@ void Engine::update_fair_values()
         // anyone's willingness to quote, so it is independent of the order
         // book in exactly the sense this guard requires.  These arrive from
         // the TibetSwap pool reserves ingested earlier in Step 1, and they are
-        // what turns a leg with a single wide book into a cross-checked one --
-        // for a CAT priced only by a 1259 bps frozen book, the pool is the
-        // difference between Unavailable and a usable clamp.
+        // what turns a leg with a single wide book into a cross-checked one.
+        //
+        // ITS WEIGHT COMES FROM POOL DEPTH, NOT A CONSTANT.  "Arbitrage holds
+        // the pool to fair value" is a claim about how much money defends the
+        // price, and it fails at the size these pools actually are: ~21 XCH
+        // (~$30) moves the wUSDC.b pool 10%, which nobody crosses two on-chain
+        // transactions to collect.  A flat 50 bps sigma let a $500 pool outvote
+        // the competing book about 166:1; sigma ~ k/sqrt(pool_usd) makes its
+        // vote proportional to the capital behind it instead.
+        //
+        // Consequence, recorded because it is easy to mistake for a
+        // regression: at today's depths this is NOT enough to make XCH/BYC
+        // clampable.  The pool moves the estimate toward the truth but arrives
+        // with ~467 bps of uncertainty, so the pair reports Unavailable and
+        // Step 7 widens instead of clamping.  That is the honest reading of
+        // $500 of liquidity plus a 1259 bps frozen book; see
+        // FairValueSweep.SweepIsNotClampedAnyMoreAndTheGapIsQuantified.
+        //
+        // The freshness gate below is reachable now that amm_age_seconds is
+        // dated from the last successful fetch rather than the last cache read.
+        const double amm_sigma = fv::amm_sigma_bps(
+            gp.obs.amm_pool_usd,
+            sc.fair_value_amm_sigma_bps,
+            sc.fair_value_amm_depth_k_bps);
+
         if (gp.obs.amm_mid > 0.0
+            && amm_sigma > 0.0
             && (sc.fair_value_amm_max_age_sec <= 0.0
                 || gp.obs.amm_age_seconds <= sc.fair_value_amm_max_age_sec)) {
             edges.push_back(fv::Edge{gp.base, gp.quote, gp.obs.amm_mid,
-                                     sc.fair_value_amm_sigma_bps,
+                                     amm_sigma,
                                      static_cast<int>(i), /*is_book=*/false});
+        } else if (gp.obs.amm_mid > 0.0) {
+            spdlog::debug("[Engine] fair value {}: AMM edge dropped "
+                          "(pool_usd={:.0f} sigma={:.0f}bps age={:.0f}s)",
+                          gp.name, gp.obs.amm_pool_usd, amm_sigma,
+                          gp.obs.amm_age_seconds);
         }
     }
 

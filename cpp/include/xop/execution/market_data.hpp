@@ -216,7 +216,18 @@ struct FairValueObservation {
     double       spread_bps{0.0};   // Width of that book.
     std::int32_t print_age{0};      // Heartbeats since the mid last moved.
     double       amm_mid{0.0};      // AMM implied mid (0 if none).
+
+    /// Seconds since the AMM sample was actually OBSERVED -- i.e. since the
+    /// last SUCCESSFUL pool fetch, not since it was last copied out of the
+    /// cache.  Re-stamping a cached sample every heartbeat pinned this at ~0
+    /// and made every AMM freshness gate unreachable.
     double       amm_age_seconds{0.0};
+
+    /// Total USD value of BOTH sides of the pool the AMM mid came from, 0 when
+    /// unknown.  This is what the AMM edge's weight is derived from: the
+    /// "arbitrage holds the pool to fair value" argument is an argument about
+    /// how much money defends the price, so the money has to be measured.
+    double       amm_pool_usd{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -310,8 +321,15 @@ struct MarketDataConfig {
     /// When AMM data is available, the blend becomes:
     ///   mid = w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid
     /// with weights re-normalised to sum to 1.0.
-    /// Default 0.15 (15%).  0 = disable AMM blending.
-    double amm_blend_weight{0.15};
+    ///
+    /// DEFAULT 0.0 -- the AMM is an independent VALIDATOR of the mid, not a
+    /// contributor to it.  The same TibetSwap sample also feeds the
+    /// fair-value solve that checks the ladder; if it fed both, the guard
+    /// would be comparing the ladder against a number that had itself set the
+    /// ladder's centre.  A validator must not be able to move the thing it
+    /// validates, so the blend side is switched off and the solve side kept.
+    /// See StrategyConfig::amm_blend_weight for the full rationale.
+    double amm_blend_weight{0.0};
 
     /// Maximum staleness (seconds) of AMM data before it is ignored.
     /// Default 300 s (5 min).  0 = disable freshness check.
@@ -331,6 +349,15 @@ struct MarketDataConfig {
     /// at the cost of including offers further from fair value.
     /// Default: 5 levels per side.
     std::size_t orderbook_mid_depth{5};
+
+    /// Layer 2 blend schedule for the order-book mid.  At or below
+    /// `microprice_narrow_bps` of relative spread the Stoikov micro-price is
+    /// used whole; at or above `microprice_wide_bps` it is discarded for the
+    /// plain BBO midpoint; in between the two are blended linearly.
+    /// Mirrored from StrategyConfig, where the defaults are justified against
+    /// measured per-pair spread distributions.
+    double microprice_narrow_bps{200.0};
+    double microprice_wide_bps{800.0};
 
     /// Maximum age (seconds) of an independent fair value before
     /// get_fair_value() reports it as UNAVAILABLE.  The external price feed
@@ -369,7 +396,10 @@ struct PairState {
 
     // --- AMM reference (TibetSwap implied price) ---
     double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)
-    Timestamp   amm_updated_at{};   // When AMM data was last refreshed
+    Timestamp   amm_updated_at{};   // When the pool was last successfully READ
+                                    // (supplied by the caller, NOT the ingest
+                                    // time -- see ingest_amm_mid).
+    double      amm_pool_usd{0.0};  // USD value of both pool sides, 0=unknown
 
     // --- Order-book-derived mid (depth-weighted VWAP micro-price) ---
     double      orderbook_mid{0.0}; // VWAP micro-price from competing offers
@@ -514,9 +544,24 @@ public:
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
-    /// @param pair_name  Trading pair identifier.
-    /// @param amm_mid    AMM implied mid-price (quote per base).
-    void ingest_amm_mid(const std::string& pair_name, double amm_mid);
+    ///
+    /// CALL THIS ONLY WHEN A POOL FETCH ACTUALLY SUCCEEDED.  `observed_at` is
+    /// stored verbatim and is what every AMM freshness gate measures against,
+    /// so re-ingesting a cached sample with a fresh timestamp would make the
+    /// data look permanently new and every one of those gates unreachable.
+    ///
+    /// @param pair_name    Trading pair identifier.
+    /// @param amm_mid      AMM implied mid-price (quote per base).
+    /// @param pool_usd     Total USD value of both pool sides; 0 = unknown,
+    ///                     which makes the sample unusable as a weighted
+    ///                     observation (it cannot be weighted without depth).
+    /// @param observed_at  When the pool was actually read.  Defaults to now()
+    ///                     for callers that fetch synchronously at the call
+    ///                     site; the engine passes its real fetch time.
+    void ingest_amm_mid(const std::string& pair_name,
+                        double             amm_mid,
+                        double             pool_usd = 0.0,
+                        Timestamp          observed_at = Timestamp::clock::now());
 
     /// Ingest an INDEPENDENT fair value for a pair.
     ///

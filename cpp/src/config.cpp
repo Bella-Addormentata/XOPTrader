@@ -763,6 +763,8 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     opt_non_negative("fair_value_feed_sigma_bps",
                      cfg.fair_value_feed_sigma_bps);
     opt_non_negative("fair_value_amm_sigma_bps", cfg.fair_value_amm_sigma_bps);
+    opt_non_negative("fair_value_amm_depth_k_bps",
+                     cfg.fair_value_amm_depth_k_bps);
     opt_non_negative("fair_value_amm_max_age_sec",
                      cfg.fair_value_amm_max_age_sec);
     opt_non_negative("fair_value_min_book_sigma_bps",
@@ -781,6 +783,20 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                      cfg.fair_value_residual_widen_ratio);
     opt_non_negative("fair_value_residual_widen_floor_bps",
                      cfg.fair_value_residual_widen_floor_bps);
+    opt_non_negative("microprice_narrow_bps", cfg.microprice_narrow_bps);
+    opt_non_negative("microprice_wide_bps",   cfg.microprice_wide_bps);
+
+    // The blend interpolates ACROSS [narrow, wide]; an inverted or empty band
+    // has no interior and would silently collapse into a step function, which
+    // is the discontinuous behaviour this schedule exists to replace.  Refuse
+    // the combination rather than quietly degrade.
+    if (cfg.microprice_wide_bps <= cfg.microprice_narrow_bps) {
+        throw ConfigError(sec
+                          + ".microprice_wide_bps ("
+                          + std::to_string(cfg.microprice_wide_bps)
+                          + ") must be > microprice_narrow_bps ("
+                          + std::to_string(cfg.microprice_narrow_bps) + ")");
+    }
 
     // A tight threshold above the usable ceiling would silently promote every
     // barely-usable value to the highest confidence tier -- the opposite of
