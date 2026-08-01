@@ -509,3 +509,56 @@ TEST(DatabaseTest, LedgerRevealsPhantomFillAsDivergence) {
         << "the books should be short by exactly the phantom fill size";
 }
 
+// ============================================================================
+// [AS-WARM] get_recent_snapshot_mids -- warm-start query (acceptance D)
+// ============================================================================
+//
+// The volatility warm-start replays the newest N snapshot mids in ASCENDING
+// time order.  Verify the query returns exactly that: newest N, ascending,
+// zero-mid rows excluded, timestamps usable.
+
+TEST(DatabaseTest, RecentSnapshotMidsAscendingFilteredAndLimited) {
+    TempDbPath temp("warmstart_mids");
+    xop::Database db(temp.path().string());
+
+    // 120 rows for the pair under test, mids 1000..1119 at blocks 1..120,
+    // with every 10th row given a zero mid (excluded at the SQL level), plus
+    // decoy rows for another pair that must never leak in.
+    std::vector<xop::DbSnapshot> batch;
+    for (int i = 0; i < 120; ++i) {
+        xop::DbSnapshot s;
+        s.block_height    = static_cast<xop::BlockHeight>(i + 1);
+        s.pair_name       = "XCH/wUSDC.b";
+        s.mid_price_mojos = (i % 10 == 9) ? 0 : (1000 + i);
+        batch.push_back(s);
+
+        xop::DbSnapshot decoy;
+        decoy.block_height    = static_cast<xop::BlockHeight>(i + 1);
+        decoy.pair_name       = "XCH/DBX";
+        decoy.mid_price_mojos = 777;
+        batch.push_back(decoy);
+    }
+    db.insert_snapshots_batch(batch);
+
+    // Limit 50: the NEWEST 50 positive-mid rows, ascending on return.
+    const auto rows = db.get_recent_snapshot_mids("XCH/wUSDC.b", 50);
+    ASSERT_EQ(rows.size(), 50u);
+    for (std::size_t i = 0; i < rows.size(); ++i) {
+        EXPECT_GT(rows[i].mid_price_mojos, 0);          // filter applied
+        EXPECT_GT(rows[i].unix_seconds, 0);             // created_at parsed
+        if (i > 0) {
+            EXPECT_GT(rows[i].block_height, rows[i - 1].block_height)
+                << "rows must come back in ascending block order";
+        }
+        // mids encode their block: mid = 1000 + (block - 1).
+        EXPECT_EQ(rows[i].mid_price_mojos,
+                  1000 + static_cast<xop::Mojo>(rows[i].block_height) - 1);
+    }
+    // Newest positive-mid row is block 119 (block 120 has i=119, mid 1119 --
+    // i%10==9 zeroes blocks 10,20,...,120, so the newest kept is block 119).
+    EXPECT_EQ(rows.back().block_height, 119u);
+
+    // Unknown pair: empty, not an error.
+    EXPECT_TRUE(db.get_recent_snapshot_mids("NOPE/PAIR", 50).empty());
+}
+

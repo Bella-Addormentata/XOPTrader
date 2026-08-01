@@ -767,6 +767,17 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.quote_center_blend_enabled =
             node["quote_center_blend_enabled"].as<bool>();
     }
+    // [AS-RES] Avellaneda-Stoikov reservation offset; defaults operative
+    // when absent (see config.hpp for the calibration numbers).
+    if (node["as_reservation_enabled"]
+        && node["as_reservation_enabled"].IsDefined()
+        && !node["as_reservation_enabled"].IsNull()) {
+        cfg.as_reservation_enabled =
+            node["as_reservation_enabled"].as<bool>();
+    }
+    opt_non_negative("as_reservation_gamma", cfg.as_reservation_gamma);
+    opt_non_negative("as_reservation_max_offset_bps",
+                     cfg.as_reservation_max_offset_bps);
     opt_non_negative("fair_value_feed_sigma_bps",
                      cfg.fair_value_feed_sigma_bps);
     opt_non_negative("fair_value_amm_sigma_bps", cfg.fair_value_amm_sigma_bps);

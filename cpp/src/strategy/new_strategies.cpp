@@ -675,6 +675,13 @@ double BlockCadenceAdaptiveSpread::current_dt_ema() const
     return dt_ema_;
 }
 
+std::size_t BlockCadenceAdaptiveSpread::arrival_count() const
+{
+    // T2-02: Shared lock -- read-only access to block_arrivals_.
+    std::shared_lock lock(mtx_);
+    return block_arrivals_.size();
+}
+
 double BlockCadenceAdaptiveSpread::cadence_ratio() const
 {
     // T2-02: Shared lock -- read-only access to dt_ema_ and cfg_.

@@ -28,6 +28,7 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -939,6 +940,59 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
     sqlite3_clear_bindings(stmt_last_snapshot_);
 
     return result;
+}
+
+std::vector<DbSnapshotMidTick> Database::get_recent_snapshot_mids(
+    const std::string& pair_name, std::uint32_t limit) const noexcept
+{
+    // [AS-WARM] Startup-only path: a one-off prepared statement keeps the
+    // hot-path statement cache untouched (same rationale as
+    // save_inventory_state).  Newest N rows are selected DESC then reversed
+    // so the caller receives ascending time order, which is what the
+    // estimator replay requires.
+    static constexpr const char* kQuery = R"SQL(
+        SELECT block_height, mid_price_mojos,
+               CAST(strftime('%s', created_at) AS INTEGER)
+        FROM snapshots
+        WHERE pair_name = ?1 AND mid_price_mojos > 0
+        ORDER BY block_height DESC
+        LIMIT ?2;
+    )SQL";
+
+    std::vector<DbSnapshotMidTick> rows;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db_, kQuery, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK || stmt == nullptr) {
+            spdlog::error("[Database] get_recent_snapshot_mids prepare "
+                          "failed: {}", sqlite3_errmsg(db_));
+            return rows;
+        }
+
+        sqlite3_bind_text(stmt, 1, pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, static_cast<std::int64_t>(limit));
+
+        rows.reserve(limit);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            DbSnapshotMidTick t;
+            t.block_height = static_cast<BlockHeight>(
+                sqlite3_column_int64(stmt, 0));
+            t.mid_price_mojos = sqlite3_column_int64(stmt, 1);
+            t.unix_seconds    = sqlite3_column_int64(stmt, 2);
+            rows.push_back(t);
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        // Never let a warm-start query disrupt startup.
+        rows.clear();
+        return rows;
+    }
+
+    // DESC -> ascending block order.
+    std::reverse(rows.begin(), rows.end());
+    return rows;
 }
 
 // ===========================================================================

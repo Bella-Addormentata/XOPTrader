@@ -256,6 +256,58 @@ struct StrategyConfig {
     /// 0 disables the sigma term (existing floors still apply).
     double   quote_width_sigma_mult{1.0};
 
+    // -- Avellaneda-Stoikov reservation offset --------------------------------
+    // [AS-RES 2026-08-01] The A-S reservation price was computed every
+    // heartbeat in Step 4 and discarded: Step 7 centred the ladder on the
+    // (uncertainty-blended) market mid and read only the risk quote's sizes.
+    // Measured consequence on 2026-07-31: ~116 XCH held against an ~80 XCH
+    // target and no selling lean anywhere in the posted ladder.  These knobs
+    // shift the ladder CENTRE by the bounded inventory term
+    //
+    //     centre' = centre * (1 - q * gamma * sigma^2 * tau)
+    //
+    // where q = signed imbalance normalized to the pair's ratio target
+    // (positive = long base), sigma = the honestly-warmed ANNUALIZED
+    // volatility (see VolatilityEstimator::rehydrate_from_ticks), and tau =
+    // the quote-refresh horizon as a year fraction (~19 min = 3.615e-5 yr).
+    // Full dimensional analysis in strategy/reservation_offset.hpp.  All
+    // downstream guards (sigma width floor, fair-value clamp, no-loss floor,
+    // peg guards, competitive caps) are untouched and act on the shifted
+    // centre.  No pair is named anywhere; the keys are absent from the
+    // shipped config.yaml on purpose -- the defaults are the operative
+    // values and must protect an unconfigured deployment.
+
+    /// Master switch for the reservation offset.  Default true -- connecting
+    /// this term to the posted ladder is the point of the mechanism; with an
+    /// unwarmed estimator the sigma floor makes the term ~0 anyway (see
+    /// as_reservation_gamma numbers below), so enabling it is safe even with
+    /// no history.
+    bool     as_reservation_enabled{true};
+
+    /// Risk-aversion for the reservation offset, DIMENSIONLESS in the
+    /// normalized units above (q as a fraction of target, sigma relative and
+    /// annualized, tau in years) -- deliberately NOT strategy.gamma, whose
+    /// 0.003 belongs to the raw-A-S formula's units and would make this term
+    /// 0.0006 bps at the measured state (decorative).  Default 1000:
+    /// the per-unit-imbalance lean gamma * sigma^2 * tau at the measured
+    /// sigma = 1.11 annualized and tau = 19 min is 445 bps, far above the
+    /// 100 bps rail below, so at high volatility the RAIL governs and the
+    /// formula provides the smooth scaling beneath it:
+    ///     sigma = 1.11 -> 445 bps per unit q  (rail binds for |q| > 0.22)
+    ///     sigma = 0.50 ->  90 bps per unit q
+    ///     sigma = 0.20 ->  14 bps per unit q
+    ///     sigma = 0.001 (floor, no history) -> 3.6e-4 bps: nothing.
+    /// At the measured 2026-07-31 state (q = +0.45, sigma = 1.11) the raw
+    /// offset is 200.4 bps, capped to 100: bids AND asks shift down 1%, the
+    /// correct selling lean the bot was observed failing to produce.
+    double   as_reservation_gamma{1000.0};
+
+    /// Rail (bps) on the reservation shift of the ladder centre, the bound
+    /// approved when this mechanism was first planned.  Default 100 (1%).
+    /// Applied symmetrically to both signs of imbalance.  0 disables the
+    /// offset entirely (a zero cap admits no shift).
+    double   as_reservation_max_offset_bps{100.0};
+
     // -- Triangulation weights ----------------------------------------------
     // The fair value is a weighted least-squares solve over the graph of
     // assets and pairs (see fair_value_solver.hpp).  Every knob below is a

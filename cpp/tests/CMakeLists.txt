@@ -70,6 +70,7 @@ add_executable(xop_tests
     test_orderbook_mid.cpp
     test_published_mid.cpp
     test_exposure_gate.cpp
+    test_reservation_offset.cpp
 )
 
 target_link_libraries(xop_tests

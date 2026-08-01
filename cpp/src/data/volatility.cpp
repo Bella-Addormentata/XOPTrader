@@ -60,6 +60,10 @@ double VolatilityEstimator::update(const Candle& candle)
     // sigma_annual_, variance_ratio_, and regime_.
     std::unique_lock lock(mtx_);
 
+    // [AS-WARM] A directly-fed candle spans exactly one tick; annualisation
+    // must not divide by the aggregation factor on this path.
+    candle_span_ticks_ = 1.0;
+
     // Append the new candle to the rolling window.
     candles_.push_back(candle);
 
@@ -175,6 +179,9 @@ double VolatilityEstimator::update_tick(double price)
         // Feed the aggregated candle through the existing pipeline.
         // Note: we already hold the exclusive lock, so we inline the
         // update(Candle) logic here to avoid double-lock UB.
+        // [AS-WARM] Each aggregated candle spans agg_n ticks; record the
+        // span so annualisation uses the true candle period.
+        candle_span_ticks_ = static_cast<double>(agg_n);
         candles_.push_back(aggregated);
         while (candles_.size() > cfg_.lookback_blocks) {
             candles_.pop_front();
@@ -275,8 +282,15 @@ const VolatilityEstimatorConfig& VolatilityEstimator::config() const noexcept
 
 void VolatilityEstimator::set_block_time_seconds(double seconds) noexcept
 {
-    // Clamp to physically reasonable range.
-    const double clamped = std::clamp(seconds, 10.0, 300.0);
+    // [AS-WARM 2026-08-01] Clamp widened from [10, 300] to [1, 7200].
+    // The old 300 s ceiling assumed one tick per CHAIN block; in production
+    // one tick arrives per engine heartbeat (~19 min = ~1140 s, measured
+    // median inter-snapshot spacing ~1125 s), so the honest cadence was
+    // being clamped to 300 s and sigma_annual overstated by
+    // sqrt(1140/300) ~ 1.95x whenever the estimator was ready.  7200 s
+    // (2 h) still rejects wildly wrong inputs while admitting any
+    // realistic heartbeat.
+    const double clamped = std::clamp(seconds, 1.0, 7200.0);
 
     std::unique_lock lock(mtx_);
     cfg_.block_time_seconds = clamped;
@@ -287,7 +301,52 @@ void VolatilityEstimator::set_block_time_seconds(double seconds) noexcept
     sqrt_blocks_per_year_ = std::sqrt(blocks_per_year);
 
     // Recompute sigma_annual from sigma_block with the new constant.
-    sigma_annual_ = sigma_block_ * sqrt_blocks_per_year_;
+    // [AS-WARM] Same candle-span correction as recompute_yang_zhang().
+    sigma_annual_ = sigma_block_ * sqrt_blocks_per_year_
+                  / std::sqrt(std::max(1.0, candle_span_ticks_));
+}
+
+// ---------------------------------------------------------------------------
+// [AS-WARM] Warm-start from persisted tick history.
+// ---------------------------------------------------------------------------
+
+std::size_t VolatilityEstimator::rehydrate_from_ticks(
+    const std::vector<double>& mids, double tick_seconds)
+{
+    // Reset all rolling state so the replay is exactly a fresh estimator
+    // fed the persisted series -- no mixing with whatever partial state
+    // existed before (normally none: this is called at startup).
+    {
+        std::unique_lock lock(mtx_);
+        candles_.clear();
+        agg_tick_count_ = 0;
+        agg_open_ = agg_high_ = agg_low_ = agg_close_ = 0.0;
+        sigma_block_  = 0.0;
+        sigma_annual_ = 0.0;
+        variance_ratio_ = 1.0;
+        regime_ = RegimeInfo{MarketRegime::Random, 1.0, 1.0, 1.0};
+        regime_duration_blocks_ = 0;
+        last_regime_ = MarketRegime::Random;
+        candle_span_ticks_ = 1.0;
+    }
+
+    // Honest cadence: the persisted ticks are spaced tick_seconds apart
+    // (typically the ~19-min engine heartbeat), and annualisation must use
+    // that spacing, not the 52 s chain-block default.
+    if (tick_seconds > 0.0) {
+        set_block_time_seconds(tick_seconds);
+    }
+
+    // Replay through the same aggregation pipeline the live feed uses
+    // (Engine Step 3 calls update_tick once per heartbeat), so warm and
+    // live candles are constructed identically.
+    std::size_t fed = 0;
+    for (const double mid : mids) {
+        if (!std::isfinite(mid) || mid <= 0.0) continue;
+        update_tick(mid);
+        ++fed;
+    }
+    return fed;
 }
 
 // ===========================================================================
@@ -483,9 +542,18 @@ void VolatilityEstimator::recompute_yang_zhang()
     // ------------------------------------------------------------------
     // Step 5: Convert to standard deviations
     // ------------------------------------------------------------------
+    //
+    // [AS-WARM] Annualisation honours the candle span:
+    //   sigma_annual = sigma_candle * sqrt(seconds_per_year /
+    //                                      (block_time * span_ticks))
+    //                = sigma_candle * sqrt_blocks_per_year_ / sqrt(span)
+    // span = 1 for update() candles, candle_aggregation_blocks for
+    // update_tick() candles.  See get_sigma_annual() for the full
+    // dimensional analysis.
 
     sigma_block_  = std::sqrt(sigma_yz_sq);
-    sigma_annual_ = sigma_block_ * sqrt_blocks_per_year_;
+    sigma_annual_ = sigma_block_ * sqrt_blocks_per_year_
+                  / std::sqrt(std::max(1.0, candle_span_ticks_));
 }
 
 // ===========================================================================

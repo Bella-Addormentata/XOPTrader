@@ -284,6 +284,14 @@ private:
     /// AdverseSelectionEstimator; update the regime classification.
     void step_update_analytics(BlockHeight block_height);
 
+    /// [AS-WARM] Warm-start every pair's VolatilityEstimator from the
+    /// persisted snapshots table at startup (mirrors
+    /// PnLTracker::rehydrate_from_db for P&L), so the estimator is ready on
+    /// the FIRST tick after a restart instead of after ~32 h of
+    /// uninterrupted uptime.  Pairs with sparse history stay cold and keep
+    /// the existing sigma-floor behaviour.
+    void warm_start_volatility_estimators();
+
     /// Step 4: Invoke the active strategy (A-S or GLFT) to compute optimal
     /// bid/ask quotes for each enabled pair.
     void step_compute_quotes(BlockHeight block_height);

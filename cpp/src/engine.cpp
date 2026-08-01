@@ -25,6 +25,7 @@
 
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
+#include "xop/strategy/reservation_offset.hpp"
 
 #include <boost/asio/co_spawn.hpp>
 #include <boost/asio/detached.hpp>
@@ -289,6 +290,13 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         pin_estimators_[pair.name] =
             std::make_unique<AdverseSelectionEstimator>(as_cfg);
     }
+
+    // [AS-WARM] Replay persisted snapshot mids through each estimator so
+    // sigma is honest from the first tick after this restart (before this,
+    // the in-memory-only buffer meant the estimator had essentially never
+    // been ready in production and sigma fell to the 0.001 floor while
+    // realized annualized vol was ~1.11).
+    warm_start_volatility_estimators();
 
     // -- Strategy layer -------------------------------------------------------
 
@@ -2696,15 +2704,91 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     co_return;
 }
 
+// [AS-WARM] Warm-start the volatility estimators from persisted snapshots.
+void Engine::warm_start_volatility_estimators()
+{
+    if (!db_) return;
+
+    for (auto& [pair_name, est] : vol_estimators_) {
+        if (!est) continue;
+        const auto& vcfg = est->config();
+        const std::uint32_t agg =
+            std::max<std::uint32_t>(1, vcfg.candle_aggregation_blocks);
+
+        // Respect lookback_blocks: the rolling window holds at most
+        // lookback_blocks candles of agg ticks each, so older rows would be
+        // evicted immediately and are not worth reading.
+        const std::uint32_t limit = vcfg.lookback_blocks * agg;
+        const auto rows = db_->get_recent_snapshot_mids(pair_name, limit);
+
+        // Readiness needs min_candles aggregated candles.  Below that the
+        // replay would leave the estimator cold anyway; skip and keep the
+        // existing floor behaviour (which the uncertainty-quoting width
+        // floor makes safe for sparse-history pairs).
+        const std::size_t min_rows =
+            static_cast<std::size_t>(vcfg.min_candles) * agg;
+        if (rows.size() < min_rows) {
+            spdlog::info("[Engine] [AS-WARM] {}: {} snapshot rows < {} "
+                         "needed -- cold start, sigma floor applies",
+                         pair_name, rows.size(), min_rows);
+            continue;
+        }
+
+        // Honest tick cadence: median inter-row wall-clock spacing.  The
+        // median is robust to downtime gaps (a restart hole of hours is one
+        // outlier, not a shift of the whole distribution).  Fallback to the
+        // configured chain block time if timestamps are unusable.
+        std::vector<double> gaps;
+        gaps.reserve(rows.size());
+        for (std::size_t i = 1; i < rows.size(); ++i) {
+            const auto dt = rows[i].unix_seconds - rows[i - 1].unix_seconds;
+            if (dt > 0) gaps.push_back(static_cast<double>(dt));
+        }
+        double tick_seconds = config_.strategy.block_time_seconds;
+        if (!gaps.empty()) {
+            auto mid_it = gaps.begin()
+                        + static_cast<std::ptrdiff_t>(gaps.size() / 2);
+            std::nth_element(gaps.begin(), mid_it, gaps.end());
+            tick_seconds = *mid_it;
+        }
+
+        std::vector<double> mids;
+        mids.reserve(rows.size());
+        for (const auto& r : rows) {
+            mids.push_back(static_cast<double>(r.mid_price_mojos)
+                           / static_cast<double>(kMojosPerXch));
+        }
+
+        const std::size_t fed = est->rehydrate_from_ticks(mids, tick_seconds);
+        spdlog::info("[Engine] [AS-WARM] {}: warm-started from {} snapshot "
+                     "mids (tick={:.0f}s, candles={}, ready={}) "
+                     "sigma_annual={:.4f}",
+                     pair_name, fed, tick_seconds, est->candle_count(),
+                     est->is_ready(), est->get_sigma_annual());
+    }
+}
+
 // Step 3: Update volatility, PIN, regime estimates.
 void Engine::step_update_analytics(BlockHeight block_height)
 {
     // [T4-15] Adaptive block time: if the block cadence tracker has a
     // stable EMA estimate, propagate it to all volatility estimators so
     // that annualisation uses the observed inter-block interval.
+    //
+    // [AS-WARM] Gate on a full EMA window of REAL observations first.  The
+    // EMA initialises at target_block_time (52 s) while the true heartbeat
+    // is ~19 min, so the early EMA is biased low by up to ~22x; propagating
+    // it would stomp the honest tick time the warm-start measured from the
+    // snapshot history and inflate sigma_annual until the EMA converged
+    // (~10 heartbeats, ~3 h).  Once the window is full the EMA reflects the
+    // observed cadence and takes over as before.
     if (block_cadence_) {
         const double dt_ema = block_cadence_->current_dt_ema();
-        if (dt_ema > 0.0) {
+        const bool cadence_converged =
+            block_cadence_->arrival_count()
+            >= static_cast<std::size_t>(
+                   block_cadence_->config().ema_window_blocks);
+        if (dt_ema > 0.0 && cadence_converged) {
             for (auto& [name, vol] : vol_estimators_) {
                 vol->set_block_time_seconds(dt_ema);
             }
@@ -4266,10 +4350,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
-        Mojo mid_mojos = static_cast<Mojo>(std::llround(
-            market_mid * static_cast<double>(kMojosPerXch)));
-
-        // Volatility.
+        // Volatility (hoisted above the centre computation: the A-S
+        // reservation offset below needs the honest annualized sigma).
         double sigma = 0.0;
         auto vol_it = vol_estimators_.find(pair_name);
         if (vol_it != vol_estimators_.end() && vol_it->second->is_ready()) {
@@ -4280,9 +4362,85 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         if (config_.strategy.sigma_floor > 0.0) {
             sigma = std::max(sigma, config_.strategy.sigma_floor);
         }
-        // Inventory ratio for skew (O(1) pair config lookup).
-        double inv_ratio = 0.5;
+
+        // Pair config (O(1) map lookup), used by the offset and everything
+        // downstream in this loop iteration.
         const PairConfig* pair_cfg = find_pair_config(pair_name);
+
+        // -- [AS-RES] Avellaneda-Stoikov reservation offset -----------------
+        // Shift the ladder CENTRE by the bounded inventory term
+        //     centre' = centre * (1 - q * gamma * sigma^2 * tau)
+        // so the whole posted book leans toward reducing imbalance -- the
+        // reservation price Step 4 computes finally reaches the ladder
+        // instead of being discarded.  q is this pair's signed imbalance
+        // normalized to its ratio target (positive = long base -> centre
+        // shifts DOWN -> bids and asks both lean to sell); sigma is the
+        // annualized estimate above (floor sigma makes the term ~0 for cold
+        // pairs -- no cliff); tau is the observed per-heartbeat quote
+        // refresh horizon as a year fraction.  Dimensional analysis and the
+        // measured 2026-07-31 magnitudes (raw 200.4 bps at q=+0.45,
+        // sigma=1.11 -> capped at the 100 bps rail) are documented in
+        // strategy/reservation_offset.hpp.  Every downstream guard (sigma
+        // width floor, fair-value clamp, no-loss floor, peg guards,
+        // competitive caps) is untouched and acts on the shifted centre.
+        if (config_.strategy.as_reservation_enabled && pair_cfg
+            && market_mid > 0.0)
+        {
+            // Valuation reference for the inventory ratio: the PRE-shift
+            // centre (the shift must not feed back into its own input).
+            const Mojo val_mojos = static_cast<Mojo>(std::llround(
+                market_mid * static_cast<double>(kMojosPerXch)));
+            const double own_ratio = inventory_->inventory_ratio(
+                AssetId{pair_cfg->base_asset_id},
+                AssetId{pair_cfg->quote_asset_id},
+                val_mojos);
+
+            double ratio_target = config_.strategy.ratio_target;
+            if (auto t = config_.strategy.ratio_target_by_pair.find(pair_name);
+                t != config_.strategy.ratio_target_by_pair.end()) {
+                ratio_target = t->second;
+            }
+
+            // tau: one quote-refresh horizon = one heartbeat tick.  The
+            // estimator's block_time_seconds is that observed cadence (set
+            // by the warm-start from measured snapshot spacing, then by the
+            // converged cadence EMA), expressed as a fraction of the same
+            // 365-day year sigma is annualized against.
+            const double tick_seconds =
+                (vol_it != vol_estimators_.end())
+                    ? vol_it->second->config().block_time_seconds
+                    : config_.strategy.block_time_seconds;
+            const double tau_years = tick_seconds / (365.0 * 24.0 * 3600.0);
+
+            const auto ro = strategy::reservation_offset(
+                own_ratio, ratio_target,
+                config_.strategy.as_reservation_gamma,
+                sigma, tau_years,
+                config_.strategy.as_reservation_max_offset_bps);
+
+            // Apply only when the shift rate is at least 1e-6 (0.01 bps);
+            // the sigma-floor case produces a rate of ~1.6e-8 (0.00016 bps)
+            // and must degrade to exactly today's behaviour.
+            if (std::abs(ro.rate) >= 1e-6) {
+                const double shifted = market_mid * (1.0 - ro.rate);
+                spdlog::info(
+                    "[Engine] Step 7: {} A-S reservation offset: centre "
+                    "{:.8f} -> {:.8f} ({:+.1f}bps{}, q={:+.3f}, "
+                    "sigma={:.3f}, tau={:.1f}s, raw={:+.1f}bps)",
+                    pair_name, market_mid, shifted,
+                    -ro.rate * 10'000.0,
+                    ro.capped ? " CAPPED" : "",
+                    ro.q, sigma, tick_seconds,
+                    -ro.raw_rate * 10'000.0);
+                market_mid = shifted;
+            }
+        }
+
+        Mojo mid_mojos = static_cast<Mojo>(std::llround(
+            market_mid * static_cast<double>(kMojosPerXch)));
+
+        // Inventory ratio for skew.
+        double inv_ratio = 0.5;
         if (pair_cfg) {
             inv_ratio = inventory_->inventory_ratio(
                 AssetId{pair_cfg->base_asset_id},

@@ -40,6 +40,7 @@
 #include <cstdint>
 #include <deque>
 #include <shared_mutex>
+#include <vector>
 
 namespace xop {
 
@@ -173,6 +174,34 @@ public:
     ///         is completed; intermediate ticks return the last-known sigma.
     double update_tick(double price);
 
+    /// [AS-WARM 2026-08-01] Warm-start the estimator from persisted history.
+    ///
+    /// Before this existed, the candle buffer was memory-only: with one tick
+    /// per ~19-minute engine heartbeat and min_candles(10) candles of
+    /// candle_aggregation_blocks(10) ticks each, readiness required ~32 hours
+    /// of UNINTERRUPTED uptime, and every restart reset the clock.  In
+    /// production the estimator had essentially never been ready, so sigma
+    /// permanently fell back to the configured floor (0.001) while realized
+    /// annualized volatility measured from the same snapshot history was
+    /// ~1.11 -- a ~1,100x understatement, squared into ~1.2e6x in any
+    /// sigma^2 term.
+    ///
+    /// This method replays a persisted mid-price series through the exact
+    /// same update_tick() aggregation pipeline the live feed uses, after
+    /// resetting all rolling state, so the estimator is ready on the FIRST
+    /// live tick after a restart.  `tick_seconds` is the measured spacing of
+    /// the persisted ticks (e.g. the median inter-snapshot interval) and is
+    /// applied via set_block_time_seconds() so annualisation reflects the
+    /// true cadence of the data actually fed.
+    ///
+    /// @param mids          Mid prices in ASCENDING time order.  Non-finite
+    ///                      and non-positive entries are skipped.
+    /// @param tick_seconds  Observed spacing between consecutive mids, in
+    ///                      seconds.  <= 0 leaves the current block time.
+    /// @return Number of ticks actually ingested.
+    std::size_t rehydrate_from_ticks(const std::vector<double>& mids,
+                                     double tick_seconds);
+
     // -- Volatility accessors ------------------------------------------------
 
     /// Per-block volatility: the standard deviation of log-returns over one
@@ -180,13 +209,26 @@ public:
     /// estimator divided by sqrt(blocks_per_candle_period).
     double get_sigma_block() const noexcept;
 
-    /// Annualised volatility:
-    ///   sigma_annual = sigma_block * sqrt(blocks_per_year)
+    /// Annualised volatility.
     ///
-    /// where blocks_per_year = seconds_per_year / block_time_seconds.
-    /// With block_time = 52 s:
-    ///   blocks_per_year = 365.0 * 24 * 3600 / 52 = 606,461.54...
-    ///   sqrt(blocks_per_year) = 778.89...
+    /// [AS-WARM 2026-08-01] Dimensional analysis (previously wrong for the
+    /// aggregated-candle path):
+    ///
+    ///   sigma_block_ is the stdev of log-returns over ONE CANDLE PERIOD.
+    ///   A candle spans candle_span_ticks ticks of block_time_seconds each:
+    ///
+    ///     candle_seconds  = block_time_seconds * candle_span_ticks
+    ///     candles_per_year = seconds_per_year / candle_seconds     [1/year]
+    ///     sigma_annual     = sigma_block * sqrt(candles_per_year)
+    ///                        [1/sqrt(candle)] * [sqrt(candle/year)]
+    ///                      = [1/sqrt(year)]                        OK
+    ///
+    /// The old code annualised with sqrt(seconds_per_year /
+    /// block_time_seconds) regardless of aggregation, overstating sigma by
+    /// sqrt(candle_aggregation_blocks) (= sqrt(10) ~ 3.16x at the production
+    /// setting) on the update_tick() path.  candle_span_ticks is 1 for
+    /// candles fed directly via update() and candle_aggregation_blocks for
+    /// candles emitted by update_tick().
     ///
     /// MEDIUM-3: Uses 365-day year (31,536,000 s), consistent with strategy
     /// sigma_block conversion in avellaneda.hpp and glft.hpp.
@@ -300,6 +342,13 @@ private:
     /// MEDIUM-3: 365-day year, consistent with strategy sigma_block conversion.
     /// Cached at construction for annualisation.
     double sqrt_blocks_per_year_{0.0};
+
+    /// [AS-WARM] Ticks spanned by each candle currently in the window: 1.0
+    /// for candles fed directly via update(), candle_aggregation_blocks for
+    /// candles emitted by update_tick().  Annualisation divides by
+    /// sqrt(candle_span_ticks_) so sigma_annual reflects the true candle
+    /// period (see get_sigma_annual() docs).
+    double candle_span_ticks_{1.0};
 
     // -- [T5-CR6] Multi-block candle accumulator state -----------------------
     // Buffers individual ticks within the current aggregation window.

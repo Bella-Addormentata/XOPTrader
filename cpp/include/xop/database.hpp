@@ -127,6 +127,18 @@ struct DbSnapshot {
 };
 
 // ---------------------------------------------------------------------------
+// DbSnapshotMidTick -- one (block, mid, wall-clock) observation from the
+// snapshots table, the minimal row needed to warm-start the volatility
+// estimator ([AS-WARM]).  unix_seconds is created_at as a Unix timestamp.
+// ---------------------------------------------------------------------------
+
+struct DbSnapshotMidTick {
+    BlockHeight  block_height{0};    ///< Block at which the snapshot was taken.
+    Mojo         mid_price_mojos{0}; ///< Mid-price in kMojosPerXch fixed point.
+    std::int64_t unix_seconds{0};    ///< created_at as Unix epoch seconds.
+};
+
+// ---------------------------------------------------------------------------
 // DbSanityFailure -- maps 1:1 to a row in the sanity_failures table.
 //
 // Records every offer that failed the pre-posting sanity checks, for
@@ -388,6 +400,20 @@ public:
     /// @return           The latest DbSnapshot, or std::nullopt.
     [[nodiscard]]
     std::optional<DbSnapshot> get_last_snapshot(const std::string& pair_name) const;
+
+    /// [AS-WARM] Most recent snapshot mid-prices for a pair, in ASCENDING
+    /// block order, for warm-starting the volatility estimator at startup
+    /// (VolatilityEstimator::rehydrate_from_ticks).  Rows with a
+    /// non-positive mid are excluded at the SQL level.  unix_seconds is the
+    /// row's created_at converted via strftime('%s', ...) so callers can
+    /// measure the true tick cadence (median inter-row spacing) instead of
+    /// assuming one.  Returns an empty vector when the pair has no history
+    /// or on error (startup-only path; never throws).
+    ///
+    /// @param pair_name  Trading pair to query.
+    /// @param limit      Maximum rows (the newest N are returned).
+    [[nodiscard]] std::vector<DbSnapshotMidTick> get_recent_snapshot_mids(
+        const std::string& pair_name, std::uint32_t limit) const noexcept;
 
     // -- Strategy quotes (per-tier quote persistence) ------------------------
 
