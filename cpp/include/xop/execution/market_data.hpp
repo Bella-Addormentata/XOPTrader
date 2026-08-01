@@ -59,6 +59,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace xop {
@@ -260,6 +261,16 @@ struct PairState {
     double      volume_24h{0.0};    // Rolling 24-hour volume (base asset units)
     Timestamp   dex_updated_at{};   // When dexie data was last refreshed
 
+    // --- Print-age staleness (value-change counter) ---
+    // dex_updated_at is rewritten on EVERY heartbeat whether or not the price
+    // moved, so it measures when we last LOOKED, not when the price last MOVED.
+    // Measured: the BYC/wUSDC.b dexie mid sat at exactly 1.1030 for 26+
+    // consecutive snapshots (longest freeze 30.4h, 92.6% of observations
+    // unchanged) while reporting an age of 0 seconds.  These two fields track
+    // the price itself so a frozen book is detectable.
+    double       last_dex_print{0.0}; // Last materially-different dex mid
+    std::int32_t dex_print_age{0};    // Heartbeats since it last moved
+
     // --- AMM reference (TibetSwap implied price) ---
     double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)
     Timestamp   amm_updated_at{};   // When AMM data was last refreshed
@@ -434,6 +445,18 @@ public:
     /// Returns 0.0 when data is fresh, 1.0 at stale_threshold, >1.0 beyond.
     /// Returns 1.0 if the pair is unknown.
     double get_staleness_fraction(const std::string& pair_name) const;
+
+    /// Number of consecutive competing-offer ingests during which the dex mid
+    /// has not moved by more than 1 bp -- i.e. the age of the last PRINT, as
+    /// opposed to the age of the last poll that dex_updated_at records.
+    /// Returns 0 if the pair is unknown or has never printed.
+    std::int32_t dex_print_age(const std::string& pair_name) const;
+
+    /// Self-filtered dexie top-of-book as {best_bid, best_ask}.
+    /// Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer exists there, so
+    /// {0, 0} means there is no external market to quote against at all.
+    /// Returns {0.0, 0.0} if the pair is unknown.
+    std::pair<double, double> get_dex_bbo(const std::string& pair_name) const;
 
     /// Retrieve the latest block height ingested from the full node.
     BlockHeight current_block_height() const;

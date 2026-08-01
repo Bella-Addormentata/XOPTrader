@@ -1978,9 +1978,25 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                     && pool.xch_reserve > 0.0
                     && pool.token_reserve > 0.0)
                 {
-                    const double amm_implied =
-                        tibet::get_implied_price(pool.xch_reserve,
-                                                 pool.token_reserve);
+                    // ingest_amm_mid expects the pair's quote-per-base
+                    // convention in displayable units, so the BASE reserve is
+                    // the input and the QUOTE reserve is the output.  The pool
+                    // always stores (XCH, token); pairs quoted the other way
+                    // round (e.g. "wmilliETH.b/XCH") must therefore swap the
+                    // reserves, and the denominations stay base-then-quote in
+                    // both branches.  Without the mojos-per-unit rescale
+                    // XCH/DBX fed 1.018e-7 instead of 101.83 -- 10^9 off the
+                    // dex_mid it is blended with (measured 2026-07-30).
+                    const bool xch_is_base = (pair.base_asset_id == "xch");
+                    const double amm_implied = xch_is_base
+                        ? tibet::get_implied_price(pool.xch_reserve,
+                                                   pool.token_reserve,
+                                                   pair.base_mojos_per_unit,
+                                                   pair.quote_mojos_per_unit)
+                        : tibet::get_implied_price(pool.token_reserve,
+                                                   pool.xch_reserve,
+                                                   pair.base_mojos_per_unit,
+                                                   pair.quote_mojos_per_unit);
                     if (amm_implied > 0.0) {
                         market_data_->ingest_amm_mid(pair.name, amm_implied);
                         spdlog::debug("[Engine] Step 1: {} Tibet AMM "

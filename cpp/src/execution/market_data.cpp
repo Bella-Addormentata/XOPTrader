@@ -601,6 +601,27 @@ double MarketDataFeed::get_staleness_fraction(const std::string& pair_name) cons
     return static_cast<double>(age.count()) / static_cast<double>(threshold_s.count());
 }
 
+std::int32_t MarketDataFeed::dex_print_age(const std::string& pair_name) const {
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return 0;  // Unknown pair has never printed.
+    }
+    return it->second.dex_print_age;
+}
+
+std::pair<double, double> MarketDataFeed::get_dex_bbo(
+    const std::string& pair_name) const {
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return {0.0, 0.0};  // Unknown pair has no book.
+    }
+    return {it->second.dex_best_bid, it->second.dex_best_ask};
+}
+
 BlockHeight MarketDataFeed::current_block_height() const {
     return block_height_.load(std::memory_order_acquire);
 }
@@ -1296,6 +1317,32 @@ void MarketDataFeed::ingest_competing_offers(
                 ps.orderbook_mid = ob_mid;
             }
             ps.dex_updated_at = std::chrono::system_clock::now();
+
+            // [PRINT-AGE 2026-07-31] dex_updated_at is rewritten here on every
+            // heartbeat regardless of whether the price moved, so it can never
+            // expose a frozen book: BYC/wUSDC.b held exactly 1.1030 for 26+
+            // consecutive snapshots (longest freeze 30.4h) while reporting an
+            // age of 0 seconds.  Count heartbeats since the mid last actually
+            // moved instead.  Signal only -- no consumer gates on it yet.
+            const double new_mid =
+                ob_mid > 0.0
+                    ? ob_mid
+                    : ((filtered_best_bid > 0.0 && filtered_best_ask > 0.0)
+                           ? (filtered_best_bid + filtered_best_ask) / 2.0
+                           : 0.0);
+            if (new_mid > 0.0) {
+                constexpr double kPrintMoveThreshold = 1e-4;  // 1 bp
+                if (ps.last_dex_print <= 0.0
+                    || std::abs(new_mid / ps.last_dex_print - 1.0)
+                           > kPrintMoveThreshold)
+                {
+                    ps.last_dex_print = new_mid;
+                    ps.dex_print_age  = 0;
+                } else {
+                    ++ps.dex_print_age;
+                }
+            }
+
             spdlog::debug("[MarketData] Dust-filtered BBO for {}: "
                           "bid={:.6f} ask={:.6f} ob_mid={:.6f}",
                           pair_name, filtered_best_bid, filtered_best_ask,

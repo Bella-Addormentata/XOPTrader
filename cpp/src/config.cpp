@@ -1147,6 +1147,12 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Untrustworthy-reference quoting gate (optional, default in StrategyConfig) --
+    if (node["dex_print_stale_heartbeats"] && node["dex_print_stale_heartbeats"].IsDefined()
+        && !node["dex_print_stale_heartbeats"].IsNull()) {
+        cfg.dex_print_stale_heartbeats = node["dex_print_stale_heartbeats"].as<uint32_t>();
+    }
+
     // -- Adverse-selection-aware tier sizing (optional, defaults in StrategyConfig) --
     if (node["adverse_selection_sizing"] && node["adverse_selection_sizing"].IsDefined()
         && !node["adverse_selection_sizing"].IsNull()) {

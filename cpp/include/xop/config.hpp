@@ -485,6 +485,19 @@ struct StrategyConfig {
     /// Inter-tier stride (bps) from the anchor point.  Default 65.
     double   competitive_anchor_stride_bps{65.0};
 
+    // -- Untrustworthy-reference quoting gate --------------------------------
+
+    /// Heartbeats the dexie mid may sit unchanged before we refuse to post
+    /// new offers on that pair (see MarketDataFeed::dex_print_age).
+    /// Measured: the BYC/wUSDC.b dexie mid held exactly 1.1030 for 26+
+    /// consecutive snapshots (longest freeze 30.4h, 92.6% of observations
+    /// unchanged) while the TibetSwap cross said 1.016196 -- the book was
+    /// 854 bps wrong, and we kept quoting around it.  Default 6, roughly
+    /// two hours at the ~19-minute heartbeat.  0 disables the staleness leg
+    /// of the gate.  Deliberately NOT in config.yaml: the default must work
+    /// unconfigured.
+    uint32_t dex_print_stale_heartbeats{6};
+
     // -- Adverse-selection-aware tier sizing ---------------------------------
 
     /// Enable adverse-selection-aware tier sizing.

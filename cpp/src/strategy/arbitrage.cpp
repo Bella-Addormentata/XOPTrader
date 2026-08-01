@@ -208,15 +208,30 @@ std::int64_t get_output_amount(std::int64_t input_amount,
 }
 
 double get_implied_price(std::int64_t input_reserve,
-                         std::int64_t output_reserve)
+                         std::int64_t output_reserve,
+                         std::int64_t input_mojos_per_unit,
+                         std::int64_t output_mojos_per_unit)
 {
     if (input_reserve <= 0 || output_reserve <= 0) {
         return 0.0;
     }
-    // Marginal price (infinitesimal trade, no fee):
-    //   price = output_reserve / input_reserve
-    return static_cast<double>(output_reserve)
-         / static_cast<double>(input_reserve);
+    if (input_mojos_per_unit <= 0 || output_mojos_per_unit <= 0) {
+        spdlog::warn("tibet::get_implied_price: non-positive denomination "
+                     "(in={}, out={})",
+                     input_mojos_per_unit, output_mojos_per_unit);
+        return 0.0;
+    }
+    // Marginal price (infinitesimal trade, no fee), rescaled from mojos to
+    // displayable units:
+    //   raw   = output_reserve / input_reserve
+    //   price = raw * input_mojos_per_unit / output_mojos_per_unit
+    // Without the rescale XCH/DBX reports 1.018e-7 instead of 101.83 DBX/XCH
+    // -- off by 10^9 against the decimal-unit dex_mid it is compared with and
+    // blended into (measured 2026-07-30).
+    return (static_cast<double>(output_reserve)
+          / static_cast<double>(input_reserve))
+         * (static_cast<double>(input_mojos_per_unit)
+          / static_cast<double>(output_mojos_per_unit));
 }
 
 double get_effective_price(std::int64_t input_amount,
@@ -403,10 +418,15 @@ ArbitrageDetector::scan_cross_dex(
         return result;
     }
 
-    // TibetSwap implied price (token per XCH, before fee).
+    // TibetSwap implied price (token per XCH, before fee), in displayable
+    // units so it is comparable with the dexie book prices below.  The
+    // reserves are mojos on both sides, so the denominations must be passed
+    // in the same (input, output) order as the reserves.
     const double tibet_implied = tibet::get_implied_price(
         tibetswap_reserves.xch_reserve,
-        tibetswap_reserves.token_reserve);
+        tibetswap_reserves.token_reserve,
+        tibetswap_reserves.xch_mojos_per_unit,
+        tibetswap_reserves.token_mojos_per_unit);
 
     if (tibet_implied <= 0.0) {
         return result;
@@ -509,9 +529,13 @@ ArbitrageDetector::scan_cross_dex(
         // Effective TibetSwap buy price: how much token per XCH output.
         // This is the reverse direction: token -> XCH.
         // Implied price for this direction = xch_reserve / token_reserve.
+        // Reserves reversed for this direction, so the denominations are
+        // reversed with them (token is now the input asset).
         const double tibet_buy_implied = tibet::get_implied_price(
             tibetswap_reserves.token_reserve,
-            tibetswap_reserves.xch_reserve);
+            tibetswap_reserves.xch_reserve,
+            tibetswap_reserves.token_mojos_per_unit,
+            tibetswap_reserves.xch_mojos_per_unit);
 
         if (dexie_bid > 0.0 && tibet_buy_implied > 0.0) {
             // Compare: TibetSwap buy implied vs dexie bid.
