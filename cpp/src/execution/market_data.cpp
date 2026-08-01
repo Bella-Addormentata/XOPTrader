@@ -1474,10 +1474,16 @@ void MarketDataFeed::ingest_competing_offers(
         // (1.144728, block 9087661) for over a day without a single warning.
         // Capping to the ask is not a fix for a mid that wanted to be above
         // the ask; the weighting itself had to degrade, which is Layer 2.
+        // [2026-08-01 adversarial review, finding 2] Thread the per-side
+        // mojo denominations so the estimator can value bid depth (quote
+        // mojos) and ask depth (base mojos) in a common numeraire before
+        // the micro-price depth weighting.
         const OrderbookMidParams ob_params{
             cfg.orderbook_mid_depth,
             cfg.microprice_narrow_bps,
             cfg.microprice_wide_bps,
+            base_mojos_per_unit,
+            quote_mojos_per_unit,
         };
         const OrderbookMid ob = cfg.orderbook_mid_enabled
             ? compute_orderbook_mid(filtered, ob_params, pair_name)

@@ -79,6 +79,59 @@ std::vector<OrderBookGap> analyse_order_book_gaps(
     double                             min_gap_bps  = 50.0,
     double                             max_scan_bps = 1500.0);
 
+// ---------------------------------------------------------------------------
+// QuoteRecoveryPrice / floor_recovery_ask_price -- sigma-floored
+// quote-recovery repricing (engine Step 8).
+//
+// [2026-08-01 adversarial review, finding 1] Quote-recovery used to reprice
+// the tightest ask tier to third_party_best_ask * (1 - undercut) with no
+// floor, AFTER every Step 7 guard including the uncertainty width-floor pass
+// and the fair-value clamp -- re-anchoring that tier to the very order book
+// the fair-value design distrusts.  A mispriced-low third-party ask inside
+// the outlier band could pull the recovery tier arbitrarily far below the
+// uncertainty floor, reproducing the 2026-08-01 sweep failure mode on that
+// one tier.
+//
+// The recovery price is therefore floored at
+//
+//     floor_mid_mojos * (1 + min_half_spread_bps / 1e4)
+//
+// where floor_mid_mojos is Step 7's blended ladder centre and
+// min_half_spread_bps is the same per-pair minimum half-spread Step 7's
+// width-floor pass enforced (max of min profit margin, AMM fee, and
+// k_sigma * combined sigma).  When that floor exceeds the third-party best
+// ask, recovery cannot both undercut the book and respect the floor, so the
+// caller must skip the repricing for that heartbeat: recovering liquidity
+// must not price below the uncertainty floor.
+// ---------------------------------------------------------------------------
+struct QuoteRecoveryPrice {
+    /// False -> do not reprice this heartbeat.  Set when there is no book
+    /// reference (best ask <= 0), no Step 7 floor is available
+    /// (floor_mid_mojos <= 0), or the floor exceeds the third-party best
+    /// ask.  The other fields are meaningless when this is false.
+    bool apply{false};
+
+    /// The recovery price in mojos, already floored.  Only when `apply`.
+    Mojo price{0};
+
+    /// True when the sigma floor lifted the price above the plain undercut
+    /// (diagnostic, for logging).
+    bool floored{false};
+};
+
+/// @param third_party_best_ask Best third-party ask (pseudo-price mojos);
+///                             <= 0 means no book reference -> skip.
+/// @param undercut_bps         How far below best ask recovery wants to
+///                             price; negative values are treated as zero.
+/// @param floor_mid_mojos      Step 7's blended ladder centre in mojos;
+///                             <= 0 means no floor available -> skip.
+/// @param min_half_spread_bps  Step 7's per-pair uncertainty minimum
+///                             half-spread; negative treated as zero.
+QuoteRecoveryPrice floor_recovery_ask_price(Mojo   third_party_best_ask,
+                                            double undercut_bps,
+                                            Mojo   floor_mid_mojos,
+                                            double min_half_spread_bps);
+
 /// Human-readable label for logging and Prometheus metric labels.
 inline const char* to_string(RebalanceReason r) noexcept {
     switch (r) {

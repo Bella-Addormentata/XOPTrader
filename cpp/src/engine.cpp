@@ -4853,6 +4853,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             std::max(0.0, config_.strategy.quote_width_sigma_mult)
                 * quote_combined_sigma_bps);
 
+        // [2026-08-01 adversarial review, finding 1] Thread the floor to
+        // Step 8: quote-recovery repricing runs AFTER every Step 7 guard
+        // and must not re-anchor a tier to the raw third-party book below
+        // mid * (1 + min_half_spread).  Stored per-pair so Step 8 applies
+        // exactly the floor this pass enforces, not a recomputation.
+        pcs.quote_mid_mojos           = mid_mojos;
+        pcs.quote_min_half_spread_bps = quote_min_half_spread_bps;
+
         // Fetch competing offers for gap-aware dynamic tier spacing.
         auto comp_offers = market_data_->get_competing_offers(pair_name);
 
@@ -7709,30 +7717,61 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         }
                     }
                     if (min_tier_idx >= 0) {
-                        const double undercut_frac =
-                            config_.strategy.quote_recovery_undercut_bps / 10000.0;
-                        const Mojo recovery_price = static_cast<Mojo>(std::llround(
-                            static_cast<double>(mkt_qr.best_ask)
-                            * (1.0 - undercut_frac)));
-                        for (auto& tq : fee_filtered_tiers) {
-                            if (tq.side == Side::Ask
-                                && tq.tier_index == min_tier_idx
-                                && tq.price > recovery_price) {
-                                spdlog::info(
-                                    "[Engine] Step 8: {} quote-recovery mode "
-                                    "(inv_ratio={:.3f} >= threshold={:.3f}) -- "
-                                    "repricing ask tier {} from {:.6f} to {:.6f} "
-                                    "({:.1f} bps below best-ask)",
-                                    pair_name,
-                                    inv_ratio_qr,
-                                    config_.strategy.quote_recovery_ratio_threshold,
-                                    min_tier_idx,
-                                    static_cast<double>(tq.price)
-                                        / static_cast<double>(kMojosPerXch),
-                                    static_cast<double>(recovery_price)
-                                        / static_cast<double>(kMojosPerXch),
-                                    config_.strategy.quote_recovery_undercut_bps);
-                                tq.price = recovery_price;
+                        // [2026-08-01 adversarial review, finding 1] The
+                        // undercut used to be applied with no floor, AFTER
+                        // every Step 7 guard including the sigma width-floor
+                        // pass -- re-anchoring this tier to the very order
+                        // book the fair-value design distrusts.  Floor the
+                        // recovery price at Step 7's uncertainty width floor
+                        // (blended centre * (1 + min half-spread)), threaded
+                        // through PairCycleState; when the floor and the
+                        // undercut cannot both hold, skip the repricing this
+                        // heartbeat -- recovering liquidity must not price
+                        // below the uncertainty floor.
+                        const QuoteRecoveryPrice rec = floor_recovery_ask_price(
+                            mkt_qr.best_ask,
+                            config_.strategy.quote_recovery_undercut_bps,
+                            pcs.quote_mid_mojos,
+                            pcs.quote_min_half_spread_bps);
+                        if (!rec.apply) {
+                            spdlog::info(
+                                "[Engine] Step 8: {} quote-recovery skipped -- "
+                                "sigma width floor (mid={:.6f}, "
+                                "min_half_spread={:.0f}bps) does not fit "
+                                "under third-party best ask {:.6f}; "
+                                "recovering liquidity must not price below "
+                                "the uncertainty floor",
+                                pair_name,
+                                static_cast<double>(pcs.quote_mid_mojos)
+                                    / static_cast<double>(kMojosPerXch),
+                                pcs.quote_min_half_spread_bps,
+                                static_cast<double>(mkt_qr.best_ask)
+                                    / static_cast<double>(kMojosPerXch));
+                        } else {
+                            const Mojo recovery_price = rec.price;
+                            for (auto& tq : fee_filtered_tiers) {
+                                if (tq.side == Side::Ask
+                                    && tq.tier_index == min_tier_idx
+                                    && tq.price > recovery_price) {
+                                    spdlog::info(
+                                        "[Engine] Step 8: {} quote-recovery mode "
+                                        "(inv_ratio={:.3f} >= threshold={:.3f}) -- "
+                                        "repricing ask tier {} from {:.6f} to {:.6f} "
+                                        "({:.1f} bps below best-ask requested{})",
+                                        pair_name,
+                                        inv_ratio_qr,
+                                        config_.strategy.quote_recovery_ratio_threshold,
+                                        min_tier_idx,
+                                        static_cast<double>(tq.price)
+                                            / static_cast<double>(kMojosPerXch),
+                                        static_cast<double>(recovery_price)
+                                            / static_cast<double>(kMojosPerXch),
+                                        config_.strategy.quote_recovery_undercut_bps,
+                                        rec.floored
+                                            ? ", lifted to the sigma width floor"
+                                            : "");
+                                    tq.price = recovery_price;
+                                }
                             }
                         }
                     }

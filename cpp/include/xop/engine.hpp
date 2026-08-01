@@ -793,6 +793,18 @@ private:
         // into quoting and offer management.
         // ISO/IEC 5055: prevents acting on invalid upstream data.
         bool          market_data_valid{false};
+
+        // [2026-08-01 adversarial review, finding 1] Step 7's uncertainty
+        // width floor, threaded to Step 8 so quote-recovery repricing can
+        // respect it without recomputing: the blended ladder centre in
+        // mojos, and the per-pair minimum half-spread in bps
+        // (max(min_profit_margin, tibetswap_fee, k_sigma * combined_sigma)
+        // -- the same value the Step 7 width-floor pass enforces).  Both
+        // stay 0 until Step 7 reaches ladder generation for the pair this
+        // cycle; Step 8 treats 0 as "no floor available" and skips the
+        // recovery repricing rather than running it unfloored.
+        Mojo          quote_mid_mojos{0};
+        double        quote_min_half_spread_bps{0.0};
     };
 
     /// Per-pair cycle state for the current block.

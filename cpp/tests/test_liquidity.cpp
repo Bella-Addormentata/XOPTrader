@@ -895,4 +895,85 @@ TEST(DustFilterTest, BidSideFilteredWithOldDefault) {
         << "With default denomination, tiny bid should be filtered";
 }
 
+// ============================================================================
+// floor_recovery_ask_price -- finding 1 of the 2026-08-01 adversarial review.
+//
+// Step 8's quote-recovery repricing (best_ask * (1 - undercut)) runs AFTER
+// every Step 7 guard and used to carry no floor; these tests pin the sigma
+// width floor that now bounds it.  Prices are pseudo-price mojos.
+// ============================================================================
+
+TEST(QuoteRecoveryFloorTest, UndercutAboveFloorPassesThroughUnchanged) {
+    // best_ask 1.10, undercut 5 bps -> 1.09945.  Floor: mid 1.00 + 50 bps
+    // = 1.005, far below.  The plain undercut survives.
+    const Mojo best_ask = 1'100'000'000'000LL;
+    const Mojo mid      = 1'000'000'000'000LL;
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 50.0);
+
+    ASSERT_TRUE(r.apply);
+    EXPECT_FALSE(r.floored);
+    EXPECT_EQ(r.price, static_cast<Mojo>(std::llround(1.1e12 * (1.0 - 5.0 / 10'000.0))));
+    EXPECT_LT(r.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, UndercutBelowFloorIsLiftedToTheFloor) {
+    // The reviewer's failure mode in miniature: a mispriced-low third-party
+    // ask (1.01, ~1.0% above mid) with a 427 bps sigma floor.  The undercut
+    // wants 1.00949...; the floor demands mid * 1.0427 = 1.0427.  1.0427 >
+    // best_ask, so recovery must SKIP, not price below the floor.
+    const Mojo best_ask = 1'010'000'000'000LL;
+    const Mojo mid      = 1'000'000'000'000LL;
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 427.0);
+    EXPECT_FALSE(r.apply);
+
+    // With a floor that binds but still fits under the best ask (98 bps:
+    // 1.0098, above the 5 bps undercut at 1.009495 and below the 1.01 ask),
+    // the price is lifted TO the floor rather than skipped.
+    const auto r2 = floor_recovery_ask_price(best_ask, 5.0, mid, 98.0);
+    ASSERT_TRUE(r2.apply);
+    EXPECT_TRUE(r2.floored);
+    EXPECT_EQ(r2.price,
+              static_cast<Mojo>(std::llround(1.0e12 * (1.0 + 98.0 / 10'000.0))));
+    EXPECT_LE(r2.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, FloorExactlyAtBestAskStillApplies) {
+    // floor == best_ask: cannot undercut, but repricing TO the best ask does
+    // not violate the floor.  Only floor > best_ask skips.
+    const Mojo mid      = 1'000'000'000'000LL;
+    const Mojo best_ask = static_cast<Mojo>(
+        std::llround(1.0e12 * (1.0 + 100.0 / 10'000.0)));
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 100.0);
+    ASSERT_TRUE(r.apply);
+    EXPECT_TRUE(r.floored);
+    EXPECT_EQ(r.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, MissingInputsSkipRatherThanRunUnfloored) {
+    // No book reference.
+    EXPECT_FALSE(floor_recovery_ask_price(0, 5.0, 1'000'000'000'000LL, 50.0).apply);
+    EXPECT_FALSE(floor_recovery_ask_price(-1, 5.0, 1'000'000'000'000LL, 50.0).apply);
+    // No Step 7 floor available: the old behaviour (unfloored undercut) must
+    // NOT be the fallback.
+    EXPECT_FALSE(floor_recovery_ask_price(1'100'000'000'000LL, 5.0, 0, 50.0).apply);
+    EXPECT_FALSE(floor_recovery_ask_price(1'100'000'000'000LL, 5.0, -5, 50.0).apply);
+}
+
+TEST(QuoteRecoveryFloorTest, ZeroHalfSpreadFloorsAtTheMidItself) {
+    // min_half_spread 0 (all config floors zero) degrades to "never below
+    // mid", not "no floor".  Negative bps are treated as zero.
+    const Mojo mid      = 1'000'000'000'000LL;
+    const Mojo best_ask = 1'000'500'000'000LL;   // 5 bps above mid
+    // Undercut of 20 bps would land 1.0004999e12 * ... below mid; floor lifts
+    // to exactly mid.
+    const auto r = floor_recovery_ask_price(best_ask, 20.0, mid, 0.0);
+    ASSERT_TRUE(r.apply);
+    EXPECT_TRUE(r.floored);
+    EXPECT_EQ(r.price, mid);
+
+    const auto rn = floor_recovery_ask_price(best_ask, 20.0, mid, -10.0);
+    ASSERT_TRUE(rn.apply);
+    EXPECT_EQ(rn.price, mid);
+}
+
 }  // namespace

@@ -61,6 +61,52 @@ OrderbookMid compute_orderbook_mid(const std::vector<CompetingOffer>& offers,
     // A non-finite or non-positive price is not a quote, and a non-positive
     // size contributes nothing to a VWAP while being able to zero or invert
     // a depth denominator.  Drop both rather than propagate a NaN.
+    //
+    // -- Unit normalization: both sides' depths in QUOTE units --------------
+    // [2026-08-01 adversarial review, finding 2] CompetingOffer::size is
+    // denominated in the OFFERED asset:
+    //
+    //     Ask (offered = base):  base-asset mojos   (XCH = 1e12 per unit)
+    //     Bid (offered = quote): quote-asset mojos  (CAT = 1e3  per unit)
+    //
+    // and CompetingOffer::price is the pseudo-price
+    //
+    //     price_pseudo = quote_units_per_base_unit * kMojosPerXch
+    //
+    // so px = price_pseudo / kMojosPerXch below is quote units per base
+    // unit.  Feeding RAW mojos into the depth weighting therefore mixed
+    // units across sides: on an XCH/CAT pair ask depth (1e12 mojos/unit)
+    // dwarfed bid depth (1e3 mojos/unit) by ~1e9, the micro-price collapsed
+    // to bid_vwap, and the Layer-1 invariant clamp pinned the mid at
+    // best_bid on essentially every ingest of XCH/DBX and XCH/wUSDC.b --
+    // burying real violations under routine warnings.  Normalize both sides
+    // into QUOTE units before any weighting:
+    //
+    //     bid:  size / quote_mojos_per_unit            [quote units]
+    //     ask: (size / base_mojos_per_unit) * px       [base units *
+    //                                                    quote/base
+    //                                                    = quote units]
+    //
+    // Worked example, XCH/wUSDC.b at px = 2.24 (wUSDC per XCH; wUSDC has
+    // 1e3 mojos/unit, XCH has 1e12):
+    //
+    //     bid of 1000 wUSDC: size = 1000 * 1e3  = 1e6  quote mojos
+    //                        ->  1e6 / 1e3            = 1000 quote units
+    //     ask of  400 XCH:   size =  400 * 1e12 = 4e14 base mojos
+    //                        -> (4e14 / 1e12) * 2.24  =  896 quote units
+    //
+    // Raw mojos would have weighted these sides 1e6 : 4e14 (~1 : 4e8);
+    // normalized they weigh 1000 : 896 -- comparable, as the book actually
+    // is.  Within one side the division is a constant factor, so bid VWAPs
+    // are unchanged; ask VWAP weights become quote VALUE, which is the
+    // correct measure of how much book is resting at each level.
+    const double base_mpu = (params.base_mojos_per_unit > 0)
+        ? static_cast<double>(params.base_mojos_per_unit)
+        : static_cast<double>(kMojosPerXch);
+    const double quote_mpu = (params.quote_mojos_per_unit > 0)
+        ? static_cast<double>(params.quote_mojos_per_unit)
+        : static_cast<double>(kMojosPerXch);
+
     std::vector<Level> bids, asks;
     bids.reserve(offers.size());
     asks.reserve(offers.size());
@@ -68,8 +114,12 @@ OrderbookMid compute_orderbook_mid(const std::vector<CompetingOffer>& offers,
     for (const auto& o : offers) {
         const double px = static_cast<double>(o.price)
                           / static_cast<double>(kMojosPerXch);
-        const double sz = static_cast<double>(o.size);  // raw mojos; cancels
         if (!std::isfinite(px) || px <= 0.0) continue;
+        // Depth in quote units (see the dimensional analysis above);
+        // non-positive sizes still cancel out of the VWAP here.
+        const double sz = (o.side == Side::Bid)
+            ? static_cast<double>(o.size) / quote_mpu
+            : (static_cast<double>(o.size) / base_mpu) * px;
         if (!std::isfinite(sz) || sz <= 0.0) continue;
         (o.side == Side::Bid ? bids : asks).push_back({px, sz});
     }

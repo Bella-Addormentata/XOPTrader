@@ -442,6 +442,129 @@ TEST(OrderbookMidSchedule, ZeroDepthParamStillProducesAUsableMid) {
 //  the book and keep most of its micro-price weight.
 // =============================================================================
 
+// =============================================================================
+//  Unit normalization -- finding 2 of the 2026-08-01 adversarial review.
+// =============================================================================
+//
+//  CompetingOffer sizes are denominated in the OFFERED asset: bid sizes in
+//  quote-asset mojos, ask sizes in base-asset mojos.  On an XCH/CAT pair the
+//  quote CAT has 1e3 mojos per unit while base XCH has 1e12, so raw-mojo
+//  depths differed by ~1e9 across sides, the micro-price collapsed to
+//  bid_vwap, and the Layer-1 invariant clamp -- documented as "always a
+//  defect signal" -- fired on essentially every ingest of a normal tight
+//  book.  The fixture mk() above sizes BOTH sides at 1e12, which is exactly
+//  why the original suite never caught it; these fixtures use the real
+//  per-side denominations.
+// =============================================================================
+
+namespace {
+
+// XCH/CAT book with the REAL denominations ingest_competing_offers()
+// produces: bid sizes in quote-CAT mojos (1e3 per unit), ask sizes in
+// base-XCH mojos (1e12 per unit).
+CompetingOffer mk_xch_cat(Side side, double price, double size_units) {
+    CompetingOffer o;
+    o.offer_id = std::to_string(price) + (side == Side::Bid ? "b" : "a")
+                 + std::to_string(size_units);
+    o.side     = side;
+    o.price    = static_cast<Mojo>(price * static_cast<double>(kMojosPerXch));
+    o.size     = static_cast<Mojo>(size_units
+                                   * (side == Side::Bid ? 1e3 : 1e12));
+    return o;
+}
+
+OrderbookMidParams xch_cat_params() {
+    OrderbookMidParams p;  // shipped blend schedule
+    p.base_mojos_per_unit  = 1'000'000'000'000LL;  // XCH
+    p.quote_mojos_per_unit = 1'000LL;              // CAT
+    return p;
+}
+
+}  // namespace
+
+// A normal tight XCH/wUSDC.b book (~89 bps, well inside the narrow band, so
+// w_micro = 1 and the mid IS the micro-price).  With raw-mojo depths the
+// ask side outweighed the bid side ~4e8:1 here, the micro-price collapsed
+// to bid_vwap (2.228125, below best_bid) and the invariant clamp pinned the
+// mid at best_bid.  Normalized, the two sides carry comparable value
+// (800 vs ~675 quote units) and the mid lands strictly inside the book.
+TEST(OrderbookMidUnits, XchCatTightBookDoesNotCollapseToBidVwapOrClamp) {
+    std::vector<CompetingOffer> book;
+    book.push_back(mk_xch_cat(Side::Bid, 2.230, 500.0));  // 500 wUSDC
+    book.push_back(mk_xch_cat(Side::Bid, 2.225, 300.0));  // 300 wUSDC
+    book.push_back(mk_xch_cat(Side::Ask, 2.250, 200.0));  // 200 XCH
+    book.push_back(mk_xch_cat(Side::Ask, 2.255, 100.0));  // 100 XCH
+
+    const OrderbookMid r =
+        compute_orderbook_mid(book, xch_cat_params(), "XCH/wUSDC.b");
+
+    // ~89 bps: micro-price used whole.
+    EXPECT_NEAR(r.spread_bps, 89.29, 0.1);
+    EXPECT_DOUBLE_EQ(r.w_micro, 1.0);
+
+    // The finding itself: no clamp on a normal tight book, and the mid does
+    // NOT collapse to the bid side.
+    EXPECT_FALSE(r.clamped);
+    const double bid_vwap = (2.230 * 500.0 + 2.225 * 300.0) / 800.0;
+    EXPECT_GT(r.microprice, bid_vwap);
+    EXPECT_GT(r.mid, r.best_bid);
+    EXPECT_LT(r.mid, r.best_ask);
+
+    // Hand-computed micro-price in quote units:
+    //   bid_depth = 500 + 300                       = 800     quote units
+    //   ask_depth = 200*2.250 + 100*2.255           = 675.5   quote units
+    //   bid_vwap  = (2.230*500 + 2.225*300) / 800   = 2.228125
+    //   ask_vwap  = (2.250*450 + 2.255*225.5)/675.5 = 2.2516691...
+    //   micro     = (675.5*bid_vwap + 800*ask_vwap) / 1475.5
+    //             = 2.2408937...
+    EXPECT_NEAR(r.mid, 2.24089, 5e-4);
+}
+
+// Same shape at a two-orders-of-magnitude pseudo-price (XCH/DBX-like) --
+// the normalization must not depend on px being near 1.  Book value is
+// balanced by construction, so the micro-price must sit near the middle
+// rather than on either VWAP.
+TEST(OrderbookMidUnits, LargePseudoPriceStaysBalancedAndInsideTheBook) {
+    std::vector<CompetingOffer> book;
+    book.push_back(mk_xch_cat(Side::Bid, 99.5, 1000.0));  // 1000 DBX
+    book.push_back(mk_xch_cat(Side::Ask, 100.5, 10.0));   // 10 XCH ~ 1005 DBX
+    const OrderbookMid r =
+        compute_orderbook_mid(book, xch_cat_params(), "XCH/DBX");
+
+    EXPECT_DOUBLE_EQ(r.w_micro, 1.0);   // 100 bps, inside narrow
+    EXPECT_FALSE(r.clamped);
+    EXPECT_GT(r.mid, r.best_bid);
+    EXPECT_LT(r.mid, r.best_ask);
+    // Depths 1000 vs 1005 quote units: micro ~ the plain midpoint, not a
+    // VWAP.  micro = (1005*99.5 + 1000*100.5)/2005 = 99.99875...
+    EXPECT_NEAR(r.mid, 100.0, 0.01);
+}
+
+// CAT/CAT pairs (BYC/wUSDC.b) have 1e3 mojos per unit on BOTH sides; the
+// normalization must reduce to the near-symmetric case there, not distort it.
+TEST(OrderbookMidUnits, CatCatPairRemainsSymmetricUnderNormalization) {
+    OrderbookMidParams p;
+    p.base_mojos_per_unit  = 1'000LL;
+    p.quote_mojos_per_unit = 1'000LL;
+
+    std::vector<CompetingOffer> book;
+    CompetingOffer b = mk_xch_cat(Side::Bid, 1.005, 100.0);  // quote mojos, 1e3
+    CompetingOffer a = mk_xch_cat(Side::Bid, 1.015, 100.0);
+    a.side = Side::Ask;
+    a.size = static_cast<Mojo>(100.0 * 1e3);  // base mojos at 1e3 per unit
+    book.push_back(b);
+    book.push_back(a);
+
+    const OrderbookMid r = compute_orderbook_mid(book, p, "BYC/wUSDC.b");
+
+    EXPECT_FALSE(r.clamped);
+    EXPECT_GE(r.mid, r.best_bid);
+    EXPECT_LE(r.mid, r.best_ask);
+    // 100 quote units vs 100 * 1.015 = 101.5 quote units: near-equal weights,
+    // micro = (101.5*1.005 + 100*1.015)/201.5 = 1.00996...
+    EXPECT_NEAR(r.mid, 1.010, 1e-3);
+}
+
 TEST(OrderbookMidRegression, EveryRecordedHealthyBookKeepsItsMicropriceAndItsInvariant) {
     struct Rec { double bid; double ask; };
     const Rec recs[] = {

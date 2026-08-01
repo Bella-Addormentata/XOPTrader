@@ -92,6 +92,17 @@ struct OrderbookMidParams {
     /// At or above this relative spread (bps) the micro-price is discarded
     /// entirely and the plain BBO midpoint is used.
     double wide_bps{800.0};
+
+    /// Mojos per whole unit of the pair's BASE asset (XCH = 1e12, CAT = 1e3)
+    /// and QUOTE asset.  CompetingOffer::size is denominated in the OFFERED
+    /// asset -- base mojos on asks, quote mojos on bids -- so on an XCH/CAT
+    /// pair the two sides' raw sizes differ by ~1e9 and cannot be compared
+    /// directly.  compute_orderbook_mid() uses these to value both sides'
+    /// depths in a common numeraire (quote units) before the micro-price
+    /// depth weighting; see the dimensional analysis at the normalization
+    /// site.  Non-positive values fall back to kMojosPerXch.
+    std::int64_t base_mojos_per_unit{kMojosPerXch};
+    std::int64_t quote_mojos_per_unit{kMojosPerXch};
 };
 
 // ---------------------------------------------------------------------------

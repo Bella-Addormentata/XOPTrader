@@ -628,6 +628,46 @@ std::vector<OrderBookGap> analyse_order_book_gaps(
 }
 
 // ===========================================================================
+// floor_recovery_ask_price -- sigma-floored quote-recovery repricing
+// ===========================================================================
+// See the header for the full rationale ([2026-08-01 adversarial review,
+// finding 1]).  The invariants this function guarantees:
+//
+//   1. apply == true implies price >= floor_mid * (1 + min_half_spread/1e4)
+//   2. apply == true implies price <= third_party_best_ask
+//   3. no floor data (floor_mid <= 0) or no book (best_ask <= 0) -> skip;
+//      the caller must never fall back to an unfloored undercut.
+
+QuoteRecoveryPrice floor_recovery_ask_price(Mojo   third_party_best_ask,
+                                            double undercut_bps,
+                                            Mojo   floor_mid_mojos,
+                                            double min_half_spread_bps)
+{
+    QuoteRecoveryPrice out;
+
+    if (third_party_best_ask <= 0) return out;  // no book reference
+    if (floor_mid_mojos <= 0)      return out;  // no Step 7 floor available
+
+    const double undercut_frac =
+        std::max(0.0, undercut_bps) / 10'000.0;
+    const Mojo undercut_price = static_cast<Mojo>(std::llround(
+        static_cast<double>(third_party_best_ask) * (1.0 - undercut_frac)));
+
+    const Mojo floor_edge = static_cast<Mojo>(std::llround(
+        static_cast<double>(floor_mid_mojos)
+        * (1.0 + std::max(0.0, min_half_spread_bps) / 10'000.0)));
+
+    // Recovery cannot both respect the floor and stay at-or-below the
+    // third-party best ask: skip the repricing this heartbeat.
+    if (floor_edge > third_party_best_ask) return out;
+
+    out.apply   = true;
+    out.floored = floor_edge > undercut_price;
+    out.price   = std::max(undercut_price, floor_edge);
+    return out;
+}
+
+// ===========================================================================
 // compute_ladder -- gap-aware + adverse-selection-aware overload
 // ===========================================================================
 
