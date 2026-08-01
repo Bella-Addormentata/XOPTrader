@@ -849,8 +849,24 @@ struct StrategyConfig {
     /// Decay factor for adverse-selection sizing (lower = more outer-heavy).
     double   adverse_selection_decay{0.7};
 
-    /// Volatility threshold above which decay is halved.
-    double   adverse_selection_sigma_threshold{0.05};
+    /// Volatility threshold above which decay is halved -- compared against
+    /// the ANNUALIZED sigma the ladder step passes in.
+    ///
+    /// [AS-WARM recalibration 2026-08-01] Raised from 0.05 (config.yaml had
+    /// 0.005) to 2.0.  The old values were tuned in a world where the
+    /// volatility estimator was never ready and sigma was pinned at the
+    /// 0.001 floor, so the branch NEVER fired in production and there is no
+    /// working semantic to preserve.  With the warm-started estimator sigma
+    /// is honest -- measured 0.4-1.9 annualized across pairs -- and a
+    /// threshold of 0.005 would fire permanently on every pair, silently
+    /// halving decay and pushing ~82% of ladder capital to the outer
+    /// 230-300 bps tiers (weights [0.8, 1.9, 4.4, 10.4, 24.6, 57.8]%
+    /// instead of the configured ~[10, 12, 15, 18, 22, 23]%) while fills
+    /// happen at 30-130 bps.  2.0 (200% annualized) fires only in genuinely
+    /// extreme regimes; it also sits above XCH/BYC's measured 1.91, which
+    /// is partly inflated by pre-fix self-priced mids still present in the
+    /// warm-start history.  0 = always use base decay.
+    double   adverse_selection_sigma_threshold{2.0};
 
     // -- Fill-rate-weighted adaptive tier sizing ----------------------------
 

@@ -178,6 +178,57 @@ TEST(ReservationOffsetTest, ImbalanceRails) {
 }
 
 // ============================================================================
+// Engine application: the EXACT formula Step 7 posts
+// ============================================================================
+//
+// engine.cpp step_generate_ladder ([AS-RES]) shifts the centre via
+// apply_reservation_offset() -- it does not re-implement the arithmetic.
+// These tests therefore guard the engine-side application itself: the
+// direction assertions above all re-derive centre * (1 - rate) locally and
+// would keep passing if the engine's line flipped sign; this one fails.
+
+TEST(ReservationOffsetTest, EngineApplicationLeansPostedCentreCorrectly) {
+    const double feed_mid = 12.19;  // unshifted (blended) feed mid
+
+    // Long base (measured 2026-07-31 state): posted centre must land BELOW
+    // the unshifted feed mid.  A sign flip turns the stabilizer into an
+    // amplifier -- this assertion is the tripwire.
+    const auto ro_long = reservation_offset(
+        0.725, 0.50, kGamma, kSigmaHigh, kTauYears, kCapBps);
+    const double posted_long =
+        xop::strategy::apply_reservation_offset(feed_mid, ro_long);
+    ASSERT_NE(posted_long, feed_mid);
+    EXPECT_LT(posted_long, feed_mid);
+    EXPECT_NEAR(posted_long, 12.0681, 1e-4);  // 12.19 * (1 - 0.01)
+
+    // Short base: posted centre must land ABOVE the unshifted feed mid.
+    const auto ro_short = reservation_offset(
+        0.25, 0.50, kGamma, kSigmaHigh, kTauYears, kCapBps);
+    const double posted_short =
+        xop::strategy::apply_reservation_offset(feed_mid, ro_short);
+    ASSERT_NE(posted_short, feed_mid);
+    EXPECT_GT(posted_short, feed_mid);
+    EXPECT_NEAR(posted_short, 12.3119, 1e-4);  // 12.19 * (1 + 0.01)
+}
+
+TEST(ReservationOffsetTest, EngineApplicationThresholdIsExactNoOp) {
+    const double feed_mid = 12.19;
+
+    // Sigma-floor pair: rate 1.627e-8 < kMinAppliedOffsetRate (1e-6).
+    // The posted centre must be BITWISE identical -- no epsilon drift.
+    const auto ro_floor = reservation_offset(
+        0.725, 0.50, kGamma, /*sigma=*/0.001, kTauYears, kCapBps);
+    EXPECT_EQ(xop::strategy::apply_reservation_offset(feed_mid, ro_floor),
+              feed_mid);
+
+    // Degenerate centres pass through untouched.
+    const auto ro_long = reservation_offset(
+        0.725, 0.50, kGamma, kSigmaHigh, kTauYears, kCapBps);
+    EXPECT_EQ(xop::strategy::apply_reservation_offset(0.0, ro_long), 0.0);
+    EXPECT_EQ(xop::strategy::apply_reservation_offset(-1.0, ro_long), -1.0);
+}
+
+// ============================================================================
 // Config defaults: the mechanism ships ON with the approved rail
 // ============================================================================
 

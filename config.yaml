@@ -102,7 +102,13 @@ strategy:
   min_trading_units: 0.1
   adverse_selection_sizing: true
   adverse_selection_decay: 0.85
-  adverse_selection_sigma_threshold: 0.005
+  # Annualized-sigma units. Recalibrated 2026-08-01 with the volatility
+  # warm-start: the old 0.005 predates honest sigma (est. was never ready;
+  # sigma sat at the 0.001 floor) and would now fire on every pair at the
+  # measured 0.4-1.9 baseline, halving decay and pushing ~82% of ladder
+  # capital to the 230-300 bps outer tiers. 2.0 fires only above 200%
+  # annualized vol -- genuinely extreme regimes.
+  adverse_selection_sigma_threshold: 2.0
   wallet_balance_caps_enabled: true
   deploy_idle_inventory_enabled: true
   auto_rebalance_enabled: true

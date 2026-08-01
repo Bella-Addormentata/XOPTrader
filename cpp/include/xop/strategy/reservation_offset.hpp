@@ -121,6 +121,38 @@ struct ReservationOffset {
     return out;
 }
 
+/// Minimum |rate| that is actually applied to the ladder centre: 1e-6
+/// (0.01 bps).  Below this the shift is an EXACT no-op (bitwise-identical
+/// centre), so sigma-floor pairs degrade to precisely today's behaviour --
+/// no epsilon drift, no cliff.
+inline constexpr double kMinAppliedOffsetRate = 1e-6;
+
+/// THE application formula Step 7 posts:
+///
+///     centre' = centre * (1 - rate)
+///
+/// Positive rate (long base) moves the whole ladder DOWN (selling
+/// pressure); negative rate (short base) moves it UP (buying pressure).
+/// The engine (engine.cpp step_generate_ladder, [AS-RES]) calls this
+/// function rather than re-implementing the arithmetic, so the direction
+/// tests in tests/test_reservation_offset.cpp guard the exact code path
+/// that reaches the posted ladder -- a sign flip here fails the suite
+/// instead of shipping an inventory AMPLIFIER.
+///
+/// Non-positive or non-finite centre, or |rate| below
+/// kMinAppliedOffsetRate (including NaN rate), returns centre unchanged.
+[[nodiscard]] constexpr double apply_reservation_offset(
+    double centre, const ReservationOffset& ro) noexcept
+{
+    if (!(centre > 0.0)) return centre;
+    // NaN-safe threshold: a NaN rate satisfies neither comparison.
+    if (!(ro.rate >= kMinAppliedOffsetRate)
+        && !(ro.rate <= -kMinAppliedOffsetRate)) {
+        return centre;
+    }
+    return centre * (1.0 - ro.rate);
+}
+
 }  // namespace xop::strategy
 
 #endif  // XOP_STRATEGY_RESERVATION_OFFSET_HPP

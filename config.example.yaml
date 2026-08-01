@@ -253,7 +253,9 @@ strategy:
   # redistributes capital to safer outer tiers.
   adverse_selection_sizing: true       # [OPTIONAL, default: true]  Enable/disable
   adverse_selection_decay: 0.7         # [OPTIONAL, default: 0.7]   Lower = more outer-heavy
-  adverse_selection_sigma_threshold: 0.05  # [OPTIONAL, default: 0.05] Halve decay above this vol
+  adverse_selection_sigma_threshold: 2.0   # [OPTIONAL, default: 2.0]  Halve decay above this
+                                           # ANNUALIZED vol (2.0 = 200%; measured baseline is
+                                           # 0.4-1.9, so only extreme regimes fire)
 
   # -- Cross-pair correlated inventory skewing (Guéant 2019) --
   # When multiple pairs share a common asset (e.g. XCH appears in XCH/BYC and

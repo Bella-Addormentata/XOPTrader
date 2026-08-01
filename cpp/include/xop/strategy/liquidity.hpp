@@ -255,8 +255,15 @@ struct LiquidityConfig {
     /// Sigma (volatility) threshold above which adverse selection sizing
     /// activates extra aggressively.  When sigma > this value, the decay
     /// factor is halved (more conservative sizing inner tiers).
-    /// Default 0.05 (5% annualised).  0 = always use base decay.
-    double adverse_selection_sigma_threshold{0.05};
+    /// Compared against ANNUALIZED sigma.  Default 2.0 (200% annualized):
+    /// the pre-warm-start defaults (0.05 here, 0.005 in config.yaml) were
+    /// tuned while sigma was pinned at the 0.001 floor and the branch never
+    /// fired; with honest sigma (measured 0.4-1.9 across pairs) they would
+    /// fire permanently and silently swap the configured tier sizes for an
+    /// outer-heavy [0.8..57.8]% profile.  See StrategyConfig::
+    /// adverse_selection_sigma_threshold for the full calibration note.
+    /// 0 = always use base decay.
+    double adverse_selection_sigma_threshold{2.0};
 
     // -- Fill-rate-weighted adaptive tier sizing ----------------------------
 

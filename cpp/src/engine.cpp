@@ -4418,11 +4418,15 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 sigma, tau_years,
                 config_.strategy.as_reservation_max_offset_bps);
 
-            // Apply only when the shift rate is at least 1e-6 (0.01 bps);
-            // the sigma-floor case produces a rate of ~1.6e-8 (0.00016 bps)
-            // and must degrade to exactly today's behaviour.
-            if (std::abs(ro.rate) >= 1e-6) {
-                const double shifted = market_mid * (1.0 - ro.rate);
+            // The application arithmetic lives in apply_reservation_offset
+            // (reservation_offset.hpp) so the direction tests exercise the
+            // EXACT formula posted here -- do not inline it back.  Below
+            // the kMinAppliedOffsetRate threshold (sigma-floor pairs: rate
+            // ~1.6e-8 = 0.00016 bps) the helper returns the centre
+            // unchanged, i.e. exactly today's behaviour.
+            const double shifted =
+                strategy::apply_reservation_offset(market_mid, ro);
+            if (shifted != market_mid) {
                 spdlog::info(
                     "[Engine] Step 7: {} A-S reservation offset: centre "
                     "{:.8f} -> {:.8f} ({:+.1f}bps{}, q={:+.3f}, "

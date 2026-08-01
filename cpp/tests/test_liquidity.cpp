@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/config.hpp>
 #include <xop/strategy/liquidity.hpp>
 #include <xop/execution/market_data.hpp>
 #include <xop/state.hpp>
@@ -262,6 +263,116 @@ TEST_F(AdverseSelectionSizingTest, SizeSumPreserved) {
     const double total_frac = static_cast<double>(total_bid)
                             / static_cast<double>(capital);
     EXPECT_NEAR(total_frac, 1.0, 0.02);
+}
+
+// ============================================================================
+// [AS-WARM recalibration 2026-08-01] sigma-threshold units regression
+// ============================================================================
+//
+// The decay-halving branch compares ANNUALIZED sigma against
+// adverse_selection_sigma_threshold.  The old defaults (0.05 in code, 0.005
+// in config.yaml) were tuned while the volatility estimator was never ready
+// and sigma sat at the 0.001 floor, so the branch never fired in production.
+// The warm-start made sigma honest (measured 0.4-1.9 annualized across
+// pairs); an unrecalibrated threshold would fire PERMANENTLY and silently
+// replace the configured tier profile with an outer-heavy one.  These tests
+// pin the new 2.0 default and the production tier-weight arithmetic on both
+// sides of it.
+//
+// Production profile (config.yaml): decay = 0.85, tier_size_pct =
+// [10, 12, 15, 18, 22, 23]%.
+//
+// Below threshold (base decay 0.85), weights_i = 1/0.85^i:
+//   [1, 1.1765, 1.3841, 1.6283, 1.9157, 2.2537], sum = 9.3583
+//   -> [10.69, 12.57, 14.79, 17.40, 20.47, 24.08]%
+//   i.e. within ~1.2 pp of the configured sizes (they were evidently
+//   calibrated to this profile).
+//
+// Above threshold (halved decay 0.425), weights_i = 1/0.425^i:
+//   [1, 2.3529, 5.5363, 13.0267, 30.6510, 72.1200], sum = 124.687
+//   -> [0.80, 1.89, 4.44, 10.45, 24.58, 57.84]%
+//   ~82% of ladder capital in the 230-300 bps outer tiers.  Nobody chose
+//   that as the everyday regime; it must be reserved for genuinely extreme
+//   volatility (> 200% annualized).
+
+class SigmaThresholdRecalibrationTest : public ::testing::Test {
+protected:
+    // Production-shaped config; adverse_selection_sigma_threshold is left
+    // at the compiled DEFAULT on purpose -- that default is what this test
+    // pins.
+    LiquidityConfig make_production_config() {
+        LiquidityConfig cfg;
+        cfg.num_tiers = 6;
+        cfg.tier_spacing_bps = {30.0, 60.0, 90.0, 160.0, 230.0, 300.0};
+        cfg.tier_size_pct = {0.10, 0.12, 0.15, 0.18, 0.22, 0.23};
+        cfg.adverse_selection_sizing = true;
+        cfg.adverse_selection_decay = 0.85;
+        cfg.gap_aware_spacing = false;  // isolate sizing
+        return cfg;
+    }
+
+    static double bid_frac(const std::vector<TierQuote>& ladder,
+                           std::uint32_t tier, Mojo capital) {
+        for (const auto& tq : ladder) {
+            if (tq.side == Side::Bid && tq.tier_index == tier) {
+                return static_cast<double>(tq.size)
+                     / static_cast<double>(capital);
+            }
+        }
+        return -1.0;
+    }
+};
+
+TEST_F(SigmaThresholdRecalibrationTest, DefaultIsAnnualizedTwoPointZero) {
+    EXPECT_DOUBLE_EQ(LiquidityConfig{}.adverse_selection_sigma_threshold, 2.0);
+    EXPECT_DOUBLE_EQ(
+        xop::StrategyConfig{}.adverse_selection_sigma_threshold, 2.0);
+}
+
+TEST_F(SigmaThresholdRecalibrationTest,
+       MeasuredBaselineVolKeepsConfiguredProfile) {
+    LiquidityConfig cfg = make_production_config();
+    LiquidityEngine engine("TEST/PAIR", cfg);
+
+    // Capital large enough that no tier hits build_raw_ladder's 1.0-XCH
+    // tier-0 minimum (which would mask the weight profile under test).
+    const Mojo mid       = 1'000'000'000'000LL;
+    const Mojo capital   = 1'000'000'000'000'000LL;  // 1000 XCH
+    const Mojo inventory = 1'000'000'000'000'000LL;
+
+    // 1.9 annualized: the TOP of the measured baseline range (XCH/BYC,
+    // itself partly inflated by pre-fix self-priced mids in the warm-start
+    // history).  Must NOT trip the halving.
+    auto ladder = engine.compute_ladder(
+        mid, /*sigma=*/1.9, 0.5, capital, inventory, {}, cfg);
+
+    // Unhalved decay-0.85 profile, ~= the configured [10..23]% sizes.
+    EXPECT_NEAR(bid_frac(ladder, 0, capital), 0.1069, 0.005);
+    EXPECT_NEAR(bid_frac(ladder, 5, capital), 0.2408, 0.005);
+    // The outer-heavy signature of the halved branch (tier5 = 57.8%) must
+    // be nowhere in sight at normal volatility.
+    EXPECT_LT(bid_frac(ladder, 5, capital), 0.30);
+    EXPECT_GT(bid_frac(ladder, 0, capital), 0.08);
+}
+
+TEST_F(SigmaThresholdRecalibrationTest, ExtremeVolStillHalvesDecay) {
+    LiquidityConfig cfg = make_production_config();
+    LiquidityEngine engine("TEST/PAIR", cfg);
+
+    // Same large-capital note as above: the halved tier-0 weight (0.80%)
+    // must clear the 1.0-XCH tier-0 minimum to be observable.
+    const Mojo mid       = 1'000'000'000'000LL;
+    const Mojo capital   = 1'000'000'000'000'000LL;  // 1000 XCH
+    const Mojo inventory = 1'000'000'000'000'000LL;
+
+    // 2.5 annualized (> 2.0): genuinely extreme regime -- the conservative
+    // outer-heavy reallocation is exactly what we want here.
+    auto ladder = engine.compute_ladder(
+        mid, /*sigma=*/2.5, 0.5, capital, inventory, {}, cfg);
+
+    // Halved decay 0.425 -> [0.80, 1.89, 4.44, 10.45, 24.58, 57.84]%.
+    EXPECT_NEAR(bid_frac(ladder, 0, capital), 0.0080, 0.002);
+    EXPECT_NEAR(bid_frac(ladder, 5, capital), 0.5784, 0.01);
 }
 
 // ============================================================================
