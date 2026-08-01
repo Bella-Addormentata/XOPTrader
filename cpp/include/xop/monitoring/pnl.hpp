@@ -95,6 +95,11 @@ struct PnLSummary {
     double sharpe_ratio;            ///< Annualised Sharpe ratio.
     double max_drawdown;            ///< Maximum peak-to-trough decline [0,1].
     double profit_factor;           ///< gross_profit / gross_loss (>1 good).
+                                    ///< [PNL-USD-TOTALS 2026-08-01] For the
+                                    ///< cross-pair total this ratio is built
+                                    ///< from USD-normalized grosses; per-pair
+                                    ///< it stays the (unit-invariant) quote-
+                                    ///< mojo ratio.
     std::uint64_t fill_count;       ///< Total number of settled fills.
     double fill_rate_per_hour;      ///< Fills per wall-clock hour.
     double adverse_selection_rate;  ///< Fraction of fills with adverse move.
@@ -365,10 +370,29 @@ private:
     };
 
     /// A single PnL snapshot for Sharpe ratio and drawdown calculation.
+    /// [PNL-USD-TOTALS 2026-08-01] The snapshot is USD-normalized: the old
+    /// Mojo total summed quote-asset mojos across pairs with different
+    /// quote currencies (a DBX mojo is ~1/70th of a wUSDC.b mojo in value),
+    /// so Sharpe and drawdown were dominated by whichever pair had the
+    /// cheapest quote mojos.  Sharpe stays dimensionless; drawdown is a
+    /// fraction -- both are now computed over a unit-coherent series.
     struct PnLSnapshot {
         Timestamp timestamp;
-        Mojo      total_pnl;
+        double    total_pnl_usd;
     };
+
+    /// Cross-pair realized totals normalized to USD via the per-pair
+    /// registered conversions (same machinery as fill_usd_components_locked,
+    /// so live and rehydrated values agree by construction).
+    /// [PNL-USD-TOTALS 2026-08-01] Raw quote-mojo sums across pairs mix
+    /// currencies and are meaningless; any cross-pair realized figure must
+    /// go through this.  Caller must hold mtx_.
+    struct UsdRealizedTotals {
+        double spread_pnl{0.0};     ///< Realized spread capture, USD.
+        double gross_profit{0.0};   ///< Sum of positive realized PnL, USD.
+        double gross_loss{0.0};     ///< Sum of negative realized PnL, USD (positive).
+    };
+    [[nodiscard]] UsdRealizedTotals realized_usd_totals_locked() const;
 
     /// Compute annualised Sharpe ratio from the PnL snapshot history.
     [[nodiscard]] double compute_sharpe() const;

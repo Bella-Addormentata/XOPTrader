@@ -286,6 +286,98 @@ TEST_F(PnLTrackerTest, SharedBaseAssetIsMarkedOnlyOnce) {
 }
 
 // ---------------------------------------------------------------------------
+// 4c. [PNL-USD-TOTALS 2026-08-01] Cross-pair realized totals normalize each
+//     pair's quote mojos through its own registered USD conversion.  Raw
+//     summing was ~70x wrong for DBX: 3045 DBX mojos (~$0.04) added to the
+//     same accumulator where 3045 wUSDC.b mojos mean ~$3.05.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CrossPairUsdTotalsNormalizePerQuote) {
+    constexpr double kUsdPerDbx = 0.0145;   // ~live cross-derived rate
+
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    register_pair(t);
+    t.set_pair_conversion("XCH/DBX", "xch", kBaseXchD, kCatDenomD, kUsdPerDbx);
+
+    // $0.50 realized on the USD-pegged pair (500 quote mojos).
+    ASSERT_TRUE(t.record_fill(
+        make_fill("trade-usdc-x", xop::Side::Ask,
+                  static_cast<xop::Mojo>(2.5e12),
+                  static_cast<xop::Mojo>(1e12)),
+        0, static_cast<xop::Mojo>(2.0e12), 500));
+
+    // 3045 DBX quote mojos = 3.045 DBX ~= $0.0442, NOT $3.05.
+    xop::Fill dbx = make_fill("trade-dbx-x", xop::Side::Ask,
+                              static_cast<xop::Mojo>(1.4e14),
+                              static_cast<xop::Mojo>(1e12));
+    dbx.pair_name = "XCH/DBX";
+    ASSERT_TRUE(t.record_fill(dbx, 0, static_cast<xop::Mojo>(1.3e14), 3045));
+
+    auto s = t.get_total_pnl();
+    const double expected = 0.50 + 3.045 * kUsdPerDbx;
+    EXPECT_NEAR(s.realized_pnl_usd, expected, 1e-9)
+        << "each pair must convert through its own quote-USD factor";
+    EXPECT_NEAR(s.profit_factor, 1e9, 1.0)
+        << "all-profit history reports the no-loss sentinel";
+}
+
+// ---------------------------------------------------------------------------
+// 4d. [PNL-USD-TOTALS 2026-08-01] The cross-pair profit factor uses
+//     USD-normalized grosses, and a restart (rehydrate_from_db) reproduces
+//     the same USD figures because they are derived at query time from the
+//     per-pair accumulators through the same conversion registry.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, ProfitFactorIsUsdNormalizedAndRestartStable) {
+    constexpr double kUsdPerDbx = 0.0145;
+    const double dbx_loss_usd   = 3.045 * kUsdPerDbx;      // ~$0.0442
+    const double expected_pf    = 0.50 / dbx_loss_usd;     // ~11.3
+
+    auto register_all = [&](xop::PnLTracker& t) {
+        register_pair(t);
+        t.set_pair_conversion("XCH/DBX", "xch",
+                              kBaseXchD, kCatDenomD, kUsdPerDbx);
+    };
+
+    {
+        xop::PnLTracker t(db_path_);
+        t.init_database();
+        register_all(t);
+
+        // +$0.50 on wUSDC.b, -$0.0442 on DBX.  The raw quote-mojo ratio
+        // would be 500/3045 = 0.16 (an apparent net loser); in USD the
+        // strategy is clearly profitable.
+        ASSERT_TRUE(t.record_fill(
+            make_fill("trade-pf-win", xop::Side::Ask,
+                      static_cast<xop::Mojo>(2.5e12),
+                      static_cast<xop::Mojo>(1e12)),
+            0, static_cast<xop::Mojo>(2.0e12), 500));
+        xop::Fill dbx = make_fill("trade-pf-loss", xop::Side::Ask,
+                                  static_cast<xop::Mojo>(1.4e14),
+                                  static_cast<xop::Mojo>(1e12));
+        dbx.pair_name = "XCH/DBX";
+        ASSERT_TRUE(t.record_fill(dbx, 0, static_cast<xop::Mojo>(1.5e14),
+                                  -3045));
+
+        auto s = t.get_total_pnl();
+        EXPECT_NEAR(s.profit_factor, expected_pf, 1e-6)
+            << "cross-pair profit factor must compare USD, not raw mojos";
+        EXPECT_NEAR(s.realized_pnl_usd, 0.50 - dbx_loss_usd, 1e-9);
+    }  // shutdown
+
+    // Restart: rehydration rebuilds the per-pair accumulators; once the
+    // engine re-registers the conversions (as it does every heartbeat) the
+    // USD totals must be identical to the pre-restart values.
+    xop::PnLTracker t2(db_path_);
+    t2.init_database();
+    register_all(t2);
+
+    auto s2 = t2.get_total_pnl();
+    EXPECT_NEAR(s2.profit_factor, expected_pf, 1e-6)
+        << "restart must not change the USD-normalized totals";
+    EXPECT_NEAR(s2.realized_pnl_usd, 0.50 - dbx_loss_usd, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
 // 5. Durable history: every recorded fill lands in
 //    <db_dir>/trade_history/trades_live.csv (header + one row per fill).
 // ---------------------------------------------------------------------------

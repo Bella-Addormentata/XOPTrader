@@ -422,8 +422,13 @@ void PnLTracker::rehydrate_from_db()
 
     sqlite3_finalize(stmt);
 
+    // [PNL-USD-TOTALS 2026-08-01] The aggregate spread figure is labelled
+    // raw: it sums quote mojos across different quote assets and is not a
+    // money amount.  (USD normalization happens at query time via
+    // realized_usd_totals_locked once the engine registers the per-pair
+    // conversions; they are not registered yet during init_database.)
     spdlog::info("PnLTracker: rehydrated {} pairs from trade_log "
-                 "(fills={} spread_pnl={} fee_pnl={})",
+                 "(fills={} spread_pnl_raw_quote_mojos={} fee_pnl={})",
                  pairs, total_pnl_.fill_count, total_pnl_.spread_pnl,
                  total_pnl_.fee_pnl);
 }
@@ -787,10 +792,18 @@ bool PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
     ppnl.last_fill_ts = fill.timestamp;
     total_pnl_.last_fill_ts = fill.timestamp;
 
+    // [PNL-USD-TOTALS 2026-08-01] The cross-pair total is logged in USD.
+    // The old raw total_pnl_.spread_pnl summed quote-asset mojos across
+    // different quote currencies (one DBX fill worth ~$0.04 once jumped the
+    // "total" from 2587 to 7173 because DBX mojos are ~70x cheaper than
+    // wUSDC.b mojos).  Per-pair spread_pnl stays in that pair's quote mojos,
+    // which is well-defined.
     spdlog::info("PnLTracker::record_fill pair={} side={} price={} size={} "
-                 "realized_pnl={} fee={} spread_pnl_total={}",
+                 "realized_pnl={} fee={} pair_spread_pnl={} "
+                 "spread_pnl_total_usd={:.4f}",
                  fill.pair_name, to_string(fill.side), fill.price, fill.size,
-                 realized_pnl, fee, total_pnl_.spread_pnl);
+                 realized_pnl, fee, ppnl.spread_pnl,
+                 realized_usd_totals_locked().spread_pnl);
     return true;
 }
 
@@ -1022,13 +1035,18 @@ void PnLTracker::mark_to_market(
     }
 
     // Record a PnL snapshot for Sharpe/drawdown analytics.
-    const Mojo total = total_pnl_.spread_pnl
-                     + total_pnl_.inventory_pnl
-                     + total_pnl_.fee_pnl;
+    // [PNL-USD-TOTALS 2026-08-01] Snapshot the USD-normalized total.  The
+    // old raw mojo sum (spread + inventory + fee) mixed quote currencies
+    // across pairs with an XCH-mojo fee leg, so the Sharpe/drawdown series
+    // was dominated by whichever pair had the cheapest quote mojos (DBX).
+    // fill_usd_components_locked is the same per-pair conversion path the
+    // displayed USD figures use; mtx_ is held throughout this method.
+    PnLSummary usd_tmp{};
+    fill_usd_components_locked(usd_tmp, /*pair_name=*/"");
 
     PnLSnapshot snap;
-    snap.timestamp = std::chrono::system_clock::now();
-    snap.total_pnl = total;
+    snap.timestamp     = std::chrono::system_clock::now();
+    snap.total_pnl_usd = usd_tmp.total_pnl_usd;
 
     pnl_history_.push_back(snap);
 
@@ -1039,10 +1057,11 @@ void PnLTracker::mark_to_market(
         pnl_history_.pop_front();
     }
 
-    spdlog::debug("PnLTracker::mark_to_market spread={} inventory={} fee={} "
-                  "total={} xch_usd={:.4f}",
-                  total_pnl_.spread_pnl, total_pnl_.inventory_pnl,
-                  total_pnl_.fee_pnl, total, xch_usd_rate_);
+    spdlog::debug("PnLTracker::mark_to_market realized_usd={:.4f} "
+                  "unrealized_usd={:.4f} fee_usd={:.4f} total_usd={:.4f} "
+                  "xch_usd={:.4f}",
+                  usd_tmp.realized_pnl_usd, usd_tmp.unrealized_pnl_usd,
+                  usd_tmp.fee_pnl_usd, usd_tmp.total_pnl_usd, xch_usd_rate_);
 }
 
 // =========================================================================
@@ -1058,9 +1077,10 @@ double PnLTracker::compute_sharpe() const
     // Each snapshot is taken ~52 seconds apart (one Chia block).
     // Periods per year = 365.25 * 24 * 3600 / 52 = ~606,646.
     //
-    // We compute returns as the difference in total_pnl between
-    // consecutive snapshots.  This is in mojos, but the ratio is
-    // dimensionless so the unit cancels.
+    // We compute returns as the difference in the USD-normalized total
+    // between consecutive snapshots.  The ratio is dimensionless; the
+    // USD normalization matters because raw quote mojos across pairs are
+    // not commensurable (PNL-USD-TOTALS 2026-08-01).
 
     if (pnl_history_.size() < 2) {
         return 0.0;
@@ -1070,8 +1090,8 @@ double PnLTracker::compute_sharpe() const
     std::vector<double> returns(n);
 
     for (std::size_t i = 0; i < n; ++i) {
-        returns[i] = static_cast<double>(
-            pnl_history_[i + 1].total_pnl - pnl_history_[i].total_pnl);
+        returns[i] = pnl_history_[i + 1].total_pnl_usd
+                   - pnl_history_[i].total_pnl_usd;
     }
 
     const double mean = std::accumulate(returns.begin(), returns.end(), 0.0)
@@ -1116,19 +1136,18 @@ double PnLTracker::compute_max_drawdown() const
         return 0.0;
     }
 
-    Mojo peak = pnl_history_.front().total_pnl;
+    double peak = pnl_history_.front().total_pnl_usd;
     double max_dd = 0.0;
 
     for (const auto& snap : pnl_history_) {
-        if (snap.total_pnl > peak) {
-            peak = snap.total_pnl;
+        if (snap.total_pnl_usd > peak) {
+            peak = snap.total_pnl_usd;
         }
 
         // [T9-FIX] Track drawdown even when PnL is negative.
-        // Use absolute peak value to avoid division by zero.
-        if (peak != 0) {
-            const double dd = static_cast<double>(peak - snap.total_pnl)
-                            / std::abs(static_cast<double>(peak));
+        // Use absolute peak value to avoid division by (near-)zero.
+        if (std::abs(peak) > 1e-9) {
+            const double dd = (peak - snap.total_pnl_usd) / std::abs(peak);
             if (dd > max_dd) {
                 max_dd = dd;
             }
@@ -1228,6 +1247,25 @@ double PnLTracker::quote_mojos_to_usd_locked(const std::string& pair_name,
     return 0.0;
 }
 
+PnLTracker::UsdRealizedTotals PnLTracker::realized_usd_totals_locked() const
+{
+    // [PNL-USD-TOTALS 2026-08-01] Derive the cross-pair realized totals
+    // from the per-pair quote-mojo accumulators at query time, through the
+    // same quote_mojos_to_usd_locked conversion that produces the displayed
+    // usd_realized figure.  Deriving (rather than accumulating a separate
+    // USD counter) guarantees the total always equals the sum of the
+    // per-pair USD figures AND that a restart reproduces the same number:
+    // rehydrate_from_db rebuilds exactly these per-pair accumulators, so
+    // live and rehydrated totals are identical by construction.
+    UsdRealizedTotals t;
+    for (const auto& [name, ppnl] : pair_pnl_) {
+        t.spread_pnl   += quote_mojos_to_usd_locked(name, ppnl.spread_pnl);
+        t.gross_profit += quote_mojos_to_usd_locked(name, ppnl.gross_profit);
+        t.gross_loss   += quote_mojos_to_usd_locked(name, ppnl.gross_loss);
+    }
+    return t;
+}
+
 void PnLTracker::fill_usd_components_locked(PnLSummary& s,
                                             const std::string& pair_name) const
 {
@@ -1272,6 +1310,21 @@ PnLSummary PnLTracker::get_total_pnl() const
     std::lock_guard<std::mutex> lock(mtx_);
     PnLSummary s = build_summary(total_pnl_, xch_usd_rate_);
     fill_usd_components_locked(s, /*pair_name=*/"");
+
+    // [PNL-USD-TOTALS 2026-08-01] Rebuild the cross-pair profit factor from
+    // USD-normalized grosses.  build_summary's ratio over total_pnl_'s raw
+    // sums mixed quote currencies (a $0.04 DBX loss weighed like a $3 one
+    // against wUSDC.b profits), which distorted the ratio arbitrarily.
+    // Per-pair summaries keep the raw ratio -- within one quote asset it is
+    // unit-invariant and identical to the USD ratio.
+    const auto usd = realized_usd_totals_locked();
+    if (usd.gross_loss > 1e-12) {
+        s.profit_factor = usd.gross_profit / usd.gross_loss;
+    } else if (usd.gross_profit > 1e-12) {
+        s.profit_factor = 1e9;  // Effectively infinite (no losses).
+    } else {
+        s.profit_factor = 0.0;  // No convertible realized PnL.
+    }
     return s;
 }
 
@@ -1299,6 +1352,10 @@ DailySummary PnLTracker::get_daily_summary() const
     // [T9-FIX] Documented as lifetime; rename deferred to avoid
     // breaking any future callers.  A true daily implementation would
     // need to query trade_log with date-range filters.
+    // [PNL-USD-TOTALS 2026-08-01] The Mojo fields below are RAW cross-pair
+    // quote-mojo sums (mixed quote currencies plus an XCH-mojo fee leg) --
+    // total_pnl_usd is the only money figure here.  Currently unused by
+    // the engine; kept raw for API compatibility.
     ds.spread_pnl    = total_pnl_.spread_pnl;
     ds.inventory_pnl = total_pnl_.inventory_pnl;
     ds.fee_pnl       = total_pnl_.fee_pnl;

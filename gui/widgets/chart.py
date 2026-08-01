@@ -349,7 +349,9 @@ class ChartWidget(QWidget):
 
         # Plot 2 -- PnL (25 % height)
         self._pnl_plot: pg.PlotItem = self._graphics.addPlot(row=1, col=0)
-        self._pnl_plot.setLabel("right", "PnL")
+        # [PNL-USD-TOTALS 2026-08-01] main_window feeds the engine's USD
+        # gauges into this plot (raw cross-pair mojo sums are meaningless).
+        self._pnl_plot.setLabel("right", "PnL (USD)")
         self._pnl_plot.showGrid(x=True, y=True, alpha=0.15)
         self._pnl_plot.getAxis("right").setWidth(70)
         self._style_plot(self._pnl_plot)

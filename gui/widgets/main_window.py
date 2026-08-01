@@ -389,8 +389,24 @@ class MainWindow(QMainWindow):
                 chart.add_pairs(pair_names)
 
             ts_now = time.time()
-            total_pnl = float(pnl.get("total", 0.0))
-            realized_pnl = float(pnl.get("realized", 0.0))
+            # [PNL-USD-TOTALS 2026-08-01] Plot the engine's USD gauges.  The
+            # xop_pnl_mojos "total"/"realized" components sum quote mojos
+            # across pairs with different quote currencies (a DBX fill worth
+            # ~$0.04 moved the raw "total" by ~70x its value), so the curves
+            # were meaningless.  Fall back to the raw values only for engines
+            # that predate the xop_pnl_usd gauge family.
+            usd_total = pnl.get("usd")
+            usd_realized = pnl.get("usd_realized")
+            total_pnl = (
+                float(usd_total)
+                if usd_total is not None
+                else float(pnl.get("total", 0.0))
+            )
+            realized_pnl = (
+                float(usd_realized)
+                if usd_realized is not None
+                else float(pnl.get("realized", 0.0))
+            )
 
             for pair_name, md in market_data.items():
                 if not md:
