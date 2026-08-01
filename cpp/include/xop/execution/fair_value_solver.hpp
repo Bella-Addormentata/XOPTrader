@@ -249,6 +249,74 @@ double combine_sigma_bps(const std::vector<double>& terms);
 // ---------------------------------------------------------------------------
 double amm_sigma_bps(double pool_usd, double floor_bps, double depth_k_bps);
 
+// ---------------------------------------------------------------------------
+// CenterBlend / blend_quote_center -- uncertainty-weighted ladder centre.
+//
+// WHY THIS EXISTS
+// ---------------
+// The offer ladder used to be centred on the pair's own mid unconditionally,
+// and the external fair value was consulted only as a binary gate: usable
+// (clamp) or Unavailable (widen blindly).  That cliff threw away the estimate
+// exactly when it mattered -- at the 2026-08-01 sweep the solve knew XCH/BYC
+// was worth ~1.36 with a 467 bps error bar, and the ladder still quoted six
+// asks centred on a 1.2673 book mid because 467 > the 200 bps usability
+// ceiling.  Sigma is not a validity flag; it is a width instruction.
+//
+// THE FORM
+// --------
+// Both inputs are estimates of the same log-price, each with its own 1-sigma
+// (in bps of log price, the solver's native unit).  The minimum-variance
+// combination of two independent estimates is the inverse-variance weighted
+// mean, taken in LOG space so the answer does not depend on which leg the
+// pair is named after (the same argument as the solver itself):
+//
+//     w_b = 1/sigma_book^2          w_e = 1/sigma_ext^2
+//     log(center) = (w_b log(book) + w_e log(ext)) / (w_b + w_e)
+//     sigma(center) = sqrt(1 / (w_b + w_e))
+//
+// A tight fresh book (small sigma_book) dominates its own pricing; a wide or
+// stale book cedes to the external estimate.  With only one side present the
+// blend degrades to that side verbatim -- a pair with no external anchor at
+// all quotes around its own mid with its own width, it does not go silent.
+//
+// No pair is named anywhere; the inputs are numbers and the policy that
+// produces them lives in the caller.
+// ---------------------------------------------------------------------------
+struct CenterBlend {
+    /// False when NEITHER input is usable (non-positive or non-finite price
+    /// or sigma).  Every other field is meaningless when this is false.
+    bool   ok{false};
+
+    /// The blended centre, on the same price scale as the inputs.
+    double center{0.0};
+
+    /// 1-sigma of the blended centre in bps of log price.  This is the
+    /// combined_sigma the ladder's minimum half-spread is derived from:
+    /// always <= min(sigma_book, sigma_ext) when both sides participate,
+    /// and exactly the surviving side's sigma when only one does.
+    double sigma_bps{0.0};
+
+    /// Weight the external estimate received, in [0, 1].  0 = book only,
+    /// 1 = external only.  Logged so an operator can see who priced a pair.
+    double w_external{0.0};
+};
+
+/// @param book_mid           The pair's own mid.  <= 0 or non-finite means
+///                           "no book opinion" and the external side is used
+///                           alone.
+/// @param book_sigma_bps     1-sigma of the book mid (spread/2 + staleness +
+///                           depth, combined by the caller with
+///                           combine_sigma_bps).  Must be > 0 for the book to
+///                           participate.
+/// @param external_price     The independent solve estimate.  <= 0 or
+///                           non-finite means "no external opinion".
+/// @param external_sigma_bps 1-sigma of that estimate, from the solve's own
+///                           normal matrix.  Must be > 0 to participate.
+CenterBlend blend_quote_center(double book_mid,
+                               double book_sigma_bps,
+                               double external_price,
+                               double external_sigma_bps);
+
 }  // namespace fv
 }  // namespace xop
 

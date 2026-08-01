@@ -469,6 +469,11 @@ void MarketDataFeed::ingest_fair_value(const std::string& pair_name,
     // both; zero only the price, so that no caller can read a number we have
     // just declared untrustworthy.
     ps.fair_value            = usable_tier ? fv.price : 0.0;
+    // The raw ESTIMATE survives an Unavailable tier: a solve that says
+    // "1.36 +- 467 bps" is a width instruction for the quoting path even
+    // though it is far too shaky to clamp against.  Zeroed only when there
+    // is no anchored answer at all.
+    ps.fair_value_estimate   = usable_price ? fv.price : 0.0;
     ps.fair_value_tier       = fv.tier;
     ps.fair_value_sigma_bps  = fv.sigma_bps;
     ps.fair_value_observations = fv.observations;
@@ -577,6 +582,49 @@ std::optional<FairValue> MarketDataFeed::get_fair_value(
 
     FairValue out;
     out.price        = ps.fair_value;
+    out.tier         = ps.fair_value_tier;
+    out.age_seconds  = age;
+    out.sigma_bps    = ps.fair_value_sigma_bps;
+    out.observations = ps.fair_value_observations;
+    out.residual_bps = ps.fair_value_residual_valid
+        ? ps.fair_value_residual_bps
+        : std::numeric_limits<double>::quiet_NaN();
+    return out;
+}
+
+std::optional<FairValue> MarketDataFeed::get_fair_value_estimate(
+        const std::string& pair_name) const {
+    // Same lock-ordering rule as get_fair_value: config first, then pairs.
+    const double max_age = [&] {
+        std::shared_lock cfg_lock(mtx_config_);
+        return config_.fair_value_max_age_sec;
+    }();
+
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return std::nullopt;
+    }
+
+    const PairState& ps = it->second;
+
+    // Deliberately NOT gated on the tier: an Unavailable-by-sigma estimate is
+    // exactly what the quoting path needs (the sigma travels with it).  Only
+    // the genuine absence of an estimate, or its expiry, reads as nullopt.
+    if (ps.fair_value_estimate <= 0.0
+        || ps.fair_value_updated_at == Timestamp{}) {
+        return std::nullopt;
+    }
+
+    const double age = std::chrono::duration<double>(
+        std::chrono::system_clock::now() - ps.fair_value_updated_at).count();
+    if (max_age > 0.0 && age > max_age) {
+        return std::nullopt;
+    }
+
+    FairValue out;
+    out.price        = ps.fair_value_estimate;
     out.tier         = ps.fair_value_tier;
     out.age_seconds  = age;
     out.sigma_bps    = ps.fair_value_sigma_bps;

@@ -266,6 +266,55 @@ double amm_sigma_bps(double pool_usd, double floor_bps, double depth_k_bps) {
     return std::max(floor_ok, derived);
 }
 
+CenterBlend blend_quote_center(double book_mid,
+                               double book_sigma_bps,
+                               double external_price,
+                               double external_sigma_bps) {
+    CenterBlend out;
+
+    const bool book_ok = std::isfinite(book_mid) && book_mid > 0.0
+                      && std::isfinite(book_sigma_bps) && book_sigma_bps > 0.0;
+    const bool ext_ok  = std::isfinite(external_price) && external_price > 0.0
+                      && std::isfinite(external_sigma_bps)
+                      && external_sigma_bps > 0.0;
+
+    if (!book_ok && !ext_ok) {
+        return out;  // Nothing to centre on; the caller keeps its own mid.
+    }
+    if (book_ok && !ext_ok) {
+        out.ok         = true;
+        out.center     = book_mid;
+        out.sigma_bps  = book_sigma_bps;
+        out.w_external = 0.0;
+        return out;
+    }
+    if (!book_ok && ext_ok) {
+        out.ok         = true;
+        out.center     = external_price;
+        out.sigma_bps  = external_sigma_bps;
+        out.w_external = 1.0;
+        return out;
+    }
+
+    // Inverse-variance weighted mean in log space (see header for why).
+    const double w_b = 1.0 / (book_sigma_bps * book_sigma_bps);
+    const double w_e = 1.0 / (external_sigma_bps * external_sigma_bps);
+    const double log_center =
+        (w_b * std::log(book_mid) + w_e * std::log(external_price))
+        / (w_b + w_e);
+
+    const double center = std::exp(log_center);
+    if (!std::isfinite(center) || center <= 0.0) {
+        return out;  // Degenerate arithmetic; refuse rather than guess.
+    }
+
+    out.ok         = true;
+    out.center     = center;
+    out.sigma_bps  = std::sqrt(1.0 / (w_b + w_e));
+    out.w_external = w_e / (w_b + w_e);
+    return out;
+}
+
 Solution solve_pair(const std::vector<Anchor>& anchors,
                     const std::vector<Edge>&   edges,
                     const std::string&         base,

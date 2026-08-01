@@ -433,6 +433,12 @@ struct PairState {
 
     // --- Independent fair value (never derived from this pair's book) ---
     double        fair_value{0.0};  // Quote-per-base (0 if unavailable)
+
+    /// The solve's raw estimate, kept even when the tier is Unavailable
+    /// because the sigma exceeded the clamp ceiling.  0 only when the solve
+    /// produced no anchored answer at all.  Served by
+    /// get_fair_value_estimate(); the clamp path never reads it.
+    double        fair_value_estimate{0.0};
     FairValueTier fair_value_tier{FairValueTier::Unavailable};
     Timestamp     fair_value_updated_at{};
     double        fair_value_sigma_bps{0.0};
@@ -638,6 +644,25 @@ public:
     /// order book -- a caller that cannot get a fair value must know it is
     /// quoting blind rather than be handed the very number it wanted checked.
     std::optional<FairValue> get_fair_value(const std::string& pair_name) const;
+
+    /// The solve's raw ESTIMATE for a pair, regardless of confidence tier.
+    ///
+    /// get_fair_value() withholds any estimate whose solved sigma exceeds
+    /// fair_value_max_sigma_bps, because CLAMPING against a reference that
+    /// uncertain is theatre.  But for CENTRING and WIDTH the sigma is not a
+    /// validity flag -- it is the width instruction: at the 2026-08-01 sweep
+    /// the solve knew XCH/BYC was worth ~1.36 +- 467 bps while the book said
+    /// 1.2673, and discarding that estimate is what left the ladder centred
+    /// 10% from the truth.  This accessor returns the estimate WITH its sigma
+    /// and tier (which may be Unavailable) so the quoting path can blend it
+    /// by uncertainty instead of ignoring it.
+    ///
+    /// Returns std::nullopt when there is genuinely NO estimate: unknown
+    /// pair, a solve that found no anchored path at all, or a sample older
+    /// than config.fair_value_max_age_sec.  Never falls back to anything
+    /// derived from this pair's own book.
+    std::optional<FairValue> get_fair_value_estimate(
+        const std::string& pair_name) const;
 
     /// CONSISTENCY RESIDUAL for a pair, in basis points:
     ///     10 000 * log(book_mid / independent_fair_value)

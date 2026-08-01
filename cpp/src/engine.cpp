@@ -4186,6 +4186,85 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // -- Uncertainty-weighted ladder centre -----------------------------
+        // The centre is a blend of the pair's own mid and the external solve
+        // ESTIMATE (get_fair_value_estimate -- returned even when its sigma
+        // exceeds the clamp ceiling, because for centring the sigma is a
+        // weight, not a validity flag).  Each side is weighted by inverse
+        // variance: the book's sigma is spread/2 + staleness + depth (the
+        // same terms update_fair_values feeds the solver), the external
+        // sigma comes from the solve's own normal matrix.  A tight fresh
+        // book dominates its own pricing; a wide or stale one cedes to the
+        // external estimate.  At the 2026-08-01 sweep this moves the
+        // XCH/BYC centre from the 1.2673 book mid to ~1.345 (external
+        // weight 0.84 against a 2114 bps book); on XCH/wUSDC.b (book sigma
+        // ~131 bps, solve sigma ~133 bps) the centre moves ~17 bps.
+        //
+        // quote_combined_sigma_bps is the 1-sigma of that blended centre; it
+        // is threaded through the ladder as the sigma term of the minimum
+        // half-spread below.  When neither a two-sided book nor an estimate
+        // exists it stays 0 and only the existing floors apply.
+        double quote_combined_sigma_bps  = 0.0;
+        bool   quote_has_external_est    = false;
+        {
+            const auto obs =
+                market_data_->get_fair_value_inputs(pair_name);
+
+            double book_sigma_bps = 0.0;
+            if (obs.has_book && market_mid > 0.0) {
+                const double n_offers =
+                    static_cast<double>(std::max<std::size_t>(
+                        1, market_data_->get_num_competing_offers(pair_name)));
+                book_sigma_bps = fv::combine_sigma_bps({
+                    std::max(std::abs(obs.spread_bps) / 2.0,
+                             config_.strategy.fair_value_min_book_sigma_bps),
+                    config_.strategy.fair_value_stale_sigma_bps_per_print
+                        * static_cast<double>(std::max(0, obs.print_age)),
+                    config_.strategy.fair_value_depth_ref_bps
+                        / std::sqrt(n_offers),
+                });
+            }
+
+            const auto est = market_data_->get_fair_value_estimate(pair_name);
+            // "The estimate informed this ladder" requires the blend to be
+            // on: with it disabled the blind-widen path must keep running.
+            quote_has_external_est =
+                est.has_value()
+                && config_.strategy.quote_center_blend_enabled;
+
+            const auto blend = fv::blend_quote_center(
+                (obs.has_book && market_mid > 0.0) ? market_mid : 0.0,
+                book_sigma_bps,
+                (config_.strategy.quote_center_blend_enabled && est)
+                    ? est->price : 0.0,
+                est ? est->sigma_bps : 0.0);
+
+            if (blend.ok) {
+                quote_combined_sigma_bps = blend.sigma_bps;
+                const double shift_bps = (market_mid > 0.0)
+                    ? std::log(blend.center / market_mid) * 10'000.0
+                    : 0.0;
+                if (std::abs(shift_bps) > 50.0) {
+                    spdlog::info(
+                        "[Engine] Step 7: {} uncertainty centre: "
+                        "mid {:.8f} -> {:.8f} ({:+.0f}bps, w_ext={:.2f}, "
+                        "book_sigma={:.0f}bps ext_sigma={:.0f}bps "
+                        "combined={:.0f}bps)",
+                        pair_name, market_mid, blend.center, shift_bps,
+                        blend.w_external, book_sigma_bps,
+                        est ? est->sigma_bps : 0.0, blend.sigma_bps);
+                } else {
+                    spdlog::debug(
+                        "[Engine] Step 7: {} uncertainty centre: "
+                        "mid {:.8f} -> {:.8f} ({:+.0f}bps, w_ext={:.2f}, "
+                        "combined={:.0f}bps)",
+                        pair_name, market_mid, blend.center, shift_bps,
+                        blend.w_external, blend.sigma_bps);
+                }
+                market_mid = blend.center;
+            }
+        }
+
         Mojo mid_mojos = static_cast<Mojo>(std::llround(
             market_mid * static_cast<double>(kMojosPerXch)));
 
@@ -4750,11 +4829,52 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // -- Minimum ladder half-spread (uncertainty-scaled) ----------------
+        // The ladder's minimum half-spread is
+        //     max(configured tier spacing, k_sigma * combined_sigma,
+        //         min_profit_margin_bps, tibetswap_fee_bps)
+        // Uncertainty about the centre IS the width instruction: quoting one
+        // standard deviation out means a taker must move the price past our
+        // honest error bar before reaching us.  At the sweep the combined
+        // sigma was ~427 bps, putting the lowest ask ~0.8% below the truth
+        // instead of 10.4%; on XCH/wUSDC.b it is ~93 bps, inside the
+        // existing tier spacing, so the floor never binds there.  Enforced
+        // three ways: the tier spacing is shifted outward before ladder
+        // generation, the competitive cap's safety floor honours it, and a
+        // final pass below catches anything (inventory skew, gap-aware
+        // spacing, stablecoin undercut) that pulled a tier back inside.
+        const double quote_base_floor_bps = std::max(
+            pair_cfg ? pair_cfg->min_profit_margin_bps_override.value_or(
+                           config_.strategy.min_profit_margin_bps)
+                     : config_.strategy.min_profit_margin_bps,
+            config_.arbitrage.tibetswap_fee_bps);
+        const double quote_min_half_spread_bps = std::max(
+            quote_base_floor_bps,
+            std::max(0.0, config_.strategy.quote_width_sigma_mult)
+                * quote_combined_sigma_bps);
+
         // Fetch competing offers for gap-aware dynamic tier spacing.
         auto comp_offers = market_data_->get_competing_offers(pair_name);
 
         // Query per-tier fill rates from the offer log for adaptive sizing.
         LiquidityConfig ladder_cfg = liq.config();
+
+        // Shift the whole spacing schedule outward (preserving inter-tier
+        // gaps, so the ladder keeps its shape and tiers stay distinct) when
+        // the innermost tier sits inside the minimum half-spread.
+        if (!ladder_cfg.tier_spacing_bps.empty()
+            && quote_min_half_spread_bps > ladder_cfg.tier_spacing_bps.front())
+        {
+            const double delta = quote_min_half_spread_bps
+                               - ladder_cfg.tier_spacing_bps.front();
+            for (double& s : ladder_cfg.tier_spacing_bps) s += delta;
+            spdlog::info("[Engine] Step 7: {} sigma width floor: tier "
+                         "spacing shifted +{:.0f}bps (min_half_spread="
+                         "{:.0f}bps, combined_sigma={:.0f}bps, k={:.2f})",
+                         pair_name, delta, quote_min_half_spread_bps,
+                         quote_combined_sigma_bps,
+                         config_.strategy.quote_width_sigma_mult);
+        }
         if (ladder_cfg.fill_rate_sizing && ladder_cfg.num_tiers > 0) {
             auto cutoff = std::chrono::system_clock::now()
                 - std::chrono::hours(ladder_cfg.fill_rate_lookback_hours);
@@ -4820,13 +4940,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 config_.strategy.wall_size_threshold_xch
                 * static_cast<double>(kMojosPerXch)));
 
-            // Minimum allowed spread: max(min_margin_bps, tibetswap_fee_bps).
-            // The TibetSwap fee creates a natural arbitrage boundary ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€¦Ã‚Â¡ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â
-            // any offer tighter than ~70 bps can be profitably arbed.
-            const double min_floor_bps = std::max(
-                pair_cfg ? pair_cfg->min_profit_margin_bps_override.value_or(
-                    config_.strategy.min_profit_margin_bps) : config_.strategy.min_profit_margin_bps,
-                config_.arbitrage.tibetswap_fee_bps);
+            // Minimum allowed spread: the uncertainty-scaled minimum half-
+            // spread, which already folds in max(min_margin_bps,
+            // tibetswap_fee_bps) plus k_sigma * combined_sigma.  Without the
+            // sigma term this cap would chase mispriced competing offers
+            // right back inside the width the centre's own error bar
+            // demands -- undoing the floor is how a ladder gets swept.
+            const double min_floor_bps = quote_min_half_spread_bps;
             const Mojo max_bid_floor = static_cast<Mojo>(std::llround(
                 static_cast<double>(mid_mojos) * (1.0 - min_floor_bps / 10000.0)));
             const Mojo min_ask_ceil  = static_cast<Mojo>(std::llround(
@@ -5007,6 +5127,97 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         tq.price = improved;
                     }
                 }
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Minimum-width floor enforcement.  The sigma-scaled minimum
+        // half-spread was already folded into the tier spacing and the
+        // competitive cap above, but three mechanisms can still pull a tier
+        // back inside it: inventory skew (a long book tightens its asks),
+        // gap-aware spacing (a gap can sit closer than the floor), and the
+        // stablecoin undercut (which chases the best competing offer).  On
+        // the sweep day every one of those was pulling toward a book that
+        // was itself the mispriced object, so the floor must be the LAST
+        // word on how close to the centre a quote may sit.  Tiers inside
+        // the floor are pushed to its edge, stepped apart so they do not
+        // collapse onto one price level (same rationale as the fair-value
+        // clamp's tier step).  Sizes are untouched.
+        // -----------------------------------------------------------------
+        if (mid_mojos > 0 && quote_min_half_spread_bps > 0.0
+            && !pcs.ladder.empty())
+        {
+            const double step_bps = std::max(
+                0.0, config_.strategy.fair_value_clamp_tier_step_bps);
+            const auto floor_bid_edge = static_cast<Mojo>(std::llround(
+                static_cast<double>(mid_mojos)
+                * (1.0 - quote_min_half_spread_bps / 10'000.0)));
+            const auto floor_ask_edge = static_cast<Mojo>(std::llround(
+                static_cast<double>(mid_mojos)
+                * (1.0 + quote_min_half_spread_bps / 10'000.0)));
+
+            auto tiers_in_order = [&](Side side) {
+                std::vector<TierQuote*> out;
+                out.reserve(pcs.ladder.size());
+                for (auto& tq : pcs.ladder) {
+                    if (tq.side == side) out.push_back(&tq);
+                }
+                std::sort(out.begin(), out.end(),
+                          [](const TierQuote* a, const TierQuote* b) {
+                              return a->tier_index < b->tier_index;
+                          });
+                return out;
+            };
+            auto resync_spread = [&](TierQuote& tq) {
+                tq.spread_bps =
+                    (static_cast<double>(tq.price)
+                   - static_cast<double>(mid_mojos))
+                    / static_cast<double>(mid_mojos) * 10'000.0;
+            };
+
+            int floored_bids = 0;
+            int floored_asks = 0;
+
+            // BID side: running ceiling stepping DOWN, so successive
+            // floored tiers stay distinct and ordered.
+            Mojo next_max = floor_bid_edge;
+            for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
+                TierQuote& tq = *tqp;
+                if (tq.price <= next_max) {
+                    next_max = std::min(next_max, tq.price);
+                    continue;
+                }
+                tq.price = next_max;
+                resync_spread(tq);
+                ++floored_bids;
+                next_max = static_cast<Mojo>(std::llround(
+                    static_cast<double>(next_max)
+                    * (1.0 - step_bps / 10'000.0)));
+            }
+
+            // ASK side: running floor stepping UP.
+            Mojo next_min = floor_ask_edge;
+            for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
+                TierQuote& tq = *tqp;
+                if (tq.price >= next_min) {
+                    next_min = std::max(next_min, tq.price);
+                    continue;
+                }
+                tq.price = next_min;
+                resync_spread(tq);
+                ++floored_asks;
+                next_min = static_cast<Mojo>(std::llround(
+                    static_cast<double>(next_min)
+                    * (1.0 + step_bps / 10'000.0)));
+            }
+
+            if (floored_bids > 0 || floored_asks > 0) {
+                spdlog::info("[Engine] Step 7: {} width floor pushed {} bid "
+                             "and {} ask tier(s) out to {:.0f}bps "
+                             "(combined_sigma={:.0f}bps)",
+                             pair_name, floored_bids, floored_asks,
+                             quote_min_half_spread_bps,
+                             quote_combined_sigma_bps);
             }
         }
 
@@ -5304,6 +5515,24 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                         max_dev_bps, fv_opt->observations,
                         fv_opt->age_seconds);
                 }
+            }
+            else if (!fv_opt && quote_has_external_est) {
+                // ---------------------------------------------------------
+                // The solve HAS an estimate, but its sigma exceeds the clamp
+                // ceiling so get_fair_value() reports absence.  This is no
+                // longer the blind case: the centre already blended that
+                // estimate by inverse variance and the ladder width already
+                // carries k_sigma * combined_sigma of the SAME uncertainty.
+                // Blind-widening on top would count it twice -- and a double-
+                // widened ladder is a de facto market withdrawal, which the
+                // owner's directive (keep quoting low-certainty markets)
+                // exists to prevent.
+                // ---------------------------------------------------------
+                spdlog::debug("[Engine] Step 7: {} fair value unusable for "
+                              "clamping (sigma above ceiling) -- centre "
+                              "blend and sigma width floor already applied; "
+                              "skipping blind widening",
+                              pair_name);
             }
             else if (!fv_opt) {
                 // ---------------------------------------------------------

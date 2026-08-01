@@ -760,6 +760,13 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     opt_non_negative("blind_quote_widen_pct", cfg.blind_quote_widen_pct);
     opt_non_negative("fair_value_clamp_tier_step_bps",
                      cfg.fair_value_clamp_tier_step_bps);
+    opt_non_negative("quote_width_sigma_mult", cfg.quote_width_sigma_mult);
+    if (node["quote_center_blend_enabled"]
+        && node["quote_center_blend_enabled"].IsDefined()
+        && !node["quote_center_blend_enabled"].IsNull()) {
+        cfg.quote_center_blend_enabled =
+            node["quote_center_blend_enabled"].as<bool>();
+    }
     opt_non_negative("fair_value_feed_sigma_bps",
                      cfg.fair_value_feed_sigma_bps);
     opt_non_negative("fair_value_amm_sigma_bps", cfg.fair_value_amm_sigma_bps);

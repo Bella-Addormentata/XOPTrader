@@ -32,6 +32,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/market_data.hpp"
 #include "xop/state.hpp"
+#include "xop/strategy/liquidity.hpp"
 #include "xop/types.hpp"
 
 #include <gtest/gtest.h>
@@ -1182,6 +1183,310 @@ TEST(CorrectedMid, BycOwnLadderCentreMovesMostOfTheWayToTheTruth) {
     // is the honest answer at that width rather than an artifact.  The bid
     // side of that same book is within 0.1% of the truth.
     EXPECT_NEAR(kBycBookBid, kBycTrueUsd, 0.002);
+}
+
+// ===========================================================================
+// Part 6 -- uncertainty-scaled quoting (phase 3)
+//
+// The binary usable/Unavailable cliff treated the solve's sigma as a validity
+// flag.  It is a WIDTH INSTRUCTION.  The ladder centre is now an inverse-
+// variance blend of the pair's own mid and the external estimate, and the
+// ladder's minimum half-spread is k_sigma * combined_sigma (floored by the
+// existing margins).  These tests replay the design's acceptance cases with
+// the real numbers, arithmetic shown.
+// ===========================================================================
+
+/// The engine's minimum half-spread, exactly as Step 7 computes it.
+double min_half_spread_bps(double combined_sigma_bps) {
+    return std::max(
+        std::max(kDefaults.min_profit_margin_bps,
+                 ArbitrageSettings{}.tibetswap_fee_bps),
+        kDefaults.quote_width_sigma_mult * combined_sigma_bps);
+}
+
+/// Build a default ladder around `center` with the spacing schedule shifted
+/// outward so the innermost tier honours the floor -- exactly the Step 7
+/// pre-generation shift.
+std::vector<TierQuote> ladder_with_floor(double center, double floor_bps) {
+    LiquidityConfig cfg;                     // default 4 tiers [60,200,500,1000]
+    if (floor_bps > cfg.tier_spacing_bps.front()) {
+        const double delta = floor_bps - cfg.tier_spacing_bps.front();
+        for (double& s : cfg.tier_spacing_bps) s += delta;
+    }
+    LiquidityEngine liq("TEST/PAIR", cfg);
+    const auto mid = static_cast<std::int64_t>(
+        std::llround(center * 1e12));
+    return liq.compute_ladder(mid, /*sigma=*/0.05, /*inventory_ratio=*/0.5,
+                              /*available_capital=*/1'000'000'000'000,
+                              /*available_inventory=*/1'000'000'000'000, cfg);
+}
+
+TEST(QuoteCenterBlend, RefusesWhenNeitherSideIsUsable) {
+    EXPECT_FALSE(fv::blend_quote_center(0.0, 0.0, 0.0, 0.0).ok);
+    EXPECT_FALSE(fv::blend_quote_center(-1.0, 50.0, 0.0, 100.0).ok);
+    EXPECT_FALSE(fv::blend_quote_center(1.0, 0.0, 1.0, 0.0).ok);  // no sigmas
+}
+
+TEST(QuoteCenterBlend, OneSidedInputDegradesToThatSideVerbatim) {
+    // No external anchor: the pair quotes around its own mid with its own
+    // width -- it does NOT go silent.  This is the general low-certainty-
+    // market behaviour the owner's directive requires.
+    const auto book_only = fv::blend_quote_center(1.2673, 1057.0, 0.0, 0.0);
+    ASSERT_TRUE(book_only.ok);
+    EXPECT_DOUBLE_EQ(book_only.center, 1.2673);
+    EXPECT_DOUBLE_EQ(book_only.sigma_bps, 1057.0);
+    EXPECT_DOUBLE_EQ(book_only.w_external, 0.0);
+
+    // No two-sided book: the external estimate prices the pair alone.
+    const auto ext_only = fv::blend_quote_center(0.0, 0.0, 1.3608, 466.7);
+    ASSERT_TRUE(ext_only.ok);
+    EXPECT_DOUBLE_EQ(ext_only.center, 1.3608);
+    EXPECT_DOUBLE_EQ(ext_only.sigma_bps, 466.7);
+    EXPECT_DOUBLE_EQ(ext_only.w_external, 1.0);
+}
+
+TEST(QuoteCenterBlend, EqualSigmasGiveTheGeometricMeanAndShrinkSigma) {
+    // Two equally-uncertain estimates: the blend is their log-space midpoint
+    // (geometric mean) and the combined sigma is sigma/sqrt(2) -- two honest
+    // witnesses know more than one.
+    const auto b = fv::blend_quote_center(1.0, 200.0, 4.0, 200.0);
+    ASSERT_TRUE(b.ok);
+    EXPECT_NEAR(b.center, 2.0, 1e-9);
+    EXPECT_NEAR(b.sigma_bps, 200.0 / std::sqrt(2.0), 1e-9);
+    EXPECT_NEAR(b.w_external, 0.5, 1e-12);
+}
+
+TEST(QuoteCenterBlend, IsSymmetricUnderPairInversion) {
+    // Log space is not a convenience here either: inverting both inputs must
+    // exactly invert the answer, so the blend cannot depend on which leg the
+    // pair is named after.
+    const auto fwd = fv::blend_quote_center(1.2673, 1057.0, 1.3608, 466.7);
+    const auto rev = fv::blend_quote_center(1.0 / 1.2673, 1057.0,
+                                            1.0 / 1.3608, 466.7);
+    ASSERT_TRUE(fwd.ok);
+    ASSERT_TRUE(rev.ok);
+    EXPECT_NEAR(fwd.center * rev.center, 1.0, 1e-12);
+    EXPECT_NEAR(fwd.sigma_bps, rev.sigma_bps, 1e-9);
+}
+
+TEST(QuoteCenterBlend, TheTighterWitnessDominates) {
+    const auto b = fv::blend_quote_center(1.0, 100.0, 1.1, 1000.0);
+    ASSERT_TRUE(b.ok);
+    EXPECT_LT(b.w_external, 0.02);          // 1:100 variance ratio
+    EXPECT_NEAR(b.center, 1.0, 0.002);
+    EXPECT_LT(b.sigma_bps, 100.0);          // never worse than the best input
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPTANCE (A): sweep replay at block 9087661 conditions.
+//
+// Book 1.133359 / 1.401333 (mid 1.267346, spread 2114.5 bps), external solve
+// estimate ~1.3608 at sigma ~466.7 bps (the real solve over the real graph,
+// re-derived here rather than hardcoded).  Arithmetic:
+//
+//   book sigma   = sqrt(1057.23^2 + 30^2)                       = 1057.65 bps
+//   w_external   = 1057.65^2 / (1057.65^2 + 466.7^2)            = 0.837
+//   centre       = exp(0.837*ln(1.3608) + 0.163*ln(1.267346))   ~ 1.3451
+//   combined     = 1057.65*466.7 / sqrt(1057.65^2 + 466.7^2)    ~  427 bps
+//   lowest ask   = centre * (1 + 427/10000)                     ~ 1.4025
+//
+// Truth was 1.4143: the lowest ask sits ~0.84% below it instead of 10.4%.
+// The six swept prices (1.2704-1.2979) are all far inside the floor and can
+// no longer be posted.
+// ---------------------------------------------------------------------------
+TEST(UncertaintyQuoting, AcceptanceA_SweepLadderCanNoLongerBePosted) {
+    const auto s = fv::solve_pair(live_anchors(), live_edges_with_amm(),
+                                  "xch", "byc", kPairXchByc);
+    ASSERT_TRUE(s.ok);
+    ASSERT_EQ(tier_of(s), FairValueTier::Unavailable);  // still not clampable
+    ASSERT_NEAR(s.price, 1.3608, 0.01);
+    ASSERT_NEAR(s.sigma_bps, 466.7, 5.0);
+
+    const double sigma_book = book_sigma(kBookXchBycSpr, 0);
+    EXPECT_NEAR(sigma_book, 1057.65, 1.0);
+
+    const auto blend = fv::blend_quote_center(kBookXchByc, sigma_book,
+                                              s.price, s.sigma_bps);
+    ASSERT_TRUE(blend.ok);
+
+    // The wide book cedes to the external estimate, but does not vanish.
+    EXPECT_NEAR(blend.w_external, 0.837, 0.01);
+    EXPECT_NEAR(blend.center, 1.3451, 0.011);
+    EXPECT_GT(blend.center, kBookXchByc);   // moved toward the truth...
+    EXPECT_LT(blend.center, s.price);       // ...but not past the estimate.
+    EXPECT_NEAR(blend.sigma_bps, 427.0, 10.0);
+
+    const double floor_bps = min_half_spread_bps(blend.sigma_bps);
+    EXPECT_DOUBLE_EQ(floor_bps,
+                     kDefaults.quote_width_sigma_mult * blend.sigma_bps);
+
+    // The lowest permissible ask covers the truth to within ~2% (0.84%
+    // measured), against 9-11% below it at the sweep.
+    const double lowest_ask = blend.center * (1.0 + floor_bps / 10'000.0);
+    EXPECT_NEAR(lowest_ask, 1.4025, 0.012);
+    EXPECT_GE(lowest_ask, 0.98 * kTrueXchByc);
+
+    // Every one of the six swept prices is now unreachable.
+    for (double px : kSweptAsks) {
+        EXPECT_LT(px, lowest_ask * 0.93) << "swept ask " << px;
+    }
+
+    // And the actual ladder, built through the same spacing shift Step 7
+    // applies, posts no ask below the floor and no bid above its mirror.
+    const auto ladder = ladder_with_floor(blend.center, floor_bps);
+    ASSERT_FALSE(ladder.empty());
+    const auto bid_edge = static_cast<std::int64_t>(std::llround(
+        blend.center * 1e12 * (1.0 - floor_bps / 10'000.0)));
+    const auto ask_edge = static_cast<std::int64_t>(std::llround(
+        blend.center * 1e12 * (1.0 + floor_bps / 10'000.0)));
+    for (const auto& tq : ladder) {
+        if (tq.side == Side::Ask) {
+            EXPECT_GE(tq.price, ask_edge - 1)
+                << "ask tier " << int(tq.tier_index);
+            EXPECT_GT(static_cast<double>(tq.price) / 1e12, kSweptAsks.back());
+        } else {
+            EXPECT_LE(tq.price, bid_edge + 1)
+                << "bid tier " << int(tq.tier_index);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPTANCE (B): the healthy pair must quote essentially as today.
+//
+// XCH/wUSDC.b at the same block: book 1.428457 at 253.96 bps (its measured
+// p50 is 237), solve 1.4335 at ~133 bps, CexDirect.  Arithmetic:
+//
+//   book sigma = sqrt(126.98^2 + 30^2)                     = 130.5 bps
+//   w_external = 130.5^2 / (130.5^2 + 133.2^2)             = 0.490
+//   shift      = 0.490 * ln(1.4335/1.428457)               ~ +17 bps
+//   combined   = 130.5*133.2 / sqrt(130.5^2 + 133.2^2)     ~  93 bps
+//
+// Net effect: centre moves ~17 bps (a fifth of the pair's own half-spread);
+// the width floor lands at ~93 bps, INSIDE the pair's existing 200-300 bps
+// tier spacing, so a configured ladder does not move at all.  On the shipped
+// 60 bps innermost default the shift is +33 bps -- bounded, as required, by
+// k_sigma * 133 bps.
+// ---------------------------------------------------------------------------
+TEST(UncertaintyQuoting, AcceptanceB_HealthyPairIsEssentiallyUnchanged) {
+    const auto s = fv::solve_pair(live_anchors(), live_edges_with_amm(),
+                                  "xch", "wusdc", kPairXchUsdc);
+    ASSERT_TRUE(s.ok);
+    ASSERT_EQ(tier_of(s), FairValueTier::CexDirect);
+    ASSERT_NEAR(s.sigma_bps, 133.0, 5.0);
+
+    const double sigma_book = book_sigma(kBookXchUsdcSpr, 0);
+    EXPECT_NEAR(sigma_book, 130.5, 1.0);
+
+    const auto blend = fv::blend_quote_center(kBookXchUsdc, sigma_book,
+                                              s.price, s.sigma_bps);
+    ASSERT_TRUE(blend.ok);
+
+    // Centre shift: near zero.  (+17.3 bps measured; a tight fresh book
+    // keeps pricing itself.)
+    const double shift_bps =
+        std::log(blend.center / kBookXchUsdc) * 10'000.0;
+    EXPECT_LT(std::abs(shift_bps), 25.0);
+
+    // Width: combined sigma ~93 bps, so with k_sigma = 1 the floor is
+    // bounded by the solve's own 133 bps and sits INSIDE the pair's
+    // existing 200-300 bps tier spacing -- a configured ladder is untouched.
+    EXPECT_NEAR(blend.sigma_bps, 93.2, 3.0);
+    const double floor_bps = min_half_spread_bps(blend.sigma_bps);
+    EXPECT_LE(floor_bps, kDefaults.quote_width_sigma_mult * 133.0 + 5.0);
+    EXPECT_LT(floor_bps, 200.0);   // no shift on 200-300 bps spacing
+
+    // On the shipped 60 bps innermost default, the shift is +33 bps.
+    LiquidityConfig def;
+    EXPECT_NEAR(floor_bps - def.tier_spacing_bps.front(), 33.2, 4.0);
+}
+
+// ---------------------------------------------------------------------------
+// ACCEPTANCE (C): a hypothetical future pair with NO external anchor and a
+// 3000 bps book.  No pair name, no peg, no special case: the blend degrades
+// to the pair's own midpoint, the combined sigma IS the book's sigma
+// (sqrt(1500^2 + 30^2) ~ 1500 bps), and the ladder is very wide, two-sided,
+// and present -- NOT silence, NOT tight quotes.
+// ---------------------------------------------------------------------------
+TEST(UncertaintyQuoting, AcceptanceC_UnanchoredWideMarketQuotesWideNotSilent) {
+    const double mid = 0.5;                       // arbitrary units
+    const double sigma_book = book_sigma(3000.0, 0);
+    EXPECT_NEAR(sigma_book, 1500.3, 1.0);
+
+    // No external estimate of any kind.
+    const auto blend = fv::blend_quote_center(mid, sigma_book, 0.0, 0.0);
+    ASSERT_TRUE(blend.ok);
+    EXPECT_DOUBLE_EQ(blend.center, mid);          // its own midpoint
+    EXPECT_DOUBLE_EQ(blend.sigma_bps, sigma_book);
+
+    const double floor_bps = min_half_spread_bps(blend.sigma_bps);
+    EXPECT_GE(floor_bps, 1500.0);                 // >= 1500 bps-ish
+
+    const auto ladder = ladder_with_floor(mid, floor_bps);
+
+    // NOT silence: both sides are quoted.
+    int bids = 0;
+    int asks = 0;
+    for (const auto& tq : ladder) {
+        (tq.side == Side::Bid ? bids : asks)++;
+    }
+    EXPECT_GT(bids, 0);
+    EXPECT_GT(asks, 0);
+
+    // NOT tight: every ask >= mid * 1.15, every bid <= mid * 0.85.
+    for (const auto& tq : ladder) {
+        const double px = static_cast<double>(tq.price) / 1e12;
+        if (tq.side == Side::Ask) {
+            EXPECT_GE(px, mid * (1.0 + floor_bps / 10'000.0) * 0.999);
+        } else {
+            EXPECT_LE(px, mid * (1.0 - floor_bps / 10'000.0) * 1.001);
+        }
+    }
+}
+
+// The knobs ship with working defaults: an operator who never touches
+// config.yaml gets uncertainty-scaled quoting, exactly like every other
+// guard in this family.
+TEST(UncertaintyQuoting, DefaultsProtectAnUnconfiguredDeployment) {
+    const StrategyConfig d{};
+    EXPECT_TRUE(d.quote_center_blend_enabled);
+    EXPECT_DOUBLE_EQ(d.quote_width_sigma_mult, 1.0);  // one standard deviation
+}
+
+// The accessor contract: an estimate whose sigma exceeds the clamp ceiling is
+// invisible to get_fair_value (clamping against it would be theatre) but
+// visible to get_fair_value_estimate WITH its sigma, so the quoting path can
+// weight it honestly instead of discarding it.
+TEST_F(FairValueTest, HighSigmaEstimateIsServedForQuotingButNotForClamping) {
+    FairValue in;
+    in.price     = 1.3608;
+    in.tier      = FairValueTier::Unavailable;   // sigma above the ceiling
+    in.sigma_bps = 466.7;
+    feed_->ingest_fair_value("XCH/BYC", in);
+
+    EXPECT_FALSE(feed_->get_fair_value("XCH/BYC").has_value());
+
+    const auto est = feed_->get_fair_value_estimate("XCH/BYC");
+    ASSERT_TRUE(est.has_value());
+    EXPECT_DOUBLE_EQ(est->price, 1.3608);
+    EXPECT_DOUBLE_EQ(est->sigma_bps, 466.7);
+    EXPECT_EQ(est->tier, FairValueTier::Unavailable);
+}
+
+// ...but a solve with no anchored answer at all has no estimate to serve, and
+// the accessor must say so rather than reheat a stale one.
+TEST_F(FairValueTest, NoAnchoredAnswerMeansNoEstimateEither) {
+    // A real estimate arrives first...
+    FairValue in;
+    in.price     = 1.3608;
+    in.tier      = FairValueTier::Unavailable;
+    in.sigma_bps = 466.7;
+    feed_->ingest_fair_value("XCH/BYC", in);
+    ASSERT_TRUE(feed_->get_fair_value_estimate("XCH/BYC").has_value());
+
+    // ...then the anchor path is lost entirely: the estimate must clear.
+    feed_->ingest_fair_value("XCH/BYC", FairValue{});
+    EXPECT_FALSE(feed_->get_fair_value_estimate("XCH/BYC").has_value());
 }
 
 }  // namespace

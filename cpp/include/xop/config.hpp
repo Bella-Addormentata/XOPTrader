@@ -221,6 +221,41 @@ struct StrategyConfig {
     /// on 2026-07-30).  Default 10 bps.
     double   fair_value_clamp_tier_step_bps{10.0};
 
+    // -- Uncertainty-scaled quoting -----------------------------------------
+    // The binary usable/Unavailable cliff treated the solve's sigma as a
+    // validity flag.  It is a WIDTH INSTRUCTION: at the 2026-08-01 sweep the
+    // solve knew XCH/BYC was worth ~1.3608 +- 467 bps while the book said
+    // 1.2673, and because 467 exceeded the 200 bps usability ceiling the
+    // estimate was discarded and six asks were posted 9-11% below the truth.
+    // These knobs make the ladder CENTRE an uncertainty-weighted blend of the
+    // pair's own mid and the external estimate, and make the ladder's minimum
+    // half-spread scale with the combined uncertainty.  Both are absent from
+    // the shipped config.yaml on purpose: the defaults must protect an
+    // unconfigured deployment, and no pair is named anywhere.
+
+    /// Blend the ladder centre toward the external solve estimate, weighted
+    /// by inverse variance (book sigma = spread/2 + staleness + depth, the
+    /// same terms the solve itself uses; external sigma = the solve's own).
+    /// At the sweep this moves the XCH/BYC centre from 1.2673 to ~1.345
+    /// (external weight 0.84, because a 2114 bps book deserves almost no
+    /// vote), while on healthy XCH/wUSDC.b (book sigma ~131 bps vs CexDirect
+    /// sigma ~133 bps) the centre moves only ~17 bps -- the tight fresh book
+    /// keeps pricing itself.  Default true.
+    bool     quote_center_blend_enabled{true};
+
+    /// Minimum ladder half-spread as a multiple of the combined 1-sigma of
+    /// the blended centre (k_sigma).  The floor is
+    ///     max(configured tier spacing, k * combined_sigma,
+    ///         min_profit_margin_bps, tibetswap_fee_bps)
+    /// and every existing floor downstream (no-loss, peg guard, competitive
+    /// cap) still applies.  Default 1.0 -- quote one standard deviation out.
+    /// At the sweep: combined sigma ~427 bps -> lowest ask at
+    /// centre * 1.0427 ~= 1.4026, i.e. 0.8% below the 1.4143 truth instead of
+    /// 10.4% below it.  On XCH/wUSDC.b the combined sigma is ~93 bps, inside
+    /// the pair's existing 200-300 bps tier spacing, so nothing changes.
+    /// 0 disables the sigma term (existing floors still apply).
+    double   quote_width_sigma_mult{1.0};
+
     // -- Triangulation weights ----------------------------------------------
     // The fair value is a weighted least-squares solve over the graph of
     // assets and pairs (see fair_value_solver.hpp).  Every knob below is a
