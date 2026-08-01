@@ -127,6 +127,31 @@ strategy:
   tier_size_pct: [0.15, 0.20, 0.30, 0.35] # [REQUIRED] Capital fraction per tier (sum ≈ 1.0)
   max_half_spread_bps: 250  # [OPTIONAL, default: 250] Global cap on half-spread
   offer_fee_mojos: 10000000  # [OPTIONAL, default: 10000000] On-chain fee per offer/cancel
+  # --- Triangulated fair-value guard ----------------------------------------
+  # The ladder is centred on a dexie book mid.  These knobs validate that mid
+  # against a weighted least-squares solve over the graph of assets and pairs,
+  # re-run per pair with that pair's OWN book edge deleted.  Every key below is
+  # commented out on purpose: the guard must protect an unconfigured
+  # deployment, so the built-in defaults are the operational values.
+  #
+  # The sigma knobs are 1-SIGMA UNCERTAINTIES in bps -- the honest error bar on
+  # one class of observation.  Weights are 1/sigma^2, so halving a sigma
+  # quadruples that source's influence.  Nothing here is a dimensionless
+  # "importance" dial and no pair is named anywhere in the implementation.
+  # max_fair_value_deviation_bps: 300    # Clamp band base (0 disables clamping)
+  # blind_quote_widen_pct: 50            # Extra width when no fair value exists
+  # fair_value_clamp_tier_step_bps: 10   # Keep clamped tiers on distinct prices
+  # fair_value_feed_sigma_bps: 100       # CoinGecko vs the on-chain market
+  # fair_value_amm_sigma_bps: 50         # TibetSwap pool implied price
+  # fair_value_amm_max_age_sec: 300
+  # fair_value_min_book_sigma_bps: 10    # Floor on a book mid's uncertainty
+  # fair_value_stale_sigma_bps_per_print: 5   # Per heartbeat since the mid MOVED
+  # fair_value_depth_ref_bps: 30         # Thin-book term, decays as 1/sqrt(n)
+  # fair_value_max_sigma_bps: 200        # Above this: UNAVAILABLE, widen not clamp
+  # fair_value_tight_sigma_bps: 150      # At or below: highest confidence tiers
+  # fair_value_sigma_band_mult: 1.0      # band = max_dev + mult * solved sigma
+  # fair_value_residual_widen_ratio: 0.5      # Widen on book-vs-graph disagreement
+  # fair_value_residual_widen_floor_bps: 150  # Ignore disagreements below this
   # Startup market analysis: observe this many blocks before trading begins.
   # 0 = skip analysis and start trading immediately (default).
   # Example: 20 blocks (~17 min at 52 s/block).
@@ -382,6 +407,35 @@ coingecko:
   # rate_limit_window_ms: 60000
   # curl_thread_pool_size: 2
   # api_key belongs in secrets.yaml
+
+# --- tibetswap: OPTIONAL (omit section entirely to use the defaults) ---------
+# On-chain TibetSwap v2 AMM reserves.  Provides an independent,
+# arbitrage-anchored marginal price for every pair with an XCH leg; feeds
+# ArbitrageDetector cross-DEX scanning and the AMM blend in the market data
+# feed.  Public, unauthenticated API -- no key required.
+#
+# Endpoints used:
+#   GET {base_url}/pairs?skip=&limit=   -- pool directory (asset_id -> pair_id)
+#   GET {base_url}/pair/{pair_id}       -- live reserves for one pool
+#
+# Every key below is commented out because the built-in default is the
+# operational value.  A failed poll is logged and skipped; cached reserves are
+# retained and the heartbeat continues.
+tibetswap:
+  enabled: true
+  # base_url: "https://api.v2.tibetswap.io"
+  # polling_interval_ms: 60000     # ~1 Chia block; minimum accepted is 5000
+  # request_timeout_ms: 15000
+  # connect_timeout_ms: 10000
+  # max_retries: 3                 # Retries on 429 / 5xx (exponential backoff)
+  # retry_base_delay_ms: 1000
+  # rate_limit_max_requests: 30    # 30 req per 60 s window
+  # rate_limit_window_ms: 60000
+  # curl_thread_pool_size: 2
+  # page_limit: 500                # Page size for the /pairs directory
+  # max_pools: 5000                # Paging guard
+  # directory_refresh_ms: 3600000  # asset_id -> pair_id cache TTL (1 h)
+
                  # Fee floor (5K mojos, ~2x typical mempool estimate
 # --- fees: OPTIONAL (omit section to use static offer_fee_mojos) -------------
 # Fee budget tracking and dynamic fee selection (T4-03).

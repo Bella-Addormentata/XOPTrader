@@ -186,6 +186,121 @@ struct StrategyConfig {
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
 
+    // -- Fair-value deviation guard -----------------------------------------
+    // The ladder is centred on the dexie book mid.  Nothing used to validate
+    // that mid against anything, so when it was wrong EVERY tier was wrong in
+    // the same direction and a single taker could lift the whole ladder: on
+    // 2026-08-01 all six XCH/BYC ask tiers filled 9-11% below the price
+    // implied by external data, while each fill logged a POSITIVE realized
+    // P&L because the basis had been inflated by equally-mispriced bids.
+    //
+    // These knobs deliberately have working defaults and are absent from
+    // config.yaml: the guard must protect an unconfigured deployment.
+
+    /// Maximum tolerated deviation (bps) of a posted tier price from the
+    /// INDEPENDENT fair value, in the direction that loses money -- a bid
+    /// above fair value, or an ask below it.  Offending tiers are CLAMPED to
+    /// the band edge, never dropped; the bot keeps quoting in all conditions.
+    /// Default 300 bps (3%).  Measured against 1 500 XCH/wUSDC.b tier quotes
+    /// (the healthy book), the worst binding-direction deviation was
+    /// -112 bps on asks and +11 bps on bids, so 300 bps never binds there.
+    /// 0 disables the clamp.
+    double   max_fair_value_deviation_bps{300.0};
+
+    /// Extra width (percent) applied to every tier's distance from the mid
+    /// when NO independent fair value is available for a pair.  Quoting blind
+    /// at normal width is what let the sweep happen; widening keeps us in the
+    /// market but out of easy reach.  Default 50 (tiers sit 1.5x further from
+    /// the mid).  0 disables the widening.
+    double   blind_quote_widen_pct{50.0};
+
+    /// Minimum price step (bps) inserted between successive tiers that all
+    /// clamp to the same fair-value band edge.  Without it, six clamped asks
+    /// collapse onto one price: six creation fees and six locked UTXOs for
+    /// what is economically a single level (observed with the no-loss floor
+    /// on 2026-07-30).  Default 10 bps.
+    double   fair_value_clamp_tier_step_bps{10.0};
+
+    // -- Triangulation weights ----------------------------------------------
+    // The fair value is a weighted least-squares solve over the graph of
+    // assets and pairs (see fair_value_solver.hpp).  Every knob below is a
+    // 1-SIGMA UNCERTAINTY in basis points -- the honest error bar on one class
+    // of observation -- because that is the only thing the solve needs and the
+    // only thing an operator can reason about.  Weights are 1/sigma^2, so
+    // halving a sigma quadruples that source's influence; nothing is a
+    // dimensionless "importance" dial and no pair is named anywhere.
+
+    /// 1-sigma disagreement between an external USD price feed and the
+    /// on-chain market, in bps.  NOT the feed's quoting precision: CoinGecko
+    /// prints XCH to eight digits, but its number and the dexie XCH/wUSDC.b
+    /// mid routinely differ by ~1%, and 1% is what must be carried into the
+    /// solve.  Default 100 bps, from that measured agreement.
+    double   fair_value_feed_sigma_bps{100.0};
+
+    /// 1-sigma of an AMM implied price, in bps.  A constant-product pool is
+    /// held to fair value by arbitrage rather than by anyone's willingness to
+    /// quote, which makes it a much better observation than a thin order book;
+    /// the residual error is pool fee plus the arbitrage band.  Default 50 bps
+    /// (TibetSwap's 0.7% fee implies roughly half that band each side).
+    double   fair_value_amm_sigma_bps{50.0};
+
+    /// Maximum age (seconds) of an AMM sample before it stops contributing.
+    double   fair_value_amm_max_age_sec{300.0};
+
+    /// Floor (bps) on the uncertainty attributed to an order-book mid, so that
+    /// a momentarily one-tick book cannot claim near-infinite weight.
+    double   fair_value_min_book_sigma_bps{10.0};
+
+    /// Uncertainty (bps) added per heartbeat since a book's mid last MOVED.
+    /// A frozen quote is not a fresh one: the BYC/wUSDC.b mid sat at exactly
+    /// 1.1030 for 26+ consecutive snapshots (longest freeze 30.4 h) while
+    /// reporting an age of 0 seconds, and the true price drifted underneath it
+    /// the whole time.  Default 5 bps per heartbeat, so a book frozen for an
+    /// hour (~60 heartbeats) carries ~300 bps of drift uncertainty and stops
+    /// being able to outvote anything.
+    double   fair_value_stale_sigma_bps_per_print{5.0};
+
+    /// Depth term: uncertainty (bps) attributed to a book observed with a
+    /// single resting third-party offer, decaying as 1/sqrt(n) with the offer
+    /// count.  Default 30 bps -- small next to the width and staleness terms,
+    /// which is correct: depth is a weak signal here and should not dominate.
+    /// 0 disables the term.
+    double   fair_value_depth_ref_bps{30.0};
+
+    /// Above this solved 1-sigma (bps), a fair value is reported as
+    /// UNAVAILABLE and the widen-don't-clamp path engages.  A 300 bps clamp
+    /// band around an estimate that is itself uncertain to more than this is
+    /// not a guard, it is theatre.  Default 200 bps.  Note that a pair between
+    /// two feed-anchored assets inherently sits near
+    /// sqrt(2) * fair_value_feed_sigma_bps ~= 141 bps, so this must stay
+    /// comfortably above that or every pair goes blind.
+    double   fair_value_max_sigma_bps{200.0};
+
+    /// At or below this solved 1-sigma (bps), a cross-checked value is
+    /// promoted to the CexDirect / Triangulated tiers; above it the value is
+    /// still usable but reported as Inferred.  Default 150 bps.
+    double   fair_value_tight_sigma_bps{150.0};
+
+    /// The deviation band is widened by this multiple of the solve's own
+    /// sigma:  band = max_fair_value_deviation_bps + mult * sigma_bps.
+    /// A shakier fair value therefore clamps less aggressively instead of
+    /// being trusted exactly as far as a firm one.  Default 1.0.  0 makes the
+    /// band a flat max_fair_value_deviation_bps.
+    double   fair_value_sigma_band_mult{1.0};
+
+    /// Extra tier width, as a fraction of the absolute CONSISTENCY RESIDUAL,
+    /// applied when a pair's own book disagrees with the rest of the graph.
+    /// The residual is the disagreement signal: when the books cannot all be
+    /// right, one of them is about to move, and quoting tight into that is how
+    /// a ladder gets swept.  Default 0.5 -- a 1 200 bps disagreement pushes
+    /// tiers 600 bps further out.  0 disables residual-driven widening.
+    double   fair_value_residual_widen_ratio{0.5};
+
+    /// Residual magnitude (bps) below which no extra widening is applied.
+    /// Books never agree to the basis point; only a real disagreement should
+    /// move quotes.  Default 150 bps.
+    double   fair_value_residual_widen_floor_bps{150.0};
+
     /// Minimum annualized sigma passed to the GLFT/A-S formula.
     /// When the Yang-Zhang estimator returns zero (flat market), the
     /// raw half-spread degenerates to (1/kappa)*ln(1+kappa/gamma) and
@@ -984,6 +1099,66 @@ struct CoinGeckoConfig {
 };
 
 // ---------------------------------------------------------------------------
+// TibetSwap AMM client configuration (`tibetswap:` section).
+//
+// TibetSwap is the on-chain constant-product AMM on Chia.  Its pool reserves
+// give an independent, arbitrage-anchored marginal price for every pair with
+// an XCH leg -- the reference that feeds ArbitrageDetector::scan_cross_dex()
+// and MarketDataFeed::ingest_amm_mid().
+//
+// Every field has a working default: the section may be omitted entirely from
+// config.yaml and the client still runs against the public API.
+// ---------------------------------------------------------------------------
+struct TibetSwapConfig {
+    /// Master switch.  Enabled by default -- the API is public, unauthenticated
+    /// and cheap, and without it the AMM leg is dead code.
+    bool        enabled{true};
+
+    /// Base URL for the TibetSwap v2 API (no trailing slash).
+    std::string base_url{"https://api.v2.tibetswap.io"};
+
+    /// How often to poll pool reserves (milliseconds).  Default 60 s, roughly
+    /// one Chia block (~52 s); reserves only move when a swap lands on chain.
+    uint32_t    polling_interval_ms{60'000};
+
+    /// HTTP request timeout.
+    uint32_t    request_timeout_ms{15'000};
+
+    /// TCP + TLS connect timeout.
+    uint32_t    connect_timeout_ms{10'000};
+
+    /// Maximum retries on 429 / 5xx.
+    uint32_t    max_retries{3};
+
+    /// Base delay between retries (exponential backoff).
+    uint32_t    retry_base_delay_ms{1'000};
+
+    /// Rate limiter: max requests per window.
+    uint32_t    rate_limit_max_requests{30};
+
+    /// Rate limiter: sliding window width (milliseconds).
+    uint32_t    rate_limit_window_ms{60'000};
+
+    /// Number of threads in the CURL worker pool.
+    uint32_t    curl_thread_pool_size{2};
+
+    /// Page size for GET /pairs (the pool directory; ~370 pools today).
+    uint32_t    page_limit{500};
+
+    /// Hard cap on directory size, guarding against a runaway paging loop.
+    uint32_t    max_pools{5'000};
+
+    /// How long the asset_id -> pair_id directory stays valid before it is
+    /// re-fetched (milliseconds).  The mapping is effectively static, so an
+    /// hour is generous; a request for an unknown asset forces an early
+    /// refresh regardless.
+    uint32_t    directory_refresh_ms{3'600'000};
+
+    /// User-Agent header.
+    std::string user_agent{"XOPTrader-TibetSwap/1.0"};
+};
+
+// ---------------------------------------------------------------------------
 // Fee budget tracking and dynamic fee selection.
 //
 // Controls two behaviours:
@@ -1369,6 +1544,7 @@ struct AppConfig {
     DepegConfig      depeg;
     ArbitrageSettings arbitrage;
     CoinGeckoConfig  coingecko;
+    TibetSwapConfig  tibetswap;
     FeeConfig        fees;
     InventoryAgingConfig inventory_aging;
     AccountingConfig accounting;

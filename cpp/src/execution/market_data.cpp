@@ -488,6 +488,53 @@ void MarketDataFeed::ingest_amm_mid(const std::string& pair_name,
                   pair_name, amm_mid);
 }
 
+void MarketDataFeed::ingest_fair_value(const std::string& pair_name,
+                                       double             fair_value,
+                                       FairValueTier      tier) {
+    FairValue fv;
+    fv.price        = fair_value;
+    fv.tier         = tier;
+    fv.residual_bps = std::numeric_limits<double>::quiet_NaN();
+    ingest_fair_value(pair_name, fv);
+}
+
+void MarketDataFeed::ingest_fair_value(const std::string& pair_name,
+                                       const FairValue&   fv) {
+    // A usable tier must carry a usable price.  Reject the combination rather
+    // than let a zero masquerade as a valid reference downstream.
+    const bool usable_tier  = fv.tier != FairValueTier::Unavailable;
+    const bool usable_price = fv.price > 0.0 && std::isfinite(fv.price);
+    if (usable_tier && !usable_price) {
+        spdlog::debug("ingest_fair_value: pair={} rejected "
+                      "(price={:.8f} tier={})",
+                      pair_name, fv.price, to_string(fv.tier));
+        return;
+    }
+
+    std::unique_lock lock(mtx_pairs_);
+    PairState& ps = get_or_create_pair(pair_name);
+
+    // An Unavailable solve still carries information: how far this pair's book
+    // sits from everything else, and how uncertain that comparison is.  Keep
+    // both; zero only the price, so that no caller can read a number we have
+    // just declared untrustworthy.
+    ps.fair_value            = usable_tier ? fv.price : 0.0;
+    ps.fair_value_tier       = fv.tier;
+    ps.fair_value_sigma_bps  = fv.sigma_bps;
+    ps.fair_value_observations = fv.observations;
+    ps.fair_value_residual_valid = std::isfinite(fv.residual_bps);
+    ps.fair_value_residual_bps =
+        ps.fair_value_residual_valid ? fv.residual_bps : 0.0;
+    ps.fair_value_updated_at = std::chrono::system_clock::now();
+
+    spdlog::debug("ingest_fair_value: pair={} price={:.8f} tier={} "
+                  "sigma={:.1f}bps residual={:.1f}bps obs={}",
+                  pair_name, ps.fair_value, to_string(fv.tier),
+                  fv.sigma_bps,
+                  ps.fair_value_residual_valid ? fv.residual_bps : 0.0,
+                  fv.observations);
+}
+
 // =========================================================================
 //  Typed accessors (thread-safe reads)
 // =========================================================================
@@ -542,6 +589,118 @@ std::optional<double> MarketDataFeed::get_cex_reference(
     }
 
     return ps.cex_mid;
+}
+
+std::optional<FairValue> MarketDataFeed::get_fair_value(
+        const std::string& pair_name) const {
+    // Read the config BEFORE taking mtx_pairs_.  Nesting mtx_config_ inside
+    // mtx_pairs_ would introduce a second lock order into a class that
+    // otherwise acquires at most one mutex per call (see the class comment).
+    const double max_age = [&] {
+        std::shared_lock cfg_lock(mtx_config_);
+        return config_.fair_value_max_age_sec;
+    }();
+
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return std::nullopt;
+    }
+
+    const PairState& ps = it->second;
+
+    if (ps.fair_value <= 0.0
+        || ps.fair_value_tier == FairValueTier::Unavailable
+        || ps.fair_value_updated_at == Timestamp{}) {
+        return std::nullopt;
+    }
+
+    const double age = std::chrono::duration<double>(
+        std::chrono::system_clock::now() - ps.fair_value_updated_at).count();
+
+    // Expired: report ABSENCE, not a stale number.  Callers must widen and
+    // warn, never silently substitute the dexie mid they wanted validated.
+    if (max_age > 0.0 && age > max_age) {
+        return std::nullopt;
+    }
+
+    FairValue out;
+    out.price        = ps.fair_value;
+    out.tier         = ps.fair_value_tier;
+    out.age_seconds  = age;
+    out.sigma_bps    = ps.fair_value_sigma_bps;
+    out.observations = ps.fair_value_observations;
+    out.residual_bps = ps.fair_value_residual_valid
+        ? ps.fair_value_residual_bps
+        : std::numeric_limits<double>::quiet_NaN();
+    return out;
+}
+
+std::optional<double> MarketDataFeed::get_fair_value_residual_bps(
+        const std::string& pair_name) const {
+    // Same lock-ordering rule as get_fair_value: config first, then pairs.
+    const double max_age = [&] {
+        std::shared_lock cfg_lock(mtx_config_);
+        return config_.fair_value_max_age_sec;
+    }();
+
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return std::nullopt;
+    }
+
+    const PairState& ps = it->second;
+    if (!ps.fair_value_residual_valid
+        || ps.fair_value_updated_at == Timestamp{}) {
+        return std::nullopt;
+    }
+
+    const double age = std::chrono::duration<double>(
+        std::chrono::system_clock::now() - ps.fair_value_updated_at).count();
+    if (max_age > 0.0 && age > max_age) {
+        return std::nullopt;
+    }
+
+    // Deliberately NOT gated on the tier: an Unavailable solve still knows
+    // that the books disagree, and that is the half of the answer the operator
+    // can act on immediately.
+    return ps.fair_value_residual_bps;
+}
+
+FairValueObservation MarketDataFeed::get_fair_value_inputs(
+        const std::string& pair_name) const {
+    FairValueObservation out;
+
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return out;
+    }
+
+    const PairState& ps = it->second;
+
+    // Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer rests there, so a
+    // missing side means there is no external market to observe -- not that
+    // the price is zero.  One-sided books contribute no edge to the solve.
+    if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
+        && ps.dex_best_ask >= ps.dex_best_bid) {
+        out.has_book   = true;
+        out.mid        = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
+        out.spread_bps = compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
+    }
+    out.print_age = ps.dex_print_age;
+
+    if (ps.amm_mid > 0.0 && ps.amm_updated_at != Timestamp{}) {
+        out.amm_mid = ps.amm_mid;
+        out.amm_age_seconds = std::chrono::duration<double>(
+            std::chrono::system_clock::now() - ps.amm_updated_at).count();
+    }
+
+    return out;
 }
 
 std::optional<double> MarketDataFeed::get_cex_reference_age_seconds(

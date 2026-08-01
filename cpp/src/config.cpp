@@ -741,6 +741,58 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     // else: default from StrategyConfig{} is used (250.0 bps).
 
+    // Optional: fair-value guard and triangulation weights.  Every key below
+    // is absent from the shipped config.yaml on purpose -- the guard must
+    // protect an unconfigured deployment, so the StrategyConfig{} defaults are
+    // the operative values unless an operator deliberately overrides them.
+    auto opt_non_negative = [&](const char* key, double& dest) {
+        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) return;
+        const double v = node[key].as<double>();
+        if (v < 0.0) {
+            throw ConfigError(sec + "." + key + " must be >= 0; got "
+                              + std::to_string(v));
+        }
+        dest = v;
+    };
+
+    opt_non_negative("max_fair_value_deviation_bps",
+                     cfg.max_fair_value_deviation_bps);
+    opt_non_negative("blind_quote_widen_pct", cfg.blind_quote_widen_pct);
+    opt_non_negative("fair_value_clamp_tier_step_bps",
+                     cfg.fair_value_clamp_tier_step_bps);
+    opt_non_negative("fair_value_feed_sigma_bps",
+                     cfg.fair_value_feed_sigma_bps);
+    opt_non_negative("fair_value_amm_sigma_bps", cfg.fair_value_amm_sigma_bps);
+    opt_non_negative("fair_value_amm_max_age_sec",
+                     cfg.fair_value_amm_max_age_sec);
+    opt_non_negative("fair_value_min_book_sigma_bps",
+                     cfg.fair_value_min_book_sigma_bps);
+    opt_non_negative("fair_value_stale_sigma_bps_per_print",
+                     cfg.fair_value_stale_sigma_bps_per_print);
+    opt_non_negative("fair_value_depth_ref_bps",
+                     cfg.fair_value_depth_ref_bps);
+    opt_non_negative("fair_value_max_sigma_bps",
+                     cfg.fair_value_max_sigma_bps);
+    opt_non_negative("fair_value_tight_sigma_bps",
+                     cfg.fair_value_tight_sigma_bps);
+    opt_non_negative("fair_value_sigma_band_mult",
+                     cfg.fair_value_sigma_band_mult);
+    opt_non_negative("fair_value_residual_widen_ratio",
+                     cfg.fair_value_residual_widen_ratio);
+    opt_non_negative("fair_value_residual_widen_floor_bps",
+                     cfg.fair_value_residual_widen_floor_bps);
+
+    // A tight threshold above the usable ceiling would silently promote every
+    // barely-usable value to the highest confidence tier -- the opposite of
+    // what both knobs are for.  Refuse the combination rather than guess.
+    if (cfg.fair_value_tight_sigma_bps > cfg.fair_value_max_sigma_bps) {
+        throw ConfigError(sec
+                          + ".fair_value_tight_sigma_bps ("
+                          + std::to_string(cfg.fair_value_tight_sigma_bps)
+                          + ") must be <= fair_value_max_sigma_bps ("
+                          + std::to_string(cfg.fair_value_max_sigma_bps) + ")");
+    }
+
     // Optional: high-volatility regime multiplier.  Default 1.80.
     if (node["high_vol_multiplier"] && node["high_vol_multiplier"].IsDefined()
         && !node["high_vol_multiplier"].IsNull()) {
@@ -1906,6 +1958,70 @@ CoinGeckoConfig parse_coingecko(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_tibetswap -- optional `tibetswap:` section.
+//
+// Every field defaults to a working value, so an absent section still yields
+// a live client against the public TibetSwap v2 API.
+// ---------------------------------------------------------------------------
+TibetSwapConfig parse_tibetswap(const YAML::Node& root)
+{
+    const std::string sec = "tibetswap";
+    TibetSwapConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_str = [&](const char* key, std::string& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::string>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_bool("enabled",                 cfg.enabled);
+    read_str ("base_url",                cfg.base_url);
+    read_u32 ("polling_interval_ms",     cfg.polling_interval_ms);
+    read_u32 ("request_timeout_ms",      cfg.request_timeout_ms);
+    read_u32 ("connect_timeout_ms",      cfg.connect_timeout_ms);
+    read_u32 ("max_retries",             cfg.max_retries);
+    read_u32 ("retry_base_delay_ms",     cfg.retry_base_delay_ms);
+    read_u32 ("rate_limit_max_requests", cfg.rate_limit_max_requests);
+    read_u32 ("rate_limit_window_ms",    cfg.rate_limit_window_ms);
+    read_u32 ("curl_thread_pool_size",   cfg.curl_thread_pool_size);
+    read_u32 ("page_limit",              cfg.page_limit);
+    read_u32 ("max_pools",               cfg.max_pools);
+    read_u32 ("directory_refresh_ms",    cfg.directory_refresh_ms);
+    read_str ("user_agent",              cfg.user_agent);
+
+    if (cfg.base_url.empty()) {
+        throw ConfigError(sec + ".base_url must not be empty");
+    }
+    // Don't hammer a free public API: one poll per block is already generous.
+    if (cfg.polling_interval_ms < 5'000) {
+        throw ConfigError(sec + ".polling_interval_ms must be >= 5000");
+    }
+    if (cfg.page_limit == 0) {
+        throw ConfigError(sec + ".page_limit must be >= 1");
+    }
+    if (cfg.max_pools == 0) {
+        throw ConfigError(sec + ".max_pools must be >= 1");
+    }
+    if (cfg.rate_limit_max_requests == 0) {
+        throw ConfigError(sec + ".rate_limit_max_requests must be >= 1");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // parse_fees -- optional `fees:` section.
 // ---------------------------------------------------------------------------
 FeeConfig parse_fees(const YAML::Node& root)
@@ -2172,7 +2288,10 @@ void log_config_summary(const AppConfig& cfg)
     }
     out << "]\n"
         << "  max_hs_cap = " << cfg.strategy.max_half_spread_bps << " bps\n"
-        << "  sigma_floor = " << cfg.strategy.sigma_floor << "\n";
+        << "  sigma_floor = " << cfg.strategy.sigma_floor << "\n"
+        << "  max_fv_dev = " << cfg.strategy.max_fair_value_deviation_bps
+        << " bps, blind_widen = " << cfg.strategy.blind_quote_widen_pct
+        << "%\n";
 
     // Risk -- all fields are tuning parameters.
     out << "[risk]\n"
@@ -2293,6 +2412,14 @@ void log_config_summary(const AppConfig& cfg)
         << "  api_key    = "
         << (cfg.coingecko.api_key.empty() ? "none (free tier)" : "<configured>")
         << "\n";
+
+    // TibetSwap AMM reference -- unauthenticated public API, nothing secret.
+    out << "[tibetswap]\n"
+        << "  enabled    = " << (cfg.tibetswap.enabled ? "true" : "false") << "\n"
+        << "  base_url   = " << cfg.tibetswap.base_url << "\n"
+        << "  poll_ms    = " << cfg.tibetswap.polling_interval_ms << "\n"
+        << "  timeout_ms = " << cfg.tibetswap.request_timeout_ms << "\n"
+        << "  dir_ttl_ms = " << cfg.tibetswap.directory_refresh_ms << "\n";
 
     // Fees -- operational settings.
     out << "[fees]\n"
@@ -2861,6 +2988,7 @@ AppConfig load_config(const std::string& path,
     cfg.depeg      = parse_depeg(root);
     cfg.arbitrage  = parse_arbitrage(root);
     cfg.coingecko  = parse_coingecko(root);
+    cfg.tibetswap  = parse_tibetswap(root);
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);

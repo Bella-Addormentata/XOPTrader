@@ -160,11 +160,13 @@ add_library(xop_core STATIC
     src/execution/offer_manager.cpp
     src/execution/coin_manager.cpp
     src/execution/market_data.cpp
+    src/execution/fair_value_solver.cpp
 
     # -- RPC / networking ------------------------------------------------------
     src/rpc/chia_rpc.cpp
     src/rpc/dexie_client.cpp
     src/rpc/coingecko_client.cpp
+    src/rpc/tibetswap_client.cpp
 
     # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp

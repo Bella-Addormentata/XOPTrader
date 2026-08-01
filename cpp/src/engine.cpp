@@ -20,6 +20,7 @@
 //   ISO/IEC 25000      -- documented step sequencing, single-responsibility
 
 #include "xop/engine.hpp"
+#include "xop/execution/fair_value_solver.hpp"
 
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
@@ -37,15 +38,20 @@
 #include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
+#include <utility>
+#include <vector>
 
 namespace xop {
 
@@ -207,6 +213,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     if (config_.coingecko.enabled) {
         coingecko_ = std::make_shared<rpc::CoinGeckoClient>(
             ioc_, config_.coingecko);
+    }
+
+    // Build TibetSwap client from AppConfig (on-chain AMM reference).
+    if (config_.tibetswap.enabled) {
+        tibetswap_ = std::make_shared<rpc::TibetSwapClient>(
+            ioc_, config_.tibetswap);
     }
 
     // -- Execution layer ------------------------------------------------------
@@ -1768,6 +1780,71 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
     }
 
+    // -- TibetSwap AMM pool reserves (throttled by polling interval) --------
+    // The on-chain AMM is an independent, arbitrage-anchored price reference.
+    // This is the only producer for ArbitrageDetector::set_tibetswap_reserves();
+    // without it the cross-DEX scan and the AMM blend below never see data.
+    //
+    // Failure tolerance matches the CoinGecko block above: any exception is
+    // logged and swallowed.  The previously cached reserves stay in place, so
+    // a transient API outage degrades to slightly stale AMM data rather than
+    // aborting the heartbeat.  The fetch timestamp is advanced on failure too,
+    // so a hard-down API is retried on the configured cadence instead of on
+    // every block.
+    if (tibetswap_ && tibetswap_->is_open() && arb_detector_) {
+        const auto now = std::chrono::steady_clock::now();
+        const auto interval = std::chrono::milliseconds{
+            config_.tibetswap.polling_interval_ms};
+        if (!tibetswap_fetch_attempted_ ||
+            now - tibetswap_last_fetch_ >= interval) {
+
+            tibetswap_fetch_attempted_ = true;
+            tibetswap_last_fetch_      = now;
+
+            try {
+                // Collect the CAT asset IDs of every enabled pair with an XCH
+                // leg.  CAT/CAT pairs have no direct TibetSwap pool.
+                std::vector<std::string> asset_ids;
+                asset_ids.reserve(config_.pairs.size());
+                for (const auto& pair : config_.pairs) {
+                    if (!pair.enabled) continue;
+                    const bool base_is_xch  = (pair.base_asset_id  == "xch");
+                    const bool quote_is_xch = (pair.quote_asset_id == "xch");
+                    if (base_is_xch == quote_is_xch) continue;
+                    asset_ids.push_back(base_is_xch ? pair.quote_asset_id
+                                                    : pair.base_asset_id);
+                }
+
+                if (!asset_ids.empty()) {
+                    auto pools =
+                        co_await tibetswap_->fetch_pools_for_assets(asset_ids);
+
+                    // Only publish when we actually got something: an empty
+                    // result must not wipe the cached reserves.
+                    if (!pools.empty()) {
+                        auto reserves = rpc::build_tibetswap_reserves(
+                            pools,
+                            config_.pairs,
+                            static_cast<std::uint32_t>(
+                                config_.arbitrage.tibetswap_fee_bps / 10.0));
+
+                        arb_detector_->set_tibetswap_reserves(reserves);
+                        spdlog::debug("[Engine] Step 1: TibetSwap reserves "
+                                      "updated for {} pair(s) from {} pool(s)",
+                                      reserves.size(), pools.size());
+                    } else {
+                        spdlog::warn("[Engine] Step 1: TibetSwap returned no "
+                                     "pools -- keeping cached reserves");
+                    }
+                }
+            } catch (const std::exception& ex) {
+                // Transient TibetSwap errors must never abort the cycle.
+                spdlog::warn("[Engine] Step 1: TibetSwap fetch failed: {}",
+                             ex.what());
+            }
+        }
+    }
+
     // For each enabled pair, fetch the latest dexie ticker data.
     // [T3-24] Track per-pair success for dependency-aware gating.
     for (const auto& pair : config_.pairs) {
@@ -2039,6 +2116,16 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 
     // Compute aggregated mid-prices, spreads, arbitrage signals.
     market_data_->refresh(enabled);
+
+    // -- Independent fair values ------------------------------------------
+    // Runs AFTER the loop above, and after refresh(), because the triangulated
+    // solve needs THIS heartbeat's books and AMM samples.  That is not a
+    // weakening of the independence guarantee: independence is enforced
+    // per-pair inside update_fair_values(), which deletes a pair's own book
+    // edge before solving for it, rather than by refusing to look at any book
+    // at all.  Refusing to look was the earlier design, and it left BYC with
+    // no observation but a peg -- an assumption, which is what got rejected.
+    update_fair_values();
 
     // -- Adaptive fee estimation (T4-03) ------------------------------------
     // Query the full node's mempool for a fee estimate when adaptive mode
@@ -3608,6 +3695,277 @@ void Engine::step_apply_risk_limits(BlockHeight block_height)
     }
 }
 
+// ---------------------------------------------------------------------------
+// Independent fair value derivation -- TRIANGULATED.
+//
+// The ladder is centred on the dexie book mid.  Until now nothing validated
+// that mid, so a wrong mid moved every tier the same way and a single taker
+// could lift the entire ladder (2026-08-01 10:31 UTC: six XCH/BYC asks swept
+// in one block, each logging a POSITIVE realized P&L because the basis had
+// been inflated by equally-mispriced bids).
+//
+// The first attempt at a fix valued a pegged leg at its declared peg.  That
+// was rejected and is gone: BYC has never traded at par, so the peg is an
+// assumption, not an observation, and an assumption wrong by ~14% is a worse
+// anchor than no anchor at all.
+//
+// What replaces it is arithmetic on what we can actually see.  Assets are
+// nodes, pairs are edges, and every cycle is a constraint:
+//
+//     XCH/wUSDC.b  ==  XCH/BYC  *  BYC/wUSDC.b
+//
+// With four pairs over four assets, three of which carry an external USD
+// feed, there are more observations than unknowns.  So the system is SOLVED
+// (weighted least squares, see fair_value_solver.hpp) instead of assumed, the
+// leftover disagreement is measured and published as a residual, and the
+// solve's own covariance decides whether the answer may be used at all.
+//
+// Three properties this function must preserve:
+//
+//  1. INDEPENDENCE.  A pair's fair value is solved with that pair's own book
+//     edge deleted.  A number derived from the book it validates is worthless.
+//     Non-book observations of the same pair (an AMM implied price) are kept:
+//     they are independent of the order book, which is the whole point.
+//
+//  2. QUALITY, NOT IDENTITY.  Edge weights come from observable properties --
+//     book width, heartbeats since the mid last MOVED, resting depth -- as
+//     1/sigma^2.  A frozen or very wide book contributes almost nothing on its
+//     own merits.  No pair name appears anywhere below.
+//
+//  3. HONEST ABSENCE.  When no estimate survives the weights, the tier is
+//     Unavailable and Step 7 widens rather than clamps.  It never falls back
+//     to the book being validated.
+//
+// Generality: legs are resolved through a symbol table of FEED IDs (which is a
+// property of the price feed, not of any pair), and the graph is whatever
+// config_.pairs declares.  Adding a pair requires no change here -- and closes
+// more cycles, which makes every other pair's answer better.
+// ---------------------------------------------------------------------------
+void Engine::update_fair_values()
+{
+    if (!market_data_) {
+        return;  // Nothing to publish into; get_fair_value() will expire.
+    }
+
+    const auto& sc = config_.strategy;
+
+    // Symbol -> external listing.  units_per_coin is how many units of the
+    // pair's asset make one unit of the listed coin: wmilliETH is 1/1000 of
+    // an ETH, so 1000 pair-units per coin.
+    struct FeedListing { const char* id; double units_per_coin; };
+    static const std::unordered_map<std::string, FeedListing> kFeedListings = {
+        {"xch",       {"chia",           1.0}},
+        {"usdc",      {"usd-coin",       1.0}},
+        {"wusdc",     {"usd-coin",       1.0}},
+        {"dbx",       {"dexie-bucks",    1.0}},
+        {"eth",       {"ethereum",       1.0}},
+        {"weth",      {"ethereum",       1.0}},
+        {"millieth",  {"ethereum",    1000.0}},
+        {"wmillieth", {"ethereum",    1000.0}},
+    };
+
+    // Canonical leg key: lower-cased, with the ".b" bridge suffix removed so
+    // that "wUSDC.b" and "wUSDC" resolve to the same underlying asset.
+    auto canonical = [](std::string s) {
+        for (auto& c : s) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (s.size() > 2 && s.compare(s.size() - 2, 2, ".b") == 0) {
+            s.erase(s.size() - 2);
+        }
+        return s;
+    };
+
+    // Split "BASE/QUOTE" into its two canonical leg keys.
+    auto split_legs = [&](const std::string& pair_name)
+        -> std::optional<std::pair<std::string, std::string>> {
+        const auto pos = pair_name.find('/');
+        if (pos == std::string::npos || pos == 0
+            || pos + 1 >= pair_name.size()) {
+            return std::nullopt;
+        }
+        auto base  = canonical(pair_name.substr(0, pos));
+        auto quote = canonical(pair_name.substr(pos + 1));
+        if (base.empty() || quote.empty() || base == quote) {
+            return std::nullopt;
+        }
+        return std::make_pair(std::move(base), std::move(quote));
+    };
+
+    // -- Step A: the graph's nodes, one entry per priceable enabled pair ----
+    struct GraphPair {
+        std::string          name;
+        std::string          base;
+        std::string          quote;
+        FairValueObservation obs{};
+    };
+    std::vector<GraphPair> graph;
+    graph.reserve(config_.pairs.size());
+
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        auto legs = split_legs(pair.name);
+        if (!legs) {
+            spdlog::debug("[Engine] fair value: pair '{}' has no BASE/QUOTE "
+                          "name; excluded from the graph", pair.name);
+            continue;
+        }
+        graph.push_back(GraphPair{pair.name, legs->first, legs->second,
+                                  market_data_->get_fair_value_inputs(
+                                      pair.name)});
+    }
+    if (graph.empty()) return;
+
+    // -- Step B: anchors -- external USD prices, one per asset -------------
+    // Deduplicated: the same feed listing quoted twice is one measurement, not
+    // two, and letting it count twice would silently halve its error bar.
+    std::vector<fv::Anchor> anchors;
+    std::unordered_set<std::string> anchored;
+    for (const GraphPair& gp : graph) {
+        for (const std::string& leg : {gp.base, gp.quote}) {
+            if (anchored.count(leg)) continue;
+            auto listing = kFeedListings.find(leg);
+            if (listing == kFeedListings.end()) continue;
+            if (listing->second.units_per_coin <= 0.0) continue;
+
+            auto quoted = coingecko_prices_.find(listing->second.id);
+            if (quoted == coingecko_prices_.end() || quoted->second <= 0.0) {
+                continue;
+            }
+            anchored.insert(leg);
+            anchors.push_back(fv::Anchor{
+                leg,
+                quoted->second / listing->second.units_per_coin,
+                sc.fair_value_feed_sigma_bps});
+        }
+    }
+
+    // -- Step C: edges -- one per observation, weighted by its own quality --
+    std::vector<fv::Edge> edges;
+    edges.reserve(graph.size() * 2);
+
+    for (std::size_t i = 0; i < graph.size(); ++i) {
+        const GraphPair& gp = graph[i];
+
+        if (gp.obs.has_book && gp.obs.mid > 0.0) {
+            // Three independent sources of error, combined in quadrature:
+            //
+            //   width -- the true price sits somewhere inside the spread, so
+            //            half the spread is the natural 1-sigma.
+            //   stale -- a mid that has not MOVED for N heartbeats has had N
+            //            heartbeats to drift away from the truth while still
+            //            reporting an age of zero seconds.  This is the term
+            //            that demotes a frozen book, and it is the reason
+            //            dex_print_age was added in da85235.
+            //   depth -- a book held up by one resting offer is one
+            //            cancellation away from meaning nothing.
+            const double n_offers = static_cast<double>(std::max<std::size_t>(
+                1, market_data_->get_num_competing_offers(gp.name)));
+            const double sigma_bps = fv::combine_sigma_bps({
+                std::max(std::abs(gp.obs.spread_bps) / 2.0,
+                         sc.fair_value_min_book_sigma_bps),
+                sc.fair_value_stale_sigma_bps_per_print
+                    * static_cast<double>(std::max(0, gp.obs.print_age)),
+                sc.fair_value_depth_ref_bps / std::sqrt(n_offers),
+            });
+
+            edges.push_back(fv::Edge{gp.base, gp.quote, gp.obs.mid, sigma_bps,
+                                     static_cast<int>(i), /*is_book=*/true});
+        }
+
+        // AMM observations are NOT excluded when validating their own pair:
+        // a constant-product pool is held near fair value by arbitrage, not by
+        // anyone's willingness to quote, so it is independent of the order
+        // book in exactly the sense this guard requires.  These arrive from
+        // the TibetSwap pool reserves ingested earlier in Step 1, and they are
+        // what turns a leg with a single wide book into a cross-checked one --
+        // for a CAT priced only by a 1259 bps frozen book, the pool is the
+        // difference between Unavailable and a usable clamp.
+        if (gp.obs.amm_mid > 0.0
+            && (sc.fair_value_amm_max_age_sec <= 0.0
+                || gp.obs.amm_age_seconds <= sc.fair_value_amm_max_age_sec)) {
+            edges.push_back(fv::Edge{gp.base, gp.quote, gp.obs.amm_mid,
+                                     sc.fair_value_amm_sigma_bps,
+                                     static_cast<int>(i), /*is_book=*/false});
+        }
+    }
+
+    // -- Step D: one solve per pair, each blind to its own book ------------
+    for (std::size_t i = 0; i < graph.size(); ++i) {
+        const GraphPair& gp = graph[i];
+
+        const fv::Solution sol = fv::solve_pair(
+            anchors, edges, gp.base, gp.quote, static_cast<int>(i));
+
+        FairValue out;
+        out.residual_bps = std::numeric_limits<double>::quiet_NaN();
+
+        if (!sol.ok) {
+            // No weighted path from either leg to an external anchor.  Publish
+            // the absence explicitly so Step 7 widens; never substitute the
+            // book mid, which is the bug this whole path exists to catch.
+            out.tier = FairValueTier::Unavailable;
+            market_data_->ingest_fair_value(gp.name, out);
+            spdlog::debug("[Engine] fair value {}: UNAVAILABLE -- no anchored "
+                          "path to legs {} / {} once its own book is excluded",
+                          gp.name, gp.base, gp.quote);
+            continue;
+        }
+
+        out.price        = sol.price;
+        out.sigma_bps    = sol.sigma_bps;
+        out.observations = sol.observations;
+
+        // CONSISTENCY RESIDUAL: how far this pair's own book sits from what
+        // every other observation implies.  Published whatever the tier --
+        // "these books contradict each other" is actionable even when the
+        // solve is too uncertain to say which one is wrong.
+        if (gp.obs.has_book && gp.obs.mid > 0.0) {
+            out.residual_bps =
+                std::log(gp.obs.mid / sol.price) * 10'000.0;
+        }
+
+        if (sol.sigma_bps > sc.fair_value_max_sigma_bps) {
+            // The graph can express an opinion, but not a usable one.  Saying
+            // so is the point: a 300 bps clamp band around an estimate that is
+            // itself uncertain by more than this would be theatre.
+            out.tier = FairValueTier::Unavailable;
+        } else if (sol.both_anchored
+                   && sol.sigma_bps <= sc.fair_value_tight_sigma_bps) {
+            out.tier = FairValueTier::CexDirect;
+        } else if (sol.redundant
+                   && sol.sigma_bps <= sc.fair_value_tight_sigma_bps) {
+            out.tier = FairValueTier::Triangulated;
+        } else {
+            out.tier = FairValueTier::Inferred;
+        }
+
+        market_data_->ingest_fair_value(gp.name, out);
+
+        const bool residual_known = std::isfinite(out.residual_bps);
+        if (out.tier == FairValueTier::Unavailable
+            || (residual_known
+                && std::abs(out.residual_bps)
+                     > sc.fair_value_residual_widen_floor_bps)) {
+            spdlog::warn("[Engine] fair value {}: {} = {:.8f} sigma={:.0f}bps "
+                         "residual={:.0f}bps book={:.8f} obs={} "
+                         "(redundant={} both_anchored={})",
+                         gp.name, to_string(out.tier), sol.price,
+                         sol.sigma_bps,
+                         residual_known ? out.residual_bps : 0.0,
+                         gp.obs.mid, sol.observations,
+                         sol.redundant, sol.both_anchored);
+        } else {
+            spdlog::debug("[Engine] fair value {}: {} = {:.8f} sigma={:.0f}bps "
+                          "residual={:.0f}bps obs={}",
+                          gp.name, to_string(out.tier), sol.price,
+                          sol.sigma_bps,
+                          residual_known ? out.residual_bps : 0.0,
+                          sol.observations);
+        }
+    }
+}
+
 // Step 7: Generate multi-tier offer ladder.
 void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 {
@@ -4623,6 +4981,281 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              "{} bids, {} asks (book bid={} ask={})",
                              pair_name, clamped_bids, clamped_asks,
                              snap.best_bid, snap.best_ask);
+            }
+        }
+
+        // -----------------------------------------------------------------
+        // Fair-value deviation guard.
+        //
+        // Every guard above this point is expressed in terms of the dexie
+        // book -- the best bid, the best ask, the mid the ladder is centred
+        // on.  None of them can catch a book that is uniformly wrong, and on
+        // 2026-08-01 that is exactly what happened: all six XCH/BYC ask tiers
+        // were swept in one block at 1.2704-1.2979 BYC/XCH while external
+        // data put XCH at 1.4285, i.e. 9.1-11.1% below fair value, for a loss
+        // of roughly $0.75 on 6 XCH.  Every one of those fills logged a
+        // POSITIVE realized P&L, because P&L is measured against a cost basis
+        // that earlier overpaid bids had themselves inflated.
+        //
+        // This guard is the first check that consults a price the book cannot
+        // influence.  Per tier, per side:
+        //
+        //   dev = tier_price / fair_value - 1
+        //   BID with dev > +band  -> clamp DOWN to fair_value*(1+band)
+        //   ASK with dev < -band  -> clamp UP   to fair_value*(1-band)
+        //
+        // The band is NOT a flat constant.  The triangulated solve reports its
+        // own 1-sigma, and the band widens by a configurable multiple of it:
+        //
+        //   band_bps = max_fair_value_deviation_bps + mult * sigma_bps
+        //
+        // so a fair value we are sure of clamps hard while a shakier one
+        // clamps gently, instead of both being trusted identically.  Values
+        // too uncertain to act on at all never arrive here: the solve reports
+        // them as Unavailable and the blind path below runs instead.
+        //
+        // CLAMP, never drop and never skip the pair: the bot must keep
+        // quoting in all conditions, and a pair-level skip here would bypass
+        // the cancellation paths in Step 8 and leave the mispriced offers
+        // resting forever.  Downstream logic (no-loss floor, min-margin, peg
+        // guard) still runs on the clamped price exactly as it does today.
+        //
+        // Deviations in the profitable direction -- a bid far BELOW fair
+        // value, an ask far ABOVE it -- are left untouched.  Those are just
+        // patient quotes.
+        // -----------------------------------------------------------------
+        {
+            const auto fv_opt = market_data_->get_fair_value(pair_name);
+
+            // CONSISTENCY RESIDUAL widening, applied whether or not a usable
+            // fair value exists.  The residual says this pair's book and the
+            // rest of the graph cannot both be right; one of them is about to
+            // move, and quoting tight into that is how a ladder gets swept.
+            // It is a separate signal from the clamp: the clamp needs to know
+            // WHICH price is correct, the residual only needs to know that
+            // they disagree -- which is why it survives an Unavailable tier.
+            const auto residual_opt =
+                market_data_->get_fair_value_residual_bps(pair_name);
+            if (residual_opt && mid_mojos > 0 && !pcs.ladder.empty()
+                && config_.strategy.fair_value_residual_widen_ratio > 0.0)
+            {
+                const double excess =
+                    std::abs(*residual_opt)
+                    - config_.strategy.fair_value_residual_widen_floor_bps;
+                if (excess > 0.0) {
+                    const double extra_bps =
+                        excess
+                        * config_.strategy.fair_value_residual_widen_ratio;
+                    // Cap the added width at the pair's own half-spread
+                    // ceiling -- the same cap Step 5 applies, honouring any
+                    // per-pair override -- so a runaway residual cannot push
+                    // us out of the market.  Measured over 7 days the two BYC
+                    // books disagree with the graph on 96% of heartbeats and
+                    // the raw widening would exceed this cap most of the time;
+                    // the cap is what keeps that from becoming a withdrawal.
+                    const double residual_cap = [&]() -> double {
+                        const PairConfig* rpc = find_pair_config(pair_name);
+                        if (rpc && rpc->max_half_spread_bps_override.has_value())
+                            return rpc->max_half_spread_bps_override.value();
+                        return config_.strategy.max_half_spread_bps;
+                    }();
+                    const double capped = std::min(extra_bps, residual_cap);
+
+                    for (auto& tq : pcs.ladder) {
+                        const double sign = (tq.side == Side::Bid) ? -1.0 : 1.0;
+                        const auto widened = static_cast<Mojo>(std::llround(
+                            static_cast<double>(tq.price)
+                            * (1.0 + sign * capped / 10'000.0)));
+                        if (widened <= 0) continue;
+                        tq.price = widened;
+                        tq.spread_bps =
+                            (static_cast<double>(tq.price)
+                           - static_cast<double>(mid_mojos))
+                            / static_cast<double>(mid_mojos) * 10'000.0;
+                    }
+
+                    spdlog::warn(
+                        "[Engine] Step 7: {} book disagrees with the rest of "
+                        "the graph by {:+.0f}bps -- widening every tier by "
+                        "{:.0f}bps",
+                        pair_name, *residual_opt, capped);
+                }
+            }
+
+            const double max_dev_bps =
+                config_.strategy.max_fair_value_deviation_bps
+                + (fv_opt ? config_.strategy.fair_value_sigma_band_mult
+                              * std::max(0.0, fv_opt->sigma_bps)
+                          : 0.0);
+
+            if (fv_opt && fv_opt->price > 0.0
+                && config_.strategy.max_fair_value_deviation_bps > 0.0
+                && !pcs.ladder.empty())
+            {
+                const double fv       = fv_opt->price;
+                const double max_dev  = max_dev_bps / 10'000.0;
+                const double fv_mojos = fv * static_cast<double>(kMojosPerXch);
+
+                // Band edges in mojos.  A bid may not sit above the upper
+                // edge; an ask may not sit below the lower edge.
+                const auto bid_ceiling = static_cast<Mojo>(std::llround(
+                    fv_mojos * (1.0 + max_dev)));
+                const auto ask_floor = static_cast<Mojo>(std::llround(
+                    fv_mojos * (1.0 - max_dev)));
+
+                // When several tiers breach the band they would all clamp to
+                // the SAME edge, collapsing the ladder into one price level
+                // that costs N creation fees and locks N UTXOs.  Step each
+                // successive clamped tier a little further out, exactly as
+                // the no-loss floor below does.
+                const double step_bps = std::max(
+                    0.0, config_.strategy.fair_value_clamp_tier_step_bps);
+
+                auto tiers_in_order = [&](Side side) {
+                    std::vector<TierQuote*> out;
+                    out.reserve(pcs.ladder.size());
+                    for (auto& tq : pcs.ladder) {
+                        if (tq.side == side) out.push_back(&tq);
+                    }
+                    std::sort(out.begin(), out.end(),
+                              [](const TierQuote* a, const TierQuote* b) {
+                                  return a->tier_index < b->tier_index;
+                              });
+                    return out;
+                };
+
+                int clamped_bid_tiers = 0;
+                int clamped_ask_tiers = 0;
+
+                auto log_clamp = [&](const TierQuote& tq, Mojo original,
+                                     Mojo clamped, double dev) {
+                    spdlog::info(
+                        "[Engine] Step 7: {} {} tier {} fair-value clamp: "
+                        "{:.8f} -> {:.8f} (fair={:.8f} dev={:+.1f}bps "
+                        "limit={:.0f}bps tier_src={})",
+                        pair_name,
+                        (tq.side == Side::Bid) ? "BID" : "ASK",
+                        tq.tier_index,
+                        static_cast<double>(original)
+                            / static_cast<double>(kMojosPerXch),
+                        static_cast<double>(clamped)
+                            / static_cast<double>(kMojosPerXch),
+                        fv, dev * 10'000.0, max_dev_bps,
+                        to_string(fv_opt->tier));
+                };
+
+                // Keep each clamped tier's reported spread consistent with
+                // its new price; untouched tiers keep the value the
+                // LiquidityEngine assigned them.
+                auto resync_spread = [&](TierQuote& tq) {
+                    if (mid_mojos > 0) {
+                        tq.spread_bps =
+                            (static_cast<double>(tq.price)
+                           - static_cast<double>(mid_mojos))
+                            / static_cast<double>(mid_mojos) * 10'000.0;
+                    }
+                };
+
+                // BID side: walk outwards holding a running ceiling that
+                // steps DOWN after each clamp, so tier N+1 stays cheaper
+                // than tier N instead of collapsing onto tier N's price.
+                // For a well-ordered in-band ladder the ceiling tracks the
+                // existing prices and nothing is touched -- the guard is a
+                // strict no-op on correctly-priced quotes.
+                Mojo next_max = bid_ceiling;
+                for (TierQuote* tqp : tiers_in_order(Side::Bid)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price <= next_max) {
+                        next_max = std::min(next_max, tq.price);
+                        continue;
+                    }
+                    const Mojo original = tq.price;
+                    const double dev =
+                        static_cast<double>(original) / fv_mojos - 1.0;
+                    tq.price = next_max;
+                    resync_spread(tq);
+                    log_clamp(tq, original, tq.price, dev);
+                    ++clamped_bid_tiers;
+                    next_max = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_max)
+                        * (1.0 - step_bps / 10'000.0)));
+                }
+
+                // ASK side: running floor that steps UP after each clamp.
+                Mojo next_min = ask_floor;
+                for (TierQuote* tqp : tiers_in_order(Side::Ask)) {
+                    TierQuote& tq = *tqp;
+                    if (tq.price >= next_min) {
+                        next_min = std::max(next_min, tq.price);
+                        continue;
+                    }
+                    const Mojo original = tq.price;
+                    const double dev =
+                        static_cast<double>(original) / fv_mojos - 1.0;
+                    tq.price = next_min;
+                    resync_spread(tq);
+                    log_clamp(tq, original, tq.price, dev);
+                    ++clamped_ask_tiers;
+                    next_min = static_cast<Mojo>(std::llround(
+                        static_cast<double>(next_min)
+                        * (1.0 + step_bps / 10'000.0)));
+                }
+
+                if (clamped_bid_tiers > 0 || clamped_ask_tiers > 0) {
+                    spdlog::warn(
+                        "[Engine] Step 7: {} fair-value guard clamped {} bid "
+                        "and {} ask tier(s) -- book mid {:.8f} is {:+.1f}bps "
+                        "from independent fair value {:.8f} (tier={} "
+                        "sigma={:.0f}bps band={:.0f}bps obs={} age={:.0f}s)",
+                        pair_name, clamped_bid_tiers, clamped_ask_tiers,
+                        static_cast<double>(mid_mojos)
+                            / static_cast<double>(kMojosPerXch),
+                        (static_cast<double>(mid_mojos) / fv_mojos - 1.0)
+                            * 10'000.0,
+                        fv, to_string(fv_opt->tier), fv_opt->sigma_bps,
+                        max_dev_bps, fv_opt->observations,
+                        fv_opt->age_seconds);
+                }
+            }
+            else if (!fv_opt) {
+                // ---------------------------------------------------------
+                // No independent fair value for this pair.  We do NOT stop
+                // quoting and we do NOT skip the pair -- skipping here would
+                // bypass Step 8's cancellation paths and strand whatever is
+                // already resting.  But quoting blind at normal width is
+                // precisely what let the ladder be swept, so push every tier
+                // further from the unvalidated mid.  A taker must now move
+                // the price much further before reaching us.
+                //
+                // One warning per pair per heartbeat: Step 7 visits each
+                // pair exactly once per cycle.
+                // ---------------------------------------------------------
+                const double widen_pct =
+                    config_.strategy.blind_quote_widen_pct;
+                const double factor = 1.0 + widen_pct / 100.0;
+
+                spdlog::warn(
+                    "[Engine] Step 7: {} QUOTING BLIND -- no independent fair "
+                    "value available; widening all tiers by {:.0f}% "
+                    "(mid={:.8f} is unvalidated)",
+                    pair_name, widen_pct,
+                    static_cast<double>(mid_mojos)
+                        / static_cast<double>(kMojosPerXch));
+
+                if (mid_mojos > 0 && factor > 1.0) {
+                    for (auto& tq : pcs.ladder) {
+                        const auto widened = static_cast<Mojo>(std::llround(
+                            static_cast<double>(mid_mojos)
+                            + (static_cast<double>(tq.price)
+                             - static_cast<double>(mid_mojos)) * factor));
+                        if (widened <= 0) continue;  // sanity, dropped below
+                        tq.price      = widened;
+                        tq.spread_bps =
+                            (static_cast<double>(tq.price)
+                           - static_cast<double>(mid_mojos))
+                            / static_cast<double>(mid_mojos) * 10'000.0;
+                    }
+                }
             }
         }
 
@@ -10569,6 +11202,15 @@ asio::awaitable<void> Engine::open_connections()
                      "(polling every {}ms)", config_.coingecko.polling_interval_ms);
     }
 
+    // Open the TibetSwap AMM client if enabled.
+    if (tibetswap_) {
+        tibetswap_->open();
+        spdlog::info("[Engine] TibetSwap AMM reference enabled at {} "
+                     "(polling every {}ms)",
+                     config_.tibetswap.base_url,
+                     config_.tibetswap.polling_interval_ms);
+    }
+
     co_return;
 }
 
@@ -10581,6 +11223,9 @@ void Engine::close_connections()
     dexie_->close();
     if (coingecko_) {
         coingecko_->close();
+    }
+    if (tibetswap_) {
+        tibetswap_->close();
     }
     spdlog::info("[Engine] All connections closed");
 }

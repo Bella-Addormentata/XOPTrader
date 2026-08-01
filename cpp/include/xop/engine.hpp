@@ -44,6 +44,7 @@
 #include "xop/rpc/chia_rpc.hpp"
 #include "xop/rpc/dexie_client.hpp"
 #include "xop/rpc/coingecko_client.hpp"
+#include "xop/rpc/tibetswap_client.hpp"
 
 // Execution layer
 #include "xop/execution/coin_manager.hpp"
@@ -298,6 +299,27 @@ private:
     /// Step 7: Expand the risk-filtered quotes into a multi-tier offer
     /// ladder via the LiquidityEngine.
     void step_generate_ladder(BlockHeight block_height);
+
+    /// Derive an INDEPENDENT, TRIANGULATED fair value for every enabled pair
+    /// and push it into MarketDataFeed.  Called once per heartbeat at the end
+    /// of Step 1, after the dexie and AMM ingests, so the solve sees this
+    /// heartbeat's observations.
+    ///
+    /// Assets are nodes and pairs are edges; the external USD feed anchors
+    /// whichever assets it lists.  Each pair is then priced by a weighted
+    /// least-squares solve (xop::fv::solve_pair) run with THAT PAIR'S OWN BOOK
+    /// EDGE DELETED, which is what makes the result independent of the book it
+    /// validates.  Edge weights are 1/sigma^2 from observable quality only --
+    /// book width, heartbeats since the mid last moved, resting depth -- so a
+    /// frozen or very wide book contributes almost nothing.  No pair or asset
+    /// is special-cased anywhere in the implementation.
+    ///
+    /// Publishes, per pair: the price, the solve's own 1-sigma, the
+    /// CONSISTENCY RESIDUAL between that pair's book and the rest of the
+    /// graph, and a confidence tier.  When no estimate survives the weights
+    /// the tier is Unavailable and Step 7 widens instead of clamping; it never
+    /// falls back to the book being validated.
+    void update_fair_values();
 
     /// Step 8: Cancel offers that have exceeded their TTL and post the new
     /// offer ladder via the OfferManager.
@@ -554,6 +576,19 @@ private:
 
     /// Timestamp of the last successful CoinGecko fetch.
     std::chrono::steady_clock::time_point coingecko_last_fetch_;
+
+    /// TibetSwap AMM reserve client -- the producer for
+    /// ArbitrageDetector::set_tibetswap_reserves().
+    std::shared_ptr<rpc::TibetSwapClient> tibetswap_;
+
+    /// Timestamp of the last TibetSwap fetch attempt (successful or not).
+    /// Gates the poll so a hard-down API is retried on the configured cadence
+    /// rather than on every block.
+    std::chrono::steady_clock::time_point tibetswap_last_fetch_;
+
+    /// True once at least one TibetSwap poll has been attempted, so the very
+    /// first heartbeat fetches immediately instead of waiting a full interval.
+    bool tibetswap_fetch_attempted_{false};
 
     // -- Execution layer -----------------------------------------------------
 
