@@ -132,6 +132,68 @@ QuoteRecoveryPrice floor_recovery_ask_price(Mojo   third_party_best_ask,
                                             Mojo   floor_mid_mojos,
                                             double min_half_spread_bps);
 
+// ---------------------------------------------------------------------------
+// width_floor_exempts_competitiveness -- reconcile the Step 7 uncertainty
+// width floor with the Step 8 competitiveness guard.
+//
+// [2026-08-01 dark-pair fix] Observed live: a pair with a tight (~8 bps) but
+// ~90% stale book gets a large uncertainty floor (~150 bps of fair-value
+// sigma), so Step 7 correctly forces every tier ~150 bps from centre; Step 8
+// then scores every tier as hopelessly uncompetitive against the 8 bps BBO
+// and suppresses all of them.  Width floor says "quote wide"; guard says
+// "wide is pointless"; the pair posts zero tiers every heartbeat.  The
+// owner's directive is quote-wide-rather-than-silent on low-certainty
+// markets, so a tier standing exactly where the floor PUT it must not be
+// suppressed for uncompetitiveness alone.
+//
+// A tier is exempt when its actual distance from the Step 7 centre is
+// within the width the pipeline mandated for it:
+//
+//     dist(price, centre)  <=  min_half_spread_bps
+//                              + (tier_spread_bps - innermost_spread_bps)
+//
+// where tier_spread_bps is the half-spread Step 7 assigned this tier (the
+// TierQuote::spread_bps field, which tracks the width-floor shift, gap
+// adjustments, and inventory skew) and innermost_spread_bps is the smallest
+// assigned half-spread on the SAME side of the full Step 7 ladder.  The
+// parenthesised term is the ladder's shape offset for the tier, so the
+// bound reads "the floor, plus this tier's place in the ladder shape".
+//
+// Consequences:
+//   - Floor binding (shift delta > 0): tier i sits at
+//     floor + (spacing_i - spacing_0), which equals the bound exactly ->
+//     exempt.  The pair quotes wide instead of going dark.
+//   - Healthy pair (floor < innermost spacing, no shift): tier i sits at
+//     spacing_i, and the bound is floor + spacing_i - spacing_0
+//     < spacing_i, so the exemption can NEVER fire -- byte-identical
+//     behaviour to before this fix.
+//   - A tier pushed beyond floor + shape (skew-widened side, stale
+//     repricing, anything else) stays suppressible exactly as today.
+//
+// Only the uncompetitiveness suppression is waived; every other Step 8
+// suppression reason (queue position, fees, sanity, exposure) is untouched.
+// ---------------------------------------------------------------------------
+
+/// @param tier_price           The tier's posted price in mojos.
+/// @param tier_spread_bps      Half-spread Step 7 assigned this tier
+///                             (TierQuote::spread_bps).
+/// @param innermost_spread_bps Smallest assigned half-spread among the FULL
+///                             Step 7 ladder's tiers on the same side.
+/// @param centre_mojos         Step 7's blended ladder centre
+///                             (PairCycleState::quote_mid_mojos); <= 0 means
+///                             no centre available -> never exempt.
+/// @param min_half_spread_bps  Step 7's per-pair uncertainty minimum
+///                             half-spread (PairCycleState::
+///                             quote_min_half_spread_bps); <= 0 -> never
+///                             exempt.
+/// @return True when the tier is at (or inside) its mandated width and must
+///         not be suppressed for uncompetitiveness alone.
+bool width_floor_exempts_competitiveness(Mojo   tier_price,
+                                         double tier_spread_bps,
+                                         double innermost_spread_bps,
+                                         Mojo   centre_mojos,
+                                         double min_half_spread_bps) noexcept;
+
 /// Human-readable label for logging and Prometheus metric labels.
 inline const char* to_string(RebalanceReason r) noexcept {
     switch (r) {

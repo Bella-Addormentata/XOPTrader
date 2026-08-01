@@ -7998,6 +7998,24 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             std::vector<TierQuote> competitive_tiers;
             competitive_tiers.reserve(fee_filtered_tiers.size());
 
+            // [2026-08-01 dark-pair fix] Innermost assigned half-spread per
+            // side, from the FULL Step 7 ladder (fee filtering must not
+            // change the shape reference).  Feeds the width-floor
+            // reconciliation below: a tier standing where the uncertainty
+            // floor PUT it must not be suppressed for uncompetitiveness
+            // alone, or a tight-but-stale book turns "quote wide" into
+            // "quote nothing" (observed live: 12/12 tiers suppressed every
+            // heartbeat against an ~8 bps BBO under a ~150 bps floor).
+            double innermost_bid_bps = std::numeric_limits<double>::infinity();
+            double innermost_ask_bps = std::numeric_limits<double>::infinity();
+            for (const auto& t : pcs.ladder) {
+                if (t.side == Side::Bid) {
+                    innermost_bid_bps = std::min(innermost_bid_bps, t.spread_bps);
+                } else {
+                    innermost_ask_bps = std::min(innermost_ask_bps, t.spread_bps);
+                }
+            }
+
             for (const auto& tier : fee_filtered_tiers) {
                 const int score = score_offer_competitiveness(
                     tier.side,
@@ -8012,6 +8030,39 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     queue_ahead_mojos,
                     tier.size);
                 if (score >= kMinCompetitivenessScore) {
+                    competitive_tiers.push_back(tier);
+                    continue;
+                }
+
+                // [2026-08-01 dark-pair fix] The sigma width floor is a
+                // legitimate reason to stand far from a tight BBO.  Only the
+                // uncompetitiveness suppression is waived; queue-position and
+                // every other suppression reason are untouched.  Healthy
+                // pairs (floor below their innermost spacing) can never
+                // satisfy this bound -- see width_floor_exempts_
+                // competitiveness in strategy/liquidity.hpp.
+                const double innermost_bps = (tier.side == Side::Bid)
+                    ? innermost_bid_bps
+                    : innermost_ask_bps;
+                if (width_floor_exempts_competitiveness(
+                        tier.price,
+                        tier.spread_bps,
+                        innermost_bps,
+                        pcs.quote_mid_mojos,
+                        pcs.quote_min_half_spread_bps)) {
+                    spdlog::info(
+                        "[Engine] Step 8: {} {} tier {} kept at mandated "
+                        "width -- competitiveness {}/10 waived (width floor "
+                        "{:.0f}bps, spacing {:.0f}bps, price={} bbo={}/{})",
+                        pair_name,
+                        (tier.side == Side::Bid ? "bid" : "ask"),
+                        tier.tier_index,
+                        score,
+                        pcs.quote_min_half_spread_bps,
+                        tier.spread_bps,
+                        tier.price,
+                        book_snap.best_bid,
+                        book_snap.best_ask);
                     competitive_tiers.push_back(tier);
                     continue;
                 }

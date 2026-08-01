@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -1085,6 +1086,133 @@ TEST(QuoteRecoveryFloorTest, ZeroHalfSpreadFloorsAtTheMidItself) {
     const auto rn = floor_recovery_ask_price(best_ask, 20.0, mid, -10.0);
     ASSERT_TRUE(rn.apply);
     EXPECT_EQ(rn.price, mid);
+}
+
+// ============================================================================
+// [2026-08-01 dark-pair fix] width_floor_exempts_competitiveness
+// ============================================================================
+//
+// Observed live: a pair with a tight (~8 bps) but ~90% stale book gets an
+// uncertainty width floor of ~150 bps, Step 7 correctly forces every tier
+// ~150 bps from centre, and the Step 8 competitiveness guard then suppresses
+// all 12 tiers against the 8 bps BBO -- the pair posts nothing, every
+// heartbeat.  The exemption: a tier whose distance from centre is within
+// floor + its ladder shape offset (assigned spacing minus the side's
+// innermost assigned spacing) is AT its mandated width and must survive the
+// uncompetitiveness suppression.  Everything else behaves exactly as today.
+//
+// Numbers used throughout: centre = 100e12 mojos, raw spacing schedule
+// [30, 60, 90] bps.  With a 150 bps floor, Step 7 shifts the schedule by
+// delta = 150 - 30 = 120 to [150, 180, 210]; without a binding floor the
+// schedule stays put.
+
+TEST(WidthFloorCompetitivenessTest, TierAtMandatedWidthSurvives) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 150.0;   // sigma-driven, tight-but-stale book
+    const double innermost = 150.0;   // shifted schedule front
+
+    // Ask tier 0 at exactly the floor: dist 150 <= 150 + 0.
+    const Mojo ask0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 150.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask0, 150.0, innermost, centre, floor_bps));
+
+    // Ask tier 2 at floor + shape offset: dist 210 <= 150 + (210 - 150).
+    const Mojo ask2 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 210.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask2, 210.0, innermost, centre, floor_bps));
+
+    // Bid side is symmetric: dist 150 below centre.
+    const Mojo bid0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 150.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        bid0, 150.0, innermost, centre, floor_bps));
+
+    // Ladder-build rounding (ceil on asks) must not defeat the exemption:
+    // one mojo past the exact edge is ~1e-8 bps, inside the epsilon.
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask0 + 1, 150.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, TierWellBeyondFloorPlusSpacingSuppressed) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 150.0;
+    const double innermost = 150.0;
+
+    // A tier repriced out to 400 bps while its assigned spacing is 210:
+    // bound = 150 + (210 - 150) = 210 < 400 -> still suppressible.
+    const Mojo far_ask = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 400.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        far_ask, 210.0, innermost, centre, floor_bps));
+
+    // Same distance on the bid side.
+    const Mojo far_bid = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 400.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        far_bid, 210.0, innermost, centre, floor_bps));
+
+    // Even one full bps beyond the bound is out (epsilon is 0.01 bps, for
+    // mojo rounding only -- not a soft margin).
+    const Mojo just_out = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 211.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        just_out, 210.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, HealthyPairFloorBelowSpacingNeverExempt) {
+    // The healthy-book case: floor (30 bps) below the innermost configured
+    // spacing (100 bps), so Step 7 never shifts the schedule and tiers sit
+    // at their configured [100, 200] positions.  The exemption must never
+    // fire -- the guard behaves byte-identically to before the fix.
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 30.0;
+    const double innermost = 100.0;
+
+    const Mojo ask0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 100.0 / 10'000.0)));
+    // dist 100 vs bound 30 + (100 - 100) = 30 -> not exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        ask0, 100.0, innermost, centre, floor_bps));
+
+    const Mojo ask1 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 200.0 / 10'000.0)));
+    // dist 200 vs bound 30 + (200 - 100) = 130 -> not exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        ask1, 200.0, innermost, centre, floor_bps));
+
+    const Mojo bid0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 100.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        bid0, 100.0, innermost, centre, floor_bps));
+
+    const Mojo bid1 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 200.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        bid1, 200.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, DegenerateInputsNeverExempt) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const Mojo price  = 101'500'000'000'000LL;
+
+    // No centre / no price / no floor -> never exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, 0, 150.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        0, 150.0, 150.0, centre, 150.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, 0.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, -25.0));
+
+    // NaN floor or spacing fails closed (not exempt), never throws.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, nan));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, nan, 150.0, centre, 150.0));
 }
 
 }  // namespace

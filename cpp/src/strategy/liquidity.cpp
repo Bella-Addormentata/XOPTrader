@@ -668,6 +668,47 @@ QuoteRecoveryPrice floor_recovery_ask_price(Mojo   third_party_best_ask,
 }
 
 // ===========================================================================
+// width_floor_exempts_competitiveness -- see the header for the full
+// rationale ([2026-08-01 dark-pair fix]).
+// ===========================================================================
+
+bool width_floor_exempts_competitiveness(Mojo   tier_price,
+                                         double tier_spread_bps,
+                                         double innermost_spread_bps,
+                                         Mojo   centre_mojos,
+                                         double min_half_spread_bps) noexcept
+{
+    if (tier_price <= 0 || centre_mojos <= 0) return false;
+    // No floor -> nothing to reconcile (also guards NaN, which fails the >).
+    if (!(min_half_spread_bps > 0.0)) return false;
+    // Explicit NaN/Inf guard: std::max(0.0, NaN) silently returns 0.0, so a
+    // poisoned spacing would otherwise degrade to a zero shape offset and
+    // could still exempt.  Fail closed instead.
+    if (!std::isfinite(tier_spread_bps)
+        || !std::isfinite(innermost_spread_bps)) {
+        return false;
+    }
+
+    const double dist_bps =
+        std::abs(static_cast<double>(tier_price)
+                 - static_cast<double>(centre_mojos))
+        / static_cast<double>(centre_mojos) * 10'000.0;
+
+    // The ladder's shape offset for this tier: how far beyond the side's
+    // innermost tier the schedule places it.
+    const double shape_offset_bps =
+        std::max(0.0, tier_spread_bps - std::max(0.0, innermost_spread_bps));
+
+    // Headroom for mojo rounding (floor/ceil/llround at ladder build):
+    // sub-mojo effects are ~1e-7 bps at production price levels, so 0.01
+    // bps is generous without admitting any economically distinct tier.
+    constexpr double kRoundingEpsBps = 0.01;
+
+    return dist_bps
+        <= min_half_spread_bps + shape_offset_bps + kRoundingEpsBps;
+}
+
+// ===========================================================================
 // compute_ladder -- gap-aware + adverse-selection-aware overload
 // ===========================================================================
 
