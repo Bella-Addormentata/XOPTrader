@@ -1263,15 +1263,35 @@ void MarketDataFeed::ingest_competing_offers(
         // acquire pairs lock separately.
         lock.unlock();
 
-        if (filtered_best_bid > 0.0 || filtered_best_ask > 0.0 || ob_mid > 0.0) {
+        {
             std::unique_lock plk(mtx_pairs_);
             PairState& ps = get_or_create_pair(pair_name);
-            if (filtered_best_bid > 0.0) {
-                ps.dex_best_bid = filtered_best_bid;
+            // [SELF-PRICE FIX 2026-07-31] The filtered book is AUTHORITATIVE,
+            // including when it is empty on a side.
+            //
+            // Previously each side was overridden only when the filtered value
+            // was > 0.  ingest_dexie() (see ~line 437) writes the RAW dexie BBO,
+            // which includes OUR OWN resting offers.  So when every offer on a
+            // side was ours, the filter produced 0, no override fired, and the
+            // raw self-inclusive price survived into compute_mid() at 70%
+            // weight -- the bot read its own quote back as the market and then
+            // quoted against it.  On the thin pairs (BYC, DBX) we are routinely
+            // the only offer, so this was the normal case, not an edge case.
+            //
+            // "No third-party offer on this side" must be reported as 0 (no
+            // data), never as our own price.  These fields are 0 before the
+            // first ingest, so downstream consumers already handle 0.
+            const bool self_only_bid = (filtered_best_bid <= 0.0);
+            const bool self_only_ask = (filtered_best_ask <= 0.0);
+            if (self_only_bid || self_only_ask) {
+                spdlog::warn("[MarketData] {}: no third-party {} -- reporting "
+                             "no-data rather than our own quote",
+                             pair_name,
+                             (self_only_bid && self_only_ask) ? "bid or ask"
+                                 : (self_only_bid ? "bid" : "ask"));
             }
-            if (filtered_best_ask > 0.0) {
-                ps.dex_best_ask = filtered_best_ask;
-            }
+            ps.dex_best_bid = filtered_best_bid > 0.0 ? filtered_best_bid : 0.0;
+            ps.dex_best_ask = filtered_best_ask > 0.0 ? filtered_best_ask : 0.0;
             if (ob_mid > 0.0) {
                 ps.orderbook_mid = ob_mid;
             }
