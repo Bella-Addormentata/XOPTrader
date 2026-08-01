@@ -392,6 +392,56 @@ struct StrategyConfig {
     /// "deviates >10% from BBO midpoint, clamp to it" guard useless.
     double   microprice_wide_bps{800.0};
 
+    // -- Published-mid BBO band ---------------------------------------------
+    //
+    // The order-book mid is clamped to its own BBO inside
+    // compute_orderbook_mid(), but the PUBLISHED mid is a further blend of
+    // that number with CEX (30%) and optionally AMM references, so it could
+    // exit the book again.  That re-exit is the exact mechanism that let
+    // self-referential garbage propagate: the artifact BYC/wUSDC.b "mid" of
+    // 1.1447 (vs a $1.01 truth corroborated five independent ways) fed the
+    // USD cross, and a comparably broken CEX reference at 30% weight could
+    // drag a healthy pair's published mid ~430 bps out of its own executable
+    // interval.  So the published mid is clamped to the dust-filtered
+    // third-party BBO widened by a band:
+    //
+    //     band_bps = max(floor_bps, spread_frac * book_spread_bps)
+    //
+    // and the clamp applies only while the dex book is two-sided and fresh
+    // (per stale_threshold) -- a stale book is history, not "now", and a
+    // fresh CEX print should govern it.  When the clamp binds it is logged
+    // at warning level: it means an external reference disagrees with the
+    // live book beyond tolerance, which is either an arbitrage or a broken
+    // feed, and both deserve eyes.
+    //
+    // Both knobs are ABSENT from the shipped config.yaml on purpose; the
+    // defaults must work unedited.
+
+    /// Minimum band (bps) beyond the BBO regardless of the book's spread.
+    ///
+    /// Default 150 bps.  The healthy pair, XCH/wUSDC.b, has a measured
+    /// CexDirect solve sigma of ~133 bps: a genuine one-standard-deviation
+    /// CEX-vs-DEX disagreement on a tight fresh book must NOT trip the
+    /// clamp, so the floor sits just above one sigma.  Anything much larger
+    /// stops being an invariant: the BYC artifact pulled the USD cross 13%
+    /// (~1300 bps) off truth, and at the 30% CEX blend weight that reaches
+    /// the published mid as a ~430 bps excursion -- the floor must be well
+    /// below that to catch it.
+    double   published_mid_band_floor_bps{150.0};
+
+    /// Band as a fraction of the book's own relative spread.
+    ///
+    /// Default 0.25.  A wide book is a weak claim about location, so an
+    /// external reference is allowed to pull further outside it.  Measured
+    /// at the 2026-08-01 sweep (block 9087661): XCH/BYC's book was
+    /// 1.1334/1.4013 (2114 bps) while external truth was 1.4143 -- 93 bps
+    /// ABOVE the best ask.  A hard clamp to the raw BBO would forbid the
+    /// published mid from ever reaching truth on that book; 0.25 * 2114 =
+    /// 528 bps of allowance covers it with margin.  On the healthy pair's
+    /// p50 spread of 237 bps the term is 59 bps, safely below the floor, so
+    /// tight books get the floor and wide books get proportional room.
+    double   published_mid_band_spread_frac{0.25};
+
     /// Minimum annualized sigma passed to the GLFT/A-S formula.
     /// When the Yang-Zhang estimator returns zero (flat market), the
     /// raw half-spread degenerates to (1/kappa)*ln(1+kappa/gamma) and

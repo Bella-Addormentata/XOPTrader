@@ -785,6 +785,10 @@ StrategyConfig parse_strategy(const YAML::Node& root)
                      cfg.fair_value_residual_widen_floor_bps);
     opt_non_negative("microprice_narrow_bps", cfg.microprice_narrow_bps);
     opt_non_negative("microprice_wide_bps",   cfg.microprice_wide_bps);
+    opt_non_negative("published_mid_band_floor_bps",
+                     cfg.published_mid_band_floor_bps);
+    opt_non_negative("published_mid_band_spread_frac",
+                     cfg.published_mid_band_spread_frac);
 
     // The blend interpolates ACROSS [narrow, wide]; an inverted or empty band
     // has no interior and would silently collapse into a step function, which

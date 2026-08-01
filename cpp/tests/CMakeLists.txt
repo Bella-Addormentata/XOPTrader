@@ -68,6 +68,7 @@ add_executable(xop_tests
     test_fair_value.cpp
     test_tibetswap.cpp
     test_orderbook_mid.cpp
+    test_published_mid.cpp
 )
 
 target_link_libraries(xop_tests

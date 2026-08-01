@@ -901,6 +901,29 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // The 70/30 blend anchors the DEX mid toward the globally discovered price
 // on CEX ($2.4M/day) while respecting that the DEX order book reflects
 // local supply/demand conditions relevant to our offers.
+//
+// Published-mid invariant (applied LAST, after the blend):
+//   compute_orderbook_mid() clamps the ORDER-BOOK mid to its own BBO, but
+//   the blend above happens after that clamp, so the PUBLISHED mid could
+//   leave the book again whenever CEX or AMM disagree.  A published mid
+//   outside the dex BBO is not automatically wrong -- the CEX may genuinely
+//   lead a thin book -- but an UNBOUNDED excursion is the exact mechanism
+//   that let self-referential garbage propagate (the artifact BYC cross sat
+//   13% off truth; at 30% CEX weight such a reference reaches the published
+//   mid as a ~430 bps excursion out of a healthy pair's own executable
+//   interval).  So while the dex book is two-sided and fresh, the blended
+//   mid is clamped to the BBO widened by
+//       band_bps = max(published_mid_band_floor_bps,
+//                      published_mid_band_spread_frac * book_spread_bps)
+//   -- floor 150 bps (just above XCH/wUSDC.b's measured ~133 bps CexDirect
+//   sigma, so a genuine one-sigma cross-venue disagreement never trips it),
+//   fraction 0.25 (at the 2026-08-01 sweep, XCH/BYC's 2114 bps book put
+//   truth 93 bps ABOVE its best ask; 0.25 * 2114 = 528 bps of room lets an
+//   honest external reference still reach truth on a wide book).  A binding
+//   clamp is logged at warning level: it is either an arbitrage or a broken
+//   feed, and both deserve eyes.  When the dex book is stale the clamp is
+//   skipped -- a stale book is history, and fresh external data should
+//   govern it, not be pinned to it.
 // -------------------------------------------------------------------------
 
 double MarketDataFeed::compute_mid(const PairState& ps) const {
@@ -994,12 +1017,49 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     if (!has_amm) w_amm = 0.0;
 
     const double w_total = w_dex + w_cex + w_amm;
-    if (w_total > 0.0) {
-        return (w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid) / w_total;
+    if (w_total <= 0.0) {
+        // No data at all.
+        return 0.0;
     }
 
-    // No data at all.
-    return 0.0;
+    double mid = (w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid)
+                 / w_total;
+
+    // Published-mid invariant -- see the block comment above compute_mid().
+    // Applies only when a two-sided THIRD-PARTY book exists and the dex data
+    // is fresh.  min/max ordering also handles crossed books (normal on
+    // Dexie: no matching engine), where the executable interval is inverted.
+    if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0
+        && ps.dex_updated_at != Timestamp{})
+    {
+        const auto dex_age = std::chrono::system_clock::now()
+                             - ps.dex_updated_at;
+        if (dex_age <= cfg.stale_threshold) {
+            const double lo_px = std::min(ps.dex_best_bid, ps.dex_best_ask);
+            const double hi_px = std::max(ps.dex_best_bid, ps.dex_best_ask);
+            const double midpoint = (lo_px + hi_px) / 2.0;
+            const double book_spread_bps =
+                midpoint > 0.0 ? (hi_px - lo_px) / midpoint * 10000.0 : 0.0;
+            const double band_bps =
+                std::max(cfg.published_mid_band_floor_bps,
+                         cfg.published_mid_band_spread_frac * book_spread_bps);
+            const double lo = lo_px * (1.0 - band_bps / 10000.0);
+            const double hi = hi_px * (1.0 + band_bps / 10000.0);
+            if (mid < lo || mid > hi) {
+                const double clamped = std::clamp(mid, lo, hi);
+                spdlog::warn(
+                    "[MarketData] {} published mid {:.6f} outside dex BBO "
+                    "[{:.6f}, {:.6f}] + {:.0f} bps band (dex={:.6f} "
+                    "cex={:.6f} amm={:.6f}) -- clamped to {:.6f}; external "
+                    "reference disagrees with the live book beyond tolerance",
+                    ps.pair_name, mid, lo_px, hi_px, band_bps,
+                    dex_mid, cex_mid, amm_mid, clamped);
+                mid = clamped;
+            }
+        }
+    }
+
+    return mid;
 }
 
 // -------------------------------------------------------------------------

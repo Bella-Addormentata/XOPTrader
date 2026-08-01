@@ -365,6 +365,29 @@ struct MarketDataConfig {
     /// the engine is told it is quoting blind.  Must never fall back to the
     /// dexie mid -- an expired fair value is reported as absent, not stale.
     double fair_value_max_age_sec{300.0};
+
+    // -- Published-mid BBO band (Layer 1 for the PUBLISHED mid) --------------
+    //
+    // compute_orderbook_mid() enforces best_bid <= mid <= best_ask on the
+    // order-book mid, but compute_mid() then blends that number with CEX and
+    // AMM references, so the PUBLISHED mid could leave the book again -- the
+    // exact mechanism by which a broken external reference (the BYC $1.1447
+    // artifact, 13% over its $1.01 truth) could drag a healthy pair's mid out
+    // of its own executable interval.  The published mid is therefore clamped
+    // to the dust-filtered third-party BBO widened by a tolerance band:
+    //
+    //     band_bps = max(floor_bps, spread_frac * book_spread_bps)
+    //     mid in [min(bid,ask) * (1 - band), max(bid,ask) * (1 + band)]
+    //
+    // applied only while the dex book is two-sided and fresh (a stale book is
+    // not "now"; CEX should govern then).  Mirrored from StrategyConfig,
+    // where the defaults are justified against measured numbers.
+
+    /// Minimum band (bps) allowed beyond the BBO regardless of spread.
+    double published_mid_band_floor_bps{150.0};
+
+    /// Band as a fraction of the book's own relative spread.
+    double published_mid_band_spread_frac{0.25};
 };
 
 // ---------------------------------------------------------------------------

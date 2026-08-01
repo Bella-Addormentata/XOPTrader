@@ -580,4 +580,37 @@ TEST(ConfigParserTest, MicropriceBandRejectsNegativeEdges) {
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
+// ============================================================================
+// Published-mid BBO band
+//
+// Like the micro-price schedule, both knobs are deliberately absent from the
+// shipped config.yaml: the defaults must protect an unconfigured deployment.
+// ============================================================================
+
+TEST(ConfigParserTest, PublishedMidBandDefaultsWithoutAnyConfig) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_floor_bps,   150.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_spread_frac, 0.25);
+}
+
+TEST(ConfigParserTest, PublishedMidBandIsOverridable) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  published_mid_band_floor_bps: 200"
+        "\n  published_mid_band_spread_frac: 0.5"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_floor_bps,   200.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_spread_frac, 0.5);
+}
+
+TEST(ConfigParserTest, PublishedMidBandRejectsNegativeValues) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  published_mid_band_floor_bps: -10"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+
+    TempYaml tmp2(with_strategy_keys(
+        "\n  published_mid_band_spread_frac: -0.1"));
+    EXPECT_THROW(xop::load_config(tmp2.path()), xop::ConfigError);
+}
+
 }  // namespace

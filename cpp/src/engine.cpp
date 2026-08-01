@@ -255,6 +255,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     // parameter, but it is consumed here where the book is turned into a mid.
     md_cfg.microprice_narrow_bps        = config_.strategy.microprice_narrow_bps;
     md_cfg.microprice_wide_bps          = config_.strategy.microprice_wide_bps;
+    // Published-mid BBO band: same [strategy] rationale as the micro-price
+    // schedule -- a pricing-policy decision consumed where the mid is made.
+    md_cfg.published_mid_band_floor_bps =
+        config_.strategy.published_mid_band_floor_bps;
+    md_cfg.published_mid_band_spread_frac =
+        config_.strategy.published_mid_band_spread_frac;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -9920,12 +9926,25 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
         return 1.0;
     }
 
-    // BYC is a Chia-native CDP stablecoin that trades OFF peg (live
-    // BYC/wUSDC.b mid was $1.0554 on 2026-07-30).  Because one XCH cost
-    // basis is now shared across quote currencies, assuming $1 here would
-    // inject that error into every XCH/BYC fill.  Prefer the live cross,
-    // and fall back to par only when that market has no mid yet.
+    // BYC is a Chia-native CDP stablecoin.  This branch used to prefer the
+    // live BYC/wUSDC.b cross unconditionally, justified by "trades OFF peg
+    // (live mid was $1.0554 on 2026-07-30)" -- but that observation was an
+    // ARTIFACT of the broken micro-price estimator (the same defect that
+    // published a BYC/wUSDC.b "mid" of 1.1447 sitting exactly on its own
+    // best ask at block 9087661).  Real anchors put BYC at ~$1.01: 7-day
+    // traded VWAP 1.001, dexie tickers 1.011, executable bids 1.000-1.014.
+    //
+    // The corrected published mid is honest now, but on this pair's book
+    // (measured p50 spread 1163 bps, dust-scale depth) a midpoint still
+    // carries a worst-case location error of ~spread/2 (~580 bps at p50),
+    // while the $1 par assumption erred by at most ~140 bps against every
+    // real anchor.  So the peg beats the book unless the book is TIGHT:
+    // trust the live cross only when its own spread is at most 300 bps
+    // (midpoint worst-case error ~150 bps, comparable to the peg's), and
+    // fall back to par otherwise.  spread_bps is 0 for one-sided or crossed
+    // books, which also (correctly) selects par.
     if (quote == "BYC") {
+        constexpr double kMaxCrossSpreadBps = 300.0;
         for (const auto& other : config_.pairs) {
             if (!other.enabled) continue;
             if (other.base_asset_id != pc.quote_asset_id) continue;
@@ -9936,7 +9955,9 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
                 continue;
             }
             auto snap = state_->get_market(other.name);
-            if (snap.mid_price > 0) {
+            if (snap.mid_price > 0
+                && snap.spread_bps > 0.0
+                && snap.spread_bps <= kMaxCrossSpreadBps) {
                 return static_cast<double>(snap.mid_price)
                      / static_cast<double>(kMojosPerXch);
             }
