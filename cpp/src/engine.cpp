@@ -20,6 +20,7 @@
 //   ISO/IEC 25000      -- documented step sequencing, single-responsibility
 
 #include "xop/engine.hpp"
+#include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
 #include "xop/strategy/avellaneda.hpp"
@@ -6740,14 +6741,28 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 : 1.0);
 
                         // Gate 1: pending_change > 0 means coins are in-flight.
-                        // Suppress only the side that spends this wallet's
-                        // asset, allowing the opposite side to keep quoting.
+                        // [2026-08-01] Track and escalate stuck transactions,
+                        // but do NOT suppress the side for pending change
+                        // alone.  spendable_balance already excludes in-flight
+                        // coins, so the spendable-based gates below (2 and 3)
+                        // and the exposure projections later in Step 8
+                        // (execution::exposure_breaches_reserve) decide
+                        // whether the side can genuinely fund its ladder plus
+                        // reserve.  The old unconditional suppression was
+                        // backwards for bid fills: buying base put pending
+                        // change on the base wallet -> ask side suppressed ->
+                        // only bids posted -> the next bid fill refreshed the
+                        // pending change, a self-sustaining bid-only loop
+                        // (10 bids / 0 asks overnight on XCH/BYC; same on
+                        // XCH/wUSDC.b).  Pending change from a buy means we
+                        // just ACQUIRED base -- more to sell, not less.
                         if (pending > 0) {
                             spdlog::info("[Engine] Step 8: {} wallet {} has "
-                                         "pending_change={} -- suppressing {} "
-                                         "side until confirmed",
+                                         "pending_change={} -- side stays "
+                                         "quotable; spendable-based gates "
+                                         "decide (spendable={})",
                                          pair_name, sb.label, pending,
-                                         sb.is_base ? "ask" : "bid");
+                                         spendable);
 
                             // Track consecutive blocks with pending_change.
                             pending_wallets_this_block.insert(sb.wid);
@@ -6809,10 +6824,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                 }
                                 consecutive_pending_blocks_ = 0;
                             }
-
-                            if (sb.is_base) can_ask = false;
-                            else            can_bid = false;
-                            continue;
+                            // Fall through to Gates 2 and 3: they evaluate
+                            // the spendable balance, which is the quantity
+                            // that actually constrains posting.
                         }
 
                         // Gate 2: spendable reserve too low (fractional).
@@ -7000,10 +7014,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     if (pair_base_balance_known && pair_base_reserve_mojos > 0
                         && pair_base_spendable > 0 && pair_base_pending_spend > 0) {
                         const Mojo projected_after_fill =
-                            (pair_base_spendable > pair_base_pending_spend)
-                                ? (pair_base_spendable - pair_base_pending_spend)
-                                : Mojo{0};
-                        if (projected_after_fill < pair_base_reserve_mojos) {
+                            execution::projected_balance_after_fills(
+                                pair_base_spendable, pair_base_pending_spend,
+                                /*planned_spend_mojos=*/0);
+                        if (execution::exposure_breaches_reserve(
+                                pair_base_spendable, pair_base_pending_spend,
+                                /*planned_spend_mojos=*/0,
+                                pair_base_reserve_mojos)) {
                             Mojo need_to_free = pair_base_reserve_mojos - projected_after_fill;
                             sort_candidates(ask_candidates, Side::Ask);
                             std::vector<std::string> cancel_ids;
@@ -7047,10 +7064,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                     if (pair_quote_balance_known && pair_quote_reserve_mojos > 0
                         && pair_quote_spendable > 0 && pair_quote_pending_spend > 0) {
                         const Mojo projected_after_fill =
-                            (pair_quote_spendable > pair_quote_pending_spend)
-                                ? (pair_quote_spendable - pair_quote_pending_spend)
-                                : Mojo{0};
-                        if (projected_after_fill < pair_quote_reserve_mojos) {
+                            execution::projected_balance_after_fills(
+                                pair_quote_spendable, pair_quote_pending_spend,
+                                /*planned_spend_mojos=*/0);
+                        if (execution::exposure_breaches_reserve(
+                                pair_quote_spendable, pair_quote_pending_spend,
+                                /*planned_spend_mojos=*/0,
+                                pair_quote_reserve_mojos)) {
                             Mojo need_to_free = pair_quote_reserve_mojos - projected_after_fill;
                             sort_candidates(bid_candidates, Side::Bid);
                             std::vector<std::string> cancel_ids;
@@ -7976,11 +7996,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             bool suppress_ask_projection = false;
             bool suppress_bid_projection = false;
             if (can_ask && pair_base_balance_known && pair_base_reserve_mojos > 0) {
-                const Mojo projected_after_fill =
-                    (pair_base_spendable > pending_plus_new_ask)
-                        ? (pair_base_spendable - pending_plus_new_ask)
-                        : Mojo{0};
-                if (projected_after_fill < pair_base_reserve_mojos) {
+                if (execution::exposure_breaches_reserve(
+                        pair_base_spendable,
+                        /*pending_spend_mojos=*/pending_plus_new_ask,
+                        /*planned_spend_mojos=*/0,
+                        pair_base_reserve_mojos)) {
                     suppress_ask_projection = true;
                     can_ask = false;
                     spdlog::info("[Engine] Step 8: {} projected ask exposure "
@@ -7994,11 +8014,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                 }
             }
             if (can_bid && pair_quote_balance_known && pair_quote_reserve_mojos > 0) {
-                const Mojo projected_after_fill =
-                    (pair_quote_spendable > pending_plus_new_bid)
-                        ? (pair_quote_spendable - pending_plus_new_bid)
-                        : Mojo{0};
-                if (projected_after_fill < pair_quote_reserve_mojos) {
+                if (execution::exposure_breaches_reserve(
+                        pair_quote_spendable,
+                        /*pending_spend_mojos=*/pending_plus_new_bid,
+                        /*planned_spend_mojos=*/0,
+                        pair_quote_reserve_mojos)) {
                     suppress_bid_projection = true;
                     can_bid = false;
                     spdlog::info("[Engine] Step 8: {} projected bid exposure "

@@ -69,6 +69,7 @@ add_executable(xop_tests
     test_tibetswap.cpp
     test_orderbook_mid.cpp
     test_published_mid.cpp
+    test_exposure_gate.cpp
 )
 
 target_link_libraries(xop_tests
