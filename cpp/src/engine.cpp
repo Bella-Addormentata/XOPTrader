@@ -23,6 +23,7 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
+#include "xop/accounting/reward_ingest.hpp"
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
 #include "xop/strategy/reservation_offset.hpp"
@@ -1734,6 +1735,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     try { step_update_pnl(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 11 (PnL) failed: {}", e.what());
+    }
+
+    // [REWARD-INCOME 2026-08-01] Book dexie reward inflows BEFORE the
+    // invariant check below: a rewarded DBX inflow must be explained flow
+    // (a 'reward' ledger entry) by the time the books are tied to the
+    // wallet, not divergence for a blind adjusting entry to absorb.
+    try { co_await step_ingest_reward_inflows(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Reward ingestion failed: {}", e.what());
     }
 
     // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
@@ -10849,6 +10859,181 @@ Mojo Engine::live_offer_exposure(const AssetId& asset_id) const
     return exposure;
 }
 
+// ---------------------------------------------------------------------------
+// [REWARD-INCOME 2026-08-01] Dexie reward-income ingestion.
+//
+// Detection point: the WALLET, not the dexie API.  The API exposes no
+// per-claim records (GET /v1/offers/{id} on a completed incentivized offer
+// carries no reward field; /v1/incentives is program metadata only), but
+// dexie pays accrued rewards as a DAILY BATCH of micro plain-send DBX
+// transactions -- measured 41 bursts over 2026-06-11..07-31, 1-219 mojos
+// per coin, vs >= 100,589 mojos for the smallest trading flow.  Full
+// evidence and the filter definition: accounting/reward_ingest.hpp.
+//
+// Booking per new coin (idempotent on the ledger's (event_id, leg, asset)
+// uniqueness -- a re-scan or restart re-posts identical rows, which are
+// ignored, and side effects run only for rows actually inserted):
+//   1. Ledger: event_type 'reward', delta +amount, FMV embedded in the note
+//      (the restart-invariance carrier for the income total).
+//   2. Inventory: record_buy at the receipt FMV -> the quantity folds into
+//      the weighted-average basis (recognize at fair value; FMV becomes
+//      cost basis).
+//   3. PnLTracker: add_reward_income_usd -- other income, never trading P&L.
+// ---------------------------------------------------------------------------
+asio::awaitable<void> Engine::step_ingest_reward_inflows(
+    BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.reward_ingest_enabled) co_return;
+    if (!db_ || !inventory_ || !pnl_ || !offer_mgr_) co_return;
+    if (!wallet_ || !wallet_->is_open()) co_return;
+    if (acc.reward_asset_id.empty()) co_return;
+
+    // Same stand-down conditions as the invariant control: without a
+    // genesis baseline (or with known-incomplete books) posting reward legs
+    // would only deepen the inconsistency.
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
+
+    const AssetId asset{acc.reward_asset_id};
+    if (!ledger_opened_assets_.count(asset)) co_return;
+
+    const std::int64_t wallet_id = offer_mgr_->resolve_wallet_id(asset);
+    if (wallet_id <= 0) co_return;   // wallet-id map not resolved yet
+
+    // Inflows at or below the asset's genesis block are already inside the
+    // opening balance (the 64.7 DBX of pre-genesis rewards live there).
+    BlockHeight genesis_block = 0;
+    if (auto git = ledger_genesis_block_.find(asset);
+        git != ledger_genesis_block_.end()) {
+        genesis_block = git->second;
+    }
+
+    // Newest 200 transactions comfortably cover the churn between daily
+    // reward batches (300 wallet transactions spanned ~7 weeks live).  A
+    // reward that ever scrolled past this window would simply remain
+    // wallet-vs-books divergence for the invariant to absorb -- the
+    // pre-existing behaviour, not a new failure mode.
+    const auto txs = co_await wallet_->get_transactions(wallet_id, 0, 200);
+
+    // The bot's own coin management appears as PAIRED outgoing+incoming
+    // transactions of equal amount in the same block; collect the outgoing
+    // side so those pairs are excluded.
+    std::set<std::pair<BlockHeight, Mojo>> outgoing;
+    for (const auto& t : txs) {
+        const int type = t.value("type", -1);
+        if (type == accounting::kOutgoingTx
+            || type == accounting::kOutgoingTrade) {
+            outgoing.emplace(
+                static_cast<BlockHeight>(t.value("confirmed_at_height", 0)),
+                static_cast<Mojo>(t.value("amount", 0)));
+        }
+    }
+
+    // Fair value: the live CoinGecko dexie-bucks feed when the reward asset
+    // is DBX (the default and the asset every dexie incentive program pays),
+    // otherwise -- and as fallback while the feed is cold -- the same
+    // pseudo-price valuation fills use.  No price this heartbeat -> defer
+    // the WHOLE scan; rewards are daily, and booking at a fabricated price
+    // is the bug class the P&L overhaul removed.
+    double usd_per_unit = 0.0;
+    if (asset == AccountingConfig{}.reward_asset_id) {
+        if (auto it = coingecko_prices_.find("dexie-bucks");
+            it != coingecko_prices_.end() && it->second > 0.0) {
+            usd_per_unit = it->second;
+        }
+    }
+    const double mojos_per_unit = (asset == "xch") ? 1e12 : 1e3;
+    if (usd_per_unit <= 0.0) {
+        const Mojo pseudo = asset_usd_pseudo_price(asset);
+        if (pseudo > 0) {
+            usd_per_unit = static_cast<double>(pseudo)
+                         / static_cast<double>(kMojosPerXch);
+        }
+    }
+
+    const auto now = std::chrono::system_clock::now();
+    std::size_t booked = 0;
+    Mojo        booked_mojos = 0;
+    double      booked_usd   = 0.0;
+
+    for (const auto& t : txs) {
+        const int         type   = t.value("type", -1);
+        const Mojo        amount = static_cast<Mojo>(t.value("amount", 0));
+        const BlockHeight height = static_cast<BlockHeight>(
+            t.value("confirmed_at_height", 0));
+
+        if (!accounting::is_reward_inflow(
+                type, amount, height, genesis_block,
+                acc.reward_max_mojos_per_coin,
+                outgoing.count({height, amount}) > 0)) {
+            continue;
+        }
+
+        const std::string tx_name = t.value("name", std::string{});
+        if (tx_name.empty()) continue;   // no stable idempotency key
+
+        if (usd_per_unit <= 0.0) {
+            spdlog::info("[Engine] Reward ingest: {} inflow of {} mojos at "
+                         "block {} detected but no FMV available this "
+                         "heartbeat -- deferred",
+                         asset.substr(0, 12), amount, height);
+            co_return;
+        }
+
+        const auto val = accounting::value_reward(
+            amount, mojos_per_unit, usd_per_unit);
+        if (val.fmv_pseudo_price <= 0) continue;
+
+        // 1. Journal first (crash-consistent, and the idempotency gate).
+        DbLedgerEntry e;
+        e.entry_time   = PnLTracker::timestamp_to_iso(now);
+        e.event_type   = "reward";
+        e.event_id     = "reward:" + tx_name;
+        e.leg          = "reward";
+        e.asset_id     = asset;
+        e.delta_mojos  = amount;
+        e.block_height = height;
+        e.note         = accounting::reward_note(val.income_usd,
+                                                 usd_per_unit, tx_name);
+
+        const auto inserted = db_->append_ledger_entries({e});
+        if (!inserted) {
+            // Mirror the fill path: a dropped leg leaves the books
+            // permanently short, so stand the control down honestly.
+            ledger_incomplete_ = true;
+            spdlog::error("[Engine] Reward ingest: ledger write FAILED for "
+                          "tx {} -- invariant control disabled until "
+                          "restart", tx_name.substr(0, 18));
+            co_return;
+        }
+        if (*inserted == 0) continue;    // already booked (restart/re-scan)
+
+        // 2. Cost basis: fold the quantity in at the receipt FMV.
+        inventory_->record_buy(asset, amount, val.fmv_pseudo_price,
+                               height, now);
+
+        // 3. Other income, kept out of trading P&L.
+        pnl_->add_reward_income_usd(val.income_usd);
+
+        booked      += 1;
+        booked_mojos += amount;
+        booked_usd   += val.income_usd;
+        spdlog::info("[Engine] Reward income: {} +{} mojos at block {} "
+                     "(FMV ${:.6f} @ ${:.6f}/unit, tx {})",
+                     asset.substr(0, 12), amount, height, val.income_usd,
+                     usd_per_unit, tx_name.substr(0, 18));
+    }
+
+    if (booked > 0) {
+        persist_inventory_state();
+        spdlog::info("[Engine] Reward ingest: booked {} reward inflow(s) "
+                     "totaling {} mojos (${:.6f} other income at receipt "
+                     "FMV) at block {}",
+                     booked, booked_mojos, booked_usd, block_height);
+    }
+    co_return;
+}
+
 void Engine::step_check_ledger_invariant(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
@@ -11449,6 +11634,9 @@ void Engine::step_export_metrics(BlockHeight block_height)
     ps.usd_realized   = total.realized_pnl_usd;
     ps.usd_unrealized = total.unrealized_pnl_usd;
     ps.usd_fees       = total.fee_pnl_usd;
+    // [REWARD-INCOME 2026-08-01] Other income beside the trading figures;
+    // not part of ps.usd.
+    ps.usd_reward_income = total.reward_income_usd;
     metrics_->update_pnl(ps);
 
     // Dashboard 2: Inventory

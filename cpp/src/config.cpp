@@ -2211,6 +2211,14 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     read_u32 ("max_balance_age_blocks", cfg.max_balance_age_blocks);
     read_u32 ("observation_window",     cfg.observation_window);
     read_bool("auto_adjust_enabled",    cfg.auto_adjust_enabled);
+    // [REWARD-INCOME 2026-08-01] Dexie reward ingestion; defaults are the
+    // operative values (see config.hpp for the measured calibration).
+    read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
+    if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
+        && !node["reward_asset_id"].IsNull()) {
+        cfg.reward_asset_id = node["reward_asset_id"].as<std::string>();
+    }
+    read_i64 ("reward_max_mojos_per_coin", cfg.reward_max_mojos_per_coin);
     read_bool("peg_monitor_enabled",    cfg.peg_monitor_enabled);
     read_dbl ("peg_external_warn_pct",  cfg.peg_external_warn_pct);
     read_dbl ("peg_implied_warn_pct",   cfg.peg_implied_warn_pct);
@@ -2249,6 +2257,9 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     if (cfg.floor_xch_mojos < 0 || cfg.floor_cat_mojos < 0
         || cfg.fee_slack_mojos < 0) {
         throw ConfigError(sec + " mojo floors must be >= 0");
+    }
+    if (cfg.reward_max_mojos_per_coin < 0) {
+        throw ConfigError(sec + ".reward_max_mojos_per_coin must be >= 0");
     }
 
     return cfg;

@@ -161,6 +161,10 @@ void MetricsExporter::register_metrics()
     pnl_usd_realized_   = &pnl_usd_family_->Add({{"component", "realized"}});
     pnl_usd_unrealized_ = &pnl_usd_family_->Add({{"component", "unrealized"}});
     pnl_usd_fees_       = &pnl_usd_family_->Add({{"component", "fees"}});
+    // [REWARD-INCOME 2026-08-01] Other income, beside the trading
+    // components; deliberately not folded into component="total".
+    pnl_usd_reward_income_ =
+        &pnl_usd_family_->Add({{"component", "reward_income"}});
 
     // ---------------------------------------------------------------
     //  Dashboard 2: Inventory
@@ -358,6 +362,9 @@ void MetricsExporter::update_pnl(const MetricsPnlSnapshot& summary)
     if (pnl_usd_realized_)   pnl_usd_realized_->Set(summary.usd_realized);
     if (pnl_usd_unrealized_) pnl_usd_unrealized_->Set(summary.usd_unrealized);
     if (pnl_usd_fees_)       pnl_usd_fees_->Set(summary.usd_fees);
+    if (pnl_usd_reward_income_) {
+        pnl_usd_reward_income_->Set(summary.usd_reward_income);
+    }
 }
 
 // ===================================================================

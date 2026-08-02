@@ -92,6 +92,12 @@ struct PnLSummary {
     double realized_pnl_usd;        ///< spread capture, in USD.
     double unrealized_pnl_usd;      ///< inventory mark-to-market, in USD.
     double fee_pnl_usd;             ///< fees (negative = cost), in USD.
+    // [REWARD-INCOME 2026-08-01] Dexie DBX liquidity rewards recognized at
+    // receipt fair value.  OTHER INCOME: surfaced next to the trading
+    // figures but deliberately NOT included in total_pnl_usd -- trading
+    // P&L stays a measure of trading.  Populated on the cross-pair total
+    // only (rewards are per-account, not per-pair).
+    double reward_income_usd{0.0};
     double sharpe_ratio;            ///< Annualised Sharpe ratio.
     double max_drawdown;            ///< Maximum peak-to-trough decline [0,1].
     double profit_factor;           ///< gross_profit / gross_loss (>1 good).
@@ -230,12 +236,28 @@ public:
                      Mojo realized_pnl);
 
     /// Record a fee event that is not associated with a specific fill.
-    /// Used for DBX incentive income (positive) and standalone blockchain
-    /// fees (negative).
+    /// Standalone blockchain fees (negative).  NOTE [REWARD-INCOME
+    /// 2026-08-01]: DBX incentive income does NOT go through here any
+    /// more -- record_fee lands in fee_pnl, which is part of trading P&L,
+    /// and the agreed treatment books rewards as separate other income.
+    /// Use add_reward_income_usd instead.
     ///
     /// @param pair_name  Trading pair this fee relates to ("" for global).
     /// @param amount     Fee amount in mojos (positive = income).
     void record_fee(const std::string& pair_name, Mojo amount);
+
+    // -- Reward income ([REWARD-INCOME 2026-08-01]) ------------------------
+
+    /// Accumulate dexie liquidity-reward income recognized at receipt fair
+    /// value (USD).  Kept SEPARATE from spread/inventory/fee P&L; surfaced
+    /// via PnLSummary::reward_income_usd and its Prometheus gauge.  The
+    /// caller journals the receipt to the ledger first (event_type
+    /// 'reward', FMV in the note); rehydrate_from_db rebuilds this
+    /// accumulator from those rows, so restarts are invariant.
+    void add_reward_income_usd(double usd);
+
+    /// Cumulative reward income in USD (live accumulation + rehydrated).
+    [[nodiscard]] double get_reward_income_usd() const;
 
     // -- Mark-to-market ---------------------------------------------------
 
@@ -473,6 +495,11 @@ private:
 
     /// Current XCH/USD rate for USD conversion.  Updated by mark_to_market().
     double xch_usd_rate_ = 0.0;
+
+    /// [REWARD-INCOME 2026-08-01] Cumulative dexie reward income at receipt
+    /// FMV, USD.  Separate from every trading accumulator; rebuilt from the
+    /// ledger's 'reward' rows on init (rehydrate_from_db).
+    double reward_income_usd_ = 0.0;
 
     // -- Per-pair unit conversions (PNL-UNITS 2026-07-30) ------------------
 

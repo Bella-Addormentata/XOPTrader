@@ -71,6 +71,9 @@ struct MetricsPnlSnapshot {
     double usd_realized{0.0};   // spread capture
     double usd_unrealized{0.0}; // inventory mark-to-market
     double usd_fees{0.0};       // blockchain fees (negative = cost)
+    // [REWARD-INCOME 2026-08-01] Dexie DBX rewards at receipt FMV.  OTHER
+    // INCOME: exported beside the trading components but NOT part of `usd`.
+    double usd_reward_income{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -298,6 +301,7 @@ private:
     prometheus::Gauge* pnl_usd_realized_{nullptr};
     prometheus::Gauge* pnl_usd_unrealized_{nullptr};
     prometheus::Gauge* pnl_usd_fees_{nullptr};
+    prometheus::Gauge* pnl_usd_reward_income_{nullptr};
 
     // -- Dashboard 2: Inventory gauges (label-keyed) -------------------------
 

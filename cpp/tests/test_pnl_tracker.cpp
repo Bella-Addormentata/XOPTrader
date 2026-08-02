@@ -15,12 +15,15 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/accounting/reward_ingest.hpp>
+#include <xop/database.hpp>
 #include <xop/monitoring/pnl.hpp>
 #include <xop/types.hpp>
 
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <limits>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -408,6 +411,82 @@ TEST_F(PnLTrackerTest, TradeHistoryCsvMirrorsFills) {
     EXPECT_NE(row.find("XCH/wUSDC.b"), std::string::npos);
     EXPECT_NE(row.find(",500,"), std::string::npos)
         << "realized quote mojos must appear in the row";
+}
+
+// ---------------------------------------------------------------------------
+// [REWARD-INCOME 2026-08-01] Reward income: separate accumulator, restart-
+// invariant via the ledger (acceptance: "restart-invariance").
+//
+// Production layout is reproduced exactly: Database owns ledger_entries and
+// PnLTracker opens the SAME SQLite file (both are constructed on
+// config.database.path); reward receipts are journaled with their receipt
+// FMV in the note, and a fresh tracker rebuilds the income total from those
+// rows alone.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, RewardIncomeRebuildsFromLedgerAcrossRestart) {
+    const std::string dbx =
+        "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20";
+
+    // The two most recent live bursts, valued at the live ~$0.0137/DBX.
+    const auto v1 = xop::accounting::value_reward(1'381, 1e3, 0.0137);
+    const auto v2 = xop::accounting::value_reward(618, 1e3, 0.0137);
+    const double expected = v1.income_usd + v2.income_usd;  // $0.0273863
+
+    {
+        xop::Database db(db_path_);
+        auto mk = [&](const char* txid, xop::Mojo amt, double usd) {
+            xop::DbLedgerEntry e;
+            e.entry_time   = "2026-07-31T19:13:14.000Z";
+            e.event_type   = "reward";
+            e.event_id     = std::string("reward:") + txid;
+            e.leg          = "reward";
+            e.asset_id     = dbx;
+            e.delta_mojos  = amt;
+            e.block_height = 9'085'813;
+            e.note = xop::accounting::reward_note(usd, 0.0137, txid);
+            return e;
+        };
+        ASSERT_EQ(db.append_ledger_entries({
+            mk("0xaaa1", 1'381, v1.income_usd),
+            mk("0xbbb2", 618, v2.income_usd),
+            // An adjusting entry must NOT count as reward income.
+            [&] {
+                xop::DbLedgerEntry e;
+                e.entry_time  = "2026-07-31T19:20:00.000Z";
+                e.event_type  = "adjust";
+                e.event_id    = "adjust:" + dbx + ":9085900";
+                e.leg         = "adjust";
+                e.asset_id    = dbx;
+                e.delta_mojos = 500;
+                e.note = "unexplained divergence reconciled to wallet";
+                return e;
+            }(),
+        }).value_or(0), 3u);
+    }
+
+    // "Restart": a fresh tracker over the same file rebuilds the total
+    // from the ledger.  Must FAIL if rehydration silently loads nothing.
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    ASSERT_NEAR(t.get_reward_income_usd(), expected, 1e-9);
+    EXPECT_NEAR(t.get_reward_income_usd(), 0.0273863, 1e-6);
+
+    // Live accumulation stacks on top of the rehydrated total.
+    t.add_reward_income_usd(0.0100);
+    EXPECT_NEAR(t.get_reward_income_usd(), expected + 0.0100, 1e-9);
+
+    // Surfaced beside the trading figures but NOT summed into them: with
+    // zero trades the trading total stays exactly 0 despite the income.
+    const auto s = t.get_total_pnl();
+    EXPECT_NEAR(s.reward_income_usd, expected + 0.0100, 1e-9);
+    EXPECT_DOUBLE_EQ(s.total_pnl_usd, 0.0);
+    EXPECT_DOUBLE_EQ(s.realized_pnl_usd, 0.0);
+    EXPECT_DOUBLE_EQ(s.fee_pnl_usd, 0.0);
+
+    // Garbage guards: negative / NaN contributions are ignored.
+    t.add_reward_income_usd(-5.0);
+    t.add_reward_income_usd(std::numeric_limits<double>::quiet_NaN());
+    EXPECT_NEAR(t.get_reward_income_usd(), expected + 0.0100, 1e-9);
 }
 
 // ---------------------------------------------------------------------------

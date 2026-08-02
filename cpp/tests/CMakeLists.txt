@@ -71,6 +71,7 @@ add_executable(xop_tests
     test_published_mid.cpp
     test_exposure_gate.cpp
     test_reservation_offset.cpp
+    test_reward_ingest.cpp
 )
 
 target_link_libraries(xop_tests

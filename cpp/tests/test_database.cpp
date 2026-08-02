@@ -562,3 +562,51 @@ TEST(DatabaseTest, RecentSnapshotMidsAscendingFilteredAndLimited) {
     EXPECT_TRUE(db.get_recent_snapshot_mids("NOPE/PAIR", 50).empty());
 }
 
+// ============================================================================
+// [REWARD-INCOME 2026-08-01] A rewarded inflow is EXPLAINED flow: once the
+// 'reward' entry is posted, the ledger balance equals the wallet balance and
+// the invariant control (which compares ledger_balances() against the
+// wallet's confirmed balance) sees zero divergence -- no blind adjusting
+// entry.  Numbers are the live DBX state: opening 775,285 mojos, fills
+// +201,294, the last two reward bursts 1,381 + 618 mojos.
+// ============================================================================
+
+TEST(DatabaseTest, RewardedInflowIsExplainedFlowNotDivergence) {
+    TempDbPath temp("ledger_reward");
+    xop::Database db(temp.path().string());
+
+    const std::string dbx =
+        "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20";
+
+    ASSERT_TRUE(db.append_ledger_entries({
+        leg("genesis:" + dbx, "opening", dbx, 775'285, "opening"),
+        leg("fill-1", "quote", dbx, 100'000),
+        leg("fill-2", "quote", dbx, 101'294),
+    }).has_value());
+
+    // Wallet then receives two reward bursts.  BEFORE the reward entries
+    // are posted, the books are short by exactly the reward amount -- the
+    // old failure mode, where the gap could only become an 'adjust' entry.
+    const xop::Mojo wallet_confirmed = 775'285 + 201'294 + 1'381 + 618;
+    EXPECT_EQ(db.ledger_balances().at(dbx) - wallet_confirmed, -1'999)
+        << "unbooked rewards must show as ledger-short divergence";
+
+    // step_ingest_reward_inflows posts one 'reward' entry per coin batch
+    // member; idempotency key is the wallet transaction id.
+    ASSERT_EQ(db.append_ledger_entries({
+        leg("reward:0xaaa1", "reward", dbx, 1'381, "reward"),
+        leg("reward:0xbbb2", "reward", dbx, 618, "reward"),
+    }).value_or(0), 2u);
+
+    // Explained: books tie to the wallet exactly; the invariant's
+    // divergence (ledger - wallet) is zero.
+    EXPECT_EQ(db.ledger_balances().at(dbx), wallet_confirmed);
+
+    // Re-posting the same rewards after a crash/restart is a no-op (the
+    // (event_id, leg, asset) uniqueness), so nothing double-books.
+    EXPECT_EQ(db.append_ledger_entries({
+        leg("reward:0xaaa1", "reward", dbx, 1'381, "reward"),
+    }).value_or(99), 0u);
+    EXPECT_EQ(db.ledger_balances().at(dbx), wallet_confirmed);
+}
+

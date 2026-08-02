@@ -1518,6 +1518,34 @@ struct AccountingConfig {
     ///   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
     bool     auto_adjust_enabled{true};
 
+    // -- Dexie reward income ingestion ([REWARD-INCOME 2026-08-01]) --------
+    //
+    // Every offer submission passes claim_rewards=true, so dexie pays DBX
+    // liquidity incentives -- previously booked NOWHERE, surfacing as
+    // wallet-vs-books divergence that the invariant's adjusting entries
+    // absorbed (income reclassified as "unexplained discrepancy").  With
+    // this on, the engine scans the reward asset's wallet each heartbeat
+    // for dexie's daily payout bursts (many small plain incoming
+    // transactions in one block; measured 1-219 mojos per coin vs
+    // >= 100,589 mojos for the smallest trading flow), books each as a
+    // 'reward' ledger entry at CoinGecko fair value, folds the quantity
+    // into the cost basis at that FMV, and accumulates the USD as reward
+    // income SEPARATE from trading P&L.  Detection evidence and treatment:
+    // accounting/reward_ingest.hpp.
+    bool     reward_ingest_enabled{true};
+
+    /// Asset the rewards arrive in: DBX (dexie bucks), mainnet CAT id.
+    /// Matches the rewardRate asset of every program on /v1/incentives.
+    std::string reward_asset_id{
+        "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"};
+
+    /// Per-coin ceiling (mojos) separating reward coins from trading
+    /// flows.  Measured reward coins: 1-219 mojos (41 daily bursts,
+    /// 2026-06-11..07-31).  Smallest observed trading flow: 100,589
+    /// mojos.  2,000 (2 DBX) gives ~10x headroom over the largest
+    /// observed reward coin while staying 50x below the smallest trade.
+    std::int64_t reward_max_mojos_per_coin{2'000LL};
+
     // -- Stablecoin peg monitor (2026-07-30) -------------------------------
     //
     // Accounting values wUSDC.b / wUSDC / USDS at exactly $1.00 -- they are

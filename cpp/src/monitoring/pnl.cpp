@@ -20,6 +20,8 @@
 
 #include "xop/monitoring/pnl.hpp"
 
+#include "xop/accounting/reward_ingest.hpp"
+
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
@@ -431,6 +433,73 @@ void PnLTracker::rehydrate_from_db()
                  "(fills={} spread_pnl_raw_quote_mojos={} fee_pnl={})",
                  pairs, total_pnl_.fill_count, total_pnl_.spread_pnl,
                  total_pnl_.fee_pnl);
+
+    // -- [REWARD-INCOME 2026-08-01] Rebuild reward income from the ledger --
+    // Reward receipts are journaled as 'reward' rows in ledger_entries
+    // (same SQLite file: the engine constructs both Database and PnLTracker
+    // on config.database.path), with the USD fair value at receipt embedded
+    // in the note by accounting::reward_note.  Summing the parsed notes here
+    // makes the accumulator restart-invariant like the USD totals.  The
+    // table may not exist when the tracker runs standalone (tests, tools);
+    // that is a clean "no rewards yet", not an error.
+    static constexpr const char* kRewardSql = R"SQL(
+        SELECT COALESCE(note, ''), delta_mojos
+        FROM ledger_entries
+        WHERE event_type = 'reward';
+    )SQL";
+
+    sqlite3_stmt* rstmt = nullptr;
+    rc = sqlite3_prepare_v2(db_, kRewardSql, -1, &rstmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::debug("PnLTracker: no ledger_entries table for reward "
+                      "rehydration ({}) -- reward income starts at 0",
+                      sqlite3_errmsg(db_));
+        return;
+    }
+
+    // NOTE: mtx_ is still held by the lock_guard taken for the trade_log
+    // replay above (its scope is the rest of this function), so the
+    // accumulator write below is already protected -- re-locking here would
+    // self-deadlock on the non-recursive mutex.
+    double      reward_usd  = 0.0;
+    std::size_t reward_rows = 0;
+    Mojo        reward_mojos = 0;
+    while (sqlite3_step(rstmt) == SQLITE_ROW) {
+        const char* note_text = reinterpret_cast<const char*>(
+            sqlite3_column_text(rstmt, 0));
+        reward_usd += accounting::parse_reward_fmv_usd(
+            note_text ? note_text : "");
+        reward_mojos += sqlite3_column_int64(rstmt, 1);
+        ++reward_rows;
+    }
+    reward_income_usd_ = reward_usd;
+    sqlite3_finalize(rstmt);
+
+    if (reward_rows > 0) {
+        spdlog::info("PnLTracker: rehydrated {} reward receipts from the "
+                     "ledger ({} mojos, ${:.6f} income at receipt FMV)",
+                     reward_rows, reward_mojos, reward_usd);
+    }
+}
+
+// =========================================================================
+// Reward income ([REWARD-INCOME 2026-08-01])
+// =========================================================================
+
+void PnLTracker::add_reward_income_usd(double usd)
+{
+    // NaN/negative-safe: income is recognized at receipt and only grows.
+    if (!(usd > 0.0) || !(usd < 1e12)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+    reward_income_usd_ += usd;
+}
+
+double PnLTracker::get_reward_income_usd() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    return reward_income_usd_;
 }
 
 void PnLTracker::set_pair_conversion(const std::string& pair_name,
@@ -1321,6 +1390,11 @@ PnLSummary PnLTracker::get_total_pnl() const
     std::lock_guard<std::mutex> lock(mtx_);
     PnLSummary s = build_summary(total_pnl_, xch_usd_rate_);
     fill_usd_components_locked(s, /*pair_name=*/"");
+
+    // [REWARD-INCOME 2026-08-01] Surfaced, NOT summed: reward income is
+    // other income (recognized at receipt FMV), deliberately kept out of
+    // total_pnl_usd so the trading P&L stays a measure of trading.
+    s.reward_income_usd = reward_income_usd_;
 
     // [PNL-USD-TOTALS 2026-08-01] Rebuild the cross-pair profit factor from
     // USD-normalized grosses.  build_summary's ratio over total_pnl_'s raw

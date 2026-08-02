@@ -528,6 +528,20 @@ private:
     /// what lets the control tighten to near-exact between quoting cycles.
     [[nodiscard]] Mojo live_offer_exposure(const AssetId& asset_id) const;
 
+    /// [REWARD-INCOME 2026-08-01] Detect dexie DBX liquidity-reward inflows
+    /// on the reward asset's wallet (daily bursts of micro incoming
+    /// transactions -- detection evidence in accounting/reward_ingest.hpp)
+    /// and book each one: 'reward' ledger entry at CoinGecko fair value,
+    /// quantity folded into the cost basis at that FMV, USD accumulated as
+    /// reward income separate from trading P&L.  MUST run before
+    /// step_check_ledger_invariant in the same heartbeat so a rewarded
+    /// inflow is explained flow by the time the books are tied to the
+    /// wallet, not "unexplained divergence" for the adjusting entries to
+    /// absorb.  Idempotent per wallet transaction (ledger event_id
+    /// uniqueness), so re-scans and restarts never double-book.
+    asio::awaitable<void> step_ingest_reward_inflows(
+        BlockHeight block_height);
+
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
     /// accounting.pause_enabled is set.
