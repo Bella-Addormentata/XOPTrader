@@ -614,9 +614,43 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 fill.offer_id     = trade_id;
                 fill.pair_name    = po.pair_name;
                 fill.side         = po.side;
-                fill.price        = po.price;
-                fill.size         = po.size;
                 fill.timestamp    = std::chrono::system_clock::now();
+
+                // [SETTLED-FIX 2026-08-02] Populate price/size from the
+                // SETTLED amounts in the wallet record's summary, not the
+                // POSTED PendingOffer values.  Copying the posted values
+                // silently discarded the executed amounts, so any
+                // settled-vs-posted divergence (partial settlement of a
+                // splittable offer, taker-side rounding) corrupted the
+                // trade_log and P&L.  Fall back to posted values with a
+                // WARNING when the summary is absent or malformed --
+                // never silently.  Conversion formula + dimensional
+                // analysis: see parse_settled_fill below.
+                const auto pc_it = pair_config_map_.find(po.pair_name);
+                std::optional<SettledFill> settled;
+                if (pc_it != pair_config_map_.end()) {
+                    settled = parse_settled_fill(rec, po.side, pc_it->second);
+                }
+                if (settled.has_value()) {
+                    fill.price = settled->price;
+                    fill.size  = settled->size;
+                    if (settled->size != po.size ||
+                        settled->price != po.price) {
+                        logger_->info(
+                            "detect_fills: {} settled amounts differ from "
+                            "posted (size {} -> {}, price {} -> {})",
+                            trade_id.substr(0, 12), po.size, settled->size,
+                            po.price, settled->price);
+                    }
+                } else {
+                    fill.price = po.price;
+                    fill.size  = po.size;
+                    logger_->warn(
+                        "detect_fills: {} settled summary missing or "
+                        "unparseable -- falling back to POSTED size={} "
+                        "price={}",
+                        trade_id.substr(0, 12), po.size, po.price);
+                }
                 // [FEE-FIX 2026-07-30] Capture the offer-creation fee NOW,
                 // while the PendingOffer is still tracked.  The engine used
                 // to look the fee up from State after this function had
@@ -647,7 +681,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 // being removed.  The wallet's confirmed fill is the
                 // authoritative record; inventory discrepancy is correctable
                 // but a missed fill is not.
-                auto pc_it = pair_config_map_.find(po.pair_name);
+                // (pc_it was resolved above for the settled-amount parse.)
                 if (pc_it == pair_config_map_.end()) {
                     logger_->error(
                         "detect_fills: no pair config for '{}' -- "
@@ -655,16 +689,19 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                         po.pair_name, trade_id.substr(0, 12));
                 } else {
                     const auto& pc = pc_it->second;
+                    // [SETTLED-FIX 2026-08-02] Position accounting uses the
+                    // fill's (settled when available) size/price so that
+                    // inventory moves match what actually settled on-chain.
                     const double quote_mojos_dbl = quote_mojos_for(
-                        static_cast<double>(po.size),
-                        static_cast<double>(po.price),
+                        static_cast<double>(fill.size),
+                        static_cast<double>(fill.price),
                         static_cast<double>(pc.base_mojos_per_unit),
                         static_cast<double>(pc.quote_mojos_per_unit));
                     const Mojo quote_mojos = static_cast<Mojo>(std::llround(quote_mojos_dbl));
 
                     if (po.side == Side::Bid) {
                         // Bid fill: we BOUGHT base asset (pc.base_asset_id) and SOLD quote asset (pc.quote_asset_id).
-                        state_->record_buy(pc.base_asset_id, po.size, po.price);
+                        state_->record_buy(pc.base_asset_id, fill.size, fill.price);
                         // [GUARD-FIX 2026-07-30] The prior condition
                         // (quote != "xch" || base != "xch") was a tautology
                         // (no pair has xch on both legs), so the intended
@@ -680,7 +717,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                         }
                     } else {
                         // Ask fill: we SOLD base asset (pc.base_asset_id) and BOUGHT quote asset (pc.quote_asset_id).
-                        bool sold = state_->record_sell(pc.base_asset_id, po.size);
+                        bool sold = state_->record_sell(pc.base_asset_id, fill.size);
                         if (!sold) {
                             logger_->error(
                                 "record_sell failed for {} (asset={}) "
@@ -698,7 +735,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
 
                 logger_->info("FILL {} {} {} mojos @ {} mojos [{}]",
                               (po.side == Side::Bid) ? "BID" : "ASK",
-                              po.pair_name, po.size, po.price,
+                              po.pair_name, fill.size, fill.price,
                               trade_id.substr(0, 12));
 
                 // Remove from pending offers.
@@ -2865,6 +2902,125 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     }
 
     return po;
+}
+
+// ---------------------------------------------------------------------------
+// parse_settled_fill -- extract SETTLED size/price from a confirmed trade
+//                       record for Fill construction (see header contract).
+//
+// Dimensional analysis (write it out -- this codebase has hit 1e9-class
+// unit errors twice):
+//
+//   The wallet summary carries RAW MOJOS of each asset:
+//     XCH : 1 unit = 1e12 mojos  (base_mojos_per_unit / quote_mojos_per_unit)
+//     CATs: 1 unit = 1e3  mojos
+//
+//   Engine Fill convention (must match build_offer_dict / quote_mojos_for):
+//     size  [base mojos]   = base_units * base_mojos_per_unit
+//     price [pseudo-mojos] = quote_units_per_base_unit * kMojosPerXch
+//
+//   From settled raw mojos:
+//     base_units  = base_mojos  / base_denom
+//     quote_units = quote_mojos / quote_denom
+//     price = (quote_units / base_units) * kMojosPerXch
+//           = quote_mojos * base_denom * kMojosPerXch
+//             / (base_mojos * quote_denom)                          ... (*)
+//
+//   Roundtrip proof against the canonical helper (types.hpp):
+//     quote_mojos_for(size, price, base_denom, quote_denom)
+//       = base_mojos * (*) * quote_denom / (base_denom * kMojosPerXch)
+//       = quote_mojos                                               [exact]
+//
+//   Worked example, XCH/wUSDC.b ask (base XCH 1e12, quote CAT 1e3):
+//     settled: gave 1 XCH (1e12 base mojos), got 20 wUSDC.b (20'000
+//     quote mojos).  price = 20'000 * 1e12 * 1e12 / (1e12 * 1e3)
+//     = 20e12 = 20 quote-units-per-base * kMojosPerXch.  Correct.
+//     Omitting the base_denom/quote_denom ratio (1e9 for XCH/CAT
+//     pairs) would yield 20e3 -- the classic 1e9-class error.
+//
+// Computation in double: the numerator can reach ~1e12 * 1e12 * 1e12
+// = 1e36 which overflows int64 (double keeps ~15-16 significant digits,
+// ample for prices whose true precision is bounded by mojo granularity).
+// ---------------------------------------------------------------------------
+
+std::optional<SettledFill> OfferManager::parse_settled_fill(
+    const json&       trade_record,
+    Side              side,
+    const PairConfig& pair)
+{
+    if (!trade_record.contains("summary") ||
+        !trade_record["summary"].is_object()) {
+        return std::nullopt;
+    }
+    const auto& summary = trade_record["summary"];
+
+    // Parse offered / requested asset -> raw-mojo maps.  Tolerates the
+    // integer, unsigned, and string encodings observed across Chia wallet
+    // versions (same tolerance as try_parse_wallet_offer above).
+    std::unordered_map<std::string, Mojo> offered;    // we gave
+    std::unordered_map<std::string, Mojo> requested;  // we got
+
+    auto parse_side_map = [](const json& obj,
+                             std::unordered_map<std::string, Mojo>& out) {
+        if (!obj.is_object()) return;
+        for (auto& [asset_id, amount_val] : obj.items()) {
+            if (amount_val.is_number_integer()) {
+                out[asset_id] = amount_val.get<Mojo>();
+            } else if (amount_val.is_number_unsigned()) {
+                out[asset_id] = static_cast<Mojo>(
+                    amount_val.get<std::uint64_t>());
+            } else if (amount_val.is_string()) {
+                try {
+                    out[asset_id] = static_cast<Mojo>(
+                        std::stoll(amount_val.get<std::string>()));
+                } catch (...) {}
+            }
+        }
+    };
+
+    if (summary.contains("offered"))
+        parse_side_map(summary["offered"], offered);
+    if (summary.contains("requested"))
+        parse_side_map(summary["requested"], requested);
+
+    if (offered.empty() || requested.empty()) return std::nullopt;
+
+    // Locate the two legs on the sides our order implies.
+    //   Ask: we GAVE base, GOT quote.
+    //   Bid: we GAVE quote, GOT base.
+    const std::string& base_id  = pair.base_asset_id;
+    const std::string& quote_id = pair.quote_asset_id;
+
+    const auto& base_side  = (side == Side::Ask) ? offered   : requested;
+    const auto& quote_side = (side == Side::Ask) ? requested : offered;
+
+    const auto b_it = base_side.find(base_id);
+    const auto q_it = quote_side.find(quote_id);
+    if (b_it == base_side.end() || q_it == quote_side.end()) {
+        return std::nullopt;
+    }
+
+    const Mojo base_mojos  = b_it->second;
+    const Mojo quote_mojos = q_it->second;
+    if (base_mojos <= 0 || quote_mojos <= 0) return std::nullopt;
+    if (pair.base_mojos_per_unit <= 0 || pair.quote_mojos_per_unit <= 0) {
+        return std::nullopt;
+    }
+
+    // Formula (*) from the dimensional analysis above.
+    const double price_d =
+        static_cast<double>(quote_mojos)
+        * static_cast<double>(pair.base_mojos_per_unit)
+        * static_cast<double>(kMojosPerXch)
+        / (static_cast<double>(base_mojos)
+           * static_cast<double>(pair.quote_mojos_per_unit));
+
+    if (!std::isfinite(price_d) || price_d <= 0.0) return std::nullopt;
+
+    SettledFill sf;
+    sf.size  = base_mojos;
+    sf.price = static_cast<Mojo>(std::llround(price_d));
+    return sf;
 }
 
 // ---------------------------------------------------------------------------

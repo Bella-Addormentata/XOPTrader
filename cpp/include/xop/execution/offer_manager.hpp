@@ -157,6 +157,16 @@ struct OrphanEvaluation {
     std::string        reason;              ///< Human-readable explanation.
 };
 
+// ---------------------------------------------------------------------------
+// SettledFill -- settled (executed) amounts extracted from a CONFIRMED
+//                wallet trade record, converted to the engine's
+//                base-mojos size + pseudo-price convention.
+// ---------------------------------------------------------------------------
+struct SettledFill {
+    Mojo size{0};   ///< Settled base-asset amount (raw base mojos).
+    Mojo price{0};  ///< Settled pseudo-price: quote_units_per_base * 1e12.
+};
+
 struct RebalanceSnapshot {
     Mojo        mid_price{0};                  ///< Mid-price at last rebalance.
     BlockHeight block_height{0};               ///< Block height at last rebalance.
@@ -577,6 +587,41 @@ public:
     std::optional<PendingOffer> try_parse_wallet_offer(
         const nlohmann::json& trade_record,
         BlockHeight current_block) const;
+
+    /**
+     * @brief Extract the SETTLED size and price for a confirmed fill.
+     *
+     * detect_fills() historically copied the POSTED price/size from the
+     * tracked PendingOffer into the Fill, silently discarding the settled
+     * amounts carried in the wallet trade record's "summary" field
+     * (offered / requested / fees).  When the settled amounts differ from
+     * the posted ones (e.g. partial settlement of a splittable offer),
+     * the trade_log and P&L inherit the divergence.  This helper parses
+     * the summary and converts the raw settled mojo amounts into the
+     * engine's Fill convention:
+     *
+     *   size  = settled base-asset amount in raw base mojos
+     *   price = pseudo-price = quote_units_per_base_unit * kMojosPerXch
+     *         = quote_mojos * base_mojos_per_unit * kMojosPerXch
+     *           / (base_mojos * quote_mojos_per_unit)
+     *
+     * (exact inverse of xop::quote_mojos_for -- see types.hpp).
+     *
+     * Pure and static so it is unit-testable without an RPC client.
+     * Returns std::nullopt when the summary is absent, malformed, does not
+     * contain both legs of the pair on the expected sides, or any amount
+     * is non-positive.  Callers MUST fall back to the posted values with
+     * a WARNING log in that case -- never silently.
+     *
+     * @param trade_record  Wallet trade record JSON (from get_offer).
+     * @param side          Our side of the offer (Bid = we bought base).
+     * @param pair          Pair config (asset IDs + mojo denominations).
+     * @return Settled size/price, or std::nullopt if unparseable.
+     */
+    static std::optional<SettledFill> parse_settled_fill(
+        const nlohmann::json& trade_record,
+        Side                  side,
+        const PairConfig&     pair);
 
 private:
     // -- Internal helpers ---------------------------------------------------
