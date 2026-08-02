@@ -19,6 +19,7 @@
 #include <xop/types.hpp>
 
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <filesystem>
 #include <fstream>
@@ -407,6 +408,41 @@ TEST_F(PnLTrackerTest, TradeHistoryCsvMirrorsFills) {
     EXPECT_NE(row.find("XCH/wUSDC.b"), std::string::npos);
     EXPECT_NE(row.find(",500,"), std::string::npos)
         << "realized quote mojos must appear in the row";
+}
+
+// ---------------------------------------------------------------------------
+// [SHARPE-CADENCE 2026-08-01] Sharpe annualization uses the MEASURED
+// snapshot cadence, never the 52-second chain-block constant.
+//
+// Snapshots are taken once per engine heartbeat (~19 min; median measured
+// inter-snapshot spacing 1,165 s).  Annualizing 19-minute returns at the
+// 52-second constant would multiply Sharpe by sqrt(1165/52) ~ 4.73.
+// ---------------------------------------------------------------------------
+TEST(SharpeAnnualizationTest, UsesMeasuredCadenceNotBlockConstant) {
+    const double mean  = 0.02;   // USD per snapshot interval
+    const double stdev = 0.10;
+
+    // At the measured 1,165 s heartbeat cadence:
+    //   periods/year = 31,557,600 / 1,165 = 27,088.07
+    //   sqrt         = 164.58
+    //   sharpe       = 0.2 * 164.58 = 32.916
+    const double at_heartbeat =
+        xop::PnLTracker::annualized_sharpe(mean, stdev, 1165.0);
+    EXPECT_NEAR(at_heartbeat, 0.2 * std::sqrt(31'557'600.0 / 1165.0), 1e-9);
+    EXPECT_NEAR(at_heartbeat, 32.916, 0.01);
+
+    // The 52-second constant would give 0.2 * sqrt(31,557,600/52) = 155.8
+    // -- ~4.73x larger.  The measured-cadence result must NOT be that.
+    const double at_block_const =
+        xop::PnLTracker::annualized_sharpe(mean, stdev, 52.0);
+    EXPECT_NEAR(at_block_const / at_heartbeat,
+                std::sqrt(1165.0 / 52.0), 1e-9);
+    EXPECT_LT(at_heartbeat, 0.5 * at_block_const);
+
+    // Degenerate inputs are safe.
+    EXPECT_DOUBLE_EQ(xop::PnLTracker::annualized_sharpe(mean, 0.0, 1165.0), 0.0);
+    EXPECT_DOUBLE_EQ(xop::PnLTracker::annualized_sharpe(mean, stdev, 0.0), 0.0);
+    EXPECT_DOUBLE_EQ(xop::PnLTracker::annualized_sharpe(mean, stdev, -5.0), 0.0);
 }
 
 }  // namespace

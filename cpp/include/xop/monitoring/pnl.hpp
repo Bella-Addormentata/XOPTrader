@@ -240,7 +240,8 @@ public:
     // -- Mark-to-market ---------------------------------------------------
 
     /// Recalculate inventory PnL for every tracked pair using current
-    /// market prices.  Call this once per heartbeat (~52 seconds).
+    /// market prices.  Call this once per engine heartbeat (~19 minutes
+    /// in production; the cadence is measured, not assumed).
     ///
     /// @param get_price  Callback: given (pair_name, asset_id) returns the
     ///                   current mid-price in mojos.  Return 0 if unknown.
@@ -345,6 +346,16 @@ public:
 
     /// Format a Timestamp as a date-only string "YYYY-MM-DD".
     [[nodiscard]] static std::string timestamp_to_date(Timestamp ts);
+
+    /// [SHARPE-CADENCE 2026-08-01] Annualize a per-snapshot Sharpe using
+    /// the MEASURED average interval between snapshots, in seconds.  Public
+    /// and pure so the annualization is pinned by tests: snapshots arrive
+    /// once per engine heartbeat (~19 min, median 1,165 s measured), and
+    /// annualizing with the 52-second chain-block constant would inflate
+    /// Sharpe ~4.7x.  Returns 0 for degenerate stdev or interval.
+    [[nodiscard]] static double annualized_sharpe(
+        double mean_return, double stdev_return,
+        double avg_interval_seconds);
 
 private:
     // -- Internal types ---------------------------------------------------
@@ -483,12 +494,15 @@ private:
 
     // [T8-21] EMA-smoothed mid-prices per pair for unrealized PnL.
     // Reduces mark-to-market noise from volatile spot prices.
-    // EMA alpha = 0.3 (half-life ~1.7 observations = ~90 s at 52 s heartbeat).
+    // EMA alpha = 0.3 (half-life ~1.7 observations; one observation per
+    // engine heartbeat, ~19 min in production -> half-life ~33 min).
     std::unordered_map<std::string, double> price_ema_;
 
     /// Maximum number of PnL snapshots retained for analytics.
-    /// 8640 snapshots at 52-second intervals covers ~5.2 days -- enough
-    /// for a robust annualised Sharpe estimate.
+    /// 8640 snapshots at one per ~19-minute heartbeat covers ~114 days
+    /// -- ample history for the annualised Sharpe estimate.  (An older
+    /// comment assumed 52-second snapshots / ~5.2 days; snapshots have
+    /// always been per-heartbeat.)
     static constexpr std::size_t kMaxSnapshots = 8640;
 };
 

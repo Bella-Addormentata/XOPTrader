@@ -1068,19 +1068,38 @@ void PnLTracker::mark_to_market(
 // PnL queries
 // =========================================================================
 
+double PnLTracker::annualized_sharpe(double mean_return,
+                                     double stdev_return,
+                                     double avg_interval_seconds)
+{
+    // Sharpe = mean(returns) / stdev(returns) * sqrt(periods_per_year)
+    //
+    // [SHARPE-CADENCE 2026-08-01] periods_per_year MUST come from the
+    // MEASURED snapshot cadence, never a constant.  Snapshots are taken
+    // once per engine heartbeat, and the heartbeat is ~19 minutes (median
+    // inter-snapshot spacing 1,165 s measured from the snapshots table),
+    // not the 52-second chain block time an earlier comment here claimed.
+    // Annualizing 19-minute returns with the 52-second constant would
+    // inflate Sharpe by sqrt(1165 / 52) ~ 4.7x.  This helper is public and
+    // pinned by a test so the constant cannot quietly come back.
+    if (stdev_return < 1e-12 || avg_interval_seconds <= 0.0) {
+        return 0.0;
+    }
+    constexpr double seconds_per_year = 365.25 * 24.0 * 3600.0;
+    const double periods_per_year = seconds_per_year / avg_interval_seconds;
+    return (mean_return / stdev_return) * std::sqrt(periods_per_year);
+}
+
 double PnLTracker::compute_sharpe() const
 {
     // Annualised Sharpe ratio from the PnL snapshot history.
     //
-    // Sharpe = mean(returns) / stdev(returns) * sqrt(periods_per_year)
-    //
-    // Each snapshot is taken ~52 seconds apart (one Chia block).
-    // Periods per year = 365.25 * 24 * 3600 / 52 = ~606,646.
-    //
-    // We compute returns as the difference in the USD-normalized total
-    // between consecutive snapshots.  The ratio is dimensionless; the
-    // USD normalization matters because raw quote mojos across pairs are
-    // not commensurable (PNL-USD-TOTALS 2026-08-01).
+    // Returns are differences of the USD-normalized total between
+    // CONSECUTIVE snapshots (one per engine heartbeat, ~19 min); the
+    // annualization uses the cadence measured from the snapshots' own
+    // timestamps -- see annualized_sharpe.  The USD normalization matters
+    // because raw quote mojos across pairs are not commensurable
+    // (PNL-USD-TOTALS 2026-08-01).
 
     if (pnl_history_.size() < 2) {
         return 0.0;
@@ -1104,14 +1123,9 @@ double PnLTracker::compute_sharpe() const
     }
     const double stdev = std::sqrt(sum_sq / static_cast<double>(n));
 
-    if (stdev < 1e-12) {
-        // Avoid division by near-zero.  If returns are flat, Sharpe is
-        // infinite (or undefined).  Return 0 as a safe default.
-        return 0.0;
-    }
-
-    // Annualisation factor.  We estimate the average interval between
-    // snapshots from the actual timestamps rather than assuming 52s.
+    // Annualisation: estimate the average interval between snapshots from
+    // the actual timestamps (measured cadence), never a constant -- see
+    // annualized_sharpe for the units note and the 4.7x failure mode.
     const auto span = pnl_history_.back().timestamp - pnl_history_.front().timestamp;
     const double span_seconds = static_cast<double>(
         std::chrono::duration_cast<std::chrono::seconds>(span).count());
@@ -1121,10 +1135,7 @@ double PnLTracker::compute_sharpe() const
     }
 
     const double avg_interval = span_seconds / static_cast<double>(n);
-    constexpr double seconds_per_year = 365.25 * 24.0 * 3600.0;
-    const double periods_per_year = seconds_per_year / avg_interval;
-
-    return (mean / stdev) * std::sqrt(periods_per_year);
+    return annualized_sharpe(mean, stdev, avg_interval);
 }
 
 double PnLTracker::compute_max_drawdown() const
