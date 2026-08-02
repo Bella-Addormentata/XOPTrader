@@ -808,12 +808,15 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
     const double threshold = thresholds_.at(
         static_cast<std::uint8_t>(AlertRule::PnlDrawdown));
 
-    if (state.peak_pnl <= 0) {
+    // [DRAWDOWN-USD 2026-08-02] Both fields are USD (see BotState); the
+    // ratio is unit-coherent only because numerator and denominator share
+    // that unit.
+    if (state.peak_pnl_usd <= 0.0) {
         return; // No positive peak yet -- cannot compute drawdown.
     }
 
-    const double drawdown = static_cast<double>(state.peak_pnl - state.total_pnl)
-                          / static_cast<double>(state.peak_pnl);
+    const double drawdown = (state.peak_pnl_usd - state.total_pnl_usd)
+                          / state.peak_pnl_usd;
 
     if (drawdown > threshold) {
         send_alert(AlertRule::PnlDrawdown,

@@ -843,10 +843,18 @@ private:
     // [H6] PnL high-water mark for drawdown detection in step 13 alerts.
     // Monotonically non-decreasing; updated each cycle in step_check_alerts.
     // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.
-    Mojo peak_pnl_hwm_{0};
+    //
+    // [DRAWDOWN-USD 2026-08-02] USD (double), tracking the USD-normalized
+    // PnLSummary::total_pnl_usd.  The previous Mojo peak tracked the raw
+    // cross-pair quote-mojo sum, which mixes currencies (a DBX mojo is
+    // ~1/73rd of a wUSDC.b mojo in value) and made every downstream
+    // drawdown ratio unit-incoherent.  In-memory only, re-seeded from the
+    // first cycle's USD total each start -- no persisted state carries the
+    // old unit across the change.
+    double peak_pnl_hwm_usd_{0.0};
 
-    // [MEDIUM-7] Tracks whether peak_pnl_hwm_ has been seeded with the
-    // first-cycle total_pnl.  Without this, the drawdown circuit breaker
+    // [MEDIUM-7] Tracks whether peak_pnl_hwm_usd_ has been seeded with the
+    // first-cycle USD total.  Without this, the drawdown circuit breaker
     // is bypassed entirely until the first profitable cycle -- leaving the
     // engine unprotected against losses from startup.
     // ISO/IEC 27001:2022: ensures continuous risk monitoring from first tick.
@@ -913,7 +921,8 @@ private:
     bool crossed_book_take_this_block_{false};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
-    // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
+    // Drawdown fraction = risk::hwm_drawdown_frac(peak_pnl_hwm_usd_,
+    // total_pnl_usd) -- both sides USD ([DRAWDOWN-USD 2026-08-02]).
     // When exceeded, engine transitions to BotStatus::Paused and alerts.
     // Configurable via risk.max_drawdown_pct in config.yaml; default 10%.
     // ISO/IEC 5055: named constant with documented default.
@@ -921,14 +930,19 @@ private:
 
     // [T3-36] Rolling time-window PnL loss circuit breaker.
     //
-    // Records (block_height, total_pnl_mojos) pairs each heartbeat cycle.
-    // The deque is trimmed to retain only entries within the most recent
-    // loss_window_blocks blocks; stale entries (age >= window) are discarded
-    // from the front.  The oldest surviving entry provides the baseline PnL
-    // for the window loss calculation.
+    // Records (block_height, total_pnl_USD) pairs each heartbeat cycle
+    // ([DRAWDOWN-USD 2026-08-02]: USD double, previously the raw
+    // quote-mojo sum).  The deque is trimmed to retain only entries within
+    // the most recent loss_window_blocks blocks; stale entries (age >=
+    // window) are discarded from the front.  The oldest surviving entry
+    // provides the baseline PnL for the window loss calculation.
     //
-    // Loss in window = oldest_pnl - current_pnl  (positive when losing).
-    // Threshold      = peak_pnl_hwm_ * max_window_loss_bps / 10000.
+    // Loss in window = oldest_pnl_usd - current_pnl_usd (positive = losing).
+    // Threshold      = risk::window_loss_threshold_usd(peak_pnl_hwm_usd_,
+    //                  anchor, max_window_loss_bps); the anchor falls back
+    //                  to the live 1-XCH USD value (or the conservative
+    //                  fixed nominal) when the bot has never been
+    //                  profitable.
     //
     // When loss_in_window > threshold AND threshold > 0, the engine
     // transitions to BotStatus::Paused the same way the HWM circuit breaker
@@ -936,7 +950,7 @@ private:
     //
     // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
     // ISO/IEC 5055: deque prevents unbounded memory growth.
-    std::deque<std::pair<BlockHeight, Mojo>> pnl_window_;
+    std::deque<std::pair<BlockHeight, double>> pnl_window_usd_;
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded

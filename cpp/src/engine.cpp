@@ -24,6 +24,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 
 #include "xop/accounting/reward_ingest.hpp"
+#include "xop/risk/drawdown_breaker.hpp"
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
 #include "xop/strategy/reservation_offset.hpp"
@@ -11727,30 +11728,42 @@ void Engine::step_check_alerts(BlockHeight block_height)
     }
 
     // PnL state.
+    //
+    // [DRAWDOWN-USD 2026-08-02] Everything from here down runs on the
+    // USD-normalized total (total_pnl_usd), never the raw total_pnl mojo
+    // sum.  The raw sum mixes quote currencies across pairs (a DBX mojo is
+    // ~1/73rd of a wUSDC.b mojo in value), so the drawdown and window-loss
+    // RATIOS below were unit-incoherent the moment two quote assets had
+    // traded: a modest DBX-side loss against a wUSDC.b-built peak
+    // overstated drawdown ~73x (spurious pause), and the inverse mix hid
+    // real losses.  All three consumers (HWM breaker, rolling-window
+    // breaker, check_pnl_drawdown) switch together -- a half-converted
+    // state is the dangerous configuration, which is why the fields are
+    // renamed rather than repurposed.
     auto total = pnl_->get_total_pnl();
-    bs.total_pnl = total.total_pnl;
+    bs.total_pnl_usd = total.total_pnl_usd;
 
-    // [MEDIUM-7] Seed peak_pnl_hwm_ on the very first cycle so the drawdown
-    // circuit breaker is active from startup.  Previously, peak_pnl_hwm_
-    // started at 0 and the drawdown check was gated on peak_pnl_hwm_ > 0,
+    // [MEDIUM-7] Seed the HWM on the very first cycle so the drawdown
+    // circuit breaker is active from startup.  Previously the peak
+    // started at 0 and the drawdown check was gated on peak > 0,
     // which meant the engine had ZERO drawdown protection until the first
     // profitable cycle.  If the engine started losing money from the first
     // block, the circuit breaker would never fire.
     //
-    // Fix: on the first cycle, initialize peak_pnl_hwm_ to total_pnl
-    // (which may be 0 or negative).  On subsequent cycles, the existing
-    // max() logic ensures monotonic non-decrease.
+    // Fix: on the first cycle, initialize peak_pnl_hwm_usd_ to the USD
+    // total (which may be 0 or negative).  On subsequent cycles, the
+    // existing max() logic ensures monotonic non-decrease.
     // ISO/IEC 27001:2022: continuous risk monitoring from first tick.
     // ISO/IEC 5055: deterministic initialization prevents unprotected window.
     if (!hwm_initialized_) {
-        peak_pnl_hwm_    = total.total_pnl;
-        hwm_initialized_ = true;
+        peak_pnl_hwm_usd_ = total.total_pnl_usd;
+        hwm_initialized_  = true;
     }
     // [H6] Track the PnL high-water mark across cycles for drawdown alerts.
     // ISO/IEC 5055: monotonically non-decreasing peak prevents false
-    // drawdown resets when total_pnl oscillates.
-    peak_pnl_hwm_ = std::max(peak_pnl_hwm_, total.total_pnl);
-    bs.peak_pnl  = peak_pnl_hwm_;
+    // drawdown resets when total_pnl_usd oscillates.
+    peak_pnl_hwm_usd_ = std::max(peak_pnl_hwm_usd_, total.total_pnl_usd);
+    bs.peak_pnl_usd   = peak_pnl_hwm_usd_;
 
     // Inventory exposure.
     bs.max_inventory_ratio = 0.5;  // Phase 2: compute max across all pairs.
@@ -11760,15 +11773,16 @@ void Engine::step_check_alerts(BlockHeight block_height)
     alerts_->check_and_alert(bs);
 
     // [T3-09] Max-drawdown global circuit breaker.
-    // Compute drawdown = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
-    // If the drawdown exceeds max_drawdown_pct_, transition to Paused state
-    // and alert.  This is a global safety net that prevents runaway losses.
+    // drawdown_frac = risk::hwm_drawdown_frac(peak_pnl_hwm_usd_,
+    // total_pnl_usd) -- USD on both sides ([DRAWDOWN-USD 2026-08-02]; the
+    // unit-critical arithmetic lives in risk/drawdown_breaker.hpp so tests
+    // pin it).  If the drawdown exceeds max_drawdown_pct_, transition to
+    // Paused state and alert.  Global safety net against runaway losses.
     //
-    // [MEDIUM-7] The condition now checks peak_pnl_hwm_ > 0 OR total_pnl < 0.
-    // This ensures the circuit breaker fires even when the engine has never
-    // been profitable (peak == 0) but is actively losing money.  The division
-    // by abs(peak_pnl_hwm_) is guarded: when peak is exactly 0 and PnL is
-    // negative, we treat any loss as exceeding the threshold.
+    // [MEDIUM-7] The condition checks peak > 0 OR total < 0 so the breaker
+    // fires even when the engine has never been profitable (peak == 0) but
+    // is actively losing money; the helper treats that case as full
+    // drawdown.
     //
     // ISO/IEC 5055: guards against division by zero and sign errors.
     // ISO/IEC 27001:2022: audit-logged state transition; no unprotected
@@ -11780,24 +11794,10 @@ void Engine::step_check_alerts(BlockHeight block_height)
         --drawdown_grace_remaining_;
     }
 
-    if ((peak_pnl_hwm_ > 0 || total.total_pnl < 0)
+    if ((peak_pnl_hwm_usd_ > 0.0 || total.total_pnl_usd < 0.0)
             && drawdown_grace_remaining_ == 0) {
-        double drawdown_frac = 0.0;
-
-        if (peak_pnl_hwm_ > 0) {
-            // Normal case: we've had profit, measure drop from peak.
-            drawdown_frac =
-                static_cast<double>(peak_pnl_hwm_ - total.total_pnl)
-                / static_cast<double>(std::abs(peak_pnl_hwm_));
-        } else {
-            // [MEDIUM-7] Edge case: peak is zero or negative (never
-            // profitable).  Any negative PnL constitutes a drawdown.
-            // Use abs(total_pnl) relative to a nominal unit to produce
-            // a meaningful fraction; treat it as 100% drawdown if we
-            // are losing money from a zero-profit baseline.
-            // ISO/IEC 5055: explicit handling of zero-denominator case.
-            drawdown_frac = (total.total_pnl < 0) ? 1.0 : 0.0;
-        }
+        const double drawdown_frac = risk::hwm_drawdown_frac(
+            peak_pnl_hwm_usd_, total.total_pnl_usd);
 
         if (drawdown_frac > max_drawdown_pct_) {
             spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
@@ -11820,19 +11820,26 @@ void Engine::step_check_alerts(BlockHeight block_height)
 
     // [T3-36] Rolling time-window loss circuit breaker.
     //
-    // Maintains a deque of (block_height, total_pnl) snapshots capped at
-    // loss_window_blocks entries.  On each cycle:
-    //   1. Append the current (block_height, total_pnl) to the back.
+    // Maintains a deque of (block_height, total_pnl_USD) snapshots capped
+    // at loss_window_blocks entries ([DRAWDOWN-USD 2026-08-02]).  On each
+    // cycle:
+    //   1. Append the current (block_height, total_pnl_usd) to the back.
     //   2. Pop front entries older than loss_window_blocks blocks.
-    //   3. Compute window_loss = front_pnl - current_pnl.
-    //   4. If window_loss exceeds the configured threshold, pause.
+    //   3. Compute window_loss_usd = front_pnl_usd - current_pnl_usd.
+    //   4. If window_loss_usd exceeds the configured threshold, pause.
     //
-    // The loss threshold is expressed in mojos: it equals
-    //   |peak_pnl_hwm_| * max_window_loss_bps / 10 000
-    // anchored to the all-time peak so that the threshold scales with the
-    // bot's trading volume.  When peak_pnl_hwm_ <= 0 we use the absolute
-    // window loss in mojos compared to the bps threshold applied to a
-    // nominal 1 XCH (1e12 mojos) to avoid a zero denominator.
+    // The loss threshold is USD:
+    //   peak_pnl_hwm_usd_ * max_window_loss_bps / 10 000
+    // anchored to the all-time USD peak so that the threshold scales with
+    // the bot's realized performance.  When the bot has never been
+    // profitable (peak <= 0) the anchor falls back to the LIVE 1-XCH USD
+    // value (usd_per_xch(): the XCH/wUSDC.b mid, cheap, already used by
+    // the accounting conversions) -- the exact USD-scale analogue of the
+    // old "nominal 1 XCH" (kMojosPerXch) anchor -- and to the conservative
+    // fixed nominal risk::kWindowAnchorFallbackUsd ($1.50) when market
+    // data is cold.  Conservative = lower anchor = lower threshold = the
+    // breaker fires EARLIER; the anchor only matters in the first cycles
+    // of a never-profitable run.
     //
     // A configured max_window_loss_bps of 0 disables this check entirely.
     //
@@ -11843,60 +11850,65 @@ void Engine::step_check_alerts(BlockHeight block_height)
             && state_->status() == BotStatus::Running) {
 
         // 1. Append current snapshot.
-        pnl_window_.push_back({block_height, total.total_pnl});
+        pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
 
         // 2. Trim entries that fall outside the rolling window.
         //    Entries are ordered by ascending block_height; pop from front.
         //    We keep only entries whose age is strictly less than
         //    loss_window_blocks (i.e., within the window).  An entry is
         //    considered stale when block_height - entry_block >= window_size.
-        while (pnl_window_.size() > 1) {
-            const BlockHeight oldest = pnl_window_.front().first;
+        while (pnl_window_usd_.size() > 1) {
+            const BlockHeight oldest = pnl_window_usd_.front().first;
             if (block_height - oldest >= config_.risk.loss_window_blocks) {
-                pnl_window_.pop_front();
+                pnl_window_usd_.pop_front();
             } else {
                 break;
             }
         }
 
         // 3. Compute window_loss (positive = PnL decreased over the window).
-        if (pnl_window_.size() >= 2) {
-            const Mojo window_start_pnl = pnl_window_.front().second;
-            const Mojo window_loss      = window_start_pnl - total.total_pnl;
+        if (pnl_window_usd_.size() >= 2) {
+            const double window_start_pnl = pnl_window_usd_.front().second;
+            const double window_loss_usd =
+                window_start_pnl - total.total_pnl_usd;
 
-            // Compute the threshold in mojos.
-            // Anchored to |peak_pnl_hwm_| when positive; fall back to 1 XCH.
-            const Mojo anchor   = (peak_pnl_hwm_ > 0)
-                                ? peak_pnl_hwm_
-                                : kMojosPerXch;
-            const Mojo threshold_mojos = static_cast<Mojo>(
-                static_cast<double>(anchor)
-                * config_.risk.max_window_loss_bps / 10'000.0);
+            // Threshold in USD (risk/drawdown_breaker.hpp, test-pinned).
+            const double live_xch_usd = usd_per_xch();
+            const double anchor_fallback_usd =
+                (live_xch_usd > 0.0) ? live_xch_usd
+                                     : risk::kWindowAnchorFallbackUsd;
+            const double threshold_usd = risk::window_loss_threshold_usd(
+                peak_pnl_hwm_usd_, anchor_fallback_usd,
+                config_.risk.max_window_loss_bps);
 
             // 4. Fire if window_loss exceeds the threshold.
-            if (window_loss > 0 && threshold_mojos > 0
-                    && window_loss > threshold_mojos) {
+            if (window_loss_usd > 0.0 && threshold_usd > 0.0
+                    && window_loss_usd > threshold_usd) {
 
                 const BlockHeight window_actual =
-                    block_height - pnl_window_.front().first;
+                    block_height - pnl_window_usd_.front().first;
 
                 spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT BREAKER "
-                              "-- loss={} mojos over {} blocks "
-                              "> threshold={} mojos ({:.1f} bps) "
-                              "-- transitioning to Paused state",
-                              window_loss, window_actual,
-                              threshold_mojos,
-                              config_.risk.max_window_loss_bps);
+                              "-- loss=${:.4f} over {} blocks "
+                              "> threshold=${:.4f} ({:.1f} bps of "
+                              "${:.4f} anchor) -- transitioning to Paused "
+                              "state",
+                              window_loss_usd, window_actual,
+                              threshold_usd,
+                              config_.risk.max_window_loss_bps,
+                              (peak_pnl_hwm_usd_ > 0.0)
+                                  ? peak_pnl_hwm_usd_
+                                  : anchor_fallback_usd);
 
                 state_->set_status(BotStatus::Paused);
 
                 alerts_->send_alert(AlertRule::CircuitBreaker,
-                    "Rolling-window circuit breaker triggered: lost " +
-                    std::to_string(window_loss) + " mojos in " +
+                    "Rolling-window circuit breaker triggered: lost $" +
+                    std::to_string(window_loss_usd) + " in " +
                     std::to_string(window_actual) + " blocks (limit " +
                     std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
-                    " bps = " + std::to_string(threshold_mojos) +
-                    " mojos) -- engine PAUSED.  Manual intervention required.");
+                    " bps = $" + std::to_string(threshold_usd) +
+                    ") -- engine PAUSED.  Manual intervention required.");
             }
         }
     }

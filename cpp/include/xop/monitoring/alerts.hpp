@@ -153,8 +153,18 @@ struct BotState {
     std::vector<AssetState> assets;
 
     // PnL (Dashboard 1).
-    Mojo   total_pnl;          // Current total PnL.
-    Mojo   peak_pnl;           // High-water mark PnL.
+    //
+    // [DRAWDOWN-USD 2026-08-02] USD, not mojos.  These previously carried
+    // PnLSummary::total_pnl -- a raw sum of QUOTE-ASSET MOJOS across pairs
+    // with different quote currencies (a DBX mojo is ~1/73rd of a wUSDC.b
+    // mojo in value), which made the drawdown ratio in check_pnl_drawdown
+    // unit-incoherent whenever more than one quote asset had traded.  They
+    // now carry the USD-normalized totals (PnLSummary::total_pnl_usd and
+    // the engine's USD high-water mark).  Renamed so any stale
+    // mojo-denominated producer or consumer fails to compile rather than
+    // silently mixing units.
+    double total_pnl_usd{0.0};  // Current total PnL, USD.
+    double peak_pnl_usd{0.0};   // High-water mark PnL, USD.
 
     // Inventory exposure.
     double max_inventory_ratio; // Highest inventory_ratio across all pairs.
