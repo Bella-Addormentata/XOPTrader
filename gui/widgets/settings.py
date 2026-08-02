@@ -262,6 +262,10 @@ class SettingsWidget(QWidget):
     # -- Qt signals ---------------------------------------------------------
     config_changed = Signal(dict)
     config_saved = Signal(str)
+    # [PNL-DISPLAY 2026-08-02] Emitted when the user resets or clears the
+    # P&L display baseline.  Payload is the UTC baseline string
+    # ("YYYY-MM-DD HH:MM:SS"), or "" when the reset was cleared.
+    pnl_baseline_changed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -1041,6 +1045,46 @@ class SettingsWidget(QWidget):
         form.addRow("Mono Font:", self._mono_font_combo)
 
         layout.addWidget(grp)
+
+        # -- P&L Display (QSettings-persisted, display-only) ----------------
+        # [PNL-DISPLAY 2026-08-02] The dashboard shows lifetime P&L derived
+        # from the engine's trade log and never resets on its own.  The
+        # only way to "zero" the display is this explicit action, which
+        # stores a baseline timestamp in QSettings.  Engine data
+        # (trade_log / ledger) is never modified, and the reset can be
+        # undone at any time.
+        pnl_grp = QGroupBox("P&L Display")
+        pnl_layout = QVBoxLayout(pnl_grp)
+        pnl_layout.setSpacing(8)
+
+        self._pnl_baseline_label = QLabel("")
+        self._pnl_baseline_label.setWordWrap(True)
+        self._pnl_baseline_label.setStyleSheet(
+            f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;"
+        )
+        pnl_layout.addWidget(self._pnl_baseline_label)
+
+        pnl_btn_row = QHBoxLayout()
+        self._pnl_reset_btn = QPushButton("Reset P&L Display…")
+        self._pnl_reset_btn.setToolTip(
+            "Start counting the dashboard P&L from now.\n"
+            "Display-only: no trade history or engine data is modified."
+        )
+        self._pnl_reset_btn.clicked.connect(self._on_reset_pnl_display)
+        pnl_btn_row.addWidget(self._pnl_reset_btn)
+
+        self._pnl_clear_reset_btn = QPushButton("Clear Reset")
+        self._pnl_clear_reset_btn.setToolTip(
+            "Remove the display baseline and show the full lifetime P&L again."
+        )
+        self._pnl_clear_reset_btn.clicked.connect(self._on_clear_pnl_reset)
+        pnl_btn_row.addWidget(self._pnl_clear_reset_btn)
+        pnl_btn_row.addStretch(1)
+        pnl_layout.addLayout(pnl_btn_row)
+
+        layout.addWidget(pnl_grp)
+        self._refresh_pnl_baseline_ui()
+
         layout.addStretch(1)
 
         # Load saved appearance preferences from QSettings.
@@ -1907,6 +1951,81 @@ class SettingsWidget(QWidget):
             "mono_font", self._mono_font_combo.currentText()
         )
         settings.endGroup()
+
+    # ===================================================================
+    # P&L display baseline (QSettings-persisted, display-only)
+    # ===================================================================
+
+    @staticmethod
+    def read_pnl_baseline() -> str:
+        """Return the persisted P&L display baseline, or "" when unset.
+
+        The baseline is a UTC ``YYYY-MM-DD HH:MM:SS`` string matching the
+        engine trade_log ``created_at`` format so it can be compared
+        directly in SQL.
+        """
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("pnl_display")
+        value = str(settings.value("baseline_utc", "") or "")
+        settings.endGroup()
+        return value
+
+    @staticmethod
+    def _write_pnl_baseline(value: str) -> None:
+        """Persist the P&L display baseline ("" clears it)."""
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("pnl_display")
+        settings.setValue("baseline_utc", value)
+        settings.endGroup()
+
+    def _refresh_pnl_baseline_ui(self) -> None:
+        """Sync the P&L Display group's label and buttons to QSettings."""
+        baseline = self.read_pnl_baseline()
+        if baseline:
+            self._pnl_baseline_label.setText(
+                f"Display reset active since {baseline} UTC — the dashboard "
+                f"shows P&L accrued after that moment.  Engine records are "
+                f"untouched; use 'Clear Reset' to show the full history again."
+            )
+            self._pnl_clear_reset_btn.setEnabled(True)
+        else:
+            self._pnl_baseline_label.setText(
+                "No display reset applied — the dashboard shows the full "
+                "lifetime P&L from the engine's trade log.  It never resets "
+                "on GUI or engine restarts."
+            )
+            self._pnl_clear_reset_btn.setEnabled(False)
+
+    def _on_reset_pnl_display(self) -> None:
+        """Handle 'Reset P&L Display' with an are-you-sure confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Reset P&L Display",
+            "Reset the P&L display to zero from this moment?\n\n"
+            "This only changes what the dashboard shows: the headline P&L "
+            "will count from now on.  No trade history, ledger, or engine "
+            "data is deleted, and you can undo this at any time with "
+            "'Clear Reset'.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        baseline = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self._write_pnl_baseline(baseline)
+        self._refresh_pnl_baseline_ui()
+        self.pnl_baseline_changed.emit(baseline)
+        log.info("P&L display baseline set to %s UTC.", baseline)
+
+    def _on_clear_pnl_reset(self) -> None:
+        """Handle 'Clear Reset': restore the full-history P&L display."""
+        self._write_pnl_baseline("")
+        self._refresh_pnl_baseline_ui()
+        self.pnl_baseline_changed.emit("")
+        log.info("P&L display baseline cleared (full history restored).")
 
     # ===================================================================
     # Dirty tracking

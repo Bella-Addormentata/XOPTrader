@@ -807,6 +807,58 @@ class ChartWidget(QWidget):
         )
         self._dirty = True
 
+    def seed_pnl_history(
+        self,
+        pair_name: str,
+        points: Sequence[tuple[int, float, float, float]],
+    ) -> None:
+        """Backfill the PnL curve with persisted history for *pair_name*.
+
+        [PNL-DISPLAY 2026-08-02] The PnL series used to exist only in GUI
+        memory, so every GUI restart started the chart empty.  At startup
+        the main window rebuilds the curve from the database (snapshots +
+        trade_log) and injects it here.
+
+        Only points strictly older than the earliest live tick are
+        inserted, so the merged series stays chronologically ordered and
+        live samples are never overwritten.  The ring-buffer cap
+        (:data:`_MAX_DATA_POINTS`) still applies.
+
+        Parameters
+        ----------
+        pair_name:
+            Trading pair whose PnL store receives the history.
+        points:
+            Chronologically ordered ``(block, timestamp, total_pnl,
+            realized_pnl)`` tuples (PnL values in USD).
+        """
+        if not points:
+            return
+
+        store = self._ensure_pair_store(pair_name)
+        pnl_store: deque[PnLTick] = store["pnl"]
+        earliest_live = pnl_store[0].timestamp if pnl_store else float("inf")
+
+        seed_ticks = [
+            PnLTick(
+                block=int(block),
+                timestamp=float(ts),
+                total_pnl=float(total),
+                realized_pnl=float(realized),
+            )
+            for (block, ts, total, realized) in points
+            if float(ts) < earliest_live
+        ]
+        if not seed_ticks:
+            return
+
+        seed_ticks.sort(key=lambda tick: tick.timestamp)
+        merged = seed_ticks + list(pnl_store)
+        store["pnl"] = deque(
+            merged[-_MAX_DATA_POINTS:], maxlen=_MAX_DATA_POINTS,
+        )
+        self._dirty = True
+
     def append_volume_data(
         self,
         block_height: int,

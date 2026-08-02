@@ -142,6 +142,12 @@ _PAGE_REPORTS: Final[int] = 6
 _PAGE_SETTINGS: Final[int] = 7
 
 
+def _fmt_usd(value: float) -> str:
+    """Format a USD amount with an explicit sign for positive values."""
+    sign = "+" if value > 0 else ""
+    return f"{sign}${value:,.2f}"
+
+
 def _placeholder_widget(label: str) -> QWidget:
     """Create a simple centred-label placeholder for unimplemented pages.
 
@@ -206,6 +212,10 @@ class MainWindow(QMainWindow):
         self._chart_volume_by_pair_block: dict[tuple[str, int], tuple[float, float]] = {}
         self._chart_seen_trade_keys: set[tuple] = set()
         self._chart_seen_trade_fifo: deque[tuple] = deque(maxlen=10_000)
+        # [PNL-DISPLAY 2026-08-02] Latest restart-proof P&L figures derived
+        # from trade_log by DatabaseService (lifetime + trailing 24h).
+        # Empty until the first pnl_display_loaded signal arrives.
+        self._pnl_display: dict[str, Any] = {}
 
         # -- Child widget references (populated in _build_central_area) -----
         self._dashboard: Optional[QWidget] = None
@@ -276,6 +286,14 @@ class MainWindow(QMainWindow):
         if self._chart is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_chart)
 
+        # [PNL-DISPLAY 2026-08-02] Restart-proof P&L: headline figures and
+        # chart history are derived from the persistent DB, not from GUI
+        # memory or the engine's since-boot gauges.
+        if hasattr(db, "pnl_display_loaded"):
+            db.pnl_display_loaded.connect(self._on_pnl_display)
+        if hasattr(db, "pnl_history_loaded"):
+            db.pnl_history_loaded.connect(self._on_pnl_history)
+
         # Kick off the initial offers query so the auto-refresh loop
         # has a set of parameters to re-issue on subsequent ticks.
         if hasattr(db, "query_offers"):
@@ -284,6 +302,14 @@ class MainWindow(QMainWindow):
             # Seed trade auto-refresh so charts can build per-block
             # volume/fill overlays from existing DB snapshots.
             db.query_trades(limit=1000)
+        if hasattr(db, "query_pnl_display"):
+            # Headline P&L (lifetime + 24h), honouring any display reset
+            # baseline the user persisted in Settings.
+            db.query_pnl_display(self._read_pnl_baseline())
+        if hasattr(db, "query_pnl_history"):
+            # Rebuild the chart's P&L curve from the DB (90-day window)
+            # so it survives GUI restarts.
+            db.query_pnl_history(90)
 
         # -- Reports widget signal -----------------------------------------
         reports_widget = self._unwrap(self._reports)
@@ -318,6 +344,10 @@ class MainWindow(QMainWindow):
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
         settings = self._unwrap(self._settings_widget)
+        if settings is not None and hasattr(settings, "pnl_baseline_changed"):
+            # Re-query the DB-derived P&L display whenever the user resets
+            # or clears the display baseline on the Settings page.
+            settings.pnl_baseline_changed.connect(self._on_pnl_baseline_changed)
         if settings is not None and hasattr(settings, "load_config"):
             cfg_path = bridge.config_service.path
             if cfg_path.is_file():
@@ -457,16 +487,18 @@ class MainWindow(QMainWindow):
                 pnl=pnl,
             )
 
-        # [PNL-UNITS 2026-07-30] Prefer the engine's quote-normalized USD
-        # gauge; the raw mojo total mixes per-pair quote currencies and the
-        # legacy /1e12 conversion understated P&L by ~1e9.
+        # [PNL-DISPLAY 2026-08-02] The status-bar headline shows the
+        # restart-proof lifetime realized P&L from trade_log when the DB
+        # figure has loaded; the engine's since-boot USD gauge is only a
+        # fallback for the first seconds after GUI start.
+        status_pnl_usd = self._pnl_display.get("lifetime_usd", pnl.get("usd"))
         self._status_bar.update_metrics(
             pnl_mojos=pnl_total,
             spread_bps=avg_spread,
             inventory_ratio=0.5,
             block_height=block_height,
             xch_usd_rate=xch_usd,
-            pnl_usd=pnl.get("usd"),
+            pnl_usd=status_pnl_usd,
         )
         self._block_label.setText(f"Block: {block_height:,}")
 
@@ -478,19 +510,16 @@ class MainWindow(QMainWindow):
             # amounts rather than 12-digit mojo integers.
             wallet_balances = data.get("wallet_balances", {})
             offers = data.get("offers", {})
-            # [PNL-UNITS 2026-07-30] Render the engine's USD gauges directly.
-            # The xop_pnl_mojos components are a raw sum across pairs with
-            # different quote currencies plus an XCH-mojo fee leg, so no
-            # divisor the GUI could apply is correct (the old /1e12 * xch_usd
-            # understated everything by ~1e9 and the dashboard sat at $0.00).
-            # The usd_* values are None on engines predating the gauges, in
-            # which case the card shows a dash rather than a wrong number.
+            # [PNL-DISPLAY 2026-08-02] Headline cards come from the
+            # persistent trade log (DatabaseService.query_pnl_display):
+            # "Total P&L" is the lifetime realized figure and "24h P&L"
+            # the trailing 24-hour realized figure.  Both survive GUI and
+            # engine restarts because the engine's Prometheus gauges are
+            # since-boot until rehydration, whereas trade_log is durable.
+            # "Unrealized PnL" remains the engine's live mark-to-market
+            # USD gauge (None on engines predating the gauge family).
             fees_xch = mojos_to_xch_float(int(data.get("fees_paid_24h", 0)))
             fees_usdc = fees_xch * xch_usd
-
-            def _fmt_usdc(value: float) -> str:
-                sign = "+" if value > 0 else ""
-                return f"{sign}${value:,.2f}"
 
             def _metric_payload(usd_value: float | None) -> dict[str, float | str]:
                 if usd_value is None:
@@ -503,22 +532,21 @@ class MainWindow(QMainWindow):
                 return {
                     "value": usd_value,
                     "spark": usd_value,
-                    "display_text": _fmt_usdc(usd_value),
+                    "display_text": _fmt_usd(usd_value),
                     "secondary_text": "",
                 }
 
+            fill_count_24h = int(
+                self._pnl_display.get("fills_24h", offers.get("filled", 0))
+            )
+
             card_data = {
-                "Total PnL": _metric_payload(pnl.get("usd")),
-                "Realized PnL": _metric_payload(pnl.get("usd_realized")),
+                "Total P&L": self._total_pnl_payload(),
+                "24h P&L": self._pnl_24h_payload(),
                 "Unrealized PnL": _metric_payload(pnl.get("usd_unrealized")),
-                # Spread capture and realized P&L are the same quantity in
-                # this engine (realized := spread); Inventory mirrors
-                # unrealized.  Kept as separate cards for continuity.
-                "Spread PnL": _metric_payload(pnl.get("usd_realized")),
-                "Inventory PnL": _metric_payload(pnl.get("usd_unrealized")),
                 "24h Fill Count": {
-                    "value": offers.get("filled", 0),
-                    "spark": offers.get("filled", 0),
+                    "value": fill_count_24h,
+                    "spark": fill_count_24h,
                 },
                 "Fees Paid 24h": {
                     "value": fees_usdc if xch_usd > 0 else fees_xch,
@@ -829,6 +857,143 @@ class MainWindow(QMainWindow):
                     sell_prev,
                     ts,
                 )
+
+    # ===================================================================== #
+    #  Restart-proof P&L display (trade_log-derived)                         #
+    # ===================================================================== #
+
+    @staticmethod
+    def _read_pnl_baseline() -> str:
+        """Return the persisted P&L display-reset baseline ("" = none).
+
+        Stored by the Settings page under the shared GUI QSettings
+        identity ("XOP", "XOPTrader") as a UTC ``YYYY-MM-DD HH:MM:SS``
+        string.  Read directly here so the dashboard works even when the
+        settings widget failed to construct.
+        """
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("pnl_display")
+        value = str(settings.value("baseline_utc", "") or "")
+        settings.endGroup()
+        return value
+
+    def _total_pnl_payload(self) -> dict[str, Any]:
+        """Build the "Total P&L" card payload from the DB-derived figures."""
+        display = self._pnl_display
+        if not display:
+            return {
+                "value": 0.0,
+                "spark": 0.0,
+                "display_text": "—",
+                "secondary_text": "loading from trade log…",
+            }
+        usd = float(display.get("lifetime_usd", 0.0))
+        trades = int(display.get("lifetime_trades", 0))
+        baseline = str(display.get("baseline_iso", "") or "")
+        if baseline:
+            secondary = f"since display reset {baseline} UTC"
+        else:
+            secondary = f"lifetime realized · {trades:,} fills"
+        return {
+            "value": usd,
+            "spark": usd,
+            "display_text": _fmt_usd(usd),
+            "secondary_text": secondary,
+        }
+
+    def _pnl_24h_payload(self) -> dict[str, Any]:
+        """Build the "24h P&L" card payload from the DB-derived figures."""
+        display = self._pnl_display
+        if not display:
+            return {
+                "value": 0.0,
+                "spark": 0.0,
+                "display_text": "—",
+                "secondary_text": "loading from trade log…",
+            }
+        usd = float(display.get("pnl_24h_usd", 0.0))
+        fills = int(display.get("fills_24h", 0))
+        return {
+            "value": usd,
+            "spark": usd,
+            "display_text": _fmt_usd(usd),
+            "secondary_text": f"realized · {fills:,} fills in 24h",
+        }
+
+    def _refresh_pnl_cards(self) -> None:
+        """Push the latest DB-derived P&L figures to the dashboard cards.
+
+        ``DashboardWidget.update_metrics`` ignores card names missing from
+        the payload, so this partial update never disturbs the other
+        cards between bridge ticks.
+        """
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is None or not hasattr(dashboard, "update_metrics"):
+            return
+        dashboard.update_metrics({
+            "Total P&L": self._total_pnl_payload(),
+            "24h P&L": self._pnl_24h_payload(),
+        })
+
+    def _on_pnl_display(self, display: dict) -> None:
+        """Receive restart-proof P&L figures from the database service."""
+        self._pnl_display = dict(display or {})
+        self._refresh_pnl_cards()
+
+    def _on_pnl_baseline_changed(self, baseline_iso: str) -> None:
+        """Re-query the P&L display after a Settings-page reset/clear."""
+        if self._bridge is None:
+            return
+        db = self._bridge.database_service
+        if hasattr(db, "query_pnl_display"):
+            db.query_pnl_display(baseline_iso)
+
+    def _on_pnl_history(self, points: list) -> None:
+        """Seed the chart's P&L curve with DB-rebuilt history.
+
+        Called once shortly after startup with the global USD P&L series
+        reconstructed from snapshots + trade_log, so the curve no longer
+        starts empty on every GUI restart.  The same global series is
+        seeded into every configured pair's store, mirroring how live
+        updates append the engine's global USD gauges per pair.
+        """
+        chart = self._unwrap(self._chart)
+        if chart is None or not points or not hasattr(chart, "seed_pnl_history"):
+            return
+
+        seed: list[tuple[int, float, float, float]] = []
+        for point in points:
+            try:
+                seed.append((
+                    int(point.get("block", 0)),
+                    float(point.get("ts", 0.0)),
+                    float(point.get("total_usd", 0.0)),
+                    float(point.get("realized_usd", 0.0)),
+                ))
+            except (TypeError, ValueError, AttributeError):
+                continue
+        if not seed:
+            return
+
+        pair_names: list[str] = []
+        if self._bridge is not None:
+            try:
+                pair_names = [
+                    p.get("name", "")
+                    for p in self._bridge.config_service.get_pairs()
+                    if p.get("name")
+                ]
+            except Exception:  # noqa: BLE001 -- config shape is external
+                pair_names = []
+        if not pair_names:
+            return
+
+        for pair_name in pair_names:
+            chart.seed_pnl_history(pair_name, seed)
+        _log.info(
+            "Chart P&L history seeded from DB: %d points × %d pairs.",
+            len(seed), len(pair_names),
+        )
 
     # ===================================================================== #
     #  Menu bar                                                              #
