@@ -54,8 +54,8 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Tier",           80),
     ("Status",         80),
     ("Filled At",     145),
-    ("Created Block", 100),
-    ("Age (blocks)",   90),
+    ("Created\nBlock", 100),
+    ("Age\n(blocks)",   90),
     ("Actions",        80),
 ]
 
@@ -232,6 +232,15 @@ class OrderPanel(QWidget):
         mono = QFont(MONO_FONT_FAMILY)
         mono.setStyleHint(QFont.StyleHint.Monospace)
         table.setFont(mono)
+        # The global theme pads header sections 10px 16px -- 32px of dead
+        # horizontal space per column, which dominates narrow columns like
+        # Side and Age once widths are content-fitted.  Tighten locally
+        # (this table only) and centre the now two-line header labels.
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        table.setStyleSheet(
+            "QHeaderView::section { padding: 4px 6px; }"
+            " QTableWidget::item { padding: 2px 6px; }"
+        )
 
         # Context menu
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
