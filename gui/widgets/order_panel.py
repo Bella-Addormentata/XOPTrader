@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS
+from gui.theme import COLORS, MONO_FONT_FAMILY
 from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
 
 # ---------------------------------------------------------------------------
@@ -218,12 +218,20 @@ class OrderPanel(QWidget):
         table.setShowGrid(True)
         table.setSortingEnabled(True)
 
-        # Column sizing
+        # Column sizing: fit every column to its content so widths track the
+        # data instead of the hardcoded guesses in _COLUMNS (which left Pair
+        # cramped and Price/Size oversized).  Offer ID keeps Stretch so the
+        # table still fills its viewport; the truncated hash absorbs the
+        # leftover space gracefully.
         header = table.horizontalHeader()
-        for idx, (_, width) in enumerate(_COLUMNS):
-            header.resizeSection(idx, width)
-        # Stretch the Offer ID column to fill remaining space.
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # A monospaced font keeps digit columns aligned and, because every
+        # digit is equal width, stops ResizeToContents from jittering as
+        # values change between refreshes.
+        mono = QFont(MONO_FONT_FAMILY)
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        table.setFont(mono)
 
         # Context menu
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -364,7 +372,9 @@ class OrderPanel(QWidget):
         self._table.setSortingEnabled(False)
         self._table.setRowCount(0)  # Clear existing rows.
 
-        mono_font = QFont("JetBrains Mono", 10)
+        # Use the theme's mono family (was a hardcoded "JetBrains Mono" that
+        # is not installed on this machine, so Qt silently substituted).
+        mono_font = QFont(MONO_FONT_FAMILY, 10)
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
 
         for row_idx, offer in enumerate(offers):
