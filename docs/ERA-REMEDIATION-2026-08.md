@@ -134,3 +134,32 @@ with backup failure in its status file.  Keep the sweep manual until the
 era is closed; if automation is wanted later, add an optional
 `--run-fill-sweep` flag to `_run_cycle` that treats exit code 2 (wallet
 unreachable) as a skip, not an error.
+
+## Execution record (2026-08-02, user-approved)
+
+Applied by `scratchpad/backfill_era.py` (session scratchpad; dry-run gated).
+Backup: `data/backups/xop_trader_pre_era_backfill_20260802.db`.
+
+Inserted: **472** maker fills -> trade_log (`realized_pnl_mojos NULL`),
+**579** taker trades -> taker_fills (`strategy='historical_backfill'`),
+**472** correction events -> offer_closure_events. No ledger writes
+(all pre-genesis; flows already in opening balances).
+
+End-to-end acid test at apply time (height window [8632223, 9080132)):
+
+| asset | claimed | +makers | +takers | =combined | actual | residual |
+|---|---|---|---|---|---|---|
+| XCH | -626.33 | -486.95 | +1175.16 | +61.88 | +61.27 | **+0.61** |
+| wUSDC.b | +1564.47 | +889.04 | -2505.30 | -51.79 | +4.24 | -56.03 |
+| BYC | -186.24 | +124.96 | -60.72 | -122.01 | -139.75 | +17.74 |
+| DBX | +7824.24 | +5939.37 | -19536.43 | -5772.82 | -6550.70 | +777.88 |
+
+Residuals documented, not forced: wUSDC.b ~-56 (unattributed inflow, likely
+bridge/reward), BYC ~+18 (unattributed outflow, 1.2% of gross), DBX ~+778
+(non-trade flows incl. pre-e14a9c1 reward claims). Note the forensic
+verdict's own acid table was internally inconsistent by ~9 XCH; every
+inserted row is individually a wallet-CONFIRMED record.
+
+Post-apply sweep: 1,401 missing -> **350**, exactly the expected exclusions
+(169 + 179 pre-window Apr 4-24, before the first wallet anchor; 2
+post-genesis takers needing ledger entries). The validated era is CLOSED.
