@@ -152,19 +152,24 @@ struct BotState {
     };
     std::vector<AssetState> assets;
 
-    // PnL (Dashboard 1).
+    // Equity (Dashboard 1).
     //
-    // [DRAWDOWN-USD 2026-08-02] USD, not mojos.  These previously carried
-    // PnLSummary::total_pnl -- a raw sum of QUOTE-ASSET MOJOS across pairs
-    // with different quote currencies (a DBX mojo is ~1/73rd of a wUSDC.b
-    // mojo in value), which made the drawdown ratio in check_pnl_drawdown
-    // unit-incoherent whenever more than one quote asset had traded.  They
-    // now carry the USD-normalized totals (PnLSummary::total_pnl_usd and
-    // the engine's USD high-water mark).  Renamed so any stale
-    // mojo-denominated producer or consumer fails to compile rather than
-    // silently mixing units.
-    double total_pnl_usd{0.0};  // Current total PnL, USD.
-    double peak_pnl_usd{0.0};   // High-water mark PnL, USD.
+    // [DRAWDOWN-USD 2026-08-02] First pass moved these off raw quote-mojo
+    // sums onto USD.  [DRAWDOWN-EQUITY 2026-08-04] Second pass, after a
+    // live false trip: they now carry PORTFOLIO EQUITY (holdings x USD
+    // price) and its high-water mark, not the P&L series -- drawdown
+    // against a ~$25 P&L peak read a ~5%-of-book mark move as "60%
+    // drawdown".  Renamed (again) so any stale P&L-semantics producer or
+    // consumer fails to compile rather than silently changing what the
+    // drawdown alert measures.
+    double equity_usd{0.0};       // Current portfolio equity, USD.
+    double peak_equity_usd{0.0};  // Equity high-water mark, USD.
+
+    // [DRAWDOWN-EQUITY 2026-08-04 item 6] True when the engine is in
+    // BotStatus::Paused (e.g. a circuit breaker fired).  Surfaced so the
+    // GUI/alert layer can display the pause state instead of inferring it
+    // from alert traffic.
+    bool engine_paused{false};
 
     // Inventory exposure.
     double max_inventory_ratio; // Highest inventory_ratio across all pairs.

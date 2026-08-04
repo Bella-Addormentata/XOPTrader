@@ -188,7 +188,13 @@ risk:
   single_cat_cap_pct: 0.25
   kelly_fraction: 0.5
   max_capital_per_pair_pct: 0.85
-  max_drawdown_pct: 0.05
+  # [DRAWDOWN-EQUITY 2026-08-04] Renamed from max_drawdown_pct and now a
+  # fraction of PORTFOLIO EQUITY (industry-standard drawdown), not the P&L
+  # high-water mark. The old 0.05 predated functional breaker math and
+  # false-tripped on 2026-08-04 (a ~5% XCH retrace = ~4-5% of equity read
+  # as "60% drawdown" against the ~$25 P&L peak). Recalibrated: 10% of
+  # equity.
+  max_drawdown_frac: 0.10
   loss_window_blocks: 576
   max_window_loss_bps: 250
   circuit_breaker_enabled: true

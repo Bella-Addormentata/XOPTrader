@@ -292,7 +292,10 @@ risk:
   kelly_fraction: 0.5    # [REQUIRED] Half-Kelly
   max_capital_per_pair_pct: 0.20  # [REQUIRED] Max fraction of total portfolio value for any pair. Raise to 0.85 if one asset dominates and needs selling
   # Circuit breakers (all OPTIONAL -- defaults shown)
-  max_drawdown_pct: 0.10        # [OPTIONAL, default: 0.10]
+  max_drawdown_frac: 0.10       # [OPTIONAL, default: 0.10] Peak-to-trough fraction
+                                # of PORTFOLIO EQUITY that pauses the engine
+                                # (renamed 2026-08-04 from max_drawdown_pct, which
+                                # measured against the P&L high-water mark)
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
   max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 

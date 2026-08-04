@@ -63,6 +63,7 @@
 #include "xop/strategy/depeg_detector.hpp"
 
 // Risk layer
+#include "xop/risk/drawdown_breaker.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -475,6 +476,17 @@ private:
     /// quote: factor * kMojosPerXch).  0 when no market data yet.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
 
+    /// [DRAWDOWN-EQUITY 2026-08-04] Total portfolio equity in USD: the sum
+    /// over all tracked inventory records of holdings x USD price, using
+    /// the same valuation machinery as the accounting paths
+    /// (asset_usd_pseudo_price / quote_usd_factor / usd_per_xch).  When an
+    /// asset has no live conversion this cycle it is carried at its LAST
+    /// KNOWN price (last_asset_usd_price_) instead of being dropped, so a
+    /// data gap cannot masquerade as a crash.  Non-const: refreshes that
+    /// cache.  This is the denominator of the max-drawdown breaker and the
+    /// anchor of the rolling-window loss threshold.
+    [[nodiscard]] double compute_portfolio_equity_usd();
+
     /// Snapshot all InventoryTracker records into the inventory_state table
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
     void persist_inventory_state() noexcept;
@@ -840,25 +852,43 @@ private:
     };
     std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
 
-    // [H6] PnL high-water mark for drawdown detection in step 13 alerts.
-    // Monotonically non-decreasing; updated each cycle in step_check_alerts.
-    // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.
+    // [H6] Portfolio-equity high-water mark for drawdown detection in
+    // step 13 alerts.  Monotonically non-decreasing; updated each cycle in
+    // step_check_alerts.
+    // ISO/IEC 5055: prevents false drawdown resets on equity oscillation.
     //
-    // [DRAWDOWN-USD 2026-08-02] USD (double), tracking the USD-normalized
-    // PnLSummary::total_pnl_usd.  The previous Mojo peak tracked the raw
-    // cross-pair quote-mojo sum, which mixes currencies (a DBX mojo is
-    // ~1/73rd of a wUSDC.b mojo in value) and made every downstream
-    // drawdown ratio unit-incoherent.  In-memory only, re-seeded from the
-    // first cycle's USD total each start -- no persisted state carries the
-    // old unit across the change.
-    double peak_pnl_hwm_usd_{0.0};
+    // [DRAWDOWN-EQUITY 2026-08-04] USD PORTFOLIO EQUITY (sum of holdings x
+    // USD price), replacing the P&L-total peak: measuring drawdown against
+    // the ~$25 P&L peak turned a ~5% overnight XCH retrace (~$8 of marks on
+    // a ~$158 book) into a "60% drawdown" false trip at 04:14.  In-memory
+    // only, re-seeded from the first cycle after every restart -- A RESTART
+    // RE-ANCHORS THE PEAK to current equity, exactly as the old P&L peak
+    // behaved; the breaker then protects against drawdown from that new
+    // anchor.  No persisted state carries the old semantics across the
+    // change.
+    double peak_equity_hwm_usd_{0.0};
 
-    // [MEDIUM-7] Tracks whether peak_pnl_hwm_usd_ has been seeded with the
-    // first-cycle USD total.  Without this, the drawdown circuit breaker
-    // is bypassed entirely until the first profitable cycle -- leaving the
-    // engine unprotected against losses from startup.
-    // ISO/IEC 27001:2022: ensures continuous risk monitoring from first tick.
-    bool hwm_initialized_{false};
+    // [MEDIUM-7] note: the old P&L peak needed an explicit first-cycle
+    // seed flag because P&L can be negative and max(0, pnl) would have
+    // hidden a losing start.  Equity is non-negative by construction, so
+    // the monotonic max IS the seed and the flag is retired; the startup
+    // grace window covers the pre-valuation cycles.
+
+    // [DRAWDOWN-EQUITY 2026-08-04] Last successfully observed USD price
+    // per asset unit, keyed by asset id.  When an asset has no live USD
+    // conversion this cycle (empty book, cold feed), its equity
+    // contribution is carried at this last-known price instead of being
+    // dropped: a vanished conversion would otherwise delete the asset's
+    // entire value from equity and read as an instantaneous crash --
+    // firing the breaker on a DATA GAP rather than a market move.
+    std::unordered_map<AssetId, double> last_asset_usd_price_;
+
+    // [DRAWDOWN-EQUITY 2026-08-04] Re-alert suppression for the breakers:
+    // while the engine stays Paused on a persisting condition, the
+    // CRITICAL alert is re-raised at most every
+    // risk.breaker_realert_minutes (default 30) and the condition is
+    // otherwise logged at info level.  Cleared when the condition lifts.
+    risk::BreakerRealertGate breaker_realert_gate_;
 
     // [T8-03] Drawdown grace period: skip the HWM drawdown circuit breaker
     // for the first N blocks after engine start so that a small initial
@@ -921,12 +951,13 @@ private:
     bool crossed_book_take_this_block_{false};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
-    // Drawdown fraction = risk::hwm_drawdown_frac(peak_pnl_hwm_usd_,
-    // total_pnl_usd) -- both sides USD ([DRAWDOWN-USD 2026-08-02]).
-    // When exceeded, engine transitions to BotStatus::Paused and alerts.
-    // Configurable via risk.max_drawdown_pct in config.yaml; default 10%.
+    // Drawdown fraction = risk::equity_drawdown_frac(peak_equity_hwm_usd_,
+    // equity_usd) -- portfolio equity on both sides ([DRAWDOWN-EQUITY
+    // 2026-08-04]).  When exceeded, engine transitions to
+    // BotStatus::Paused and alerts.  Configurable via
+    // risk.max_drawdown_frac in config.yaml; default 10% of equity.
     // ISO/IEC 5055: named constant with documented default.
-    double max_drawdown_pct_;
+    double max_drawdown_frac_;
 
     // [T3-36] Rolling time-window PnL loss circuit breaker.
     //

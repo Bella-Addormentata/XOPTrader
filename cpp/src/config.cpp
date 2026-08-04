@@ -1517,14 +1517,42 @@ RiskConfig parse_risk(const YAML::Node& root)
 
     // -- Circuit breaker parameters (all optional with safe defaults) ---------
 
-    // max_drawdown_pct: HWM drawdown threshold in (0, 1].  Default 0.10 (10%).
+    // [DRAWDOWN-EQUITY 2026-08-04] The drawdown key was RENAMED when its
+    // semantics changed from "fraction of the P&L high-water mark" to
+    // "fraction of portfolio equity".  A stale P&L-calibrated value (the
+    // live 0.05 fired a false trip on a ~5% XCH retrace) must not silently
+    // apply to equity semantics, so the old key is a hard error with a
+    // migration message rather than being ignored.
     if (node["max_drawdown_pct"] && node["max_drawdown_pct"].IsDefined()
             && !node["max_drawdown_pct"].IsNull()) {
-        cfg.max_drawdown_pct = node["max_drawdown_pct"].as<double>();
-        if (!(cfg.max_drawdown_pct > 0.0 && cfg.max_drawdown_pct <= 1.0)) {
-            throw ConfigError(sec + ".max_drawdown_pct must be in (0, 1]; got "
-                              + std::to_string(cfg.max_drawdown_pct));
+        throw ConfigError(sec + ".max_drawdown_pct has been renamed to "
+                          + sec + ".max_drawdown_frac and is now measured "
+                          "against PORTFOLIO EQUITY, not the P&L high-water "
+                          "mark. Remove the old key; the recalibrated "
+                          "default is 0.10 (10% of equity).");
+    }
+
+    // max_drawdown_frac: equity drawdown threshold in (0, 1].
+    // Default 0.10 (10% of portfolio equity).
+    if (node["max_drawdown_frac"] && node["max_drawdown_frac"].IsDefined()
+            && !node["max_drawdown_frac"].IsNull()) {
+        cfg.max_drawdown_frac = node["max_drawdown_frac"].as<double>();
+        if (!(cfg.max_drawdown_frac > 0.0 && cfg.max_drawdown_frac <= 1.0)) {
+            throw ConfigError(sec + ".max_drawdown_frac must be in (0, 1]; got "
+                              + std::to_string(cfg.max_drawdown_frac));
         }
+    }
+
+    // breaker_realert_minutes: minimum minutes between repeat CRITICAL
+    // breaker alerts while the engine stays paused on the same condition.
+    if (node["breaker_realert_minutes"] && node["breaker_realert_minutes"].IsDefined()
+            && !node["breaker_realert_minutes"].IsNull()) {
+        int64_t v = node["breaker_realert_minutes"].as<int64_t>();
+        if (v < 1 || v > 1440) {
+            throw ConfigError(sec + ".breaker_realert_minutes must be in "
+                              "[1, 1440]; got " + std::to_string(v));
+        }
+        cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
     }
 
     // drawdown_grace_blocks: blocks to skip drawdown check at startup [0, UINT32_MAX].
@@ -2349,7 +2377,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  cat_cap        = " << cfg.risk.single_cat_cap_pct << "\n"
         << "  kelly          = " << cfg.risk.kelly_fraction << "\n"
         << "  max_pair       = " << cfg.risk.max_capital_per_pair_pct << "\n"
-        << "  max_drawdown   = " << cfg.risk.max_drawdown_pct * 100.0 << "%\n"
+        << "  max_drawdown   = " << cfg.risk.max_drawdown_frac * 100.0
+        << "% of equity\n"
         << "  loss_window    = " << cfg.risk.loss_window_blocks << " blocks\n"
         << "  max_window_loss = " << cfg.risk.max_window_loss_bps << " bps"
         << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n"

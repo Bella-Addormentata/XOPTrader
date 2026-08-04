@@ -171,14 +171,16 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     , poll_timer_(ioc_)
     , state_(std::make_shared<State>())
     , drawdown_grace_remaining_(config.risk.drawdown_grace_blocks)
-    , max_drawdown_pct_(config.risk.max_drawdown_pct)
+    , max_drawdown_frac_(config.risk.max_drawdown_frac)
 {
     spdlog::info("[Engine] Initializing subsystems (dry_run={})", dry_run);
-    spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% "
-                 "window_loss={:.0f}bps/{} blocks",
-                 config_.risk.max_drawdown_pct * 100.0,
+    spdlog::info("[Engine] Circuit breakers: max_drawdown={:.1f}% of equity "
+                 "window_loss={:.0f}bps of equity/{} blocks "
+                 "realert={}min",
+                 config_.risk.max_drawdown_frac * 100.0,
                  config_.risk.max_window_loss_bps,
-                 config_.risk.loss_window_blocks);
+                 config_.risk.loss_window_blocks,
+                 config_.risk.breaker_realert_minutes);
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -10540,6 +10542,44 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
     return 0;
 }
 
+// [DRAWDOWN-EQUITY 2026-08-04] Portfolio equity: holdings x USD price over
+// every tracked inventory record, via the same valuation paths the
+// accounting uses (asset_usd_pseudo_price -> quote_usd_factor ->
+// usd_per_xch).  Assets whose conversion is unavailable THIS cycle are
+// carried at their last-known price (see last_asset_usd_price_) -- a data
+// gap must not read as a crash.  Assets that have never been valued
+// contribute 0 (and never contributed to the equity peak either).
+double Engine::compute_portfolio_equity_usd()
+{
+    if (!inventory_) return 0.0;
+
+    std::vector<risk::AssetValuationInput> inputs;
+    for (const auto& rec : inventory_->get_all_records()) {
+        if (rec.total_quantity <= 0) continue;
+
+        const double mojos_per_unit =
+            (rec.asset_id == "xch") ? 1e12 : 1e3;
+
+        risk::AssetValuationInput in;
+        in.units = static_cast<double>(rec.total_quantity) / mojos_per_unit;
+
+        // Live USD price per display unit (pseudo-price is USD * 1e12).
+        const Mojo pseudo = asset_usd_pseudo_price(rec.asset_id);
+        if (pseudo > 0) {
+            in.live_usd_per_unit = static_cast<double>(pseudo)
+                                 / static_cast<double>(kMojosPerXch);
+            last_asset_usd_price_[rec.asset_id] = in.live_usd_per_unit;
+        }
+        if (auto it = last_asset_usd_price_.find(rec.asset_id);
+            it != last_asset_usd_price_.end()) {
+            in.last_usd_per_unit = it->second;
+        }
+        inputs.push_back(in);
+    }
+
+    return risk::portfolio_equity_usd(inputs);
+}
+
 void Engine::persist_inventory_state() noexcept
 {
     if (!inventory_ || !db_) return;
@@ -11727,43 +11767,31 @@ void Engine::step_check_alerts(BlockHeight block_height)
         bs.pairs.push_back(ps);
     }
 
-    // PnL state.
+    // P&L and equity state.
     //
-    // [DRAWDOWN-USD 2026-08-02] Everything from here down runs on the
-    // USD-normalized total (total_pnl_usd), never the raw total_pnl mojo
-    // sum.  The raw sum mixes quote currencies across pairs (a DBX mojo is
-    // ~1/73rd of a wUSDC.b mojo in value), so the drawdown and window-loss
-    // RATIOS below were unit-incoherent the moment two quote assets had
-    // traded: a modest DBX-side loss against a wUSDC.b-built peak
-    // overstated drawdown ~73x (spurious pause), and the inverse mix hid
-    // real losses.  All three consumers (HWM breaker, rolling-window
-    // breaker, check_pnl_drawdown) switch together -- a half-converted
-    // state is the dangerous configuration, which is why the fields are
-    // renamed rather than repurposed.
+    // [DRAWDOWN-EQUITY 2026-08-04] The breakers below measure against
+    // PORTFOLIO EQUITY (holdings x USD price), not the P&L series.
+    // Measuring drawdown against the P&L high-water mark false-tripped
+    // live at 04:14: a ~5% overnight XCH retrace moved the marks by ~$8 --
+    // ~5% of the ~$158 book, but "60%" of the ~$25 P&L peak -- pausing a
+    // healthy engine whose inventory basis sat BELOW the mid.  The P&L
+    // USD series still drives the rolling-window FLOW (a genuine
+    // trading-loss detector); equity is the denominator/anchor for both
+    // thresholds.
     auto total = pnl_->get_total_pnl();
-    bs.total_pnl_usd = total.total_pnl_usd;
+    const double equity_usd = compute_portfolio_equity_usd();
 
-    // [MEDIUM-7] Seed the HWM on the very first cycle so the drawdown
-    // circuit breaker is active from startup.  Previously the peak
-    // started at 0 and the drawdown check was gated on peak > 0,
-    // which meant the engine had ZERO drawdown protection until the first
-    // profitable cycle.  If the engine started losing money from the first
-    // block, the circuit breaker would never fire.
-    //
-    // Fix: on the first cycle, initialize peak_pnl_hwm_usd_ to the USD
-    // total (which may be 0 or negative).  On subsequent cycles, the
-    // existing max() logic ensures monotonic non-decrease.
-    // ISO/IEC 27001:2022: continuous risk monitoring from first tick.
-    // ISO/IEC 5055: deterministic initialization prevents unprotected window.
-    if (!hwm_initialized_) {
-        peak_pnl_hwm_usd_ = total.total_pnl_usd;
-        hwm_initialized_  = true;
-    }
-    // [H6] Track the PnL high-water mark across cycles for drawdown alerts.
-    // ISO/IEC 5055: monotonically non-decreasing peak prevents false
-    // drawdown resets when total_pnl_usd oscillates.
-    peak_pnl_hwm_usd_ = std::max(peak_pnl_hwm_usd_, total.total_pnl_usd);
-    bs.peak_pnl_usd   = peak_pnl_hwm_usd_;
+    // [MEDIUM-7]/[H6] Equity high-water mark.  Equity is non-negative by
+    // construction, so a plain monotonic max is a complete seed: the first
+    // valued cycle sets the peak, and the startup grace window below
+    // covers the cycles before valuations warm up.  In-memory only -- a
+    // restart re-anchors the peak to current equity (documented at the
+    // member).
+    peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
+
+    bs.equity_usd      = equity_usd;
+    bs.peak_equity_usd = peak_equity_hwm_usd_;
+    bs.engine_paused   = (state_->status() == BotStatus::Paused);
 
     // Inventory exposure.
     bs.max_inventory_ratio = 0.5;  // Phase 2: compute max across all pairs.
@@ -11773,48 +11801,78 @@ void Engine::step_check_alerts(BlockHeight block_height)
     alerts_->check_and_alert(bs);
 
     // [T3-09] Max-drawdown global circuit breaker.
-    // drawdown_frac = risk::hwm_drawdown_frac(peak_pnl_hwm_usd_,
-    // total_pnl_usd) -- USD on both sides ([DRAWDOWN-USD 2026-08-02]; the
-    // unit-critical arithmetic lives in risk/drawdown_breaker.hpp so tests
-    // pin it).  If the drawdown exceeds max_drawdown_pct_, transition to
-    // Paused state and alert.  Global safety net against runaway losses.
-    //
-    // [MEDIUM-7] The condition checks peak > 0 OR total < 0 so the breaker
-    // fires even when the engine has never been profitable (peak == 0) but
-    // is actively losing money; the helper treats that case as full
-    // drawdown.
+    // drawdown_frac = risk::equity_drawdown_frac(peak_equity_hwm_usd_,
+    // equity_usd) -- PORTFOLIO EQUITY on both sides ([DRAWDOWN-EQUITY
+    // 2026-08-04]; the unit-critical arithmetic lives in
+    // risk/drawdown_breaker.hpp so tests pin it).  If the drawdown exceeds
+    // max_drawdown_frac_, transition to Paused state and alert.  Global
+    // safety net against runaway losses -- industry-standard semantics: a
+    // 10% default means "a tenth of the portfolio's peak value is gone",
+    // not "a tenth of accumulated profit", which is the miscalibration
+    // that fired at 04:14 on a healthy book.
     //
     // ISO/IEC 5055: guards against division by zero and sign errors.
-    // ISO/IEC 27001:2022: audit-logged state transition; no unprotected
-    //   window at startup.
+    // ISO/IEC 27001:2022: audit-logged state transition.
     // [T8-03] Decrement the grace period counter each cycle.  During the
-    // grace window the HWM drawdown check is skipped so that a small initial
-    // loss from the zero-peak baseline does not immediately pause the engine.
+    // grace window the drawdown check is skipped so early-cycle valuation
+    // warm-up cannot trip the breaker.
     if (drawdown_grace_remaining_ > 0) {
         --drawdown_grace_remaining_;
     }
 
-    if ((peak_pnl_hwm_usd_ > 0.0 || total.total_pnl_usd < 0.0)
-            && drawdown_grace_remaining_ == 0) {
-        const double drawdown_frac = risk::hwm_drawdown_frac(
-            peak_pnl_hwm_usd_, total.total_pnl_usd);
+    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
+        const double drawdown_frac = risk::equity_drawdown_frac(
+            peak_equity_hwm_usd_, equity_usd);
 
-        if (drawdown_frac > max_drawdown_pct_) {
-            spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
-                          "drawdown={:.2f}% > threshold={:.2f}% -- "
-                          "transitioning to Paused state",
-                          drawdown_frac * 100.0,
-                          max_drawdown_pct_ * 100.0);
+        if (drawdown_frac > max_drawdown_frac_) {
+            // [DRAWDOWN-EQUITY 2026-08-04 item 6] Alert suppression: the
+            // first trip pauses and alerts immediately; while the engine
+            // stays Paused on a persisting condition, the CRITICAL alert
+            // is re-raised at most every risk.breaker_realert_minutes and
+            // the recurring condition is otherwise an info-level log
+            // (measured spam every ~10-30 s during the 04:14 episode).
+            const bool first_trip =
+                (state_->status() != BotStatus::Paused);
+            if (first_trip) {
+                spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
+                              "equity ${:.2f} is {:.2f}% below peak "
+                              "${:.2f} > threshold={:.2f}% -- "
+                              "transitioning to Paused state",
+                              equity_usd, drawdown_frac * 100.0,
+                              peak_equity_hwm_usd_,
+                              max_drawdown_frac_ * 100.0);
+                // Transition to Paused: stops new offer creation in
+                // subsequent cycles while keeping connections open for
+                // monitoring.
+                state_->set_status(BotStatus::Paused);
+            }
 
-            // Transition to Paused: stops new offer creation in subsequent
-            // cycles while keeping connections open for monitoring.
-            state_->set_status(BotStatus::Paused);
-
-            alerts_->send_alert(AlertRule::CircuitBreaker,
-                "Global max-drawdown circuit breaker triggered: drawdown " +
-                std::to_string(drawdown_frac * 100.0) + "% exceeds threshold " +
-                std::to_string(max_drawdown_pct_ * 100.0) +
-                "% -- engine PAUSED.  Manual intervention required.");
+            if (breaker_realert_gate_.should_alert(
+                    std::chrono::steady_clock::now(),
+                    std::chrono::minutes(
+                        config_.risk.breaker_realert_minutes))) {
+                alerts_->send_alert(AlertRule::CircuitBreaker,
+                    "Global max-drawdown circuit breaker: equity $" +
+                    std::to_string(equity_usd) + " is " +
+                    std::to_string(drawdown_frac * 100.0) +
+                    "% below its $" +
+                    std::to_string(peak_equity_hwm_usd_) +
+                    " peak (threshold " +
+                    std::to_string(max_drawdown_frac_ * 100.0) +
+                    "% of equity) -- engine PAUSED.  Manual intervention "
+                    "required.");
+            } else {
+                spdlog::info("[Engine] Step 13: max-drawdown condition "
+                             "persists while paused (equity ${:.2f}, "
+                             "{:.2f}% below peak) -- re-alert suppressed "
+                             "(interval {} min)",
+                             equity_usd, drawdown_frac * 100.0,
+                             config_.risk.breaker_realert_minutes);
+            }
+        } else {
+            // Condition lifted: re-arm so the next episode alerts
+            // immediately.
+            breaker_realert_gate_.clear();
         }
     }
 
@@ -11828,18 +11886,18 @@ void Engine::step_check_alerts(BlockHeight block_height)
     //   3. Compute window_loss_usd = front_pnl_usd - current_pnl_usd.
     //   4. If window_loss_usd exceeds the configured threshold, pause.
     //
-    // The loss threshold is USD:
-    //   peak_pnl_hwm_usd_ * max_window_loss_bps / 10 000
-    // anchored to the all-time USD peak so that the threshold scales with
-    // the bot's realized performance.  When the bot has never been
-    // profitable (peak <= 0) the anchor falls back to the LIVE 1-XCH USD
-    // value (usd_per_xch(): the XCH/wUSDC.b mid, cheap, already used by
-    // the accounting conversions) -- the exact USD-scale analogue of the
-    // old "nominal 1 XCH" (kMojosPerXch) anchor -- and to the conservative
-    // fixed nominal risk::kWindowAnchorFallbackUsd ($1.50) when market
-    // data is cold.  Conservative = lower anchor = lower threshold = the
-    // breaker fires EARLIER; the anchor only matters in the first cycles
-    // of a never-profitable run.
+    // The loss threshold is USD, anchored to PORTFOLIO EQUITY
+    // ([DRAWDOWN-EQUITY 2026-08-04]):
+    //   equity_usd * max_window_loss_bps / 10 000
+    // 250 bps of the measured ~$150 book is ~$3.75; the previous
+    // |P&L-HWM| anchor produced $1.09 and tripped spuriously on the
+    // 08-02 overnight mark wiggle.  In the first cycles before anything
+    // is valued (equity 0) the anchor falls back to the LIVE 1-XCH USD
+    // value (usd_per_xch()) and then the conservative fixed nominal
+    // risk::kWindowAnchorFallbackUsd ($1.50) -- lower anchor = lower
+    // threshold = fires earlier, the safe direction.  The FLOW series
+    // stays the P&L USD deque: what the window detects is trading losses,
+    // and only the scale it is judged against changes.
     //
     // A configured max_window_loss_bps of 0 disables this check entirely.
     //
@@ -11872,13 +11930,15 @@ void Engine::step_check_alerts(BlockHeight block_height)
             const double window_loss_usd =
                 window_start_pnl - total.total_pnl_usd;
 
-            // Threshold in USD (risk/drawdown_breaker.hpp, test-pinned).
+            // Threshold in USD (risk/drawdown_breaker.hpp, test-pinned):
+            // anchored to current portfolio equity, with the 1-XCH-USD /
+            // fixed-nominal chain only for the pre-valuation cycles.
             const double live_xch_usd = usd_per_xch();
             const double anchor_fallback_usd =
                 (live_xch_usd > 0.0) ? live_xch_usd
                                      : risk::kWindowAnchorFallbackUsd;
             const double threshold_usd = risk::window_loss_threshold_usd(
-                peak_pnl_hwm_usd_, anchor_fallback_usd,
+                equity_usd, anchor_fallback_usd,
                 config_.risk.max_window_loss_bps);
 
             // 4. Fire if window_loss exceeds the threshold.
@@ -11896,9 +11956,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
                               window_loss_usd, window_actual,
                               threshold_usd,
                               config_.risk.max_window_loss_bps,
-                              (peak_pnl_hwm_usd_ > 0.0)
-                                  ? peak_pnl_hwm_usd_
-                                  : anchor_fallback_usd);
+                              (equity_usd > 0.0) ? equity_usd
+                                                 : anchor_fallback_usd);
 
                 state_->set_status(BotStatus::Paused);
 

@@ -1087,16 +1087,34 @@ struct StrategyConfig {
 //   max_capital_per_pair_pct-- upper bound on capital allocated to one pair.
 //
 // Circuit breakers (ISO/IEC 27001:2022 §8.20 -- continuous risk monitoring):
-//   max_drawdown_pct     -- peak-to-trough drawdown fraction that pauses the
-//                           engine.  Default 10% (0.10).  Measures the drop
-//                           from the all-time PnL high-water mark.
+//   max_drawdown_frac    -- peak-to-trough drawdown fraction OF PORTFOLIO
+//                           EQUITY that pauses the engine.  Default 10%
+//                           (0.10).  [DRAWDOWN-EQUITY 2026-08-04] Renamed
+//                           from max_drawdown_pct: the old key measured
+//                           against the P&L high-water mark, whose small
+//                           denominator (~$25 of accumulated profit vs a
+//                           ~$158 portfolio) turned a normal ~5% overnight
+//                           XCH retrace into a "60% drawdown" false trip
+//                           at 04:14 on 2026-08-04.  The old key's 0.05
+//                           was set before the breaker math even worked
+//                           and was never calibrated; presence of the old
+//                           key is now a hard config error so a stale
+//                           P&L-calibrated value cannot silently apply to
+//                           equity semantics.
 //   loss_window_blocks   -- rolling window size in blocks for the time-window
 //                           loss circuit breaker.  Default 1152 blocks ≈ 10 h
 //                           at the Chia mean block time of 52 s.
-//   max_window_loss_bps  -- maximum loss (in basis points, i.e. 0.01 % per bp)
-//                           permitted within the rolling window before the
-//                           engine is paused.  Default 500 bps = 5 %.
-//                           A value of 0 disables the window circuit breaker.
+//   max_window_loss_bps  -- maximum P&L loss within the rolling window,
+//                           in basis points OF PORTFOLIO EQUITY
+//                           ([DRAWDOWN-EQUITY 2026-08-04]: 250 bps of the
+//                           measured ~$150 book is ~$3.75, vs the $1.09
+//                           the retired |P&L-HWM| anchor produced).
+//                           A value of 0 disables the window breaker.
+//   breaker_realert_minutes -- once a breaker has PAUSED the engine, the
+//                           persisting condition is logged at info level
+//                           and the CRITICAL alert is re-raised at most
+//                           this often (measured spam every ~10-30 s
+//                           while paused on 2026-08-04).
 // ---------------------------------------------------------------------------
 struct RiskConfig {
     double   soft_limit_pct{0.60};
@@ -1106,10 +1124,11 @@ struct RiskConfig {
     double   max_capital_per_pair_pct{0.20};
 
     // -- Circuit breakers ---------------------------------------------------
-    double   max_drawdown_pct{0.10};        ///< HWM drawdown threshold (0,1].
+    double   max_drawdown_frac{0.10};       ///< Equity drawdown threshold (0,1].
     uint32_t drawdown_grace_blocks{100};    ///< Blocks to skip drawdown check at startup.
     uint32_t loss_window_blocks{1152};      ///< Rolling window size in blocks.
-    double   max_window_loss_bps{500.0};    ///< Max loss in window (bps; 0=disabled).
+    double   max_window_loss_bps{500.0};    ///< Max window P&L loss (bps of equity; 0=disabled).
+    uint32_t breaker_realert_minutes{30};   ///< Min minutes between repeat breaker alerts while paused.
 
     // -- Flash crash detection (T7-07, T7-08) --------------------------------
     double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
