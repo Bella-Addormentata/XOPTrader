@@ -36,6 +36,25 @@ Method, per enabled pair:
   5. Ladder total = tier0 * sum(tier_size_pct) / tier_size_pct[0]
      (per-pair override when present, else strategy defaults, else equal).
 
+The script then INVERTS the holdings cap to answer: what balances SHOULD
+we hold so that participation (the market opportunity), not our holdings,
+is the binding constraint?  Per pair-side, the unconstrained flow-keyed
+ladder (participation + inventory-days caps and the uncertainty haircut
+still apply; the holdings cap is removed) divided by the 40% cap gives the
+required locked-asset holdings -- base asset for the ask ladder, quote for
+the bid (converted at current prices).  Requirements are SUMMED per asset
+across pairs because all ladders post concurrently (XCH backs the ask
+ladders of every XCH-base pair at the same time), which is the
+conservative aggregation.  The engine fee reserve (fee_reserve_xch) is
+added on top; the --liquid-floor operating reserve is checked but is
+mathematically subsumed by the 40% cap (a fully funded asset is at most
+40% deployed, i.e. at least 60% liquid) unless the floor exceeds 0.60.
+Two answers are produced: (A) what fully funding the target costs, and
+(B) the best proportional allocation of the CURRENT total, plus the
+capital ceiling above which the strategy cannot deploy usefully at
+current market volumes (participation beyond the hard cap stops adding
+profit).
+
 Usage:
     .venv/Scripts/python.exe scripts/recommend_offer_sizes.py
     .venv/Scripts/python.exe scripts/recommend_offer_sizes.py \
@@ -235,10 +254,13 @@ def _recommend(pair_cfg: dict, strategy: dict, db: DbReader,
 
     result = {
         "name": name, "base_name": base_name,
+        "base_id": base_id, "quote_id": quote_id,
         "our_fills_day": our_fills_day, "our_volume_day": our_volume_day,
         "modal_units": modal_units, "config_floor": config_floor,
-        "ladder_mult": ladder_mult, "haircut_note": haircut_note,
-        "num_tiers": len(weights),
+        "ladder_mult": ladder_mult, "haircut": haircut,
+        "haircut_note": haircut_note, "num_tiers": len(weights),
+        "fills_div": max(our_fills_day, 1.0),
+        "tighter_side": None, "holdings_bound": False, "floored": False,
     }
 
     ticker = _match_ticker(tickers, base_id, quote_id)
@@ -289,15 +311,17 @@ def _recommend(pair_cfg: dict, strategy: dict, db: DbReader,
     # tighter side, converted at the dexie last price.  NOTE: XCH holdings
     # back every XCH-base ladder, so these per-pair caps overlap.
     holdings = db.holdings_units()
-    side_caps_base_units = []
+    side_caps: dict[str, float] = {}
     if base_id in holdings:
-        side_caps_base_units.append(HOLDINGS_CAP_FRAC * holdings[base_id])
+        side_caps["base"] = HOLDINGS_CAP_FRAC * holdings[base_id]
     price_in_base = _ticker_price_in_base(ticker, base_id)
     if quote_id in holdings and price_in_base is not None:
-        side_caps_base_units.append(
-            HOLDINGS_CAP_FRAC * holdings[quote_id] * price_in_base)
-    if side_caps_base_units:
-        caps["holdings cap"] = min(side_caps_base_units) / ladder_mult
+        side_caps["quote"] = \
+            HOLDINGS_CAP_FRAC * holdings[quote_id] * price_in_base
+    if side_caps:
+        tighter = min(side_caps, key=side_caps.get)
+        result["tighter_side"] = tighter
+        caps["holdings cap"] = side_caps[tighter] / ladder_mult
 
     chain = ["target participation"]
     tier0 = naive_tier0
@@ -320,6 +344,8 @@ def _recommend(pair_cfg: dict, strategy: dict, db: DbReader,
         "recommended_tier0": tier0,
         "ladder_total": tier0 * ladder_mult,
         "binding": binding,
+        "holdings_bound": "holdings cap" in chain,
+        "floored": floored,
     })
 
     # One-line rationale.
@@ -375,6 +401,249 @@ def _print_pair(r: dict, args: argparse.Namespace) -> None:
     print()
 
 
+def _usd_prices(tickers: list[dict]) -> dict[str, float]:
+    """USD per unit, per asset id.  wUSDC.b is the numeraire ($1.00 exactly,
+    matching the accounting policy); XCH is derived from the wUSDC.b_XCH
+    ticker and every other CAT crosses through its CAT_XCH ticker."""
+    usdc = "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
+    xch_per_unit: dict[str, float] = {}
+    for t in tickers:
+        if t.get("target_id") == "xch" and t.get("base_id"):
+            last = float(t.get("last_price") or 0.0)
+            if last > 0:
+                xch_per_unit[t["base_id"]] = last
+    if usdc not in xch_per_unit:
+        raise RuntimeError("dexie has no wUSDC.b_XCH ticker; cannot "
+                           "establish a USD anchor")
+    xch_usd = 1.0 / xch_per_unit[usdc]
+    prices = {"xch": xch_usd, usdc: 1.0}
+    for asset_id, xch_per in xch_per_unit.items():
+        prices.setdefault(asset_id, xch_per * xch_usd)
+    return prices
+
+
+def _ideal_tier0(r: dict, target: float, args: argparse.Namespace) -> float:
+    """Tier-0 size if holdings never bound: participation + inventory-days
+    caps and the uncertainty haircut still apply, then the config floor."""
+    mkt = r.get("market_volume_day")
+    if not mkt:
+        return r["config_floor"]
+    tier0 = min(target * mkt / r["fills_div"],
+                args.max_participation * mkt / r["fills_div"],
+                args.inventory_days * mkt / r["ladder_mult"])
+    tier0 *= r["haircut"]
+    return max(tier0, r["config_floor"])
+
+
+def _ideal_requirements(results: list[dict], usd: dict[str, float],
+                        target: float, args: argparse.Namespace
+                        ) -> tuple[dict[str, float], dict[str, float],
+                                   dict[str, float]]:
+    """(required units, deployed units, ideal ladder per pair), inverting the
+    holdings cap: required = ladder / HOLDINGS_CAP_FRAC in the locked asset
+    (base for the ask ladder, quote for the bid, at current USD crosses).
+    Requirements are SUMMED per asset across pairs -- all ladders post
+    concurrently, so the sum is the conservative/correct aggregation."""
+    required: dict[str, float] = {}
+    deployed: dict[str, float] = {}
+    ladders: dict[str, float] = {}
+    for r in results:
+        base_id, quote_id = r["base_id"], r["quote_id"]
+        if base_id not in usd or quote_id not in usd:
+            continue
+        ladder = _ideal_tier0(r, target, args) * r["ladder_mult"]
+        ladders[r["name"]] = ladder
+        quote_per_base = usd[base_id] / usd[quote_id]
+        required[base_id] = required.get(base_id, 0.0) \
+            + ladder / HOLDINGS_CAP_FRAC
+        required[quote_id] = required.get(quote_id, 0.0) \
+            + ladder * quote_per_base / HOLDINGS_CAP_FRAC
+        deployed[base_id] = deployed.get(base_id, 0.0) + ladder
+        deployed[quote_id] = deployed.get(quote_id, 0.0) \
+            + ladder * quote_per_base
+    return required, deployed, ladders
+
+
+def _apply_reserves(required: dict[str, float], deployed: dict[str, float],
+                    fee_reserve_xch: float, liquid_floor: float
+                    ) -> dict[str, float]:
+    """Operating reserves on top of the ladder-backing requirement.  The
+    liquid floor is checked per asset but with the 40% holdings cap a fully
+    funded asset is at most 40% deployed (>= 60% liquid), so the floor only
+    binds above --liquid-floor 0.60."""
+    ideal = dict(required)
+    if liquid_floor < 1.0:
+        for asset_id, dep in deployed.items():
+            floor_req = dep / (1.0 - liquid_floor)
+            if floor_req > ideal.get(asset_id, 0.0):
+                ideal[asset_id] = floor_req
+    ideal["xch"] = ideal.get("xch", 0.0) + fee_reserve_xch
+    return ideal
+
+
+def _unlocks_note(asset_id: str, results: list[dict]) -> str:
+    parts = []
+    for r in results:
+        if r["base_id"] == asset_id:
+            tag = " (binding now)" if (r["holdings_bound"]
+                                       and r["tighter_side"] == "base") else ""
+            parts.append(f"ask {r['name']}{tag}")
+        elif r["quote_id"] == asset_id:
+            tag = " (binding now)" if (r["holdings_bound"]
+                                       and r["tighter_side"] == "quote") else ""
+            parts.append(f"bid {r['name']}{tag}")
+    return ", ".join(parts) if parts else "reserves only"
+
+
+def _marginal_impact_per_usd(asset_id: str, results: list[dict]) -> float:
+    """Extra recommended USD volume/day per extra USD of this asset, at
+    current holdings.  Adding $1 to the tighter side of a holdings-bound
+    pair raises that side's tier-0 cap by HOLDINGS_CAP_FRAC/ladder_mult
+    dollars-of-base, which fills fills_div times a day with the haircut
+    applied -- the USD terms cancel, leaving a dimensionless $/day per $."""
+    impact = 0.0
+    for r in results:
+        if not r["holdings_bound"]:
+            continue
+        side_asset = r["base_id"] if r["tighter_side"] == "base" \
+            else r["quote_id"]
+        if side_asset != asset_id:
+            continue
+        impact += r["fills_div"] * r["haircut"] \
+            * HOLDINGS_CAP_FRAC / r["ladder_mult"]
+    return impact
+
+
+def _print_ideal_balances(results: list[dict], usd: dict[str, float],
+                          holdings: dict[str, float], config: dict,
+                          args: argparse.Namespace) -> None:
+    fee_reserve = float(config.get("strategy", {}).get("fee_reserve_xch", 0.0))
+
+    required, deployed, ladders = _ideal_requirements(
+        results, usd, args.target_participation, args)
+    ideal = _apply_reserves(required, deployed, fee_reserve,
+                            args.liquid_floor)
+
+    print()
+    print("Ideal balances: what we SHOULD hold so participation, not "
+          "holdings, binds")
+    print(f"  method: unconstrained flow-keyed ladder per side (holdings "
+          f"cap removed, all")
+    print(f"  other caps + haircut kept) / {HOLDINGS_CAP_FRAC:.0%} holdings "
+          f"cap = required locked asset;")
+    print("  SUMMED per asset across pairs (all ladders post concurrently "
+          "-- conservative);")
+    if args.liquid_floor <= 1.0 - HOLDINGS_CAP_FRAC:
+        floor_note = (f"subsumed by the {HOLDINGS_CAP_FRAC:.0%} cap (a "
+                      f"funded asset is <= {HOLDINGS_CAP_FRAC:.0%} "
+                      f"deployed), binds only above "
+                      f"{1.0 - HOLDINGS_CAP_FRAC:.0%}")
+    else:
+        floor_note = (f"BINDING (exceeds the {1.0 - HOLDINGS_CAP_FRAC:.0%} "
+                      f"liquidity the {HOLDINGS_CAP_FRAC:.0%} cap implies)")
+    print(f"  + fee reserve {fee_reserve:g} XCH.  Liquid floor "
+          f"{args.liquid_floor:.0%}: {floor_note}.")
+    print()
+    ladder_bits = " | ".join(
+        f"{r['name']} {ladders[r['name']]:,.2f} {r['base_name']}"
+        for r in results if r["name"] in ladders)
+    print(f"  ideal ladder/side: {ladder_bits}")
+    print()
+
+    asset_ids = [a for a in ASSET_NAMES if a in ideal or a in holdings]
+    current_total = sum(holdings.get(a, 0.0) * usd[a]
+                        for a in asset_ids if a in usd)
+    ideal_total = sum(ideal.get(a, 0.0) * usd[a]
+                      for a in asset_ids if a in usd)
+
+    header = (f"  {'asset':<9} {'current':>12} {'ideal':>12} "
+              f"{'delta':>12} {'delta $':>9}  unlocks")
+    print(header)
+    print("  " + "-" * (len(header) + 10))
+    for a in asset_ids:
+        cur = holdings.get(a, 0.0)
+        idl = ideal.get(a, 0.0)
+        delta = idl - cur
+        print(f"  {_asset_name(a):<9} {cur:>12,.2f} {idl:>12,.2f} "
+              f"{delta:>+12,.2f} {delta * usd[a]:>+9,.2f}  "
+              f"{_unlocks_note(a, results)}")
+    print(f"  {'TOTAL $':<9} {current_total:>12,.2f} {ideal_total:>12,.2f} "
+          f"{ideal_total - current_total:>+12,.2f}")
+    print()
+
+    # (A) Full funding.
+    gap = ideal_total - current_total
+    if gap > 0:
+        print(f"  A) To fully fund {args.target_participation:.0%} "
+              f"participation you would add ~${gap:,.0f}")
+        print(f"     (${current_total:,.0f} now -> ${ideal_total:,.0f}).")
+    else:
+        print(f"  A) Current capital ${current_total:,.0f} already covers "
+              f"the ${ideal_total:,.0f} ideal; only the mix differs.")
+
+    # (B) Best allocation of what exists: same math, scaled proportionally.
+    print()
+    scale = current_total / ideal_total if ideal_total > 0 else 0.0
+    print(f"  B) Best allocation of the current ${current_total:,.0f} "
+          f"(same math scaled x{scale:.3f}):")
+    for a in asset_ids:
+        cur = holdings.get(a, 0.0)
+        alloc = ideal.get(a, 0.0) * scale
+        delta = alloc - cur
+        print(f"     {_asset_name(a):<9} {cur:>12,.2f} -> {alloc:>12,.2f} "
+              f"({delta:>+12,.2f} units, {delta * usd[a]:>+8,.2f} $)")
+    print("     caveat: proportional scaling keeps each pair's SHARE fixed; "
+          "XCH/DBX's share")
+    print("     is inflated by the max(fills,1) divisor on a <1 fill/day "
+          "market, so treat")
+    print("     its slice as an upper bound.  Where (B) disagrees with the "
+          "rebalance path")
+    print("     below (e.g. it sells the asset the path buys first), trust "
+          "the path for the")
+    print("     first dollars -- it is the measured marginal impact, not a "
+          "fixed-share scale.")
+
+    # Capital ceiling: the same derivation at the hard participation cap.
+    ceil_required, ceil_deployed, _ = _ideal_requirements(
+        results, usd, args.max_participation, args)
+    ceil_ideal = _apply_reserves(ceil_required, ceil_deployed, fee_reserve,
+                                 args.liquid_floor)
+    ceiling_total = sum(ceil_ideal.get(a, 0.0) * usd[a]
+                        for a in asset_ids if a in usd)
+    print()
+    print(f"  Capital ceiling: ~${ceiling_total:,.0f} at current market "
+          f"volumes.  Participation")
+    print(f"  above ~{args.max_participation:.0%} stops adding profit (we "
+          f"become the market), so capital beyond")
+    print("  this level cannot be deployed usefully by this strategy.")
+
+    # Rebalance path: order buys by marginal impact per dollar today.
+    print()
+    print("  Rebalance path (marginal recommended USD volume/day per $1 "
+          "added, at current")
+    print("  holdings; only holdings-bound pair-sides count):")
+    rows = []
+    for a in asset_ids:
+        delta = ideal.get(a, 0.0) - holdings.get(a, 0.0)
+        if delta <= 0:
+            continue
+        rows.append((a, _marginal_impact_per_usd(a, results), delta))
+    rows.sort(key=lambda t: t[1], reverse=True)
+    for rank, (a, impact, delta) in enumerate(rows, 1):
+        floored_pairs = [r["name"] for r in results
+                         if r["floored"] and r["holdings_bound"]
+                         and (r["base_id"] == a
+                              if r["tighter_side"] == "base"
+                              else r["quote_id"] == a)]
+        note = (f" (first dollars only clear the config floor on "
+                f"{', '.join(floored_pairs)})" if floored_pairs else "")
+        if impact <= 0:
+            note = (" (no marginal volume today -- needed at full funding "
+                    "once the quote sides fund up)")
+        print(f"    {rank}. {_asset_name(a):<9} ~${impact:.2f}/day per $1, "
+              f"gap {delta:+,.2f} units (${delta * usd[a]:+,.2f}){note}")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Advisory offer-size recommendations from market flow. "
@@ -386,6 +655,11 @@ def main() -> int:
     parser.add_argument("--inventory-days", type=float, default=2.5,
                         help="Ladder cap in days of market volume "
                              "(default 2.5).")
+    parser.add_argument("--liquid-floor", type=float, default=0.30,
+                        help="Operating reserve: fraction of each asset "
+                             "kept liquid in the ideal-balance derivation "
+                             "(default 0.30; subsumed by the 40%% holdings "
+                             "cap unless > 0.60).")
     parser.add_argument("--db", default=str(DB_PATH),
                         help="Engine SQLite database (opened read-only).")
     args = parser.parse_args()
@@ -429,6 +703,7 @@ def main() -> int:
     db = DbReader(db_path)
     try:
         results = [_recommend(p, strategy, db, tickers, args) for p in pairs]
+        holdings = db.holdings_units()
     finally:
         db.close()
 
@@ -450,6 +725,13 @@ def main() -> int:
         print(f"{r['name']:<14} {mkt:>10} {r['our_volume_day']:>9,.2f} "
               f"{part:>6} {now:>6} {r['recommended_tier0']:>8,.2f} "
               f"{r['ladder_total']:>8,.2f}  {r['binding']}")
+
+    try:
+        usd = _usd_prices(tickers)
+    except RuntimeError as exc:
+        print(f"\nIdeal-balance section skipped: {exc}", file=sys.stderr)
+        return 0
+    _print_ideal_balances(results, usd, holdings, config, args)
     return 0
 
 
