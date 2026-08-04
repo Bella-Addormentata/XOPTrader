@@ -83,6 +83,15 @@ _PNL_USDC_EXPR: Final[str] = (
 # Sentinel baseline meaning "no display reset applied" (include everything).
 _EPOCH_ISO: Final[str] = "1970-01-01 00:00:00"
 
+# Mojos-per-unit denominators (engine convention: XCH = 1e12, CATs = 1e3).
+_MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
+_MOJOS_PER_CAT: Final[float] = 1_000.0
+
+
+def _mojos_per_unit(symbol: str) -> float:
+    """Return the mojos-per-unit denominator for an asset display symbol."""
+    return _MOJOS_PER_XCH if symbol.strip().upper() == "XCH" else _MOJOS_PER_CAT
+
 
 # ===================================================================
 # Worker -- runs queries on a background QThread
@@ -106,6 +115,7 @@ class _DatabaseWorker(QObject):
     reports_ready = Signal(dict)
     pnl_display_ready = Signal(dict)
     pnl_history_ready = Signal(list)
+    deployed_ready = Signal(dict)
     query_error = Signal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -537,6 +547,80 @@ class _DatabaseWorker(QObject):
         _log.info("PnL history rebuilt from DB: %d points (%d days).",
                   len(points), safe_days)
         self.pnl_history_ready.emit(points)
+
+    @Slot()
+    def fetch_deployed_capital(self) -> None:
+        """Aggregate resting (pending) offers into per-asset offered amounts.
+
+        [DEPLOYED 2026-08-04] Feeds the Balances tab's "Deployed %" column.
+        For each ``offer_log`` row with status='pending' on pair BASE/QUOTE:
+
+        - an ASK locks the BASE asset: ``size_mojos`` base-asset mojos;
+        - a BID locks the QUOTE asset: the engine pseudo-price is
+          ``quote_units_per_base_unit * 1e12`` and sizes are base-asset
+          mojos, so (per ``xop::quote_mojos_for`` in cpp types.hpp)
+          ``quote_units = size_mojos * price_mojos
+          / (base_mojos_per_unit * 1e12)``.
+
+        Amounts are converted to whole asset units (XCH = 1e12 mojos/unit,
+        CATs = 1e3) and summed per display symbol.  NOTE: these are OFFER
+        sizes; on-chain offers lock whole coins, so the wallet's true
+        locked value (confirmed - spendable) can exceed these figures.
+
+        Emits ``deployed_ready`` with::
+
+            {"offered_units": {SYMBOL: units, ...},
+             "offer_counts":  {SYMBOL: count, ...},
+             "pending_offers": total_pending_count}
+
+        Symbols are upper-cased pair-name components (e.g. "XCH",
+        "WUSDC.B", "BYC", "DBX").
+        """
+        # CAST to REAL before multiplying: size*price reaches ~1.5e24 for
+        # XCH pairs, which overflows SQLite's 64-bit integers.
+        sql = """
+            SELECT pair_name, side,
+                   COALESCE(SUM(size_mojos), 0)                    AS size_sum,
+                   COALESCE(SUM(CAST(size_mojos AS REAL)
+                                * CAST(price_mojos AS REAL)), 0.0) AS size_price_sum,
+                   COUNT(*)                                        AS offer_count
+            FROM offer_log
+            WHERE status = 'pending'
+            GROUP BY pair_name, side
+        """
+        rows = self._execute_query(sql, [])
+        if rows is None:
+            return
+
+        offered_units: dict[str, float] = {}
+        offer_counts: dict[str, int] = {}
+        pending_total = 0
+        for row in rows:
+            pair = str(row["pair_name"] or "")
+            if "/" not in pair:
+                continue
+            base_sym, quote_sym = (part.strip() for part in pair.split("/", 1))
+            side = str(row["side"] or "").strip().lower()
+            count = int(row["offer_count"] or 0)
+            base_denom = _mojos_per_unit(base_sym)
+            if side == "ask":
+                symbol = base_sym.upper()
+                units = float(row["size_sum"] or 0) / base_denom
+            elif side == "bid":
+                symbol = quote_sym.upper()
+                units = (float(row["size_price_sum"] or 0.0)
+                         / (base_denom * _MOJOS_PER_XCH))
+            else:
+                continue
+            pending_total += count
+            offered_units[symbol] = offered_units.get(symbol, 0.0) + units
+            offer_counts[symbol] = offer_counts.get(symbol, 0) + count
+
+        self.deployed_ready.emit({
+            "offered_units": offered_units,
+            "offer_counts": offer_counts,
+            "pending_offers": pending_total,
+        })
 
     @Slot()
     def fetch_reports(self) -> None:
@@ -1177,6 +1261,7 @@ class DatabaseService(QObject):
     reports_loaded = Signal(dict)
     pnl_display_loaded = Signal(dict)
     pnl_history_loaded = Signal(list)
+    deployed_loaded = Signal(dict)
     query_error = Signal(str)
 
     # -- Internal trigger signals (queued connections to worker thread) ------
@@ -1191,6 +1276,7 @@ class DatabaseService(QObject):
     _trigger_reports = Signal()
     _trigger_pnl_display = Signal(str)
     _trigger_pnl_history = Signal(int)
+    _trigger_deployed = Signal()
 
     def __init__(
         self,
@@ -1220,6 +1306,7 @@ class DatabaseService(QObject):
         self._worker.reports_ready.connect(self.reports_loaded)
         self._worker.pnl_display_ready.connect(self.pnl_display_loaded)
         self._worker.pnl_history_ready.connect(self.pnl_history_loaded)
+        self._worker.deployed_ready.connect(self.deployed_loaded)
         self._worker.query_error.connect(self._on_worker_error)
 
         # Queued connections: emit trigger signals to dispatch work to
@@ -1236,6 +1323,7 @@ class DatabaseService(QObject):
         self._trigger_reports.connect(self._worker.fetch_reports)
         self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
         self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
+        self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
 
         # -- Auto-refresh timer ---------------------------------------------
         self._refresh_timer: QTimer = QTimer(self)
@@ -1250,6 +1338,9 @@ class DatabaseService(QObject):
         # Last requested P&L display baseline (None until first query;
         # "" means "no reset / full history").  Auto-refresh re-issues it.
         self._last_pnl_baseline: Optional[str] = None
+        # Whether deployed-capital data was ever requested; auto-refresh
+        # keeps it current once the Balances tab has asked for it.
+        self._deployed_requested: bool = False
 
         _log.info(
             "DatabaseService created: path=%s, refresh=%d ms",
@@ -1438,6 +1529,17 @@ class DatabaseService(QObject):
             self._last_pnl_baseline = safe_baseline
         self._trigger_pnl_display.emit(safe_baseline)
 
+    def query_deployed_capital(self) -> None:
+        """Request per-asset resting-offer ("offered") amounts.
+
+        Results arrive on :pyattr:`deployed_loaded`.  Once requested, the
+        query is re-issued on every auto-refresh tick so the Balances
+        tab's Deployed % figures stay current.
+        """
+        with QMutexLocker(self._mutex):
+            self._deployed_requested = True
+        self._trigger_deployed.emit()
+
     def query_pnl_history(self, days: int = 90) -> None:
         """Request the persisted global P&L (USD) time series.
 
@@ -1468,6 +1570,7 @@ class DatabaseService(QObject):
             trade_params = self._last_trade_params
             offer_params = self._last_offer_params
             pnl_baseline = self._last_pnl_baseline
+            deployed_requested = self._deployed_requested
 
         if trade_params is not None:
             self._trigger_trades.emit(*trade_params)
@@ -1478,6 +1581,10 @@ class DatabaseService(QObject):
         # Keep the restart-proof P&L display current.
         if pnl_baseline is not None:
             self._trigger_pnl_display.emit(pnl_baseline)
+
+        # Keep the Balances tab's Deployed % figures current.
+        if deployed_requested:
+            self._trigger_deployed.emit()
 
         # Also refresh the trade summary on each tick.
         self._trigger_summary.emit()

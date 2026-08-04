@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS as _C
+from gui.theme import MONO_FONT_FAMILY
 
 # ---------------------------------------------------------------------------
 # Palette aliases
@@ -58,7 +59,15 @@ _COLUMNS: Final[list[str]] = [
     "Pending",
     "Unconfirmed",
     "Reserve %",
+    "Deployed %",
 ]
+
+# Index of the "Deployed %" column (filled by _refresh_deployed_view).
+_DEPLOYED_COL: Final[int] = _COLUMNS.index("Deployed %")
+
+# Operator's recommended liquidity floor: warn when less than 20% of
+# USD-weighted capital remains liquid (i.e. overall deployment > 80%).
+_LIQUID_FLOOR_FRAC: Final[float] = 0.20
 
 # Well-known wallet type names.
 _WALLET_TYPES: Final[dict[int, str]] = {
@@ -107,6 +116,15 @@ class WalletBalancesWidget(QWidget):
         self._stuck_offers: int = 0
         self._last_balances: dict[str, dict[str, float]] = {}
         self._last_market_data: dict[str, dict[str, float]] = {}
+        # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts from
+        # DatabaseService.query_deployed_capital (offer_log pending rows,
+        # keyed by upper-cased symbol, in whole asset units).
+        self._offered_units: dict[str, float] = {}
+        self._offer_counts: dict[str, int] = {}
+        self._pending_offers: int = 0
+        # Wallet name per balances-table row (populated by update_balances)
+        # so the Deployed % column can be refreshed without a full rebuild.
+        self._row_wallets: list[str] = []
         # Pair configs from config.yaml (each with at least "name" and
         # "enabled" keys).  Used to restrict the Target Allocation table
         # to assets that participate in at least one enabled pair.
@@ -162,6 +180,22 @@ class WalletBalancesWidget(QWidget):
             "Wallets", "0", summary_layout
         )
         root.addWidget(self._summary_frame)
+
+        # -- Deployed-capital summary line --
+        self._deployed_label = QLabel("Deployed: —")
+        self._deployed_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 12px; "
+            f"font-family: {MONO_FONT_FAMILY};"
+        )
+        self._deployed_label.setToolTip(
+            "Locked = confirmed − spendable (the wallet's real committed "
+            "value; offers lock whole coins, so this can exceed offer "
+            "sizes).\n"
+            "Offered = sum of resting offer sizes from offer_log "
+            "(status='pending').\n"
+            "Percentages are USD-weighted across priced assets."
+        )
+        root.addWidget(self._deployed_label)
 
         # -- Stuck offers warning --
         self._stuck_label = QLabel()
@@ -389,6 +423,7 @@ class WalletBalancesWidget(QWidget):
             return
 
         self._table.setRowCount(len(balances))
+        self._row_wallets = [name for name, _ in sorted(balances.items())]
 
         total_spendable = 0.0
         total_confirmed = 0.0
@@ -425,7 +460,8 @@ class WalletBalancesWidget(QWidget):
                 total_confirmed += confirmed
                 total_pending += pending
 
-            # Populate row.
+            # Populate row.  The Deployed % placeholder is filled by
+            # _refresh_deployed_view() below.
             items: list[tuple[str, QColor | None]] = [
                 (display_name, None),
                 (self._fmt(spendable), None),
@@ -433,6 +469,7 @@ class WalletBalancesWidget(QWidget):
                 (self._fmt(pending), QColor(WARNING) if pending != 0 else None),
                 (self._fmt(unconfirmed), None),
                 (res_display, res_color),
+                ("—", None),
             ]
 
             for col, (text, color) in enumerate(items):
@@ -465,7 +502,165 @@ class WalletBalancesWidget(QWidget):
         self._status_label.setText(
             f"Last update: {len(balances)} wallet(s) loaded"
         )
+        self._refresh_deployed_view()
         self._refresh_allocation_table()
+
+    @Slot(dict)
+    def update_deployed(self, payload: dict[str, Any]) -> None:
+        """Receive per-asset resting-offer amounts from the database.
+
+        Parameters
+        ----------
+        payload:
+            Dict from ``DatabaseService.deployed_loaded`` with keys
+            ``offered_units`` (symbol -> whole asset units),
+            ``offer_counts`` (symbol -> pending offer count) and
+            ``pending_offers`` (total pending count).
+        """
+        self._offered_units = {
+            str(key).upper(): float(value)
+            for key, value in (payload.get("offered_units") or {}).items()
+        }
+        self._offer_counts = {
+            str(key).upper(): int(value)
+            for key, value in (payload.get("offer_counts") or {}).items()
+        }
+        self._pending_offers = int(payload.get("pending_offers", 0) or 0)
+        self._refresh_deployed_view()
+
+    def _refresh_deployed_view(self) -> None:
+        """Fill the Deployed % column and the deployment summary line.
+
+        Two measures per asset:
+
+        - **locked**  = confirmed − spendable from the wallet RPC.  This is
+          the real committed value: on-chain offers lock WHOLE coins, so a
+          2.8-XCH coin backing a 1-XCH offer locks all 2.8 XCH.
+        - **offered** = sum of resting offer sizes from ``offer_log``
+          (status='pending'), via DatabaseService.
+
+        The column shows the locked-based percentage (the honest number);
+        cell tooltips carry both figures.  The summary line is USD-weighted
+        with the same price graph used by the Target Allocation panel and
+        switches to the warning colour when less than 20% of capital
+        remains liquid.
+        """
+        balances = self._last_balances
+        if not balances:
+            self._deployed_label.setText("Deployed: — (waiting for wallet data)")
+            return
+
+        asset_prices = self._asset_prices_usdc()
+        asset_id_map = self._asset_id_symbol_map()
+
+        # Resolve each wallet to a display symbol and aggregate confirmed
+        # units per symbol (needed to express "offered" as a percentage).
+        wallet_symbols: dict[str, Optional[str]] = {}
+        confirmed_by_symbol: dict[str, float] = {}
+        for wallet_name, bal in balances.items():
+            symbol = self._wallet_asset_symbol(
+                wallet_name, bal, asset_prices, asset_id_map
+            )
+            key = symbol.upper() if symbol else None
+            wallet_symbols[wallet_name] = key
+            if key:
+                confirmed_by_symbol[key] = (
+                    confirmed_by_symbol.get(key, 0.0)
+                    + float(bal.get("confirmed", 0.0) or 0.0)
+                )
+
+        # -- Per-row column ------------------------------------------------
+        for row, wallet_name in enumerate(self._row_wallets):
+            item = self._table.item(row, _DEPLOYED_COL)
+            if item is None:
+                continue
+            bal = balances.get(wallet_name, {})
+            confirmed = float(bal.get("confirmed", 0.0) or 0.0)
+            spendable = float(bal.get("spendable", 0.0) or 0.0)
+            locked = max(0.0, confirmed - spendable)
+
+            key = wallet_symbols.get(wallet_name)
+            offered = self._offered_units.get(key, 0.0) if key else 0.0
+            offer_count = self._offer_counts.get(key, 0) if key else 0
+            symbol_confirmed = (
+                confirmed_by_symbol.get(key, confirmed) if key else confirmed
+            )
+
+            if confirmed > 0.0:
+                locked_pct = locked / confirmed * 100.0
+                item.setText(f"{locked_pct:.1f}%")
+                # Subtle cue when this asset itself is below the 20%
+                # liquidity floor; default colour otherwise.
+                if locked_pct > (1.0 - _LIQUID_FLOOR_FRAC) * 100.0:
+                    item.setForeground(QColor(WARNING))
+                else:
+                    item.setForeground(QColor(TEXT_PRIMARY))
+            else:
+                item.setText("—")
+                item.setForeground(QColor(TEXT_SECONDARY))
+
+            tooltip_lines = [
+                f"Locked (confirmed − spendable): {self._fmt(locked)}",
+            ]
+            if key:
+                offered_pct = (
+                    f" = {offered / symbol_confirmed * 100.0:.1f}% of {key}"
+                    if symbol_confirmed > 0.0 else ""
+                )
+                tooltip_lines.append(
+                    f"Offered ({offer_count} resting offer(s)): "
+                    f"{self._fmt(offered)}{offered_pct}"
+                )
+            tooltip_lines.append(
+                "Offers lock whole coins, so locked can exceed offered."
+            )
+            item.setToolTip("\n".join(tooltip_lines))
+
+        # -- USD-weighted summary line -------------------------------------
+        total_usd = 0.0
+        locked_usd = 0.0
+        for wallet_name, bal in balances.items():
+            key = wallet_symbols.get(wallet_name)
+            price = asset_prices.get(key, 0.0) if key else 0.0
+            if price <= 0.0:
+                continue
+            confirmed = float(bal.get("confirmed", 0.0) or 0.0)
+            spendable = float(bal.get("spendable", 0.0) or 0.0)
+            total_usd += confirmed * price
+            locked_usd += max(0.0, confirmed - spendable) * price
+
+        offered_usd = sum(
+            units * asset_prices.get(key, 0.0)
+            for key, units in self._offered_units.items()
+            if asset_prices.get(key, 0.0) > 0.0
+        )
+
+        if total_usd <= 0.0:
+            self._deployed_label.setText(
+                "Deployed: — (waiting for market data)"
+            )
+            self._deployed_label.setStyleSheet(
+                f"color: {TEXT_SECONDARY}; font-size: 12px; "
+                f"font-family: {MONO_FONT_FAMILY};"
+            )
+            return
+
+        deployed_frac = locked_usd / total_usd
+        liquid_frac = 1.0 - deployed_frac
+        offered_pct = offered_usd / total_usd * 100.0
+        self._deployed_label.setText(
+            f"Deployed: {deployed_frac * 100.0:.1f}% of "
+            f"${total_usd:,.2f} total (locked) · "
+            f"offered {offered_pct:.1f}% "
+            f"({self._pending_offers} offer(s)) · "
+            f"liquid {liquid_frac * 100.0:.1f}%"
+        )
+        # Subtle cue when overall deployment leaves <20% liquid.
+        colour = WARNING if liquid_frac < _LIQUID_FLOOR_FRAC else TEXT_SECONDARY
+        self._deployed_label.setStyleSheet(
+            f"color: {colour}; font-size: 12px; "
+            f"font-family: {MONO_FONT_FAMILY};"
+        )
 
     def _asset_prices_usdc(self) -> dict[str, float]:
         prices: dict[str, float] = {}
@@ -1031,6 +1226,15 @@ class WalletBalancesWidget(QWidget):
         self._target_tolerances.clear()
         self._last_balances = {}
         self._last_market_data = {}
+        self._offered_units = {}
+        self._offer_counts = {}
+        self._pending_offers = 0
+        self._row_wallets = []
+        self._deployed_label.setText("Deployed: —")
+        self._deployed_label.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 12px; "
+            f"font-family: {MONO_FONT_FAMILY};"
+        )
         self._alloc_sum_label.setText("Target sum: —")
         self._alloc_hint_label.setText("")
         self._total_spendable_label.setText("—")

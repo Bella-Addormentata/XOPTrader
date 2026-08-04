@@ -285,6 +285,13 @@ class MainWindow(QMainWindow):
             db.trades_loaded.connect(self._trade_log.load_trades)
         if self._chart is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_chart)
+        # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
+        # Balances tab's Deployed % column and summary line.
+        _wallet_widget = self._unwrap(self._wallet_balances)
+        if (_wallet_widget is not None
+                and hasattr(_wallet_widget, "update_deployed")
+                and hasattr(db, "deployed_loaded")):
+            db.deployed_loaded.connect(_wallet_widget.update_deployed)
 
         # [PNL-DISPLAY 2026-08-02] Restart-proof P&L: headline figures and
         # chart history are derived from the persistent DB, not from GUI
@@ -310,6 +317,10 @@ class MainWindow(QMainWindow):
             # Rebuild the chart's P&L curve from the DB (90-day window)
             # so it survives GUI restarts.
             db.query_pnl_history(90)
+        if hasattr(db, "query_deployed_capital"):
+            # Seed the Balances tab's deployed-capital figures; the
+            # auto-refresh loop re-issues this on every DB tick.
+            db.query_deployed_capital()
 
         # -- Reports widget signal -----------------------------------------
         reports_widget = self._unwrap(self._reports)
