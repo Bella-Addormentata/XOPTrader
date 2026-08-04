@@ -16,7 +16,7 @@ import json
 import logging
 from typing import Any, Final, Optional
 
-from PySide6.QtCore import QSettings, Qt, Signal, Slot
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QFrame,
@@ -98,6 +98,35 @@ _ALLOC_TOLERANCES_KEY: Final[str] = "wallet/allocation_tolerances"
 
 _log = logging.getLogger(__name__)
 
+# Tooltip base for the read-only "Suggested %" allocation column.
+_SUGGESTED_ALLOC_TOOLTIP: Final[str] = (
+    "Flow-keyed advisory: the best allocation of EXISTING capital -- ideal "
+    "holdings from the offer-sizing calculator (dexie 7-day volume vs our "
+    "fills, holdings cap inverted), normalized to 100%.  Re-computed each "
+    "time this page opens.  Advisory only -- never applied automatically."
+)
+
+
+class _SuggestedAllocationWorker(QObject):
+    """Computes the advisory per-asset portfolio allocation off the UI
+    thread (dexie HTTP fetch + read-only SQLite reads), following the
+    database_service worker pattern: a QObject moved to a QThread whose
+    results come back via queued signals.  Never blocks the event loop.
+    """
+
+    ready = Signal(dict)   # payload of offer_sizing.suggested_portfolio_allocation
+    failed = Signal(str)
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from gui.utils import load_offer_sizing  # noqa: WPS433
+
+            sizing = load_offer_sizing()
+            self.ready.emit(dict(sizing.suggested_portfolio_allocation()))
+        except Exception as exc:  # fail soft -> "n/a" in the table
+            self.failed.emit(str(exc))
+
 
 class WalletBalancesWidget(QWidget):
     """Full-page widget showing wallet balances in a styled table.
@@ -132,6 +161,16 @@ class WalletBalancesWidget(QWidget):
         self._target_allocations: dict[str, float] = {}
         self._target_tolerances: dict[str, float] = {}
         self._alloc_updating = False
+        # Advisory suggested allocation (flow-keyed calculator output).
+        # None until the first async compute lands; _suggested_status is
+        # "pending", "ready" or "failed: <msg>".
+        self._suggested_alloc: Optional[dict[str, Any]] = None
+        self._suggested_status: str = "pending"
+        self._suggest_thread: Optional[QThread] = None
+        # Keep a Python reference to the worker while it runs: PySide6
+        # would otherwise garbage-collect the unparented QObject before
+        # the thread invokes it.
+        self._suggest_worker: Optional[_SuggestedAllocationWorker] = None
         # Restore persisted targets before the UI is built so the first
         # render already has them.
         self._load_target_allocations()
@@ -269,9 +308,12 @@ class WalletBalancesWidget(QWidget):
         alloc_desc.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         alloc_layout.addWidget(alloc_desc)
 
-        self._alloc_table = QTableWidget(0, 5)
+        self._alloc_table = QTableWidget(0, 6)
         self._alloc_table.setHorizontalHeaderLabels(
-            ["Asset", "Current %", "Target %", "Target % +/-", "Delta %"]
+            [
+                "Asset", "Current %", "Target %", "Suggested %",
+                "Target % +/-", "Delta %",
+            ]
         )
         self._alloc_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -304,6 +346,16 @@ class WalletBalancesWidget(QWidget):
         )
         self._alloc_table.cellChanged.connect(self._on_alloc_cell_changed)
         alloc_layout.addWidget(self._alloc_table)
+
+        # Advisory footnote for the Suggested % column.  States the
+        # marginal-priority tension explicitly once results arrive.
+        self._alloc_suggest_note = QLabel("")
+        self._alloc_suggest_note.setWordWrap(True)
+        self._alloc_suggest_note.setStyleSheet(
+            f"color: {TEXT_SECONDARY}; font-size: 11px;"
+        )
+        self._alloc_suggest_note.setVisible(False)
+        alloc_layout.addWidget(self._alloc_suggest_note)
 
         alloc_controls = QHBoxLayout()
         self._alloc_sum_label = QLabel("Target sum: —")
@@ -930,32 +982,40 @@ class WalletBalancesWidget(QWidget):
                 delta_pct = 0.0
                 delta_text = "—"
 
+            suggested_text, suggested_tooltip, suggested_color = \
+                self._suggested_cell_for(asset)
+            suggested_item = QTableWidgetItem(suggested_text)
+            suggested_item.setToolTip(suggested_tooltip)
+            suggested_item.setForeground(QColor(suggested_color))
+
             cols = [
                 QTableWidgetItem(asset),
                 QTableWidgetItem(current_text),
                 QTableWidgetItem(f"{target_pct:.2f}"),
+                suggested_item,
                 QTableWidgetItem(f"{tolerance_pct:.2f}"),
                 QTableWidgetItem(delta_text),
             ]
 
             cols[0].setFlags(cols[0].flags() & ~Qt.ItemFlag.ItemIsEditable)
             cols[1].setFlags(cols[1].flags() & ~Qt.ItemFlag.ItemIsEditable)
-            cols[4].setFlags(cols[4].flags() & ~Qt.ItemFlag.ItemIsEditable)
+            cols[3].setFlags(cols[3].flags() & ~Qt.ItemFlag.ItemIsEditable)
+            cols[5].setFlags(cols[5].flags() & ~Qt.ItemFlag.ItemIsEditable)
 
             cols[0].setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-            for idx in (1, 2, 3, 4):
+            for idx in (1, 2, 3, 4, 5):
                 cols[idx].setTextAlignment(
                     Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
                 )
 
             if not priced:
-                cols[4].setForeground(QColor(TEXT_SECONDARY))
+                cols[5].setForeground(QColor(TEXT_SECONDARY))
             elif tolerance_pct > 0.0 and abs(delta_pct) <= tolerance_pct:
-                cols[4].setForeground(QColor(PROFIT_GREEN))
+                cols[5].setForeground(QColor(PROFIT_GREEN))
             elif abs(delta_pct) > 5.0:
-                cols[4].setForeground(QColor(WARNING))
+                cols[5].setForeground(QColor(WARNING))
             else:
-                cols[4].setForeground(QColor(PROFIT_GREEN))
+                cols[5].setForeground(QColor(PROFIT_GREEN))
 
             for col, item in enumerate(cols):
                 self._alloc_table.setItem(row, col, item)
@@ -984,9 +1044,117 @@ class WalletBalancesWidget(QWidget):
         )
         self._alloc_hint_label.setToolTip("\n".join(diag_lines))
 
+    # ------------------------------------------------------------------
+    # Suggested allocation (advisory, async)
+    # ------------------------------------------------------------------
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 -- Qt override
+        """Re-compute the advisory suggested allocation whenever the page
+        becomes visible, per the column's "re-computed on open" contract."""
+        super().showEvent(event)
+        self._refresh_suggested_allocation()
+
+    def _refresh_suggested_allocation(self) -> None:
+        """Kick off the async suggested-allocation computation.
+
+        The dexie fetch and the read-only DB queries run on a dedicated
+        QThread (database_service worker pattern); results arrive via
+        queued signals, so the UI thread never blocks.  A run already in
+        flight is left alone.
+        """
+        if self._suggest_thread is not None:
+            return
+        self._suggested_status = "pending"
+        thread = QThread(self)
+        worker = _SuggestedAllocationWorker()
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ready.connect(self._on_suggested_ready)
+        worker.failed.connect(self._on_suggested_failed)
+        worker.ready.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_suggest_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._suggest_thread = thread
+        self._suggest_worker = worker
+        thread.start()
+
+    @Slot()
+    def _on_suggest_thread_finished(self) -> None:
+        self._suggest_thread = None
+        self._suggest_worker = None
+
+    @Slot(dict)
+    def _on_suggested_ready(self, payload: dict) -> None:
+        self._suggested_alloc = payload
+        self._suggested_status = "ready"
+        note = str(payload.get("marginal_note", ""))
+        self._alloc_suggest_note.setText(
+            "Suggested % = flow-keyed best split of EXISTING capital "
+            f"(advisory, {payload.get('computed_at', '?')}).  {note}"
+        )
+        self._alloc_suggest_note.setToolTip(self._suggested_tooltip())
+        self._alloc_suggest_note.setVisible(True)
+        self._refresh_allocation_table()
+
+    @Slot(str)
+    def _on_suggested_failed(self, message: str) -> None:
+        _log.warning("Suggested allocation unavailable: %s", message)
+        self._suggested_alloc = None
+        self._suggested_status = f"failed: {message}"
+        self._alloc_suggest_note.setText(
+            f"Suggested % unavailable: {message}"
+        )
+        self._alloc_suggest_note.setVisible(True)
+        self._refresh_allocation_table()
+
+    def _suggested_tooltip(self) -> str:
+        """Full advisory tooltip: method, corrections, marginal note."""
+        lines = [_SUGGESTED_ALLOC_TOOLTIP]
+        if self._suggested_alloc:
+            corrections = self._suggested_alloc.get("corrections") or []
+            if corrections:
+                lines.append("")
+                lines.append("Corrections applied:")
+                lines.extend(f"  - {c}" for c in corrections)
+            note = self._suggested_alloc.get("marginal_note")
+            if note:
+                lines.append("")
+                lines.append(str(note))
+        elif self._suggested_status.startswith("failed"):
+            lines.append("")
+            lines.append(self._suggested_status)
+        return "\n".join(lines)
+
+    def _suggested_cell_for(self, asset: str) -> tuple[str, str, str]:
+        """(text, tooltip, colour) for the Suggested % cell of *asset*."""
+        tooltip = self._suggested_tooltip()
+        if self._suggested_status == "pending":
+            return "…", tooltip + "\n\nComputing…", TEXT_SECONDARY
+        if self._suggested_alloc is None:
+            return "n/a", tooltip, TEXT_SECONDARY
+        info = (self._suggested_alloc.get("assets") or {}).get(
+            asset.strip().upper()
+        )
+        if info is None:
+            return (
+                "—",
+                tooltip + "\n\nNot part of the flow-keyed derivation "
+                "(no enabled pair trades this asset).",
+                TEXT_SECONDARY,
+            )
+        return (
+            f"{float(info.get('suggested_pct', 0.0)):.2f}",
+            tooltip,
+            TEXT_PRIMARY,
+        )
+
     @Slot(int, int)
     def _on_alloc_cell_changed(self, row: int, col: int) -> None:
-        if self._alloc_updating or col not in (2, 3):
+        # Editable columns: 2 = Target %, 4 = Target % +/- (tolerance).
+        # Column 3 (Suggested %) is read-only advisory.
+        if self._alloc_updating or col not in (2, 4):
             return
         asset_item = self._alloc_table.item(row, 0)
         edited_item = self._alloc_table.item(row, col)
@@ -1003,7 +1171,7 @@ class WalletBalancesWidget(QWidget):
             value = max(0.0, min(100.0, value))
             self._target_allocations[asset] = value
             self._save_target_allocations()
-        else:  # col == 3 -- tolerance
+        else:  # col == 4 -- tolerance
             try:
                 value = float(raw_text)
             except ValueError:

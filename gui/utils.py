@@ -42,6 +42,36 @@ _STABLECOINS: frozenset[str] = frozenset({
 })
 
 
+def load_offer_sizing():
+    """Import scripts/offer_sizing.py by path and return the module.
+
+    The advisory offer-sizing calculator is shared with the
+    recommend_offer_sizes.py CLI; scripts/ is not a package, so it is
+    loaded by file path, registered in ``sys.modules`` (dataclass
+    processing requires the entry to exist during exec) and cached there
+    for every GUI caller.  The calculator is read-only against
+    config.yaml, the engine database and dexie.
+    """
+    import importlib.util
+    import sys
+    from pathlib import Path
+
+    name = "xop_offer_sizing"
+    existing = sys.modules.get(name)
+    if existing is not None:
+        return existing
+    path = Path(__file__).resolve().parents[1] / "scripts" / "offer_sizing.py"
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return module
+
+
 def is_stablecoin_quoted(pair_name: str) -> bool:
     """Return ``True`` when the quote asset of *pair_name* is a stablecoin."""
     parts = pair_name.split("/")
