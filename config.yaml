@@ -67,9 +67,6 @@ strategy:
   kappa: 1.5
   phi: 0.5
   q_max: 20
-  # Raised 30 -> 50 bps on 2026-07-30, once realized P&L became measurable.
-  # Asks below cost+margin are now LIFTED to this floor rather than dropped,
-  # so raising it widens the ask side instead of withdrawing it.
   min_profit_margin_bps: 50
   max_half_spread_bps: 150
   high_vol_multiplier: 1.3
@@ -83,7 +80,7 @@ strategy:
   - 230.0
   - 300.0
   tier_size_pct:
-  - 0.10
+  - 0.1
   - 0.12
   - 0.15
   - 0.18
@@ -102,12 +99,6 @@ strategy:
   min_trading_units: 0.1
   adverse_selection_sizing: true
   adverse_selection_decay: 0.85
-  # Annualized-sigma units. Recalibrated 2026-08-01 with the volatility
-  # warm-start: the old 0.005 predates honest sigma (est. was never ready;
-  # sigma sat at the 0.001 floor) and would now fire on every pair at the
-  # measured 0.4-1.9 baseline, halving decay and pushing ~82% of ladder
-  # capital to the 230-300 bps outer tiers. 2.0 fires only above 200%
-  # annualized vol -- genuinely extreme regimes.
   adverse_selection_sigma_threshold: 2.0
   wallet_balance_caps_enabled: true
   deploy_idle_inventory_enabled: true
@@ -163,38 +154,32 @@ strategy:
   comp_pid_min_offset: -3
   comp_pid_max_offset: 3
   asset_target_allocations:
-    BYC: 0.1
-    DBX: 0.05
-    WUSDC.B: 0.35
-    XCH: 0.5
+    BYC: 0.2
+    DBX: 0.1
+    WUSDC.B: 0.25
+    XCH: 0.45
   ratio_target_by_pair:
-    BYC/wUSDC.b: 0.2222222222222222
-    XCH/BYC: 0.8333333333333334
-    XCH/DBX: 0.9090909090909091
-    XCH/wUSDC.b: 0.5882352941176471
+    BYC/wUSDC.b: 0.4444444444444444
+    XCH/BYC: 0.6923076923076923
+    XCH/DBX: 0.8181818181818182
+    XCH/wUSDC.b: 0.6428571428571429
   asset_target_tolerances:
-    BYC: 0.04
+    BYC: 0.1
     DBX: 0.04
     WUSDC.B: 0.2
     XCH: 0.2
   ratio_band_enter_by_pair:
-    BYC/wUSDC.b: 0.260536398467433
-    XCH/BYC: 0.1515151515151516
-    XCH/DBX: 0.1398601398601398
-    XCH/wUSDC.b: 0.23529411764705882
+    BYC/wUSDC.b: 0.4126984126984127
+    XCH/BYC: 0.23776223776223776
+    XCH/DBX: 0.17715617715617715
+    XCH/wUSDC.b: 0.28571428571428575
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
   single_cat_cap_pct: 0.25
   kelly_fraction: 0.5
   max_capital_per_pair_pct: 0.85
-  # [DRAWDOWN-EQUITY 2026-08-04] Renamed from max_drawdown_pct and now a
-  # fraction of PORTFOLIO EQUITY (industry-standard drawdown), not the P&L
-  # high-water mark. The old 0.05 predated functional breaker math and
-  # false-tripped on 2026-08-04 (a ~5% XCH retrace = ~4-5% of equity read
-  # as "60% drawdown" against the ~$25 P&L peak). Recalibrated: 10% of
-  # equity.
-  max_drawdown_frac: 0.10
+  max_drawdown_frac: 0.1
   loss_window_blocks: 576
   max_window_loss_bps: 250
   circuit_breaker_enabled: true
@@ -252,66 +237,12 @@ arbitrage:
   midpoint_recycling_require_cex_ref: true
   midpoint_recycling_max_cex_age_blocks: 10
   midpoint_recycling_vpin_max: 0.7
-  # ===================================================================
-  # VERDICT 2026-07-30: THIS STRATEGY IS NOT VIABLE. Do not re-enable.
-  #
-  # The "edge" is denominated in the BYC/wUSDC.b MID, a price you cannot
-  # trade at. The arb ends short BYC and long wUSDC.b, so closing it means
-  # lifting that book's ask -- and its spread has run 290-1519 bps against
-  # gross edges of ~186 bps.
-  #
-  # Measured over 14,003 historical observations, correctly netted:
-  #     median net edge      -313 bps
-  #     positive              13.5% of the time
-  # Over the 215 scans the engine actually logged, it believed a median
-  # +2093 bps; the truth after the return leg was -775 bps.
-  # The single real trade found by audit nets -64.9 bps.
-  #
-  # The gap is a STALE-QUOTE ARTIFACT, not a premium. XCH/wUSDC.b reprices
-  # on 100% of observations; XCH/BYC on 9.1%; BYC/wUSDC.b on 3.0% (longest
-  # run: 398 identical readings). The "opportunity" is the liquid book
-  # drifting since the illiquid ones last updated, and it closes by the
-  # liquid leg coming back -- nothing is captured. It is widest exactly
-  # when BYC is least tradeable.
-  #
-  # Even gating on all three books being <=50 bps wide (4.1% of the time)
-  # clears +15 bps on only 0.7% of observations, at a mean edge smaller
-  # than one standard deviation of the price move during the 3-6 blocks
-  # three non-atomic takes require. Negative Sharpe before adverse
-  # selection.
-  #
-  # The monitor still runs and records every observation to arb_edge_log so
-  # this conclusion keeps being tested against live data. Only EXECUTION is
-  # off (cross_stable_execute_when_armed: false).
-  # ===================================================================
-  #
-  # Original defect list (1-2 fixed, 3-6 moot while execution is off):
-  #   1. [FIXED] Inverted cross-rate conversion manufactured ~1138 bps of
-  #      phantom edge on every scan (r^2 = 1.1138). A logged 1345.7 bps
-  #      "opportunity" was really 186.2 bps gross.
-  #   2. [FIXED] Own-offer exclusion compared dexie ids to wallet trade ids
-  #      and never matched; the scanner targeted our own resting asks seven
-  #      times on 2026-07-30, stopped only by the counterparty wallet.
-  #   3. [OPEN] Only the BUY leg executes. The code logs "buy X sell Y" but
-  #      never places the sell, so this is an unhedged directional take, not
-  #      an arbitrage.
-  #   4. [OPEN] cross_stable_max_take_xch is cosmetic: take_offer() has no
-  #      size parameter and consumes the ENTIRE counterparty offer.
-  #   5. [OPEN] min_edge is compared against a GROSS edge -- no fees, no
-  #      slippage, no second-leg spread, no third leg to convert back.
-  #   6. [OPEN] Takes write nothing to trade_log, offer_log or the ledger,
-  #      so the strategy's P&L is unmeasurable.
-  # Monitor ON (records edge history to arb_edge_log), EXECUTION OFF.
   cross_stable_arb_enabled: true
   cross_stable_min_edge_bps: 15
   cross_stable_max_take_xch: 5.0
-  # Arm/disarm state machine: an edge must PERSIST to be considered real,
-  # because a single-tick edge is usually a stale quote (the scanner's
-  # chosen offer came back status=3, already gone, on 2026-07-30).
   cross_stable_arm_edge_bps: 50.0
   cross_stable_disarm_edge_bps: 20.0
   cross_stable_arm_observations: 3
-  # THE TRADING SWITCH. Leave false -- see the verdict above.
   cross_stable_execute_when_armed: false
   peg_arb_enabled: true
   peg_arb_min_edge_bps: 5
@@ -349,46 +280,21 @@ inventory_aging:
   aging_start_blocks: 500
   max_loss_relax_bps: 25
   relax_rate_bps_per_block: 0.05
-# Double-entry ledger and its wallet reconciliation control.
-# See docs/ACCOUNTING-POLICY.md for the rationale behind every number here.
 accounting:
   ledger_enabled: true
-  # Divergence beyond tolerance for N consecutive same-signed checks.
-  # Tolerance = live offer exposure + fee slack + max(floor, pct * confirmed).
-  alert_pct: 0.005          # 0.5% -- above all observed dust, below one 1-XCH offer
+  alert_pct: 0.005
   alert_observations: 2
-  pause_pct: 0.02           # 2%   -- roughly three offers' worth
+  pause_pct: 0.02
   pause_observations: 3
-  # OFF until the ledger runs clean: taker fills (Steps 9d/9f) and external
-  # deposits/withdrawals have no ledger event yet, so auto-pausing would halt
-  # trading on legitimate activity.  Alerts still fire either way.
   pause_enabled: false
-  floor_xch_mojos: 1000000000   # 0.001 XCH -- covers fee dust
-  floor_cat_mojos: 100          # 0.1 unit  -- 100x the per-leg rounding error
-  fee_slack_mojos: 200000       # ~40 offer events at 5,000 mojos
+  floor_xch_mojos: 1000000000
+  floor_cat_mojos: 100
+  fee_slack_mojos: 200000
   max_balance_age_blocks: 10
-  # Breaches are scored over a sliding window, not required to be strictly
-  # consecutive: the tolerance includes live offer exposure, which swings
-  # ~100x between heartbeats as the book is re-quoted.
   observation_window: 6
-  # On sustained divergence, record the unexplained amount as an `adjust`
-  # leg and re-tie the books.  Without this the ledger drifts monotonically
-  # (every unrecorded flow is one-directional) and the control's only end
-  # state is being switched off.  With it:
-  #   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
-  # is the running total of what the bot cannot account for.
   auto_adjust_enabled: true
-  # Stablecoin peg monitor.  Accounting keeps valuing wUSDC.b/wUSDC/USDS at
-  # exactly $1.00 (they are the numeraire, and a live feed in a PERSISTED
-  # cost basis is the bug class removed in v0.8.0).  This surfaces a real
-  # depeg instead of silently pricing it in.  NOT covered by `depeg:` below,
-  # which compares a pair's own mid to a constant and is registered only for
-  # BYC/wUSDC.b -- it cannot see wUSDC.b itself move.
   peg_monitor_enabled: true
-  peg_external_warn_pct: 1.0   # CoinGecko usd-coin vs par: clean signal
-  # Implied wUSDC.b from cex/dex ratio catches a BRIDGE depeg, which the
-  # CoinGecko feed cannot. Threshold must clear this venue's structural
-  # DEX-vs-CEX basis: 217 logged samples ran p50 78bps, p90 118bps, max 218bps.
+  peg_external_warn_pct: 1.0
   peg_implied_warn_pct: 3.0
   peg_observations: 4
 market_allocator:
