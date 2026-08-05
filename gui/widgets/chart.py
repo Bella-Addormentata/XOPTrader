@@ -11,6 +11,7 @@ ISO/IEC 5055      -- all public APIs carry type hints and docstrings.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from typing import Any, Sequence
 
 import pyqtgraph as pg
 from pyqtgraph import DateAxisItem
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QElapsedTimer, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -52,11 +53,16 @@ LOSS_RED: str       = COLORS.LOSS_RED
 WARNING: str        = COLORS.WARNING_YELLOW
 INFO: str           = COLORS.INFO_BLUE
 
-# Apply global pyqtgraph defaults matching the dark theme
-pg.setConfigOptions(antialias=True, background=DARK_BG, foreground=TEXT_PRIMARY)
+# Apply global pyqtgraph defaults matching the dark theme.
+# antialias is OFF globally: the large history curves (up to 10k points
+# each) repaint every 5 s and antialiased stroking dominated the paint
+# cost.  The small scatter/fill-marker items re-enable it individually.
+pg.setConfigOptions(antialias=False, background=DARK_BG, foreground=TEXT_PRIMARY)
 
 # Maximum data points retained in each ring buffer before oldest are trimmed
 _MAX_DATA_POINTS: int = 10_000
+
+_log: logging.Logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -333,16 +339,20 @@ class ChartWidget(QWidget):
             name="Ask",
         )
 
-        # Fill markers (scatter overlay)
+        # Fill markers (scatter overlay).  Antialias is disabled globally
+        # for the heavy curves; keep it on for these small marker sets so
+        # the triangles stay crisp (symbols are cached, so this is cheap).
         self._buy_scatter = pg.ScatterPlotItem(
             symbol="t1", size=10,  # upward triangle
             brush=pg.mkBrush(PROFIT_GREEN),
             pen=pg.mkPen(None),
+            antialias=True,
         )
         self._sell_scatter = pg.ScatterPlotItem(
             symbol="t", size=10,   # downward triangle
             brush=pg.mkBrush(LOSS_RED),
             pen=pg.mkPen(None),
+            antialias=True,
         )
         self._price_plot.addItem(self._buy_scatter)
         self._price_plot.addItem(self._sell_scatter)
@@ -405,6 +415,14 @@ class ChartWidget(QWidget):
             name="Inventory",
         )
 
+        # Cheap large-series rendering: peak-preserving auto downsampling
+        # plus clip-to-view on every PlotDataItem (curves).  PlotItem
+        # forwards these settings to existing and future data items;
+        # BarGraphItem / ScatterPlotItem are unaffected.
+        for _plot in (self._price_plot, self._pnl_plot, self._vol_plot):
+            _plot.setDownsampling(auto=True, mode="peak")
+            _plot.setClipToView(True)
+
         # Link X axes so all three scroll and zoom together
         self._pnl_plot.setXLink(self._price_plot)
         self._vol_plot.setXLink(self._price_plot)
@@ -423,25 +441,36 @@ class ChartWidget(QWidget):
 
     @Slot(object, object)
     def _on_x_range_changed(self, window, viewRange) -> None:
-        """Auto-scale Y axis to fit the max/min of the currently visible X range."""
+        """Auto-scale Y axis to fit the max/min of the currently visible X range.
+
+        Note: this handler previously referenced a non-existent
+        ``self._price_history`` attribute and raised AttributeError on
+        every range change (each repaint under auto-scroll), spamming
+        tracebacks from the repaint path.  It now reads the current
+        pair's price ring buffer.
+        """
         x_min, x_max = viewRange[0]
-        
-        if not self._price_history:
+
+        store = self._data.get(self._current_pair)
+        if not store:
             return
-            
-        visible_ticks = [t for t in self._price_history if x_min <= t.timestamp <= x_max]
+        price_ticks: deque[PriceTick] = store["price"]
+        if not price_ticks:
+            return
+
+        visible_ticks = [t for t in price_ticks if x_min <= t.timestamp <= x_max]
         if not visible_ticks:
             return
-            
+
         y_min = min(t.bid for t in visible_ticks)
         y_max = max(t.ask for t in visible_ticks)
-        
+
         # Add a 5% margin to the top and bottom
         padding = (y_max - y_min) * 0.05
         # If flat line
         if padding == 0:
             padding = y_max * 0.05 if y_max != 0 else 0.05
-            
+
         self._price_plot.setYRange(y_min - padding, y_max + padding, padding=0)
 
     # =====================================================================
@@ -583,7 +612,24 @@ class ChartWidget(QWidget):
         return self._data[pair]
 
     def _repaint(self) -> None:
-        """Redraw all curves from the current pair's data store."""
+        """Redraw all curves from the current pair's data store.
+
+        Paint cost is measured with a QElapsedTimer and logged at debug
+        level so before/after comparisons stay cheap to collect.
+        """
+        _elapsed = QElapsedTimer()
+        _elapsed.start()
+        try:
+            self._repaint_impl()
+        finally:
+            _log.debug(
+                "ChartWidget._repaint took %d ms (pair=%s)",
+                _elapsed.elapsed(),
+                self._current_pair,
+            )
+
+    def _repaint_impl(self) -> None:
+        """Push the current pair's ring buffers into the plot items."""
         store = self._data.get(self._current_pair)
         if store is None:
             return

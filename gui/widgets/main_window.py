@@ -967,6 +967,12 @@ class MainWindow(QMainWindow):
         starts empty on every GUI restart.  The same global series is
         seeded into every configured pair's store, mirroring how live
         updates append the engine's global USD gauges per pair.
+
+        The per-pair merge (~13k points x N pairs) used to run in one
+        synchronous burst on the UI thread at startup.  It is now
+        chunked: one pair per zero-length QTimer slice, so each
+        event-loop stall is bounded to a single pair's merge and input
+        events stay responsive.
         """
         chart = self._unwrap(self._chart)
         if chart is None or not points or not hasattr(chart, "seed_pnl_history"):
@@ -999,12 +1005,41 @@ class MainWindow(QMainWindow):
         if not pair_names:
             return
 
-        for pair_name in pair_names:
+        self._pnl_seed_points = seed
+        self._pnl_seed_queue = list(pair_names)
+        self._pnl_seed_total = len(pair_names)
+        QTimer.singleShot(0, self._seed_next_pnl_pair)
+
+    def _seed_next_pnl_pair(self) -> None:
+        """Seed one pair's P&L history, then yield back to the event loop."""
+        queue: list[str] = getattr(self, "_pnl_seed_queue", [])
+        seed = getattr(self, "_pnl_seed_points", [])
+        if not queue or not seed:
+            return
+
+        chart = self._unwrap(self._chart)
+        if chart is None or not hasattr(chart, "seed_pnl_history"):
+            self._pnl_seed_queue = []
+            self._pnl_seed_points = []
+            return
+
+        pair_name = queue.pop(0)
+        try:
             chart.seed_pnl_history(pair_name, seed)
-        _log.info(
-            "Chart P&L history seeded from DB: %d points × %d pairs.",
-            len(seed), len(pair_names),
-        )
+        except RuntimeError:
+            # Chart widget destroyed mid-chain (window closing).
+            self._pnl_seed_queue = []
+            self._pnl_seed_points = []
+            return
+
+        if queue:
+            QTimer.singleShot(0, self._seed_next_pnl_pair)
+        else:
+            _log.info(
+                "Chart P&L history seeded from DB: %d points × %d pairs.",
+                len(seed), getattr(self, "_pnl_seed_total", 0),
+            )
+            self._pnl_seed_points = []
 
     # ===================================================================== #
     #  Menu bar                                                              #
