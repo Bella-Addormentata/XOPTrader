@@ -22,6 +22,8 @@
 
 #include <xop/execution/offer_manager.hpp>
 
+#include <xop/execution/wallet_poll_throttle.hpp>
+
 #include <algorithm>
 #include <cctype>
 #include <cmath>
@@ -485,6 +487,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
         pending.fee_mojos        = current_fee_mojos_;
+        // [WALLET-LOAD] Post-time distance-from-mid, for the fill-poll
+        // backoff's striking-distance reset.
+        pending.post_spread_bps  = tier.spread_bps;
         // Retain dexie's id -- own-offer exclusion in the arbitrage taker
         // matches the orderbook feed on THIS id, not the wallet trade id.
         pending.dexie_id         = dexie_id;
@@ -558,13 +563,19 @@ asio::awaitable<int> OfferManager::post_quotes(
 // detect_fills -- poll wallet, identify settled offers, emit Fill events
 // ---------------------------------------------------------------------------
 
-asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
+asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
+    BlockHeight current_block)
 {
     std::vector<Fill> fills;
+
+    // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
+    // invocation -- the backoff schedule below is phased on it.
+    ++fill_poll_heartbeat_;
 
     // Get all known pending offers from state for comparison.
     auto pending_offers = state_->get_all_offers();
     if (pending_offers.empty()) {
+        fill_poll_pending_counts_.clear();
         co_return fills;
     }
 
@@ -575,20 +586,108 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
         pending_map.emplace(po.offer_id, std::move(po));
     }
 
-    // Query only offers we currently track.  Scanning get_all_offers with
-    // include_completed=true can walk the entire historical offer archive
-    // before every ladder cycle.
-    std::vector<json> trade_records;
+    // Prune throttle bookkeeping for offers no longer tracked.
+    for (auto it = fill_poll_pending_counts_.begin();
+         it != fill_poll_pending_counts_.end();) {
+        it = pending_map.count(it->first)
+                 ? std::next(it)
+                 : fill_poll_pending_counts_.erase(it);
+    }
+
+    // Query only offers we currently track AND due for a poll this
+    // heartbeat.  [WALLET-LOAD 2026-08-04] This was one get_offer per
+    // tracked offer (~26) EVERY heartbeat, a major share of the load that
+    // froze the wallet daemon.  Throttles (wallet_poll_throttle.hpp):
+    //   - age gate: a just-posted offer cannot have settled;
+    //   - backoff: an offer still PENDING_ACCEPT after M consecutive
+    //     polls is polled every Kth heartbeat, reset to every-heartbeat
+    //     the moment the book mid is within 2x its post-time
+    //     distance-from-mid or a cancel is pending on it.
+    // Safety: a fill in a skipped heartbeat is DELAYED detection, never
+    // lost -- CONFIRMED offers stay tracked in State until this function
+    // processes them (cae2bfd), and the completeness sweep catches
+    // stragglers.
+    std::vector<json>        trade_records;
+    std::vector<std::string> polled_ids;
+    std::size_t              skipped_age = 0, skipped_backoff = 0;
     trade_records.reserve(pending_map.size());
-    for (const auto& entry : pending_map) {
-        const auto& trade_id = entry.first;
+    for (const auto& [trade_id, po] : pending_map) {
+        const std::int64_t age_blocks =
+            (current_block > 0 && po.created_at_block > 0
+             && current_block >= po.created_at_block)
+                ? static_cast<std::int64_t>(current_block
+                                            - po.created_at_block)
+                : -1;   // unknown -> age gate does not apply
+
+        // Striking distance: current mid vs the offer's post-time
+        // distance.  cancel_pending offers are near resolution and are
+        // always polled at full cadence.
+        const Mojo mid = state_->get_market(po.pair_name).mid_price;
+        const bool striking = po.cancel_pending
+            || execution::within_striking_distance(po.price, mid,
+                                                   po.post_spread_bps);
+        if (striking) {
+            fill_poll_pending_counts_.erase(trade_id);
+        }
+
+        auto cnt_it = fill_poll_pending_counts_.find(trade_id);
+        const std::uint32_t consecutive =
+            (cnt_it != fill_poll_pending_counts_.end()) ? cnt_it->second
+                                                        : 0;
+        if (!execution::fill_poll_due(
+                age_blocks,
+                strategy_cfg_.detect_fills_min_age_blocks,
+                consecutive,
+                strategy_cfg_.detect_fills_backoff_polls,
+                strategy_cfg_.detect_fills_backoff_interval,
+                fill_poll_heartbeat_,
+                striking)) {
+            if (age_blocks >= 0
+                && age_blocks < static_cast<std::int64_t>(
+                       strategy_cfg_.detect_fills_min_age_blocks)) {
+                ++skipped_age;
+            } else {
+                ++skipped_backoff;
+            }
+            continue;
+        }
+
         try {
             trade_records.push_back(
                 co_await wallet_->get_offer(trade_id,
                                             /*file_contents=*/false));
+            polled_ids.push_back(trade_id);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("get_offer failed during fill detection for {}: {}",
                            trade_id.substr(0, 12), e.what());
+        }
+    }
+
+    if (skipped_age + skipped_backoff > 0) {
+        logger_->debug("detect_fills: polled {}/{} tracked offers "
+                       "(skipped {} too-young, {} backed-off)",
+                       polled_ids.size(), pending_map.size(),
+                       skipped_age, skipped_backoff);
+    }
+
+    // Update the backoff counters from what the wallet reported: still
+    // PENDING_ACCEPT extends the streak; any other status ends it.
+    {
+        std::unordered_map<std::string, int> polled_status;
+        for (const auto& rec : trade_records) {
+            if (rec.contains("trade_id") && rec.contains("status")) {
+                polled_status[rec["trade_id"].get<std::string>()] =
+                    trade_status::parse(rec["status"]);
+            }
+        }
+        for (const auto& id : polled_ids) {
+            auto st = polled_status.find(id);
+            if (st != polled_status.end()
+                && st->second == trade_status::kPendingAccept) {
+                ++fill_poll_pending_counts_[id];
+            } else {
+                fill_poll_pending_counts_.erase(id);
+            }
         }
     }
 
@@ -1554,24 +1653,75 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
     // wallet offers that are still pending but not tracked in State.
     std::vector<json> unadopted_records;
 
-    // Paginate through all wallet offers.
+    // ------------------------------------------------------------------
+    // [WALLET-LOAD 2026-08-04] Early-stopped pagination.
+    //
+    // This loop used to walk the ENTIRE trade archive (14,100+ records at
+    // 50/page = ~282 get_all_offers calls) every reconcile because the
+    // wallet's DEFAULT ordering (confirmed_at_index DESC) sorts pending
+    // offers LAST.  start/end are array indices, not heights (verified:
+    // docs.chia.net offer-rpc + chia-blockchain trade_store.py), so a
+    // since-height filter is impossible -- but sort_key="RELEVANCE"
+    // orders pending statuses FIRST, then terminal records by
+    // created_at_time DESC.  Page 1 therefore carries the whole live set
+    // (tracked offers + PENDING_ACCEPT adoptees), and the scan stops
+    // after kReconcileStopAfterOldPages consecutive pages entirely older
+    // than the oldest tracked offer's creation minus a 24 h adoptee
+    // slack (wallet_poll_throttle.hpp).  ~282 calls -> ~2-4.
+    //
+    // SAFETY: phantom/adoption semantics for TRACKED offers are fully
+    // preserved.  Absence-from-scan was never trusted (SETTLE-FIX
+    // 2026-07-31): every tracked offer not seen in the scanned pages is
+    // individually verified with get_offer below before any removal, so
+    // stopping early can only convert bulk pages into a handful of
+    // targeted lookups, never a wrong removal.
+    // ------------------------------------------------------------------
+    std::int64_t oldest_tracked_unix = 0;
+    for (const auto& [id, po] : pending_map) {
+        const auto unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+            po.created_at_ts.time_since_epoch()).count();
+        if (unix_s > 0
+            && (oldest_tracked_unix == 0 || unix_s < oldest_tracked_unix)) {
+            oldest_tracked_unix = unix_s;
+        }
+    }
+    const std::int64_t now_unix =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::int64_t cutoff_unix =
+        execution::reconcile_scan_cutoff(oldest_tracked_unix, now_unix);
+    execution::ReconcileEarlyStop early_stop;
+
+    // Paginate through wallet offers, newest-relevant first.
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
+    std::int64_t pages_scanned = 0;
     bool more = true;
 
     while (more) {
         std::vector<json> trade_records;
         try {
             trade_records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false);
+                offset, offset + kPageSize, /*file_contents=*/false,
+                /*include_completed=*/true,
+                /*sort_key=*/"RELEVANCE", /*reverse=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[reconcile] get_all_offers failed: {}", e.what());
             co_return removed_ids;
         }
+        ++pages_scanned;
 
         if (trade_records.empty() ||
             static_cast<std::int64_t>(trade_records.size()) < kPageSize) {
             more = false;
+        }
+
+        // Newest created_at_time on this page, for the early-stop rule.
+        std::int64_t page_newest_created = 0;
+        for (const auto& rec : trade_records) {
+            const std::int64_t created =
+                rec.value("created_at_time", std::int64_t{0});
+            page_newest_created = std::max(page_newest_created, created);
         }
 
         for (const auto& rec : trade_records) {
@@ -1609,6 +1759,19 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             // they are handled by detect_fills() which now uses
             // include_completed=true and matches against cancel_pending
             // offers still in State.
+        }
+
+        // [WALLET-LOAD 2026-08-04] Early stop: in the RELEVANCE ordering
+        // the terminal region is created_at_time-descending, so once
+        // consecutive pages are entirely older than the cutoff nothing
+        // relevant can follow.
+        if (more && early_stop.observe_page(execution::page_entirely_older(
+                        page_newest_created, cutoff_unix))) {
+            logger_->debug("[reconcile] early stop after {} pages "
+                           "({} consecutive pages older than cutoff {})",
+                           pages_scanned,
+                           early_stop.consecutive_old_pages(), cutoff_unix);
+            more = false;
         }
 
         offset += kPageSize;
@@ -2567,6 +2730,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.tier             = tier.tier_index;
                 po.created_at_block = block_height;
                 po.created_at_ts    = std::chrono::system_clock::now();
+                // [WALLET-LOAD] For the fill-poll striking-distance reset.
+                po.post_spread_bps  = tier.spread_bps;
                 state_->upsert_offer(po);
                 ++fallback_count;
 
@@ -2631,6 +2796,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
         pending.fee_mojos        = current_fee_mojos_;
+        // [WALLET-LOAD] For the fill-poll striking-distance reset.
+        pending.post_spread_bps  = tier.spread_bps;
         pending.dexie_id         = batch_dexie_id;
         state_->upsert_offer(pending);
     }

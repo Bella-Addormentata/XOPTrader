@@ -74,6 +74,7 @@ add_executable(xop_tests
     test_reward_ingest.cpp
     test_drawdown_breaker.cpp
     test_settled_fill.cpp
+    test_wallet_poll_throttle.cpp
 )
 
 target_link_libraries(xop_tests

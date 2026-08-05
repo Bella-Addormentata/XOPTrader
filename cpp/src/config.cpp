@@ -1243,6 +1243,26 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         cfg.dex_print_stale_heartbeats = node["dex_print_stale_heartbeats"].as<uint32_t>();
     }
 
+    // -- Wallet-RPC polling throttles ([WALLET-LOAD 2026-08-04]) -------------
+    if (node["detect_fills_min_age_blocks"]
+        && node["detect_fills_min_age_blocks"].IsDefined()
+        && !node["detect_fills_min_age_blocks"].IsNull()) {
+        cfg.detect_fills_min_age_blocks =
+            node["detect_fills_min_age_blocks"].as<uint32_t>();
+    }
+    if (node["detect_fills_backoff_polls"]
+        && node["detect_fills_backoff_polls"].IsDefined()
+        && !node["detect_fills_backoff_polls"].IsNull()) {
+        cfg.detect_fills_backoff_polls =
+            node["detect_fills_backoff_polls"].as<uint32_t>();
+    }
+    if (node["detect_fills_backoff_interval"]
+        && node["detect_fills_backoff_interval"].IsDefined()
+        && !node["detect_fills_backoff_interval"].IsNull()) {
+        cfg.detect_fills_backoff_interval =
+            node["detect_fills_backoff_interval"].as<uint32_t>();
+    }
+
     // -- Adverse-selection-aware tier sizing (optional, defaults in StrategyConfig) --
     if (node["adverse_selection_sizing"] && node["adverse_selection_sizing"].IsDefined()
         && !node["adverse_selection_sizing"].IsNull()) {

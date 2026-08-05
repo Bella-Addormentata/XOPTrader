@@ -252,17 +252,35 @@ public:
     /**
      * @brief Poll the wallet for settled offers and return newly detected fills.
      *
-     * Queries get_all_offers(), compares each returned trade record against
-     * the internal pending-offer map.  An offer whose status transitions to
-     * CONFIRMED (status == 4 in the Chia wallet) is treated as filled:
+     * Queries get_offer per tracked offer, compares each returned trade
+     * record against the internal pending-offer map.  An offer whose
+     * status transitions to CONFIRMED (status == 4 in the Chia wallet) is
+     * treated as filled:
      *   - A Fill event is constructed.
      *   - The PendingOffer is removed from State.
      *   - Position accounting is updated (record_buy for bids, record_sell
      *     for asks) via the shared State object.
      *
+     * [WALLET-LOAD 2026-08-04] Per-offer polling is throttled to protect
+     * the wallet daemon (execution/wallet_poll_throttle.hpp):
+     *   - offers younger than detect_fills_min_age_blocks are skipped (a
+     *     just-posted offer cannot have settled);
+     *   - offers still PENDING_ACCEPT after detect_fills_backoff_polls
+     *     consecutive polls are polled every
+     *     detect_fills_backoff_interval-th heartbeat, resetting to
+     *     every-heartbeat the moment the book mid comes within 2x the
+     *     offer's post-time distance-from-mid, or when a cancel is
+     *     pending on it.
+     * A fill surfacing during a skipped heartbeat is DELAYED, never lost:
+     * CONFIRMED offers stay tracked until processed (cae2bfd) and the
+     * completeness sweep catches stragglers.
+     *
+     * @param current_block  Latest known block height (for the age gate;
+     *                       0 = unknown, gate disabled).
      * @return Vector of Fill events detected in this poll cycle.
      */
-    asio::awaitable<std::vector<Fill>> detect_fills();
+    asio::awaitable<std::vector<Fill>> detect_fills(
+        BlockHeight current_block = 0);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -716,6 +734,20 @@ private:
 
     /// Flag indicating whether wallet_id_map_ has been initialised.
     bool wallet_ids_resolved_{false};
+
+    // -- detect_fills poll throttling ([WALLET-LOAD 2026-08-04]) -------------
+
+    /// Consecutive detect_fills polls that saw an offer still
+    /// PENDING_ACCEPT, keyed by offer id.  Reaching
+    /// detect_fills_backoff_polls demotes the offer to
+    /// every-Kth-heartbeat polling; entries are erased when the offer
+    /// leaves PENDING_ACCEPT, leaves State, or re-enters striking
+    /// distance.
+    std::unordered_map<std::string, std::uint32_t> fill_poll_pending_counts_;
+
+    /// Monotonic detect_fills invocation counter (the "heartbeat index"
+    /// of the poll backoff schedule).
+    std::uint64_t fill_poll_heartbeat_{0};
 
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;

@@ -841,6 +841,30 @@ struct StrategyConfig {
     /// unconfigured.
     uint32_t dex_print_stale_heartbeats{6};
 
+    // -- Wallet-RPC polling throttles ([WALLET-LOAD 2026-08-04]) -------------
+    // The wallet daemon was being hammered to the point of freezing the
+    // wallet app: detect_fills issued one get_offer per tracked offer
+    // (~26) every heartbeat.  These knobs cut that volume without
+    // weakening the cae2bfd fill guarantees -- a fill missed for K-1
+    // heartbeats is DELAYED detection, not lost (CONFIRMED offers stay
+    // tracked until processed; the completeness sweep also catches).
+    // Deliberately absent from config.yaml: defaults are the operative
+    // values.  Full decision logic: execution/wallet_poll_throttle.hpp.
+
+    /// Skip status polling for offers younger than this many blocks -- a
+    /// just-posted offer cannot have settled.  0 disables the age gate.
+    uint32_t detect_fills_min_age_blocks{2};
+
+    /// M: after this many consecutive polls still PENDING_ACCEPT, an offer
+    /// drops to every-Kth-heartbeat polling (unless the book price is
+    /// within striking distance -- 2x its post-time distance-from-mid --
+    /// which resets it to every heartbeat).  0 disables the backoff.
+    uint32_t detect_fills_backoff_polls{10};
+
+    /// K: while backed off, poll every Kth heartbeat.  Values <= 1
+    /// effectively disable the backoff.
+    uint32_t detect_fills_backoff_interval{3};
+
     // -- Adverse-selection-aware tier sizing ---------------------------------
 
     /// Enable adverse-selection-aware tier sizing.

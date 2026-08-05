@@ -24,6 +24,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 
 #include "xop/accounting/reward_ingest.hpp"
+#include "xop/execution/wallet_poll_throttle.hpp"
 #include "xop/risk/drawdown_breaker.hpp"
 #include "xop/strategy/avellaneda.hpp"
 #include "xop/strategy/glft.hpp"
@@ -181,6 +182,18 @@ Engine::Engine(const AppConfig& config, bool dry_run)
                  config_.risk.max_window_loss_bps,
                  config_.risk.loss_window_blocks,
                  config_.risk.breaker_realert_minutes);
+    // [WALLET-LOAD 2026-08-04] Operator eyeball line for the wallet-RPC
+    // throttles: fill polling gates/backoff and the reconcile early-stop.
+    spdlog::info("[Engine] Wallet-RPC throttles: detect_fills min_age={} "
+                 "blocks, backoff after {} pending polls -> every {}. "
+                 "heartbeat (2.0x striking-distance reset); reconcile "
+                 "early-stop after {} pages older than oldest tracked "
+                 "-{}h slack",
+                 config_.strategy.detect_fills_min_age_blocks,
+                 config_.strategy.detect_fills_backoff_polls,
+                 config_.strategy.detect_fills_backoff_interval,
+                 execution::kReconcileStopAfterOldPages,
+                 execution::kReconcileScanSlackSecs / 3600);
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -2267,7 +2280,9 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
     // [T1-03] co_await the fill-detection coroutine directly.
-    auto new_fills = co_await offer_mgr_->detect_fills();
+    // [WALLET-LOAD 2026-08-04] Passes the block height for the fill-poll
+    // age gate (a just-posted offer cannot have settled).
+    auto new_fills = co_await offer_mgr_->detect_fills(block_height);
 
     // [T4-02] Reorg protection: confirmation depth gating.
     // Newly detected fills are buffered in pending_unconfirmed_fills_ and

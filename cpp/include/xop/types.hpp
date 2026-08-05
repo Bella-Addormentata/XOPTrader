@@ -166,6 +166,14 @@ struct PendingOffer {
     std::uint64_t fee_mojos{0};    // fee attached to this offer (mojos)
     bool         cancel_pending{false}; // cancel RPC sent; awaiting on-chain confirmation
 
+    // [WALLET-LOAD 2026-08-04] Distance-from-mid at POST time in bps
+    // (TierQuote::spread_bps of the tier this offer was created from).
+    // Feeds the detect_fills poll backoff's striking-distance reset:
+    // polling relaxes only for offers the market is nowhere near.  0 =
+    // unknown (adopted/legacy offers) -> the backoff never applies and the
+    // offer is polled every heartbeat (fail-safe).
+    double       post_spread_bps{0.0};
+
     // Dexie's own id for this offer, returned by POST /v1/offers.
     //
     // A DIFFERENT ID SPACE from offer_id: offer_id is the wallet trade id
