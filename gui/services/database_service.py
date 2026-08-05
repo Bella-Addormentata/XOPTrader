@@ -116,6 +116,7 @@ class _DatabaseWorker(QObject):
     pnl_display_ready = Signal(dict)
     pnl_history_ready = Signal(list)
     deployed_ready = Signal(dict)
+    last_trade_prices_ready = Signal(dict)
     query_error = Signal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -366,6 +367,42 @@ class _DatabaseWorker(QObject):
         if rows is None:
             return
         self.pairs_list_ready.emit([row["pair_name"] for row in rows])
+
+    @Slot()
+    def fetch_last_trade_prices(self) -> None:
+        """Query the most recent fill price per pair from ``trade_log``.
+
+        Used by EngineBridge as a price fallback for the wallet
+        allocation panel when live metrics report no mid price.  Runs on
+        the worker thread so the (measured 171-208 ms) query never
+        touches the GUI thread.
+
+        Emits ``last_trade_prices_ready`` with ``{pair_name:
+        price_mojos}``.
+        """
+        sql = (
+            "SELECT pair_name, price_mojos "
+            "FROM trade_log t "
+            "WHERE id = ("
+            "  SELECT id FROM trade_log "
+            "  WHERE pair_name = t.pair_name "
+            "  ORDER BY block_height DESC, id DESC LIMIT 1"
+            ")"
+        )
+        rows = self._execute_query(sql, [])
+        if rows is None:
+            return
+
+        prices: dict[str, float] = {}
+        for row in rows:
+            pair_name = row["pair_name"]
+            price_mojos = row["price_mojos"]
+            if pair_name and price_mojos is not None:
+                try:
+                    prices[str(pair_name)] = float(price_mojos)
+                except (TypeError, ValueError):
+                    continue
+        self.last_trade_prices_ready.emit(prices)
 
     @Slot(str)
     def fetch_latest_snapshot(self, pair: str) -> None:
@@ -1262,6 +1299,7 @@ class DatabaseService(QObject):
     pnl_display_loaded = Signal(dict)
     pnl_history_loaded = Signal(list)
     deployed_loaded = Signal(dict)
+    last_trade_prices_loaded = Signal(dict)
     query_error = Signal(str)
 
     # -- Internal trigger signals (queued connections to worker thread) ------
@@ -1277,6 +1315,7 @@ class DatabaseService(QObject):
     _trigger_pnl_display = Signal(str)
     _trigger_pnl_history = Signal(int)
     _trigger_deployed = Signal()
+    _trigger_last_trade_prices = Signal()
 
     def __init__(
         self,
@@ -1307,6 +1346,7 @@ class DatabaseService(QObject):
         self._worker.pnl_display_ready.connect(self.pnl_display_loaded)
         self._worker.pnl_history_ready.connect(self.pnl_history_loaded)
         self._worker.deployed_ready.connect(self.deployed_loaded)
+        self._worker.last_trade_prices_ready.connect(self.last_trade_prices_loaded)
         self._worker.query_error.connect(self._on_worker_error)
 
         # Queued connections: emit trigger signals to dispatch work to
@@ -1324,6 +1364,7 @@ class DatabaseService(QObject):
         self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
         self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
         self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
+        self._trigger_last_trade_prices.connect(self._worker.fetch_last_trade_prices)
 
         # -- Auto-refresh timer ---------------------------------------------
         self._refresh_timer: QTimer = QTimer(self)
@@ -1539,6 +1580,15 @@ class DatabaseService(QObject):
         with QMutexLocker(self._mutex):
             self._deployed_requested = True
         self._trigger_deployed.emit()
+
+    def query_last_trade_prices(self) -> None:
+        """Request the most recent fill price per pair.
+
+        Results arrive on :pyattr:`last_trade_prices_loaded` as
+        ``{pair_name: price_mojos}``.  Not auto-refreshed; EngineBridge
+        re-requests when its 30 s cache expires.
+        """
+        self._trigger_last_trade_prices.emit()
 
     def query_pnl_history(self, days: int = 90) -> None:
         """Request the persisted global P&L (USD) time series.

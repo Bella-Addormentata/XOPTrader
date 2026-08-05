@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import logging
 import os
-import sqlite3
 import subprocess
 import sys
 import time
@@ -159,8 +158,12 @@ class EngineBridge(QObject):
         # seconds so the wallet allocation widget has a price source even
         # when xop_market_mid_price is 0 (engine just restarted, market
         # is quiet, or metrics endpoint is briefly unreachable).
+        # The query itself runs on the DatabaseService worker thread
+        # (fetch_last_trade_prices); the bridge only consumes the cached
+        # result and must never touch sqlite3 on the UI thread.
         self._last_trade_prices: dict[str, float] = {}
         self._last_trade_cache_ts: float = 0.0
+        self._last_trade_request_ts: float = 0.0
 
         # -- Master refresh timer -------------------------------------------
         self._master_timer: QTimer = QTimer(self)
@@ -177,6 +180,7 @@ class EngineBridge(QObject):
         self._metrics_svc.connection_restored.connect(self._on_metrics_restored)
 
         self._database_svc.trade_summary_loaded.connect(self._on_trade_summary)
+        self._database_svc.last_trade_prices_loaded.connect(self._on_last_trade_prices)
         self._database_svc.query_error.connect(self._on_service_error)
 
         _log.info(
@@ -294,48 +298,39 @@ class EngineBridge(QObject):
     def _get_last_trade_prices(self) -> dict[str, float]:
         """Return ``{pair_name: price_mojos}`` from the most recent fill per pair.
 
-        Results are cached for ``_LAST_TRADE_CACHE_TTL_S`` seconds.  On any
-        SQLite error (DB missing, locked, schema mismatch) the previously
-        cached value is returned so callers always get a usable dict.
+        Non-blocking: always returns the cached dict immediately.  When
+        the cache is older than ``_LAST_TRADE_CACHE_TTL_S`` an async
+        refresh is dispatched to the DatabaseService worker thread; the
+        result lands in :meth:`_on_last_trade_prices`.  On any query
+        error the previously cached value simply stays in place, so
+        callers always get a usable dict.
         """
         now = time.monotonic()
-        if (
+        cache_fresh = (
             self._last_trade_prices
             and (now - self._last_trade_cache_ts) < _LAST_TRADE_CACHE_TTL_S
-        ):
+        )
+        if cache_fresh:
             return self._last_trade_prices
 
-        if not self._db_path.exists():
-            return self._last_trade_prices
+        # Rate-limit refresh requests: at most one outstanding request
+        # per master-tick period, so a failing worker query (DB locked,
+        # missing table) cannot pile up triggers while still allowing a
+        # retry on the next tick.
+        if (now - self._last_trade_request_ts) >= 5.0:
+            self._last_trade_request_ts = now
+            self._database_svc.query_last_trade_prices()
 
-        prices: dict[str, float] = {}
-        try:
-            # Use a short timeout so a contended writer never stalls the UI
-            # thread.  read-only URI avoids accidentally creating the file.
-            uri = f"file:{self._db_path.as_posix()}?mode=ro"
-            with sqlite3.connect(uri, uri=True, timeout=1.0) as conn:
-                cur = conn.execute(
-                    "SELECT pair_name, price_mojos "
-                    "FROM trade_log t "
-                    "WHERE id = ("
-                    "  SELECT id FROM trade_log "
-                    "  WHERE pair_name = t.pair_name "
-                    "  ORDER BY block_height DESC, id DESC LIMIT 1"
-                    ")"
-                )
-                for pair_name, price_mojos in cur.fetchall():
-                    if pair_name and price_mojos is not None:
-                        try:
-                            prices[str(pair_name)] = float(price_mojos)
-                        except (TypeError, ValueError):
-                            continue
-        except sqlite3.Error as exc:
-            _log.debug("last-trade-price query failed: %s", exc)
-            return self._last_trade_prices
+        return self._last_trade_prices
 
-        self._last_trade_prices = prices
-        self._last_trade_cache_ts = now
-        return prices
+    @Slot(dict)
+    def _on_last_trade_prices(self, prices: dict) -> None:
+        """Cache the worker-fetched last-trade prices (GUI thread)."""
+        if prices:
+            self._last_trade_prices = dict(prices)
+        # Mark the cache warm even for an empty result (no fills yet)
+        # so we do not hammer the worker with a re-query every tick.
+        self._last_trade_cache_ts = time.monotonic()
 
     def get_all_data(self) -> dict[str, Any]:
         """Aggregate the latest data from all services into one dict.
@@ -966,7 +961,12 @@ class EngineBridge(QObject):
             parent=self,
         )
         self._database_svc.trade_summary_loaded.connect(self._on_trade_summary)
+        self._database_svc.last_trade_prices_loaded.connect(self._on_last_trade_prices)
         self._database_svc.query_error.connect(self._on_service_error)
+        # The replaced service's price cache may describe a different DB;
+        # invalidate so the next tick re-queries the new database.
+        self._last_trade_cache_ts = 0.0
+        self._last_trade_request_ts = 0.0
 
     def _resolve_config_relative_path(self, raw_path: str) -> Path:
         """Resolve config paths relative to the config file directory."""
