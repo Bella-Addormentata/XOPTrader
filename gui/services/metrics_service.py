@@ -379,24 +379,48 @@ class MetricsService(QObject):
     # Convenience getters (main-thread, non-blocking)
     # ===================================================================
 
-    def get_pnl(self) -> dict[str, float]:
+    def get_pnl(self) -> dict[str, float | None]:
         """Return a dict of PnL metrics in mojos.
 
         Keys: ``total``, ``realized``, ``unrealized``, ``spread``,
-        ``inventory``.
+        ``inventory`` (mojos) and ``usd``, ``usd_realized``,
+        ``usd_unrealized``, ``usd_fees`` (US dollars).
+
+        The mojo components are a raw sum across pairs with DIFFERENT quote
+        currencies (wUSDC.b / BYC / DBX mojos) plus an XCH-mojo fee leg, so
+        no single divisor converts them -- do not render them as money.  The
+        ``usd_*`` values come from the engine's per-pair quote-normalized
+        ``xop_pnl_usd`` gauge family (added 2026-07-30) and are the only
+        figures safe to display.
+
+        The ``usd_*`` values are ``None`` -- not 0.0 -- when the engine
+        predates the gauge, so callers can distinguish "this engine cannot
+        report USD" from a genuinely flat P&L of zero.
 
         Returns
         -------
-        dict[str, float]
+        dict[str, float | None]
         """
         with QMutexLocker(self._mutex):
             m = self._latest
+
+        # NaN sentinel: _labelled's default is returned only when the metric
+        # is absent, and NaN cannot collide with a real gauge value.
+        def _usd(component: str) -> float | None:
+            raw = _labelled(m, "xop_pnl_usd", "component", component,
+                            default=float("nan"))
+            return None if raw != raw else raw
+
         return {
             "total": _labelled(m, "xop_pnl_mojos", "component", "total"),
             "realized": _labelled(m, "xop_pnl_mojos", "component", "realized"),
             "unrealized": _labelled(m, "xop_pnl_mojos", "component", "unrealized"),
             "spread": _labelled(m, "xop_pnl_mojos", "component", "spread"),
             "inventory": _labelled(m, "xop_pnl_mojos", "component", "inventory"),
+            "usd": _usd("total"),
+            "usd_realized": _usd("realized"),
+            "usd_unrealized": _usd("unrealized"),
+            "usd_fees": _usd("fees"),
         }
 
     def get_inventory(self, asset_id: str) -> dict[str, float]:

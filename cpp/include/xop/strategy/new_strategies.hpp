@@ -415,6 +415,15 @@ public:
     /// Returns target_block_time if insufficient data.
     double current_dt_ema() const;
 
+    /// [AS-WARM] Number of arrival observations recorded so far.  The EMA
+    /// initialises at target_block_time and needs ~ema_window_blocks real
+    /// observations before it reflects the observed cadence rather than the
+    /// initial guess; callers that propagate dt_ema into annualisation
+    /// (Engine Step 3 -> VolatilityEstimator) gate on this so a freshly
+    /// restarted engine does not stomp an honestly warm-started block time
+    /// with the biased early EMA.
+    std::size_t arrival_count() const;
+
     /// Get the cadence deviation ratio R = dt_ema / dt_target.
     double cadence_ratio() const;
 

@@ -902,14 +902,22 @@ asio::awaitable<std::vector<json>>
 ChiaWalletRPC::get_all_offers(std::int64_t start,
                                std::int64_t end,
                                bool         file_contents,
-                               bool         include_completed)
+                               bool         include_completed,
+                               const std::string& sort_key,
+                               bool         reverse)
 {
-    const json payload = {
+    json payload = {
         {"start",              start},
         {"end",                end},
         {"file_contents",      file_contents},
         {"include_completed",  include_completed}
     };
+    // [WALLET-LOAD 2026-08-04] Only sent when explicitly requested, so
+    // existing callers keep the wallet's default ordering byte-for-byte.
+    if (!sort_key.empty()) {
+        payload["sort_key"] = sort_key;
+        payload["reverse"]  = reverse;
+    }
     const json resp = co_await rpc_post("get_all_offers", payload);
 
     std::vector<json> offers;

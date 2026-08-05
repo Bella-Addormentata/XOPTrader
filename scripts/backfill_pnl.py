@@ -13,7 +13,26 @@ This script:
 
 import shutil
 import sqlite3
+import sys
 from pathlib import Path
+
+# =============================================================================
+# RETIRED 2026-07-30 -- DO NOT RUN.
+#
+# This v0.6.5-era script recomputes P&L with ONE GLOBAL cross-pair inventory
+# and the pre-v0.7.45 formula (missing the quote_denom/base_denom factor), so
+# re-running it rewrites trade_log with dimensionally wrong values.  Forensic
+# evidence shows it was already re-run once AFTER the unit fix, corrupting
+# rows the corrective backfill_pnl_units.py had fixed.
+#
+# For historical P&L use scripts/compute_actual_pnl.py (cash-flow method).
+# For durable exports use scripts/export_trade_history.py.
+# =============================================================================
+if "--i-understand-this-corrupts-trade-log" not in sys.argv:
+    sys.exit(
+        "REFUSING TO RUN: backfill_pnl.py is retired (wrong formula, global "
+        "cross-pair basis -- it corrupts trade_log).  See the header comment."
+    )
 
 DB_PATH = Path(r"c:\GitHub\XOPTrader\data\xop_trader.db")
 K = 1_000_000_000_000  # kMojosPerXch = 10^12

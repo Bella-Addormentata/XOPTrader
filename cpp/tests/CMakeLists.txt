@@ -63,7 +63,18 @@ add_executable(xop_tests
     test_market_allocator.cpp
     test_fee_tracker.cpp
     test_pnl_units.cpp
+    test_pnl_tracker.cpp
     test_competitiveness_pid.cpp
+    test_fair_value.cpp
+    test_tibetswap.cpp
+    test_orderbook_mid.cpp
+    test_published_mid.cpp
+    test_exposure_gate.cpp
+    test_reservation_offset.cpp
+    test_reward_ingest.cpp
+    test_drawdown_breaker.cpp
+    test_settled_fill.cpp
+    test_wallet_poll_throttle.cpp
 )
 
 target_link_libraries(xop_tests

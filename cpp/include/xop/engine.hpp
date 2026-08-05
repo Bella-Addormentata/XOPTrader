@@ -44,6 +44,7 @@
 #include "xop/rpc/chia_rpc.hpp"
 #include "xop/rpc/dexie_client.hpp"
 #include "xop/rpc/coingecko_client.hpp"
+#include "xop/rpc/tibetswap_client.hpp"
 
 // Execution layer
 #include "xop/execution/coin_manager.hpp"
@@ -62,6 +63,7 @@
 #include "xop/strategy/depeg_detector.hpp"
 
 // Risk layer
+#include "xop/risk/drawdown_breaker.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -283,6 +285,14 @@ private:
     /// AdverseSelectionEstimator; update the regime classification.
     void step_update_analytics(BlockHeight block_height);
 
+    /// [AS-WARM] Warm-start every pair's VolatilityEstimator from the
+    /// persisted snapshots table at startup (mirrors
+    /// PnLTracker::rehydrate_from_db for P&L), so the estimator is ready on
+    /// the FIRST tick after a restart instead of after ~32 h of
+    /// uninterrupted uptime.  Pairs with sparse history stay cold and keep
+    /// the existing sigma-floor behaviour.
+    void warm_start_volatility_estimators();
+
     /// Step 4: Invoke the active strategy (A-S or GLFT) to compute optimal
     /// bid/ask quotes for each enabled pair.
     void step_compute_quotes(BlockHeight block_height);
@@ -298,6 +308,27 @@ private:
     /// Step 7: Expand the risk-filtered quotes into a multi-tier offer
     /// ladder via the LiquidityEngine.
     void step_generate_ladder(BlockHeight block_height);
+
+    /// Derive an INDEPENDENT, TRIANGULATED fair value for every enabled pair
+    /// and push it into MarketDataFeed.  Called once per heartbeat at the end
+    /// of Step 1, after the dexie and AMM ingests, so the solve sees this
+    /// heartbeat's observations.
+    ///
+    /// Assets are nodes and pairs are edges; the external USD feed anchors
+    /// whichever assets it lists.  Each pair is then priced by a weighted
+    /// least-squares solve (xop::fv::solve_pair) run with THAT PAIR'S OWN BOOK
+    /// EDGE DELETED, which is what makes the result independent of the book it
+    /// validates.  Edge weights are 1/sigma^2 from observable quality only --
+    /// book width, heartbeats since the mid last moved, resting depth -- so a
+    /// frozen or very wide book contributes almost nothing.  No pair or asset
+    /// is special-cased anywhere in the implementation.
+    ///
+    /// Publishes, per pair: the price, the solve's own 1-sigma, the
+    /// CONSISTENCY RESIDUAL between that pair's book and the rest of the
+    /// graph, and a confidence tier.  When no estimate survives the weights
+    /// the tier is Unavailable and Step 7 widens instead of clamping; it never
+    /// falls back to the book being validated.
+    void update_fair_values();
 
     /// Step 8: Cancel offers that have exceeded their TTL and post the new
     /// offer ladder via the OfferManager.
@@ -407,6 +438,132 @@ private:
         return (it != pair_config_map_.end()) ? it->second : nullptr;
     }
 
+    // -- USD normalization helpers (PNL-BASIS-USD 2026-07-30) ----------------
+    //
+    // The InventoryTracker keeps ONE cost-basis record per asset, but the
+    // engine's pseudo-prices are denominated per-pair in that pair's QUOTE
+    // currency.  XCH trades against wUSDC.b (~1.4e12), BYC (~1.2e12) and DBX
+    // (~1.4e14) simultaneously, so feeding raw pair prices into one shared
+    // record blended incompatible currencies.  All basis values are now
+    // stored in USD-normalized pseudo-units (USD-per-base-unit * 1e12):
+    // fills convert pair price -> USD on the way in (to_usd_pseudo) and
+    // basis -> pair price on the way out (from_usd_pseudo).  Mirrors the
+    // GUI's per-quote conversion in database_service.py::pnl_usdc_expr.
+
+    /// Live USD value of 1 XCH, derived from an enabled XCH/<usd-stable>
+    /// pair's mid price.  Falls back to kFallbackXchUsdRate when no such
+    /// market snapshot is available yet.
+    [[nodiscard]] double usd_per_xch() const;
+
+    /// USD value of one QUOTE display unit for the pair.  1.0 for
+    /// USD-pegged stables (wUSDC/wUSDC.b/USDS) and BYC; cross-derived for
+    /// DBX (usd_per_xch / dbx_per_xch); usd_per_xch for XCH-quoted pairs.
+    /// Returns 0.0 when unknown (pair excluded from USD accounting).
+    [[nodiscard]] double quote_usd_factor(const PairConfig& pc) const;
+
+    /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
+    /// Returns 0 when the quote's USD value is unknown.
+    [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
+                                     const PairConfig& pc) const;
+
+    /// Convert a USD-normalized pseudo-price back into the pair's quote
+    /// pseudo-price.  Returns 0 when the quote's USD value is unknown.
+    [[nodiscard]] Mojo from_usd_pseudo(Mojo usd_price,
+                                       const PairConfig& pc) const;
+
+    /// USD-normalized pseudo-price for one display unit of an asset,
+    /// resolved from any enabled pair that trades it (base: mid * factor;
+    /// quote: factor * kMojosPerXch).  0 when no market data yet.
+    [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// [DRAWDOWN-EQUITY 2026-08-04] Total portfolio equity in USD: the sum
+    /// over all tracked inventory records of holdings x USD price, using
+    /// the same valuation machinery as the accounting paths
+    /// (asset_usd_pseudo_price / quote_usd_factor / usd_per_xch).  When an
+    /// asset has no live conversion this cycle it is carried at its LAST
+    /// KNOWN price (last_asset_usd_price_) instead of being dropped, so a
+    /// data gap cannot masquerade as a crash.  Non-const: refreshes that
+    /// cache.  This is the denominator of the max-drawdown breaker and the
+    /// anchor of the rolling-window loss threshold.
+    [[nodiscard]] double compute_portfolio_equity_usd();
+
+    /// Snapshot all InventoryTracker records into the inventory_state table
+    /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
+    void persist_inventory_state() noexcept;
+
+    // -- Double-entry accounting (LEDGER 2026-07-30) ------------------------
+
+    /// Establish opening balances once, from the wallet's confirmed balances.
+    /// The ledger deliberately does NOT replay trade_log: that table was shown
+    /// to disagree with the wallet by ~665 XCH, so replaying it would import
+    /// the very corruption the ledger exists to detect.
+    /// @param at_block  Chain height when the balances were observed.  Fills
+    ///                  that settled at or below it are ALREADY inside the
+    ///                  opening balance (offers restored from a prior run can
+    ///                  settle during downtime and are detected afterwards),
+    ///                  so their legs must be suppressed or they double-count.
+    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances,
+                             BlockHeight at_block);
+
+    /// Post the balanced legs of a settled fill (base, quote and fee).
+    /// Idempotent on the fill's trade id.
+    void post_ledger_fill(const Fill& fill, const PairConfig& pc,
+                          Mojo quote_mojos);
+
+    /// Record a TAKER trade -- one where we crossed the spread and lifted
+    /// someone else's offer.  Writes both the ledger legs (so the books
+    /// balance) and a taker_fills row (so the trade is attributable to the
+    /// strategy that placed it).
+    ///
+    /// Every take_offer() success site must call this.  Before 2026-07-30
+    /// none of them did: 70 taker trades across the retained logs wrote
+    /// nothing to trade_log, offer_log or the ledger, which is why the
+    /// strategies placing them had no measurable P&L.
+    ///
+    /// @param we_bought_base true when we acquired the base asset and paid
+    ///                       quote; false for the reverse.
+    /// @param base_mojos     Absolute size of the base leg.
+    /// @param price_mojos    Execution price in engine pseudo-units.
+    void record_taker_fill(const std::string& strategy,
+                           const std::string& trade_id,
+                           const std::string& counterparty_offer_id,
+                           const PairConfig& pc,
+                           bool we_bought_base,
+                           Mojo base_mojos,
+                           Mojo price_mojos,
+                           std::uint64_t fee_mojos,
+                           BlockHeight block_height) noexcept;
+
+    /// Notional of asset @p asset_id currently committed to live offers.
+    /// This bounds how much the wallet can legitimately move before the
+    /// ledger sees it, and collapses to 0 when the book is empty -- which is
+    /// what lets the control tighten to near-exact between quoting cycles.
+    [[nodiscard]] Mojo live_offer_exposure(const AssetId& asset_id) const;
+
+    /// [REWARD-INCOME 2026-08-01] Detect dexie DBX liquidity-reward inflows
+    /// on the reward asset's wallet (daily bursts of micro incoming
+    /// transactions -- detection evidence in accounting/reward_ingest.hpp)
+    /// and book each one: 'reward' ledger entry at CoinGecko fair value,
+    /// quantity folded into the cost basis at that FMV, USD accumulated as
+    /// reward income separate from trading P&L.  MUST run before
+    /// step_check_ledger_invariant in the same heartbeat so a rewarded
+    /// inflow is explained flow by the time the books are tied to the
+    /// wallet, not "unexplained divergence" for the adjusting entries to
+    /// absorb.  Idempotent per wallet transaction (ledger event_id
+    /// uniqueness), so re-scans and restarts never double-book.
+    asio::awaitable<void> step_ingest_reward_inflows(
+        BlockHeight block_height);
+
+    /// Tie the ledger's implied balances to the wallet's confirmed balances
+    /// and escalate on sustained, unexplained divergence.  Alert-only unless
+    /// accounting.pause_enabled is set.
+    void step_check_ledger_invariant(BlockHeight block_height);
+
+    /// Alert when a quote stablecoin leaves its peg.  Accounting keeps
+    /// valuing wUSDC.b/wUSDC/USDS at $1.00 either way -- this makes the
+    /// exposure visible rather than silently priced in.
+    void step_check_stablecoin_peg(BlockHeight block_height);
+
     /// Emit a trade decision-tree metric when the Prometheus exporter exists.
     void record_trade_decision_metric(const char* strategy,
                                       const char* scenario_id,
@@ -453,6 +610,33 @@ private:
 
     /// Timestamp of the last successful CoinGecko fetch.
     std::chrono::steady_clock::time_point coingecko_last_fetch_;
+
+    /// TibetSwap AMM reserve client -- the producer for
+    /// ArbitrageDetector::set_tibetswap_reserves().
+    std::shared_ptr<rpc::TibetSwapClient> tibetswap_;
+
+    /// Timestamp of the last TibetSwap fetch attempt (successful or not).
+    /// Gates the poll so a hard-down API is retried on the configured cadence
+    /// rather than on every block.
+    std::chrono::steady_clock::time_point tibetswap_last_fetch_;
+
+    /// True once at least one TibetSwap poll has been attempted, so the very
+    /// first heartbeat fetches immediately instead of waiting a full interval.
+    bool tibetswap_fetch_attempted_{false};
+
+    /// Wall-clock time of the last SUCCESSFUL TibetSwap reserve fetch, i.e.
+    /// when the cached reserves were actually read from the chain.  This is
+    /// what MarketDataFeed::ingest_amm_mid() is given as the observation time,
+    /// so amm_age_seconds measures real staleness.  Default-constructed means
+    /// "never fetched", and no AMM sample is published in that state.
+    Timestamp tibetswap_reserves_at_{};
+
+    /// True when tibetswap_reserves_at_ advanced on THIS heartbeat and the new
+    /// reserves have not been published to the market data feed yet.  Step 1
+    /// publishes once per successful fetch and then clears this; without it the
+    /// cache was re-ingested every heartbeat, re-stamping a stale sample as
+    /// fresh and making every AMM freshness gate unreachable.
+    bool tibetswap_reserves_pending_{false};
 
     // -- Execution layer -----------------------------------------------------
 
@@ -643,6 +827,18 @@ private:
         // into quoting and offer management.
         // ISO/IEC 5055: prevents acting on invalid upstream data.
         bool          market_data_valid{false};
+
+        // [2026-08-01 adversarial review, finding 1] Step 7's uncertainty
+        // width floor, threaded to Step 8 so quote-recovery repricing can
+        // respect it without recomputing: the blended ladder centre in
+        // mojos, and the per-pair minimum half-spread in bps
+        // (max(min_profit_margin, tibetswap_fee, k_sigma * combined_sigma)
+        // -- the same value the Step 7 width-floor pass enforces).  Both
+        // stay 0 until Step 7 reaches ladder generation for the pair this
+        // cycle; Step 8 treats 0 as "no floor available" and skips the
+        // recovery repricing rather than running it unfloored.
+        Mojo          quote_mid_mojos{0};
+        double        quote_min_half_spread_bps{0.0};
     };
 
     /// Per-pair cycle state for the current block.
@@ -656,17 +852,43 @@ private:
     };
     std::unordered_map<std::string, RatioRebalanceMode> ratio_rebalance_modes_;
 
-    // [H6] PnL high-water mark for drawdown detection in step 13 alerts.
-    // Monotonically non-decreasing; updated each cycle in step_check_alerts.
-    // ISO/IEC 5055: prevents false drawdown resets on PnL oscillation.
-    Mojo peak_pnl_hwm_{0};
+    // [H6] Portfolio-equity high-water mark for drawdown detection in
+    // step 13 alerts.  Monotonically non-decreasing; updated each cycle in
+    // step_check_alerts.
+    // ISO/IEC 5055: prevents false drawdown resets on equity oscillation.
+    //
+    // [DRAWDOWN-EQUITY 2026-08-04] USD PORTFOLIO EQUITY (sum of holdings x
+    // USD price), replacing the P&L-total peak: measuring drawdown against
+    // the ~$25 P&L peak turned a ~5% overnight XCH retrace (~$8 of marks on
+    // a ~$158 book) into a "60% drawdown" false trip at 04:14.  In-memory
+    // only, re-seeded from the first cycle after every restart -- A RESTART
+    // RE-ANCHORS THE PEAK to current equity, exactly as the old P&L peak
+    // behaved; the breaker then protects against drawdown from that new
+    // anchor.  No persisted state carries the old semantics across the
+    // change.
+    double peak_equity_hwm_usd_{0.0};
 
-    // [MEDIUM-7] Tracks whether peak_pnl_hwm_ has been seeded with the
-    // first-cycle total_pnl.  Without this, the drawdown circuit breaker
-    // is bypassed entirely until the first profitable cycle -- leaving the
-    // engine unprotected against losses from startup.
-    // ISO/IEC 27001:2022: ensures continuous risk monitoring from first tick.
-    bool hwm_initialized_{false};
+    // [MEDIUM-7] note: the old P&L peak needed an explicit first-cycle
+    // seed flag because P&L can be negative and max(0, pnl) would have
+    // hidden a losing start.  Equity is non-negative by construction, so
+    // the monotonic max IS the seed and the flag is retired; the startup
+    // grace window covers the pre-valuation cycles.
+
+    // [DRAWDOWN-EQUITY 2026-08-04] Last successfully observed USD price
+    // per asset unit, keyed by asset id.  When an asset has no live USD
+    // conversion this cycle (empty book, cold feed), its equity
+    // contribution is carried at this last-known price instead of being
+    // dropped: a vanished conversion would otherwise delete the asset's
+    // entire value from equity and read as an instantaneous crash --
+    // firing the breaker on a DATA GAP rather than a market move.
+    std::unordered_map<AssetId, double> last_asset_usd_price_;
+
+    // [DRAWDOWN-EQUITY 2026-08-04] Re-alert suppression for the breakers:
+    // while the engine stays Paused on a persisting condition, the
+    // CRITICAL alert is re-raised at most every
+    // risk.breaker_realert_minutes (default 30) and the condition is
+    // otherwise logged at info level.  Cleared when the condition lifts.
+    risk::BreakerRealertGate breaker_realert_gate_;
 
     // [T8-03] Drawdown grace period: skip the HWM drawdown circuit breaker
     // for the first N blocks after engine start so that a small initial
@@ -729,22 +951,29 @@ private:
     bool crossed_book_take_this_block_{false};
 
     // [T3-09] Max-drawdown global circuit breaker threshold.
-    // Drawdown fraction = (peak_pnl_hwm_ - total_pnl) / abs(peak_pnl_hwm_).
-    // When exceeded, engine transitions to BotStatus::Paused and alerts.
-    // Configurable via risk.max_drawdown_pct in config.yaml; default 10%.
+    // Drawdown fraction = risk::equity_drawdown_frac(peak_equity_hwm_usd_,
+    // equity_usd) -- portfolio equity on both sides ([DRAWDOWN-EQUITY
+    // 2026-08-04]).  When exceeded, engine transitions to
+    // BotStatus::Paused and alerts.  Configurable via
+    // risk.max_drawdown_frac in config.yaml; default 10% of equity.
     // ISO/IEC 5055: named constant with documented default.
-    double max_drawdown_pct_;
+    double max_drawdown_frac_;
 
     // [T3-36] Rolling time-window PnL loss circuit breaker.
     //
-    // Records (block_height, total_pnl_mojos) pairs each heartbeat cycle.
-    // The deque is trimmed to retain only entries within the most recent
-    // loss_window_blocks blocks; stale entries (age >= window) are discarded
-    // from the front.  The oldest surviving entry provides the baseline PnL
-    // for the window loss calculation.
+    // Records (block_height, total_pnl_USD) pairs each heartbeat cycle
+    // ([DRAWDOWN-USD 2026-08-02]: USD double, previously the raw
+    // quote-mojo sum).  The deque is trimmed to retain only entries within
+    // the most recent loss_window_blocks blocks; stale entries (age >=
+    // window) are discarded from the front.  The oldest surviving entry
+    // provides the baseline PnL for the window loss calculation.
     //
-    // Loss in window = oldest_pnl - current_pnl  (positive when losing).
-    // Threshold      = peak_pnl_hwm_ * max_window_loss_bps / 10000.
+    // Loss in window = oldest_pnl_usd - current_pnl_usd (positive = losing).
+    // Threshold      = risk::window_loss_threshold_usd(peak_pnl_hwm_usd_,
+    //                  anchor, max_window_loss_bps); the anchor falls back
+    //                  to the live 1-XCH USD value (or the conservative
+    //                  fixed nominal) when the bot has never been
+    //                  profitable.
     //
     // When loss_in_window > threshold AND threshold > 0, the engine
     // transitions to BotStatus::Paused the same way the HWM circuit breaker
@@ -752,7 +981,7 @@ private:
     //
     // ISO/IEC 27001:2022: continuous monitoring within a bounded time window.
     // ISO/IEC 5055: deque prevents unbounded memory growth.
-    std::deque<std::pair<BlockHeight, Mojo>> pnl_window_;
+    std::deque<std::pair<BlockHeight, double>> pnl_window_usd_;
 
     // [T3-08] NHE (Natural Hedge Efficiency) accumulators for step 10.
     // These running totals track net inventory change and total traded
@@ -883,8 +1112,111 @@ private:
         Mojo spendable{0};
         Mojo confirmed{0};
         Mojo pending_change{0};
+        // Block at which this snapshot was taken.  Step 8 (the only writer)
+        // is skipped during GUI pause, flash-crash, XCH-recovery and
+        // wallet-circuit-open, while Step 2 keeps processing fills -- so a
+        // consumer must check freshness or it may reconcile against a
+        // pre-fill balance and undo the fill (PNL-BASIS-PERSIST 2026-07-30).
+        BlockHeight as_of_block{0};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
+
+    // -- [PNL-BASIS-PERSIST 2026-07-30] One-shot wallet reconcile ---------
+    // After restart the restored inventory quantities can drift from the
+    // wallet (deposits/withdrawals while the engine was down; fills settled
+    // during downtime are replayed via restored pending offers instead).
+    // Once cached_wallet_balances_ and market mids are warm, tracked
+    // quantities are reconciled to wallet truth exactly once per process:
+    // decreases draw cost down proportionally, increases are added at the
+    // current mid (mark-at-receipt).  Gated on an empty confirmation buffer
+    // plus a grace period so downtime fills replay through the normal path
+    // first (otherwise the wallet delta would be double-applied).
+    //
+    // Tracked PER ASSET, not as a single flag: an asset can be skipped on a
+    // given heartbeat (coins in flight, stale balance, no market mark), and
+    // a single flag would burn the one-shot for every other asset too.  A
+    // market maker reposting a ladder each block leaves XCH with
+    // pending_change != 0 most of the time, so the single-flag version
+    // almost never reconciled XCH -- the asset that needed it most.
+    std::unordered_set<std::string> inventory_reconciled_assets_;
+
+    /// First block height observed by step_update_pnl (0 = none yet).
+    /// Anchors the wallet-reconcile grace period above.
+    BlockHeight pnl_first_block_{0};
+
+    // -- Ledger invariant control state (LEDGER 2026-07-30) ---------------
+    // Consecutive same-sign breaches per asset.  A divergence caused by
+    // detection latency self-heals on the next observation; a real one does
+    // not, so escalation requires persistence rather than a single sample.
+    // Recent observations per asset, newest last.  Breaches are scored over
+    // this window rather than requiring strict consecutiveness: the
+    // tolerance includes live offer exposure, which swings ~100x between
+    // heartbeats as the book is re-quoted, so a genuine constant divergence
+    // would otherwise keep having a consecutive counter reset by whichever
+    // heartbeats happen to carry a large book.
+    struct LedgerObservation {
+        int  sign{0};             // +1 ledger above wallet, -1 below, 0 clean.
+        Mojo divergence{0};
+    };
+    std::unordered_map<std::string, std::deque<LedgerObservation>>
+        ledger_observations_;
+
+    /// True once opening balances have been established this process.
+    bool ledger_genesis_done_{false};
+
+    /// Consecutive breaching observations per peg signal, keyed by signal
+    /// name.  DEX-vs-CEX basis spikes are transient; a real depeg persists.
+    std::unordered_map<std::string, int> peg_breach_;
+
+    // -- Arbitrage leg-pair state machine (ARB-ARMING 2026-07-30) ----------
+    //
+    // Spreads on this venue swing by an order of magnitude between
+    // heartbeats, so a single reading cannot separate a real opportunity
+    // from a stale quote -- and stale is the common case (a chosen offer
+    // came back status=3, already gone, on 2026-07-30).  Execution is
+    // therefore gated on an edge that PERSISTS, with a lower disarm
+    // threshold so the state cannot flap at the boundary.
+    struct ArbLegState {
+        int         consecutive_above{0};  ///< Observations above arm threshold.
+        bool        armed{false};
+        double      last_net_edge_bps{0.0};
+        BlockHeight armed_since_block{0};
+    };
+    /// Keyed by direction, e.g. "buy@XCH/BYC -> sell@XCH/wUSDC.b".
+    std::unordered_map<std::string, ArbLegState> arb_leg_state_;
+
+    /// Update the arm/disarm machine for one leg pair and persist the
+    /// observation.  Returns true when execution is permitted right now
+    /// (armed AND the execute switch is on).
+    bool update_arb_leg_state(const std::string& direction,
+                              BlockHeight block_height,
+                              Mojo ask_a, Mojo bid_b, double cross_rate,
+                              double gross_edge_bps, double net_edge_bps,
+                              Mojo ask_size, Mojo bid_size);
+
+    /// Chain height observed during startup reconcile; the anchor for
+    /// genesis so downtime fills are not counted twice.
+    BlockHeight startup_block_{0};
+
+    /// Per-asset genesis block, cached from the ledger's `opening` legs.
+    /// A fill at or below an asset's genesis block is already inside its
+    /// opening balance and must not post a leg.
+    std::unordered_map<std::string, BlockHeight> ledger_genesis_block_;
+
+    /// Assets that actually have an `opening` leg.  Legs are posted ONLY for
+    /// these.  A per-asset wallet RPC timeout at startup (observed on this
+    /// deployment 2026-07-26 for the XCH wallet) leaves an asset unopened;
+    /// posting its fills anyway would put legs in the ledger with no opening
+    /// balance, and the NEXT restart would then open at a wallet balance that
+    /// already reflects them -- baking in a permanent divergence equal to the
+    /// whole session's flow, carrying the same signature as the phantom-fill
+    /// bug this control exists to measure.
+    std::unordered_set<std::string> ledger_opened_assets_;
+
+    /// Set when a ledger write FAILED (not merely duplicated).  The ledger
+    /// is then known-incomplete, so the invariant control stands down rather
+    /// than reporting a divergence it caused itself.
+    bool ledger_incomplete_{false};
 
     // -- [T4-05] GUI-requested pause via signal file ----------------------
     // The GUI creates / removes a "pause.flag" file next to the database.

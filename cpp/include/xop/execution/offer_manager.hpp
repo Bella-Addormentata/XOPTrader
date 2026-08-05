@@ -157,6 +157,16 @@ struct OrphanEvaluation {
     std::string        reason;              ///< Human-readable explanation.
 };
 
+// ---------------------------------------------------------------------------
+// SettledFill -- settled (executed) amounts extracted from a CONFIRMED
+//                wallet trade record, converted to the engine's
+//                base-mojos size + pseudo-price convention.
+// ---------------------------------------------------------------------------
+struct SettledFill {
+    Mojo size{0};   ///< Settled base-asset amount (raw base mojos).
+    Mojo price{0};  ///< Settled pseudo-price: quote_units_per_base * 1e12.
+};
+
 struct RebalanceSnapshot {
     Mojo        mid_price{0};                  ///< Mid-price at last rebalance.
     BlockHeight block_height{0};               ///< Block height at last rebalance.
@@ -242,17 +252,35 @@ public:
     /**
      * @brief Poll the wallet for settled offers and return newly detected fills.
      *
-     * Queries get_all_offers(), compares each returned trade record against
-     * the internal pending-offer map.  An offer whose status transitions to
-     * CONFIRMED (status == 4 in the Chia wallet) is treated as filled:
+     * Queries get_offer per tracked offer, compares each returned trade
+     * record against the internal pending-offer map.  An offer whose
+     * status transitions to CONFIRMED (status == 4 in the Chia wallet) is
+     * treated as filled:
      *   - A Fill event is constructed.
      *   - The PendingOffer is removed from State.
      *   - Position accounting is updated (record_buy for bids, record_sell
      *     for asks) via the shared State object.
      *
+     * [WALLET-LOAD 2026-08-04] Per-offer polling is throttled to protect
+     * the wallet daemon (execution/wallet_poll_throttle.hpp):
+     *   - offers younger than detect_fills_min_age_blocks are skipped (a
+     *     just-posted offer cannot have settled);
+     *   - offers still PENDING_ACCEPT after detect_fills_backoff_polls
+     *     consecutive polls are polled every
+     *     detect_fills_backoff_interval-th heartbeat, resetting to
+     *     every-heartbeat the moment the book mid comes within 2x the
+     *     offer's post-time distance-from-mid, or when a cancel is
+     *     pending on it.
+     * A fill surfacing during a skipped heartbeat is DELAYED, never lost:
+     * CONFIRMED offers stay tracked until processed (cae2bfd) and the
+     * completeness sweep catches stragglers.
+     *
+     * @param current_block  Latest known block height (for the age gate;
+     *                       0 = unknown, gate disabled).
      * @return Vector of Fill events detected in this poll cycle.
      */
-    asio::awaitable<std::vector<Fill>> detect_fills();
+    asio::awaitable<std::vector<Fill>> detect_fills(
+        BlockHeight current_block = 0);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -578,6 +606,41 @@ public:
         const nlohmann::json& trade_record,
         BlockHeight current_block) const;
 
+    /**
+     * @brief Extract the SETTLED size and price for a confirmed fill.
+     *
+     * detect_fills() historically copied the POSTED price/size from the
+     * tracked PendingOffer into the Fill, silently discarding the settled
+     * amounts carried in the wallet trade record's "summary" field
+     * (offered / requested / fees).  When the settled amounts differ from
+     * the posted ones (e.g. partial settlement of a splittable offer),
+     * the trade_log and P&L inherit the divergence.  This helper parses
+     * the summary and converts the raw settled mojo amounts into the
+     * engine's Fill convention:
+     *
+     *   size  = settled base-asset amount in raw base mojos
+     *   price = pseudo-price = quote_units_per_base_unit * kMojosPerXch
+     *         = quote_mojos * base_mojos_per_unit * kMojosPerXch
+     *           / (base_mojos * quote_mojos_per_unit)
+     *
+     * (exact inverse of xop::quote_mojos_for -- see types.hpp).
+     *
+     * Pure and static so it is unit-testable without an RPC client.
+     * Returns std::nullopt when the summary is absent, malformed, does not
+     * contain both legs of the pair on the expected sides, or any amount
+     * is non-positive.  Callers MUST fall back to the posted values with
+     * a WARNING log in that case -- never silently.
+     *
+     * @param trade_record  Wallet trade record JSON (from get_offer).
+     * @param side          Our side of the offer (Bid = we bought base).
+     * @param pair          Pair config (asset IDs + mojo denominations).
+     * @return Settled size/price, or std::nullopt if unparseable.
+     */
+    static std::optional<SettledFill> parse_settled_fill(
+        const nlohmann::json& trade_record,
+        Side                  side,
+        const PairConfig&     pair);
+
 private:
     // -- Internal helpers ---------------------------------------------------
 
@@ -625,9 +688,14 @@ private:
      * (the offer is already valid on-chain).
      *
      * @param offer_text  Bech32m-encoded offer string.
-     * @return true if submission succeeded, false on any error.
+     * @return Dexie's offer id on success, empty string on any error.
+     *         The id MUST be retained on the PendingOffer: the dexie
+     *         orderbook reports our resting offers under it, and own-offer
+     *         exclusion in the arbitrage taker matches on it.  Discarding it
+     *         (as this did until 2026-07-30) leaves the taker able to trade
+     *         against the bot's own offers.
      */
-    asio::awaitable<bool> submit_to_dexie(const std::string& offer_text);
+    asio::awaitable<std::string> submit_to_dexie(const std::string& offer_text);
 
     /**
      * @brief One-time initialisation of the asset-to-wallet-ID cache.
@@ -666,6 +734,20 @@ private:
 
     /// Flag indicating whether wallet_id_map_ has been initialised.
     bool wallet_ids_resolved_{false};
+
+    // -- detect_fills poll throttling ([WALLET-LOAD 2026-08-04]) -------------
+
+    /// Consecutive detect_fills polls that saw an offer still
+    /// PENDING_ACCEPT, keyed by offer id.  Reaching
+    /// detect_fills_backoff_polls demotes the offer to
+    /// every-Kth-heartbeat polling; entries are erased when the offer
+    /// leaves PENDING_ACCEPT, leaves State, or re-enters striking
+    /// distance.
+    std::unordered_map<std::string, std::uint32_t> fill_poll_pending_counts_;
+
+    /// Monotonic detect_fills invocation counter (the "heartbeat index"
+    /// of the poll backoff schedule).
+    std::uint64_t fill_poll_heartbeat_{0};
 
     /// Per-pair rebalance baselines for trigger evaluation.
     std::unordered_map<std::string, RebalanceSnapshot> rebalance_baselines_;

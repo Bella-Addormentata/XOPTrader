@@ -133,6 +133,13 @@ struct TibetSwapReserves {
     std::uint32_t fee_bps{7};      // pool fee in per-mille numerator
                                    //   (7 = 0.7% per swap direction).
                                    //   Populate from config: tibetswap_fee_bps / 10.
+
+    // Denominations of the two reserves above, needed to turn the raw mojo
+    // ratio into a displayable price comparable with dexie quotes.  Defaults
+    // match every TibetSwap pool today (native XCH vs a 3-decimal CAT); a
+    // populator with per-asset config should set them explicitly.
+    std::int64_t xch_mojos_per_unit{1'000'000'000'000LL};   // 1 XCH = 10^12 mojos.
+    std::int64_t token_mojos_per_unit{1'000LL};             // 1 CAT unit = 10^3 mojos.
 };
 
 /// CEX price for a single asset pair, fetched from OKX / MEXC / Gate.io.
@@ -319,22 +326,39 @@ std::int64_t get_output_amount(std::int64_t input_amount,
                                std::int64_t output_reserve,
                                std::int64_t fee_bps = 7);
 
-/// Compute the implied mid-price of the pool (output per unit of input)
+/// Compute the implied mid-price of the pool (output units per input unit)
 /// from the current reserves.
 ///
 /// For a constant-product pool the marginal price (infinitesimal trade) is:
 ///
-///   implied_price = output_reserve / input_reserve
+///   raw_ratio     = output_reserve / input_reserve     (mojo per mojo)
+///   implied_price = raw_ratio * input_mojos_per_unit
+///                             / output_mojos_per_unit
+///
+/// The denomination factor is NOT optional.  Reserves are held in mojos and
+/// XCH (10^12 mojos/unit) and CATs (10^3 mojos/unit) differ by 10^9, so the
+/// bare ratio for XCH/DBX is 1.018e-7 where the displayable price is 101.83
+/// DBX/XCH -- a 10^9 error against any dexie/CEX mid it is compared with or
+/// blended into.  The unit parameters are therefore mandatory (no defaults):
+/// callers that swap the reserve order must swap the denominations too, and
+/// the compiler forces every call site to state which is which.
 ///
 /// This is the price BEFORE fees.  The effective price after fees for a
 /// finite-size trade is lower (computed via get_output_amount).
 ///
-/// @param input_reserve   Pool reserve of the input token.
-/// @param output_reserve  Pool reserve of the output token.
+/// @param input_reserve         Pool reserve of the input token (mojos).
+/// @param output_reserve        Pool reserve of the output token (mojos).
+/// @param input_mojos_per_unit  Mojos per displayable unit of the INPUT
+///                              asset (XCH: 10^12, CAT: 10^3).
+/// @param output_mojos_per_unit Mojos per displayable unit of the OUTPUT
+///                              asset (XCH: 10^12, CAT: 10^3).
 ///
-/// @return Implied price (double), or 0.0 if either reserve is non-positive.
+/// @return Implied price in displayable units (output per input), or 0.0 if
+///         any reserve or denomination is non-positive.
 double get_implied_price(std::int64_t input_reserve,
-                         std::int64_t output_reserve);
+                         std::int64_t output_reserve,
+                         std::int64_t input_mojos_per_unit,
+                         std::int64_t output_mojos_per_unit);
 
 /// Compute the effective execution price for a given trade size, accounting
 /// for the AMM fee and price impact (slippage).

@@ -96,7 +96,15 @@ enum class AlertRule : std::uint8_t {
     HourlyPnl           = 12, // Hourly PnL summary.
     DailyPnl            = 13, // Daily PnL summary.
     NewPairVolume        = 14, // Volume detected on a newly listed pair.
-    ArbitrageDetected    = 15  // Cross-venue or cross-bridge arb opportunity.
+    ArbitrageDetected    = 15, // Cross-venue or cross-bridge arb opportunity.
+
+    // Accounting (rule 16)
+    StablecoinDepeg      = 17, // A quote stablecoin has left its peg.
+    LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
+                               // Its own rule so accounting noise can never
+                               // rate-limit or masquerade as ExposureBreach,
+                               // which is CRITICAL tier and already carries
+                               // three unrelated risk conditions.
 };
 
 /// Human-readable label for logging.
@@ -144,9 +152,24 @@ struct BotState {
     };
     std::vector<AssetState> assets;
 
-    // PnL (Dashboard 1).
-    Mojo   total_pnl;          // Current total PnL.
-    Mojo   peak_pnl;           // High-water mark PnL.
+    // Equity (Dashboard 1).
+    //
+    // [DRAWDOWN-USD 2026-08-02] First pass moved these off raw quote-mojo
+    // sums onto USD.  [DRAWDOWN-EQUITY 2026-08-04] Second pass, after a
+    // live false trip: they now carry PORTFOLIO EQUITY (holdings x USD
+    // price) and its high-water mark, not the P&L series -- drawdown
+    // against a ~$25 P&L peak read a ~5%-of-book mark move as "60%
+    // drawdown".  Renamed (again) so any stale P&L-semantics producer or
+    // consumer fails to compile rather than silently changing what the
+    // drawdown alert measures.
+    double equity_usd{0.0};       // Current portfolio equity, USD.
+    double peak_equity_usd{0.0};  // Equity high-water mark, USD.
+
+    // [DRAWDOWN-EQUITY 2026-08-04 item 6] True when the engine is in
+    // BotStatus::Paused (e.g. a circuit breaker fired).  Surfaced so the
+    // GUI/alert layer can display the pause state instead of inferring it
+    // from alert traffic.
+    bool engine_paused{false};
 
     // Inventory exposure.
     double max_inventory_ratio; // Highest inventory_ratio across all pairs.

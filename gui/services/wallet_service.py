@@ -4,6 +4,12 @@ Queries the local Chia wallet daemon over its authenticated HTTPS RPC
 interface to retrieve spendable, confirmed, and pending balances for
 each wallet associated with the configured fingerprint.
 
+All HTTP I/O runs in a dedicated ``QThread`` worker (mirroring
+``MetricsService``) so the GUI event loop is never blocked -- a full
+balance pass is log_in + get_wallets + one get_wallet_balance per
+wallet, each with a 5 s timeout, which measured 4-11 s when the wallet
+daemon is slow.
+
 Compliant with:
     - ISO/IEC 27001:2022  (SSL certs loaded from disk, not embedded)
     - ISO/IEC 5055       (bounded timeout, deterministic error handling)
@@ -13,11 +19,17 @@ from __future__ import annotations
 
 import logging
 import re
-import ssl
 from pathlib import Path
 from typing import Any, Final, Optional
 
-from PySide6.QtCore import QMutex, QMutexLocker, QObject
+from PySide6.QtCore import (
+    QMutex,
+    QMutexLocker,
+    QObject,
+    QThread,
+    Signal,
+    Slot,
+)
 
 _log: logging.Logger = logging.getLogger(__name__)
 
@@ -37,60 +49,83 @@ _WALLET_TYPE_CAT: Final[int] = 6
 _ASSET_ID_RE: Final[re.Pattern[str]] = re.compile(r"[0-9a-fA-F]{64}")
 
 
-class WalletService(QObject):
-    """Queries Chia wallet RPC for balance information.
+def _params_from_config(config: dict[str, Any]) -> dict[str, Any]:
+    """Extract wallet RPC connection parameters from a config snapshot."""
+    chia = config.get("chia", {})
+    return {
+        "host": chia.get("wallet_host", "localhost"),
+        "port": int(chia.get("wallet_port", 9256)),
+        "fingerprint": chia.get("wallet_fingerprint"),
+        "cert_path": str(chia.get("wallet_cert_path", "") or ""),
+        "key_path": str(chia.get("wallet_key_path", "") or ""),
+    }
 
-    Parameters
-    ----------
-    config : dict
-        The full config dict (must contain ``chia`` section with
-        ``wallet_host``, ``wallet_port``, ``wallet_cert_path``,
-        ``wallet_key_path``, ``wallet_fingerprint``).
-    parent : QObject | None
-        Optional Qt parent.
+
+# ===================================================================
+# Worker -- runs blocking wallet RPC calls on a background QThread
+# ===================================================================
+
+class _WalletWorker(QObject):
+    """Background worker performing the blocking wallet RPC sequence.
+
+    This object is *moved* to a ``QThread`` and communicates with the
+    main-thread ``WalletService`` exclusively through Qt signals, so
+    the multi-second RPC pass never runs on the GUI thread.
     """
 
-    def __init__(
-        self,
-        config: dict[str, Any],
-        parent: Optional[QObject] = None,
-    ) -> None:
+    # Emitted after every fetch attempt.  Carries the freshly fetched
+    # wallet map on success or an empty dict on failure -- the service
+    # merges into its cache and clears the in-flight guard either way.
+    balances_ready = Signal(dict)
+
+    def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
-        self._mutex = QMutex()
-        self._cached: dict[str, dict[str, float]] = {}
-        self._update_config(config)
+        self._host: str = "localhost"
+        self._port: int = 9256
+        self._fingerprint: Optional[int] = None
+        self._cert_path: Path = Path("")
+        self._key_path: Path = Path("")
 
-    def _update_config(self, config: dict[str, Any]) -> None:
-        chia = config.get("chia", {})
-        self._host: str = chia.get("wallet_host", "localhost")
-        self._port: int = int(chia.get("wallet_port", 9256))
-        self._fingerprint: Optional[int] = chia.get("wallet_fingerprint")
+    @Slot(dict)
+    def set_params(self, params: dict) -> None:
+        """Update connection parameters.
 
-        cert = chia.get("wallet_cert_path", "")
-        key = chia.get("wallet_key_path", "")
-        self._cert_path: Path = Path(str(cert)).expanduser()
-        self._key_path: Path = Path(str(key)).expanduser()
+        Thread-safe: invoked via a queued signal from the main thread so
+        the mutation occurs on the worker thread.
+        """
+        self._host = str(params.get("host", "localhost"))
+        self._port = int(params.get("port", 9256))
+        self._fingerprint = params.get("fingerprint")
+        self._cert_path = Path(str(params.get("cert_path", ""))).expanduser()
+        self._key_path = Path(str(params.get("key_path", ""))).expanduser()
 
-    def update_config(self, config: dict[str, Any]) -> None:
-        """Re-read connection parameters from a new config snapshot."""
-        self._update_config(config)
+    def _certs_available(self) -> bool:
+        """Return True when both configured SSL cert files exist."""
+        if self._cert_path.is_file() and self._key_path.is_file():
+            return True
+        _log.warning(
+            "Wallet SSL certs not found: cert=%s key=%s",
+            self._cert_path,
+            self._key_path,
+        )
+        return False
 
-    def _build_ssl_context(self) -> Optional[ssl.SSLContext]:
-        """Create an SSL context with the configured wallet certs."""
-        if not self._cert_path.is_file() or not self._key_path.is_file():
-            _log.warning(
-                "Wallet SSL certs not found: cert=%s key=%s",
-                self._cert_path,
-                self._key_path,
-            )
-            return None
-        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
-        ctx.check_hostname = False
-        ctx.verify_mode = ssl.CERT_NONE
-        ctx.load_cert_chain(str(self._cert_path), str(self._key_path))
-        return ctx
+    @Slot()
+    def fetch(self) -> None:
+        """Perform the blocking wallet RPC pass and emit ``balances_ready``.
 
-    def fetch_balances(self) -> dict[str, dict[str, float]]:
+        This slot is invoked from the main thread via a queued
+        connection, so it executes on the worker thread.  Emits an empty
+        dict on any failure so the service can clear its in-flight flag.
+        """
+        try:
+            result = self._fetch_impl()
+        except Exception as exc:  # noqa: BLE001 -- never kill the worker
+            _log.warning("Wallet balance fetch failed unexpectedly: %s", exc)
+            result = {}
+        self.balances_ready.emit(result)
+
+    def _fetch_impl(self) -> dict[str, dict[str, float]]:
         """Query the Chia wallet RPC and return per-wallet balances.
 
         Returns
@@ -98,7 +133,7 @@ class WalletService(QObject):
         dict[str, dict[str, float]]
             Mapping of wallet name to ``{spendable, confirmed,
             pending_change, unconfirmed}`` in display units (XCH or
-            token units).
+            token units).  Empty on failure.
         """
         try:
             import requests  # type: ignore[import-untyped]
@@ -106,11 +141,10 @@ class WalletService(QObject):
             urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
         except ImportError:
             _log.debug("requests library not available")
-            return self._get_cached()
+            return {}
 
-        ssl_ctx = self._build_ssl_context()
-        if ssl_ctx is None:
-            return self._get_cached()
+        if not self._certs_available():
+            return {}
 
         base_url = f"https://{self._host}:{self._port}"
 
@@ -140,11 +174,11 @@ class WalletService(QObject):
             wallets_data = resp.json()
         except requests.RequestException as exc:
             _log.debug("Failed to get wallets: %s", exc)
-            return self._get_cached()
+            return {}
 
         if not wallets_data.get("success"):
             _log.debug("get_wallets returned success=false")
-            return self._get_cached()
+            return {}
 
         wallets = wallets_data.get("wallets", [])
         result: dict[str, dict[str, float]] = {}
@@ -242,20 +276,150 @@ class WalletService(QObject):
                 "asset_id": asset_id,
             }
 
+        return result
+
+
+# ===================================================================
+# Main service -- lives on the GUI thread
+# ===================================================================
+
+class WalletService(QObject):
+    """Queries Chia wallet RPC for balance information.
+
+    The blocking RPC pass runs on a dedicated worker ``QThread``;
+    ``fetch_balances()`` only *triggers* a fetch and returns the cached
+    snapshot immediately.  Overlapping fetches are skipped (never
+    queued) so a slow wallet daemon cannot build a request backlog.
+
+    Parameters
+    ----------
+    config : dict
+        The full config dict (must contain ``chia`` section with
+        ``wallet_host``, ``wallet_port``, ``wallet_cert_path``,
+        ``wallet_key_path``, ``wallet_fingerprint``).
+    parent : QObject | None
+        Optional Qt parent.
+
+    Signals
+    -------
+    balances_updated(dict)
+        Emitted on the GUI thread after every completed fetch with the
+        merged balance cache (empty fetches keep the previous cache).
+    """
+
+    # -- Qt signals ---------------------------------------------------------
+    balances_updated = Signal(dict)
+
+    # -- Internal trigger signals (queued connections to worker thread) -----
+    _trigger_fetch = Signal()
+    _trigger_params = Signal(dict)
+
+    def __init__(
+        self,
+        config: dict[str, Any],
+        parent: Optional[QObject] = None,
+    ) -> None:
+        super().__init__(parent)
+        self._mutex = QMutex()
+        self._cached: dict[str, dict[str, float]] = {}
+        self._fetch_in_flight: bool = False
+
+        # -- Worker thread --------------------------------------------------
+        self._thread: QThread = QThread(self)
+        self._thread.setObjectName("WalletWorkerThread")
+
+        self._worker: _WalletWorker = _WalletWorker()
+        self._worker.moveToThread(self._thread)
+
+        # Worker signals -> main-thread slots (auto == queued here).
+        self._worker.balances_ready.connect(self._on_balances_ready)
+
+        # Queued connections: emit trigger signals to invoke worker slots
+        # on the worker thread rather than blocking the GUI thread.
+        self._trigger_fetch.connect(self._worker.fetch)
+        self._trigger_params.connect(self._worker.set_params)
+
+        # Dispatch the initial parameters; delivered once the thread runs.
+        self._trigger_params.emit(_params_from_config(config))
+
+    # ===================================================================
+    # Lifecycle
+    # ===================================================================
+
+    def start(self) -> None:
+        """Start the background worker thread."""
+        if self._thread.isRunning():
+            _log.warning("WalletService.start() called but thread already running.")
+            return
+        _log.info("Starting WalletService worker thread.")
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Cleanly shut down the worker thread.
+
+        Safe to call even if the service was never started.
+        """
+        _log.info("Stopping WalletService.")
+        if self._thread.isRunning():
+            self._thread.quit()
+            if not self._thread.wait(5_000):
+                _log.warning("WalletService worker thread did not exit in time.")
+
+    # ===================================================================
+    # Public API
+    # ===================================================================
+
+    def update_config(self, config: dict[str, Any]) -> None:
+        """Re-read connection parameters from a new config snapshot."""
+        self._trigger_params.emit(_params_from_config(config))
+
+    def fetch_balances(self) -> dict[str, dict[str, float]]:
+        """Trigger an asynchronous balance fetch on the worker thread.
+
+        Non-blocking: returns the cached snapshot immediately.  If a
+        fetch is already in flight the trigger is skipped entirely (no
+        backlog is queued).  Fresh results arrive via
+        :pyattr:`balances_updated` and are merged into the cache read by
+        :meth:`get_balances`.
+
+        Returns
+        -------
+        dict[str, dict[str, float]]
+            The last known balance snapshot (possibly empty).
+        """
+        if self._fetch_in_flight:
+            _log.debug("Wallet fetch already in flight; skipping trigger.")
+            return self._get_cached()
+
+        if not self._thread.isRunning():
+            # Lazy safety net for callers that never invoked start().
+            self.start()
+
+        self._fetch_in_flight = True
+        self._trigger_fetch.emit()
+        return self._get_cached()
+
+    def get_balances(self) -> dict[str, dict[str, float]]:
+        """Return cached balances without making an RPC call."""
+        return self._get_cached()
+
+    # ===================================================================
+    # Internal slots (GUI thread)
+    # ===================================================================
+
+    @Slot(dict)
+    def _on_balances_ready(self, result: dict) -> None:
+        """Merge a completed fetch into the cache and clear the guard."""
+        self._fetch_in_flight = False
         if result:
             with QMutexLocker(self._mutex):
                 # Merge new data into cache rather than replacing it.
                 # This prevents a single timed-out wallet RPC from
                 # erasing previously-fetched wallets from the display.
                 self._cached.update(result)
-
-        return self._get_cached()
+        self.balances_updated.emit(self._get_cached())
 
     def _get_cached(self) -> dict[str, dict[str, float]]:
         """Return the last successful balance snapshot."""
         with QMutexLocker(self._mutex):
             return dict(self._cached)
-
-    def get_balances(self) -> dict[str, dict[str, float]]:
-        """Return cached balances without making an RPC call."""
-        return self._get_cached()

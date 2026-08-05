@@ -105,7 +105,18 @@ inline constexpr CapitalLimits kDefaultCapitalLimits[kCapitalCategoryCount] = {
 struct AssetRecord {
     AssetId     asset_id;         // Which asset this record tracks.
     Mojo        total_quantity;   // Current holdings in mojos (>= 0).
-    Mojo        total_cost;       // Cumulative cost of current holdings (mojos).
+    double      total_cost;       // Cumulative cost of current holdings:
+                                  //   sum of (fill_price * qty) over open lots.
+                                  // Stored as double because fill_price is a
+                                  // pseudo-price (~1e12-1e14) and qty is in
+                                  // base mojos (~1e12+), so the product
+                                  // (~1e24+) cannot fit int64.  The prior
+                                  // int64 storage saturated to INT64_MIN on
+                                  // the first XCH-sized buy, permanently
+                                  // zeroing the cost basis (PNL-BASIS-OVERFLOW,
+                                  // fixed 2026-07-30).  Double keeps ~15
+                                  // significant digits; basis error is
+                                  // sub-mojo at all realistic scales.
     Mojo        weighted_avg_cost_basis; // total_cost / total_quantity (mojos),
                                          // or 0 when total_quantity == 0.
     BlockHeight last_fill_block;  // Block height of the most recent fill.
@@ -293,6 +304,54 @@ public:
     void seed_position(const AssetId& asset_id,
                        Mojo           qty,
                        Mojo           estimated_price);
+
+    // -- Persistence support (PNL-BASIS-PERSIST, 2026-07-30) ----------------
+
+    /// Restore a record exactly as previously persisted (inventory_state
+    /// table).  Overwrites any existing record for the asset.  Used once at
+    /// engine startup, before wallet seeding, so that cost basis survives
+    /// restarts.  `total_cost` and the sentinel flag round-trip verbatim.
+    void restore_record(const AssetId& asset_id,
+                        Mojo           qty,
+                        double         total_cost,
+                        bool           basis_is_seed_sentinel);
+
+    /// Replace the basis of an existing position with `price`, keeping the
+    /// tracked quantity.  Used to upgrade a seed-sentinel basis to the first
+    /// observed market price ("mark at first observation") once market data
+    /// is warm, and clears the sentinel flag.  No-op when there is no
+    /// position or price <= 0.
+    void reseed_basis(const AssetId& asset_id, Mojo price);
+
+    /// Apply a fill's quantity change when no trustworthy price is available
+    /// (e.g. the pair's quote has no USD valuation yet), WITHOUT inventing a
+    /// cost.  The weighted-average basis and the seed-sentinel flag are both
+    /// preserved: a buy is costed at the existing basis, so the basis is
+    /// unchanged and a still-sentinel record stays repairable by the
+    /// mark-at-first-observation upgrade.
+    ///
+    /// This exists because passing a placeholder price to record_buy() would
+    /// destroy the position: the sentinel branch REPLACES the basis of the
+    /// entire holding with that price and clears the sentinel flag, making
+    /// the damage permanent and unrepairable.
+    ///
+    /// @return false when a sell exceeds tracked quantity (caller should
+    ///         alert); true otherwise.
+    bool record_fill_unpriced(const AssetId& asset_id,
+                              Mojo           qty,
+                              bool           is_buy,
+                              BlockHeight    block,
+                              Timestamp      ts);
+
+    /// Reconcile tracked quantity against an externally observed balance
+    /// (wallet truth).  A decrease (withdrawal / untracked spend) draws
+    /// total_cost down proportionally, preserving the basis.  An increase
+    /// (deposit / untracked receipt) is added at `price_for_additions`
+    /// (typically the current mid), i.e. mark-at-receipt accounting.
+    /// No-op when new_qty < 0 or when an increase has no usable price.
+    void adjust_quantity(const AssetId& asset_id,
+                         Mojo           new_qty,
+                         Mojo           price_for_additions);
 
     // -- Accessors ----------------------------------------------------------
 

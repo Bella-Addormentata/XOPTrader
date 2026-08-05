@@ -19,6 +19,8 @@
 #include <xop/strategy/base.hpp>  // MarketRegime, RegimeInfo
 
 #include <cmath>
+#include <limits>
+#include <random>
 #include <vector>
 
 namespace {
@@ -343,6 +345,179 @@ TEST(VolatilityTest, RegimeClassificationFromVR) {
         EXPECT_NEAR(regime.spread_mult, 0.80, 1e-10);
         EXPECT_NEAR(regime.skew_mult, 0.50, 1e-10);
     }
+}
+
+// ============================================================================
+// [AS-WARM] Warm-start from persisted snapshot mids (acceptance D)
+// ============================================================================
+//
+// Production settings: candle_aggregation_blocks = 10, min_candles = 10, so
+// readiness needs 100 ticks.  At one tick per ~19-minute engine heartbeat
+// that used to mean ~32 h of UNINTERRUPTED uptime (the in-memory buffer reset
+// on every restart) -- the estimator had essentially never been ready and
+// sigma permanently fell to the 0.001 floor while realized annualized vol
+// measured from the same snapshot history was ~1.11.
+// rehydrate_from_ticks() must make the estimator ready immediately after a
+// simulated restart, with a sigma close to an offline computation on the
+// same window.
+
+// Deterministic pseudo-random walk shared by the warm-start tests.
+// Per-tick log-return stdev is calibrated so that at the measured ~19-min
+// snapshot cadence (1140 s) the annualized sigma is ~1.10:
+//   sd_tick = sigma_annual * sqrt(tick_seconds / seconds_per_year)
+//           = 1.10 * sqrt(1140 / 31,536,000) = 1.10 * 6.013e-3 = 6.614e-3
+std::vector<double> synthetic_snapshot_mids(std::size_t n, unsigned seed) {
+    std::mt19937 rng(seed);
+    std::normal_distribution<double> ret(0.0, 6.614e-3);
+    std::vector<double> mids;
+    mids.reserve(n);
+    double log_p = std::log(12.19);  // ~XCH/wUSDC.b mid, 2026-07-31
+    for (std::size_t i = 0; i < n; ++i) {
+        log_p += ret(rng);
+        mids.push_back(std::exp(log_p));
+    }
+    return mids;
+}
+
+TEST(VolatilityWarmStartTest, ReadyImmediatelyAndSigmaMatchesOffline) {
+    auto cfg = default_vol_config();
+    cfg.min_candles = 10;
+    cfg.candle_aggregation_blocks = 10;  // production setting
+    cfg.lookback_blocks = 200;
+    xop::VolatilityEstimator estimator(cfg);
+
+    // Simulated restart: fresh estimator, cold buffer.
+    EXPECT_FALSE(estimator.is_ready());
+    EXPECT_EQ(estimator.get_sigma_annual(), 0.0);
+
+    const double tick_seconds = 1140.0;  // measured median snapshot spacing
+    const auto mids = synthetic_snapshot_mids(1000, 20260801u);
+
+    const std::size_t fed = estimator.rehydrate_from_ticks(mids, tick_seconds);
+
+    // Must FAIL if warm-start silently loads nothing.
+    ASSERT_EQ(fed, mids.size());
+    ASSERT_TRUE(estimator.is_ready());
+    EXPECT_EQ(estimator.candle_count(), 100u);  // 1000 ticks / 10 per candle
+
+    // The honest cadence must survive: the old [10, 300] clamp would have
+    // silently squashed 1140 s to 300 s and inflated sigma by sqrt(1140/300)
+    // ~ 1.95x.
+    EXPECT_DOUBLE_EQ(estimator.config().block_time_seconds, tick_seconds);
+
+    // Offline computation on the SAME window: close-to-close stdev of the
+    // aggregated candle closes (every 10th tick), annualized over the true
+    // candle period of 10 * 1140 s = 11,400 s:
+    //   sigma_annual = sd_close * sqrt(31,536,000 / 11,400)
+    //                = sd_close * 52.60
+    std::vector<double> closes;
+    for (std::size_t i = 9; i < mids.size(); i += 10) closes.push_back(mids[i]);
+    ASSERT_EQ(closes.size(), 100u);
+    std::vector<double> lr;
+    for (std::size_t i = 1; i < closes.size(); ++i)
+        lr.push_back(std::log(closes[i] / closes[i - 1]));
+    double mean = 0.0;
+    for (double r : lr) mean += r;
+    mean /= static_cast<double>(lr.size());
+    double var = 0.0;
+    for (double r : lr) var += (r - mean) * (r - mean);
+    var /= static_cast<double>(lr.size() - 1);
+    const double offline_annual =
+        std::sqrt(var) * std::sqrt(31'536'000.0 / (tick_seconds * 10.0));
+
+    const double warm_annual = estimator.get_sigma_annual();
+    EXPECT_GT(warm_annual, 0.0);
+    // Acceptance D: within 20% of the offline computation.  (Yang-Zhang vs
+    // close-to-close on the same GBM window differ only by estimator noise.)
+    EXPECT_NEAR(warm_annual, offline_annual, 0.20 * offline_annual)
+        << "warm=" << warm_annual << " offline=" << offline_annual;
+    // And the annualisation itself must be honest: the calibrated ~1.10
+    // must come back at the right ORDER OF MAGNITUDE, not the sqrt(10)- or
+    // 1.95x-inflated variants the old span/clamp bugs produced.
+    EXPECT_GT(warm_annual, 0.6);
+    EXPECT_LT(warm_annual, 1.8);
+}
+
+TEST(VolatilityWarmStartTest, ReadyAtExactly100RowsNotAt99) {
+    auto cfg = default_vol_config();
+    cfg.min_candles = 10;
+    cfg.candle_aggregation_blocks = 10;
+    cfg.lookback_blocks = 200;
+
+    const auto mids = synthetic_snapshot_mids(100, 7u);
+
+    {
+        // >= 100 snapshot rows -> ready immediately after simulated restart.
+        xop::VolatilityEstimator est(cfg);
+        const std::size_t fed = est.rehydrate_from_ticks(mids, 1140.0);
+        ASSERT_EQ(fed, 100u);
+        EXPECT_TRUE(est.is_ready());
+        EXPECT_EQ(est.candle_count(), 10u);
+    }
+    {
+        // 99 rows -> 9 full candles < min_candles -> still cold: the engine
+        // skips such pairs and the existing sigma-floor behaviour applies.
+        xop::VolatilityEstimator est(cfg);
+        const std::vector<double> sparse(mids.begin(), mids.begin() + 99);
+        const std::size_t fed = est.rehydrate_from_ticks(sparse, 1140.0);
+        ASSERT_EQ(fed, 99u);
+        EXPECT_FALSE(est.is_ready());
+        EXPECT_EQ(est.get_sigma_annual(), 0.0);
+    }
+}
+
+TEST(VolatilityWarmStartTest, SkipsNonFiniteAndNonPositiveMids) {
+    auto cfg = default_vol_config();
+    cfg.min_candles = 10;
+    cfg.candle_aggregation_blocks = 10;
+    xop::VolatilityEstimator est(cfg);
+
+    auto mids = synthetic_snapshot_mids(100, 11u);
+    mids.push_back(0.0);
+    mids.push_back(-3.0);
+    mids.push_back(std::numeric_limits<double>::quiet_NaN());
+    mids.push_back(std::numeric_limits<double>::infinity());
+
+    const std::size_t fed = est.rehydrate_from_ticks(mids, 1140.0);
+    EXPECT_EQ(fed, 100u);  // the four junk entries are not ingested
+    EXPECT_TRUE(est.is_ready());
+}
+
+TEST(VolatilityWarmStartTest, RehydrationResetsPriorState) {
+    auto cfg = default_vol_config();
+    cfg.min_candles = 10;
+    cfg.candle_aggregation_blocks = 10;
+    xop::VolatilityEstimator est(cfg);
+
+    // Pre-existing partial state (e.g. a few live ticks before the DB read
+    // finished) must not leak into the replayed series.
+    for (int i = 0; i < 37; ++i) est.update_tick(500.0 + i);
+
+    const auto mids = synthetic_snapshot_mids(500, 13u);
+    const std::size_t fed = est.rehydrate_from_ticks(mids, 1140.0);
+    ASSERT_EQ(fed, 500u);
+    EXPECT_TRUE(est.is_ready());
+    // 500 ticks -> exactly 50 candles: none of the 37 junk ticks survived.
+    EXPECT_EQ(est.candle_count(), 50u);
+}
+
+// ============================================================================
+// [AS-WARM] set_block_time_seconds: widened clamp admits the real heartbeat
+// ============================================================================
+
+TEST(VolatilityWarmStartTest, BlockTimeClampAdmitsHeartbeatCadence) {
+    auto cfg = default_vol_config();
+    xop::VolatilityEstimator est(cfg);
+
+    // The measured ~19-min snapshot cadence must be representable.
+    est.set_block_time_seconds(1140.0);
+    EXPECT_DOUBLE_EQ(est.config().block_time_seconds, 1140.0);
+
+    // Wildly wrong inputs are still rejected at the new [1, 7200] rails.
+    est.set_block_time_seconds(0.0);
+    EXPECT_DOUBLE_EQ(est.config().block_time_seconds, 1.0);
+    est.set_block_time_seconds(1e9);
+    EXPECT_DOUBLE_EQ(est.config().block_time_seconds, 7200.0);
 }
 
 }  // namespace

@@ -33,7 +33,7 @@ struct LimitsTestFixture : public ::testing::Test {
         risk_cfg.hard_limit_pct         = 0.80;
         risk_cfg.single_cat_cap_pct     = 0.12;
         risk_cfg.max_capital_per_pair_pct = 0.20;
-        risk_cfg.max_drawdown_pct       = 0.10;
+        risk_cfg.max_drawdown_frac      = 0.10;
 
         strat_cfg.min_profit_margin_bps = 35.0;  // 0.35%
     }

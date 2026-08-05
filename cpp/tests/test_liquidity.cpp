@@ -9,12 +9,14 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/config.hpp>
 #include <xop/strategy/liquidity.hpp>
 #include <xop/execution/market_data.hpp>
 #include <xop/state.hpp>
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <numeric>
 #include <vector>
 
@@ -262,6 +264,116 @@ TEST_F(AdverseSelectionSizingTest, SizeSumPreserved) {
     const double total_frac = static_cast<double>(total_bid)
                             / static_cast<double>(capital);
     EXPECT_NEAR(total_frac, 1.0, 0.02);
+}
+
+// ============================================================================
+// [AS-WARM recalibration 2026-08-01] sigma-threshold units regression
+// ============================================================================
+//
+// The decay-halving branch compares ANNUALIZED sigma against
+// adverse_selection_sigma_threshold.  The old defaults (0.05 in code, 0.005
+// in config.yaml) were tuned while the volatility estimator was never ready
+// and sigma sat at the 0.001 floor, so the branch never fired in production.
+// The warm-start made sigma honest (measured 0.4-1.9 annualized across
+// pairs); an unrecalibrated threshold would fire PERMANENTLY and silently
+// replace the configured tier profile with an outer-heavy one.  These tests
+// pin the new 2.0 default and the production tier-weight arithmetic on both
+// sides of it.
+//
+// Production profile (config.yaml): decay = 0.85, tier_size_pct =
+// [10, 12, 15, 18, 22, 23]%.
+//
+// Below threshold (base decay 0.85), weights_i = 1/0.85^i:
+//   [1, 1.1765, 1.3841, 1.6283, 1.9157, 2.2537], sum = 9.3583
+//   -> [10.69, 12.57, 14.79, 17.40, 20.47, 24.08]%
+//   i.e. within ~1.2 pp of the configured sizes (they were evidently
+//   calibrated to this profile).
+//
+// Above threshold (halved decay 0.425), weights_i = 1/0.425^i:
+//   [1, 2.3529, 5.5363, 13.0267, 30.6510, 72.1200], sum = 124.687
+//   -> [0.80, 1.89, 4.44, 10.45, 24.58, 57.84]%
+//   ~82% of ladder capital in the 230-300 bps outer tiers.  Nobody chose
+//   that as the everyday regime; it must be reserved for genuinely extreme
+//   volatility (> 200% annualized).
+
+class SigmaThresholdRecalibrationTest : public ::testing::Test {
+protected:
+    // Production-shaped config; adverse_selection_sigma_threshold is left
+    // at the compiled DEFAULT on purpose -- that default is what this test
+    // pins.
+    LiquidityConfig make_production_config() {
+        LiquidityConfig cfg;
+        cfg.num_tiers = 6;
+        cfg.tier_spacing_bps = {30.0, 60.0, 90.0, 160.0, 230.0, 300.0};
+        cfg.tier_size_pct = {0.10, 0.12, 0.15, 0.18, 0.22, 0.23};
+        cfg.adverse_selection_sizing = true;
+        cfg.adverse_selection_decay = 0.85;
+        cfg.gap_aware_spacing = false;  // isolate sizing
+        return cfg;
+    }
+
+    static double bid_frac(const std::vector<TierQuote>& ladder,
+                           std::uint32_t tier, Mojo capital) {
+        for (const auto& tq : ladder) {
+            if (tq.side == Side::Bid && tq.tier_index == tier) {
+                return static_cast<double>(tq.size)
+                     / static_cast<double>(capital);
+            }
+        }
+        return -1.0;
+    }
+};
+
+TEST_F(SigmaThresholdRecalibrationTest, DefaultIsAnnualizedTwoPointZero) {
+    EXPECT_DOUBLE_EQ(LiquidityConfig{}.adverse_selection_sigma_threshold, 2.0);
+    EXPECT_DOUBLE_EQ(
+        xop::StrategyConfig{}.adverse_selection_sigma_threshold, 2.0);
+}
+
+TEST_F(SigmaThresholdRecalibrationTest,
+       MeasuredBaselineVolKeepsConfiguredProfile) {
+    LiquidityConfig cfg = make_production_config();
+    LiquidityEngine engine("TEST/PAIR", cfg);
+
+    // Capital large enough that no tier hits build_raw_ladder's 1.0-XCH
+    // tier-0 minimum (which would mask the weight profile under test).
+    const Mojo mid       = 1'000'000'000'000LL;
+    const Mojo capital   = 1'000'000'000'000'000LL;  // 1000 XCH
+    const Mojo inventory = 1'000'000'000'000'000LL;
+
+    // 1.9 annualized: the TOP of the measured baseline range (XCH/BYC,
+    // itself partly inflated by pre-fix self-priced mids in the warm-start
+    // history).  Must NOT trip the halving.
+    auto ladder = engine.compute_ladder(
+        mid, /*sigma=*/1.9, 0.5, capital, inventory, {}, cfg);
+
+    // Unhalved decay-0.85 profile, ~= the configured [10..23]% sizes.
+    EXPECT_NEAR(bid_frac(ladder, 0, capital), 0.1069, 0.005);
+    EXPECT_NEAR(bid_frac(ladder, 5, capital), 0.2408, 0.005);
+    // The outer-heavy signature of the halved branch (tier5 = 57.8%) must
+    // be nowhere in sight at normal volatility.
+    EXPECT_LT(bid_frac(ladder, 5, capital), 0.30);
+    EXPECT_GT(bid_frac(ladder, 0, capital), 0.08);
+}
+
+TEST_F(SigmaThresholdRecalibrationTest, ExtremeVolStillHalvesDecay) {
+    LiquidityConfig cfg = make_production_config();
+    LiquidityEngine engine("TEST/PAIR", cfg);
+
+    // Same large-capital note as above: the halved tier-0 weight (0.80%)
+    // must clear the 1.0-XCH tier-0 minimum to be observable.
+    const Mojo mid       = 1'000'000'000'000LL;
+    const Mojo capital   = 1'000'000'000'000'000LL;  // 1000 XCH
+    const Mojo inventory = 1'000'000'000'000'000LL;
+
+    // 2.5 annualized (> 2.0): genuinely extreme regime -- the conservative
+    // outer-heavy reallocation is exactly what we want here.
+    auto ladder = engine.compute_ladder(
+        mid, /*sigma=*/2.5, 0.5, capital, inventory, {}, cfg);
+
+    // Halved decay 0.425 -> [0.80, 1.89, 4.44, 10.45, 24.58, 57.84]%.
+    EXPECT_NEAR(bid_frac(ladder, 0, capital), 0.0080, 0.002);
+    EXPECT_NEAR(bid_frac(ladder, 5, capital), 0.5784, 0.01);
 }
 
 // ============================================================================
@@ -893,6 +1005,214 @@ TEST(DustFilterTest, BidSideFilteredWithOldDefault) {
     auto result = feed.get_competing_offers("XCH/wUSDC.b");
     EXPECT_EQ(result.size(), 0u)
         << "With default denomination, tiny bid should be filtered";
+}
+
+// ============================================================================
+// floor_recovery_ask_price -- finding 1 of the 2026-08-01 adversarial review.
+//
+// Step 8's quote-recovery repricing (best_ask * (1 - undercut)) runs AFTER
+// every Step 7 guard and used to carry no floor; these tests pin the sigma
+// width floor that now bounds it.  Prices are pseudo-price mojos.
+// ============================================================================
+
+TEST(QuoteRecoveryFloorTest, UndercutAboveFloorPassesThroughUnchanged) {
+    // best_ask 1.10, undercut 5 bps -> 1.09945.  Floor: mid 1.00 + 50 bps
+    // = 1.005, far below.  The plain undercut survives.
+    const Mojo best_ask = 1'100'000'000'000LL;
+    const Mojo mid      = 1'000'000'000'000LL;
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 50.0);
+
+    ASSERT_TRUE(r.apply);
+    EXPECT_FALSE(r.floored);
+    EXPECT_EQ(r.price, static_cast<Mojo>(std::llround(1.1e12 * (1.0 - 5.0 / 10'000.0))));
+    EXPECT_LT(r.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, UndercutBelowFloorIsLiftedToTheFloor) {
+    // The reviewer's failure mode in miniature: a mispriced-low third-party
+    // ask (1.01, ~1.0% above mid) with a 427 bps sigma floor.  The undercut
+    // wants 1.00949...; the floor demands mid * 1.0427 = 1.0427.  1.0427 >
+    // best_ask, so recovery must SKIP, not price below the floor.
+    const Mojo best_ask = 1'010'000'000'000LL;
+    const Mojo mid      = 1'000'000'000'000LL;
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 427.0);
+    EXPECT_FALSE(r.apply);
+
+    // With a floor that binds but still fits under the best ask (98 bps:
+    // 1.0098, above the 5 bps undercut at 1.009495 and below the 1.01 ask),
+    // the price is lifted TO the floor rather than skipped.
+    const auto r2 = floor_recovery_ask_price(best_ask, 5.0, mid, 98.0);
+    ASSERT_TRUE(r2.apply);
+    EXPECT_TRUE(r2.floored);
+    EXPECT_EQ(r2.price,
+              static_cast<Mojo>(std::llround(1.0e12 * (1.0 + 98.0 / 10'000.0))));
+    EXPECT_LE(r2.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, FloorExactlyAtBestAskStillApplies) {
+    // floor == best_ask: cannot undercut, but repricing TO the best ask does
+    // not violate the floor.  Only floor > best_ask skips.
+    const Mojo mid      = 1'000'000'000'000LL;
+    const Mojo best_ask = static_cast<Mojo>(
+        std::llround(1.0e12 * (1.0 + 100.0 / 10'000.0)));
+    const auto r = floor_recovery_ask_price(best_ask, 5.0, mid, 100.0);
+    ASSERT_TRUE(r.apply);
+    EXPECT_TRUE(r.floored);
+    EXPECT_EQ(r.price, best_ask);
+}
+
+TEST(QuoteRecoveryFloorTest, MissingInputsSkipRatherThanRunUnfloored) {
+    // No book reference.
+    EXPECT_FALSE(floor_recovery_ask_price(0, 5.0, 1'000'000'000'000LL, 50.0).apply);
+    EXPECT_FALSE(floor_recovery_ask_price(-1, 5.0, 1'000'000'000'000LL, 50.0).apply);
+    // No Step 7 floor available: the old behaviour (unfloored undercut) must
+    // NOT be the fallback.
+    EXPECT_FALSE(floor_recovery_ask_price(1'100'000'000'000LL, 5.0, 0, 50.0).apply);
+    EXPECT_FALSE(floor_recovery_ask_price(1'100'000'000'000LL, 5.0, -5, 50.0).apply);
+}
+
+TEST(QuoteRecoveryFloorTest, ZeroHalfSpreadFloorsAtTheMidItself) {
+    // min_half_spread 0 (all config floors zero) degrades to "never below
+    // mid", not "no floor".  Negative bps are treated as zero.
+    const Mojo mid      = 1'000'000'000'000LL;
+    const Mojo best_ask = 1'000'500'000'000LL;   // 5 bps above mid
+    // Undercut of 20 bps would land 1.0004999e12 * ... below mid; floor lifts
+    // to exactly mid.
+    const auto r = floor_recovery_ask_price(best_ask, 20.0, mid, 0.0);
+    ASSERT_TRUE(r.apply);
+    EXPECT_TRUE(r.floored);
+    EXPECT_EQ(r.price, mid);
+
+    const auto rn = floor_recovery_ask_price(best_ask, 20.0, mid, -10.0);
+    ASSERT_TRUE(rn.apply);
+    EXPECT_EQ(rn.price, mid);
+}
+
+// ============================================================================
+// [2026-08-01 dark-pair fix] width_floor_exempts_competitiveness
+// ============================================================================
+//
+// Observed live: a pair with a tight (~8 bps) but ~90% stale book gets an
+// uncertainty width floor of ~150 bps, Step 7 correctly forces every tier
+// ~150 bps from centre, and the Step 8 competitiveness guard then suppresses
+// all 12 tiers against the 8 bps BBO -- the pair posts nothing, every
+// heartbeat.  The exemption: a tier whose distance from centre is within
+// floor + its ladder shape offset (assigned spacing minus the side's
+// innermost assigned spacing) is AT its mandated width and must survive the
+// uncompetitiveness suppression.  Everything else behaves exactly as today.
+//
+// Numbers used throughout: centre = 100e12 mojos, raw spacing schedule
+// [30, 60, 90] bps.  With a 150 bps floor, Step 7 shifts the schedule by
+// delta = 150 - 30 = 120 to [150, 180, 210]; without a binding floor the
+// schedule stays put.
+
+TEST(WidthFloorCompetitivenessTest, TierAtMandatedWidthSurvives) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 150.0;   // sigma-driven, tight-but-stale book
+    const double innermost = 150.0;   // shifted schedule front
+
+    // Ask tier 0 at exactly the floor: dist 150 <= 150 + 0.
+    const Mojo ask0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 150.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask0, 150.0, innermost, centre, floor_bps));
+
+    // Ask tier 2 at floor + shape offset: dist 210 <= 150 + (210 - 150).
+    const Mojo ask2 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 210.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask2, 210.0, innermost, centre, floor_bps));
+
+    // Bid side is symmetric: dist 150 below centre.
+    const Mojo bid0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 150.0 / 10'000.0)));
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        bid0, 150.0, innermost, centre, floor_bps));
+
+    // Ladder-build rounding (ceil on asks) must not defeat the exemption:
+    // one mojo past the exact edge is ~1e-8 bps, inside the epsilon.
+    EXPECT_TRUE(width_floor_exempts_competitiveness(
+        ask0 + 1, 150.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, TierWellBeyondFloorPlusSpacingSuppressed) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 150.0;
+    const double innermost = 150.0;
+
+    // A tier repriced out to 400 bps while its assigned spacing is 210:
+    // bound = 150 + (210 - 150) = 210 < 400 -> still suppressible.
+    const Mojo far_ask = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 400.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        far_ask, 210.0, innermost, centre, floor_bps));
+
+    // Same distance on the bid side.
+    const Mojo far_bid = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 400.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        far_bid, 210.0, innermost, centre, floor_bps));
+
+    // Even one full bps beyond the bound is out (epsilon is 0.01 bps, for
+    // mojo rounding only -- not a soft margin).
+    const Mojo just_out = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 211.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        just_out, 210.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, HealthyPairFloorBelowSpacingNeverExempt) {
+    // The healthy-book case: floor (30 bps) below the innermost configured
+    // spacing (100 bps), so Step 7 never shifts the schedule and tiers sit
+    // at their configured [100, 200] positions.  The exemption must never
+    // fire -- the guard behaves byte-identically to before the fix.
+    const Mojo centre = 100'000'000'000'000LL;
+    const double floor_bps = 30.0;
+    const double innermost = 100.0;
+
+    const Mojo ask0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 100.0 / 10'000.0)));
+    // dist 100 vs bound 30 + (100 - 100) = 30 -> not exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        ask0, 100.0, innermost, centre, floor_bps));
+
+    const Mojo ask1 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 + 200.0 / 10'000.0)));
+    // dist 200 vs bound 30 + (200 - 100) = 130 -> not exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        ask1, 200.0, innermost, centre, floor_bps));
+
+    const Mojo bid0 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 100.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        bid0, 100.0, innermost, centre, floor_bps));
+
+    const Mojo bid1 = static_cast<Mojo>(std::llround(
+        static_cast<double>(centre) * (1.0 - 200.0 / 10'000.0)));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        bid1, 200.0, innermost, centre, floor_bps));
+}
+
+TEST(WidthFloorCompetitivenessTest, DegenerateInputsNeverExempt) {
+    const Mojo centre = 100'000'000'000'000LL;
+    const Mojo price  = 101'500'000'000'000LL;
+
+    // No centre / no price / no floor -> never exempt.
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, 0, 150.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        0, 150.0, 150.0, centre, 150.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, 0.0));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, -25.0));
+
+    // NaN floor or spacing fails closed (not exempt), never throws.
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, 150.0, 150.0, centre, nan));
+    EXPECT_FALSE(width_floor_exempts_competitiveness(
+        price, nan, 150.0, centre, 150.0));
 }
 
 }  // namespace

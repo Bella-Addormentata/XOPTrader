@@ -13,7 +13,7 @@ from __future__ import annotations
 from typing import Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QAction, QColor, QFont
+from PySide6.QtGui import QAction, QColor, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QHBoxLayout,
@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS
+from gui.theme import COLORS, MONO_FONT_FAMILY
 from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
 
 # ---------------------------------------------------------------------------
@@ -54,8 +54,8 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Tier",           80),
     ("Status",         80),
     ("Filled At",     145),
-    ("Created Block", 100),
-    ("Age (blocks)",   90),
+    ("Created\nBlock", 100),
+    ("Age\n(blocks)",   90),
     ("Actions",        80),
 ]
 
@@ -125,6 +125,10 @@ class OrderPanel(QWidget):
         self._current_block: int = 0
         self._offer_ttl: int = self._DEFAULT_TTL
         self._all_offers: list[dict] = []
+
+        # True when data arrived while the widget was hidden and the
+        # table render was deferred until the next showEvent.
+        self._render_pending: bool = False
 
         self._build_ui()
 
@@ -218,12 +222,29 @@ class OrderPanel(QWidget):
         table.setShowGrid(True)
         table.setSortingEnabled(True)
 
-        # Column sizing
+        # Column sizing: fit every column to its content so widths track the
+        # data instead of the hardcoded guesses in _COLUMNS (which left Pair
+        # cramped and Price/Size oversized).  Offer ID keeps Stretch so the
+        # table still fills its viewport; the truncated hash absorbs the
+        # leftover space gracefully.
         header = table.horizontalHeader()
-        for idx, (_, width) in enumerate(_COLUMNS):
-            header.resizeSection(idx, width)
-        # Stretch the Offer ID column to fill remaining space.
+        header.setSectionResizeMode(QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        # A monospaced font keeps digit columns aligned and, because every
+        # digit is equal width, stops ResizeToContents from jittering as
+        # values change between refreshes.
+        mono = QFont(MONO_FONT_FAMILY)
+        mono.setStyleHint(QFont.StyleHint.Monospace)
+        table.setFont(mono)
+        # The global theme pads header sections 10px 16px -- 32px of dead
+        # horizontal space per column, which dominates narrow columns like
+        # Side and Age once widths are content-fitted.  Tighten locally
+        # (this table only) and centre the now two-line header labels.
+        header.setDefaultAlignment(Qt.AlignmentFlag.AlignCenter)
+        table.setStyleSheet(
+            "QHeaderView::section { padding: 4px 6px; }"
+            " QTableWidget::item { padding: 2px 6px; }"
+        )
 
         # Context menu
         table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
@@ -272,8 +293,27 @@ class OrderPanel(QWidget):
             Complete list of offers (active + historical) from the DB.
         """
         self._all_offers = list(offers)
+
+        # The DB auto-refresh delivers offers every 10 s regardless of
+        # which page is shown; a full QTableWidget rebuild is wasted
+        # work while this panel is hidden.  Cache the payload (above)
+        # and defer the render until the next showEvent.
+        if not self.isVisible():
+            self._render_pending = True
+            return
+        self._render_now()
+
+    def _render_now(self) -> None:
+        """Rebuild the pair combo, table, and summary from cached data."""
+        self._render_pending = False
         self._rebuild_pair_combo()
         self._apply_filters()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Replay any render deferred while the widget was hidden."""
+        super().showEvent(event)
+        if self._render_pending:
+            self._render_now()
 
     def set_current_block(self, block: int) -> None:
         """Update the current block height used for age calculations.
@@ -364,7 +404,9 @@ class OrderPanel(QWidget):
         self._table.setSortingEnabled(False)
         self._table.setRowCount(0)  # Clear existing rows.
 
-        mono_font = QFont("JetBrains Mono", 10)
+        # Use the theme's mono family (was a hardcoded "JetBrains Mono" that
+        # is not installed on this machine, so Qt silently substituted).
+        mono_font = QFont(MONO_FONT_FAMILY, 10)
         mono_font.setStyleHint(QFont.StyleHint.Monospace)
 
         for row_idx, offer in enumerate(offers):

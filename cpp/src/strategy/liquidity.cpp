@@ -628,6 +628,87 @@ std::vector<OrderBookGap> analyse_order_book_gaps(
 }
 
 // ===========================================================================
+// floor_recovery_ask_price -- sigma-floored quote-recovery repricing
+// ===========================================================================
+// See the header for the full rationale ([2026-08-01 adversarial review,
+// finding 1]).  The invariants this function guarantees:
+//
+//   1. apply == true implies price >= floor_mid * (1 + min_half_spread/1e4)
+//   2. apply == true implies price <= third_party_best_ask
+//   3. no floor data (floor_mid <= 0) or no book (best_ask <= 0) -> skip;
+//      the caller must never fall back to an unfloored undercut.
+
+QuoteRecoveryPrice floor_recovery_ask_price(Mojo   third_party_best_ask,
+                                            double undercut_bps,
+                                            Mojo   floor_mid_mojos,
+                                            double min_half_spread_bps)
+{
+    QuoteRecoveryPrice out;
+
+    if (third_party_best_ask <= 0) return out;  // no book reference
+    if (floor_mid_mojos <= 0)      return out;  // no Step 7 floor available
+
+    const double undercut_frac =
+        std::max(0.0, undercut_bps) / 10'000.0;
+    const Mojo undercut_price = static_cast<Mojo>(std::llround(
+        static_cast<double>(third_party_best_ask) * (1.0 - undercut_frac)));
+
+    const Mojo floor_edge = static_cast<Mojo>(std::llround(
+        static_cast<double>(floor_mid_mojos)
+        * (1.0 + std::max(0.0, min_half_spread_bps) / 10'000.0)));
+
+    // Recovery cannot both respect the floor and stay at-or-below the
+    // third-party best ask: skip the repricing this heartbeat.
+    if (floor_edge > third_party_best_ask) return out;
+
+    out.apply   = true;
+    out.floored = floor_edge > undercut_price;
+    out.price   = std::max(undercut_price, floor_edge);
+    return out;
+}
+
+// ===========================================================================
+// width_floor_exempts_competitiveness -- see the header for the full
+// rationale ([2026-08-01 dark-pair fix]).
+// ===========================================================================
+
+bool width_floor_exempts_competitiveness(Mojo   tier_price,
+                                         double tier_spread_bps,
+                                         double innermost_spread_bps,
+                                         Mojo   centre_mojos,
+                                         double min_half_spread_bps) noexcept
+{
+    if (tier_price <= 0 || centre_mojos <= 0) return false;
+    // No floor -> nothing to reconcile (also guards NaN, which fails the >).
+    if (!(min_half_spread_bps > 0.0)) return false;
+    // Explicit NaN/Inf guard: std::max(0.0, NaN) silently returns 0.0, so a
+    // poisoned spacing would otherwise degrade to a zero shape offset and
+    // could still exempt.  Fail closed instead.
+    if (!std::isfinite(tier_spread_bps)
+        || !std::isfinite(innermost_spread_bps)) {
+        return false;
+    }
+
+    const double dist_bps =
+        std::abs(static_cast<double>(tier_price)
+                 - static_cast<double>(centre_mojos))
+        / static_cast<double>(centre_mojos) * 10'000.0;
+
+    // The ladder's shape offset for this tier: how far beyond the side's
+    // innermost tier the schedule places it.
+    const double shape_offset_bps =
+        std::max(0.0, tier_spread_bps - std::max(0.0, innermost_spread_bps));
+
+    // Headroom for mojo rounding (floor/ceil/llround at ladder build):
+    // sub-mojo effects are ~1e-7 bps at production price levels, so 0.01
+    // bps is generous without admitting any economically distinct tier.
+    constexpr double kRoundingEpsBps = 0.01;
+
+    return dist_bps
+        <= min_half_spread_bps + shape_offset_bps + kRoundingEpsBps;
+}
+
+// ===========================================================================
 // compute_ladder -- gap-aware + adverse-selection-aware overload
 // ===========================================================================
 

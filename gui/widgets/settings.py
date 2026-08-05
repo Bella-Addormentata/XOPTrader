@@ -51,7 +51,7 @@ from pathlib import Path
 from typing import Any, Final, Optional
 
 import yaml
-from PySide6.QtCore import QSettings, Qt, Signal
+from PySide6.QtCore import QObject, QSettings, Qt, QThread, Signal, Slot
 from PySide6.QtGui import (
     QColor,
     QFont,
@@ -101,6 +101,45 @@ _VALID_BORDER: Final[str] = f"border: 1px solid {_C.BORDER};"
 
 # Default config.yaml file name when none is provided.
 _DEFAULT_CONFIG_FILENAME: Final[str] = "config.yaml"
+
+# Tooltip for the read-only "Suggested (%)" pairs-table column.
+_SUGGESTED_TOOLTIP_BASE: Final[str] = (
+    "Flow-keyed advisory suggestion: the base asset's share of pair value "
+    "at the IDEAL holdings implied by ~15% market participation "
+    "(offer-sizing calculator).  7-day dexie/trade_log window; re-computed "
+    "each time Settings opens.  Advisory only -- never written to config."
+)
+
+# ===================================================================
+# Background worker: flow-keyed suggested ratio targets
+# ===================================================================
+
+class _SuggestedTargetsWorker(QObject):
+    """Computes the advisory per-pair suggested ratio targets off the UI
+    thread (dexie HTTP fetch + read-only SQLite reads), following the
+    database_service worker pattern: a QObject moved to a QThread whose
+    results come back via queued signals.  Never blocks the event loop.
+    """
+
+    ready = Signal(dict)   # {pair_name: {"ratio", "artifact", "reason"}}
+    failed = Signal(str)
+
+    def __init__(self, config_path: Optional[str]) -> None:
+        super().__init__()
+        self._config_path = config_path
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            from gui.utils import load_offer_sizing  # noqa: WPS433
+
+            sizing = load_offer_sizing()
+            result = sizing.compute_suggested_targets(
+                config_path=self._config_path
+            )
+            self.ready.emit(dict(result.get("pairs", {})))
+        except Exception as exc:  # fail soft -> "n/a" in the table
+            self.failed.emit(str(exc))
 
 
 # ===================================================================
@@ -262,6 +301,10 @@ class SettingsWidget(QWidget):
     # -- Qt signals ---------------------------------------------------------
     config_changed = Signal(dict)
     config_saved = Signal(str)
+    # [PNL-DISPLAY 2026-08-02] Emitted when the user resets or clears the
+    # P&L display baseline.  Payload is the UTC baseline string
+    # ("YYYY-MM-DD HH:MM:SS"), or "" when the reset was cleared.
+    pnl_baseline_changed = Signal(str)
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -279,6 +322,15 @@ class SettingsWidget(QWidget):
         # Registry of all input widgets keyed by config path for
         # validation and bulk operations.
         self._field_widgets: dict[str, QWidget] = {}
+
+        # Flow-keyed suggested ratio targets (advisory, computed async).
+        # {pair_name: {"ratio": float|None, "artifact": bool, "reason": str}}
+        self._suggested_targets: Optional[dict[str, dict]] = None
+        self._suggest_thread: Optional[QThread] = None
+        # Keep a Python reference to the worker while it runs: PySide6
+        # would otherwise garbage-collect the unparented QObject before
+        # the thread invokes it.
+        self._suggest_worker: Optional[_SuggestedTargetsWorker] = None
 
         self._build_ui()
 
@@ -563,11 +615,11 @@ class SettingsWidget(QWidget):
         layout.addLayout(toolbar)
 
         # -- Pairs table --
-        self._pairs_table = QTableWidget(0, 6)
+        self._pairs_table = QTableWidget(0, 7)
         self._pairs_table.setHorizontalHeaderLabels(
             [
                 "Enabled", "Name", "Base Asset", "Quote Asset",
-                "Ratio Target Override (%)", "Actions",
+                "Ratio Target Override (%)", "Suggested (%)", "Actions",
             ]
         )
         header = self._pairs_table.horizontalHeader()
@@ -577,6 +629,7 @@ class SettingsWidget(QWidget):
         header.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
         self._pairs_table.setAlternatingRowColors(True)
         self._pairs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -1041,6 +1094,46 @@ class SettingsWidget(QWidget):
         form.addRow("Mono Font:", self._mono_font_combo)
 
         layout.addWidget(grp)
+
+        # -- P&L Display (QSettings-persisted, display-only) ----------------
+        # [PNL-DISPLAY 2026-08-02] The dashboard shows lifetime P&L derived
+        # from the engine's trade log and never resets on its own.  The
+        # only way to "zero" the display is this explicit action, which
+        # stores a baseline timestamp in QSettings.  Engine data
+        # (trade_log / ledger) is never modified, and the reset can be
+        # undone at any time.
+        pnl_grp = QGroupBox("P&L Display")
+        pnl_layout = QVBoxLayout(pnl_grp)
+        pnl_layout.setSpacing(8)
+
+        self._pnl_baseline_label = QLabel("")
+        self._pnl_baseline_label.setWordWrap(True)
+        self._pnl_baseline_label.setStyleSheet(
+            f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;"
+        )
+        pnl_layout.addWidget(self._pnl_baseline_label)
+
+        pnl_btn_row = QHBoxLayout()
+        self._pnl_reset_btn = QPushButton("Reset P&L Display…")
+        self._pnl_reset_btn.setToolTip(
+            "Start counting the dashboard P&L from now.\n"
+            "Display-only: no trade history or engine data is modified."
+        )
+        self._pnl_reset_btn.clicked.connect(self._on_reset_pnl_display)
+        pnl_btn_row.addWidget(self._pnl_reset_btn)
+
+        self._pnl_clear_reset_btn = QPushButton("Clear Reset")
+        self._pnl_clear_reset_btn.setToolTip(
+            "Remove the display baseline and show the full lifetime P&L again."
+        )
+        self._pnl_clear_reset_btn.clicked.connect(self._on_clear_pnl_reset)
+        pnl_btn_row.addWidget(self._pnl_clear_reset_btn)
+        pnl_btn_row.addStretch(1)
+        pnl_layout.addLayout(pnl_btn_row)
+
+        layout.addWidget(pnl_grp)
+        self._refresh_pnl_baseline_ui()
+
         layout.addStretch(1)
 
         # Load saved appearance preferences from QSettings.
@@ -1909,6 +2002,81 @@ class SettingsWidget(QWidget):
         settings.endGroup()
 
     # ===================================================================
+    # P&L display baseline (QSettings-persisted, display-only)
+    # ===================================================================
+
+    @staticmethod
+    def read_pnl_baseline() -> str:
+        """Return the persisted P&L display baseline, or "" when unset.
+
+        The baseline is a UTC ``YYYY-MM-DD HH:MM:SS`` string matching the
+        engine trade_log ``created_at`` format so it can be compared
+        directly in SQL.
+        """
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("pnl_display")
+        value = str(settings.value("baseline_utc", "") or "")
+        settings.endGroup()
+        return value
+
+    @staticmethod
+    def _write_pnl_baseline(value: str) -> None:
+        """Persist the P&L display baseline ("" clears it)."""
+        settings = QSettings("XOP", "XOPTrader")
+        settings.beginGroup("pnl_display")
+        settings.setValue("baseline_utc", value)
+        settings.endGroup()
+
+    def _refresh_pnl_baseline_ui(self) -> None:
+        """Sync the P&L Display group's label and buttons to QSettings."""
+        baseline = self.read_pnl_baseline()
+        if baseline:
+            self._pnl_baseline_label.setText(
+                f"Display reset active since {baseline} UTC — the dashboard "
+                f"shows P&L accrued after that moment.  Engine records are "
+                f"untouched; use 'Clear Reset' to show the full history again."
+            )
+            self._pnl_clear_reset_btn.setEnabled(True)
+        else:
+            self._pnl_baseline_label.setText(
+                "No display reset applied — the dashboard shows the full "
+                "lifetime P&L from the engine's trade log.  It never resets "
+                "on GUI or engine restarts."
+            )
+            self._pnl_clear_reset_btn.setEnabled(False)
+
+    def _on_reset_pnl_display(self) -> None:
+        """Handle 'Reset P&L Display' with an are-you-sure confirmation."""
+        reply = QMessageBox.question(
+            self,
+            "Reset P&L Display",
+            "Reset the P&L display to zero from this moment?\n\n"
+            "This only changes what the dashboard shows: the headline P&L "
+            "will count from now on.  No trade history, ledger, or engine "
+            "data is deleted, and you can undo this at any time with "
+            "'Clear Reset'.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        baseline = datetime.datetime.now(datetime.timezone.utc).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        self._write_pnl_baseline(baseline)
+        self._refresh_pnl_baseline_ui()
+        self.pnl_baseline_changed.emit(baseline)
+        log.info("P&L display baseline set to %s UTC.", baseline)
+
+    def _on_clear_pnl_reset(self) -> None:
+        """Handle 'Clear Reset': restore the full-history P&L display."""
+        self._write_pnl_baseline("")
+        self._refresh_pnl_baseline_ui()
+        self.pnl_baseline_changed.emit("")
+        log.info("P&L display baseline cleared (full history restored).")
+
+    # ===================================================================
     # Dirty tracking
     # ===================================================================
 
@@ -2553,6 +2721,16 @@ class SettingsWidget(QWidget):
         )
         self._pairs_table.setItem(row, 4, ratio_item)
 
+        # Read-only "Suggested (%)" column: the flow-keyed advisory target
+        # from the offer-sizing calculator, filled in asynchronously.
+        suggested_item = QTableWidgetItem("…")
+        suggested_item.setFlags(
+            suggested_item.flags() & ~Qt.ItemFlag.ItemIsEditable
+        )
+        suggested_item.setToolTip(_SUGGESTED_TOOLTIP_BASE)
+        self._pairs_table.setItem(row, 5, suggested_item)
+        self._apply_suggested_to_row(row)
+
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
@@ -2572,7 +2750,7 @@ class SettingsWidget(QWidget):
             )
         )
         actions_layout.addWidget(remove_btn)
-        self._pairs_table.setCellWidget(row, 5, actions)
+        self._pairs_table.setCellWidget(row, 6, actions)
 
     def _on_add_pair(self) -> None:
         """Open the Add Pair dialog and append the result to the table."""
@@ -2602,6 +2780,130 @@ class SettingsWidget(QWidget):
         if reply == QMessageBox.StandardButton.Yes:
             self._pairs_table.removeRow(row)
             self._mark_dirty(1)
+
+    # ===================================================================
+    # Suggested ratio targets (advisory, async)
+    # ===================================================================
+
+    def showEvent(self, event: Any) -> None:  # noqa: N802 -- Qt override
+        """Re-compute the advisory suggested targets whenever the panel
+        becomes visible, per the column's "re-computed on open" contract."""
+        super().showEvent(event)
+        self._refresh_suggested_targets()
+
+    def _refresh_suggested_targets(self) -> None:
+        """Kick off the async suggested-target computation.
+
+        The dexie fetch and the read-only DB queries run on a dedicated
+        QThread (database_service worker pattern); results arrive via
+        queued signals, so the UI thread never blocks.  A run already in
+        flight is left alone.
+        """
+        if self._suggest_thread is not None:
+            return
+        self._set_all_suggested_cells(
+            "…", _SUGGESTED_TOOLTIP_BASE + "\n\nComputing…"
+        )
+        thread = QThread(self)
+        worker = _SuggestedTargetsWorker(self._config_path)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.ready.connect(self._on_suggested_ready)
+        worker.failed.connect(self._on_suggested_failed)
+        worker.ready.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_suggest_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._suggest_thread = thread
+        self._suggest_worker = worker
+        thread.start()
+
+    @Slot()
+    def _on_suggest_thread_finished(self) -> None:
+        self._suggest_thread = None
+        self._suggest_worker = None
+
+    @Slot(dict)
+    def _on_suggested_ready(self, pairs: dict) -> None:
+        self._suggested_targets = pairs
+        self._apply_suggested_targets()
+
+    @Slot(str)
+    def _on_suggested_failed(self, message: str) -> None:
+        log.warning("Suggested ratio targets unavailable: %s", message)
+        self._suggested_targets = None
+        self._set_all_suggested_cells(
+            "n/a",
+            _SUGGESTED_TOOLTIP_BASE + f"\n\nUnavailable: {message}",
+        )
+
+    def _apply_suggested_targets(self) -> None:
+        """Write the computed suggestions into column 5 of every row."""
+        for row in range(self._pairs_table.rowCount()):
+            self._apply_suggested_to_row(row)
+
+    def _apply_suggested_to_row(self, row: int) -> None:
+        """Fill the read-only Suggested cell of *row* from the cache.
+
+        Signals are blocked around the update: the pairs table's
+        cellChanged is wired to dirty-tracking, and this advisory column
+        must never mark the config dirty.
+        """
+        item = self._pairs_table.item(row, 5)
+        name_item = self._pairs_table.item(row, 1)
+        if item is None or name_item is None:
+            return
+        if self._suggested_targets is None:
+            return  # leave the placeholder ("…" or "n/a") in place
+        info = self._suggested_targets.get(name_item.text().strip())
+        blocked = self._pairs_table.blockSignals(True)
+        try:
+            if info is None:
+                item.setText("n/a")
+                item.setToolTip(
+                    _SUGGESTED_TOOLTIP_BASE
+                    + "\n\nNot computed for this pair (disabled or not "
+                    "in the loaded config)."
+                )
+                item.setForeground(QColor(_C.TEXT_DISABLED))
+                return
+            ratio = info.get("ratio")
+            if ratio is None:
+                item.setText("n/a")
+                item.setToolTip(
+                    _SUGGESTED_TOOLTIP_BASE
+                    + f"\n\n{info.get('reason', 'not computable')}"
+                )
+                item.setForeground(QColor(_C.TEXT_DISABLED))
+                return
+            if info.get("artifact"):
+                # Upper-bound artifact (e.g. XCH/DBX's max(fills,1)
+                # divisor): "~" prefix and muted colour.
+                item.setText(f"~{ratio * 100.0:.2f}")
+                item.setToolTip(
+                    _SUGGESTED_TOOLTIP_BASE
+                    + f"\n\nUPPER-BOUND ARTIFACT: {info.get('reason', '')}"
+                )
+                item.setForeground(QColor(_C.TEXT_SECONDARY))
+            else:
+                item.setText(f"{ratio * 100.0:.2f}")
+                item.setToolTip(_SUGGESTED_TOOLTIP_BASE)
+                item.setForeground(QColor(_C.TEXT_PRIMARY))
+        finally:
+            self._pairs_table.blockSignals(blocked)
+
+    def _set_all_suggested_cells(self, text: str, tooltip: str) -> None:
+        blocked = self._pairs_table.blockSignals(True)
+        try:
+            for row in range(self._pairs_table.rowCount()):
+                item = self._pairs_table.item(row, 5)
+                if item is not None:
+                    item.setText(text)
+                    item.setToolTip(tooltip)
+                    item.setForeground(QColor(_C.TEXT_DISABLED))
+        finally:
+            self._pairs_table.blockSignals(blocked)
 
     # ===================================================================
     # Tier table helpers
@@ -2907,6 +3209,10 @@ class SettingsWidget(QWidget):
         self._config_path_label.setText(f"Config: {resolved}")
         self._last_saved_label.setText("")
         log.info("Settings loaded from %s", resolved)
+
+        # Advisory column: recompute the flow-keyed suggestions for the
+        # freshly loaded pair list (async; never blocks the UI thread).
+        self._refresh_suggested_targets()
 
     def save_config(self, path: Optional[str] = None) -> bool:
         """Validate and write the current settings to a YAML file.

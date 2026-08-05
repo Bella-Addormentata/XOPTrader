@@ -40,6 +40,7 @@
 #include <mutex>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 // Forward-declare the opaque sqlite3 handles to avoid pulling the full
@@ -126,6 +127,18 @@ struct DbSnapshot {
 };
 
 // ---------------------------------------------------------------------------
+// DbSnapshotMidTick -- one (block, mid, wall-clock) observation from the
+// snapshots table, the minimal row needed to warm-start the volatility
+// estimator ([AS-WARM]).  unix_seconds is created_at as a Unix timestamp.
+// ---------------------------------------------------------------------------
+
+struct DbSnapshotMidTick {
+    BlockHeight  block_height{0};    ///< Block at which the snapshot was taken.
+    Mojo         mid_price_mojos{0}; ///< Mid-price in kMojosPerXch fixed point.
+    std::int64_t unix_seconds{0};    ///< created_at as Unix epoch seconds.
+};
+
+// ---------------------------------------------------------------------------
 // DbSanityFailure -- maps 1:1 to a row in the sanity_failures table.
 //
 // Records every offer that failed the pre-posting sanity checks, for
@@ -159,6 +172,111 @@ struct DbStrategyQuote {
     std::string side;               ///< "bid" or "ask".
     Mojo        price_mojos{0};     ///< Quote price in mojos.
     Mojo        size_mojos{0};      ///< Quote size in mojos.
+};
+
+// ---------------------------------------------------------------------------
+// DbInventoryState -- maps 1:1 to a row in the inventory_state table.
+//
+// Persists the InventoryTracker's per-asset cost-basis accounting so that
+// realized-P&L attribution survives engine restarts (PNL-BASIS-PERSIST,
+// TODO #9).  Before this table existed, every restart re-seeded all assets
+// at a sentinel basis and realized P&L was recorded as 0 until the next
+// buy fill in the same process lifetime.
+//
+// total_cost is a REAL: it holds sum(fill_price * qty) where fill_price is a
+// USD-normalized pseudo-price (~1e12) and qty is in base mojos, so the value
+// (~1e24+) exceeds int64 range by design.
+// ---------------------------------------------------------------------------
+
+struct DbInventoryState {
+    AssetId asset_id;                    ///< "xch" or 64-hex CAT id.
+    Mojo    total_quantity{0};           ///< Tracked holdings in mojos.
+    double  total_cost{0.0};             ///< Cumulative cost of open holdings.
+    bool    basis_is_seed_sentinel{false}; ///< True when basis is synthetic.
+};
+
+// ---------------------------------------------------------------------------
+// DbLedgerEntry -- one leg of a double-entry accounting event.
+//
+// Every event that changes what the bot believes it holds posts a BALANCED
+// set of legs (e.g. an ask fill posts base -size, quote +proceeds, xch -fee).
+// Summing delta_mojos per asset gives the ledger's implied balance, which is
+// then tied to the wallet's confirmed balance by the reconciliation control.
+//
+// The ledger records what the bot BELIEVES happened, from its own event
+// stream.  That is deliberate: the gap between belief and the wallet is the
+// diagnostic signal.  trade_log was shown on 2026-07-30 to claim a ~604 XCH
+// outflow across a period when the wallet actually gained 61 XCH, and nothing
+// in the system noticed for three months because no invariant tied the two
+// together.
+//
+// Idempotency: (event_id, leg, asset_id) is UNIQUE.  A fill re-detected after
+// a crash re-posts identical legs, which are ignored rather than doubled.
+// ---------------------------------------------------------------------------
+
+struct DbLedgerEntry {
+    std::string entry_time;         ///< ISO-8601 UTC of the event.
+    std::string event_type;         ///< opening | fill | fee | take | adjust.
+    std::string event_id;           ///< trade_id, or a synthetic unique id.
+    std::string leg;                ///< base | quote | fee | opening | adjust.
+    AssetId     asset_id;           ///< Canonical id ("xch" or 64-hex).
+    Mojo        delta_mojos{0};     ///< Signed: + inflow, - outflow.
+    std::string pair_name;          ///< Context (may be empty).
+    BlockHeight block_height{0};    ///< Settlement block, 0 if not applicable.
+    std::string note;               ///< Free-form provenance.
+};
+
+// ---------------------------------------------------------------------------
+// DbArbEdgeObservation -- one sample of an arbitrage leg-pair's economics.
+//
+// Written every scan whether or not a trade is taken, so the strategy's
+// viability can be measured from live data instead of assumed.  Spreads on
+// this venue are extremely volatile (XCH/BYC ranges 0-1247 bps), so a
+// point-in-time edge cannot distinguish a real opportunity from a stale
+// quote -- the history is what separates them.
+// ---------------------------------------------------------------------------
+
+struct DbArbEdgeObservation {
+    std::string observed_at;        ///< ISO-8601 UTC.
+    BlockHeight block_height{0};
+    std::string direction;          ///< "buy@XCH/BYC -> sell@XCH/wUSDC.b".
+    Mojo        ask_a_mojos{0};     ///< Price paid on the buy leg.
+    Mojo        bid_b_mojos{0};     ///< Price received on the sell leg.
+    double      cross_rate{0.0};    ///< Stable cross used to normalise.
+    double      gross_edge_bps{0.0};
+    double      net_edge_bps{0.0};  ///< After fees and costs.
+    Mojo        ask_size_mojos{0};  ///< Counterparty size (takes are all-or-nothing).
+    Mojo        bid_size_mojos{0};
+    std::string state;              ///< dormant | watching | armed.
+    bool        armed{false};
+    bool        executed{false};
+};
+
+// ---------------------------------------------------------------------------
+// DbTakerFill -- a trade where WE crossed the spread and took someone's offer.
+//
+// Distinct from trade_log, which records OUR offers being filled by others.
+// Taker trades used to write nothing anywhere: 70 of them across the
+// retained logs, invisible to trade_log, offer_log and P&L alike. The ledger
+// catches the aggregate as an `adjust` leg, but that only says "N units
+// unaccounted" -- it cannot say which trade, at what price, or whether the
+// strategy that placed it makes money.
+// ---------------------------------------------------------------------------
+
+struct DbTakerFill {
+    std::string taken_at;              ///< ISO-8601 UTC.
+    BlockHeight block_height{0};
+    std::string strategy;              ///< crossed_book | cross_stable | peg_arb | drift | xch_recovery.
+    std::string trade_id;              ///< Wallet trade id returned by take_offer.
+    std::string counterparty_offer_id; ///< The offer we lifted.
+    std::string pair_name;
+    bool        we_bought_base{false}; ///< True = we acquired base, paid quote.
+    AssetId     base_asset;
+    Mojo        base_delta_mojos{0};   ///< Signed, our perspective.
+    AssetId     quote_asset;
+    Mojo        quote_delta_mojos{0};  ///< Signed, our perspective.
+    Mojo        price_mojos{0};
+    Mojo        fee_mojos{0};
 };
 
 // ---------------------------------------------------------------------------
@@ -283,6 +401,20 @@ public:
     [[nodiscard]]
     std::optional<DbSnapshot> get_last_snapshot(const std::string& pair_name) const;
 
+    /// [AS-WARM] Most recent snapshot mid-prices for a pair, in ASCENDING
+    /// block order, for warm-starting the volatility estimator at startup
+    /// (VolatilityEstimator::rehydrate_from_ticks).  Rows with a
+    /// non-positive mid are excluded at the SQL level.  unix_seconds is the
+    /// row's created_at converted via strftime('%s', ...) so callers can
+    /// measure the true tick cadence (median inter-row spacing) instead of
+    /// assuming one.  Returns an empty vector when the pair has no history
+    /// or on error (startup-only path; never throws).
+    ///
+    /// @param pair_name  Trading pair to query.
+    /// @param limit      Maximum rows (the newest N are returned).
+    [[nodiscard]] std::vector<DbSnapshotMidTick> get_recent_snapshot_mids(
+        const std::string& pair_name, std::uint32_t limit) const noexcept;
+
     // -- Strategy quotes (per-tier quote persistence) ------------------------
 
     /// Insert a batch of per-tier strategy quotes inside a single transaction.
@@ -290,6 +422,59 @@ public:
     ///
     /// @param batch  Vector of DbStrategyQuote records.
     void insert_strategy_quotes_batch(const std::vector<DbStrategyQuote>& batch);
+
+    // -- Inventory state (cost-basis persistence) ----------------------------
+
+    /// Upsert the full set of inventory records inside one transaction.
+    /// Called by the engine after every fill / seed / reconcile so the
+    /// cost basis survives restarts.  Never throws: persistence failures
+    /// are logged and must not disrupt live trading.
+    void save_inventory_state(const std::vector<DbInventoryState>& records) noexcept;
+
+    /// Load all persisted inventory records.  Returns an empty vector when
+    /// the table is empty (first run) or on error.
+    [[nodiscard]] std::vector<DbInventoryState> load_inventory_state() const;
+
+    // -- Double-entry ledger -------------------------------------------------
+
+    /// Append ledger legs inside one transaction.  Uses INSERT OR IGNORE on
+    /// the (event_id, leg, asset_id) uniqueness key, so re-posting the legs
+    /// of an already-recorded event is a no-op rather than a double count.
+    /// Never throws: accounting must not disrupt live trading.
+    ///
+    /// @return number of legs actually inserted (0 = all were duplicates),
+    ///         or std::nullopt when the write FAILED.  Callers must
+    ///         distinguish these: a dropped fill leg is unrecoverable (the
+    ///         fill is never re-processed) and leaves the ledger permanently
+    ///         short, which would put the invariant control into a permanent
+    ///         false breach.
+    [[nodiscard]] std::optional<std::size_t> append_ledger_entries(
+        const std::vector<DbLedgerEntry>& legs) noexcept;
+
+    /// Block height recorded on an asset's `opening` leg, or 0 if it has
+    /// none.  Fills at or below this height are already reflected in the
+    /// opening balance and must not be posted again.
+    [[nodiscard]] BlockHeight ledger_opening_block(const AssetId& asset_id) const;
+
+    /// Sum of delta_mojos per asset across the whole ledger, i.e. the
+    /// ledger's implied current balance for each asset.
+    [[nodiscard]] std::unordered_map<AssetId, Mojo> ledger_balances() const;
+
+    /// True when an 'opening' leg already exists for this asset, so genesis
+    /// balances are established exactly once in the ledger's lifetime.
+    [[nodiscard]] bool has_ledger_opening(const AssetId& asset_id) const;
+
+    /// Total number of legs (diagnostics / first-run detection).
+    [[nodiscard]] std::int64_t ledger_entry_count() const;
+
+    // -- Arbitrage edge history ----------------------------------------------
+
+    /// Record one arbitrage leg-pair observation.  Never throws.
+    void insert_arb_edge(const DbArbEdgeObservation& obs) noexcept;
+
+    /// Record a taker trade (we crossed the spread).  Idempotent on
+    /// trade_id.  Never throws: accounting must not disrupt trading.
+    void insert_taker_fill(const DbTakerFill& fill) noexcept;
 
     // -- Diagnostics ---------------------------------------------------------
 

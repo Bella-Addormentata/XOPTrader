@@ -192,14 +192,14 @@ Position::Position()
     : asset_id{}
     , balance{0}
     , cost_basis{0}
-    , total_cost{0}
+    , total_cost{0.0}
 {}
 
 Position::Position(const AssetId& id)
     : asset_id{id}
     , balance{0}
     , cost_basis{0}
-    , total_cost{0}
+    , total_cost{0.0}
 {}
 
 // ISO/IEC 5055 -- CWE-190: return false on overflow instead of silently
@@ -222,29 +222,29 @@ Position::Position(const AssetId& id)
         return false;
     }
 
-    // Guard against overflow: qty * unit_price could exceed int64 range if
-    // both operands are very large.  In practice Chia values stay well below
-    // 10^15 mojos (~1000 XCH) per single trade, so the product fits int64.
-    // Defensive check: use 128-bit intermediate and verify the result fits.
-
-    const U128 wide_total = wide_mul_add(
-        static_cast<std::uint64_t>(qty),
-        static_cast<std::uint64_t>(unit_price),
-        static_cast<std::uint64_t>(total_cost));
+    // [PNL-BASIS-OVERFLOW 2026-07-30] qty * unit_price legitimately exceeds
+    // int64: a 1-XCH fill is qty=1e12 mojos at a pseudo-price of ~1.3e12,
+    // i.e. ~1.3e24 versus INT64_MAX 9.2e18.  The previous int64 total_cost
+    // therefore made this method reject EVERY XCH buy ("[Position] Overflow
+    // in cost basis -- addition rejected", 20 occurrences in the live log on
+    // 2026-07-29), so the XCH balance only ever decreased.  total_cost is a
+    // double now; the product cannot overflow and the only real failure mode
+    // left is a non-positive resulting balance.
 
     const Mojo new_balance = balance + qty;
-
-    // Reject on overflow -- callers must check the return value.
-    if (exceeds_int64(wide_total) || new_balance <= 0) {
-        spdlog::error("[Position] Overflow in cost basis -- addition rejected "
-                      "for asset={} qty={} price={}",
+    if (new_balance <= 0) {
+        spdlog::error("[Position] Invalid resulting balance -- addition "
+                      "rejected for asset={} qty={} price={}",
                        asset_id, qty, unit_price);
         return false;
     }
 
-    total_cost = static_cast<Mojo>(wide_total.lo);
+    total_cost += static_cast<double>(qty) * static_cast<double>(unit_price);
     balance    = new_balance;
-    cost_basis = (balance > 0) ? (total_cost / balance) : 0;
+    cost_basis = (balance > 0)
+        ? static_cast<Mojo>(std::llround(total_cost
+                                         / static_cast<double>(balance)))
+        : 0;
     return true;
 }
 
@@ -263,17 +263,23 @@ bool Position::remove(Mojo qty)
     }
 
     // Proportional drawdown preserves cost_basis:
-    //   removed_cost = total_cost * (qty / balance)
-    //   new_total    = total_cost - removed_cost
+    //   new_total_cost = total_cost * (balance - qty) / balance
     //
-    // Use 128-bit intermediate to avoid overflow on the multiply.
+    // [PNL-BASIS-OVERFLOW 2026-07-30] total_cost is a double, so this is a
+    // plain scale with no wide-integer intermediate needed.
+    if (qty == balance) {
+        total_cost = 0.0;   // full exit -- avoid rounding residue
+        balance    = 0;
+    } else {
+        total_cost *= static_cast<double>(balance - qty)
+                    / static_cast<double>(balance);
+        balance    -= qty;
+    }
 
-    const Mojo removed_cost = wide_mul_div(total_cost, qty, balance);
-    total_cost -= removed_cost;
-    balance    -= qty;
-
-    // Recompute cost_basis from integers to avoid drift accumulation.
-    cost_basis = (balance > 0) ? (total_cost / balance) : 0;
+    cost_basis = (balance > 0)
+        ? static_cast<Mojo>(std::llround(total_cost
+                                         / static_cast<double>(balance)))
+        : 0;
 
     return true;
 }
@@ -368,30 +374,30 @@ double State::inventory_skew(const AssetId& base_id, const AssetId& quote_id) co
 
     std::shared_lock lock(mtx_positions_);
 
-    Mojo base_val  = 0;
-    Mojo quote_val = 0;
+    // total_cost is a double (PNL-BASIS-OVERFLOW); keep the whole ratio in
+    // double so the ~1e24-scale values cannot be truncated on the way in.
+    double base_val  = 0.0;
+    double quote_val = 0.0;
 
     if (auto it = positions_.find(base_id); it != positions_.end()) {
         // Use total_cost (denominated in quote mojos) when available;
         // fall back to balance for the native quote asset.
-        base_val = (it->second.total_cost > 0)
+        base_val = (it->second.total_cost > 0.0)
                        ? it->second.total_cost
-                       : it->second.balance;
+                       : static_cast<double>(it->second.balance);
     }
 
     if (auto it = positions_.find(quote_id); it != positions_.end()) {
-        quote_val = (it->second.total_cost > 0)
+        quote_val = (it->second.total_cost > 0.0)
                         ? it->second.total_cost
-                        : it->second.balance;
+                        : static_cast<double>(it->second.balance);
     }
 
-    const Mojo total = base_val + quote_val;
-    if (total == 0) {
+    const double total = base_val + quote_val;
+    if (total == 0.0) {
         return 0.0;
     }
 
-    // Integer subtraction is exact; division into double is fine for a
-    // dimensionless ratio.
     return static_cast<double>(base_val - quote_val)
          / static_cast<double>(total);
 }

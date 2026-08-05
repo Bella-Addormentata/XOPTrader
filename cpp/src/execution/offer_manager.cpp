@@ -1,4 +1,4 @@
-/**
+﻿/**
  * @file offer_manager.cpp
  * @brief Implementation of the CHIA DEX offer lifecycle manager.
  *
@@ -21,6 +21,8 @@
  */
 
 #include <xop/execution/offer_manager.hpp>
+
+#include <xop/execution/wallet_poll_throttle.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -144,12 +146,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         int ask_count = 0;
 
         // -- XCH fee reserve pre-check (batch mode) ------------------------
-        // Verify XCH spendable >= 2× fee_reserve_xch before posting.
+        // Verify XCH spendable >= 2Ã— fee_reserve_xch before posting.
         // ALL offers lock XCH UTXOs for on-chain fees, even buy-XCH
-        // offers.  Use 2× reserve as the creation floor so that
+        // offers.  Use 2Ã— reserve as the creation floor so that
         // worst-case UTXO locking still preserves the reserve.
         //
-        // Recovery zone: when spendable is between 1× and 2× reserve,
+        // Recovery zone: when spendable is between 1Ã— and 2Ã— reserve,
         // allow buy-XCH offers through to escape the low-balance
         // deadlock (can't buy XCH because can't create offers because
         // not enough XCH).  Buy-XCH offers will net-increase XCH
@@ -167,7 +169,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    // Check recovery zone: 1× reserve ≤ spendable < 2×.
+                    // Check recovery zone: 1Ã— reserve â‰¤ spendable < 2Ã—.
                     const auto recovery_floor = static_cast<Mojo>(
                         std::llround(effective_reserve
                                      * static_cast<double>(kMojosPerXch)));
@@ -205,7 +207,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
-        // Check XCH spendable balance after bids; skip asks if below 2× reserve.
+        // Check XCH spendable balance after bids; skip asks if below 2Ã— reserve.
         // No buy-XCH exemption: UTXO locking is direction-agnostic.
         if (bid_count > 0 && !asks.empty()
             && effective_reserve > 0.0) {
@@ -340,12 +342,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         // -- XCH fee reserve pre-creation guard (per-offer, UTXO-aware) ----
         // Check XCH spendable BEFORE each individual offer creation.
         // The Chia wallet locks entire UTXOs for fee coins -- a single
-        // create_offer can lock far more than the 5M mojo fee.  Use 2×
+        // create_offer can lock far more than the 5M mojo fee.  Use 2Ã—
         // the reserve as the creation floor so that even after worst-case
         // UTXO locking, the reserve is preserved.  This prevents the
-        // create → drain → cancel → create churn cycle.
+        // create â†’ drain â†’ cancel â†’ create churn cycle.
         //
-        // Recovery zone: when spendable is between 1× and 2× reserve,
+        // Recovery zone: when spendable is between 1Ã— and 2Ã— reserve,
         // allow buy-XCH offers through to escape the low-balance
         // deadlock.  Buy-XCH offers net-increase XCH when filled.
         if (effective_reserve > 0.0) {
@@ -354,12 +356,12 @@ asio::awaitable<int> OfferManager::post_quotes(
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                // 2× reserve: survive worst-case UTXO lock.
+                // 2Ã— reserve: survive worst-case UTXO lock.
                 const auto creation_floor = static_cast<Mojo>(std::llround(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    // Check recovery zone: 1× ≤ spendable < 2×.
+                    // Check recovery zone: 1Ã— â‰¤ spendable < 2Ã—.
                     const auto recovery_floor = static_cast<Mojo>(
                         std::llround(effective_reserve
                                      * static_cast<double>(kMojosPerXch)));
@@ -465,10 +467,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // Step 4: Submit to dexie for cross-platform aggregation (best-effort).
-        bool dexie_ok = co_await submit_to_dexie(offer_text);
-        if (!dexie_ok) {
+        const std::string dexie_id = co_await submit_to_dexie(offer_text);
+        if (dexie_id.empty()) {
             logger_->warn("Dexie submission failed for {} tier {} -- "
-                          "offer is still valid on-chain",
+                          "offer is still valid on-chain, but with no dexie "
+                          "id it cannot be excluded from our own arbitrage "
+                          "scan",
                           pair.name, tier.tier_index);
         }
 
@@ -483,6 +487,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
         pending.fee_mojos        = current_fee_mojos_;
+        // [WALLET-LOAD] Post-time distance-from-mid, for the fill-poll
+        // backoff's striking-distance reset.
+        pending.post_spread_bps  = tier.spread_bps;
+        // Retain dexie's id -- own-offer exclusion in the arbitrage taker
+        // matches the orderbook feed on THIS id, not the wallet trade id.
+        pending.dexie_id         = dexie_id;
 
         state_->upsert_offer(pending);
         ++created_count;
@@ -498,9 +508,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
-        // the 2× reserve floor.
+        // the 2Ã— reserve floor.
         //
-        // Recovery zone: if between 1× and 2× reserve, only stop
+        // Recovery zone: if between 1Ã— and 2Ã— reserve, only stop
         // non-buy-XCH tiers.  Buy-XCH tiers are allowed through to
         // help the engine escape the low-balance state.
         if (effective_reserve > 0.0) {
@@ -553,13 +563,19 @@ asio::awaitable<int> OfferManager::post_quotes(
 // detect_fills -- poll wallet, identify settled offers, emit Fill events
 // ---------------------------------------------------------------------------
 
-asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
+asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
+    BlockHeight current_block)
 {
     std::vector<Fill> fills;
+
+    // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
+    // invocation -- the backoff schedule below is phased on it.
+    ++fill_poll_heartbeat_;
 
     // Get all known pending offers from state for comparison.
     auto pending_offers = state_->get_all_offers();
     if (pending_offers.empty()) {
+        fill_poll_pending_counts_.clear();
         co_return fills;
     }
 
@@ -570,20 +586,108 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
         pending_map.emplace(po.offer_id, std::move(po));
     }
 
-    // Query only offers we currently track.  Scanning get_all_offers with
-    // include_completed=true can walk the entire historical offer archive
-    // before every ladder cycle.
-    std::vector<json> trade_records;
+    // Prune throttle bookkeeping for offers no longer tracked.
+    for (auto it = fill_poll_pending_counts_.begin();
+         it != fill_poll_pending_counts_.end();) {
+        it = pending_map.count(it->first)
+                 ? std::next(it)
+                 : fill_poll_pending_counts_.erase(it);
+    }
+
+    // Query only offers we currently track AND due for a poll this
+    // heartbeat.  [WALLET-LOAD 2026-08-04] This was one get_offer per
+    // tracked offer (~26) EVERY heartbeat, a major share of the load that
+    // froze the wallet daemon.  Throttles (wallet_poll_throttle.hpp):
+    //   - age gate: a just-posted offer cannot have settled;
+    //   - backoff: an offer still PENDING_ACCEPT after M consecutive
+    //     polls is polled every Kth heartbeat, reset to every-heartbeat
+    //     the moment the book mid is within 2x its post-time
+    //     distance-from-mid or a cancel is pending on it.
+    // Safety: a fill in a skipped heartbeat is DELAYED detection, never
+    // lost -- CONFIRMED offers stay tracked in State until this function
+    // processes them (cae2bfd), and the completeness sweep catches
+    // stragglers.
+    std::vector<json>        trade_records;
+    std::vector<std::string> polled_ids;
+    std::size_t              skipped_age = 0, skipped_backoff = 0;
     trade_records.reserve(pending_map.size());
-    for (const auto& entry : pending_map) {
-        const auto& trade_id = entry.first;
+    for (const auto& [trade_id, po] : pending_map) {
+        const std::int64_t age_blocks =
+            (current_block > 0 && po.created_at_block > 0
+             && current_block >= po.created_at_block)
+                ? static_cast<std::int64_t>(current_block
+                                            - po.created_at_block)
+                : -1;   // unknown -> age gate does not apply
+
+        // Striking distance: current mid vs the offer's post-time
+        // distance.  cancel_pending offers are near resolution and are
+        // always polled at full cadence.
+        const Mojo mid = state_->get_market(po.pair_name).mid_price;
+        const bool striking = po.cancel_pending
+            || execution::within_striking_distance(po.price, mid,
+                                                   po.post_spread_bps);
+        if (striking) {
+            fill_poll_pending_counts_.erase(trade_id);
+        }
+
+        auto cnt_it = fill_poll_pending_counts_.find(trade_id);
+        const std::uint32_t consecutive =
+            (cnt_it != fill_poll_pending_counts_.end()) ? cnt_it->second
+                                                        : 0;
+        if (!execution::fill_poll_due(
+                age_blocks,
+                strategy_cfg_.detect_fills_min_age_blocks,
+                consecutive,
+                strategy_cfg_.detect_fills_backoff_polls,
+                strategy_cfg_.detect_fills_backoff_interval,
+                fill_poll_heartbeat_,
+                striking)) {
+            if (age_blocks >= 0
+                && age_blocks < static_cast<std::int64_t>(
+                       strategy_cfg_.detect_fills_min_age_blocks)) {
+                ++skipped_age;
+            } else {
+                ++skipped_backoff;
+            }
+            continue;
+        }
+
         try {
             trade_records.push_back(
                 co_await wallet_->get_offer(trade_id,
                                             /*file_contents=*/false));
+            polled_ids.push_back(trade_id);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("get_offer failed during fill detection for {}: {}",
                            trade_id.substr(0, 12), e.what());
+        }
+    }
+
+    if (skipped_age + skipped_backoff > 0) {
+        logger_->debug("detect_fills: polled {}/{} tracked offers "
+                       "(skipped {} too-young, {} backed-off)",
+                       polled_ids.size(), pending_map.size(),
+                       skipped_age, skipped_backoff);
+    }
+
+    // Update the backoff counters from what the wallet reported: still
+    // PENDING_ACCEPT extends the streak; any other status ends it.
+    {
+        std::unordered_map<std::string, int> polled_status;
+        for (const auto& rec : trade_records) {
+            if (rec.contains("trade_id") && rec.contains("status")) {
+                polled_status[rec["trade_id"].get<std::string>()] =
+                    trade_status::parse(rec["status"]);
+            }
+        }
+        for (const auto& id : polled_ids) {
+            auto st = polled_status.find(id);
+            if (st != polled_status.end()
+                && st->second == trade_status::kPendingAccept) {
+                ++fill_poll_pending_counts_[id];
+            } else {
+                fill_poll_pending_counts_.erase(id);
+            }
         }
     }
 
@@ -609,9 +713,50 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 fill.offer_id     = trade_id;
                 fill.pair_name    = po.pair_name;
                 fill.side         = po.side;
-                fill.price        = po.price;
-                fill.size         = po.size;
                 fill.timestamp    = std::chrono::system_clock::now();
+
+                // [SETTLED-FIX 2026-08-02] Populate price/size from the
+                // SETTLED amounts in the wallet record's summary, not the
+                // POSTED PendingOffer values.  Copying the posted values
+                // silently discarded the executed amounts, so any
+                // settled-vs-posted divergence (partial settlement of a
+                // splittable offer, taker-side rounding) corrupted the
+                // trade_log and P&L.  Fall back to posted values with a
+                // WARNING when the summary is absent or malformed --
+                // never silently.  Conversion formula + dimensional
+                // analysis: see parse_settled_fill below.
+                const auto pc_it = pair_config_map_.find(po.pair_name);
+                std::optional<SettledFill> settled;
+                if (pc_it != pair_config_map_.end()) {
+                    settled = parse_settled_fill(rec, po.side, pc_it->second);
+                }
+                if (settled.has_value()) {
+                    fill.price = settled->price;
+                    fill.size  = settled->size;
+                    if (settled->size != po.size ||
+                        settled->price != po.price) {
+                        logger_->info(
+                            "detect_fills: {} settled amounts differ from "
+                            "posted (size {} -> {}, price {} -> {})",
+                            trade_id.substr(0, 12), po.size, settled->size,
+                            po.price, settled->price);
+                    }
+                } else {
+                    fill.price = po.price;
+                    fill.size  = po.size;
+                    logger_->warn(
+                        "detect_fills: {} settled summary missing or "
+                        "unparseable -- falling back to POSTED size={} "
+                        "price={}",
+                        trade_id.substr(0, 12), po.size, po.price);
+                }
+                // [FEE-FIX 2026-07-30] Capture the offer-creation fee NOW,
+                // while the PendingOffer is still tracked.  The engine used
+                // to look the fee up from State after this function had
+                // already called remove_offer(), which always returned a
+                // default (fee 0) -- trade_log.fee_mojos was silently 0 for
+                // every fill since June 2026.
+                fill.fee_mojos    = static_cast<Mojo>(po.fee_mojos);
 
                 // Extract confirmed block height if available.
                 if (rec.contains("confirmed_at_index")) {
@@ -635,7 +780,7 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                 // being removed.  The wallet's confirmed fill is the
                 // authoritative record; inventory discrepancy is correctable
                 // but a missed fill is not.
-                auto pc_it = pair_config_map_.find(po.pair_name);
+                // (pc_it was resolved above for the settled-amount parse.)
                 if (pc_it == pair_config_map_.end()) {
                     logger_->error(
                         "detect_fills: no pair config for '{}' -- "
@@ -643,12 +788,35 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                         po.pair_name, trade_id.substr(0, 12));
                 } else {
                     const auto& pc = pc_it->second;
+                    // [SETTLED-FIX 2026-08-02] Position accounting uses the
+                    // fill's (settled when available) size/price so that
+                    // inventory moves match what actually settled on-chain.
+                    const double quote_mojos_dbl = quote_mojos_for(
+                        static_cast<double>(fill.size),
+                        static_cast<double>(fill.price),
+                        static_cast<double>(pc.base_mojos_per_unit),
+                        static_cast<double>(pc.quote_mojos_per_unit));
+                    const Mojo quote_mojos = static_cast<Mojo>(std::llround(quote_mojos_dbl));
+
                     if (po.side == Side::Bid) {
-                        // Bid fill: we BOUGHT base asset.
-                        state_->record_buy(pc.base_asset_id, po.size, po.price);
+                        // Bid fill: we BOUGHT base asset (pc.base_asset_id) and SOLD quote asset (pc.quote_asset_id).
+                        state_->record_buy(pc.base_asset_id, fill.size, fill.price);
+                        // [GUARD-FIX 2026-07-30] The prior condition
+                        // (quote != "xch" || base != "xch") was a tautology
+                        // (no pair has xch on both legs), so the intended
+                        // XCH-leg exclusion never applied.  Guard per-leg.
+                        if (pc.quote_asset_id != "xch") {
+                            bool sold_quote = state_->record_sell(pc.quote_asset_id, quote_mojos);
+                            if (!sold_quote) {
+                                logger_->warn(
+                                    "detect_fills: record_sell failed for quote asset {} "
+                                    "(size={}) representing spent quote",
+                                    pc.quote_asset_id, quote_mojos);
+                            }
+                        }
                     } else {
-                        // Ask fill: we SOLD base asset.
-                        bool sold = state_->record_sell(pc.base_asset_id, po.size);
+                        // Ask fill: we SOLD base asset (pc.base_asset_id) and BOUGHT quote asset (pc.quote_asset_id).
+                        bool sold = state_->record_sell(pc.base_asset_id, fill.size);
                         if (!sold) {
                             logger_->error(
                                 "record_sell failed for {} (asset={}) "
@@ -656,12 +824,17 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills()
                                 "recorded, inventory needs reconciliation",
                                 trade_id.substr(0, 12), pc.base_asset_id);
                         }
+                        // [GUARD-FIX 2026-07-30] Same tautology fix as the
+                        // bid branch: guard the quote leg only.
+                        if (pc.quote_asset_id != "xch") {
+                            state_->record_buy(pc.quote_asset_id, quote_mojos, Mojo{1});
+                        }
                     }
                 }
 
                 logger_->info("FILL {} {} {} mojos @ {} mojos [{}]",
                               (po.side == Side::Bid) ? "BID" : "ASK",
-                              po.pair_name, po.size, po.price,
+                              po.pair_name, fill.size, fill.price,
                               trade_id.substr(0, 12));
 
                 // Remove from pending offers.
@@ -1092,14 +1265,14 @@ asio::awaitable<void> OfferManager::ensure_wallet_ids()
 // Scholarly basis:
 //   - Gao & Wang (2020): optimal cancel threshold is a function of the
 //     fractional deviation from the current fair price.
-//   - Aït-Sahalia & Saglam (2017): stale-quote risk increases with the
+//   - AÃ¯t-Sahalia & Saglam (2017): stale-quote risk increases with the
 //     magnitude of price deviation, not uniformly across all tiers.
 //
 // Direction-aware approach:
 //   Only *adverse* deviations trigger cancellation.  An adverse move is
 //   one that makes our offer more generous than intended:
-//     - Bid: new optimal < old price → our bid is too high (overpaying)
-//     - Ask: new optimal > old price → our ask is too low (underselling)
+//     - Bid: new optimal < old price â†’ our bid is too high (overpaying)
+//     - Ask: new optimal > old price â†’ our ask is too low (underselling)
 //   Favorable deviations (bid drifted below optimal, ask drifted above)
 //   make the offer more conservative and are safe to leave live.
 //
@@ -1170,7 +1343,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         const bool past_hard_ttl = (age >= hard_ttl);
 
         // Hard TTL: absolute expiration regardless of price.
-        // Safety backstop — offers should never live indefinitely.
+        // Safety backstop â€” offers should never live indefinitely.
         if (past_hard_ttl) {
             tc.staleness       = TierStaleness::Expired;
             tc.price_deviation = 1.0;  // maximal
@@ -1242,16 +1415,16 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // Determine if the deviation is adverse (makes our offer
         // more generous than intended) or favorable (more conservative).
         //   Bid: adverse when new_p < old_p (signed_dev < 0)
-        //        → our old bid is higher than the new optimal, overpaying.
+        //        â†’ our old bid is higher than the new optimal, overpaying.
         //   Ask: adverse when new_p > old_p (signed_dev > 0)
-        //        → our old ask is lower than the new optimal, underselling.
+        //        â†’ our old ask is lower than the new optimal, underselling.
         tc.adverse = (po.side == Side::Bid)
             ? (signed_dev < 0.0)
             : (signed_dev > 0.0);
 
         // Crossing detection: a Bid at or above best_ask (or Ask at or below
         // best_bid) faces immediate adverse selection and must be cancelled
-        // urgently.  Using model mid as the threshold is too conservative —
+        // urgently.  Using model mid as the threshold is too conservative â€”
         // a bid between mid and best_ask is a valid competitive bid, not a
         // crossed offer.  When BBO is unavailable, fall back to mid with a
         // generous buffer (5%) to avoid false positives.
@@ -1267,7 +1440,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                     tc.crossed = true;
                 }
             } else if (mid_price > 0) {
-                // BBO unavailable: fall back to mid ±5% buffer.
+                // BBO unavailable: fall back to mid Â±5% buffer.
                 constexpr double kCrossBuffer = 0.05;
                 if (po.side == Side::Bid && old_p > mid_p * (1.0 + kCrossBuffer)) {
                     tc.crossed = true;
@@ -1279,11 +1452,11 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
         // Classification logic (cancel-reduction optimisations):
         //
-        //   1. Crossed mid-price → always Stale (urgent cancel, no age guard).
+        //   1. Crossed mid-price â†’ always Stale (urgent cancel, no age guard).
         //
-        //   2. Soft TTL zone (soft TTL ≤ age < hard TTL):
+        //   2. Soft TTL zone (soft TTL â‰¤ age < hard TTL):
         //      The offer is old.  Apply a gentler adverse threshold
-        //      (kSoftTtlAdverseThreshold = 0.2%) — even a small drift
+        //      (kSoftTtlAdverseThreshold = 0.2%) â€” even a small drift
         //      on an aged offer should trigger a refresh.  But if the
         //      offer is still perfectly priced, keep it.
         //
@@ -1296,9 +1469,9 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         //   4. Tier-scaled threshold (normal zone):
         //      Outer tiers tolerate more movement because they are further
         //      from mid and capture larger spreads.
-        //      threshold = kSelectiveRefreshThreshold × (1 + tier × scale)
-        //        tier 0 → 0.50%   tier 1 → 0.75%
-        //        tier 2 → 1.00%   tier 3 → 1.25%
+        //      threshold = kSelectiveRefreshThreshold Ã— (1 + tier Ã— scale)
+        //        tier 0 â†’ 0.50%   tier 1 â†’ 0.75%
+        //        tier 2 â†’ 1.00%   tier 3 â†’ 1.25%
 
         if (tc.crossed) {
             // (1) Urgent: offer crossed mid-price.
@@ -1328,7 +1501,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // When the market allocator changes allocation fractions, existing
         // offers may be significantly oversized relative to the new optimal.
         // If the pending offer's size is > 2x the new ladder's optimal size,
-        // override Fresh→Stale to trigger a cancel+repost with correct sizing.
+        // override Freshâ†’Stale to trigger a cancel+repost with correct sizing.
         // Respects the minimum age guard: only apply past kMinRefreshAgeBlocks.
         if (tc.staleness == TierStaleness::Fresh
             && age >= kMinRefreshAgeBlocks) {
@@ -1340,7 +1513,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                 if (size_ratio > kSizeStaleThreshold) {
                     tc.staleness = TierStaleness::Stale;
                     logger_->debug("classify_tier_staleness({}): tier {} {} "
-                                   "size oversized {:.1f}x ({}→{}) -- marking "
+                                   "size oversized {:.1f}x ({}â†’{}) -- marking "
                                    "stale", pair_name, po.tier,
                                    to_string(po.side), size_ratio,
                                    po.size, sz_it->second);
@@ -1353,7 +1526,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // offers to track the BBO.  A "favorable" drift (bid drifted low,
         // ask drifted high) is normally safe, but under anchor mode it
         // means we're deep in the book instead of near the top.  Override
-        // Fresh→Stale when the ABSOLUTE deviation exceeds the tier-scaled
+        // Freshâ†’Stale when the ABSOLUTE deviation exceeds the tier-scaled
         // threshold, regardless of direction.
         if (anchor_active
             && tc.staleness == TierStaleness::Fresh
@@ -1480,24 +1653,75 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
     // wallet offers that are still pending but not tracked in State.
     std::vector<json> unadopted_records;
 
-    // Paginate through all wallet offers.
+    // ------------------------------------------------------------------
+    // [WALLET-LOAD 2026-08-04] Early-stopped pagination.
+    //
+    // This loop used to walk the ENTIRE trade archive (14,100+ records at
+    // 50/page = ~282 get_all_offers calls) every reconcile because the
+    // wallet's DEFAULT ordering (confirmed_at_index DESC) sorts pending
+    // offers LAST.  start/end are array indices, not heights (verified:
+    // docs.chia.net offer-rpc + chia-blockchain trade_store.py), so a
+    // since-height filter is impossible -- but sort_key="RELEVANCE"
+    // orders pending statuses FIRST, then terminal records by
+    // created_at_time DESC.  Page 1 therefore carries the whole live set
+    // (tracked offers + PENDING_ACCEPT adoptees), and the scan stops
+    // after kReconcileStopAfterOldPages consecutive pages entirely older
+    // than the oldest tracked offer's creation minus a 24 h adoptee
+    // slack (wallet_poll_throttle.hpp).  ~282 calls -> ~2-4.
+    //
+    // SAFETY: phantom/adoption semantics for TRACKED offers are fully
+    // preserved.  Absence-from-scan was never trusted (SETTLE-FIX
+    // 2026-07-31): every tracked offer not seen in the scanned pages is
+    // individually verified with get_offer below before any removal, so
+    // stopping early can only convert bulk pages into a handful of
+    // targeted lookups, never a wrong removal.
+    // ------------------------------------------------------------------
+    std::int64_t oldest_tracked_unix = 0;
+    for (const auto& [id, po] : pending_map) {
+        const auto unix_s = std::chrono::duration_cast<std::chrono::seconds>(
+            po.created_at_ts.time_since_epoch()).count();
+        if (unix_s > 0
+            && (oldest_tracked_unix == 0 || unix_s < oldest_tracked_unix)) {
+            oldest_tracked_unix = unix_s;
+        }
+    }
+    const std::int64_t now_unix =
+        std::chrono::duration_cast<std::chrono::seconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count();
+    const std::int64_t cutoff_unix =
+        execution::reconcile_scan_cutoff(oldest_tracked_unix, now_unix);
+    execution::ReconcileEarlyStop early_stop;
+
+    // Paginate through wallet offers, newest-relevant first.
     constexpr std::int64_t kPageSize = 50;
     std::int64_t offset = 0;
+    std::int64_t pages_scanned = 0;
     bool more = true;
 
     while (more) {
         std::vector<json> trade_records;
         try {
             trade_records = co_await wallet_->get_all_offers(
-                offset, offset + kPageSize, /*file_contents=*/false);
+                offset, offset + kPageSize, /*file_contents=*/false,
+                /*include_completed=*/true,
+                /*sort_key=*/"RELEVANCE", /*reverse=*/false);
         } catch (const rpc::ChiaRPCError& e) {
             logger_->error("[reconcile] get_all_offers failed: {}", e.what());
             co_return removed_ids;
         }
+        ++pages_scanned;
 
         if (trade_records.empty() ||
             static_cast<std::int64_t>(trade_records.size()) < kPageSize) {
             more = false;
+        }
+
+        // Newest created_at_time on this page, for the early-stop rule.
+        std::int64_t page_newest_created = 0;
+        for (const auto& rec : trade_records) {
+            const std::int64_t created =
+                rec.value("created_at_time", std::int64_t{0});
+            page_newest_created = std::max(page_newest_created, created);
         }
 
         for (const auto& rec : trade_records) {
@@ -1537,20 +1761,82 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             // offers still in State.
         }
 
+        // [WALLET-LOAD 2026-08-04] Early stop: in the RELEVANCE ordering
+        // the terminal region is created_at_time-descending, so once
+        // consecutive pages are entirely older than the cutoff nothing
+        // relevant can follow.
+        if (more && early_stop.observe_page(execution::page_entirely_older(
+                        page_newest_created, cutoff_unix))) {
+            logger_->debug("[reconcile] early stop after {} pages "
+                           "({} consecutive pages older than cutoff {})",
+                           pages_scanned,
+                           early_stop.consecutive_old_pages(), cutoff_unix);
+            more = false;
+        }
+
         offset += kPageSize;
     }
 
     // Detect orphans: offers in State that no longer exist in the wallet.
     // This can happen if the wallet was restarted or the offer expired
     // server-side without a cancel call.
+    //
+    // [SETTLE-FIX 2026-07-31] Absence from the paginated scan above is NOT
+    // proof the offer is gone.  Offers settle while the loop walks pages, so
+    // records get skipped.  Previously a skipped CONFIRMED offer was deleted
+    // from State here and stamped "cancelled/periodic_reconcile" by the
+    // caller -- which DESTROYED the fill, because detect_fills() only
+    // inspects offers still tracked in State.  A read-only wallet probe on
+    // 2026-07-31 found 6 XCH/BYC asks the wallet reported CONFIRMED that we
+    // had recorded as cancels (6 XCH and its BYC proceeds off the books).
+    //
+    // Verify each candidate directly before destroying tracking state.  We
+    // deliberately do NOT emit the Fill from here: leaving a confirmed offer
+    // in State lets detect_fills() handle it through the normal path, which
+    // captures the creation fee and updates position accounting correctly.
     for (const auto& [offer_id, po] : pending_map) {
-        if (wallet_offer_ids.find(offer_id) == wallet_offer_ids.end()) {
-            state_->remove_offer(offer_id);
-            removed_ids.push_back(offer_id);
-            logger_->warn("[reconcile] Removed phantom offer {} ({}) "
-                          "-- not found in wallet",
-                          offer_id.substr(0, 12), po.pair_name);
+        if (wallet_offer_ids.find(offer_id) != wallet_offer_ids.end()) {
+            continue;
         }
+
+        int status = -1;
+        try {
+            const json rec = co_await wallet_->get_offer(
+                offer_id, /*file_contents=*/false);
+            if (rec.contains("status")) {
+                status = trade_status::parse(rec["status"]);
+            }
+        } catch (const rpc::ChiaRPCError& e) {
+            // Fail safe: never destroy tracking on an RPC error.  The offer
+            // stays in State and is re-examined next cycle.
+            logger_->warn("[reconcile] get_offer failed for {} ({}) -- "
+                          "keeping tracked, will retry: {}",
+                          offer_id.substr(0, 12), po.pair_name, e.what());
+            continue;
+        }
+
+        if (status == trade_status::kConfirmed) {
+            logger_->info("[reconcile] Offer {} ({}) missing from scan but "
+                          "wallet reports CONFIRMED -- keeping tracked so "
+                          "detect_fills records the fill",
+                          offer_id.substr(0, 12), po.pair_name);
+            continue;
+        }
+
+        if (status != trade_status::kCancelled &&
+            status != trade_status::kFailed) {
+            // Still live, pending, or unrecognised -- not ours to remove.
+            logger_->debug("[reconcile] Offer {} ({}) missing from scan, "
+                           "wallet status={} -- keeping tracked",
+                           offer_id.substr(0, 12), po.pair_name, status);
+            continue;
+        }
+
+        state_->remove_offer(offer_id);
+        removed_ids.push_back(offer_id);
+        logger_->warn("[reconcile] Removed phantom offer {} ({}) "
+                      "-- wallet status={}",
+                      offer_id.substr(0, 12), po.pair_name, status);
     }
 
     // -----------------------------------------------------------------------
@@ -1560,7 +1846,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
     // removed an offer from State (e.g., during wallet desync, pagination
     // race, or restart), but the wallet still holds it as PENDING_ACCEPT
     // with coins locked.  Without adoption the engine sees 0 pending
-    // offers yet 0 spendable XCH — a permanent deadlock.
+    // offers yet 0 spendable XCH â€” a permanent deadlock.
     //
     // Gao & Wang (2020): tracking an offer we created is always cheaper
     // than leaving coins locked invisibly.  Worst case the UTXO liberation
@@ -1583,13 +1869,13 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             state_->upsert_offer(*parsed);
             ++adopted_count;
             logger_->warn("[reconcile] ADOPTED untracked wallet offer {} "
-                          "({} {} on {}) — wallet has it PENDING_ACCEPT "
+                          "({} {} on {}) â€” wallet has it PENDING_ACCEPT "
                           "but engine lost tracking",
                           trade_id.substr(0, 12),
                           (parsed->side == Side::Bid) ? "BID" : "ASK",
                           parsed->size, parsed->pair_name);
         } else {
-            // Can't determine pair/side — adopt with minimal metadata.
+            // Can't determine pair/side â€” adopt with minimal metadata.
             // UTXO liberation can still cancel it to free locked coins.
             PendingOffer po;
             po.offer_id         = trade_id;
@@ -1603,7 +1889,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             state_->upsert_offer(po);
             ++adopted_count;
             logger_->warn("[reconcile] ADOPTED unparseable wallet offer {} "
-                          "— tracking to prevent coin-lock deadlock",
+                          "â€” tracking to prevent coin-lock deadlock",
                           trade_id.substr(0, 12));
         }
     }
@@ -1622,12 +1908,12 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
 // evaluate_orphan -- cost-aware evaluation of an untracked wallet offer
 //
 // Scholarly basis:
-//   Guéant, Lehalle & Fernandez-Tapia (2013) — cancel only when expected
+//   GuÃ©ant, Lehalle & Fernandez-Tapia (2013) â€” cancel only when expected
 //     adverse selection loss exceeds the cancellation cost.
-//   Gao & Wang (2020) — the zero-offer gap during cancel→repost is the
+//   Gao & Wang (2020) â€” the zero-offer gap during cancelâ†’repost is the
 //     primary adverse selection cost for latent market makers.  Keeping a
 //     slightly stale offer is cheaper than having no presence.
-//   Aït-Sahalia & Saglam (2017) — stale-quote risk = f(price_deviation,
+//   AÃ¯t-Sahalia & Saglam (2017) â€” stale-quote risk = f(price_deviation,
 //     remaining_lifetime, offer_size).  Cancellation threshold should
 //     scale with all three factors.
 //
@@ -1657,7 +1943,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     }
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested asset→amount maps.
+    // Parse offered and requested assetâ†’amount maps.
     // Chia wallet format: { "asset_id_hex_or_xch": amount_int, ... }
     std::unordered_map<std::string, Mojo> offered;    // we give
     std::unordered_map<std::string, Mojo> requested;  // we get
@@ -1699,7 +1985,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
         bool requested_quote = requested.count(quote) > 0;
 
         if (offered_base && requested_quote) {
-            // We gave base, got quote → ASK (we sold base).
+            // We gave base, got quote â†’ ASK (we sold base).
             eval.pair_name = pname;
             eval.side      = Side::Ask;
             eval.size      = offered.at(base);
@@ -1716,7 +2002,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
             break;
         }
         if (offered_quote && requested_base) {
-            // We gave quote, got base → BID (we bought base).
+            // We gave quote, got base â†’ BID (we bought base).
             eval.pair_name = pname;
             eval.side      = Side::Bid;
             eval.size      = requested.at(base);
@@ -1774,7 +2060,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     // ---- Price deviation check --------------------------------------------
     auto mid_it = mid_prices.find(eval.pair_name);
     if (mid_it == mid_prices.end() || mid_it->second <= 0) {
-        // No market data available for this pair — can't evaluate.
+        // No market data available for this pair â€” can't evaluate.
         // Conservatively cancel.
         eval.disposition = OrphanDisposition::Cancel;
         eval.reason = "no current mid-price available for " + eval.pair_name;
@@ -1790,8 +2076,8 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     eval.price_deviation = std::abs(signed_dev);
 
     // Adverse direction:
-    //   BID too high (signed_dev > 0) → overpaying, adverse.
-    //   ASK too low  (signed_dev < 0) → underselling, adverse.
+    //   BID too high (signed_dev > 0) â†’ overpaying, adverse.
+    //   ASK too low  (signed_dev < 0) â†’ underselling, adverse.
     eval.adverse = (eval.side == Side::Bid)
         ? (signed_dev > 0.0)
         : (signed_dev < 0.0);
@@ -1811,8 +2097,8 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                 else ++ask_count;
             }
         }
-        // If we have more bids than asks, we're accumulating → asks help.
-        // If we have more asks than bids, we're depleting → bids help.
+        // If we have more bids than asks, we're accumulating â†’ asks help.
+        // If we have more asks than bids, we're depleting â†’ bids help.
         const bool helps_inventory =
             (bid_count > ask_count && eval.side == Side::Ask) ||
             (ask_count > bid_count && eval.side == Side::Bid);
@@ -1827,7 +2113,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     // From Gao & Wang (2020), the optimal decision is:
     //   cancel if expected_adverse_loss > cancel_cost
     //
-    // expected_adverse_loss = deviation × size × adverse_fill_prob
+    // expected_adverse_loss = deviation Ã— size Ã— adverse_fill_prob
     // cancel_cost = fee + liquidity_opportunity_cost
     //
     // For simplicity and robustness, we use the threshold approach:
@@ -1838,7 +2124,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     eval.cancel_cost = static_cast<Mojo>(current_fee_mojos_);
 
     if (!eval.adverse) {
-        // Favorable deviation — our offer is more conservative than
+        // Favorable deviation â€” our offer is more conservative than
         // the current optimal.  Safe to keep: a bid below mid is fine,
         // an ask above mid is fine.
         eval.disposition = OrphanDisposition::Adopt;
@@ -1847,13 +2133,13 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                                   eval.price_deviation * 100.0,
                                   eval.pair_name);
     } else if (eval.price_deviation <= effective_threshold * 0.5) {
-        // Small adverse deviation — well within tolerance.
+        // Small adverse deviation â€” well within tolerance.
         eval.disposition = OrphanDisposition::Adopt;
         eval.reason = fmt::format("small adverse {:.2f}% < {:.1f}% half-threshold",
                                   eval.price_deviation * 100.0,
                                   effective_threshold * 50.0);
     } else if (eval.price_deviation <= effective_threshold) {
-        // Moderate adverse — cheaper to keep than cancel, but flag
+        // Moderate adverse â€” cheaper to keep than cancel, but flag
         // for early refresh on the next heartbeat.
         eval.disposition = OrphanDisposition::AdoptStale;
         eval.expected_loss = static_cast<Mojo>(std::llround(
@@ -1864,7 +2150,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                                   effective_threshold * 100.0,
                                   eval.inventory_helper ? " (inventory helper)" : "");
     } else {
-        // Large adverse deviation — expected loss exceeds cancel cost.
+        // Large adverse deviation â€” expected loss exceeds cancel cost.
         eval.expected_loss = static_cast<Mojo>(std::llround(
             eval.price_deviation * static_cast<double>(eval.size)));
         eval.disposition = OrphanDisposition::Cancel;
@@ -1887,9 +2173,9 @@ OrphanEvaluation OfferManager::evaluate_orphan(
 // market presence.
 //
 // Scholarly basis:
-//   Guéant, Lehalle & Fernandez-Tapia (2013) — cost-aware cancellation
-//   Gao & Wang (2020) — zero-offer gap avoidance for latent market makers
-//   Aït-Sahalia & Saglam (2017) — stale-quote risk scaling
+//   GuÃ©ant, Lehalle & Fernandez-Tapia (2013) â€” cost-aware cancellation
+//   Gao & Wang (2020) â€” zero-offer gap avoidance for latent market makers
+//   AÃ¯t-Sahalia & Saglam (2017) â€” stale-quote risk scaling
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
@@ -2040,7 +2326,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 po.side            = eval.side;
                 po.price           = eval.price;
                 po.size            = eval.size;
-                po.tier            = 0;  // Unknown original tier — assign 0.
+                po.tier            = 0;  // Unknown original tier â€” assign 0.
                 po.fee_mojos       = current_fee_mojos_;
                 // Approximate creation block from age.
                 if (current_block > 0 && wo->record.contains("created_at_time")) {
@@ -2077,7 +2363,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 if (eval.disposition == OrphanDisposition::Adopt) {
                     ++adopted;
                     logger_->info("[startup_reconcile] ADOPTED orphan {} "
-                                  "({} {} on {} @ {} mojos) — {}",
+                                  "({} {} on {} @ {} mojos) â€” {}",
                                   wo->trade_id.substr(0, 24),
                                   (eval.side == Side::Bid) ? "BID" : "ASK",
                                   eval.size, eval.pair_name, eval.price,
@@ -2085,7 +2371,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 } else {
                     ++adopted_stale;
                     logger_->info("[startup_reconcile] ADOPTED-STALE orphan {} "
-                                  "({} {} on {} @ {} mojos) — {}",
+                                  "({} {} on {} @ {} mojos) â€” {}",
                                   wo->trade_id.substr(0, 24),
                                   (eval.side == Side::Bid) ? "BID" : "ASK",
                                   eval.size, eval.pair_name, eval.price,
@@ -2099,7 +2385,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 // Cancel this orphan on-chain.
                 const char* label = (eval.disposition == OrphanDisposition::Unknown)
                     ? "UNKNOWN" : "CANCEL";
-                logger_->warn("[startup_reconcile] {} orphan {} — {}",
+                logger_->warn("[startup_reconcile] {} orphan {} â€” {}",
                               label, wo->trade_id.substr(0, 24), eval.reason);
 
                 bool cancel_ok = false;
@@ -2149,7 +2435,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                     // etc.).  Force-adopt to prevent deadlock: the wallet
                     // still holds this offer as PENDING_ACCEPT, locking
                     // coins.  If we don't track it, the engine sees 0
-                    // pending offers but 0 spendable XCH — permanent
+                    // pending offers but 0 spendable XCH â€” permanent
                     // stall.  Adopting lets UTXO liberation or the next
                     // cancel cycle free the locked coins.
                     auto parsed = try_parse_wallet_offer(
@@ -2171,7 +2457,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                     ++adopted;
                     logger_->warn(
                         "[startup_reconcile] FORCE-ADOPTED uncancellable "
-                        "orphan {} ({} {} on {}) — cancel failed, tracking "
+                        "orphan {} ({} {} on {}) â€” cancel failed, tracking "
                         "to prevent deadlock",
                         wo->trade_id.substr(0, 24),
                         (eval.side == Side::Bid) ? "BID" : "ASK",
@@ -2431,8 +2717,11 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 && sr["trade_record"].contains("trade_id")
                 && sr["trade_record"]["trade_id"].is_string()) {
                 std::string offer_text = sr["offer"].get<std::string>();
-                co_await submit_to_dexie(offer_text);
                 PendingOffer po;
+                // Retain dexie's id so this offer is excluded from our own
+                // arbitrage scan; dropping it here would leave the fallback
+                // path takeable by our own taker.
+                po.dexie_id         = co_await submit_to_dexie(offer_text);
                 po.offer_id         = sr["trade_record"]["trade_id"].get<std::string>();
                 po.pair_name        = pair.name;
                 po.side             = tier.side;
@@ -2441,6 +2730,8 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 po.tier             = tier.tier_index;
                 po.created_at_block = block_height;
                 po.created_at_ts    = std::chrono::system_clock::now();
+                // [WALLET-LOAD] For the fill-poll striking-distance reset.
+                po.post_spread_bps  = tier.spread_bps;
                 state_->upsert_offer(po);
                 ++fallback_count;
 
@@ -2488,8 +2779,10 @@ asio::awaitable<int> OfferManager::post_merged_side(
     std::string trade_id   = result["trade_record"]["trade_id"].get<std::string>();
     std::string offer_text = result["offer"].get<std::string>();
 
-    // Submit to dexie (best-effort).
-    co_await submit_to_dexie(offer_text);
+    // Submit to dexie (best-effort).  Retain the id: every tier merged into
+    // this batch rests on the book under it, and own-offer exclusion in the
+    // arbitrage taker matches on it.
+    const std::string batch_dexie_id = co_await submit_to_dexie(offer_text);
 
     // Track all constituent tiers with the same offer_id.
     for (const auto& tier : tiers) {
@@ -2503,6 +2796,9 @@ asio::awaitable<int> OfferManager::post_merged_side(
         pending.created_at_block = block_height;
         pending.created_at_ts    = std::chrono::system_clock::now();
         pending.fee_mojos        = current_fee_mojos_;
+        // [WALLET-LOAD] For the fill-poll striking-distance reset.
+        pending.post_spread_bps  = tier.spread_bps;
+        pending.dexie_id         = batch_dexie_id;
         state_->upsert_offer(pending);
     }
 
@@ -2517,7 +2813,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
 // submit_to_dexie -- post offer text to the dexie aggregator (best-effort)
 // ---------------------------------------------------------------------------
 
-asio::awaitable<bool> OfferManager::submit_to_dexie(
+asio::awaitable<std::string> OfferManager::submit_to_dexie(
     const std::string& offer_text)
 {
     // Best-effort submission to the Dexie aggregator for cross-platform
@@ -2532,7 +2828,7 @@ asio::awaitable<bool> OfferManager::submit_to_dexie(
     if (!dexie_client_) {
         logger_->debug("submit_to_dexie: no DexieClient configured -- "
                        "skipping aggregator submission");
-        co_return false;
+        co_return std::string{};
     }
 
     try {
@@ -2550,40 +2846,40 @@ asio::awaitable<bool> OfferManager::submit_to_dexie(
         if (result.success) {
             logger_->info("submit_to_dexie: accepted (dexie_id={})",
                           result.offer_id);
-            co_return true;
+            co_return result.offer_id;
         }
 
         // Dexie rejected the offer (e.g. duplicate, invalid, expired).
         // Log the reason but do not treat as a hard failure.
         logger_->warn("submit_to_dexie: rejected by Dexie -- {}",
                       result.error_message);
-        co_return false;
+        co_return std::string{};
 
     } catch (const rpc::DexieRateLimitError& e) {
         // Rate-limit exhaustion after max retries.  Non-fatal: the offer
         // remains valid on-chain; aggregator visibility is best-effort.
         logger_->warn("submit_to_dexie: rate-limited -- {}", e.what());
-        co_return false;
+        co_return std::string{};
     } catch (const rpc::DexieClientError& e) {
         // Non-retryable 4xx error (bad request, invalid offer format, etc.).
         logger_->warn("submit_to_dexie: client error -- {}", e.what());
-        co_return false;
+        co_return std::string{};
     } catch (const rpc::DexieServerError& e) {
         // Server-side 5xx that persisted after retries.
         logger_->warn("submit_to_dexie: server error -- {}", e.what());
-        co_return false;
+        co_return std::string{};
     } catch (const rpc::DexieError& e) {
         // Catch-all for any other DexieClient transport error
         // (curl failure, JSON parse error, client not open, etc.).
         logger_->warn("submit_to_dexie: transport error -- {}", e.what());
-        co_return false;
+        co_return std::string{};
     } catch (const std::exception& e) {
         // Defensive catch for unexpected exceptions.  Should not fire in
         // normal operation, but prevents an unhandled exception from
         // propagating and crashing the offer lifecycle coroutine.
         logger_->error("submit_to_dexie: unexpected exception -- {}",
                        e.what());
-        co_return false;
+        co_return std::string{};
     }
 }
 
@@ -2680,7 +2976,7 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     const std::string trade_id = trade_record["trade_id"].get<std::string>();
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested asset → amount maps.
+    // Parse offered and requested asset â†’ amount maps.
     std::unordered_map<std::string, Mojo> offered;
     std::unordered_map<std::string, Mojo> requested;
 
@@ -2776,6 +3072,125 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
 }
 
 // ---------------------------------------------------------------------------
+// parse_settled_fill -- extract SETTLED size/price from a confirmed trade
+//                       record for Fill construction (see header contract).
+//
+// Dimensional analysis (write it out -- this codebase has hit 1e9-class
+// unit errors twice):
+//
+//   The wallet summary carries RAW MOJOS of each asset:
+//     XCH : 1 unit = 1e12 mojos  (base_mojos_per_unit / quote_mojos_per_unit)
+//     CATs: 1 unit = 1e3  mojos
+//
+//   Engine Fill convention (must match build_offer_dict / quote_mojos_for):
+//     size  [base mojos]   = base_units * base_mojos_per_unit
+//     price [pseudo-mojos] = quote_units_per_base_unit * kMojosPerXch
+//
+//   From settled raw mojos:
+//     base_units  = base_mojos  / base_denom
+//     quote_units = quote_mojos / quote_denom
+//     price = (quote_units / base_units) * kMojosPerXch
+//           = quote_mojos * base_denom * kMojosPerXch
+//             / (base_mojos * quote_denom)                          ... (*)
+//
+//   Roundtrip proof against the canonical helper (types.hpp):
+//     quote_mojos_for(size, price, base_denom, quote_denom)
+//       = base_mojos * (*) * quote_denom / (base_denom * kMojosPerXch)
+//       = quote_mojos                                               [exact]
+//
+//   Worked example, XCH/wUSDC.b ask (base XCH 1e12, quote CAT 1e3):
+//     settled: gave 1 XCH (1e12 base mojos), got 20 wUSDC.b (20'000
+//     quote mojos).  price = 20'000 * 1e12 * 1e12 / (1e12 * 1e3)
+//     = 20e12 = 20 quote-units-per-base * kMojosPerXch.  Correct.
+//     Omitting the base_denom/quote_denom ratio (1e9 for XCH/CAT
+//     pairs) would yield 20e3 -- the classic 1e9-class error.
+//
+// Computation in double: the numerator can reach ~1e12 * 1e12 * 1e12
+// = 1e36 which overflows int64 (double keeps ~15-16 significant digits,
+// ample for prices whose true precision is bounded by mojo granularity).
+// ---------------------------------------------------------------------------
+
+std::optional<SettledFill> OfferManager::parse_settled_fill(
+    const json&       trade_record,
+    Side              side,
+    const PairConfig& pair)
+{
+    if (!trade_record.contains("summary") ||
+        !trade_record["summary"].is_object()) {
+        return std::nullopt;
+    }
+    const auto& summary = trade_record["summary"];
+
+    // Parse offered / requested asset -> raw-mojo maps.  Tolerates the
+    // integer, unsigned, and string encodings observed across Chia wallet
+    // versions (same tolerance as try_parse_wallet_offer above).
+    std::unordered_map<std::string, Mojo> offered;    // we gave
+    std::unordered_map<std::string, Mojo> requested;  // we got
+
+    auto parse_side_map = [](const json& obj,
+                             std::unordered_map<std::string, Mojo>& out) {
+        if (!obj.is_object()) return;
+        for (auto& [asset_id, amount_val] : obj.items()) {
+            if (amount_val.is_number_integer()) {
+                out[asset_id] = amount_val.get<Mojo>();
+            } else if (amount_val.is_number_unsigned()) {
+                out[asset_id] = static_cast<Mojo>(
+                    amount_val.get<std::uint64_t>());
+            } else if (amount_val.is_string()) {
+                try {
+                    out[asset_id] = static_cast<Mojo>(
+                        std::stoll(amount_val.get<std::string>()));
+                } catch (...) {}
+            }
+        }
+    };
+
+    if (summary.contains("offered"))
+        parse_side_map(summary["offered"], offered);
+    if (summary.contains("requested"))
+        parse_side_map(summary["requested"], requested);
+
+    if (offered.empty() || requested.empty()) return std::nullopt;
+
+    // Locate the two legs on the sides our order implies.
+    //   Ask: we GAVE base, GOT quote.
+    //   Bid: we GAVE quote, GOT base.
+    const std::string& base_id  = pair.base_asset_id;
+    const std::string& quote_id = pair.quote_asset_id;
+
+    const auto& base_side  = (side == Side::Ask) ? offered   : requested;
+    const auto& quote_side = (side == Side::Ask) ? requested : offered;
+
+    const auto b_it = base_side.find(base_id);
+    const auto q_it = quote_side.find(quote_id);
+    if (b_it == base_side.end() || q_it == quote_side.end()) {
+        return std::nullopt;
+    }
+
+    const Mojo base_mojos  = b_it->second;
+    const Mojo quote_mojos = q_it->second;
+    if (base_mojos <= 0 || quote_mojos <= 0) return std::nullopt;
+    if (pair.base_mojos_per_unit <= 0 || pair.quote_mojos_per_unit <= 0) {
+        return std::nullopt;
+    }
+
+    // Formula (*) from the dimensional analysis above.
+    const double price_d =
+        static_cast<double>(quote_mojos)
+        * static_cast<double>(pair.base_mojos_per_unit)
+        * static_cast<double>(kMojosPerXch)
+        / (static_cast<double>(base_mojos)
+           * static_cast<double>(pair.quote_mojos_per_unit));
+
+    if (!std::isfinite(price_d) || price_d <= 0.0) return std::nullopt;
+
+    SettledFill sf;
+    sf.size  = base_mojos;
+    sf.price = static_cast<Mojo>(std::llround(price_d));
+    return sf;
+}
+
+// ---------------------------------------------------------------------------
 // emergency_cancel -- reduced/zero-fee cancel fallback
 // ---------------------------------------------------------------------------
 
@@ -2813,7 +3228,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
 
         if (xch_spendable > 0) {
-            // Try descending fee tiers: 2× dynamic fee, 1× dynamic fee,
+            // Try descending fee tiers: 2Ã— dynamic fee, 1Ã— dynamic fee,
             // half, quarter, down to 1 mojo.  If the wallet reports
             // insufficient funds at a given tier, halve and retry.
             // This lets us cancel even when spendable is far below the
@@ -2906,3 +3321,4 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
 }
 
 }  // namespace xop::execution
+

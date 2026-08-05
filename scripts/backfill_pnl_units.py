@@ -29,6 +29,22 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+# =============================================================================
+# RETIRED 2026-07-30 -- DO NOT RUN AGAIN.
+#
+# This script already executed on 2026-04-20 (backup:
+# data/xop_trader.db.pnlfix.20260420_182615.bak).  It assumes every row uses
+# the POST-v0.7.45 pseudo-price encoding; the April 3-5 2026 rows use the
+# legacy quote-mojo encoding, so a re-run would destroy their (correct)
+# realized P&L values.  For historical P&L use compute_actual_pnl.py.
+# =============================================================================
+if "--i-understand-the-legacy-rows-will-be-destroyed" not in sys.argv:
+    sys.exit(
+        "REFUSING TO RUN: backfill_pnl_units.py already ran on 2026-04-20 "
+        "and is not idempotent for pre-2026-04-14 legacy rows.  See the "
+        "header comment."
+    )
+
 K_MOJOS_PER_XCH = 1_000_000_000_000  # 1e12
 
 # Per-asset mojos-per-unit; matches ``parse_pairs()`` auto-detection in C++

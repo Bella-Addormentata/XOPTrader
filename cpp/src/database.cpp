@@ -28,6 +28,7 @@
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <stdexcept>
 #include <string>
 
@@ -157,6 +158,88 @@ CREATE TABLE IF NOT EXISTS sanity_failures (
     details                TEXT,
     created_at             TEXT    DEFAULT CURRENT_TIMESTAMP
 );
+)SQL";
+
+constexpr const char* kCreateInventoryState = R"SQL(
+CREATE TABLE IF NOT EXISTS inventory_state (
+    asset_id                TEXT    PRIMARY KEY,
+    total_quantity          INTEGER NOT NULL,
+    total_cost              REAL    NOT NULL,
+    basis_is_seed_sentinel  INTEGER NOT NULL DEFAULT 0,
+    updated_at              TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
+constexpr const char* kCreateLedgerEntries = R"SQL(
+CREATE TABLE IF NOT EXISTS ledger_entries (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    entry_time    TEXT    NOT NULL,
+    event_type    TEXT    NOT NULL,
+    event_id      TEXT    NOT NULL,
+    leg           TEXT    NOT NULL,
+    asset_id      TEXT    NOT NULL,
+    delta_mojos   INTEGER NOT NULL,
+    pair_name     TEXT,
+    block_height  INTEGER,
+    note          TEXT,
+    created_at    TEXT    DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(event_id, leg, asset_id)
+);
+)SQL";
+
+constexpr const char* kCreateArbEdgeLog = R"SQL(
+CREATE TABLE IF NOT EXISTS arb_edge_log (
+    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+    observed_at    TEXT    NOT NULL,
+    block_height   INTEGER NOT NULL,
+    direction      TEXT    NOT NULL,
+    ask_a_mojos    INTEGER NOT NULL,
+    bid_b_mojos    INTEGER NOT NULL,
+    cross_rate     REAL    NOT NULL,
+    gross_edge_bps REAL    NOT NULL,
+    net_edge_bps   REAL    NOT NULL,
+    ask_size_mojos INTEGER NOT NULL,
+    bid_size_mojos INTEGER NOT NULL,
+    state          TEXT    NOT NULL,
+    armed          INTEGER NOT NULL DEFAULT 0,
+    executed       INTEGER NOT NULL DEFAULT 0,
+    created_at     TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
+constexpr const char* kCreateTakerFills = R"SQL(
+CREATE TABLE IF NOT EXISTS taker_fills (
+    id                    INTEGER PRIMARY KEY AUTOINCREMENT,
+    taken_at              TEXT    NOT NULL,
+    block_height          INTEGER NOT NULL,
+    strategy              TEXT    NOT NULL,
+    trade_id              TEXT    UNIQUE,
+    counterparty_offer_id TEXT,
+    pair_name             TEXT    NOT NULL,
+    we_bought_base        INTEGER NOT NULL,
+    base_asset            TEXT    NOT NULL,
+    base_delta_mojos      INTEGER NOT NULL,
+    quote_asset           TEXT    NOT NULL,
+    quote_delta_mojos     INTEGER NOT NULL,
+    price_mojos           INTEGER NOT NULL,
+    fee_mojos             INTEGER NOT NULL,
+    created_at            TEXT    DEFAULT CURRENT_TIMESTAMP
+);
+)SQL";
+
+constexpr const char* kIndexTakerFillsTime = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_taker_fills_time
+    ON taker_fills(taken_at);
+)SQL";
+
+constexpr const char* kIndexArbEdgeDirTime = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_arb_edge_log_dir_time
+    ON arb_edge_log(direction, observed_at);
+)SQL";
+
+constexpr const char* kIndexLedgerAsset = R"SQL(
+CREATE INDEX IF NOT EXISTS idx_ledger_entries_asset
+    ON ledger_entries(asset_id);
 )SQL";
 
 // -- Index DDL ----------------------------------------------------------------
@@ -546,9 +629,18 @@ std::vector<DbOfferRecord> Database::query_pending_offers() const
         rec.price_mojos   = sqlite3_column_int64(stmt_query_pending_, 3);
         rec.size_mojos    = sqlite3_column_int64(stmt_query_pending_, 4);
         rec.tier          = static_cast<int>(sqlite3_column_int64(stmt_query_pending_, 5));
+        // Column 6 is `status` (always the literal 'pending' given the WHERE
+        // clause), 7 is created_block, 8 is fee_mojos.
+        //
+        // [FEE-INDEX-FIX 2026-07-30] These two used to read columns 6 and 7,
+        // i.e. created_block was parsed from the TEXT 'pending' (yielding 0)
+        // and fee_mojos was actually the BLOCK HEIGHT (~9e6).  Harmless while
+        // the restored fee was unused, but FEE-FIX now propagates a restored
+        // offer's fee into trade_log.fee_mojos, which would have booked
+        // block heights as fees for every fill that settled during downtime.
         rec.status        = "pending";
-        rec.created_block = static_cast<BlockHeight>(sqlite3_column_int64(stmt_query_pending_, 6));
-        rec.fee_mojos     = static_cast<std::uint64_t>(sqlite3_column_int64(stmt_query_pending_, 7));
+        rec.created_block = static_cast<BlockHeight>(sqlite3_column_int64(stmt_query_pending_, 7));
+        rec.fee_mojos     = static_cast<std::uint64_t>(sqlite3_column_int64(stmt_query_pending_, 8));
         results.push_back(std::move(rec));
     }
 
@@ -850,6 +942,457 @@ std::optional<DbSnapshot> Database::get_last_snapshot(
     return result;
 }
 
+std::vector<DbSnapshotMidTick> Database::get_recent_snapshot_mids(
+    const std::string& pair_name, std::uint32_t limit) const noexcept
+{
+    // [AS-WARM] Startup-only path: a one-off prepared statement keeps the
+    // hot-path statement cache untouched (same rationale as
+    // save_inventory_state).  Newest N rows are selected DESC then reversed
+    // so the caller receives ascending time order, which is what the
+    // estimator replay requires.
+    static constexpr const char* kQuery = R"SQL(
+        SELECT block_height, mid_price_mojos,
+               CAST(strftime('%s', created_at) AS INTEGER)
+        FROM snapshots
+        WHERE pair_name = ?1 AND mid_price_mojos > 0
+        ORDER BY block_height DESC
+        LIMIT ?2;
+    )SQL";
+
+    std::vector<DbSnapshotMidTick> rows;
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db_, kQuery, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK || stmt == nullptr) {
+            spdlog::error("[Database] get_recent_snapshot_mids prepare "
+                          "failed: {}", sqlite3_errmsg(db_));
+            return rows;
+        }
+
+        sqlite3_bind_text(stmt, 1, pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, static_cast<std::int64_t>(limit));
+
+        rows.reserve(limit);
+        while (sqlite3_step(stmt) == SQLITE_ROW) {
+            DbSnapshotMidTick t;
+            t.block_height = static_cast<BlockHeight>(
+                sqlite3_column_int64(stmt, 0));
+            t.mid_price_mojos = sqlite3_column_int64(stmt, 1);
+            t.unix_seconds    = sqlite3_column_int64(stmt, 2);
+            rows.push_back(t);
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        // Never let a warm-start query disrupt startup.
+        rows.clear();
+        return rows;
+    }
+
+    // DESC -> ascending block order.
+    std::reverse(rows.begin(), rows.end());
+    return rows;
+}
+
+// ===========================================================================
+// Inventory state (cost-basis persistence, PNL-BASIS-PERSIST 2026-07-30)
+// ===========================================================================
+
+void Database::save_inventory_state(
+    const std::vector<DbInventoryState>& records) noexcept
+{
+    // Fills arrive a handful of times per day; a one-off prepared statement
+    // per call is fine and keeps the hot-path statement cache untouched.
+    static constexpr const char* kUpsert = R"SQL(
+        INSERT INTO inventory_state
+            (asset_id, total_quantity, total_cost,
+             basis_is_seed_sentinel, updated_at)
+        VALUES (?1, ?2, ?3, ?4, CURRENT_TIMESTAMP)
+        ON CONFLICT(asset_id) DO UPDATE SET
+            total_quantity         = excluded.total_quantity,
+            total_cost             = excluded.total_cost,
+            basis_is_seed_sentinel = excluded.basis_is_seed_sentinel,
+            updated_at             = CURRENT_TIMESTAMP;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db_, kUpsert, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] save_inventory_state prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return;
+        }
+
+        // The snapshot must be all-or-nothing: restore_record() replays these
+        // rows verbatim at startup, so a half-written set (asset A's post-sell
+        // quantity beside asset B's stale one) restores an inconsistent cost
+        // basis that then contaminates realized P&L and the no-loss floor.
+        //
+        // A failed BEGIN leaves SQLite in autocommit, which would silently
+        // turn the loop into N independent commits and make the ROLLBACK
+        // below a no-op.  Bail out instead: keeping the previous consistent
+        // snapshot is strictly better than writing a torn one, and the next
+        // fill (or the next seed/reconcile) retries.
+        rc = sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] save_inventory_state: BEGIN IMMEDIATE "
+                          "failed ({}): {} -- skipping this snapshot, "
+                          "previous state retained",
+                          rc, sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return;
+        }
+
+        bool ok = true;
+        for (const auto& rec : records) {
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            sqlite3_bind_text(stmt, 1, rec.asset_id.c_str(), -1,
+                              SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 2, rec.total_quantity);
+            sqlite3_bind_double(stmt, 3, rec.total_cost);
+            sqlite3_bind_int(stmt, 4, rec.basis_is_seed_sentinel ? 1 : 0);
+
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                spdlog::error("[Database] save_inventory_state step failed "
+                              "for {}: {}",
+                              rec.asset_id.substr(0, 12), sqlite3_errmsg(db_));
+                ok = false;
+                break;
+            }
+        }
+
+        sqlite3_finalize(stmt);
+
+        char* end_err = nullptr;
+        rc = sqlite3_exec(db_, ok ? "COMMIT;" : "ROLLBACK;",
+                          nullptr, nullptr, &end_err);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] save_inventory_state: {} failed ({}): {}",
+                          ok ? "COMMIT" : "ROLLBACK", rc,
+                          end_err ? end_err : "unknown");
+            if (end_err) sqlite3_free(end_err);
+            // Never leave a transaction open on this shared connection --
+            // the next unrelated write would inherit it.
+            if (!sqlite3_get_autocommit(db_)) {
+                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            }
+        }
+    } catch (...) {
+        // noexcept contract: persistence must never disrupt trading.
+        if (!sqlite3_get_autocommit(db_)) {
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        spdlog::error("[Database] save_inventory_state: unexpected exception");
+    }
+}
+
+std::vector<DbInventoryState> Database::load_inventory_state() const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT asset_id, total_quantity, total_cost, basis_is_seed_sentinel
+        FROM inventory_state;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    std::vector<DbInventoryState> result;
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("[Database] load_inventory_state prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return result;
+    }
+
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        DbInventoryState rec;
+        const char* aid = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 0));
+        rec.asset_id               = aid ? aid : "";
+        rec.total_quantity         = sqlite3_column_int64(stmt, 1);
+        rec.total_cost             = sqlite3_column_double(stmt, 2);
+        rec.basis_is_seed_sentinel = (sqlite3_column_int(stmt, 3) != 0);
+        if (!rec.asset_id.empty()) {
+            result.push_back(std::move(rec));
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return result;
+}
+
+// ===========================================================================
+// Double-entry ledger (2026-07-30)
+// ===========================================================================
+
+std::optional<std::size_t> Database::append_ledger_entries(
+    const std::vector<DbLedgerEntry>& legs) noexcept
+{
+    if (legs.empty()) {
+        return std::size_t{0};
+    }
+
+    // INSERT OR IGNORE against UNIQUE(event_id, leg, asset_id): re-posting an
+    // already-recorded event is a no-op, which is what makes fill
+    // re-detection after a crash safe.
+    static constexpr const char* kInsert = R"SQL(
+        INSERT OR IGNORE INTO ledger_entries
+            (entry_time, event_type, event_id, leg, asset_id,
+             delta_mojos, pair_name, block_height, note)
+        VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::size_t inserted = 0;
+
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        int rc = sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] append_ledger_entries prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return std::nullopt;
+        }
+
+        // All-or-nothing: a half-posted event would permanently unbalance the
+        // ledger and make the reconciliation control fire forever.
+        rc = sqlite3_exec(db_, "BEGIN IMMEDIATE;", nullptr, nullptr, nullptr);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] append_ledger_entries: BEGIN failed "
+                          "({}): {}", rc, sqlite3_errmsg(db_));
+            sqlite3_finalize(stmt);
+            return std::nullopt;
+        }
+
+        bool ok = true;
+        for (const auto& leg : legs) {
+            sqlite3_reset(stmt);
+            sqlite3_clear_bindings(stmt);
+            sqlite3_bind_text(stmt, 1, leg.entry_time.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 2, leg.event_type.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 3, leg.event_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 4, leg.leg.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_text(stmt, 5, leg.asset_id.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 6, leg.delta_mojos);
+            sqlite3_bind_text(stmt, 7, leg.pair_name.c_str(), -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(stmt, 8, static_cast<std::int64_t>(leg.block_height));
+            sqlite3_bind_text(stmt, 9, leg.note.c_str(), -1, SQLITE_TRANSIENT);
+
+            if (sqlite3_step(stmt) != SQLITE_DONE) {
+                spdlog::error("[Database] append_ledger_entries step failed "
+                              "for event {} leg {}: {}",
+                              leg.event_id.substr(0, 16), leg.leg,
+                              sqlite3_errmsg(db_));
+                ok = false;
+                break;
+            }
+            inserted += static_cast<std::size_t>(sqlite3_changes(db_));
+        }
+
+        sqlite3_finalize(stmt);
+
+        char* err = nullptr;
+        rc = sqlite3_exec(db_, ok ? "COMMIT;" : "ROLLBACK;", nullptr, nullptr, &err);
+        if (rc != SQLITE_OK) {
+            spdlog::error("[Database] append_ledger_entries: {} failed: {}",
+                          ok ? "COMMIT" : "ROLLBACK", err ? err : "unknown");
+            if (err) sqlite3_free(err);
+            if (!sqlite3_get_autocommit(db_)) {
+                sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+            }
+            return std::nullopt;
+        }
+        if (!ok) {
+            return std::nullopt;
+        }
+    } catch (...) {
+        if (!sqlite3_get_autocommit(db_)) {
+            sqlite3_exec(db_, "ROLLBACK;", nullptr, nullptr, nullptr);
+        }
+        spdlog::error("[Database] append_ledger_entries: unexpected exception");
+        return std::nullopt;
+    }
+
+    return inserted;
+}
+
+BlockHeight Database::ledger_opening_block(const AssetId& asset_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT COALESCE(block_height, 0) FROM ledger_entries
+        WHERE asset_id = ?1 AND leg = 'opening' LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+    BlockHeight h = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        h = static_cast<BlockHeight>(sqlite3_column_int64(stmt, 0));
+    }
+    sqlite3_finalize(stmt);
+    return h;
+}
+
+std::unordered_map<AssetId, Mojo> Database::ledger_balances() const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT asset_id, SUM(delta_mojos)
+        FROM ledger_entries GROUP BY asset_id;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    std::unordered_map<AssetId, Mojo> out;
+
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        spdlog::error("[Database] ledger_balances prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return out;
+    }
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* a = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0));
+        if (a && a[0]) {
+            out[a] = sqlite3_column_int64(stmt, 1);
+        }
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
+bool Database::has_ledger_opening(const AssetId& asset_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT 1 FROM ledger_entries
+        WHERE asset_id = ?1 AND leg = 'opening' LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        return false;
+    }
+    sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+    const bool found = (sqlite3_step(stmt) == SQLITE_ROW);
+    sqlite3_finalize(stmt);
+    return found;
+}
+
+std::int64_t Database::ledger_entry_count() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, "SELECT COUNT(*) FROM ledger_entries;", -1,
+                           &stmt, nullptr) != SQLITE_OK) {
+        return 0;
+    }
+    std::int64_t n = 0;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        n = sqlite3_column_int64(stmt, 0);
+    }
+    sqlite3_finalize(stmt);
+    return n;
+}
+
+// ===========================================================================
+// Arbitrage edge history (2026-07-30)
+// ===========================================================================
+
+void Database::insert_arb_edge(const DbArbEdgeObservation& obs) noexcept
+{
+    static constexpr const char* kInsert = R"SQL(
+        INSERT INTO arb_edge_log
+            (observed_at, block_height, direction, ask_a_mojos, bid_b_mojos,
+             cross_rate, gross_edge_bps, net_edge_bps, ask_size_mojos,
+             bid_size_mojos, state, armed, executed)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::warn("[Database] insert_arb_edge prepare failed: {}",
+                         sqlite3_errmsg(db_));
+            return;
+        }
+        sqlite3_bind_text  (stmt, 1, obs.observed_at.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (stmt, 2, static_cast<std::int64_t>(obs.block_height));
+        sqlite3_bind_text  (stmt, 3, obs.direction.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64 (stmt, 4, obs.ask_a_mojos);
+        sqlite3_bind_int64 (stmt, 5, obs.bid_b_mojos);
+        sqlite3_bind_double(stmt, 6, obs.cross_rate);
+        sqlite3_bind_double(stmt, 7, obs.gross_edge_bps);
+        sqlite3_bind_double(stmt, 8, obs.net_edge_bps);
+        sqlite3_bind_int64 (stmt, 9, obs.ask_size_mojos);
+        sqlite3_bind_int64 (stmt, 10, obs.bid_size_mojos);
+        sqlite3_bind_text  (stmt, 11, obs.state.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int   (stmt, 12, obs.armed ? 1 : 0);
+        sqlite3_bind_int   (stmt, 13, obs.executed ? 1 : 0);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            spdlog::warn("[Database] insert_arb_edge step failed: {}",
+                         sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        spdlog::warn("[Database] insert_arb_edge: unexpected exception");
+    }
+}
+
+void Database::insert_taker_fill(const DbTakerFill& f) noexcept
+{
+    static constexpr const char* kInsert = R"SQL(
+        INSERT OR IGNORE INTO taker_fills
+            (taken_at, block_height, strategy, trade_id,
+             counterparty_offer_id, pair_name, we_bought_base,
+             base_asset, base_delta_mojos, quote_asset, quote_delta_mojos,
+             price_mojos, fee_mojos)
+        VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13);
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    try {
+        sqlite3_stmt* stmt = nullptr;
+        if (sqlite3_prepare_v2(db_, kInsert, -1, &stmt, nullptr) != SQLITE_OK) {
+            spdlog::error("[Database] insert_taker_fill prepare failed: {}",
+                          sqlite3_errmsg(db_));
+            return;
+        }
+        sqlite3_bind_text (stmt, 1, f.taken_at.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 2, static_cast<std::int64_t>(f.block_height));
+        sqlite3_bind_text (stmt, 3, f.strategy.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 4, f.trade_id.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 5, f.counterparty_offer_id.c_str(), -1,
+                           SQLITE_TRANSIENT);
+        sqlite3_bind_text (stmt, 6, f.pair_name.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int  (stmt, 7, f.we_bought_base ? 1 : 0);
+        sqlite3_bind_text (stmt, 8, f.base_asset.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 9, f.base_delta_mojos);
+        sqlite3_bind_text (stmt, 10, f.quote_asset.c_str(), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(stmt, 11, f.quote_delta_mojos);
+        sqlite3_bind_int64(stmt, 12, f.price_mojos);
+        sqlite3_bind_int64(stmt, 13, f.fee_mojos);
+
+        if (sqlite3_step(stmt) != SQLITE_DONE) {
+            spdlog::error("[Database] insert_taker_fill step failed: {}",
+                          sqlite3_errmsg(db_));
+        }
+        sqlite3_finalize(stmt);
+    } catch (...) {
+        spdlog::error("[Database] insert_taker_fill: unexpected exception");
+    }
+}
+
 // ===========================================================================
 // Diagnostics
 // ===========================================================================
@@ -993,7 +1536,19 @@ void Database::configure_pragmas()
         sqlite3_free(err_msg);
     }
 
-    spdlog::debug("[Database] Pragmas configured (WAL, NORMAL sync, 10MB cache)");
+    // Busy timeout: retry for up to 5 s instead of failing immediately with
+    // SQLITE_BUSY when another connection (PnLTracker, GUI, maintenance
+    // scripts) holds the write lock.  Without this, a transient lock during
+    // fill processing throws and the fill's audit-trail row is lost forever.
+    rc = sqlite3_exec(db_, "PRAGMA busy_timeout=5000;",
+                      nullptr, nullptr, &err_msg);
+    if (rc != SQLITE_OK && err_msg) {
+        spdlog::warn("[Database] PRAGMA busy_timeout failed: {}", err_msg);
+        sqlite3_free(err_msg);
+    }
+
+    spdlog::debug("[Database] Pragmas configured (WAL, NORMAL sync, 10MB cache, "
+                  "5s busy timeout)");
 }
 
 void Database::run_migrations()
@@ -1008,6 +1563,13 @@ void Database::run_migrations()
         kCreateSnapshots,
         kCreateStrategyQuotes,
         kCreateSanityFailures,
+        kCreateInventoryState,
+        kCreateLedgerEntries,
+        kIndexLedgerAsset,
+        kCreateArbEdgeLog,
+        kIndexArbEdgeDirTime,
+        kCreateTakerFills,
+        kIndexTakerFillsTime,
         kIndexTradeTimestamp,
         kIndexTradePair,
         kIndexOfferStatus,

@@ -157,6 +157,7 @@ class StatusBar(QStatusBar):
         inventory_ratio: float,
         block_height: int,
         xch_usd_rate: float = 0.0,
+        pnl_usd: float | None = None,
     ) -> None:
         """Push a new set of live metrics into the status bar.
 
@@ -173,17 +174,31 @@ class StatusBar(QStatusBar):
         xch_usd_rate : float
             Current XCH price in USD.  When > 0 a parenthesised USD
             equivalent is appended to the PnL readout.
+        pnl_usd : float | None
+            Engine-computed USD total from the ``xop_pnl_usd`` gauge
+            (per-pair quote-normalized, 2026-07-30).  When provided it is
+            displayed directly.  ``None`` means the engine predates the
+            gauge, in which case the legacy path below runs -- note it
+            wrongly treats the mixed quote-currency mojo total as XCH mojos
+            and understates P&L by ~1e9 for CAT-quoted pairs.
         """
         # PnL -- colour-coded
-        xch_value: float = mojos_to_xch_float(pnl_mojos)
-        colour = PROFIT_GREEN if pnl_mojos >= 0 else LOSS_RED
-        sign = "+" if pnl_mojos > 0 else ""
-        pnl_text = f"PnL: {sign}{xch_value:.4f} XCH"
-        if xch_usd_rate > 0:
-            usd_value = xch_value * xch_usd_rate
-            pnl_text = f"PnL: ${usd_value:+,.2f} ({sign}{xch_value:.4f} XCH)"
-        self._pnl_label.setText(pnl_text)
-        self._pnl_label.setStyleSheet(f"color: {colour}; font-weight: bold; font-size: 13px;")
+        if pnl_usd is not None:
+            colour = PROFIT_GREEN if pnl_usd >= 0 else LOSS_RED
+            self._pnl_label.setText(f"PnL: ${pnl_usd:+,.2f}")
+            self._pnl_label.setStyleSheet(
+                f"color: {colour}; font-weight: bold; font-size: 13px;")
+        else:
+            xch_value: float = mojos_to_xch_float(pnl_mojos)
+            colour = PROFIT_GREEN if pnl_mojos >= 0 else LOSS_RED
+            sign = "+" if pnl_mojos > 0 else ""
+            pnl_text = f"PnL: {sign}{xch_value:.4f} XCH"
+            if xch_usd_rate > 0:
+                usd_value = xch_value * xch_usd_rate
+                pnl_text = f"PnL: ${usd_value:+,.2f} ({sign}{xch_value:.4f} XCH)"
+            self._pnl_label.setText(pnl_text)
+            self._pnl_label.setStyleSheet(
+                f"color: {colour}; font-weight: bold; font-size: 13px;")
 
         # Spread
         self._spread_label.setText(f"Spread: {spread_bps:.0f} bps")

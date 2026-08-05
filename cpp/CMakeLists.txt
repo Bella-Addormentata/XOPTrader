@@ -30,7 +30,7 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
 endif()
 
 project(xop_trader
-    VERSION   0.7.48
+    VERSION   0.8.0
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )
@@ -160,11 +160,14 @@ add_library(xop_core STATIC
     src/execution/offer_manager.cpp
     src/execution/coin_manager.cpp
     src/execution/market_data.cpp
+    src/execution/orderbook_mid.cpp
+    src/execution/fair_value_solver.cpp
 
     # -- RPC / networking ------------------------------------------------------
     src/rpc/chia_rpc.cpp
     src/rpc/dexie_client.cpp
     src/rpc/coingecko_client.cpp
+    src/rpc/tibetswap_client.cpp
 
     # -- Data layer ------------------------------------------------------------
     src/data/volatility.cpp

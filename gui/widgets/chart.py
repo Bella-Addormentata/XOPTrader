@@ -11,6 +11,7 @@ ISO/IEC 5055      -- all public APIs carry type hints and docstrings.
 
 from __future__ import annotations
 
+import logging
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -19,7 +20,7 @@ from typing import Any, Sequence
 
 import pyqtgraph as pg
 from pyqtgraph import DateAxisItem
-from PySide6.QtCore import Qt, QTimer, Signal, Slot
+from PySide6.QtCore import QElapsedTimer, Qt, QTimer, Signal, Slot
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -52,11 +53,16 @@ LOSS_RED: str       = COLORS.LOSS_RED
 WARNING: str        = COLORS.WARNING_YELLOW
 INFO: str           = COLORS.INFO_BLUE
 
-# Apply global pyqtgraph defaults matching the dark theme
-pg.setConfigOptions(antialias=True, background=DARK_BG, foreground=TEXT_PRIMARY)
+# Apply global pyqtgraph defaults matching the dark theme.
+# antialias is OFF globally: the large history curves (up to 10k points
+# each) repaint every 5 s and antialiased stroking dominated the paint
+# cost.  The small scatter/fill-marker items re-enable it individually.
+pg.setConfigOptions(antialias=False, background=DARK_BG, foreground=TEXT_PRIMARY)
 
 # Maximum data points retained in each ring buffer before oldest are trimmed
 _MAX_DATA_POINTS: int = 10_000
+
+_log: logging.Logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -333,23 +339,29 @@ class ChartWidget(QWidget):
             name="Ask",
         )
 
-        # Fill markers (scatter overlay)
+        # Fill markers (scatter overlay).  Antialias is disabled globally
+        # for the heavy curves; keep it on for these small marker sets so
+        # the triangles stay crisp (symbols are cached, so this is cheap).
         self._buy_scatter = pg.ScatterPlotItem(
             symbol="t1", size=10,  # upward triangle
             brush=pg.mkBrush(PROFIT_GREEN),
             pen=pg.mkPen(None),
+            antialias=True,
         )
         self._sell_scatter = pg.ScatterPlotItem(
             symbol="t", size=10,   # downward triangle
             brush=pg.mkBrush(LOSS_RED),
             pen=pg.mkPen(None),
+            antialias=True,
         )
         self._price_plot.addItem(self._buy_scatter)
         self._price_plot.addItem(self._sell_scatter)
 
         # Plot 2 -- PnL (25 % height)
         self._pnl_plot: pg.PlotItem = self._graphics.addPlot(row=1, col=0)
-        self._pnl_plot.setLabel("right", "PnL")
+        # [PNL-USD-TOTALS 2026-08-01] main_window feeds the engine's USD
+        # gauges into this plot (raw cross-pair mojo sums are meaningless).
+        self._pnl_plot.setLabel("right", "PnL (USD)")
         self._pnl_plot.showGrid(x=True, y=True, alpha=0.15)
         self._pnl_plot.getAxis("right").setWidth(70)
         self._style_plot(self._pnl_plot)
@@ -403,6 +415,26 @@ class ChartWidget(QWidget):
             name="Inventory",
         )
 
+        # Cheap large-series rendering: peak-preserving auto downsampling
+        # plus clip-to-view on every line curve, so off-screen and
+        # sub-pixel points never reach QPainter.  Applied per
+        # PlotDataItem rather than via PlotItem.setDownsampling: the
+        # PlotItem-level call routes through its context-menu control
+        # signals and (in pyqtgraph 0.14) blindly calls setDownsampling
+        # on every 'plotData' item, which raises AttributeError on
+        # BarGraphItem and leaves the volume plot misconfigured.
+        for _curve in (
+            self._mid_curve,
+            self._bid_curve,
+            self._ask_curve,
+            self._pnl_total_curve,
+            self._pnl_zero_line,
+            self._pnl_realized_curve,
+            self._inv_curve,
+        ):
+            _curve.setDownsampling(auto=True, method="peak")
+            _curve.setClipToView(True)
+
         # Link X axes so all three scroll and zoom together
         self._pnl_plot.setXLink(self._price_plot)
         self._vol_plot.setXLink(self._price_plot)
@@ -421,25 +453,36 @@ class ChartWidget(QWidget):
 
     @Slot(object, object)
     def _on_x_range_changed(self, window, viewRange) -> None:
-        """Auto-scale Y axis to fit the max/min of the currently visible X range."""
+        """Auto-scale Y axis to fit the max/min of the currently visible X range.
+
+        Note: this handler previously referenced a non-existent
+        ``self._price_history`` attribute and raised AttributeError on
+        every range change (each repaint under auto-scroll), spamming
+        tracebacks from the repaint path.  It now reads the current
+        pair's price ring buffer.
+        """
         x_min, x_max = viewRange[0]
-        
-        if not self._price_history:
+
+        store = self._data.get(self._current_pair)
+        if not store:
             return
-            
-        visible_ticks = [t for t in self._price_history if x_min <= t.timestamp <= x_max]
+        price_ticks: deque[PriceTick] = store["price"]
+        if not price_ticks:
+            return
+
+        visible_ticks = [t for t in price_ticks if x_min <= t.timestamp <= x_max]
         if not visible_ticks:
             return
-            
+
         y_min = min(t.bid for t in visible_ticks)
         y_max = max(t.ask for t in visible_ticks)
-        
+
         # Add a 5% margin to the top and bottom
         padding = (y_max - y_min) * 0.05
         # If flat line
         if padding == 0:
             padding = y_max * 0.05 if y_max != 0 else 0.05
-            
+
         self._price_plot.setYRange(y_min - padding, y_max + padding, padding=0)
 
     # =====================================================================
@@ -581,7 +624,24 @@ class ChartWidget(QWidget):
         return self._data[pair]
 
     def _repaint(self) -> None:
-        """Redraw all curves from the current pair's data store."""
+        """Redraw all curves from the current pair's data store.
+
+        Paint cost is measured with a QElapsedTimer and logged at debug
+        level so before/after comparisons stay cheap to collect.
+        """
+        _elapsed = QElapsedTimer()
+        _elapsed.start()
+        try:
+            self._repaint_impl()
+        finally:
+            _log.debug(
+                "ChartWidget._repaint took %d ms (pair=%s)",
+                _elapsed.elapsed(),
+                self._current_pair,
+            )
+
+    def _repaint_impl(self) -> None:
+        """Push the current pair's ring buffers into the plot items."""
         store = self._data.get(self._current_pair)
         if store is None:
             return
@@ -802,6 +862,58 @@ class ChartWidget(QWidget):
         store["pnl"].append(
             PnLTick(block=block_height, timestamp=ts,
                     total_pnl=total_pnl, realized_pnl=realized_pnl)
+        )
+        self._dirty = True
+
+    def seed_pnl_history(
+        self,
+        pair_name: str,
+        points: Sequence[tuple[int, float, float, float]],
+    ) -> None:
+        """Backfill the PnL curve with persisted history for *pair_name*.
+
+        [PNL-DISPLAY 2026-08-02] The PnL series used to exist only in GUI
+        memory, so every GUI restart started the chart empty.  At startup
+        the main window rebuilds the curve from the database (snapshots +
+        trade_log) and injects it here.
+
+        Only points strictly older than the earliest live tick are
+        inserted, so the merged series stays chronologically ordered and
+        live samples are never overwritten.  The ring-buffer cap
+        (:data:`_MAX_DATA_POINTS`) still applies.
+
+        Parameters
+        ----------
+        pair_name:
+            Trading pair whose PnL store receives the history.
+        points:
+            Chronologically ordered ``(block, timestamp, total_pnl,
+            realized_pnl)`` tuples (PnL values in USD).
+        """
+        if not points:
+            return
+
+        store = self._ensure_pair_store(pair_name)
+        pnl_store: deque[PnLTick] = store["pnl"]
+        earliest_live = pnl_store[0].timestamp if pnl_store else float("inf")
+
+        seed_ticks = [
+            PnLTick(
+                block=int(block),
+                timestamp=float(ts),
+                total_pnl=float(total),
+                realized_pnl=float(realized),
+            )
+            for (block, ts, total, realized) in points
+            if float(ts) < earliest_live
+        ]
+        if not seed_ticks:
+            return
+
+        seed_ticks.sort(key=lambda tick: tick.timestamp)
+        merged = seed_ticks + list(pnl_store)
+        store["pnl"] = deque(
+            merged[-_MAX_DATA_POINTS:], maxlen=_MAX_DATA_POINTS,
         )
         self._dirty = True
 

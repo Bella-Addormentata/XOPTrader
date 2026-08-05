@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Final, Optional
 
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -284,6 +284,9 @@ class ReportsWidget(QWidget):
         self._wallet_balances: dict[str, dict[str, float]] = {}
         self._live_pnl: dict[str, Any] = {}
         self._last_reports: dict[str, Any] = {}
+        # True when a payload arrived while the widget was hidden and
+        # the tab re-render was deferred until the next showEvent.
+        self._render_pending: bool = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -754,28 +757,29 @@ class ReportsWidget(QWidget):
         wallet_balances: dict[str, dict[str, float]],
         pnl: dict[str, Any],
     ) -> None:
-        """Inject current market, wallet, and live P&L context."""
+        """Inject current market, wallet, and live P&L context.
+
+        Called on every 5 s bridge tick.  The context itself is always
+        cached; the expensive tab re-render is skipped while the widget
+        is hidden and replayed once on the next showEvent.
+        """
         self._xch_usd_rate = max(0.0, float(xch_usd_rate or 0.0))
         self._market_data = dict(market_data or {})
         self._wallet_balances = dict(wallet_balances or {})
         self._live_pnl = dict(pnl or {})
 
-        if self._last_reports:
-            self._update_performance(self._last_reports.get("periods", {}))
-            self._update_pairs(self._last_reports.get("per_pair", []))
-            self._update_capgains(self._last_reports.get("capital_gains", {}))
-            self._update_top_trades(
-                self._last_reports.get("top_trades", []),
-                self._last_reports.get("worst_trades", []),
-            )
-            self._update_daily(self._last_reports.get("daily_pnl", []))
-            self._update_forecast(self._last_reports.get("forecast", {}))
+        if not self.isVisible():
+            self._render_pending = True
+            return
 
-        self._update_portfolio_summary()
+        self._render_all()
 
     @Slot(dict)
     def update_reports(self, data: dict[str, Any]) -> None:
         """Update all report tabs with fresh data.
+
+        The payload is always cached; when the widget is hidden the
+        rendering pass is deferred until the next showEvent.
 
         Parameters
         ----------
@@ -790,19 +794,39 @@ class ReportsWidget(QWidget):
 
         self._last_reports = dict(data)
 
-        self._update_performance(data.get("periods", {}))
-        self._update_pairs(data.get("per_pair", []))
-        self._update_capgains(data.get("capital_gains", {}))
-        self._update_offers(data.get("offer_stats", {}))
-        self._update_top_trades(
-            data.get("top_trades", []),
-            data.get("worst_trades", []),
-        )
-        self._update_daily(data.get("daily_pnl", []))
-        self._update_forecast(data.get("forecast", {}))
+        if not self.isVisible():
+            self._render_pending = True
+            return
+
+        self._render_all()
+        self._status_label.setText("Reports updated")
+
+    def _render_all(self) -> None:
+        """Re-render every tab from the cached report + live context."""
+        self._render_pending = False
+
+        if self._last_reports:
+            data = self._last_reports
+            self._update_performance(data.get("periods", {}))
+            self._update_pairs(data.get("per_pair", []))
+            self._update_capgains(data.get("capital_gains", {}))
+            self._update_offers(data.get("offer_stats", {}))
+            self._update_top_trades(
+                data.get("top_trades", []),
+                data.get("worst_trades", []),
+            )
+            self._update_daily(data.get("daily_pnl", []))
+            self._update_forecast(data.get("forecast", {}))
+
         self._update_portfolio_summary()
 
-        self._status_label.setText("Reports updated")
+    def showEvent(self, event: QShowEvent) -> None:
+        """Replay any render deferred while the widget was hidden."""
+        super().showEvent(event)
+        if self._render_pending:
+            self._render_all()
+            if self._last_reports:
+                self._status_label.setText("Reports updated")
 
     # -----------------------------------------------------------------------
     # Internal update methods
@@ -1249,10 +1273,17 @@ class ReportsWidget(QWidget):
         confirmed_value, spendable_value, priced_wallets, total_wallets = (
             self._portfolio_values_usdc()
         )
-        live_total = int(self._live_pnl.get("total", 0) or 0)
-        live_realized = int(self._live_pnl.get("realized", 0) or 0)
-        live_unrealized = int(self._live_pnl.get("unrealized", 0) or 0)
-        live_inventory = int(self._live_pnl.get("inventory", 0) or 0)
+        # [PNL-UNITS 2026-07-30] Use the engine's per-pair quote-normalized
+        # USD gauges.  The xop_pnl_mojos components sum different quote
+        # currencies plus an XCH-mojo fee leg, so no divisor applied here
+        # would be correct (the old _money_text_from_mojos(/1e12 * rate)
+        # rendered a permanent $0.00).  None => engine predates the gauges.
+        total_usd = self._live_pnl.get("usd")
+        realized_usd = self._live_pnl.get("usd_realized")
+        unrealized_usd = self._live_pnl.get("usd_unrealized")
+
+        def _usd_text(value: float | None) -> str:
+            return "—" if value is None else _format_usdc(value, signed=True)
 
         self._set_metric_value(
             self._portfolio_labels["confirmed_value"],
@@ -1266,23 +1297,25 @@ class ReportsWidget(QWidget):
         )
         self._set_metric_value(
             self._portfolio_labels["total_pnl"],
-            _money_text_from_mojos(live_total, self._xch_usd_rate, signed=True),
-            live_total,
+            _usd_text(total_usd),
+            total_usd or 0.0,
         )
+        # Inventory P&L is the mark-to-market on open positions, i.e. the
+        # same quantity the engine exports as "unrealized".
         self._set_metric_value(
             self._portfolio_labels["inventory_pnl"],
-            _money_text_from_mojos(live_inventory, self._xch_usd_rate, signed=True),
-            live_inventory,
+            _usd_text(unrealized_usd),
+            unrealized_usd or 0.0,
         )
         self._set_metric_value(
             self._portfolio_labels["realized_pnl"],
-            _money_text_from_mojos(live_realized, self._xch_usd_rate, signed=True),
-            live_realized,
+            _usd_text(realized_usd),
+            realized_usd or 0.0,
         )
         self._set_metric_value(
             self._portfolio_labels["unrealized_pnl"],
-            _money_text_from_mojos(live_unrealized, self._xch_usd_rate, signed=True),
-            live_unrealized,
+            _usd_text(unrealized_usd),
+            unrealized_usd or 0.0,
         )
 
         if total_wallets > 0:

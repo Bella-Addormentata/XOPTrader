@@ -741,6 +741,96 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
     // else: default from StrategyConfig{} is used (250.0 bps).
 
+    // Optional: fair-value guard and triangulation weights.  Every key below
+    // is absent from the shipped config.yaml on purpose -- the guard must
+    // protect an unconfigured deployment, so the StrategyConfig{} defaults are
+    // the operative values unless an operator deliberately overrides them.
+    auto opt_non_negative = [&](const char* key, double& dest) {
+        if (!node[key] || !node[key].IsDefined() || node[key].IsNull()) return;
+        const double v = node[key].as<double>();
+        if (v < 0.0) {
+            throw ConfigError(sec + "." + key + " must be >= 0; got "
+                              + std::to_string(v));
+        }
+        dest = v;
+    };
+
+    opt_non_negative("max_fair_value_deviation_bps",
+                     cfg.max_fair_value_deviation_bps);
+    opt_non_negative("blind_quote_widen_pct", cfg.blind_quote_widen_pct);
+    opt_non_negative("fair_value_clamp_tier_step_bps",
+                     cfg.fair_value_clamp_tier_step_bps);
+    opt_non_negative("quote_width_sigma_mult", cfg.quote_width_sigma_mult);
+    if (node["quote_center_blend_enabled"]
+        && node["quote_center_blend_enabled"].IsDefined()
+        && !node["quote_center_blend_enabled"].IsNull()) {
+        cfg.quote_center_blend_enabled =
+            node["quote_center_blend_enabled"].as<bool>();
+    }
+    // [AS-RES] Avellaneda-Stoikov reservation offset; defaults operative
+    // when absent (see config.hpp for the calibration numbers).
+    if (node["as_reservation_enabled"]
+        && node["as_reservation_enabled"].IsDefined()
+        && !node["as_reservation_enabled"].IsNull()) {
+        cfg.as_reservation_enabled =
+            node["as_reservation_enabled"].as<bool>();
+    }
+    opt_non_negative("as_reservation_gamma", cfg.as_reservation_gamma);
+    opt_non_negative("as_reservation_max_offset_bps",
+                     cfg.as_reservation_max_offset_bps);
+    opt_non_negative("fair_value_feed_sigma_bps",
+                     cfg.fair_value_feed_sigma_bps);
+    opt_non_negative("fair_value_amm_sigma_bps", cfg.fair_value_amm_sigma_bps);
+    opt_non_negative("fair_value_amm_depth_k_bps",
+                     cfg.fair_value_amm_depth_k_bps);
+    opt_non_negative("fair_value_amm_max_age_sec",
+                     cfg.fair_value_amm_max_age_sec);
+    opt_non_negative("fair_value_min_book_sigma_bps",
+                     cfg.fair_value_min_book_sigma_bps);
+    opt_non_negative("fair_value_stale_sigma_bps_per_print",
+                     cfg.fair_value_stale_sigma_bps_per_print);
+    opt_non_negative("fair_value_depth_ref_bps",
+                     cfg.fair_value_depth_ref_bps);
+    opt_non_negative("fair_value_max_sigma_bps",
+                     cfg.fair_value_max_sigma_bps);
+    opt_non_negative("fair_value_tight_sigma_bps",
+                     cfg.fair_value_tight_sigma_bps);
+    opt_non_negative("fair_value_sigma_band_mult",
+                     cfg.fair_value_sigma_band_mult);
+    opt_non_negative("fair_value_residual_widen_ratio",
+                     cfg.fair_value_residual_widen_ratio);
+    opt_non_negative("fair_value_residual_widen_floor_bps",
+                     cfg.fair_value_residual_widen_floor_bps);
+    opt_non_negative("microprice_narrow_bps", cfg.microprice_narrow_bps);
+    opt_non_negative("microprice_wide_bps",   cfg.microprice_wide_bps);
+    opt_non_negative("published_mid_band_floor_bps",
+                     cfg.published_mid_band_floor_bps);
+    opt_non_negative("published_mid_band_spread_frac",
+                     cfg.published_mid_band_spread_frac);
+
+    // The blend interpolates ACROSS [narrow, wide]; an inverted or empty band
+    // has no interior and would silently collapse into a step function, which
+    // is the discontinuous behaviour this schedule exists to replace.  Refuse
+    // the combination rather than quietly degrade.
+    if (cfg.microprice_wide_bps <= cfg.microprice_narrow_bps) {
+        throw ConfigError(sec
+                          + ".microprice_wide_bps ("
+                          + std::to_string(cfg.microprice_wide_bps)
+                          + ") must be > microprice_narrow_bps ("
+                          + std::to_string(cfg.microprice_narrow_bps) + ")");
+    }
+
+    // A tight threshold above the usable ceiling would silently promote every
+    // barely-usable value to the highest confidence tier -- the opposite of
+    // what both knobs are for.  Refuse the combination rather than guess.
+    if (cfg.fair_value_tight_sigma_bps > cfg.fair_value_max_sigma_bps) {
+        throw ConfigError(sec
+                          + ".fair_value_tight_sigma_bps ("
+                          + std::to_string(cfg.fair_value_tight_sigma_bps)
+                          + ") must be <= fair_value_max_sigma_bps ("
+                          + std::to_string(cfg.fair_value_max_sigma_bps) + ")");
+    }
+
     // Optional: high-volatility regime multiplier.  Default 1.80.
     if (node["high_vol_multiplier"] && node["high_vol_multiplier"].IsDefined()
         && !node["high_vol_multiplier"].IsNull()) {
@@ -1147,6 +1237,32 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    // -- Untrustworthy-reference quoting gate (optional, default in StrategyConfig) --
+    if (node["dex_print_stale_heartbeats"] && node["dex_print_stale_heartbeats"].IsDefined()
+        && !node["dex_print_stale_heartbeats"].IsNull()) {
+        cfg.dex_print_stale_heartbeats = node["dex_print_stale_heartbeats"].as<uint32_t>();
+    }
+
+    // -- Wallet-RPC polling throttles ([WALLET-LOAD 2026-08-04]) -------------
+    if (node["detect_fills_min_age_blocks"]
+        && node["detect_fills_min_age_blocks"].IsDefined()
+        && !node["detect_fills_min_age_blocks"].IsNull()) {
+        cfg.detect_fills_min_age_blocks =
+            node["detect_fills_min_age_blocks"].as<uint32_t>();
+    }
+    if (node["detect_fills_backoff_polls"]
+        && node["detect_fills_backoff_polls"].IsDefined()
+        && !node["detect_fills_backoff_polls"].IsNull()) {
+        cfg.detect_fills_backoff_polls =
+            node["detect_fills_backoff_polls"].as<uint32_t>();
+    }
+    if (node["detect_fills_backoff_interval"]
+        && node["detect_fills_backoff_interval"].IsDefined()
+        && !node["detect_fills_backoff_interval"].IsNull()) {
+        cfg.detect_fills_backoff_interval =
+            node["detect_fills_backoff_interval"].as<uint32_t>();
+    }
+
     // -- Adverse-selection-aware tier sizing (optional, defaults in StrategyConfig) --
     if (node["adverse_selection_sizing"] && node["adverse_selection_sizing"].IsDefined()
         && !node["adverse_selection_sizing"].IsNull()) {
@@ -1421,14 +1537,42 @@ RiskConfig parse_risk(const YAML::Node& root)
 
     // -- Circuit breaker parameters (all optional with safe defaults) ---------
 
-    // max_drawdown_pct: HWM drawdown threshold in (0, 1].  Default 0.10 (10%).
+    // [DRAWDOWN-EQUITY 2026-08-04] The drawdown key was RENAMED when its
+    // semantics changed from "fraction of the P&L high-water mark" to
+    // "fraction of portfolio equity".  A stale P&L-calibrated value (the
+    // live 0.05 fired a false trip on a ~5% XCH retrace) must not silently
+    // apply to equity semantics, so the old key is a hard error with a
+    // migration message rather than being ignored.
     if (node["max_drawdown_pct"] && node["max_drawdown_pct"].IsDefined()
             && !node["max_drawdown_pct"].IsNull()) {
-        cfg.max_drawdown_pct = node["max_drawdown_pct"].as<double>();
-        if (!(cfg.max_drawdown_pct > 0.0 && cfg.max_drawdown_pct <= 1.0)) {
-            throw ConfigError(sec + ".max_drawdown_pct must be in (0, 1]; got "
-                              + std::to_string(cfg.max_drawdown_pct));
+        throw ConfigError(sec + ".max_drawdown_pct has been renamed to "
+                          + sec + ".max_drawdown_frac and is now measured "
+                          "against PORTFOLIO EQUITY, not the P&L high-water "
+                          "mark. Remove the old key; the recalibrated "
+                          "default is 0.10 (10% of equity).");
+    }
+
+    // max_drawdown_frac: equity drawdown threshold in (0, 1].
+    // Default 0.10 (10% of portfolio equity).
+    if (node["max_drawdown_frac"] && node["max_drawdown_frac"].IsDefined()
+            && !node["max_drawdown_frac"].IsNull()) {
+        cfg.max_drawdown_frac = node["max_drawdown_frac"].as<double>();
+        if (!(cfg.max_drawdown_frac > 0.0 && cfg.max_drawdown_frac <= 1.0)) {
+            throw ConfigError(sec + ".max_drawdown_frac must be in (0, 1]; got "
+                              + std::to_string(cfg.max_drawdown_frac));
         }
+    }
+
+    // breaker_realert_minutes: minimum minutes between repeat CRITICAL
+    // breaker alerts while the engine stays paused on the same condition.
+    if (node["breaker_realert_minutes"] && node["breaker_realert_minutes"].IsDefined()
+            && !node["breaker_realert_minutes"].IsNull()) {
+        int64_t v = node["breaker_realert_minutes"].as<int64_t>();
+        if (v < 1 || v > 1440) {
+            throw ConfigError(sec + ".breaker_realert_minutes must be in "
+                              "[1, 1440]; got " + std::to_string(v));
+        }
+        cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
     }
 
     // drawdown_grace_blocks: blocks to skip drawdown check at startup [0, UINT32_MAX].
@@ -1759,6 +1903,20 @@ ArbitrageSettings parse_arbitrage(const YAML::Node& root)
     read_bool("cross_stable_arb_enabled",       cfg.cross_stable_arb_enabled);
     read_dbl ("cross_stable_min_edge_bps",      cfg.cross_stable_min_edge_bps);
     read_dbl ("cross_stable_max_take_xch",      cfg.cross_stable_max_take_xch, 0.001);
+    read_dbl ("cross_stable_arm_edge_bps",      cfg.cross_stable_arm_edge_bps);
+    read_dbl ("cross_stable_disarm_edge_bps",   cfg.cross_stable_disarm_edge_bps);
+    read_u32 ("cross_stable_arm_observations",  cfg.cross_stable_arm_observations);
+    read_bool("cross_stable_execute_when_armed",
+              cfg.cross_stable_execute_when_armed);
+
+    if (cfg.cross_stable_disarm_edge_bps >= cfg.cross_stable_arm_edge_bps) {
+        throw ConfigError(sec + ".cross_stable_disarm_edge_bps must be < "
+                                ".cross_stable_arm_edge_bps, or the state "
+                                "machine has no hysteresis and will flap");
+    }
+    if (cfg.cross_stable_arm_observations == 0) {
+        throw ConfigError(sec + ".cross_stable_arm_observations must be >= 1");
+    }
 
     // Peg-crossing offer taker
     read_bool("peg_arb_enabled",                cfg.peg_arb_enabled);
@@ -1886,6 +2044,70 @@ CoinGeckoConfig parse_coingecko(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_tibetswap -- optional `tibetswap:` section.
+//
+// Every field defaults to a working value, so an absent section still yields
+// a live client against the public TibetSwap v2 API.
+// ---------------------------------------------------------------------------
+TibetSwapConfig parse_tibetswap(const YAML::Node& root)
+{
+    const std::string sec = "tibetswap";
+    TibetSwapConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_str = [&](const char* key, std::string& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::string>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+
+    read_bool("enabled",                 cfg.enabled);
+    read_str ("base_url",                cfg.base_url);
+    read_u32 ("polling_interval_ms",     cfg.polling_interval_ms);
+    read_u32 ("request_timeout_ms",      cfg.request_timeout_ms);
+    read_u32 ("connect_timeout_ms",      cfg.connect_timeout_ms);
+    read_u32 ("max_retries",             cfg.max_retries);
+    read_u32 ("retry_base_delay_ms",     cfg.retry_base_delay_ms);
+    read_u32 ("rate_limit_max_requests", cfg.rate_limit_max_requests);
+    read_u32 ("rate_limit_window_ms",    cfg.rate_limit_window_ms);
+    read_u32 ("curl_thread_pool_size",   cfg.curl_thread_pool_size);
+    read_u32 ("page_limit",              cfg.page_limit);
+    read_u32 ("max_pools",               cfg.max_pools);
+    read_u32 ("directory_refresh_ms",    cfg.directory_refresh_ms);
+    read_str ("user_agent",              cfg.user_agent);
+
+    if (cfg.base_url.empty()) {
+        throw ConfigError(sec + ".base_url must not be empty");
+    }
+    // Don't hammer a free public API: one poll per block is already generous.
+    if (cfg.polling_interval_ms < 5'000) {
+        throw ConfigError(sec + ".polling_interval_ms must be >= 5000");
+    }
+    if (cfg.page_limit == 0) {
+        throw ConfigError(sec + ".page_limit must be >= 1");
+    }
+    if (cfg.max_pools == 0) {
+        throw ConfigError(sec + ".max_pools must be >= 1");
+    }
+    if (cfg.rate_limit_max_requests == 0) {
+        throw ConfigError(sec + ".rate_limit_max_requests must be >= 1");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // parse_fees -- optional `fees:` section.
 // ---------------------------------------------------------------------------
 FeeConfig parse_fees(const YAML::Node& root)
@@ -1995,6 +2217,103 @@ InventoryAgingConfig parse_inventory_aging(const YAML::Node& root)
 }
 
 // ---------------------------------------------------------------------------
+// parse_accounting -- optional `accounting:` section (2026-07-30).
+// Double-entry ledger and its wallet reconciliation control.
+// ---------------------------------------------------------------------------
+AccountingConfig parse_accounting(const YAML::Node& root)
+{
+    const std::string sec = "accounting";
+    AccountingConfig cfg;  // All fields have sensible defaults.
+
+    if (!root[sec] || !root[sec].IsMap()) {
+        return cfg;
+    }
+    const YAML::Node& node = root[sec];
+
+    auto read_bool = [&](const char* key, bool& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<bool>();
+    };
+    auto read_u32 = [&](const char* key, uint32_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<uint32_t>();
+    };
+    auto read_dbl = [&](const char* key, double& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<double>();
+    };
+    auto read_i64 = [&](const char* key, std::int64_t& out) {
+        if (node[key] && node[key].IsDefined() && !node[key].IsNull())
+            out = node[key].as<std::int64_t>();
+    };
+
+    read_bool("ledger_enabled",         cfg.ledger_enabled);
+    read_dbl ("alert_pct",              cfg.alert_pct);
+    read_u32 ("alert_observations",     cfg.alert_observations);
+    read_dbl ("pause_pct",              cfg.pause_pct);
+    read_u32 ("pause_observations",     cfg.pause_observations);
+    read_bool("pause_enabled",          cfg.pause_enabled);
+    read_i64 ("floor_xch_mojos",        cfg.floor_xch_mojos);
+    read_i64 ("floor_cat_mojos",        cfg.floor_cat_mojos);
+    read_i64 ("fee_slack_mojos",        cfg.fee_slack_mojos);
+    read_u32 ("max_balance_age_blocks", cfg.max_balance_age_blocks);
+    read_u32 ("observation_window",     cfg.observation_window);
+    read_bool("auto_adjust_enabled",    cfg.auto_adjust_enabled);
+    // [REWARD-INCOME 2026-08-01] Dexie reward ingestion; defaults are the
+    // operative values (see config.hpp for the measured calibration).
+    read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
+    if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
+        && !node["reward_asset_id"].IsNull()) {
+        cfg.reward_asset_id = node["reward_asset_id"].as<std::string>();
+    }
+    read_i64 ("reward_max_mojos_per_coin", cfg.reward_max_mojos_per_coin);
+    read_bool("peg_monitor_enabled",    cfg.peg_monitor_enabled);
+    read_dbl ("peg_external_warn_pct",  cfg.peg_external_warn_pct);
+    read_dbl ("peg_implied_warn_pct",   cfg.peg_implied_warn_pct);
+    read_u32 ("peg_observations",       cfg.peg_observations);
+
+    if (cfg.alert_pct < 0.0 || cfg.alert_pct > 1.0) {
+        throw ConfigError(sec + ".alert_pct must be in [0,1]; got "
+                          + std::to_string(cfg.alert_pct));
+    }
+    if (cfg.pause_pct < 0.0 || cfg.pause_pct > 1.0) {
+        throw ConfigError(sec + ".pause_pct must be in [0,1]; got "
+                          + std::to_string(cfg.pause_pct));
+    }
+    if (cfg.pause_pct < cfg.alert_pct) {
+        throw ConfigError(sec + ".pause_pct must be >= alert_pct");
+    }
+    if (cfg.alert_observations == 0 || cfg.pause_observations == 0) {
+        throw ConfigError(sec + ".alert_observations and .pause_observations "
+                                "must be >= 1");
+    }
+    if (cfg.observation_window == 0) {
+        throw ConfigError(sec + ".observation_window must be >= 1");
+    }
+    if (cfg.peg_external_warn_pct <= 0.0 || cfg.peg_implied_warn_pct <= 0.0) {
+        throw ConfigError(sec + " peg warn thresholds must be > 0");
+    }
+    if (cfg.peg_observations == 0) {
+        throw ConfigError(sec + ".peg_observations must be >= 1");
+    }
+    if (cfg.pause_observations > cfg.observation_window
+        || cfg.alert_observations > cfg.observation_window) {
+        throw ConfigError(sec + ".observation_window must be >= both "
+                                "alert_observations and pause_observations, "
+                                "or escalation can never trigger");
+    }
+    if (cfg.floor_xch_mojos < 0 || cfg.floor_cat_mojos < 0
+        || cfg.fee_slack_mojos < 0) {
+        throw ConfigError(sec + " mojo floors must be >= 0");
+    }
+    if (cfg.reward_max_mojos_per_coin < 0) {
+        throw ConfigError(sec + ".reward_max_mojos_per_coin must be >= 0");
+    }
+
+    return cfg;
+}
+
+// ---------------------------------------------------------------------------
 // Redacted summary printer.  Emits every operationally useful field while
 // suppressing all classified secrets (SSL paths, fingerprint, tokens).
 // ---------------------------------------------------------------------------
@@ -2066,7 +2385,10 @@ void log_config_summary(const AppConfig& cfg)
     }
     out << "]\n"
         << "  max_hs_cap = " << cfg.strategy.max_half_spread_bps << " bps\n"
-        << "  sigma_floor = " << cfg.strategy.sigma_floor << "\n";
+        << "  sigma_floor = " << cfg.strategy.sigma_floor << "\n"
+        << "  max_fv_dev = " << cfg.strategy.max_fair_value_deviation_bps
+        << " bps, blind_widen = " << cfg.strategy.blind_quote_widen_pct
+        << "%\n";
 
     // Risk -- all fields are tuning parameters.
     out << "[risk]\n"
@@ -2075,7 +2397,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  cat_cap        = " << cfg.risk.single_cat_cap_pct << "\n"
         << "  kelly          = " << cfg.risk.kelly_fraction << "\n"
         << "  max_pair       = " << cfg.risk.max_capital_per_pair_pct << "\n"
-        << "  max_drawdown   = " << cfg.risk.max_drawdown_pct * 100.0 << "%\n"
+        << "  max_drawdown   = " << cfg.risk.max_drawdown_frac * 100.0
+        << "% of equity\n"
         << "  loss_window    = " << cfg.risk.loss_window_blocks << " blocks\n"
         << "  max_window_loss = " << cfg.risk.max_window_loss_bps << " bps"
         << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n"
@@ -2152,6 +2475,12 @@ void log_config_summary(const AppConfig& cfg)
         << "  cross_stable_arb     = " << (cfg.arbitrage.cross_stable_arb_enabled ? "true" : "false") << "\n"
         << "  cross_stable_edge_bps= " << cfg.arbitrage.cross_stable_min_edge_bps << "\n"
         << "  cross_stable_max_xch = " << cfg.arbitrage.cross_stable_max_take_xch << "\n"
+        << "  cross_stable_arm     = " << cfg.arbitrage.cross_stable_arm_edge_bps
+        << " bps x " << cfg.arbitrage.cross_stable_arm_observations
+        << " obs, disarm " << cfg.arbitrage.cross_stable_disarm_edge_bps << " bps\n"
+        << "  cross_stable_execute = "
+        << (cfg.arbitrage.cross_stable_execute_when_armed
+                ? "ARMED->TRADE" : "monitor only") << "\n"
         << "  peg_arb              = " << (cfg.arbitrage.peg_arb_enabled ? "true" : "false") << "\n"
         << "  peg_arb_min_edge_bps = " << cfg.arbitrage.peg_arb_min_edge_bps << "\n"
         << "  peg_arb_max_units    = " << cfg.arbitrage.peg_arb_max_take_units << "\n"
@@ -2181,6 +2510,14 @@ void log_config_summary(const AppConfig& cfg)
         << "  api_key    = "
         << (cfg.coingecko.api_key.empty() ? "none (free tier)" : "<configured>")
         << "\n";
+
+    // TibetSwap AMM reference -- unauthenticated public API, nothing secret.
+    out << "[tibetswap]\n"
+        << "  enabled    = " << (cfg.tibetswap.enabled ? "true" : "false") << "\n"
+        << "  base_url   = " << cfg.tibetswap.base_url << "\n"
+        << "  poll_ms    = " << cfg.tibetswap.polling_interval_ms << "\n"
+        << "  timeout_ms = " << cfg.tibetswap.request_timeout_ms << "\n"
+        << "  dir_ttl_ms = " << cfg.tibetswap.directory_refresh_ms << "\n";
 
     // Fees -- operational settings.
     out << "[fees]\n"
@@ -2228,6 +2565,15 @@ void log_config_summary(const AppConfig& cfg)
         << "  start      = " << cfg.inventory_aging.aging_start_blocks << " blocks\n"
         << "  max_relax  = " << cfg.inventory_aging.max_loss_relax_bps << " bps\n"
         << "  rate       = " << cfg.inventory_aging.relax_rate_bps_per_block << " bps/block\n";
+
+    // Accounting -- double-entry ledger and reconciliation control.
+    out << "[accounting]\n"
+        << "  ledger     = " << (cfg.accounting.ledger_enabled ? "ON" : "off") << "\n"
+        << "  alert      = " << (cfg.accounting.alert_pct * 100.0) << "% x "
+        << cfg.accounting.alert_observations << " obs\n"
+        << "  pause      = " << (cfg.accounting.pause_pct * 100.0) << "% x "
+        << cfg.accounting.pause_observations << " obs "
+        << (cfg.accounting.pause_enabled ? "(ENABLED)" : "(alert-only)") << "\n";
 
     // Market allocator -- dynamic capital allocation.
     out << "[market_allocator]\n"
@@ -2740,8 +3086,10 @@ AppConfig load_config(const std::string& path,
     cfg.depeg      = parse_depeg(root);
     cfg.arbitrage  = parse_arbitrage(root);
     cfg.coingecko  = parse_coingecko(root);
+    cfg.tibetswap  = parse_tibetswap(root);
     cfg.fees       = parse_fees(root);
     cfg.inventory_aging = parse_inventory_aging(root);
+    cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);

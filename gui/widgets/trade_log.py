@@ -15,7 +15,7 @@ from datetime import date, datetime
 from typing import Optional
 
 from PySide6.QtCore import QDate, Qt, Signal
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QComboBox,
     QDateEdit,
@@ -93,6 +93,10 @@ class TradeLogWidget(QWidget):
 
         # Master data set (unfiltered).
         self._all_trades: list[dict] = []
+
+        # True when data arrived while the widget was hidden and the
+        # table render was deferred until the next showEvent.
+        self._render_pending: bool = False
 
         self._build_ui()
 
@@ -242,8 +246,27 @@ class TradeLogWidget(QWidget):
             List of trade dictionaries from the database layer.
         """
         self._all_trades = list(trades)
+
+        # Rebuilding ~1000 QTableWidget rows costs 74-114 ms; skip the
+        # render entirely while the widget is hidden and replay the
+        # latest payload once it becomes visible.  Data caching (above)
+        # is never gated, so CSV export and consumers stay current.
+        if not self.isVisible():
+            self._render_pending = True
+            return
+        self._render_now()
+
+    def _render_now(self) -> None:
+        """Rebuild the pair combo, table, and summary from cached data."""
+        self._render_pending = False
         self._rebuild_pair_combo()
         self._apply_filters()
+
+    def showEvent(self, event: QShowEvent) -> None:
+        """Replay any render deferred while the widget was hidden."""
+        super().showEvent(event)
+        if self._render_pending:
+            self._render_now()
 
     def export_csv(self, filepath: str) -> None:
         """Write the currently visible (filtered) trades to a CSV file.

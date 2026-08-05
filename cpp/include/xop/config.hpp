@@ -186,6 +186,349 @@ struct StrategyConfig {
     /// Default 250 bps half-spread = 500 bps round-trip = 5% total.
     double   max_half_spread_bps{250.0};
 
+    // -- Fair-value deviation guard -----------------------------------------
+    // The ladder is centred on the dexie book mid.  Nothing used to validate
+    // that mid against anything, so when it was wrong EVERY tier was wrong in
+    // the same direction and a single taker could lift the whole ladder: on
+    // 2026-08-01 all six XCH/BYC ask tiers filled 9-11% below the price
+    // implied by external data, while each fill logged a POSITIVE realized
+    // P&L because the basis had been inflated by equally-mispriced bids.
+    //
+    // These knobs deliberately have working defaults and are absent from
+    // config.yaml: the guard must protect an unconfigured deployment.
+
+    /// Maximum tolerated deviation (bps) of a posted tier price from the
+    /// INDEPENDENT fair value, in the direction that loses money -- a bid
+    /// above fair value, or an ask below it.  Offending tiers are CLAMPED to
+    /// the band edge, never dropped; the bot keeps quoting in all conditions.
+    /// Default 300 bps (3%).  Measured against 1 500 XCH/wUSDC.b tier quotes
+    /// (the healthy book), the worst binding-direction deviation was
+    /// -112 bps on asks and +11 bps on bids, so 300 bps never binds there.
+    /// 0 disables the clamp.
+    double   max_fair_value_deviation_bps{300.0};
+
+    /// Extra width (percent) applied to every tier's distance from the mid
+    /// when NO independent fair value is available for a pair.  Quoting blind
+    /// at normal width is what let the sweep happen; widening keeps us in the
+    /// market but out of easy reach.  Default 50 (tiers sit 1.5x further from
+    /// the mid).  0 disables the widening.
+    double   blind_quote_widen_pct{50.0};
+
+    /// Minimum price step (bps) inserted between successive tiers that all
+    /// clamp to the same fair-value band edge.  Without it, six clamped asks
+    /// collapse onto one price: six creation fees and six locked UTXOs for
+    /// what is economically a single level (observed with the no-loss floor
+    /// on 2026-07-30).  Default 10 bps.
+    double   fair_value_clamp_tier_step_bps{10.0};
+
+    // -- Uncertainty-scaled quoting -----------------------------------------
+    // The binary usable/Unavailable cliff treated the solve's sigma as a
+    // validity flag.  It is a WIDTH INSTRUCTION: at the 2026-08-01 sweep the
+    // solve knew XCH/BYC was worth ~1.3608 +- 467 bps while the book said
+    // 1.2673, and because 467 exceeded the 200 bps usability ceiling the
+    // estimate was discarded and six asks were posted 9-11% below the truth.
+    // These knobs make the ladder CENTRE an uncertainty-weighted blend of the
+    // pair's own mid and the external estimate, and make the ladder's minimum
+    // half-spread scale with the combined uncertainty.  Both are absent from
+    // the shipped config.yaml on purpose: the defaults must protect an
+    // unconfigured deployment, and no pair is named anywhere.
+
+    /// Blend the ladder centre toward the external solve estimate, weighted
+    /// by inverse variance (book sigma = spread/2 + staleness + depth, the
+    /// same terms the solve itself uses; external sigma = the solve's own).
+    /// At the sweep this moves the XCH/BYC centre from 1.2673 to ~1.345
+    /// (external weight 0.84, because a 2114 bps book deserves almost no
+    /// vote), while on healthy XCH/wUSDC.b (book sigma ~131 bps vs CexDirect
+    /// sigma ~133 bps) the centre moves only ~17 bps -- the tight fresh book
+    /// keeps pricing itself.  Default true.
+    bool     quote_center_blend_enabled{true};
+
+    /// Minimum ladder half-spread as a multiple of the combined 1-sigma of
+    /// the blended centre (k_sigma).  The floor is
+    ///     max(configured tier spacing, k * combined_sigma,
+    ///         min_profit_margin_bps, tibetswap_fee_bps)
+    /// and every existing floor downstream (no-loss, peg guard, competitive
+    /// cap) still applies.  Default 1.0 -- quote one standard deviation out.
+    /// At the sweep: combined sigma ~427 bps -> lowest ask at
+    /// centre * 1.0427 ~= 1.4026, i.e. 0.8% below the 1.4143 truth instead of
+    /// 10.4% below it.  On XCH/wUSDC.b the combined sigma is ~93 bps, inside
+    /// the pair's existing 200-300 bps tier spacing, so nothing changes.
+    /// 0 disables the sigma term (existing floors still apply).
+    double   quote_width_sigma_mult{1.0};
+
+    // -- Avellaneda-Stoikov reservation offset --------------------------------
+    // [AS-RES 2026-08-01] The A-S reservation price was computed every
+    // heartbeat in Step 4 and discarded: Step 7 centred the ladder on the
+    // (uncertainty-blended) market mid and read only the risk quote's sizes.
+    // Measured consequence on 2026-07-31: ~116 XCH held against an ~80 XCH
+    // target and no selling lean anywhere in the posted ladder.  These knobs
+    // shift the ladder CENTRE by the bounded inventory term
+    //
+    //     centre' = centre * (1 - q * gamma * sigma^2 * tau)
+    //
+    // where q = signed imbalance normalized to the pair's ratio target
+    // (positive = long base), sigma = the honestly-warmed ANNUALIZED
+    // volatility (see VolatilityEstimator::rehydrate_from_ticks), and tau =
+    // the quote-refresh horizon as a year fraction (~19 min = 3.615e-5 yr).
+    // Full dimensional analysis in strategy/reservation_offset.hpp.  All
+    // downstream guards (sigma width floor, fair-value clamp, no-loss floor,
+    // peg guards, competitive caps) are untouched and act on the shifted
+    // centre.  No pair is named anywhere; the keys are absent from the
+    // shipped config.yaml on purpose -- the defaults are the operative
+    // values and must protect an unconfigured deployment.
+
+    /// Master switch for the reservation offset.  Default true -- connecting
+    /// this term to the posted ladder is the point of the mechanism; with an
+    /// unwarmed estimator the sigma floor makes the term ~0 anyway (see
+    /// as_reservation_gamma numbers below), so enabling it is safe even with
+    /// no history.
+    bool     as_reservation_enabled{true};
+
+    /// Risk-aversion for the reservation offset, DIMENSIONLESS in the
+    /// normalized units above (q as a fraction of target, sigma relative and
+    /// annualized, tau in years) -- deliberately NOT strategy.gamma, whose
+    /// 0.003 belongs to the raw-A-S formula's units and would make this term
+    /// 0.0006 bps at the measured state (decorative).  Default 1000:
+    /// the per-unit-imbalance lean gamma * sigma^2 * tau at the measured
+    /// sigma = 1.11 annualized and tau = 19 min is 445 bps, far above the
+    /// 100 bps rail below, so at high volatility the RAIL governs and the
+    /// formula provides the smooth scaling beneath it:
+    ///     sigma = 1.11 -> 445 bps per unit q  (rail binds for |q| > 0.22)
+    ///     sigma = 0.50 ->  90 bps per unit q
+    ///     sigma = 0.20 ->  14 bps per unit q
+    ///     sigma = 0.001 (floor, no history) -> 3.6e-4 bps: nothing.
+    /// At the measured 2026-07-31 state (q = +0.45, sigma = 1.11) the raw
+    /// offset is 200.4 bps, capped to 100: bids AND asks shift down 1%, the
+    /// correct selling lean the bot was observed failing to produce.
+    double   as_reservation_gamma{1000.0};
+
+    /// Rail (bps) on the reservation shift of the ladder centre, the bound
+    /// approved when this mechanism was first planned.  Default 100 (1%).
+    /// Applied symmetrically to both signs of imbalance.  0 disables the
+    /// offset entirely (a zero cap admits no shift).
+    double   as_reservation_max_offset_bps{100.0};
+
+    // -- Triangulation weights ----------------------------------------------
+    // The fair value is a weighted least-squares solve over the graph of
+    // assets and pairs (see fair_value_solver.hpp).  Every knob below is a
+    // 1-SIGMA UNCERTAINTY in basis points -- the honest error bar on one class
+    // of observation -- because that is the only thing the solve needs and the
+    // only thing an operator can reason about.  Weights are 1/sigma^2, so
+    // halving a sigma quadruples that source's influence; nothing is a
+    // dimensionless "importance" dial and no pair is named anywhere.
+
+    /// 1-sigma disagreement between an external USD price feed and the
+    /// on-chain market, in bps.  NOT the feed's quoting precision: CoinGecko
+    /// prints XCH to eight digits, but its number and the dexie XCH/wUSDC.b
+    /// mid routinely differ by ~1%, and 1% is what must be carried into the
+    /// solve.  Default 100 bps, from that measured agreement.
+    double   fair_value_feed_sigma_bps{100.0};
+
+    /// FLOOR (bps) on the 1-sigma of an AMM implied price: the uncertainty a
+    /// pool deep enough to be genuinely arbitrage-pinned still carries, which
+    /// is the swap fee plus the arbitrage band.  Default 50 bps (TibetSwap's
+    /// 0.7% fee implies roughly half that band each side).
+    ///
+    /// This was formerly the WHOLE sigma, applied flat to every pool.  That
+    /// gave a $500 pool weight 1/(50e-4)^2 = 4.0e4 against ~242 for the book
+    /// it was outvoting -- about 166:1 -- on the strength of an arbitrage
+    /// argument that does not hold at $500.  The actual sigma is now derived
+    /// from pool depth (see fair_value_amm_depth_k_bps) and this value is only
+    /// its best-case asymptote.
+    double   fair_value_amm_sigma_bps{50.0};
+
+    /// Calibration constant for the depth-weighted AMM sigma, in bps:
+    ///
+    ///     sigma_bps = max(fair_value_amm_sigma_bps,
+    ///                     fair_value_amm_depth_k_bps / sqrt(pool_usd))
+    ///
+    /// Numerically it is the sigma a $1 pool would carry; operationally it is
+    /// set by the crossover point where an AMM stops outvoting a mediocre
+    /// order book.  Default 15000 bps, calibrated so the live BYC pool lands
+    /// just ABOVE the book it competes with rather than 16,500x below it:
+    ///
+    ///     pool             pool_usd    AMM sigma   competing book sigma
+    ///     BYC              ~$501        670 bps    643 bps  (BYC/wUSDC.b)
+    ///     wUSDC.b          ~$1,125      447 bps    130 bps  (XCH/wUSDC.b)
+    ///     100x BYC pool    ~$50,100      67 bps    -- (approaches the floor)
+    ///     ~$90,000+                      50 bps    -- (at the floor)
+    ///
+    /// In weight terms the BYC pool goes from 166x the book it was outvoting
+    /// to 0.92x it -- a peer rather than a dictator -- while the wUSDC.b pool
+    /// sits an order of magnitude below the tight book it competes with, which
+    /// is correct for $1,125 of depth against a live two-sided market.
+    ///
+    /// The one out-of-sample check available agrees: at the 2026-08-01 sweep
+    /// the BYC pool was wrong by ~550 bps (implied 1.4917, truth ~1.414), so
+    /// 670 bps is the right order of magnitude and the old flat 50 bps
+    /// understated the real error by roughly 11x.
+    double   fair_value_amm_depth_k_bps{15000.0};
+
+    /// Maximum age (seconds) of an AMM sample before it stops contributing.
+    double   fair_value_amm_max_age_sec{300.0};
+
+    /// Floor (bps) on the uncertainty attributed to an order-book mid, so that
+    /// a momentarily one-tick book cannot claim near-infinite weight.
+    double   fair_value_min_book_sigma_bps{10.0};
+
+    /// Uncertainty (bps) added per heartbeat since a book's mid last MOVED.
+    /// A frozen quote is not a fresh one: the BYC/wUSDC.b mid sat at exactly
+    /// 1.1030 for 26+ consecutive snapshots (longest freeze 30.4 h) while
+    /// reporting an age of 0 seconds, and the true price drifted underneath it
+    /// the whole time.  Default 5 bps per heartbeat, so a book frozen for an
+    /// hour (~60 heartbeats) carries ~300 bps of drift uncertainty and stops
+    /// being able to outvote anything.
+    double   fair_value_stale_sigma_bps_per_print{5.0};
+
+    /// Depth term: uncertainty (bps) attributed to a book observed with a
+    /// single resting third-party offer, decaying as 1/sqrt(n) with the offer
+    /// count.  Default 30 bps -- small next to the width and staleness terms,
+    /// which is correct: depth is a weak signal here and should not dominate.
+    /// 0 disables the term.
+    double   fair_value_depth_ref_bps{30.0};
+
+    /// Above this solved 1-sigma (bps), a fair value is reported as
+    /// UNAVAILABLE and the widen-don't-clamp path engages.  A 300 bps clamp
+    /// band around an estimate that is itself uncertain to more than this is
+    /// not a guard, it is theatre.  Default 200 bps.  Note that a pair between
+    /// two feed-anchored assets inherently sits near
+    /// sqrt(2) * fair_value_feed_sigma_bps ~= 141 bps, so this must stay
+    /// comfortably above that or every pair goes blind.
+    double   fair_value_max_sigma_bps{200.0};
+
+    /// At or below this solved 1-sigma (bps), a cross-checked value is
+    /// promoted to the CexDirect / Triangulated tiers; above it the value is
+    /// still usable but reported as Inferred.  Default 150 bps.
+    double   fair_value_tight_sigma_bps{150.0};
+
+    /// The deviation band is widened by this multiple of the solve's own
+    /// sigma:  band = max_fair_value_deviation_bps + mult * sigma_bps.
+    /// A shakier fair value therefore clamps less aggressively instead of
+    /// being trusted exactly as far as a firm one.  Default 1.0.  0 makes the
+    /// band a flat max_fair_value_deviation_bps.
+    double   fair_value_sigma_band_mult{1.0};
+
+    /// Extra tier width, as a fraction of the absolute CONSISTENCY RESIDUAL,
+    /// applied when a pair's own book disagrees with the rest of the graph.
+    /// The residual is the disagreement signal: when the books cannot all be
+    /// right, one of them is about to move, and quoting tight into that is how
+    /// a ladder gets swept.  Default 0.5 -- a 1 200 bps disagreement pushes
+    /// tiers 600 bps further out.  0 disables residual-driven widening.
+    double   fair_value_residual_widen_ratio{0.5};
+
+    /// Residual magnitude (bps) below which no extra widening is applied.
+    /// Books never agree to the basis point; only a real disagreement should
+    /// move quotes.  Default 150 bps.
+    double   fair_value_residual_widen_floor_bps{150.0};
+
+    // -- Order-book micro-price blend schedule -------------------------------
+    // The order-book mid is a Stoikov micro-price: each side's top-N VWAP is
+    // weighted by the OPPOSITE side's depth, so the estimate leans toward the
+    // thin side -- the side that moves next.  That is genuinely the right
+    // estimator on a tight two-sided book and it is why it is still here.
+    //
+    // Its information content collapses as the book widens.  "Which side is
+    // thinner" is a statement about the next tick; on a 1259 bps book there is
+    // no next tick to speak of, and the answer says essentially nothing about
+    // fair value.  Worse, each side's VWAP lies OUTSIDE the BBO by
+    // construction (bid_vwap <= best_bid, ask_vwap >= best_ask), so once one
+    // side's depth dominates the estimate is dragged out of the book entirely:
+    // BYC/wUSDC.b (~65 deep bids vs ~9 thin asks) published a "mid" of
+    // 1.144728 sitting EXACTLY on its own best ask at block 9087661, against a
+    // true BYC value of ~$1.01 corroborated five independent ways.
+    //
+    // So the micro-price weight is degraded continuously with relative spread:
+    //
+    //     w_micro = clamp(1 - (spread_bps - narrow) / (wide - narrow), 0, 1)
+    //     mid     = w_micro * microprice + (1 - w_micro) * BBO midpoint
+    //
+    // Both knobs are ABSENT from the shipped config.yaml on purpose: the
+    // defaults below must work unedited, because an operator who never touches
+    // config.yaml is exactly the operator this defect reached.
+
+    /// At or below this relative spread (bps), the micro-price is used whole.
+    ///
+    /// Default 200 bps, chosen against MEASURED snapshot spread distributions
+    /// over the seven days to 2026-08-01:
+    ///
+    ///     pair            p10    p50    p90     n
+    ///     XCH/wUSDC.b     130    237    315     509
+    ///     XCH/DBX          41     63    123     489
+    ///     XCH/BYC          58    794   2549     440
+    ///     BYC/wUSDC.b     290   1163   1452     509
+    ///
+    /// XCH/DBX (p90 = 123) sits entirely inside the narrow band and keeps the
+    /// micro-price in full.  XCH/wUSDC.b -- the healthy, profitable pair the
+    /// fix must not disturb -- straddles it: at its p50 of 237 bps the weight
+    /// is 0.94, and at its p90 of 315 bps still 0.81, so substantially all of
+    /// its micro-price behaviour survives.  Setting narrow at its p50 instead
+    /// would have cut the healthy pair's weight to 0.5 for no reason; setting
+    /// it wider would have started trusting XCH/BYC's 794 bps p50.
+    double   microprice_narrow_bps{200.0};
+
+    /// At or above this relative spread (bps), the micro-price is discarded
+    /// entirely and the plain BBO midpoint is used.
+    ///
+    /// Default 800 bps.  Same measured distributions.  This is set just above
+    /// XCH/BYC's p50 (794) and far below BYC/wUSDC.b's p10 (290 -> w = 0.85)
+    /// and p50 (1163 -> w = 0), so the pathological pair lands essentially at
+    /// the plain midpoint in its normal state while XCH/wUSDC.b never comes
+    /// close to reaching zero weight (its p99 of 365 bps still carries 0.73).
+    /// The band 200..800 is also wide enough that the weight moves smoothly
+    /// rather than snapping -- a discontinuity here is what made the old
+    /// "deviates >10% from BBO midpoint, clamp to it" guard useless.
+    double   microprice_wide_bps{800.0};
+
+    // -- Published-mid BBO band ---------------------------------------------
+    //
+    // The order-book mid is clamped to its own BBO inside
+    // compute_orderbook_mid(), but the PUBLISHED mid is a further blend of
+    // that number with CEX (30%) and optionally AMM references, so it could
+    // exit the book again.  That re-exit is the exact mechanism that let
+    // self-referential garbage propagate: the artifact BYC/wUSDC.b "mid" of
+    // 1.1447 (vs a $1.01 truth corroborated five independent ways) fed the
+    // USD cross, and a comparably broken CEX reference at 30% weight could
+    // drag a healthy pair's published mid ~430 bps out of its own executable
+    // interval.  So the published mid is clamped to the dust-filtered
+    // third-party BBO widened by a band:
+    //
+    //     band_bps = max(floor_bps, spread_frac * book_spread_bps)
+    //
+    // and the clamp applies only while the dex book is two-sided and fresh
+    // (per stale_threshold) -- a stale book is history, not "now", and a
+    // fresh CEX print should govern it.  When the clamp binds it is logged
+    // at warning level: it means an external reference disagrees with the
+    // live book beyond tolerance, which is either an arbitrage or a broken
+    // feed, and both deserve eyes.
+    //
+    // Both knobs are ABSENT from the shipped config.yaml on purpose; the
+    // defaults must work unedited.
+
+    /// Minimum band (bps) beyond the BBO regardless of the book's spread.
+    ///
+    /// Default 150 bps.  The healthy pair, XCH/wUSDC.b, has a measured
+    /// CexDirect solve sigma of ~133 bps: a genuine one-standard-deviation
+    /// CEX-vs-DEX disagreement on a tight fresh book must NOT trip the
+    /// clamp, so the floor sits just above one sigma.  Anything much larger
+    /// stops being an invariant: the BYC artifact pulled the USD cross 13%
+    /// (~1300 bps) off truth, and at the 30% CEX blend weight that reaches
+    /// the published mid as a ~430 bps excursion -- the floor must be well
+    /// below that to catch it.
+    double   published_mid_band_floor_bps{150.0};
+
+    /// Band as a fraction of the book's own relative spread.
+    ///
+    /// Default 0.25.  A wide book is a weak claim about location, so an
+    /// external reference is allowed to pull further outside it.  Measured
+    /// at the 2026-08-01 sweep (block 9087661): XCH/BYC's book was
+    /// 1.1334/1.4013 (2114 bps) while external truth was 1.4143 -- 93 bps
+    /// ABOVE the best ask.  A hard clamp to the raw BBO would forbid the
+    /// published mid from ever reaching truth on that book; 0.25 * 2114 =
+    /// 528 bps of allowance covers it with margin.  On the healthy pair's
+    /// p50 spread of 237 bps the term is 59 bps, safely below the floor, so
+    /// tight books get the floor and wide books get proportional room.
+    double   published_mid_band_spread_frac{0.25};
+
     /// Minimum annualized sigma passed to the GLFT/A-S formula.
     /// When the Yang-Zhang estimator returns zero (flat market), the
     /// raw half-spread degenerates to (1/kappa)*ln(1+kappa/gamma) and
@@ -485,6 +828,43 @@ struct StrategyConfig {
     /// Inter-tier stride (bps) from the anchor point.  Default 65.
     double   competitive_anchor_stride_bps{65.0};
 
+    // -- Untrustworthy-reference quoting gate --------------------------------
+
+    /// Heartbeats the dexie mid may sit unchanged before we refuse to post
+    /// new offers on that pair (see MarketDataFeed::dex_print_age).
+    /// Measured: the BYC/wUSDC.b dexie mid held exactly 1.1030 for 26+
+    /// consecutive snapshots (longest freeze 30.4h, 92.6% of observations
+    /// unchanged) while the TibetSwap cross said 1.016196 -- the book was
+    /// 854 bps wrong, and we kept quoting around it.  Default 6, roughly
+    /// two hours at the ~19-minute heartbeat.  0 disables the staleness leg
+    /// of the gate.  Deliberately NOT in config.yaml: the default must work
+    /// unconfigured.
+    uint32_t dex_print_stale_heartbeats{6};
+
+    // -- Wallet-RPC polling throttles ([WALLET-LOAD 2026-08-04]) -------------
+    // The wallet daemon was being hammered to the point of freezing the
+    // wallet app: detect_fills issued one get_offer per tracked offer
+    // (~26) every heartbeat.  These knobs cut that volume without
+    // weakening the cae2bfd fill guarantees -- a fill missed for K-1
+    // heartbeats is DELAYED detection, not lost (CONFIRMED offers stay
+    // tracked until processed; the completeness sweep also catches).
+    // Deliberately absent from config.yaml: defaults are the operative
+    // values.  Full decision logic: execution/wallet_poll_throttle.hpp.
+
+    /// Skip status polling for offers younger than this many blocks -- a
+    /// just-posted offer cannot have settled.  0 disables the age gate.
+    uint32_t detect_fills_min_age_blocks{2};
+
+    /// M: after this many consecutive polls still PENDING_ACCEPT, an offer
+    /// drops to every-Kth-heartbeat polling (unless the book price is
+    /// within striking distance -- 2x its post-time distance-from-mid --
+    /// which resets it to every heartbeat).  0 disables the backoff.
+    uint32_t detect_fills_backoff_polls{10};
+
+    /// K: while backed off, poll every Kth heartbeat.  Values <= 1
+    /// effectively disable the backoff.
+    uint32_t detect_fills_backoff_interval{3};
+
     // -- Adverse-selection-aware tier sizing ---------------------------------
 
     /// Enable adverse-selection-aware tier sizing.
@@ -493,8 +873,24 @@ struct StrategyConfig {
     /// Decay factor for adverse-selection sizing (lower = more outer-heavy).
     double   adverse_selection_decay{0.7};
 
-    /// Volatility threshold above which decay is halved.
-    double   adverse_selection_sigma_threshold{0.05};
+    /// Volatility threshold above which decay is halved -- compared against
+    /// the ANNUALIZED sigma the ladder step passes in.
+    ///
+    /// [AS-WARM recalibration 2026-08-01] Raised from 0.05 (config.yaml had
+    /// 0.005) to 2.0.  The old values were tuned in a world where the
+    /// volatility estimator was never ready and sigma was pinned at the
+    /// 0.001 floor, so the branch NEVER fired in production and there is no
+    /// working semantic to preserve.  With the warm-started estimator sigma
+    /// is honest -- measured 0.4-1.9 annualized across pairs -- and a
+    /// threshold of 0.005 would fire permanently on every pair, silently
+    /// halving decay and pushing ~82% of ladder capital to the outer
+    /// 230-300 bps tiers (weights [0.8, 1.9, 4.4, 10.4, 24.6, 57.8]%
+    /// instead of the configured ~[10, 12, 15, 18, 22, 23]%) while fills
+    /// happen at 30-130 bps.  2.0 (200% annualized) fires only in genuinely
+    /// extreme regimes; it also sits above XCH/BYC's measured 1.91, which
+    /// is partly inflated by pre-fix self-priced mids still present in the
+    /// warm-start history.  0 = always use base decay.
+    double   adverse_selection_sigma_threshold{2.0};
 
     // -- Fill-rate-weighted adaptive tier sizing ----------------------------
 
@@ -512,8 +908,26 @@ struct StrategyConfig {
 
     // -- AMM blend weight for market data feed ------------------------------
 
-    /// Weight of TibetSwap AMM implied price in mid-price blend.
-    double   amm_blend_weight{0.15};
+    /// Weight of the TibetSwap AMM implied price in the composite mid-price.
+    ///
+    /// DEFAULT 0.0 -- THE AMM IS A VALIDATOR, NOT A PRICE INPUT.
+    ///
+    /// The AMM sample feeds two consumers: this blend (composite mid ->
+    /// market_mid -> centre of every ladder) and the fair-value solve that
+    /// checks those ladder prices.  Letting it do both makes the guard's
+    /// reference the same number that moved the thing being checked -- the
+    /// solve would "confirm" a price it had itself set, and the deviation
+    /// band would measure nothing.  This weight was inert until the TibetSwap
+    /// client gave it a producer; wiring that client is what made the cycle
+    /// real, so the cycle is broken here at the input side.
+    ///
+    /// Validation is the more valuable of the two roles: as a price input the
+    /// AMM would move quotes by at most its blend share, while as an
+    /// independent edge it is what turns a leg priced only by one wide frozen
+    /// book from Unavailable into a usable clamp.  So the blend gives way.
+    ///
+    /// Setting this above 0 re-creates the cycle and is not supported.
+    double   amm_blend_weight{0.0};
 
     // -- Wall-aware retail niche pricing ------------------------------------
 
@@ -697,16 +1111,34 @@ struct StrategyConfig {
 //   max_capital_per_pair_pct-- upper bound on capital allocated to one pair.
 //
 // Circuit breakers (ISO/IEC 27001:2022 §8.20 -- continuous risk monitoring):
-//   max_drawdown_pct     -- peak-to-trough drawdown fraction that pauses the
-//                           engine.  Default 10% (0.10).  Measures the drop
-//                           from the all-time PnL high-water mark.
+//   max_drawdown_frac    -- peak-to-trough drawdown fraction OF PORTFOLIO
+//                           EQUITY that pauses the engine.  Default 10%
+//                           (0.10).  [DRAWDOWN-EQUITY 2026-08-04] Renamed
+//                           from max_drawdown_pct: the old key measured
+//                           against the P&L high-water mark, whose small
+//                           denominator (~$25 of accumulated profit vs a
+//                           ~$158 portfolio) turned a normal ~5% overnight
+//                           XCH retrace into a "60% drawdown" false trip
+//                           at 04:14 on 2026-08-04.  The old key's 0.05
+//                           was set before the breaker math even worked
+//                           and was never calibrated; presence of the old
+//                           key is now a hard config error so a stale
+//                           P&L-calibrated value cannot silently apply to
+//                           equity semantics.
 //   loss_window_blocks   -- rolling window size in blocks for the time-window
 //                           loss circuit breaker.  Default 1152 blocks ≈ 10 h
 //                           at the Chia mean block time of 52 s.
-//   max_window_loss_bps  -- maximum loss (in basis points, i.e. 0.01 % per bp)
-//                           permitted within the rolling window before the
-//                           engine is paused.  Default 500 bps = 5 %.
-//                           A value of 0 disables the window circuit breaker.
+//   max_window_loss_bps  -- maximum P&L loss within the rolling window,
+//                           in basis points OF PORTFOLIO EQUITY
+//                           ([DRAWDOWN-EQUITY 2026-08-04]: 250 bps of the
+//                           measured ~$150 book is ~$3.75, vs the $1.09
+//                           the retired |P&L-HWM| anchor produced).
+//                           A value of 0 disables the window breaker.
+//   breaker_realert_minutes -- once a breaker has PAUSED the engine, the
+//                           persisting condition is logged at info level
+//                           and the CRITICAL alert is re-raised at most
+//                           this often (measured spam every ~10-30 s
+//                           while paused on 2026-08-04).
 // ---------------------------------------------------------------------------
 struct RiskConfig {
     double   soft_limit_pct{0.60};
@@ -716,10 +1148,11 @@ struct RiskConfig {
     double   max_capital_per_pair_pct{0.20};
 
     // -- Circuit breakers ---------------------------------------------------
-    double   max_drawdown_pct{0.10};        ///< HWM drawdown threshold (0,1].
+    double   max_drawdown_frac{0.10};       ///< Equity drawdown threshold (0,1].
     uint32_t drawdown_grace_blocks{100};    ///< Blocks to skip drawdown check at startup.
     uint32_t loss_window_blocks{1152};      ///< Rolling window size in blocks.
-    double   max_window_loss_bps{500.0};    ///< Max loss in window (bps; 0=disabled).
+    double   max_window_loss_bps{500.0};    ///< Max window P&L loss (bps of equity; 0=disabled).
+    uint32_t breaker_realert_minutes{30};   ///< Min minutes between repeat breaker alerts while paused.
 
     // -- Flash crash detection (T7-07, T7-08) --------------------------------
     double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
@@ -859,9 +1292,34 @@ struct ArbitrageSettings {
     double   cex_reference_half_spread_bps{10.0};
 
     // -- Cross-stablecoin arbitrage (XCH/BYC vs XCH/wUSDC.b) ----------------
-    bool     cross_stable_arb_enabled{true};
-    double   cross_stable_min_edge_bps{15.0};
-    double   cross_stable_max_take_xch{5.0};
+    //
+    // Execution is gated by a STATE MACHINE over observed edge history, not
+    // by a single point-in-time reading.  Spreads here are wildly volatile
+    // (XCH/BYC has ranged 0-1247 bps, XCH/wUSDC.b 7-615 bps), so one sample
+    // cannot tell a genuine opportunity from a stale quote -- and a stale
+    // quote is the common case: on 2026-07-30 the scanner's chosen offer came
+    // back status=3 (already gone) when it tried to take it.
+    //
+    // An edge that PERSISTS across observations is far more likely to be
+    // executable.  The monitor therefore runs continuously and records every
+    // observation to arb_edge_log, arming only after sustained evidence and
+    // disarming on a lower threshold so it cannot flap at the boundary.
+    bool     cross_stable_arb_enabled{true};   ///< Run the monitor at all.
+    double   cross_stable_min_edge_bps{15.0};  ///< Legacy floor; still applied.
+    double   cross_stable_max_take_xch{5.0};   ///< Candidate size filter (see below).
+
+    /// Net edge (bps) that must be sustained to ARM the leg pair.
+    double   cross_stable_arm_edge_bps{50.0};
+    /// Net edge (bps) below which it DISARMS.  Must be < arm to give
+    /// hysteresis; between the two the current state is held.
+    double   cross_stable_disarm_edge_bps{20.0};
+    /// Consecutive observations above the arm threshold before arming.
+    uint32_t cross_stable_arm_observations{3};
+
+    /// Master switch for ACTUALLY TRADING when armed.  Default false: the
+    /// monitor measures viability first, and capital is only ever at risk
+    /// after that data says the edge is real and repeatable.
+    bool     cross_stable_execute_when_armed{false};
 
     // -- Peg-crossing offer taker (stablecoin pair direct arb) ---------------
     // Takes competing offers that cross the $1 peg on stablecoin pairs
@@ -946,6 +1404,66 @@ struct CoinGeckoConfig {
 };
 
 // ---------------------------------------------------------------------------
+// TibetSwap AMM client configuration (`tibetswap:` section).
+//
+// TibetSwap is the on-chain constant-product AMM on Chia.  Its pool reserves
+// give an independent, arbitrage-anchored marginal price for every pair with
+// an XCH leg -- the reference that feeds ArbitrageDetector::scan_cross_dex()
+// and MarketDataFeed::ingest_amm_mid().
+//
+// Every field has a working default: the section may be omitted entirely from
+// config.yaml and the client still runs against the public API.
+// ---------------------------------------------------------------------------
+struct TibetSwapConfig {
+    /// Master switch.  Enabled by default -- the API is public, unauthenticated
+    /// and cheap, and without it the AMM leg is dead code.
+    bool        enabled{true};
+
+    /// Base URL for the TibetSwap v2 API (no trailing slash).
+    std::string base_url{"https://api.v2.tibetswap.io"};
+
+    /// How often to poll pool reserves (milliseconds).  Default 60 s, roughly
+    /// one Chia block (~52 s); reserves only move when a swap lands on chain.
+    uint32_t    polling_interval_ms{60'000};
+
+    /// HTTP request timeout.
+    uint32_t    request_timeout_ms{15'000};
+
+    /// TCP + TLS connect timeout.
+    uint32_t    connect_timeout_ms{10'000};
+
+    /// Maximum retries on 429 / 5xx.
+    uint32_t    max_retries{3};
+
+    /// Base delay between retries (exponential backoff).
+    uint32_t    retry_base_delay_ms{1'000};
+
+    /// Rate limiter: max requests per window.
+    uint32_t    rate_limit_max_requests{30};
+
+    /// Rate limiter: sliding window width (milliseconds).
+    uint32_t    rate_limit_window_ms{60'000};
+
+    /// Number of threads in the CURL worker pool.
+    uint32_t    curl_thread_pool_size{2};
+
+    /// Page size for GET /pairs (the pool directory; ~370 pools today).
+    uint32_t    page_limit{500};
+
+    /// Hard cap on directory size, guarding against a runaway paging loop.
+    uint32_t    max_pools{5'000};
+
+    /// How long the asset_id -> pair_id directory stays valid before it is
+    /// re-fetched (milliseconds).  The mapping is effectively static, so an
+    /// hour is generous; a request for an unknown asset forces an early
+    /// refresh regardless.
+    uint32_t    directory_refresh_ms{3'600'000};
+
+    /// User-Agent header.
+    std::string user_agent{"XOPTrader-TibetSwap/1.0"};
+};
+
+// ---------------------------------------------------------------------------
 // Fee budget tracking and dynamic fee selection.
 //
 // Controls two behaviours:
@@ -974,6 +1492,136 @@ struct CoinGeckoConfig {
 // The effective margin is never allowed to go below -max_loss_relax_bps
 // (i.e. the bot will never accept a loss larger than the configured cap).
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// AccountingConfig -- double-entry ledger and its reconciliation control.
+//
+// The control ties the ledger's implied per-asset balance to the wallet's
+// CONFIRMED balance.  Thresholds are flow-based rather than a flat
+// percentage, because the CAT wallets are tiny (a single heartbeat of fills
+// can move 20-75% of the wUSDC.b balance) while 1% of the XCH wallet would
+// swallow an entire missed 1-XCH fill.
+//
+// Tolerance for asset a:
+//     live_offer_exposure(a)              -- only live offers can settle
+//   + fee_slack (XCH only)                -- observed dust is 5,000-mojo steps
+//   + max(floor_a, pct * confirmed_a)
+// ---------------------------------------------------------------------------
+
+struct AccountingConfig {
+    /// Master switch for ledger posting and the invariant check.
+    bool     ledger_enabled{true};
+
+    /// Divergence beyond the ALERT tolerance, sustained for
+    /// `alert_observations` consecutive same-sign checks, raises an alert.
+    double   alert_pct{0.005};              ///< 0.5% of confirmed balance.
+    uint32_t alert_observations{2};
+
+    /// Divergence beyond the PAUSE tolerance for `pause_observations`
+    /// consecutive same-sign checks pauses quoting.
+    double   pause_pct{0.02};               ///< 2% of confirmed balance.
+    uint32_t pause_observations{3};
+
+    /// OFF by default.  Several real balance movements have no ledger event
+    /// yet (taker fills from the arbitrage/drift steps, external deposits and
+    /// withdrawals), so auto-pausing would halt trading on legitimate
+    /// activity.  Turn this on only once the ledger runs clean.
+    bool     pause_enabled{false};
+
+    /// Absolute noise floors, in mojos.  XCH: 0.001 XCH covers fee dust.
+    /// CAT: 100 mojos = 0.1 unit, 100x the 1-mojo per-leg rounding error.
+    std::int64_t floor_xch_mojos{1'000'000'000LL};
+    std::int64_t floor_cat_mojos{100LL};
+
+    /// Extra XCH slack for accumulated per-offer fee dust between checks.
+    /// Observed worst case was 55,000 mojos per heartbeat; 200,000 covers
+    /// ~40 offer events.
+    std::int64_t fee_slack_mojos{200'000LL};
+
+    /// Skip the check when the balance snapshot is older than this many
+    /// blocks (the wallet reader is skipped in several engine modes).
+    uint32_t max_balance_age_blocks{10};
+
+    /// Observations retained per asset for breach scoring.  Breaches are
+    /// counted over this window rather than required to be strictly
+    /// consecutive: the tolerance includes live offer exposure, which swings
+    /// by two orders of magnitude between heartbeats as the book is
+    /// re-quoted, so a real constant divergence would otherwise keep having
+    /// its consecutive counter reset and might never escalate.
+    uint32_t observation_window{6};
+
+    /// On sustained divergence, post an `adjust` leg that brings the ledger
+    /// back in line and RECORDS the unexplained amount as a discrete entry.
+    ///
+    /// Without this the ledger drifts monotonically -- the known-unrecorded
+    /// flows (taker fills, DBX rewards, external transfers) are all
+    /// one-directional -- so the first breach becomes permanent and the only
+    /// remaining operator action is to switch the control off.  With it, each
+    /// unexplained movement becomes a queryable adjusting entry, which is
+    /// both proper accounting treatment and the measurement wanted:
+    ///   SELECT SUM(delta_mojos) FROM ledger_entries WHERE event_type='adjust'
+    bool     auto_adjust_enabled{true};
+
+    // -- Dexie reward income ingestion ([REWARD-INCOME 2026-08-01]) --------
+    //
+    // Every offer submission passes claim_rewards=true, so dexie pays DBX
+    // liquidity incentives -- previously booked NOWHERE, surfacing as
+    // wallet-vs-books divergence that the invariant's adjusting entries
+    // absorbed (income reclassified as "unexplained discrepancy").  With
+    // this on, the engine scans the reward asset's wallet each heartbeat
+    // for dexie's daily payout bursts (many small plain incoming
+    // transactions in one block; measured 1-219 mojos per coin vs
+    // >= 100,589 mojos for the smallest trading flow), books each as a
+    // 'reward' ledger entry at CoinGecko fair value, folds the quantity
+    // into the cost basis at that FMV, and accumulates the USD as reward
+    // income SEPARATE from trading P&L.  Detection evidence and treatment:
+    // accounting/reward_ingest.hpp.
+    bool     reward_ingest_enabled{true};
+
+    /// Asset the rewards arrive in: DBX (dexie bucks), mainnet CAT id.
+    /// Matches the rewardRate asset of every program on /v1/incentives.
+    std::string reward_asset_id{
+        "db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20"};
+
+    /// Per-coin ceiling (mojos) separating reward coins from trading
+    /// flows.  Measured reward coins: 1-219 mojos (41 daily bursts,
+    /// 2026-06-11..07-31).  Smallest observed trading flow: 100,589
+    /// mojos.  2,000 (2 DBX) gives ~10x headroom over the largest
+    /// observed reward coin while staying 50x below the smallest trade.
+    std::int64_t reward_max_mojos_per_coin{2'000LL};
+
+    // -- Stablecoin peg monitor (2026-07-30) -------------------------------
+    //
+    // Accounting values wUSDC.b / wUSDC / USDS at exactly $1.00 -- they are
+    // the numeraire, and feeding a live rate into a PERSISTED cost basis
+    // recreates the bug class removed in v0.8.0 (a hardcoded 2.70 XCH rate
+    // baked into stored basis).  The exposure to an actual depeg is real
+    // though, so it is MONITORED instead of being priced in.
+    //
+    // Note this is not covered by the existing `depeg:` detector, which
+    // compares a pair's own mid against a config constant and is registered
+    // only for BYC/wUSDC.b -- it can never see wUSDC.b itself move, because
+    // wUSDC.b is that pair's quote unit.
+    bool     peg_monitor_enabled{true};
+
+    /// CoinGecko `usd-coin` vs $1.00.  Catches a NATIVE USDC depeg.  Clean,
+    /// low-noise signal, so a tight threshold is appropriate.
+    double   peg_external_warn_pct{1.0};
+
+    /// Implied wUSDC.b value from cex_mid / dex_mid on XCH/wUSDC.b.  Catches
+    /// a BRIDGE depeg, which the CoinGecko feed cannot see (native USDC can
+    /// hold $1.00 while the wrapper breaks).
+    ///
+    /// Threshold must clear the structural DEX-vs-CEX basis on this venue.
+    /// The engine's existing arbitrage signal is algebraically the same
+    /// quantity; across 217 logged samples it ran p50 78 bps, p90 118 bps,
+    /// max 218 bps.  3% sits above that observed noise floor.
+    double   peg_implied_warn_pct{3.0};
+
+    /// Consecutive breaching observations before alerting.  DEX-vs-CEX basis
+    /// spikes are transient; a real depeg persists.
+    uint32_t peg_observations{4};
+};
+
 struct InventoryAgingConfig {
     bool     enabled{false};                   // Master switch.
 
@@ -1229,8 +1877,10 @@ struct AppConfig {
     DepegConfig      depeg;
     ArbitrageSettings arbitrage;
     CoinGeckoConfig  coingecko;
+    TibetSwapConfig  tibetswap;
     FeeConfig        fees;
     InventoryAgingConfig inventory_aging;
+    AccountingConfig accounting;
     MarketDataSettings market_data;
     AdverseSelectionSettings adverse_selection;
     MarketAllocatorConfig market_allocator;

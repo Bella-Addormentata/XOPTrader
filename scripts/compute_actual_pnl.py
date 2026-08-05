@@ -2,9 +2,39 @@
 compute_actual_pnl.py
 =====================
 
-Reconstructs the bot's true historical P&L from `trade_log` entries, bypassing
-the corrupted `realized_pnl_mojos` column (cost basis was never tracked --
-all historical fills were written with cost_basis_mojos in {0, 1}).
+!!  DO NOT TRUST THIS SCRIPT'S OUTPUT AS ACTUAL P&L  (verified 2026-07-30)  !!
+
+    This script derives everything from `trade_log`, and `trade_log` has been
+    shown NOT to be a faithful record of what happened on-chain.  Comparing it
+    against wallet balances observed directly in the engine logs:
+
+        2026-04-24 wallet: 61.685 XCH   5.744 wUSDC.b   167.6 BYC   7,326 DBX
+        2026-07-30 wallet: 122.957 XCH  9.985 wUSDC.b    27.8 BYC     775 DBX
+
+        asset      trade_log claims      wallet actually did
+        XCH             -604.33 XCH            +61.27 XCH
+        wUSDC.b       +1,560.90             +4.24
+        DBX           +7,824.24          -6,550.70      (sign inverted)
+
+    The recorded fills claim a ~604 XCH outflow over a period in which the
+    XCH balance ROSE, and claim ~1,561 wUSDC.b of sale proceeds that never
+    appeared in the wallet.  Any figure computed from these rows -- including
+    this script's "cash-flow PnL" -- is therefore fiction.  It previously
+    reported roughly +$629 for a wallet whose total value is ~$218.
+
+    Ground truth for the same window, valued at each date's own prices:
+        2026-04-24 portfolio  $446.24
+        2026-07-30 portfolio  $217.75
+    i.e. the portfolio LOST value; and versus simply holding the April basket
+    it is about -$148 (before accounting for any deposits/withdrawals, which
+    are not tracked anywhere -- the +61 XCH looks like a deposit).
+
+    Use wallet-balance deltas plus explicit deposit/withdrawal accounting for
+    real P&L.  Keep this script only as a fill-record diagnostic.
+
+Reconstructs the bot's P&L from `trade_log` entries, bypassing the corrupted
+`realized_pnl_mojos` column (cost basis was never tracked -- all historical
+fills were written with cost_basis_mojos in {0, 1}).
 
 Two views are produced:
 

@@ -77,6 +77,8 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::DailyPnl:            return "DailyPnl";
         case AlertRule::NewPairVolume:        return "NewPairVolume";
         case AlertRule::ArbitrageDetected:    return "ArbitrageDetected";
+        case AlertRule::LedgerDivergence:     return "LedgerDivergence";
+        case AlertRule::StablecoinDepeg:      return "StablecoinDepeg";
     }
     return "UNKNOWN";
 }
@@ -99,7 +101,15 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         case AlertRule::ConcentrationBreach:
         case AlertRule::PnlDrawdown:
         case AlertRule::OfferCreationFail:
+        // Accounting divergence is a WARNING: it needs investigation but,
+        // with auto-adjust on, it does not by itself endanger capital.
+        case AlertRule::LedgerDivergence:
             return AlertTier::WARNING;
+
+        // A quote stablecoin leaving its peg mis-values the entire book and
+        // every USD figure derived from it -- treat as critical.
+        case AlertRule::StablecoinDepeg:
+            return AlertTier::CRITICAL;
 
         // INFO (rules 12-15).
         case AlertRule::HourlyPnl:
@@ -798,17 +808,23 @@ void AlertManager::check_pnl_drawdown(const BotState& state)
     const double threshold = thresholds_.at(
         static_cast<std::uint8_t>(AlertRule::PnlDrawdown));
 
-    if (state.peak_pnl <= 0) {
-        return; // No positive peak yet -- cannot compute drawdown.
+    // [DRAWDOWN-EQUITY 2026-08-04] Both fields are USD PORTFOLIO EQUITY
+    // (see BotState); the ratio is unit-coherent only because numerator
+    // and denominator share that unit, and it is industry-standard
+    // drawdown only because the denominator is equity, not the P&L peak.
+    if (state.peak_equity_usd <= 0.0) {
+        return; // Nothing valued yet -- cannot compute drawdown.
     }
 
-    const double drawdown = static_cast<double>(state.peak_pnl - state.total_pnl)
-                          / static_cast<double>(state.peak_pnl);
+    const double drawdown = (state.peak_equity_usd - state.equity_usd)
+                          / state.peak_equity_usd;
 
     if (drawdown > threshold) {
         send_alert(AlertRule::PnlDrawdown,
-            fmt::format("PnL drawdown: {:.1f}% from peak (threshold {:.1f}%)",
+            fmt::format("Equity drawdown: {:.1f}% from peak ${:.2f} "
+                        "(threshold {:.1f}%)",
                         drawdown * 100.0,
+                        state.peak_equity_usd,
                         threshold * 100.0));
     }
 }

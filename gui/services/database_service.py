@@ -22,7 +22,7 @@ from __future__ import annotations
 import math
 import logging
 import sqlite3
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Final, Optional
 
@@ -58,6 +58,40 @@ _RETRY_DELAY_MS: Final[int] = 2_000
 # Approximate blocks per hour on Chia (52s block target).
 _BLOCKS_PER_HOUR: Final[int] = 69
 
+# [PNL-DISPLAY 2026-08-02] Per-pair USD conversion for realized_pnl_mojos.
+#
+# The engine stores realized_pnl_mojos in QUOTE-asset mojos (the currency
+# the seller receives), not in XCH mojos.  Conversion is per-pair using the
+# quote-asset's mojos-per-unit and USD-per-unit:
+#   wUSDC.b / wUSDC : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
+#   BYC             : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
+#   USDS            : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
+#   DBX             : not USD-pegged and no on-DB rate -> 0.0
+#   anything else   : 0.0 (future pairs require an explicit mapping)
+#
+# Shared by fetch_reports and the restart-proof P&L display queries so the
+# dashboard and Reports page always agree.  Requires the trade_log table to
+# be aliased as ``t``.
+_PNL_USDC_EXPR: Final[str] = (
+    "CASE "
+    "WHEN t.pair_name LIKE '%/wUSDC%' THEN t.realized_pnl_mojos / 1000.0 "
+    "WHEN t.pair_name LIKE '%/BYC%'   THEN t.realized_pnl_mojos / 1000.0 "
+    "WHEN t.pair_name LIKE '%/USDS%'  THEN t.realized_pnl_mojos / 1000.0 "
+    "ELSE 0.0 END"
+)
+
+# Sentinel baseline meaning "no display reset applied" (include everything).
+_EPOCH_ISO: Final[str] = "1970-01-01 00:00:00"
+
+# Mojos-per-unit denominators (engine convention: XCH = 1e12, CATs = 1e3).
+_MOJOS_PER_XCH: Final[float] = 1_000_000_000_000.0
+_MOJOS_PER_CAT: Final[float] = 1_000.0
+
+
+def _mojos_per_unit(symbol: str) -> float:
+    """Return the mojos-per-unit denominator for an asset display symbol."""
+    return _MOJOS_PER_XCH if symbol.strip().upper() == "XCH" else _MOJOS_PER_CAT
+
 
 # ===================================================================
 # Worker -- runs queries on a background QThread
@@ -79,6 +113,10 @@ class _DatabaseWorker(QObject):
     pairs_list_ready = Signal(list)
     latest_snapshot_ready = Signal(dict)
     reports_ready = Signal(dict)
+    pnl_display_ready = Signal(dict)
+    pnl_history_ready = Signal(list)
+    deployed_ready = Signal(dict)
+    last_trade_prices_ready = Signal(dict)
     query_error = Signal(str)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
@@ -330,6 +368,42 @@ class _DatabaseWorker(QObject):
             return
         self.pairs_list_ready.emit([row["pair_name"] for row in rows])
 
+    @Slot()
+    def fetch_last_trade_prices(self) -> None:
+        """Query the most recent fill price per pair from ``trade_log``.
+
+        Used by EngineBridge as a price fallback for the wallet
+        allocation panel when live metrics report no mid price.  Runs on
+        the worker thread so the (measured 171-208 ms) query never
+        touches the GUI thread.
+
+        Emits ``last_trade_prices_ready`` with ``{pair_name:
+        price_mojos}``.
+        """
+        sql = (
+            "SELECT pair_name, price_mojos "
+            "FROM trade_log t "
+            "WHERE id = ("
+            "  SELECT id FROM trade_log "
+            "  WHERE pair_name = t.pair_name "
+            "  ORDER BY block_height DESC, id DESC LIMIT 1"
+            ")"
+        )
+        rows = self._execute_query(sql, [])
+        if rows is None:
+            return
+
+        prices: dict[str, float] = {}
+        for row in rows:
+            pair_name = row["pair_name"]
+            price_mojos = row["price_mojos"]
+            if pair_name and price_mojos is not None:
+                try:
+                    prices[str(pair_name)] = float(price_mojos)
+                except (TypeError, ValueError):
+                    continue
+        self.last_trade_prices_ready.emit(prices)
+
     @Slot(str)
     def fetch_latest_snapshot(self, pair: str) -> None:
         """Fetch the most recent snapshot for a trading pair.
@@ -352,6 +426,238 @@ class _DatabaseWorker(QObject):
             self.latest_snapshot_ready.emit(dict(rows[0]))
         else:
             self.latest_snapshot_ready.emit({})
+
+    @Slot(str)
+    def fetch_pnl_display(self, baseline_iso: str) -> None:
+        """Compute restart-proof headline P&L figures from ``trade_log``.
+
+        [PNL-DISPLAY 2026-08-02] The dashboard's headline numbers must be
+        LONG-TERM: they may never reset across GUI or engine restarts.
+        The Prometheus gauges are owned by the engine process and read
+        since-boot values until the engine finishes rehydrating, so the
+        headline is derived here from the persistent trade log instead.
+
+        Emits ``pnl_display_ready`` with:
+            ``lifetime_usd``     -- SUM of realized P&L (USD-normalized per
+                                    quote asset via _PNL_USDC_EXPR) since
+                                    *baseline_iso* (all-time when empty).
+            ``lifetime_trades``  -- number of realized fills in that span.
+            ``pnl_24h_usd``      -- realized P&L over the trailing 24 hours.
+            ``fills_24h``        -- total fills over the trailing 24 hours.
+            ``baseline_iso``     -- echo of the applied display baseline
+                                    ("" when showing full history).
+
+        Parameters
+        ----------
+        baseline_iso : str
+            Optional display-reset baseline as UTC ``YYYY-MM-DD HH:MM:SS``
+            (matches the trade_log ``created_at`` format).  Empty string
+            means no reset: include the full history.  This is a pure
+            display filter -- no engine data is modified.
+        """
+        baseline = (baseline_iso or "").strip() or _EPOCH_ISO
+
+        lifetime_sql = f"""
+            SELECT
+                COUNT(*)                                AS lifetime_trades,
+                COALESCE(SUM({_PNL_USDC_EXPR}), 0.0)    AS lifetime_usd
+            FROM trade_log t
+            WHERE t.realized_pnl_mojos IS NOT NULL
+              AND t.created_at >= ?
+        """
+        rows = self._execute_query(lifetime_sql, [baseline])
+        if rows is None:
+            return
+        lifetime_usd = float(rows[0]["lifetime_usd"] or 0.0) if rows else 0.0
+        lifetime_trades = int(rows[0]["lifetime_trades"] or 0) if rows else 0
+
+        # Trailing 24h window; also clipped to the baseline so a fresh
+        # display reset zeroes the 24h card consistently.
+        day_sql = f"""
+            SELECT
+                COUNT(*) AS fills_24h,
+                COALESCE(SUM(CASE WHEN t.realized_pnl_mojos IS NOT NULL
+                                  THEN {_PNL_USDC_EXPR}
+                                  ELSE 0.0 END), 0.0) AS pnl_24h_usd
+            FROM trade_log t
+            WHERE t.created_at >= datetime('now', '-1 day')
+              AND t.created_at >= ?
+        """
+        rows = self._execute_query(day_sql, [baseline])
+        if rows is None:
+            return
+        pnl_24h_usd = float(rows[0]["pnl_24h_usd"] or 0.0) if rows else 0.0
+        fills_24h = int(rows[0]["fills_24h"] or 0) if rows else 0
+
+        self.pnl_display_ready.emit({
+            "lifetime_usd": lifetime_usd,
+            "lifetime_trades": lifetime_trades,
+            "pnl_24h_usd": pnl_24h_usd,
+            "fills_24h": fills_24h,
+            "baseline_iso": "" if baseline == _EPOCH_ISO else baseline,
+        })
+
+    @Slot(int)
+    def fetch_pnl_history(self, days: int) -> None:
+        """Rebuild the global P&L (USD) time series from persisted data.
+
+        [PNL-DISPLAY 2026-08-02] The chart's P&L curve used to live only in
+        GUI memory, so every GUI restart started it empty.  This query
+        reconstructs the curve from the database instead of a sidecar file:
+
+        - The *total* (mark-to-market) series comes from the per-pair
+          ``snapshots.pnl_total_usd`` column, summed across pairs at each
+          snapshot block (matching the engine's global USD total gauge).
+        - The *realized* series is the cumulative sum of trade_log realized
+          P&L (USD-normalized via _PNL_USDC_EXPR) evaluated at each
+          snapshot timestamp.
+
+        Emits ``pnl_history_ready`` with a chronologically ordered list of
+        ``{"block": int, "ts": float, "total_usd": float,
+        "realized_usd": float}`` dicts.
+
+        Parameters
+        ----------
+        days : int
+            Retention window in days (clamped to 1..365).
+        """
+        safe_days = max(1, min(int(days), 365))
+        cutoff = f"-{safe_days} day"
+
+        snap_sql = """
+            SELECT block_height, created_at,
+                   COALESCE(SUM(pnl_total_usd), 0.0) AS total_usd
+            FROM snapshots
+            WHERE created_at >= datetime('now', ?)
+            GROUP BY block_height, created_at
+            ORDER BY created_at ASC, block_height ASC
+        """
+        snap_rows = self._execute_query(snap_sql, [cutoff])
+        if snap_rows is None:
+            return
+
+        realized_sql = f"""
+            SELECT t.created_at AS created_at,
+                   COALESCE(SUM({_PNL_USDC_EXPR}), 0.0) AS usd
+            FROM trade_log t
+            WHERE t.realized_pnl_mojos IS NOT NULL
+            GROUP BY t.created_at
+            ORDER BY t.created_at ASC
+        """
+        realized_rows = self._execute_query(realized_sql, [])
+        if realized_rows is None:
+            realized_rows = []
+
+        def _to_unix(created_at: str) -> float:
+            """Parse a UTC 'YYYY-MM-DD HH:MM:SS' string to Unix seconds."""
+            try:
+                dt = datetime.strptime(created_at, "%Y-%m-%d %H:%M:%S")
+                return dt.replace(tzinfo=timezone.utc).timestamp()
+            except (ValueError, TypeError):
+                return 0.0
+
+        points: list[dict[str, Any]] = []
+        realized_cum = 0.0
+        r_idx = 0
+        n_realized = len(realized_rows)
+        for row in snap_rows:
+            created = str(row["created_at"] or "")
+            if not created:
+                continue
+            # Advance cumulative realized P&L up to this snapshot time.
+            # Both columns share the 'YYYY-MM-DD HH:MM:SS' format, so
+            # lexicographic comparison equals chronological comparison.
+            while (r_idx < n_realized
+                   and str(realized_rows[r_idx]["created_at"] or "") <= created):
+                realized_cum += float(realized_rows[r_idx]["usd"] or 0.0)
+                r_idx += 1
+            ts = _to_unix(created)
+            if ts <= 0.0:
+                continue
+            points.append({
+                "block": int(row["block_height"] or 0),
+                "ts": ts,
+                "total_usd": float(row["total_usd"] or 0.0),
+                "realized_usd": realized_cum,
+            })
+
+        _log.info("PnL history rebuilt from DB: %d points (%d days).",
+                  len(points), safe_days)
+        self.pnl_history_ready.emit(points)
+
+    @Slot()
+    def fetch_deployed_capital(self) -> None:
+        """Aggregate resting (pending) offers into per-asset offered amounts.
+
+        [DEPLOYED 2026-08-04] Feeds the Balances tab's "Deployed %" column.
+        For each ``offer_log`` row with status='pending' on pair BASE/QUOTE:
+
+        - an ASK locks the BASE asset: ``size_mojos`` base-asset mojos;
+        - a BID locks the QUOTE asset: the engine pseudo-price is
+          ``quote_units_per_base_unit * 1e12`` and sizes are base-asset
+          mojos, so (per ``xop::quote_mojos_for`` in cpp types.hpp)
+          ``quote_units = size_mojos * price_mojos
+          / (base_mojos_per_unit * 1e12)``.
+
+        Amounts are converted to whole asset units (XCH = 1e12 mojos/unit,
+        CATs = 1e3) and summed per display symbol.  NOTE: these are OFFER
+        sizes; on-chain offers lock whole coins, so the wallet's true
+        locked value (confirmed - spendable) can exceed these figures.
+
+        Emits ``deployed_ready`` with::
+
+            {"offered_units": {SYMBOL: units, ...},
+             "offer_counts":  {SYMBOL: count, ...},
+             "pending_offers": total_pending_count}
+
+        Symbols are upper-cased pair-name components (e.g. "XCH",
+        "WUSDC.B", "BYC", "DBX").
+        """
+        # CAST to REAL before multiplying: size*price reaches ~1.5e24 for
+        # XCH pairs, which overflows SQLite's 64-bit integers.
+        sql = """
+            SELECT pair_name, side,
+                   COALESCE(SUM(size_mojos), 0)                    AS size_sum,
+                   COALESCE(SUM(CAST(size_mojos AS REAL)
+                                * CAST(price_mojos AS REAL)), 0.0) AS size_price_sum,
+                   COUNT(*)                                        AS offer_count
+            FROM offer_log
+            WHERE status = 'pending'
+            GROUP BY pair_name, side
+        """
+        rows = self._execute_query(sql, [])
+        if rows is None:
+            return
+
+        offered_units: dict[str, float] = {}
+        offer_counts: dict[str, int] = {}
+        pending_total = 0
+        for row in rows:
+            pair = str(row["pair_name"] or "")
+            if "/" not in pair:
+                continue
+            base_sym, quote_sym = (part.strip() for part in pair.split("/", 1))
+            side = str(row["side"] or "").strip().lower()
+            count = int(row["offer_count"] or 0)
+            base_denom = _mojos_per_unit(base_sym)
+            if side == "ask":
+                symbol = base_sym.upper()
+                units = float(row["size_sum"] or 0) / base_denom
+            elif side == "bid":
+                symbol = quote_sym.upper()
+                units = (float(row["size_price_sum"] or 0.0)
+                         / (base_denom * _MOJOS_PER_XCH))
+            else:
+                continue
+            pending_total += count
+            offered_units[symbol] = offered_units.get(symbol, 0.0) + units
+            offer_counts[symbol] = offer_counts.get(symbol, 0) + count
+
+        self.deployed_ready.emit({
+            "offered_units": offered_units,
+            "offer_counts": offer_counts,
+            "pending_offers": pending_total,
+        })
 
     @Slot()
     def fetch_reports(self) -> None:
@@ -406,27 +712,22 @@ class _DatabaseWorker(QObject):
         # which produced numbers ~1e9x too large for CAT-quoted pairs
         # ("billions of dollars" in the GUI).
         #
-        # We convert per-pair using the quote-asset's mojos-per-unit and
-        # USD-per-unit:
-        #   wUSDC.b / wUSDC : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
-        #   BYC             : 1e3 mojos/unit, $1.00/unit  -> divide by 1e3
-        #                     (BYC is a Chia-native USD stablecoin; treated
-        #                      as 1:1 for accounting until a feed is added)
-        #   DBX             : not USD-pegged and no on-DB rate -> 0.0 (will
-        #                     be reported as "USD value unknown")
-        #   anything else   : 0.0 (future pairs require an explicit mapping)
+        # The conversion table lives in the module-level _PNL_USDC_EXPR so
+        # the dashboard's restart-proof P&L display uses the exact same
+        # mapping (see fetch_pnl_display / fetch_pnl_history).
         #
         # Fees are paid on-chain in XCH mojos, so the fee_usdc_expr below
         # keeps the legacy XCH/USD conversion.
-        pnl_usdc_expr = (
-            "CASE "
-            "WHEN t.pair_name LIKE '%/wUSDC%' THEN t.realized_pnl_mojos / 1000.0 "
-            "WHEN t.pair_name LIKE '%/BYC%'   THEN t.realized_pnl_mojos / 1000.0 "
-            "WHEN t.pair_name LIKE '%/USDS%'  THEN t.realized_pnl_mojos / 1000.0 "
-            "ELSE 0.0 END"
-        )
+        pnl_usdc_expr = _PNL_USDC_EXPR
+        # [REPORTS-CRASH-FIX 2026-07-30] This line previously read
+        # `fee_usdc_expr = (f"({fee_usdc_expr})")` -- a self-reference before
+        # assignment introduced in the v0.7.46 refactor.  Every fetch_reports
+        # call since 2026-04-21 died here with UnboundLocalError before
+        # running any SQL, so the Reports page silently showed placeholders
+        # for three months.  Fees are on-chain XCH mojos; convert via the
+        # daily XCH/USD rate (0 when no rate row exists for that day).
         fee_usdc_expr = (
-            f"({fee_usdc_expr})"
+            f"((t.fee_mojos / 1000000000000.0) * {usd_rate_expr})"
         )
 
         # -- Period-based P&L -------------------------------------------------
@@ -995,6 +1296,10 @@ class DatabaseService(QObject):
     pairs_list_loaded = Signal(list)
     latest_snapshot_loaded = Signal(dict)
     reports_loaded = Signal(dict)
+    pnl_display_loaded = Signal(dict)
+    pnl_history_loaded = Signal(list)
+    deployed_loaded = Signal(dict)
+    last_trade_prices_loaded = Signal(dict)
     query_error = Signal(str)
 
     # -- Internal trigger signals (queued connections to worker thread) ------
@@ -1007,6 +1312,10 @@ class DatabaseService(QObject):
     _trigger_pairs = Signal()
     _trigger_latest_snapshot = Signal(str)
     _trigger_reports = Signal()
+    _trigger_pnl_display = Signal(str)
+    _trigger_pnl_history = Signal(int)
+    _trigger_deployed = Signal()
+    _trigger_last_trade_prices = Signal()
 
     def __init__(
         self,
@@ -1034,6 +1343,10 @@ class DatabaseService(QObject):
         self._worker.pairs_list_ready.connect(self.pairs_list_loaded)
         self._worker.latest_snapshot_ready.connect(self.latest_snapshot_loaded)
         self._worker.reports_ready.connect(self.reports_loaded)
+        self._worker.pnl_display_ready.connect(self.pnl_display_loaded)
+        self._worker.pnl_history_ready.connect(self.pnl_history_loaded)
+        self._worker.deployed_ready.connect(self.deployed_loaded)
+        self._worker.last_trade_prices_ready.connect(self.last_trade_prices_loaded)
         self._worker.query_error.connect(self._on_worker_error)
 
         # Queued connections: emit trigger signals to dispatch work to
@@ -1048,6 +1361,10 @@ class DatabaseService(QObject):
         self._trigger_pairs.connect(self._worker.fetch_pairs_list)
         self._trigger_latest_snapshot.connect(self._worker.fetch_latest_snapshot)
         self._trigger_reports.connect(self._worker.fetch_reports)
+        self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
+        self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
+        self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
+        self._trigger_last_trade_prices.connect(self._worker.fetch_last_trade_prices)
 
         # -- Auto-refresh timer ---------------------------------------------
         self._refresh_timer: QTimer = QTimer(self)
@@ -1059,6 +1376,12 @@ class DatabaseService(QObject):
         self._mutex: QMutex = QMutex()
         self._last_trade_params: Optional[tuple[str, str, Optional[int], Optional[int], int]] = None
         self._last_offer_params: Optional[tuple[str, str, int]] = None
+        # Last requested P&L display baseline (None until first query;
+        # "" means "no reset / full history").  Auto-refresh re-issues it.
+        self._last_pnl_baseline: Optional[str] = None
+        # Whether deployed-capital data was ever requested; auto-refresh
+        # keeps it current once the Balances tab has asked for it.
+        self._deployed_requested: bool = False
 
         _log.info(
             "DatabaseService created: path=%s, refresh=%d ms",
@@ -1229,6 +1552,59 @@ class DatabaseService(QObject):
         """
         self._trigger_reports.emit()
 
+    def query_pnl_display(self, baseline_iso: str = "") -> None:
+        """Request restart-proof headline P&L figures from ``trade_log``.
+
+        Results arrive on :pyattr:`pnl_display_loaded`.  The query is
+        re-issued on every auto-refresh tick with the same baseline until
+        a new baseline is supplied.
+
+        Parameters
+        ----------
+        baseline_iso : str
+            Display-reset baseline (UTC ``YYYY-MM-DD HH:MM:SS``), or an
+            empty string for the full lifetime history.
+        """
+        safe_baseline = (baseline_iso or "").strip()
+        with QMutexLocker(self._mutex):
+            self._last_pnl_baseline = safe_baseline
+        self._trigger_pnl_display.emit(safe_baseline)
+
+    def query_deployed_capital(self) -> None:
+        """Request per-asset resting-offer ("offered") amounts.
+
+        Results arrive on :pyattr:`deployed_loaded`.  Once requested, the
+        query is re-issued on every auto-refresh tick so the Balances
+        tab's Deployed % figures stay current.
+        """
+        with QMutexLocker(self._mutex):
+            self._deployed_requested = True
+        self._trigger_deployed.emit()
+
+    def query_last_trade_prices(self) -> None:
+        """Request the most recent fill price per pair.
+
+        Results arrive on :pyattr:`last_trade_prices_loaded` as
+        ``{pair_name: price_mojos}``.  Not auto-refreshed; EngineBridge
+        re-requests when its 30 s cache expires.
+        """
+        self._trigger_last_trade_prices.emit()
+
+    def query_pnl_history(self, days: int = 90) -> None:
+        """Request the persisted global P&L (USD) time series.
+
+        Results arrive on :pyattr:`pnl_history_loaded`.  Intended to be
+        called once at startup to rebuild the chart's P&L curve after a
+        GUI restart; it is not auto-refreshed (live gauge samples extend
+        the curve from there).
+
+        Parameters
+        ----------
+        days : int
+            Retention window in days (default 90, clamped to 1..365).
+        """
+        self._trigger_pnl_history.emit(int(days))
+
     # ===================================================================
     # Internal slots
     # ===================================================================
@@ -1243,12 +1619,22 @@ class DatabaseService(QObject):
         with QMutexLocker(self._mutex):
             trade_params = self._last_trade_params
             offer_params = self._last_offer_params
+            pnl_baseline = self._last_pnl_baseline
+            deployed_requested = self._deployed_requested
 
         if trade_params is not None:
             self._trigger_trades.emit(*trade_params)
 
         if offer_params is not None:
             self._trigger_offers.emit(*offer_params)
+
+        # Keep the restart-proof P&L display current.
+        if pnl_baseline is not None:
+            self._trigger_pnl_display.emit(pnl_baseline)
+
+        # Keep the Balances tab's Deployed % figures current.
+        if deployed_requested:
+            self._trigger_deployed.emit()
 
         # Also refresh the trade summary on each tick.
         self._trigger_summary.emit()

@@ -84,10 +84,28 @@ struct PnLSummary {
     Mojo   inventory_pnl;           ///< Current mark-to-market on inventory.
     Mojo   fee_pnl;                 ///< Net fees: income minus costs (mojos).
     Mojo   total_pnl;               ///< spread + inventory + fee (mojos).
-    double total_pnl_usd;           ///< total_pnl converted at XCH/USD rate.
+    // [PNL-UNITS 2026-07-30] The mojo fields above mix per-pair quote
+    // currencies (and an XCH-mojo fee leg), so they cannot be converted by a
+    // consumer.  These are normalized per pair via the registered quote-USD
+    // factors and are the only figures safe to display as money.
+    double total_pnl_usd;           ///< realized + unrealized + fees, in USD.
+    double realized_pnl_usd;        ///< spread capture, in USD.
+    double unrealized_pnl_usd;      ///< inventory mark-to-market, in USD.
+    double fee_pnl_usd;             ///< fees (negative = cost), in USD.
+    // [REWARD-INCOME 2026-08-01] Dexie DBX liquidity rewards recognized at
+    // receipt fair value.  OTHER INCOME: surfaced next to the trading
+    // figures but deliberately NOT included in total_pnl_usd -- trading
+    // P&L stays a measure of trading.  Populated on the cross-pair total
+    // only (rewards are per-account, not per-pair).
+    double reward_income_usd{0.0};
     double sharpe_ratio;            ///< Annualised Sharpe ratio.
     double max_drawdown;            ///< Maximum peak-to-trough decline [0,1].
     double profit_factor;           ///< gross_profit / gross_loss (>1 good).
+                                    ///< [PNL-USD-TOTALS 2026-08-01] For the
+                                    ///< cross-pair total this ratio is built
+                                    ///< from USD-normalized grosses; per-pair
+                                    ///< it stays the (unit-invariant) quote-
+                                    ///< mojo ratio.
     std::uint64_t fill_count;       ///< Total number of settled fills.
     double fill_rate_per_hour;      ///< Fills per wall-clock hour.
     double adverse_selection_rate;  ///< Fraction of fills with adverse move.
@@ -162,7 +180,35 @@ public:
     /// Create or verify the trade_log table and its indices.
     /// Safe to call repeatedly (IF NOT EXISTS).  Must be called before
     /// any other method that touches the database.
+    ///
+    /// [PNL-REHYDRATE 2026-07-30] Also rebuilds the in-memory per-pair and
+    /// total accumulators from the existing trade_log rows so that realized
+    /// P&L, fees, and fill statistics survive engine restarts.  Previously
+    /// every restart silently reset all cumulative P&L to zero.
     void init_database();
+
+    // -- Pair conversion registry (PNL-UNITS 2026-07-30) -------------------
+
+    /// Register (or refresh) the unit/denomination info for a pair so the
+    /// tracker can (a) key mark-to-market balance lookups by the canonical
+    /// base asset id instead of the display symbol -- the prior symbol
+    /// keying missed every lookup and pinned unrealized P&L at exactly 0 --
+    /// and (b) normalize per-pair quote-mojo P&L into USD for aggregation.
+    ///
+    /// @param pair_name            e.g. "XCH/wUSDC.b".
+    /// @param base_asset_id        canonical id ("xch" or 64-hex CAT id).
+    /// @param base_mojos_per_unit  1e12 for XCH, 1e3 for CATs.
+    /// @param quote_mojos_per_unit same convention for the quote asset.
+    /// @param usd_per_quote_unit   USD value of one quote display unit
+    ///                             (1.0 for USD-pegged stables; cross-derived
+    ///                             for DBX; 0 = unknown -> pair excluded
+    ///                             from USD totals and mark-to-market).
+    /// Called from the engine each heartbeat; cheap, lock-protected.
+    void set_pair_conversion(const std::string& pair_name,
+                             const std::string& base_asset_id,
+                             double base_mojos_per_unit,
+                             double quote_mojos_per_unit,
+                             double usd_per_quote_unit);
 
     // -- Fill recording ---------------------------------------------------
 
@@ -176,24 +222,48 @@ public:
     /// @param fee   Blockchain fee paid for this settlement (mojos, >= 0).
     /// @param cost_basis  Weighted-average cost basis at the time of fill.
     /// @param realized_pnl  Pre-computed realized PnL for this fill (mojos).
-    ///        Computed by the engine as (price - cost_basis) * size / kMojosPerXch
-    ///        for sells, 0 for buys.  Single source of truth to avoid
-    ///        redundant computation.
-    void record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
+    ///        Computed by the engine via quote_mojos_for for sells, 0 for
+    ///        buys.  Single source of truth to avoid redundant computation.
+    ///
+    /// @return true when the fill was newly recorded; false when a row with
+    ///         the same trade_id already exists (duplicate re-detection after
+    ///         a crash between the insert and the engine's side effects).
+    ///         On false, accumulators and the trade-history file are NOT
+    ///         touched -- the fill was already counted -- but the caller
+    ///         should still complete its own side effects (offer status,
+    ///         inventory) which may not have run before the crash.
+    bool record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
                      Mojo realized_pnl);
 
     /// Record a fee event that is not associated with a specific fill.
-    /// Used for DBX incentive income (positive) and standalone blockchain
-    /// fees (negative).
+    /// Standalone blockchain fees (negative).  NOTE [REWARD-INCOME
+    /// 2026-08-01]: DBX incentive income does NOT go through here any
+    /// more -- record_fee lands in fee_pnl, which is part of trading P&L,
+    /// and the agreed treatment books rewards as separate other income.
+    /// Use add_reward_income_usd instead.
     ///
     /// @param pair_name  Trading pair this fee relates to ("" for global).
     /// @param amount     Fee amount in mojos (positive = income).
     void record_fee(const std::string& pair_name, Mojo amount);
 
+    // -- Reward income ([REWARD-INCOME 2026-08-01]) ------------------------
+
+    /// Accumulate dexie liquidity-reward income recognized at receipt fair
+    /// value (USD).  Kept SEPARATE from spread/inventory/fee P&L; surfaced
+    /// via PnLSummary::reward_income_usd and its Prometheus gauge.  The
+    /// caller journals the receipt to the ledger first (event_type
+    /// 'reward', FMV in the note); rehydrate_from_db rebuilds this
+    /// accumulator from those rows, so restarts are invariant.
+    void add_reward_income_usd(double usd);
+
+    /// Cumulative reward income in USD (live accumulation + rehydrated).
+    [[nodiscard]] double get_reward_income_usd() const;
+
     // -- Mark-to-market ---------------------------------------------------
 
     /// Recalculate inventory PnL for every tracked pair using current
-    /// market prices.  Call this once per heartbeat (~52 seconds).
+    /// market prices.  Call this once per engine heartbeat (~19 minutes
+    /// in production; the cadence is measured, not assumed).
     ///
     /// @param get_price  Callback: given (pair_name, asset_id) returns the
     ///                   current mid-price in mojos.  Return 0 if unknown.
@@ -299,6 +369,16 @@ public:
     /// Format a Timestamp as a date-only string "YYYY-MM-DD".
     [[nodiscard]] static std::string timestamp_to_date(Timestamp ts);
 
+    /// [SHARPE-CADENCE 2026-08-01] Annualize a per-snapshot Sharpe using
+    /// the MEASURED average interval between snapshots, in seconds.  Public
+    /// and pure so the annualization is pinned by tests: snapshots arrive
+    /// once per engine heartbeat (~19 min, median 1,165 s measured), and
+    /// annualizing with the 52-second chain-block constant would inflate
+    /// Sharpe ~4.7x.  Returns 0 for degenerate stdev or interval.
+    [[nodiscard]] static double annualized_sharpe(
+        double mean_return, double stdev_return,
+        double avg_interval_seconds);
+
 private:
     // -- Internal types ---------------------------------------------------
 
@@ -323,10 +403,29 @@ private:
     };
 
     /// A single PnL snapshot for Sharpe ratio and drawdown calculation.
+    /// [PNL-USD-TOTALS 2026-08-01] The snapshot is USD-normalized: the old
+    /// Mojo total summed quote-asset mojos across pairs with different
+    /// quote currencies (a DBX mojo is ~1/70th of a wUSDC.b mojo in value),
+    /// so Sharpe and drawdown were dominated by whichever pair had the
+    /// cheapest quote mojos.  Sharpe stays dimensionless; drawdown is a
+    /// fraction -- both are now computed over a unit-coherent series.
     struct PnLSnapshot {
         Timestamp timestamp;
-        Mojo      total_pnl;
+        double    total_pnl_usd;
     };
+
+    /// Cross-pair realized totals normalized to USD via the per-pair
+    /// registered conversions (same machinery as fill_usd_components_locked,
+    /// so live and rehydrated values agree by construction).
+    /// [PNL-USD-TOTALS 2026-08-01] Raw quote-mojo sums across pairs mix
+    /// currencies and are meaningless; any cross-pair realized figure must
+    /// go through this.  Caller must hold mtx_.
+    struct UsdRealizedTotals {
+        double spread_pnl{0.0};     ///< Realized spread capture, USD.
+        double gross_profit{0.0};   ///< Sum of positive realized PnL, USD.
+        double gross_loss{0.0};     ///< Sum of negative realized PnL, USD (positive).
+    };
+    [[nodiscard]] UsdRealizedTotals realized_usd_totals_locked() const;
 
     /// Compute annualised Sharpe ratio from the PnL snapshot history.
     [[nodiscard]] double compute_sharpe() const;
@@ -338,9 +437,34 @@ private:
     [[nodiscard]] PnLSummary build_summary(const PairPnL& ppnl,
                                             double xch_usd) const;
 
+    /// USD value of a quote-asset-mojo amount for a pair, using its
+    /// registered conversion (or the retired-pair peg fallback).  Returns 0
+    /// when the pair's quote has no known USD value.  Caller must hold mtx_.
+    /// Fees are NOT convertible here -- they are XCH-denominated and go
+    /// through xch_usd_rate_ instead (PNL-UNITS 2026-07-30).
+    [[nodiscard]] double quote_mojos_to_usd_locked(
+        const std::string& pair_name, Mojo quote_mojos) const;
+
+    /// Fill in the USD component fields of a summary.  Caller must hold mtx_.
+    /// @param pair_name  Empty to aggregate every pair (the global total).
+    void fill_usd_components_locked(PnLSummary& s,
+                                    const std::string& pair_name) const;
+
     /// Lock-free insert helper; caller must already hold mtx_.
     /// ISO/IEC 5055 -- CWE-362: separated to avoid deadlock with record_fill.
-    void insert_trade_unlocked(const TradeRecord& record);
+    /// @return true when the row was inserted; false when trade_id already
+    ///         exists (UNIQUE constraint -- idempotent replay support).
+    bool insert_trade_unlocked(const TradeRecord& record);
+
+    /// Rebuild the in-memory accumulators from trade_log (called once at the
+    /// end of init_database, before any live fills).  Caller must NOT hold
+    /// mtx_.  PNL-REHYDRATE 2026-07-30.
+    void rehydrate_from_db();
+
+    /// Append one fill to the durable trade-history CSV
+    /// (<db_dir>/trade_history/trades_live.csv).  Best-effort: failures are
+    /// logged, never thrown.  Caller must hold mtx_ (reads pair_conv_).
+    void append_history_csv(const TradeRecord& record, Mojo realized_pnl);
 
     /// Finalise and null-out a prepared statement, ignoring errors.
     static void finalize_stmt(sqlite3_stmt*& stmt) noexcept;
@@ -372,14 +496,40 @@ private:
     /// Current XCH/USD rate for USD conversion.  Updated by mark_to_market().
     double xch_usd_rate_ = 0.0;
 
+    /// [REWARD-INCOME 2026-08-01] Cumulative dexie reward income at receipt
+    /// FMV, USD.  Separate from every trading accumulator; rebuilt from the
+    /// ledger's 'reward' rows on init (rehydrate_from_db).
+    double reward_income_usd_ = 0.0;
+
+    // -- Per-pair unit conversions (PNL-UNITS 2026-07-30) ------------------
+
+    /// Denomination and USD-normalization info per pair, registered by the
+    /// engine.  Used for canonical-asset-id keying in mark_to_market and for
+    /// converting per-pair quote-mojo P&L into USD before cross-pair
+    /// aggregation (the raw mojo totals mix incompatible quote currencies).
+    struct PairConversion {
+        std::string base_asset_id;          ///< "xch" or 64-hex CAT id.
+        double      base_mojos_per_unit{1e12};
+        double      quote_mojos_per_unit{1e3};
+        double      usd_per_quote_unit{0.0}; ///< 0 = unknown.
+    };
+    std::unordered_map<std::string, PairConversion> pair_conv_;
+
+    /// Durable trade-history CSV path (<db_dir>/trade_history/trades_live.csv).
+    /// Empty when the directory could not be created.
+    std::string history_csv_path_;
+
     // [T8-21] EMA-smoothed mid-prices per pair for unrealized PnL.
     // Reduces mark-to-market noise from volatile spot prices.
-    // EMA alpha = 0.3 (half-life ~1.7 observations = ~90 s at 52 s heartbeat).
+    // EMA alpha = 0.3 (half-life ~1.7 observations; one observation per
+    // engine heartbeat, ~19 min in production -> half-life ~33 min).
     std::unordered_map<std::string, double> price_ema_;
 
     /// Maximum number of PnL snapshots retained for analytics.
-    /// 8640 snapshots at 52-second intervals covers ~5.2 days -- enough
-    /// for a robust annualised Sharpe estimate.
+    /// 8640 snapshots at one per ~19-minute heartbeat covers ~114 days
+    /// -- ample history for the annualised Sharpe estimate.  (An older
+    /// comment assumed 52-second snapshots / ~5.2 days; snapshots have
+    /// always been per-heartbeat.)
     static constexpr std::size_t kMaxSnapshots = 8640;
 };
 

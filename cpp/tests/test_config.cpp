@@ -145,6 +145,80 @@ TEST(ConfigParserTest, OptionalSections_DefaultCorrectly) {
 
     // Strategy confirmation depth defaults to 6.
     EXPECT_EQ(cfg.strategy.confirmation_depth_blocks, 6u);
+
+    // [LEDGER 2026-07-30] The accounting section is optional.  An existing
+    // deployment whose config.yaml predates it must still boot -- a throw
+    // here would stop the engine from starting at all.
+    EXPECT_TRUE(cfg.accounting.ledger_enabled);
+    EXPECT_FALSE(cfg.accounting.pause_enabled)
+        << "auto-pause must be opt-in, never a default";
+    EXPECT_NEAR(cfg.accounting.alert_pct, 0.005, 1e-9);
+    EXPECT_NEAR(cfg.accounting.pause_pct, 0.02, 1e-9);
+    EXPECT_EQ(cfg.accounting.alert_observations, 2u);
+    EXPECT_EQ(cfg.accounting.pause_observations, 3u);
+}
+
+// ============================================================================
+// accounting: -- ledger / reconciliation control (LEDGER 2026-07-30)
+// ============================================================================
+
+TEST(ConfigParserTest, AccountingSection_Parses) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  ledger_enabled: true
+  alert_pct: 0.01
+  alert_observations: 3
+  pause_pct: 0.05
+  pause_observations: 4
+  pause_enabled: true
+  floor_xch_mojos: 2000000000
+  floor_cat_mojos: 250
+  fee_slack_mojos: 300000
+  max_balance_age_blocks: 20
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+
+    EXPECT_TRUE(cfg.accounting.ledger_enabled);
+    EXPECT_NEAR(cfg.accounting.alert_pct, 0.01, 1e-9);
+    EXPECT_EQ(cfg.accounting.alert_observations, 3u);
+    EXPECT_NEAR(cfg.accounting.pause_pct, 0.05, 1e-9);
+    EXPECT_EQ(cfg.accounting.pause_observations, 4u);
+    EXPECT_TRUE(cfg.accounting.pause_enabled);
+    EXPECT_EQ(cfg.accounting.floor_xch_mojos, 2'000'000'000LL);
+    EXPECT_EQ(cfg.accounting.floor_cat_mojos, 250LL);
+    EXPECT_EQ(cfg.accounting.fee_slack_mojos, 300'000LL);
+    EXPECT_EQ(cfg.accounting.max_balance_age_blocks, 20u);
+}
+
+TEST(ConfigParserTest, AccountingPauseBelowAlert_Throws) {
+    // A pause threshold tighter than the alert threshold would pause before
+    // ever alerting -- reject it rather than silently mis-escalate.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_pct: 0.05
+  pause_pct: 0.01
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, AccountingZeroObservations_Throws) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_observations: 0
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, AccountingOutOfRangePct_Throws) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  alert_pct: 1.5
+)";
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
 // ============================================================================
@@ -447,6 +521,96 @@ TEST(ConfigParserTest, RecoveryConfig_PairAllowlistParses) {
     EXPECT_EQ(cfg.recovery.pair_allowlist[0], "XCH/wUSDC.b");
     EXPECT_FALSE(cfg.recovery.cancel_on_enter);
     EXPECT_DOUBLE_EQ(cfg.recovery.zero_fee_below_xch, 0.002);
+}
+
+// ============================================================================
+// Micro-price blend schedule
+//
+// Both knobs are absent from the shipped config.yaml on purpose: the defaults
+// have to protect an unconfigured deployment, because an unconfigured
+// deployment is exactly what the BYC mispricing reached.
+// ============================================================================
+
+namespace {
+
+/// kMinimalValidYaml with extra keys spliced into the [strategy] block.
+std::string with_strategy_keys(const std::string& extra) {
+    std::string y = kMinimalValidYaml;
+    const std::string anchor = "  tier_size_pct: [0.6, 0.4]";
+    const auto pos = y.find(anchor);
+    if (pos == std::string::npos) return y;
+    y.insert(pos + anchor.size(), extra);
+    return y;
+}
+
+}  // namespace
+
+TEST(ConfigParserTest, MicropriceBandDefaultsWithoutAnyConfig) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_narrow_bps, 200.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_wide_bps,   800.0);
+}
+
+TEST(ConfigParserTest, MicropriceBandIsOverridable) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 150\n  microprice_wide_bps: 1200"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_narrow_bps,  150.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.microprice_wide_bps,   1200.0);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsAnInvertedBand) {
+    // wide <= narrow leaves no interior to interpolate across, so the blend
+    // would silently collapse into the discontinuous step this schedule
+    // exists to replace.  Refuse it rather than quietly degrade.
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 800\n  microprice_wide_bps: 200"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsEqualEdges) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  microprice_narrow_bps: 400\n  microprice_wide_bps: 400"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, MicropriceBandRejectsNegativeEdges) {
+    TempYaml tmp(with_strategy_keys("\n  microprice_narrow_bps: -1"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+// ============================================================================
+// Published-mid BBO band
+//
+// Like the micro-price schedule, both knobs are deliberately absent from the
+// shipped config.yaml: the defaults must protect an unconfigured deployment.
+// ============================================================================
+
+TEST(ConfigParserTest, PublishedMidBandDefaultsWithoutAnyConfig) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_floor_bps,   150.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_spread_frac, 0.25);
+}
+
+TEST(ConfigParserTest, PublishedMidBandIsOverridable) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  published_mid_band_floor_bps: 200"
+        "\n  published_mid_band_spread_frac: 0.5"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_floor_bps,   200.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.published_mid_band_spread_frac, 0.5);
+}
+
+TEST(ConfigParserTest, PublishedMidBandRejectsNegativeValues) {
+    TempYaml tmp(with_strategy_keys(
+        "\n  published_mid_band_floor_bps: -10"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+
+    TempYaml tmp2(with_strategy_keys(
+        "\n  published_mid_band_spread_frac: -0.1"));
+    EXPECT_THROW(xop::load_config(tmp2.path()), xop::ConfigError);
 }
 
 }  // namespace

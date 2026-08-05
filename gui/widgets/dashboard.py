@@ -428,13 +428,18 @@ class DashboardWidget(QWidget):
         self._grid.setSpacing(6)
 
         # ---- Row 0: Metric cards -----------------------------------------
+        # [PNL-DISPLAY 2026-08-02] "Total P&L" is the lifetime realized
+        # figure derived from the persistent trade log (never resets on
+        # GUI/engine restart); "24h P&L" is the trailing-24-hour realized
+        # figure.  "Unrealized PnL" remains the engine's live
+        # mark-to-market gauge.  The old Realized/Spread/Inventory cards
+        # were removed: Spread and Inventory literally duplicated
+        # Realized/Unrealized, and Realized is now the headline.
         self._metric_cards: dict[str, MetricCard] = {}
         metric_defs: list[str] = [
-            "Total PnL",
-            "Realized PnL",
+            "Total P&L",
+            "24h P&L",
             "Unrealized PnL",
-            "Spread PnL",
-            "Inventory PnL",
             "24h Fill Count",
             "Fees Paid 24h",
         ]
@@ -719,13 +724,15 @@ class DashboardWidget(QWidget):
         Expected keys mirror the card titles::
 
             {
-                "Total PnL":      {"value": 1234.56, "change_pct": 0.5, "spark": 1234.56},
-                "Realized PnL":   {...},
+                "Total P&L":      {"value": 1234.56, "change_pct": 0.5, "spark": 1234.56},
+                "24h P&L":        {...},
                 "Unrealized PnL": {...},
-                "Spread PnL":     {...},
-                "Inventory PnL":  {...},
                 "24h Fill Count": {"value": 42, "change_pct": 10.0, "spark": 42},
+                "Fees Paid 24h":  {...},
             }
+
+        Missing keys leave the corresponding card untouched, so partial
+        updates (e.g. DB-derived P&L arriving on its own timer) are safe.
 
         Parameters
         ----------
@@ -746,9 +753,10 @@ class DashboardWidget(QWidget):
             if data is None:
                 continue
             value = data.get("value", 0.0)
+            is_pnl_card = "PnL" in name or "P&L" in name
 
             if "display_text" in data:
-                sign_value = value if "PnL" in name else None
+                sign_value = value if is_pnl_card else None
                 card.set_value_text(str(data.get("display_text", "—")), sign_value=sign_value)
             # Fill Count is always shown as an integer
             elif "Fill Count" in name:
@@ -770,7 +778,7 @@ class DashboardWidget(QWidget):
                 card.append_spark(data["spark"])
 
             # Annotate PnL cards when no fills have occurred.
-            if "PnL" in name:
+            if is_pnl_card:
                 if fill_count == 0 and value == 0.0:
                     card.set_annotation("No trades filled yet")
                 else:

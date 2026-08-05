@@ -12,14 +12,18 @@
 // only inside ratio calculations and the result is never stored back as a
 // monetary value.
 //
-// Overflow note:
-//   The product (fill_price * qty) could theoretically overflow int64_t if
-//   both operands are near 2^31.  At CHIA's scale this is impossible -- max
-//   reasonable qty is ~11,000 XCH = 1.1e16 mojos and max price is ~10 XCH =
-//   1e13 mojos, so the product is ~1.1e29 which overflows.  We therefore use
-//   __int128 (or double) for the intermediate multiplication, then store back
-//   to int64_t after division.  This eliminates any overflow risk for all
-//   realistic capital levels.
+// Overflow note (PNL-BASIS-OVERFLOW, fixed 2026-07-30):
+//   The product (fill_price * qty) routinely exceeds int64_t: fill_price is
+//   an engine pseudo-price (~1e12-1e14) and qty is in base mojos (1 XCH =
+//   1e12), so total_cost reaches ~1e24+ for any XCH-sized fill.  The previous
+//   code stored the UNDIVIDED product back into an int64 AssetRecord field;
+//   on MSVC (Wide = double, no __int128) the out-of-range double->int64 cast
+//   saturated to INT64_MIN and recompute_basis clamped the negative basis to
+//   0 -- silently zeroing the XCH cost basis on the first bid fill after
+//   every restart, which in turn forced realized PnL to 0 on every later
+//   ask.  AssetRecord::total_cost is now a double end-to-end: ~15
+//   significant digits keeps the derived basis accurate to well under one
+//   mojo at any realistic capital level, and there is no int64 round-trip.
 //
 // Compliant with:
 //   ISO/IEC 27001:2022 -- controlled mutable state, defensive input validation
@@ -36,28 +40,6 @@
 #include <limits>
 #include <mutex>
 #include <stdexcept>
-
-// ---------------------------------------------------------------------------
-// On MSVC __int128 is not available; fall back to double for the intermediate
-// multiplication.  The precision loss (~15 significant digits) is acceptable
-// because the final result is a ratio (cost basis) and both numerator and
-// denominator share the same magnitude.
-// ---------------------------------------------------------------------------
-#if defined(__SIZEOF_INT128__)
-  #if defined(__GNUC__) || defined(__clang__)
-    #pragma GCC diagnostic push
-    #pragma GCC diagnostic ignored "-Wpedantic"
-  #endif
-    using Wide = __int128;
-    #define XOP_WIDE_DIV(num, den) static_cast<Mojo>((num) / (den))
-  #if defined(__GNUC__) || defined(__clang__)
-    #pragma GCC diagnostic pop
-  #endif
-#else
-    using Wide = double;
-    #define XOP_WIDE_DIV(num, den) static_cast<Mojo>(static_cast<double>(num) / \
-                                                      static_cast<double>(den))
-#endif
 
 namespace xop {
 
@@ -107,7 +89,7 @@ const char* to_string(CapitalCategory c) noexcept {
 
 AssetRecord::AssetRecord()
     : total_quantity{0}
-    , total_cost{0}
+    , total_cost{0.0}
     , weighted_avg_cost_basis{0}
     , last_fill_block{0}
     , last_fill_time{}
@@ -117,7 +99,7 @@ AssetRecord::AssetRecord()
 AssetRecord::AssetRecord(const AssetId& id)
     : asset_id{id}
     , total_quantity{0}
-    , total_cost{0}
+    , total_cost{0.0}
     , weighted_avg_cost_basis{0}
     , last_fill_block{0}
     , last_fill_time{}
@@ -188,9 +170,8 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
         // quantity at basis=1 with a small real fill at basis=P keeps
         // basis ~= 1, causing realized PnL to wildly overstate gains
         // on subsequent sells (XOPTRADER-PNL-COST-BASIS-SENTINEL).
-        const Wide new_total_cost = static_cast<Wide>(fill_price)
-                                  * static_cast<Wide>(new_total_qty);
-        rec.total_cost              = static_cast<Mojo>(new_total_cost);
+        rec.total_cost              = static_cast<double>(fill_price)
+                                    * static_cast<double>(new_total_qty);
         rec.total_quantity          = new_total_qty;
         rec.basis_is_seed_sentinel  = false;
     } else {
@@ -199,12 +180,10 @@ void InventoryTracker::record_buy(const AssetId& asset_id,
         //   new_total_qty  = old_qty + qty
         //   new_basis      = new_total_cost / new_total_qty
         //
-        // Use wide arithmetic to prevent overflow in the multiplication.
-        const Wide cost_increment = static_cast<Wide>(fill_price)
-                                  * static_cast<Wide>(qty);
-        const Wide new_total_cost = static_cast<Wide>(rec.total_cost)
-                                  + cost_increment;
-        rec.total_cost     = static_cast<Mojo>(new_total_cost);
+        // total_cost is a double; the product cannot overflow (double range
+        // ~1e308) and precision loss is negligible (PNL-BASIS-OVERFLOW).
+        rec.total_cost    += static_cast<double>(fill_price)
+                           * static_cast<double>(qty);
         rec.total_quantity = new_total_qty;
     }
 
@@ -265,16 +244,15 @@ bool InventoryTracker::record_sell(const AssetId& asset_id,
     // method.
     //
     // Edge case: qty == total_quantity  =>  new_total_cost = 0, new_qty = 0.
-    //
-    // We use wide arithmetic to avoid overflow in (total_cost * qty).
     if (qty == rec.total_quantity) {
         // Full liquidation -- shortcut avoids rounding residue.
-        rec.total_cost     = 0;
+        rec.total_cost     = 0.0;
         rec.total_quantity = 0;
     } else {
-        const Wide numerator = static_cast<Wide>(rec.total_cost)
-                             * static_cast<Wide>(rec.total_quantity - qty);
-        rec.total_cost     = XOP_WIDE_DIV(numerator, rec.total_quantity);
+        const double remaining_fraction =
+            static_cast<double>(rec.total_quantity - qty)
+            / static_cast<double>(rec.total_quantity);
+        rec.total_cost     *= remaining_fraction;
         rec.total_quantity -= qty;
     }
 
@@ -658,16 +636,161 @@ void InventoryTracker::seed_position(const AssetId& asset_id,
     auto [ins_it, inserted] = records_.try_emplace(asset_id, asset_id);
     AssetRecord& rec = ins_it->second;
 
-    // Use wide arithmetic for cost = qty * estimated_price.
-    const Wide cost = static_cast<Wide>(qty) * static_cast<Wide>(estimated_price);
     rec.total_quantity = qty;
-    rec.total_cost     = static_cast<Mojo>(cost);
+    rec.total_cost     = static_cast<double>(qty)
+                       * static_cast<double>(estimated_price);
     // [v0.7.46 #1] Mark the basis as a synthetic seed so that the first
     // real record_buy() replaces (not blends) it with the observed fill
     // price.  Only treat estimated_price <= 1 as a sentinel; callers that
     // pass a real estimate (e.g. cost-basis restore from DB) still get
     // standard weighted-average behaviour.
     rec.basis_is_seed_sentinel = (estimated_price <= 1);
+    recompute_basis(rec);
+}
+
+// ===========================================================================
+// Persistence support (PNL-BASIS-PERSIST, 2026-07-30)
+// ===========================================================================
+
+void InventoryTracker::restore_record(const AssetId& asset_id,
+                                      Mojo           qty,
+                                      double         total_cost,
+                                      bool           basis_is_seed_sentinel)
+{
+    if (qty < 0 || total_cost < 0.0) {
+        return;
+    }
+
+    std::unique_lock lock(mtx_records_);
+
+    auto [it, inserted] = records_.try_emplace(asset_id, asset_id);
+    AssetRecord& rec = it->second;
+
+    rec.total_quantity         = qty;
+    rec.total_cost             = total_cost;
+    rec.basis_is_seed_sentinel = basis_is_seed_sentinel;
+    recompute_basis(rec);
+}
+
+void InventoryTracker::reseed_basis(const AssetId& asset_id, Mojo price)
+{
+    if (price <= 0) {
+        return;
+    }
+
+    std::unique_lock lock(mtx_records_);
+
+    auto it = records_.find(asset_id);
+    if (it == records_.end() || it->second.total_quantity <= 0) {
+        return;
+    }
+
+    AssetRecord& rec = it->second;
+    rec.total_cost = static_cast<double>(rec.total_quantity)
+                   * static_cast<double>(price);
+    rec.basis_is_seed_sentinel = false;
+    recompute_basis(rec);
+}
+
+bool InventoryTracker::record_fill_unpriced(const AssetId& asset_id,
+                                            Mojo           qty,
+                                            bool           is_buy,
+                                            BlockHeight    block,
+                                            Timestamp      ts)
+{
+    if (qty <= 0) {
+        return false;
+    }
+
+    std::unique_lock lock(mtx_records_);
+
+    auto [it, inserted] = records_.try_emplace(asset_id, asset_id);
+    AssetRecord& rec = it->second;
+
+    if (is_buy) {
+        const Mojo new_qty = rec.total_quantity + qty;
+        if (new_qty < rec.total_quantity) {
+            return false;  // overflow guard
+        }
+        // Cost the new lot at the CURRENT basis so the weighted average is
+        // unchanged.  When the record is still a sentinel this keeps basis
+        // at the sentinel value AND keeps the flag set, so the later
+        // mark-at-first-observation upgrade still repairs the whole holding.
+        rec.total_cost += static_cast<double>(qty)
+                        * static_cast<double>(rec.weighted_avg_cost_basis);
+        rec.total_quantity = new_qty;
+
+        // A record that never had a real price (basis 0 on a brand-new
+        // record, or the 1-mojo wallet seed) now holds quantity whose cost
+        // is genuinely unknown.  Flag it as a sentinel so the
+        // mark-at-first-observation upgrade repairs it once a mark exists.
+        // Without this, an unpriced fill against a fresh record would leave
+        // basis 0 with the flag clear -- silently unrepairable.
+        if (rec.weighted_avg_cost_basis <= 1) {
+            rec.basis_is_seed_sentinel = true;
+        }
+    } else {
+        if (qty > rec.total_quantity) {
+            return false;
+        }
+        if (qty == rec.total_quantity) {
+            rec.total_cost     = 0.0;
+            rec.total_quantity = 0;
+        } else {
+            rec.total_cost *= static_cast<double>(rec.total_quantity - qty)
+                            / static_cast<double>(rec.total_quantity);
+            rec.total_quantity -= qty;
+        }
+    }
+
+    recompute_basis(rec);
+    rec.last_fill_block = block;
+    rec.last_fill_time  = ts;
+    return true;
+}
+
+void InventoryTracker::adjust_quantity(const AssetId& asset_id,
+                                       Mojo           new_qty,
+                                       Mojo           price_for_additions)
+{
+    if (new_qty < 0) {
+        return;
+    }
+
+    std::unique_lock lock(mtx_records_);
+
+    auto [it, inserted] = records_.try_emplace(asset_id, asset_id);
+    AssetRecord& rec = it->second;
+
+    if (new_qty == rec.total_quantity) {
+        return;
+    }
+
+    if (new_qty < rec.total_quantity) {
+        // Withdrawal / untracked spend: proportional cost drawdown keeps the
+        // weighted-average basis of the remaining position unchanged.
+        if (new_qty == 0) {
+            rec.total_cost = 0.0;
+        } else {
+            rec.total_cost *= static_cast<double>(new_qty)
+                            / static_cast<double>(rec.total_quantity);
+        }
+        rec.total_quantity = new_qty;
+    } else {
+        // Deposit / untracked receipt: mark-at-receipt.  Without a usable
+        // price the delta cannot be costed -- leave the record untouched so
+        // the caller can retry once market data is available.
+        if (price_for_additions <= 0) {
+            return;
+        }
+        const Mojo delta = new_qty - rec.total_quantity;
+        rec.total_cost    += static_cast<double>(delta)
+                           * static_cast<double>(price_for_additions);
+        rec.total_quantity = new_qty;
+        // A real price observation replaces sentinel provenance.
+        rec.basis_is_seed_sentinel = false;
+    }
+
     recompute_basis(rec);
 }
 
@@ -792,15 +915,17 @@ void InventoryTracker::recompute_basis(AssetRecord& rec)
     // This avoids division by zero and stale cost data.
     if (rec.total_quantity == 0) {
         rec.weighted_avg_cost_basis = 0;
-        rec.total_cost              = 0;
+        rec.total_cost              = 0.0;
         return;
     }
 
     // Weighted-average cost basis = total_cost / total_quantity.
-    // Use wide arithmetic to avoid overflow in the division's numerator
-    // (which is just total_cost, already stored safely).
-    rec.weighted_avg_cost_basis = XOP_WIDE_DIV(
-        static_cast<Wide>(rec.total_cost), static_cast<Wide>(rec.total_quantity));
+    // total_cost is a double (PNL-BASIS-OVERFLOW); llround keeps the basis
+    // faithful to the nearest mojo instead of truncating toward zero (the
+    // prior truncation could round a basis of 0.9999 down to the sentinel
+    // range and re-trigger the basis-unknown guard).
+    rec.weighted_avg_cost_basis = static_cast<Mojo>(std::llround(
+        rec.total_cost / static_cast<double>(rec.total_quantity)));
 
     // Defensive: ensure cost basis is never negative (should not happen with
     // valid inputs, but guard per ISO/IEC 5055).

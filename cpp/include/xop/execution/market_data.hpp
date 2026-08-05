@@ -50,6 +50,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <deque>
 #include <functional>
@@ -59,6 +60,7 @@
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 namespace xop {
@@ -127,6 +129,105 @@ struct ArbitrageSignal {
 struct PriceHistoryEntry {
     BlockHeight block_height;  // Block at which this price was observed
     double      price;         // Mid-price in quote-per-base (double for math)
+};
+
+// ---------------------------------------------------------------------------
+// FairValue -- an INDEPENDENT reference price for a pair.
+//
+// "Independent" is the whole point: this value must contain no input from the
+// dexie order book for the pair it prices, because its job is to validate that
+// very book.  On 2026-08-01 all six XCH/BYC ask tiers were swept in one block,
+// because every tier was centred on a dexie mid that nothing had ever checked.
+// A number derived from that same mid could not have caught it.
+//
+// The value is produced by xop::fv::solve_pair (see fair_value_solver.hpp): a
+// weighted least-squares solve over the graph whose nodes are assets and whose
+// edges are pairs, re-run per pair with that pair's own book edge deleted.
+//
+// Confidence tiers, assigned from the SOLVE, never from a pair's identity:
+//   CexDirect    -- both legs carry a direct external USD anchor and the
+//                   solved uncertainty is inside the tight threshold.  No
+//                   on-chain book is needed to price this pair at all.
+//   Triangulated -- the answer survives deleting any single observation (the
+//                   graph is genuinely over-determined here) and the solved
+//                   uncertainty is inside the tight threshold.
+//   Inferred     -- solved and usable, but along a path with no cross-check,
+//                   or with an uncertainty above the tight threshold.
+//   Unavailable  -- no path to an anchor, or the solved uncertainty exceeds
+//                   the usable threshold.  The caller must WIDEN, never guess.
+//
+// An earlier revision added a tier that valued a pegged leg at its declared
+// peg.  It was removed: a peg is an assumption, not an observation, and BYC has
+// never traded at par.  Everything here is now measured.
+// ---------------------------------------------------------------------------
+
+enum class FairValueTier {
+    Unavailable  = 0,  // No independent source -- do NOT quote against this.
+    CexDirect    = 1,  // Both legs anchored by the external price feed.
+    Triangulated = 2,  // Over-determined graph solve, cross-checked.
+    Inferred     = 3,  // Solved, usable, but not cross-checked.
+};
+
+inline const char* to_string(FairValueTier t) noexcept {
+    switch (t) {
+        case FairValueTier::CexDirect:    return "cex-direct";
+        case FairValueTier::Triangulated: return "triangulated";
+        case FairValueTier::Inferred:     return "inferred";
+        default:                          return "unavailable";
+    }
+}
+
+struct FairValue {
+    double        price{0.0};       // Quote-per-base, independent of the book.
+    FairValueTier tier{FairValueTier::Unavailable};
+    double        age_seconds{0.0}; // Age of the sample the solve was fed.
+
+    /// 1-sigma uncertainty of log(price) in basis points, from the solve's own
+    /// normal matrix.  This is what decides whether the value may be used at
+    /// all, and it widens the deviation band so a shakier estimate clamps less
+    /// aggressively rather than being trusted like a firm one.
+    double        sigma_bps{0.0};
+
+    /// CONSISTENCY RESIDUAL: 10 000 * log(book_mid / fair_value).  How far this
+    /// pair's own book sits from what every OTHER observation implies.  Signed:
+    /// positive means the book is quoting the base asset richer than the rest
+    /// of the graph agrees.  NaN when the pair has no two-sided book to compare
+    /// against.  This is the disagreement signal -- it is published even when
+    /// the tier is Unavailable, because "these books contradict each other" is
+    /// informative regardless of which one is wrong.
+    double        residual_bps{0.0};
+
+    /// Observations (anchors + edges) that fed the solve.
+    std::size_t   observations{0};
+};
+
+// ---------------------------------------------------------------------------
+// FairValueObservation -- the raw, book-derived inputs the fair-value solve
+// needs from one pair, fetched under a single lock.
+//
+// Deliberately reports the SELF-FILTERED dexie top of book rather than the
+// aggregated mid: the aggregated mid may already blend a CEX reference, and
+// feeding that back into a solve anchored on the same CEX feed would double
+// count it.  The solve wants the raw market observation and nothing else.
+// ---------------------------------------------------------------------------
+struct FairValueObservation {
+    bool         has_book{false};   // Two-sided third-party book exists.
+    double       mid{0.0};          // (best_bid + best_ask) / 2.
+    double       spread_bps{0.0};   // Width of that book.
+    std::int32_t print_age{0};      // Heartbeats since the mid last moved.
+    double       amm_mid{0.0};      // AMM implied mid (0 if none).
+
+    /// Seconds since the AMM sample was actually OBSERVED -- i.e. since the
+    /// last SUCCESSFUL pool fetch, not since it was last copied out of the
+    /// cache.  Re-stamping a cached sample every heartbeat pinned this at ~0
+    /// and made every AMM freshness gate unreachable.
+    double       amm_age_seconds{0.0};
+
+    /// Total USD value of BOTH sides of the pool the AMM mid came from, 0 when
+    /// unknown.  This is what the AMM edge's weight is derived from: the
+    /// "arbitrage holds the pool to fair value" argument is an argument about
+    /// how much money defends the price, so the money has to be measured.
+    double       amm_pool_usd{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -220,8 +321,15 @@ struct MarketDataConfig {
     /// When AMM data is available, the blend becomes:
     ///   mid = w_dex * dex_mid + w_cex * cex_mid + w_amm * amm_mid
     /// with weights re-normalised to sum to 1.0.
-    /// Default 0.15 (15%).  0 = disable AMM blending.
-    double amm_blend_weight{0.15};
+    ///
+    /// DEFAULT 0.0 -- the AMM is an independent VALIDATOR of the mid, not a
+    /// contributor to it.  The same TibetSwap sample also feeds the
+    /// fair-value solve that checks the ladder; if it fed both, the guard
+    /// would be comparing the ladder against a number that had itself set the
+    /// ladder's centre.  A validator must not be able to move the thing it
+    /// validates, so the blend side is switched off and the solve side kept.
+    /// See StrategyConfig::amm_blend_weight for the full rationale.
+    double amm_blend_weight{0.0};
 
     /// Maximum staleness (seconds) of AMM data before it is ignored.
     /// Default 300 s (5 min).  0 = disable freshness check.
@@ -241,6 +349,45 @@ struct MarketDataConfig {
     /// at the cost of including offers further from fair value.
     /// Default: 5 levels per side.
     std::size_t orderbook_mid_depth{5};
+
+    /// Layer 2 blend schedule for the order-book mid.  At or below
+    /// `microprice_narrow_bps` of relative spread the Stoikov micro-price is
+    /// used whole; at or above `microprice_wide_bps` it is discarded for the
+    /// plain BBO midpoint; in between the two are blended linearly.
+    /// Mirrored from StrategyConfig, where the defaults are justified against
+    /// measured per-pair spread distributions.
+    double microprice_narrow_bps{200.0};
+    double microprice_wide_bps{800.0};
+
+    /// Maximum age (seconds) of an independent fair value before
+    /// get_fair_value() reports it as UNAVAILABLE.  The external price feed
+    /// polls every 30 s, so 300 s tolerates nine consecutive misses before
+    /// the engine is told it is quoting blind.  Must never fall back to the
+    /// dexie mid -- an expired fair value is reported as absent, not stale.
+    double fair_value_max_age_sec{300.0};
+
+    // -- Published-mid BBO band (Layer 1 for the PUBLISHED mid) --------------
+    //
+    // compute_orderbook_mid() enforces best_bid <= mid <= best_ask on the
+    // order-book mid, but compute_mid() then blends that number with CEX and
+    // AMM references, so the PUBLISHED mid could leave the book again -- the
+    // exact mechanism by which a broken external reference (the BYC $1.1447
+    // artifact, 13% over its $1.01 truth) could drag a healthy pair's mid out
+    // of its own executable interval.  The published mid is therefore clamped
+    // to the dust-filtered third-party BBO widened by a tolerance band:
+    //
+    //     band_bps = max(floor_bps, spread_frac * book_spread_bps)
+    //     mid in [min(bid,ask) * (1 - band), max(bid,ask) * (1 + band)]
+    //
+    // applied only while the dex book is two-sided and fresh (a stale book is
+    // not "now"; CEX should govern then).  Mirrored from StrategyConfig,
+    // where the defaults are justified against measured numbers.
+
+    /// Minimum band (bps) allowed beyond the BBO regardless of spread.
+    double published_mid_band_floor_bps{150.0};
+
+    /// Band as a fraction of the book's own relative spread.
+    double published_mid_band_spread_frac{0.25};
 };
 
 // ---------------------------------------------------------------------------
@@ -260,9 +407,22 @@ struct PairState {
     double      volume_24h{0.0};    // Rolling 24-hour volume (base asset units)
     Timestamp   dex_updated_at{};   // When dexie data was last refreshed
 
+    // --- Print-age staleness (value-change counter) ---
+    // dex_updated_at is rewritten on EVERY heartbeat whether or not the price
+    // moved, so it measures when we last LOOKED, not when the price last MOVED.
+    // Measured: the BYC/wUSDC.b dexie mid sat at exactly 1.1030 for 26+
+    // consecutive snapshots (longest freeze 30.4h, 92.6% of observations
+    // unchanged) while reporting an age of 0 seconds.  These two fields track
+    // the price itself so a frozen book is detectable.
+    double       last_dex_print{0.0}; // Last materially-different dex mid
+    std::int32_t dex_print_age{0};    // Heartbeats since it last moved
+
     // --- AMM reference (TibetSwap implied price) ---
     double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)
-    Timestamp   amm_updated_at{};   // When AMM data was last refreshed
+    Timestamp   amm_updated_at{};   // When the pool was last successfully READ
+                                    // (supplied by the caller, NOT the ingest
+                                    // time -- see ingest_amm_mid).
+    double      amm_pool_usd{0.0};  // USD value of both pool sides, 0=unknown
 
     // --- Order-book-derived mid (depth-weighted VWAP micro-price) ---
     double      orderbook_mid{0.0}; // VWAP micro-price from competing offers
@@ -270,6 +430,21 @@ struct PairState {
     // --- CEX reference ---
     double      cex_mid{0.0};       // CEX mid-price (0 if unavailable)
     Timestamp   cex_updated_at{};   // When CEX data was last refreshed
+
+    // --- Independent fair value (never derived from this pair's book) ---
+    double        fair_value{0.0};  // Quote-per-base (0 if unavailable)
+
+    /// The solve's raw estimate, kept even when the tier is Unavailable
+    /// because the sigma exceeded the clamp ceiling.  0 only when the solve
+    /// produced no anchored answer at all.  Served by
+    /// get_fair_value_estimate(); the clamp path never reads it.
+    double        fair_value_estimate{0.0};
+    FairValueTier fair_value_tier{FairValueTier::Unavailable};
+    Timestamp     fair_value_updated_at{};
+    double        fair_value_sigma_bps{0.0};
+    double        fair_value_residual_bps{0.0};  // NaN when not measurable.
+    std::size_t   fair_value_observations{0};
+    bool          fair_value_residual_valid{false};
 
     // --- Block height context ---
     BlockHeight last_block{0};      // Most recent block height observed
@@ -398,9 +573,48 @@ public:
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
-    /// @param pair_name  Trading pair identifier.
-    /// @param amm_mid    AMM implied mid-price (quote per base).
-    void ingest_amm_mid(const std::string& pair_name, double amm_mid);
+    ///
+    /// CALL THIS ONLY WHEN A POOL FETCH ACTUALLY SUCCEEDED.  `observed_at` is
+    /// stored verbatim and is what every AMM freshness gate measures against,
+    /// so re-ingesting a cached sample with a fresh timestamp would make the
+    /// data look permanently new and every one of those gates unreachable.
+    ///
+    /// @param pair_name    Trading pair identifier.
+    /// @param amm_mid      AMM implied mid-price (quote per base).
+    /// @param pool_usd     Total USD value of both pool sides; 0 = unknown,
+    ///                     which makes the sample unusable as a weighted
+    ///                     observation (it cannot be weighted without depth).
+    /// @param observed_at  When the pool was actually read.  Defaults to now()
+    ///                     for callers that fetch synchronously at the call
+    ///                     site; the engine passes its real fetch time.
+    void ingest_amm_mid(const std::string& pair_name,
+                        double             amm_mid,
+                        double             pool_usd = 0.0,
+                        Timestamp          observed_at = Timestamp::clock::now());
+
+    /// Ingest an INDEPENDENT fair value for a pair.
+    ///
+    /// The caller is responsible for the independence guarantee: the value
+    /// must not be derived, directly or indirectly, from this pair's dexie
+    /// order book.  Unlike ingest_cex_reference this value is NOT blended
+    /// into the composite mid; it exists purely to validate the mid.
+    ///
+    /// @param pair_name   Trading pair identifier.
+    /// @param fair_value  Independent reference price (quote per base), > 0.
+    /// @param tier        Provenance/confidence of the value.
+    void ingest_fair_value(const std::string& pair_name,
+                           double             fair_value,
+                           FairValueTier      tier);
+
+    /// Full-fidelity form of the above: stores the solved uncertainty, the
+    /// consistency residual and the observation count alongside the price.
+    ///
+    /// A value whose tier is Unavailable is NOT rejected here -- the price is
+    /// zeroed (so nothing downstream can mistake it for usable) while the
+    /// residual and sigma are retained.  "The books disagree by 12% and I do
+    /// not know which is right" is exactly the state the operator most needs
+    /// to see, and discarding it would make the failure invisible.
+    void ingest_fair_value(const std::string& pair_name, const FairValue& fv);
 
     // -- Typed accessors (thread-safe reads) --------------------------------
 
@@ -421,6 +635,56 @@ public:
     /// or if the CEX data is stale.
     std::optional<double> get_cex_reference(const std::string& pair_name) const;
 
+    /// Independent fair value for a pair, with its confidence tier.
+    ///
+    /// Returns std::nullopt when there is NO independent source: unknown
+    /// pair, nothing ever ingested, or the last sample is older than
+    /// config.fair_value_max_age_sec.  It deliberately does NOT fall back to
+    /// the dexie mid, the composite mid, or anything else touched by the
+    /// order book -- a caller that cannot get a fair value must know it is
+    /// quoting blind rather than be handed the very number it wanted checked.
+    std::optional<FairValue> get_fair_value(const std::string& pair_name) const;
+
+    /// The solve's raw ESTIMATE for a pair, regardless of confidence tier.
+    ///
+    /// get_fair_value() withholds any estimate whose solved sigma exceeds
+    /// fair_value_max_sigma_bps, because CLAMPING against a reference that
+    /// uncertain is theatre.  But for CENTRING and WIDTH the sigma is not a
+    /// validity flag -- it is the width instruction: at the 2026-08-01 sweep
+    /// the solve knew XCH/BYC was worth ~1.36 +- 467 bps while the book said
+    /// 1.2673, and discarding that estimate is what left the ladder centred
+    /// 10% from the truth.  This accessor returns the estimate WITH its sigma
+    /// and tier (which may be Unavailable) so the quoting path can blend it
+    /// by uncertainty instead of ignoring it.
+    ///
+    /// Returns std::nullopt when there is genuinely NO estimate: unknown
+    /// pair, a solve that found no anchored path at all, or a sample older
+    /// than config.fair_value_max_age_sec.  Never falls back to anything
+    /// derived from this pair's own book.
+    std::optional<FairValue> get_fair_value_estimate(
+        const std::string& pair_name) const;
+
+    /// CONSISTENCY RESIDUAL for a pair, in basis points:
+    ///     10 000 * log(book_mid / independent_fair_value)
+    ///
+    /// Positive means this pair's own book prices the base asset richer than
+    /// every other observation in the graph implies.  Unlike get_fair_value
+    /// this is reported even when the tier is Unavailable, because the fact
+    /// that two books contradict each other is actionable on its own -- it is
+    /// the signal that should widen quotes -- whether or not the solve is
+    /// confident enough to say which of them is wrong.
+    ///
+    /// Returns std::nullopt when the pair is unknown, no solve has run, the
+    /// last solve had no book to compare against, or the sample has expired.
+    std::optional<double> get_fair_value_residual_bps(
+        const std::string& pair_name) const;
+
+    /// Raw book inputs the fair-value solve needs, fetched under one lock.
+    /// Returns a default-constructed value (has_book == false) for an unknown
+    /// pair or one with no two-sided third-party book.
+    FairValueObservation get_fair_value_inputs(
+        const std::string& pair_name) const;
+
     /// Age of the current CEX reference in seconds.
     /// Returns std::nullopt if no CEX reference exists for the pair.
     std::optional<double> get_cex_reference_age_seconds(
@@ -434,6 +698,18 @@ public:
     /// Returns 0.0 when data is fresh, 1.0 at stale_threshold, >1.0 beyond.
     /// Returns 1.0 if the pair is unknown.
     double get_staleness_fraction(const std::string& pair_name) const;
+
+    /// Number of consecutive competing-offer ingests during which the dex mid
+    /// has not moved by more than 1 bp -- i.e. the age of the last PRINT, as
+    /// opposed to the age of the last poll that dex_updated_at records.
+    /// Returns 0 if the pair is unknown or has never printed.
+    std::int32_t dex_print_age(const std::string& pair_name) const;
+
+    /// Self-filtered dexie top-of-book as {best_bid, best_ask}.
+    /// Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer exists there, so
+    /// {0, 0} means there is no external market to quote against at all.
+    /// Returns {0.0, 0.0} if the pair is unknown.
+    std::pair<double, double> get_dex_bbo(const std::string& pair_name) const;
 
     /// Retrieve the latest block height ingested from the full node.
     BlockHeight current_block_height() const;

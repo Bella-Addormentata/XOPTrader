@@ -46,6 +46,78 @@ Writers:
 
 ---
 
+## `inventory_state` — persisted cost-basis records (2026-07-30)
+
+Persists the `InventoryTracker` per-asset accounting so realized-P&L
+attribution survives engine restarts (the missing piece behind "P&L never
+worked": every restart re-seeded all assets at a sentinel basis, so almost
+every sell recorded `realized_pnl_mojos = 0`).
+
+| Column                   | Type    | Notes                                              |
+|--------------------------|---------|----------------------------------------------------|
+| `asset_id`               | TEXT PK | `xch` or 64-hex CAT id                             |
+| `total_quantity`         | INTEGER | Tracked holdings in mojos                          |
+| `total_cost`             | REAL    | Σ(price × qty) in **USD-normalized pseudo-units × mojos** — exceeds int64 range by design |
+| `basis_is_seed_sentinel` | INTEGER | 1 when the basis is synthetic (wallet seed)        |
+| `updated_at`             | TEXT    |                                                    |
+
+Writers: `Database::save_inventory_state` (engine, after every fill / seed /
+reconcile).  Reader: `Database::load_inventory_state` (engine startup,
+before wallet seeding).
+
+> ℹ️  Cost-basis units changed on 2026-07-30: the `InventoryTracker` now
+> stores basis in **USD-normalized pseudo-units** (USD-per-base-unit ×
+> 1e12), converted per pair via `Engine::quote_usd_factor` (wUSDC*/USDS/BYC
+> = $1/unit, DBX cross-derived).  This fixes the cross-currency blending of
+> one shared XCH basis across wUSDC.b-, BYC- and DBX-quoted pairs.
+> `trade_log.cost_basis_mojos` continues to store the **pair's own quote
+> pseudo-units** (converted on write) so per-row `(price − basis)` stays
+> dimensionally sound.
+
+---
+
+## `ledger_entries` — double-entry accounting ledger (2026-07-30)
+
+Every event that changes what the bot believes it holds posts a **balanced
+set of legs**. `SUM(delta_mojos) GROUP BY asset_id` is the ledger's implied
+balance, which the reconciliation control ties to the wallet's *confirmed*
+balance each heartbeat.
+
+| Column         | Type    | Notes                                              |
+|----------------|---------|----------------------------------------------------|
+| `id`           | INTEGER | PK autoinc                                         |
+| `entry_time`   | TEXT    | ISO-8601 UTC of the event                          |
+| `event_type`   | TEXT    | `opening`, `fill`, `fee`, `take`, `adjust`         |
+| `event_id`     | TEXT    | trade_id, or `genesis:<asset>`                     |
+| `leg`          | TEXT    | `base`, `quote`, `fee`, `opening`, `adjust`        |
+| `asset_id`     | TEXT    | Canonical (`xch` or 64-hex) — never a display symbol |
+| `delta_mojos`  | INTEGER | Signed: **+ inflow, − outflow**                    |
+| `pair_name`    | TEXT    | Context                                            |
+| `block_height` | INTEGER | Settlement block, 0 if n/a                         |
+| `note`         | TEXT    | Free-form provenance                               |
+| `created_at`   | TEXT    |                                                    |
+
+`UNIQUE(event_id, leg, asset_id)` is the idempotency key — a fill re-detected
+after a crash re-posts identical legs, which are ignored rather than doubled.
+
+Legs per event:
+
+| Event | Legs |
+|---|---|
+| `opening` | one per asset = wallet confirmed balance at genesis |
+| `fill` (bid) | base `+size`, quote `−quote_mojos`, `xch −fee` |
+| `fill` (ask) | base `−size`, quote `+quote_mojos`, `xch −fee` |
+
+**Append-only.** Never `UPDATE` or `DELETE`; corrections are new `adjust`
+legs. Genesis deliberately does **not** replay `trade_log` — that table
+disagrees with the wallet by ~665 XCH, and replaying it would import the
+corruption the ledger exists to detect.
+
+Writer: `Database::append_ledger_entries` (engine, on genesis and every fill).
+Reader: `Database::ledger_balances` (the invariant control).
+
+---
+
 ## `offer_log` — every offer ever posted
 
 | Column                      | Type    | Notes                                          |
@@ -176,6 +248,46 @@ Primary key: `(pair_name, bucket_start_unix)`.
 | `failure_reason`       | TEXT    | e.g. `competitiveness_too_low`, `crossed_book` |
 | `details`              | TEXT    | JSON-ish blob                                  |
 | `created_at`           | TEXT    |                                                |
+
+---
+
+## Durable trade-history files (`data/trade_history/`, 2026-07-30)
+
+Plain-text mirrors of `trade_log` so the record survives engine restarts,
+GUI restarts, reboots, and loss of the SQLite file.  SQLite remains
+authoritative; these are append-only / regenerable mirrors.  (`data/` is
+gitignored, so this section is the version-controlled spec.)
+
+| File | Writer | Contents |
+|------|--------|----------|
+| `trades_live.csv` | Engine, one row per fill at settlement (`PnLTracker::append_history_csv`) | Fills from engine builds ≥ 2026-07-30 |
+| `trades_full.csv` | `scripts/export_trade_history.py` (manual, idempotent) | Every `trade_log` row, all eras |
+
+Shared column layout:
+
+```
+timestamp_utc, trade_id, pair, side,
+price_pseudo_mojos, size_base_mojos,
+price_quote_per_base, size_base_units, quote_amount,
+fee_xch_mojos, cost_basis_pseudo_mojos,
+realized_pnl_quote_mojos, realized_pnl_usd, block_height
+```
+
+- `price_pseudo_mojos` — raw stored price.  Rows before 2026-04-14 use the
+  legacy encoding (quote mojos per base unit, ~2000–3000); later rows use
+  pseudo-units (`quote_units_per_base × 1e12`).  The display columns already
+  account for both; the exporter auto-detects via a 1e9 threshold.
+- `fee_xch_mojos` — XCH mojos.  In `trades_full.csv` this is backfilled from
+  `offer_log` because `trade_log.fee_mojos` was 0 from June 2026 until the
+  2026-07-30 fee fix.
+- `realized_pnl_quote_mojos` — the pair's QUOTE-asset mojos; `0` means a buy
+  **or** a sell whose cost basis was unknown at fill time.
+- `realized_pnl_usd` — USD for USD-pegged quotes; blank for DBX.
+
+> ⚠️  `realized_pnl_mojos` is ~all zeros before 2026-07-30 (cost basis was
+> lost on every restart and overflowed for XCH pairs).  For truthful
+> historical P&L use `scripts/compute_actual_pnl.py` (cash-flow method),
+> which needs only prices and sizes.
 
 ---
 

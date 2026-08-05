@@ -42,7 +42,15 @@ struct Position {
     AssetId  asset_id;     // which asset this position tracks
     Mojo     balance;      // current holdings (mojos, >= 0)
     Mojo     cost_basis;   // weighted-average cost per mojo-of-base in mojos-of-quote
-    Mojo     total_cost;   // cumulative cost of current holdings (mojos of quote)
+    double   total_cost;   // cumulative cost of current holdings (mojos of quote).
+                           // double, not int64: qty * unit_price reaches ~1.3e24
+                           // for a 1-XCH fill at a ~1.3e12 pseudo-price, far
+                           // beyond int64 range.  The prior int64 field made
+                           // add() reject EVERY XCH buy as an overflow (20
+                           // such errors in the live log on 2026-07-29 alone),
+                           // so State's XCH balance could only ever decrease.
+                           // Same defect class as the InventoryTracker
+                           // overflow fixed under PNL-BASIS-OVERFLOW.
 
     Position();
     explicit Position(const AssetId& id);
@@ -50,7 +58,7 @@ struct Position {
     /// Record an inflow of `qty` mojos purchased at `unit_price` mojos-of-quote
     /// per mojo-of-base.  Updates balance, total_cost, and recomputes the
     /// weighted-average cost_basis.
-    /// Returns false (and leaves state unchanged) on overflow or invalid input.
+    /// Returns false (and leaves state unchanged) on invalid input.
     /// ISO/IEC 5055 -- CWE-190: callers must check the return value.
     [[nodiscard]] bool add(Mojo qty, Mojo unit_price);
 

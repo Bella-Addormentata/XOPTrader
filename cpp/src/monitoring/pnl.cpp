@@ -20,6 +20,8 @@
 
 #include "xop/monitoring/pnl.hpp"
 
+#include "xop/accounting/reward_ingest.hpp"
+
 #include <sqlite3.h>
 #include <spdlog/spdlog.h>
 
@@ -29,6 +31,7 @@
 #include <cmath>
 #include <cstring>
 #include <ctime>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <mutex>
@@ -188,6 +191,12 @@ void PnLTracker::init_database()
     // Enable foreign keys (good practice even if not currently used).
     sqlite3_exec(db_, "PRAGMA foreign_keys=ON;", nullptr, nullptr, nullptr);
 
+    // Busy timeout: retry for up to 5 s instead of throwing SQLITE_BUSY when
+    // another connection (Database class, GUI, maintenance scripts) briefly
+    // holds the write lock.  A thrown insert during fill processing would
+    // permanently lose that fill's audit-trail row (PNL-DURABILITY).
+    sqlite3_exec(db_, "PRAGMA busy_timeout=5000;", nullptr, nullptr, nullptr);
+
     // Create the trade_log table and indices.  IF NOT EXISTS makes this
     // idempotent -- safe to call on every startup.
     static constexpr const char* kCreateTable = R"SQL(
@@ -310,7 +319,206 @@ void PnLTracker::init_database()
             + std::string(sqlite3_errmsg(db_)));
     }
 
+    // [PNL-HISTORY 2026-07-30] Prepare the durable trade-history directory
+    // next to the database file.  Every recorded fill is appended to
+    // trade_history/trades_live.csv as a plain-text, restart-proof mirror of
+    // trade_log (the SQLite file remains the authoritative store).
+    try {
+        namespace fs = std::filesystem;
+        const fs::path dir =
+            fs::path(db_path_).parent_path() / "trade_history";
+        fs::create_directories(dir);
+        history_csv_path_ = (dir / "trades_live.csv").string();
+    } catch (const std::exception& e) {
+        spdlog::warn("PnLTracker: could not create trade_history dir: {} -- "
+                     "CSV mirroring disabled", e.what());
+        history_csv_path_.clear();
+    }
+
     spdlog::info("PnLTracker: database initialised (WAL mode, tables verified)");
+
+    // [PNL-REHYDRATE 2026-07-30] Rebuild in-memory accumulators from the
+    // persisted trade log so cumulative P&L survives restarts.  Must run
+    // before any live fill is recorded.
+    rehydrate_from_db();
+}
+
+void PnLTracker::rehydrate_from_db()
+{
+    if (!db_) {
+        return;
+    }
+
+    // Aggregate per pair.  realized_pnl_mojos is stored in QUOTE-asset mojos
+    // (0 for buys and for legacy sentinel-basis sells); fee_mojos is XCH
+    // mojos.  These are exactly the units the live accumulators use, so the
+    // replayed totals are unit-identical to what record_fill would have
+    // accumulated in a single uninterrupted run.
+    static constexpr const char* kRehydrateSql = R"SQL(
+        SELECT pair_name,
+               COUNT(*),
+               COALESCE(SUM(realized_pnl_mojos), 0),
+               COALESCE(SUM(CASE WHEN realized_pnl_mojos > 0
+                                 THEN realized_pnl_mojos ELSE 0 END), 0),
+               COALESCE(SUM(CASE WHEN realized_pnl_mojos < 0
+                                 THEN -realized_pnl_mojos ELSE 0 END), 0),
+               COALESCE(SUM(fee_mojos), 0),
+               MIN(timestamp),
+               MAX(timestamp)
+        FROM trade_log
+        GROUP BY pair_name;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+    int rc = sqlite3_prepare_v2(db_, kRehydrateSql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::error("PnLTracker::rehydrate_from_db prepare failed: {}",
+                      sqlite3_errmsg(db_));
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+
+    std::size_t pairs = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* pair_text = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 0));
+        if (!pair_text || pair_text[0] == '\0') {
+            continue;
+        }
+
+        auto& ppnl = pair_pnl_[pair_text];
+        ppnl.fill_count   = static_cast<std::uint64_t>(
+            sqlite3_column_int64(stmt, 1));
+        ppnl.spread_pnl   = sqlite3_column_int64(stmt, 2);
+        ppnl.gross_profit = sqlite3_column_int64(stmt, 3);
+        ppnl.gross_loss   = sqlite3_column_int64(stmt, 4);
+        // record_fill accumulates fee_pnl -= fee per fill.
+        ppnl.fee_pnl      = -sqlite3_column_int64(stmt, 5);
+
+        const char* first_ts = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 6));
+        const char* last_ts  = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 7));
+        if (first_ts) ppnl.first_fill_ts = iso_to_timestamp(first_ts);
+        if (last_ts)  ppnl.last_fill_ts  = iso_to_timestamp(last_ts);
+
+        // Acquisition-timestamp weighting cannot be reconstructed from the
+        // aggregate; it re-establishes itself from the next buy fill.
+
+        total_pnl_.fill_count   += ppnl.fill_count;
+        total_pnl_.spread_pnl   += ppnl.spread_pnl;
+        total_pnl_.gross_profit += ppnl.gross_profit;
+        total_pnl_.gross_loss   += ppnl.gross_loss;
+        total_pnl_.fee_pnl      += ppnl.fee_pnl;
+        if (total_pnl_.first_fill_ts == Timestamp{}
+            || (ppnl.first_fill_ts != Timestamp{}
+                && ppnl.first_fill_ts < total_pnl_.first_fill_ts)) {
+            total_pnl_.first_fill_ts = ppnl.first_fill_ts;
+        }
+        if (ppnl.last_fill_ts > total_pnl_.last_fill_ts) {
+            total_pnl_.last_fill_ts = ppnl.last_fill_ts;
+        }
+        ++pairs;
+    }
+
+    sqlite3_finalize(stmt);
+
+    // [PNL-USD-TOTALS 2026-08-01] The aggregate spread figure is labelled
+    // raw: it sums quote mojos across different quote assets and is not a
+    // money amount.  (USD normalization happens at query time via
+    // realized_usd_totals_locked once the engine registers the per-pair
+    // conversions; they are not registered yet during init_database.)
+    spdlog::info("PnLTracker: rehydrated {} pairs from trade_log "
+                 "(fills={} spread_pnl_raw_quote_mojos={} fee_pnl={})",
+                 pairs, total_pnl_.fill_count, total_pnl_.spread_pnl,
+                 total_pnl_.fee_pnl);
+
+    // -- [REWARD-INCOME 2026-08-01] Rebuild reward income from the ledger --
+    // Reward receipts are journaled as 'reward' rows in ledger_entries
+    // (same SQLite file: the engine constructs both Database and PnLTracker
+    // on config.database.path), with the USD fair value at receipt embedded
+    // in the note by accounting::reward_note.  Summing the parsed notes here
+    // makes the accumulator restart-invariant like the USD totals.  The
+    // table may not exist when the tracker runs standalone (tests, tools);
+    // that is a clean "no rewards yet", not an error.
+    static constexpr const char* kRewardSql = R"SQL(
+        SELECT COALESCE(note, ''), delta_mojos
+        FROM ledger_entries
+        WHERE event_type = 'reward';
+    )SQL";
+
+    sqlite3_stmt* rstmt = nullptr;
+    rc = sqlite3_prepare_v2(db_, kRewardSql, -1, &rstmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::debug("PnLTracker: no ledger_entries table for reward "
+                      "rehydration ({}) -- reward income starts at 0",
+                      sqlite3_errmsg(db_));
+        return;
+    }
+
+    // NOTE: mtx_ is still held by the lock_guard taken for the trade_log
+    // replay above (its scope is the rest of this function), so the
+    // accumulator write below is already protected -- re-locking here would
+    // self-deadlock on the non-recursive mutex.
+    double      reward_usd  = 0.0;
+    std::size_t reward_rows = 0;
+    Mojo        reward_mojos = 0;
+    while (sqlite3_step(rstmt) == SQLITE_ROW) {
+        const char* note_text = reinterpret_cast<const char*>(
+            sqlite3_column_text(rstmt, 0));
+        reward_usd += accounting::parse_reward_fmv_usd(
+            note_text ? note_text : "");
+        reward_mojos += sqlite3_column_int64(rstmt, 1);
+        ++reward_rows;
+    }
+    reward_income_usd_ = reward_usd;
+    sqlite3_finalize(rstmt);
+
+    if (reward_rows > 0) {
+        spdlog::info("PnLTracker: rehydrated {} reward receipts from the "
+                     "ledger ({} mojos, ${:.6f} income at receipt FMV)",
+                     reward_rows, reward_mojos, reward_usd);
+    }
+}
+
+// =========================================================================
+// Reward income ([REWARD-INCOME 2026-08-01])
+// =========================================================================
+
+void PnLTracker::add_reward_income_usd(double usd)
+{
+    // NaN/negative-safe: income is recognized at receipt and only grows.
+    if (!(usd > 0.0) || !(usd < 1e12)) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+    reward_income_usd_ += usd;
+}
+
+double PnLTracker::get_reward_income_usd() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    return reward_income_usd_;
+}
+
+void PnLTracker::set_pair_conversion(const std::string& pair_name,
+                                     const std::string& base_asset_id,
+                                     double base_mojos_per_unit,
+                                     double quote_mojos_per_unit,
+                                     double usd_per_quote_unit)
+{
+    if (pair_name.empty() || base_mojos_per_unit <= 0.0
+        || quote_mojos_per_unit <= 0.0) {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    auto& conv = pair_conv_[pair_name];
+    conv.base_asset_id       = base_asset_id;
+    conv.base_mojos_per_unit = base_mojos_per_unit;
+    conv.quote_mojos_per_unit = quote_mojos_per_unit;
+    conv.usd_per_quote_unit  = usd_per_quote_unit;
 }
 
 // =========================================================================
@@ -323,10 +531,13 @@ void PnLTracker::insert_trade(const TradeRecord& record)
     // concurrent callers.  Callers that already hold mtx_ (e.g. record_fill)
     // must use insert_trade_unlocked() to avoid deadlock.
     std::lock_guard<std::mutex> lock(mtx_);
-    insert_trade_unlocked(record);
+    // A duplicate trade_id is not an error for this direct-insert entry
+    // point: the row is already in the audit trail, which is the caller's
+    // intent.  (record_fill needs the distinction and uses the bool.)
+    static_cast<void>(insert_trade_unlocked(record));
 }
 
-void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
+bool PnLTracker::insert_trade_unlocked(const TradeRecord& record)
 {
     if (!db_ || !stmt_insert_) {
         throw std::runtime_error(
@@ -369,6 +580,16 @@ void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
 
     const int rc = sqlite3_step(stmt_insert_);
     if (rc != SQLITE_DONE) {
+        // Idempotent replay: a UNIQUE violation on trade_id means this fill
+        // was already journalled by a previous run (crash between the insert
+        // and the engine's side effects, or a re-detection race).  Signal
+        // "already recorded" instead of throwing so the caller can complete
+        // any missing side effects without double-counting P&L.
+        if (rc == SQLITE_CONSTRAINT) {
+            spdlog::warn("PnLTracker::insert_trade: trade_id={} already "
+                         "recorded -- skipping duplicate", record.trade_id);
+            return false;
+        }
         spdlog::error("PnLTracker::insert_trade: step failed (rc={}): {}",
                        rc, sqlite3_errmsg(db_));
         throw std::runtime_error(
@@ -378,6 +599,7 @@ void PnLTracker::insert_trade_unlocked(const TradeRecord& record)
 
     spdlog::debug("PnLTracker::insert_trade: persisted trade_id={}",
                    record.trade_id);
+    return true;
 }
 
 // =========================================================================
@@ -506,7 +728,7 @@ std::vector<TradeRecord> PnLTracker::query_trades(
 // Fill recording and PnL attribution
 // =========================================================================
 
-void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
+bool PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
                              Mojo realized_pnl)
 {
     // -- Step 1: Use the pre-computed realised PnL from the engine ---------
@@ -555,7 +777,15 @@ void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
     // Buy records leave acquisition_ts default-initialised (epoch); the
     // insert_trade_unlocked method binds NULL for those.
 
-    insert_trade_unlocked(record);
+    if (!insert_trade_unlocked(record)) {
+        // Already journalled by a prior run: the accumulators either counted
+        // it live before the crash or picked it up via rehydrate_from_db().
+        // Do not double-count; the caller completes its own side effects.
+        return false;
+    }
+
+    // Mirror the fill to the durable trade-history CSV (best-effort).
+    append_history_csv(record, realized_pnl);
 
     // -- Step 3: Update in-memory PnL accumulators -----------------------
 
@@ -631,10 +861,109 @@ void PnLTracker::record_fill(const Fill& fill, Mojo fee, Mojo cost_basis,
     ppnl.last_fill_ts = fill.timestamp;
     total_pnl_.last_fill_ts = fill.timestamp;
 
+    // [PNL-USD-TOTALS 2026-08-01] The cross-pair total is logged in USD.
+    // The old raw total_pnl_.spread_pnl summed quote-asset mojos across
+    // different quote currencies (one DBX fill worth ~$0.04 once jumped the
+    // "total" from 2587 to 7173 because DBX mojos are ~70x cheaper than
+    // wUSDC.b mojos).  Per-pair spread_pnl stays in that pair's quote mojos,
+    // which is well-defined.
     spdlog::info("PnLTracker::record_fill pair={} side={} price={} size={} "
-                 "realized_pnl={} fee={} spread_pnl_total={}",
+                 "realized_pnl={} fee={} pair_spread_pnl={} "
+                 "spread_pnl_total_usd={:.4f}",
                  fill.pair_name, to_string(fill.side), fill.price, fill.size,
-                 realized_pnl, fee, total_pnl_.spread_pnl);
+                 realized_pnl, fee, ppnl.spread_pnl,
+                 realized_usd_totals_locked().spread_pnl);
+    return true;
+}
+
+void PnLTracker::append_history_csv(const TradeRecord& record,
+                                    Mojo realized_pnl)
+{
+    if (history_csv_path_.empty()) {
+        return;
+    }
+
+    try {
+        namespace fs = std::filesystem;
+        const bool need_header = !fs::exists(history_csv_path_)
+                              || fs::file_size(history_csv_path_) == 0;
+
+        std::ofstream out(history_csv_path_,
+                          std::ios::out | std::ios::app);
+        if (!out.is_open()) {
+            spdlog::warn("PnLTracker: cannot open trade-history CSV '{}'",
+                         history_csv_path_);
+            return;
+        }
+
+        if (need_header) {
+            out << "timestamp_utc,trade_id,pair,side,"
+                   "price_pseudo_mojos,size_base_mojos,"
+                   "price_quote_per_base,size_base_units,quote_amount,"
+                   "fee_xch_mojos,cost_basis_pseudo_mojos,"
+                   "realized_pnl_quote_mojos,realized_pnl_usd,"
+                   "block_height\n";
+        }
+
+        // Display-unit conversions need the pair's registered denominations;
+        // when the pair is unknown the raw mojo columns still make the row
+        // fully reconstructible.
+        std::string price_disp, size_disp, quote_amt_disp, pnl_usd_disp;
+        auto conv_it = pair_conv_.find(record.pair_name);
+        if (conv_it != pair_conv_.end()) {
+            const auto& conv = conv_it->second;
+            const double price_units =
+                static_cast<double>(record.price_mojos)
+                / static_cast<double>(kMojosPerXch);
+            const double size_units =
+                static_cast<double>(record.size_mojos)
+                / conv.base_mojos_per_unit;
+
+            std::ostringstream tmp;
+            tmp << std::setprecision(12) << price_units;
+            price_disp = tmp.str();
+
+            tmp.str(""); tmp << std::setprecision(12) << size_units;
+            size_disp = tmp.str();
+
+            tmp.str(""); tmp << std::setprecision(12)
+                             << (price_units * size_units);
+            quote_amt_disp = tmp.str();
+
+            if (conv.usd_per_quote_unit > 0.0) {
+                tmp.str("");
+                tmp << std::setprecision(12)
+                    << (static_cast<double>(realized_pnl)
+                        / conv.quote_mojos_per_unit
+                        * conv.usd_per_quote_unit);
+                pnl_usd_disp = tmp.str();
+            }
+        }
+
+        out << timestamp_to_iso(record.timestamp) << ','
+            << record.trade_id << ','
+            << record.pair_name << ','
+            << ((record.side == Side::Bid) ? "bid" : "ask") << ','
+            << record.price_mojos << ','
+            << record.size_mojos << ','
+            << price_disp << ','
+            << size_disp << ','
+            << quote_amt_disp << ','
+            << record.fee_mojos << ','
+            << record.cost_basis_mojos << ','
+            << realized_pnl << ','
+            << pnl_usd_disp << ','
+            << record.block_height << '\n';
+
+        out.flush();
+        if (out.fail()) {
+            spdlog::warn("PnLTracker: write error on trade-history CSV '{}'",
+                         history_csv_path_);
+        }
+    } catch (const std::exception& e) {
+        spdlog::warn("PnLTracker: trade-history CSV append failed: {}",
+                     e.what());
+    }
 }
 
 void PnLTracker::record_fee(const std::string& pair_name, Mojo amount)
@@ -669,18 +998,40 @@ void PnLTracker::mark_to_market(
     // Reset aggregate inventory PnL before recalculating.
     total_pnl_.inventory_pnl = 0;
 
-    for (auto& [pair_name, ppnl] : pair_pnl_) {
-        // Extract the base asset from the pair name.
-        // Convention: pair_name is "BASE/QUOTE", e.g. "XCH/wUSDC".
-        // The base asset is the part before the '/'.
-        const auto slash_pos = pair_name.find('/');
-        if (slash_pos == std::string::npos) {
-            spdlog::warn("PnLTracker::mark_to_market: "
-                         "invalid pair format '{}'", pair_name);
-            continue;
-        }
+    // [PNL-MTM-DEDUP 2026-07-30] A base asset must be marked at most ONCE
+    // per pass.  Balances are per ASSET but this loop is per PAIR, and XCH
+    // is the base of three enabled pairs (XCH/wUSDC.b, XCH/BYC, XCH/DBX) --
+    // marking each pair would value the entire XCH holding three times and
+    // sum all three into the total.  This was latent while the old
+    // display-symbol keying made every balance lookup miss (unrealized P&L
+    // was structurally 0); fixing the keying made the triple-count live.
+    // The first pair to produce a usable mark owns the asset's unrealized
+    // P&L; the others report 0 so per-pair figures still add up to the total.
+    std::unordered_map<std::string, bool> asset_marked;
 
-        const std::string base_asset = pair_name.substr(0, slash_pos);
+    for (auto& [pair_name, ppnl] : pair_pnl_) {
+        // [PNL-KEYING-FIX 2026-07-30] Resolve the CANONICAL base asset id
+        // ("xch" / 64-hex CAT id) from the registered pair conversion.  The
+        // previous code passed the display-symbol prefix of the pair name
+        // ("XCH", "BYC") into callbacks whose stores are keyed by canonical
+        // ids, so every balance/basis lookup missed and unrealized P&L was
+        // structurally zero.  The substring fallback remains only for
+        // unregistered pairs (legacy tests).
+        std::string base_asset;
+        const PairConversion* conv = nullptr;
+        auto conv_it = pair_conv_.find(pair_name);
+        if (conv_it != pair_conv_.end()) {
+            conv = &conv_it->second;
+            base_asset = conv->base_asset_id;
+        } else {
+            const auto slash_pos = pair_name.find('/');
+            if (slash_pos == std::string::npos) {
+                spdlog::warn("PnLTracker::mark_to_market: "
+                             "invalid pair format '{}'", pair_name);
+                continue;
+            }
+            base_asset = pair_name.substr(0, slash_pos);
+        }
 
         const Mojo current_price = get_price(pair_name, base_asset);
 
@@ -700,9 +1051,29 @@ void PnLTracker::mark_to_market(
             }
         }
         const Mojo balance       = get_balance(base_asset);
-        const Mojo basis         = get_cost_basis(base_asset);
+        Mojo       basis         = get_cost_basis(base_asset);
 
-        if (basis > 0 && balance > 0) {
+        // [PNL-BASIS-USD 2026-07-30] The engine stores cost basis in
+        // USD-normalized pseudo-units so that one asset traded against
+        // several quote currencies keeps a single coherent basis.  Convert
+        // to THIS pair's quote pseudo-units before subtracting from the
+        // (quote-denominated) smoothed mid.  A pair whose quote has no
+        // known USD value cannot be marked -- treat basis as unknown.
+        if (conv) {
+            if (conv->usd_per_quote_unit > 0.0) {
+                basis = static_cast<Mojo>(std::llround(
+                    static_cast<double>(basis) / conv->usd_per_quote_unit));
+            } else {
+                basis = 0;
+            }
+        }
+
+        // [PNL-MTM-DEDUP] Skip if another pair already marked this asset.
+        const bool already_marked = asset_marked[base_asset];
+
+        // smoothed_price > 0 guard: a missing market snapshot (mid = 0)
+        // must not mark the whole position as a total loss.
+        if (!already_marked && basis > 0 && balance > 0 && smoothed_price > 0) {
             // [PNL-UNIT-FIX] Inventory PnL in quote-asset mojos.
             // Uses the canonical xop::quote_mojos_for helper from types.hpp
             // so this stays in lock-step with offer_manager.cpp and engine.cpp.
@@ -724,6 +1095,7 @@ void PnLTracker::mark_to_market(
                 * static_cast<double>(balance)
                 * unit_factor
                 / static_cast<double>(kMojosPerXch)));
+            asset_marked[base_asset] = true;
         } else {
             ppnl.inventory_pnl = 0;
         }
@@ -732,13 +1104,18 @@ void PnLTracker::mark_to_market(
     }
 
     // Record a PnL snapshot for Sharpe/drawdown analytics.
-    const Mojo total = total_pnl_.spread_pnl
-                     + total_pnl_.inventory_pnl
-                     + total_pnl_.fee_pnl;
+    // [PNL-USD-TOTALS 2026-08-01] Snapshot the USD-normalized total.  The
+    // old raw mojo sum (spread + inventory + fee) mixed quote currencies
+    // across pairs with an XCH-mojo fee leg, so the Sharpe/drawdown series
+    // was dominated by whichever pair had the cheapest quote mojos (DBX).
+    // fill_usd_components_locked is the same per-pair conversion path the
+    // displayed USD figures use; mtx_ is held throughout this method.
+    PnLSummary usd_tmp{};
+    fill_usd_components_locked(usd_tmp, /*pair_name=*/"");
 
     PnLSnapshot snap;
-    snap.timestamp = std::chrono::system_clock::now();
-    snap.total_pnl = total;
+    snap.timestamp     = std::chrono::system_clock::now();
+    snap.total_pnl_usd = usd_tmp.total_pnl_usd;
 
     pnl_history_.push_back(snap);
 
@@ -749,28 +1126,49 @@ void PnLTracker::mark_to_market(
         pnl_history_.pop_front();
     }
 
-    spdlog::debug("PnLTracker::mark_to_market spread={} inventory={} fee={} "
-                  "total={} xch_usd={:.4f}",
-                  total_pnl_.spread_pnl, total_pnl_.inventory_pnl,
-                  total_pnl_.fee_pnl, total, xch_usd_rate_);
+    spdlog::debug("PnLTracker::mark_to_market realized_usd={:.4f} "
+                  "unrealized_usd={:.4f} fee_usd={:.4f} total_usd={:.4f} "
+                  "xch_usd={:.4f}",
+                  usd_tmp.realized_pnl_usd, usd_tmp.unrealized_pnl_usd,
+                  usd_tmp.fee_pnl_usd, usd_tmp.total_pnl_usd, xch_usd_rate_);
 }
 
 // =========================================================================
 // PnL queries
 // =========================================================================
 
+double PnLTracker::annualized_sharpe(double mean_return,
+                                     double stdev_return,
+                                     double avg_interval_seconds)
+{
+    // Sharpe = mean(returns) / stdev(returns) * sqrt(periods_per_year)
+    //
+    // [SHARPE-CADENCE 2026-08-01] periods_per_year MUST come from the
+    // MEASURED snapshot cadence, never a constant.  Snapshots are taken
+    // once per engine heartbeat, and the heartbeat is ~19 minutes (median
+    // inter-snapshot spacing 1,165 s measured from the snapshots table),
+    // not the 52-second chain block time an earlier comment here claimed.
+    // Annualizing 19-minute returns with the 52-second constant would
+    // inflate Sharpe by sqrt(1165 / 52) ~ 4.7x.  This helper is public and
+    // pinned by a test so the constant cannot quietly come back.
+    if (stdev_return < 1e-12 || avg_interval_seconds <= 0.0) {
+        return 0.0;
+    }
+    constexpr double seconds_per_year = 365.25 * 24.0 * 3600.0;
+    const double periods_per_year = seconds_per_year / avg_interval_seconds;
+    return (mean_return / stdev_return) * std::sqrt(periods_per_year);
+}
+
 double PnLTracker::compute_sharpe() const
 {
     // Annualised Sharpe ratio from the PnL snapshot history.
     //
-    // Sharpe = mean(returns) / stdev(returns) * sqrt(periods_per_year)
-    //
-    // Each snapshot is taken ~52 seconds apart (one Chia block).
-    // Periods per year = 365.25 * 24 * 3600 / 52 = ~606,646.
-    //
-    // We compute returns as the difference in total_pnl between
-    // consecutive snapshots.  This is in mojos, but the ratio is
-    // dimensionless so the unit cancels.
+    // Returns are differences of the USD-normalized total between
+    // CONSECUTIVE snapshots (one per engine heartbeat, ~19 min); the
+    // annualization uses the cadence measured from the snapshots' own
+    // timestamps -- see annualized_sharpe.  The USD normalization matters
+    // because raw quote mojos across pairs are not commensurable
+    // (PNL-USD-TOTALS 2026-08-01).
 
     if (pnl_history_.size() < 2) {
         return 0.0;
@@ -780,8 +1178,8 @@ double PnLTracker::compute_sharpe() const
     std::vector<double> returns(n);
 
     for (std::size_t i = 0; i < n; ++i) {
-        returns[i] = static_cast<double>(
-            pnl_history_[i + 1].total_pnl - pnl_history_[i].total_pnl);
+        returns[i] = pnl_history_[i + 1].total_pnl_usd
+                   - pnl_history_[i].total_pnl_usd;
     }
 
     const double mean = std::accumulate(returns.begin(), returns.end(), 0.0)
@@ -794,14 +1192,9 @@ double PnLTracker::compute_sharpe() const
     }
     const double stdev = std::sqrt(sum_sq / static_cast<double>(n));
 
-    if (stdev < 1e-12) {
-        // Avoid division by near-zero.  If returns are flat, Sharpe is
-        // infinite (or undefined).  Return 0 as a safe default.
-        return 0.0;
-    }
-
-    // Annualisation factor.  We estimate the average interval between
-    // snapshots from the actual timestamps rather than assuming 52s.
+    // Annualisation: estimate the average interval between snapshots from
+    // the actual timestamps (measured cadence), never a constant -- see
+    // annualized_sharpe for the units note and the 4.7x failure mode.
     const auto span = pnl_history_.back().timestamp - pnl_history_.front().timestamp;
     const double span_seconds = static_cast<double>(
         std::chrono::duration_cast<std::chrono::seconds>(span).count());
@@ -811,10 +1204,7 @@ double PnLTracker::compute_sharpe() const
     }
 
     const double avg_interval = span_seconds / static_cast<double>(n);
-    constexpr double seconds_per_year = 365.25 * 24.0 * 3600.0;
-    const double periods_per_year = seconds_per_year / avg_interval;
-
-    return (mean / stdev) * std::sqrt(periods_per_year);
+    return annualized_sharpe(mean, stdev, avg_interval);
 }
 
 double PnLTracker::compute_max_drawdown() const
@@ -826,19 +1216,18 @@ double PnLTracker::compute_max_drawdown() const
         return 0.0;
     }
 
-    Mojo peak = pnl_history_.front().total_pnl;
+    double peak = pnl_history_.front().total_pnl_usd;
     double max_dd = 0.0;
 
     for (const auto& snap : pnl_history_) {
-        if (snap.total_pnl > peak) {
-            peak = snap.total_pnl;
+        if (snap.total_pnl_usd > peak) {
+            peak = snap.total_pnl_usd;
         }
 
         // [T9-FIX] Track drawdown even when PnL is negative.
-        // Use absolute peak value to avoid division by zero.
-        if (peak != 0) {
-            const double dd = static_cast<double>(peak - snap.total_pnl)
-                            / std::abs(static_cast<double>(peak));
+        // Use absolute peak value to avoid division by (near-)zero.
+        if (std::abs(peak) > 1e-9) {
+            const double dd = (peak - snap.total_pnl_usd) / std::abs(peak);
             if (dd > max_dd) {
                 max_dd = dd;
             }
@@ -903,10 +1292,125 @@ PnLSummary PnLTracker::build_summary(const PairPnL& ppnl,
     return s;
 }
 
+double PnLTracker::quote_mojos_to_usd_locked(const std::string& pair_name,
+                                             Mojo quote_mojos_int) const
+{
+    const double quote_mojos = static_cast<double>(quote_mojos_int);
+
+    auto it = pair_conv_.find(pair_name);
+    if (it != pair_conv_.end()
+        && it->second.usd_per_quote_unit > 0.0
+        && it->second.quote_mojos_per_unit > 0.0) {
+        return quote_mojos / it->second.quote_mojos_per_unit
+                           * it->second.usd_per_quote_unit;
+    }
+
+    // Retired-pair fallback: rehydration resurrects pairs that are no longer
+    // in config (e.g. "XCH/wUSDC" before the wUSDC.b migration), so the
+    // engine never registers a conversion for them.  Without this, their
+    // historical P&L silently vanishes from the engine's USD total while the
+    // GUI's SQL still counts it (pnl_usdc_expr matches LIKE '%/wUSDC%'), and
+    // the two displays disagree.  Mirror that heuristic exactly: USD-pegged
+    // CAT quotes at 1e3 mojos per $1 unit.  Anything else stays excluded --
+    // an unpegged quote (DBX) has no defensible USD value here.
+    const auto slash = pair_name.find('/');
+    if (slash == std::string::npos) {
+        return 0.0;
+    }
+    const std::string quote = pair_name.substr(slash + 1);
+    if (quote == "wUSDC" || quote == "wUSDC.b" || quote == "USDS"
+        || quote == "BYC") {
+        constexpr double kCatMojosPerUnit = 1'000.0;
+        return quote_mojos / kCatMojosPerUnit;
+    }
+
+    return 0.0;
+}
+
+PnLTracker::UsdRealizedTotals PnLTracker::realized_usd_totals_locked() const
+{
+    // [PNL-USD-TOTALS 2026-08-01] Derive the cross-pair realized totals
+    // from the per-pair quote-mojo accumulators at query time, through the
+    // same quote_mojos_to_usd_locked conversion that produces the displayed
+    // usd_realized figure.  Deriving (rather than accumulating a separate
+    // USD counter) guarantees the total always equals the sum of the
+    // per-pair USD figures AND that a restart reproduces the same number:
+    // rehydrate_from_db rebuilds exactly these per-pair accumulators, so
+    // live and rehydrated totals are identical by construction.
+    UsdRealizedTotals t;
+    for (const auto& [name, ppnl] : pair_pnl_) {
+        t.spread_pnl   += quote_mojos_to_usd_locked(name, ppnl.spread_pnl);
+        t.gross_profit += quote_mojos_to_usd_locked(name, ppnl.gross_profit);
+        t.gross_loss   += quote_mojos_to_usd_locked(name, ppnl.gross_loss);
+    }
+    return t;
+}
+
+void PnLTracker::fill_usd_components_locked(PnLSummary& s,
+                                            const std::string& pair_name) const
+{
+    // [PNL-UNITS 2026-07-30] The mojo totals mix per-pair quote currencies
+    // (wUSDC.b / BYC / DBX mojos) with an XCH-mojo fee leg, so the old
+    // single "/kMojosPerXch * xch_usd" conversion was wrong by ~1e9.
+    // Convert realized and unrealized per pair with that pair's own
+    // quote-USD factor; fees are XCH-denominated and use the XCH rate.
+    double realized_usd   = 0.0;
+    double unrealized_usd = 0.0;
+    Mojo   fee_mojos      = 0;
+
+    if (pair_name.empty()) {
+        for (const auto& [name, ppnl] : pair_pnl_) {
+            realized_usd   += quote_mojos_to_usd_locked(name, ppnl.spread_pnl);
+            unrealized_usd += quote_mojos_to_usd_locked(name,
+                                                        ppnl.inventory_pnl);
+        }
+        fee_mojos = total_pnl_.fee_pnl;
+    } else {
+        auto it = pair_pnl_.find(pair_name);
+        if (it != pair_pnl_.end()) {
+            realized_usd   = quote_mojos_to_usd_locked(pair_name,
+                                                       it->second.spread_pnl);
+            unrealized_usd = quote_mojos_to_usd_locked(
+                pair_name, it->second.inventory_pnl);
+            fee_mojos = it->second.fee_pnl;
+        }
+    }
+
+    const double fee_usd = static_cast<double>(fee_mojos)
+                         / static_cast<double>(kMojosPerXch) * xch_usd_rate_;
+
+    s.realized_pnl_usd   = realized_usd;
+    s.unrealized_pnl_usd = unrealized_usd;
+    s.fee_pnl_usd        = fee_usd;
+    s.total_pnl_usd      = realized_usd + unrealized_usd + fee_usd;
+}
+
 PnLSummary PnLTracker::get_total_pnl() const
 {
     std::lock_guard<std::mutex> lock(mtx_);
-    return build_summary(total_pnl_, xch_usd_rate_);
+    PnLSummary s = build_summary(total_pnl_, xch_usd_rate_);
+    fill_usd_components_locked(s, /*pair_name=*/"");
+
+    // [REWARD-INCOME 2026-08-01] Surfaced, NOT summed: reward income is
+    // other income (recognized at receipt FMV), deliberately kept out of
+    // total_pnl_usd so the trading P&L stays a measure of trading.
+    s.reward_income_usd = reward_income_usd_;
+
+    // [PNL-USD-TOTALS 2026-08-01] Rebuild the cross-pair profit factor from
+    // USD-normalized grosses.  build_summary's ratio over total_pnl_'s raw
+    // sums mixed quote currencies (a $0.04 DBX loss weighed like a $3 one
+    // against wUSDC.b profits), which distorted the ratio arbitrarily.
+    // Per-pair summaries keep the raw ratio -- within one quote asset it is
+    // unit-invariant and identical to the USD ratio.
+    const auto usd = realized_usd_totals_locked();
+    if (usd.gross_loss > 1e-12) {
+        s.profit_factor = usd.gross_profit / usd.gross_loss;
+    } else if (usd.gross_profit > 1e-12) {
+        s.profit_factor = 1e9;  // Effectively infinite (no losses).
+    } else {
+        s.profit_factor = 0.0;  // No convertible realized PnL.
+    }
+    return s;
 }
 
 PnLSummary PnLTracker::get_pair_pnl(const std::string& pair_name) const
@@ -917,7 +1421,9 @@ PnLSummary PnLTracker::get_pair_pnl(const std::string& pair_name) const
     if (it == pair_pnl_.end()) {
         return PnLSummary{};
     }
-    return build_summary(it->second, xch_usd_rate_);
+    PnLSummary s = build_summary(it->second, xch_usd_rate_);
+    fill_usd_components_locked(s, pair_name);
+    return s;
 }
 
 DailySummary PnLTracker::get_daily_summary() const
@@ -931,6 +1437,10 @@ DailySummary PnLTracker::get_daily_summary() const
     // [T9-FIX] Documented as lifetime; rename deferred to avoid
     // breaking any future callers.  A true daily implementation would
     // need to query trade_log with date-range filters.
+    // [PNL-USD-TOTALS 2026-08-01] The Mojo fields below are RAW cross-pair
+    // quote-mojo sums (mixed quote currencies plus an XCH-mojo fee leg) --
+    // total_pnl_usd is the only money figure here.  Currently unused by
+    // the engine; kept raw for API compatibility.
     ds.spread_pnl    = total_pnl_.spread_pnl;
     ds.inventory_pnl = total_pnl_.inventory_pnl;
     ds.fee_pnl       = total_pnl_.fee_pnl;
@@ -938,8 +1448,12 @@ DailySummary PnLTracker::get_daily_summary() const
                      + total_pnl_.inventory_pnl
                      + total_pnl_.fee_pnl;
 
-    ds.total_pnl_usd = (static_cast<double>(ds.total_pnl)
-                        / static_cast<double>(kMojosPerXch)) * xch_usd_rate_;
+    // [PNL-UNITS 2026-07-30] Per-pair USD conversion; see get_total_pnl.
+    {
+        PnLSummary tmp{};
+        fill_usd_components_locked(tmp, /*pair_name=*/"");
+        ds.total_pnl_usd = tmp.total_pnl_usd;
+    }
 
     ds.fill_count    = total_pnl_.fill_count;
     ds.gross_profit  = total_pnl_.gross_profit;
@@ -1002,16 +1516,30 @@ void PnLTracker::export_trades_csv(const std::string& start_date,
                 ? timestamp_to_date(rec.acquisition_ts)
                 : date_sold;
 
-        // [T9-FIX] Use double intermediates to avoid int64 overflow
-        // (price_mojos * size_mojos can exceed 2^63 for realistic trades).
-        const auto proceeds = static_cast<Mojo>(std::llround(
-            static_cast<double>(rec.price_mojos)
-            * static_cast<double>(rec.size_mojos)
-            / static_cast<double>(kMojosPerXch)));
-        const auto cost = static_cast<Mojo>(std::llround(
-            static_cast<double>(rec.cost_basis_mojos)
-            * static_cast<double>(rec.size_mojos)
-            / static_cast<double>(kMojosPerXch)));
+        // [PNL-UNITS 2026-07-30] Route through the canonical quote_mojos_for
+        // helper.  This site was missed by the v0.7.46 centralization and
+        // still used the pre-v0.7.45 formula (1e9-inflated for XCH/CAT
+        // pairs).  Denominations come from the registered pair conversion;
+        // unregistered pairs fall back to the raw (legacy) formula so the
+        // export degrades rather than throws.
+        double base_denom  = static_cast<double>(kMojosPerXch);
+        double quote_denom = static_cast<double>(kMojosPerXch);
+        {
+            std::lock_guard<std::mutex> conv_lock(mtx_);
+            auto conv_it = pair_conv_.find(rec.pair_name);
+            if (conv_it != pair_conv_.end()) {
+                base_denom  = conv_it->second.base_mojos_per_unit;
+                quote_denom = conv_it->second.quote_mojos_per_unit;
+            }
+        }
+        const auto proceeds = static_cast<Mojo>(std::llround(quote_mojos_for(
+            static_cast<double>(rec.size_mojos),
+            static_cast<double>(rec.price_mojos),
+            base_denom, quote_denom)));
+        const auto cost = static_cast<Mojo>(std::llround(quote_mojos_for(
+            static_cast<double>(rec.size_mojos),
+            static_cast<double>(rec.cost_basis_mojos),
+            base_denom, quote_denom)));
         const Mojo gain     = proceeds - cost;
 
         // T2-06: Determine holding period from actual acquisition date.
