@@ -248,6 +248,10 @@ class EngineBridge(QObject):
 
         self._metrics_svc.start()
 
+        # Wallet RPC fetches run on their own worker thread; the master
+        # tick only triggers fetches (never blocks on them).
+        self._wallet_svc.start()
+
         db_ok: bool = self._database_svc.start()
         if not db_ok:
             _log.warning("Database open failed; DB features disabled.")
@@ -264,6 +268,7 @@ class EngineBridge(QObject):
         self._master_timer.stop()
         self._metrics_svc.stop()
         self._database_svc.stop()
+        self._wallet_svc.stop()
         self._stop_engine_process()
         _log.info("EngineBridge shutdown complete.")
 
@@ -623,8 +628,10 @@ class EngineBridge(QObject):
         """
         self._tick_count += 1
 
-        # Fetch wallet balances every 6th tick (~30s at 5s interval)
-        # to avoid spamming the Chia wallet RPC on every refresh.
+        # Trigger an async wallet balance fetch every 6th tick (~30s at
+        # 5s interval).  The RPC pass runs on WalletService's worker
+        # thread; this call returns immediately and overlapping fetches
+        # are skipped by the service.
         if self._tick_count % 6 == 1:
             self._wallet_svc.fetch_balances()
 
