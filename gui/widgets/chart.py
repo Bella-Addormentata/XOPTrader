@@ -416,12 +416,24 @@ class ChartWidget(QWidget):
         )
 
         # Cheap large-series rendering: peak-preserving auto downsampling
-        # plus clip-to-view on every PlotDataItem (curves).  PlotItem
-        # forwards these settings to existing and future data items;
-        # BarGraphItem / ScatterPlotItem are unaffected.
-        for _plot in (self._price_plot, self._pnl_plot, self._vol_plot):
-            _plot.setDownsampling(auto=True, mode="peak")
-            _plot.setClipToView(True)
+        # plus clip-to-view on every line curve, so off-screen and
+        # sub-pixel points never reach QPainter.  Applied per
+        # PlotDataItem rather than via PlotItem.setDownsampling: the
+        # PlotItem-level call routes through its context-menu control
+        # signals and (in pyqtgraph 0.14) blindly calls setDownsampling
+        # on every 'plotData' item, which raises AttributeError on
+        # BarGraphItem and leaves the volume plot misconfigured.
+        for _curve in (
+            self._mid_curve,
+            self._bid_curve,
+            self._ask_curve,
+            self._pnl_total_curve,
+            self._pnl_zero_line,
+            self._pnl_realized_curve,
+            self._inv_curve,
+        ):
+            _curve.setDownsampling(auto=True, method="peak")
+            _curve.setClipToView(True)
 
         # Link X axes so all three scroll and zoom together
         self._pnl_plot.setXLink(self._price_plot)
