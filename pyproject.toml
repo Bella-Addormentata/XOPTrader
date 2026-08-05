@@ -20,6 +20,9 @@ gui = [
     "pyqtgraph>=0.13.0,<1",
     "requests>=2.31.0,<3",
     "packaging>=23.0",
+    # Round-trip YAML: the GUI config writer preserves config.yaml comments.
+    # Without it saves fall back to PyYAML and strip every comment.
+    "ruamel.yaml>=0.18,<0.19",
 ]
 dev = [
     "pytest>=8.0,<9",

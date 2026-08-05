@@ -5,6 +5,14 @@ tokens, database path) live in ``secrets.yaml`` which is gitignored.
 Public tuning knobs stay in ``config.yaml``.  Both the C++ engine
 and the Python GUI merge secrets on top of the base config at load
 time; this module provides the shared Python helpers.
+
+Writing is **comment-preserving**.  ``config.yaml`` carries a large
+amount of operator rationale in comments (why a threshold was
+recalibrated, why a strategy is disabled).  A plain ``yaml.safe_dump``
+of a parsed dict discards every one of them -- on 2026-08-05 a single
+GUI Save destroyed 115 lines of that rationale.  :func:`dump_preserving`
+therefore re-uses the *existing* file as a round-trip template
+(``ruamel.yaml``) and writes only the values that actually changed.
 """
 
 from __future__ import annotations
@@ -17,6 +25,193 @@ from typing import Any
 import yaml
 
 _log = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# ruamel.yaml round-trip support (optional dependency)
+# ---------------------------------------------------------------------------
+
+try:  # pragma: no cover - import guard
+    from ruamel.yaml import YAML as _RuamelYAML
+
+    RUAMEL_AVAILABLE: bool = True
+except ImportError:  # pragma: no cover - exercised only without ruamel
+    _RuamelYAML = None  # type: ignore[assignment]
+    RUAMEL_AVAILABLE = False
+
+# Emitted once per process so a missing dependency is loud but not noisy.
+_warned_no_ruamel: bool = False
+
+# Sentinel for "key absent" (``None`` is a legitimate YAML value).
+_MISSING: Any = object()
+
+
+def _round_trip_yaml() -> Any:
+    """Return a configured ``ruamel.yaml.YAML`` round-trip instance.
+
+    Indentation is matched to the historical ``yaml.safe_dump`` output
+    (block sequences dedented under their parent key) so switching the
+    writer does not reflow the whole file.
+    """
+    y = _RuamelYAML(typ="rt")
+    y.preserve_quotes = True
+    # Never re-wrap long scalars or comment lines.
+    y.width = 4096
+    # safe_dump style:  "pairs:\n- base_asset_id: ..."
+    y.indent(mapping=2, sequence=2, offset=0)
+    return y
+
+
+def _detect_newline(path: Path) -> str | None:
+    """Return the dominant line terminator already used in *path*.
+
+    Keeps a save from rewriting every line of the file just because the
+    platform default differs from what is on disk.  ``None`` means "no
+    existing file — use the platform default".
+    """
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    crlf = raw.count(b"\r\n")
+    lf = raw.count(b"\n") - crlf
+    if crlf == 0 and lf == 0:
+        return None
+    return "\r\n" if crlf >= lf else "\n"
+
+
+def _unchanged(old: Any, new: Any) -> bool:
+    """Return ``True`` when *new* is the same scalar value as *old*.
+
+    Used to leave an existing node — and therefore its source formatting
+    and trailing comment — completely untouched when the GUI round-trips
+    a value it never edited.  ``bool`` is checked before the numeric
+    branch because ``True == 1`` in Python.
+    """
+    if isinstance(old, bool) or isinstance(new, bool):
+        return isinstance(old, bool) and isinstance(new, bool) and old == new
+    if isinstance(old, (int, float)) and isinstance(new, (int, float)):
+        return old == new
+    if isinstance(old, str) and isinstance(new, str):
+        return old == new
+    return old is None and new is None
+
+
+def _apply_map(target: Any, source: dict) -> None:
+    """Copy *source* values into the round-trip mapping *target* in place.
+
+    Existing keys keep their position and attached comments; keys absent
+    from *source* are deleted; new keys are appended.
+    """
+    for key, value in source.items():
+        current = target.get(key, _MISSING) if hasattr(target, "get") else _MISSING
+        if isinstance(value, dict) and isinstance(current, dict):
+            _apply_map(current, value)
+        elif isinstance(value, list) and isinstance(current, list):
+            _apply_seq(current, value)
+        elif current is not _MISSING and _unchanged(current, value):
+            # Identical scalar — keep the original node so its literal
+            # formatting (0.10 vs 0.1) and inline comment survive.
+            continue
+        else:
+            target[key] = value
+
+    for key in [k for k in list(target.keys()) if k not in source]:
+        del target[key]
+
+
+def _apply_seq(target: list, source: list) -> None:
+    """Copy *source* into the round-trip sequence *target* in place.
+
+    Element-wise so that comments attached to individual list items
+    (e.g. per-pair notes) are preserved across a save.
+    """
+    common = min(len(target), len(source))
+    for idx in range(common):
+        current, value = target[idx], source[idx]
+        if isinstance(value, dict) and isinstance(current, dict):
+            _apply_map(current, value)
+        elif isinstance(value, list) and isinstance(current, list):
+            _apply_seq(current, value)
+        elif not _unchanged(current, value):
+            target[idx] = value
+
+    if len(source) > common:
+        target.extend(source[common:])
+    elif len(target) > common:
+        del target[common:]
+
+
+def dump_preserving(path: Path, data: dict[str, Any]) -> None:
+    """Write *data* to *path*, preserving the existing file's comments.
+
+    The file already at *path* (if any) is loaded with the ``ruamel.yaml``
+    round-trip parser and used as a template: *data*'s values are applied
+    onto it, so comments, key order, blank lines and scalar formatting all
+    survive.  Keys removed from *data* are dropped; new keys are appended.
+
+    Degrades gracefully: if ``ruamel.yaml`` is not installed, or the
+    existing file cannot be round-tripped, this falls back to
+    ``yaml.safe_dump`` and logs a WARNING naming the comment-loss risk.
+    The save itself never fails because of comment handling.
+
+    Parameters
+    ----------
+    path : Path
+        Destination file.  Its current contents are the comment template.
+    data : dict
+        Fully-resolved configuration mapping to serialise.
+    """
+    global _warned_no_ruamel
+
+    if not RUAMEL_AVAILABLE:
+        if not _warned_no_ruamel:
+            _warned_no_ruamel = True
+            _log.warning(
+                "ruamel.yaml is not installed: writing %s with PyYAML, which "
+                "DISCARDS ALL COMMENTS in the file. Install ruamel.yaml "
+                "(pip install 'ruamel.yaml>=0.18,<0.19') to preserve the "
+                "operator rationale stored in config.yaml.",
+                path,
+            )
+        _dump_plain(path, data)
+        return
+
+    try:
+        yaml_rt = _round_trip_yaml()
+        newline = _detect_newline(path)
+        template: Any = None
+        if path.is_file():
+            with open(path, "r", encoding="utf-8") as fh:
+                template = yaml_rt.load(fh)
+
+        if not isinstance(template, dict):
+            # No usable template (new file, empty file, or a non-mapping
+            # root).  Emit through ruamel anyway so future saves have one.
+            template = data
+
+        else:
+            _apply_map(template, data)
+
+        with open(path, "w", encoding="utf-8", newline=newline) as fh:
+            yaml_rt.dump(template, fh)
+    except Exception as exc:  # noqa: BLE001 - a save must never be lost
+        _log.warning(
+            "Comment-preserving write of %s failed (%s); falling back to "
+            "PyYAML, WHICH DISCARDS ALL COMMENTS in this file.",
+            path, exc,
+        )
+        _dump_plain(path, data)
+
+
+def _dump_plain(path: Path, data: dict[str, Any]) -> None:
+    """Last-resort PyYAML writer (comment-destroying)."""
+    with open(path, "w", encoding="utf-8", newline=_detect_newline(path)) as fh:
+        yaml.safe_dump(
+            data, fh,
+            default_flow_style=False,
+            sort_keys=False,
+            allow_unicode=True,
+        )
 
 # Top-level section → set of keys that belong in secrets.yaml.
 SECRET_KEYS: dict[str, set[str]] = {
@@ -66,6 +261,9 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     and written to ``secrets.yaml``.  Everything else goes to
     *config_path*.  Existing secrets.yaml entries that are NOT managed
     by :data:`SECRET_KEYS` are preserved.
+
+    Both files are written through :func:`dump_preserving`, so comments
+    already in them survive the save.
     """
     public = copy.deepcopy(full)
     secrets: dict[str, Any] = {}
@@ -81,14 +279,8 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if not src:
             del public[section]
 
-    # Write public config.
-    with open(config_path, "w", encoding="utf-8") as fh:
-        yaml.safe_dump(
-            public, fh,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
+    # Write public config (comments in the existing file are preserved).
+    dump_preserving(config_path, public)
 
     # Write secrets — preserve any keys the user added manually.
     secrets_path = config_path.parent / "secrets.yaml"
@@ -102,10 +294,4 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
                     secrets = existing
             except Exception:
                 pass
-        with open(secrets_path, "w", encoding="utf-8") as fh:
-            yaml.safe_dump(
-                secrets, fh,
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-            )
+        dump_preserving(secrets_path, secrets)
