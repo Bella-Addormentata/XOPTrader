@@ -108,6 +108,7 @@ class _DatabaseWorker(QObject):
     # -- Result signals (one per query type) --------------------------------
     trades_ready = Signal(list)
     offers_ready = Signal(list)
+    offer_summary_ready = Signal(dict)
     snapshots_ready = Signal(list)
     trade_summary_ready = Signal(dict)
     pairs_list_ready = Signal(list)
@@ -264,6 +265,32 @@ class _DatabaseWorker(QObject):
         params.append(safe_limit)
 
         self._execute_and_emit(sql, params, self.offers_ready)
+
+    @Slot()
+    def fetch_offer_summary(self) -> None:
+        """Aggregate ``offer_log`` counts and locked size for the GUI.
+
+        The Orders panel only fetches a capped slice of one status at a
+        time, so its summary bar cannot be derived from the rows it
+        holds.  This runs the counting in SQL instead -- one indexed
+        scan on the worker thread rather than a Python loop over every
+        offer on the GUI thread.
+        """
+        sql = """
+            SELECT
+                COUNT(*)                                                          AS total,
+                COALESCE(SUM(CASE WHEN status = 'pending'   THEN 1 ELSE 0 END), 0) AS pending,
+                COALESCE(SUM(CASE WHEN status = 'filled'    THEN 1 ELSE 0 END), 0) AS filled,
+                COALESCE(SUM(CASE WHEN status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled,
+                COALESCE(SUM(CASE WHEN status = 'expired'   THEN 1 ELSE 0 END), 0) AS expired,
+                COALESCE(SUM(CASE WHEN status = 'pending'
+                                  THEN size_mojos ELSE 0 END), 0)                  AS locked_mojos
+            FROM offer_log
+        """
+        rows = self._execute_query(sql, [])
+        if not rows:
+            return
+        self.offer_summary_ready.emit(dict(rows[0]))
 
     @Slot(str, int, int)
     def fetch_snapshots(
@@ -1291,6 +1318,7 @@ class DatabaseService(QObject):
     # -- Qt signals (forwarded from worker) ---------------------------------
     trades_loaded = Signal(list)
     offers_loaded = Signal(list)
+    offer_summary_loaded = Signal(dict)
     snapshots_loaded = Signal(list)
     trade_summary_loaded = Signal(dict)
     pairs_list_loaded = Signal(list)
@@ -1307,6 +1335,7 @@ class DatabaseService(QObject):
     _trigger_close = Signal()
     _trigger_trades = Signal(str, str, object, object, int)
     _trigger_offers = Signal(str, str, int)
+    _trigger_offer_summary = Signal()
     _trigger_snapshots = Signal(str, int, int)
     _trigger_summary = Signal()
     _trigger_pairs = Signal()
@@ -1338,6 +1367,7 @@ class DatabaseService(QObject):
         # Forward worker signals to the service's public signals.
         self._worker.trades_ready.connect(self.trades_loaded)
         self._worker.offers_ready.connect(self.offers_loaded)
+        self._worker.offer_summary_ready.connect(self.offer_summary_loaded)
         self._worker.snapshots_ready.connect(self.snapshots_loaded)
         self._worker.trade_summary_ready.connect(self.trade_summary_loaded)
         self._worker.pairs_list_ready.connect(self.pairs_list_loaded)
@@ -1356,6 +1386,7 @@ class DatabaseService(QObject):
         self._trigger_close.connect(self._worker.close)
         self._trigger_trades.connect(self._worker.fetch_trades)
         self._trigger_offers.connect(self._worker.fetch_offers)
+        self._trigger_offer_summary.connect(self._worker.fetch_offer_summary)
         self._trigger_snapshots.connect(self._worker.fetch_snapshots)
         self._trigger_summary.connect(self._worker.fetch_trade_summary)
         self._trigger_pairs.connect(self._worker.fetch_pairs_list)
@@ -1382,6 +1413,8 @@ class DatabaseService(QObject):
         # Whether deployed-capital data was ever requested; auto-refresh
         # keeps it current once the Balances tab has asked for it.
         self._deployed_requested: bool = False
+        # Same for the Orders panel's whole-table offer aggregates.
+        self._offer_summary_requested: bool = False
 
         _log.info(
             "DatabaseService created: path=%s, refresh=%d ms",
@@ -1497,6 +1530,18 @@ class DatabaseService(QObject):
             self._last_offer_params = (safe_pair, safe_status, safe_limit)
 
         self._trigger_offers.emit(safe_pair, safe_status, safe_limit)
+
+    def query_offer_summary(self) -> None:
+        """Request whole-table ``offer_log`` aggregates.
+
+        Results arrive on :pyattr:`offer_summary_loaded` as
+        ``{"total", "pending", "filled", "cancelled", "expired",
+        "locked_mojos"}``.  Once requested, the auto-refresh timer keeps
+        the figures current.
+        """
+        with QMutexLocker(self._mutex):
+            self._offer_summary_requested = True
+        self._trigger_offer_summary.emit()
 
     def query_snapshots(
         self,
@@ -1621,12 +1666,17 @@ class DatabaseService(QObject):
             offer_params = self._last_offer_params
             pnl_baseline = self._last_pnl_baseline
             deployed_requested = self._deployed_requested
+            offer_summary_requested = self._offer_summary_requested
 
         if trade_params is not None:
             self._trigger_trades.emit(*trade_params)
 
         if offer_params is not None:
             self._trigger_offers.emit(*offer_params)
+
+        # Keep the Orders panel's summary bar current.
+        if offer_summary_requested:
+            self._trigger_offer_summary.emit()
 
         # Keep the restart-proof P&L display current.
         if pnl_baseline is not None:
