@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS, MONO_FONT_FAMILY
-from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
+from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price, num, text
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -520,16 +520,16 @@ class OrderPanel(QWidget):
             if pair_filter != "All Pairs" and offer.get("pair_name") != pair_filter:
                 continue
             # Side filter
-            if side_filter != "all" and offer.get("side", "").lower() != side_filter:
+            if side_filter != "all" and text(offer, "side").lower() != side_filter:
                 continue
             # Status filter
-            if status_filter != "all" and offer.get("status", "").lower() != status_filter:
+            if status_filter != "all" and text(offer, "status").lower() != status_filter:
                 continue
             # Free-text search (matches against offer_id and pair_name)
             if search_text:
                 searchable = (
-                    offer.get("offer_id", "")
-                    + offer.get("pair_name", "")
+                    text(offer, "offer_id")
+                    + text(offer, "pair_name")
                 ).lower()
                 if search_text not in searchable:
                     continue
@@ -678,9 +678,13 @@ class OrderPanel(QWidget):
         # widgets); growing adds empty rows that _item() fills in.
         table.setRowCount(len(offers))
 
+        # Rows arrive from `SELECT * FROM offer_log`, so nullable columns
+        # (tier, fee_mojos, resolved_*, cancel_reason, the book/queue
+        # analytics) are present with the value None.  Read through the
+        # NULL-safe helpers, never `.get(key, default)`.
         for row_idx, offer in enumerate(offers):
             # -- Offer ID (clickable link to Dexie) --
-            oid: str = offer.get("offer_id", "")
+            oid: str = text(offer, "offer_id")
             display_oid = oid[:16] + "..." if len(oid) > 16 else oid
             # Keep a plain item for sorting / UserRole data lookup, and
             # overlay a link label for the click-through to Dexie.
@@ -703,11 +707,11 @@ class OrderPanel(QWidget):
                 link_label.setToolTip(oid)
 
             # -- Pair --
-            pair_name: str = offer.get("pair_name", "")
+            pair_name: str = text(offer, "pair_name")
             self._item(row_idx, 1, pair_name)
 
             # -- Side (coloured) --
-            side: str = offer.get("side", "")
+            side: str = text(offer, "side")
             self._item(row_idx, 2, side.upper()).setForeground(_side_color(side))
 
             # -- Price (mojos -> display units) --
@@ -718,34 +722,34 @@ class OrderPanel(QWidget):
             if base_mpu is None:
                 base_mpu = mojos_per_unit_for_pair(pair_name, "base")
                 self._mpu_cache[pair_name] = base_mpu
-            price_mojos: int = offer.get("price_mojos", 0)
+            price_mojos: int = num(offer, "price_mojos")
             # Store raw mojos for correct numeric sorting.
             self._item(row_idx, 3, format_price(price_mojos, pair_name)).setData(
                 Qt.ItemDataRole.UserRole, price_mojos
             )
 
             # -- Size (mojos -> display units) --
-            size_mojos: int = offer.get("size_mojos", 0)
+            size_mojos: int = num(offer, "size_mojos")
             self._item(
                 row_idx, 4, mojos_to_xch(size_mojos, mojos_per_unit=base_mpu)
             ).setData(Qt.ItemDataRole.UserRole, size_mojos)
 
             # -- Tier --
-            tier: int = offer.get("tier", 0)
+            tier: int = num(offer, "tier")
             self._item(row_idx, 5, f"{tier} ({TIER_NAMES.get(tier, '?')})")
 
             # -- Status (coloured badge) --
-            status: str = offer.get("status", "")
+            status: str = text(offer, "status")
             self._item(row_idx, 6, status.capitalize()).setForeground(
                 _status_color(status)
             )
 
             # -- Filled At (datetime for resolved offers) --
-            resolved_at: str = offer.get("resolved_at", "") or ""
+            resolved_at: str = text(offer, "resolved_at")
             self._item(row_idx, 7, resolved_at).setForeground(self._secondary_color)
 
             # -- Created Block --
-            created_block: int = offer.get("created_block", 0)
+            created_block: int = num(offer, "created_block")
             self._item(row_idx, 8, str(created_block)).setData(
                 Qt.ItemDataRole.UserRole, created_block
             )
@@ -803,16 +807,16 @@ class OrderPanel(QWidget):
         else:
             total = len(self._all_offers)
             pending = sum(
-                1 for o in self._all_offers if o.get("status", "").lower() == "pending"
+                1 for o in self._all_offers if text(o, "status").lower() == "pending"
             )
             filled = sum(
-                1 for o in self._all_offers if o.get("status", "").lower() == "filled"
+                1 for o in self._all_offers if text(o, "status").lower() == "filled"
             )
             # Total value locked = sum of sizes of pending offers.
             locked_mojos = sum(
-                int(o.get("size_mojos", 0))
+                int(num(o, "size_mojos"))
                 for o in self._all_offers
-                if o.get("status", "").lower() == "pending"
+                if text(o, "status").lower() == "pending"
             )
         fill_rate = (filled / total * 100.0) if total > 0 else 0.0
 

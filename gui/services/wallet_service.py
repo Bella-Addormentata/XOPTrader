@@ -261,10 +261,13 @@ class _WalletWorker(QObject):
             else:
                 divisor = 1000.0
 
-            confirmed = float(balance.get("confirmed_wallet_balance", 0)) / divisor
-            spendable = float(balance.get("spendable_balance", 0)) / divisor
-            pending = float(balance.get("pending_change", 0)) / divisor
-            unconfirmed = float(balance.get("unconfirmed_wallet_balance", 0)) / divisor
+            # `or 0` guards a key that is PRESENT but JSON-null in the wallet
+            # RPC response: `.get(key, 0)` returns None in that case, and
+            # float(None) raises TypeError.
+            confirmed = float(balance.get("confirmed_wallet_balance") or 0) / divisor
+            spendable = float(balance.get("spendable_balance") or 0) / divisor
+            pending = float(balance.get("pending_change") or 0) / divisor
+            unconfirmed = float(balance.get("unconfirmed_wallet_balance") or 0) / divisor
 
             result[wallet_name] = {
                 "confirmed": confirmed,

@@ -8,9 +8,71 @@ ISO/IEC 5055 -- bounded arithmetic, explicit integer division constant.
 
 from __future__ import annotations
 
+from typing import Any, Mapping, Optional
+
 # 1 XCH = 10^12 mojos.  CAT tokens use 10^3 mojos per unit.
 MOJOS_PER_XCH: int = 1_000_000_000_000
 MOJOS_PER_CAT: int = 1_000
+
+# Shown in place of a numeric value the database does not have (SQL NULL).
+# Deliberately distinct from ``0`` so a backfilled fill with no recorded
+# cost basis is never misread as a genuine zero-profit trade.
+NULL_DISPLAY: str = "—"  # em dash
+
+
+# ---------------------------------------------------------------------------
+# NULL-safe row accessors
+# ---------------------------------------------------------------------------
+#
+# sqlite3 maps a SQL NULL to Python ``None``.  Widgets read rows produced by
+# ``SELECT *``, so a nullable column is PRESENT in the dict with the value
+# ``None`` -- and ``dict.get(key, default)`` returns ``None``, never the
+# default, because the key exists.  Any arithmetic or numeric formatting on
+# that result then raises TypeError.  ``trade_log.cost_basis_mojos`` and
+# ``trade_log.realized_pnl_mojos`` are nullable by design (rows backfilled
+# from chain history carry no basis), so this is a live crash, not a theory.
+# Use these helpers instead of ``.get(key, default)`` on any DB row.
+
+
+def num(row: Mapping[str, Any], key: str, default: float = 0) -> Any:
+    """Return a numeric column from *row*, substituting *default* for NULL.
+
+    Unlike ``row.get(key, default)`` this also returns *default* when the
+    key exists but holds ``None`` (SQL NULL).
+
+    Parameters
+    ----------
+    row:
+        Database row rendered as a mapping (e.g. ``dict(sqlite3.Row)``).
+    key:
+        Column name.
+    default:
+        Value substituted when the column is missing or NULL.
+    """
+    value = row.get(key, default)
+    return default if value is None else value
+
+
+def text(row: Mapping[str, Any], key: str, default: str = "") -> str:
+    """Return a string column from *row*, substituting *default* for NULL.
+
+    Guards the same missing-vs-NULL distinction as :func:`num` and always
+    returns a ``str`` so ``.lower()`` / slicing on the result is safe.
+    """
+    value = row.get(key, default)
+    if value is None:
+        return default
+    return value if isinstance(value, str) else str(value)
+
+
+def opt_num(row: Mapping[str, Any], key: str) -> Optional[float]:
+    """Return a numeric column, or ``None`` when it is missing or NULL.
+
+    Use when NULL must stay visible to the caller (to render
+    :data:`NULL_DISPLAY` rather than a misleading ``0``).
+    """
+    value = row.get(key)
+    return None if value is None else value
 
 
 def mojos_per_unit_for_pair(pair_name: str, which: str = "base") -> int:
