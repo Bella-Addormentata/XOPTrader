@@ -18,7 +18,7 @@ from __future__ import annotations
 from typing import Any, Final, Optional
 
 from PySide6.QtCore import Qt, Slot
-from PySide6.QtGui import QColor, QFont
+from PySide6.QtGui import QColor, QFont, QShowEvent
 from PySide6.QtWidgets import (
     QFrame,
     QGridLayout,
@@ -284,6 +284,9 @@ class ReportsWidget(QWidget):
         self._wallet_balances: dict[str, dict[str, float]] = {}
         self._live_pnl: dict[str, Any] = {}
         self._last_reports: dict[str, Any] = {}
+        # True when a payload arrived while the widget was hidden and
+        # the tab re-render was deferred until the next showEvent.
+        self._render_pending: bool = False
         self._build_ui()
 
     def _build_ui(self) -> None:
@@ -754,28 +757,29 @@ class ReportsWidget(QWidget):
         wallet_balances: dict[str, dict[str, float]],
         pnl: dict[str, Any],
     ) -> None:
-        """Inject current market, wallet, and live P&L context."""
+        """Inject current market, wallet, and live P&L context.
+
+        Called on every 5 s bridge tick.  The context itself is always
+        cached; the expensive tab re-render is skipped while the widget
+        is hidden and replayed once on the next showEvent.
+        """
         self._xch_usd_rate = max(0.0, float(xch_usd_rate or 0.0))
         self._market_data = dict(market_data or {})
         self._wallet_balances = dict(wallet_balances or {})
         self._live_pnl = dict(pnl or {})
 
-        if self._last_reports:
-            self._update_performance(self._last_reports.get("periods", {}))
-            self._update_pairs(self._last_reports.get("per_pair", []))
-            self._update_capgains(self._last_reports.get("capital_gains", {}))
-            self._update_top_trades(
-                self._last_reports.get("top_trades", []),
-                self._last_reports.get("worst_trades", []),
-            )
-            self._update_daily(self._last_reports.get("daily_pnl", []))
-            self._update_forecast(self._last_reports.get("forecast", {}))
+        if not self.isVisible():
+            self._render_pending = True
+            return
 
-        self._update_portfolio_summary()
+        self._render_all()
 
     @Slot(dict)
     def update_reports(self, data: dict[str, Any]) -> None:
         """Update all report tabs with fresh data.
+
+        The payload is always cached; when the widget is hidden the
+        rendering pass is deferred until the next showEvent.
 
         Parameters
         ----------
@@ -790,19 +794,39 @@ class ReportsWidget(QWidget):
 
         self._last_reports = dict(data)
 
-        self._update_performance(data.get("periods", {}))
-        self._update_pairs(data.get("per_pair", []))
-        self._update_capgains(data.get("capital_gains", {}))
-        self._update_offers(data.get("offer_stats", {}))
-        self._update_top_trades(
-            data.get("top_trades", []),
-            data.get("worst_trades", []),
-        )
-        self._update_daily(data.get("daily_pnl", []))
-        self._update_forecast(data.get("forecast", {}))
+        if not self.isVisible():
+            self._render_pending = True
+            return
+
+        self._render_all()
+        self._status_label.setText("Reports updated")
+
+    def _render_all(self) -> None:
+        """Re-render every tab from the cached report + live context."""
+        self._render_pending = False
+
+        if self._last_reports:
+            data = self._last_reports
+            self._update_performance(data.get("periods", {}))
+            self._update_pairs(data.get("per_pair", []))
+            self._update_capgains(data.get("capital_gains", {}))
+            self._update_offers(data.get("offer_stats", {}))
+            self._update_top_trades(
+                data.get("top_trades", []),
+                data.get("worst_trades", []),
+            )
+            self._update_daily(data.get("daily_pnl", []))
+            self._update_forecast(data.get("forecast", {}))
+
         self._update_portfolio_summary()
 
-        self._status_label.setText("Reports updated")
+    def showEvent(self, event: QShowEvent) -> None:
+        """Replay any render deferred while the widget was hidden."""
+        super().showEvent(event)
+        if self._render_pending:
+            self._render_all()
+            if self._last_reports:
+                self._status_label.setText("Reports updated")
 
     # -----------------------------------------------------------------------
     # Internal update methods
