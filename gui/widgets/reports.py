@@ -36,6 +36,10 @@ from PySide6.QtWidgets import (
 
 from gui.theme import COLORS as _C
 from gui.utils import format_price, mojos_to_xch, mojos_to_xch_float, mojos_per_unit_for_pair
+from gui.utils import NULL_DISPLAY
+from gui.utils import num as row_num
+from gui.utils import opt_num as row_opt_num
+from gui.utils import text as row_text
 
 # ---------------------------------------------------------------------------
 # Palette aliases
@@ -1050,27 +1054,30 @@ class ReportsWidget(QWidget):
         """Populate a trade table (best or worst)."""
         table.setRowCount(len(trades))
 
+        # These rows are the only un-COALESCE'd projection in fetch_reports
+        # (`t.price_mojos, t.size_mojos, t.realized_pnl_mojos,
+        # t.cost_basis_mojos`), so every read here must be NULL-safe.
         for row, t in enumerate(trades):
-            ts = str(t.get("timestamp", ""))[:19]
+            ts = row_text(t, "timestamp")[:19]
             table.setItem(row, 0, _text_item(ts))
-            table.setItem(row, 1, _text_item(t.get("pair_name", "")))
+            table.setItem(row, 1, _text_item(row_text(t, "pair_name")))
 
-            side = t.get("side", "")
+            side = row_text(t, "side")
             side_item = _text_item(side.upper())
             side_item.setForeground(
                 QColor(PROFIT_GREEN) if side.lower() == "bid" else QColor(LOSS_RED)
             )
             table.setItem(row, 2, side_item)
 
-            pair_name = t.get("pair_name", "")
-            table.setItem(row, 3, _price_item(pair_name, int(t.get("price_mojos", 0))))
-            table.setItem(row, 4, _size_item(pair_name, int(t.get("size_mojos", 0))))
+            pair_name = row_text(t, "pair_name")
+            table.setItem(row, 3, _price_item(pair_name, int(row_num(t, "price_mojos"))))
+            table.setItem(row, 4, _size_item(pair_name, int(row_num(t, "size_mojos"))))
             if t.get("realized_pnl_usdc") is not None:
                 table.setItem(
                     row,
                     5,
                     _money_item_from_usdc(
-                        float(t.get("realized_pnl_usdc", 0.0)),
+                        float(row_num(t, "realized_pnl_usdc", 0.0)),
                         signed=True,
                     ),
                 )
@@ -1079,16 +1086,18 @@ class ReportsWidget(QWidget):
                     row,
                     5,
                     _money_item_from_mojos(
-                        t.get("realized_pnl_mojos", 0),
+                        row_num(t, "realized_pnl_mojos"),
                         self._xch_usd_rate,
                         signed=True,
                     ),
                 )
-            table.setItem(
-                row,
-                6,
-                _price_item(pair_name, int(t.get("cost_basis_mojos", 0))),
-            )
+            # Cost basis is nullable by design (backfilled fills carry none):
+            # show an em dash rather than a misleading 0.00 price.
+            cb_mojos = row_opt_num(t, "cost_basis_mojos")
+            if cb_mojos is None:
+                table.setItem(row, 6, _text_item(NULL_DISPLAY))
+            else:
+                table.setItem(row, 6, _price_item(pair_name, int(cb_mojos)))
 
     def _update_daily(self, daily: list[dict]) -> None:
         """Update the daily P&L table."""

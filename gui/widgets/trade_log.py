@@ -31,7 +31,22 @@ from PySide6.QtWidgets import (
 )
 
 from gui.theme import COLORS
-from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price
+from gui.utils import (
+    NULL_DISPLAY,
+    format_price,
+    mojos_per_unit_for_pair,
+    mojos_to_xch,
+    num,
+    opt_num,
+    text,
+)
+
+# Explains the em dash shown for a fill with no recorded cost basis / P&L.
+_NULL_TOOLTIP: str = (
+    "Not recorded for this fill.\n"
+    "Rows recovered from chain history carry no cost basis or realized "
+    "P&L — this is NOT a zero-profit trade."
+)
 
 # ---------------------------------------------------------------------------
 # Constants
@@ -64,8 +79,14 @@ def _side_color(side: str) -> QColor:
     return QColor(COLORS.LOSS_RED)
 
 
-def _pnl_color(pnl_mojos: int) -> QColor:
-    """Return green for positive PnL, red for negative, gray for zero."""
+def _pnl_color(pnl_mojos: Optional[int]) -> QColor:
+    """Return green for positive PnL, red for negative, gray for zero/unknown.
+
+    ``None`` (SQL NULL — no realized P&L recorded) is treated as unknown
+    and rendered in the secondary colour, never as a zero result.
+    """
+    if pnl_mojos is None:
+        return QColor(COLORS.TEXT_SECONDARY)
     if pnl_mojos > 0:
         return QColor(COLORS.PROFIT_GREEN)
     if pnl_mojos < 0:
@@ -288,19 +309,24 @@ class TradeLogWidget(QWidget):
                 "cost_basis_xch", "realized_pnl_xch", "block",
             ])
             for trade in visible:
-                pn = trade.get("pair_name", "")
+                pn = text(trade, "pair_name")
                 b_mpu = mojos_per_unit_for_pair(pn, "base")
+                # NULL cost basis / realized P&L export as an EMPTY cell,
+                # not 0.  A spreadsheet would sum a 0 into the totals and
+                # silently understate profit on backfilled fills.
+                cb = opt_num(trade, "cost_basis_mojos")
+                pnl = opt_num(trade, "realized_pnl_mojos")
                 writer.writerow([
-                    trade.get("timestamp", ""),
-                    trade.get("trade_id", ""),
+                    text(trade, "timestamp"),
+                    text(trade, "trade_id"),
                     pn,
-                    trade.get("side", ""),
-                    mojos_to_xch(trade.get("price_mojos", 0), 12),
-                    mojos_to_xch(trade.get("size_mojos", 0), 12, mojos_per_unit=b_mpu),
-                    mojos_to_xch(trade.get("fee_mojos", 0), 12),
-                    mojos_to_xch(trade.get("cost_basis_mojos", 0), 12),
-                    mojos_to_xch(trade.get("realized_pnl_mojos", 0), 12),
-                    trade.get("block_height", ""),
+                    text(trade, "side"),
+                    mojos_to_xch(num(trade, "price_mojos"), 12),
+                    mojos_to_xch(num(trade, "size_mojos"), 12, mojos_per_unit=b_mpu),
+                    mojos_to_xch(num(trade, "fee_mojos"), 12),
+                    "" if cb is None else mojos_to_xch(cb, 12),
+                    "" if pnl is None else mojos_to_xch(pnl, 12),
+                    text(trade, "block_height"),
                 ])
 
     # ------------------------------------------------------------------
@@ -315,7 +341,7 @@ class TradeLogWidget(QWidget):
         self._combo_pair.addItem("All Pairs")
         pairs_seen: set[str] = set()
         for trade in self._all_trades:
-            pname = trade.get("pair_name", "")
+            pname = text(trade, "pair_name")
             if pname and pname not in pairs_seen:
                 pairs_seen.add(pname)
                 self._combo_pair.addItem(pname)
@@ -336,7 +362,7 @@ class TradeLogWidget(QWidget):
         result: list[dict] = []
         for trade in self._all_trades:
             # Date range filter -- parse the timestamp string.
-            ts_raw = trade.get("timestamp", "")
+            ts_raw = text(trade, "timestamp")
             if ts_raw:
                 try:
                     ts_date = datetime.fromisoformat(str(ts_raw)).date()
@@ -351,7 +377,7 @@ class TradeLogWidget(QWidget):
                 continue
 
             # Side filter
-            if side_filter != "all" and trade.get("side", "").lower() != side_filter:
+            if side_filter != "all" and text(trade, "side").lower() != side_filter:
                 continue
 
             result.append(trade)
@@ -383,27 +409,32 @@ class TradeLogWidget(QWidget):
         for row_idx, trade in enumerate(trades):
             self._table.insertRow(row_idx)
 
+            # NOTE: every read below goes through the NULL-safe helpers in
+            # gui.utils.  Rows come from `SELECT * FROM trade_log`, so a
+            # nullable column is PRESENT with the value None and a plain
+            # `trade.get(key, 0)` would return None, not the default.
+
             # -- Timestamp --
-            ts = str(trade.get("timestamp", ""))
+            ts = text(trade, "timestamp")
             item_ts = QTableWidgetItem(ts)
             item_ts.setForeground(QColor(COLORS.TEXT_SECONDARY))
             self._table.setItem(row_idx, 0, item_ts)
 
             # -- Trade ID (truncated) --
-            tid: str = trade.get("trade_id", "")
+            tid: str = text(trade, "trade_id")
             item_tid = QTableWidgetItem(tid[:16] + "..." if len(tid) > 16 else tid)
             item_tid.setToolTip(tid)
             item_tid.setData(Qt.ItemDataRole.UserRole, tid)
             self._table.setItem(row_idx, 1, item_tid)
 
             # -- Pair --
-            pair_name: str = trade.get("pair_name", "")
+            pair_name: str = text(trade, "pair_name")
             self._table.setItem(
                 row_idx, 2, QTableWidgetItem(pair_name)
             )
 
             # -- Side (coloured) --
-            side: str = trade.get("side", "")
+            side: str = text(trade, "side")
             item_side = QTableWidgetItem(side.upper())
             item_side.setForeground(_side_color(side))
             item_side.setFont(QFont("JetBrains Mono", 10, QFont.Weight.Bold))
@@ -415,7 +446,7 @@ class TradeLogWidget(QWidget):
             base_mpu = mojos_per_unit_for_pair(pair_name, "base")
 
             # -- Price --
-            price_mojos: int = trade.get("price_mojos", 0)
+            price_mojos: int = num(trade, "price_mojos")
             item_price = QTableWidgetItem(format_price(price_mojos, pair_name))
             item_price.setFont(mono_font)
             item_price.setTextAlignment(
@@ -425,7 +456,7 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 4, item_price)
 
             # -- Size --
-            size_mojos: int = trade.get("size_mojos", 0)
+            size_mojos: int = num(trade, "size_mojos")
             item_size = QTableWidgetItem(mojos_to_xch(size_mojos, mojos_per_unit=base_mpu))
             item_size.setFont(mono_font)
             item_size.setTextAlignment(
@@ -435,7 +466,7 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 5, item_size)
 
             # -- Fee --
-            fee_mojos: int = trade.get("fee_mojos", 0)
+            fee_mojos: int = num(trade, "fee_mojos")
             item_fee = QTableWidgetItem(mojos_to_xch(fee_mojos))
             item_fee.setFont(mono_font)
             item_fee.setTextAlignment(
@@ -445,8 +476,16 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 6, item_fee)
 
             # -- Cost Basis --
-            cb_mojos: int = trade.get("cost_basis_mojos", 0)
-            item_cb = QTableWidgetItem(mojos_to_xch(cb_mojos))
+            # NULLable by design: rows backfilled from chain history have no
+            # basis.  Render an em dash, never 0.00 -- a zero here would read
+            # as "bought for free", inverting the trade's apparent profit.
+            cb_mojos: Optional[int] = opt_num(trade, "cost_basis_mojos")
+            if cb_mojos is None:
+                item_cb = QTableWidgetItem(NULL_DISPLAY)
+                item_cb.setForeground(QColor(COLORS.TEXT_SECONDARY))
+                item_cb.setToolTip(_NULL_TOOLTIP)
+            else:
+                item_cb = QTableWidgetItem(mojos_to_xch(cb_mojos))
             item_cb.setFont(mono_font)
             item_cb.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -455,12 +494,17 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 7, item_cb)
 
             # -- Realized PnL (coloured) --
-            pnl_mojos: int = trade.get("realized_pnl_mojos", 0)
-            pnl_text = mojos_to_xch(pnl_mojos)
-            # Prefix with '+' for positive values.
-            if pnl_mojos > 0:
-                pnl_text = "+" + pnl_text
-            item_pnl = QTableWidgetItem(pnl_text)
+            # Same NULL semantics as Cost Basis: unknown, not break-even.
+            pnl_mojos: Optional[int] = opt_num(trade, "realized_pnl_mojos")
+            if pnl_mojos is None:
+                item_pnl = QTableWidgetItem(NULL_DISPLAY)
+                item_pnl.setToolTip(_NULL_TOOLTIP)
+            else:
+                pnl_text = mojos_to_xch(pnl_mojos)
+                # Prefix with '+' for positive values.
+                if pnl_mojos > 0:
+                    pnl_text = "+" + pnl_text
+                item_pnl = QTableWidgetItem(pnl_text)
             item_pnl.setFont(mono_font)
             item_pnl.setForeground(_pnl_color(pnl_mojos))
             item_pnl.setTextAlignment(
@@ -470,7 +514,7 @@ class TradeLogWidget(QWidget):
             self._table.setItem(row_idx, 8, item_pnl)
 
             # -- Block --
-            block_h: int = trade.get("block_height", 0)
+            block_h: int = num(trade, "block_height")
             item_block = QTableWidgetItem(str(block_h))
             item_block.setTextAlignment(
                 Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter
@@ -491,18 +535,31 @@ class TradeLogWidget(QWidget):
         total_pnl: int = 0
         total_size: int = 0
         wins: int = 0
+        # Fills that actually carry a realized P&L figure.  Rows backfilled
+        # from chain history have NULL and must not dilute the win rate:
+        # "unknown" is not "not a win".  Mirrors the engine-side query,
+        # which filters on `realized_pnl_mojos IS NOT NULL`.
+        priced: int = 0
 
         for t in trades:
-            pnl = t.get("realized_pnl_mojos", 0)
-            total_pnl += pnl
-            total_size += t.get("size_mojos", 0)
-            if pnl > 0:
-                wins += 1
+            pnl = opt_num(t, "realized_pnl_mojos")
+            if pnl is not None:
+                priced += 1
+                total_pnl += pnl
+                if pnl > 0:
+                    wins += 1
+            total_size += num(t, "size_mojos")
 
         avg_size = total_size // total if total > 0 else 0
-        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+        win_rate = (wins / priced * 100.0) if priced > 0 else 0.0
 
-        self._lbl_total_trades.setText(f"Total trades: {total}")
+        unpriced = total - priced
+        if unpriced:
+            self._lbl_total_trades.setText(
+                f"Total trades: {total}  ({unpriced} without P&L)"
+            )
+        else:
+            self._lbl_total_trades.setText(f"Total trades: {total}")
 
         # Colour the PnL label to reflect overall performance.
         pnl_colour = COLORS.PROFIT_GREEN if total_pnl >= 0 else COLORS.LOSS_RED
@@ -514,7 +571,10 @@ class TradeLogWidget(QWidget):
         )
 
         self._lbl_avg_size.setText(f"Avg fill size: {mojos_to_xch(avg_size)}")
-        self._lbl_win_rate.setText(f"Win rate: {win_rate:.1f}%")
+        if priced > 0:
+            self._lbl_win_rate.setText(f"Win rate: {win_rate:.1f}% of {priced}")
+        else:
+            self._lbl_win_rate.setText(f"Win rate: {NULL_DISPLAY}")
 
     # ------------------------------------------------------------------
     # Slots

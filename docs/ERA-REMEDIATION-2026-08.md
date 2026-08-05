@@ -163,3 +163,25 @@ inserted row is individually a wallet-CONFIRMED record.
 Post-apply sweep: 1,401 missing -> **350**, exactly the expected exclusions
 (169 + 179 pre-window Apr 4-24, before the first wallet anchor; 2
 post-genesis takers needing ledger entries). The validated era is CLOSED.
+
+## Post-genesis takers (2026-08-05)
+
+The two CONFIRMED taker trades above ledger genesis that the completeness sweep
+flagged — `0xe214945d…` (h=9080575) and `0x0be54305…` (h=9080645), each +2 XCH
+for ~2.5 BYC — are now recorded in `taker_fills` with
+`strategy='historical_backfill_postgenesis'`.
+
+**Deliberately NO ledger entries.** Unlike the pre-genesis backfill (whose flows
+sit inside the opening balances), these settled *after* genesis, so the ledger
+genuinely missed them at the time. However the 2026-08-02 adjusting entries
+(XCH −17.000001, BYC +10.192, wUSDC.b +13.745) have since re-tied the ledger to
+the wallet, absorbing all then-unexplained flow **including these two**. Posting
+individual legs now would double-count and break the live invariant.
+
+Treatment: the trade record is preserved for audit in `taker_fills`; the value
+movement is already reflected in the ledger via the adjustment. This follows the
+accounting policy's preference for recording corrections over rewriting history.
+
+Remaining known gap: 348 pre-window trades (2026-04-04..24), before the first
+wallet balance anchor, individually chain-verified but not aggregate-validatable.
+Documented, not backfilled.

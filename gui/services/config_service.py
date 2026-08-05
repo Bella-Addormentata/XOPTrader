@@ -381,13 +381,9 @@ class ConfigService(QObject):
         _log.info("Saving config to %s", dest)
 
         try:
-            yaml_text: str = yaml.dump(
-                config,
-                default_flow_style=False,
-                sort_keys=False,
-                allow_unicode=True,
-            )
-            dest.write_text(yaml_text, encoding="utf-8")
+            from gui.services.config_split import dump_preserving  # noqa: WPS433
+
+            dump_preserving(dest, config)
         except (OSError, yaml.YAMLError) as exc:
             msg = f"Failed to save config: {exc}"
             _log.error(msg)

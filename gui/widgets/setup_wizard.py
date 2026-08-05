@@ -198,7 +198,9 @@ class FirstRunSetupDialog(QDialog):
 
         if token or chat_id:
             try:
-                from gui.services.config_split import deep_merge  # noqa: WPS433
+                from gui.services.config_split import (  # noqa: WPS433
+                    dump_preserving,
+                )
 
                 secrets_path = self._config_path.parent / "secrets.yaml"
                 existing: dict = {}
@@ -210,14 +212,8 @@ class FirstRunSetupDialog(QDialog):
                     mon["telegram_bot_token"] = token
                 if chat_id:
                     mon["telegram_chat_id"] = chat_id
-                with open(secrets_path, "w", encoding="utf-8") as fh:
-                    yaml.dump(
-                        existing,
-                        fh,
-                        default_flow_style=False,
-                        allow_unicode=True,
-                        sort_keys=False,
-                    )
+                # Comment-preserving write; never clobbers hand-written notes.
+                dump_preserving(secrets_path, existing)
             except Exception as exc:
                 from PySide6.QtWidgets import QMessageBox  # noqa: WPS433
 
