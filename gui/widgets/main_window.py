@@ -281,6 +281,19 @@ class MainWindow(QMainWindow):
             db.offers_loaded.connect(self._order_panel.update_offers)
         if self._tab_order_panel is not None and hasattr(db, "offers_loaded"):
             db.offers_loaded.connect(self._tab_order_panel.update_offers)
+        # [ORDERS-PERF] The Orders panel pushes its pair/status filters down
+        # into SQL so the worker thread does the filtering and only a capped
+        # slice ever reaches the GUI thread; whole-table counts for its
+        # summary bar come from a separate aggregate query.
+        for _panel in (self._order_panel, self._tab_order_panel):
+            if _panel is None:
+                continue
+            if hasattr(_panel, "offers_query_requested") and hasattr(db, "query_offers"):
+                _panel.offers_query_requested.connect(db.query_offers)
+            if hasattr(_panel, "update_offer_summary") and hasattr(
+                db, "offer_summary_loaded"
+            ):
+                db.offer_summary_loaded.connect(_panel.update_offer_summary)
         if self._trade_log is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._trade_log.load_trades)
         if self._chart is not None and hasattr(db, "trades_loaded"):
@@ -305,6 +318,10 @@ class MainWindow(QMainWindow):
         # has a set of parameters to re-issue on subsequent ticks.
         if hasattr(db, "query_offers"):
             db.query_offers()
+        if hasattr(db, "query_offer_summary"):
+            # Whole-table offer counts for the Orders panel summary bar
+            # (its row payload is a capped, status-filtered slice).
+            db.query_offer_summary()
         if hasattr(db, "query_trades"):
             # Seed trade auto-refresh so charts can build per-block
             # volume/fill overlays from existing DB snapshots.
