@@ -127,7 +127,7 @@ def _rs_tree_hash(hex_str: str) -> str:
 def test_every_vendored_puzzle_matches_expected_and_chia_rs():
     from gui.services.warp.puzzles.hashes import EXPECTED_TREE_HASHES
 
-    assert len(EXPECTED_TREE_HASHES) == 11
+    assert len(EXPECTED_TREE_HASHES) == 12
     for name, expected in EXPECTED_TREE_HASHES.items():
         program = cu.load_puzzle(name)  # hash-asserted internally
         mine = cu.sha256tree(program).hex()

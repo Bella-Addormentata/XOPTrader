@@ -28,4 +28,5 @@ EXPECTED_TREE_HASHES: dict[str, str] = {
     "singleton_top_layer_v1_1": "7faa3253bfddd1e0decb0906b2dc6247bbc4cf608f58345d173adb63e8b47c9f",
     "cat_v2": "37bef360ee858133b69d595a906dc45d01af50379dad515eb9518abb7c1d2a7a",
     "p2_delegated_puzzle_or_hidden_puzzle": "e9aaa49f45bad5c889b86ee3341550c155cfdd10c3a6757de618d20612fffd52",
+    "p2_m_of_n_delegate_direct": "0f199d5263ac1a62b077c159404a71abd3f9691cc57520bf1d4c5cb501504457",
 }
