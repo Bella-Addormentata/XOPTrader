@@ -583,3 +583,25 @@ recovery:
 buyer:
   enabled: false                         # [OPTIONAL, default: false]
   config_path: "buyer.yaml"             # [OPTIONAL] external buyer config
+
+# --- warp: OPTIONAL (omit section to disable the bridge entirely) ------------
+# Automatic warp.green bridging of USDC (Base) -> wUSDC.b (Chia CAT), run in the
+# background by the GUI. GUI-only; the C++ engine never reads this section.
+# Leave enabled=false (the default) and the bridge stays completely dark.
+# The EVM hot-wallet private key is NOT stored here -- the GUI generates it and
+# writes it DPAPI-encrypted to secrets.yaml under warp.evm_private_key_dpapi.
+warp:
+  enabled: false                         # [OPTIONAL, default: false] master switch
+  testnet: false                         # [OPTIONAL, default: false] Base Sepolia + testnet11
+  base_rpc_url: "https://mainnet.base.org"  # [OPTIONAL] a private RPC (Alchemy/Infura) is more reliable
+  auto_bridge: false                     # [OPTIONAL, default: false] bridge deposits automatically
+  min_auto_bridge_usdc: 100              # [OPTIONAL] ignore auto-bridge below this (manual still works)
+  max_auto_bridge_usdc: 10000            # [OPTIONAL] cap per auto-bridge; bounds blast radius
+  claim_fee_mojos: 100000000             # [OPTIONAL] XCH fee reserved for the Chia claim spend (0.0001 XCH)
+  chia_funding_fee_mojos: 0              # [OPTIONAL] extra fee on the wallet->claim funding send
+  poll_interval_s: 15                    # [OPTIONAL, default: 15] background tick cadence
+  coinset_url: ""                        # [OPTIONAL] override coinset API base (blank = network default)
+  chia_receiver_address: ""              # [OPTIONAL] where wUSDC.b lands (blank = bot's own wallet address)
+  # Correctness anchor: the derived wrapped-asset id must equal this or the
+  # service refuses to move funds. This is the Base-bridged wUSDC.b CAT.
+  expected_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"

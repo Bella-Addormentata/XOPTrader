@@ -226,6 +226,8 @@ SECRET_KEYS: dict[str, set[str]] = {
     "monitoring": {"telegram_bot_token", "telegram_chat_id"},
     "coingecko": {"api_key"},
     "database": {"path"},
+    # warp bridge hot-wallet key, DPAPI-encrypted (gui/services/warp/keystore.py).
+    "warp": {"evm_private_key_dpapi"},
 }
 
 
