@@ -18,8 +18,8 @@ import webbrowser
 from typing import Any, Final, Optional
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
+    QApplication,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -419,8 +419,7 @@ class WarpWidget(QWidget):
         address = self._addr_field.text().strip()
         if not address:
             return
-        from PySide6.QtWidgets import QApplication as _QApp
-        clipboard = _QApp.clipboard()
+        clipboard = QApplication.clipboard()
         if clipboard is not None:
             clipboard.setText(address)
         self.address_copy_requested.emit(address)
