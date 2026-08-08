@@ -32,6 +32,7 @@ from gui.services.config_service import ConfigService
 from gui.services.database_service import DatabaseService
 from gui.services.metrics_service import MetricsService
 from gui.services.wallet_service import WalletService
+from gui.services.warp.service import WarpService
 from gui.services.config_split import split_and_save
 
 # ---------------------------------------------------------------------------
@@ -143,6 +144,13 @@ class EngineBridge(QObject):
             config={},
             parent=self,
         )
+        # Warp bridge worker (background USDC(Base) -> wUSDC.b). Constructed
+        # here but inert until warp.enabled is set in config; see the
+        # enabled-gate in WarpService's worker (_build_engine).
+        self._warp_svc: WarpService = WarpService(
+            config={},
+            parent=self,
+        )
 
         # -- Internal state -------------------------------------------------
         self._bot_status: str = STATUS_UNKNOWN
@@ -209,6 +217,11 @@ class EngineBridge(QObject):
         """Return the owned DatabaseService instance."""
         return self._database_svc
 
+    @property
+    def warp_service(self) -> WarpService:
+        """Return the owned WarpService instance."""
+        return self._warp_svc
+
     # ===================================================================
     # Startup / shutdown
     # ===================================================================
@@ -256,6 +269,11 @@ class EngineBridge(QObject):
         # tick only triggers fetches (never blocks on them).
         self._wallet_svc.start()
 
+        # Warp bridge worker starts alongside the wallet.  It is an idle
+        # no-op unless warp.enabled is set in config, so this is always safe
+        # for the live bot; a disabled tick never touches the network.
+        self._warp_svc.start()
+
         db_ok: bool = self._database_svc.start()
         if not db_ok:
             _log.warning("Database open failed; DB features disabled.")
@@ -273,6 +291,7 @@ class EngineBridge(QObject):
         self._metrics_svc.stop()
         self._database_svc.stop()
         self._wallet_svc.stop()
+        self._warp_svc.stop()
         self._stop_engine_process()
         _log.info("EngineBridge shutdown complete.")
 
@@ -404,6 +423,7 @@ class EngineBridge(QObject):
             "stuck_offers": self._metrics_svc.get_stuck_offers(),
             "fees_paid_24h": self._metrics_svc.get_fees_paid_24h(),
             "wallet_balances": self._wallet_svc.get_balances(),
+            "warp": self._warp_svc.get_snapshot(),
             "metrics_connected": self._metrics_svc.is_connected,
         }
         return data
@@ -634,6 +654,13 @@ class EngineBridge(QObject):
         if self._tick_count % 6 == 3:
             self._database_svc.get_reports()
 
+        # Advance the warp bridge one bounded step every 6th tick (~30s),
+        # offset from wallet and reports.  The step is a cheap no-op when
+        # warp is disabled or has no active job; overlapping ticks are
+        # dropped by the service's in-flight guard.
+        if self._tick_count % 6 == 5:
+            self._warp_svc.tick()
+
         data = self.get_all_data()
         self._last_data = data
         self.data_updated.emit(data)
@@ -649,6 +676,7 @@ class EngineBridge(QObject):
         """
         _log.info("Config loaded into EngineBridge (%d keys).", len(config))
         self._wallet_svc.update_config(config)
+        self._warp_svc.update_config(config)
 
     @Slot(dict)
     def _on_metrics_updated(self, metrics: dict) -> None:
