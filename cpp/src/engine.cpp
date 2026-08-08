@@ -157,10 +157,6 @@ int score_execution_quality(int competitiveness_score, int queue_ahead_score)
 
 }  // namespace
 
-// [H9] Fallback XCH/USD rate when CEX feed is unavailable (Phase 2).
-// ISO/IEC 5055: no magic numbers in financial calculations.
-static constexpr double kFallbackXchUsdRate = 2.70;
-
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -10431,7 +10427,7 @@ double Engine::usd_per_xch() const
     }
 
     // [PNL-BASIS-USD 2026-07-30] Return 0 ("unknown"), NOT the historical
-    // kFallbackXchUsdRate constant.  That constant is 2.70 while XCH has
+    // hard-coded fallback rate.  That rate was 2.70 while XCH has
     // traded near $1.35, so using it would silently value fills at ~2x and
     // -- now that cost basis is PERSISTED -- bake that error in permanently
     // instead of it evaporating at the next restart.  Callers treat 0 as
@@ -11560,8 +11556,8 @@ void Engine::step_update_pnl(BlockHeight block_height)
             return rec.weighted_avg_cost_basis;
         },
         // [PNL-UNITS 2026-07-30] Live XCH/USD from an enabled stable-quoted
-        // pair's mid (falls back to kFallbackXchUsdRate only before the
-        // first market snapshot).  Previously hard-coded 2.70 forever.
+        // pair's mid, or 0 ("unknown") before the first market snapshot --
+        // see usd_per_xch.  Previously hard-coded 2.70 forever.
         xch_usd,
         // [PNL-UNIT-FIX] Per-pair unit factor (quote_denom/base_denom).
         // Without this the inventory PnL is overstated by 1e9 for

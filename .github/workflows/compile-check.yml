@@ -38,6 +38,31 @@ jobs:
         with:
           submodules: recursive
 
+      # ---- System dependencies ---------------------------------------------
+      #
+      # GCC 13, not the runner image's default GCC 11.  GCC 11 ICEs on lambda
+      # coroutines that bind a class-type co_await result into their frame
+      # ("in build_special_member_call, at cp/call.c:10200"), which a codebase
+      # built on asio::awaitable hits readily.  jammy carries no gcc-13, hence
+      # the toolchain PPA.  The runner image itself stays on ubuntu-22.04 so
+      # the release binaries keep their glibc floor.
+      - name: Install system dependencies
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libcurl4-openssl-dev \
+            gcc-13 g++-13
+          # Export the toolchain before vcpkg is set up so the ports are built
+          # by the same compiler as the project.  This job builds Debug, which
+          # does not use LTO, so a mixed GCC 11/13 link happens to work here --
+          # but it broke the Release link in release.yml, where
+          # CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE is ON and GCC 13's lto1
+          # cannot read GCC 11 bytecode.  Keep the two workflows identical.
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
       # ---- Read vcpkg baseline from manifest (single source of truth) -------
       - name: Read vcpkg baseline
         id: vcpkg-baseline
@@ -64,23 +89,6 @@ jobs:
           vcpkgDirectory: "${{ github.workspace }}/vcpkg"
           vcpkgJsonGlob: "cpp/vcpkg.json"
           vcpkgGitCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
-
-      # ---- System dependencies ---------------------------------------------
-      #
-      # GCC 13, not the runner image's default GCC 11.  GCC 11 ICEs on lambda
-      # coroutines that bind a class-type co_await result into their frame
-      # ("in build_special_member_call, at cp/call.c:10200"), which a codebase
-      # built on asio::awaitable hits readily.  jammy carries no gcc-13, hence
-      # the toolchain PPA.  The runner image itself stays on ubuntu-22.04 so
-      # the release binaries keep their glibc floor.
-      - name: Install system dependencies
-        run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
-            libssl-dev libcurl4-openssl-dev \
-            gcc-13 g++-13
 
       # ---- CMake configure -------------------------------------------------
       - name: Configure CMake
