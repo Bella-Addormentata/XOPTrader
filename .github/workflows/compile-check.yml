@@ -169,9 +169,9 @@ jobs:
       - name: Verify the warp dependencies actually installed
         run: |
           python - <<'PY'
-          import importlib
+          import importlib.util
           missing = [m for m in ("clvm", "chia_rs", "eth_account", "eth_utils")
-                     if not importlib.util.find_spec(m)]
+                     if importlib.util.find_spec(m) is None]
           if missing:
               raise SystemExit(
                   "warp dependencies missing: " + ", ".join(missing) +
