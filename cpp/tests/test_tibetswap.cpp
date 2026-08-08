@@ -526,6 +526,17 @@ TEST(TibetSwapClientLifecycle, RequestsBeforeOpenFailLoudlyRatherThanCrash) {
     EXPECT_TRUE(threw);
 }
 
+// GCC 11 (ubuntu-22.04) ICEs -- "in build_special_member_call, at
+// cp/call.c:10200" -- on a lambda coroutine that binds the class-type result
+// of a co_await into its frame.  The other two co_spawn lambdas in this file
+// discard their results and compile fine.  Holding the vector in a plain
+// function coroutine keeps the closure's frame scalar-only and sidesteps it.
+boost::asio::awaitable<std::size_t> pool_count_for_assets(
+    TibetSwapClient& client, std::vector<std::string> asset_ids)
+{
+    co_return (co_await client.fetch_pools_for_assets(asset_ids)).size();
+}
+
 TEST(TibetSwapClientLifecycle, EmptyAssetListShortCircuitsWithoutNetwork) {
     // No asset IDs (or only the native XCH sentinel) => no request at all,
     // even though the client was never opened.  Proves the guard runs first.
@@ -538,8 +549,7 @@ TEST(TibetSwapClientLifecycle, EmptyAssetListShortCircuitsWithoutNetwork) {
     boost::asio::co_spawn(
         ioc,
         [&client, &results]() -> boost::asio::awaitable<void> {
-            auto pools = co_await client.fetch_pools_for_assets({"xch", ""});
-            results = pools.size();
+            results = co_await pool_count_for_assets(client, {"xch", ""});
             co_return;
         },
         [&threw](std::exception_ptr ep) { threw = (ep != nullptr); });
