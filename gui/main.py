@@ -233,20 +233,34 @@ def _kill_old_instances_posix(protected_pids: set[int]) -> None:
 # Bundle self-check
 # ---------------------------------------------------------------------------
 
+#: Env var naming a file the self-check appends its report to.  Set by CI on
+#: the Windows leg, where there is no console to read the report from.
+_SELF_CHECK_REPORT_ENV: Final[str] = "XOP_SELF_CHECK_REPORT"
+
+
 def _emit(message: str) -> None:
-    """Print, tolerating the absence of a stream.
+    """Report a self-check line to wherever this build can actually write.
 
     A ``--windowed`` PyInstaller build on Windows has no console subsystem, so
     ``sys.stdout`` and ``sys.stderr`` are both ``None`` and a bare ``print``
-    raises.  That is the whole reason the Windows bundle previously had no
-    smoke test; ``--self-check`` reports through its exit code instead, and
-    only writes when there is somewhere to write.
+    raises.  The exit code is the contract precisely because of that -- but an
+    exit code alone cannot say WHICH resource is missing, which makes a failure
+    on that platform undiagnosable.  So when ``XOP_SELF_CHECK_REPORT`` names a
+    file, every line is appended there as well.
     """
     stream = sys.stdout or sys.stderr
     if stream is not None:
         try:
             print(message, file=stream)
         except (OSError, ValueError):
+            pass
+
+    report = os.environ.get(_SELF_CHECK_REPORT_ENV)
+    if report:
+        try:
+            with open(report, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        except OSError:
             pass
 
 
@@ -264,6 +278,16 @@ def _run_self_check() -> int:
     frozen = bool(getattr(sys, "frozen", False))
     failures: list[str] = []
 
+    def _fail(label: str, exc: BaseException) -> None:
+        failures.append(f"{label}: {exc!r}")
+        _emit(f"FAIL {label}: {exc!r}")
+        # A bare repr cannot place a failure inside a frozen import chain --
+        # the useful frame is usually several levels down in the package being
+        # checked, and a missing transitive dependency names only itself.
+        import traceback
+        for line in traceback.format_exc().rstrip().splitlines():
+            _emit(f"     | {line}")
+
     def _check(label: str, fn, *, optional_deps: bool = False) -> None:
         try:
             fn()
@@ -273,11 +297,9 @@ def _run_self_check() -> int:
             if optional_deps and not frozen:
                 _emit(f"SKIP {label}: {exc.name} not installed (source checkout)")
                 return
-            failures.append(f"{label}: {exc!r}")
-            _emit(f"FAIL {label}: {exc!r}")
+            _fail(label, exc)
         except Exception as exc:  # noqa: BLE001 -- report, never propagate
-            failures.append(f"{label}: {exc!r}")
-            _emit(f"FAIL {label}: {exc!r}")
+            _fail(label, exc)
         else:
             _emit(f"OK   {label}")
 

@@ -443,10 +443,17 @@ jobs:
       - name: Smoke-test the bundle
         working-directory: gui
         shell: pwsh
+        env:
+          # No console subsystem here, so the report cannot come back on
+          # stdout -- the exe appends it to this file instead.
+          XOP_SELF_CHECK_REPORT: ${{ runner.temp }}\self-check.txt
         run: |
           & .\dist\xop_trader_gui.exe --self-check
-          if ($LASTEXITCODE -ne 0) {
-            throw "bundle self-check failed with exit code $LASTEXITCODE"
+          $code = $LASTEXITCODE
+          $report = "${{ runner.temp }}\self-check.txt"
+          if (Test-Path $report) { Get-Content $report } else { Write-Host "(no report written)" }
+          if ($code -ne 0) {
+            throw "bundle self-check failed with exit code $code"
           }
 
       - name: Rename binary
