@@ -66,12 +66,21 @@ jobs:
           vcpkgGitCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
 
       # ---- System dependencies ---------------------------------------------
+      #
+      # GCC 13, not the runner image's default GCC 11.  GCC 11 ICEs on lambda
+      # coroutines that bind a class-type co_await result into their frame
+      # ("in build_special_member_call, at cp/call.c:10200"), which a codebase
+      # built on asio::awaitable hits readily.  jammy carries no gcc-13, hence
+      # the toolchain PPA.  The runner image itself stays on ubuntu-22.04 so
+      # the release binaries keep their glibc floor.
       - name: Install system dependencies
         run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update -y
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
-            libssl-dev libcurl4-openssl-dev
+            libssl-dev libcurl4-openssl-dev \
+            gcc-13 g++-13
 
       # ---- CMake configure -------------------------------------------------
       - name: Configure CMake
@@ -80,6 +89,8 @@ jobs:
           cmake -B ../build -S .
           -DCMAKE_BUILD_TYPE=Debug
           -DXOP_BUILD_TESTS=ON
+          -DCMAKE_C_COMPILER=gcc-13
+          -DCMAKE_CXX_COMPILER=g++-13
           -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=x64-linux
 

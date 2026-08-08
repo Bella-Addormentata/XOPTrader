@@ -111,13 +111,26 @@ jobs:
           vcpkgGitCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
 
       # ---- System dependencies (Ubuntu) ------------------------------------
+      #
+      # GCC 13, not the runner image's default GCC 11 -- see the note in
+      # compile-check.yml.  jammy carries no gcc-13, hence the toolchain PPA.
+      #
+      # The runner image deliberately stays on ubuntu-22.04: it sets the glibc
+      # floor for xop_trader-linux-x64, and moving to 24.04 would raise that
+      # floor for everyone already running the binary.  GCC 13 does raise the
+      # *libstdc++* floor the same way (jammy ships GLIBCXX_3.4.30; GCC 13
+      # emits references to 3.4.32), so the Linux link below is static for
+      # libstdc++/libgcc.  glibc stays dynamic -- it is the compatibility
+      # boundary we are preserving, and static glibc breaks NSS anyway.
       - name: Install system dependencies (Ubuntu)
         if: runner.os == 'Linux'
         run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
           sudo apt-get update -y
           sudo apt-get install -y \
             build-essential cmake ninja-build pkg-config \
-            libssl-dev libcurl4-openssl-dev
+            libssl-dev libcurl4-openssl-dev \
+            gcc-13 g++-13
 
       # ---- System dependencies (macOS) -------------------------------------
       # sqlite3 is excluded from vcpkg on macOS (sqlite.org is unreachable from
@@ -132,9 +145,14 @@ jobs:
       - name: Configure CMake
         working-directory: cpp
         shell: bash
+        env:
+          # CMake seeds CMAKE_EXE_LINKER_FLAGS from LDFLAGS on first configure.
+          # Empty on Windows/macOS, which CMake ignores.
+          LDFLAGS: ${{ runner.os == 'Linux' && '-static-libstdc++ -static-libgcc' || '' }}
         run: >
           cmake -B ../build -S .
           ${{ runner.os != 'Windows' && '-G Ninja' || '' }}
+          ${{ runner.os == 'Linux' && '-DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13' || '' }}
           -DCMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
           -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=${{ runner.os == 'Windows' && 'x64-windows' || runner.os == 'Linux' && 'x64-linux' || 'arm64-osx' }}
