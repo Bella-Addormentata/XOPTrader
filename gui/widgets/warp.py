@@ -80,10 +80,10 @@ _LOW_GAS_WEI: Final[int] = 1_000_000_000_000_000  # 0.001 ETH -- warn below this
 _ST_COMPLETED: Final[str] = "COMPLETED"
 _ST_FAILED: Final[str] = "FAILED"
 _ST_CANCELLED: Final[str] = "CANCELLED"
+_ST_DRY_RUN_OK: Final[str] = "DRY_RUN_OK"
 _CANCELLABLE: Final[frozenset[str]] = frozenset(
     {"AWAITING_DEPOSIT", "DEPOSIT_SEEN", "APPROVING"}
 )
-_TERMINAL: Final[frozenset[str]] = frozenset({_ST_COMPLETED, _ST_FAILED, _ST_CANCELLED})
 
 _STATUS_LABELS: Final[dict[str, str]] = {
     "AWAITING_DEPOSIT": "Awaiting deposit",
@@ -99,9 +99,11 @@ _STATUS_LABELS: Final[dict[str, str]] = {
     "COMPLETED": "Completed",
     "FAILED": "Failed",
     "CANCELLED": "Cancelled",
+    "DRY_RUN_OK": "Dry run OK",
 }
 
 _WARP_PORTAL_URL: Final[str] = "https://www.warp.green"
+_WARP_DOCS_URL: Final[str] = "https://docs.warp.green/developers/introduction"
 
 _log = logging.getLogger(__name__)
 
@@ -201,11 +203,12 @@ class WarpWidget(QWidget):
 
     Displays, all sourced from ``data["warp"]``:
 
-    * a status banner (disabled / blocked reason / active, with a TESTNET badge);
+    * a status banner (disabled / blocked reason / dry run / active);
     * the Base hot-wallet deposit address + copy, and its USDC / ETH balances
       with a low-gas warning;
     * the bridge configuration (destination XCH address, auto-bridge state,
-      min/max caps, wUSDC.b asset id) and a "Bridge now" button;
+      min/max caps, wUSDC.b asset id) and a "Bridge now" button, plus warp.green
+      portal and developer-docs links;
     * a jobs table with per-job BaseScan / SpaceScan links, error tooltips, and a
       Retry / Sweep / Cancel context menu.
 
@@ -374,6 +377,23 @@ class WarpWidget(QWidget):
         self._bridge_btn.clicked.connect(self._on_bridge_now)
         ctrl_row.addWidget(self._bridge_btn)
         ctrl_row.addStretch(1)
+
+        # Deliberately always enabled, independent of `built`/`enabled`: the
+        # portal is the documented out-of-band recovery path for a message this
+        # app cannot claim, so a *blocked* operator is exactly who needs it.
+        self._portal_btn = self._link_button("Open warp.green portal")
+        self._portal_btn.setToolTip(
+            f"{_WARP_PORTAL_URL}\n\nThe official bridge UI. Also the recovery path: "
+            "an attested message stays claimable there forever, paid to the same "
+            "attested Chia receiver.\n\nVerify the URL before connecting any wallet."
+        )
+        self._portal_btn.clicked.connect(lambda: _open_url(_WARP_PORTAL_URL))
+        ctrl_row.addWidget(self._portal_btn)
+
+        self._docs_btn = self._link_button("Developer docs")
+        self._docs_btn.setToolTip(_WARP_DOCS_URL)
+        self._docs_btn.clicked.connect(lambda: _open_url(_WARP_DOCS_URL))
+        ctrl_row.addWidget(self._docs_btn)
         layout.addLayout(ctrl_row)
 
         layout.addWidget(_separator())
@@ -405,8 +425,9 @@ class WarpWidget(QWidget):
         notice_lbl = QLabel(
             "⚠️  <b>Important:</b> deposits must be <b>USDC on Base</b>. "
             "The hot-wallet key is stored encrypted (DPAPI) in secrets.yaml; back "
-            "it up per the runbook. Bridging is disabled by default — enable "
-            "it only after completing the testnet drill."
+            "it up per the runbook. Bridging is disabled by default, and ships in "
+            "dry run — go live only after a clean dry-run rehearsal followed by a "
+            "small live test deposit."
         )
         notice_lbl.setWordWrap(True)
         notice_lbl.setTextFormat(Qt.TextFormat.RichText)
@@ -450,30 +471,24 @@ class WarpWidget(QWidget):
         enabled = bool(snap.get("enabled"))
         built = "hot_wallet" in snap  # rich keys present only when the engine built
         error = snap.get("error")
-        testnet = bool(snap.get("testnet"))
 
-        self._render_banner(snap, enabled=enabled, built=built, error=error, testnet=testnet)
+        self._render_banner(snap, enabled=enabled, built=built, error=error)
         self._render_hot_wallet(snap.get("hot_wallet") or {}, built=built)
         self._render_bridge_config(snap, enabled=enabled, built=built)
         self._render_jobs(list(snap.get("jobs") or []))
 
     def _render_banner(
-        self, snap: dict, *, enabled: bool, built: bool, error: Any, testnet: bool
+        self, snap: dict, *, enabled: bool, built: bool, error: Any
     ) -> None:
         badge = ""
-        if testnet:
-            badge = (
-                f" <span style='color:{DARK_BG}; background-color:{WARNING_YELLOW}; "
-                f"padding:1px 6px; border-radius:3px;'><b>TESTNET</b></span>"
-            )
         if not snap:
             colour, text = TEXT_SECONDARY, "Connecting to the warp service…"
         elif not enabled:
             colour = TEXT_SECONDARY
             text = (
                 "Bridge <b>disabled</b>. Set <code>warp.enabled: true</code> in "
-                "config.yaml (and complete the testnet drill) to activate "
-                "automatic background bridging."
+                "config.yaml to activate automatic background bridging. Rehearse "
+                "with <code>warp.dry_run: true</code> before going live."
             )
             if error and error != "warp disabled":
                 text += f"<br><span style='color:{WARNING_YELLOW};'>{error}</span>"
@@ -481,6 +496,19 @@ class WarpWidget(QWidget):
             colour = WARNING_YELLOW
             reason = error or "the engine could not start (check dependencies / config)"
             text = f"Bridge enabled but <b>blocked</b>: {reason}"
+        elif snap.get("dry_run"):
+            # Signing but never broadcasting is a safe state, not a healthy one:
+            # make it impossible to mistake a rehearsal for a working bridge.
+            colour = WARNING_YELLOW
+            badge = (
+                f" <span style='color:{DARK_BG}; background-color:{WARNING_YELLOW}; "
+                f"padding:1px 6px; border-radius:3px;'><b>DRY RUN</b></span>"
+            )
+            text = (
+                "Bridge in <b>dry run</b>: both Base transactions are built and "
+                "signed, then <b>not broadcast</b>. No funds move. Set "
+                "<code>warp.dry_run: false</code> and restart to go live."
+            )
         else:
             colour = PROFIT_GREEN
             network = snap.get("network") or "mainnet"
@@ -488,6 +516,15 @@ class WarpWidget(QWidget):
             text = (
                 f"Bridge <b>active</b> on {network}. Automatic bridging of "
                 f"detected deposits is <b>{auto}</b>."
+            )
+        # A rejected Bridge now / Retry / Sweep is otherwise silent: the worker
+        # swallows the exception so it cannot kill the thread, which left the
+        # operator watching a click do nothing.
+        action_error = snap.get("action_error")
+        if action_error:
+            text += (
+                f"<br><span style='color:{WARNING_YELLOW};'>Last action failed: "
+                f"{action_error}</span>"
             )
         self._banner.setText(text + badge)
         self._banner.setStyleSheet(
@@ -538,8 +575,19 @@ class WarpWidget(QWidget):
         self._gas_lbl.setVisible(bool(low))
 
     def _render_bridge_config(self, snap: dict, *, enabled: bool, built: bool) -> None:
-        self._dest_field.setText(str(snap.get("receiver_address") or ""))
+        dest = str(snap.get("receiver_address") or "")
+        self._dest_field.setText(dest)
         self._dest_field.setCursorPosition(0)
+        source = str(snap.get("receiver_source") or "")
+        if dest and source == "wallet":
+            self._dest_field.setToolTip(
+                f"{dest}\n\nDerived from the bot's own Chia wallet because "
+                "warp.chia_receiver_address is blank."
+            )
+        elif dest:
+            self._dest_field.setToolTip(f"{dest}\n\nFrom warp.chia_receiver_address.")
+        else:
+            self._dest_field.setToolTip(str(source) or "")
 
         if built:
             lo = _usdc(snap.get("min_micros"))
@@ -547,8 +595,9 @@ class WarpWidget(QWidget):
             auto_on = bool(snap.get("auto_bridge"))
             state = "enabled" if auto_on else "disabled (deposits wait for Bridge now)"
             self._auto_lbl.setText(
-                f"Auto-bridge is <b>{state}</b>. Deposits between "
-                f"<b>{lo}</b> and <b>{hi}</b> USDC are eligible."
+                f"Auto-bridge is <b>{state}</b>. Automatic bridging covers deposits "
+                f"between <b>{lo}</b> and <b>{hi}</b> USDC; <b>Bridge now</b> "
+                f"bridges any balance, up to <b>{hi}</b>."
             )
             self._auto_lbl.setTextFormat(Qt.TextFormat.RichText)
             asset = snap.get("expected_asset_id") or ""
@@ -559,14 +608,24 @@ class WarpWidget(QWidget):
             self._asset_lbl.setText("")
             self._asset_lbl.setToolTip("")
 
-        # A bridge can only be requested when the engine is built and no job is
-        # already active (WarpService.request_bridge raises otherwise).
+        # Any row the service still reports as the active job owns the single
+        # slot, FAILED included -- the store keeps a failed job open until the
+        # operator resolves it. Second-guessing that here (by filtering out
+        # terminal-looking statuses) enabled a button that request_bridge then
+        # rejected, and the rejection was swallowed: a silently dead control.
         active = snap.get("active_job")
-        active_open = bool(active) and active.get("status") not in _TERMINAL
+        active_open = bool(active)
+        status = str((active or {}).get("status") or "")
         can_bridge = built and enabled and not active_open
         self._bridge_btn.setEnabled(can_bridge)
         if not built or not enabled:
             self._bridge_btn.setToolTip("Enable the bridge in config to request a bridge.")
+        elif status == _ST_FAILED:
+            self._bridge_btn.setToolTip(
+                "The last bridge job failed and still holds the single job slot. "
+                "Right-click it in the table and choose Retry, or Sweep to recover "
+                "its funding coin and close it."
+            )
         elif active_open:
             self._bridge_btn.setToolTip(
                 "A bridge job is already in progress; only one runs at a time."
@@ -677,21 +736,41 @@ class WarpWidget(QWidget):
         _log.debug("Warp Base deposit address copied to clipboard.")
 
     # ------------------------------------------------------------------
-    # Explorer URL helpers (network-aware)
+    # Explorer URL helpers
     # ------------------------------------------------------------------
 
     def _basescan_url(self, tx_hash: str) -> str:
-        host = "sepolia.basescan.org" if self._snap.get("testnet") else "basescan.org"
         h = tx_hash if tx_hash.startswith("0x") else f"0x{tx_hash}"
-        return f"https://{host}/tx/{h}"
+        return f"https://basescan.org/tx/{h}"
 
     def _spacescan_url(self, address: str) -> str:
-        prefix = "testnet11." if self._snap.get("testnet") else ""
-        return f"https://{prefix}spacescan.io/address/{address}"
+        return f"https://spacescan.io/address/{address}"
 
     # ------------------------------------------------------------------
     # Button factories
     # ------------------------------------------------------------------
+
+    @staticmethod
+    def _link_button(label: str) -> QPushButton:
+        """A secondary button that opens an external URL.
+
+        Distinct from :meth:`_small_button`, which pins a 70 px width suited to
+        the inline Copy control and would truncate these labels.
+        """
+        btn = QPushButton(label)
+        btn.setStyleSheet(
+            f"""
+            QPushButton {{
+                background-color: {PANEL_BG};
+                color: {TEXT_SECONDARY};
+                border: 1px solid {BORDER};
+                border-radius: 3px;
+                padding: 8px 14px;
+            }}
+            QPushButton:hover {{ border-color: {PRIMARY_GREEN}; color: {LIGHT_GREEN}; }}
+            """
+        )
+        return btn
 
     @staticmethod
     def _small_button(label: str) -> QPushButton:
@@ -748,6 +827,8 @@ def _status_brush(status: str):
         return QBrush(QColor(LOSS_RED))
     if status == _ST_CANCELLED:
         return QBrush(QColor(TEXT_SECONDARY))
+    if status == _ST_DRY_RUN_OK:
+        return QBrush(QColor(WARNING_YELLOW))
     return QBrush(QColor(INFO_BLUE))
 
 

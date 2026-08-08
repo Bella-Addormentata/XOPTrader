@@ -400,27 +400,69 @@ def test_security_coin_spent_detects_spend():
     assert claim.security_coin_spent(fake, b"\xee" * 32) is False
 
 
-def test_wrapped_cat_full_puzzle_hash_and_count():
-    receiver = _RECEIVER_PH
-    ph = claim.wrapped_cat_full_puzzle_hash(NET, receiver)
-    # Self-consistent with the drivers currying (default tail == expected_asset_id).
-    tail = bytes.fromhex(NET.expected_asset_id)
-    expect = drivers.curry_hashes(
-        drivers.CAT_MOD_HASH,
-        cu.sha256(b"\x01" + drivers.CAT_MOD_HASH),
-        cu.sha256(b"\x01" + tail),
-        receiver,
+_MSG_KW = dict(
+    nonce=bytes.fromhex("00" * 31 + "07"),
+    source=bytes.fromhex(NET.erc20_bridge_address[2:]),
+    destination=bytes(32),
+    contents=[b"\xaa" * 20, _RECEIVER_PH, b"\x13\x79"],
+)
+
+
+def test_message_coin_puzzle_hash_matches_the_driver_currying():
+    ph = claim.message_coin_puzzle_hash(NET, **_MSG_KW)
+    expect = cu.sha256tree(
+        drivers.get_message_coin_puzzle(
+            bytes.fromhex(NET.portal_launcher_id),
+            NET.source_chain.encode(),
+            _MSG_KW["source"],
+            _MSG_KW["nonce"],
+            _MSG_KW["destination"],
+            cu.sha256tree(drivers.SExp.to(list(_MSG_KW["contents"]))),
+        )
     )
     assert ph == expect
-    # A custom TAIL yields a different holding puzzle hash.
-    assert claim.wrapped_cat_full_puzzle_hash(NET, receiver, tail_hash=b"\xaa" * 32) != ph
+
+
+def test_message_claimed_on_chain_is_per_nonce():
+    """Unrelated receiver CAT activity must not register as a claim.
+
+    This is the whole point of the check: the bot trades wUSDC.b continuously,
+    so a signal derived from the receiver's coin set is unusable here.
+    """
+    ph = claim.message_coin_puzzle_hash(NET, **_MSG_KW)
 
     fake = FakeCoinset()
-    assert claim.count_wrapped_cat_coins(fake, NET, receiver) == 0
-    _seed_coin(fake, parent=b"\x01" * 32, ph=ph, amount=1000, spent=True, spent_index=10)
-    _seed_coin(fake, parent=b"\x02" * 32, ph=ph, amount=1000, spent=False)
-    # Counts spent + unspent (best-effort third-party-claim snapshot).
-    assert claim.count_wrapped_cat_coins(fake, NET, receiver) == 2
+    assert claim.message_claimed_on_chain(fake, NET, **_MSG_KW) is False
+
+    # An ordinary trade landing coins at the receiver changes nothing.
+    _seed_coin(fake, parent=b"\x01" * 32, ph=_RECEIVER_PH, amount=1000, spent=False)
+    assert claim.message_claimed_on_chain(fake, NET, **_MSG_KW) is False
+
+    # A *spent* message coin does. It is an amount-0 coin whose parent is
+    # whichever portal coin the claimer spent, so only the puzzle hash matches.
+    _seed_coin(fake, parent=b"\x02" * 32, ph=ph, amount=0, spent=True, spent_index=10)
+    assert claim.message_claimed_on_chain(fake, NET, **_MSG_KW) is True
+
+    # ...and only for *this* nonce.
+    other = dict(_MSG_KW, nonce=bytes.fromhex("00" * 31 + "08"))
+    assert claim.message_claimed_on_chain(fake, NET, **other) is False
+
+
+def test_message_coin_must_be_spent_not_merely_created():
+    """Creation burns the nonce; only consumption forces the mint.
+
+    A relayer can advance the portal -- killing our claim -- without funding the
+    minter coin, leaving the message coin created and unspent while nothing was
+    minted. Reading that as "claimed" would close the job and abandon the money.
+    """
+    ph = claim.message_coin_puzzle_hash(NET, **_MSG_KW)
+    fake = FakeCoinset()
+
+    _seed_coin(fake, parent=b"\x03" * 32, ph=ph, amount=0, spent=False)
+    assert claim.message_claimed_on_chain(fake, NET, **_MSG_KW) is False
+
+    _seed_coin(fake, parent=b"\x04" * 32, ph=ph, amount=0, spent=True, spent_index=11)
+    assert claim.message_claimed_on_chain(fake, NET, **_MSG_KW) is True
 
 
 # --------------------------------------------------------------------------- #
@@ -482,21 +524,24 @@ def test_build_and_push_sweep_reports_status_and_swallows_conflict():
 
     fake = FakeCoinset()
     fake.push_result = "SUCCESS"
-    status = claim.build_and_push_sweep(
+    kind, status = claim.build_and_push_sweep(
         fake, NET, security_coin=coin, destination_puzzle_hash=dest,
         ephemeral_sk=_ephemeral_sk_bytes(), sweep_fee=0,
     )
-    assert status == "SUCCESS"
+    assert (kind, status) == ("accepted", "SUCCESS")
     assert len(fake.pushed) == 1
     assert set(fake.pushed[0]) == {"coin_spends", "aggregated_signature"}
 
     # The security coin was already spent (our claim landed, or a prior sweep):
-    # reported in the status, not raised -- nothing left to recover.
+    # reported in the status, not raised -- nothing left to recover. The caller
+    # needs the "conflict" kind to know the sweep is *resolved* and may close a
+    # FAILED job, which is what frees the single active-job slot.
     fake.push_result = CoinsetError("push_tx failed: DOUBLE_SPEND")
-    status = claim.build_and_push_sweep(
+    kind, status = claim.build_and_push_sweep(
         fake, NET, security_coin=coin, destination_puzzle_hash=dest,
         ephemeral_sk=_ephemeral_sk_bytes(), sweep_fee=0,
     )
+    assert kind == "conflict"
     assert "DOUBLE_SPEND" in status
 
 

@@ -11,8 +11,10 @@ build and push the Chia claim spend. wUSDC.b lands in the bot's Chia wallet.
 This is a **GUI-only** feature. The C++ trading engine never reads any of it and
 is completely untouched.
 
-> **Read this whole document before enabling anything on mainnet.** The
-> [testnet drill](#4-testnet-drill-hard-gate) is a **hard gate** — do it first.
+> **Read this whole document before enabling anything.** The
+> [dry-run rehearsal](#4-dry-run-rehearsal-hard-gate) is a **hard gate** — do it
+> first. This bridge is **mainnet-only**; there is no testnet mode (see
+> [Why there is no testnet](#41-why-there-is-no-testnet)).
 
 ---
 
@@ -21,8 +23,8 @@ is completely untouched.
 1. [Safety model](#1-safety-model)
 2. [Prerequisites](#2-prerequisites)
 3. [One-time setup](#3-one-time-setup)
-4. [Testnet drill (hard gate)](#4-testnet-drill-hard-gate)
-5. [Mainnet smoke test](#5-mainnet-smoke-test)
+4. [Dry-run rehearsal (hard gate)](#4-dry-run-rehearsal-hard-gate)
+5. [First live bridge (small amount)](#5-first-live-bridge-small-amount)
 6. [Day-to-day operation](#6-day-to-day-operation)
 7. [Recovery & sweep](#7-recovery--sweep)
 8. [Config & secrets reference](#8-config--secrets-reference)
@@ -36,6 +38,11 @@ is completely untouched.
 - **Off by default.** `warp.enabled: false` and `warp.auto_bridge: false` ship as
   the defaults. Merging this PR changes nothing for the live bot until you
   explicitly turn it on and restart the GUI.
+- **Dry run by default.** `warp.dry_run` defaults to **true**. In dry run the
+  bridge does everything except broadcast: it resolves the receiver, reads the
+  live message toll and bridge tip, estimates gas, and encodes *and signs* both
+  Base transactions — then ends the job at `DRY_RUN_OK` without sending. Turning
+  `enabled: true` on by itself cannot move funds.
 - **Disabled = dark.** When disabled (or when deps are missing, or the key is not
   configured) the background worker is a no-op and imports nothing heavy. The
   Warp tab simply shows *disabled* / *blocked* with the reason.
@@ -45,13 +52,22 @@ is completely untouched.
   validators, the message is **claimable forever**. Every failure mode leaves
   funds either still in the hot wallet or claimable — never destroyed. See
   [Recovery & sweep](#7-recovery--sweep).
-- **Refuse-to-move anchors.** Before any funds move, the service re-derives the
-  wrapped-asset TAIL and checks it equals the configured
-  `expected_asset_id`; it checks the attested message destination and contents
-  match what it precomputed. A mismatch **blocks** the service (visible in the
-  banner) rather than moving funds.
-- **Blast-radius caps.** `min_auto_bridge_usdc` / `max_auto_bridge_usdc` bound
-  each automatic bridge. Manual "Bridge now" is always available regardless.
+- **Refuse-to-start anchor.** At **engine construction**, before a single client
+  is built or a single wei moves, the service re-derives the wrapped-asset TAIL
+  offline and checks it against both the deployment constant and your configured
+  `expected_asset_id`. A mismatch **blocks the engine** with a banner. During the
+  claim it re-checks the same anchor against the *attested* token contract, plus
+  the attested message destination and contents. A mismatch at any point refuses
+  rather than moving funds.
+- **Blast-radius caps.** `max_auto_bridge_usdc` caps every bridge, automatic or
+  manual — a mis-click on a large balance bridges at most the cap, and the
+  remainder stays in the hot wallet. `min_auto_bridge_usdc` is an *auto-bridge
+  floor only*: "Bridge now" deliberately ignores it, so you can test with a
+  small deposit without lowering the threshold that arms auto-bridge.
+- **One hot wallet per job.** A job records the network and hot-wallet address it
+  was frozen against. If the configured key changes, the engine refuses to
+  process that job and says so in the banner, rather than signing wallet B's
+  funds for wallet A's frozen amounts.
 - **Key at rest.** The EVM hot-wallet private key is stored **DPAPI-encrypted**
   (Windows `CryptProtectData`, current-user scope + app entropy) in
   `secrets.yaml` (gitignored), never in `config.yaml` and never in the job DB. A
@@ -130,28 +146,31 @@ put the key in `config.yaml`.
 
 ### 3c. Configure the `warp:` section
 
-In `config.yaml`, set the [warp keys](#8-config--secrets-reference). To start,
-leave `enabled: false` — you will turn it on for the testnet drill first. At
-minimum review:
+In `config.yaml`, set the [warp keys](#8-config--secrets-reference). Start with
+the rehearsal settings — `dry_run: true` and a small cap:
 
 ```yaml
 warp:
-  enabled: false
-  testnet: false
+  enabled: true
+  dry_run: true                              # sign, never broadcast
   base_rpc_url: "https://mainnet.base.org"   # a private RPC is more reliable
-  auto_bridge: false
-  min_auto_bridge_usdc: 100
-  max_auto_bridge_usdc: 10000
+  auto_bridge: false                         # manual only; nothing fires on its own
+  min_auto_bridge_usdc: 100                  # auto-bridge floor; Bridge now ignores it
+  max_auto_bridge_usdc: 5                    # HARD cap, manual included — raise later
   claim_fee_mojos: 100000000                 # 0.0001 XCH reserved per claim
   chia_receiver_address: ""                  # blank = the bot's own wallet
   expected_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"
 ```
 
+Set `expected_asset_id` deliberately. It is now cross-checked against the offline
+derivation at startup, so a typo blocks the bridge with a banner instead of being
+silently ignored.
+
 ### 3d. Fund the hot wallet
 
 - Send **ETH on Base** to the ADDRESS from 3a for gas (≥ 0.005 ETH recommended).
-- Do **not** send mainnet USDC yet — the [testnet drill](#4-testnet-drill-hard-gate)
-  comes first.
+- Send **$5 of USDC on Base**. The dry run needs a real balance to freeze real
+  amounts against, and with `dry_run: true` it cannot be spent.
 
 ### 3e. Restart the GUI
 
@@ -160,51 +179,78 @@ instance on launch). **Restart it** after any code update or after enabling warp
 
 ---
 
-## 4. Testnet drill (hard gate)
+## 4. Dry-run rehearsal (hard gate)
 
-**Do not enable mainnet until an end-to-end testnet bridge has completed.** The
-testnet path exercises the exact same state machine and claim-bundle construction
-as mainnet; a shape error shows up here for free instead of with real money.
+**Do not set `dry_run: false` until a dry run has reached `DRY_RUN_OK`.** The dry
+run exercises every part of the deposit leg for real — the DPAPI key, the Base
+RPC, the Chia wallet daemon, the receiver address decode, the live message toll
+and bridge tip, gas estimation, nonce selection, ABI encoding, and transaction
+signing. The only thing it does not do is broadcast.
 
-Base Sepolia has no wired USDC, so the drill bridges **milliETH** instead — which
-also exercises the 3-decimal / mojo-factor-1 edge case and the lower validator
-threshold (3 of 10, vs 6 on mainnet).
+1. With the [3c](#3c-configure-the-warp-section) config in place, restart the GUI
+   and open the **Warp** tab. The banner should read *dry run* with a **DRY RUN**
+   badge. Confirm the hot-wallet address, the USDC/ETH balances, the destination
+   Chia address, and the wUSDC.b asset id all populate.
+2. Click **Bridge now**. Watch the job advance:
+   `AWAITING_DEPOSIT → DEPOSIT_SEEN → APPROVING → BRIDGING → DRY_RUN_OK`.
+3. Check the frozen numbers on the row: USDC in should be exactly your test
+   amount (clamped to `max_auto_bridge_usdc` if lower), and the wUSDC.b out
+   figure should be that amount less the 0.3% bridge tip.
+4. Confirm the destination address matches the Chia wallet you expect.
 
-1. Set `warp.testnet: true` and `warp.enabled: true` in `config.yaml`. Point
-   `base_rpc_url` at a Base **Sepolia** RPC (e.g. `https://sepolia.base.org`), or
-   leave it blank to use the network default.
-2. Generate a **separate** testnet hot-wallet key (repeat 3a/3b). Fund it with
-   Base Sepolia ETH from a faucet.
-3. Make sure your Chia wallet is pointed at **testnet11** and has a little TXCH.
-4. Restart the GUI, open the **Warp** tab. The banner should read *active on
-   testnet11* with a **TESTNET** badge. Confirm the hot-wallet address and
-   balances populate.
-5. Click **Bridge now** (or send a small amount and let auto-bridge pick it up).
-   Watch the job advance through the states:
-   `AWAITING_DEPOSIT → DEPOSIT_SEEN → APPROVING → BRIDGING → BRIDGE_CONFIRMED →
-   MESSAGE_SENT → FUNDING_CLAIM → CLAIM_FUNDED → COLLECTING_SIGS → CLAIMING →
-   COMPLETED`.
-6. Confirm the wrapped testnet asset arrives in the Chia wallet, and the job row
-   ends **Completed**. Use the row's BaseScan / SpaceScan links to cross-check.
+Nothing was broadcast, so there is no abort path to know — if anything looks
+wrong, set `warp.enabled: false` and walk away. That is the whole point.
 
-If the job sticks, see [Recovery & sweep](#7-recovery--sweep) and
-[Troubleshooting](#9-troubleshooting). **Only proceed to mainnet once a testnet
-bridge has reached COMPLETED.**
+If the job sticks or the banner reads *blocked*, see
+[Troubleshooting](#9-troubleshooting).
+
+### 4.1 Why there is no testnet
+
+Earlier versions documented a Base Sepolia / testnet11 drill. It was removed
+because it could not do what it claimed:
+
+- Base Sepolia has **no wired USDC**, and the EVM client only builds ERC-20
+  `approve`/`bridgeToChia` calls — so a testnet job could never leave
+  `AWAITING_DEPOSIT`, while still occupying the single job slot.
+- The testnet deployment shipped with an **empty `expected_asset_id`**, which
+  disabled the one anchor that refuses to move funds. The drill therefore
+  exercised *less* safety than production while claiming to be identical.
+- Sharing one job database across two networks made it possible to resume a
+  mainnet job under testnet contracts, or vice versa.
+
+The dry run replaces it and is a strictly better rehearsal for the deposit leg:
+same network, same contracts, same key, same anchors, zero broadcast. Setting
+`warp.testnet: true` now raises a clear configuration error rather than silently
+running against mainnet.
 
 ---
 
-## 5. Mainnet smoke test
+## 5. First live bridge (small amount)
 
-1. Set `warp.testnet: false`, keep `warp.enabled: true`, restore the mainnet
-   `base_rpc_url`, and make sure the **mainnet** hot-wallet blob is in
-   `secrets.yaml`. Restart the GUI.
-2. Confirm the banner reads *active on mainnet* (no TESTNET badge) and balances
-   populate. Leave `auto_bridge: false` for the smoke test.
-3. Send a **small** amount of USDC on Base (~$5) to the hot-wallet address.
-4. Click **Bridge now** and watch it run to **COMPLETED**, confirming wUSDC.b
-   arrives in the Chia wallet.
-5. Only after that succeeds, decide whether to enable `auto_bridge: true` and set
-   your `min_auto_bridge_usdc` / `max_auto_bridge_usdc` caps. Restart to apply.
+Only after a clean `DRY_RUN_OK`.
+
+1. Set `warp.dry_run: false` in `config.yaml`. Leave `auto_bridge: false` and
+   `max_auto_bridge_usdc: 5`. Restart the GUI.
+2. Confirm the banner reads *active on mainnet* with no DRY RUN badge.
+3. Click **Bridge now** on the same $5. Watch the full state walk:
+   `AWAITING_DEPOSIT → DEPOSIT_SEEN → APPROVING → BRIDGING → BRIDGE_CONFIRMED →
+   MESSAGE_SENT → FUNDING_CLAIM → CLAIM_FUNDED → COLLECTING_SIGS → CLAIMING →
+   COMPLETED`.
+4. Check at each stage: the approve and bridge transactions confirm on BaseScan;
+   `MESSAGE_SENT` attests the exact post-tip amount; `FUNDING_CLAIM` sends
+   **exactly one** funding transaction (verify in your Chia wallet); signatures
+   reach 6 of 10; the wUSDC.b lands at the receiver on SpaceScan.
+5. Only after that succeeds, raise `max_auto_bridge_usdc` incrementally. Leave
+   `auto_bridge: false` for at least one more manual round-trip before enabling
+   it. Restart to apply any change.
+
+**Abort paths.** Before the bridge transaction is broadcast (`AWAITING_DEPOSIT`,
+`DEPOSIT_SEEN`, `APPROVING`) right-click the job and **Cancel** — clean, nothing
+on chain. Once `bridgeToChia` broadcasts you **cannot** abort: the message exists
+and must be claimed. Let it run; if it fails, **Retry**, and if Retry cannot
+progress, **Sweep** recovers the XCH funding coin and closes the job. The attested
+message stays claimable forever — through warp.green's own portal if necessary
+(the **Open warp.green portal** button on this tab).
 
 ---
 
@@ -214,8 +260,12 @@ bridge has reached COMPLETED.**
   at least `min_auto_bridge_usdc`, the service opens a job automatically and
   bridges up to `max_auto_bridge_usdc`. Deposit USDC from anywhere (Coinbase, a
   Circle payout, any wallet) and walk away.
-- **Manual** ("Bridge now"): opens a single job for the current balance. Disabled
-  while a job is already active (the button tooltip explains why).
+- **Manual** ("Bridge now"): opens a single job for the current balance,
+  **ignoring `min_auto_bridge_usdc`** but still honouring `max_auto_bridge_usdc`.
+  That is what lets you test with $5 without lowering the threshold that arms
+  auto-bridge. Disabled while a job is already active — including a **failed**
+  one, which holds the slot until you Retry or Sweep it. The button tooltip says
+  which case applies.
 - **Where funds land:** `chia_receiver_address` if set, otherwise the bot's own
   Chia wallet address.
 - **The jobs table** shows status, USDC in / wUSDC.b out, last-updated, and the
@@ -247,11 +297,14 @@ Right-click a job in the table:
 - **Sweep security coin** — for a terminal job (**COMPLETED** or **FAILED**).
   Recovers the ephemeral funding coin back to your Chia wallet. On a COMPLETED job
   this reclaims any leftover; on a FAILED job where funding already happened, this
-  is how you get the XCH back. Sweep is best-effort and re-runnable.
+  is how you get the XCH back. Sweep is re-runnable.
 
 A **FAILED** job deliberately holds the single active-job slot until you resolve
-it (Retry or Sweep, then it clears), so a failure can't be silently buried under
-a new job.
+it, so a failure can't be silently buried under a new job. **Sweep is the escape:**
+a sweep that *resolves* — the coin was recovered, was already spent, or never
+existed — moves the job to **Cancelled** and frees the slot. A sweep that could
+not reach the chain leaves the job FAILED so you can try again with the funds
+still known recoverable.
 
 **The core guarantee:** an attested warp.green message is claimable forever. If a
 job is stuck after the bridge confirmed, the USDC is not lost — it is waiting to
@@ -267,17 +320,20 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | Key | Default | Meaning |
 |---|---|---|
 | `enabled` | `false` | Master switch. Off ⇒ the bridge is completely dark. |
-| `testnet` | `false` | `true` ⇒ Base Sepolia + testnet11 deployment. |
+| `dry_run` | **`true`** | Sign both Base transactions but never broadcast; the job ends at `DRY_RUN_OK`. Set `false` only after a clean rehearsal. |
 | `base_rpc_url` | `https://mainnet.base.org` | Base JSON-RPC endpoint. A private Alchemy/Infura key is more reliable. Blank ⇒ network default. |
 | `auto_bridge` | `false` | Automatically bridge deposits at/above `min_auto_bridge_usdc`. |
-| `min_auto_bridge_usdc` | `100` | Ignore auto-bridge below this (manual still works). |
-| `max_auto_bridge_usdc` | `10000` | Cap per auto-bridge; bounds blast radius. |
+| `min_auto_bridge_usdc` | `100` | **Auto-bridge floor only.** "Bridge now" ignores it and bridges any positive balance. |
+| `max_auto_bridge_usdc` | `10000` | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. |
 | `claim_fee_mojos` | `100000000` | XCH fee reserved for the Chia claim spend (0.0001 XCH). |
 | `chia_funding_fee_mojos` | `0` | Extra fee on the wallet→claim funding send. |
-| `poll_interval_s` | `15` | Background tick cadence (seconds). |
+| `poll_interval_s` | `15` | How long a healthy "still waiting" step sleeps before it is re-checked. The GUI's own tick cadence (~30 s) is separate and not configurable here. |
 | `coinset_url` | `""` | Override the coinset API base. Blank ⇒ network default. |
-| `chia_receiver_address` | `""` | Where wUSDC.b lands. Blank ⇒ the bot's own wallet address. |
-| `expected_asset_id` | `fa4a180a…a6b7a99d` | Correctness anchor: the derived wrapped-asset id must equal this or the service refuses to move funds. |
+| `chia_receiver_address` | `""` | Where wUSDC.b lands. Blank ⇒ the bot's own wallet address, resolved once at startup and shown in the tab. |
+| `expected_asset_id` | `fa4a180a…a6b7a99d` | Correctness anchor, checked **at startup** before any client is built. A mismatch blocks the engine with a banner. |
+
+`testnet` is **no longer supported**. A truthy `warp.testnet` raises a
+configuration error rather than silently running against mainnet — remove the key.
 
 Reused from your existing `chia:` section (no new keys): `wallet_host`,
 `wallet_port`, `wallet_fingerprint`, `wallet_cert_path`, `wallet_key_path`.
@@ -296,7 +352,7 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
 | Base ERC20Bridge | `0x8412f06e811b858Ea9edcf81a5E5882dbf70aC96` |
 | USDC (Base, 6 dec) | `0x833589fcd6edb6e08f4c7c32d4f71b54bda02913` |
 | Message toll | 0.00001 ETH (owner-mutable; read live each bridge) |
-| Validator threshold | 6 of 10 (testnet: 3) |
+| Validator threshold | 6 of 10 |
 | wUSDC.b (Chia CAT, 3 dec) | `fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d` |
 | Bridge tip | 0.3% deducted in-message (min 1 mojo) |
 
@@ -312,10 +368,20 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
   ([3a](#3a-generate-or-import-the-hot-wallet-key)).
 - **Banner: "blocked: …DPAPI…" / KeystoreUnavailable** — you're not on Windows, or
   DPAPI failed. The bridge requires Windows.
-- **Banner: "blocked: expected asset id mismatch"** — the derived wrapped-asset id
-  doesn't equal `expected_asset_id`. This is the anchor doing its job; funds do
-  **not** move. Verify `expected_asset_id` and `testnet` are correct for the
-  network you intend.
+- **Banner: "blocked: wrapped-asset anchor failed"** — the offline derivation
+  doesn't match `expected_asset_id` (or the deployment constant). This is the
+  anchor doing its job at startup; nothing was built and no funds can move. Fix
+  `expected_asset_id` in `config.yaml` — the Base-bridged wUSDC.b id is
+  `fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d`.
+- **Banner: "blocked: warp.testnet is no longer supported"** — remove the
+  `testnet` key from `config.yaml`; see [4.1](#41-why-there-is-no-testnet).
+- **Banner: a hot-wallet binding error** — the job database holds a job frozen
+  against a different Base hot wallet (you rotated the key, or copied a job DB).
+  Restore the original key and resolve or sweep that job before rotating. A job
+  that never reached the chain can still be cancelled.
+- **"Bridge now" is greyed out with a failed job in the table** — that failed job
+  holds the single active-job slot by design. Retry it, or Sweep it to recover
+  the funding coin and close it.
 - **Balances show "unavailable"** — the Base RPC is unreachable or rate-limiting.
   Set a private `base_rpc_url`.
 - **Low-gas warning** — top up the hot wallet's ETH on Base.
@@ -347,8 +413,51 @@ committed engine exposes only `tick` / `request_bridge` / `job_action` /
   box. The app only claims bridges it initiated (it tracks the job from deposit
   onward). If USDC is bridged out-of-band, or a job row is lost before the claim,
   the attested message is still claimable forever — recover it through
-  **warp.green's own web UI**, which pays the attested Chia receiver.
+  **warp.green's own web UI**, which pays the attested Chia receiver. The **Open
+  warp.green portal** button on the Warp tab is that path; it stays enabled even
+  when the engine is blocked, which is exactly when you need it.
 
-Also out of scope for this version: unwrap (Chia → Base), the Ethereum-mainnet
-path (that mints a *different* CAT, wUSDC — this bridge is the **Base**-bridged
-wUSDC.b), non-USDC tokens, and any Circle Mint API integration.
+### Third-party-claim detection is conservative
+
+If someone else claims your attested message first, they pay the *same* attested
+receiver, so your deposit still lands and only your XCH funding needs sweeping
+back. The service detects this by checking whether the message coin for your
+specific nonce has been **spent** — spending it is what forces the mint to the
+attested receiver, so mere existence is not proof and is not accepted.
+
+The check is deliberately conservative in both directions. The message coin has
+`amount = 0`, so if the coinset index omits zero-amount coins it reads as "not
+claimed". Either way the job stays in `CLAIMING` and re-syncs rather than
+auto-completing. There is no Sweep action while a job is in `CLAIMING`, by
+design — sweeping the security coin under a claim that might still land would
+break it. After 10 conflicting rounds with no evidence the mint ran, the job
+fails terminally, which is what makes **Sweep** available to recover the ~0.1 XCH
+funding coin. Check SpaceScan: if the wUSDC.b did arrive, a third party claimed
+it and only the funding coin needs recovering.
+
+This replaced a heuristic that compared a count of *all* the receiver's wUSDC.b
+coins against a baseline, which the bot's own trading could trip, wrongly marking
+an unclaimed bridge as completed.
+
+### A job that fails after the bridge confirms cannot be closed in-app
+
+Three attested-terms anchors fire *after* `bridgeToChia` has confirmed but before
+the claim key exists — for example if warp.green's tip changes between the quote
+and execution, so the attested amount no longer matches what was frozen. Such a
+job holds a real, unclaimed deposit and has no funding coin to sweep, so **Sweep
+refuses to close it** and says so, naming the nonce. That is deliberate: closing
+it would discard the only in-app record of live funds. Recover the message
+through the warp.green portal, which pays the attested Chia receiver.
+
+### The bridge is one-way
+
+There is no unwrap (Chia → Base) in this version. To move wUSDC.b back to native
+USDC on Base, use warp.green's own portal — the **Open warp.green portal** button
+on the Warp tab. What building an in-app unwrap would require is scoped in
+[warp-unwrap-design.md](warp-unwrap-design.md); note that the return leg's commit
+point is irreversible in a way the deposit leg's is not, so it is not a mirror
+image of this one.
+
+Also out of scope for this version: the Ethereum-mainnet path (that mints a
+*different* CAT, wUSDC — this bridge is the **Base**-bridged wUSDC.b), non-USDC
+tokens, and any Circle Mint API integration.

@@ -67,8 +67,8 @@ def _hot(**over):
 def _full(**over):
     snap = {
         "enabled": True,
+        "dry_run": False,
         "auto_bridge": True,
-        "testnet": False,
         "network": "mainnet",
         "hot_wallet": _hot(),
         "active_job": None,
@@ -76,6 +76,7 @@ def _full(**over):
         "min_micros": 100_000_000,     # 100 USDC
         "max_micros": 10_000_000_000,  # 10,000 USDC
         "receiver_address": _XCH_ADDR,
+        "receiver_source": "config",
         "expected_asset_id": _ASSET_ID,
     }
     snap.update(over)
@@ -205,11 +206,75 @@ def test_active_job_blocks_new_bridge(qapp):
     assert "in progress" in w._bridge_btn.toolTip().lower()
 
 
-def test_testnet_badge_and_explorer_hosts(qapp):
-    w = _make(qapp, _full(testnet=True, network="testnet11"))
-    assert "TESTNET" in w._banner.text()
-    assert w._basescan_url("0xdead").startswith("https://sepolia.basescan.org/tx/0xdead")
-    assert w._spacescan_url(_XCH_ADDR).startswith("https://testnet11.spacescan.io/address/")
+def test_failed_job_also_blocks_new_bridge(qapp):
+    """A FAILED job keeps the single slot, so the button must stay disabled.
+
+    The widget used to treat FAILED as terminal and enable the button, which
+    ``request_bridge`` then rejected -- and the rejection was swallowed, so the
+    control was silently dead.
+    """
+    failed = _job(status="FAILED", last_error="node rejected bundle")
+    w = _make(qapp, _full(active_job=failed, jobs=[failed]))
+    assert not w._bridge_btn.isEnabled()
+    tip = w._bridge_btn.toolTip().lower()
+    assert "retry" in tip and "sweep" in tip
+
+
+def test_explorer_hosts_are_mainnet(qapp):
+    w = _make(qapp, _full())
+    assert w._basescan_url("0xdead").startswith("https://basescan.org/tx/0xdead")
+    assert w._spacescan_url(_XCH_ADDR).startswith("https://spacescan.io/address/")
+
+
+def test_dry_run_is_visibly_distinct_from_active(qapp):
+    """Signing without broadcasting is safe, not healthy -- never show it green."""
+    w = _make(qapp, _full(dry_run=True))
+    assert "DRY RUN" in w._banner.text()
+    assert "not broadcast" in w._banner.text()
+
+    live = _make(qapp, _full(dry_run=False))
+    assert "DRY RUN" not in live._banner.text()
+    assert "active" in live._banner.text()
+
+
+def test_dry_run_status_label_and_manual_hint(qapp):
+    row = _job(status="DRY_RUN_OK", bridge_tx_hash=None)
+    w = _make(qapp, _full(dry_run=True, jobs=[row]))
+    assert w._jobs_table.item(0, 0).text() == "Dry run OK"
+    # The caps hint must say manual ignores the floor but honours the cap.
+    text = w._auto_lbl.text().lower()
+    assert "bridge now" in text and "any balance" in text
+
+
+def test_engine_failure_reads_as_blocked_not_disabled(qapp):
+    """A failed startup anchor must not advise 'set warp.enabled: true'."""
+    w = _make(qapp, {"enabled": True,
+                     "error": "wrapped-asset anchor failed: derived ... != ..."})
+    text = w._banner.text()
+    assert "blocked" in text
+    assert "disabled" not in text.lower()
+
+
+def test_rejected_action_is_surfaced_in_the_banner(qapp):
+    """Otherwise the worker swallows it and the click looks like a no-op."""
+    w = _make(qapp, _full(action_error="a warp job is already active (job 3, FAILED)"))
+    assert "Last action failed" in w._banner.text()
+    assert "job 3" in w._banner.text()
+
+
+def test_portal_and_docs_buttons_are_always_available(qapp):
+    """A blocked operator is exactly who needs the out-of-band recovery link."""
+    w = _make(qapp, {"enabled": True, "error": "engine blocked"})
+    assert w._portal_btn.isEnabled()
+    assert w._docs_btn.isEnabled()
+    assert "warp.green" in w._portal_btn.toolTip()
+    assert w._docs_btn.toolTip().startswith("https://docs.warp.green")
+
+
+def test_wallet_derived_destination_is_labelled(qapp):
+    w = _make(qapp, _full(receiver_address=_XCH_ADDR, receiver_source="wallet"))
+    assert w._dest_field.text() == _XCH_ADDR
+    assert "bot's own Chia wallet" in w._dest_field.toolTip()
 
 
 # ---------------------------------------------------------------------------

@@ -393,18 +393,23 @@ def build_and_push_sweep(
     destination_puzzle_hash: bytes,
     ephemeral_sk: bytes,
     sweep_fee: int = 0,
-) -> str:
+) -> Tuple[str, str]:
     """Recover the funding coin back to the bot wallet (idempotent).
 
     A conflict means the security coin was already spent (our claim landed, or a
     prior sweep) -- reported in the status rather than raised, since there is
     nothing left to recover. Transport failures still raise.
+
+    Returns ``(kind, status)``. ``kind`` is the push classification --
+    ``"accepted"``, ``"pending"``, or ``"conflict"``, all of which mean the sweep
+    is *resolved* and there is nothing further to recover. The caller needs this
+    to decide whether a FAILED job may be closed; it used to be discarded, which
+    is why sweeping a failed job never freed the single active-job slot.
     """
     bundle = drivers.build_sweep_bundle(
         net, security_coin, destination_puzzle_hash, ephemeral_sk, sweep_fee
     )
-    _kind, status = _push_bundle(coinset, bundle.to_json())
-    return status
+    return _push_bundle(coinset, bundle.to_json())
 
 
 # --------------------------------------------------------------------------- #
@@ -426,35 +431,70 @@ def security_coin_spent(coinset: CoinsetClient, security_coin_id: bytes) -> bool
     return rec is not None and rec.spent
 
 
-def wrapped_cat_full_puzzle_hash(
-    net: WarpNet, receiver_ph: bytes, *, tail_hash: Optional[bytes] = None
+def message_coin_puzzle_hash(
+    net: WarpNet,
+    *,
+    nonce: bytes,
+    source: bytes,
+    destination: bytes,
+    contents: Sequence[bytes],
 ) -> bytes:
-    """Full CAT puzzle hash of the receiver's wrapped-asset holdings.
+    """Puzzle hash of the portal message coin for one attested message.
 
-    Identical no matter who claims a given attested message (the receiver and
-    TAIL are both fixed by the attestation), so it underlies the best-effort
-    third-party-claim check below.
+    Every curried field -- the portal launcher id, the warp source chain, the
+    Base bridge source, the nonce, the destination, and the message hash -- is
+    fixed by the attestation, and **nothing about the claimer appears in it**.
+    Only the coin's *parent* varies (it is whichever portal coin the claimer
+    spent), so the puzzle hash is a stable, relayer-independent fingerprint for
+    "this specific message was claimed by somebody".
     """
-    if tail_hash is None:
-        tail_hash = bytes.fromhex(net.expected_asset_id)
-    return drivers.curry_hashes(
-        drivers.CAT_MOD_HASH,
-        cu.sha256(b"\x01" + drivers.CAT_MOD_HASH),
-        cu.sha256(b"\x01" + bytes(tail_hash)),
-        bytes(receiver_ph),
+    message_hash = cu.sha256tree(drivers.SExp.to(list(contents)))
+    puzzle = drivers.get_message_coin_puzzle(
+        bytes.fromhex(net.portal_launcher_id),
+        net.source_chain.encode(),
+        bytes(source),
+        bytes(nonce),
+        bytes(destination),
+        message_hash,
     )
+    return cu.sha256tree(puzzle)
 
 
-def count_wrapped_cat_coins(
-    coinset: CoinsetClient, net: WarpNet, receiver_ph: bytes, *, tail_hash: Optional[bytes] = None
-) -> int:
-    """Number of wUSDC.b coins the receiver holds (incl. spent).
+def message_claimed_on_chain(
+    coinset: CoinsetClient,
+    net: WarpNet,
+    *,
+    nonce: bytes,
+    source: bytes,
+    destination: bytes,
+    contents: Sequence[bytes],
+) -> bool:
+    """``True`` once *this* message's coin has been **spent** -- the mint ran.
 
-    Best-effort: this counts *all* of the receiver's wrapped-asset coins, not
-    just this claim's, so the service uses a snapshot-and-compare over a single
-    in-flight job (enforced unique) to tell that a third party paid the receiver
-    the attested amount -- in which case the deposit landed and only our funding
-    needs sweeping. The precise per-claim signal remains :func:`claim_landed`.
+    Replaces an earlier check that compared a count of *all* the receiver's
+    wrapped-asset coins against a baseline. That was unsound here: XOPTrader
+    trades wUSDC.b continuously, so any ordinary trade or change output landing
+    on the receiver puzzle hash made the count grow and could mark a still-
+    unclaimed bridge COMPLETED. This check is per-nonce and cannot be tripped by
+    unrelated wallet activity.
+
+    **Spent, not merely existing.** The message coin is created by the portal
+    spend but consumed by a *separate* spend, and only that consumption enforces
+    the payout. A relayer may advance the portal -- burning our nonce so our
+    claim can never land -- without funding the minter coin the mint requires,
+    leaving the message coin created and unspent while nothing was minted.
+    Treating existence as proof would close such a job as COMPLETED and abandon
+    a live deposit. Consuming the coin, by contrast, requires concurrently
+    spending a coin whose puzzle hash equals the curried ``destination``, which
+    is anchored to the cat_minter hash whose puzzle forces mint-and-payout to
+    the attested receiver. So ``spent`` proves the mint; ``exists`` does not.
+
+    Fails *safe* in both directions: the message coin has ``amount = 0``, so if
+    the coinset index omits zero-amount coins this returns ``False``, and the
+    caller stays in ``CLAIMING`` and re-syncs rather than falsely completing.
     """
-    ph = wrapped_cat_full_puzzle_hash(net, receiver_ph, tail_hash=tail_hash)
-    return len(coinset.get_coin_records_by_puzzle_hash(_hx(ph), include_spent=True))
+    ph = message_coin_puzzle_hash(
+        net, nonce=nonce, source=source, destination=destination, contents=contents
+    )
+    records = coinset.get_coin_records_by_puzzle_hash(_hx(ph), include_spent=True)
+    return any(getattr(r, "spent", False) for r in records)

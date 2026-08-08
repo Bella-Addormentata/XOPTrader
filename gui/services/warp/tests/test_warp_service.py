@@ -229,7 +229,9 @@ def new_store() -> WarpJobStore:
 def default_params(**over) -> S.WarpParams:
     base = dict(
         enabled=False,
-        testnet=False,
+        # Most tests drive the live path; the dry-run cut points get their own
+        # dedicated tests that flip this on.
+        dry_run=False,
         auto_bridge=False,
         min_micros=1_000_000,
         max_micros=0,
@@ -280,8 +282,17 @@ def make_ephemeral_blob(job_id: int):
     return blob, bls.private_key
 
 
+# The hot-wallet address baked into build()'s fake EVM key. Jobs must carry it,
+# or WarpEngine._binding_mismatch refuses to process them (see F8): a job past
+# AWAITING_DEPOSIT with no recorded hot wallet cannot be proven to belong to the
+# configured key. Without this every seeded test would silently no-op.
+HOT_ADDRESS = "0x" + "ab" * 20
+
+
 def seed(store, status, *, columns=None, state=None):
-    return store.create_job(NET.name, status=status, columns=columns, state=state or {})
+    merged = {"network": NET.name, "hot_address": "ab" * 20}
+    merged.update(state or {})
+    return store.create_job(NET.name, status=status, columns=columns, state=merged)
 
 
 # --------------------------------------------------------------------------- #
@@ -530,8 +541,7 @@ def _seed_message_sent(store):
     )
 
 
-def test_message_sent_anchor_match_generates_key(monkeypatch):
-    monkeypatch.setattr(claim_mod, "count_wrapped_cat_coins", lambda *a, **k: 0)
+def test_message_sent_anchor_match_generates_key():
     store = new_store()
     engine, ctx = build(store, watcher=FakeWatcher(_sent_msg()))
     _seed_message_sent(store)
@@ -543,7 +553,9 @@ def test_message_sent_anchor_match_generates_key(monkeypatch):
     assert job.state["ephemeral_blob"]                       # key persisted with the advance
     assert job.state["message_destination"] == "00" * 32
     assert job.state["message_contents"] == ["aa" * 20, RECEIVER_PH.hex(), "1379"]
-    assert job.state["wrapped_cat_baseline"] == 0
+    # No CAT-coin baseline is taken any more: third-party-claim detection is
+    # per-nonce (see test_claiming_conflict_*), not a count-versus-baseline.
+    assert "wrapped_cat_baseline" not in job.state
     # The persisted blob is a real, decryptable ephemeral key bound to this job.
     sk = engine._load_ephemeral_sk(job)
     assert len(sk) == 32
@@ -739,7 +751,6 @@ def _seed_claiming(store, job_id_holder=None, **state):
         "portal_coin_id": PORTAL.hex(),
         "sigs": {str(i): bytes([0xC0 + i]).hex() for i in range(6)},
         "security_coin_id": (b"\x5a" * 32).hex(),
-        "wrapped_cat_baseline": 0,
     }
     base.update(state)
     job = seed(store, JobStatus.CLAIMING,

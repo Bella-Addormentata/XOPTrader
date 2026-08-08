@@ -71,6 +71,10 @@ class JobStatus:
     COMPLETED = "COMPLETED"
     FAILED = "FAILED"
     CANCELLED = "CANCELLED"
+    # Rehearsal outcome: both Base transactions were built and signed, then
+    # deliberately not broadcast because ``warp.dry_run`` was set. Nothing moved
+    # on either chain, so this is a closed, successful, zero-risk end state.
+    DRY_RUN_OK = "DRY_RUN_OK"
 
 
 ALL_STATES: frozenset[str] = frozenset(
@@ -79,15 +83,25 @@ ALL_STATES: frozenset[str] = frozenset(
 
 # A job in one of these states no longer occupies the single "open" slot, so a
 # new job may be created. FAILED is deliberately NOT closed: a failed job still
-# holds the slot until the operator resolves it (Retry to completion, or Sweep
-# and dismiss to CANCELLED), preventing a second job from touching the same hot
-# wallet while funds may still be recoverable.
-CLOSED_STATES: frozenset[str] = frozenset({JobStatus.COMPLETED, JobStatus.CANCELLED})
+# holds the slot until the operator resolves it, preventing a second job from
+# touching the same hot wallet while funds may still be recoverable. The escape
+# is Sweep -- a *resolved* sweep (the funding coin was recovered, or there was
+# none) moves the job to CANCELLED and frees the slot; a sweep that could not
+# reach the chain leaves it FAILED so the operator can try again. See
+# ``WarpEngine._sweep_job``.
+CLOSED_STATES: frozenset[str] = frozenset(
+    {JobStatus.COMPLETED, JobStatus.CANCELLED, JobStatus.DRY_RUN_OK}
+)
 
 # States the worker no longer auto-advances (machine-terminal), for the service
 # layer's benefit; the store itself only distinguishes open vs closed.
 TERMINAL_STATES: frozenset[str] = frozenset(
-    {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+    {
+        JobStatus.COMPLETED,
+        JobStatus.FAILED,
+        JobStatus.CANCELLED,
+        JobStatus.DRY_RUN_OK,
+    }
 )
 
 

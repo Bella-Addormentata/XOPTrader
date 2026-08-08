@@ -441,6 +441,70 @@ def get_wrapped_tail(
     )
 
 
+def derive_wrapped_asset_id(net: WarpNet) -> bytes:
+    """Re-derive the wrapped-asset (CAT) id for this deployment, fully offline.
+
+    Everything the TAIL commits to is a fixed deployment constant -- the portal
+    launcher id, the warp source chain, the Base ERC20Bridge address, and the
+    source token contract -- so this needs no chain reads, no attestation, and
+    no job. That is what lets :func:`verify_wrapped_asset_anchor` run at engine
+    construction, *before* a single client is built or a single wei moves.
+
+    Identical by construction to the derivation inside
+    :func:`build_claim_bundle`: there, ``erc20_contract`` comes from the attested
+    ``contents[0]`` (32-byte padded) rather than from ``net``, and
+    :func:`get_wrapped_tail` left-pads a short token to 32 bytes, so a 20-byte
+    ``net.usdc_address`` and the padded attested value curry to the same TAIL.
+    ``_h_message_sent`` separately anchors that the attested source token equals
+    ``net.usdc_address``, so the two can never diverge unnoticed.
+    """
+    tail = get_wrapped_tail(
+        bytes.fromhex(net.portal_launcher_id),
+        net.source_chain.encode(),
+        bytes.fromhex(net.erc20_bridge_address[2:]),
+        bytes.fromhex(net.usdc_address[2:]),
+    )
+    return cu.sha256tree(tail)
+
+
+def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
+    """Refuse-to-start anchor: the derived asset id must match what is expected.
+
+    Checks the derivation against :attr:`WarpNet.expected_asset_id` and, when the
+    operator pinned one in ``config.yaml``, against ``warp.expected_asset_id``
+    too. Raises :class:`WarpDriverError` on any mismatch; returns the derived id.
+
+    This is the check the runbook has always promised ("before any funds move").
+    It used to live only in :func:`build_claim_bundle`, which runs during
+    ``CLAIMING`` -- after the Base approve, after ``bridgeToChia``, and after the
+    Chia funding send. Running it here makes a bad constant or a typo'd config a
+    *blocked engine with a banner*, not three irreversible broadcasts.
+    """
+    if not net.expected_asset_id:
+        raise WarpDriverError(
+            f"{net.name}.expected_asset_id is empty; refusing to run without the "
+            "wrapped-asset anchor"
+        )
+    derived = derive_wrapped_asset_id(net)
+    if derived.hex() != net.expected_asset_id:
+        raise WarpDriverError(
+            f"derived wrapped-asset id {derived.hex()} != {net.name} anchor "
+            f"{net.expected_asset_id}; the deployment constants are wrong or "
+            "warp.green redeployed -- refusing to move funds"
+        )
+    pinned = (configured or "").strip().lower()
+    if pinned:
+        if pinned.startswith("0x"):
+            pinned = pinned[2:]
+        if pinned != derived.hex():
+            raise WarpDriverError(
+                f"configured warp.expected_asset_id {pinned} != derived "
+                f"{derived.hex()}; fix config.yaml (the Base-bridged wUSDC.b id "
+                "is fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d)"
+            )
+    return derived
+
+
 def get_cat_minter_puzzle_solution(
     nonce: bytes,
     message,
@@ -652,7 +716,14 @@ def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
     # --- eve CAT (asset-id anchor) ------------------------------------------- #
     tail = get_wrapped_tail(launcher_id, source_chain, req.source, erc20_contract)
     tail_hash = cu.sha256tree(tail)
-    if net.expected_asset_id and tail_hash.hex() != net.expected_asset_id:
+    # Unconditional: defence in depth behind verify_wrapped_asset_anchor(), which
+    # already ran at engine construction. This one additionally covers the
+    # attested erc20_contract, which the offline anchor cannot see.
+    if not net.expected_asset_id:
+        raise WarpDriverError(
+            f"{net.name}.expected_asset_id is empty; refusing to build a claim"
+        )
+    if tail_hash.hex() != net.expected_asset_id:
         raise WarpDriverError(
             f"derived wrapped-TAIL {tail_hash.hex()} != configured asset id "
             f"{net.expected_asset_id}"
