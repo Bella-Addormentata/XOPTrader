@@ -97,6 +97,29 @@ is completely untouched.
   Portal message toll (currently 0.00001 ETH, read live) plus gas for the ERC-20
   `approve` and `bridgeToChia`. Keep ≥ 0.005 ETH; the tab warns below 0.001 ETH.
 
+### 2a. Run the tests first
+
+**Do this before the [dry run](#4-dry-run-rehearsal-hard-gate), on a machine with
+the GUI dependencies installed.** CI runs `python -m compileall` only, so the warp
+test suite is not executed anywhere automatically:
+
+```bash
+.venv/Scripts/python.exe -m pytest gui/services/warp/tests tests/test_warp_widget.py -q
+```
+
+Every module `importorskip`s `clvm` and `chia_rs`, and the widget tests need
+`PySide6` — if those are missing the suite reports skips or collection errors
+rather than passing, so check the summary line says what you expect.
+
+Three defects have already been found that no amount of static review would have
+caught, each of which alone prevented any bridge from completing: a `0x`-prefixed
+watcher nonce (HTTP 500), a `bytes32`-vs-20-byte token comparison that could never
+be equal, and coinset "not found" responses being read as successes. All three
+were invisible to the tests because the fixtures encoded the same wrong
+assumptions as the code. Treat a green suite as necessary, not sufficient — and
+note the dry run does not exercise any of them, since all three sit past the
+broadcast point it stops at.
+
 ---
 
 ## 3. One-time setup
