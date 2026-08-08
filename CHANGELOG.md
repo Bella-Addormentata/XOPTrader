@@ -5,7 +5,7 @@ All notable changes to XOPTrader are documented in this file.
 Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.0] — 2026-07-30 — P&L overhaul (unreleased; requires engine restart to take effect)
+## [0.8.0] — 2026-08-08 — P&L overhaul + warp bridge (requires an engine and GUI restart to take effect)
 
 Root-cause fix set for "P&L never worked".  A multi-agent audit against the
 live DB (774 fills, Apr 3–Jul 30) found realized P&L was recorded for only
@@ -162,6 +162,24 @@ Found by adversarial review of the fixes above, before deployment:
   (rehydration, duplicate idempotency, USD conversion, canonical-id keying,
   CSV mirror) plus XCH-scale overflow/persistence regression tests in
   `test_inventory.cpp`.
+- **Warp bridge** (`gui/services/warp/`): automatic background bridging of
+  USDC (Base) into wUSDC.b — the Chia CAT
+  `fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d` — via
+  [warp.green](https://warp.green). Fund an app-controlled Base hot wallet
+  from anywhere (Coinbase, a Circle payout, any wallet); the GUI detects the
+  deposit and runs the whole bridge unattended: approve + `bridgeToChia` on
+  Base, wait for the validator attestation, collect the 6-of-10 Nostr BLS
+  signatures, then build and push the Chia claim spend. Off by default
+  (`warp.enabled: false`, `warp.auto_bridge: false`) — merging/upgrading
+  changes nothing for the live bot until explicitly enabled and the GUI
+  restarted. The hot-wallet key is DPAPI-encrypted at rest (Windows-only);
+  every failure mode is stuck-not-lost (an attested message is claimable
+  forever). `warp.dry_run` defaults to `true` and is a hard rehearsal gate —
+  it signs both Base transactions without broadcasting, so the whole deposit
+  leg (RPC, wallet daemon, receiver decode, live toll/tip, gas, signing) is
+  exercised with no funds moved before an operator sets it to `false`. See
+  `docs/warp-bridge.md` for the full setup, safety model, and recovery/sweep
+  guide.
 
 ### Retired
 

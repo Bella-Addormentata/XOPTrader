@@ -6,3 +6,8 @@ PyYAML>=6.0,<7
 # Comment-preserving config writes (gui/services/config_split.py).
 ruamel.yaml>=0.18,<0.19
 requests>=2.31.0,<3
+# warp.green bridge (gui/services/warp) — imported lazily; GUI boots without them.
+web3>=7,<8
+clvm>=0.9.10,<1
+chia_rs>=0.47,<1
+websocket-client>=1.7,<2

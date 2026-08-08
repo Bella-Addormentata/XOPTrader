@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "xop-trader"
-version = "0.7.48"
+version = "0.8.0"
 description = "CHIA DEX market maker — Avellaneda-Stoikov / GLFT strategy engine"
 requires-python = ">=3.11,<4"
 dependencies = [
@@ -23,6 +23,14 @@ gui = [
     # Round-trip YAML: the GUI config writer preserves config.yaml comments.
     # Without it saves fall back to PyYAML and strip every comment.
     "ruamel.yaml>=0.18,<0.19",
+    # warp.green bridge (gui/services/warp). All imported lazily inside warp
+    # code paths, so the GUI still boots if these are absent or the bridge is
+    # disabled. clvm = pure-python SExp/serialize; chia_rs = BLS + coin oracle;
+    # web3 = Base EVM client; websocket-client = Nostr signature collection.
+    "web3>=7,<8",
+    "clvm>=0.9.10,<1",
+    "chia_rs>=0.47,<1",
+    "websocket-client>=1.7,<2",
 ]
 dev = [
     "pytest>=8.0,<9",

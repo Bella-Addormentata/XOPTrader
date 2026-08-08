@@ -95,6 +95,11 @@ try:
 except ImportError:
     ReportsWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.warp import WarpWidget
+except ImportError:
+    WarpWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -139,7 +144,8 @@ _PAGE_ORDER_BOOK: Final[int] = 3
 _PAGE_ANALYSIS: Final[int] = 4
 _PAGE_WALLET: Final[int] = 5
 _PAGE_REPORTS: Final[int] = 6
-_PAGE_SETTINGS: Final[int] = 7
+_PAGE_WARP: Final[int] = 7
+_PAGE_SETTINGS: Final[int] = 8
 
 
 def _fmt_usd(value: float) -> str:
@@ -229,6 +235,7 @@ class MainWindow(QMainWindow):
         self._trade_log: Optional[QWidget] = None
         self._bot_log: Optional[QWidget] = None
         self._tab_order_panel: Optional[QWidget] = None
+        self._warp_widget: Optional[QWidget] = None
 
         # -- Settings persistence -------------------------------------------
         self._settings = QSettings(_ORG_NAME, _APP_NAME)
@@ -368,6 +375,18 @@ class MainWindow(QMainWindow):
             wallet_widget.allocation_targets_applied.connect(
                 bridge.apply_wallet_allocation_targets
             )
+
+        # -- Warp widget -> WarpService command signals --------------------
+        # "Bridge now" and the per-job Retry/Sweep/Cancel context menu drive the
+        # background bridge worker. Guarded so a build without the warp service
+        # (or with the widget stubbed to None) simply skips the wiring.
+        warp_widget = self._unwrap(self._warp_widget)
+        warp_svc = getattr(bridge, "warp_service", None)
+        if warp_widget is not None and warp_svc is not None:
+            if hasattr(warp_widget, "bridge_now_requested"):
+                warp_widget.bridge_now_requested.connect(warp_svc.request_bridge)
+            if hasattr(warp_widget, "job_action_requested"):
+                warp_widget.job_action_requested.connect(warp_svc.job_action)
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
@@ -653,6 +672,12 @@ class MainWindow(QMainWindow):
                 stuck_offers=stuck,
                 pairs=pairs_cfg,
             )
+
+        # Warp Bridge tab -- feed the live warp snapshot (hot-wallet balances,
+        # bridge config, and job list) sourced from data["warp"].
+        warp_widget = self._unwrap(self._warp_widget)
+        if warp_widget is not None and hasattr(warp_widget, "update_data"):
+            warp_widget.update_data(data)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
@@ -1436,8 +1461,12 @@ class MainWindow(QMainWindow):
             ReportsWidget, "Reports", scrollable=True
         )
         self._stacked.addWidget(self._reports)
+        self._warp_widget = self._create_page_widget(               # index 7
+            WarpWidget, "Warp Bridge"
+        )
+        self._stacked.addWidget(self._warp_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 7
+        self._stacked.addWidget(self._settings_widget)              # index 8
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)
