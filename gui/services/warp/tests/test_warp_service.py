@@ -45,6 +45,14 @@ RECEIVER_PH = bytes(range(32))
 ADDR = cu.encode_puzzle_hash(RECEIVER_PH, NET.chia_prefix)
 
 
+def _hx_pad32(value: str) -> str:
+    """Bare hex left-padded to a 32-byte word, as warp message contents are."""
+    s = str(value or "")
+    if s[:2].lower() == "0x":
+        s = s[2:]
+    return s.lower().rjust(64, "0")
+
+
 # --------------------------------------------------------------------------- #
 # Fakes.
 # --------------------------------------------------------------------------- #
@@ -519,15 +527,24 @@ def test_bridge_confirmed_waits_then_advances():
 # MESSAGE_SENT (attestation anchors, then key mint).
 # --------------------------------------------------------------------------- #
 
+# The real watcher returns every message content as a bytes32 word, so the
+# ERC-20 source arrives 12 zero bytes wider than net.usdc_address. Verified
+# against a live mainnet attestation (nonce ...01d7):
+#   contents[0] == "000000000000000000000000833589fcd6edb6e08f4c7c32d4f71b54bda02913"
+# This fixture previously used the bare 20-byte form, which is why the
+# always-unequal comparison in _h_message_sent went unnoticed.
+_USDC_WORD = _hx_pad32(NET.usdc_address)
+
+
 def _sent_msg(**over):
     fields = dict(
         is_sent=True,
         status="sent",
         receiver_ph=RECEIVER_PH.hex(),
         amount_mojos=4985,
-        erc20_source=NET.usdc_address,
+        erc20_source=_USDC_WORD,
         destination=bytes(32),
-        contents=["aa" * 20, RECEIVER_PH.hex(), "1379"],
+        contents=[_USDC_WORD, RECEIVER_PH.hex(), "1379"],
     )
     fields.update(over)
     return SimpleNamespace(**fields)

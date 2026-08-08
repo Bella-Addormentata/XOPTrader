@@ -236,6 +236,18 @@ def _hx(value: Any) -> str:
     return s.lower()
 
 
+def _word(value: Any) -> str:
+    """Left-pad hex to a 32-byte EVM word, for width-agnostic comparison.
+
+    warp messages carry every content item as a ``bytes32``, so the attested
+    ERC-20 source arrives as 12 zero bytes followed by the 20-byte address,
+    while :attr:`WarpNet.usdc_address` is the bare 20-byte address. Comparing
+    those with :func:`_hx` alone is a 64-char-vs-40-char string comparison that
+    can never be equal -- which failed every mainnet job at ``MESSAGE_SENT``.
+    """
+    return _hx(value).rjust(64, "0")
+
+
 def _encode_sigs(collected: Dict[int, bytes]) -> Dict[str, str]:
     """Serialize ``{index: sig}`` to JSON-safe ``{"index": "hexsig"}``."""
     return {str(i): bytes(s).hex() for i, s in collected.items()}
@@ -716,14 +728,17 @@ class WarpEngine:
             raise WarpPending(f"watcher status {msg.status!r}; awaiting 'sent'")
 
         # Fail-closed anchors: funds only proceed on the exact attested terms.
-        if _hx(msg.receiver_ph) != _hx(job.receiver_ph):
+        if _word(msg.receiver_ph) != _word(job.receiver_ph):
             raise WarpTerminal("attested receiver != frozen receiver")
         if msg.amount_mojos is None or int(msg.amount_mojos) != int(job.post_tip_mojos):
             raise WarpTerminal(
                 f"attested amount {msg.amount_mojos} != post-tip {job.post_tip_mojos}"
             )
-        if _hx(msg.erc20_source) != _hx(net.usdc_address):
-            raise WarpTerminal("attested source token != configured USDC")
+        if _word(msg.erc20_source) != _word(net.usdc_address):
+            raise WarpTerminal(
+                f"attested source token {_hx(msg.erc20_source)} != configured "
+                f"USDC {_hx(net.usdc_address)}"
+            )
 
         # Persist-then-act: generate the ephemeral security key locally; it lands
         # atomically with the advance. A crash before persistence just regenerates

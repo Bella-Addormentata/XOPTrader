@@ -455,6 +455,84 @@ def test_message_coin_puzzle_hash_is_per_nonce_and_claimer_independent():
 
 
 # --------------------------------------------------------------------------- #
+# Attested source token: bytes32 word vs 20-byte address.
+# --------------------------------------------------------------------------- #
+
+def test_attested_source_token_accepts_the_padded_bytes32_word():
+    """warp sends contents as bytes32; net.usdc_address is 20 bytes.
+
+    A bare _hx() comparison is 64 chars vs 40 and can never be equal, so every
+    mainnet job hit WarpTerminal at MESSAGE_SENT. Shape verified against the
+    live watcher for nonce ...01d7.
+    """
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    padded = "0" * 24 + NET.usdc_address[2:].lower()
+    assert len(padded) == 64
+    engine, _ = build(store, watcher=FakeWatcher(_sent_msg(erc20_source=padded)))
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FUNDING_CLAIM
+
+
+def test_attested_source_token_still_rejects_a_different_token():
+    """The anchor must keep working -- widening must not weaken it."""
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    wrong = "0" * 24 + "de" * 20
+    engine, _ = build(store, watcher=FakeWatcher(_sent_msg(erc20_source=wrong)))
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FAILED
+    assert "source token" in (out["last_error"] or "")
+
+
+# --------------------------------------------------------------------------- #
+# Coinset responses must be explicitly successful.
+# --------------------------------------------------------------------------- #
+
+def test_push_tx_rejects_a_response_with_no_success_field():
+    """Otherwise status defaults to "SUCCESS" and a bundle that was never
+    submitted is reported as accepted -- which would let a sweep be recorded
+    as done without touching the chain."""
+    from gui.services.warp import coinset as coinset_mod
+
+    client = coinset_mod.CoinsetClient("https://example.invalid",
+                                       poster=lambda url, body: {})
+    with pytest.raises(coinset_mod.CoinsetError):
+        client.push_tx({"coin_spends": []})
+
+
+def test_not_found_is_none_not_an_error():
+    """Coinset reports "coin not on chain yet" as success:false. That is a
+    normal polling outcome, not a transport error -- treating it as one would
+    drive every pending job into exponential backoff."""
+    from gui.services.warp import coinset as coinset_mod
+
+    not_found = {
+        "success": False,
+        "error": "Coin record ... not found",
+        "structuredError": {"code": "COIN_RECORD_NOT_FOUND"},
+    }
+    client = coinset_mod.CoinsetClient("https://example.invalid",
+                                       poster=lambda url, body: not_found)
+    assert client.get_coin_record_by_name("ab" * 32) is None
+
+    # A genuine failure still raises.
+    broken = {"success": False, "error": "boom", "structuredError": {"code": "OTHER"}}
+    client2 = coinset_mod.CoinsetClient("https://example.invalid",
+                                        poster=lambda url, body: broken)
+    with pytest.raises(coinset_mod.CoinsetError):
+        client2.get_coin_record_by_name("ab" * 32)
+
+
+# --------------------------------------------------------------------------- #
 # F8 -- never resume a job under a different hot wallet or network.
 # --------------------------------------------------------------------------- #
 

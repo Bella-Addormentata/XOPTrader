@@ -131,7 +131,24 @@ class CoinsetClient:
         self._timeout = timeout
         self._poster = poster or _default_poster(timeout)
 
-    def _post(self, endpoint: str, body: dict) -> dict:
+    def _post(
+        self, endpoint: str, body: dict, *, empty_codes: tuple = ()
+    ) -> Optional[dict]:
+        """POST and return the response, or ``None`` for a benign "not found".
+
+        ``success`` must be explicitly true. Merely "not false" is not good
+        enough: a response missing the field entirely -- a proxy error page, a
+        truncated body -- would otherwise sail through, and :meth:`push_tx`
+        defaults its status to ``"SUCCESS"``, so a bundle that was never
+        submitted would be reported as accepted. That is how a sweep gets
+        recorded as done without touching the chain.
+
+        Coinset reports "this coin does not exist yet" as ``success: false``
+        with a structured error code, not as an empty success. Those are normal
+        polling outcomes for a state machine waiting on confirmation, so a
+        caller passes the codes it considers benign and gets ``None`` back
+        rather than an exception and an exponential backoff.
+        """
         url = f"{self._base}/{endpoint}"
         try:
             data = self._poster(url, body)
@@ -141,14 +158,25 @@ class CoinsetClient:
             raise CoinsetError(f"{endpoint} request failed: {exc}") from exc
         if not isinstance(data, dict):
             raise CoinsetError(f"{endpoint}: unexpected response {type(data).__name__}")
-        if data.get("success") is False:
+        if data.get("success") is not True:
+            code = str(
+                ((data.get("structuredError") or {}).get("code") or "")
+            ).upper()
+            if code and code in empty_codes:
+                return None
             raise CoinsetError(f"{endpoint} failed: {data.get('error') or 'unknown'}")
         return data
 
     # -- reads --------------------------------------------------------------- #
 
+    # Benign "not found" codes: the coin/spend simply is not on chain yet, which
+    # is the expected answer while a job waits on confirmation.
+    _NOT_FOUND = ("COIN_RECORD_NOT_FOUND",)
+    _NOT_SPENT = ("PUZZLE_SOLUTION_FAILED",)
+
     def get_blockchain_state(self) -> dict:
-        return self._post("get_blockchain_state", {}).get("blockchain_state", {}) or {}
+        data = self._post("get_blockchain_state", {}) or {}
+        return data.get("blockchain_state", {}) or {}
 
     def get_peak_height(self) -> int:
         state = self.get_blockchain_state()
@@ -156,7 +184,19 @@ class CoinsetClient:
         return int(peak.get("height", 0) or 0)
 
     def get_coin_record_by_name(self, name: str) -> Optional[CoinRecord]:
-        data = self._post("get_coin_record_by_name", {"name": _0x(name)})
+        """The coin record, or ``None`` when the coin is not on chain yet.
+
+        ``None`` is the load-bearing case: the claim path polls this to learn
+        that a security coin has appeared, or that the predicted final CAT coin
+        has landed. Coinset answers "not found" with ``success: false``, so
+        without the benign-code mapping every such poll would raise and drive
+        the job into exponential backoff instead of a healthy pending wait.
+        """
+        data = self._post(
+            "get_coin_record_by_name", {"name": _0x(name)}, empty_codes=self._NOT_FOUND
+        )
+        if data is None:
+            return None
         record = data.get("coin_record")
         return _coin_record(record) if record else None
 
@@ -176,15 +216,18 @@ class CoinsetClient:
             body["start_height"] = int(start_height)
         if end_height is not None:
             body["end_height"] = int(end_height)
-        data = self._post("get_coin_records_by_puzzle_hash", body)
+        # An unknown puzzle hash is a normal success with an empty list here --
+        # no benign-code mapping needed.
+        data = self._post("get_coin_records_by_puzzle_hash", body) or {}
         return [_coin_record(r) for r in (data.get("coin_records") or [])]
 
     def get_puzzle_and_solution(self, coin_id: str, height: int) -> CoinSolution:
         data = self._post(
             "get_puzzle_and_solution",
             {"coin_id": _0x(coin_id), "height": int(height)},
+            empty_codes=self._NOT_SPENT,
         )
-        sol = data.get("coin_solution")
+        sol = (data or {}).get("coin_solution")
         if not sol:
             raise CoinsetError(
                 f"get_puzzle_and_solution: coin {_hx(coin_id)} not spent at "
@@ -206,4 +249,6 @@ class CoinsetClient:
         treated as idempotent by the caller.
         """
         data = self._post("push_tx", {"spend_bundle": spend_bundle})
+        if data is None:  # unreachable: push_tx declares no benign codes
+            raise CoinsetError("push_tx: no response")
         return str(data.get("status", "SUCCESS"))
