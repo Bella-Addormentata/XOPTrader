@@ -448,12 +448,21 @@ jobs:
           # stdout -- the exe appends it to this file instead.
           XOP_SELF_CHECK_REPORT: ${{ runner.temp }}\self-check.txt
         run: |
-          & .\dist\xop_trader_gui.exe --self-check
-          $code = $LASTEXITCODE
           $report = "${{ runner.temp }}\self-check.txt"
+          if (Test-Path $report) { Remove-Item $report }
+
+          # Start-Process -Wait, not the call operator.  A --windowed build is
+          # a GUI-subsystem binary, and PowerShell does not block on those: `&`
+          # returns immediately, leaving $LASTEXITCODE empty and the report
+          # unwritten, then the process runs seconds later with nothing reading
+          # its result.  That reported a passing bundle as a failure once
+          # already.
+          $exe = Join-Path (Get-Location) 'dist\xop_trader_gui.exe'
+          $proc = Start-Process -FilePath $exe -ArgumentList '--self-check' -Wait -PassThru
+
           if (Test-Path $report) { Get-Content $report } else { Write-Host "(no report written)" }
-          if ($code -ne 0) {
-            throw "bundle self-check failed with exit code $code"
+          if ($proc.ExitCode -ne 0) {
+            throw "bundle self-check failed with exit code $($proc.ExitCode)"
           }
 
       - name: Rename binary
