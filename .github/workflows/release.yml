@@ -265,15 +265,39 @@ jobs:
         run: cp resources/icon.${{ matrix.icon_fmt }} icon.${{ matrix.icon_fmt }}
 
       # ---- Build with PyInstaller ------------------------------------------
+      #
+      # These steps run with working-directory: gui, but main.py opens with
+      # `from gui.app import XOPTraderApp` and gui/app.py does `import gui` --
+      # absolute imports of the package that *contains* them.  From gui/ there
+      # is no gui/gui/, so the package is not importable and PyInstaller cannot
+      # follow the entry point's own imports; `--collect-submodules gui` also
+      # silently returns [] and logs it at debug level.  --paths/PYTHONPATH put
+      # the repo root on the search path so both resolve.
+      #
+      # --exclude-module: with the package importable, --collect-submodules
+      # would otherwise force-import the 10 warp test modules (~4,600 lines)
+      # into the bundle, every one of which imports pytest -- a dev-only
+      # dependency that is not installed here.
+      #
+      # --add-data: gui/services/warp/clvm_utils.py resolves the puzzle reveals
+      # as Path(__file__).parent/"puzzles" and read_text()s them, and
+      # drivers.py loads all 12 at module scope.  PyInstaller bundles no
+      # non-Python file it is not told about, so without this the whole warp
+      # module raises on import inside a frozen build.
       - name: Build with PyInstaller (Unix)
         if: runner.os != 'Windows'
         working-directory: gui
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: >
           pyinstaller
           --onefile
           --name xop_trader_gui
           --windowed
+          --paths ..
           --collect-submodules gui
+          --exclude-module gui.services.warp.tests
+          --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
           --hidden-import requests
           ${{ matrix.icon_flag }}
           main.py
@@ -282,12 +306,18 @@ jobs:
         if: runner.os == 'Windows'
         working-directory: gui
         shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           $args = @(
             '--onefile',
             '--name', 'xop_trader_gui',
             '--windowed',
+            '--paths', '..',
             '--collect-submodules', 'gui',
+            '--exclude-module', 'gui.services.warp.tests',
+            # ';' separator to match the --add-binary calls below.
+            '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
             '--hidden-import', 'requests',
             '--icon', 'icon.ico'
           )
@@ -299,6 +329,29 @@ jobs:
 
           $args += 'main.py'
           pyinstaller @args
+
+      # ---- Prove the bundle is not dead on arrival -------------------------
+      #
+      # PyInstaller exits 0 on missing-module and missing-data warnings, and
+      # `if-no-files-found: error` on the upload only proves a file exists --
+      # so nothing downstream can tell a working bundle from a broken one.
+      #
+      # `--help` returns through argparse, but not before main.py's
+      # module-level `from gui.app import XOPTraderApp` has run, so this fails
+      # loudly if the gui package did not make it in.  argparse exits before
+      # any QApplication is constructed; QT_QPA_PLATFORM is set anyway so an
+      # import-time Qt probe cannot block on a missing display.
+      #
+      # Windows is excluded on purpose: --windowed builds there have no console
+      # subsystem, so sys.stdout/stderr are None and argparse's own --help
+      # handler raises. The defect this guards against (the gui package missing
+      # from the bundle) is platform-independent, so the Unix legs catch it.
+      - name: Smoke-test the bundle (Unix)
+        if: runner.os != 'Windows'
+        working-directory: gui
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ./dist/xop_trader_gui --help
 
       # ---- Rename dist to platform-specific name ---------------------------
       - name: Rename binary (Unix)
