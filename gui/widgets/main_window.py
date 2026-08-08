@@ -376,6 +376,18 @@ class MainWindow(QMainWindow):
                 bridge.apply_wallet_allocation_targets
             )
 
+        # -- Warp widget -> WarpService command signals --------------------
+        # "Bridge now" and the per-job Retry/Sweep/Cancel context menu drive the
+        # background bridge worker. Guarded so a build without the warp service
+        # (or with the widget stubbed to None) simply skips the wiring.
+        warp_widget = self._unwrap(self._warp_widget)
+        warp_svc = getattr(bridge, "warp_service", None)
+        if warp_widget is not None and warp_svc is not None:
+            if hasattr(warp_widget, "bridge_now_requested"):
+                warp_widget.bridge_now_requested.connect(warp_svc.request_bridge)
+            if hasattr(warp_widget, "job_action_requested"):
+                warp_widget.job_action_requested.connect(warp_svc.job_action)
+
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
         settings = self._unwrap(self._settings_widget)
@@ -661,11 +673,11 @@ class MainWindow(QMainWindow):
                 pairs=pairs_cfg,
             )
 
-        # Warp Bridge tab -- keep the receive address in sync with the
-        # wallet balances so users can copy it directly into the portal.
+        # Warp Bridge tab -- feed the live warp snapshot (hot-wallet balances,
+        # bridge config, and job list) sourced from data["warp"].
         warp_widget = self._unwrap(self._warp_widget)
-        if warp_widget is not None and hasattr(warp_widget, "update_balances"):
-            warp_widget.update_balances(data.get("wallet_balances", {}))
+        if warp_widget is not None and hasattr(warp_widget, "update_data"):
+            warp_widget.update_data(data)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
