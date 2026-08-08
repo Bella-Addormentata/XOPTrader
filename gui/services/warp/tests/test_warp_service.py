@@ -569,7 +569,7 @@ def test_message_sent_anchor_match_generates_key():
     job = store.get_active_job()
     assert job.state["ephemeral_blob"]                       # key persisted with the advance
     assert job.state["message_destination"] == "00" * 32
-    assert job.state["message_contents"] == ["aa" * 20, RECEIVER_PH.hex(), "1379"]
+    assert job.state["message_contents"] == [_USDC_WORD, RECEIVER_PH.hex(), "1379"]
     # No CAT-coin baseline is taken any more: third-party-claim detection is
     # per-nonce (see test_claiming_conflict_*), not a count-versus-baseline.
     assert "wrapped_cat_baseline" not in job.state
