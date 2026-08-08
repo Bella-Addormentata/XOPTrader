@@ -287,13 +287,24 @@ jobs:
       # into the bundle, every one of which imports pytest -- a dev-only
       # dependency that is not installed here.
       #
-      # --add-data: gui/services/warp/clvm_utils.py resolves the puzzle reveals
-      # as Path(__file__).parent/"puzzles" and read_text()s them, and
-      # drivers.py loads all 12 at module scope.  PyInstaller bundles no
-      # non-Python file it is not told about, so without this the whole warp
-      # module raises on import inside a frozen build.  Relative --add-data
-      # sources resolve against the spec directory; no --specpath is passed, so
-      # the spec lands in gui/ and these paths are correct.
+      # This combination logs ten lines of
+      #   ERROR: Hidden import 'gui.services.warp.tests.test_*' not found
+      # which are expected and not failures: --collect-submodules enumerates
+      # them, --exclude-module then removes them, and PyInstaller reports the
+      # gap it just created.  Verified against a local build -- the resulting
+      # bundle contains no test module and no pytest.
+      #
+      # --add-data: PyInstaller bundles no non-Python file it is not told
+      # about, and four things here are read from disk rather than imported:
+      #   * the 12 .clsp.hex puzzle reveals -- clvm_utils.py resolves them as
+      #     Path(__file__).parent/"puzzles" and read_text()s them, and
+      #     drivers.py load_puzzle()s all 12 at module scope, so without them
+      #     the whole warp module raises on import;
+      #   * scripts/offer_sizing.py -- loaded by file path (gui/utils.py), so
+      #     the import graph never sees it;
+      #   * the two example configs -- first-run bootstrap copies them out.
+      # Relative sources resolve against the spec directory; no --specpath is
+      # passed, so the spec lands in gui/ and these paths are correct.
       - name: Build with PyInstaller
         working-directory: gui
         env:
@@ -307,6 +318,9 @@ jobs:
           --collect-submodules gui
           --exclude-module gui.services.warp.tests
           --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
+          --add-data "../scripts/offer_sizing.py:scripts"
+          --add-data "../config.example.yaml:."
+          --add-data "../secrets.example.yaml:."
           --hidden-import requests
           --icon icon.${{ matrix.icon_fmt }}
           main.py
@@ -317,16 +331,23 @@ jobs:
       # `if-no-files-found: error` on the upload only proves a file exists --
       # so nothing downstream can tell a working bundle from a broken one.
       #
-      # `--help` returns through argparse, but not before main.py's
-      # module-level `from gui.app import XOPTraderApp` has run, so this fails
-      # loudly if the gui package did not make it in.  argparse exits before
-      # any QApplication is constructed; QT_QPA_PLATFORM is set anyway so an
-      # import-time Qt probe cannot block on a missing display.
+      # `--help` proves the gui package itself made it in: it returns through
+      # argparse, but not before main.py's module-level `from gui.app import
+      # XOPTraderApp` has run.
+      #
+      # It proves nothing about bundled DATA, though -- argparse returns at
+      # main.py's parse_args long before anything reads a file, and
+      # gui.services.warp.drivers is imported lazily, so a broken --add-data
+      # still exits 0.  --self-check is what actually covers that: it imports
+      # drivers (all 12 puzzle reveals), loads scripts/offer_sizing.py by path,
+      # and stats both example configs.
       - name: Smoke-test the bundle
         working-directory: gui
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ./dist/xop_trader_gui --help
+        run: |
+          ./dist/xop_trader_gui --help
+          ./dist/xop_trader_gui --self-check
 
       - name: Rename binary
         run: cp gui/dist/xop_trader_gui ${{ matrix.artifact_name }}
@@ -398,6 +419,9 @@ jobs:
             '--exclude-module', 'gui.services.warp.tests',
             # ';' separator to match the --add-binary calls below.
             '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
+            '--add-data', '../scripts/offer_sizing.py;scripts',
+            '--add-data', '../config.example.yaml;.',
+            '--add-data', '../secrets.example.yaml;.',
             '--hidden-import', 'requests',
             '--icon', 'icon.ico'
           )
@@ -409,6 +433,21 @@ jobs:
 
           $args += 'main.py'
           pyinstaller @args
+
+      # This leg had no smoke test until --self-check existed.  --windowed
+      # leaves the executable no console subsystem, so sys.stdout/stderr are
+      # None and argparse's --help handler raises -- but --self-check reports
+      # through its exit code and only writes when a stream exists, so it
+      # works here.  This is the bundle that embeds the engine and the only
+      # platform warp supports, so it is the one that most needed covering.
+      - name: Smoke-test the bundle
+        working-directory: gui
+        shell: pwsh
+        run: |
+          & .\dist\xop_trader_gui.exe --self-check
+          if ($LASTEXITCODE -ne 0) {
+            throw "bundle self-check failed with exit code $LASTEXITCODE"
+          }
 
       - name: Rename binary
         shell: pwsh
