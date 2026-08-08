@@ -48,9 +48,15 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Prevent duplicate runs when a release also creates a tag push
+# Prevent duplicate runs when a release also creates a tag push.  Both of those
+# events leave `inputs` unset, so they still share a group and still dedupe.
+#
+# `inputs.publish` is in the key so a non-publishing dry run can never cancel a
+# real release of the same ref -- cancel-in-progress would otherwise kill it,
+# and notify-on-failure does not fire on cancellation, so it would vanish
+# silently.  That hazard only exists because dry runs are now possible at all.
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.ref_name }}-${{ inputs.publish }}
   cancel-in-progress: true
 
 # ---------------------------------------------------------------------------
@@ -263,6 +269,7 @@ jobs:
       # ---- Copy pre-built application icon --------------------------------
       - name: Copy application icon
         working-directory: gui
+        shell: bash
         run: cp resources/icon.${{ matrix.icon_fmt }} icon.${{ matrix.icon_fmt }}
 
       # ---- Build with PyInstaller ------------------------------------------

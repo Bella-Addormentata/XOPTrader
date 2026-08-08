@@ -162,12 +162,14 @@ jobs:
       # flat-layout auto-discovery trips over the ten top-level directories.
       # Install the requirements file directly until that is fixed.
       #
-      # --only-binary: chia_rs is a Rust extension.  Without this a missing
-      # wheel silently starts a source build instead of failing.
+      # --only-binary is scoped to the compiled extensions it is meant for.
+      # `:all:` would apply to all 50+ transitive distributions, so a single
+      # sdist-only release anywhere in the tree would turn this job red for a
+      # reason unrelated to the repo.
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install --only-binary=:all: -r gui/requirements.txt
+          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.txt
           pip install pytest pytest-asyncio
 
       # Every warp test module opens with pytest.importorskip("clvm") /
