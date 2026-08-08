@@ -42,6 +42,12 @@ def _0x(value: str) -> str:
     return "0x" + _hx(value)
 
 
+# NOTE: the watcher API rejects a 0x-prefixed nonce with HTTP 500, on both
+# source chains. Verified live against https://watcher-api.warp.green/messages
+# with a real bse nonce: bare hex -> 200, "0x"-prefixed -> 500. Query params
+# must therefore use bare hex (:func:`_hx`), not :func:`_0x`.
+
+
 @dataclass(frozen=True)
 class WatcherMessage:
     """A bridge message as attested by the validators.
@@ -146,7 +152,7 @@ class WatcherClient:
         pending -- check :attr:`WatcherMessage.is_sent` before claiming.
         """
         url = f"{self._base}/messages"
-        params = {"source_chain": source_chain, "nonce": _0x(nonce)}
+        params = {"source_chain": source_chain, "nonce": _hx(nonce)}
         try:
             data = self._getter(url, params)
         except WatcherError:

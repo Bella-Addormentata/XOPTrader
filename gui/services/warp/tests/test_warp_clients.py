@@ -210,9 +210,12 @@ def test_watcher_parses_sent_message():
     assert m.erc20_source == "833589fc"
     assert m.receiver_ph == "abcd"
     assert m.amount_mojos == 0x1368
-    # Nonce is 0x-prefixed for the API; default source_chain is "bse".
+    # The nonce query param must be BARE hex. A 0x prefix makes the live
+    # watcher API return HTTP 500 (verified against watcher-api.warp.green on
+    # both source chains), which _default_getter turns into a WatcherError --
+    # so every attestation poll failed. Default source_chain is "bse".
     _url, params = getter.calls[0]
-    assert params == {"source_chain": "bse", "nonce": "0x2a"}
+    assert params == {"source_chain": "bse", "nonce": "2a"}
 
 
 def test_watcher_messages_envelope_shape():
