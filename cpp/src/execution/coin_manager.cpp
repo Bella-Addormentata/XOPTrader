@@ -259,7 +259,6 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
     std::int64_t       wallet_id,
     int                target_count,
     Mojo               target_amount_mojos,
-    const std::string& address,
     Mojo               fee)
 {
     SplitResult result;

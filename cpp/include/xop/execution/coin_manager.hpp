@@ -242,13 +242,13 @@ public:
      * transaction spends one or more large coins and produces target_count
      * outputs of target_amount_mojos each, plus a change output.
      *
-     * The split is a standard XCH send-to-self using the provided receive
-     * address.  A blockchain fee is attached to incentivise prompt inclusion.
+     * The split uses the wallet's split_coins RPC, which divides a coin in
+     * place and therefore needs no receive address.  A blockchain fee is
+     * attached to incentivise prompt inclusion.
      *
      * @param wallet_id           Wallet to split coins in.
      * @param target_count        Desired total number of spendable coins.
      * @param target_amount_mojos Denomination of each new coin (mojos).
-     * @param address             Receive address (bech32m, own wallet).
      * @param fee                 Transaction fee in mojos.
      * @return SplitResult with the number of coins created and success flag.
      */
@@ -256,7 +256,6 @@ public:
         std::int64_t   wallet_id,
         int            target_count,
         Mojo           target_amount_mojos,
-        const std::string& address,
         Mojo           fee);
 
     // -- Coin locking -------------------------------------------------------
