@@ -28,7 +28,7 @@ is completely untouched.
 6. [Day-to-day operation](#6-day-to-day-operation)
 7. [Recovery & sweep](#7-recovery--sweep)
 8. [Config & secrets reference](#8-config--secrets-reference)
-9. [Troubleshooting](#9-troubleshooting)
+9. [Troubleshooting](#9-troubleshooting) · [9b Unwrap](#9b-unwrap-chia---base) · [9c Altruistic relay & Chia-only unwraps](#9c-altruistic-relay--chia-only-unwraps)
 10. [Known limitations](#10-known-limitations)
 
 ---
@@ -364,6 +364,11 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `coinset_url` | `""` | Override the coinset API base. Blank ⇒ network default. |
 | `chia_receiver_address` | `""` | Where wUSDC.b lands. Blank ⇒ the bot's own wallet address, resolved once at startup and shown in the tab. |
 | `expected_asset_id` | `fa4a180a…a6b7a99d` | Correctness anchor, checked **at startup** before any client is built. A mismatch blocks the engine with a banner. |
+| `max_unwrap_usdc` | *unset* | Unwrap blast-radius cap. Must be stated (or `unlimited`, explicitly) before the Unwrap button does anything. |
+| `unwrap_chia_fee_mojos` | `0` | Extra XCH fee on the burn bundle, on top of the 0.001 XCH toll. |
+| `altruistic_relay` | `false` | Opt-in: volunteer this node to deliver **strangers'** stuck xch→bse messages by paying their ~145k relay gas (see [9c](#9c-altruistic-relay--chia-only-unwraps)). |
+| `relay_grace_min` | `30` | Never touch a stuck message younger than this — ~98% are delivered by their own senders within minutes. |
+| `relay_daily_gas_budget_eth` | `0.0002` | Hard daily ceiling on volunteer gas spend. |
 
 `testnet` is **no longer supported**. A truthy `warp.testnet` raises a
 configuration error rather than silently running against mainnet — remove the key.
@@ -376,6 +381,12 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
 | Key | Meaning |
 |---|---|
 | `evm_private_key_dpapi` | Base64 of the DPAPI-encrypted EVM hot-wallet private key. Generated in [3a](#3a-generate-or-import-the-hot-wallet-key). Never commit; never place in `config.yaml`. |
+| `relay_private_key_dpapi` | Optional dedicated gas-only key for the altruistic relay. When present it — not the hot key — signs volunteer relays. Recommended hygiene. |
+| `retired_keys` | Written by the Base Wallet page's key rotation: every replaced key's blob, address and timestamp. **Archived forever, never deleted** — anything later landing at an old address stays recoverable. |
+| `evm_key_backup_confirmed` | Written by the Base Wallet page: whether the operator confirmed an offline backup of the current key. |
+
+All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
+`secrets.yaml` — never into git-tracked `config.yaml`.
 
 ### Fixed protocol facts (mainnet, for reference)
 
@@ -468,17 +479,87 @@ stated explicitly) before the Unwrap button does anything.
   "unexplained" by the sum of deliberate unwraps. A proper `transfer` ledger
   event is a follow-up PR.
 
+## 9c. Altruistic relay & Chia-only unwraps
+
+The warp protocol has no relayer network: `Portal.receiveMessage` is
+non-payable and whoever submits it pays the gas, so a sender holding only
+Chia assets can burn but never deliver. Delivery is trustless by construction
+— the receiver is attested in the signed contents, the Portal verifies exact
+validator signatures, and `usedNonces` prevents doubles — so a volunteer can
+do nothing except pay a stranger's ~145k gas (sub-cent on Base). Three pieces
+close the gap:
+
+### The "No Base ETH" unwrap checkbox (consumer side)
+
+Ticking **"No Base ETH — wait for an altruistic relay"** on the Warp tab
+skips exactly one gate (the hot wallet's relay-gas floor; the burn is
+entirely Chia-side). The job burns, collects the validator quorum, and then
+waits in `AWAITING_EXTERNAL_RELAY`:
+
+* **Completion is proven on-chain**, never taken from an indexer: each tick
+  replays our own relay calldata as a free `eth_call`, and a `!nonce` revert
+  is the Portal's own used-nonce refusal — unforgeable evidence the receiver
+  was paid. The watcher's delivery hash is recorded for display only.
+* **Gas appearing switches to self-relay automatically.** Fund the hot
+  wallet at any time; whichever path completes first wins.
+* **~24h deadline**: if no volunteer delivers, the job goes FAILED with
+  guidance (fund gas + Retry, or the portal). The message itself stays
+  deliverable forever; nothing expires.
+
+### Volunteering (`warp.altruistic_relay: true`)
+
+The engine sweeps the network's stuck tail every 10 minutes: messages stuck
+past `relay_grace_min` are digest-verified against the validator signatures
+on Nostr (a lying watcher produces a digest no signature matches — skipped,
+not paid for), simulated with a free `eth_call` preflight, and only then
+broadcast. Rails: repeated failures skip-list a nonce, `relay_daily_gas_budget_eth`
+caps the spend, and a lost race (`!nonce` on broadcast) is reported, not
+penalised. With `warp.dry_run: true` sweeps are full rehearsals — fetch,
+verify, preflight, sign, **no broadcast**.
+
+One stuck message can also be relayed by hand:
+
+```bash
+.venv/Scripts/python.exe scripts/warp_relay_once.py            # rehearse
+```
+
+```bash
+.venv/Scripts/python.exe scripts/warp_relay_once.py --broadcast
+```
+
+### The liveness indicator
+
+Under the unwrap controls the Warp tab shows whether waiting is realistic,
+from two independent evidence layers joined by relayer address:
+
+* 🟢 **online now** — a Nostr heartbeat seen minutes ago. *Proven* when the
+  heartbeating address also appears in the on-chain third-party evidence
+  (claiming someone else's address gains nothing — it doesn't make the
+  claimant relay).
+* 🟡 **active recently** — a third-party delivery observed on-chain in the
+  lookback window (unforgeable: a message stuck past the grace period,
+  delivered by an address that is not its attested receiver).
+* ⚪ **none** — plan on funding your own gas, or the portal.
+
+Heartbeats are BIP340-signed NIP-01 events published by live (never
+dry-run) volunteers, under an identity *derived from* — never equal to —
+the relay key. Consumers recompute the event id, verify the signature
+against the official-vector-pinned `schnorr.py`, and bound the timestamp in
+both directions, so a post-dated event cannot stay "online" forever. The
+heartbeat reveals the relayer's **public** EVM address and network name,
+nothing else.
+
 ## 10. Known limitations
 
-This PR wires the fully-automatic bridge and its live monitor. Two operator
-affordances from the original design are **deferred** to this runbook because the
-committed engine exposes only `tick` / `request_bridge` / `job_action` /
-`update_config` — there is no GUI method backing them yet:
-
-- **In-GUI key generation / import.** There is no one-click "Generate key" dialog
-  with an on-screen backup reveal. Instead, generate the key once with the venv
-  snippet in [3a](#3a-generate-or-import-the-hot-wallet-key) and back up the raw
-  key yourself.
+- **In-GUI key generation exists; the backup reveal does not.** The **Base
+  Wallet** page (🔷 in the sidebar) can create the hot-wallet key, send
+  ETH/USDC, and rotate the key (sweeping funds to a fresh key and archiving
+  the old blob in `warp.retired_keys` — never deleted). What it deliberately
+  does NOT do is display the raw private key: the offline backup still comes
+  from the console flow in [3a](#3a-generate-or-import-the-hot-wallet-key),
+  and the page nags until you confirm it happened. Remember DPAPI blobs are
+  bound to this Windows user — a machine failure without that backup
+  destroys access.
 - **Claim-by-Base-tx-hash recovery.** There is no in-app "claim this tx hash"
   box. The app only claims bridges it initiated (it tracks the job from deposit
   onward). If USDC is bridged out-of-band, or a job row is lost before the claim,
@@ -519,14 +600,15 @@ refuses to close it** and says so, naming the nonce. That is deliberate: closing
 it would discard the only in-app record of live funds. Recover the message
 through the warp.green portal, which pays the attested Chia receiver.
 
-### The bridge is one-way
+### Both directions exist; the unwrap is operator-only
 
-There is no unwrap (Chia → Base) in this version. To move wUSDC.b back to native
-USDC on Base, use warp.green's own portal — the **Open warp.green portal** button
-on the Warp tab. What building an in-app unwrap would require is scoped in
-[warp-unwrap-design.md](warp-unwrap-design.md); note that the return leg's commit
-point is irreversible in a way the deposit leg's is not, so it is not a mirror
-image of this one.
+The return leg (Chia → Base) is wired: the **Unwrap** controls on the Warp
+tab, including the Chia-only mode ([9c](#9c-altruistic-relay--chia-only-unwraps)).
+There is no auto-unwrap and none is planned — the return leg's commit point
+(the `cat_spend`) is irreversible in a way the deposit leg's is not, so it
+stays behind an explicit operator action with a stated cap
+(`warp.max_unwrap_usdc`). Design and executed evidence:
+[warp-unwrap-design.md](warp-unwrap-design.md).
 
 Also out of scope for this version: the Ethereum-mainnet path (that mints a
 *different* CAT, wUSDC — this bridge is the **Base**-bridged wUSDC.b), non-USDC
