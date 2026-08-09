@@ -265,3 +265,50 @@ def test_uncurry_rejects_non_curried():
 
     assert cu.uncurry(SExp.to(b"\x00")) is None
     assert cu.uncurry(SExp.to([1, 2, 3])) is None
+
+
+# --------------------------------------------------------------------------- #
+# Outbound (unwrap) anchors.
+# --------------------------------------------------------------------------- #
+
+def test_burn_puzzle_hash_derives_from_this_repos_drivers():
+    """Design doc Q2, settled in-tree and offline.
+
+    sha256tree of our own cat_burner curry must equal the constant that is
+    also read live from ERC20Bridge.burnPuzzleHash() at gate time. This is
+    the outbound analogue of the wrapped-asset anchor: a drivers or vendored
+    puzzle defect fails here before any job exists.
+
+    Known divergence, deliberately preserved: our get_cat_burner_puzzle
+    applies _strip_source(destination) and upstream does not. A no-op for the
+    deployed bridge address (no leading zero byte); a bridge redeploy to a
+    leading-zero address would surface here as a hash mismatch, which is the
+    correct failure.
+    """
+    from gui.services.warp import constants as C
+    from gui.services.warp import drivers
+
+    bridge = bytes.fromhex(C.MAINNET.erc20_bridge_address[2:])
+    derived = cu.sha256tree(drivers.get_cat_burner_puzzle(b"bse", bridge))
+    assert derived.hex() == C.MAINNET.burn_puzzle_hash
+
+
+def test_eip712_domain_separator_reconstructs_from_the_fields():
+    """The separator is derived, never trusted: name/version/chainId/portal
+    hashed per EIP-712 must equal the anchored constant, which was validated
+    end to end by recovering a real relay's six validator signatures."""
+    keccak = pytest.importorskip("eth_utils").keccak
+    from gui.services.warp import constants as C
+
+    net = C.MAINNET
+    type_hash = keccak(
+        text="EIP712Domain(string name,string version,uint256 chainId,address verifyingContract)"
+    )
+    sep = keccak(
+        type_hash
+        + keccak(text=net.eip712_name)
+        + keccak(text=net.eip712_version)
+        + net.evm_chain_id.to_bytes(32, "big")
+        + b"\x00" * 12 + bytes.fromhex(net.portal_address[2:])
+    )
+    assert sep.hex() == net.eip712_domain_separator
