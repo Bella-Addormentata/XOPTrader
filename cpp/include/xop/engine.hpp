@@ -451,8 +451,10 @@ private:
     // GUI's per-quote conversion in database_service.py::pnl_usdc_expr.
 
     /// Live USD value of 1 XCH, derived from an enabled XCH/<usd-stable>
-    /// pair's mid price.  Falls back to kFallbackXchUsdRate when no such
-    /// market snapshot is available yet.
+    /// pair's mid price.  Returns 0 ("unknown") when no such market snapshot
+    /// is available yet -- deliberately, not a fallback rate: see the
+    /// [PNL-BASIS-USD] note in usd_per_xch for why a fixed rate is unsafe
+    /// now that cost basis is persisted.
     [[nodiscard]] double usd_per_xch() const;
 
     /// USD value of one QUOTE display unit for the pair.  1.0 for

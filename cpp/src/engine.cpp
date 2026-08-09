@@ -157,10 +157,6 @@ int score_execution_quality(int competitiveness_score, int queue_ahead_score)
 
 }  // namespace
 
-// [H9] Fallback XCH/USD rate when CEX feed is unavailable (Phase 2).
-// ISO/IEC 5055: no magic numbers in financial calculations.
-static constexpr double kFallbackXchUsdRate = 2.70;
-
 // ===========================================================================
 // Construction / destruction
 // ===========================================================================
@@ -6224,6 +6220,11 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     ++bumped_tiers;
                 }
             }
+            if (bumped_tiers > 0) {
+                spdlog::info("[Engine] Step 7: {} up-scaled {} tiers to "
+                             "the min offer size ({:.2f} units)",
+                             pair_name, bumped_tiers, eff_min_units);
+            }
 
             // Diagnostic: show what's in ladder before dust filtering
             uint32_t pre_bids = 0, pre_asks = 0;
@@ -9540,23 +9541,17 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
             if (to_lower(pair.base_asset_id) == lid) {
                 auto pos = pair.name.find('/');
                 if (pos != std::string::npos) {
-                    auto sym = pair.name.substr(0, pos);
-                    for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    return sym;
+                    return upper(pair.name.substr(0, pos));
                 }
             }
             if (to_lower(pair.quote_asset_id) == lid) {
                 auto pos = pair.name.find('/');
                 if (pos != std::string::npos) {
-                    auto sym = pair.name.substr(pos + 1);
-                    for (char& c : sym) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-                    return sym;
+                    return upper(pair.name.substr(pos + 1));
                 }
             }
         }
-        auto uid = asset_id;
-        for (char& c : uid) c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
-        return uid;
+        return upper(asset_id);
     };
 
     std::unordered_map<std::string, double> portfolio_pct_by_asset;
@@ -10432,7 +10427,7 @@ double Engine::usd_per_xch() const
     }
 
     // [PNL-BASIS-USD 2026-07-30] Return 0 ("unknown"), NOT the historical
-    // kFallbackXchUsdRate constant.  That constant is 2.70 while XCH has
+    // hard-coded fallback rate.  That rate was 2.70 while XCH has
     // traded near $1.35, so using it would silently value fills at ~2x and
     // -- now that cost basis is PERSISTED -- bake that error in permanently
     // instead of it evaporating at the next restart.  Callers treat 0 as
@@ -11561,8 +11556,8 @@ void Engine::step_update_pnl(BlockHeight block_height)
             return rec.weighted_avg_cost_basis;
         },
         // [PNL-UNITS 2026-07-30] Live XCH/USD from an enabled stable-quoted
-        // pair's mid (falls back to kFallbackXchUsdRate only before the
-        // first market snapshot).  Previously hard-coded 2.70 forever.
+        // pair's mid, or 0 ("unknown") before the first market snapshot --
+        // see usd_per_xch.  Previously hard-coded 2.70 forever.
         xch_usd,
         // [PNL-UNIT-FIX] Per-pair unit factor (quote_denom/base_denom).
         // Without this the inventory PnL is overstated by 1e9 for
@@ -12201,31 +12196,21 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                              free_count, xch_target_count,
                              xch_target_count - free_count, target_xch);
 
-                std::string address;
+                constexpr Mojo split_fee = 0;
                 try {
-                    address = co_await wallet_->get_next_address(1, false);
-                } catch (const std::exception& e) {
-                    spdlog::error("[Engine] Coin pool: XCH get_next_address failed: {}",
-                                  e.what());
-                }
+                    auto result = co_await coin_mgr_->ensure_split(
+                        1, xch_target_count, target_mojos, split_fee);
 
-                if (!address.empty()) {
-                    constexpr Mojo split_fee = 0;
-                    try {
-                        auto result = co_await coin_mgr_->ensure_split(
-                            1, xch_target_count, target_mojos, address, split_fee);
-
-                        if (result.success && result.coins_created > 0) {
-                            spdlog::info("[Engine] Coin pool: XCH created {} new coins",
-                                         result.coins_created);
-                        } else if (!result.success) {
-                            spdlog::warn("[Engine] Coin pool: XCH split failed "
-                                         "(insufficient balance or RPC error)");
-                        }
-                    } catch (const std::exception& e) {
-                        spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
-                                      e.what());
+                    if (result.success && result.coins_created > 0) {
+                        spdlog::info("[Engine] Coin pool: XCH created {} new coins",
+                                     result.coins_created);
+                    } else if (!result.success) {
+                        spdlog::warn("[Engine] Coin pool: XCH split failed "
+                                     "(insufficient balance or RPC error)");
                     }
+                } catch (const std::exception& e) {
+                    spdlog::error("[Engine] Coin pool: XCH ensure_split failed: {}",
+                                  e.what());
                 }
             }
         }
@@ -12337,22 +12322,11 @@ asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
                          cat_target_count - free_count,
                          cat_target_units, target_mojos);
 
-            // Get a receive address for this CAT wallet.
-            std::string address;
-            try {
-                address = co_await wallet_->get_next_address(info.wallet_id, false);
-            } catch (const std::exception& e) {
-                spdlog::error("[Engine] Coin pool: {} get_next_address failed: {}",
-                              info.display_name, e.what());
-                continue;
-            }
-
             // Execute the split.
             constexpr Mojo split_fee = 0;
             try {
                 auto result = co_await coin_mgr_->ensure_split(
-                    info.wallet_id, cat_target_count, target_mojos,
-                    address, split_fee);
+                    info.wallet_id, cat_target_count, target_mojos, split_fee);
 
                 if (result.success && result.coins_created > 0) {
                     spdlog::info("[Engine] Coin pool: {} created {} new coins "

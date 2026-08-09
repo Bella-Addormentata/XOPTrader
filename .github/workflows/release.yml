@@ -36,6 +36,11 @@ on:
         description: "Release tag (e.g. v0.1)"
         required: true
         default: "v0.1"
+      publish:
+        description: "Create the GitHub Release. Uncheck to exercise the build matrix without publishing anything."
+        type: boolean
+        required: false
+        default: true
 
 permissions:
   contents: read
@@ -43,9 +48,15 @@ permissions:
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
-# Prevent duplicate runs when a release also creates a tag push
+# Prevent duplicate runs when a release also creates a tag push.  Both of those
+# events leave `inputs` unset, so they still share a group and still dedupe.
+#
+# `inputs.publish` is in the key so a non-publishing dry run can never cancel a
+# real release of the same ref -- cancel-in-progress would otherwise kill it,
+# and notify-on-failure does not fire on cancellation, so it would vanish
+# silently.  That hazard only exists because dry runs are now possible at all.
 concurrency:
-  group: release-${{ github.ref_name }}
+  group: release-${{ github.ref_name }}-${{ inputs.publish }}
   cancel-in-progress: true
 
 # ---------------------------------------------------------------------------
@@ -82,6 +93,36 @@ jobs:
         with:
           submodules: recursive
 
+      # ---- System dependencies (Ubuntu) ------------------------------------
+      #
+      # GCC 13, not the runner image's default GCC 11 -- see the note in
+      # compile-check.yml.  jammy carries no gcc-13, hence the toolchain PPA.
+      #
+      # The runner image deliberately stays on ubuntu-22.04: it sets the glibc
+      # floor for xop_trader-linux-x64, and moving to 24.04 would raise that
+      # floor for everyone already running the binary.  GCC 13 does raise the
+      # *libstdc++* floor the same way (jammy ships GLIBCXX_3.4.30; GCC 13
+      # emits references to 3.4.32), so the Linux link below is static for
+      # libstdc++/libgcc.  glibc stays dynamic -- it is the compatibility
+      # boundary we are preserving, and static glibc breaks NSS anyway.
+      - name: Install system dependencies (Ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update -y
+          sudo apt-get install -y \
+            build-essential cmake ninja-build pkg-config \
+            libssl-dev libcurl4-openssl-dev \
+            gcc-13 g++-13
+          # vcpkg builds its ports with whatever compiler the environment
+          # names, and CMAKE_INTERPROCEDURAL_OPTIMIZATION_RELEASE is ON
+          # (cpp/CMakeLists.txt:104).  Ports built by GCC 11 emit LTO 11.3
+          # bytecode that GCC 13's lto1 refuses to read, so exporting the
+          # toolchain here -- before vcpkg is set up -- is what keeps the
+          # Release link working.  Debug does not use LTO and never saw this.
+          echo "CC=gcc-13"  >> "$GITHUB_ENV"
+          echo "CXX=g++-13" >> "$GITHUB_ENV"
+
       # ---- Read vcpkg baseline from manifest (single source of truth) -------
       - name: Read vcpkg baseline
         id: vcpkg-baseline
@@ -110,14 +151,6 @@ jobs:
           vcpkgJsonGlob: "cpp/vcpkg.json"
           vcpkgGitCommitId: "${{ steps.vcpkg-baseline.outputs.sha }}"
 
-      # ---- System dependencies (Ubuntu) ------------------------------------
-      - name: Install system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update -y
-          sudo apt-get install -y \
-            build-essential cmake ninja-build pkg-config \
-            libssl-dev libcurl4-openssl-dev
 
       # ---- System dependencies (macOS) -------------------------------------
       # sqlite3 is excluded from vcpkg on macOS (sqlite.org is unreachable from
@@ -132,9 +165,14 @@ jobs:
       - name: Configure CMake
         working-directory: cpp
         shell: bash
+        env:
+          # CMake seeds CMAKE_EXE_LINKER_FLAGS from LDFLAGS on first configure.
+          # Empty on Windows/macOS, which CMake ignores.
+          LDFLAGS: ${{ runner.os == 'Linux' && '-static-libstdc++ -static-libgcc' || '' }}
         run: >
           cmake -B ../build -S .
           ${{ runner.os != 'Windows' && '-G Ninja' || '' }}
+          ${{ runner.os == 'Linux' && '-DCMAKE_C_COMPILER=gcc-13 -DCMAKE_CXX_COMPILER=g++-13' || '' }}
           -DCMAKE_BUILD_TYPE=${{ matrix.cmake_build_type }}
           -DCMAKE_TOOLCHAIN_FILE="${{ github.workspace }}/vcpkg/scripts/buildsystems/vcpkg.cmake"
           -DVCPKG_TARGET_TRIPLET=${{ runner.os == 'Windows' && 'x64-windows' || runner.os == 'Linux' && 'x64-linux' || 'arm64-osx' }}
@@ -180,31 +218,26 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # Job 2 — Build the Python GUI with PyInstaller on each OS
+  # Job 2a — Python GUI for the Unix platforms
+  #
+  # Deliberately carries no `needs: [build-cpp]`.  Only the Windows GUI embeds a
+  # C++ artifact, so gating these two on the engine build meant a red C++ job
+  # hid every GUI and packaging defect behind it -- which is exactly how the
+  # problems fixed in this file survived unseen from 2026-04-08 onward.
   # ---------------------------------------------------------------------------
   build-gui:
     name: Python GUI (${{ matrix.os }})
-    needs: [build-cpp]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: windows-latest
-            artifact_name: xop_trader-gui-windows-x64.exe
-            dist_path: gui/dist/xop_trader_gui.exe
-            icon_fmt: ico
-            icon_flag: --icon icon.ico
           - os: ubuntu-22.04
             artifact_name: xop_trader-gui-linux-x64
-            dist_path: gui/dist/xop_trader_gui
             icon_fmt: png
-            icon_flag: --icon icon.png
           - os: macos-latest
             artifact_name: xop_trader-gui-macos-arm64
-            dist_path: gui/dist/xop_trader_gui
             icon_fmt: icns
-            icon_flag: --icon icon.icns
 
     steps:
       - uses: actions/checkout@v4
@@ -233,13 +266,6 @@ jobs:
           pip install -r requirements.txt
           pip install pyinstaller
 
-      - name: Download Windows runtime bundle
-        if: runner.os == 'Windows'
-        uses: actions/download-artifact@v4
-        with:
-          name: xop_trader-windows-runtime-x64
-          path: gui/engine-runtime
-
       # ---- Copy pre-built application icon --------------------------------
       - name: Copy application icon
         working-directory: gui
@@ -247,29 +273,155 @@ jobs:
         run: cp resources/icon.${{ matrix.icon_fmt }} icon.${{ matrix.icon_fmt }}
 
       # ---- Build with PyInstaller ------------------------------------------
-      - name: Build with PyInstaller (Unix)
-        if: runner.os != 'Windows'
+      #
+      # This step runs with working-directory: gui, but main.py opens with
+      # `from gui.app import XOPTraderApp` and gui/app.py does `import gui` --
+      # absolute imports of the package that *contains* them.  From gui/ there
+      # is no gui/gui/, so the package is not importable and PyInstaller cannot
+      # follow the entry point's own imports; `--collect-submodules gui` also
+      # silently returns [] and logs it at debug level.  --paths/PYTHONPATH put
+      # the repo root on the search path so both resolve.
+      #
+      # --exclude-module: with the package importable, --collect-submodules
+      # would otherwise force-import the 10 warp test modules (~4,600 lines)
+      # into the bundle, every one of which imports pytest -- a dev-only
+      # dependency that is not installed here.
+      #
+      # This combination logs ten lines of
+      #   ERROR: Hidden import 'gui.services.warp.tests.test_*' not found
+      # which are expected and not failures: --collect-submodules enumerates
+      # them, --exclude-module then removes them, and PyInstaller reports the
+      # gap it just created.  Verified against a local build -- the resulting
+      # bundle contains no test module and no pytest.
+      #
+      # --add-data: PyInstaller bundles no non-Python file it is not told
+      # about, and four things here are read from disk rather than imported:
+      #   * the 12 .clsp.hex puzzle reveals -- clvm_utils.py resolves them as
+      #     Path(__file__).parent/"puzzles" and read_text()s them, and
+      #     drivers.py load_puzzle()s all 12 at module scope, so without them
+      #     the whole warp module raises on import;
+      #   * scripts/offer_sizing.py -- loaded by file path (gui/utils.py), so
+      #     the import graph never sees it;
+      #   * the two example configs -- first-run bootstrap copies them out.
+      # Relative sources resolve against the spec directory; no --specpath is
+      # passed, so the spec lands in gui/ and these paths are correct.
+      - name: Build with PyInstaller
         working-directory: gui
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: >
           pyinstaller
           --onefile
           --name xop_trader_gui
           --windowed
+          --paths ..
           --collect-submodules gui
+          --exclude-module gui.services.warp.tests
+          --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
+          --add-data "../scripts/offer_sizing.py:scripts"
+          --add-data "../config.example.yaml:."
+          --add-data "../secrets.example.yaml:."
           --hidden-import requests
-          ${{ matrix.icon_flag }}
+          --icon icon.${{ matrix.icon_fmt }}
           main.py
 
-      - name: Build with PyInstaller (Windows + bundled engine)
-        if: runner.os == 'Windows'
+      # ---- Prove the bundle is not dead on arrival -------------------------
+      #
+      # PyInstaller exits 0 on missing-module and missing-data warnings, and
+      # `if-no-files-found: error` on the upload only proves a file exists --
+      # so nothing downstream can tell a working bundle from a broken one.
+      #
+      # `--help` proves the gui package itself made it in: it returns through
+      # argparse, but not before main.py's module-level `from gui.app import
+      # XOPTraderApp` has run.
+      #
+      # It proves nothing about bundled DATA, though -- argparse returns at
+      # main.py's parse_args long before anything reads a file, and
+      # gui.services.warp.drivers is imported lazily, so a broken --add-data
+      # still exits 0.  --self-check is what actually covers that: it imports
+      # drivers (all 12 puzzle reveals), loads scripts/offer_sizing.py by path,
+      # and stats both example configs.
+      - name: Smoke-test the bundle
+        working-directory: gui
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          ./dist/xop_trader_gui --help
+          ./dist/xop_trader_gui --self-check
+
+      - name: Rename binary
+        run: cp gui/dist/xop_trader_gui ${{ matrix.artifact_name }}
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_name }}
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Job 2b — Python GUI for Windows
+  #
+  # The one GUI leg with a genuine dependency on build-cpp: it embeds the engine
+  # runtime DLLs and the VC redistributable staged by that job.
+  #
+  # There is no smoke-test step here.  --windowed leaves the executable no
+  # console subsystem, so sys.stdout/stderr are None and argparse's own --help
+  # handler raises.  The defect the Unix smoke test guards against (the gui
+  # package missing from the bundle) is platform-independent, so those legs
+  # cover it; a Windows-specific check needs a self-test entry point in the app.
+  # ---------------------------------------------------------------------------
+  build-gui-windows:
+    name: Python GUI (windows-latest)
+    needs: [build-cpp]
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install Python dependencies
+        working-directory: gui
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+
+      - name: Download Windows runtime bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: xop_trader-windows-runtime-x64
+          path: gui/engine-runtime
+
+      - name: Copy application icon
+        working-directory: gui
+        shell: bash
+        run: cp resources/icon.ico icon.ico
+
+      # See the Unix leg above for why --paths/PYTHONPATH, --exclude-module and
+      # --add-data are all required.
+      - name: Build with PyInstaller (bundled engine runtime)
         working-directory: gui
         shell: pwsh
+        env:
+          PYTHONPATH: ${{ github.workspace }}
         run: |
           $args = @(
             '--onefile',
             '--name', 'xop_trader_gui',
             '--windowed',
+            '--paths', '..',
             '--collect-submodules', 'gui',
+            '--exclude-module', 'gui.services.warp.tests',
+            # ';' separator to match the --add-binary calls below.
+            '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
+            '--add-data', '../scripts/offer_sizing.py;scripts',
+            '--add-data', '../config.example.yaml;.',
+            '--add-data', '../secrets.example.yaml;.',
             '--hidden-import', 'requests',
             '--icon', 'icon.ico'
           )
@@ -282,20 +434,45 @@ jobs:
           $args += 'main.py'
           pyinstaller @args
 
-      # ---- Rename dist to platform-specific name ---------------------------
-      - name: Rename binary (Unix)
-        if: runner.os != 'Windows'
-        run: cp ${{ matrix.dist_path }} ${{ matrix.artifact_name }}
-
-      - name: Rename binary (Windows)
-        if: runner.os == 'Windows'
+      # This leg had no smoke test until --self-check existed.  --windowed
+      # leaves the executable no console subsystem, so sys.stdout/stderr are
+      # None and argparse's --help handler raises -- but --self-check reports
+      # through its exit code and only writes when a stream exists, so it
+      # works here.  This is the bundle that embeds the engine and the only
+      # platform warp supports, so it is the one that most needed covering.
+      - name: Smoke-test the bundle
+        working-directory: gui
         shell: pwsh
-        run: Copy-Item "${{ matrix.dist_path }}" "${{ matrix.artifact_name }}"
+        env:
+          # No console subsystem here, so the report cannot come back on
+          # stdout -- the exe appends it to this file instead.
+          XOP_SELF_CHECK_REPORT: ${{ runner.temp }}\self-check.txt
+        run: |
+          $report = "${{ runner.temp }}\self-check.txt"
+          if (Test-Path $report) { Remove-Item $report }
+
+          # Start-Process -Wait, not the call operator.  A --windowed build is
+          # a GUI-subsystem binary, and PowerShell does not block on those: `&`
+          # returns immediately, leaving $LASTEXITCODE empty and the report
+          # unwritten, then the process runs seconds later with nothing reading
+          # its result.  That reported a passing bundle as a failure once
+          # already.
+          $exe = Join-Path (Get-Location) 'dist\xop_trader_gui.exe'
+          $proc = Start-Process -FilePath $exe -ArgumentList '--self-check' -Wait -PassThru
+
+          if (Test-Path $report) { Get-Content $report } else { Write-Host "(no report written)" }
+          if ($proc.ExitCode -ne 0) {
+            throw "bundle self-check failed with exit code $($proc.ExitCode)"
+          }
+
+      - name: Rename binary
+        shell: pwsh
+        run: Copy-Item "gui\dist\xop_trader_gui.exe" "xop_trader-gui-windows-x64.exe"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact_name }}
-          path: ${{ matrix.artifact_name }}
+          name: xop_trader-gui-windows-x64.exe
+          path: xop_trader-gui-windows-x64.exe
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
@@ -303,7 +480,7 @@ jobs:
   # ---------------------------------------------------------------------------
   build-installer:
     name: Windows Installer
-    needs: [build-cpp, build-gui]
+    needs: [build-cpp, build-gui-windows]
     runs-on: windows-latest
 
     steps:
@@ -418,8 +595,14 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Create GitHub Release
-    needs: [build-cpp, build-gui, build-installer, build-linux-bundle]
+    needs: [build-cpp, build-gui, build-gui-windows, build-installer, build-linux-bundle]
     runs-on: ubuntu-22.04
+    # Tag pushes and published-release events always publish; only a manual
+    # dispatch can opt out, so this cannot change the behaviour of a real
+    # release.  Unchecking `publish` runs the whole matrix and stops short of
+    # creating anything -- the only way to exercise this pipeline end to end
+    # without leaving a release behind.
+    if: ${{ github.event_name != 'workflow_dispatch' || inputs.publish }}
     permissions:
       contents: write   # needed to create releases and upload assets
 
@@ -593,8 +776,10 @@ jobs:
   notify-on-failure:
     name: Notify on failure
     runs-on: ubuntu-22.04
-    needs: [build-cpp, build-gui, build-installer, build-linux-bundle, release]
-    if: failure()
+    needs: [build-cpp, build-gui, build-gui-windows, build-installer, build-linux-bundle, release]
+    # A non-publishing dispatch is a deliberate pipeline test, so a failure is
+    # the expected outcome being measured, not an incident worth filing.
+    if: ${{ failure() && (github.event_name != 'workflow_dispatch' || inputs.publish) }}
     permissions:
       issues: write     # needed to create failure notification issues
 

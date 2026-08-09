@@ -20,6 +20,7 @@ from typing import Final, Optional
 
 from gui.app import XOPTraderApp
 from gui.services.engine_bridge import EngineBridge
+from gui.utils import bundle_dir, install_dir
 
 # Module-level logger.
 _log: logging.Logger = logging.getLogger(__name__)
@@ -229,6 +230,111 @@ def _kill_old_instances_posix(protected_pids: set[int]) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Bundle self-check
+# ---------------------------------------------------------------------------
+
+#: Env var naming a file the self-check appends its report to.  Set by CI on
+#: the Windows leg, where there is no console to read the report from.
+_SELF_CHECK_REPORT_ENV: Final[str] = "XOP_SELF_CHECK_REPORT"
+
+
+def _emit(message: str) -> None:
+    """Report a self-check line to wherever this build can actually write.
+
+    A ``--windowed`` PyInstaller build on Windows has no console subsystem, so
+    ``sys.stdout`` and ``sys.stderr`` are both ``None`` and a bare ``print``
+    raises.  The exit code is the contract precisely because of that -- but an
+    exit code alone cannot say WHICH resource is missing, which makes a failure
+    on that platform undiagnosable.  So when ``XOP_SELF_CHECK_REPORT`` names a
+    file, every line is appended there as well.
+    """
+    stream = sys.stdout or sys.stderr
+    if stream is not None:
+        try:
+            print(message, file=stream)
+        except (OSError, ValueError):
+            pass
+
+    report = os.environ.get(_SELF_CHECK_REPORT_ENV)
+    if report:
+        try:
+            with open(report, "a", encoding="utf-8") as handle:
+                handle.write(message + "\n")
+        except OSError:
+            pass
+
+
+def _run_self_check() -> int:
+    """Verify the resources a frozen build must carry are actually present.
+
+    Every check here covers something that lives outside the Python import
+    graph, which is exactly what PyInstaller does not pick up on its own and
+    what ``--help`` cannot detect: it returns through argparse long before any
+    of this is touched.
+
+    Returns 0 if everything resolved, 1 otherwise.  Exit code is the contract;
+    the printed lines are a convenience where a console exists.
+    """
+    frozen = bool(getattr(sys, "frozen", False))
+    failures: list[str] = []
+
+    def _fail(label: str, exc: BaseException) -> None:
+        failures.append(f"{label}: {exc!r}")
+        _emit(f"FAIL {label}: {exc!r}")
+        # A bare repr cannot place a failure inside a frozen import chain --
+        # the useful frame is usually several levels down in the package being
+        # checked, and a missing transitive dependency names only itself.
+        import traceback
+        for line in traceback.format_exc().rstrip().splitlines():
+            _emit(f"     | {line}")
+
+    def _check(label: str, fn, *, optional_deps: bool = False) -> None:
+        try:
+            fn()
+        except ModuleNotFoundError as exc:
+            # A source checkout without the optional warp wheels is a
+            # legitimate state; the same gap inside a bundle is a defect.
+            if optional_deps and not frozen:
+                _emit(f"SKIP {label}: {exc.name} not installed (source checkout)")
+                return
+            _fail(label, exc)
+        except Exception as exc:  # noqa: BLE001 -- report, never propagate
+            _fail(label, exc)
+        else:
+            _emit(f"OK   {label}")
+
+    # The 12 .clsp.hex puzzle reveals: drivers.py load_puzzle()s all of them at
+    # module scope, so importing it is a complete test of --add-data for them.
+    def _warp_drivers() -> None:
+        import importlib
+        importlib.import_module("gui.services.warp.drivers")
+
+    # scripts/offer_sizing.py, loaded by file path rather than imported.
+    def _offer_sizing() -> None:
+        from gui.utils import load_offer_sizing
+        load_offer_sizing()
+
+    def _example(name: str):
+        def _check_example() -> None:
+            if not (bundle_dir() / name).is_file():
+                raise FileNotFoundError(bundle_dir() / name)
+        return _check_example
+
+    _emit(f"xop_trader_gui self-check (frozen={frozen}, bundle={bundle_dir()})")
+    _check("warp puzzle reveals (gui.services.warp.drivers)", _warp_drivers,
+           optional_deps=True)
+    _check("offer sizing calculator (scripts/offer_sizing.py)", _offer_sizing)
+    _check(f"{_EXAMPLE_CONFIG_NAME}", _example(_EXAMPLE_CONFIG_NAME))
+    _check(f"{_EXAMPLE_SECRETS_NAME}", _example(_EXAMPLE_SECRETS_NAME))
+
+    if failures:
+        _emit(f"self-check FAILED ({len(failures)} of 4)")
+        return 1
+    _emit("self-check passed")
+    return 0
+
+
+# ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
 
@@ -269,6 +375,16 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         default=False,
         help="Launch in read-only mode (no orders placed).",
+    )
+    parser.add_argument(
+        "--self-check",
+        action="store_true",
+        default=False,
+        help=(
+            "Verify that bundled resources (warp puzzle reveals, offer-sizing "
+            "calculator, example configs) resolved, then exit 0 or 1 without "
+            "starting the GUI."
+        ),
     )
     parser.add_argument(
         "--font-size",
@@ -343,19 +459,20 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
         return
 
     # Candidate locations for the example config.
-    app_dir = Path(__file__).resolve().parent
-    project_dir = app_dir.parent
+    #
+    # These used to be derived from Path(__file__).parent, which under a
+    # one-file build resolves inside _MEIPASS -- making the "project"
+    # candidate the *system temp directory*, i.e. a location any local user
+    # can write.  A planted /tmp/config.example.yaml would then have been
+    # copied in as the operator's config on first run.  bundle_dir() and
+    # install_dir() resolve correctly frozen and unfrozen, and no candidate
+    # is a shared temp root.
     candidates = [
         target.parent / _EXAMPLE_CONFIG_NAME,
         Path.cwd() / _EXAMPLE_CONFIG_NAME,
-        project_dir / _EXAMPLE_CONFIG_NAME,
-        app_dir / _EXAMPLE_CONFIG_NAME,
+        install_dir() / _EXAMPLE_CONFIG_NAME,
+        bundle_dir() / _EXAMPLE_CONFIG_NAME,
     ]
-
-    # PyInstaller one-file bundles extract files under _MEIPASS.
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        candidates.append(Path(meipass) / _EXAMPLE_CONFIG_NAME)
     for example in candidates:
         if example.is_file():
             # Ensure the destination directory exists when --config points
@@ -417,7 +534,10 @@ def _bootstrap_config_info(config_path: Optional[Path]) -> tuple[Path, bool]:
     # Also bootstrap secrets.yaml from secrets.example.yaml if it doesn't exist.
     secrets_target = target.parent / _DEFAULT_SECRETS_NAME
     if not secrets_target.is_file():
-        for candidate_dir in [target.parent, Path.cwd(), Path(__file__).resolve().parent.parent]:
+        # Same reasoning as _bootstrap_config: the old third candidate was the
+        # system temp root under a frozen build, and this one writes a file the
+        # operator is told to put credentials in.
+        for candidate_dir in [target.parent, Path.cwd(), install_dir(), bundle_dir()]:
             example = candidate_dir / _EXAMPLE_SECRETS_NAME
             if example.is_file():
                 try:
@@ -688,6 +808,12 @@ def main() -> None:
     """Parse arguments, create the application, and enter the event loop."""
     args = _build_parser().parse_args()
 
+    # Before anything with a side effect -- no logging setup, no killing of
+    # other instances, no config bootstrap.  A build verification must not
+    # touch the machine it runs on.
+    if args.self_check:
+        raise SystemExit(_run_self_check())
+
     # Configure basic logging early so _kill_old_instances can log.
     # When launched via pythonw.exe stderr is discarded, so also attach a
     # rotating file handler under logs/ so INFO/DEBUG messages remain
@@ -698,7 +824,10 @@ def main() -> None:
     )
     try:
         from logging.handlers import RotatingFileHandler
-        logs_dir = Path(__file__).resolve().parent.parent / "logs"
+        # install_dir(), not parent.parent: frozen, that resolved to the system
+        # temp root, so gui.log landed in /tmp/logs and vanished with the temp
+        # directory -- exactly when post-hoc diagnostics are wanted.
+        logs_dir = install_dir() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         _fh = RotatingFileHandler(
             logs_dir / "gui.log",

@@ -8,7 +8,44 @@ ISO/IEC 5055 -- bounded arithmetic, explicit integer division constant.
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
 from typing import Any, Mapping, Optional
+
+
+# ---------------------------------------------------------------------------
+# Filesystem roots
+# ---------------------------------------------------------------------------
+#
+# Under a PyInstaller one-file build, ``Path(__file__).parent`` points inside
+# ``sys._MEIPASS`` -- a per-run temp directory that is deleted on exit.  That
+# makes it right for reading bundled resources and wrong for everything else,
+# so the two cases get separate helpers rather than one shared guess.
+
+
+def bundle_dir() -> Path:
+    """Root for read-only resources shipped alongside the code.
+
+    Frozen: PyInstaller's extraction root, where ``--add-data`` places files.
+    Source checkout: the repository root.
+    """
+    meipass = getattr(sys, "_MEIPASS", None)
+    return Path(meipass) if meipass else Path(__file__).resolve().parents[1]
+
+
+def install_dir() -> Path:
+    """Root for files the user owns -- config, secrets, logs, database.
+
+    Frozen: the directory holding the executable.  Deliberately NOT
+    ``_MEIPASS``: that is discarded when the process exits, so anything
+    written there is lost, and its parent is the world-writable system temp
+    directory, which must never be searched for configuration.
+    Source checkout: the repository root.
+    """
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[1]
+
 
 # 1 XCH = 10^12 mojos.  CAT tokens use 10^3 mojos per unit.
 MOJOS_PER_XCH: int = 1_000_000_000_000
@@ -115,14 +152,14 @@ def load_offer_sizing():
     config.yaml, the engine database and dexie.
     """
     import importlib.util
-    import sys
-    from pathlib import Path
 
     name = "xop_offer_sizing"
     existing = sys.modules.get(name)
     if existing is not None:
         return existing
-    path = Path(__file__).resolve().parents[1] / "scripts" / "offer_sizing.py"
+    # bundle_dir(), not parents[1]: frozen, this file lives under _MEIPASS and
+    # scripts/ is only there because release.yml --add-data puts it there.
+    path = bundle_dir() / "scripts" / "offer_sizing.py"
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module

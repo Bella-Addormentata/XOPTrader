@@ -6,6 +6,12 @@ PyYAML>=6.0,<7
 # Comment-preserving config writes (gui/services/config_split.py).
 ruamel.yaml>=0.18,<0.19
 requests>=2.31.0,<3
+# gui/services/__init__.py imports UpdateService eagerly, and
+# gui/services/update_service.py imports packaging.version at module scope --
+# so a missing `packaging` is a hard GUI boot failure, not a lazy one.  Nothing
+# else here pulls it in transitively; the release build only survives because
+# `pip install pyinstaller` happens to require it.
+packaging>=23.0
 # warp.green bridge (gui/services/warp) — imported lazily; GUI boots without them.
 web3>=7,<8
 clvm>=0.9.10,<1

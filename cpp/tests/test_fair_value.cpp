@@ -43,6 +43,7 @@
 #include <limits>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace xop {
@@ -757,7 +758,7 @@ TEST_F(FairValueTest, ExpiredValueIsReportedAsAbsentNotStale) {
     feed_->ingest_fair_value("XCH/DBX", in);
 
     // Any measurable elapsed time exceeds a 1 microsecond budget.
-    for (volatile int i = 0; i < 100000; ++i) { /* burn a little wall clock */ }
+    std::this_thread::sleep_for(std::chrono::milliseconds(1));
 
     EXPECT_FALSE(feed_->get_fair_value("XCH/DBX").has_value());
     EXPECT_FALSE(feed_->get_fair_value_residual_bps("XCH/DBX").has_value());

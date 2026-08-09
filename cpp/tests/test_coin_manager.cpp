@@ -20,14 +20,24 @@ TEST(CoinManagerTest, PoolReadyBandUsesHalfToDoubleTarget) {
 
 TEST(CoinManagerTest, CountPoolReadyCoinsIgnoresTinyAndOversizedCoins) {
     const Mojo target = 500'000'000'000LL;
+
+    // Only the amount participates in the pool-ready predicate; the identity
+    // fields are left value-initialised.  Naming just `.amount` in a braced
+    // initialiser trips -Wmissing-field-initializers under GCC.
+    const auto coin = [](Mojo amount) {
+        CoinInfo c{};
+        c.amount = amount;
+        return c;
+    };
+
     const std::vector<CoinInfo> coins = {
-        {.amount = 530'532'825LL},
-        {.amount = 66'982'204'562LL},
-        {.amount = 250'000'000'000LL},
-        {.amount = 500'000'000'000LL},
-        {.amount = 750'000'000'000LL},
-        {.amount = 1'000'000'000'000LL},
-        {.amount = 13'000'000'000'000LL},
+        coin(530'532'825LL),
+        coin(66'982'204'562LL),
+        coin(250'000'000'000LL),
+        coin(500'000'000'000LL),
+        coin(750'000'000'000LL),
+        coin(1'000'000'000'000LL),
+        coin(13'000'000'000'000LL),
     };
 
     EXPECT_EQ(CoinManager::count_pool_ready_coins(coins, target), 4U);
