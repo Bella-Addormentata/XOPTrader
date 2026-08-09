@@ -467,6 +467,276 @@ def derive_wrapped_asset_id(net: WarpNet) -> bytes:
     return cu.sha256tree(tail)
 
 
+# --------------------------------------------------------------------------- #
+# Burn bundle (unwrap: wUSDC.b -> USDC; drivers/wrapped_assets.py burn path).
+#
+# Every structural fact here was pinned by evaluating the vendored bytecode
+# and replaying a real mainnet unwrap (the fixture in
+# tests/fixtures_unwrap.json): curry orders, solution arities, the
+# announcement interlock, and the offline nonce.
+# --------------------------------------------------------------------------- #
+
+def _pad_token(token: bytes) -> bytes:
+    """Left-pad the source token contract to 32 bytes.
+
+    The burn inner puzzle's first curry commits the 32-byte form -- proven by
+    uncurrying the real burn CAT's inner puzzle, whose curried argument equals
+    the padded hash and NOT the 20-byte variant. Mirrors get_wrapped_tail.
+    """
+    if len(token) < 32:
+        return b"\x00" * (32 - len(token)) + token
+    return token
+
+
+def get_cat_burn_inner_puzzle(
+    destination_chain: bytes,
+    destination: bytes,
+    source_chain_token_contract_address: bytes,
+    receiver: bytes,
+    bridge_toll_mojos: int,
+) -> SExp:
+    """The burn CAT's inner puzzle: second curry over the first.
+
+    ``receiver`` is the Base address the released USDC pays -- curried in, so
+    even a third party who pushes the burn pays *us*. ``bridge_toll_mojos``
+    (BRIDGE_FEE upstream) must equal the cat_burner coin's amount: the
+    announcement interlock computes the cat_burner coin id with it, so a
+    mismatch makes the bundle structurally unspendable.
+    """
+    first = get_cat_burn_inner_puzzle_first_curry(
+        destination_chain,
+        destination,
+        _pad_token(source_chain_token_contract_address),
+    )
+    return cu.curry(first, receiver, bridge_toll_mojos)
+
+
+def get_burn_inner_puzzle_solution(
+    cat_burner_parent_id: bytes,
+    my_coin_id: bytes,
+    tail_reveal,
+) -> SExp:
+    """Arity 3: (cat_burner_parent_id, my_coin_id, tail_reveal).
+
+    ``cat_burner_parent_id`` is the SECURITY coin's id (the cat_burner coin's
+    parent), NOT the source CAT's -- the two parent fields in this bundle are
+    an easy swap and a swapped pair builds an unspendable bundle (announcement
+    mismatch). The vendored bytecode raises on a non-32-byte parent id.
+    """
+    if len(cat_burner_parent_id) != 32:
+        raise WarpDriverError(
+            f"cat_burner parent id must be 32 bytes, got {len(cat_burner_parent_id)}"
+        )
+    if len(my_coin_id) != 32:
+        raise WarpDriverError(f"my_coin_id must be 32 bytes, got {len(my_coin_id)}")
+    return SExp.to([cat_burner_parent_id, my_coin_id, tail_reveal])
+
+
+def get_cat_burner_puzzle_solution(
+    cat_parent_info: bytes,
+    tail_hash: bytes,
+    cat_amount: int,
+    source_chain_token_contract_address: bytes,
+    receiver: bytes,
+    my_coin: Coin,
+) -> SExp:
+    """Arity 8; the second field is the PRE-HASHED ``sha256(0x01 || tail_hash)``.
+
+    ``cat_parent_info`` here is the SOURCE CAT coin's id (the burn CAT's
+    parent) -- the mirror of the swap hazard documented on the burn inner
+    solution. The puzzle re-derives the burn CAT's full coin id from these
+    fields via the same curry-hash chain as :func:`curry_hashes`, so any
+    disagreement with the coin actually on chain fails the announcement.
+    """
+    return get_cat_burner_puzzle_solution_prehashed(
+        cat_parent_info,
+        cu.raw_hash(b"\x01", tail_hash),
+        cat_amount,
+        source_chain_token_contract_address,
+        receiver,
+        my_coin,
+    )
+
+
+def get_cat_burner_puzzle_solution_prehashed(
+    cat_parent_info: bytes,
+    tail_hash_treehash: bytes,
+    cat_amount: int,
+    source_chain_token_contract_address: bytes,
+    receiver: bytes,
+    my_coin: Coin,
+) -> SExp:
+    """As above, with the TAIL's tree hash supplied directly.
+
+    The puzzle only ever sees ``sha256(0x01 || tail_hash)``; splitting the
+    builder lets the golden tests reproduce a real third-party unwrap whose
+    TAIL preimage we do not hold.
+    """
+    return SExp.to([
+        cat_parent_info,
+        tail_hash_treehash,
+        cat_amount,
+        _pad_token(source_chain_token_contract_address),
+        receiver,
+        my_coin.amount,
+        my_coin.puzzle_hash,
+        my_coin.name(),
+    ])
+
+
+@dataclass(frozen=True)
+class BurnRequest:
+    """Everything :func:`build_burn_bundle` needs, resolved by the caller."""
+
+    net: object                       # WarpNet
+    burn_cat_coin: Coin               # the coin cat_spend created at the burn inner PH
+    cat_lineage_proof: object         # CAT lineage proof list for burn_cat_coin's parent
+    security_coin: Coin               # ephemeral toll coin (amount == chia_toll_mojos)
+    security_sk: bytes                # its raw BLS secret key
+    receiver: bytes                   # 20-byte Base address the USDC pays
+
+
+@dataclass(frozen=True)
+class BurnBundle:
+    bundle: SpendBundle
+    nonce: bytes                      # the bridging coin's id, computed OFFLINE
+    cat_burner_coin: Coin
+    bridging_coin: Coin
+
+
+def expected_burn_inner_puzzle_hash(net, receiver: bytes) -> bytes:
+    """Where ``cat_spend`` must deliver the wUSDC.b -- THE commit point.
+
+    Once a coin sits at this inner puzzle hash its only possible future is
+    destruction into a message paying ``receiver``. Every gate runs before
+    the spend that targets this.
+    """
+    inner = get_cat_burn_inner_puzzle(
+        b"bse",
+        bytes.fromhex(net.erc20_bridge_address[2:]),
+        bytes.fromhex(net.usdc_address[2:]),
+        receiver,
+        net.chia_toll_mojos,
+    )
+    return cu.sha256tree(inner)
+
+
+def build_burn_bundle(req: BurnRequest) -> BurnBundle:
+    """Assemble the four-spend burn: security, burn CAT, cat_burner, bridging.
+
+    The doc's five-spend table counts the daemon's own ``cat_spend`` -- that
+    one has already happened by the time this runs, and is the irreversible
+    step. This bundle is re-buildable and re-pushable at will: the nonce (the
+    bridging coin's id) is a pure function of its inputs, so a resumed job
+    recomputes the identical bundle.
+    """
+    net = req.net
+    toll = int(net.chia_toll_mojos)
+    if req.security_coin.amount != toll:
+        raise WarpDriverError(
+            f"security coin amount {req.security_coin.amount} != toll {toll}"
+        )
+    if len(req.receiver) != 20:
+        raise WarpDriverError(f"receiver must be 20 bytes, got {len(req.receiver)}")
+
+    bridge20 = bytes.fromhex(net.erc20_bridge_address[2:])
+    token20 = bytes.fromhex(net.usdc_address[2:])
+    tail_hash = bytes.fromhex(net.expected_asset_id)
+
+    # The burn CAT: outer = cat_v2(tail, burn inner). Verify the coin we were
+    # handed actually sits at the puzzle this bundle is about to reveal --
+    # a mismatch means the cat_spend went somewhere else entirely.
+    burn_inner = get_cat_burn_inner_puzzle(b"bse", bridge20, token20, req.receiver, toll)
+    burn_cat_puzzle = construct_cat_puzzle(tail_hash, burn_inner)
+    if cu.sha256tree(burn_cat_puzzle) != req.burn_cat_coin.puzzle_hash:
+        raise WarpDriverError(
+            "burn CAT coin is not at the expected cat_v2(burn inner) puzzle hash"
+        )
+
+    # The cat_burner coin is created by the security coin; the bridging coin
+    # by the cat_burner. Both ids -- and therefore the message nonce -- are
+    # computable before anything is pushed.
+    burn_ph = bytes.fromhex(net.burn_puzzle_hash)
+    cat_burner_coin = Coin(req.security_coin.name(), burn_ph, toll)
+    bridging_ph = bytes.fromhex(net.bridging_puzzle_hash)
+    bridging_coin = Coin(cat_burner_coin.name(), bridging_ph, toll)
+
+    # 1. Security spend: fund the cat_burner coin, and refuse to be spent in
+    # any block that does not also spend it (the toll cannot be stranded).
+    conditions = [
+        [CREATE_COIN, burn_ph, toll],
+        [ASSERT_CONCURRENT_SPEND, cat_burner_coin.name()],
+    ]
+    security_spend, sig = build_security_coin_spend(
+        req.security_coin,
+        conditions,
+        req.security_sk,
+        bytes.fromhex(net.agg_sig_extra_data),
+    )
+
+    # 2. Burn CAT spend: ring of one, extra_delta = -amount (the CAT-v2 magic
+    # that lets supply shrink), no signature -- the burn inner is announcement
+    # -locked to the cat_burner, not key-locked.
+    tail_reveal = get_wrapped_tail(
+        bytes.fromhex(net.portal_launcher_id),
+        net.source_chain.encode(),
+        bridge20,
+        token20,
+    )
+    inner_solution = get_burn_inner_puzzle_solution(
+        req.security_coin.name(),          # cat_burner's parent == security coin
+        req.burn_cat_coin.name(),
+        tail_reveal,
+    )
+    burn_cat_spend = CoinSpend(
+        req.burn_cat_coin,
+        burn_cat_puzzle,
+        get_cat_solution(
+            inner_solution,
+            req.cat_lineage_proof,
+            req.burn_cat_coin.name(),      # ring of one: prev == this == next
+            req.burn_cat_coin,
+            req.burn_cat_coin,
+            0,
+            -req.burn_cat_coin.amount,
+        ),
+    )
+
+    # 3. cat_burner spend: emits the message (the bridging coin) and
+    # re-derives the burn CAT's id from scratch -- contents cannot disagree
+    # with the coin actually burned.
+    cat_burner_spend = CoinSpend(
+        cat_burner_coin,
+        get_cat_burner_puzzle(b"bse", bridge20),
+        get_cat_burner_puzzle_solution(
+            req.burn_cat_coin.parent_coin_info,   # the SOURCE CAT's id
+            tail_hash,
+            req.burn_cat_coin.amount,
+            token20,
+            req.receiver,
+            cat_burner_coin,
+        ),
+    )
+
+    # 4. Bridging spend: ASSERT_MY_AMOUNT + RESERVE_FEE my_amount -- the toll
+    # becomes the bundle's mempool fee and is burned to farmers.
+    bridging_spend = CoinSpend(
+        bridging_coin,
+        BRIDGING_PUZZLE,
+        SExp.to([toll]),
+    )
+
+    return BurnBundle(
+        bundle=SpendBundle(
+            coin_spends=[security_spend, burn_cat_spend, cat_burner_spend, bridging_spend],
+            aggregated_signature=aggregate_sigs([sig]),
+        ),
+        nonce=bridging_coin.name(),
+        cat_burner_coin=cat_burner_coin,
+        bridging_coin=bridging_coin,
+    )
+
+
 def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
     """Refuse-to-start anchor: the derived asset id must match what is expected.
 
