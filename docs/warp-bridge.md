@@ -287,7 +287,8 @@ message stays claimable forever — through warp.green's own portal if necessary
   **ignoring `min_auto_bridge_usdc`** but still honouring `max_auto_bridge_usdc`.
   That is what lets you test with $5 without lowering the threshold that arms
   auto-bridge. Disabled while a job is already active — including a **failed**
-  one, which holds the slot until you Retry or Sweep it. The button tooltip says
+  one, which holds the slot until you Retry, Sweep or Abandon it. The button
+  tooltip says
   which case applies.
 - **Where funds land:** `chia_receiver_address` if set, otherwise the bot's own
   Chia wallet address.
@@ -323,11 +324,20 @@ Right-click a job in the table:
   is how you get the XCH back. Sweep is re-runnable.
 
 A **FAILED** job deliberately holds the single active-job slot until you resolve
-it, so a failure can't be silently buried under a new job. **Sweep is the escape:**
+it, so a failure can't be silently buried under a new job. **Sweep is the usual escape:**
 a sweep that *resolves* — the coin was recovered, was already spent, or never
 existed — moves the job to **Cancelled** and frees the slot. A sweep that could
 not reach the chain leaves the job FAILED so you can try again with the funds
 still known recoverable.
+
+Some failures cannot be swept at all. The three attested-terms anchors run
+*after* `bridgeToChia` confirms and *before* the ephemeral key is minted, so a
+job that trips one has a bridge nonce and no security coin: Sweep raises,
+Cancel is refused, and Retry re-fails against the same immutable attestation.
+For those, use **Abandon job**. It records the unclaimed nonce and the portal
+recovery details in the job's audit log, then closes the job and frees the
+slot. No funds are lost: the message stays claimable at the portal, which is
+exactly why the details are written down before the row is closed.
 
 **The core guarantee:** an attested warp.green message is claimable forever. If a
 job is stuck after the bridge confirmed, the USDC is not lost — it is waiting to
@@ -347,7 +357,7 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `base_rpc_url` | `https://mainnet.base.org` | Base JSON-RPC endpoint. A private Alchemy/Infura key is more reliable. Blank ⇒ network default. |
 | `auto_bridge` | `false` | Automatically bridge deposits at/above `min_auto_bridge_usdc`. |
 | `min_auto_bridge_usdc` | `100` | **Auto-bridge floor only.** "Bridge now" ignores it and bridges any positive balance. |
-| `max_auto_bridge_usdc` | `10000` | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. |
+| `max_auto_bridge_usdc` | *required* | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. There is no default: with `warp.enabled: true` the bridge refuses to start unless this is set, because an absent value previously meant *no cap*, not `10000`. Set `unlimited` to allow any balance. |
 | `claim_fee_mojos` | `100000000` | XCH fee reserved for the Chia claim spend (0.0001 XCH). |
 | `chia_funding_fee_mojos` | `0` | Extra fee on the wallet→claim funding send. |
 | `poll_interval_s` | `15` | How long a healthy "still waiting" step sleeps before it is re-checked. The GUI's own tick cadence (~30 s) is separate and not configurable here. |
@@ -404,7 +414,9 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
   that never reached the chain can still be cancelled.
 - **"Bridge now" is greyed out with a failed job in the table** — that failed job
   holds the single active-job slot by design. Retry it, or Sweep it to recover
-  the funding coin and close it.
+  the funding coin and close it. If the job has no security coin to sweep
+  (an attested-terms anchor failed), use **Abandon job** — Sweep and Retry
+  cannot resolve that one, and it would otherwise hold the slot forever.
 - **Balances show "unavailable"** — the Base RPC is unreachable or rate-limiting.
   Set a private `base_rpc_url`.
 - **Low-gas warning** — top up the hot wallet's ETH on Base.

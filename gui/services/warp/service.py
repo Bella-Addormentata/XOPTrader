@@ -114,6 +114,47 @@ _BRIDGE_MAX_ATTEMPTS: int = 2
 # we cannot see, and looping forever would leave the operator with no escape
 # (neither Sweep nor Cancel is offered in CLAIMING). Fail into FAILED, which is.
 _CLAIM_CONFLICT_MAX_ROUNDS: int = 10
+# Receipts that carry no usable status. Base is post-Byzantium so this should
+# never happen; if it does, it means we cannot tell success from revert, and
+# guessing either way is worse than handing the job to the operator.
+_AMBIGUOUS_RECEIPT_POLLS: int = 5
+# Polls of an unmined bridge before re-signing it at a higher fee. Base blocks
+# every ~2s, so a correctly-priced transaction mines almost immediately; this is
+# deliberately generous before spending more on gas.
+_STUCK_TX_POLLS: int = 20
+# Fee escalations before giving up. bump_fees caps its own multiplier at 3, so
+# beyond that a further attempt would re-sign at an identical fee and be
+# rejected as a non-replacement.
+_MAX_FEE_BUMPS: int = 3
+
+# How long a job may sit pending in a given state before it is handed to the
+# operator. _apply_stay resets retry_count and clears last_error on every pend
+# -- correctly, since nothing moved -- but that also made these loops invisible
+# and unbounded. None of these states offers Cancel, Retry is a no-op on a
+# non-FAILED job, and Sweep closes only FAILED, so a job stuck here held the
+# single active slot forever. FAILED is the one status with affordances, so
+# expiry routes there rather than nowhere.
+#
+# Counted in polls rather than wall time, matching _CLAIM_CONFLICT_MAX_ROUNDS
+# and _STUCK_TX_POLLS above. Times below assume the default 15s poll interval.
+#
+# Deliberately generous: every one of these waits on somebody else's
+# infrastructure (the warp.green watcher, the validator quorum, a Chia block),
+# and failing a live bridge early is worse than waiting too long.
+_PENDING_MAX_POLLS: Dict[str, int] = {
+    JobStatus.MESSAGE_SENT: 1440,       # ~6h -- watcher indexing the message
+    JobStatus.COLLECTING_SIGS: 1440,    # ~6h -- validator quorum
+    JobStatus.FUNDING_CLAIM: 480,       # ~2h -- a Chia send confirming
+    JobStatus.CLAIM_FUNDED: 480,        # ~2h -- the funding coin reaching depth
+    JobStatus.CLAIMING: 1440,           # ~6h -- the final CAT coin appearing
+    JobStatus.BRIDGE_CONFIRMED: 480,    # ~2h -- Base confirmation depth
+    # BRIDGING bounds its own pend paths (_STUCK_TX_POLLS, revert attempts,
+    # ambiguous-receipt polls), but a persistent transport error loops through
+    # _apply_retry and would otherwise never expire. Failing out of BRIDGING is
+    # safe: _retry_tx_reset keeps the raw while the nonce is live, and Abandon
+    # refuses while a signed bridge could still mine.
+    JobStatus.BRIDGING: 480,            # ~2h -- Base RPC unreachable
+}
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
@@ -124,6 +165,22 @@ _MIN_GAS_WEI: int = 300_000_000_000_000  # 0.0003 ETH
 _CANCELLABLE = frozenset(
     {JobStatus.AWAITING_DEPOSIT, JobStatus.DEPOSIT_SEEN, JobStatus.APPROVING}
 )
+
+# Stand-in for a funding transaction the wallet accepted without returning an
+# id. What matters downstream is not the id itself -- the security coin is
+# located by puzzle hash and amount -- but that ``funding_tx_id`` stays truthy,
+# because that is the flag saying "already sent, do not send again".
+_FUNDING_TX_UNKNOWN: str = "sent-id-unknown"
+
+# The only two states whose behaviour depends on whether the job is a rehearsal.
+# Everywhere else the flag is never consulted, so a row that predates the freeze
+# is harmless there and must not be refused.
+_DRY_RUN_SENSITIVE = frozenset({JobStatus.APPROVING, JobStatus.BRIDGING})
+
+# Sweep spends the job's own ephemeral security coin, which is an input to the
+# claim the state machine may still be assembling. Only safe once the machine
+# has stopped: FAILED (the operator's escape) or COMPLETED (nothing left).
+_SWEEPABLE = frozenset({JobStatus.FAILED, JobStatus.COMPLETED})
 
 
 # --------------------------------------------------------------------------- #
@@ -176,7 +233,46 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     net = constants.MAINNET
     scale = 10 ** int(net.usdc_decimals)
     min_usdc = float(warp.get("min_auto_bridge_usdc", 0) or 0)
-    max_usdc = float(warp.get("max_auto_bridge_usdc", 0) or 0)
+
+    # [WARP-CAP-FAIL-OPEN 2026-08-08] The cap must be stated, not inferred.
+    # This resolved absent / commented-out / 0 / null all to 0, and the clamp
+    # is guarded on `if p.max_micros > 0` -- so a missing cap meant NO cap.
+    # Bridge now takes no amount argument and has no confirmation dialog, and
+    # the manual path deliberately skips the floor with want = have, so one
+    # click bridged the entire hot-wallet balance. The key is not exposed in
+    # any settings widget either, so it can only be hand-edited.
+    # Only enforced when the bridge is actually on: a disabled warp section
+    # must not stop the GUI from loading a config.
+    enabled = bool(warp.get("enabled", False))
+    raw_cap = warp.get("max_auto_bridge_usdc", None)
+    blank_cap = raw_cap is None or str(raw_cap).strip() == ""
+    if enabled and blank_cap:
+        raise WarpError(
+            "warp.max_auto_bridge_usdc is required when warp.enabled is true: "
+            "it is the blast radius for both auto-bridging and the Bridge now "
+            "button, and an absent value meant no limit at all. Set a number, "
+            "or 'unlimited' to state explicitly that any balance may be bridged"
+        )
+    if blank_cap or str(raw_cap).strip().lower() == "unlimited":
+        max_usdc = 0.0                      # 0 == uncapped
+    else:
+        max_usdc = float(raw_cap or 0)
+        if max_usdc <= 0:
+            if enabled:
+                raise WarpError(
+                    f"warp.max_auto_bridge_usdc must be positive (got {raw_cap!r}); "
+                    "use 'unlimited' if no cap is genuinely intended"
+                )
+            max_usdc = 0.0
+        elif enabled and int(round(max_usdc * scale)) <= 0:
+            # A stated cap below half a micro-USDC rounds to 0 micros, and the
+            # clamp is guarded on max_micros > 0 -- so a tiny positive cap
+            # would silently mean NO cap, the exact fail-open this key was
+            # made mandatory to prevent.
+            raise WarpError(
+                f"warp.max_auto_bridge_usdc of {raw_cap!r} rounds to zero "
+                "micro-USDC and would disable the cap; set at least 0.000001"
+            )
     return WarpParams(
         enabled=bool(warp.get("enabled", False)),
         dry_run=bool(warp.get("dry_run", True)),
@@ -337,6 +433,7 @@ class WarpEngine:
         # Cached wallet-derived receiver, so snapshot() never does I/O and we
         # never burn a fresh derivation index per call: (address, source, ph_hex).
         self._receiver_cache: Optional[tuple] = None
+        self._sweep_dest_cache: Optional[bytes] = None
         self._receiver_snap: Optional[Dict[str, Any]] = None
 
         self._HANDLERS: Dict[str, Callable[[WarpJob], _Step]] = {
@@ -407,6 +504,10 @@ class WarpEngine:
         if handler is None:
             return _job_dict(job)
 
+        expired = self._pending_expired(job)
+        if expired is not None:
+            return self._apply_terminal(job, WarpTerminal(expired))
+
         try:
             result = handler(job)
         except WarpPending as exc:
@@ -440,15 +541,40 @@ class WarpEngine:
         if result.columns:
             columns.update(result.columns)
         message = result.message or f"{job.status} -> {result.next_status}"
+        # A new state starts its own count; see _pending_expired.
+        state = dict(result.state or {})
+        state["pending_polls"] = 0
         updated = self._store.update_job(
             job.id,
             status=result.next_status,
             expected_status=job.status,
             columns=columns,
-            state_patch=result.state,
+            state_patch=state,
             event=("transition", message, None),
         )
         return _job_dict(updated)
+
+    def _pending_expired(self, job: WarpJob) -> Optional[str]:
+        """Why this job has pended too long in its current state, or ``None``."""
+        limit = _PENDING_MAX_POLLS.get(job.status)
+        if limit is None:
+            return None
+        polls = int(job.state.get("pending_polls") or 0)
+        if polls < limit:
+            return None
+        hours = polls * float(self._params.poll_interval_s) / 3600.0
+        # No Sweep suggestion for the Base-side states: they have no funding
+        # coin, and pointing the operator at Sweep there aimed them straight at
+        # the close-over-a-live-bridge hazard the sweep guard now blocks.
+        remedy = (
+            "Retry re-attempts it"
+            if job.status in (JobStatus.BRIDGING, JobStatus.BRIDGE_CONFIRMED)
+            else "Retry re-attempts it, Sweep recovers the funding coin"
+        )
+        return (
+            f"no progress in {job.status} after {polls} polls (~{hours:.1f}h); "
+            f"handing over to the operator -- {remedy}"
+        )
 
     def _apply_stay(self, job: WarpJob, result: _Step) -> dict:
         """Healthy stay/pending: schedule the next poll, clear any prior error."""
@@ -459,12 +585,17 @@ class WarpEngine:
         }
         if result.columns:
             columns.update(result.columns)
+        state = dict(result.state or {})
+        # Count pends in a deadline-bearing state. Reset on every advance, so
+        # this measures time in *this* state rather than the age of the job.
+        if job.status in _PENDING_MAX_POLLS:
+            state["pending_polls"] = int(job.state.get("pending_polls") or 0) + 1
         event = ("progress", result.message, None) if result.message else None
         updated = self._store.update_job(
             job.id,
             expected_status=job.status,
             columns=columns,
-            state_patch=result.state,
+            state_patch=state or None,
             event=event,
         )
         return _job_dict(updated)
@@ -474,6 +605,16 @@ class WarpEngine:
         n = int(job.retry_count or 0) + 1
         delay = min(_BACKOFF_BASE_S * (2 ** (n - 1)), _BACKOFF_CAP_S)
         message = str(exc)[:500]
+        # A retryable error counts toward the state's deadline too. Only
+        # _apply_stay advanced the counter, so a state that kept *erroring*
+        # rather than pending never expired -- and the push allow-list added on
+        # this branch turns an unrecognised claim rejection into exactly that
+        # kind of loop.
+        state = (
+            {"pending_polls": int(job.state.get("pending_polls") or 0) + 1}
+            if job.status in _PENDING_MAX_POLLS
+            else None
+        )
         updated = self._store.update_job(
             job.id,
             expected_status=job.status,
@@ -482,6 +623,7 @@ class WarpEngine:
                 "last_error": message,
                 "next_retry_at": repr(self._now() + delay),
             },
+            state_patch=state,
             event=("error", message, None),
         )
         return _job_dict(updated)
@@ -494,7 +636,14 @@ class WarpEngine:
             status=JobStatus.FAILED,
             expected_status=job.status,
             columns={"last_error": message, "next_retry_at": None},
-            state_patch={"failed_from": job.status},
+            # Clear the pending counter with the failure. _pending_expired runs
+            # before the handler and only _apply resets the counter, so a job
+            # failed by the deadline kept it at the limit: Retry restored the
+            # status and the very next tick re-expired it. That made Retry a
+            # dead button for all five deadline states -- and pushed the
+            # operator toward Sweep, which on a CLAIMING job with a pushed
+            # claim bundle would race the bot's own claim for the same coin.
+            state_patch={"failed_from": job.status, "pending_polls": 0},
             event=("failed", message, None),
         )
         return _job_dict(updated)
@@ -614,7 +763,7 @@ class WarpEngine:
         # Rehearsal stop: the allowance approve is signed and durable, but never
         # broadcast. Skip straight to BRIDGING so the dry run also exercises
         # prepare_bridge (live toll, gas estimate, encoding, signing).
-        if self._params.dry_run:
+        if self._job_dry_run(job):
             return _advance(
                 JobStatus.BRIDGING,
                 state={"approve_raw": None},
@@ -639,6 +788,21 @@ class WarpEngine:
                 },
                 message=f"approve reverted; re-preparing (attempt {attempt})",
             )
+        if not evm.receipt_succeeded(receipt):
+            # [WARP-RECEIPT-AMBIG 2026-08-08] Not reverted is not the same as
+            # succeeded. Branching on receipt_reverted alone sent a receipt with
+            # no parseable status down the success path, advancing to BRIDGING
+            # on an allowance that may never have taken effect.
+            polls = int(job.state.get("approve_status_polls", 0)) + 1
+            if polls >= _AMBIGUOUS_RECEIPT_POLLS:
+                raise WarpTerminal(
+                    f"approve receipt still carries no status after {polls} polls; "
+                    "check the transaction on Base before retrying"
+                )
+            return _stay(
+                state={"approve_status_polls": polls},
+                message=f"approve receipt has no status; re-polling ({polls})",
+            )
         return _advance(
             JobStatus.BRIDGING, state={"approve_raw": None}, message="approve confirmed"
         )
@@ -658,7 +822,19 @@ class WarpEngine:
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
                 columns={"bridge_tx_hash": signed.tx_hash},
-                state={"bridge_raw": signed.raw.hex(), "bridge_tx_nonce": signed.nonce},
+                state={
+                    "bridge_raw": signed.raw.hex(),
+                    "bridge_tx_nonce": signed.nonce,
+                    # Kept so a replacement escalates from the fee this was
+                    # actually signed at. bump_fees derives every attempt from
+                    # one base, which is what keeps consecutive attempts a full
+                    # 1.3x apart -- comfortably over the node's 10% replacement
+                    # floor. Re-reading live fees each time would lose that.
+                    "bridge_fees": [
+                        unsigned.max_fee_per_gas,
+                        unsigned.max_priority_fee_per_gas,
+                    ],
+                },
                 message="bridge signed; broadcasting next tick",
             )
 
@@ -667,7 +843,7 @@ class WarpEngine:
         # Base RPC, the wallet daemon, the receiver decode, the live message toll
         # and tip, gas estimation, nonce selection, ABI encoding and signing. The
         # only thing that does not happen is the broadcast.
-        if self._params.dry_run:
+        if self._job_dry_run(job):
             return _advance(
                 JobStatus.DRY_RUN_OK,
                 columns={"bridge_tx_hash": None},
@@ -680,27 +856,56 @@ class WarpEngine:
 
         # phase 2: idempotent broadcast, then poll the receipt.
         self._evm.send_raw_transaction(bytes.fromhex(raw))
-        receipt = (
-            self._evm.get_transaction_receipt(job.bridge_tx_hash)
-            if job.bridge_tx_hash
-            else None
-        )
+        mined_hash, receipt = self._bridge_receipt(job)
         if receipt is None:
-            return _stay(message="bridge broadcast; awaiting receipt")
+            return self._bridge_unmined_step(job)
         if evm.receipt_reverted(receipt):
             attempt = int(job.state.get("bridge_attempt", 0)) + 1
             if attempt >= _BRIDGE_MAX_ATTEMPTS:
                 raise WarpTerminal(f"bridge reverted {attempt} times")
             return _stay(
                 columns={"bridge_tx_hash": None},
-                state={"bridge_raw": None, "bridge_attempt": attempt},
+                state={
+                    "bridge_raw": None,
+                    "bridge_attempt": attempt,
+                    # The abandoned nonce's replacement bookkeeping must go with
+                    # it. Left behind, _bridge_hashes keeps returning the old
+                    # hashes, so the very next poll finds THIS reverted receipt
+                    # again and fails a freshly signed bridge at a different
+                    # nonce -- while that new transaction is live in the mempool.
+                    "bridge_prior_hashes": None,
+                    "bridge_fee_bumps": None,
+                    "bridge_unmined_polls": None,
+                    "bridge_fees": None,
+                    # Receipt-specific like the rest: left behind, attempt 2's
+                    # first ambiguous receipt inherits attempt 1's count and
+                    # goes terminal at a fraction of the documented budget.
+                    "bridge_status_polls": None,
+                },
                 message=f"bridge reverted; re-preparing (attempt {attempt})",
+            )
+        if not evm.receipt_succeeded(receipt):
+            # See _h_approving: an unparseable status is neither outcome, and
+            # here the wrong guess advances a bridge that may not have moved
+            # anything -- taking the MessageSent nonce with it.
+            polls = int(job.state.get("bridge_status_polls", 0)) + 1
+            if polls >= _AMBIGUOUS_RECEIPT_POLLS:
+                raise WarpTerminal(
+                    f"bridge receipt still carries no status after {polls} polls; "
+                    "check the transaction on Base before retrying"
+                )
+            return _stay(
+                state={"bridge_status_polls": polls},
+                message=f"bridge receipt has no status; re-polling ({polls})",
             )
         msg_nonce = evm.parse_message_sent_nonce(receipt, net.portal_address)
         return _advance(
             JobStatus.BRIDGE_CONFIRMED,
-            columns={"bridge_nonce": msg_nonce},
-            state={"bridge_raw": None},
+            # Pin the column to the signing that actually mined. After a fee
+            # bump this may be an earlier hash than the one we last signed, and
+            # _h_bridge_confirmed polls this column for its confirmation count.
+            columns={"bridge_nonce": msg_nonce, "bridge_tx_hash": mined_hash},
+            state={"bridge_raw": None, "bridge_prior_hashes": None},
             message=f"bridged; MessageSent nonce {msg_nonce}",
         )
 
@@ -743,6 +948,35 @@ class WarpEngine:
         # Persist-then-act: generate the ephemeral security key locally; it lands
         # atomically with the advance. A crash before persistence just regenerates
         # (nothing was funded to the discarded key).
+        # [WARP-MSG-WIDTH 2026-08-08] Validate the attested fields before
+        # anything is minted or funded. Nothing checked them, and _classify
+        # treats a ValueError as retryable with no cap -- so a malformed
+        # attestation degraded into a silent infinite backoff, with the
+        # ephemeral key already generated and the failure surfacing only much
+        # later, deep in the claim build.
+        #
+        # The destination is a puzzle hash and is always 32 bytes. The contents
+        # are NOT: they are heterogeneous CLVM atoms, and the amount in
+        # particular is a minimal-encoding integer (a couple of bytes), so any
+        # uniform width rule here would reject every real message. What is
+        # checked is that each one is decodable at all -- which is exactly what
+        # would otherwise raise later, out of reach of a terminal state.
+        dest_hex = _hx(msg.destination)
+        if len(dest_hex) != 64:
+            raise WarpTerminal(
+                f"watcher returned a {len(dest_hex) // 2}-byte message destination, "
+                "expected 32; the attestation cannot build a claim"
+            )
+        try:
+            contents_hex = [_hx(c) for c in msg.contents]
+            for atom in contents_hex:
+                bytes.fromhex(atom)
+        except (ValueError, TypeError) as exc:
+            raise WarpTerminal(
+                f"watcher returned undecodable message contents ({exc}); the "
+                "attestation cannot build a claim"
+            ) from exc
+
         bls = keystore.new_bls_key()
         blob = keystore.protect_bls_key(
             bls, extra_entropy=self._job_entropy(job), protector=self._protector
@@ -752,8 +986,8 @@ class WarpEngine:
             state={
                 "ephemeral_blob": blob,
                 "ephemeral_pk": bls.public_key.hex(),
-                "message_destination": _hx(msg.destination),
-                "message_contents": list(msg.contents),
+                "message_destination": dest_hex,
+                "message_contents": contents_hex,
             },
             message="attested 'sent'; ephemeral security key generated",
         )
@@ -764,7 +998,7 @@ class WarpEngine:
 
         net, p = self._net, self._params
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is not None:
@@ -786,7 +1020,10 @@ class WarpEngine:
         existing = self._find_existing_funding(security_ph.hex(), expected)
         if existing:
             return _stay(
-                state={"funding_tx_id": existing},
+                # funding_amount travels with the id here too: a job that
+                # resumes through this branch would otherwise leave every
+                # later lookup recomputing the amount from live config.
+                state={"funding_tx_id": existing, "funding_amount": expected},
                 message="funding tx already in flight (dedupe hit)",
             )
 
@@ -795,7 +1032,21 @@ class WarpEngine:
         record = self._wallet.send_transaction(
             1, expected, address, fee_mojos=p.chia_funding_fee_mojos
         )
+        # [WARP-DUP-FUND 2026-08-08] send_transaction returned, so the coin is
+        # on its way whether or not the wallet named the transaction. Persisting
+        # None would leave the `if prior:` guard above falsy on the next tick,
+        # and the dedupe scan cannot cover the gap because the coin is not on
+        # chain yet -- so the security coin would be funded a SECOND time, out
+        # of the operator's wallet. Keep the guard armed with a sentinel.
         tx_id = record.get("name") or record.get("transaction_id")
+        if not tx_id:
+            tx_id = _FUNDING_TX_UNKNOWN
+            _log.warning(
+                "warp: wallet accepted the funding send for job %s but named no "
+                "transaction; recording %r so the in-flight guard still holds",
+                job.id,
+                tx_id,
+            )
         return _stay(
             # Record what was actually sent. A later Sweep must look for *this*
             # amount, not whatever claim_fee_mojos happens to say at the time.
@@ -807,18 +1058,16 @@ class WarpEngine:
         """Wait for the security coin to reach the Chia confirmation depth."""
         from . import claim
 
-        net, p = self._net, self._params
+        net = self._net
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is None:
             raise WarpPending("security coin not yet on chain")
-        record = self._coinset.get_coin_record_by_name(coin.name().hex())
-        if record is None:
+        depth = self._chia_depth(coin.name().hex())
+        if depth is None:
             raise WarpPending("security coin not yet indexed")
-        peak = self._coinset.get_peak_height()
-        depth = peak - int(record.confirmed_block_index) + 1
         if depth < net.chia_confirmation_min_height:
             raise WarpPending(
                 f"funding {depth}/{net.chia_confirmation_min_height} confirmations"
@@ -834,8 +1083,7 @@ class WarpEngine:
         from . import claim
 
         net = self._net
-        hint = self._resolve_portal_hint(job)
-        portal = claim.sync_portal(self._coinset, net, hint=hint)
+        portal = self._sync_portal(job)
         fresh = portal.coin_id.hex()
         self._store.set_meta("portal_hint", fresh)
 
@@ -877,16 +1125,34 @@ class WarpEngine:
         """Re-sync, build + push the claim; handle completion / conflict / drift."""
         from . import claim, nostr
 
-        net, p = self._net, self._params
+        net = self._net
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
+        # The bundle must balance against the coin that actually exists, so the
+        # fee it spends is the one that was funded, not today's config value.
+        claim_fee = expected - int(job.post_tip_mojos or 0)
 
         # Completion first (idempotent resume): our predicted final CAT coin id is
         # derived from our own bundle, so its presence means *our* claim landed.
         final_hex = job.state.get("final_cat_coin_id")
         if final_hex and claim.claim_landed(self._coinset, bytes.fromhex(final_hex)):
+            # [WARP-CLAIM-DEPTH 2026-08-08] Existence is not finality. This
+            # advanced to COMPLETED as soon as the coin appeared -- depth 1 --
+            # even though chia_confirmation_min_height is 32 and
+            # _h_claim_funded already waits that long for the *funding* coin.
+            # COMPLETED is a closed state that frees the active slot, so a
+            # reorg afterwards would reopen a claim the operator had been told
+            # was finished, with the job no longer tracking it.
+            depth = self._chia_depth(final_hex)
+            if depth is None:
+                raise WarpPending("final CAT coin not indexed yet")
+            if depth < net.chia_confirmation_min_height:
+                raise WarpPending(
+                    f"claim {depth}/{net.chia_confirmation_min_height} confirmations"
+                )
             return _advance(
-                JobStatus.COMPLETED, message="claim confirmed; final CAT coin on chain"
+                JobStatus.COMPLETED,
+                message=f"claim confirmed at {depth} confirmations",
             )
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
@@ -898,8 +1164,7 @@ class WarpEngine:
                 raise WarpPending("security coin spent; awaiting final CAT coin")
             raise WarpPending("security coin not found on chain")
 
-        hint = self._resolve_portal_hint(job)
-        portal = claim.sync_portal(self._coinset, net, hint=hint)
+        portal = self._sync_portal(job)
         self._store.set_meta("portal_hint", portal.coin_id.hex())
         prev = job.state.get("portal_coin_id")
         if prev and portal.coin_id.hex() != prev:
@@ -922,7 +1187,7 @@ class WarpEngine:
             validator_sigs=sigs,
             security_coin=coin,
             ephemeral_sk=sk,
-            claim_fee=p.claim_fee_mojos,
+            claim_fee=claim_fee,
         )
         final_id = push.claim.final_cat_coin_id.hex()
         if push.accepted:
@@ -1020,6 +1285,32 @@ class WarpEngine:
         self._receiver_cache = (address, source, ph.hex())
         return address, ph.hex()
 
+    def _sweep_destination_ph(self) -> bytes:
+        """Where recovered XCH goes: the bot's own wallet, always.
+
+        [WARP-SWEEP-DEST 2026-08-08] The sweep used ``job.receiver_ph``, which
+        is the *wUSDC.b* receiver -- and once ``warp.chia_receiver_address`` is
+        set that can be anywhere, including an address the bot does not
+        control. build_sweep_bundle emits a bare CREATE_COIN of raw XCH, not a
+        CAT, so the recovered funding fee was paid to whoever holds the CAT
+        receiver rather than back to the wallet that put it up. Dust, and
+        spendable by that holder, so misdirected rather than destroyed -- but
+        it contradicted both docstrings, and the third-party-claim auto-sweep
+        does it unattended.
+
+        Cached like :meth:`_resolve_receiver`, and for the same reason:
+        ``new_address=True`` would burn a derivation index per sweep.
+        """
+        from . import clvm_utils as cu
+
+        if self._sweep_dest_cache is not None:
+            return self._sweep_dest_cache
+        self._wallet.log_in()
+        address = self._wallet.get_next_address(1, new_address=False)
+        ph = cu.decode_puzzle_hash(address, expected_prefix=self._net.chia_prefix)
+        self._sweep_dest_cache = ph
+        return ph
+
     def effective_receiver(self) -> Dict[str, Any]:
         """Where wUSDC.b will actually land, for display. Never raises.
 
@@ -1086,8 +1377,222 @@ class WarpEngine:
         return f"warp-job-{job.id}".encode()
 
     def _binding(self) -> Dict[str, Any]:
-        """The (network, hot wallet) identity a new job is frozen against."""
-        return {"network": self._net.name, "hot_address": _hx(self._hot_address)}
+        """The (network, hot wallet, rehearsal) identity a new job is frozen against."""
+        return {
+            "network": self._net.name,
+            "hot_address": _hx(self._hot_address),
+            # [WARP-DRYRUN-FREEZE 2026-08-08] Frozen, never re-read: a job
+            # created live must not become a rehearsal because the flag moved
+            # under it. See _job_dry_run.
+            "dry_run": bool(self._params.dry_run),
+        }
+
+    def _job_dry_run(self, job: WarpJob) -> bool:
+        """Whether *job* was created as a rehearsal, per the job itself.
+
+        Read from job state rather than live config. The rehearsal stops in
+        :meth:`_h_approving` and :meth:`_h_bridging` used ``self._params``, so
+        flipping ``warp.dry_run`` while a live job sat in BRIDGING closed it as
+        DRY_RUN_OK and nulled ``bridge_tx_hash`` -- freeing the slot and leaving
+        an audit trail reading "no funds moved" while real USDC was in flight.
+        ``dry_run`` defaults to true, so a plain restart was enough to do it.
+
+        Rows written before the freeze have no recorded value; those are refused
+        outright in the two states where it decides anything (see
+        :meth:`_binding_mismatch`), because neither default is safe there.
+        """
+        frozen = job.state.get("dry_run")
+        return bool(self._params.dry_run if frozen is None else frozen)
+
+    def _retry_tx_reset(self, job: WarpJob) -> Dict[str, Any]:
+        """State to clear so a retry re-signs, rather than replaying a dead tx.
+
+        [WARP-RETRY-RAW 2026-08-08] A job that FAILED out of APPROVING or
+        BRIDGING still holds the raw it was last signed as -- the final revert
+        raises WarpTerminal without clearing it, unlike the earlier attempts.
+        Retry restored the status and phase 2 rebroadcast that same raw, so the
+        job reverted again immediately and the operator's only affordance did
+        nothing.
+
+        Clearing it is only safe once the nonce cannot mine. The stuck-tx path
+        also lands in FAILED, and there the transaction may still be sitting in
+        the mempool: re-signing would take a *new* nonce and bridge a second
+        time. So the nonce is checked against the chain first, and while it is
+        still open the raw is kept and the retry just resumes polling it.
+        """
+        target = job.state.get("failed_from")
+        if target not in (JobStatus.APPROVING, JobStatus.BRIDGING):
+            return {}
+
+        # "approve_nonce" is what _h_approving actually persists. This read
+        # said "approve_tx_nonce", a key nothing writes, so the guard below was
+        # inert for APPROVING: nonce was always None, the chain check was
+        # skipped, and the raw was cleared unconditionally -- exactly the
+        # unsafe behaviour the docstring above says it prevents.
+        nonce = job.state.get(
+            "bridge_tx_nonce" if target == JobStatus.BRIDGING else "approve_nonce"
+        )
+        if nonce is not None:
+            try:
+                mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            except Exception:  # noqa: BLE001 -- cannot prove it is dead, so keep it
+                return {}
+            if mined <= int(nonce):
+                return {}          # still live: replaying is safer than re-signing
+            if target == JobStatus.BRIDGING:
+                # A consumed nonce is ambiguous: someone else took it, or OUR
+                # bridge mined during the outage that failed the job. Only a
+                # receipt distinguishes them, and clearing on a mined bridge
+                # re-signs a second bridgeToChia at a fresh nonce -- a true
+                # double bridge against the same deposit. Keep everything: the
+                # resumed phase 2's rebroadcast is benign ("nonce too low") and
+                # _bridge_receipt routes the mined receipt to success/revert.
+                _mined_hash, receipt = self._bridge_receipt(job)
+                if receipt is not None:
+                    return {}
+
+        if target == JobStatus.BRIDGING:
+            return {
+                "bridge_raw": None,
+                "bridge_status_polls": None,
+                "bridge_unmined_polls": None,
+                "bridge_fee_bumps": None,
+                "bridge_prior_hashes": None,
+            }
+        return {"approve_raw": None, "approve_tx_hash": None, "approve_status_polls": None}
+
+    def _bridge_hashes(self, job: WarpJob) -> list:
+        """Every hash this job's bridge nonce has been signed under, newest first."""
+        hashes = [job.bridge_tx_hash] if job.bridge_tx_hash else []
+        hashes += [h for h in (job.state.get("bridge_prior_hashes") or []) if h]
+        return hashes
+
+    def _bridge_receipt(self, job: WarpJob) -> tuple:
+        """``(tx_hash, receipt)`` for whichever signing of this nonce mined.
+
+        A fee replacement reuses the nonce, so at most one of these can ever
+        have a receipt -- but which one is the node's choice, not ours. Polling
+        only the newest hash would miss the case where the original mined just
+        as the replacement went out.
+
+        The winning hash is returned, not just the receipt: ``bridge_tx_hash``
+        still points at the last thing we signed, and if the *original* mined
+        that column names a transaction which will never exist. _h_bridge_confirmed
+        polls it, get_confirmations returns 0 forever, and the job stalls until
+        the BRIDGE_CONFIRMED deadline fails it -- with real USDC bridged and the
+        MessageSent nonce correctly recorded. The caller writes this back.
+        """
+        for tx_hash in self._bridge_hashes(job):
+            receipt = self._evm.get_transaction_receipt(tx_hash)
+            if receipt is not None:
+                return tx_hash, receipt
+        return None, None
+
+    def _bridge_unmined_step(self, job: WarpJob) -> "_Step":
+        """Nothing has mined yet: escalate the fee, or stop if the nonce is gone.
+
+        [WARP-STUCK-TX 2026-08-08] This path used to be a bare
+        ``_stay("awaiting receipt")``. :meth:`_apply_stay` resets ``retry_count``
+        and clears ``last_error`` on every pend, so the loop was invisible and
+        unbounded; ``_BRIDGE_MAX_ATTEMPTS`` only counts *reverted* receipts,
+        never an absent one. BRIDGING is not cancellable, Retry on a non-FAILED
+        job only clears backoff, and Sweep closes only FAILED -- so a bridge
+        that never mined held the single active job row forever and every later
+        bridge raised ActiveJobExists. Recovery meant editing warp_jobs.db by
+        hand.
+
+        The likeliest cause is plain underpricing: ``suggest_fees`` sets
+        maxFee = base*2 + priority, so any sustained climb past 2x strands the
+        transaction with nothing to escalate it. ``bump_fees`` was written for
+        exactly this and had no callers.
+        """
+        from . import evm
+
+        nonce = job.state.get("bridge_tx_nonce")
+        if nonce is not None:
+            mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            if mined > int(nonce):
+                # The account has moved past our nonce and none of our hashes
+                # has a receipt, so something else consumed it. Nothing we
+                # signed can mine now, and no funds of ours moved.
+                raise WarpTerminal(
+                    f"bridge nonce {nonce} was consumed by another transaction "
+                    f"(account is at {mined}) and nothing this job signed "
+                    "mined; the USDC deposit is untouched"
+                )
+
+        polls = int(job.state.get("bridge_unmined_polls", 0)) + 1
+        if polls < _STUCK_TX_POLLS:
+            return _stay(
+                state={"bridge_unmined_polls": polls},
+                message=f"bridge broadcast; awaiting receipt (poll {polls})",
+            )
+
+        bumps = int(job.state.get("bridge_fee_bumps", 0)) + 1
+        base = job.state.get("bridge_fees")
+        if bumps > _MAX_FEE_BUMPS or not base:
+            raise WarpTerminal(
+                f"bridge has not mined after {bumps - 1} fee escalations; it is "
+                "stuck and needs an operator decision (the nonce can be cleared "
+                "with a replacement from the wallet)"
+            )
+
+        fees = evm.bump_fees(
+            evm.EIP1559Fees(max_fee_per_gas=int(base[0]),
+                            max_priority_fee_per_gas=int(base[1])),
+            bumps,
+        )
+        signed = evm.sign_tx(
+            self._evm.prepare_bridge(
+                owner=self._hot_address,
+                receiver_ph=bytes.fromhex(job.receiver_ph),
+                mojo_amount=int(job.amount_mojos),
+                nonce=int(nonce) if nonce is not None else None,
+                fees=fees,
+            ),
+            self._evm_key.private_key,
+        )
+        return _stay(
+            columns={"bridge_tx_hash": signed.tx_hash},
+            state={
+                "bridge_raw": signed.raw.hex(),
+                # The old hash stays pollable: the node may still mine it.
+                "bridge_prior_hashes": self._bridge_hashes(job),
+                "bridge_fee_bumps": bumps,
+                "bridge_unmined_polls": 0,
+            },
+            message=(
+                f"bridge unmined after {polls} polls; re-signed nonce {nonce} at a "
+                f"higher fee (escalation {bumps} of {_MAX_FEE_BUMPS})"
+            ),
+        )
+
+    def _chia_depth(self, coin_id_hex: str) -> Optional[int]:
+        """Confirmations behind the peak for a coin, or ``None`` if unindexed."""
+        record = self._coinset.get_coin_record_by_name(coin_id_hex)
+        if record is None:
+            return None
+        return self._coinset.get_peak_height() - int(record.confirmed_block_index) + 1
+
+    def _funded_amount(self, job: WarpJob) -> int:
+        """The amount the security coin was actually funded with.
+
+        [WARP-FEE-FREEZE 2026-08-08] ``find_security_coin`` matches the on-chain
+        amount exactly, so every lookup has to use what was *sent*, not what
+        ``claim_fee_mojos`` says now. The three hot-path handlers recomputed it
+        from live params: editing that key and reloading made them scan for an
+        amount no coin has, so the claim raised WarpPending forever, and because
+        :meth:`_apply_stay` resets ``retry_count`` and clears ``last_error`` on
+        every pend, the job never reached FAILED and its context menu stayed
+        empty. Only reverting the config recovered it.
+
+        Falls back to live config for rows funded before the amount was
+        recorded, which is what :meth:`_sweep_job` already did.
+        """
+        return int(
+            job.state.get("funding_amount")
+            or int(job.post_tip_mojos or 0) + int(self._params.claim_fee_mojos)
+        )
 
     def _binding_mismatch(self, job: WarpJob) -> Optional[str]:
         """Why this job must not be processed under the current config, or ``None``.
@@ -1108,6 +1613,20 @@ class WarpEngine:
                 f"job {job.id} was created on network {job.network!r} but warp is "
                 f"configured for {self._net.name!r}; resolve it under the original "
                 "configuration"
+            )
+        # Checked before the hot-wallet binding, which returns early on a match:
+        # a row created between the two freezes carries hot_address but not
+        # dry_run, and that is exactly the row this has to catch.
+        if job.status in _DRY_RUN_SENSITIVE and job.state.get("dry_run") is None:
+            # Neither default is safe here. Assume rehearsal and a live job is
+            # closed DRY_RUN_OK with its broadcast tx hash discarded; assume
+            # live and a rehearsal broadcasts real funds. Only the operator can
+            # say which this row is.
+            return (
+                f"job {job.id} is in {job.status} but predates the dry_run "
+                "freeze, so it cannot be proven to be a rehearsal or a live "
+                "bridge; check the Base hot wallet for a broadcast transaction "
+                "and resolve it manually"
             )
         bound = _hx(job.state.get("hot_address") or "")
         mine = _hx(self._hot_address)
@@ -1133,6 +1652,35 @@ class WarpEngine:
 
     def _claim_contents(self, job: WarpJob) -> List[bytes]:
         return [bytes.fromhex(_hx(c)) for c in job.state.get("message_contents", [])]
+
+    def _sync_portal(self, job: WarpJob):
+        """Resolve the portal tip, re-bootstrapping if the hint is too far behind.
+
+        [WARP-PORTAL-HINT 2026-08-08] ``sync_portal`` walks forward a bounded
+        number of hops from the hint. Once the portal has advanced further than
+        that, every sync raises PortalSyncError and the job retries forever --
+        the Nostr bootstrap that would fix it was consulted only when no hint
+        existed at all, never when a persisted one had gone stale. A stored
+        hint is therefore self-perpetuating: it can never be replaced by the
+        mechanism designed to replace it.
+
+        On failure the stored hint is cleared and one fresh bootstrap is tried.
+        A second failure propagates as a normal retryable error.
+        """
+        from . import claim
+
+        hint = self._resolve_portal_hint(job)
+        try:
+            return claim.sync_portal(self._coinset, self._net, hint=hint)
+        except claim.PortalSyncError as exc:
+            _log.warning(
+                "warp: portal hint %s unusable (%s); discarding it and "
+                "re-bootstrapping from Nostr",
+                _hx(hint), exc,
+            )
+            self._store.set_meta("portal_hint", "")
+            fresh = self._bootstrap_hint_from_nostr(job)
+            return claim.sync_portal(self._coinset, self._net, hint=fresh)
 
     def _resolve_portal_hint(self, job: WarpJob) -> bytes:
         """A recent portal coin id to walk forward from (never the launcher)."""
@@ -1181,17 +1729,34 @@ class WarpEngine:
         from . import claim
 
         try:
-            _kind, status = claim.build_and_push_sweep(
+            kind, status = claim.build_and_push_sweep(
                 self._coinset,
                 self._net,
                 security_coin=coin,
-                destination_puzzle_hash=bytes.fromhex(job.receiver_ph),
+                destination_puzzle_hash=self._sweep_destination_ph(),
                 ephemeral_sk=sk,
                 sweep_fee=0,
             )
-            return True, status
         except Exception as exc:  # noqa: BLE001 -- operator can re-sweep later
             return False, f"sweep failed: {exc}"
+
+        if kind == "conflict":
+            # The coin is already spent -- by our own claim, or a prior sweep.
+            # Nothing left to recover, so this genuinely is resolved.
+            return True, status
+
+        # [WARP-SWEEP-VERIFY 2026-08-08] "accepted" and "pending" only say the
+        # node took the bundle into its mempool. Treating that as resolved
+        # closed the job as CANCELLED with swept: True -- and CANCELLED offers
+        # neither Retry nor Sweep -- so an evicted bundle left the funding coin
+        # sitting unspent with no route back to it. The sweep pushes at zero
+        # fee, which is exactly what a busy mempool drops.
+        if claim.security_coin_spent(self._coinset, coin.name()):
+            return True, status
+        return False, (
+            f"sweep pushed ({status}) but the security coin is not spent yet; "
+            "run Sweep again once it confirms"
+        )
 
     def _funding_provably_gone(self, job: WarpJob) -> tuple:
         """``(resolved, status)`` for a job with no coin at the expected amount.
@@ -1262,7 +1827,8 @@ class WarpEngine:
         if active is not None:
             raise WarpError(
                 f"a warp job is already active (job {active.id}, {active.status}); "
-                "resolve it first -- Retry, Cancel, or Sweep from the jobs table"
+                "resolve it first -- Retry, Cancel, Sweep or Abandon from the "
+                "jobs table"
             )
         state: Dict[str, Any] = {"manual": True, **self._binding()}
         if target_micros:
@@ -1275,8 +1841,162 @@ class WarpEngine:
         )
         return _job_dict(job)
 
+    def _refuse_while_bridge_unresolved(self, job: WarpJob, action: str) -> None:
+        """Refuse to close a job whose signed bridge is live or already mined.
+
+        [WARP-NONCE-AMBIGUITY 2026-08-09] ``get_nonce`` alone cannot tell the
+        two meanings of a consumed nonce apart: something *else* took it (the
+        deposit is untouched -- closing is fine) versus *our own transaction
+        mined* (real USDC is bridged and the job must be completed via Retry,
+        which rebroadcasts benignly and routes the receipt through phase 2).
+        The first version of this guard checked only liveness, so a mined
+        bridge could be abandoned -- and Sweep's no-key branch, which concluded
+        "nothing was ever funded" and closed, had no guard at all: the exact
+        bypass the abandon guard existed to block, one button over.
+
+        Raises unless the nonce is provably dead AND nothing this job signed
+        has a receipt. Callers must be same-binding (the nonce check reads the
+        configured hot wallet).
+        """
+        raw_nonce = job.state.get("bridge_tx_nonce")
+        if not (job.state.get("bridge_raw") and raw_nonce is not None):
+            return
+        try:
+            mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+        except Exception as exc:  # noqa: BLE001 -- cannot prove it is dead
+            raise WarpError(
+                f"cannot {action}: unable to verify whether the signed bridge "
+                f"at nonce {raw_nonce} is still live ({exc}); try again when "
+                "the Base RPC is reachable"
+            ) from exc
+        if mined <= int(raw_nonce):
+            raise WarpError(
+                f"cannot {action}: this job's signed bridge is still live at "
+                f"nonce {raw_nonce}. Wait for it to mine (then Retry), or "
+                "clear the nonce with a self-send replacement from the hot "
+                f"wallet, then {action}"
+            )
+        _mined_hash, receipt = self._bridge_receipt(job)
+        if receipt is not None:
+            raise WarpError(
+                f"cannot {action}: this job's bridge mined at nonce {raw_nonce}. "
+                "Use Retry -- it picks up the receipt and completes the job"
+            )
+
+    def _abandon_job(self, job: WarpJob) -> dict:
+        """Close a FAILED job the machine cannot resolve, freeing the slot.
+
+        [WARP-ABANDON 2026-08-08] A job that trips one of the attested-terms
+        anchors is a permanent dead end: the anchors run after bridgeToChia
+        confirmed and before the ephemeral key is minted, so the row has a
+        bridge_nonce and no ephemeral_blob. Sweep raises before touching it,
+        Cancel is refused (FAILED is not cancellable once the bridge is on
+        chain), and Retry restores the same status to re-fail against the same
+        immutable attestation. The GUI gives such a job an empty context menu.
+        Since FAILED holds the single active slot, the bridge could then never
+        open another job -- with no in-app way out at all.
+
+        No funds are lost in that state: the message stays claimable at the
+        warp.green portal, which is why the recovery details are written into
+        the audit log before the row is closed rather than discarded with it.
+
+        Only FAILED is accepted. Loosening _sweep_job's FAILED check instead
+        would let a sweep flip a COMPLETED job to CANCELLED.
+        """
+        # A binding-refused job is the other kind the engine cannot resolve, and
+        # it has strictly fewer exits than a FAILED one: step() is read-only,
+        # Retry and Sweep raise on the binding check, and BRIDGING is not
+        # cancellable. Refusing Abandon there too left an upgraded installation
+        # with a job holding the single active slot permanently -- recoverable
+        # only by hand-editing warp_jobs.db, which is what this whole branch
+        # set out to eliminate. Abandon is a pure DB write that records the
+        # recovery details first, so it is safe for a job we refuse to touch.
+        # Never a closed one, though: a hot-wallet rotation makes every historic
+        # row binding-mismatched, and without this a COMPLETED job could be
+        # flipped to CANCELLED -- rewriting the record of a finished bridge.
+        if job.status in jobs.CLOSED_STATES:
+            raise WarpError(f"job {job.id} is already closed ({job.status})")
+
+        mismatch = self._binding_mismatch(job)
+        # A status this build has no handler for (version skew: a newer schema
+        # ran against this DB) would otherwise park forever -- the dispatcher
+        # skips it and every other action refuses it -- so it is abandonable too.
+        known_open = job.status == JobStatus.FAILED or job.status in self._HANDLERS
+        if job.status != JobStatus.FAILED and not mismatch and known_open:
+            raise WarpError(
+                f"cannot abandon a job in {job.status}; abandon is the escape "
+                "from a job the engine cannot resolve"
+            )
+
+        # [WARP-ABANDON-LIVE-TX 2026-08-09] A signed-but-unmined bridge must not
+        # be buried. The stuck-tx terminal lands in FAILED with bridge_raw still
+        # set and the nonce unconsumed; abandoning that frees the slot, the next
+        # bridge reads the same untouched USDC balance and signs a second
+        # bridgeToChia -- and if the stuck transaction later mines, real USDC
+        # bridges under a nonce no job tracks. Refused until the nonce is
+        # provably dead (something else consumed it) or provably resolved (it
+        # mined -- in which case Retry, not Abandon, completes the job).
+        # Skipped only when the job's nonce belongs to a DIFFERENT hot wallet
+        # than the configured key, where the check would interrogate the wrong
+        # account; the recovery blob records what to verify by hand instead.
+        # A dry_run-legacy row is binding-refused but same-wallet, so the
+        # check still runs -- and still protects -- there.
+        raw_nonce = job.state.get("bridge_tx_nonce")
+        bound = _hx(job.state.get("hot_address") or "")
+        same_wallet = not bound or bound == _hx(self._hot_address)
+        if not mismatch or same_wallet:
+            self._refuse_while_bridge_unresolved(job, "abandon")
+
+        recovery = {
+            "bridge_nonce": job.bridge_nonce,
+            "bridge_tx_hash": job.bridge_tx_hash,
+            "bridge_tx_nonce": raw_nonce,
+            "signed_raw_present": bool(job.state.get("bridge_raw")),
+            "amount_usdc_micros": job.amount_usdc_micros,
+            "receiver_ph": job.receiver_ph,
+            "failed_from": job.state.get("failed_from"),
+            "last_error": job.last_error,
+            "portal": self._net.status_url,
+        }
+        if job.bridge_nonce:
+            detail = (
+                f"message nonce {job.bridge_nonce} was never claimed and remains "
+                f"claimable at {self._net.status_url}"
+            )
+        elif job.state.get("bridge_raw"):
+            if not mismatch or same_wallet:
+                # The guard above ran and passed: nonce consumed by something
+                # else, and nothing this job signed has a receipt.
+                detail = (
+                    f"its signed bridge is provably dead (nonce {raw_nonce} was "
+                    "consumed by another transaction, with no receipt for "
+                    "anything this job signed); the USDC deposit is untouched"
+                )
+            else:
+                # A foreign-wallet job: the guard could not interrogate the
+                # right account, so the operator has to.
+                detail = (
+                    f"a signed bridge transaction may still be live at nonce "
+                    f"{raw_nonce} on the job's own hot wallet -- verify on "
+                    "BaseScan before treating the deposit as untouched"
+                )
+        else:
+            detail = "no bridge message was ever attested"
+        note = f"operator abandoned: {detail}"
+        self._store.update_job(
+            job.id,
+            status=JobStatus.CANCELLED,
+            # The job's own status, not FAILED: a binding-refused job is
+            # abandonable from whatever state it is frozen in.
+            expected_status=job.status,
+            columns={"next_retry_at": None},
+            state_patch={"abandoned": True, "abandon_recovery": recovery},
+            event=("abandon", note, recovery),
+        )
+        return _job_dict(self._store.get_job(job.id))
+
     def job_action(self, job_id: int, action: str) -> Optional[dict]:
-        """Operator affordance: ``retry`` | ``cancel`` | ``sweep``."""
+        """Operator affordance: ``retry`` | ``cancel`` | ``sweep`` | ``abandon``."""
         action = str(action).lower()
         job = self._store.get_job(job_id)
         # Retry and Sweep both sign or resume against the configured hot wallet;
@@ -1294,12 +2014,19 @@ class WarpEngine:
                 else None
             )
             if job.status == JobStatus.FAILED and target:
+                reset = self._retry_tx_reset(job)
                 self._store.update_job(
                     job_id,
                     status=target,
                     expected_status=JobStatus.FAILED,
                     columns={"retry_count": 0, "last_error": None, "next_retry_at": None},
-                    event=("retry", f"operator retry -> {target}", None),
+                    state_patch=reset or None,
+                    event=(
+                        "retry",
+                        f"operator retry -> {target}"
+                        + (" (re-signing: the previous nonce is spent)" if reset else ""),
+                        None,
+                    ),
                 )
             else:
                 self._store.update_job(
@@ -1320,7 +2047,20 @@ class WarpEngine:
                 event=("cancel", "operator cancelled", None),
             )
             return _job_dict(self._store.get_job(job_id))
+        if action == "abandon":
+            return self._abandon_job(job)
         if action == "sweep":
+            # The GUI already restricts Sweep to these two (widgets/warp.py),
+            # but it acts on a polled snapshot that can be a full interval
+            # stale. Sweep spends the job's own security coin, which is the
+            # input to the claim the machine may still be building, so a race
+            # could pull it out from under an in-flight job. Enforce it here
+            # too, where the state is authoritative.
+            if job.status not in _SWEEPABLE:
+                raise WarpError(
+                    f"cannot sweep a job in {job.status}; the security coin is "
+                    "still an input to the claim being built"
+                )
             return self._sweep_job(job)
         raise WarpError(f"unknown job action: {action!r}")
 
@@ -1359,30 +2099,45 @@ class WarpEngine:
                     "through the warp.green portal, which pays the attested Chia "
                     "receiver. This job is kept open deliberately as the record."
                 )
+            # Same guard as Abandon: this branch closes the job, and a FAILED
+            # BRIDGING row has no ephemeral key either -- concluding "nothing
+            # was ever funded" over a signed bridge that can still mine (or
+            # already did) frees the slot for a second bridge against the same
+            # deposit. Sweep is same-binding here: job_action checks the
+            # binding before calling, and the auto-sweep path always has a key.
+            self._refuse_while_bridge_unresolved(job, "sweep")
             resolved, status = True, "no ephemeral key: nothing was ever funded"
-        else:
+        coin_id: Optional[str] = None
+        if blob:
             sk = self._load_ephemeral_sk(job)
-            # What was actually sent, not what current config would send.
-            expected = int(
-                job.state.get("funding_amount")
-                or int(job.post_tip_mojos or 0) + int(self._params.claim_fee_mojos)
-            )
+            expected = self._funded_amount(job)
             coin = claim.find_security_coin(self._coinset, sk, expected)
             if coin is None:
                 resolved, status = self._funding_provably_gone(job)
             else:
+                coin_id = coin.name().hex()
                 resolved, status = self._sweep_security(job, coin, sk)
 
         # Only a resolved sweep frees the slot. A transport failure leaves the
         # job FAILED so the operator can try again with the funds still known
         # recoverable.
         close = resolved and job.status == JobStatus.FAILED
+        patch: Dict[str, Any] = {"swept": resolved, "sweep_status": status}
+        if coin_id and not job.state.get("security_coin_id"):
+            # The follow-up Sweep proves the spend from this id. A job that
+            # failed out of FUNDING_CLAIM by the pending deadline never had it
+            # recorded (only _h_funding_claim's advance writes it), so an
+            # unresolved first sweep -- bundle pushed, coin not yet spent --
+            # could never be closed by the second: find_security_coin returns
+            # None once the sweep mines, and _funding_provably_gone had nothing
+            # to check.
+            patch["security_coin_id"] = coin_id
         self._store.update_job(
             job.id,
             status=JobStatus.CANCELLED if close else None,
             expected_status=job.status,
             columns={"next_retry_at": None},
-            state_patch={"swept": resolved, "sweep_status": status},
+            state_patch=patch,
             event=(
                 "sweep",
                 f"{status}; job closed, active slot freed" if close else status,
@@ -1410,6 +2165,22 @@ class WarpEngine:
         self._hot_cache = snap
         self._receiver_snap = self.effective_receiver()
         return snap
+
+    def close(self) -> None:
+        """Release the job store's sqlite connection.
+
+        [WARP-STORE-LEAK 2026-08-08] WarpJobStore.close() had no caller
+        anywhere: set_config drops the engine and _build_engine opens a fresh
+        store, so every config reload leaked a connection plus its WAL and SHM
+        handles against warp_jobs.db. Not a correctness bug -- the partial
+        unique index still holds -- but unbounded in a process left running for
+        days, and on Windows an open handle is also what turns the documented
+        hard-kill relaunch into a file still in use.
+        """
+        try:
+            self._store.close()
+        except Exception as exc:  # noqa: BLE001 -- teardown must not raise
+            _log.debug("warp: job store close failed: %s", exc)
 
     def snapshot(self) -> Dict[str, Any]:
         """A GUI-serializable snapshot of the whole warp subsystem.
@@ -1484,8 +2255,14 @@ class _WarpWorker(QObject):
     def set_config(self, config: dict) -> None:
         """Adopt a new config snapshot and force a lazy engine rebuild."""
         self._config = dict(config or {})
-        self._engine = None
+        self._drop_engine()
         self._engine_error = None
+
+    def _drop_engine(self) -> None:
+        """Discard the engine, closing its sqlite connection first."""
+        engine, self._engine = self._engine, None
+        if engine is not None:
+            engine.close()
 
     @Slot()
     def tick(self) -> None:
@@ -1570,14 +2347,10 @@ class _WarpWorker(QObject):
         if not params.enabled:
             raise WarpError("warp disabled")
 
+        # Only drivers is used here; the client imports moved with the code
+        # that constructs them into _build_engine_with.
         from . import (
-            coinset as coinset_mod,
             drivers as drivers_mod,
-            evm as evm_mod,
-            keystore,
-            nostr,
-            wallet as wallet_mod,
-            watcher as watcher_mod,
         )
 
         net = constants.MAINNET
@@ -1593,7 +2366,30 @@ class _WarpWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- surfaced as a blocked banner
             raise WarpError(f"wrapped-asset anchor failed: {exc}") from exc
 
+        # The store opens a sqlite connection, and everything below it can still
+        # raise -- a missing hot-wallet key is the ordinary case. Without this,
+        # each failed build leaked a connection, and _ensure_engine is retried
+        # on every config reload.
         store = WarpJobStore(_job_db_path(self._config))
+        try:
+            return self._build_engine_with(net, params, store)
+        except Exception:
+            store.close()
+            raise
+
+    def _build_engine_with(
+        self, net: Any, params: WarpParams, store: WarpJobStore
+    ) -> WarpEngine:
+        """Construct the clients and the engine around an open *store*."""
+        from . import (
+            coinset as coinset_mod,
+            evm as evm_mod,
+            keystore,
+            nostr,
+            wallet as wallet_mod,
+            watcher as watcher_mod,
+        )
+
         rpc_url = params.base_rpc_url or net.evm_default_rpc_url
         evm_client = evm_mod.EvmClient(net, rpc_url=rpc_url)
         coinset_client = coinset_mod.CoinsetClient(_coinset_url(self._config, net))
@@ -1694,6 +2490,13 @@ class WarpService(QObject):
             self._thread.quit()
             if not self._thread.wait(5_000):
                 _log.warning("WarpService worker thread did not exit in time.")
+        # Only quitting the thread left warp_jobs.db open. On Windows that is
+        # the handle that turns the documented hard-kill relaunch into "the
+        # process cannot access the file".
+        try:
+            self._worker._drop_engine()
+        except Exception as exc:  # noqa: BLE001 -- shutdown must not raise
+            _log.debug("warp: engine teardown failed: %s", exc)
 
     # -- public API --------------------------------------------------------- #
 

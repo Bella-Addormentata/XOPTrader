@@ -602,7 +602,7 @@ warp:
   base_rpc_url: "https://mainnet.base.org"  # [OPTIONAL] a private RPC (Alchemy/Infura) is more reliable
   auto_bridge: false                     # [OPTIONAL, default: false] bridge deposits automatically
   min_auto_bridge_usdc: 100              # [OPTIONAL] AUTO-bridge floor only; "Bridge now" ignores it
-  max_auto_bridge_usdc: 10000            # [OPTIONAL] blast-radius cap; applies to manual bridges too
+  max_auto_bridge_usdc: 10000            # [REQUIRED when enabled] blast-radius cap, manual included; 'unlimited' to opt out
   claim_fee_mojos: 100000000             # [OPTIONAL] XCH fee reserved for the Chia claim spend (0.0001 XCH)
   chia_funding_fee_mojos: 0              # [OPTIONAL] extra fee on the wallet->claim funding send
   poll_interval_s: 15                    # [OPTIONAL, default: 15] background tick cadence

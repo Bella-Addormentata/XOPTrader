@@ -164,7 +164,14 @@ class CoinsetClient:
             ).upper()
             if code and code in empty_codes:
                 return None
-            raise CoinsetError(f"{endpoint} failed: {data.get('error') or 'unknown'}")
+            # Keep the structured code in the message. It was parsed and then
+            # dropped for every endpoint that is not an empty-code read, which
+            # left _push_bundle classifying a rejection from prose alone.
+            detail = str(data.get("error") or "unknown")
+            raise CoinsetError(
+                f"{endpoint} failed: [{code}] {detail}" if code
+                else f"{endpoint} failed: {detail}"
+            )
         return data
 
     # -- reads --------------------------------------------------------------- #

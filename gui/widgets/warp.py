@@ -623,8 +623,9 @@ class WarpWidget(QWidget):
         elif status == _ST_FAILED:
             self._bridge_btn.setToolTip(
                 "The last bridge job failed and still holds the single job slot. "
-                "Right-click it in the table and choose Retry, or Sweep to recover "
-                "its funding coin and close it."
+                "Right-click it in the table: Retry re-attempts it, Sweep recovers "
+                "its funding coin and closes it, and Abandon closes a job neither "
+                "of those can resolve (the recovery details go to the audit log)."
             )
         elif active_open:
             self._bridge_btn.setToolTip(
@@ -704,6 +705,23 @@ class WarpWidget(QWidget):
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "sweep")
             )
             menu.addAction(act_sweep)
+        # Offered for FAILED, and for any job the engine is refusing outright.
+        # A job frozen before the dry_run freeze (or against another hot wallet)
+        # is read-only to the engine: Retry and Sweep raise on the binding
+        # check, and a BRIDGING one is not cancellable either -- so its menu was
+        # empty while it held the single active slot permanently.
+        refused = bool(self._snap.get("error")) and self._snap.get("error") != "warp disabled"
+        if (status == _ST_FAILED or refused) and job_id is not None:
+            # The escape from a job the engine cannot resolve. A job that
+            # tripped an attested-terms anchor has no ephemeral key, so Sweep
+            # raises and Retry re-fails against the same attestation -- this
+            # menu was empty for it, and FAILED holds the single active slot,
+            # so the bridge could never open another job.
+            act_abandon = QAction("Abandon job (frees the slot)", menu)
+            act_abandon.triggered.connect(
+                lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "abandon")
+            )
+            menu.addAction(act_abandon)
 
         tx = job.get("bridge_tx_hash")
         receiver = job.get("receiver_address")

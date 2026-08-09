@@ -88,6 +88,10 @@ class FakeEvm:
         self.prepared: list = []
         self.erc20_calls = 0
         self.raise_erc20: Exception | None = None
+        # Mined transaction count. fake_sign_tx signs at nonce 3, so a default
+        # of 0 means "our nonce has not been consumed by anything else".
+        self.mined_nonce = 0
+        self.receipts_by_hash: dict | None = None
 
     def get_erc20_balance(self, token, owner):
         self.erc20_calls += 1
@@ -108,15 +112,36 @@ class FakeEvm:
         self.prepared.append(("approve", amount_base_units))
         return {"kind": "approve", "amount": amount_base_units}
 
-    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount):
-        self.prepared.append(("bridge", mojo_amount))
-        return {"kind": "bridge", "mojo": mojo_amount}
+    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None, fees=None):
+        # Mirrors the real UnsignedTx closely enough for the fee-escalation
+        # path, which reads the fee legs back off the unsigned transaction.
+        # nonce/fees are recorded so tests can assert a replacement pinned the
+        # nonce and escalated the fee -- discarding them made the escalation
+        # test unable to fail against a replacement signed at a fresh nonce.
+        self.prepared.append(("bridge", mojo_amount, nonce, fees))
+        return SimpleNamespace(
+            kind="bridge",
+            mojo=mojo_amount,
+            nonce=nonce,
+            max_fee_per_gas=fees.max_fee_per_gas if fees else 2_000_000_000,
+            max_priority_fee_per_gas=(
+                fees.max_priority_fee_per_gas if fees else 1_000_000
+            ),
+        )
+
+    def get_nonce(self, address, *, pending=True):
+        return self.mined_nonce
 
     def send_raw_transaction(self, raw):
         self.sent_raw.append(bytes(raw))
         return "0x" + "cd" * 32
 
     def get_transaction_receipt(self, tx_hash):
+        # receipts_by_hash lets a test say WHICH signing of a nonce mined,
+        # which is the case a fee-bump replacement creates. self.receipt stays
+        # the hash-agnostic default the bulk of the suite relies on.
+        if self.receipts_by_hash is not None:
+            return self.receipts_by_hash.get(tx_hash)
         return self.receipt
 
     def get_confirmations(self, tx_hash):
@@ -193,7 +218,12 @@ class FakeCoin:
 
 def fake_sign_tx(unsigned, key):
     """Deterministic signer: distinct raw per tx kind, hex-round-trippable."""
-    kind = unsigned.get("kind") if isinstance(unsigned, dict) else "x"
+    # prepare_approve returns a dict; prepare_bridge returns an UnsignedTx-alike
+    # so the fee-escalation path can read its fee legs back.
+    kind = (
+        unsigned.get("kind") if isinstance(unsigned, dict)
+        else getattr(unsigned, "kind", "x")
+    )
     if kind == "bridge":
         return SimpleNamespace(raw=b"\x02\xbb\xbb\xbb", tx_hash="0x" + "22" * 32, nonce=3)
     return SimpleNamespace(raw=b"\x02\xaa\xaa\xaa", tx_hash="0x" + "11" * 32, nonce=0)
@@ -298,7 +328,10 @@ HOT_ADDRESS = "0x" + "ab" * 20
 
 
 def seed(store, status, *, columns=None, state=None):
-    merged = {"network": NET.name, "hot_address": "ab" * 20}
+    # Mirrors WarpEngine._binding(), so fixtures look like rows the engine
+    # actually writes. dry_run defaults to False to match default_params();
+    # a test exercising the rehearsal path passes state={"dry_run": True}.
+    merged = {"network": NET.name, "hot_address": "ab" * 20, "dry_run": False}
     merged.update(state or {})
     return store.create_job(NET.name, status=status, columns=columns, state=merged)
 
@@ -797,8 +830,9 @@ def test_claiming_pushes_then_completes(monkeypatch):
     monkeypatch.setattr(claim_mod, "build_and_push_claim", fake_push)
 
     store = new_store()
-    engine, _ = build(store)
+    engine, ctx = build(store)
     _seed_claiming(store)
+    ctx.coinset.record = SimpleNamespace(confirmed_block_index=100)
 
     # Tick 1: build + push; final not yet on chain -> stay, predicted id persisted.
     out1 = engine.step()
@@ -807,9 +841,15 @@ def test_claiming_pushes_then_completes(monkeypatch):
     assert job.state["final_cat_coin_id"] == FINAL_CAT.hex()
     assert job.state["security_coin_id"] == (b"\x5a" * 32).hex()
 
-    # Tick 2 (resume): the predicted final CAT coin exists -> COMPLETED.
-    out2 = engine.step()
-    assert out2["status"] == JobStatus.COMPLETED
+    # Tick 2: the coin exists but is one block deep -- existence is not
+    # finality, and COMPLETED frees the slot, so it must wait like the funding
+    # coin does.
+    ctx.coinset.peak = 100
+    assert engine.step()["status"] == JobStatus.CLAIMING
+
+    # Tick 3: at the configured depth -> COMPLETED.
+    ctx.coinset.peak = 100 + NET.chia_confirmation_min_height - 1
+    assert engine.step()["status"] == JobStatus.COMPLETED
 
 
 def test_claiming_portal_drift_recollects_and_wipes_sigs(monkeypatch):

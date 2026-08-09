@@ -251,6 +251,26 @@ def bump_fees(fees: EIP1559Fees, attempt: int, *, cap: int = 3, num: int = 13, d
 # Receipt / log parsing (pure).
 # --------------------------------------------------------------------------- #
 
+#: Node wording for "this call reverts", as distinct from "the node is
+#: unreachable". Deliberately narrow: a false positive here refuses to broadcast
+#: a sound transaction, which surfaces to the operator, whereas a false negative
+#: broadcasts one already known to fail and burns the gas.
+_REVERT_MARKERS: tuple = (
+    "execution reverted",
+    "execution error",
+    "always failing transaction",
+)
+
+
+def _is_execution_revert(exc: BaseException) -> bool:
+    """Whether an RPC failure is the node rejecting the call, not the transport."""
+    low = str(exc).lower()
+    if any(marker in low for marker in _REVERT_MARKERS):
+        return True
+    data = getattr(exc, "data", None)
+    return isinstance(data, str) and data.startswith("0x08c379a0")  # Error(string)
+
+
 def receipt_status(receipt: dict) -> Optional[int]:
     """1 == success, 0 == reverted, ``None`` == pre-Byzantium/absent."""
     return _to_int(receipt.get("status"))
@@ -577,7 +597,15 @@ class EvmClient:
         }
         try:
             est = self._call_quantity("eth_estimateGas", [call])
-        except EvmError:
+        except EvmError as exc:
+            # [WARP-ESTIMATE-REVERT 2026-08-08] An execution revert during
+            # estimation is the node saying this transaction will fail. Falling
+            # back to a fixed limit and broadcasting anyway spends the gas to
+            # be told the same thing on chain. A transport or node error says
+            # nothing about the transaction, so the fallback still applies
+            # there -- which is the case `default` was added for.
+            if _is_execution_revert(exc):
+                raise
             if default is None:
                 raise
             return default
@@ -606,10 +634,20 @@ class EvmClient:
         mojo_amount: int,
         gas: Optional[int] = None,
         toll_wei: Optional[int] = None,
+        nonce: Optional[int] = None,
+        fees: Optional[EIP1559Fees] = None,
     ) -> UnsignedTx:
+        """Build an unsigned bridgeToChia.
+
+        ``nonce`` and ``fees`` are overridable so a stuck transaction can be
+        re-signed as a *replacement*: same nonce, higher fee. Left unset they
+        are read live, which is what a first broadcast wants.
+        """
         toll = toll_wei if toll_wei is not None else self.get_message_toll()
-        nonce = self.get_nonce(owner)
-        fees = self.get_fee_data()
+        if nonce is None:
+            nonce = self.get_nonce(owner)
+        if fees is None:
+            fees = self.get_fee_data()
         if gas is None:
             data = encode_bridge_to_chia(self._net.usdc_address, receiver_ph, mojo_amount)
             gas = self.estimate_gas(

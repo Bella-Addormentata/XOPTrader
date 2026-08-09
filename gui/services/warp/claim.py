@@ -340,7 +340,21 @@ def _push_bundle(coinset: CoinsetClient, bundle_json: dict) -> Tuple[str, str]:
             raise
         if any(t in low for t in ("already", "pending", "including")):
             return "pending", text
-        return "conflict", text
+        if any(
+            t in low
+            for t in ("double_spend", "double spend", "mempool_conflict", "conflict")
+        ):
+            return "conflict", text
+        # [WARP-PUSH-CLASSIFY 2026-08-08] Allow-list, deliberately. "conflict"
+        # used to be the default for every unrecognised rejection, and callers
+        # treat a conflict as resolved -- so a plain refusal was recorded as a
+        # finished push. A zero-fee sweep evicted from a busy mempool reads
+        # "Failed to include transaction <id>, error INVALID_FEE_LOW_FEE", and
+        # "include" does not match "including", so it landed here: the job was
+        # closed CANCELLED with swept: True while the funding coin sat unspent,
+        # with neither Retry nor Sweep offered afterwards. Re-raise instead, so
+        # the caller backs off and the operator still has the coin.
+        raise
 
 
 def build_and_push_claim(

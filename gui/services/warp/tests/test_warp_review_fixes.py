@@ -48,7 +48,9 @@ from .test_warp_service import (  # noqa: E402
     FakeCoin,
     build,
     default_params,
+    fake_sign_tx,
     make_ephemeral_blob,
+    message_sent_receipt,
     new_store,
     seed,
 )
@@ -172,6 +174,60 @@ def test_funding_claim_sends_once_when_the_scan_is_clean(monkeypatch):
     assert store.get_active_job().state["funding_tx_id"] == "funding-tx-1"
 
 
+def test_funding_claim_guards_even_when_the_wallet_names_no_transaction(monkeypatch):
+    """[WARP-DUP-FUND] A send the wallet does not name must still block a resend.
+
+    ``send_transaction`` returning neither ``name`` nor ``transaction_id``
+    used to persist ``None``, which is falsy -- so the next tick sailed past
+    the in-flight guard and funded the security coin a SECOND time out of the
+    operator's wallet.  The dedupe scan cannot cover it: the coin is not on
+    chain yet, which is the whole reason the guard exists.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding_claim(store)
+
+    def _unnamed_send(wallet_id, amount, address, fee_mojos=0):
+        ctx.wallet.sent.append((amount, address, fee_mojos))
+        return {"status": "SUCCESS"}          # accepted, but named nothing
+
+    ctx.wallet.send_transaction = _unnamed_send
+
+    engine.step()
+    assert len(ctx.wallet.sent) == 1
+    assert store.get_active_job().state["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+
+    engine.step()
+    assert len(ctx.wallet.sent) == 1, "the second tick must not re-fund the coin"
+
+
+def test_funding_dedupe_hit_also_records_the_amount(monkeypatch):
+    """The dedupe branch must persist funding_amount, not just the tx id.
+
+    Without it a job resuming through the dedupe path leaves Sweep and
+    _funding_provably_gone recomputing the expected amount from live config --
+    the exact drift the funding_amount field was introduced to prevent.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    store = new_store()
+    engine, ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    expected = int(job.post_tip_mojos) + int(default_params().claim_fee_mojos)
+    monkeypatch.setattr(
+        S.WarpEngine, "_find_existing_funding", lambda self, ph, amt: "prior-tx"
+    )
+
+    engine.step()
+
+    state = store.get_active_job().state
+    assert ctx.wallet.sent == []
+    assert state["funding_tx_id"] == "prior-tx"
+    assert state["funding_amount"] == expected
+
+
 # --------------------------------------------------------------------------- #
 # F4 / F5 -- a resolved sweep frees the slot.
 # --------------------------------------------------------------------------- #
@@ -190,6 +246,8 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
                         lambda *a, **k: FakeCoin(b"\x5a" * 32))
     monkeypatch.setattr(claim_mod, "build_and_push_sweep",
                         lambda *a, **k: ("accepted", "ok"))
+    # The sweep mines: the coin really is spent afterwards.
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
     store = new_store()
     engine, _ = build(store)
     job = _seed_failed_funded(store)
@@ -199,6 +257,573 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     assert out["status"] == JobStatus.CANCELLED
     assert store.get_active_job() is None      # the whole point
     engine.request_bridge()                    # a new job is possible again
+
+
+def test_abandon_refuses_to_bury_a_live_signed_bridge(monkeypatch):
+    """[WARP-ABANDON-LIVE-TX] Freeing the slot invites a second bridge.
+
+    The stuck-tx terminal lands in FAILED with bridge_raw set and the nonce
+    unconsumed. Abandoning that frees the slot, the next bridge reads the same
+    untouched USDC balance and signs a second bridgeToChia -- and if the stuck
+    transaction later mines, real USDC bridges under a nonce no job tracks.
+    """
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"failed_from": JobStatus.BRIDGING,
+               "bridge_raw": "02bbbbbb", "bridge_tx_nonce": 3},
+    )
+
+    ctx.evm.mined_nonce = 3          # still open: the bridge may yet mine
+    with pytest.raises(S.WarpError, match="still live at nonce 3"):
+        engine.job_action(job.id, "abandon")
+
+    ctx.evm.mined_nonce = 9          # provably dead: something else took it
+    out = engine.job_action(job.id, "abandon")
+    assert out["status"] == JobStatus.CANCELLED
+
+
+def _seed_failed_bridging(store, *, prior=None, tx_hash=None):
+    return seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex(),
+                 **({"bridge_tx_hash": tx_hash} if tx_hash else {})},
+        state={"failed_from": JobStatus.BRIDGING,
+               "bridge_raw": "02bbbbbb", "bridge_tx_nonce": 3,
+               **({"bridge_prior_hashes": prior} if prior else {})},
+    )
+
+
+def test_sweep_cannot_bury_a_live_signed_bridge(monkeypatch):
+    """[WARP-NONCE-AMBIGUITY] Sweep reached the outcome Abandon refuses.
+
+    A FAILED BRIDGING job has no ephemeral key, so Sweep's no-key branch
+    concluded "nothing was ever funded" and closed the job -- freeing the slot
+    for a second bridge against the same deposit while the first job's signed
+    bridgeToChia could still mine. The exact double-bridge the abandon guard
+    blocks, one button over, and the expiry message pointed operators at it.
+    """
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store)
+
+    ctx.evm.mined_nonce = 3          # still open: the bridge may yet mine
+    with pytest.raises(S.WarpError, match="still live at nonce 3"):
+        engine.job_action(job.id, "sweep")
+
+    ctx.evm.mined_nonce = 9          # provably dead, and nothing of ours mined
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.CANCELLED
+
+
+def test_retry_completes_a_mined_bridge_instead_of_double_signing(monkeypatch):
+    """[WARP-NONCE-AMBIGUITY] A consumed nonce with a receipt is a SUCCESS.
+
+    _retry_tx_reset read "nonce consumed" as "safe to re-sign", but our own
+    transaction mining consumes the nonce too. Clearing the raw then signed a
+    brand-new bridgeToChia at a fresh nonce -- a true double bridge -- while
+    the mined MessageSent nonce was never read. Retry must instead resume:
+    the rebroadcast is benign and phase 2 routes the receipt.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    h1 = "0x" + "aa" * 32
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store, prior=[h1], tx_hash="0x" + "22" * 32)
+
+    ctx.evm.mined_nonce = 9                          # consumed...
+    ctx.evm.receipts_by_hash = {h1: message_sent_receipt("00" * 31 + "07")}
+
+    engine.job_action(job.id, "retry")
+    state = store.get_job(job.id).state
+    assert state["bridge_raw"] == "02bbbbbb", "a mined bridge must not be re-signed"
+    assert state["bridge_prior_hashes"] == [h1]
+
+    out = engine.step()                              # ...and completed by resume
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED
+    job2 = store.get_active_job()
+    assert job2.bridge_nonce == "00" * 31 + "07"
+    assert job2.bridge_tx_hash == h1, "pinned to the signing that mined"
+
+
+def test_abandon_refuses_a_bridge_that_actually_mined(monkeypatch):
+    """The abandon guard's first version checked liveness only, so a mined
+    bridge -- nonce consumed by our own transaction -- passed it and was
+    closed over real bridged USDC with the MessageSent nonce unread."""
+    h1 = "0x" + "aa" * 32
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store, prior=[h1], tx_hash="0x" + "22" * 32)
+
+    ctx.evm.mined_nonce = 9
+    ctx.evm.receipts_by_hash = {h1: message_sent_receipt("00" * 31 + "07")}
+
+    with pytest.raises(S.WarpError, match="Use Retry"):
+        engine.job_action(job.id, "abandon")
+
+
+def test_a_revert_re_prepare_resets_the_ambiguous_receipt_budget(monkeypatch):
+    """bridge_status_polls is receipt-specific bookkeeping like the rest."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                    # phase 1: sign
+    ctx.evm.receipt = {"blockNumber": "0x10"}        # ambiguous
+    engine.step()
+    engine.step()
+    assert store.get_active_job().state["bridge_status_polls"] == 2
+
+    ctx.evm.receipt = {"blockNumber": "0x10", "status": "0x0"}   # reverted
+    engine.step()
+    state = store.get_active_job().state
+    assert state["bridge_attempt"] == 1
+    assert state.get("bridge_status_polls") is None, (
+        "attempt 2 must get the full ambiguous-receipt budget"
+    )
+
+
+def test_a_second_sweep_can_close_a_job_with_no_recorded_coin_id(monkeypatch):
+    """[WARP-SWEEP-COIN-ID] The first sweep must record what it tried to spend.
+
+    A job failed out of FUNDING_CLAIM by the pending deadline never had
+    security_coin_id written (only the FUNDING_CLAIM advance writes it). The
+    first Sweep pushes the bundle and correctly stays open -- the coin is not
+    spent yet -- but without the id the second Sweep could never prove the
+    spend once the bundle mined: find_security_coin returns None for a spent
+    coin and _funding_provably_gone had nothing to check. Held the slot
+    forever.
+    """
+    coin = FakeCoin(b"\x5a" * 32)
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: coin)
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "pushed"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, _ctx = build(store)
+    job = _seed_failed_funded(store)
+    assert "security_coin_id" not in store.get_job(job.id).state
+
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.FAILED             # unresolved, stays open
+    assert store.get_job(job.id).state["security_coin_id"] == (b"\x5a" * 32).hex()
+
+    # The sweep mines: the coin is now gone from the unspent set, and the
+    # recorded id is what lets the second sweep prove the spend and close.
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+
+
+def test_every_open_status_has_an_operator_exit():
+    """The invariant behind this whole branch, asserted once.
+
+    Every non-terminal status must be cancellable, sweepable, or bounded by a
+    pending deadline that routes to FAILED (which offers Retry, Sweep and
+    Abandon). CLAIM_FUNDED silently violated this when the deadline table was
+    first written, and nothing structural stops the next status added from
+    doing the same -- except this test.
+    """
+    from gui.services.warp import jobs
+
+    statuses = {
+        v for k, v in vars(JobStatus).items()
+        if not k.startswith("_") and isinstance(v, str)
+    }
+    open_statuses = statuses - jobs.TERMINAL_STATES - jobs.CLOSED_STATES
+    # _SWEEPABLE is deliberately NOT a disjunct: both its members are terminal,
+    # so it can never cover an open status -- including it would falsely
+    # certify a future open sweepable state as having an exit.
+    covered = set(S._PENDING_MAX_POLLS) | S._CANCELLABLE
+    uncovered = open_statuses - covered
+    assert not uncovered, (
+        f"{sorted(uncovered)} can pend or error forever with no operator exit"
+    )
+    # And every deadline-bounded status must actually be dispatched, or the
+    # deadline never runs.
+    engine, _ctx = build(new_store())
+    undispatched = set(S._PENDING_MAX_POLLS) - set(engine._HANDLERS)
+    assert not undispatched, f"{sorted(undispatched)} have deadlines but no handler"
+
+
+def test_a_job_frozen_as_a_rehearsal_stays_a_rehearsal(monkeypatch):
+    """The mirror of the flip test: frozen dry_run=True wins over live False.
+
+    Without it, flipping the config live mid-rehearsal would broadcast a
+    transaction the operator was told was never going to be sent.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(dry_run=False))
+
+    def never(*a, **k):
+        raise AssertionError("a frozen rehearsal must never broadcast")
+
+    ctx.evm.send_raw_transaction = never
+    seed(
+        store, JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"dry_run": True},
+    )
+
+    engine.step()                                   # phase 1: sign
+    out = engine.step()                             # rehearsal stop
+
+    assert out["status"] == JobStatus.DRY_RUN_OK
+    assert store.get_job(out["id"]).bridge_tx_hash is None
+
+
+def test_retry_after_a_deadline_expiry_actually_gets_another_chance(monkeypatch):
+    """[WARP-STICKY-POLLS] The expiry message promises Retry works. It must.
+
+    _pending_expired runs before the handler and only _apply resets the
+    counter, so a job failed by the deadline kept pending_polls at the limit:
+    Retry restored the status and the very next tick re-expired it. That made
+    Retry a dead button for all five deadline states, and pushed the operator
+    toward Sweep -- which on a CLAIMING job with a pushed claim bundle races
+    the bot's own claim for the same coin.
+    """
+    monkeypatch.setitem(S._PENDING_MAX_POLLS, JobStatus.COLLECTING_SIGS, 2)
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.COLLECTING_SIGS,
+               columns={"receiver_ph": RECEIVER_PH.hex()},
+               state={"pending_polls": 2})
+
+    assert engine.step()["status"] == JobStatus.FAILED
+    assert store.get_job(job.id).state["pending_polls"] == 0
+
+    out = engine.job_action(job.id, "retry")
+    assert out["status"] == JobStatus.COLLECTING_SIGS
+    # The point: the next tick must not immediately re-fail.
+    assert engine.step()["status"] == JobStatus.COLLECTING_SIGS
+
+
+def test_retry_after_an_approve_failure_keeps_a_live_transaction(monkeypatch):
+    """[WARP-APPROVE-NONCE] The approve guard read a key nothing writes.
+
+    _h_approving persists "approve_nonce"; _retry_tx_reset read
+    "approve_tx_nonce", so nonce was always None, the chain check was skipped,
+    and the raw was cleared unconditionally. Retry while the original approve
+    was still pending therefore re-signed at nonce+1: two approves mine, and
+    anything queued behind the stuck one stays stuck.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000},
+        state={"failed_from": JobStatus.APPROVING,
+               "approve_raw": "02aaaaaa", "approve_nonce": 7},
+    )
+
+    ctx.evm.mined_nonce = 7          # still open -> the approve may yet mine
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["approve_raw"] == "02aaaaaa"
+
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     state_patch={"failed_from": JobStatus.APPROVING})
+    ctx.evm.mined_nonce = 12         # spent -> safe to re-sign
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state.get("approve_raw") is None
+
+
+def test_a_binding_refused_job_can_still_be_abandoned():
+    """[WARP-REFUSED-DEADEND] A refused job had strictly fewer exits than FAILED.
+
+    step() is read-only on a binding mismatch, Retry and Sweep raise on the
+    same check, and BRIDGING is not cancellable -- so a row predating the
+    dry_run freeze held the single active slot for the life of the
+    installation. That is reachable by a plain upgrade.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    store.create_job(
+        NET.name,
+        status=JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"network": NET.name, "hot_address": "ab" * 20},   # no dry_run
+    )
+    job = store.get_active_job()
+
+    assert engine.step()["status"] == JobStatus.BRIDGING       # refused, read-only
+    with pytest.raises(S.WarpError):
+        engine.job_action(job.id, "retry")
+    with pytest.raises(S.WarpError):
+        engine.job_action(job.id, "cancel")
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+    engine.request_bridge()
+
+
+def test_the_real_engine_construction_path_actually_runs(tmp_path, monkeypatch):
+    """[WARP-BUILD-IMPORTS] _build_engine_with must resolve every name it uses.
+
+    Splitting _build_engine to close a sqlite leak moved the client imports
+    into the new half and dropped `nostr` from the list -- which
+    _build_engine_with still calls. The engine raised NameError on every
+    start, i.e. the bridge could never run at all, and nothing noticed:
+    every other test constructs WarpEngine directly through the harness's
+    build(), so this function had no coverage whatsoever.
+    """
+    from unittest import mock
+
+    from gui.services.warp import keystore as ks
+
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg: str(tmp_path / "warp_jobs.db"))
+    worker = S._WarpWorker()
+    worker.set_config({
+        "warp": {
+            "enabled": True,
+            "max_auto_bridge_usdc": 100,
+            "evm_private_key_dpapi": "irrelevant",
+        }
+    })
+
+    # The protector is mocked alongside the key: default_protector() requires
+    # Windows DPAPI and raises on the Linux CI runner, which is a platform
+    # gate, not the wiring this test exists to cover.
+    with mock.patch.object(
+        ks, "load_evm_key", return_value=ks.EvmKey(b"\x11" * 32, "0x" + "ab" * 20)
+    ), mock.patch.object(ks, "default_protector", return_value=object()):
+        engine = worker._ensure_engine()
+
+    assert engine is not None, f"engine did not build: {worker._engine_error}"
+    assert worker._engine_error is None
+    engine.close()
+
+
+def test_abandon_frees_the_slot_and_records_how_to_recover():
+    """[WARP-ABANDON] The escape from a job the engine cannot resolve.
+
+    A job that trips an attested-terms anchor has a bridge_nonce and no
+    ephemeral key: Sweep raises before touching it, Cancel is refused, and
+    Retry re-fails against the same immutable attestation. Its context menu
+    was empty, and FAILED holds the single active slot -- so the bridge could
+    never open another job, with no in-app way out.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"bridge_nonce": "00" * 31 + "07",
+                 "receiver_ph": RECEIVER_PH.hex(),
+                 "last_error": "attested amount mismatch"},
+        state={"failed_from": JobStatus.MESSAGE_SENT},
+    )
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None          # the slot is free
+    engine.request_bridge()                        # and a new job is possible
+
+    # No funds are lost here -- the message stays claimable -- so the recovery
+    # details must survive the close rather than go with it.
+    recovery = store.get_job(job.id).state["abandon_recovery"]
+    assert recovery["bridge_nonce"] == "00" * 31 + "07"
+    assert recovery["portal"]
+
+
+def test_abandon_never_touches_a_closed_job():
+    """A hot-wallet rotation binding-mismatches every historic row.
+
+    The widened gate (abandon for any refused job) would then have let a
+    COMPLETED job be flipped to CANCELLED -- rewriting the record of a
+    finished bridge. Closed is closed.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.COMPLETED, state={"hot_address": OTHER_HOT})
+
+    with pytest.raises(S.WarpError, match="already closed"):
+        engine.job_action(job.id, "abandon")
+
+
+def test_a_status_this_build_does_not_know_is_abandonable():
+    """Version skew: a newer build wrote a status this one has no handler for.
+
+    The dispatcher skips it, every other action refuses it, and it holds the
+    single active slot -- the same no-exit shape as everything else this
+    branch closed, so Abandon accepts it.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.BRIDGING)
+    store._conn.execute(
+        "UPDATE warp_jobs SET status='FUTURE_STATE' WHERE id=?", (job.id,)
+    )
+    store._conn.commit()
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+
+
+def test_abandon_is_refused_for_a_job_that_is_not_failed():
+    """It is an escape hatch, not a second Cancel."""
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING, columns={"receiver_ph": RECEIVER_PH.hex()})
+
+    with pytest.raises(S.WarpError, match="cannot abandon a job in CLAIMING"):
+        engine.job_action(job.id, "abandon")
+
+
+def test_a_state_that_never_progresses_eventually_reaches_the_operator(monkeypatch):
+    """[WARP-PENDING-DEADLINE] An invisible pend is an unrecoverable job.
+
+    _apply_stay resets retry_count and clears last_error on every pend --
+    correctly, since nothing moved -- but that also made these loops
+    unbounded. None of the pending states offers Cancel, Retry is a no-op on a
+    non-FAILED job, and Sweep closes only FAILED, so a job stuck here held the
+    single active slot forever. FAILED is the one status with affordances.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    monkeypatch.setitem(S._PENDING_MAX_POLLS, JobStatus.FUNDING_CLAIM, 3)
+    store = new_store()
+    engine, _ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    store.update_job(job.id, state_patch={"funding_tx_id": "already-sent"})
+
+    out = None
+    for _ in range(6):
+        out = engine.step()
+        if out["status"] == JobStatus.FAILED:
+            break
+
+    assert out["status"] == JobStatus.FAILED
+    assert "no progress in FUNDING_CLAIM" in (out["last_error"] or "")
+
+
+def test_the_pending_counter_resets_when_the_job_advances(monkeypatch):
+    """The clock measures time in one state, not the age of the job."""
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    store = new_store()
+    engine, _ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    store.update_job(job.id, state_patch={"pending_polls": 400})
+
+    out = engine.step()          # the coin is there -> advance
+
+    assert out["status"] == JobStatus.CLAIM_FUNDED
+    assert store.get_active_job().state["pending_polls"] == 0
+
+
+def test_a_malformed_message_destination_fails_terminally():
+    """[WARP-MSG-WIDTH] Fail before the ephemeral key is minted, not after.
+
+    Nothing checked the attested fields, and _classify treats a ValueError as
+    retryable with no cap -- so a bad destination degraded into a silent
+    infinite backoff, surfacing much later in the claim build.
+    """
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    engine, _ctx = build(
+        store, watcher=FakeWatcher(_sent_msg(destination=bytes(20)))  # not 32
+    )
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FAILED
+    assert "20-byte message destination" in (out["last_error"] or "")
+    assert "ephemeral_blob" not in store.get_job(out["id"]).state
+
+
+def test_variable_width_message_contents_are_still_accepted():
+    """Contents are heterogeneous CLVM atoms -- the amount is a short one.
+
+    A uniform 32-byte rule here would reject every real message; this pins
+    that down so the validation above cannot be tightened into a bug.
+    """
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    engine, _ctx = build(store, watcher=FakeWatcher(_sent_msg()))
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FUNDING_CLAIM
+    contents = store.get_active_job().state["message_contents"]
+    assert any(len(c) != 64 for c in contents), "fixture should include a short atom"
+
+
+def test_the_sweep_pays_the_bot_wallet_not_the_cat_receiver(monkeypatch):
+    """[WARP-SWEEP-DEST] build_sweep_bundle emits raw XCH, not a CAT.
+
+    The destination was job.receiver_ph -- the wUSDC.b receiver, which once
+    warp.chia_receiver_address is set can be an address the bot does not
+    control. drivers.build_sweep_bundle's own docstring already says "the bot
+    wallet"; the caller was what disagreed. Both sweep paths share this
+    helper, including the unattended third-party-claim auto-sweep.
+    """
+    from gui.services.warp import clvm_utils as cu
+
+    seen = {}
+
+    def _capture(coinset, net, *, security_coin, destination_puzzle_hash,
+                 ephemeral_sk, sweep_fee=0):
+        seen["dest"] = destination_puzzle_hash
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", _capture)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_funded(store)
+
+    # The harness's default wallet address decodes to RECEIVER_PH, so the two
+    # have to be separated for this to discriminate at all.
+    wallet_ph = b"\x77" * 32
+    ctx.wallet.next_address = cu.encode_puzzle_hash(wallet_ph, NET.chia_prefix)
+
+    engine.job_action(job.id, "sweep")
+
+    assert seen["dest"] == wallet_ph, "recovered XCH must go back to the bot wallet"
+    assert seen["dest"] != RECEIVER_PH, "must not pay the wUSDC.b receiver"
+
+
+def test_a_pushed_but_unspent_sweep_does_not_close_the_job(monkeypatch):
+    """[WARP-SWEEP-VERIFY] Mempool acceptance is not a spent coin.
+
+    The sweep pushes at zero fee, which is exactly what a busy mempool drops.
+    Recording swept: True on acceptance closed the job as CANCELLED -- which
+    offers neither Retry nor Sweep -- and left the funding coin unspent with
+    no route back to it.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, _ = build(store)
+    job = _seed_failed_funded(store)
+
+    out = engine.job_action(job.id, "sweep")
+
+    assert out["status"] == JobStatus.FAILED, "must stay open while the coin lives"
+    assert store.get_active_job() is not None
+    state = store.get_active_job().state
+    assert state["swept"] is False
+    assert "not spent yet" in state["sweep_status"]
 
 
 def test_sweep_closes_when_the_security_coin_is_provably_spent(monkeypatch):
@@ -392,6 +1017,9 @@ def test_claiming_conflict_completes_when_the_message_coin_was_spent(monkeypatch
     monkeypatch.setattr(claim_mod, "message_claimed_on_chain", lambda *a, **k: True)
     monkeypatch.setattr(claim_mod, "build_and_push_sweep",
                         lambda *a, **k: ("accepted", "swept"))
+    # The sweep mines. Without this the coin is still live, and COMPLETED -- a
+    # closed state -- must not bury it; that is the companion test below.
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
 
     out = engine.step()
 
@@ -615,6 +1243,430 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def test_key_objects_never_render_their_private_key():
+    """[WARP-KEY-REPR] _guarded pipes exception text into the log and the GUI.
+
+    Both key types were plain frozen dataclasses, so the generated repr
+    rendered private_key=b'\\x..' in full. One traceback holding the object
+    was all it would have taken.
+    """
+    from gui.services.warp import keystore as ks
+
+    secret = b"\x11" * 32
+    evm = ks.evm_key_from_hex(secret.hex())
+    for text in (repr(evm), str(evm), f"{evm}", f"{[evm]}"):
+        assert secret.hex() not in text.lower()
+        assert "\\x11" not in text
+    assert evm.address in repr(evm)          # still identifiable
+
+    bls = ks.BlsKey(private_key=secret, public_key=b"\x22" * 48)
+    for text in (repr(bls), str(bls), f"{[bls]}"):
+        assert secret.hex() not in text.lower()
+        assert "\\x11" not in text
+
+
+def test_dropping_the_engine_closes_the_job_store(tmp_path, monkeypatch):
+    """[WARP-STORE-LEAK] WarpJobStore.close() had no caller anywhere.
+
+    set_config drops the engine and _build_engine opens a fresh store, so
+    every config reload leaked a connection plus its WAL/SHM handles.
+    """
+    from gui.services.warp.jobs import WarpJobStore
+
+    store = WarpJobStore(str(tmp_path / "warp_jobs.db"))
+    engine, _ctx = build(store)
+
+    worker = S._WarpWorker()
+    worker._engine = engine
+    worker._drop_engine()
+
+    assert worker._engine is None
+    with pytest.raises(Exception):           # the connection really is closed
+        store.get_active_job()
+
+
+def test_an_enabled_bridge_must_state_its_cap():
+    """[WARP-CAP-FAIL-OPEN] A missing cap used to mean no cap at all.
+
+    The clamp is guarded on `if p.max_micros > 0`, and absent / blank / 0 / null
+    all resolved to 0 -- so omitting the key removed the limit rather than
+    setting one. Bridge now takes no amount and has no confirmation dialog, and
+    the manual path skips the floor with want = have, so one click bridged the
+    whole hot-wallet balance.
+    """
+    with pytest.raises(S.WarpError, match="max_auto_bridge_usdc is required"):
+        S.warp_params_from_config({"warp": {"enabled": True}})
+
+    with pytest.raises(S.WarpError, match="must be positive"):
+        S.warp_params_from_config(
+            {"warp": {"enabled": True, "max_auto_bridge_usdc": 0}}
+        )
+
+    # A stated positive cap below half a micro-USDC rounds to 0 micros, and
+    # the clamp is guarded on max_micros > 0 -- a silent fail-open.
+    with pytest.raises(S.WarpError, match="rounds to zero"):
+        S.warp_params_from_config(
+            {"warp": {"enabled": True, "max_auto_bridge_usdc": 0.0000004}}
+        )
+
+    # Uncapped is still reachable, but it has to be said out loud.
+    assert S.warp_params_from_config(
+        {"warp": {"enabled": True, "max_auto_bridge_usdc": "unlimited"}}
+    ).max_micros == 0
+
+    # A disabled warp section must never stop a config from loading.
+    assert S.warp_params_from_config({"warp": {"enabled": False}}).max_micros == 0
+
+
+def test_sweep_is_refused_engine_side_for_an_in_flight_job():
+    """The GUI gates Sweep on a polled snapshot; the engine must gate it too."""
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING, columns={"receiver_ph": RECEIVER_PH.hex()})
+
+    with pytest.raises(S.WarpError, match="still an input to the claim"):
+        engine.job_action(job.id, "sweep")
+
+
+def test_retry_re_signs_only_once_the_nonce_is_spent(monkeypatch):
+    """[WARP-RETRY-RAW] Replaying a reverted raw fails again immediately.
+
+    But clearing it unconditionally is worse: the stuck-tx path also lands in
+    FAILED with the transaction possibly still in the mempool, and re-signing
+    would take a new nonce and bridge a second time.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"failed_from": JobStatus.BRIDGING,
+               "bridge_raw": "02bbbbbb", "bridge_tx_nonce": 3},
+    )
+
+    # Nonce still open -> the transaction may yet mine, so keep the raw.
+    ctx.evm.mined_nonce = 3
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["bridge_raw"] == "02bbbbbb"
+
+    # Nonce spent -> nothing signed can mine, so re-sign on the next tick.
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     state_patch={"failed_from": JobStatus.BRIDGING})
+    ctx.evm.mined_nonce = 9
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state.get("bridge_raw") is None
+
+
+def _seed_broadcast_bridge(store):
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()})
+
+
+def test_an_unmined_bridge_is_re_signed_at_a_higher_fee(monkeypatch):
+    """[WARP-STUCK-TX] bump_fees finally has a caller.
+
+    An unmined bridge used to sit in a bare _stay forever. _apply_stay resets
+    retry_count and clears last_error on every pend, so the loop was
+    invisible; _BRIDGE_MAX_ATTEMPTS only counts reverted receipts, never an
+    absent one. BRIDGING is not cancellable and Sweep closes only FAILED, so
+    the job held the single active row permanently and every later bridge
+    raised ActiveJobExists -- recoverable only by editing warp_jobs.db.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                   # phase 1: sign
+    original = store.get_active_job().state["bridge_fees"]
+    ctx.evm.receipt = None                          # never mines
+
+    for _ in range(S._STUCK_TX_POLLS):   # the last one triggers the bump
+        engine.step()
+
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING
+    assert job.state["bridge_fee_bumps"] == 1, "should have escalated exactly once"
+    assert job.state["bridge_unmined_polls"] == 0, "poll counter resets after a bump"
+    # The two properties the test is named for, asserted directly. The first
+    # version checked only bookkeeping counters, and passed unchanged against
+    # a replacement signed at a freshly-read nonce -- the double-bridge case.
+    kind, _mojo, nonce, fees = ctx.evm.prepared[-1]
+    assert kind == "bridge"
+    assert nonce == 3, "the replacement must pin the original signing's nonce"
+    assert fees.max_fee_per_gas > original[0]
+    assert fees.max_priority_fee_per_gas > original[1]
+    # And escalation stays anchored to the ORIGINAL fees, so consecutive
+    # attempts stay a full ratio apart and clear the node's replacement floor.
+    assert store.get_active_job().state["bridge_fees"] == original
+
+
+def test_a_bridge_nonce_consumed_elsewhere_fails_instead_of_pending(monkeypatch):
+    """If something else took the nonce, nothing we signed can ever mine."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                   # signs at nonce 3
+    ctx.evm.receipt = None
+    ctx.evm.mined_nonce = 9                         # account moved past it
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FAILED
+    assert "consumed by another transaction" in (store.get_active_job().last_error or "")
+
+
+def _hash_aware_signer():
+    """A signer that gives every signing a distinct hash, like the real one.
+
+    fake_sign_tx returns a CONSTANT bridge hash, so under it a fee replacement
+    is indistinguishable from the original -- which made the first version of
+    the test below vacuous, and hid a real defect: the mined hash was never
+    written back to bridge_tx_hash.
+    """
+    box = {"n": 0}
+
+    def _sign(unsigned, key):
+        box["n"] += 1
+        return SimpleNamespace(
+            raw=bytes([0x02, box["n"], box["n"], box["n"]]),
+            tx_hash="0x" + f"{box['n']:02x}" * 32,
+            nonce=3,
+        )
+
+    return _sign
+
+
+def test_a_replacement_still_polls_the_original_hash(monkeypatch):
+    """Only one signing of a nonce can mine, and the node picks which."""
+    monkeypatch.setattr(evm_mod, "sign_tx", _hash_aware_signer())
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()
+    first_hash = store.get_active_job().bridge_tx_hash
+    ctx.evm.receipt = None
+    for _ in range(S._STUCK_TX_POLLS):   # the last one triggers the bump
+        engine.step()
+
+    job = store.get_active_job()
+    assert job.bridge_tx_hash != first_hash, "the replacement must be a new signing"
+    assert first_hash in job.state["bridge_prior_hashes"]
+
+
+def test_a_bridge_that_mines_under_its_original_hash_still_completes(monkeypatch):
+    """[WARP-MINED-HASH] Pin bridge_tx_hash to the signing that actually mined.
+
+    _bridge_receipt polls every hash precisely because the original can mine
+    as the replacement goes out -- but it discarded WHICH one won, so
+    bridge_tx_hash kept pointing at the replacement, a transaction that will
+    never exist. _h_bridge_confirmed then polls a phantom hash,
+    get_confirmations returns 0 forever, and the BRIDGE_CONFIRMED deadline
+    fails the job -- with real USDC bridged and the nonce correctly recorded.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", _hash_aware_signer())
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()
+    original = store.get_active_job().bridge_tx_hash
+    ctx.evm.receipt = None
+    for _ in range(S._STUCK_TX_POLLS):
+        engine.step()
+    replacement = store.get_active_job().bridge_tx_hash
+    assert replacement != original
+
+    # The ORIGINAL mines, not the replacement.
+    ctx.evm.receipts_by_hash = {original: message_sent_receipt("00" * 31 + "07")}
+    out = engine.step()
+
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED
+    assert store.get_active_job().bridge_tx_hash == original, (
+        "the column must name the transaction that mined, not the one we last signed"
+    )
+
+
+def test_a_receipt_without_a_status_is_not_treated_as_success(monkeypatch):
+    """[WARP-RECEIPT-AMBIG] "not reverted" is not "succeeded".
+
+    Both handlers branched on receipt_reverted alone, so a receipt whose
+    status is absent or unparseable took the success path -- advancing to
+    BRIDGING on an allowance that may never have taken effect.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000})
+
+    engine.step()                                   # phase 1: sign
+    ctx.evm.receipt = {"blockNumber": "0x10"}       # mined, but no status field
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.APPROVING, "must not advance on an unknown status"
+    assert store.get_active_job().state["approve_status_polls"] == 1
+
+
+def test_an_ambiguous_receipt_eventually_fails_instead_of_pending_forever(monkeypatch):
+    """The re-poll is bounded: FAILED is the status with operator affordances."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000})
+
+    engine.step()
+    ctx.evm.receipt = {"blockNumber": "0x10"}
+    out = None
+    for _ in range(S._AMBIGUOUS_RECEIPT_POLLS + 2):
+        out = engine.step()
+        if out["status"] == JobStatus.FAILED:
+            break
+
+    assert out["status"] == JobStatus.FAILED
+
+
+def test_estimate_gas_refuses_to_broadcast_a_reverting_call():
+    """[WARP-ESTIMATE-REVERT] A revert during estimation must not fall back.
+
+    Falling back to a fixed gas limit and broadcasting anyway spends the gas
+    to be told on chain what the node already said. A transport error is
+    different -- it says nothing about the transaction, and the fallback is
+    exactly right there.
+    """
+    from gui.services.warp.evm import EvmError, EvmRpcError
+
+    class _Client(evm_mod.EvmClient):
+        def __init__(self, exc):
+            self._exc = exc
+
+        def _call_quantity(self, method, params):
+            raise self._exc
+
+    reverting = _Client(EvmRpcError("execution reverted: ERC20: bad allowance", code=3))
+    with pytest.raises(EvmError):
+        reverting.estimate_gas(
+            from_address="0x" + "ab" * 20, to="0x" + "cd" * 20,
+            value=0, data=b"", default=250_000,
+        )
+
+    # A node that is merely unreachable still gets the fallback.
+    offline = _Client(EvmError("eth_estimateGas request failed: connection reset"))
+    assert offline.estimate_gas(
+        from_address="0x" + "ab" * 20, to="0x" + "cd" * 20,
+        value=0, data=b"", default=250_000,
+    ) == 250_000
+
+
+def test_editing_claim_fee_does_not_orphan_a_funded_job(monkeypatch):
+    """[WARP-FEE-FREEZE] Lookups use the funded amount, not today's config.
+
+    find_security_coin matches the on-chain amount exactly. The claim-path
+    handlers recomputed it as post_tip + claim_fee_mojos from live params, so
+    editing that key and reloading made every scan look for an amount no coin
+    has. The job then pended forever -- _apply_stay clears last_error and
+    resets retry_count on each pend, so it never reached FAILED, and a
+    non-FAILED job offers neither Retry nor Sweep.
+    """
+    store = new_store()
+    job = seed(
+        store, JobStatus.CLAIM_FUNDED,
+        columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985},
+    )
+    blob, _sk = make_ephemeral_blob(job.id)
+    funded = 4985 + 100_000_000            # what was actually sent
+    store.update_job(
+        job.id,
+        state_patch={"ephemeral_blob": blob, "funding_amount": funded},
+    )
+
+    # Operator edits claim_fee_mojos and the config reloads.
+    engine, ctx = build(store, params=default_params(claim_fee_mojos=250_000_000))
+
+    looked_for = []
+    monkeypatch.setattr(
+        claim_mod, "find_security_coin",
+        lambda coinset, sk, amount: looked_for.append(amount),
+    )
+
+    engine.step()
+
+    assert looked_for == [funded], (
+        f"scanned for {looked_for} but the coin on chain holds {funded}"
+    )
+
+
+def test_flipping_dry_run_cannot_close_a_live_broadcast_job(monkeypatch):
+    """[WARP-DRYRUN-FREEZE] A live job stays live when the config flips.
+
+    The rehearsal stops used to read self._params.dry_run. A job broadcast
+    live and sitting in BRIDGING would, the moment warp.dry_run went true,
+    be closed as DRY_RUN_OK with bridge_tx_hash nulled -- freeing the slot
+    and leaving an audit trail saying "no funds moved" while real USDC was
+    in flight, recoverable only by BaseScan forensics. dry_run defaults to
+    true, so restarting the GUI was enough to trigger it.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    # Engine now configured for rehearsal; the job was frozen live.
+    engine, ctx = build(store, params=default_params(dry_run=True))
+    seed(
+        store, JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"dry_run": False},
+    )
+
+    engine.step()                                   # phase 1: sign
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING
+    assert job.bridge_tx_hash == "0x" + "22" * 32
+
+    ctx.evm.receipt = message_sent_receipt("00" * 31 + "07")
+    out = engine.step()                             # phase 2: broadcast
+
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED, "a live job must not go DRY_RUN_OK"
+    assert ctx.evm.sent_raw == [b"\x02\xbb\xbb\xbb"], "the live job must still broadcast"
+    assert store.get_active_job().bridge_tx_hash == "0x" + "22" * 32
+
+
+def test_a_job_predating_the_dry_run_freeze_is_refused_not_guessed(monkeypatch):
+    """A row with no frozen dry_run cannot be resumed in APPROVING/BRIDGING.
+
+    Neither default is safe: assume rehearsal and a live job is closed with
+    its tx hash discarded; assume live and a rehearsal broadcasts real funds.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    # Bypass seed(), which freezes dry_run -- this is a pre-freeze row, whose
+    # state carries the old binding and nothing else.
+    store.create_job(
+        NET.name,
+        status=JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"network": NET.name, "hot_address": "ab" * 20},
+    )
+    assert "dry_run" not in store.get_active_job().state
+
+    engine.step()
+
+    # A binding mismatch is read-only: it refuses before the handler runs, so
+    # phase 1 never signs. Asserting on sent_raw alone would be vacuous here --
+    # a single BRIDGING step never broadcasts even on the happy path.
+    job = store.get_active_job()
+    assert "bridge_raw" not in job.state, "a job that cannot be classified must not sign"
+    assert job.bridge_tx_hash is None
+    assert ctx.evm.sent_raw == []
+    assert job.status == JobStatus.BRIDGING
+    assert engine._binding_error and "predates the dry_run freeze" in engine._binding_error
+
+
 def test_dry_run_signs_both_txs_and_never_broadcasts(monkeypatch):
     monkeypatch.setattr(
         evm_mod, "sign_tx",
@@ -678,9 +1730,12 @@ def test_testnet_config_key_is_rejected():
 
 
 def test_dry_run_defaults_on():
-    assert S.warp_params_from_config({"warp": {"enabled": True}}).dry_run is True
+    cap = {"max_auto_bridge_usdc": 100}      # required once enabled
     assert S.warp_params_from_config(
-        {"warp": {"enabled": True, "dry_run": False}}
+        {"warp": {"enabled": True, **cap}}
+    ).dry_run is True
+    assert S.warp_params_from_config(
+        {"warp": {"enabled": True, "dry_run": False, **cap}}
     ).dry_run is False
 
 
@@ -794,6 +1849,7 @@ def test_build_engine_checks_the_anchor_before_constructing_clients(monkeypatch)
     worker.set_config({
         "warp": {
             "enabled": True,
+            "max_auto_bridge_usdc": 100,             # required once enabled
             "expected_asset_id": "ff" * 32,          # deliberately wrong
             "evm_private_key_dpapi": "irrelevant",
         }
