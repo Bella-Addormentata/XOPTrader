@@ -259,6 +259,48 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     engine.request_bridge()                    # a new job is possible again
 
 
+def test_a_state_that_never_progresses_eventually_reaches_the_operator(monkeypatch):
+    """[WARP-PENDING-DEADLINE] An invisible pend is an unrecoverable job.
+
+    _apply_stay resets retry_count and clears last_error on every pend --
+    correctly, since nothing moved -- but that also made these loops
+    unbounded. None of the pending states offers Cancel, Retry is a no-op on a
+    non-FAILED job, and Sweep closes only FAILED, so a job stuck here held the
+    single active slot forever. FAILED is the one status with affordances.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    monkeypatch.setitem(S._PENDING_MAX_POLLS, JobStatus.FUNDING_CLAIM, 3)
+    store = new_store()
+    engine, _ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    store.update_job(job.id, state_patch={"funding_tx_id": "already-sent"})
+
+    out = None
+    for _ in range(6):
+        out = engine.step()
+        if out["status"] == JobStatus.FAILED:
+            break
+
+    assert out["status"] == JobStatus.FAILED
+    assert "no progress in FUNDING_CLAIM" in (out["last_error"] or "")
+
+
+def test_the_pending_counter_resets_when_the_job_advances(monkeypatch):
+    """The clock measures time in one state, not the age of the job."""
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    store = new_store()
+    engine, _ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    store.update_job(job.id, state_patch={"pending_polls": 400})
+
+    out = engine.step()          # the coin is there -> advance
+
+    assert out["status"] == JobStatus.CLAIM_FUNDED
+    assert store.get_active_job().state["pending_polls"] == 0
+
+
 def test_a_malformed_message_destination_fails_terminally():
     """[WARP-MSG-WIDTH] Fail before the ephemeral key is minted, not after.
 

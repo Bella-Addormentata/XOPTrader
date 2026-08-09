@@ -126,6 +126,28 @@ _STUCK_TX_POLLS: int = 20
 # beyond that a further attempt would re-sign at an identical fee and be
 # rejected as a non-replacement.
 _MAX_FEE_BUMPS: int = 3
+
+# How long a job may sit pending in a given state before it is handed to the
+# operator. _apply_stay resets retry_count and clears last_error on every pend
+# -- correctly, since nothing moved -- but that also made these loops invisible
+# and unbounded. None of these states offers Cancel, Retry is a no-op on a
+# non-FAILED job, and Sweep closes only FAILED, so a job stuck here held the
+# single active slot forever. FAILED is the one status with affordances, so
+# expiry routes there rather than nowhere.
+#
+# Counted in polls rather than wall time, matching _CLAIM_CONFLICT_MAX_ROUNDS
+# and _STUCK_TX_POLLS above. Times below assume the default 15s poll interval.
+#
+# Deliberately generous: every one of these waits on somebody else's
+# infrastructure (the warp.green watcher, the validator quorum, a Chia block),
+# and failing a live bridge early is worse than waiting too long.
+_PENDING_MAX_POLLS: Dict[str, int] = {
+    JobStatus.MESSAGE_SENT: 1440,       # ~6h -- watcher indexing the message
+    JobStatus.COLLECTING_SIGS: 1440,    # ~6h -- validator quorum
+    JobStatus.FUNDING_CLAIM: 480,       # ~2h -- a Chia send confirming
+    JobStatus.CLAIMING: 1440,           # ~6h -- the final CAT coin appearing
+    JobStatus.BRIDGE_CONFIRMED: 480,    # ~2h -- Base confirmation depth
+}
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
@@ -466,6 +488,10 @@ class WarpEngine:
         if handler is None:
             return _job_dict(job)
 
+        expired = self._pending_expired(job)
+        if expired is not None:
+            return self._apply_terminal(job, WarpTerminal(expired))
+
         try:
             result = handler(job)
         except WarpPending as exc:
@@ -499,15 +525,33 @@ class WarpEngine:
         if result.columns:
             columns.update(result.columns)
         message = result.message or f"{job.status} -> {result.next_status}"
+        # A new state starts its own count; see _pending_expired.
+        state = dict(result.state or {})
+        state["pending_polls"] = 0
         updated = self._store.update_job(
             job.id,
             status=result.next_status,
             expected_status=job.status,
             columns=columns,
-            state_patch=result.state,
+            state_patch=state,
             event=("transition", message, None),
         )
         return _job_dict(updated)
+
+    def _pending_expired(self, job: WarpJob) -> Optional[str]:
+        """Why this job has pended too long in its current state, or ``None``."""
+        limit = _PENDING_MAX_POLLS.get(job.status)
+        if limit is None:
+            return None
+        polls = int(job.state.get("pending_polls") or 0)
+        if polls < limit:
+            return None
+        hours = polls * float(self._params.poll_interval_s) / 3600.0
+        return (
+            f"no progress in {job.status} after {polls} polls (~{hours:.1f}h); "
+            "handing over to the operator -- Retry re-attempts it, Sweep "
+            "recovers the funding coin"
+        )
 
     def _apply_stay(self, job: WarpJob, result: _Step) -> dict:
         """Healthy stay/pending: schedule the next poll, clear any prior error."""
@@ -518,12 +562,17 @@ class WarpEngine:
         }
         if result.columns:
             columns.update(result.columns)
+        state = dict(result.state or {})
+        # Count pends in a deadline-bearing state. Reset on every advance, so
+        # this measures time in *this* state rather than the age of the job.
+        if job.status in _PENDING_MAX_POLLS:
+            state["pending_polls"] = int(job.state.get("pending_polls") or 0) + 1
         event = ("progress", result.message, None) if result.message else None
         updated = self._store.update_job(
             job.id,
             expected_status=job.status,
             columns=columns,
-            state_patch=result.state,
+            state_patch=state or None,
             event=event,
         )
         return _job_dict(updated)
