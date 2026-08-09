@@ -412,6 +412,22 @@ def build_filter(
 
 
 @dataclass(frozen=True)
+class EcdsaSigResult:
+    """Outcome of an outbound (ECDSA) collection pass, keyed by address."""
+
+    collected: Dict[str, bytes]
+    threshold: int
+
+    @property
+    def count(self) -> int:
+        return len(self.collected)
+
+    @property
+    def complete(self) -> bool:
+        return len(self.collected) >= self.threshold
+
+
+@dataclass(frozen=True)
 class SigResult:
     """Outcome of a collection pass."""
 
@@ -549,3 +565,48 @@ class NostrSigCollector:
             )
 
         return SigResult(collected=collected, threshold=threshold)
+
+    def collect_ecdsa(
+        self,
+        *,
+        nonce: bytes,
+        digest: bytes,
+        threshold: int,
+        have: Optional[Dict[str, bytes]] = None,
+        deadline_s: float = 20.0,
+        relay_offset: int = 0,
+    ) -> "EcdsaSigResult":
+        """The outbound sweep: same relay loop, ECDSA gates, no coin tag.
+
+        ``threshold`` comes from the live ``Portal.signatureThreshold()`` read
+        rather than the BLS constant -- the two quorums are independent and
+        the EVM one is owner-mutable. No portal-freshness logic on purpose:
+        outbound signatures never expire.
+        """
+        net = self._net
+        collected: Dict[str, bytes] = dict(have or {})
+        routing_tag = outbound_routing_tag(nonce)
+        filt = build_filter(net, routing_tag)
+
+        relays = list(net.nostr_relays)
+        if relays and relay_offset:
+            offset = relay_offset % len(relays)
+            relays = relays[offset:] + relays[:offset]
+
+        start = self._now()
+        for relay in relays:
+            if len(collected) >= threshold:
+                break
+            elapsed = self._now() - start
+            if elapsed >= deadline_s:
+                break
+            per = min(self._per_relay_timeout, max(1.0, deadline_s - elapsed))
+            try:
+                events = self._fetcher(relay, filt, per)
+            except Exception:  # noqa: BLE001 -- a dead relay must not abort the sweep
+                continue
+            collected = collect_ecdsa_from_events(
+                net, events, digest=digest, routing_tag=routing_tag, have=collected,
+            )
+
+        return EcdsaSigResult(collected=collected, threshold=int(threshold))

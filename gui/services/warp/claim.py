@@ -399,6 +399,43 @@ def build_and_push_claim(
     return ClaimPush(claim=claim, accepted=kind in ("accepted", "pending"), status=status)
 
 
+def cat_lineage_proof_for(coinset: CoinsetClient, parent_coin_id: bytes) -> list:
+    """The CAT lineage proof for a coin whose parent is *parent_coin_id*.
+
+    ``(parent's parent, parent's INNER puzzle hash, parent's amount)`` -- the
+    inner hash comes from uncurrying the parent's on-chain cat_v2 reveal,
+    which exists because the parent was spent to create our coin. Raises if
+    the parent is unspent or not a CAT: a burn CAT whose parent cannot prove
+    lineage can never be spent, and the caller must know now, not at push.
+    """
+    from . import clvm_utils as cu, drivers
+
+    rec = coinset.get_coin_record_by_name(_hx(parent_coin_id))
+    if rec is None or not rec.spent:
+        raise WarpClaimError(
+            f"burn CAT parent {_hx(parent_coin_id)} is missing or unspent; "
+            "cannot build its lineage proof"
+        )
+    ps = coinset.get_puzzle_and_solution(_hx(parent_coin_id), rec.spent_block_index)
+    reveal = cu.program_from_hex(ps.puzzle_reveal)
+    out = cu.uncurry(reveal)
+    if out is None:
+        raise WarpClaimError("burn CAT parent reveal is not a curried puzzle")
+    mod, args = out
+    if cu.sha256tree(mod) != drivers.CAT_MOD_HASH or len(args) != 3:
+        raise WarpClaimError("burn CAT parent is not a cat_v2 coin")
+    inner_ph = cu.sha256tree(args[2])
+    coin = rec.coin
+    return drivers.make_lineage_proof(
+        bytes.fromhex(_hx(coin.parent_coin_info)), inner_ph, int(coin.amount)
+    )
+
+
+def push_burn_bundle(coinset: CoinsetClient, bundle) -> Tuple[str, str]:
+    """Push the burn bundle; same classification contract as the claim push."""
+    return _push_bundle(coinset, bundle.to_json())
+
+
 def build_and_push_sweep(
     coinset: CoinsetClient,
     net: WarpNet,

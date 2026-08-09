@@ -154,6 +154,12 @@ _PENDING_MAX_POLLS: Dict[str, int] = {
     # safe: _retry_tx_reset keeps the raw while the nonce is live, and Abandon
     # refuses while a signed bridge could still mine.
     JobStatus.BRIDGING: 480,            # ~2h -- Base RPC unreachable
+    # Outbound (unwrap).
+    JobStatus.UNWRAP_CHECKS: 1440,      # ~6h -- liquidity/spendable waits
+    JobStatus.BURN_SENT: 480,           # ~2h -- the cat_spend confirming
+    JobStatus.BURNING: 1440,            # ~6h -- funding + bundle + depth
+    JobStatus.COLLECTING_EVM_SIGS: 1440,  # ~6h -- validator quorum
+    JobStatus.RELAYING: 480,            # ~2h -- Base receipt/confirmations
 }
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
@@ -163,7 +169,10 @@ _MIN_GAS_WEI: int = 300_000_000_000_000  # 0.0003 ETH
 
 # Jobs may only be cancelled before the irreversible on-chain bridge is signed.
 _CANCELLABLE = frozenset(
-    {JobStatus.AWAITING_DEPOSIT, JobStatus.DEPOSIT_SEEN, JobStatus.APPROVING}
+    {JobStatus.AWAITING_DEPOSIT, JobStatus.DEPOSIT_SEEN, JobStatus.APPROVING,
+     # The only cancellable outbound state: pure reads, nothing moved.
+     # From BURN_SENT on, the cat_spend makes the job forward-only.
+     JobStatus.UNWRAP_CHECKS}
 )
 
 # Stand-in for a funding transaction the wallet accepted without returning an
@@ -215,6 +224,33 @@ class WarpParams:
     chia_receiver_address: str = ""
     expected_asset_id: str = ""
     portal_hint: Optional[str] = None
+    # Outbound (unwrap). -1 == never configured: request_unwrap refuses
+    # until the operator states a cap, but an absent key cannot break an
+    # existing enabled inbound config on upgrade.  0 == explicit unlimited.
+    max_unwrap_micros: int = -1
+    unwrap_chia_fee_mojos: int = 0
+
+
+def _parse_unwrap_cap(warp: dict) -> int:
+    """warp.max_unwrap_usdc -> micros; -1 when the key was never set.
+
+    Same fail-closed shape as max_auto_bridge_usdc ([WARP-CAP-FAIL-OPEN]),
+    with one difference: absence refuses the unwrap ACTION, not the config --
+    the key did not exist when existing inbound configs were written, so a
+    parse-time refusal would break every enabled deployment on upgrade.
+    """
+    raw = warp.get("max_unwrap_usdc", None)
+    if raw is None or str(raw).strip() == "":
+        return -1
+    if str(raw).strip().lower() == "unlimited":
+        return 0
+    value = float(raw)
+    if value <= 0 or int(round(value * 1_000_000)) <= 0:
+        raise WarpError(
+            f"warp.max_unwrap_usdc must be positive (got {raw!r}); use "
+            "'unlimited' if no cap is genuinely intended"
+        )
+    return int(round(value * 1_000_000))
 
 
 def warp_params_from_config(config: Optional[dict]) -> WarpParams:
@@ -286,6 +322,8 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         chia_receiver_address=str(warp.get("chia_receiver_address", "") or ""),
         expected_asset_id=str(warp.get("expected_asset_id", "") or ""),
         portal_hint=(str(warp.get("portal_hint")) if warp.get("portal_hint") else None),
+        max_unwrap_micros=_parse_unwrap_cap(warp),
+        unwrap_chia_fee_mojos=int(warp.get("unwrap_chia_fee_mojos", 0) or 0),
     )
 
 
@@ -447,6 +485,12 @@ class WarpEngine:
             JobStatus.CLAIM_FUNDED: self._h_claim_funded,
             JobStatus.COLLECTING_SIGS: self._h_collecting_sigs,
             JobStatus.CLAIMING: self._h_claiming,
+            # Outbound (unwrap).
+            JobStatus.UNWRAP_CHECKS: self._h_unwrap_checks,
+            JobStatus.BURN_SENT: self._h_burn_sent,
+            JobStatus.BURNING: self._h_burning,
+            JobStatus.COLLECTING_EVM_SIGS: self._h_collecting_evm_sigs,
+            JobStatus.RELAYING: self._h_relaying,
         }
 
     # -- clock -------------------------------------------------------------- #
@@ -1421,6 +1465,15 @@ class WarpEngine:
         still open the raw is kept and the retry just resumes polling it.
         """
         target = job.state.get("failed_from")
+        if target == JobStatus.RELAYING:
+            # Unconditional, and safe ONLY here: a relay re-signed at a
+            # fresh nonce cannot double-deliver -- the second attempt
+            # reverts "!nonce". The bridge below has no such guard, which
+            # is why its clear is receipt-gated.
+            return {"relay_raw": None, "relay_tx_hash": None,
+                    "relay_status_polls": None, "relay_unmined_polls": None,
+                    "relay_fee_bumps": None, "relay_prior_hashes": None,
+                    "relay_fees": None, "relay_attempt": None}
         if target not in (JobStatus.APPROVING, JobStatus.BRIDGING):
             return {}
 
@@ -1652,6 +1705,526 @@ class WarpEngine:
 
     def _claim_contents(self, job: WarpJob) -> List[bytes]:
         return [bytes.fromhex(_hx(c)) for c in job.state.get("message_contents", [])]
+
+
+    # ================================================================== #
+    # Outbound (unwrap) handlers: wUSDC.b on Chia -> native USDC on Base.
+    #
+    # The commit point is the cat_spend in _h_burn_sent. Every gate runs
+    # before it; after it the job is forward-only -- there is no outbound
+    # Sweep of the burned CAT, only of the toll security coin, and the
+    # failure mode is "stuck pending a relay", never "stolen": RECEIVER is
+    # curried into the burn inner puzzle, so even a third party pushing the
+    # burn pays us (docs/warp-unwrap-design.md par.3).
+    # ================================================================== #
+
+    def _resolve_cat_wallet_id(self) -> int:
+        """The daemon wallet holding the wrapped asset, by TAIL hash."""
+        from .wallet import WalletError
+
+        want = self._net.expected_asset_id.lower()
+        self._wallet.log_in()
+        matches = []
+        for w in self._wallet.get_wallets(wallet_type=6):
+            try:
+                wid = int(w.get("id"))
+                asset = _hx(self._wallet.cat_get_asset_id(wid)).lower()
+            except (WalletError, TypeError, ValueError):
+                continue
+            if asset == want:
+                matches.append(wid)
+        if len(matches) != 1:
+            raise WarpTerminal(
+                f"expected exactly one CAT wallet for asset "
+                f"{self._net.expected_asset_id}, found {matches or 'none'}"
+            )
+        return matches[0]
+
+    def _h_unwrap_checks(self, job: WarpJob) -> _Step:
+        """Every gate, ordered cheap-to-expensive, all before the cat_spend."""
+        from . import clvm_utils as cu, drivers, evm
+
+        net, p = self._net, self._params
+        receiver = bytes.fromhex(job.state["receiver_evm"])
+        amount = int(job.amount_mojos)
+
+        # G1/G2: the burn anchor, offline then live. A mismatch on either is
+        # a code defect or a bridge redeploy -- both stop everything.
+        derived = cu.sha256tree(
+            drivers.get_cat_burner_puzzle(
+                b"bse", bytes.fromhex(net.erc20_bridge_address[2:])
+            )
+        )
+        if derived.hex() != net.burn_puzzle_hash:
+            raise WarpTerminal(
+                "offline burn puzzle hash derivation does not match the anchor"
+            )
+        live = self._evm.get_burn_puzzle_hash()
+        if live.hex() != net.burn_puzzle_hash:
+            raise WarpTerminal(
+                f"live burnPuzzleHash 0x{live.hex()} != anchor; bridge redeploy"
+            )
+        # G3: the EIP-712 domain. A MISMATCH is terminal (redeploy); transport
+        # failures stay retryable -- split on the anchor wording.
+        try:
+            self._evm.verify_eip712_domain()
+        except evm.EvmError as exc:
+            if "redeploy" in str(exc) or "anchor" in str(exc):
+                raise WarpTerminal(str(exc)) from exc
+            raise
+
+        # G4: the CAT wallet.
+        wallet_id = int(job.state.get("cat_wallet_id") or self._resolve_cat_wallet_id())
+
+        # G5: spendable vs confirmed. Over-confirmed is terminal (the amount
+        # cannot exist); over-spendable only pends -- the difference is offer
+        # collateral that frees as offers close.
+        bal = self._wallet.get_wallet_balance(wallet_id)
+        confirmed = int(bal.get("confirmed_wallet_balance") or 0)
+        spendable = int(bal.get("spendable_balance") or 0)
+        if amount > confirmed:
+            raise WarpTerminal(
+                f"unwrap amount {amount} exceeds the confirmed balance {confirmed}"
+            )
+        if amount > spendable:
+            raise WarpPending(
+                f"amount {amount} > spendable {spendable} "
+                f"({confirmed - spendable} mojos are offer collateral)"
+            )
+
+        # G6/G7: live threshold sanity + the receiver's actual take.
+        threshold = int(self._evm.get_signature_threshold())
+        if not 0 < threshold <= len(net.evm_validator_addresses):
+            raise WarpTerminal(f"live signatureThreshold {threshold} out of range")
+        tip_bps = self._evm.get_tip_bps()
+        post_tip = evm.unwrap_post_tip_base_units(
+            amount, tip_bps, net.usdc_decimals, net.cat_decimals
+        )
+
+        # G8/G9/G10: liquidity, relay gas, toll funds -- all pends.
+        liquidity = self._evm.get_erc20_balance(
+            net.usdc_address, net.erc20_bridge_address
+        )
+        if liquidity < post_tip:
+            raise WarpPending(
+                f"bridge liquidity {liquidity} < post-tip {post_tip} base units"
+            )
+        if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
+            raise WarpPending("hot wallet ETH is below the relay gas floor")
+        xch = self._wallet.get_wallet_balance(1)
+        toll_need = net.chia_toll_mojos + p.unwrap_chia_fee_mojos
+        if int(xch.get("spendable_balance") or 0) < toll_need:
+            raise WarpPending(f"spendable XCH below toll+fee {toll_need}")
+
+        burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(net, receiver)
+        state = {
+            "cat_wallet_id": wallet_id,
+            "post_tip_base_units": post_tip,
+            "burn_inner_ph": burn_inner_ph.hex(),
+            "burn_cat_ph": drivers.expected_burn_cat_puzzle_hash(net, receiver).hex(),
+            "burn_address": cu.encode_puzzle_hash(burn_inner_ph, net.chia_prefix),
+        }
+        if self._job_dry_run(job):
+            return _advance(
+                JobStatus.DRY_RUN_OK,
+                state=state,
+                message=(
+                    "dry run OK: every unwrap gate passed (anchors, domain, "
+                    f"wallet {wallet_id}, {amount} mojos spendable, liquidity, "
+                    "gas, toll); the cat_spend was NOT sent -- nothing moved. "
+                    "Set warp.dry_run: false to go live"
+                ),
+            )
+        return _advance(
+            JobStatus.BURN_SENT,
+            state=state,
+            message=f"all gates passed; sending {amount} mojos to the burn puzzle",
+        )
+
+    def _find_existing_burn(self, wallet_id: int, burn_cat_ph_hex: str):
+        """A wallet-history transaction that already created the burn CAT."""
+        for tx in self._wallet.get_transactions(wallet_id, start=0, end=200):
+            for add in tx.get("additions") or []:
+                if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph_hex:
+                    return str(tx.get("name") or tx.get("transaction_id") or "found")
+        return None
+
+    def _h_burn_sent(self, job: WarpJob) -> _Step:
+        """THE COMMIT POINT: one cat_spend, guarded like the funding send."""
+        net, p = self._net, self._params
+        amount = int(job.amount_mojos)
+        burn_cat_ph = job.state["burn_cat_ph"]
+
+        # a) Completion first (idempotent resume): the burn CAT exists.
+        for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
+            if int(rec.coin.amount) == amount and not rec.spent:
+                return _advance(
+                    JobStatus.BURNING,
+                    state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
+                    message="burn CAT is on chain; the unwrap is now forward-only",
+                )
+
+        # b) The persisted marker.
+        prior = job.state.get("burn_tx_id")
+        if prior:
+            return _stay(message=f"cat_spend {prior} already sent; awaiting the coin")
+
+        # c) Fail-closed history scan -- a lost response must not burn twice.
+        try:
+            found = self._find_existing_burn(
+                int(job.state["cat_wallet_id"]), burn_cat_ph
+            )
+        except Exception as exc:  # noqa: BLE001 -- cannot prove it was not sent
+            raise WarpError(
+                f"wallet history scan failed ({exc}); refusing to send the "
+                "irreversible cat_spend blindly"
+            ) from exc
+        if found:
+            return _stay(
+                state={"burn_tx_id": found},
+                message="cat_spend already in the wallet history (dedupe hit)",
+            )
+
+        # d) Send. Default coin selection ONLY -- it is what honours the trade
+        # manager's offer locks (the client has no coins parameter, by design).
+        self._wallet.log_in()
+        record = self._wallet.cat_spend(
+            int(job.state["cat_wallet_id"]),
+            amount,
+            job.state["burn_address"],
+            fee_mojos=p.unwrap_chia_fee_mojos,
+        )
+        tx_id = record.get("name") or record.get("transaction_id")
+        if not tx_id:
+            tx_id = _FUNDING_TX_UNKNOWN
+            _log.warning(
+                "warp: daemon accepted the cat_spend for job %s but named no "
+                "transaction; recording %r so the guard holds", job.id, tx_id,
+            )
+        return _stay(
+            state={"burn_tx_id": tx_id},
+            message=f"cat_spend sent ({amount} mojos); the coin is forward-only",
+        )
+
+    def _h_burning(self, job: WarpJob) -> _Step:
+        """Fund the toll coin, build + push the burn bundle, wait for depth."""
+        from . import claim, clvm_utils as cu, drivers, keystore
+
+        net, p = self._net, self._params
+        amount = int(job.amount_mojos)
+        receiver = bytes.fromhex(job.state["receiver_evm"])
+        toll = int(net.chia_toll_mojos)
+
+        # Completion first: the bridging coin (the nonce) confirmed at depth.
+        nonce_hex = job.state.get("unwrap_nonce")
+        if nonce_hex:
+            depth = self._chia_depth(nonce_hex)
+            if depth is not None:
+                if depth < net.chia_confirmation_min_height:
+                    raise WarpPending(
+                        f"burn {depth}/{net.chia_confirmation_min_height} confirmations"
+                    )
+                return _advance(
+                    JobStatus.COLLECTING_EVM_SIGS,
+                    columns={"bridge_nonce": nonce_hex},
+                    message=f"burn confirmed; message nonce {nonce_hex}",
+                )
+
+        # The ephemeral toll key, persisted before anything is funded to it.
+        blob = job.state.get("ephemeral_blob")
+        if not blob:
+            bls = keystore.new_bls_key()
+            return _stay(
+                state={
+                    "ephemeral_blob": keystore.protect_bls_key(
+                        bls, extra_entropy=self._job_entropy(job),
+                        protector=self._protector,
+                    ),
+                    "ephemeral_pk": bls.public_key.hex(),
+                },
+                message="ephemeral toll key generated",
+            )
+        sk = self._load_ephemeral_sk(job)
+
+        sec = claim.find_security_coin(self._coinset, sk, toll)
+        if sec is None:
+            # Fund it -- the same marker/dedupe/send ladder as the claim path,
+            # with funding_amount persisted so Sweep just works.
+            prior = job.state.get("funding_tx_id")
+            if prior:
+                return _stay(message=f"toll tx {prior} sent; awaiting the coin")
+            ph = claim.security_coin_puzzle_hash(sk)
+            try:
+                existing = self._find_existing_funding(ph.hex(), toll)
+            except Exception as exc:  # noqa: BLE001
+                raise WarpError(
+                    f"wallet history scan failed ({exc}); refusing to fund blindly"
+                ) from exc
+            if existing:
+                return _stay(
+                    state={"funding_tx_id": existing, "funding_amount": toll},
+                    message="toll funding already in flight (dedupe hit)",
+                )
+            self._wallet.log_in()
+            record = self._wallet.send_transaction(
+                1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
+                fee_mojos=p.unwrap_chia_fee_mojos,
+            )
+            tx_id = (record.get("name") or record.get("transaction_id")
+                     or _FUNDING_TX_UNKNOWN)
+            return _stay(
+                state={"funding_tx_id": tx_id, "funding_amount": toll},
+                message=f"funded {toll} mojos to the toll coin",
+            )
+
+        # The burn CAT (created by the cat_spend; unspent until our bundle).
+        burn_cat = None
+        for rec in self._coinset.get_coin_records_by_puzzle_hash(
+            job.state["burn_cat_ph"]
+        ):
+            if int(rec.coin.amount) == amount and not rec.spent:
+                burn_cat = drivers.Coin(
+                    bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                    bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                    int(rec.coin.amount),
+                )
+                break
+        if burn_cat is None:
+            raise WarpPending(
+                "burn CAT not found unspent; awaiting index (a landed bundle "
+                "resolves via the nonce check next tick)"
+            )
+
+        lineage = claim.cat_lineage_proof_for(self._coinset, burn_cat.parent_coin_info)
+        out = drivers.build_burn_bundle(drivers.BurnRequest(
+            net=net, burn_cat_coin=burn_cat, cat_lineage_proof=lineage,
+            security_coin=sec, security_sk=sk, receiver=receiver,
+        ))
+        # Persist the nonce BEFORE pushing: it is deterministic, so a crash
+        # between persist and push re-derives the same value, and a crash
+        # after the push still knows what to poll.
+        self._store.update_job(
+            job.id, expected_status=job.status,
+            state_patch={"unwrap_nonce": out.nonce.hex()},
+        )
+        kind, status = claim.push_burn_bundle(self._coinset, out.bundle)
+        return _stay(
+            state={"unwrap_nonce": out.nonce.hex()},
+            message=f"burn bundle pushed ({kind}: {status}); nonce {out.nonce.hex()}",
+        )
+
+    def _h_collecting_evm_sigs(self, job: WarpJob) -> _Step:
+        """Collect ECDSA signatures over the EIP-712 digest until quorum."""
+        from . import drivers, evm, nostr
+
+        net = self._net
+        nonce = bytes.fromhex(job.bridge_nonce)
+        receiver = bytes.fromhex(job.state["receiver_evm"])
+
+        separator = self._evm.verify_eip712_domain()
+        contents = drivers.outbound_message_contents(
+            net, receiver, int(job.amount_mojos)
+        )
+        digest = evm.validator_message_digest(
+            separator, nonce, b"xch",
+            bytes.fromhex(net.burn_puzzle_hash),   # the SOURCE is the cat_burner
+            net.erc20_bridge_address,              # PUZZLE HASH, never a coin id
+            contents,
+        )
+        threshold = int(self._evm.get_signature_threshold())
+
+        have = {
+            a: bytes.fromhex(v)
+            for a, v in (job.state.get("evm_sigs") or {}).items()
+        }
+        round_ = int(job.state.get("collect_round", 0))
+        result = self._collector.collect_ecdsa(
+            nonce=nonce, digest=digest, threshold=threshold, have=have,
+            deadline_s=_SIG_COLLECT_DEADLINE_S, relay_offset=round_,
+        )
+        encoded = {a: v.hex() for a, v in result.collected.items()}
+        if result.complete:
+            tuples = nostr.ecdsa_sigs_for_relay(result.collected, threshold)
+            packed = evm.pack_validator_sigs(tuples)
+            return _advance(
+                JobStatus.RELAYING,
+                state={
+                    "evm_sigs": encoded,
+                    "relay_sigs": packed.hex(),
+                    "relay_threshold": threshold,
+                },
+                message=f"collected {result.count}/{threshold} EVM signatures",
+            )
+        return _stay(
+            state={"evm_sigs": encoded, "collect_round": round_ + 1},
+            message=f"collected {result.count}/{threshold} EVM signatures",
+        )
+
+    def _relay_calldata(self, job: WarpJob) -> bytes:
+        from . import drivers, evm
+
+        net = self._net
+        return evm.encode_receive_message(
+            bytes.fromhex(job.bridge_nonce), b"xch",
+            bytes.fromhex(net.burn_puzzle_hash),
+            net.erc20_bridge_address,
+            drivers.outbound_message_contents(
+                net, bytes.fromhex(job.state["receiver_evm"]),
+                int(job.amount_mojos),
+            ),
+            bytes.fromhex(job.state["relay_sigs"]),
+        )
+
+    def _h_relaying(self, job: WarpJob) -> _Step:
+        """Two-phase receiveMessage; '!nonce' means someone else delivered."""
+        from . import evm
+
+        net = self._net
+        nonce = bytes.fromhex(job.bridge_nonce)
+
+        raw = job.state.get("relay_raw")
+        if not raw:  # phase 1: encode + sign + persist, no broadcast
+            unsigned = self._evm.prepare_relay(
+                owner=self._hot_address, calldata=self._relay_calldata(job)
+            )
+            signed = evm.sign_tx(unsigned, self._evm_key.private_key)
+            return _stay(
+                state={
+                    "relay_raw": signed.raw.hex(),
+                    "relay_tx_hash": signed.tx_hash,
+                    "relay_tx_nonce": signed.nonce,
+                    "relay_fees": [unsigned.max_fee_per_gas,
+                                   unsigned.max_priority_fee_per_gas],
+                },
+                message="relay signed; broadcasting next tick",
+            )
+
+        # phase 2: broadcast (benign-idempotent), then poll every hash.
+        try:
+            self._evm.send_raw_transaction(bytes.fromhex(raw))
+        except evm.EvmError as exc:
+            if evm.is_already_delivered(exc):
+                return self._unwrap_delivered(job, by="a third-party relayer")
+            raise
+
+        mined_hash, receipt = self._relay_receipt(job)
+        if receipt is None:
+            return self._relay_unmined_step(job)
+        if evm.receipt_reverted(receipt):
+            attempt = int(job.state.get("relay_attempt", 0)) + 1
+            if attempt >= _BRIDGE_MAX_ATTEMPTS:
+                raise WarpTerminal(
+                    f"relay reverted {attempt} times; the message stays "
+                    f"deliverable forever -- relay manually at {net.status_url}"
+                )
+            return _stay(
+                state={"relay_raw": None, "relay_tx_hash": None,
+                       "relay_attempt": attempt, "relay_prior_hashes": None,
+                       "relay_unmined_polls": None, "relay_fees": None,
+                       "relay_status_polls": None},
+                message=f"relay reverted; re-preparing (attempt {attempt})",
+            )
+        if not evm.receipt_succeeded(receipt):
+            polls = int(job.state.get("relay_status_polls", 0)) + 1
+            if polls >= _AMBIGUOUS_RECEIPT_POLLS:
+                raise WarpTerminal(
+                    f"relay receipt has no status after {polls} polls; check "
+                    "the transaction on Base before retrying"
+                )
+            return _stay(
+                state={"relay_status_polls": polls},
+                message=f"relay receipt has no status; re-polling ({polls})",
+            )
+
+        if not evm.parse_message_received(receipt, net.portal_address, nonce):
+            raise WarpTerminal(
+                "relay succeeded but the Portal emitted no MessageReceived for "
+                "our nonce -- refusing to guess; check the transaction on Base"
+            )
+        confs = self._evm.get_confirmations(mined_hash)
+        if confs < net.evm_confirmation_min_height:
+            raise WarpPending(
+                f"relay {confs}/{net.evm_confirmation_min_height} confirmations"
+            )
+        return self._unwrap_delivered(job, by="our relay", tx_hash=mined_hash)
+
+    def _unwrap_delivered(self, job: WarpJob, *, by: str, tx_hash=None) -> _Step:
+        post_tip = job.state.get("post_tip_base_units")
+        return _advance(
+            JobStatus.COMPLETED,
+            columns={"bridge_tx_hash": tx_hash} if tx_hash else None,
+            state={"delivered_by": by},
+            message=(
+                f"unwrap complete ({by}): {post_tip} USDC base units paid to "
+                f"0x{job.state.get('receiver_evm')}"
+            ),
+        )
+
+    def _relay_hashes(self, job: WarpJob) -> list:
+        hashes = []
+        if job.state.get("relay_tx_hash"):
+            hashes.append(job.state["relay_tx_hash"])
+        hashes += [h for h in (job.state.get("relay_prior_hashes") or []) if h]
+        return hashes
+
+    def _relay_receipt(self, job: WarpJob) -> tuple:
+        for tx_hash in self._relay_hashes(job):
+            receipt = self._evm.get_transaction_receipt(tx_hash)
+            if receipt is not None:
+                return tx_hash, receipt
+        return None, None
+
+    def _relay_unmined_step(self, job: WarpJob) -> _Step:
+        """The bridge's stuck-tx ladder with one safe difference: a relay
+        replacement may take a FRESH nonce, because double delivery is
+        structurally impossible ('!nonce'). A consumed nonce with no receipt
+        therefore clears the raw and re-signs -- it never terminals."""
+        from . import evm
+
+        nonce = job.state.get("relay_tx_nonce")
+        if nonce is not None:
+            mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            if mined > int(nonce):
+                _mh, receipt = self._relay_receipt(job)
+                if receipt is None:
+                    return _stay(
+                        state={"relay_raw": None, "relay_tx_hash": None,
+                               "relay_unmined_polls": None},
+                        message="relay nonce consumed elsewhere; re-signing",
+                    )
+        polls = int(job.state.get("relay_unmined_polls", 0)) + 1
+        if polls < _STUCK_TX_POLLS:
+            return _stay(
+                state={"relay_unmined_polls": polls},
+                message=f"relay broadcast; awaiting receipt (poll {polls})",
+            )
+        bumps = int(job.state.get("relay_fee_bumps", 0)) + 1
+        base = job.state.get("relay_fees")
+        if bumps > _MAX_FEE_BUMPS or not base:
+            raise WarpTerminal(
+                f"relay unmined after {bumps - 1} fee escalations; the message "
+                f"stays deliverable forever -- relay manually at "
+                f"{self._net.status_url}"
+            )
+        fees = evm.bump_fees(evm.EIP1559Fees(int(base[0]), int(base[1])), bumps)
+        unsigned = self._evm.prepare_relay(
+            owner=self._hot_address, calldata=self._relay_calldata(job),
+            nonce=int(job.state["relay_tx_nonce"]), fees=fees,
+        )
+        signed = evm.sign_tx(unsigned, self._evm_key.private_key)
+        return _stay(
+            state={
+                "relay_raw": signed.raw.hex(),
+                "relay_tx_hash": signed.tx_hash,
+                "relay_prior_hashes": self._relay_hashes(job),
+                "relay_fee_bumps": bumps,
+                "relay_unmined_polls": 0,
+            },
+            message=(
+                f"relay unmined after {polls} polls; re-signed at a higher fee "
+                f"(escalation {bumps} of {_MAX_FEE_BUMPS})"
+            ),
+        )
 
     def _sync_portal(self, job: WarpJob):
         """Resolve the portal tip, re-bootstrapping if the hint is too far behind.
@@ -1948,6 +2521,15 @@ class WarpEngine:
             self._refuse_while_bridge_unresolved(job, "abandon")
 
         recovery = {
+            # Outbound rows: the burn is forward-only and the message is
+            # deliverable forever -- record everything a manual relay or a
+            # later bundle push needs before the row closes.
+            "unwrap": {
+                k: job.state.get(k)
+                for k in ("burn_address", "burn_cat_ph", "burn_tx_id",
+                          "unwrap_nonce", "receiver_evm")
+                if job.state.get(k) is not None
+            } or None,
             "bridge_nonce": job.bridge_nonce,
             "bridge_tx_hash": job.bridge_tx_hash,
             "bridge_tx_nonce": raw_nonce,
@@ -1994,6 +2576,70 @@ class WarpEngine:
             event=("abandon", note, recovery),
         )
         return _job_dict(self._store.get_job(job.id))
+
+
+    def request_unwrap(self, amount_mojos: int, receiver: str) -> dict:
+        """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
+
+        Refusals here are synchronous and create no job. Unlike Bridge now,
+        the operator states an exact amount and destination -- there is no
+        balance-sized default and no clamping: a cap violation refuses rather
+        than silently shrinking what was typed.
+        """
+        p = self._params
+        active = self._store.get_active_job()
+        if active is not None:
+            raise WarpError(
+                f"a warp job is already active (job {active.id}, {active.status}); "
+                "resolve it first -- Retry, Cancel, Sweep or Abandon from the "
+                "jobs table"
+            )
+        receiver = str(receiver).strip()
+        if not (receiver.startswith("0x") and len(receiver) == 42):
+            raise WarpError("receiver must be a 0x-prefixed 20-byte Base address")
+        try:
+            rec_bytes = bytes.fromhex(receiver[2:])
+        except ValueError as exc:
+            raise WarpError("receiver is not valid hex") from exc
+        if rec_bytes == b"\x00" * 20:
+            raise WarpError("receiver is the zero address")
+        if receiver != receiver.lower():
+            from eth_utils import is_checksum_address
+
+            if not is_checksum_address(receiver):
+                raise WarpError(
+                    "receiver mixed-case checksum (EIP-55) is invalid -- "
+                    "a typo would send the USDC to a stranger"
+                )
+        amount = int(amount_mojos)
+        if amount < 1:
+            raise WarpError("unwrap amount must be at least 1 mojo (0.001 USDC)")
+        if p.max_unwrap_micros < 0:
+            raise WarpError(
+                "warp.max_unwrap_usdc is not set; the unwrap cap must be stated "
+                "before any unwrap (use 'unlimited' to opt out explicitly)"
+            )
+        micros = amount * 10 ** (
+            self._net.usdc_decimals - self._net.cat_decimals
+        )
+        if p.max_unwrap_micros and micros > p.max_unwrap_micros:
+            raise WarpError(
+                f"unwrap of {micros} micro-USDC exceeds warp.max_unwrap_usdc "
+                f"({p.max_unwrap_micros}); refusing rather than clamping"
+            )
+        job = self._store.create_job(
+            self._net.name,
+            status=JobStatus.UNWRAP_CHECKS,
+            columns={"amount_mojos": amount, "amount_usdc_micros": micros},
+            state={
+                "direction": "out",
+                "manual": True,
+                "receiver_evm": rec_bytes.hex(),
+                **self._binding(),
+            },
+            event_message=f"unwrap requested: {amount} mojos -> {receiver}",
+        )
+        return _job_dict(job)
 
     def job_action(self, job_id: int, action: str) -> Optional[dict]:
         """Operator affordance: ``retry`` | ``cancel`` | ``sweep`` | ``abandon``."""

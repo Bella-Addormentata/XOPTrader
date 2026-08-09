@@ -149,6 +149,18 @@ class WalletClient:
         data = self._post("get_wallets", body)
         return list(data.get("wallets") or [])
 
+    def get_wallet_balance(self, wallet_id: int) -> dict:
+        """The daemon's balance record: confirmed, spendable, pending, etc.
+
+        ``spendable_balance`` < ``confirmed_wallet_balance`` is the normal
+        state for a market maker -- the difference is offer collateral the
+        trade manager has locked, which default coin selection honours. The
+        unwrap's spendable gate reads this rather than the confirmed figure.
+        """
+        data = self._post("get_wallet_balance", {"wallet_id": int(wallet_id)})
+        bal = data.get("wallet_balance")
+        return bal if isinstance(bal, dict) else data
+
     def cat_get_asset_id(self, wallet_id: int) -> str:
         """The TAIL hash (hex, no 0x) behind a CAT wallet."""
         data = self._post("cat_get_asset_id", {"wallet_id": int(wallet_id)})

@@ -621,6 +621,42 @@ def expected_burn_inner_puzzle_hash(net, receiver: bytes) -> bytes:
     return cu.sha256tree(inner)
 
 
+def expected_burn_cat_puzzle_hash(net, receiver: bytes) -> bytes:
+    """The full cat_v2 outer hash the burn CAT sits at -- what coin scans match."""
+    inner = get_cat_burn_inner_puzzle(
+        b"bse",
+        bytes.fromhex(net.erc20_bridge_address[2:]),
+        bytes.fromhex(net.usdc_address[2:]),
+        receiver,
+        net.chia_toll_mojos,
+    )
+    return cu.sha256tree(
+        construct_cat_puzzle(bytes.fromhex(net.expected_asset_id), inner)
+    )
+
+
+def outbound_message_contents(net, receiver: bytes, amount_mojos: int) -> list:
+    """The three 32-byte atoms the validators sign for an unwrap.
+
+    Reproduces the validator's memo padding exactly: each Chia memo atom is
+    left-padded to 32 bytes, and the amount atom is CLVM minimal-int encoded
+    before padding -- ``SExp.to`` gives the canonical form, so a value with
+    the high bit set carries its leading zero byte the same way the chain
+    serialized it.
+    """
+    def pad32(b: bytes) -> bytes:
+        if len(b) > 32:
+            raise WarpDriverError(f"memo atom is {len(b)} bytes, over 32")
+        return b"\x00" * (32 - len(b)) + b
+
+    amount_atom = SExp.to(int(amount_mojos)).atom or b""
+    return [
+        pad32(bytes.fromhex(net.usdc_address[2:])),
+        pad32(receiver),
+        pad32(amount_atom),
+    ]
+
+
 def build_burn_bundle(req: BurnRequest) -> BurnBundle:
     """Assemble the four-spend burn: security, burn CAT, cat_burner, bridging.
 

@@ -73,6 +73,7 @@ SEL_BRIDGE_TO_CHIA = bytes.fromhex("cdb50da7")    # bridgeToChia(address,bytes32
 SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)
 SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
 SEL_EIP712_DOMAIN = bytes.fromhex("84b0196e")     # eip712Domain() (EIP-5267)
+SEL_BURN_PUZZLE_HASH = bytes.fromhex("3f4710d3")  # burnPuzzleHash()
 
 # MessageReceived(bytes32 indexed nonce, ...) -- the Portal's delivery event.
 # Pinned against the real relay receipt in tests/fixtures_unwrap.json, not
@@ -86,6 +87,8 @@ MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7
 # always estimates live and applies headroom.
 _APPROVE_GAS_DEFAULT = 80_000
 _BRIDGE_GAS_DEFAULT = 300_000
+# A real relay measured 145,195; 250k default only when estimation is down.
+_RELAY_GAS_DEFAULT = 250_000
 
 # Node error fragments that mean "this exact transaction is already in the
 # mempool or already mined" -- rebroadcasting the stored raw is a no-op, so we
@@ -311,7 +314,8 @@ def validator_message_digest(
 
 def parse_message_received(receipt: dict, portal_address: Any, nonce: Any) -> bool:
     """Whether *receipt* carries the Portal's MessageReceived for *nonce*."""
-    want_nonce = _hx(nonce)
+    # _hx stringifies bytes into repr garbage; hex them first.
+    want_nonce = nonce.hex() if isinstance(nonce, (bytes, bytearray)) else _hx(nonce)
     want_addr = _hx(portal_address)
     for log in receipt.get("logs") or []:
         if _hx(log.get("address", "")) != want_addr:
@@ -774,6 +778,13 @@ class EvmClient:
         """
         return self._call_uint(self._net.portal_address, SEL_SIGNATURE_THRESHOLD)
 
+    def get_burn_puzzle_hash(self) -> bytes:
+        """``ERC20Bridge.burnPuzzleHash()`` -- the live half of the burn anchor."""
+        raw = self._eth_call(self._net.erc20_bridge_address, SEL_BURN_PUZZLE_HASH)
+        if len(raw) != 32:
+            raise EvmError(f"burnPuzzleHash() returned {len(raw)} bytes")
+        return raw
+
     def verify_eip712_domain(self) -> bytes:
         """Read the Portal's EIP-712 domain live and return the separator.
 
@@ -887,6 +898,39 @@ class EvmClient:
             )
         return build_approve_tx(
             self._net, amount_base_units=amount_base_units, nonce=nonce, fees=fees, gas=gas
+        )
+
+    def prepare_relay(
+        self,
+        *,
+        owner: str,
+        calldata: bytes,
+        nonce: Optional[int] = None,
+        fees: Optional[EIP1559Fees] = None,
+    ) -> UnsignedTx:
+        """Sign-ready ``Portal.receiveMessage`` -- non-payable, value 0.
+
+        Unlike the bridge, a relay replacement may safely take a FRESH nonce:
+        double delivery is impossible (``usedNonces`` makes the second attempt
+        revert ``!nonce``), so pinning is an optimisation, not a safety rail.
+        """
+        if nonce is None:
+            nonce = self.get_nonce(owner)
+        if fees is None:
+            fees = self.get_fee_data()
+        gas = self.estimate_gas(
+            from_address=owner, to=self._net.portal_address, value=0,
+            data=calldata, default=_RELAY_GAS_DEFAULT,
+        )
+        return UnsignedTx(
+            chain_id=self._net.evm_chain_id,
+            nonce=int(nonce),
+            to=_addr_bytes(self._net.portal_address),
+            value=0,
+            data=calldata,
+            gas=gas,
+            max_fee_per_gas=fees.max_fee_per_gas,
+            max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
         )
 
     def prepare_bridge(
