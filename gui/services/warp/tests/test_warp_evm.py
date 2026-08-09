@@ -414,3 +414,32 @@ def test_already_delivered_classification():
     assert evm.is_already_delivered(evm.EvmRpcError("execution reverted: !nonce"))
     assert not evm.is_already_delivered(evm.EvmRpcError("execution reverted: !amnt"))
     assert not evm.is_already_delivered(evm.EvmRpcError("execution reverted: !sig"))
+
+
+def test_message_type_hash_matches_keccak():
+    keccak = pytest.importorskip("eth_utils").keccak
+    assert evm.MESSAGE_TYPE_HASH == keccak(
+        text="Message(bytes32 nonce,bytes3 source_chain,bytes32 source,"
+             "address destination,bytes32[] contents)"
+    )
+
+
+def test_validator_message_digest_shape():
+    """Structural checks; the end-to-end proof against a real delivered
+    message's recovered signatures lives with the collector tests."""
+    keccak = pytest.importorskip("eth_utils").keccak
+    sep = b"\x77" * 32
+    d1 = evm.validator_message_digest(
+        sep, b"\x01" * 32, b"xch", b"\x02" * 32, "0x" + "ab" * 20, [b"\x03" * 32]
+    )
+    assert len(d1) == 32
+    # Any field change must change the digest.
+    d2 = evm.validator_message_digest(
+        sep, b"\x01" * 32, b"xch", b"\x02" * 32, "0x" + "ab" * 20, [b"\x04" * 32]
+    )
+    assert d1 != d2
+    # And the 0x1901 prefix binds the domain separator.
+    d3 = evm.validator_message_digest(
+        b"\x78" * 32, b"\x01" * 32, b"xch", b"\x02" * 32, "0x" + "ab" * 20, [b"\x03" * 32]
+    )
+    assert d1 != d3

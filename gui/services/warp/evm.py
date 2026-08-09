@@ -257,6 +257,52 @@ def encode_receive_message(
     )
 
 
+# keccak256("Message(bytes32 nonce,bytes3 source_chain,bytes32 source,
+# address destination,bytes32[] contents)") -- anchored to keccak in the tests
+# and to the deployed Portal per docs/warp-unwrap-design.md §2.2.
+MESSAGE_TYPE_HASH = bytes.fromhex(
+    "9972dc9e80132460f6459b361feb003781068b85cac2d95d54bc2150f439b824"
+)
+
+
+def validator_message_digest(
+    domain_separator: bytes,
+    nonce: Any,
+    source_chain: bytes,
+    source: Any,
+    destination: Any,
+    contents: list,
+) -> bytes:
+    """The EIP-712 digest the validators sign for an outbound message.
+
+    ``domain_separator`` is read live from the Portal (it binds chainId and
+    the verifying contract; hardcoding it would silently break on a portal
+    redeploy). Unlike the inbound leg, nothing in this digest is mutable --
+    outbound signatures never expire [V].
+
+    Per EIP-712: value types pad to 32 (``bytes3`` right-pads), dynamic
+    arrays hash to ``keccak(concat(elements))``, and the digest is
+    ``keccak(0x1901 || domainSeparator || structHash)``.
+    """
+    from eth_utils import keccak
+
+    sep = bytes(domain_separator)
+    if len(sep) != 32:
+        raise EvmError(f"domain separator must be 32 bytes, got {len(sep)}")
+    chain = bytes(source_chain)
+    if len(chain) != 3:
+        raise EvmError(f"source_chain must be 3 bytes, got {len(chain)}")
+    struct_hash = keccak(
+        MESSAGE_TYPE_HASH
+        + _enc_bytes32(nonce)
+        + chain + b"\x00" * 29
+        + _enc_bytes32(source)
+        + _enc_address(destination)
+        + keccak(b"".join(_enc_bytes32(c) for c in contents))
+    )
+    return keccak(b"\x19\x01" + sep + struct_hash)
+
+
 def is_already_delivered(exc: BaseException) -> bool:
     """Whether a relay revert means the message was already delivered.
 
