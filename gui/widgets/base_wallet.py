@@ -33,6 +33,7 @@ ISO/IEC 25000 -- degrades gracefully across all snapshot shapes (absent,
 
 from __future__ import annotations
 
+import html as _html
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Optional
@@ -322,6 +323,10 @@ class BaseWalletWidget(QWidget):
         # -- Last-action notice ----------------------------------------
         self._notice = QLabel()
         self._notice.setWordWrap(True)
+        # PlainText, explicitly: the notice carries untrusted exception text
+        # (wallet_action_error), and the default AutoText format would let a
+        # '<...>' inside an RPC error be interpreted as RichText markup.
+        self._notice.setTextFormat(Qt.TextFormat.PlainText)
         self._notice.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -549,7 +554,8 @@ class BaseWalletWidget(QWidget):
             colour, text = TEXT_SECONDARY, "Connecting to the wallet service…"
         elif error:
             colour = WARNING_YELLOW
-            text = f"Wallet <b>unavailable</b>: {error}"
+            # Untrusted exception text into a RichText label: escape it.
+            text = f"Wallet <b>unavailable</b>: {_html.escape(str(error))}"
         elif not configured:
             colour = TEXT_SECONDARY
             text = (

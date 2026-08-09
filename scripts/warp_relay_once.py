@@ -6,7 +6,7 @@ power is spending its own gas (~145k, sub-cent on Base). Default is a full
 rehearsal: fetch, verify signatures, preflight, sign -- and stop. Broadcasting
 is a deliberate second step:
 
-    .venv/Scripts/python.exe scripts/warp_relay_once.py                # rehearse newest stuck
+    .venv/Scripts/python.exe scripts/warp_relay_once.py                # rehearse oldest (most stuck)
     .venv/Scripts/python.exe scripts/warp_relay_once.py --nonce <hex>  # rehearse a specific one
     .venv/Scripts/python.exe scripts/warp_relay_once.py --broadcast    # actually deliver
 

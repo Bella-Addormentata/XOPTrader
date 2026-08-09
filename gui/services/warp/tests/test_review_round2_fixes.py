@@ -220,3 +220,43 @@ def test_pending_gate_survives_a_same_seq_timer_tick():
                             "wallet_notice": "USDC transfer broadcast: 0xabc"}})
     assert not w._action_pending and w._send_btn.isEnabled()
     w.deleteLater()
+
+
+# --------------------------------------------------------------------------- #
+# [PR-73 Copilot] untrusted error text must never be interpreted as RichText.
+# --------------------------------------------------------------------------- #
+
+def test_error_text_cannot_inject_markup_into_the_widgets():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication
+
+    from gui.widgets.base_wallet import BaseWalletWidget
+    from gui.widgets.warp import WarpWidget
+
+    app = QApplication.instance() or QApplication([])
+    evil = 'boom <img src="x"> & <b>styled</b>'
+
+    # Base Wallet: the notice is PlainText, the banner escapes the error.
+    bw = BaseWalletWidget()
+    bw.show()
+    assert bw._notice.textFormat() == Qt.TextFormat.PlainText
+    bw.update_data({"warp": {"base_wallet": {"configured": True, "error": evil}}})
+    assert "&lt;img" in bw._banner.text() and "<img" not in bw._banner.text()
+
+    # Warp tab: banner error, action_error, and the activity error all escape.
+    ww = WarpWidget()
+    ww.show()
+    ww.update_data({"warp": {"enabled": True, "error": evil,
+                             "action_error": evil,
+                             "relay_activity": {"checked_at": 1.0,
+                                                "error": evil}}})
+    assert "<img" not in ww._banner.text()
+    assert "&lt;img" in ww._banner.text()
+    assert "<img" not in ww._relay_activity_lbl.text()
+    assert "&lt;img" in ww._relay_activity_lbl.text()
+    bw.deleteLater()
+    ww.deleteLater()

@@ -311,3 +311,33 @@ def test_recent_third_party_relays_rejects_forged_evidence():
     )
     assert [o["nonce"][:2] for o in out] == ["b1"], \
         "only the verified Portal delivery with a readable receiver counts"
+
+
+def test_recent_third_party_relays_requires_a_full_hex_receiver_suffix():
+    """[PR-73 Copilot] contents[1][-40:] on a short or non-hex watcher value
+    manufactured a bogus 'receiver' that then counted as third-party
+    evidence. The suffix must be exactly 40 hex chars or the row is dropped."""
+    portal = NET.portal_address
+    base = dict(status="received",
+                source_timestamp=NOW - 20000,
+                destination_timestamp=NOW - 9000)
+    msgs = [
+        # Too short to be an address word -> dropped.
+        _watcher_msg(nonce="c1" * 32, destination_transaction_hash="0x" + "01" * 32,
+                     contents=["11" * 32, "abcd", "05" * 32], **base),
+        # Right length, not hex -> dropped.
+        _watcher_msg(nonce="c2" * 32, destination_transaction_hash="0x" + "02" * 32,
+                     contents=["11" * 32, "zz" * 20, "05" * 32], **base),
+        # A genuine 32-byte word whose low 20 bytes are the receiver -> kept.
+        _watcher_msg(nonce="c3" * 32, destination_transaction_hash="0x" + "03" * 32,
+                     contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32], **base),
+    ]
+
+    class Ev:
+        def _call(self, method, params):
+            return {"to": portal, "from": "0x" + "99" * 20}
+
+    out = relayer.recent_third_party_relays(
+        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+    )
+    assert [o["nonce"][:2] for o in out] == ["c3"]

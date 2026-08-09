@@ -373,7 +373,16 @@ def recent_third_party_relays(
         receiver = ""
         contents = msg.get("contents")
         if isinstance(contents, list) and len(contents) >= 2 and contents[1]:
-            receiver = str(contents[1])[-40:].lower()
+            candidate = str(contents[1]).lower().removeprefix("0x")[-40:]
+            # The suffix must be a full 20-byte hex address; a short or
+            # non-hex watcher value must not manufacture a bogus "receiver"
+            # that then reads as third-party evidence.
+            if len(candidate) == 40:
+                try:
+                    bytes.fromhex(candidate)
+                    receiver = candidate
+                except ValueError:
+                    receiver = ""
         if not receiver:
             continue          # receiver unreadable -> cannot prove third-party
         if sender.removeprefix("0x").endswith(receiver):

@@ -24,6 +24,7 @@ ISO/IEC 25000 -- degrades gracefully when warp data is unavailable (three
 
 from __future__ import annotations
 
+import html as _html
 import logging
 import webbrowser
 from typing import Any, Final, Optional
@@ -547,11 +548,16 @@ class WarpWidget(QWidget):
                 "with <code>warp.dry_run: true</code> before going live."
             )
             if error and error != "warp disabled":
-                text += f"<br><span style='color:{WARNING_YELLOW};'>{error}</span>"
+                # Errors are untrusted text (RPC exceptions can carry JSON /
+                # markup); escape before interpolating into a RichText label.
+                text += (
+                    f"<br><span style='color:{WARNING_YELLOW};'>"
+                    f"{_html.escape(str(error))}</span>"
+                )
         elif not built or error:
             colour = WARNING_YELLOW
             reason = error or "the engine could not start (check dependencies / config)"
-            text = f"Bridge enabled but <b>blocked</b>: {reason}"
+            text = f"Bridge enabled but <b>blocked</b>: {_html.escape(str(reason))}"
         elif snap.get("dry_run"):
             # Signing but never broadcasting is a safe state, not a healthy one:
             # make it impossible to mistake a rehearsal for a working bridge.
@@ -580,7 +586,7 @@ class WarpWidget(QWidget):
         if action_error:
             text += (
                 f"<br><span style='color:{WARNING_YELLOW};'>Last action failed: "
-                f"{action_error}</span>"
+                f"{_html.escape(str(action_error))}</span>"
             )
         self._banner.setText(text + badge)
         self._banner.setStyleSheet(
@@ -739,7 +745,7 @@ class WarpWidget(QWidget):
         if volunteering:
             parts.append("This node is volunteering as a relay.")
         if act.get("error"):
-            parts.append(f"(evidence partial: {act['error']})")
+            parts.append(f"(evidence partial: {_html.escape(str(act['error']))})")
         self._relay_activity_lbl.setText(" ".join(parts))
         self._relay_activity_lbl.setStyleSheet(f"color: {colour};")
         self._relay_activity_lbl.setVisible(True)
