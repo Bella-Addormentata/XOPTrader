@@ -380,6 +380,30 @@ def test_push_bundle_classifies_outcomes():
         claim._push_bundle(fake, {})
 
 
+def test_push_bundle_reraises_an_unrecognised_rejection():
+    """[WARP-PUSH-CLASSIFY] An unknown refusal is not a resolved conflict.
+
+    "conflict" used to be the default for anything unmatched, and callers
+    treat a conflict as resolved -- so a plain refusal was recorded as a
+    finished push and the coin was abandoned. The real text from a zero-fee
+    sweep evicted by a busy mempool is the motivating case: it says "Failed
+    to include transaction", and "include" does not match "including".
+    """
+    fake = FakeCoinset()
+
+    fake.push_result = CoinsetError(
+        "push_tx failed: [INVALID_FEE_LOW_FEE] Failed to include transaction "
+        "abc123, error INVALID_FEE_LOW_FEE"
+    )
+    with pytest.raises(CoinsetError):
+        claim._push_bundle(fake, {})
+
+    # Something nobody has seen before must also refuse to be guessed at.
+    fake.push_result = CoinsetError("push_tx failed: [BLOCK_COST_EXCEEDED] too big")
+    with pytest.raises(CoinsetError):
+        claim._push_bundle(fake, {})
+
+
 # --------------------------------------------------------------------------- #
 # Completion checks.
 # --------------------------------------------------------------------------- #
