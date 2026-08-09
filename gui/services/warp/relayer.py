@@ -31,7 +31,7 @@ from __future__ import annotations
 import logging
 import time
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Sequence
 
 from .constants import WarpNet
 
@@ -322,29 +322,39 @@ def recent_third_party_relays(
     portal_address: Optional[str] = None,
     grace_s: float = 1800.0,
     lookback: int = 100,
+    exclude_addresses: Optional[Sequence[str]] = None,
 ) -> List[dict]:
     """Altruism evidence derived from the chain, verified not merely believed.
 
     A message that sat stuck past the grace period and was then delivered by
-    an address that is not its attested receiver was relayed by a volunteer.
-    To be evidence rather than a watcher's say-so, EACH claim is checked
-    against the chain before it counts:
+    an address that is not its attested receiver was (very probably) relayed
+    by a volunteer. To be evidence rather than a watcher's say-so, EACH claim
+    is checked against the chain before it counts:
 
-    * the delivery tx must actually be a call to the Portal (``tx.to`` ==
-      ``net.portal_address``) -- otherwise the watcher could point at any
-      unrelated Base tx from any address to manufacture a fake volunteer;
-    * the attested receiver must be determinable and must NOT be the sender.
-      When contents are malformed/serialised such that the receiver cannot be
-      read, the row is dropped (fail closed), never counted as altruism.
+    * the delivery receipt must be a SUCCESSFUL call to the Portal carrying
+      the ``MessageReceived`` log for THIS message's nonce -- a reverted tx,
+      an unrelated Portal call, or any other Base tx a hostile watcher points
+      at is dropped;
+    * the attested receiver must be a readable 20-byte address and must NOT
+      be the sender (a receiver delivering its own message is self-rescue);
+    * ``exclude_addresses`` (this node's own hot/relay addresses) never
+      count -- our own delayed self-relay to an exchange receiver must not
+      manufacture "volunteer" evidence about ourselves.
 
-    This backs the GUI's "proven volunteer online" badge, which an operator
-    uses to decide a gasless Chia-only burn is safe -- so an unverifiable
-    row must not inflate it.
+    Residual limit, stated plainly: the sender-is-not-the-receiver test
+    cannot attribute the message's original OWNER (a Chia-side identity), so
+    an owner who relays late from a different address than their receiver is
+    indistinguishable from a volunteer. That misattribution cannot be
+    manufactured without actually paying gas to deliver a genuinely stuck
+    message -- which is the behaviour the badge exists to signal.
     """
+    from . import evm as evm_mod
+
     if portal_address is None:
         net = getattr(evm_client, "net", None)
         portal_address = getattr(net, "portal_address", "") or ""
     portal = str(portal_address).lower()
+    excluded = {str(a).lower() for a in (exclude_addresses or ()) if a}
     raw = watcher_fetch(f"/messages?source_chain=xch&limit={lookback}") or []
     out: List[dict] = []
     for msg in raw:
@@ -359,17 +369,33 @@ def recent_third_party_relays(
         if not src_ts or not dst_ts or (dst_ts - src_ts) < grace_s:
             continue          # delivered promptly -> almost surely the owner
         try:
-            tx = evm_client._call("eth_getTransactionByHash", [str(tx_hash)])
-            sender = str((tx or {}).get("from") or "").lower()
-            to = str((tx or {}).get("to") or "").lower()
+            nonce_bytes = bytes.fromhex(
+                str(msg.get("nonce") or "").lower().removeprefix("0x")
+            )
+        except ValueError:
+            continue
+        if len(nonce_bytes) != 32:
+            continue
+        try:
+            receipt = evm_client._call(
+                "eth_getTransactionReceipt", [str(tx_hash)]
+            ) or {}
+            sender = str(receipt.get("from") or "").lower()
+            to = str(receipt.get("to") or "").lower()
         except Exception:  # noqa: BLE001 -- evidence gathering must not raise
             continue
-        if not sender or not to:
+        if not sender or not to or not portal or to != portal:
             continue
-        # The delivery must be a Portal call; anything else is not a relay of
-        # this message (fail closed if we cannot confirm the Portal address).
-        if not portal or to != portal:
+        # Success + the Portal's own MessageReceived log for THIS nonce: the
+        # unforgeable core. Reverted txs emit no logs, but check status
+        # explicitly anyway -- proof should not lean on that implementation
+        # detail of the EVM.
+        if not evm_mod.receipt_succeeded(receipt):
             continue
+        if not evm_mod.parse_message_received(receipt, portal, nonce_bytes):
+            continue
+        if sender in excluded:
+            continue          # our own late self-relay is not volunteer evidence
         receiver = ""
         contents = msg.get("contents")
         if isinstance(contents, list) and len(contents) >= 2 and contents[1]:

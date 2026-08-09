@@ -297,6 +297,34 @@ def _parse_positive_float(key: str, raw: object) -> float:
     return value
 
 
+def _parse_config_bool(key: str, raw: object, default: bool) -> bool:
+    """A strict boolean from a config knob -- ``bool()`` fails open.
+
+    A YAML-quoted ``"false"`` is a non-empty string, so ``bool(raw)`` reads
+    it as True -- which for ``altruistic_relay`` silently enables gas
+    spending, and for ``enabled`` starts a bridge the operator wrote
+    ``"false"`` for. Accept real booleans, 0/1, and the strings
+    "true"/"false" (case-insensitive); refuse everything else loudly.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s == "":
+            return default
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+    raise WarpError(
+        f"warp.{key} must be a boolean (got {raw!r}); use true or false"
+    )
+
+
 def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     """Build :class:`WarpParams` from a config snapshot (all reads null-safe)."""
     warp = (config or {}).get("warp") or {}
@@ -325,7 +353,7 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     # any settings widget either, so it can only be hand-edited.
     # Only enforced when the bridge is actually on: a disabled warp section
     # must not stop the GUI from loading a config.
-    enabled = bool(warp.get("enabled", False))
+    enabled = _parse_config_bool("enabled", warp.get("enabled"), False)
     raw_cap = warp.get("max_auto_bridge_usdc", None)
     blank_cap = raw_cap is None or str(raw_cap).strip() == ""
     if enabled and blank_cap:
@@ -356,9 +384,11 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
                 "micro-USDC and would disable the cap; set at least 0.000001"
             )
     return WarpParams(
-        enabled=bool(warp.get("enabled", False)),
-        dry_run=bool(warp.get("dry_run", True)),
-        auto_bridge=bool(warp.get("auto_bridge", False)),
+        enabled=enabled,
+        dry_run=_parse_config_bool("dry_run", warp.get("dry_run"), True),
+        auto_bridge=_parse_config_bool(
+            "auto_bridge", warp.get("auto_bridge"), False
+        ),
         base_rpc_url=str(warp.get("base_rpc_url", "") or ""),
         min_micros=int(round(min_usdc * scale)),
         max_micros=int(round(max_usdc * scale)),
@@ -370,7 +400,9 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         portal_hint=(str(warp.get("portal_hint")) if warp.get("portal_hint") else None),
         max_unwrap_micros=_parse_unwrap_cap(warp),
         unwrap_chia_fee_mojos=int(warp.get("unwrap_chia_fee_mojos", 0) or 0),
-        altruistic_relay=bool(warp.get("altruistic_relay", False)),
+        altruistic_relay=_parse_config_bool(
+            "altruistic_relay", warp.get("altruistic_relay"), False
+        ),
         relay_grace_min=_parse_positive_float(
             "relay_grace_min", warp.get("relay_grace_min", 30) or 30
         ),
@@ -3194,6 +3226,12 @@ class WarpEngine:
                 self._watcher.fetch_path, self._evm,
                 portal_address=self._net.portal_address,
                 lookback=_ACTIVITY_LOOKBACK,
+                # Our own late self-relays (hot key or the dedicated relay
+                # key) must never read back as volunteer evidence about us.
+                exclude_addresses=[
+                    self._hot_address,
+                    getattr(self._relay_key, "address", None),
+                ],
             )
             out["third_party"] = third[:10]
             out["third_party_count"] = len(third)
@@ -3218,7 +3256,14 @@ class WarpEngine:
             proven = set(out.get("_proven_addrs") or [])
             out["heartbeats"] = beats[:10]
             out["online_now"] = bool(beats)
-            out["online_proven"] = any(b["relayer"] in proven for b in beats)
+            # Proven requires BOTH halves verified: the heartbeat must be
+            # cryptographically bound to the address it claims (evm_sig
+            # recovers to it), and that address must have receipt-verified
+            # late deliveries. An unbound heartbeat naming a proven address
+            # is exactly the spoof the binding exists to kill.
+            out["online_proven"] = any(
+                b.get("bound") and b["relayer"] in proven for b in beats
+            )
         except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
             out.setdefault("error", str(exc))
             out["online_now"] = False

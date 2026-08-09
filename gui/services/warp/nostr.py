@@ -508,6 +508,8 @@ def _default_fetcher() -> RelayFetcher:
 HEARTBEAT_KIND = 1
 HEARTBEAT_TAG = "warp-altruistic-relay-v1"
 _HEARTBEAT_KEY_DOMAIN = b"xoptrader-nostr-heartbeat-v1"
+#: Domain tag for the EVM-key binding signature (see heartbeat_binding_digest).
+_HEARTBEAT_BINDING_DOMAIN = b"xoptrader-heartbeat-binding-v1"
 #: Reject events stamped further into the future than honest clock skew allows;
 #: without this a spoofer could post-date one event and stay "online" forever.
 _HEARTBEAT_MAX_FUTURE_SKEW_S = 300.0
@@ -553,6 +555,48 @@ def nip01_event_id(
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
+def heartbeat_binding_digest(relayer_address: str, nostr_pubkey_hex: str) -> bytes:
+    """The digest the relayer's EVM key signs to bind its Nostr identity.
+
+    Without this binding a heartbeat proved only that SOME Nostr key signed
+    the content -- any attacker could mint a fresh Nostr key, name a
+    previously-proven EVM address in the content, and light up
+    ``online_proven``. The binding signature (recoverable ECDSA over this
+    digest) proves the holder of the claimed EVM key authorised exactly this
+    Nostr identity; freshness still comes from the BIP340-signed
+    ``created_at``, so replaying an old binding gains nothing.
+    """
+    import hashlib
+
+    return hashlib.sha256(
+        _HEARTBEAT_BINDING_DOMAIN
+        + str(relayer_address).lower().encode()
+        + bytes.fromhex(nostr_pubkey_hex)
+    ).digest()
+
+
+def _sign_binding(evm_private_key: bytes, digest: bytes) -> str:
+    """r||s||v (65 bytes, v in {0,1}) hex over the binding digest."""
+    from eth_keys import keys
+
+    sig = keys.PrivateKey(bytes(evm_private_key)).sign_msg_hash(digest)
+    return sig.to_bytes().hex()
+
+
+def _recover_binding(evm_sig_hex: str, digest: bytes) -> Optional[str]:
+    """The lowercase address a binding signature recovers to, or ``None``."""
+    try:
+        from eth_keys import keys
+
+        raw = bytes.fromhex(str(evm_sig_hex))
+        if len(raw) != 65:
+            return None
+        sig = keys.Signature(signature_bytes=raw)
+        return sig.recover_public_key_from_msg_hash(digest).to_address().lower()
+    except Exception:  # noqa: BLE001 -- malformed => not a valid binding
+        return None
+
+
 def build_heartbeat_event(
     net: WarpNet,
     evm_private_key: bytes,
@@ -564,7 +608,9 @@ def build_heartbeat_event(
     """A complete, signed heartbeat event ready for ``["EVENT", ...]``.
 
     ``relayer_address`` is the EVM address the volunteer relays from -- the
-    join key against the on-chain altruism evidence.
+    join key against the on-chain altruism evidence. The content carries an
+    EVM-key binding signature over the Nostr identity, so the claim is
+    verifiable, not merely stated (see :func:`heartbeat_binding_digest`).
     """
     import json
     import os
@@ -572,8 +618,17 @@ def build_heartbeat_event(
     from . import schnorr
 
     seckey, pubkey_hex = heartbeat_keypair(evm_private_key)
+    binding = _sign_binding(
+        evm_private_key,
+        heartbeat_binding_digest(relayer_address, pubkey_hex),
+    )
     content = json.dumps(
-        {"net": net.name, "relayer": str(relayer_address).lower(), "v": 1},
+        {
+            "evm_sig": binding,
+            "net": net.name,
+            "relayer": str(relayer_address).lower(),
+            "v": 2,
+        },
         separators=(",", ":"),
         sort_keys=True,
     )
@@ -642,7 +697,24 @@ def verify_heartbeat_event(
         bytes.fromhex(relayer[2:])
     except ValueError:
         return None
-    return {"relayer": relayer, "pubkey": pubkey.lower(), "seen_at": created}
+    # The EVM-key binding: ``bound`` is True only when the content's evm_sig
+    # recovers to exactly the claimed relayer address over this event's Nostr
+    # identity. An unbound event remains a liveness CLAIM (online_now), but
+    # must never feed online_proven -- otherwise anyone could mint a Nostr
+    # key and name someone else's proven address.
+    bound = False
+    evm_sig = body.get("evm_sig")
+    if evm_sig:
+        recovered = _recover_binding(
+            str(evm_sig), heartbeat_binding_digest(relayer, pubkey.lower())
+        )
+        bound = recovered == relayer
+    return {
+        "relayer": relayer,
+        "pubkey": pubkey.lower(),
+        "seen_at": created,
+        "bound": bound,
+    }
 
 
 def heartbeat_filter(*, since: float) -> dict:

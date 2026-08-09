@@ -38,7 +38,17 @@ from .test_warp_unwrap_service import (  # noqa: E402
 NET = C.MAINNET
 NOW = 1_786_000_000.0
 EVM_PRIVKEY = b"\x42" * 32
-RELAYER_ADDR = "0x" + "99" * 20
+
+
+def _addr_of(privkey: bytes) -> str:
+    from eth_keys import keys
+
+    return keys.PrivateKey(privkey).public_key.to_address().lower()
+
+
+#: The claimed relayer address matches EVM_PRIVKEY, so built heartbeats carry
+#: a VALID binding; spoof tests use a mismatched pair deliberately.
+RELAYER_ADDR = _addr_of(EVM_PRIVKEY)
 
 _VECTORS = pathlib.Path(__file__).parent / "fixtures_bip340_vectors.csv"
 
@@ -92,6 +102,7 @@ def test_heartbeat_round_trips_and_identity_is_derived_not_reused():
         "relayer": RELAYER_ADDR.lower(),
         "pubkey": event["pubkey"],
         "seen_at": int(NOW),
+        "bound": True,
     }
     sk1, pk1 = nostr_mod.heartbeat_keypair(EVM_PRIVKEY)
     sk2, pk2 = nostr_mod.heartbeat_keypair(EVM_PRIVKEY)
@@ -100,11 +111,50 @@ def test_heartbeat_round_trips_and_identity_is_derived_not_reused():
     assert schnorr.pubkey_gen(sk1).hex() == pk1 == event["pubkey"]
 
 
+def test_a_heartbeat_claiming_someone_elses_address_is_unbound():
+    """[PR-73 Copilot] Anyone can mint a Nostr key and NAME a proven EVM
+    address; the binding signature is what makes the claim verifiable. An
+    attacker's event (their key, the victim's address) must verify as a
+    liveness claim at most -- never bound."""
+    attacker_key = b"\x66" * 32
+    victim_addr = RELAYER_ADDR                 # a "proven" address
+    assert _addr_of(attacker_key) != victim_addr
+    spoof = nostr_mod.build_heartbeat_event(
+        NET, attacker_key, victim_addr, created_at=NOW, aux_rand=b"\x00" * 32
+    )
+    out = nostr_mod.verify_heartbeat_event(NET, spoof, now=NOW + 60, max_age_s=900)
+    assert out is not None and out["bound"] is False
+
+    # Tampered or missing evm_sig on an otherwise-honest event: unbound too.
+    import json
+
+    honest = _beat()
+    body = json.loads(honest["content"])
+    body.pop("evm_sig")
+    stripped = dict(honest)
+    stripped["content"] = json.dumps(body, separators=(",", ":"), sort_keys=True)
+    # Re-sign the stripped event properly so only the binding is absent.
+    seckey, pubkey_hex = nostr_mod.heartbeat_keypair(EVM_PRIVKEY)
+    stripped["id"] = nostr_mod.nip01_event_id(
+        pubkey_hex, stripped["created_at"], stripped["kind"],
+        stripped["tags"], stripped["content"],
+    )
+    stripped["sig"] = schnorr.sign(
+        bytes.fromhex(stripped["id"]), seckey, b"\x00" * 32
+    ).hex()
+    out2 = nostr_mod.verify_heartbeat_event(
+        NET, stripped, now=NOW + 60, max_age_s=900
+    )
+    assert out2 is not None and out2["bound"] is False
+
+
 def test_every_forgery_lever_is_rejected():
     ok = dict(now=NOW + 60, max_age_s=900.0)
-    # Content tamper -> the recomputed id no longer matches.
+    # Content tamper -> the recomputed id no longer matches. Flip the tail of
+    # the relayer address inside the content (guaranteed present).
     tampered = dict(_beat())
-    tampered["content"] = tampered["content"].replace("99", "aa", 1)
+    assert RELAYER_ADDR[-6:] in tampered["content"]
+    tampered["content"] = tampered["content"].replace(RELAYER_ADDR[-6:], "ffffff")
     assert nostr_mod.verify_heartbeat_event(NET, tampered, **ok) is None
     # A lying id field alone (signature still valid over the TRUE id) is a
     # NIP-01 violation and must be rejected -- this is the one case the
@@ -466,15 +516,28 @@ def _third_party_msg():
     }
 
 
+def _delivery_receipt(nonce_hex: str, *, sender: str = None) -> dict:
+    """A successful Portal receipt carrying MessageReceived for *nonce_hex*."""
+    from gui.services.warp import evm as evm_mod
+
+    return {
+        "from": sender or RELAYER_ADDR,
+        "to": NET.portal_address,
+        "status": "0x1",
+        "logs": [{
+            "address": NET.portal_address,
+            "topics": ["0x" + evm_mod.MESSAGE_RECEIVED_TOPIC0, "0x" + nonce_hex],
+        }],
+    }
+
+
 def test_activity_composes_both_evidence_layers_and_throttles():
     beat = _beat(created_at=NOW - 60)
     store = new_store()
     evm = UnwrapFakeEvm()
-    # A genuine Portal delivery from the volunteer (to == Portal is now
-    # required for the evidence to count).
-    evm._call = lambda method, params: {
-        "from": RELAYER_ADDR, "to": NET.portal_address,
-    }
+    # A receipt-verified Portal delivery from the volunteer: success status
+    # plus the MessageReceived log for the row's exact nonce.
+    evm._call = lambda method, params: _delivery_receipt("aa" * 32)
     engine, _ctx = build(
         store, params=params_with_cap(),
         evm=evm, watcher=ActivityWatcher([_third_party_msg()]),
@@ -486,9 +549,55 @@ def test_activity_composes_both_evidence_layers_and_throttles():
     assert out["third_party"][0]["relayer"] == RELAYER_ADDR
     assert out["online_now"] is True
     assert out["online_proven"] is True, \
-        "the heartbeat's address matches the on-chain evidence"
+        "a BOUND heartbeat whose address matches the on-chain evidence"
     assert engine.refresh_relay_activity_if_due() is None, "throttled"
     assert engine.snapshot()["relay_activity"]["online_proven"] is True
+
+
+def test_an_unbound_spoof_heartbeat_never_lights_online_proven():
+    """End-to-end [PR-73 Copilot]: an attacker's own Nostr key claiming the
+    proven volunteer's EVM address gets online_now (a claim) but must not
+    reach online_proven -- the binding fails."""
+    spoof = nostr_mod.build_heartbeat_event(
+        NET, b"\x66" * 32, RELAYER_ADDR, created_at=NOW - 60,
+        aux_rand=b"\x00" * 32,
+    )
+    store = new_store()
+    evm = UnwrapFakeEvm()
+    evm._call = lambda method, params: _delivery_receipt("aa" * 32)
+    engine, _ctx = build(
+        store, params=params_with_cap(),
+        evm=evm, watcher=ActivityWatcher([_third_party_msg()]),
+        nostr_fetcher=lambda relay, filt, timeout: [spoof],
+        clock=_fixed_clock(),
+    )
+    out = engine.refresh_relay_activity_if_due()
+    assert out["third_party_count"] == 1, "the on-chain half is real"
+    assert out["online_now"] is True, "the spoof still reads as a claim"
+    assert out["online_proven"] is False, \
+        "an unbound heartbeat naming a proven address must not be proven"
+
+
+def test_our_own_late_self_relay_is_not_volunteer_evidence():
+    """[PR-73 Copilot] This node self-relays from its hot address while the
+    receiver may be an exchange; a delayed self-relay must not read back as
+    third-party altruism about ourselves."""
+    from .test_warp_service import HOT_ADDRESS
+
+    store = new_store()
+    evm = UnwrapFakeEvm()
+    evm._call = lambda method, params: _delivery_receipt(
+        "aa" * 32, sender=HOT_ADDRESS.lower()
+    )
+    engine, _ctx = build(
+        store, params=params_with_cap(),
+        evm=evm, watcher=ActivityWatcher([_third_party_msg()]),
+        nostr_fetcher=lambda relay, filt, timeout: [],
+        clock=_fixed_clock(),
+    )
+    out = engine.refresh_relay_activity_if_due()
+    assert out["third_party_count"] == 0, \
+        "our own address is excluded from the evidence"
 
 
 def test_activity_survives_both_sources_failing():
@@ -529,6 +638,33 @@ def test_altruistic_params_parse_and_refuse_junk():
     assert S.warp_params_from_config(
         {"warp": {"relay_grace_min": 0}}
     ).relay_grace_min == 30.0
+
+
+def test_warp_booleans_parse_strictly_never_fail_open():
+    """[PR-73 Copilot] bool('false') is True: a YAML-quoted string must not
+    silently enable a gas-spending opt-in (or start the bridge, or disarm a
+    rehearsal). Real booleans, 0/1, and 'true'/'false' strings only."""
+    # The flagged key, and its boolean siblings in the same config section.
+    p = S.warp_params_from_config({"warp": {
+        "altruistic_relay": "false", "enabled": "false",
+        "auto_bridge": "FALSE", "dry_run": "true",
+    }})
+    assert p.altruistic_relay is False
+    assert p.enabled is False
+    assert p.auto_bridge is False
+    assert p.dry_run is True
+
+    p2 = S.warp_params_from_config({"warp": {
+        "enabled": True, "max_auto_bridge_usdc": 5,
+        "altruistic_relay": "true", "dry_run": False,
+    }})
+    assert p2.altruistic_relay is True and p2.dry_run is False
+
+    for bad in ("yes", "on", 2, [], "enable"):
+        with pytest.raises(S.WarpError, match="must be a boolean"):
+            S.warp_params_from_config({"warp": {"altruistic_relay": bad}})
+    with pytest.raises(S.WarpError, match="must be a boolean"):
+        S.warp_params_from_config({"warp": {"dry_run": "off"}})
 
 
 def test_build_engine_wires_the_relayer_and_key_fallback(tmp_path, monkeypatch):

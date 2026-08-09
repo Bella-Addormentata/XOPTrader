@@ -716,14 +716,16 @@ class WarpWidget(QWidget):
         if act.get("online_proven"):
             colour = PROFIT_GREEN
             parts.append(
-                "🟢 <b>Altruistic relay online now</b> — a volunteer with "
-                "proven on-chain deliveries is heartbeating."
+                "🟢 <b>Altruistic relay online now</b> — a volunteer whose "
+                "heartbeat is cryptographically bound to an address with "
+                "verified on-chain deliveries."
             )
         elif act.get("online_now"):
             colour = PROFIT_GREEN
             parts.append(
                 "🟢 <b>Altruistic relay heartbeat seen</b> in the last "
-                "few minutes (liveness claim; unverified on-chain history)."
+                "few minutes (an unbound liveness claim; no verified "
+                "delivery history)."
             )
         elif act.get("last_third_party_at"):
             colour = WARNING_YELLOW

@@ -532,22 +532,32 @@ One stuck message can also be relayed by hand:
 Under the unwrap controls the Warp tab shows whether waiting is realistic,
 from two independent evidence layers joined by relayer address:
 
-* 🟢 **online now** — a Nostr heartbeat seen minutes ago. *Proven* when the
-  heartbeating address also appears in the on-chain third-party evidence
-  (claiming someone else's address gains nothing — it doesn't make the
-  claimant relay).
-* 🟡 **active recently** — a third-party delivery observed on-chain in the
-  lookback window (unforgeable: a message stuck past the grace period,
-  delivered by an address that is not its attested receiver).
+* 🟢 **online now** — a Nostr heartbeat seen minutes ago. *Proven* requires
+  BOTH halves verified: the heartbeat carries an ECDSA **binding signature**
+  by the claimed EVM key over its Nostr identity (so naming someone else's
+  address is detectably invalid), and that address has receipt-verified
+  late deliveries.
+* 🟡 **active recently** — a late delivery observed on-chain in the lookback
+  window, verified end-to-end: a successful Portal receipt carrying the
+  `MessageReceived` log for that exact nonce, delivered past the grace
+  period by an address that is not the attested receiver, and not one of
+  this node's own addresses (our own late self-relays are excluded).
 * ⚪ **none** — plan on funding your own gas, or the portal.
 
 Heartbeats are BIP340-signed NIP-01 events published by live (never
 dry-run) volunteers, under an identity *derived from* — never equal to —
 the relay key. Consumers recompute the event id, verify the signature
-against the official-vector-pinned `schnorr.py`, and bound the timestamp in
-both directions, so a post-dated event cannot stay "online" forever. The
-heartbeat reveals the relayer's **public** EVM address and network name,
-nothing else.
+against the official-vector-pinned `schnorr.py`, verify the EVM binding,
+and bound the timestamp in both directions, so a post-dated event cannot
+stay "online" forever. The heartbeat reveals the relayer's **public** EVM
+address, its Nostr identity, and the network name — nothing else.
+
+One stated residual: the receiver-vs-sender test cannot attribute a
+message's original *owner* (a Chia-side identity), so an owner who relays
+late from a different address than their receiver reads as a volunteer.
+That cannot be manufactured without actually delivering a genuinely stuck
+message at one's own gas cost — which is the behaviour the badge exists
+to signal.
 
 ## 10. Known limitations
 

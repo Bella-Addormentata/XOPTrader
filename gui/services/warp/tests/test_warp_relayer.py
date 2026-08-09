@@ -235,6 +235,31 @@ def test_a_successful_relay_spends_budget(monkeypatch):
 # The unforgeable altruism signal.
 # --------------------------------------------------------------------------- #
 
+def _receipt_for(nonce_hex: str, *, sender: str, to: str = None,
+                 status: str = "0x1", with_log: bool = True) -> dict:
+    """A delivery receipt: Portal call + MessageReceived log for *nonce_hex*."""
+    from gui.services.warp import evm as evm_mod
+
+    logs = []
+    if with_log:
+        logs = [{"address": NET.portal_address,
+                 "topics": ["0x" + evm_mod.MESSAGE_RECEIVED_TOPIC0,
+                            "0x" + nonce_hex]}]
+    return {"from": sender, "to": to or NET.portal_address,
+            "status": status, "logs": logs}
+
+
+class ReceiptEv:
+    """Maps tx-hash suffixes to receipts (the eth_getTransactionReceipt fake)."""
+
+    def __init__(self, by_tx: dict) -> None:
+        self.by_tx = by_tx
+
+    def _call(self, method, params):
+        assert method == "eth_getTransactionReceipt"
+        return self.by_tx[str(params[0])]
+
+
 def test_recent_third_party_relays_derives_evidence_correctly():
     receiver_hex = "22" * 20
     msgs = [
@@ -256,19 +281,14 @@ def test_recent_third_party_relays_derives_evidence_correctly():
                      source_timestamp=NOW - 20000,
                      destination_timestamp=NOW - 9000),
     ]
-
-    portal = NET.portal_address
-
-    class Ev:
-        def _call(self, method, params):
-            # Every delivery is a genuine Portal call; the from-address is the
-            # receiver only for the a3 self-rescue row.
-            return {"to": portal,
-                    "from": "0x" + ("ab" * 20 if params[0].endswith("03" * 32)
-                                    else "99" * 20)}
+    ev = ReceiptEv({
+        "0x" + "01" * 32: _receipt_for("a1" * 32, sender="0x" + "99" * 20),
+        "0x" + "02" * 32: _receipt_for("a2" * 32, sender="0x" + "99" * 20),
+        "0x" + "03" * 32: _receipt_for("a3" * 32, sender="0x" + "ab" * 20),
+    })
 
     out = relayer.recent_third_party_relays(
-        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+        lambda p: msgs, ev, portal_address=NET.portal_address, grace_s=1800
     )
     assert [o["nonce"][:2] for o in out] == ["a2"]
     assert out[0]["relayer"] == "0x" + "99" * 20
@@ -276,48 +296,60 @@ def test_recent_third_party_relays_derives_evidence_correctly():
 
 
 def test_recent_third_party_relays_rejects_forged_evidence():
-    """The badge an operator trusts must not be fakeable: a delivery tx that
-    does not target the Portal, or a row whose receiver cannot be read, is
-    dropped rather than counted as a volunteer."""
-    portal = NET.portal_address
+    """The badge an operator trusts must not be fakeable: a tx that does not
+    target the Portal, a REVERTED tx, a receipt without the MessageReceived
+    log for this nonce, a row whose receiver cannot be read, or our own
+    address -- all dropped rather than counted as a volunteer."""
+    base = dict(status="received",
+                contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32],
+                source_timestamp=NOW - 20000,
+                destination_timestamp=NOW - 9000)
+    stranger = "0x" + "99" * 20
     msgs = [
-        # Real Portal call from a stranger -> genuine altruism (kept).
-        _watcher_msg(nonce="b1" * 32, status="received",
-                     destination_transaction_hash="0x" + "01" * 32,
-                     contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32],
-                     source_timestamp=NOW - 20000,
-                     destination_timestamp=NOW - 9000),
+        # Receipt-verified Portal delivery from a stranger -> kept.
+        _watcher_msg(nonce="b1" * 32,
+                     destination_transaction_hash="0x" + "01" * 32, **base),
         # tx.to is NOT the Portal -> an unrelated Base tx, forged (dropped).
-        _watcher_msg(nonce="b2" * 32, status="received",
-                     destination_transaction_hash="0x" + "02" * 32,
-                     contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32],
-                     source_timestamp=NOW - 20000,
-                     destination_timestamp=NOW - 9000),
+        _watcher_msg(nonce="b2" * 32,
+                     destination_transaction_hash="0x" + "02" * 32, **base),
         # Receiver unreadable (contents serialised as a string) -> fail closed.
-        _watcher_msg(nonce="b3" * 32, status="received",
+        _watcher_msg(nonce="b3" * 32,
                      destination_transaction_hash="0x" + "03" * 32,
-                     contents="not-a-list",
-                     source_timestamp=NOW - 20000,
-                     destination_timestamp=NOW - 9000),
+                     **{**base, "contents": "not-a-list"}),
+        # REVERTED Portal call -> not a delivery (dropped).
+        _watcher_msg(nonce="b4" * 32,
+                     destination_transaction_hash="0x" + "04" * 32, **base),
+        # Successful Portal call but the log names a DIFFERENT nonce ->
+        # a real delivery of some other message pointed at this row (dropped).
+        _watcher_msg(nonce="b5" * 32,
+                     destination_transaction_hash="0x" + "05" * 32, **base),
+        # Delivered by one of OUR OWN addresses -> self-relay, not altruism.
+        _watcher_msg(nonce="b6" * 32,
+                     destination_transaction_hash="0x" + "06" * 32, **base),
     ]
-
-    class Ev:
-        def _call(self, method, params):
-            to = ("0x" + "de" * 20) if params[0].endswith("02" * 32) else portal
-            return {"to": to, "from": "0x" + "99" * 20}
+    ev = ReceiptEv({
+        "0x" + "01" * 32: _receipt_for("b1" * 32, sender=stranger),
+        "0x" + "02" * 32: _receipt_for("b2" * 32, sender=stranger,
+                                       to="0x" + "de" * 20),
+        "0x" + "03" * 32: _receipt_for("b3" * 32, sender=stranger),
+        "0x" + "04" * 32: _receipt_for("b4" * 32, sender=stranger,
+                                       status="0x0", with_log=False),
+        "0x" + "05" * 32: _receipt_for("ee" * 32, sender=stranger),
+        "0x" + "06" * 32: _receipt_for("b6" * 32, sender="0x" + "77" * 20),
+    })
 
     out = relayer.recent_third_party_relays(
-        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+        lambda p: msgs, ev, portal_address=NET.portal_address, grace_s=1800,
+        exclude_addresses=["0x" + "77" * 20],
     )
     assert [o["nonce"][:2] for o in out] == ["b1"], \
-        "only the verified Portal delivery with a readable receiver counts"
+        "only the receipt-verified stranger delivery counts"
 
 
 def test_recent_third_party_relays_requires_a_full_hex_receiver_suffix():
     """[PR-73 Copilot] contents[1][-40:] on a short or non-hex watcher value
     manufactured a bogus 'receiver' that then counted as third-party
     evidence. The suffix must be exactly 40 hex chars or the row is dropped."""
-    portal = NET.portal_address
     base = dict(status="received",
                 source_timestamp=NOW - 20000,
                 destination_timestamp=NOW - 9000)
@@ -332,12 +364,13 @@ def test_recent_third_party_relays_requires_a_full_hex_receiver_suffix():
         _watcher_msg(nonce="c3" * 32, destination_transaction_hash="0x" + "03" * 32,
                      contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32], **base),
     ]
-
-    class Ev:
-        def _call(self, method, params):
-            return {"to": portal, "from": "0x" + "99" * 20}
+    ev = ReceiptEv({
+        "0x" + "01" * 32: _receipt_for("c1" * 32, sender="0x" + "99" * 20),
+        "0x" + "02" * 32: _receipt_for("c2" * 32, sender="0x" + "99" * 20),
+        "0x" + "03" * 32: _receipt_for("c3" * 32, sender="0x" + "99" * 20),
+    })
 
     out = relayer.recent_third_party_relays(
-        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+        lambda p: msgs, ev, portal_address=NET.portal_address, grace_s=1800
     )
     assert [o["nonce"][:2] for o in out] == ["c3"]
