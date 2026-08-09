@@ -148,6 +148,12 @@ _PENDING_MAX_POLLS: Dict[str, int] = {
     JobStatus.CLAIM_FUNDED: 480,        # ~2h -- the funding coin reaching depth
     JobStatus.CLAIMING: 1440,           # ~6h -- the final CAT coin appearing
     JobStatus.BRIDGE_CONFIRMED: 480,    # ~2h -- Base confirmation depth
+    # BRIDGING bounds its own pend paths (_STUCK_TX_POLLS, revert attempts,
+    # ambiguous-receipt polls), but a persistent transport error loops through
+    # _apply_retry and would otherwise never expire. Failing out of BRIDGING is
+    # safe: _retry_tx_reset keeps the raw while the nonce is live, and Abandon
+    # refuses while a signed bridge could still mine.
+    JobStatus.BRIDGING: 480,            # ~2h -- Base RPC unreachable
 }
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
@@ -258,6 +264,15 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
                     "use 'unlimited' if no cap is genuinely intended"
                 )
             max_usdc = 0.0
+        elif enabled and int(round(max_usdc * scale)) <= 0:
+            # A stated cap below half a micro-USDC rounds to 0 micros, and the
+            # clamp is guarded on max_micros > 0 -- so a tiny positive cap
+            # would silently mean NO cap, the exact fail-open this key was
+            # made mandatory to prevent.
+            raise WarpError(
+                f"warp.max_auto_bridge_usdc of {raw_cap!r} rounds to zero "
+                "micro-USDC and would disable the cap; set at least 0.000001"
+            )
     return WarpParams(
         enabled=bool(warp.get("enabled", False)),
         dry_run=bool(warp.get("dry_run", True)),
@@ -1790,7 +1805,8 @@ class WarpEngine:
         if active is not None:
             raise WarpError(
                 f"a warp job is already active (job {active.id}, {active.status}); "
-                "resolve it first -- Retry, Cancel, or Sweep from the jobs table"
+                "resolve it first -- Retry, Cancel, Sweep or Abandon from the "
+                "jobs table"
             )
         state: Dict[str, Any] = {"manual": True, **self._binding()}
         if target_micros:
@@ -1831,30 +1847,69 @@ class WarpEngine:
         # only by hand-editing warp_jobs.db, which is what this whole branch
         # set out to eliminate. Abandon is a pure DB write that records the
         # recovery details first, so it is safe for a job we refuse to touch.
-        if job.status != JobStatus.FAILED and not self._binding_mismatch(job):
+        mismatch = self._binding_mismatch(job)
+        if job.status != JobStatus.FAILED and not mismatch:
             raise WarpError(
                 f"cannot abandon a job in {job.status}; abandon is the escape "
                 "from a job the engine cannot resolve"
             )
 
+        # [WARP-ABANDON-LIVE-TX 2026-08-09] A signed-but-unmined bridge must not
+        # be buried. The stuck-tx terminal lands in FAILED with bridge_raw still
+        # set and the nonce unconsumed; abandoning that frees the slot, the next
+        # bridge reads the same untouched USDC balance and signs a second
+        # bridgeToChia -- and if the stuck transaction later mines, real USDC
+        # bridges under a nonce no job tracks. Refused until the nonce is
+        # provably dead (something else consumed it) or provably resolved (it
+        # mined -- in which case Retry, not Abandon, completes the job).
+        # Skipped for a binding-refused job: its nonce belongs to a different
+        # hot wallet than the configured key, so the check would be meaningless;
+        # the recovery blob records what to verify by hand instead.
+        raw_nonce = job.state.get("bridge_tx_nonce")
+        if not mismatch and job.state.get("bridge_raw") and raw_nonce is not None:
+            try:
+                mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            except Exception as exc:  # noqa: BLE001 -- cannot prove it is dead
+                raise WarpError(
+                    f"cannot abandon: unable to verify whether the signed bridge "
+                    f"at nonce {raw_nonce} is still live ({exc}); try again when "
+                    "the Base RPC is reachable"
+                ) from exc
+            if mined <= int(raw_nonce):
+                raise WarpError(
+                    f"cannot abandon: this job's signed bridge is still live at "
+                    f"nonce {raw_nonce}. Wait for it to mine (then Retry), or "
+                    "clear the nonce with a self-send replacement from the hot "
+                    "wallet, then abandon"
+                )
+
         recovery = {
             "bridge_nonce": job.bridge_nonce,
             "bridge_tx_hash": job.bridge_tx_hash,
+            "bridge_tx_nonce": raw_nonce,
+            "signed_raw_present": bool(job.state.get("bridge_raw")),
             "amount_usdc_micros": job.amount_usdc_micros,
             "receiver_ph": job.receiver_ph,
             "failed_from": job.state.get("failed_from"),
             "last_error": job.last_error,
             "portal": self._net.status_url,
         }
-        note = (
-            "operator abandoned: "
-            + (
+        if job.bridge_nonce:
+            detail = (
                 f"message nonce {job.bridge_nonce} was never claimed and remains "
                 f"claimable at {self._net.status_url}"
-                if job.bridge_nonce
-                else "no bridge message was ever attested"
             )
-        )
+        elif job.state.get("bridge_raw"):
+            # Only reachable for a binding-refused job (the guard above covers
+            # the same-binding case), where we cannot check the foreign wallet.
+            detail = (
+                f"a signed bridge transaction may still be live at nonce "
+                f"{raw_nonce} on the job's own hot wallet -- verify on BaseScan "
+                "before treating the deposit as untouched"
+            )
+        else:
+            detail = "no bridge message was ever attested"
+        note = f"operator abandoned: {detail}"
         self._store.update_job(
             job.id,
             status=JobStatus.CANCELLED,
@@ -1972,25 +2027,37 @@ class WarpEngine:
                     "receiver. This job is kept open deliberately as the record."
                 )
             resolved, status = True, "no ephemeral key: nothing was ever funded"
-        else:
+        coin_id: Optional[str] = None
+        if blob:
             sk = self._load_ephemeral_sk(job)
             expected = self._funded_amount(job)
             coin = claim.find_security_coin(self._coinset, sk, expected)
             if coin is None:
                 resolved, status = self._funding_provably_gone(job)
             else:
+                coin_id = coin.name().hex()
                 resolved, status = self._sweep_security(job, coin, sk)
 
         # Only a resolved sweep frees the slot. A transport failure leaves the
         # job FAILED so the operator can try again with the funds still known
         # recoverable.
         close = resolved and job.status == JobStatus.FAILED
+        patch: Dict[str, Any] = {"swept": resolved, "sweep_status": status}
+        if coin_id and not job.state.get("security_coin_id"):
+            # The follow-up Sweep proves the spend from this id. A job that
+            # failed out of FUNDING_CLAIM by the pending deadline never had it
+            # recorded (only _h_funding_claim's advance writes it), so an
+            # unresolved first sweep -- bundle pushed, coin not yet spent --
+            # could never be closed by the second: find_security_coin returns
+            # None once the sweep mines, and _funding_provably_gone had nothing
+            # to check.
+            patch["security_coin_id"] = coin_id
         self._store.update_job(
             job.id,
             status=JobStatus.CANCELLED if close else None,
             expected_status=job.status,
             columns={"next_retry_at": None},
-            state_patch={"swept": resolved, "sweep_status": status},
+            state_patch=patch,
             event=(
                 "sweep",
                 f"{status}; job closed, active slot freed" if close else status,

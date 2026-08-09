@@ -115,7 +115,10 @@ class FakeEvm:
     def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None, fees=None):
         # Mirrors the real UnsignedTx closely enough for the fee-escalation
         # path, which reads the fee legs back off the unsigned transaction.
-        self.prepared.append(("bridge", mojo_amount))
+        # nonce/fees are recorded so tests can assert a replacement pinned the
+        # nonce and escalated the fee -- discarding them made the escalation
+        # test unable to fail against a replacement signed at a fresh nonce.
+        self.prepared.append(("bridge", mojo_amount, nonce, fees))
         return SimpleNamespace(
             kind="bridge",
             mojo=mojo_amount,

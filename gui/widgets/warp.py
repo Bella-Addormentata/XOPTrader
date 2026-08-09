@@ -623,8 +623,9 @@ class WarpWidget(QWidget):
         elif status == _ST_FAILED:
             self._bridge_btn.setToolTip(
                 "The last bridge job failed and still holds the single job slot. "
-                "Right-click it in the table and choose Retry, or Sweep to recover "
-                "its funding coin and close it."
+                "Right-click it in the table: Retry re-attempts it, Sweep recovers "
+                "its funding coin and closes it, and Abandon closes a job neither "
+                "of those can resolve (the recovery details go to the audit log)."
             )
         elif active_open:
             self._bridge_btn.setToolTip(
