@@ -3127,6 +3127,23 @@ class WarpEngine:
         if now < self._next_relay_sweep:
             return None
         self._next_relay_sweep = now + _RELAY_SWEEP_INTERVAL_S
+        # Nonce-collision guard. When the relay shares the engine's hot key
+        # (the no-dedicated-key fallback), broadcasting a relay grabs the same
+        # pending nonce the engine may hold a signed-but-unbroadcast tx at --
+        # the relay mines first and the engine's approve/bridge/relay then
+        # silently wedges on a benign 'nonce too low'. A dedicated relay key
+        # has its own nonce space and is unaffected; only the shared case is
+        # skipped, and only while a job actually occupies the slot.
+        if (
+            self._relay_key is not None
+            and str(self._relay_key.address).lower() == str(self._hot_address).lower()
+            and self._store.get_active_job() is not None
+        ):
+            self._relay_report = {
+                "at": now,
+                "skipped": "relay shares the hot key with an active bridge job",
+            }
+            return self._relay_report
         broadcast = not self._params.dry_run
         report: Dict[str, Any] = {"at": now, "broadcast": broadcast}
         try:
@@ -3175,6 +3192,7 @@ class WarpEngine:
 
             third = relayer_mod.recent_third_party_relays(
                 self._watcher.fetch_path, self._evm,
+                portal_address=self._net.portal_address,
                 lookback=_ACTIVITY_LOOKBACK,
             )
             out["third_party"] = third[:10]
@@ -3182,6 +3200,13 @@ class WarpEngine:
             out["last_third_party_at"] = max(
                 (t["delivered_at"] for t in third), default=None
             )
+            # Join heartbeats against the FULL evidence set, not the truncated
+            # display slice -- a volunteer past the 10th recent delivery is
+            # still proven, and dropping it would silently downgrade a genuine
+            # "online (proven)" to a mere "online (claim)".
+            out["_proven_addrs"] = sorted({
+                str(t.get("relayer") or "").lower() for t in third
+            })
         except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
             out["error"] = str(exc)
         try:
@@ -3190,10 +3215,7 @@ class WarpEngine:
             beats = nostr.fetch_recent_heartbeats(
                 self._net, now=now, fetcher=self._nostr_fetcher,
             )
-            proven = {
-                str(t.get("relayer") or "").lower()
-                for t in out.get("third_party") or []
-            }
+            proven = set(out.get("_proven_addrs") or [])
             out["heartbeats"] = beats[:10]
             out["online_now"] = bool(beats)
             out["online_proven"] = any(b["relayer"] in proven for b in beats)
@@ -3201,6 +3223,7 @@ class WarpEngine:
             out.setdefault("error", str(exc))
             out["online_now"] = False
             out["online_proven"] = False
+        out.pop("_proven_addrs", None)  # internal join key; keep it out of the snapshot
         self._relay_activity = out
         return out
 
@@ -3312,8 +3335,22 @@ class _SecretsFileIO:
         if not self._path.is_file():
             return {}
         with open(self._path, "r", encoding="utf-8") as fh:
-            data = yaml.safe_load(fh) or {}
-        return data if isinstance(data, dict) else {}
+            data = yaml.safe_load(fh)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            # A present-but-corrupt secrets.yaml (a manual edit left it parsing
+            # as a list/scalar). Masking it as {} would make create_wallet's
+            # overwrite guard read an empty store and rewrite the file from
+            # scratch, erasing whatever key blob it actually held. Fail loud;
+            # _wallet_summary surfaces this as an error banner, and the write
+            # side never runs.
+            raise ValueError(
+                f"{self._path} does not parse to a mapping "
+                f"(got {type(data).__name__}); refusing to treat a corrupt "
+                "secrets file as empty"
+            )
+        return data
 
     def write(self, data: dict) -> None:
         from gui.services.config_split import dump_preserving
@@ -3350,6 +3387,17 @@ class _WarpWorker(QObject):
         # wallet_action). Set once before moveToThread, never mutated after.
         self._secrets_path: Optional[Path] = secrets_path
         self._last_wallet_notice: str = ""
+        # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
+        # the GUI can tell a wallet-action-completion snapshot apart from the
+        # timer-driven ticks that carry the same cached value -- without it,
+        # the ~5s master tick clears the widget's post-click gate before the
+        # action finishes, re-enabling a duplicate irreversible transfer.
+        self._wallet_action_seq: int = 0
+        # The altruistic relay's daily-gas ledger, failure counts, and
+        # skip-list, owned by the worker so they survive an engine rebuild on
+        # config reload (the engine, and its relayer, are dropped and rebuilt;
+        # this dict is passed by reference into each new relayer).
+        self._relay_state: Dict[str, Any] = {}
 
     @Slot(dict)
     def set_config(self, config: dict) -> None:
@@ -3421,6 +3469,9 @@ class _WarpWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- never kill the worker
             error = str(exc)
             _log.warning("wallet action %r failed: %s", action, exc)
+        # Mark this action processed BEFORE snapshotting, so the emitted
+        # snapshot carries the bumped seq the GUI keys its gate off.
+        self._wallet_action_seq += 1
         snap = self._snapshot_or_error()
         if error:
             snap["wallet_action_error"] = error
@@ -3467,6 +3518,7 @@ class _WarpWorker(QObject):
         # Base-wallet fields ride every snapshot, so the wallet page works in
         # all three shapes (engine built, blocked, warp disabled).
         snap["base_wallet"] = self._wallet_summary(snap.get("hot_wallet"))
+        snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
         return snap
@@ -3587,6 +3639,8 @@ class _WarpWorker(QObject):
                 daily_gas_budget_wei=int(
                     params.relay_daily_gas_budget_eth * 10 ** 18
                 ),
+                # Ledger/skip-list survive engine rebuilds (see _relay_state).
+                persistent=self._relay_state,
             )
 
         return WarpEngine(
@@ -3631,8 +3685,12 @@ class _WarpWorker(QObject):
 
         wallet = self._base_wallet()
         if action == "create":
-            address = wallet.create_wallet()
-            self._adopt_key_from_disk()
+            try:
+                address = wallet.create_wallet()
+            finally:
+                # create writes the key before returning; adopt regardless so
+                # a raise after the write still points the engine at it.
+                self._adopt_key_from_disk()
             return (
                 f"Wallet created: {address}. Back up the key now (runbook: "
                 "hot-wallet key backup), then confirm the backup."
@@ -3641,20 +3699,37 @@ class _WarpWorker(QObject):
             wallet.mark_backup_confirmed()
             return "Key backup confirmed."
         if action == "send_eth":
+            self._refuse_wallet_send_while_job_open("send_eth")
             tx = wallet.send_eth(
                 str(payload.get("destination") or ""),
                 int(payload.get("amount_wei") or 0),
             )
             return f"ETH transfer broadcast: {tx}"
         if action == "send_usdc":
+            self._refuse_wallet_send_while_job_open("send_usdc")
             tx = wallet.send_usdc(
                 str(payload.get("destination") or ""),
                 int(payload.get("amount_micros") or 0),
             )
             return f"USDC transfer broadcast: {tx}"
+        if action == "recover_retired":
+            out = wallet.recover_retired(str(payload.get("address") or ""))
+            txs = ", ".join(out["sweep_txs"])
+            return (
+                f"Recovered {out['from']} -> {out['to']}: {txs}. "
+                f"({out['swept_usdc_micros']} USDC micros, "
+                f"{out['swept_eth_wei']} wei ETH swept.)"
+            )
         if action == "rotate":
-            out = wallet.rotate(open_job_check=self._wallet_open_job)
-            self._adopt_key_from_disk()
+            try:
+                out = wallet.rotate(open_job_check=self._wallet_open_job)
+            finally:
+                # rotate persists the NEW key before broadcasting the sweeps;
+                # if a sweep broadcast raised, the on-disk key already changed,
+                # so the engine must adopt it regardless or it keeps signing
+                # with the now-retired key. A pre-persist raise (open-job or
+                # gas gate) just re-reads the unchanged blob -- harmless.
+                self._adopt_key_from_disk()
             txs = ", ".join(out["sweep_txs"]) or "none (nothing to sweep)"
             return (
                 f"Key rotated: {out['old_address']} -> {out['new_address']}. "
@@ -3662,6 +3737,25 @@ class _WarpWorker(QObject):
                 "Back up the NEW key, then confirm the backup."
             )
         raise BaseWalletError(f"unknown wallet action: {action!r}")
+
+    def _refuse_wallet_send_while_job_open(self, action: str) -> None:
+        """A manual send shares the hot wallet with the engine's bridge txs.
+
+        A send grabs the pending nonce, which does not see the engine's
+        signed-but-unbroadcast approve/bridge/relay raw; broadcasting the send
+        first reuses that nonce and wedges the bridge. Refuse while a job holds
+        the slot -- the operator resolves it first (Bridge already serialises
+        against a single active job for the same reason)."""
+        from gui.services.basewallet import BaseWalletError
+
+        open_job = self._wallet_open_job()
+        if open_job is not None:
+            raise BaseWalletError(
+                f"cannot {action}: warp job {getattr(open_job, 'id', '?')} "
+                f"({getattr(open_job, 'status', '?')}) is open and shares this "
+                "hot wallet; resolve it first so the send cannot race its "
+                "pending nonce"
+            )
 
     def _wallet_open_job(self) -> Optional[WarpJob]:
         """The rotation guard's open-job probe -- fail-closed.

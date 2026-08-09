@@ -235,13 +235,26 @@ class BaseWallet:
                 from_address=old.address, to=self._net.usdc_address, value=0,
                 data=data, default=_ERC20_TRANSFER_GAS_DEFAULT,
             )
+            usdc_gas_cost = gas * fees.max_fee_per_gas
+            # Refuse BEFORE the irreversible key swap if the wallet cannot pay
+            # the USDC sweep's gas: otherwise we would archive the old key,
+            # then have the node reject the sweep for insufficient gas, leaving
+            # the whole USDC balance stranded at an address the GUI can no
+            # longer spend from. A wallet with USDC but ~no ETH (the state
+            # unwraps leave behind) is exactly this case.
+            if eth < usdc_gas_cost:
+                raise BaseWalletError(
+                    f"cannot rotate: sweeping {usdc} USDC needs ~{usdc_gas_cost} "
+                    f"wei of gas but the wallet holds only {eth} wei of ETH. "
+                    "Fund the wallet with a little Base ETH first, then rotate."
+                )
             usdc_unsigned = evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(self._net.usdc_address[2:]), value=0,
                 data=data, gas=gas, max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
             )
-            reserved += gas * fees.max_fee_per_gas
+            reserved += usdc_gas_cost
             nonce += 1
 
         eth_amount = eth - reserved - _ETH_TRANSFER_GAS * fees.max_fee_per_gas
@@ -284,3 +297,108 @@ class BaseWallet:
         return {"old_address": old.address, "new_address": new_key.address,
                 "sweep_txs": txs, "swept_usdc_micros": usdc,
                 "swept_eth_wei": max(0, eth_amount)}
+
+    # -- retired-key recovery ------------------------------------------------ #
+
+    def retired_balances(self) -> List[dict]:
+        """Per archived key: its address and current ETH/USDC balances.
+
+        The in-app view of what a past rotation may have left behind (a crash
+        between the key swap and a sweep broadcast, or a partial sweep). Read
+        side only; never raises on a single unreadable balance.
+        """
+        out: List[dict] = []
+        warp = self._io.read().get("warp") or {}
+        for entry in warp.get("retired_keys") or []:
+            addr = str(entry.get("address") or "")
+            row = {"address": addr, "retired_at": entry.get("retired_at")}
+            try:
+                row["eth_wei"] = int(self._evm.get_eth_balance(addr))
+                row["usdc_micros"] = int(
+                    self._evm.get_erc20_balance(self._net.usdc_address, addr)
+                )
+            except Exception as exc:  # noqa: BLE001 -- a bad row must not hide the rest
+                row["error"] = str(exc)
+            out.append(row)
+        return out
+
+    def recover_retired(self, address: str) -> dict:
+        """Sweep a retired key's balance back to the active key.
+
+        The in-app escape from a strand: whenever the retired address still
+        holds enough ETH to pay one transfer's gas, this moves its USDC and
+        then its ETH to the current active address. It cannot conjure gas --
+        an address holding USDC but zero ETH must be funded with a little ETH
+        first (send some to it), after which this sweeps both. Signs with the
+        retired key loaded from its archived blob; the archive is untouched.
+        """
+        from .warp import evm, keystore
+
+        address = str(address).strip()
+        warp = self._io.read().get("warp") or {}
+        entry = next(
+            (e for e in (warp.get("retired_keys") or [])
+             if str(e.get("address") or "").lower() == address.lower()),
+            None,
+        )
+        if entry is None:
+            raise BaseWalletError(f"no retired key archived for {address}")
+        old = keystore.load_evm_key(entry["blob"], protector=self._protector)
+        dest = self.active_key().address
+        if old.address.lower() == dest.lower():
+            raise BaseWalletError(
+                "the retired address is the active address; nothing to recover"
+            )
+
+        eth = int(self._evm.get_eth_balance(old.address))
+        usdc = int(self._evm.get_erc20_balance(self._net.usdc_address, old.address))
+        fees = self._evm.get_fee_data()
+        nonce = self._evm.get_nonce(old.address)
+        reserved = 0
+        txs: List[str] = []
+
+        if usdc > 0:
+            data = evm.encode_transfer(dest, usdc)
+            gas = self._evm.estimate_gas(
+                from_address=old.address, to=self._net.usdc_address, value=0,
+                data=data, default=_ERC20_TRANSFER_GAS_DEFAULT,
+            )
+            usdc_gas_cost = gas * fees.max_fee_per_gas
+            if eth < usdc_gas_cost:
+                raise BaseWalletError(
+                    f"retired {address} holds {usdc} USDC but only {eth} wei ETH "
+                    f"(~{usdc_gas_cost} needed for gas). Send it a little Base "
+                    "ETH, then recover again."
+                )
+            unsigned = evm.UnsignedTx(
+                chain_id=self._net.evm_chain_id, nonce=nonce,
+                to=bytes.fromhex(self._net.usdc_address[2:]), value=0,
+                data=data, gas=gas, max_fee_per_gas=fees.max_fee_per_gas,
+                max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            )
+            signed = evm.sign_tx(unsigned, old.private_key)
+            self._evm.send_raw_transaction(signed.raw)
+            txs.append(signed.tx_hash)
+            reserved += usdc_gas_cost
+            nonce += 1
+
+        eth_amount = eth - reserved - _ETH_TRANSFER_GAS * fees.max_fee_per_gas
+        if eth_amount > 0:
+            unsigned = evm.UnsignedTx(
+                chain_id=self._net.evm_chain_id, nonce=nonce,
+                to=bytes.fromhex(dest[2:]), value=eth_amount, data=b"",
+                gas=_ETH_TRANSFER_GAS, max_fee_per_gas=fees.max_fee_per_gas,
+                max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            )
+            signed = evm.sign_tx(unsigned, old.private_key)
+            self._evm.send_raw_transaction(signed.raw)
+            txs.append(signed.tx_hash)
+
+        if not txs:
+            raise BaseWalletError(
+                f"retired {address} holds nothing sweepable "
+                f"(ETH {eth} wei, USDC {usdc})"
+            )
+        _log.info("recovered retired %s -> %s (%d txs)", address, dest, len(txs))
+        return {"from": old.address, "to": dest, "sweep_txs": txs,
+                "swept_usdc_micros": usdc, "swept_eth_wei": max(0, eth_amount)}

@@ -43,11 +43,16 @@ def main() -> int:
     from gui.services.warp.evm import EvmClient
 
     net = C.MAINNET
+    from gui.services.warp.watcher import _messages_from
 
     def watcher_fetch(path: str) -> list:
         r = requests.get(f"{net.watcher_api_url.rstrip('/')}{path}", timeout=20)
         r.raise_for_status()
-        return r.json()
+        # Normalise the same way WatcherClient does: the API may return a bare
+        # list, {"messages": [...]}, or a single dict -- fetch_stuck_messages
+        # expects a list of message dicts, so a raw .json() crashes on the
+        # documented non-list shapes.
+        return _messages_from(r.json())
 
     stuck = relayer.fetch_stuck_messages(
         watcher_fetch, grace_s=args.grace_min * 60.0

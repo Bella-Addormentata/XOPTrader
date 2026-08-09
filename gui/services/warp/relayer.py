@@ -68,7 +68,10 @@ class StuckMessage:
             import ast
 
             raw_contents = ast.literal_eval(raw_contents)
-        ts = float(msg.get("source_timestamp") or 0)
+        try:
+            ts = float(msg.get("source_timestamp") or 0)
+        except (TypeError, ValueError):
+            ts = 0.0
         now = time.time() if now is None else now
         return cls(
             nonce=bytes.fromhex(str(msg["nonce"])),
@@ -100,7 +103,11 @@ def fetch_stuck_messages(
             continue
         try:
             m = StuckMessage.from_watcher(msg, now=now)
-        except (KeyError, ValueError, SyntaxError) as exc:
+        except (KeyError, ValueError, TypeError, SyntaxError, OverflowError) as exc:
+            # Hostile/garbled watcher rows must skip THIS message, not abort
+            # discovery of every other stuck message. TypeError covers a
+            # non-str field reaching bytes.fromhex/float; OverflowError a
+            # pathological timestamp.
             _log.warning("relayer: unparseable watcher message skipped: %s", exc)
             continue
         if m.age_s >= grace_s:
@@ -173,102 +180,171 @@ class AltruisticRelayer:
     grace_s: float = 1800.0           # 30 min: never race the owner
     daily_gas_budget_wei: int = 200_000_000_000_000   # 0.0002 ETH/day
     clock: Callable[[], float] = time.time
+    #: Optional mutable dict owned by a longer-lived caller (the Qt worker),
+    #: so the daily-budget ledger, failure counts, and skip-list SURVIVE an
+    #: engine rebuild on config reload -- otherwise the documented hard daily
+    #: ceiling would silently reset every reload and the skip-list would
+    #: forget its poison messages.
+    persistent: Optional[Dict[str, Any]] = None
 
     _failures: Dict[str, int] = field(default_factory=dict)
     _skiplist: set = field(default_factory=set)
     _spent_today_wei: int = 0
     _budget_day: Optional[int] = None
 
+    def __post_init__(self) -> None:
+        if self.persistent is not None:
+            # Adopt the shared containers by reference (mutations persist) and
+            # load the scalar budget state.
+            self._failures = self.persistent.setdefault("failures", {})
+            self._skiplist = self.persistent.setdefault("skiplist", set())
+            budget = self.persistent.setdefault("budget", {})
+            self._budget_day = budget.get("day")
+            self._spent_today_wei = int(budget.get("spent", 0))
+
+    def _save_budget(self) -> None:
+        if self.persistent is not None:
+            self.persistent["budget"] = {
+                "day": self._budget_day, "spent": self._spent_today_wei,
+            }
+
     def _budget_remaining(self) -> int:
         day = int(self.clock() // 86400)
         if day != self._budget_day:
             self._budget_day, self._spent_today_wei = day, 0
+            self._save_budget()
         return self.daily_gas_budget_wei - self._spent_today_wei
+
+    def _note_failure(self, key: str) -> None:
+        self._failures[key] = self._failures.get(key, 0) + 1
+        if self._failures[key] >= SKIP_AFTER_FAILURES:
+            self._skiplist.add(key)
 
     def sweep(self, *, broadcast: bool = True) -> List[dict]:
         """One pass; returns a report entry per candidate considered.
 
         ``broadcast=False`` runs everything except the send -- the same
-        rehearsal cut the bridge uses.
+        rehearsal cut the bridge uses. One malformed/hostile candidate can
+        never abort the pass: each is processed inside its own guard.
         """
-        from . import evm
-
         reports: List[dict] = []
-        candidates = fetch_stuck_messages(
+        fetched = fetch_stuck_messages(
             self.watcher_fetch, grace_s=self.grace_s, now=self.clock()
-        )[:MAX_CANDIDATES_PER_SWEEP]
-        for msg in candidates:
+        )
+        actioned = 0
+        for msg in fetched:
             key = msg.nonce.hex()
+            age = int(msg.age_s) if msg.age_s != float("inf") else None
             entry: dict = {"nonce": key, "destination": msg.destination,
-                           "age_s": int(msg.age_s), "action": None}
-            reports.append(entry)
+                           "age_s": age, "action": None}
+            # Skip-listed messages are reported but never consume an action
+            # slot: a handful of permanently-stuck ones at the front of the
+            # (oldest-first) list must not occlude fresh, deliverable ones.
             if key in self._skiplist:
                 entry["action"] = "skiplisted"
+                reports.append(entry)
                 continue
-            if self._budget_remaining() <= 0:
-                entry["action"] = "budget exhausted"
-                continue
+            if actioned >= MAX_CANDIDATES_PER_SWEEP:
+                break
+            reports.append(entry)
+            actioned += 1
             try:
-                calldata = build_relay_calldata(
-                    self.evm_client, self.collector, self.net, msg
-                )
-            except RelayError as exc:
-                entry["action"] = f"skipped: {exc}"
-                continue
+                self._consider(msg, entry, broadcast=broadcast)
+            except Exception as exc:  # noqa: BLE001 -- one bad message, not the pass
+                entry["action"] = f"error: {exc}"
+                _log.warning("relayer: candidate %s failed: %s", key[:16], exc)
+        return reports
 
-            reason = preflight(self.evm_client, self.net, calldata)
-            if reason is not None:
-                entry["action"] = f"preflight: {reason}"
-                if reason != "already delivered":
-                    self._failures[key] = self._failures.get(key, 0) + 1
-                    if self._failures[key] >= SKIP_AFTER_FAILURES:
-                        self._skiplist.add(key)
-                continue
+    def _consider(self, msg: "StuckMessage", entry: dict, *, broadcast: bool) -> None:
+        """Process one non-skiplisted candidate, mutating ``entry['action']``."""
+        from . import evm
 
+        key = msg.nonce.hex()
+        if self._budget_remaining() <= 0:
+            entry["action"] = "budget exhausted"
+            return
+        try:
+            calldata = build_relay_calldata(
+                self.evm_client, self.collector, self.net, msg
+            )
+        except RelayError as exc:
+            entry["action"] = f"skipped: {exc}"
+            return
+
+        reason = preflight(self.evm_client, self.net, calldata)
+        if reason is not None:
+            entry["action"] = f"preflight: {reason}"
+            if reason != "already delivered":
+                self._note_failure(key)
+            return
+
+        # prepare_relay re-estimates gas, which itself can revert '!nonce' if
+        # the message was delivered between preflight and here -- that is a
+        # lost race, not our failure, and must not poison the skip-list.
+        try:
             unsigned = self.evm_client.prepare_relay(
                 owner=self.evm_key.address, calldata=calldata
             )
-            max_cost = unsigned.gas * unsigned.max_fee_per_gas
-            if max_cost > self._budget_remaining():
-                entry["action"] = "budget exhausted"
-                continue
-            signed = evm.sign_tx(unsigned, self.evm_key.private_key)
-            entry["tx_hash"] = signed.tx_hash
-            if not broadcast:
-                entry["action"] = "signed, not broadcast (rehearsal)"
-                continue
-            try:
-                self.evm_client.send_raw_transaction(signed.raw)
-            except evm.EvmError as exc:
-                if evm.is_already_delivered(exc):
-                    entry["action"] = "raced: delivered by someone else"
-                    continue
-                entry["action"] = f"broadcast failed: {evm.decode_revert_reason(exc)}"
-                self._failures[key] = self._failures.get(key, 0) + 1
-                if self._failures[key] >= SKIP_AFTER_FAILURES:
-                    self._skiplist.add(key)
-                continue
-            self._spent_today_wei += max_cost
-            entry["action"] = "relayed"
-            _log.info("relayer: delivered stranger's message %s via %s",
-                      key[:16], signed.tx_hash)
-        return reports
+        except evm.EvmError as exc:
+            if evm.is_already_delivered(exc):
+                entry["action"] = "raced: delivered by someone else"
+                return
+            raise
+        max_cost = unsigned.gas * unsigned.max_fee_per_gas
+        if max_cost > self._budget_remaining():
+            entry["action"] = "budget exhausted"
+            return
+        signed = evm.sign_tx(unsigned, self.evm_key.private_key)
+        entry["tx_hash"] = signed.tx_hash
+        if not broadcast:
+            entry["action"] = "signed, not broadcast (rehearsal)"
+            return
+        try:
+            self.evm_client.send_raw_transaction(signed.raw)
+        except evm.EvmError as exc:
+            if evm.is_already_delivered(exc):
+                entry["action"] = "raced: delivered by someone else"
+                return
+            entry["action"] = f"broadcast failed: {evm.decode_revert_reason(exc)}"
+            self._note_failure(key)
+            return
+        self._spent_today_wei += max_cost
+        self._save_budget()
+        entry["action"] = "relayed"
+        _log.info("relayer: delivered stranger's message %s via %s",
+                  key[:16], signed.tx_hash)
 
 
 def recent_third_party_relays(
     watcher_fetch: Callable[[str], list],
     evm_client,
     *,
+    portal_address: Optional[str] = None,
     grace_s: float = 1800.0,
     lookback: int = 100,
 ) -> List[dict]:
-    """Unforgeable altruism evidence, derived purely from public data.
+    """Altruism evidence derived from the chain, verified not merely believed.
 
     A message that sat stuck past the grace period and was then delivered by
     an address that is not its attested receiver was relayed by a volunteer.
-    This is the GUI's "an altruistic relay has been active recently" signal --
-    computed, never claimed, impossible to fake.
+    To be evidence rather than a watcher's say-so, EACH claim is checked
+    against the chain before it counts:
+
+    * the delivery tx must actually be a call to the Portal (``tx.to`` ==
+      ``net.portal_address``) -- otherwise the watcher could point at any
+      unrelated Base tx from any address to manufacture a fake volunteer;
+    * the attested receiver must be determinable and must NOT be the sender.
+      When contents are malformed/serialised such that the receiver cannot be
+      read, the row is dropped (fail closed), never counted as altruism.
+
+    This backs the GUI's "proven volunteer online" badge, which an operator
+    uses to decide a gasless Chia-only burn is safe -- so an unverifiable
+    row must not inflate it.
     """
+    if portal_address is None:
+        net = getattr(evm_client, "net", None)
+        portal_address = getattr(net, "portal_address", "") or ""
+    portal = str(portal_address).lower()
     raw = watcher_fetch(f"/messages?source_chain=xch&limit={lookback}") or []
     out: List[dict] = []
     for msg in raw:
@@ -285,13 +361,22 @@ def recent_third_party_relays(
         try:
             tx = evm_client._call("eth_getTransactionByHash", [str(tx_hash)])
             sender = str((tx or {}).get("from") or "").lower()
+            to = str((tx or {}).get("to") or "").lower()
         except Exception:  # noqa: BLE001 -- evidence gathering must not raise
+            continue
+        if not sender or not to:
+            continue
+        # The delivery must be a Portal call; anything else is not a relay of
+        # this message (fail closed if we cannot confirm the Portal address).
+        if not portal or to != portal:
             continue
         receiver = ""
         contents = msg.get("contents")
-        if isinstance(contents, list) and len(contents) >= 2:
+        if isinstance(contents, list) and len(contents) >= 2 and contents[1]:
             receiver = str(contents[1])[-40:].lower()
-        if sender and receiver and sender.removeprefix("0x").endswith(receiver):
+        if not receiver:
+            continue          # receiver unreadable -> cannot prove third-party
+        if sender.removeprefix("0x").endswith(receiver):
             continue          # the receiver delivered their own -> not altruism
         out.append({
             "nonce": str(msg.get("nonce")),

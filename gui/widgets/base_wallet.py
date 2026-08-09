@@ -159,6 +159,18 @@ def _short(value: Any, head: int = 10, tail: int = 6) -> str:
     return f"{s[:head]}…{s[-tail:]}"
 
 
+def _exact_amount(units: int, decimals: int) -> str:
+    """Full-precision human string for base units, no rounding.
+
+    The balance formatters (_usdc: 2dp, _eth: 6dp) are for display; a
+    confirmation dialog for an irreversible transfer must show EXACTLY what
+    will be sent, so 1.234567 USDC never reads back as '1.23'. Trailing
+    zeros are stripped for readability (normalize), and format "f" always
+    expands to fixed-point -- never scientific notation.
+    """
+    return format(Decimal(int(units)).scaleb(-decimals).normalize(), "f")
+
+
 def parse_asset_amount(text: str, *, decimals: int) -> Optional[int]:
     """Parse a human amount into base units, or ``None`` when invalid.
 
@@ -170,19 +182,24 @@ def parse_asset_amount(text: str, *, decimals: int) -> Optional[int]:
     """
     try:
         amount = Decimal(str(text).strip())
+        if not amount.is_finite() or amount <= 0:
+            return None
+        # A magnitude bound: Decimal accepts 1e309 happily, and while the
+        # backend balance check would refuse it anyway, an absurd amount
+        # should never even reach the confirmation dialog. The bound also
+        # keeps the modulo below the Decimal context precision, so a 29+
+        # significant-digit input cannot raise DivisionImpossible.
+        if amount > Decimal(10) ** 12:
+            return None
+        quantum = Decimal(1).scaleb(-decimals)
+        if amount % quantum != 0:
+            return None
+        return int(amount.scaleb(decimals))
     except InvalidOperation:
+        # Any Decimal failure -- unparseable text, or a modulo that would need
+        # more digits than the context precision -- is an invalid amount, not
+        # a crash in the click handler.
         return None
-    if not amount.is_finite() or amount <= 0:
-        return None
-    # A magnitude bound: Decimal accepts 1e309 happily, and while the backend
-    # balance check would refuse it anyway, an absurd amount should never even
-    # reach the confirmation dialog.
-    if amount > Decimal(10) ** 12:
-        return None
-    quantum = Decimal(1).scaleb(-decimals)
-    if amount % quantum != 0:
-        return None
-    return int(amount.scaleb(decimals))
 
 
 class BaseWalletWidget(QWidget):
@@ -212,10 +229,14 @@ class BaseWalletWidget(QWidget):
         super().__init__(parent)
         self._snap: dict[str, Any] = {}
         self._address: str = ""
-        # One in-flight action at a time: buttons grey out on click and come
-        # back with the next snapshot, so an impatient double-click cannot
-        # queue a second broadcast.
+        # One in-flight action at a time. The gate is keyed off the worker's
+        # monotonic wallet_action_seq, NOT "any next snapshot": the ~5s master
+        # tick delivers cached snapshots that must NOT re-enable the buttons
+        # while a click is still queued on the worker thread, or an impatient
+        # second click broadcasts a duplicate irreversible transfer.
         self._action_pending: bool = False
+        self._last_seen_seq: int = 0
+        self._pending_since_seq: int = 0
         self._build_ui()
         self._render()
 
@@ -233,7 +254,13 @@ class BaseWalletWidget(QWidget):
             ``data["warp"]`` is consumed; null-safe when missing.
         """
         self._snap = dict((data or {}).get("warp") or {})
-        self._action_pending = False
+        seq = int(self._snap.get("wallet_action_seq") or 0)
+        # Clear the post-click gate only when the worker has PROCESSED an
+        # action since we sent ours (seq advanced). Timer ticks carry an
+        # unchanged seq and leave the gate closed.
+        if self._action_pending and seq > self._pending_since_seq:
+            self._action_pending = False
+        self._last_seen_seq = seq
         if self.isVisible():
             self._render()
 
@@ -570,8 +597,9 @@ class BaseWalletWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _emit_action(self, action: str, payload: dict) -> None:
-        """Grey the controls until the next snapshot, then emit."""
+        """Grey the controls until the worker processes THIS action, then emit."""
         self._action_pending = True
+        self._pending_since_seq = self._last_seen_seq
         self._render()
         self.wallet_action_requested.emit(action, payload)
 
@@ -595,7 +623,7 @@ class BaseWalletWidget(QWidget):
         if not dest:
             self._send_dest.setFocus()
             return
-        human = _usdc(units) if asset == "USDC" else _eth(units)
+        human = _exact_amount(units, decimals)
         answer = QMessageBox.question(
             self,
             "Confirm transfer",

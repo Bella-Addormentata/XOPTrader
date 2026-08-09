@@ -19,12 +19,39 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 _log = logging.getLogger(__name__)
+
+
+def _atomic_write_text(path: Path, text: str, *, newline: str) -> None:
+    """Write *text* to *path* atomically (temp file + fsync + os.replace).
+
+    ``open(path, "w")`` truncates in place, so a crash or ENOSPC mid-write
+    leaves the file empty or partial. For secrets.yaml that window can erase
+    the ONLY at-rest copy of a hot-wallet key -- the exact loss rotate()'s
+    persist-before-broadcast ordering exists to prevent. os.replace is atomic
+    on the same filesystem, so a reader ever sees only the whole old file or
+    the whole new one, and a crash leaves the old file intact.
+    """
+    path = Path(path)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    try:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
+            fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, path)
+    finally:
+        try:
+            if tmp.exists():
+                tmp.unlink()
+        except OSError:  # pragma: no cover -- best-effort temp cleanup
+            pass
 
 # ---------------------------------------------------------------------------
 # ruamel.yaml round-trip support (optional dependency)
@@ -192,8 +219,11 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
         else:
             _apply_map(template, data)
 
-        with open(path, "w", encoding="utf-8", newline=newline) as fh:
-            yaml_rt.dump(template, fh)
+        import io
+
+        buf = io.StringIO()
+        yaml_rt.dump(template, buf)
+        _atomic_write_text(path, buf.getvalue(), newline=newline)
     except Exception as exc:  # noqa: BLE001 - a save must never be lost
         _log.warning(
             "Comment-preserving write of %s failed (%s); falling back to "
@@ -204,14 +234,14 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
 
 
 def _dump_plain(path: Path, data: dict[str, Any]) -> None:
-    """Last-resort PyYAML writer (comment-destroying)."""
-    with open(path, "w", encoding="utf-8", newline=_detect_newline(path)) as fh:
-        yaml.safe_dump(
-            data, fh,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
+    """Last-resort PyYAML writer (comment-destroying), still atomic."""
+    text = yaml.safe_dump(
+        data,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    _atomic_write_text(path, text, newline=_detect_newline(path))
 
 # Top-level section → set of keys that belong in secrets.yaml.
 SECRET_KEYS: dict[str, set[str]] = {
@@ -231,6 +261,23 @@ SECRET_KEYS: dict[str, set[str]] = {
     # blobs from every rotation and evm_key_backup_confirmed rides with the
     # key it describes; ALL of these must live here -- a settings save of the
     # merged config would otherwise write them into git-tracked config.yaml.
+    "warp": {
+        "evm_private_key_dpapi",
+        "relay_private_key_dpapi",
+        "retired_keys",
+        "evm_key_backup_confirmed",
+    },
+}
+
+# The subset of SECRET_KEYS written EXCLUSIVELY by BaseWallet (create/rotate/
+# confirm-backup), never by the Settings UI. split_and_save must strip these
+# from the public config (so they never leak to config.yaml) but must NOT
+# copy them from the incoming snapshot into secrets.yaml: the settings page
+# and ConfigService both cache secrets.yaml merged into memory at load, so a
+# later Save would otherwise round-trip a STALE pre-rotation key blob back
+# over the fresh one on disk -- destroying the only persisted copy of the
+# rotated funds key. The on-disk secrets.yaml is authoritative for these.
+WALLET_MANAGED_KEYS: dict[str, set[str]] = {
     "warp": {
         "evm_private_key_dpapi",
         "relay_private_key_dpapi",
@@ -283,9 +330,18 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if section not in public:
             continue
         src = public[section]
+        managed = WALLET_MANAGED_KEYS.get(section, set())
         for k in list(keys):
-            if k in src:
-                secrets.setdefault(section, {})[k] = src.pop(k)
+            if k not in src:
+                continue
+            if k in managed:
+                # Strip from public (never leak to config.yaml) but do NOT
+                # carry the possibly-stale snapshot value into the secrets
+                # overlay: the on-disk secrets.yaml already holds the truth,
+                # written by BaseWallet, and must win.
+                src.pop(k)
+                continue
+            secrets.setdefault(section, {})[k] = src.pop(k)
         # Remove the section from public if it became empty.
         if not src:
             del public[section]

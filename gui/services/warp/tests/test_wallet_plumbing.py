@@ -232,30 +232,48 @@ def test_summary_never_raises_when_the_balance_read_fails(tmp_path, monkeypatch)
 # --------------------------------------------------------------------------- #
 
 def test_wallet_secret_keys_never_reach_public_config(tmp_path):
+    """A settings-page save must (a) never leak wallet key material into the
+    git-tracked config.yaml, and (b) never clobber the on-disk wallet keys
+    with the stale copy it cached at load -- BaseWallet is the sole writer of
+    those keys, so on-disk truth wins."""
     from gui.services.config_split import split_and_save
 
     config_path = tmp_path / "config.yaml"
+    secrets_path = tmp_path / "secrets.yaml"
+    # BaseWallet has written the CURRENT keys (e.g. just after a rotation).
+    secrets_path.write_text(
+        "warp:\n"
+        "  evm_private_key_dpapi: NEW-BLOB\n"
+        "  relay_private_key_dpapi: relay-blob\n"
+        "  retired_keys:\n"
+        "  - {blob: old-blob, address: '0xdead'}\n"
+        "  evm_key_backup_confirmed: false\n",
+        encoding="utf-8",
+    )
+    # A settings save carrying the STALE merged snapshot (pre-rotation blob,
+    # empty retired list, backup wrongly true).
     full = {
         "warp": {
             "enabled": True,
-            "evm_private_key_dpapi": "blob",
+            "evm_private_key_dpapi": "STALE-BLOB",
             "relay_private_key_dpapi": "relay-blob",
-            "retired_keys": [{"blob": "old-blob", "address": "0xdead"}],
+            "retired_keys": [],
             "evm_key_backup_confirmed": True,
         },
+        "coingecko": {"api_key": "abc123"},
     }
     split_and_save(config_path, full)
 
     public = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    secrets = yaml.safe_load(
-        (tmp_path / "secrets.yaml").read_text(encoding="utf-8")
-    ) or {}
+    secrets = yaml.safe_load(secrets_path.read_text(encoding="utf-8")) or {}
     assert set(public.get("warp") or {}) == {"enabled"}, \
-        "a settings save must not copy key material into git-tracked config.yaml"
-    assert secrets["warp"]["evm_private_key_dpapi"] == "blob"
-    assert secrets["warp"]["relay_private_key_dpapi"] == "relay-blob"
+        "no key material may reach git-tracked config.yaml"
+    # The on-disk (fresh) values survive; the stale snapshot is ignored.
+    assert secrets["warp"]["evm_private_key_dpapi"] == "NEW-BLOB"
     assert secrets["warp"]["retired_keys"][0]["blob"] == "old-blob"
-    assert secrets["warp"]["evm_key_backup_confirmed"] is True
+    assert secrets["warp"]["evm_key_backup_confirmed"] is False
+    # A genuinely non-wallet secret still round-trips through the save.
+    assert secrets["coingecko"]["api_key"] == "abc123"
 
 
 # --------------------------------------------------------------------------- #

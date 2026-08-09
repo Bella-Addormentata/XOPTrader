@@ -470,7 +470,11 @@ def test_activity_composes_both_evidence_layers_and_throttles():
     beat = _beat(created_at=NOW - 60)
     store = new_store()
     evm = UnwrapFakeEvm()
-    evm._call = lambda method, params: {"from": RELAYER_ADDR}
+    # A genuine Portal delivery from the volunteer (to == Portal is now
+    # required for the evidence to count).
+    evm._call = lambda method, params: {
+        "from": RELAYER_ADDR, "to": NET.portal_address,
+    }
     engine, _ctx = build(
         store, params=params_with_cap(),
         evm=evm, watcher=ActivityWatcher([_third_party_msg()]),

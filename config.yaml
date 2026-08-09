@@ -418,3 +418,14 @@ recovery:
 buyer:
   enabled: true
   config_path: buyer.yaml
+
+# --- warp.green bridge (GUI-only; the C++ engine never reads this) ----------
+# Test configuration 2026-08-09: dry_run is the hard gate -- nothing can move
+# until it is flipped to false AND the GUI is restarted.
+warp:
+  enabled: true
+  dry_run: true                # flip to false only after the rehearsal passes
+  auto_bridge: false           # leg 2 is a manual "Bridge now" click
+  min_auto_bridge_usdc: 100    # auto floor only; manual ignores it
+  max_auto_bridge_usdc: 5      # blast radius for the $1 round-trip test
+  max_unwrap_usdc: 2           # unwrap cap for the test; raise deliberately later

@@ -257,12 +257,57 @@ def test_recent_third_party_relays_derives_evidence_correctly():
                      destination_timestamp=NOW - 9000),
     ]
 
+    portal = NET.portal_address
+
     class Ev:
         def _call(self, method, params):
-            return {"from": "0x" + ("ab" * 20 if params[0].endswith("03" * 32)
+            # Every delivery is a genuine Portal call; the from-address is the
+            # receiver only for the a3 self-rescue row.
+            return {"to": portal,
+                    "from": "0x" + ("ab" * 20 if params[0].endswith("03" * 32)
                                     else "99" * 20)}
 
-    out = relayer.recent_third_party_relays(lambda p: msgs, Ev(), grace_s=1800)
+    out = relayer.recent_third_party_relays(
+        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+    )
     assert [o["nonce"][:2] for o in out] == ["a2"]
     assert out[0]["relayer"] == "0x" + "99" * 20
     assert out[0]["stuck_for_s"] == 11000
+
+
+def test_recent_third_party_relays_rejects_forged_evidence():
+    """The badge an operator trusts must not be fakeable: a delivery tx that
+    does not target the Portal, or a row whose receiver cannot be read, is
+    dropped rather than counted as a volunteer."""
+    portal = NET.portal_address
+    msgs = [
+        # Real Portal call from a stranger -> genuine altruism (kept).
+        _watcher_msg(nonce="b1" * 32, status="received",
+                     destination_transaction_hash="0x" + "01" * 32,
+                     contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32],
+                     source_timestamp=NOW - 20000,
+                     destination_timestamp=NOW - 9000),
+        # tx.to is NOT the Portal -> an unrelated Base tx, forged (dropped).
+        _watcher_msg(nonce="b2" * 32, status="received",
+                     destination_transaction_hash="0x" + "02" * 32,
+                     contents=["11" * 32, "00" * 12 + "22" * 20, "05" * 32],
+                     source_timestamp=NOW - 20000,
+                     destination_timestamp=NOW - 9000),
+        # Receiver unreadable (contents serialised as a string) -> fail closed.
+        _watcher_msg(nonce="b3" * 32, status="received",
+                     destination_transaction_hash="0x" + "03" * 32,
+                     contents="not-a-list",
+                     source_timestamp=NOW - 20000,
+                     destination_timestamp=NOW - 9000),
+    ]
+
+    class Ev:
+        def _call(self, method, params):
+            to = ("0x" + "de" * 20) if params[0].endswith("02" * 32) else portal
+            return {"to": to, "from": "0x" + "99" * 20}
+
+    out = relayer.recent_third_party_relays(
+        lambda p: msgs, Ev(), portal_address=portal, grace_s=1800
+    )
+    assert [o["nonce"][:2] for o in out] == ["b1"], \
+        "only the verified Portal delivery with a readable receiver counts"
