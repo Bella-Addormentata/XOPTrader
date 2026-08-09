@@ -91,6 +91,7 @@ class FakeEvm:
         # Mined transaction count. fake_sign_tx signs at nonce 3, so a default
         # of 0 means "our nonce has not been consumed by anything else".
         self.mined_nonce = 0
+        self.receipts_by_hash: dict | None = None
 
     def get_erc20_balance(self, token, owner):
         self.erc20_calls += 1
@@ -133,6 +134,11 @@ class FakeEvm:
         return "0x" + "cd" * 32
 
     def get_transaction_receipt(self, tx_hash):
+        # receipts_by_hash lets a test say WHICH signing of a nonce mined,
+        # which is the case a fee-bump replacement creates. self.receipt stays
+        # the hash-agnostic default the bulk of the suite relies on.
+        if self.receipts_by_hash is not None:
+            return self.receipts_by_hash.get(tx_hash)
         return self.receipt
 
     def get_confirmations(self, tx_hash):

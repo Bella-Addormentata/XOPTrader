@@ -259,6 +259,93 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     engine.request_bridge()                    # a new job is possible again
 
 
+def test_retry_after_a_deadline_expiry_actually_gets_another_chance(monkeypatch):
+    """[WARP-STICKY-POLLS] The expiry message promises Retry works. It must.
+
+    _pending_expired runs before the handler and only _apply resets the
+    counter, so a job failed by the deadline kept pending_polls at the limit:
+    Retry restored the status and the very next tick re-expired it. That made
+    Retry a dead button for all five deadline states, and pushed the operator
+    toward Sweep -- which on a CLAIMING job with a pushed claim bundle races
+    the bot's own claim for the same coin.
+    """
+    monkeypatch.setitem(S._PENDING_MAX_POLLS, JobStatus.COLLECTING_SIGS, 2)
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.COLLECTING_SIGS,
+               columns={"receiver_ph": RECEIVER_PH.hex()},
+               state={"pending_polls": 2})
+
+    assert engine.step()["status"] == JobStatus.FAILED
+    assert store.get_job(job.id).state["pending_polls"] == 0
+
+    out = engine.job_action(job.id, "retry")
+    assert out["status"] == JobStatus.COLLECTING_SIGS
+    # The point: the next tick must not immediately re-fail.
+    assert engine.step()["status"] == JobStatus.COLLECTING_SIGS
+
+
+def test_retry_after_an_approve_failure_keeps_a_live_transaction(monkeypatch):
+    """[WARP-APPROVE-NONCE] The approve guard read a key nothing writes.
+
+    _h_approving persists "approve_nonce"; _retry_tx_reset read
+    "approve_tx_nonce", so nonce was always None, the chain check was skipped,
+    and the raw was cleared unconditionally. Retry while the original approve
+    was still pending therefore re-signed at nonce+1: two approves mine, and
+    anything queued behind the stuck one stays stuck.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000},
+        state={"failed_from": JobStatus.APPROVING,
+               "approve_raw": "02aaaaaa", "approve_nonce": 7},
+    )
+
+    ctx.evm.mined_nonce = 7          # still open -> the approve may yet mine
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["approve_raw"] == "02aaaaaa"
+
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     state_patch={"failed_from": JobStatus.APPROVING})
+    ctx.evm.mined_nonce = 12         # spent -> safe to re-sign
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state.get("approve_raw") is None
+
+
+def test_a_binding_refused_job_can_still_be_abandoned():
+    """[WARP-REFUSED-DEADEND] A refused job had strictly fewer exits than FAILED.
+
+    step() is read-only on a binding mismatch, Retry and Sweep raise on the
+    same check, and BRIDGING is not cancellable -- so a row predating the
+    dry_run freeze held the single active slot for the life of the
+    installation. That is reachable by a plain upgrade.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    store.create_job(
+        NET.name,
+        status=JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"network": NET.name, "hot_address": "ab" * 20},   # no dry_run
+    )
+    job = store.get_active_job()
+
+    assert engine.step()["status"] == JobStatus.BRIDGING       # refused, read-only
+    with pytest.raises(S.WarpError):
+        engine.job_action(job.id, "retry")
+    with pytest.raises(S.WarpError):
+        engine.job_action(job.id, "cancel")
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
+    engine.request_bridge()
+
+
 def test_the_real_engine_construction_path_actually_runs(tmp_path, monkeypatch):
     """[WARP-BUILD-IMPORTS] _build_engine_with must resolve every name it uses.
 
@@ -1061,9 +1148,30 @@ def test_a_bridge_nonce_consumed_elsewhere_fails_instead_of_pending(monkeypatch)
     assert "consumed by another transaction" in (store.get_active_job().last_error or "")
 
 
+def _hash_aware_signer():
+    """A signer that gives every signing a distinct hash, like the real one.
+
+    fake_sign_tx returns a CONSTANT bridge hash, so under it a fee replacement
+    is indistinguishable from the original -- which made the first version of
+    the test below vacuous, and hid a real defect: the mined hash was never
+    written back to bridge_tx_hash.
+    """
+    box = {"n": 0}
+
+    def _sign(unsigned, key):
+        box["n"] += 1
+        return SimpleNamespace(
+            raw=bytes([0x02, box["n"], box["n"], box["n"]]),
+            tx_hash="0x" + f"{box['n']:02x}" * 32,
+            nonce=3,
+        )
+
+    return _sign
+
+
 def test_a_replacement_still_polls_the_original_hash(monkeypatch):
     """Only one signing of a nonce can mine, and the node picks which."""
-    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    monkeypatch.setattr(evm_mod, "sign_tx", _hash_aware_signer())
     store = new_store()
     engine, ctx = build(store)
     _seed_broadcast_bridge(store)
@@ -1074,7 +1182,42 @@ def test_a_replacement_still_polls_the_original_hash(monkeypatch):
     for _ in range(S._STUCK_TX_POLLS):   # the last one triggers the bump
         engine.step()
 
-    assert first_hash in store.get_active_job().state["bridge_prior_hashes"]
+    job = store.get_active_job()
+    assert job.bridge_tx_hash != first_hash, "the replacement must be a new signing"
+    assert first_hash in job.state["bridge_prior_hashes"]
+
+
+def test_a_bridge_that_mines_under_its_original_hash_still_completes(monkeypatch):
+    """[WARP-MINED-HASH] Pin bridge_tx_hash to the signing that actually mined.
+
+    _bridge_receipt polls every hash precisely because the original can mine
+    as the replacement goes out -- but it discarded WHICH one won, so
+    bridge_tx_hash kept pointing at the replacement, a transaction that will
+    never exist. _h_bridge_confirmed then polls a phantom hash,
+    get_confirmations returns 0 forever, and the BRIDGE_CONFIRMED deadline
+    fails the job -- with real USDC bridged and the nonce correctly recorded.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", _hash_aware_signer())
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()
+    original = store.get_active_job().bridge_tx_hash
+    ctx.evm.receipt = None
+    for _ in range(S._STUCK_TX_POLLS):
+        engine.step()
+    replacement = store.get_active_job().bridge_tx_hash
+    assert replacement != original
+
+    # The ORIGINAL mines, not the replacement.
+    ctx.evm.receipts_by_hash = {original: message_sent_receipt("00" * 31 + "07")}
+    out = engine.step()
+
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED
+    assert store.get_active_job().bridge_tx_hash == original, (
+        "the column must name the transaction that mined, not the one we last signed"
+    )
 
 
 def test_a_receipt_without_a_status_is_not_treated_as_success(monkeypatch):

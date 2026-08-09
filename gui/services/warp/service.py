@@ -145,6 +145,7 @@ _PENDING_MAX_POLLS: Dict[str, int] = {
     JobStatus.MESSAGE_SENT: 1440,       # ~6h -- watcher indexing the message
     JobStatus.COLLECTING_SIGS: 1440,    # ~6h -- validator quorum
     JobStatus.FUNDING_CLAIM: 480,       # ~2h -- a Chia send confirming
+    JobStatus.CLAIM_FUNDED: 480,        # ~2h -- the funding coin reaching depth
     JobStatus.CLAIMING: 1440,           # ~6h -- the final CAT coin appearing
     JobStatus.BRIDGE_CONFIRMED: 480,    # ~2h -- Base confirmation depth
 }
@@ -582,6 +583,16 @@ class WarpEngine:
         n = int(job.retry_count or 0) + 1
         delay = min(_BACKOFF_BASE_S * (2 ** (n - 1)), _BACKOFF_CAP_S)
         message = str(exc)[:500]
+        # A retryable error counts toward the state's deadline too. Only
+        # _apply_stay advanced the counter, so a state that kept *erroring*
+        # rather than pending never expired -- and the push allow-list added on
+        # this branch turns an unrecognised claim rejection into exactly that
+        # kind of loop.
+        state = (
+            {"pending_polls": int(job.state.get("pending_polls") or 0) + 1}
+            if job.status in _PENDING_MAX_POLLS
+            else None
+        )
         updated = self._store.update_job(
             job.id,
             expected_status=job.status,
@@ -590,6 +601,7 @@ class WarpEngine:
                 "last_error": message,
                 "next_retry_at": repr(self._now() + delay),
             },
+            state_patch=state,
             event=("error", message, None),
         )
         return _job_dict(updated)
@@ -602,7 +614,14 @@ class WarpEngine:
             status=JobStatus.FAILED,
             expected_status=job.status,
             columns={"last_error": message, "next_retry_at": None},
-            state_patch={"failed_from": job.status},
+            # Clear the pending counter with the failure. _pending_expired runs
+            # before the handler and only _apply resets the counter, so a job
+            # failed by the deadline kept it at the limit: Retry restored the
+            # status and the very next tick re-expired it. That made Retry a
+            # dead button for all five deadline states -- and pushed the
+            # operator toward Sweep, which on a CLAIMING job with a pushed
+            # claim bundle would race the bot's own claim for the same coin.
+            state_patch={"failed_from": job.status, "pending_polls": 0},
             event=("failed", message, None),
         )
         return _job_dict(updated)
@@ -815,7 +834,7 @@ class WarpEngine:
 
         # phase 2: idempotent broadcast, then poll the receipt.
         self._evm.send_raw_transaction(bytes.fromhex(raw))
-        receipt = self._bridge_receipt(job)
+        mined_hash, receipt = self._bridge_receipt(job)
         if receipt is None:
             return self._bridge_unmined_step(job)
         if evm.receipt_reverted(receipt):
@@ -824,7 +843,19 @@ class WarpEngine:
                 raise WarpTerminal(f"bridge reverted {attempt} times")
             return _stay(
                 columns={"bridge_tx_hash": None},
-                state={"bridge_raw": None, "bridge_attempt": attempt},
+                state={
+                    "bridge_raw": None,
+                    "bridge_attempt": attempt,
+                    # The abandoned nonce's replacement bookkeeping must go with
+                    # it. Left behind, _bridge_hashes keeps returning the old
+                    # hashes, so the very next poll finds THIS reverted receipt
+                    # again and fails a freshly signed bridge at a different
+                    # nonce -- while that new transaction is live in the mempool.
+                    "bridge_prior_hashes": None,
+                    "bridge_fee_bumps": None,
+                    "bridge_unmined_polls": None,
+                    "bridge_fees": None,
+                },
                 message=f"bridge reverted; re-preparing (attempt {attempt})",
             )
         if not evm.receipt_succeeded(receipt):
@@ -844,8 +875,11 @@ class WarpEngine:
         msg_nonce = evm.parse_message_sent_nonce(receipt, net.portal_address)
         return _advance(
             JobStatus.BRIDGE_CONFIRMED,
-            columns={"bridge_nonce": msg_nonce},
-            state={"bridge_raw": None},
+            # Pin the column to the signing that actually mined. After a fee
+            # bump this may be an earlier hash than the one we last signed, and
+            # _h_bridge_confirmed polls this column for its confirmation count.
+            columns={"bridge_nonce": msg_nonce, "bridge_tx_hash": mined_hash},
+            state={"bridge_raw": None, "bridge_prior_hashes": None},
             message=f"bridged; MessageSent nonce {msg_nonce}",
         )
 
@@ -1364,8 +1398,13 @@ class WarpEngine:
         if target not in (JobStatus.APPROVING, JobStatus.BRIDGING):
             return {}
 
+        # "approve_nonce" is what _h_approving actually persists. This read
+        # said "approve_tx_nonce", a key nothing writes, so the guard below was
+        # inert for APPROVING: nonce was always None, the chain check was
+        # skipped, and the raw was cleared unconditionally -- exactly the
+        # unsafe behaviour the docstring above says it prevents.
         nonce = job.state.get(
-            "bridge_tx_nonce" if target == JobStatus.BRIDGING else "approve_tx_nonce"
+            "bridge_tx_nonce" if target == JobStatus.BRIDGING else "approve_nonce"
         )
         if nonce is not None:
             try:
@@ -1391,19 +1430,26 @@ class WarpEngine:
         hashes += [h for h in (job.state.get("bridge_prior_hashes") or []) if h]
         return hashes
 
-    def _bridge_receipt(self, job: WarpJob) -> Optional[dict]:
-        """The receipt for whichever signing of this nonce mined, if any.
+    def _bridge_receipt(self, job: WarpJob) -> tuple:
+        """``(tx_hash, receipt)`` for whichever signing of this nonce mined.
 
         A fee replacement reuses the nonce, so at most one of these can ever
         have a receipt -- but which one is the node's choice, not ours. Polling
         only the newest hash would miss the case where the original mined just
         as the replacement went out.
+
+        The winning hash is returned, not just the receipt: ``bridge_tx_hash``
+        still points at the last thing we signed, and if the *original* mined
+        that column names a transaction which will never exist. _h_bridge_confirmed
+        polls it, get_confirmations returns 0 forever, and the job stalls until
+        the BRIDGE_CONFIRMED deadline fails it -- with real USDC bridged and the
+        MessageSent nonce correctly recorded. The caller writes this back.
         """
         for tx_hash in self._bridge_hashes(job):
             receipt = self._evm.get_transaction_receipt(tx_hash)
             if receipt is not None:
-                return receipt
-        return None
+                return tx_hash, receipt
+        return None, None
 
     def _bridge_unmined_step(self, job: WarpJob) -> "_Step":
         """Nothing has mined yet: escalate the fee, or stop if the nonce is gone.
@@ -1777,10 +1823,18 @@ class WarpEngine:
         Only FAILED is accepted. Loosening _sweep_job's FAILED check instead
         would let a sweep flip a COMPLETED job to CANCELLED.
         """
-        if job.status != JobStatus.FAILED:
+        # A binding-refused job is the other kind the engine cannot resolve, and
+        # it has strictly fewer exits than a FAILED one: step() is read-only,
+        # Retry and Sweep raise on the binding check, and BRIDGING is not
+        # cancellable. Refusing Abandon there too left an upgraded installation
+        # with a job holding the single active slot permanently -- recoverable
+        # only by hand-editing warp_jobs.db, which is what this whole branch
+        # set out to eliminate. Abandon is a pure DB write that records the
+        # recovery details first, so it is safe for a job we refuse to touch.
+        if job.status != JobStatus.FAILED and not self._binding_mismatch(job):
             raise WarpError(
                 f"cannot abandon a job in {job.status}; abandon is the escape "
-                "from a FAILED job the engine cannot resolve"
+                "from a job the engine cannot resolve"
             )
 
         recovery = {
@@ -1804,7 +1858,9 @@ class WarpEngine:
         self._store.update_job(
             job.id,
             status=JobStatus.CANCELLED,
-            expected_status=JobStatus.FAILED,
+            # The job's own status, not FAILED: a binding-refused job is
+            # abandonable from whatever state it is frozen in.
+            expected_status=job.status,
             columns={"next_retry_at": None},
             state_patch={"abandoned": True, "abandon_recovery": recovery},
             event=("abandon", note, recovery),

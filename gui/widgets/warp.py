@@ -704,12 +704,18 @@ class WarpWidget(QWidget):
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "sweep")
             )
             menu.addAction(act_sweep)
-        if status == _ST_FAILED and job_id is not None:
-            # The escape from a FAILED job the engine cannot resolve. A job
-            # that tripped an attested-terms anchor has no ephemeral key, so
-            # Sweep raises and Retry re-fails against the same attestation --
-            # this menu was empty for it, and FAILED holds the single active
-            # slot, so the bridge could never open another job.
+        # Offered for FAILED, and for any job the engine is refusing outright.
+        # A job frozen before the dry_run freeze (or against another hot wallet)
+        # is read-only to the engine: Retry and Sweep raise on the binding
+        # check, and a BRIDGING one is not cancellable either -- so its menu was
+        # empty while it held the single active slot permanently.
+        refused = bool(self._snap.get("error")) and self._snap.get("error") != "warp disabled"
+        if (status == _ST_FAILED or refused) and job_id is not None:
+            # The escape from a job the engine cannot resolve. A job that
+            # tripped an attested-terms anchor has no ephemeral key, so Sweep
+            # raises and Retry re-fails against the same attestation -- this
+            # menu was empty for it, and FAILED holds the single active slot,
+            # so the bridge could never open another job.
             act_abandon = QAction("Abandon job (frees the slot)", menu)
             act_abandon.triggered.connect(
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "abandon")
