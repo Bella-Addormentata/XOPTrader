@@ -704,6 +704,17 @@ class WarpWidget(QWidget):
                 lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "sweep")
             )
             menu.addAction(act_sweep)
+        if status == _ST_FAILED and job_id is not None:
+            # The escape from a FAILED job the engine cannot resolve. A job
+            # that tripped an attested-terms anchor has no ephemeral key, so
+            # Sweep raises and Retry re-fails against the same attestation --
+            # this menu was empty for it, and FAILED holds the single active
+            # slot, so the bridge could never open another job.
+            act_abandon = QAction("Abandon job (frees the slot)", menu)
+            act_abandon.triggered.connect(
+                lambda _=False, j=int(job_id): self.job_action_requested.emit(j, "abandon")
+            )
+            menu.addAction(act_abandon)
 
         tx = job.get("bridge_tx_hash")
         receiver = job.get("receiver_address")

@@ -1757,8 +1757,62 @@ class WarpEngine:
         )
         return _job_dict(job)
 
+    def _abandon_job(self, job: WarpJob) -> dict:
+        """Close a FAILED job the machine cannot resolve, freeing the slot.
+
+        [WARP-ABANDON 2026-08-08] A job that trips one of the attested-terms
+        anchors is a permanent dead end: the anchors run after bridgeToChia
+        confirmed and before the ephemeral key is minted, so the row has a
+        bridge_nonce and no ephemeral_blob. Sweep raises before touching it,
+        Cancel is refused (FAILED is not cancellable once the bridge is on
+        chain), and Retry restores the same status to re-fail against the same
+        immutable attestation. The GUI gives such a job an empty context menu.
+        Since FAILED holds the single active slot, the bridge could then never
+        open another job -- with no in-app way out at all.
+
+        No funds are lost in that state: the message stays claimable at the
+        warp.green portal, which is why the recovery details are written into
+        the audit log before the row is closed rather than discarded with it.
+
+        Only FAILED is accepted. Loosening _sweep_job's FAILED check instead
+        would let a sweep flip a COMPLETED job to CANCELLED.
+        """
+        if job.status != JobStatus.FAILED:
+            raise WarpError(
+                f"cannot abandon a job in {job.status}; abandon is the escape "
+                "from a FAILED job the engine cannot resolve"
+            )
+
+        recovery = {
+            "bridge_nonce": job.bridge_nonce,
+            "bridge_tx_hash": job.bridge_tx_hash,
+            "amount_usdc_micros": job.amount_usdc_micros,
+            "receiver_ph": job.receiver_ph,
+            "failed_from": job.state.get("failed_from"),
+            "last_error": job.last_error,
+            "portal": self._net.status_url,
+        }
+        note = (
+            "operator abandoned: "
+            + (
+                f"message nonce {job.bridge_nonce} was never claimed and remains "
+                f"claimable at {self._net.status_url}"
+                if job.bridge_nonce
+                else "no bridge message was ever attested"
+            )
+        )
+        self._store.update_job(
+            job.id,
+            status=JobStatus.CANCELLED,
+            expected_status=JobStatus.FAILED,
+            columns={"next_retry_at": None},
+            state_patch={"abandoned": True, "abandon_recovery": recovery},
+            event=("abandon", note, recovery),
+        )
+        return _job_dict(self._store.get_job(job.id))
+
     def job_action(self, job_id: int, action: str) -> Optional[dict]:
-        """Operator affordance: ``retry`` | ``cancel`` | ``sweep``."""
+        """Operator affordance: ``retry`` | ``cancel`` | ``sweep`` | ``abandon``."""
         action = str(action).lower()
         job = self._store.get_job(job_id)
         # Retry and Sweep both sign or resume against the configured hot wallet;
@@ -1809,6 +1863,8 @@ class WarpEngine:
                 event=("cancel", "operator cancelled", None),
             )
             return _job_dict(self._store.get_job(job_id))
+        if action == "abandon":
+            return self._abandon_job(job)
         if action == "sweep":
             # The GUI already restricts Sweep to these two (widgets/warp.py),
             # but it acts on a polled snapshot that can be a full interval

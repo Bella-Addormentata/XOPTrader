@@ -259,6 +259,48 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     engine.request_bridge()                    # a new job is possible again
 
 
+def test_abandon_frees_the_slot_and_records_how_to_recover():
+    """[WARP-ABANDON] The escape from a job the engine cannot resolve.
+
+    A job that trips an attested-terms anchor has a bridge_nonce and no
+    ephemeral key: Sweep raises before touching it, Cancel is refused, and
+    Retry re-fails against the same immutable attestation. Its context menu
+    was empty, and FAILED holds the single active slot -- so the bridge could
+    never open another job, with no in-app way out.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"bridge_nonce": "00" * 31 + "07",
+                 "receiver_ph": RECEIVER_PH.hex(),
+                 "last_error": "attested amount mismatch"},
+        state={"failed_from": JobStatus.MESSAGE_SENT},
+    )
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None          # the slot is free
+    engine.request_bridge()                        # and a new job is possible
+
+    # No funds are lost here -- the message stays claimable -- so the recovery
+    # details must survive the close rather than go with it.
+    recovery = store.get_job(job.id).state["abandon_recovery"]
+    assert recovery["bridge_nonce"] == "00" * 31 + "07"
+    assert recovery["portal"]
+
+
+def test_abandon_is_refused_for_a_job_that_is_not_failed():
+    """It is an escape hatch, not a second Cancel."""
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING, columns={"receiver_ph": RECEIVER_PH.hex()})
+
+    with pytest.raises(S.WarpError, match="cannot abandon a job in CLAIMING"):
+        engine.job_action(job.id, "abandon")
+
+
 def test_a_state_that_never_progresses_eventually_reaches_the_operator(monkeypatch):
     """[WARP-PENDING-DEADLINE] An invisible pend is an unrecoverable job.
 
