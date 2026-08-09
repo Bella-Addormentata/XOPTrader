@@ -118,6 +118,14 @@ _CLAIM_CONFLICT_MAX_ROUNDS: int = 10
 # never happen; if it does, it means we cannot tell success from revert, and
 # guessing either way is worse than handing the job to the operator.
 _AMBIGUOUS_RECEIPT_POLLS: int = 5
+# Polls of an unmined bridge before re-signing it at a higher fee. Base blocks
+# every ~2s, so a correctly-priced transaction mines almost immediately; this is
+# deliberately generous before spending more on gas.
+_STUCK_TX_POLLS: int = 20
+# Fee escalations before giving up. bump_fees caps its own multiplier at 3, so
+# beyond that a further attempt would re-sign at an identical fee and be
+# rejected as a non-replacement.
+_MAX_FEE_BUMPS: int = 3
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
@@ -688,7 +696,19 @@ class WarpEngine:
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
                 columns={"bridge_tx_hash": signed.tx_hash},
-                state={"bridge_raw": signed.raw.hex(), "bridge_tx_nonce": signed.nonce},
+                state={
+                    "bridge_raw": signed.raw.hex(),
+                    "bridge_tx_nonce": signed.nonce,
+                    # Kept so a replacement escalates from the fee this was
+                    # actually signed at. bump_fees derives every attempt from
+                    # one base, which is what keeps consecutive attempts a full
+                    # 1.3x apart -- comfortably over the node's 10% replacement
+                    # floor. Re-reading live fees each time would lose that.
+                    "bridge_fees": [
+                        unsigned.max_fee_per_gas,
+                        unsigned.max_priority_fee_per_gas,
+                    ],
+                },
                 message="bridge signed; broadcasting next tick",
             )
 
@@ -710,13 +730,9 @@ class WarpEngine:
 
         # phase 2: idempotent broadcast, then poll the receipt.
         self._evm.send_raw_transaction(bytes.fromhex(raw))
-        receipt = (
-            self._evm.get_transaction_receipt(job.bridge_tx_hash)
-            if job.bridge_tx_hash
-            else None
-        )
+        receipt = self._bridge_receipt(job)
         if receipt is None:
-            return _stay(message="bridge broadcast; awaiting receipt")
+            return self._bridge_unmined_step(job)
         if evm.receipt_reverted(receipt):
             attempt = int(job.state.get("bridge_attempt", 0)) + 1
             if attempt >= _BRIDGE_MAX_ATTEMPTS:
@@ -1176,6 +1192,105 @@ class WarpEngine:
         """
         frozen = job.state.get("dry_run")
         return bool(self._params.dry_run if frozen is None else frozen)
+
+    def _bridge_hashes(self, job: WarpJob) -> list:
+        """Every hash this job's bridge nonce has been signed under, newest first."""
+        hashes = [job.bridge_tx_hash] if job.bridge_tx_hash else []
+        hashes += [h for h in (job.state.get("bridge_prior_hashes") or []) if h]
+        return hashes
+
+    def _bridge_receipt(self, job: WarpJob) -> Optional[dict]:
+        """The receipt for whichever signing of this nonce mined, if any.
+
+        A fee replacement reuses the nonce, so at most one of these can ever
+        have a receipt -- but which one is the node's choice, not ours. Polling
+        only the newest hash would miss the case where the original mined just
+        as the replacement went out.
+        """
+        for tx_hash in self._bridge_hashes(job):
+            receipt = self._evm.get_transaction_receipt(tx_hash)
+            if receipt is not None:
+                return receipt
+        return None
+
+    def _bridge_unmined_step(self, job: WarpJob) -> "_Step":
+        """Nothing has mined yet: escalate the fee, or stop if the nonce is gone.
+
+        [WARP-STUCK-TX 2026-08-08] This path used to be a bare
+        ``_stay("awaiting receipt")``. :meth:`_apply_stay` resets ``retry_count``
+        and clears ``last_error`` on every pend, so the loop was invisible and
+        unbounded; ``_BRIDGE_MAX_ATTEMPTS`` only counts *reverted* receipts,
+        never an absent one. BRIDGING is not cancellable, Retry on a non-FAILED
+        job only clears backoff, and Sweep closes only FAILED -- so a bridge
+        that never mined held the single active job row forever and every later
+        bridge raised ActiveJobExists. Recovery meant editing warp_jobs.db by
+        hand.
+
+        The likeliest cause is plain underpricing: ``suggest_fees`` sets
+        maxFee = base*2 + priority, so any sustained climb past 2x strands the
+        transaction with nothing to escalate it. ``bump_fees`` was written for
+        exactly this and had no callers.
+        """
+        from . import evm
+
+        nonce = job.state.get("bridge_tx_nonce")
+        if nonce is not None:
+            mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            if mined > int(nonce):
+                # The account has moved past our nonce and none of our hashes
+                # has a receipt, so something else consumed it. Nothing we
+                # signed can mine now, and no funds of ours moved.
+                raise WarpTerminal(
+                    f"bridge nonce {nonce} was consumed by another transaction "
+                    f"(account is at {mined}) and nothing this job signed "
+                    "mined; the USDC deposit is untouched"
+                )
+
+        polls = int(job.state.get("bridge_unmined_polls", 0)) + 1
+        if polls < _STUCK_TX_POLLS:
+            return _stay(
+                state={"bridge_unmined_polls": polls},
+                message=f"bridge broadcast; awaiting receipt (poll {polls})",
+            )
+
+        bumps = int(job.state.get("bridge_fee_bumps", 0)) + 1
+        base = job.state.get("bridge_fees")
+        if bumps > _MAX_FEE_BUMPS or not base:
+            raise WarpTerminal(
+                f"bridge has not mined after {bumps - 1} fee escalations; it is "
+                "stuck and needs an operator decision (the nonce can be cleared "
+                "with a replacement from the wallet)"
+            )
+
+        fees = evm.bump_fees(
+            evm.EIP1559Fees(max_fee_per_gas=int(base[0]),
+                            max_priority_fee_per_gas=int(base[1])),
+            bumps,
+        )
+        signed = evm.sign_tx(
+            self._evm.prepare_bridge(
+                owner=self._hot_address,
+                receiver_ph=bytes.fromhex(job.receiver_ph),
+                mojo_amount=int(job.amount_mojos),
+                nonce=int(nonce) if nonce is not None else None,
+                fees=fees,
+            ),
+            self._evm_key.private_key,
+        )
+        return _stay(
+            columns={"bridge_tx_hash": signed.tx_hash},
+            state={
+                "bridge_raw": signed.raw.hex(),
+                # The old hash stays pollable: the node may still mine it.
+                "bridge_prior_hashes": self._bridge_hashes(job),
+                "bridge_fee_bumps": bumps,
+                "bridge_unmined_polls": 0,
+            },
+            message=(
+                f"bridge unmined after {polls} polls; re-signed nonce {nonce} at a "
+                f"higher fee (escalation {bumps} of {_MAX_FEE_BUMPS})"
+            ),
+        )
 
     def _funded_amount(self, job: WarpJob) -> int:
         """The amount the security coin was actually funded with.

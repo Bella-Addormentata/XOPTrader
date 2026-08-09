@@ -634,10 +634,20 @@ class EvmClient:
         mojo_amount: int,
         gas: Optional[int] = None,
         toll_wei: Optional[int] = None,
+        nonce: Optional[int] = None,
+        fees: Optional[EIP1559Fees] = None,
     ) -> UnsignedTx:
+        """Build an unsigned bridgeToChia.
+
+        ``nonce`` and ``fees`` are overridable so a stuck transaction can be
+        re-signed as a *replacement*: same nonce, higher fee. Left unset they
+        are read live, which is what a first broadcast wants.
+        """
         toll = toll_wei if toll_wei is not None else self.get_message_toll()
-        nonce = self.get_nonce(owner)
-        fees = self.get_fee_data()
+        if nonce is None:
+            nonce = self.get_nonce(owner)
+        if fees is None:
+            fees = self.get_fee_data()
         if gas is None:
             data = encode_bridge_to_chia(self._net.usdc_address, receiver_ph, mojo_amount)
             gas = self.estimate_gas(

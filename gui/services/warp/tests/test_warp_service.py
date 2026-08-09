@@ -88,6 +88,9 @@ class FakeEvm:
         self.prepared: list = []
         self.erc20_calls = 0
         self.raise_erc20: Exception | None = None
+        # Mined transaction count. fake_sign_tx signs at nonce 3, so a default
+        # of 0 means "our nonce has not been consumed by anything else".
+        self.mined_nonce = 0
 
     def get_erc20_balance(self, token, owner):
         self.erc20_calls += 1
@@ -108,9 +111,22 @@ class FakeEvm:
         self.prepared.append(("approve", amount_base_units))
         return {"kind": "approve", "amount": amount_base_units}
 
-    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount):
+    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None, fees=None):
+        # Mirrors the real UnsignedTx closely enough for the fee-escalation
+        # path, which reads the fee legs back off the unsigned transaction.
         self.prepared.append(("bridge", mojo_amount))
-        return {"kind": "bridge", "mojo": mojo_amount}
+        return SimpleNamespace(
+            kind="bridge",
+            mojo=mojo_amount,
+            nonce=nonce,
+            max_fee_per_gas=fees.max_fee_per_gas if fees else 2_000_000_000,
+            max_priority_fee_per_gas=(
+                fees.max_priority_fee_per_gas if fees else 1_000_000
+            ),
+        )
+
+    def get_nonce(self, address, *, pending=True):
+        return self.mined_nonce
 
     def send_raw_transaction(self, raw):
         self.sent_raw.append(bytes(raw))
@@ -193,7 +209,12 @@ class FakeCoin:
 
 def fake_sign_tx(unsigned, key):
     """Deterministic signer: distinct raw per tx kind, hex-round-trippable."""
-    kind = unsigned.get("kind") if isinstance(unsigned, dict) else "x"
+    # prepare_approve returns a dict; prepare_bridge returns an UnsignedTx-alike
+    # so the fee-escalation path can read its fee legs back.
+    kind = (
+        unsigned.get("kind") if isinstance(unsigned, dict)
+        else getattr(unsigned, "kind", "x")
+    )
     if kind == "bridge":
         return SimpleNamespace(raw=b"\x02\xbb\xbb\xbb", tx_hash="0x" + "22" * 32, nonce=3)
     return SimpleNamespace(raw=b"\x02\xaa\xaa\xaa", tx_hash="0x" + "11" * 32, nonce=0)

@@ -671,6 +671,77 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def _seed_broadcast_bridge(store):
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()})
+
+
+def test_an_unmined_bridge_is_re_signed_at_a_higher_fee(monkeypatch):
+    """[WARP-STUCK-TX] bump_fees finally has a caller.
+
+    An unmined bridge used to sit in a bare _stay forever. _apply_stay resets
+    retry_count and clears last_error on every pend, so the loop was
+    invisible; _BRIDGE_MAX_ATTEMPTS only counts reverted receipts, never an
+    absent one. BRIDGING is not cancellable and Sweep closes only FAILED, so
+    the job held the single active row permanently and every later bridge
+    raised ActiveJobExists -- recoverable only by editing warp_jobs.db.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                   # phase 1: sign
+    original = store.get_active_job().state["bridge_fees"]
+    ctx.evm.receipt = None                          # never mines
+
+    for _ in range(S._STUCK_TX_POLLS):   # the last one triggers the bump
+        engine.step()
+
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING
+    assert job.state["bridge_fee_bumps"] == 1, "should have escalated exactly once"
+    assert job.state["bridge_unmined_polls"] == 0, "poll counter resets after a bump"
+    # The replacement is signed against the ORIGINAL fees, so consecutive
+    # attempts stay a full ratio apart and clear the node's replacement floor.
+    bumped = ctx.evm.prepared[-1]
+    assert bumped[0] == "bridge"
+    assert store.get_active_job().state["bridge_fees"] == original
+
+
+def test_a_bridge_nonce_consumed_elsewhere_fails_instead_of_pending(monkeypatch):
+    """If something else took the nonce, nothing we signed can ever mine."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                   # signs at nonce 3
+    ctx.evm.receipt = None
+    ctx.evm.mined_nonce = 9                         # account moved past it
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FAILED
+    assert "consumed by another transaction" in (store.get_active_job().last_error or "")
+
+
+def test_a_replacement_still_polls_the_original_hash(monkeypatch):
+    """Only one signing of a nonce can mine, and the node picks which."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()
+    first_hash = store.get_active_job().bridge_tx_hash
+    ctx.evm.receipt = None
+    for _ in range(S._STUCK_TX_POLLS):   # the last one triggers the bump
+        engine.step()
+
+    assert first_hash in store.get_active_job().state["bridge_prior_hashes"]
+
+
 def test_a_receipt_without_a_status_is_not_treated_as_success(monkeypatch):
     """[WARP-RECEIPT-AMBIG] "not reverted" is not "succeeded".
 
