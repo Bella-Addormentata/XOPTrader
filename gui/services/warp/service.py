@@ -160,12 +160,24 @@ _PENDING_MAX_POLLS: Dict[str, int] = {
     JobStatus.BURNING: 1440,            # ~6h -- funding + bundle + depth
     JobStatus.COLLECTING_EVM_SIGS: 1440,  # ~6h -- validator quorum
     JobStatus.RELAYING: 480,            # ~2h -- Base receipt/confirmations
+    # Generous on purpose: an altruistic relay is best-effort by nature and
+    # the message stays deliverable forever. The deadline exists to hand the
+    # wait back to the operator eventually (fund gas + Retry, or the portal),
+    # never because anything expires.
+    JobStatus.AWAITING_EXTERNAL_RELAY: 5760,  # ~24h -- volunteer relay wait
 }
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
 # the Portal message toll (1e13 wei) plus a comfortable Base gas margin.
 _MIN_GAS_WEI: int = 300_000_000_000_000  # 0.0003 ETH
+
+# Altruistic-relay cadence. The sweep hits the watcher plus (per candidate) the
+# Nostr relays, so it runs far below the ~30s tick; the activity refresh feeds
+# a GUI hint and can be lazier still.
+_RELAY_SWEEP_INTERVAL_S: float = 600.0
+_ACTIVITY_REFRESH_INTERVAL_S: float = 900.0
+_ACTIVITY_LOOKBACK: int = 100
 
 # Jobs may only be cancelled before the irreversible on-chain bridge is signed.
 _CANCELLABLE = frozenset(
@@ -229,6 +241,11 @@ class WarpParams:
     # existing enabled inbound config on upgrade.  0 == explicit unlimited.
     max_unwrap_micros: int = -1
     unwrap_chia_fee_mojos: int = 0
+    # Altruistic relay (opt-in): deliver strangers' stuck xch -> bse messages
+    # by paying their ~145k relay gas. Inert by default.
+    altruistic_relay: bool = False
+    relay_grace_min: float = 30.0
+    relay_daily_gas_budget_eth: float = 0.0002
 
 
 def _parse_unwrap_cap(warp: dict) -> int:
@@ -269,6 +286,14 @@ def _parse_usdc_config_value(key: str, raw: object) -> float:
         raise WarpError(f"warp.{key} is not a number (got {raw!r})") from exc
     if not math.isfinite(value):
         raise WarpError(f"warp.{key} must be finite (got {raw!r})")
+    return value
+
+
+def _parse_positive_float(key: str, raw: object) -> float:
+    """A positive finite float from a config knob (same rigour as the USDC keys)."""
+    value = _parse_usdc_config_value(key, raw)
+    if value <= 0:
+        raise WarpError(f"warp.{key} must be positive (got {raw!r})")
     return value
 
 
@@ -345,6 +370,14 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         portal_hint=(str(warp.get("portal_hint")) if warp.get("portal_hint") else None),
         max_unwrap_micros=_parse_unwrap_cap(warp),
         unwrap_chia_fee_mojos=int(warp.get("unwrap_chia_fee_mojos", 0) or 0),
+        altruistic_relay=bool(warp.get("altruistic_relay", False)),
+        relay_grace_min=_parse_positive_float(
+            "relay_grace_min", warp.get("relay_grace_min", 30) or 30
+        ),
+        relay_daily_gas_budget_eth=_parse_positive_float(
+            "relay_daily_gas_budget_eth",
+            warp.get("relay_daily_gas_budget_eth", 0.0002) or 0.0002,
+        ),
     )
 
 
@@ -469,6 +502,9 @@ class WarpEngine:
         protector: Any,
         clock: Optional[Callable[[], float]] = None,
         nostr_fetcher: Optional[Callable[[str, dict, float], List[dict]]] = None,
+        relayer: Any = None,
+        relay_key: Any = None,
+        heartbeat_publisher: Optional[Callable[[str, dict, float], bool]] = None,
     ) -> None:
         self._net = net
         self._store = store
@@ -482,6 +518,16 @@ class WarpEngine:
         self._protector = protector
         self._nostr_fetcher = nostr_fetcher
         self._clock = clock or time.time
+        # Altruistic relay (opt-in): the sweeper instance, the key it signs
+        # with (a dedicated gas-only key when configured, else the hot key),
+        # and an injectable heartbeat publisher for tests.
+        self._relayer = relayer
+        self._relay_key = relay_key
+        self._heartbeat_publisher = heartbeat_publisher
+        self._next_relay_sweep: float = 0.0
+        self._relay_report: Dict[str, Any] = {}
+        self._relay_activity: Dict[str, Any] = {}
+        self._next_activity_refresh: float = 0.0
         self._hot_address = evm_key.address
         self._hot_cache: Dict[str, Any] = {"address": evm_key.address}
         self._terminal_cache: Optional[tuple] = None
@@ -512,6 +558,7 @@ class WarpEngine:
             JobStatus.BURNING: self._h_burning,
             JobStatus.COLLECTING_EVM_SIGS: self._h_collecting_evm_sigs,
             JobStatus.RELAYING: self._h_relaying,
+            JobStatus.AWAITING_EXTERNAL_RELAY: self._h_awaiting_external_relay,
         }
 
     # -- clock -------------------------------------------------------------- #
@@ -1845,8 +1892,12 @@ class WarpEngine:
             raise WarpPending(
                 f"bridge liquidity {liquidity} < post-tip {post_tip} base units"
             )
-        if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
-            raise WarpPending("hot wallet ETH is below the relay gas floor")
+        # G9 is what an external-relay unwrap exists to not need: the operator
+        # holds only Chia assets, and delivery gas is a volunteer's. Every
+        # other gate still applies -- the burn itself is entirely Chia-side.
+        if not job.state.get("external_relay"):
+            if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
+                raise WarpPending("hot wallet ETH is below the relay gas floor")
         xch = self._wallet.get_wallet_balance(1)
         toll_need = net.chia_toll_mojos + p.unwrap_chia_fee_mojos
         if int(xch.get("spendable_balance") or 0) < toll_need:
@@ -2188,13 +2239,29 @@ class WarpEngine:
         if result.complete:
             tuples = nostr.ecdsa_sigs_for_relay(result.collected, threshold)
             packed = evm.pack_validator_sigs(tuples)
+            state = {
+                "evm_sigs": encoded,
+                "relay_sigs": packed.hex(),
+                "relay_threshold": threshold,
+            }
+            # External-relay mode only bites when the gas is actually absent:
+            # if the wallet can self-relay, it should -- faster for the
+            # operator and one less message in the network's stuck tail.
+            if (
+                job.state.get("external_relay")
+                and self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI
+            ):
+                return _advance(
+                    JobStatus.AWAITING_EXTERNAL_RELAY,
+                    state=state,
+                    message=(
+                        f"collected {result.count}/{threshold} EVM signatures; "
+                        "no Base gas -- awaiting an altruistic relayer"
+                    ),
+                )
             return _advance(
                 JobStatus.RELAYING,
-                state={
-                    "evm_sigs": encoded,
-                    "relay_sigs": packed.hex(),
-                    "relay_threshold": threshold,
-                },
+                state=state,
                 message=f"collected {result.count}/{threshold} EVM signatures",
             )
         return _stay(
@@ -2313,6 +2380,65 @@ class WarpEngine:
                 f"relay {confs}/{net.evm_confirmation_min_height} confirmations"
             )
         return self._unwrap_delivered(job, by="our relay", tx_hash=mined_hash)
+
+    def _h_awaiting_external_relay(self, job: WarpJob) -> _Step:
+        """Chia-only mode: wait for a stranger's relay, proven on-chain.
+
+        Delivery detection is an eth_call replay of OUR calldata: a ``!nonce``
+        revert is the Portal's own ``usedNonces`` refusal -- unforgeable
+        evidence the receiver was paid. The watcher's
+        ``destination_transaction_hash`` is recorded when present but is
+        display provenance, never the completion signal. Whenever the hot
+        wallet turns out to hold relay gas after all, the job switches to
+        self-relay -- whichever path completes first wins.
+        """
+        from . import evm
+
+        net = self._net
+
+        # Threshold drift invalidates the packed blob exactly as in RELAYING;
+        # signatures never expire, so bouncing back to collection is lossless.
+        live = int(self._evm.get_signature_threshold())
+        if live != int(job.state.get("relay_threshold") or live):
+            return _advance(
+                JobStatus.COLLECTING_EVM_SIGS,
+                state={"relay_sigs": None, "relay_threshold": None},
+                message=(
+                    f"signatureThreshold changed to {live} while waiting; "
+                    "re-selecting signatures"
+                ),
+            )
+
+        try:
+            self._evm._eth_call(net.portal_address, self._relay_calldata(job))
+        except evm.EvmError as exc:
+            if evm.is_already_delivered(exc):
+                return self._unwrap_delivered(
+                    job,
+                    by="an altruistic relayer",
+                    tx_hash=self._external_delivery_hash(job),
+                )
+            raise  # transport or an unexpected revert: retryable per taxonomy
+
+        if self._evm.get_eth_balance(self._hot_address) >= _MIN_GAS_WEI:
+            return _advance(
+                JobStatus.RELAYING,
+                message="hot wallet now holds relay gas; switching to self-relay",
+            )
+        raise WarpPending(
+            "message is live and deliverable; waiting for an altruistic "
+            "relayer (or fund the hot wallet with ~0.0003 ETH on Base to "
+            f"self-relay). Also claimable any time at {net.status_url}"
+        )
+
+    def _external_delivery_hash(self, job: WarpJob) -> Optional[str]:
+        """The watcher's destination tx hash -- display only, never the proof."""
+        try:
+            msg = self._watcher.get_message(job.bridge_nonce, source_chain="xch")
+            raw = msg.raw if msg is not None else {}
+            return str(raw.get("destination_transaction_hash") or "") or None
+        except Exception:  # noqa: BLE001 -- provenance is best-effort
+            return None
 
     def _unwrap_delivered(self, job: WarpJob, *, by: str, tx_hash=None) -> _Step:
         post_tip = job.state.get("post_tip_base_units")
@@ -2744,13 +2870,20 @@ class WarpEngine:
         return _job_dict(self._store.get_job(job.id))
 
 
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> dict:
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> dict:
         """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
 
         Refusals here are synchronous and create no job. Unlike Bridge now,
         the operator states an exact amount and destination -- there is no
         balance-sized default and no clamping: a cap violation refuses rather
         than silently shrinking what was typed.
+
+        ``external_relay`` is the Chia-only mode: skip the hot-wallet gas
+        gate and, if the gas really is absent after signature collection,
+        wait in ``AWAITING_EXTERNAL_RELAY`` for an altruistic relayer instead
+        of self-relaying.
         """
         p = self._params
         active = self._store.get_active_job()
@@ -2804,9 +2937,13 @@ class WarpEngine:
                 "direction": "out",
                 "manual": True,
                 "receiver_evm": rec_bytes.hex(),
+                "external_relay": bool(external_relay),
                 **self._binding(),
             },
-            event_message=f"unwrap requested: {amount} mojos -> {receiver}",
+            event_message=(
+                f"unwrap requested: {amount} mojos -> {receiver}"
+                + (" (external relay: no Base gas needed)" if external_relay else "")
+            ),
         )
         return _job_dict(job)
 
@@ -2975,6 +3112,98 @@ class WarpEngine:
         )
         return _job_dict(self._store.get_job(job.id))
 
+    def relay_sweep_if_due(self) -> Optional[dict]:
+        """One altruistic sweep (plus heartbeat) when enabled and due.
+
+        Never raises: this rides the worker tick behind the operator's own
+        job step and must not be able to break it. ``dry_run`` sweeps are
+        full rehearsals (fetch, verify, preflight, sign -- no broadcast) and
+        deliberately publish NO heartbeat: a rehearsal must not tell
+        Chia-only users that help is online.
+        """
+        if self._relayer is None:
+            return None
+        now = self._now()
+        if now < self._next_relay_sweep:
+            return None
+        self._next_relay_sweep = now + _RELAY_SWEEP_INTERVAL_S
+        broadcast = not self._params.dry_run
+        report: Dict[str, Any] = {"at": now, "broadcast": broadcast}
+        try:
+            entries = self._relayer.sweep(broadcast=broadcast)
+            report["entries"] = entries
+            report["relayed"] = sum(
+                1 for e in entries if e.get("action") == "relayed"
+            )
+        except Exception as exc:  # noqa: BLE001 -- must not break the tick
+            report["error"] = str(exc)
+            _log.warning("altruistic relay sweep failed: %s", exc)
+        if broadcast and self._relay_key is not None:
+            from . import nostr
+
+            try:
+                report["heartbeat_accepted"] = nostr.publish_heartbeat(
+                    self._net,
+                    self._relay_key.private_key,
+                    self._relay_key.address,
+                    created_at=now,
+                    publisher=self._heartbeat_publisher,
+                )
+            except Exception as exc:  # noqa: BLE001 -- advertising is best-effort
+                report["heartbeat_error"] = str(exc)
+        self._relay_report = report
+        return report
+
+    def refresh_relay_activity_if_due(self) -> Optional[dict]:
+        """Refresh the cached liveness evidence for the GUI (never raises).
+
+        Two independent layers, joined by relayer address:
+
+        * on-chain third-party deliveries (unforgeable, but lagging), and
+        * verified Nostr heartbeats (fresh, but only a claim).
+
+        A heartbeat whose address also appears in the on-chain evidence is a
+        proven volunteer saying it is still running (``online_proven``).
+        """
+        now = self._now()
+        if now < self._next_activity_refresh:
+            return None
+        self._next_activity_refresh = now + _ACTIVITY_REFRESH_INTERVAL_S
+        out: Dict[str, Any] = {"checked_at": now}
+        try:
+            from . import relayer as relayer_mod
+
+            third = relayer_mod.recent_third_party_relays(
+                self._watcher.fetch_path, self._evm,
+                lookback=_ACTIVITY_LOOKBACK,
+            )
+            out["third_party"] = third[:10]
+            out["third_party_count"] = len(third)
+            out["last_third_party_at"] = max(
+                (t["delivered_at"] for t in third), default=None
+            )
+        except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
+            out["error"] = str(exc)
+        try:
+            from . import nostr
+
+            beats = nostr.fetch_recent_heartbeats(
+                self._net, now=now, fetcher=self._nostr_fetcher,
+            )
+            proven = {
+                str(t.get("relayer") or "").lower()
+                for t in out.get("third_party") or []
+            }
+            out["heartbeats"] = beats[:10]
+            out["online_now"] = bool(beats)
+            out["online_proven"] = any(b["relayer"] in proven for b in beats)
+        except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
+            out.setdefault("error", str(exc))
+            out["online_now"] = False
+            out["online_proven"] = False
+        self._relay_activity = out
+        return out
+
     def refresh_hot_wallet(self) -> Dict[str, Any]:
         """Refresh the cached Base hot-wallet balances (never raises).
 
@@ -3032,6 +3261,13 @@ class WarpEngine:
             "min_micros": self._params.min_micros,
             "max_micros": self._params.max_micros,
             "expected_asset_id": self._net.expected_asset_id,
+            "altruistic_relay": {
+                "enabled": self._relayer is not None,
+                "dry_run": self._params.dry_run,
+                "relayer_address": getattr(self._relay_key, "address", None),
+                "last_sweep": dict(self._relay_report),
+            },
+            "relay_activity": dict(self._relay_activity),
             **receiver,
         }
         if self._binding_error:
@@ -3130,11 +3366,17 @@ class _WarpWorker(QObject):
 
     @Slot()
     def tick(self) -> None:
-        """Advance the active job one step and refresh the hot-wallet balances."""
+        """Advance the active job one step and refresh the hot-wallet balances.
+
+        The altruistic sweep and the activity refresh ride behind the job
+        step; both are internally throttled and contracted never to raise.
+        """
 
         def _run(engine: WarpEngine) -> None:
             engine.step()
             engine.refresh_hot_wallet()
+            engine.relay_sweep_if_due()
+            engine.refresh_relay_activity_if_due()
 
         self.snapshot_ready.emit(self._guarded(_run))
 
@@ -3144,11 +3386,15 @@ class _WarpWorker(QObject):
             self._guarded(lambda engine: engine.request_bridge(target_micros))
         )
 
-    @Slot(int, str)
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+    @Slot(int, str, bool)
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> None:
         self.snapshot_ready.emit(
             self._guarded(
-                lambda engine: engine.request_unwrap(int(amount_mojos), receiver)
+                lambda engine: engine.request_unwrap(
+                    int(amount_mojos), receiver, bool(external_relay)
+                )
             )
         )
 
@@ -3319,6 +3565,30 @@ class _WarpWorker(QObject):
             raise WarpError("no EVM hot-wallet key configured (warp.evm_private_key_dpapi)")
         evm_key = keystore.load_evm_key(blob, protector=protector)
 
+        # Opt-in altruistic relay: a dedicated gas-only key wins when present
+        # (warp.relay_private_key_dpapi), else the hot key pays the gas.
+        relayer_obj = None
+        relay_key = None
+        if params.altruistic_relay:
+            from . import relayer as relayer_mod
+
+            relay_blob = warp_cfg.get("relay_private_key_dpapi")
+            relay_key = (
+                keystore.load_evm_key(relay_blob, protector=protector)
+                if relay_blob else evm_key
+            )
+            relayer_obj = relayer_mod.AltruisticRelayer(
+                net=net,
+                evm_client=evm_client,
+                collector=nostr.NostrSigCollector(net),
+                watcher_fetch=watcher_client.fetch_path,
+                evm_key=relay_key,
+                grace_s=params.relay_grace_min * 60.0,
+                daily_gas_budget_wei=int(
+                    params.relay_daily_gas_budget_eth * 10 ** 18
+                ),
+            )
+
         return WarpEngine(
             net,
             store,
@@ -3331,6 +3601,8 @@ class _WarpWorker(QObject):
             evm_key=evm_key,
             protector=protector,
             nostr_fetcher=None,
+            relayer=relayer_obj,
+            relay_key=relay_key,
         )
 
     # -- base wallet (operator commands; independent of the engine) --------- #
@@ -3495,7 +3767,7 @@ class WarpService(QObject):
     _trigger_tick = Signal()
     _trigger_params = Signal(dict)
     _trigger_bridge = Signal(object)
-    _trigger_unwrap = Signal(int, str)
+    _trigger_unwrap = Signal(int, str, bool)
     _trigger_action = Signal(int, str)
     _trigger_wallet = Signal(str, dict)
 
@@ -3569,10 +3841,14 @@ class WarpService(QObject):
             self.start()
         self._trigger_bridge.emit(target_micros)
 
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> None:
         if not self._thread.isRunning():
             self.start()
-        self._trigger_unwrap.emit(int(amount_mojos), str(receiver))
+        self._trigger_unwrap.emit(
+            int(amount_mojos), str(receiver), bool(external_relay)
+        )
 
     def job_action(self, job_id: int, action: str) -> None:
         if not self._thread.isRunning():

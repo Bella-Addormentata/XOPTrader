@@ -170,3 +170,18 @@ class WatcherClient:
         # No exact nonce match -> the API returned something unrelated; treat as
         # not-yet-indexed rather than silently claiming the wrong message.
         return None
+
+    def fetch_path(self, path: str) -> list:
+        """Raw GET of ``base + path`` normalised to a list of message dicts.
+
+        The altruistic relayer's and the activity monitor's fetcher: ``path``
+        carries its own query string (e.g. ``/messages?source_chain=xch``).
+        """
+        url = f"{self._base}{path}"
+        try:
+            data = self._getter(url, {})
+        except WatcherError:
+            raise
+        except Exception as exc:  # noqa: BLE001 -- unify transport failures
+            raise WatcherError(f"watcher fetch_path failed: {exc}") from exc
+        return _messages_from(data)

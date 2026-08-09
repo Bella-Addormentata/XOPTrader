@@ -33,6 +33,7 @@ from PySide6.QtGui import QAction
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
+    QCheckBox,
     QFrame,
     QGroupBox,
     QHBoxLayout,
@@ -108,6 +109,7 @@ _STATUS_LABELS: Final[dict[str, str]] = {
     "BURNING": "Unwrap: burning",
     "COLLECTING_EVM_SIGS": "Unwrap: collecting signatures",
     "RELAYING": "Unwrap: relaying to Base",
+    "AWAITING_EXTERNAL_RELAY": "Unwrap: awaiting altruistic relay",
 }
 
 _WARP_PORTAL_URL: Final[str] = "https://www.warp.green"
@@ -231,8 +233,8 @@ class WarpWidget(QWidget):
     address_copy_requested = Signal(str)
     # Emitted when the user clicks "Bridge now" -> WarpService.request_bridge().
     bridge_now_requested = Signal()
-    # (amount_mojos, receiver_0x) -> WarpService.request_unwrap().
-    unwrap_requested = Signal(int, str)
+    # (amount_mojos, receiver_0x, external_relay) -> WarpService.request_unwrap().
+    unwrap_requested = Signal(int, str, bool)
     # Emitted for a per-job action -> WarpService.job_action(job_id, action).
     # ``action`` is one of "retry", "cancel", "sweep".
     job_action_requested = Signal(int, str)
@@ -422,6 +424,27 @@ class WarpWidget(QWidget):
         unwrap_row.addWidget(self._unwrap_btn)
         layout.addLayout(unwrap_row)
 
+        # Chia-only mode + the liveness evidence that makes it worth choosing.
+        self._unwrap_external = QCheckBox(
+            "No Base ETH — wait for an altruistic relay to deliver"
+        )
+        self._unwrap_external.setStyleSheet(f"color: {TEXT_SECONDARY};")
+        self._unwrap_external.setToolTip(
+            "Chia-only unwrap: the burn and signature collection proceed as "
+            "normal, but final delivery on Base is left to a volunteer relayer "
+            "(or to this wallet, automatically, if it gains ETH later).\n\n"
+            "Best-effort: if no volunteer delivers within ~24h the job asks "
+            "for your attention — the message itself stays deliverable "
+            "forever, including via the warp.green portal."
+        )
+        layout.addWidget(self._unwrap_external)
+
+        self._relay_activity_lbl = QLabel()
+        self._relay_activity_lbl.setWordWrap(True)
+        self._relay_activity_lbl.setTextFormat(Qt.TextFormat.RichText)
+        self._relay_activity_lbl.setVisible(False)
+        layout.addWidget(self._relay_activity_lbl)
+
         self._docs_btn = self._link_button("Developer docs")
         self._docs_btn.setToolTip(_WARP_DOCS_URL)
         self._docs_btn.clicked.connect(lambda: _open_url(_WARP_DOCS_URL))
@@ -507,6 +530,7 @@ class WarpWidget(QWidget):
         self._render_banner(snap, enabled=enabled, built=built, error=error)
         self._render_hot_wallet(snap.get("hot_wallet") or {}, built=built)
         self._render_bridge_config(snap, enabled=enabled, built=built)
+        self._render_relay_activity(snap)
         self._render_jobs(list(snap.get("jobs") or []))
 
     def _render_banner(
@@ -668,6 +692,58 @@ class WarpWidget(QWidget):
                 "Bridge the current Base USDC balance to wUSDC.b now."
             )
 
+    def _render_relay_activity(self, snap: dict) -> None:
+        """The altruistic-relay liveness hint under the unwrap controls.
+
+        Composes the two evidence layers the engine caches: unforgeable
+        on-chain third-party deliveries, and verified-but-claimed heartbeats.
+        Hidden entirely until the engine has produced a check.
+        """
+        act = snap.get("relay_activity") or {}
+        checked = act.get("checked_at")
+        if not checked:
+            self._relay_activity_lbl.setVisible(False)
+            return
+
+        volunteering = bool((snap.get("altruistic_relay") or {}).get("enabled"))
+        parts: list[str] = []
+        if act.get("online_proven"):
+            colour = PROFIT_GREEN
+            parts.append(
+                "🟢 <b>Altruistic relay online now</b> — a volunteer with "
+                "proven on-chain deliveries is heartbeating."
+            )
+        elif act.get("online_now"):
+            colour = PROFIT_GREEN
+            parts.append(
+                "🟢 <b>Altruistic relay heartbeat seen</b> in the last "
+                "few minutes (liveness claim; unverified on-chain history)."
+            )
+        elif act.get("last_third_party_at"):
+            colour = WARNING_YELLOW
+            age_h = max(0.0, (float(checked) - float(act["last_third_party_at"])) / 3600.0)
+            parts.append(
+                f"🟡 <b>Altruistic relays active recently</b>: last "
+                f"third-party delivery ~{age_h:.0f}h ago."
+            )
+        else:
+            colour = TEXT_SECONDARY
+            parts.append(
+                "⚪ No recent altruistic relay activity observed — a "
+                "no-Base-ETH unwrap may wait until you fund gas or use the "
+                "portal."
+            )
+        count = act.get("third_party_count")
+        if count:
+            parts.append(f"{count} third-party deliveries in the recent window.")
+        if volunteering:
+            parts.append("This node is volunteering as a relay.")
+        if act.get("error"):
+            parts.append(f"(evidence partial: {act['error']})")
+        self._relay_activity_lbl.setText(" ".join(parts))
+        self._relay_activity_lbl.setStyleSheet(f"color: {colour};")
+        self._relay_activity_lbl.setVisible(True)
+
     def _render_jobs(self, jobs: list[dict]) -> None:
         self._jobs_rows = jobs
         table = self._jobs_table
@@ -732,7 +808,9 @@ class WarpWidget(QWidget):
             _log.warning("unwrap: amount %r is below the 0.001 USDC minimum", text)
             self._unwrap_amount.setFocus()
             return
-        self.unwrap_requested.emit(mojos, dest)
+        self.unwrap_requested.emit(
+            mojos, dest, bool(self._unwrap_external.isChecked())
+        )
 
     def _on_bridge_now(self) -> None:
         """Request an immediate bridge of the current Base USDC balance."""

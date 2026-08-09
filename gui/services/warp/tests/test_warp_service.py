@@ -290,7 +290,9 @@ def default_params(**over) -> S.WarpParams:
 
 
 def build(store, *, params=None, evm=None, coinset=None, watcher=None,
-          wallet=None, collector=None, protector=None, clock=None):
+          wallet=None, collector=None, protector=None, clock=None,
+          relayer=None, relay_key=None, heartbeat_publisher=None,
+          nostr_fetcher=None):
     evm = evm or FakeEvm()
     coinset = coinset or FakeCoinset()
     watcher = watcher or FakeWatcher()
@@ -306,6 +308,8 @@ def build(store, *, params=None, evm=None, coinset=None, watcher=None,
         evm=evm, coinset=coinset, watcher=watcher, wallet=wallet,
         collector=collector, evm_key=key, protector=protector,
         clock=clock or big_clock(),
+        relayer=relayer, relay_key=relay_key,
+        heartbeat_publisher=heartbeat_publisher, nostr_fetcher=nostr_fetcher,
     )
     ctx = SimpleNamespace(
         engine=engine, store=store, evm=evm, coinset=coinset, watcher=watcher,

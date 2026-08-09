@@ -490,6 +490,264 @@ def _default_fetcher() -> RelayFetcher:
     return fetch
 
 
+# --------------------------------------------------------------------------- #
+# Altruistic-relay heartbeat: BIP340-signed NIP-01 events.
+#
+# The "online right now" half of the liveness signal. The on-chain half
+# (relayer.recent_third_party_relays) is unforgeable but lagging; a heartbeat
+# is fresh but only a *claim*. The two compose: a heartbeat whose relayer
+# address also appears in the on-chain third-party evidence is a proven
+# volunteer saying it is still running. Spoofing someone else's address gains
+# nothing -- claiming an address does not make the claimant relay.
+#
+# Every consumed event is fully verified (id recomputed, BIP340 signature
+# checked, timestamp bounded) -- the same never-trust-the-relay rule as the
+# signature collectors above.
+# --------------------------------------------------------------------------- #
+
+HEARTBEAT_KIND = 1
+HEARTBEAT_TAG = "warp-altruistic-relay-v1"
+_HEARTBEAT_KEY_DOMAIN = b"xoptrader-nostr-heartbeat-v1"
+#: Reject events stamped further into the future than honest clock skew allows;
+#: without this a spoofer could post-date one event and stay "online" forever.
+_HEARTBEAT_MAX_FUTURE_SKEW_S = 300.0
+
+# (relay_url, signed_event, timeout_s) -> accepted (the relay's OK verdict).
+RelayPublisher = Callable[[str, dict, float], bool]
+
+
+def heartbeat_keypair(evm_private_key: bytes) -> Tuple[bytes, str]:
+    """Deterministic Nostr identity derived from -- never equal to -- the relay key.
+
+    ``sha256(domain || key || counter)``: stable across restarts (consumers can
+    recognise a repeat volunteer by npub) without ever signing Nostr events
+    with a funds-holding secp256k1 scalar. Returns ``(seckey32, pubkey_hex)``.
+    """
+    import hashlib
+
+    from . import schnorr
+
+    counter = 0
+    while True:
+        candidate = hashlib.sha256(
+            _HEARTBEAT_KEY_DOMAIN + bytes(evm_private_key)
+            + counter.to_bytes(4, "big")
+        ).digest()
+        if 1 <= int.from_bytes(candidate, "big") <= schnorr.N - 1:
+            return candidate, schnorr.pubkey_gen(candidate).hex()
+        counter += 1
+
+
+def nip01_event_id(
+    pubkey_hex: str, created_at: int, kind: int, tags: list, content: str
+) -> str:
+    """The NIP-01 event id: sha256 of the canonical serialization array."""
+    import hashlib
+    import json
+
+    payload = json.dumps(
+        [0, pubkey_hex, int(created_at), int(kind), tags, content],
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
+def build_heartbeat_event(
+    net: WarpNet,
+    evm_private_key: bytes,
+    relayer_address: str,
+    *,
+    created_at: float,
+    aux_rand: Optional[bytes] = None,
+) -> dict:
+    """A complete, signed heartbeat event ready for ``["EVENT", ...]``.
+
+    ``relayer_address`` is the EVM address the volunteer relays from -- the
+    join key against the on-chain altruism evidence.
+    """
+    import json
+    import os
+
+    from . import schnorr
+
+    seckey, pubkey_hex = heartbeat_keypair(evm_private_key)
+    content = json.dumps(
+        {"net": net.name, "relayer": str(relayer_address).lower(), "v": 1},
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    tags = [["t", HEARTBEAT_TAG]]
+    created = int(created_at)
+    event_id = nip01_event_id(pubkey_hex, created, HEARTBEAT_KIND, tags, content)
+    sig = schnorr.sign(
+        bytes.fromhex(event_id), seckey, aux_rand if aux_rand is not None else os.urandom(32)
+    )
+    return {
+        "id": event_id,
+        "pubkey": pubkey_hex,
+        "created_at": created,
+        "kind": HEARTBEAT_KIND,
+        "tags": tags,
+        "content": content,
+        "sig": sig.hex(),
+    }
+
+
+def verify_heartbeat_event(
+    net: WarpNet, event: dict, *, now: float, max_age_s: float
+) -> Optional[dict]:
+    """Full verification of one heartbeat; ``None`` means ignore the event.
+
+    Gates, in order: shape, kind, tag, recomputed id, BIP340 signature over
+    the id, bounded timestamp (neither stale nor post-dated), parseable
+    content for this network with an EVM-shaped relayer address.
+    """
+    import json
+
+    from . import schnorr
+
+    if not isinstance(event, dict) or event.get("kind") != HEARTBEAT_KIND:
+        return None
+    if _first_tag(event.get("tags") or [], "t") != HEARTBEAT_TAG:
+        return None
+    try:
+        pubkey = str(event["pubkey"])
+        created = int(event["created_at"])
+        content = str(event["content"])
+        want_id = nip01_event_id(
+            pubkey, created, HEARTBEAT_KIND, event.get("tags") or [], content
+        )
+        if want_id != str(event.get("id", "")).lower():
+            return None
+        if not schnorr.verify(
+            bytes.fromhex(want_id), bytes.fromhex(pubkey),
+            bytes.fromhex(str(event["sig"])),
+        ):
+            return None
+    except (KeyError, ValueError, TypeError):
+        return None
+    if created < now - max_age_s or created > now + _HEARTBEAT_MAX_FUTURE_SKEW_S:
+        return None
+    try:
+        body = json.loads(content)
+    except ValueError:
+        return None
+    if not isinstance(body, dict) or body.get("net") != net.name:
+        return None
+    relayer = str(body.get("relayer") or "").lower()
+    if not (relayer.startswith("0x") and len(relayer) == 42):
+        return None
+    try:
+        bytes.fromhex(relayer[2:])
+    except ValueError:
+        return None
+    return {"relayer": relayer, "pubkey": pubkey.lower(), "seen_at": created}
+
+
+def heartbeat_filter(*, since: float) -> dict:
+    """The REQ filter consumers use to find recent heartbeats."""
+    return {
+        "kinds": [HEARTBEAT_KIND],
+        "#t": [HEARTBEAT_TAG],
+        "since": int(since),
+    }
+
+
+def _default_publisher() -> RelayPublisher:
+    import json
+
+    import websocket  # websocket-client; lazy so the GUI boots without it
+
+    def publish(relay_url: str, event: dict, timeout: float) -> bool:
+        ws = websocket.create_connection(relay_url, timeout=timeout)
+        try:
+            ws.send(json.dumps(["EVENT", event]))
+            while True:
+                try:
+                    raw = ws.recv()
+                except Exception:  # noqa: BLE001 -- timeout/closed => no verdict
+                    return False
+                if not raw:
+                    return False
+                try:
+                    msg = json.loads(raw)
+                except Exception:  # noqa: BLE001 -- skip non-JSON frames
+                    continue
+                if (
+                    isinstance(msg, list) and len(msg) >= 3
+                    and msg[0] == "OK" and msg[1] == event.get("id")
+                ):
+                    return bool(msg[2])
+        finally:
+            try:
+                ws.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    return publish
+
+
+def publish_heartbeat(
+    net: WarpNet,
+    evm_private_key: bytes,
+    relayer_address: str,
+    *,
+    created_at: float,
+    publisher: Optional[RelayPublisher] = None,
+    per_relay_timeout: float = 6.0,
+) -> int:
+    """Publish one heartbeat to every configured relay; count acceptances.
+
+    Best-effort by contract: a dead relay is skipped, and the function never
+    raises -- liveness advertising must not be able to break the sweep loop
+    that feeds it.
+    """
+    event = build_heartbeat_event(
+        net, evm_private_key, relayer_address, created_at=created_at
+    )
+    publish = publisher or _default_publisher()
+    accepted = 0
+    for relay in net.nostr_relays:
+        try:
+            if publish(relay, event, per_relay_timeout):
+                accepted += 1
+        except Exception:  # noqa: BLE001 -- a dead relay must not abort the pass
+            continue
+    return accepted
+
+
+def fetch_recent_heartbeats(
+    net: WarpNet,
+    *,
+    now: float,
+    max_age_s: float = 900.0,
+    fetcher: Optional[RelayFetcher] = None,
+    per_relay_timeout: float = 6.0,
+) -> List[dict]:
+    """Verified recent heartbeats across all relays, newest first.
+
+    Deduplicated by Nostr pubkey (a volunteer restarting its sweep loop posts
+    repeatedly; only the freshest matters). Never raises.
+    """
+    fetch = fetcher or _default_fetcher()
+    filt = heartbeat_filter(since=now - max_age_s)
+    best: Dict[str, dict] = {}
+    for relay in net.nostr_relays:
+        try:
+            events = fetch(relay, filt, per_relay_timeout)
+        except Exception:  # noqa: BLE001 -- a dead relay must not abort the pass
+            continue
+        for event in events or []:
+            hb = verify_heartbeat_event(net, event, now=now, max_age_s=max_age_s)
+            if hb is None:
+                continue
+            prior = best.get(hb["pubkey"])
+            if prior is None or hb["seen_at"] > prior["seen_at"]:
+                best[hb["pubkey"]] = hb
+    return sorted(best.values(), key=lambda h: -h["seen_at"])
+
+
 class NostrSigCollector:
     """Collects validator signatures across relays until quorum or a deadline.
 
