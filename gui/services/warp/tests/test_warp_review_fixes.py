@@ -259,6 +259,84 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     engine.request_bridge()                    # a new job is possible again
 
 
+def test_a_malformed_message_destination_fails_terminally():
+    """[WARP-MSG-WIDTH] Fail before the ephemeral key is minted, not after.
+
+    Nothing checked the attested fields, and _classify treats a ValueError as
+    retryable with no cap -- so a bad destination degraded into a silent
+    infinite backoff, surfacing much later in the claim build.
+    """
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    engine, _ctx = build(
+        store, watcher=FakeWatcher(_sent_msg(destination=bytes(20)))  # not 32
+    )
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FAILED
+    assert "20-byte message destination" in (out["last_error"] or "")
+    assert "ephemeral_blob" not in store.get_job(out["id"]).state
+
+
+def test_variable_width_message_contents_are_still_accepted():
+    """Contents are heterogeneous CLVM atoms -- the amount is a short one.
+
+    A uniform 32-byte rule here would reject every real message; this pins
+    that down so the validation above cannot be tightened into a bug.
+    """
+    from .test_warp_service import FakeWatcher, _seed_message_sent, _sent_msg
+
+    store = new_store()
+    engine, _ctx = build(store, watcher=FakeWatcher(_sent_msg()))
+    _seed_message_sent(store)
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.FUNDING_CLAIM
+    contents = store.get_active_job().state["message_contents"]
+    assert any(len(c) != 64 for c in contents), "fixture should include a short atom"
+
+
+def test_the_sweep_pays_the_bot_wallet_not_the_cat_receiver(monkeypatch):
+    """[WARP-SWEEP-DEST] build_sweep_bundle emits raw XCH, not a CAT.
+
+    The destination was job.receiver_ph -- the wUSDC.b receiver, which once
+    warp.chia_receiver_address is set can be an address the bot does not
+    control. drivers.build_sweep_bundle's own docstring already says "the bot
+    wallet"; the caller was what disagreed. Both sweep paths share this
+    helper, including the unattended third-party-claim auto-sweep.
+    """
+    from gui.services.warp import clvm_utils as cu
+
+    seen = {}
+
+    def _capture(coinset, net, *, security_coin, destination_puzzle_hash,
+                 ephemeral_sk, sweep_fee=0):
+        seen["dest"] = destination_puzzle_hash
+        return ("accepted", "ok")
+
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep", _capture)
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_funded(store)
+
+    # The harness's default wallet address decodes to RECEIVER_PH, so the two
+    # have to be separated for this to discriminate at all.
+    wallet_ph = b"\x77" * 32
+    ctx.wallet.next_address = cu.encode_puzzle_hash(wallet_ph, NET.chia_prefix)
+
+    engine.job_action(job.id, "sweep")
+
+    assert seen["dest"] == wallet_ph, "recovered XCH must go back to the bot wallet"
+    assert seen["dest"] != RECEIVER_PH, "must not pay the wUSDC.b receiver"
+
+
 def test_a_pushed_but_unspent_sweep_does_not_close_the_job(monkeypatch):
     """[WARP-SWEEP-VERIFY] Mempool acceptance is not a spent coin.
 

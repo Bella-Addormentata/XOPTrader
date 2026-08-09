@@ -395,6 +395,7 @@ class WarpEngine:
         # Cached wallet-derived receiver, so snapshot() never does I/O and we
         # never burn a fresh derivation index per call: (address, source, ph_hex).
         self._receiver_cache: Optional[tuple] = None
+        self._sweep_dest_cache: Optional[bytes] = None
         self._receiver_snap: Optional[Dict[str, Any]] = None
 
         self._HANDLERS: Dict[str, Callable[[WarpJob], _Step]] = {
@@ -838,6 +839,35 @@ class WarpEngine:
         # Persist-then-act: generate the ephemeral security key locally; it lands
         # atomically with the advance. A crash before persistence just regenerates
         # (nothing was funded to the discarded key).
+        # [WARP-MSG-WIDTH 2026-08-08] Validate the attested fields before
+        # anything is minted or funded. Nothing checked them, and _classify
+        # treats a ValueError as retryable with no cap -- so a malformed
+        # attestation degraded into a silent infinite backoff, with the
+        # ephemeral key already generated and the failure surfacing only much
+        # later, deep in the claim build.
+        #
+        # The destination is a puzzle hash and is always 32 bytes. The contents
+        # are NOT: they are heterogeneous CLVM atoms, and the amount in
+        # particular is a minimal-encoding integer (a couple of bytes), so any
+        # uniform width rule here would reject every real message. What is
+        # checked is that each one is decodable at all -- which is exactly what
+        # would otherwise raise later, out of reach of a terminal state.
+        dest_hex = _hx(msg.destination)
+        if len(dest_hex) != 64:
+            raise WarpTerminal(
+                f"watcher returned a {len(dest_hex) // 2}-byte message destination, "
+                "expected 32; the attestation cannot build a claim"
+            )
+        try:
+            contents_hex = [_hx(c) for c in msg.contents]
+            for atom in contents_hex:
+                bytes.fromhex(atom)
+        except (ValueError, TypeError) as exc:
+            raise WarpTerminal(
+                f"watcher returned undecodable message contents ({exc}); the "
+                "attestation cannot build a claim"
+            ) from exc
+
         bls = keystore.new_bls_key()
         blob = keystore.protect_bls_key(
             bls, extra_entropy=self._job_entropy(job), protector=self._protector
@@ -847,8 +877,8 @@ class WarpEngine:
             state={
                 "ephemeral_blob": blob,
                 "ephemeral_pk": bls.public_key.hex(),
-                "message_destination": _hx(msg.destination),
-                "message_contents": list(msg.contents),
+                "message_destination": dest_hex,
+                "message_contents": contents_hex,
             },
             message="attested 'sent'; ephemeral security key generated",
         )
@@ -944,8 +974,7 @@ class WarpEngine:
         from . import claim
 
         net = self._net
-        hint = self._resolve_portal_hint(job)
-        portal = claim.sync_portal(self._coinset, net, hint=hint)
+        portal = self._sync_portal(job)
         fresh = portal.coin_id.hex()
         self._store.set_meta("portal_hint", fresh)
 
@@ -1026,8 +1055,7 @@ class WarpEngine:
                 raise WarpPending("security coin spent; awaiting final CAT coin")
             raise WarpPending("security coin not found on chain")
 
-        hint = self._resolve_portal_hint(job)
-        portal = claim.sync_portal(self._coinset, net, hint=hint)
+        portal = self._sync_portal(job)
         self._store.set_meta("portal_hint", portal.coin_id.hex())
         prev = job.state.get("portal_coin_id")
         if prev and portal.coin_id.hex() != prev:
@@ -1147,6 +1175,32 @@ class WarpEngine:
         ph = cu.decode_puzzle_hash(address, expected_prefix=net.chia_prefix)
         self._receiver_cache = (address, source, ph.hex())
         return address, ph.hex()
+
+    def _sweep_destination_ph(self) -> bytes:
+        """Where recovered XCH goes: the bot's own wallet, always.
+
+        [WARP-SWEEP-DEST 2026-08-08] The sweep used ``job.receiver_ph``, which
+        is the *wUSDC.b* receiver -- and once ``warp.chia_receiver_address`` is
+        set that can be anywhere, including an address the bot does not
+        control. build_sweep_bundle emits a bare CREATE_COIN of raw XCH, not a
+        CAT, so the recovered funding fee was paid to whoever holds the CAT
+        receiver rather than back to the wallet that put it up. Dust, and
+        spendable by that holder, so misdirected rather than destroyed -- but
+        it contradicted both docstrings, and the third-party-claim auto-sweep
+        does it unattended.
+
+        Cached like :meth:`_resolve_receiver`, and for the same reason:
+        ``new_address=True`` would burn a derivation index per sweep.
+        """
+        from . import clvm_utils as cu
+
+        if self._sweep_dest_cache is not None:
+            return self._sweep_dest_cache
+        self._wallet.log_in()
+        address = self._wallet.get_next_address(1, new_address=False)
+        ph = cu.decode_puzzle_hash(address, expected_prefix=self._net.chia_prefix)
+        self._sweep_dest_cache = ph
+        return ph
 
     def effective_receiver(self) -> Dict[str, Any]:
         """Where wUSDC.b will actually land, for display. Never raises.
@@ -1467,6 +1521,35 @@ class WarpEngine:
     def _claim_contents(self, job: WarpJob) -> List[bytes]:
         return [bytes.fromhex(_hx(c)) for c in job.state.get("message_contents", [])]
 
+    def _sync_portal(self, job: WarpJob):
+        """Resolve the portal tip, re-bootstrapping if the hint is too far behind.
+
+        [WARP-PORTAL-HINT 2026-08-08] ``sync_portal`` walks forward a bounded
+        number of hops from the hint. Once the portal has advanced further than
+        that, every sync raises PortalSyncError and the job retries forever --
+        the Nostr bootstrap that would fix it was consulted only when no hint
+        existed at all, never when a persisted one had gone stale. A stored
+        hint is therefore self-perpetuating: it can never be replaced by the
+        mechanism designed to replace it.
+
+        On failure the stored hint is cleared and one fresh bootstrap is tried.
+        A second failure propagates as a normal retryable error.
+        """
+        from . import claim
+
+        hint = self._resolve_portal_hint(job)
+        try:
+            return claim.sync_portal(self._coinset, self._net, hint=hint)
+        except claim.PortalSyncError as exc:
+            _log.warning(
+                "warp: portal hint %s unusable (%s); discarding it and "
+                "re-bootstrapping from Nostr",
+                _hx(hint), exc,
+            )
+            self._store.set_meta("portal_hint", "")
+            fresh = self._bootstrap_hint_from_nostr(job)
+            return claim.sync_portal(self._coinset, self._net, hint=fresh)
+
     def _resolve_portal_hint(self, job: WarpJob) -> bytes:
         """A recent portal coin id to walk forward from (never the launcher)."""
         pcid = job.state.get("portal_coin_id")
@@ -1518,7 +1601,7 @@ class WarpEngine:
                 self._coinset,
                 self._net,
                 security_coin=coin,
-                destination_puzzle_hash=bytes.fromhex(job.receiver_ph),
+                destination_puzzle_hash=self._sweep_destination_ph(),
                 ephemeral_sk=sk,
                 sweep_fee=0,
             )
