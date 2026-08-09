@@ -1911,8 +1911,18 @@ class WarpEngine:
         # only by hand-editing warp_jobs.db, which is what this whole branch
         # set out to eliminate. Abandon is a pure DB write that records the
         # recovery details first, so it is safe for a job we refuse to touch.
+        # Never a closed one, though: a hot-wallet rotation makes every historic
+        # row binding-mismatched, and without this a COMPLETED job could be
+        # flipped to CANCELLED -- rewriting the record of a finished bridge.
+        if job.status in jobs.CLOSED_STATES:
+            raise WarpError(f"job {job.id} is already closed ({job.status})")
+
         mismatch = self._binding_mismatch(job)
-        if job.status != JobStatus.FAILED and not mismatch:
+        # A status this build has no handler for (version skew: a newer schema
+        # ran against this DB) would otherwise park forever -- the dispatcher
+        # skips it and every other action refuses it -- so it is abandonable too.
+        known_open = job.status == JobStatus.FAILED or job.status in self._HANDLERS
+        if job.status != JobStatus.FAILED and not mismatch and known_open:
             raise WarpError(
                 f"cannot abandon a job in {job.status}; abandon is the escape "
                 "from a job the engine cannot resolve"
@@ -1926,11 +1936,15 @@ class WarpEngine:
         # bridges under a nonce no job tracks. Refused until the nonce is
         # provably dead (something else consumed it) or provably resolved (it
         # mined -- in which case Retry, not Abandon, completes the job).
-        # Skipped for a binding-refused job: its nonce belongs to a different
-        # hot wallet than the configured key, so the check would be meaningless;
-        # the recovery blob records what to verify by hand instead.
+        # Skipped only when the job's nonce belongs to a DIFFERENT hot wallet
+        # than the configured key, where the check would interrogate the wrong
+        # account; the recovery blob records what to verify by hand instead.
+        # A dry_run-legacy row is binding-refused but same-wallet, so the
+        # check still runs -- and still protects -- there.
         raw_nonce = job.state.get("bridge_tx_nonce")
-        if not mismatch:
+        bound = _hx(job.state.get("hot_address") or "")
+        same_wallet = not bound or bound == _hx(self._hot_address)
+        if not mismatch or same_wallet:
             self._refuse_while_bridge_unresolved(job, "abandon")
 
         recovery = {
@@ -1950,13 +1964,22 @@ class WarpEngine:
                 f"claimable at {self._net.status_url}"
             )
         elif job.state.get("bridge_raw"):
-            # Only reachable for a binding-refused job (the guard above covers
-            # the same-binding case), where we cannot check the foreign wallet.
-            detail = (
-                f"a signed bridge transaction may still be live at nonce "
-                f"{raw_nonce} on the job's own hot wallet -- verify on BaseScan "
-                "before treating the deposit as untouched"
-            )
+            if not mismatch or same_wallet:
+                # The guard above ran and passed: nonce consumed by something
+                # else, and nothing this job signed has a receipt.
+                detail = (
+                    f"its signed bridge is provably dead (nonce {raw_nonce} was "
+                    "consumed by another transaction, with no receipt for "
+                    "anything this job signed); the USDC deposit is untouched"
+                )
+            else:
+                # A foreign-wallet job: the guard could not interrogate the
+                # right account, so the operator has to.
+                detail = (
+                    f"a signed bridge transaction may still be live at nonce "
+                    f"{raw_nonce} on the job's own hot wallet -- verify on "
+                    "BaseScan before treating the deposit as untouched"
+                )
         else:
             detail = "no bridge message was ever attested"
         note = f"operator abandoned: {detail}"

@@ -436,11 +436,19 @@ def test_every_open_status_has_an_operator_exit():
         if not k.startswith("_") and isinstance(v, str)
     }
     open_statuses = statuses - jobs.TERMINAL_STATES - jobs.CLOSED_STATES
-    covered = set(S._PENDING_MAX_POLLS) | S._CANCELLABLE | S._SWEEPABLE
+    # _SWEEPABLE is deliberately NOT a disjunct: both its members are terminal,
+    # so it can never cover an open status -- including it would falsely
+    # certify a future open sweepable state as having an exit.
+    covered = set(S._PENDING_MAX_POLLS) | S._CANCELLABLE
     uncovered = open_statuses - covered
     assert not uncovered, (
         f"{sorted(uncovered)} can pend or error forever with no operator exit"
     )
+    # And every deadline-bounded status must actually be dispatched, or the
+    # deadline never runs.
+    engine, _ctx = build(new_store())
+    undispatched = set(S._PENDING_MAX_POLLS) - set(engine._HANDLERS)
+    assert not undispatched, f"{sorted(undispatched)} have deadlines but no handler"
 
 
 def test_a_job_frozen_as_a_rehearsal_stays_a_rehearsal(monkeypatch):
@@ -581,9 +589,12 @@ def test_the_real_engine_construction_path_actually_runs(tmp_path, monkeypatch):
         }
     })
 
+    # The protector is mocked alongside the key: default_protector() requires
+    # Windows DPAPI and raises on the Linux CI runner, which is a platform
+    # gate, not the wiring this test exists to cover.
     with mock.patch.object(
         ks, "load_evm_key", return_value=ks.EvmKey(b"\x11" * 32, "0x" + "ab" * 20)
-    ):
+    ), mock.patch.object(ks, "default_protector", return_value=object()):
         engine = worker._ensure_engine()
 
     assert engine is not None, f"engine did not build: {worker._engine_error}"
@@ -621,6 +632,42 @@ def test_abandon_frees_the_slot_and_records_how_to_recover():
     recovery = store.get_job(job.id).state["abandon_recovery"]
     assert recovery["bridge_nonce"] == "00" * 31 + "07"
     assert recovery["portal"]
+
+
+def test_abandon_never_touches_a_closed_job():
+    """A hot-wallet rotation binding-mismatches every historic row.
+
+    The widened gate (abandon for any refused job) would then have let a
+    COMPLETED job be flipped to CANCELLED -- rewriting the record of a
+    finished bridge. Closed is closed.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.COMPLETED, state={"hot_address": OTHER_HOT})
+
+    with pytest.raises(S.WarpError, match="already closed"):
+        engine.job_action(job.id, "abandon")
+
+
+def test_a_status_this_build_does_not_know_is_abandonable():
+    """Version skew: a newer build wrote a status this one has no handler for.
+
+    The dispatcher skips it, every other action refuses it, and it holds the
+    single active slot -- the same no-exit shape as everything else this
+    branch closed, so Abandon accepts it.
+    """
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.BRIDGING)
+    store._conn.execute(
+        "UPDATE warp_jobs SET status='FUTURE_STATE' WHERE id=?", (job.id,)
+    )
+    store._conn.commit()
+
+    out = engine.job_action(job.id, "abandon")
+
+    assert out["status"] == JobStatus.CANCELLED
+    assert store.get_active_job() is None
 
 
 def test_abandon_is_refused_for_a_job_that_is_not_failed():
