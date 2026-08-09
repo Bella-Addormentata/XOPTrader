@@ -671,6 +671,44 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def test_editing_claim_fee_does_not_orphan_a_funded_job(monkeypatch):
+    """[WARP-FEE-FREEZE] Lookups use the funded amount, not today's config.
+
+    find_security_coin matches the on-chain amount exactly. The claim-path
+    handlers recomputed it as post_tip + claim_fee_mojos from live params, so
+    editing that key and reloading made every scan look for an amount no coin
+    has. The job then pended forever -- _apply_stay clears last_error and
+    resets retry_count on each pend, so it never reached FAILED, and a
+    non-FAILED job offers neither Retry nor Sweep.
+    """
+    store = new_store()
+    job = seed(
+        store, JobStatus.CLAIM_FUNDED,
+        columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985},
+    )
+    blob, _sk = make_ephemeral_blob(job.id)
+    funded = 4985 + 100_000_000            # what was actually sent
+    store.update_job(
+        job.id,
+        state_patch={"ephemeral_blob": blob, "funding_amount": funded},
+    )
+
+    # Operator edits claim_fee_mojos and the config reloads.
+    engine, ctx = build(store, params=default_params(claim_fee_mojos=250_000_000))
+
+    looked_for = []
+    monkeypatch.setattr(
+        claim_mod, "find_security_coin",
+        lambda coinset, sk, amount: looked_for.append(amount),
+    )
+
+    engine.step()
+
+    assert looked_for == [funded], (
+        f"scanned for {looked_for} but the coin on chain holds {funded}"
+    )
+
+
 def test_flipping_dry_run_cannot_close_a_live_broadcast_job(monkeypatch):
     """[WARP-DRYRUN-FREEZE] A live job stays live when the config flips.
 

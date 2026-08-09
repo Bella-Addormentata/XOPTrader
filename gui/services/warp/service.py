@@ -775,7 +775,7 @@ class WarpEngine:
 
         net, p = self._net, self._params
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is not None:
@@ -835,9 +835,9 @@ class WarpEngine:
         """Wait for the security coin to reach the Chia confirmation depth."""
         from . import claim
 
-        net, p = self._net, self._params
+        net = self._net
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is None:
@@ -905,9 +905,12 @@ class WarpEngine:
         """Re-sync, build + push the claim; handle completion / conflict / drift."""
         from . import claim, nostr
 
-        net, p = self._net, self._params
+        net = self._net
         sk = self._load_ephemeral_sk(job)
-        expected = int(job.post_tip_mojos) + int(p.claim_fee_mojos)
+        expected = self._funded_amount(job)
+        # The bundle must balance against the coin that actually exists, so the
+        # fee it spends is the one that was funded, not today's config value.
+        claim_fee = expected - int(job.post_tip_mojos or 0)
 
         # Completion first (idempotent resume): our predicted final CAT coin id is
         # derived from our own bundle, so its presence means *our* claim landed.
@@ -950,7 +953,7 @@ class WarpEngine:
             validator_sigs=sigs,
             security_coin=coin,
             ephemeral_sk=sk,
-            claim_fee=p.claim_fee_mojos,
+            claim_fee=claim_fee,
         )
         final_id = push.claim.final_cat_coin_id.hex()
         if push.accepted:
@@ -1140,6 +1143,26 @@ class WarpEngine:
         """
         frozen = job.state.get("dry_run")
         return bool(self._params.dry_run if frozen is None else frozen)
+
+    def _funded_amount(self, job: WarpJob) -> int:
+        """The amount the security coin was actually funded with.
+
+        [WARP-FEE-FREEZE 2026-08-08] ``find_security_coin`` matches the on-chain
+        amount exactly, so every lookup has to use what was *sent*, not what
+        ``claim_fee_mojos`` says now. The three hot-path handlers recomputed it
+        from live params: editing that key and reloading made them scan for an
+        amount no coin has, so the claim raised WarpPending forever, and because
+        :meth:`_apply_stay` resets ``retry_count`` and clears ``last_error`` on
+        every pend, the job never reached FAILED and its context menu stayed
+        empty. Only reverting the config recovered it.
+
+        Falls back to live config for rows funded before the amount was
+        recorded, which is what :meth:`_sweep_job` already did.
+        """
+        return int(
+            job.state.get("funding_amount")
+            or int(job.post_tip_mojos or 0) + int(self._params.claim_fee_mojos)
+        )
 
     def _binding_mismatch(self, job: WarpJob) -> Optional[str]:
         """Why this job must not be processed under the current config, or ``None``.
@@ -1428,11 +1451,7 @@ class WarpEngine:
             resolved, status = True, "no ephemeral key: nothing was ever funded"
         else:
             sk = self._load_ephemeral_sk(job)
-            # What was actually sent, not what current config would send.
-            expected = int(
-                job.state.get("funding_amount")
-                or int(job.post_tip_mojos or 0) + int(self._params.claim_fee_mojos)
-            )
+            expected = self._funded_amount(job)
             coin = claim.find_security_coin(self._coinset, sk, expected)
             if coin is None:
                 resolved, status = self._funding_provably_gone(job)
