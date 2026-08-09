@@ -385,6 +385,8 @@ class MainWindow(QMainWindow):
         if warp_widget is not None and warp_svc is not None:
             if hasattr(warp_widget, "bridge_now_requested"):
                 warp_widget.bridge_now_requested.connect(warp_svc.request_bridge)
+            if hasattr(warp_widget, "unwrap_requested"):
+                warp_widget.unwrap_requested.connect(warp_svc.request_unwrap)
             if hasattr(warp_widget, "job_action_requested"):
                 warp_widget.job_action_requested.connect(warp_svc.job_action)
 

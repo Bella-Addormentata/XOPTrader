@@ -344,3 +344,46 @@ def test_copy_says_base_not_ethereum(qapp):
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+# ---------------------------------------------------------------------------
+# Unwrap controls
+# ---------------------------------------------------------------------------
+
+def test_unwrap_click_emits_mojos_and_destination(qapp):
+    w = _make(qapp, {"enabled": True})
+    got = []
+    w.unwrap_requested.connect(lambda mojos, dest: got.append((mojos, dest)))
+
+    w._unwrap_amount.setText("5.000")
+    w._unwrap_dest.setText("0x" + "ab" * 20)
+    w._unwrap_btn.click()
+
+    assert got == [(5000, "0x" + "ab" * 20)]
+
+
+def test_unwrap_click_refuses_a_non_numeric_amount(qapp):
+    w = _make(qapp, {"enabled": True})
+    got = []
+    w.unwrap_requested.connect(lambda *a: got.append(a))
+
+    w._unwrap_amount.setText("five")
+    w._unwrap_dest.setText("0x" + "ab" * 20)
+    w._unwrap_btn.click()
+
+    assert got == [], "an unparseable amount must emit nothing"
+
+
+def test_unwrap_destination_has_no_default(qapp):
+    """The receiver is curried into the burn puzzle; a defaulted destination
+    would make a mis-click unrecoverable by anyone."""
+    w = _make(qapp, {"enabled": True})
+    assert w._unwrap_dest.text() == ""
+
+
+def test_outbound_statuses_have_labels(qapp):
+    from gui.widgets import warp as warp_widget_mod
+
+    for status in ("UNWRAP_CHECKS", "BURN_SENT", "BURNING",
+                   "COLLECTING_EVM_SIGS", "RELAYING"):
+        assert status in warp_widget_mod._STATUS_LABELS

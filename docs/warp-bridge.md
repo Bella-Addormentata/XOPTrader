@@ -433,6 +433,41 @@ a mid-job surprise.
 
 ---
 
+## 9b. Unwrap (Chia -> Base)
+
+The return leg burns wUSDC.b and releases native USDC on Base. Operator-only:
+no auto-unwrap exists, and `warp.max_unwrap_usdc` must be set (or `unlimited`,
+stated explicitly) before the Unwrap button does anything.
+
+* **The commit point is the `cat_spend`.** Every gate -- burn anchors (offline
+  and live), the EIP-712 domain, wallet resolution, spendable balance, live
+  signature threshold, bridge liquidity, relay gas, toll funds -- runs before
+  it. After it the unwrap is **forward-only**: the receiver is curried into
+  the burn puzzle, so nothing can redirect the funds, including us. The
+  failure mode is "stuck pending a relay", never "stolen".
+* **Costs**: the 0.3% warp tip (scale-then-tip: 0.001 USDC in pays 997
+  micro-USDC out) + the 0.001 XCH toll (burned as the bundle's fee) + Base
+  relay gas (~145k measured).
+* **Dry run**: with `warp.dry_run: true` an unwrap exercises every gate and
+  closes DRY_RUN_OK without sending the `cat_spend`. **The first live unwrap
+  should be 0.001 USDC** -- the smallest possible -- and treated as the
+  rehearsal for the one step no test has ever executed.
+* **Spendable vs confirmed**: the daemon's default coin selection honours
+  offer locks, so an unwrap waits while the balance is offer collateral
+  rather than double-spending it. The gate pends with the difference shown.
+* **Recovery**: a FAILED unwrap offers Retry (safe: the relay is idempotent,
+  '!nonce' means someone already delivered and completes the job), Sweep (the
+  toll coin only), and Abandon (records the nonce and recovery details; the
+  attested message stays deliverable forever). Whether the portal explorer's
+  "Complete Relay" works for xch->bse is **unverified** -- until it is, keep
+  ETH on Base for our own relay.
+* **P&L**: the engine has no transfer-out event yet, so an unwrap appears as
+  a wUSDC.b balance drop: expect one LedgerDivergence alert and one negative
+  `adjust` per unwrap. Cross-check any divergence against `warp_jobs.db`
+  (both directions) before dismissing it; `SUM(adjust)` now overstates
+  "unexplained" by the sum of deliberate unwraps. A proper `transfer` ledger
+  event is a follow-up PR.
+
 ## 10. Known limitations
 
 This PR wires the fully-automatic bridge and its live monitor. Two operator

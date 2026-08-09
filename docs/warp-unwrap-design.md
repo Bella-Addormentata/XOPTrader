@@ -1,6 +1,36 @@
 # Warp unwrap (Chia → Base) — requirements and design notes
 
-**Status: design only. Nothing in this document is implemented.**
+**Status: IMPLEMENTED (2026-08-09), with the corrections below.** The design
+survived contact with reality well; where execution disagreed with this
+document, execution won:
+
+* **The minimum viable unwrap is 0.001 USDC (1 mojo), not 0.002** (SS8): the
+  ERC20Bridge scales mojos to base units FIRST and then takes the 30 bps tip
+  -- proven against two real unwraps. 1 mojo pays the receiver 997 base units.
+* **Relay gas measured 145,195** on a real delivery (SS4 guessed ~160k).
+* **The domain separator getters all revert** on the deployed Portal; the live
+  read is EIP-5267 `eip712Domain()`, and the reconstructed separator is
+  anchored in tests and verified by recovering a real relay's six signatures.
+* **Five states, not seven** (SS6.2): UNWRAP_CHECKS -> BURN_SENT -> BURNING ->
+  COLLECTING_EVM_SIGS -> RELAYING, sharing the closed states. No `direction`
+  column (SS5): the status vocabulary is the discriminator and direction rides
+  in JSON state, per the store's own evolving-payload rule. The single
+  active-slot index stays table-wide (Q4 settled).
+* **Two transactions, not one five-spend bundle** (SS2.1): the daemon's
+  `cat_spend` first (THE commit point), then a four-spend bundle (security,
+  burn CAT, cat_burner, bridging). The burn<->message atomicity lives inside
+  the bundle, so the structural guarantee holds unchanged.
+* Q1 settled: daemon 2.7.3 exposes `cat_spend`; the wUSDC.b wallet resolves
+  by TAIL at runtime. Q2 settled in-tree: the burn hash derives offline and
+  matches the live contract. Q3 (portal-explorer relay for xch->bse) remains
+  UNVERIFIED and the manual-fallback story still rests on it. Q6 (ledger):
+  an unwrap books as engine drift -- see the runbook; a proper transfer event
+  is a follow-up.
+* **What remains unexecuted anywhere: the `cat_spend` itself.** Every gate,
+  bundle construction, digest, signature and relay encoding is pinned against
+  real mainnet data, but no one has ever run the commit point. The first live
+  action must be the 0.001-USDC micro-unwrap rehearsal.
+
 
 The shipped bridge (see [warp-bridge.md](warp-bridge.md)) is one-way: USDC on Base →
 wUSDC.b on Chia. This document describes what the return leg — wUSDC.b → native USDC

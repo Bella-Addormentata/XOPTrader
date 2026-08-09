@@ -2927,6 +2927,14 @@ class _WarpWorker(QObject):
         )
 
     @Slot(int, str)
+    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+        self.snapshot_ready.emit(
+            self._guarded(
+                lambda engine: engine.request_unwrap(int(amount_mojos), receiver)
+            )
+        )
+
+    @Slot(int, str)
     def job_action(self, job_id: int, action: str) -> None:
         self.snapshot_ready.emit(
             self._guarded(lambda engine: engine.job_action(job_id, action))
@@ -3101,6 +3109,7 @@ class WarpService(QObject):
     _trigger_tick = Signal()
     _trigger_params = Signal(dict)
     _trigger_bridge = Signal(object)
+    _trigger_unwrap = Signal(int, str)
     _trigger_action = Signal(int, str)
 
     def __init__(self, config: Optional[dict] = None, parent: Optional[QObject] = None) -> None:
@@ -3118,6 +3127,7 @@ class WarpService(QObject):
         self._trigger_tick.connect(self._worker.tick)
         self._trigger_params.connect(self._worker.set_config)
         self._trigger_bridge.connect(self._worker.request_bridge)
+        self._trigger_unwrap.connect(self._worker.request_unwrap)
         self._trigger_action.connect(self._worker.job_action)
 
         self._trigger_params.emit(dict(config or {}))
@@ -3162,6 +3172,11 @@ class WarpService(QObject):
         if not self._thread.isRunning():
             self.start()
         self._trigger_bridge.emit(target_micros)
+
+    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+        if not self._thread.isRunning():
+            self.start()
+        self._trigger_unwrap.emit(int(amount_mojos), str(receiver))
 
     def job_action(self, job_id: int, action: str) -> None:
         if not self._thread.isRunning():
