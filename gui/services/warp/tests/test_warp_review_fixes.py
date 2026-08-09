@@ -259,6 +259,40 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     engine.request_bridge()                    # a new job is possible again
 
 
+def test_the_real_engine_construction_path_actually_runs(tmp_path, monkeypatch):
+    """[WARP-BUILD-IMPORTS] _build_engine_with must resolve every name it uses.
+
+    Splitting _build_engine to close a sqlite leak moved the client imports
+    into the new half and dropped `nostr` from the list -- which
+    _build_engine_with still calls. The engine raised NameError on every
+    start, i.e. the bridge could never run at all, and nothing noticed:
+    every other test constructs WarpEngine directly through the harness's
+    build(), so this function had no coverage whatsoever.
+    """
+    from unittest import mock
+
+    from gui.services.warp import keystore as ks
+
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg: str(tmp_path / "warp_jobs.db"))
+    worker = S._WarpWorker()
+    worker.set_config({
+        "warp": {
+            "enabled": True,
+            "max_auto_bridge_usdc": 100,
+            "evm_private_key_dpapi": "irrelevant",
+        }
+    })
+
+    with mock.patch.object(
+        ks, "load_evm_key", return_value=ks.EvmKey(b"\x11" * 32, "0x" + "ab" * 20)
+    ):
+        engine = worker._ensure_engine()
+
+    assert engine is not None, f"engine did not build: {worker._engine_error}"
+    assert worker._engine_error is None
+    engine.close()
+
+
 def test_abandon_frees_the_slot_and_records_how_to_recover():
     """[WARP-ABANDON] The escape from a job the engine cannot resolve.
 

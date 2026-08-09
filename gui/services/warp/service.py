@@ -2144,14 +2144,10 @@ class _WarpWorker(QObject):
         if not params.enabled:
             raise WarpError("warp disabled")
 
+        # Only drivers is used here; the client imports moved with the code
+        # that constructs them into _build_engine_with.
         from . import (
-            coinset as coinset_mod,
             drivers as drivers_mod,
-            evm as evm_mod,
-            keystore,
-            nostr,
-            wallet as wallet_mod,
-            watcher as watcher_mod,
         )
 
         net = constants.MAINNET
@@ -2186,6 +2182,7 @@ class _WarpWorker(QObject):
             coinset as coinset_mod,
             evm as evm_mod,
             keystore,
+            nostr,
             wallet as wallet_mod,
             watcher as watcher_mod,
         )
