@@ -74,6 +74,7 @@ SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes
 SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
 SEL_EIP712_DOMAIN = bytes.fromhex("84b0196e")     # eip712Domain() (EIP-5267)
 SEL_BURN_PUZZLE_HASH = bytes.fromhex("3f4710d3")  # burnPuzzleHash()
+SEL_TRANSFER = bytes.fromhex("a9059cbb")          # transfer(address,uint256)
 
 # MessageReceived(bytes32 indexed nonce, ...) -- the Portal's delivery event.
 # Pinned against the real relay receipt in tests/fixtures_unwrap.json, not
@@ -166,6 +167,10 @@ def _enc_bytes32(value: Any) -> bytes:
 
 def encode_call(selector: bytes, *words: bytes) -> bytes:
     return selector + b"".join(words)
+
+
+def encode_transfer(to: Any, amount_base_units: int) -> bytes:
+    return encode_call(SEL_TRANSFER, _enc_address(to), _enc_uint256(amount_base_units))
 
 
 def encode_approve(spender: Any, amount_base_units: int) -> bytes:
