@@ -148,6 +148,11 @@ _FUNDING_TX_UNKNOWN: str = "sent-id-unknown"
 # is harmless there and must not be refused.
 _DRY_RUN_SENSITIVE = frozenset({JobStatus.APPROVING, JobStatus.BRIDGING})
 
+# Sweep spends the job's own ephemeral security coin, which is an input to the
+# claim the state machine may still be assembling. Only safe once the machine
+# has stopped: FAILED (the operator's escape) or COMPLETED (nothing left).
+_SWEEPABLE = frozenset({JobStatus.FAILED, JobStatus.COMPLETED})
+
 
 # --------------------------------------------------------------------------- #
 # Parameters (parsed from the null-safe config dict).
@@ -199,7 +204,37 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     net = constants.MAINNET
     scale = 10 ** int(net.usdc_decimals)
     min_usdc = float(warp.get("min_auto_bridge_usdc", 0) or 0)
-    max_usdc = float(warp.get("max_auto_bridge_usdc", 0) or 0)
+
+    # [WARP-CAP-FAIL-OPEN 2026-08-08] The cap must be stated, not inferred.
+    # This resolved absent / commented-out / 0 / null all to 0, and the clamp
+    # is guarded on `if p.max_micros > 0` -- so a missing cap meant NO cap.
+    # Bridge now takes no amount argument and has no confirmation dialog, and
+    # the manual path deliberately skips the floor with want = have, so one
+    # click bridged the entire hot-wallet balance. The key is not exposed in
+    # any settings widget either, so it can only be hand-edited.
+    # Only enforced when the bridge is actually on: a disabled warp section
+    # must not stop the GUI from loading a config.
+    enabled = bool(warp.get("enabled", False))
+    raw_cap = warp.get("max_auto_bridge_usdc", None)
+    blank_cap = raw_cap is None or str(raw_cap).strip() == ""
+    if enabled and blank_cap:
+        raise WarpError(
+            "warp.max_auto_bridge_usdc is required when warp.enabled is true: "
+            "it is the blast radius for both auto-bridging and the Bridge now "
+            "button, and an absent value meant no limit at all. Set a number, "
+            "or 'unlimited' to state explicitly that any balance may be bridged"
+        )
+    if blank_cap or str(raw_cap).strip().lower() == "unlimited":
+        max_usdc = 0.0                      # 0 == uncapped
+    else:
+        max_usdc = float(raw_cap or 0)
+        if max_usdc <= 0:
+            if enabled:
+                raise WarpError(
+                    f"warp.max_auto_bridge_usdc must be positive (got {raw_cap!r}); "
+                    "use 'unlimited' if no cap is genuinely intended"
+                )
+            max_usdc = 0.0
     return WarpParams(
         enabled=bool(warp.get("enabled", False)),
         dry_run=bool(warp.get("dry_run", True)),
@@ -1193,6 +1228,47 @@ class WarpEngine:
         frozen = job.state.get("dry_run")
         return bool(self._params.dry_run if frozen is None else frozen)
 
+    def _retry_tx_reset(self, job: WarpJob) -> Dict[str, Any]:
+        """State to clear so a retry re-signs, rather than replaying a dead tx.
+
+        [WARP-RETRY-RAW 2026-08-08] A job that FAILED out of APPROVING or
+        BRIDGING still holds the raw it was last signed as -- the final revert
+        raises WarpTerminal without clearing it, unlike the earlier attempts.
+        Retry restored the status and phase 2 rebroadcast that same raw, so the
+        job reverted again immediately and the operator's only affordance did
+        nothing.
+
+        Clearing it is only safe once the nonce cannot mine. The stuck-tx path
+        also lands in FAILED, and there the transaction may still be sitting in
+        the mempool: re-signing would take a *new* nonce and bridge a second
+        time. So the nonce is checked against the chain first, and while it is
+        still open the raw is kept and the retry just resumes polling it.
+        """
+        target = job.state.get("failed_from")
+        if target not in (JobStatus.APPROVING, JobStatus.BRIDGING):
+            return {}
+
+        nonce = job.state.get(
+            "bridge_tx_nonce" if target == JobStatus.BRIDGING else "approve_tx_nonce"
+        )
+        if nonce is not None:
+            try:
+                mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+            except Exception:  # noqa: BLE001 -- cannot prove it is dead, so keep it
+                return {}
+            if mined <= int(nonce):
+                return {}          # still live: replaying is safer than re-signing
+
+        if target == JobStatus.BRIDGING:
+            return {
+                "bridge_raw": None,
+                "bridge_status_polls": None,
+                "bridge_unmined_polls": None,
+                "bridge_fee_bumps": None,
+                "bridge_prior_hashes": None,
+            }
+        return {"approve_raw": None, "approve_tx_hash": None, "approve_status_polls": None}
+
     def _bridge_hashes(self, job: WarpJob) -> list:
         """Every hash this job's bridge nonce has been signed under, newest first."""
         hashes = [job.bridge_tx_hash] if job.bridge_tx_hash else []
@@ -1531,12 +1607,19 @@ class WarpEngine:
                 else None
             )
             if job.status == JobStatus.FAILED and target:
+                reset = self._retry_tx_reset(job)
                 self._store.update_job(
                     job_id,
                     status=target,
                     expected_status=JobStatus.FAILED,
                     columns={"retry_count": 0, "last_error": None, "next_retry_at": None},
-                    event=("retry", f"operator retry -> {target}", None),
+                    state_patch=reset or None,
+                    event=(
+                        "retry",
+                        f"operator retry -> {target}"
+                        + (" (re-signing: the previous nonce is spent)" if reset else ""),
+                        None,
+                    ),
                 )
             else:
                 self._store.update_job(
@@ -1558,6 +1641,17 @@ class WarpEngine:
             )
             return _job_dict(self._store.get_job(job_id))
         if action == "sweep":
+            # The GUI already restricts Sweep to these two (widgets/warp.py),
+            # but it acts on a polled snapshot that can be a full interval
+            # stale. Sweep spends the job's own security coin, which is the
+            # input to the claim the machine may still be building, so a race
+            # could pull it out from under an in-flight job. Enforce it here
+            # too, where the state is authoritative.
+            if job.status not in _SWEEPABLE:
+                raise WarpError(
+                    f"cannot sweep a job in {job.status}; the security coin is "
+                    "still an input to the claim being built"
+                )
             return self._sweep_job(job)
         raise WarpError(f"unknown job action: {action!r}")
 

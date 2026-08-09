@@ -347,7 +347,7 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `base_rpc_url` | `https://mainnet.base.org` | Base JSON-RPC endpoint. A private Alchemy/Infura key is more reliable. Blank ⇒ network default. |
 | `auto_bridge` | `false` | Automatically bridge deposits at/above `min_auto_bridge_usdc`. |
 | `min_auto_bridge_usdc` | `100` | **Auto-bridge floor only.** "Bridge now" ignores it and bridges any positive balance. |
-| `max_auto_bridge_usdc` | `10000` | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. |
+| `max_auto_bridge_usdc` | *required* | Blast-radius cap. Applies to **manual bridges too**; the excess stays in the hot wallet. There is no default: with `warp.enabled: true` the bridge refuses to start unless this is set, because an absent value previously meant *no cap*, not `10000`. Set `unlimited` to allow any balance. |
 | `claim_fee_mojos` | `100000000` | XCH fee reserved for the Chia claim spend (0.0001 XCH). |
 | `chia_funding_fee_mojos` | `0` | Extra fee on the wallet→claim funding send. |
 | `poll_interval_s` | `15` | How long a healthy "still waiting" step sleeps before it is re-checked. The GUI's own tick cadence (~30 s) is separate and not configurable here. |

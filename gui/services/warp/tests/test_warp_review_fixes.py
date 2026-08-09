@@ -671,6 +671,72 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def test_an_enabled_bridge_must_state_its_cap():
+    """[WARP-CAP-FAIL-OPEN] A missing cap used to mean no cap at all.
+
+    The clamp is guarded on `if p.max_micros > 0`, and absent / blank / 0 / null
+    all resolved to 0 -- so omitting the key removed the limit rather than
+    setting one. Bridge now takes no amount and has no confirmation dialog, and
+    the manual path skips the floor with want = have, so one click bridged the
+    whole hot-wallet balance.
+    """
+    with pytest.raises(S.WarpError, match="max_auto_bridge_usdc is required"):
+        S.warp_params_from_config({"warp": {"enabled": True}})
+
+    with pytest.raises(S.WarpError, match="must be positive"):
+        S.warp_params_from_config(
+            {"warp": {"enabled": True, "max_auto_bridge_usdc": 0}}
+        )
+
+    # Uncapped is still reachable, but it has to be said out loud.
+    assert S.warp_params_from_config(
+        {"warp": {"enabled": True, "max_auto_bridge_usdc": "unlimited"}}
+    ).max_micros == 0
+
+    # A disabled warp section must never stop a config from loading.
+    assert S.warp_params_from_config({"warp": {"enabled": False}}).max_micros == 0
+
+
+def test_sweep_is_refused_engine_side_for_an_in_flight_job():
+    """The GUI gates Sweep on a polled snapshot; the engine must gate it too."""
+    store = new_store()
+    engine, _ctx = build(store)
+    job = seed(store, JobStatus.CLAIMING, columns={"receiver_ph": RECEIVER_PH.hex()})
+
+    with pytest.raises(S.WarpError, match="still an input to the claim"):
+        engine.job_action(job.id, "sweep")
+
+
+def test_retry_re_signs_only_once_the_nonce_is_spent(monkeypatch):
+    """[WARP-RETRY-RAW] Replaying a reverted raw fails again immediately.
+
+    But clearing it unconditionally is worse: the stuck-tx path also lands in
+    FAILED with the transaction possibly still in the mempool, and re-signing
+    would take a new nonce and bridge a second time.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"failed_from": JobStatus.BRIDGING,
+               "bridge_raw": "02bbbbbb", "bridge_tx_nonce": 3},
+    )
+
+    # Nonce still open -> the transaction may yet mine, so keep the raw.
+    ctx.evm.mined_nonce = 3
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state["bridge_raw"] == "02bbbbbb"
+
+    # Nonce spent -> nothing signed can mine, so re-sign on the next tick.
+    store.update_job(job.id, status=JobStatus.FAILED,
+                     state_patch={"failed_from": JobStatus.BRIDGING})
+    ctx.evm.mined_nonce = 9
+    engine.job_action(job.id, "retry")
+    assert store.get_job(job.id).state.get("bridge_raw") is None
+
+
 def _seed_broadcast_bridge(store):
     seed(store, JobStatus.BRIDGING,
          columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()})
@@ -981,9 +1047,12 @@ def test_testnet_config_key_is_rejected():
 
 
 def test_dry_run_defaults_on():
-    assert S.warp_params_from_config({"warp": {"enabled": True}}).dry_run is True
+    cap = {"max_auto_bridge_usdc": 100}      # required once enabled
     assert S.warp_params_from_config(
-        {"warp": {"enabled": True, "dry_run": False}}
+        {"warp": {"enabled": True, **cap}}
+    ).dry_run is True
+    assert S.warp_params_from_config(
+        {"warp": {"enabled": True, "dry_run": False, **cap}}
     ).dry_run is False
 
 
@@ -1097,6 +1166,7 @@ def test_build_engine_checks_the_anchor_before_constructing_clients(monkeypatch)
     worker.set_config({
         "warp": {
             "enabled": True,
+            "max_auto_bridge_usdc": 100,             # required once enabled
             "expected_asset_id": "ff" * 32,          # deliberately wrong
             "evm_private_key_dpapi": "irrelevant",
         }
