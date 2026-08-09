@@ -67,6 +67,11 @@ SEL_DECIMALS = bytes.fromhex("313ce567")          # decimals()
 SEL_MESSAGE_TOLL = bytes.fromhex("79c06b8b")      # messageToll()
 SEL_TIP = bytes.fromhex("2755cd2d")               # tip()
 SEL_BRIDGE_TO_CHIA = bytes.fromhex("cdb50da7")    # bridgeToChia(address,bytes32,uint256)
+# Outbound (unwrap) relay -- both verified against keccak in the tests, and
+# SEL_RECEIVE_MESSAGE against the deployed selector noted in
+# docs/warp-unwrap-design.md §2.2.
+SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)
+SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
 
 # MessageSent(bytes32 indexed nonce, address, bytes3, bytes32, bytes32[])
 MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7251a7a8"
@@ -165,6 +170,102 @@ def encode_bridge_to_chia(asset: Any, receiver_ph: Any, mojo_amount: int) -> byt
         _enc_bytes32(receiver_ph),
         _enc_uint256(mojo_amount),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Outbound relay encoding (unwrap: Portal.receiveMessage).
+#
+# The only dynamic-ABI call in this module. Everything else is static words, so
+# the head/tail layout is written out longhand here and byte-compared against
+# eth_abi's independent encoder in the tests rather than pulling eth_abi into
+# the runtime path.
+# --------------------------------------------------------------------------- #
+
+def pack_validator_sigs(sigs: list) -> bytes:
+    """Pack validator signatures the way the Portal demands.
+
+    ``sigs`` is a list of ``(signer_address, v, r, s)`` with ``v`` in
+    {27, 28}, ``r``/``s`` 32 bytes each. The Portal requires (all verified
+    [V] in docs/warp-unwrap-design.md §2.2):
+
+    * layout ``v||r||s`` per signature -- NOT the usual r||s||v;
+    * recovered signers in strictly ascending address order
+      (``require(signer > lastSigner)``), so the pack sorts;
+    * the exact length ``signatureThreshold * 65`` -- not a minimum -- which
+      is the caller's check since only it knows the live threshold.
+    """
+    entries = []
+    seen = set()
+    for signer, v, r, s in sigs:
+        addr = int(_hx(signer), 16)
+        if addr in seen:
+            raise EvmError(f"duplicate validator signature from {signer}")
+        seen.add(addr)
+        v = int(v)
+        if v not in (27, 28):
+            raise EvmError(f"signature v must be 27 or 28, got {v}")
+        r, s = bytes(r), bytes(s)
+        if len(r) != 32 or len(s) != 32:
+            raise EvmError("signature r and s must be 32 bytes each")
+        entries.append((addr, bytes([v]) + r + s))
+    entries.sort(key=lambda e: e[0])
+    return b"".join(chunk for _addr, chunk in entries)
+
+
+def encode_receive_message(
+    nonce: Any,
+    source_chain: bytes,
+    source: Any,
+    destination: Any,
+    contents: list,
+    sigs_packed: bytes,
+) -> bytes:
+    """Calldata for ``Portal.receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)``.
+
+    ``source`` is the Chia-side sender (the bridging coin's parent lineage --
+    a 32-byte word), ``destination`` the ERC20Bridge, ``contents`` the
+    validator-padded 32-byte memo atoms. Head is six slots; ``contents`` and
+    ``sigs`` are dynamic tails.
+    """
+    contents_words = [_enc_bytes32(c) for c in contents]
+    head_size = 6 * 32
+    contents_offset = head_size
+    contents_size = 32 + 32 * len(contents_words)
+    sigs_offset = contents_offset + contents_size
+
+    chain = bytes(source_chain)
+    if len(chain) != 3:
+        raise EvmError(f"source_chain must be 3 bytes, got {len(chain)}")
+
+    sigs = bytes(sigs_packed)
+    if len(sigs) % 65 != 0:
+        raise EvmError(f"packed sigs length {len(sigs)} is not a multiple of 65")
+    padded_sigs = sigs + b"\x00" * ((32 - len(sigs) % 32) % 32)
+
+    return (
+        SEL_RECEIVE_MESSAGE
+        + _enc_bytes32(nonce)
+        + chain + b"\x00" * 29                    # bytes3, right-padded
+        + _enc_bytes32(source)
+        + _enc_address(destination)
+        + _enc_uint256(contents_offset)
+        + _enc_uint256(sigs_offset)
+        + _enc_uint256(len(contents_words))
+        + b"".join(contents_words)
+        + _enc_uint256(len(sigs))
+        + padded_sigs
+    )
+
+
+def is_already_delivered(exc: BaseException) -> bool:
+    """Whether a relay revert means the message was already delivered.
+
+    ``usedNonces[key] = true`` is written *before* the bridge call with no
+    try/catch, so a bridge-side revert rolls the nonce write back and the
+    relay is retryable. Only the Portal's own ``"!nonce"`` means someone
+    (us or a third party) already delivered this message [V].
+    """
+    return "!nonce" in str(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -560,6 +661,15 @@ class EvmClient:
     def get_tip_bps(self) -> int:
         """``ERC20Bridge.tip()`` in basis points (immutable)."""
         return self._call_uint(self._net.erc20_bridge_address, SEL_TIP)
+
+    def get_signature_threshold(self) -> int:
+        """``Portal.signatureThreshold()`` -- owner-mutable, so always read live.
+
+        The relay's signature blob must be exactly ``threshold * 65`` bytes --
+        the contract checks equality, not a minimum -- so a stale count makes
+        every relay revert. Read it at gate time, never cached across a job.
+        """
+        return self._call_uint(self._net.portal_address, SEL_SIGNATURE_THRESHOLD)
 
     # -- fees / nonce -------------------------------------------------------- #
 

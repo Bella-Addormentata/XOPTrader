@@ -69,6 +69,8 @@ def test_selectors_and_topic_match_keccak():
         "messageToll()": evm.SEL_MESSAGE_TOLL,
         "tip()": evm.SEL_TIP,
         "bridgeToChia(address,bytes32,uint256)": evm.SEL_BRIDGE_TO_CHIA,
+        "receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)": evm.SEL_RECEIVE_MESSAGE,
+        "signatureThreshold()": evm.SEL_SIGNATURE_THRESHOLD,
     }
     for sig, selector in cases.items():
         assert keccak(text=sig)[:4] == selector, sig
@@ -351,3 +353,64 @@ def test_prepare_bridge_reads_live_toll_nonce_and_fees():
     assert tx.nonce == 3
     assert tx.gas == 200_000 * 5 // 4          # estimate + 25% headroom
     assert tx.max_priority_fee_per_gas == 1_000_000
+
+
+# --------------------------------------------------------------------------- #
+# Outbound relay encoding (unwrap).
+# --------------------------------------------------------------------------- #
+
+def test_receive_message_calldata_matches_an_independent_encoder():
+    """Byte-compare the hand-rolled head/tail layout against eth_abi.
+
+    Two independent implementations agreeing is the check; a shape mistake in
+    dynamic ABI encoding (offsets, padding) would produce calldata the Portal
+    decodes as garbage -- and the relay burns gas to be told so.
+    """
+    eth_abi = pytest.importorskip("eth_abi")
+
+    nonce = bytes(range(32))
+    source = b"\x11" * 32
+    dest = "0x" + "ab" * 20
+    contents = [b"\x22" * 32, b"\x33" * 32, b"\x44" * 32]
+    sigs = bytes(range(65)) * 6                    # threshold 6, v||r||s each
+
+    ours = evm.encode_receive_message(nonce, b"xch", source, dest, contents, sigs)
+
+    reference = evm.SEL_RECEIVE_MESSAGE + eth_abi.encode(
+        ["bytes32", "bytes3", "bytes32", "address", "bytes32[]", "bytes"],
+        [nonce, b"xch", source, bytes.fromhex("ab" * 20), contents, sigs],
+    )
+    assert ours == reference
+
+
+def test_pack_validator_sigs_sorts_ascending_and_packs_v_first():
+    """The Portal wants v||r||s in strictly ascending recovered-signer order."""
+    lo = "0x" + "01" * 20
+    hi = "0x" + "ff" * 20
+    r1, s1 = b"\xaa" * 32, b"\xbb" * 32
+    r2, s2 = b"\xcc" * 32, b"\xdd" * 32
+
+    packed = evm.pack_validator_sigs([(hi, 28, r2, s2), (lo, 27, r1, s1)])
+
+    assert len(packed) == 130
+    assert packed[:65] == bytes([27]) + r1 + s1    # lower address first
+    assert packed[65:] == bytes([28]) + r2 + s2
+    assert packed[0] == 27, "v sits at +0, not after r||s"
+
+
+def test_pack_validator_sigs_rejects_duplicates_and_bad_v():
+    r, s = b"\x00" * 32, b"\x00" * 32
+    with pytest.raises(evm.EvmError, match="duplicate"):
+        evm.pack_validator_sigs([("0x" + "01" * 20, 27, r, s),
+                                 ("0x" + "01" * 20, 28, r, s)])
+    with pytest.raises(evm.EvmError, match="v must be 27 or 28"):
+        evm.pack_validator_sigs([("0x" + "01" * 20, 1, r, s)])
+
+
+def test_already_delivered_classification():
+    """Only the Portal's own "!nonce" means delivered; usedNonces is written
+    before the bridge call with no try/catch, so bridge-side reverts roll the
+    nonce back and the relay stays retryable."""
+    assert evm.is_already_delivered(evm.EvmRpcError("execution reverted: !nonce"))
+    assert not evm.is_already_delivered(evm.EvmRpcError("execution reverted: !amnt"))
+    assert not evm.is_already_delivered(evm.EvmRpcError("execution reverted: !sig"))
