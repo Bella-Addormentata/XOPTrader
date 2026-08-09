@@ -387,3 +387,24 @@ def test_outbound_statuses_have_labels(qapp):
     for status in ("UNWRAP_CHECKS", "BURN_SENT", "BURNING",
                    "COLLECTING_EVM_SIGS", "RELAYING"):
         assert status in warp_widget_mod._STATUS_LABELS
+
+
+def test_unwrap_amount_parser_never_rounds_or_crashes(qapp):
+    """[PR72-REVIEW] float(text)*1000 rounded 0.0006 UP to 1 mojo (an unwrap
+    the operator never typed), drifted on 5.0005, and raised an uncaught
+    OverflowError on 1e309. Decimal + exact-increment + minimum, or no emit."""
+    w = _make(qapp, {"enabled": True})
+    got = []
+    w.unwrap_requested.connect(lambda *a: got.append(a))
+    w._unwrap_dest.setText("0x" + "ab" * 20)
+
+    for bad in ("0.0006", "0.0004", "5.0005", "1e309", "nan", "inf", "-1", "0"):
+        w._unwrap_amount.setText(bad)
+        w._unwrap_btn.click()
+    assert got == [], f"none of the malformed inputs may emit, got {got}"
+
+    w._unwrap_amount.setText("0.001")
+    w._unwrap_btn.click()
+    w._unwrap_amount.setText("5.001")
+    w._unwrap_btn.click()
+    assert got == [(1, "0x" + "ab" * 20), (5001, "0x" + "ab" * 20)]

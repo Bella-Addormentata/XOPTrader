@@ -618,3 +618,25 @@ def test_a_threshold_change_bounces_relay_back_to_collection(monkeypatch):
 
     assert out["status"] == JobStatus.COLLECTING_EVM_SIGS
     assert store.get_active_job().state.get("relay_sigs") is None
+
+
+# --------------------------------------------------------------------------- #
+# PR #72 review comments (Copilot), pinned.
+# --------------------------------------------------------------------------- #
+
+def test_cap_parsers_reject_junk_with_a_clear_error():
+    """[PR72-REVIEW] float(raw) let 'abc' surface as a raw ValueError, 1e309
+    overflow downstream, and nan slip PAST the positivity check entirely
+    (NaN comparisons are always False). Both cap keys and the min share the
+    parser now."""
+    for key in ("max_unwrap_usdc", "max_auto_bridge_usdc"):
+        for bad in ("abc", float("nan"), float("inf"), "1e309", [1]):
+            cfg = {"warp": {"enabled": key == "max_auto_bridge_usdc",
+                            key: bad}}
+            if key == "max_auto_bridge_usdc":
+                cfg["warp"]["max_auto_bridge_usdc"] = bad
+            with pytest.raises(S.WarpError, match="is not a number|must be finite"):
+                S.warp_params_from_config(cfg)
+
+    with pytest.raises(S.WarpError, match="min_auto_bridge_usdc"):
+        S.warp_params_from_config({"warp": {"min_auto_bridge_usdc": "abc"}})

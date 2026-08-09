@@ -244,13 +244,32 @@ def _parse_unwrap_cap(warp: dict) -> int:
         return -1
     if str(raw).strip().lower() == "unlimited":
         return 0
-    value = float(raw)
+    value = _parse_usdc_config_value("max_unwrap_usdc", raw)
     if value <= 0 or int(round(value * 1_000_000)) <= 0:
         raise WarpError(
             f"warp.max_unwrap_usdc must be positive (got {raw!r}); use "
             "'unlimited' if no cap is genuinely intended"
         )
     return int(round(value * 1_000_000))
+
+
+def _parse_usdc_config_value(key: str, raw: object) -> float:
+    """A finite float from a user-facing config knob, or a clear WarpError.
+
+    A bare ``float(raw)`` let ``'abc'`` raise a raw ValueError that surfaced
+    as an unhelpful engine-start failure, ``1e309`` overflow on the later
+    ``int()``, and ``nan`` slip PAST the positivity check entirely -- NaN
+    comparisons are always False -- before crashing downstream.
+    """
+    import math
+
+    try:
+        value = float(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise WarpError(f"warp.{key} is not a number (got {raw!r})") from exc
+    if not math.isfinite(value):
+        raise WarpError(f"warp.{key} must be finite (got {raw!r})")
+    return value
 
 
 def warp_params_from_config(config: Optional[dict]) -> WarpParams:
@@ -268,7 +287,9 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         )
     net = constants.MAINNET
     scale = 10 ** int(net.usdc_decimals)
-    min_usdc = float(warp.get("min_auto_bridge_usdc", 0) or 0)
+    min_usdc = _parse_usdc_config_value(
+        "min_auto_bridge_usdc", warp.get("min_auto_bridge_usdc", 0) or 0
+    )
 
     # [WARP-CAP-FAIL-OPEN 2026-08-08] The cap must be stated, not inferred.
     # This resolved absent / commented-out / 0 / null all to 0, and the clamp
@@ -292,7 +313,7 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     if blank_cap or str(raw_cap).strip().lower() == "unlimited":
         max_usdc = 0.0                      # 0 == uncapped
     else:
-        max_usdc = float(raw_cap or 0)
+        max_usdc = _parse_usdc_config_value("max_auto_bridge_usdc", raw_cap or 0)
         if max_usdc <= 0:
             if enabled:
                 raise WarpError(

@@ -707,12 +707,29 @@ class WarpWidget(QWidget):
 
     def _on_unwrap_clicked(self) -> None:
         """Parse to mojos and emit; the engine re-validates everything."""
+        from decimal import Decimal, InvalidOperation
+
         text = (self._unwrap_amount.text() or "").strip()
         dest = (self._unwrap_dest.text() or "").strip()
+        # Decimal, not float: float(text) * 1000 rounds sub-minimum inputs UP
+        # (0.0006 -> 1 mojo -- an unwrap the operator never typed), drifts on
+        # values like 5.0005, and overflows on 1e309 with an exception the old
+        # ValueError-only catch missed, crashing the click handler.
         try:
-            mojos = int(round(float(text) * 1000))
-        except ValueError:
+            amount = Decimal(text)
+        except InvalidOperation:
             _log.warning("unwrap: amount %r is not a number", text)
+            self._unwrap_amount.setFocus()
+            return
+        if not amount.is_finite() or amount % Decimal("0.001") != 0:
+            _log.warning(
+                "unwrap: amount %r is not a whole 0.001-USDC increment", text
+            )
+            self._unwrap_amount.setFocus()
+            return
+        mojos = int(amount * 1000)
+        if mojos < 1:
+            _log.warning("unwrap: amount %r is below the 0.001 USDC minimum", text)
             self._unwrap_amount.setFocus()
             return
         self.unwrap_requested.emit(mojos, dest)
