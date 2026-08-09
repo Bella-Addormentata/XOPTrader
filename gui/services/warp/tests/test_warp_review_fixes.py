@@ -671,6 +671,79 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def test_a_receipt_without_a_status_is_not_treated_as_success(monkeypatch):
+    """[WARP-RECEIPT-AMBIG] "not reverted" is not "succeeded".
+
+    Both handlers branched on receipt_reverted alone, so a receipt whose
+    status is absent or unparseable took the success path -- advancing to
+    BRIDGING on an allowance that may never have taken effect.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000})
+
+    engine.step()                                   # phase 1: sign
+    ctx.evm.receipt = {"blockNumber": "0x10"}       # mined, but no status field
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.APPROVING, "must not advance on an unknown status"
+    assert store.get_active_job().state["approve_status_polls"] == 1
+
+
+def test_an_ambiguous_receipt_eventually_fails_instead_of_pending_forever(monkeypatch):
+    """The re-poll is bounded: FAILED is the status with operator affordances."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5_000_000, "amount_mojos": 5000})
+
+    engine.step()
+    ctx.evm.receipt = {"blockNumber": "0x10"}
+    out = None
+    for _ in range(S._AMBIGUOUS_RECEIPT_POLLS + 2):
+        out = engine.step()
+        if out["status"] == JobStatus.FAILED:
+            break
+
+    assert out["status"] == JobStatus.FAILED
+
+
+def test_estimate_gas_refuses_to_broadcast_a_reverting_call():
+    """[WARP-ESTIMATE-REVERT] A revert during estimation must not fall back.
+
+    Falling back to a fixed gas limit and broadcasting anyway spends the gas
+    to be told on chain what the node already said. A transport error is
+    different -- it says nothing about the transaction, and the fallback is
+    exactly right there.
+    """
+    from gui.services.warp.evm import EvmError, EvmRpcError
+
+    class _Client(evm_mod.EvmClient):
+        def __init__(self, exc):
+            self._exc = exc
+
+        def _call_quantity(self, method, params):
+            raise self._exc
+
+    reverting = _Client(EvmRpcError("execution reverted: ERC20: bad allowance", code=3))
+    with pytest.raises(EvmError):
+        reverting.estimate_gas(
+            from_address="0x" + "ab" * 20, to="0x" + "cd" * 20,
+            value=0, data=b"", default=250_000,
+        )
+
+    # A node that is merely unreachable still gets the fallback.
+    offline = _Client(EvmError("eth_estimateGas request failed: connection reset"))
+    assert offline.estimate_gas(
+        from_address="0x" + "ab" * 20, to="0x" + "cd" * 20,
+        value=0, data=b"", default=250_000,
+    ) == 250_000
+
+
 def test_editing_claim_fee_does_not_orphan_a_funded_job(monkeypatch):
     """[WARP-FEE-FREEZE] Lookups use the funded amount, not today's config.
 

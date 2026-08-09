@@ -114,6 +114,10 @@ _BRIDGE_MAX_ATTEMPTS: int = 2
 # we cannot see, and looping forever would leave the operator with no escape
 # (neither Sweep nor Cancel is offered in CLAIMING). Fail into FAILED, which is.
 _CLAIM_CONFLICT_MAX_ROUNDS: int = 10
+# Receipts that carry no usable status. Base is post-Byzantium so this should
+# never happen; if it does, it means we cannot tell success from revert, and
+# guessing either way is worse than handing the job to the operator.
+_AMBIGUOUS_RECEIPT_POLLS: int = 5
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
@@ -650,6 +654,21 @@ class WarpEngine:
                 },
                 message=f"approve reverted; re-preparing (attempt {attempt})",
             )
+        if not evm.receipt_succeeded(receipt):
+            # [WARP-RECEIPT-AMBIG 2026-08-08] Not reverted is not the same as
+            # succeeded. Branching on receipt_reverted alone sent a receipt with
+            # no parseable status down the success path, advancing to BRIDGING
+            # on an allowance that may never have taken effect.
+            polls = int(job.state.get("approve_status_polls", 0)) + 1
+            if polls >= _AMBIGUOUS_RECEIPT_POLLS:
+                raise WarpTerminal(
+                    f"approve receipt still carries no status after {polls} polls; "
+                    "check the transaction on Base before retrying"
+                )
+            return _stay(
+                state={"approve_status_polls": polls},
+                message=f"approve receipt has no status; re-polling ({polls})",
+            )
         return _advance(
             JobStatus.BRIDGING, state={"approve_raw": None}, message="approve confirmed"
         )
@@ -706,6 +725,20 @@ class WarpEngine:
                 columns={"bridge_tx_hash": None},
                 state={"bridge_raw": None, "bridge_attempt": attempt},
                 message=f"bridge reverted; re-preparing (attempt {attempt})",
+            )
+        if not evm.receipt_succeeded(receipt):
+            # See _h_approving: an unparseable status is neither outcome, and
+            # here the wrong guess advances a bridge that may not have moved
+            # anything -- taking the MessageSent nonce with it.
+            polls = int(job.state.get("bridge_status_polls", 0)) + 1
+            if polls >= _AMBIGUOUS_RECEIPT_POLLS:
+                raise WarpTerminal(
+                    f"bridge receipt still carries no status after {polls} polls; "
+                    "check the transaction on Base before retrying"
+                )
+            return _stay(
+                state={"bridge_status_polls": polls},
+                message=f"bridge receipt has no status; re-polling ({polls})",
             )
         msg_nonce = evm.parse_message_sent_nonce(receipt, net.portal_address)
         return _advance(
