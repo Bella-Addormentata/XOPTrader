@@ -246,6 +246,8 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
                         lambda *a, **k: FakeCoin(b"\x5a" * 32))
     monkeypatch.setattr(claim_mod, "build_and_push_sweep",
                         lambda *a, **k: ("accepted", "ok"))
+    # The sweep mines: the coin really is spent afterwards.
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
     store = new_store()
     engine, _ = build(store)
     job = _seed_failed_funded(store)
@@ -255,6 +257,32 @@ def test_sweep_closes_a_failed_job_and_frees_the_slot(monkeypatch):
     assert out["status"] == JobStatus.CANCELLED
     assert store.get_active_job() is None      # the whole point
     engine.request_bridge()                    # a new job is possible again
+
+
+def test_a_pushed_but_unspent_sweep_does_not_close_the_job(monkeypatch):
+    """[WARP-SWEEP-VERIFY] Mempool acceptance is not a spent coin.
+
+    The sweep pushes at zero fee, which is exactly what a busy mempool drops.
+    Recording swept: True on acceptance closed the job as CANCELLED -- which
+    offers neither Retry nor Sweep -- and left the funding coin unspent with
+    no route back to it.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin",
+                        lambda *a, **k: FakeCoin(b"\x5a" * 32))
+    monkeypatch.setattr(claim_mod, "build_and_push_sweep",
+                        lambda *a, **k: ("accepted", "ok"))
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: False)
+    store = new_store()
+    engine, _ = build(store)
+    job = _seed_failed_funded(store)
+
+    out = engine.job_action(job.id, "sweep")
+
+    assert out["status"] == JobStatus.FAILED, "must stay open while the coin lives"
+    assert store.get_active_job() is not None
+    state = store.get_active_job().state
+    assert state["swept"] is False
+    assert "not spent yet" in state["sweep_status"]
 
 
 def test_sweep_closes_when_the_security_coin_is_provably_spent(monkeypatch):
@@ -448,6 +476,9 @@ def test_claiming_conflict_completes_when_the_message_coin_was_spent(monkeypatch
     monkeypatch.setattr(claim_mod, "message_claimed_on_chain", lambda *a, **k: True)
     monkeypatch.setattr(claim_mod, "build_and_push_sweep",
                         lambda *a, **k: ("accepted", "swept"))
+    # The sweep mines. Without this the coin is still live, and COMPLETED -- a
+    # closed state -- must not bury it; that is the companion test below.
+    monkeypatch.setattr(claim_mod, "security_coin_spent", lambda *a, **k: True)
 
     out = engine.step()
 

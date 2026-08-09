@@ -926,11 +926,9 @@ class WarpEngine:
         coin = claim.find_security_coin(self._coinset, sk, expected)
         if coin is None:
             raise WarpPending("security coin not yet on chain")
-        record = self._coinset.get_coin_record_by_name(coin.name().hex())
-        if record is None:
+        depth = self._chia_depth(coin.name().hex())
+        if depth is None:
             raise WarpPending("security coin not yet indexed")
-        peak = self._coinset.get_peak_height()
-        depth = peak - int(record.confirmed_block_index) + 1
         if depth < net.chia_confirmation_min_height:
             raise WarpPending(
                 f"funding {depth}/{net.chia_confirmation_min_height} confirmations"
@@ -1000,8 +998,23 @@ class WarpEngine:
         # derived from our own bundle, so its presence means *our* claim landed.
         final_hex = job.state.get("final_cat_coin_id")
         if final_hex and claim.claim_landed(self._coinset, bytes.fromhex(final_hex)):
+            # [WARP-CLAIM-DEPTH 2026-08-08] Existence is not finality. This
+            # advanced to COMPLETED as soon as the coin appeared -- depth 1 --
+            # even though chia_confirmation_min_height is 32 and
+            # _h_claim_funded already waits that long for the *funding* coin.
+            # COMPLETED is a closed state that frees the active slot, so a
+            # reorg afterwards would reopen a claim the operator had been told
+            # was finished, with the job no longer tracking it.
+            depth = self._chia_depth(final_hex)
+            if depth is None:
+                raise WarpPending("final CAT coin not indexed yet")
+            if depth < net.chia_confirmation_min_height:
+                raise WarpPending(
+                    f"claim {depth}/{net.chia_confirmation_min_height} confirmations"
+                )
             return _advance(
-                JobStatus.COMPLETED, message="claim confirmed; final CAT coin on chain"
+                JobStatus.COMPLETED,
+                message=f"claim confirmed at {depth} confirmations",
             )
 
         coin = claim.find_security_coin(self._coinset, sk, expected)
@@ -1368,6 +1381,13 @@ class WarpEngine:
             ),
         )
 
+    def _chia_depth(self, coin_id_hex: str) -> Optional[int]:
+        """Confirmations behind the peak for a coin, or ``None`` if unindexed."""
+        record = self._coinset.get_coin_record_by_name(coin_id_hex)
+        if record is None:
+            return None
+        return self._coinset.get_peak_height() - int(record.confirmed_block_index) + 1
+
     def _funded_amount(self, job: WarpJob) -> int:
         """The amount the security coin was actually funded with.
 
@@ -1494,7 +1514,7 @@ class WarpEngine:
         from . import claim
 
         try:
-            _kind, status = claim.build_and_push_sweep(
+            kind, status = claim.build_and_push_sweep(
                 self._coinset,
                 self._net,
                 security_coin=coin,
@@ -1502,9 +1522,26 @@ class WarpEngine:
                 ephemeral_sk=sk,
                 sweep_fee=0,
             )
-            return True, status
         except Exception as exc:  # noqa: BLE001 -- operator can re-sweep later
             return False, f"sweep failed: {exc}"
+
+        if kind == "conflict":
+            # The coin is already spent -- by our own claim, or a prior sweep.
+            # Nothing left to recover, so this genuinely is resolved.
+            return True, status
+
+        # [WARP-SWEEP-VERIFY 2026-08-08] "accepted" and "pending" only say the
+        # node took the bundle into its mempool. Treating that as resolved
+        # closed the job as CANCELLED with swept: True -- and CANCELLED offers
+        # neither Retry nor Sweep -- so an evicted bundle left the funding coin
+        # sitting unspent with no route back to it. The sweep pushes at zero
+        # fee, which is exactly what a busy mempool drops.
+        if claim.security_coin_spent(self._coinset, coin.name()):
+            return True, status
+        return False, (
+            f"sweep pushed ({status}) but the security coin is not spent yet; "
+            "run Sweep again once it confirms"
+        )
 
     def _funding_provably_gone(self, job: WarpJob) -> tuple:
         """``(resolved, status)`` for a job with no coin at the expected amount.

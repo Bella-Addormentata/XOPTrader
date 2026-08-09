@@ -821,8 +821,9 @@ def test_claiming_pushes_then_completes(monkeypatch):
     monkeypatch.setattr(claim_mod, "build_and_push_claim", fake_push)
 
     store = new_store()
-    engine, _ = build(store)
+    engine, ctx = build(store)
     _seed_claiming(store)
+    ctx.coinset.record = SimpleNamespace(confirmed_block_index=100)
 
     # Tick 1: build + push; final not yet on chain -> stay, predicted id persisted.
     out1 = engine.step()
@@ -831,9 +832,15 @@ def test_claiming_pushes_then_completes(monkeypatch):
     assert job.state["final_cat_coin_id"] == FINAL_CAT.hex()
     assert job.state["security_coin_id"] == (b"\x5a" * 32).hex()
 
-    # Tick 2 (resume): the predicted final CAT coin exists -> COMPLETED.
-    out2 = engine.step()
-    assert out2["status"] == JobStatus.COMPLETED
+    # Tick 2: the coin exists but is one block deep -- existence is not
+    # finality, and COMPLETED frees the slot, so it must wait like the funding
+    # coin does.
+    ctx.coinset.peak = 100
+    assert engine.step()["status"] == JobStatus.CLAIMING
+
+    # Tick 3: at the configured depth -> COMPLETED.
+    ctx.coinset.peak = 100 + NET.chia_confirmation_min_height - 1
+    assert engine.step()["status"] == JobStatus.COMPLETED
 
 
 def test_claiming_portal_drift_recollects_and_wipes_sigs(monkeypatch):
