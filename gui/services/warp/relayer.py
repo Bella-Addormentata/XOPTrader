@@ -150,6 +150,12 @@ def preflight(evm_client, net: WarpNet, calldata: bytes) -> Optional[str]:
 
     Free, and load-bearing: it converts "pay to find out" into "know before
     paying" everywhere except the one-block race window.
+
+    Raises the original :class:`~gui.services.warp.evm.EvmError` for
+    INFRASTRUCTURE failures (an RPC outage, a rate limit): those are not a
+    verdict on this message, so the caller retries rather than counting a
+    failure. Only a deterministic node-evaluated revert becomes a reason
+    string (or ``"already delivered"`` for ``!nonce``).
     """
     from . import evm
 
@@ -157,10 +163,11 @@ def preflight(evm_client, net: WarpNet, calldata: bytes) -> Optional[str]:
         evm_client._eth_call(net.portal_address, calldata)
         return None
     except evm.EvmError as exc:
-        reason = evm.decode_revert_reason(exc)
         if evm.is_already_delivered(exc):
             return "already delivered"
-        return f"would revert: {reason}"
+        if evm.is_infrastructure_error(exc):
+            raise                          # transport/operator: not a verdict
+        return f"would revert: {evm.decode_revert_reason(exc)}"
 
 
 @dataclass
@@ -271,11 +278,18 @@ class AltruisticRelayer:
             entry["action"] = f"skipped: {exc}"
             return
 
-        reason = preflight(self.evm_client, self.net, calldata)
+        try:
+            reason = preflight(self.evm_client, self.net, calldata)
+        except evm.EvmError as exc:
+            # Infrastructure failure (preflight re-raises these): retry next
+            # sweep, never poison a message that only failed to simulate
+            # because the RPC was down.
+            entry["action"] = f"preflight deferred (transient): {exc}"
+            return
         if reason is not None:
             entry["action"] = f"preflight: {reason}"
             if reason != "already delivered":
-                self._note_failure(key)
+                self._note_failure(key)   # a deterministic revert: poison-eligible
             return
 
         # prepare_relay re-estimates gas, which itself can revert '!nonce' if
@@ -288,6 +302,10 @@ class AltruisticRelayer:
         except evm.EvmError as exc:
             if evm.is_already_delivered(exc):
                 entry["action"] = "raced: delivered by someone else"
+                return
+            if evm.is_infrastructure_error(exc):
+                # RPC/gas-estimate outage: retry next sweep, don't poison.
+                entry["action"] = f"deferred (transient): {exc}"
                 return
             raise
         max_cost = unsigned.gas * unsigned.max_fee_per_gas
@@ -304,6 +322,16 @@ class AltruisticRelayer:
         except evm.EvmError as exc:
             if evm.is_already_delivered(exc):
                 entry["action"] = "raced: delivered by someone else"
+                return
+            if evm.is_infrastructure_error(exc):
+                # A transport error, or an unfunded/underpriced relay key --
+                # an operator/node condition that clears on its own, NOT a
+                # deterministic rejection of this message. Report without
+                # poisoning: skip-listing a valid nonce over a temporary
+                # outage or an empty gas tank would strand it forever.
+                entry["action"] = (
+                    f"broadcast deferred (transient): {evm.decode_revert_reason(exc)}"
+                )
                 return
             entry["action"] = f"broadcast failed: {evm.decode_revert_reason(exc)}"
             self._note_failure(key)

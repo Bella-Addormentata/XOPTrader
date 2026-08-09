@@ -20,6 +20,9 @@ from __future__ import annotations
 import copy
 import logging
 import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -28,8 +31,51 @@ import yaml
 _log = logging.getLogger(__name__)
 
 
+# --------------------------------------------------------------------------- #
+# Per-file write serialization.
+#
+# secrets.yaml is a read-modify-write store touched from more than one thread:
+# the GUI settings page (preserving on-disk secrets it did not change) and the
+# warp worker (BaseWallet create/rotate/backup). Without a shared lock, a
+# settings save that read the file BEFORE a rotation wrote the new key can
+# merge onto its stale snapshot and write the OLD key back, stranding the
+# swept funds. A single re-entrant lock per resolved path makes each side's
+# whole read-modify-write atomic against the other.
+# --------------------------------------------------------------------------- #
+
+_file_locks: dict[str, threading.RLock] = {}
+_file_locks_guard = threading.Lock()
+
+
+def file_lock(path: Path) -> threading.RLock:
+    """The shared re-entrant lock for a config/secrets file, keyed by real path."""
+    key = str(Path(path).resolve())
+    with _file_locks_guard:
+        lock = _file_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _file_locks[key] = lock
+        return lock
+
+
+@contextmanager
+def file_transaction(path: Path):
+    """Hold the per-file lock for a whole read-modify-write over *path*.
+
+    Both the settings-save path and BaseWallet's key mutations enter this
+    around their entire read...write span, so they can never interleave and
+    clobber each other's writes.
+    """
+    lock = file_lock(path)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
 def _atomic_write_text(path: Path, text: str, *, newline: str) -> None:
-    """Write *text* to *path* atomically (temp file + fsync + os.replace).
+    """Write *text* to *path* atomically (unique temp + fsync + os.replace).
 
     ``open(path, "w")`` truncates in place, so a crash or ENOSPC mid-write
     leaves the file empty or partial. For secrets.yaml that window can erase
@@ -37,21 +83,31 @@ def _atomic_write_text(path: Path, text: str, *, newline: str) -> None:
     persist-before-broadcast ordering exists to prevent. os.replace is atomic
     on the same filesystem, so a reader ever sees only the whole old file or
     the whole new one, and a crash leaves the old file intact.
+
+    The temp file gets a unique name (``mkstemp``), so two writers never
+    collide on one staging path; and the destination ``os.replace`` runs
+    under the per-file lock, because on Windows a concurrent replace of the
+    same destination raises ``PermissionError``. The lock is re-entrant, so
+    callers already inside :func:`file_transaction` nest harmlessly.
     """
     path = Path(path)
-    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-    try:
-        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
-            fh.write(text)
-            fh.flush()
-            os.fsync(fh.fileno())
-        os.replace(tmp, path)
-    finally:
+    with file_transaction(path):
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
         try:
-            if tmp.exists():
-                tmp.unlink()
-        except OSError:  # pragma: no cover -- best-effort temp cleanup
-            pass
+            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:  # pragma: no cover -- best-effort temp cleanup
+                pass
 
 # ---------------------------------------------------------------------------
 # ruamel.yaml round-trip support (optional dependency)
@@ -349,16 +405,20 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     # Write public config (comments in the existing file are preserved).
     dump_preserving(config_path, public)
 
-    # Write secrets — preserve any keys the user added manually.
+    # Write secrets — preserve any keys the user added manually. The whole
+    # read-existing / merge / write runs under the per-file lock so a
+    # concurrent BaseWallet key write cannot land between our read and write
+    # and be silently overwritten by our stale snapshot.
     secrets_path = config_path.parent / "secrets.yaml"
     if secrets:
-        if secrets_path.is_file():
-            try:
-                with open(secrets_path, "r", encoding="utf-8") as fh:
-                    existing = yaml.safe_load(fh) or {}
-                if isinstance(existing, dict):
-                    deep_merge(existing, secrets)
-                    secrets = existing
-            except Exception:
-                pass
-        dump_preserving(secrets_path, secrets)
+        with file_transaction(secrets_path):
+            if secrets_path.is_file():
+                try:
+                    with open(secrets_path, "r", encoding="utf-8") as fh:
+                        existing = yaml.safe_load(fh) or {}
+                    if isinstance(existing, dict):
+                        deep_merge(existing, secrets)
+                        secrets = existing
+                except Exception:
+                    pass
+            dump_preserving(secrets_path, secrets)

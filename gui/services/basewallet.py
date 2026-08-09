@@ -23,11 +23,21 @@ Rules that carry scars from the bridge work:
 from __future__ import annotations
 
 import logging
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, List, Optional
 
 _log = logging.getLogger(__name__)
+
+
+def _io_transaction(secrets_io: Any):
+    """The secrets file's read-modify-write lock, or a no-op for fakes.
+
+    Real wiring (``_SecretsFileIO``) exposes ``transaction()`` -> the shared
+    per-file lock; injected test doubles need not, and run single-threaded."""
+    txn = getattr(secrets_io, "transaction", None)
+    return txn() if callable(txn) else nullcontext()
 
 _ETH_TRANSFER_GAS = 21_000
 _ERC20_TRANSFER_GAS_DEFAULT = 80_000
@@ -106,26 +116,28 @@ class BaseWallet:
         """
         from .warp import keystore
 
-        secrets = self._io.read()
-        warp = self._warp_section(secrets)
-        if warp.get("evm_private_key_dpapi"):
-            raise BaseWalletError(
-                "an active wallet already exists; use rotation, which archives "
-                "it -- overwriting a key is destroying money"
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            warp = self._warp_section(secrets)
+            if warp.get("evm_private_key_dpapi"):
+                raise BaseWalletError(
+                    "an active wallet already exists; use rotation, which "
+                    "archives it -- overwriting a key is destroying money"
+                )
+            key = keystore.new_evm_key()
+            warp["evm_private_key_dpapi"] = keystore.protect_evm_key(
+                key, protector=self._protector
             )
-        key = keystore.new_evm_key()
-        warp["evm_private_key_dpapi"] = keystore.protect_evm_key(
-            key, protector=self._protector
-        )
-        warp["evm_key_backup_confirmed"] = False
-        self._io.write(secrets)
+            warp["evm_key_backup_confirmed"] = False
+            self._io.write(secrets)
         _log.info("base wallet created: %s", key.address)
         return key.address
 
     def mark_backup_confirmed(self) -> None:
-        secrets = self._io.read()
-        self._warp_section(secrets)["evm_key_backup_confirmed"] = True
-        self._io.write(secrets)
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            self._warp_section(secrets)["evm_key_backup_confirmed"] = True
+            self._io.write(secrets)
 
     # -- read side ----------------------------------------------------------- #
 
@@ -271,19 +283,22 @@ class BaseWallet:
         # Persist the NEW key and archive the old BEFORE broadcasting: a crash
         # after the sweep with only the old key on disk loses nothing, but a
         # crash after broadcasting with only the old key recorded would leave
-        # the funds at an address whose key was never saved.
-        secrets = self._io.read()
-        warp = self._warp_section(secrets)
-        warp.setdefault("retired_keys", []).append({
-            "blob": warp["evm_private_key_dpapi"],
-            "address": old.address,
-            "retired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        })
-        warp["evm_private_key_dpapi"] = keystore.protect_evm_key(
-            new_key, protector=self._protector
-        )
-        warp["evm_key_backup_confirmed"] = False
-        self._io.write(secrets)
+        # the funds at an address whose key was never saved. The read-modify-
+        # write runs under the shared file lock so a concurrent settings save
+        # cannot merge onto a stale snapshot and write the old key back.
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            warp = self._warp_section(secrets)
+            warp.setdefault("retired_keys", []).append({
+                "blob": warp["evm_private_key_dpapi"],
+                "address": old.address,
+                "retired_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            })
+            warp["evm_private_key_dpapi"] = keystore.protect_evm_key(
+                new_key, protector=self._protector
+            )
+            warp["evm_key_backup_confirmed"] = False
+            self._io.write(secrets)
 
         for unsigned in (usdc_unsigned, eth_unsigned):
             if unsigned is None:

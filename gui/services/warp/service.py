@@ -537,6 +537,7 @@ class WarpEngine:
         relayer: Any = None,
         relay_key: Any = None,
         heartbeat_publisher: Optional[Callable[[str, dict, float], bool]] = None,
+        relay_state_saver: Optional[Callable[[], None]] = None,
     ) -> None:
         self._net = net
         self._store = store
@@ -556,6 +557,7 @@ class WarpEngine:
         self._relayer = relayer
         self._relay_key = relay_key
         self._heartbeat_publisher = heartbeat_publisher
+        self._relay_state_saver = relay_state_saver
         self._next_relay_sweep: float = 0.0
         self._relay_report: Dict[str, Any] = {}
         self._relay_activity: Dict[str, Any] = {}
@@ -3200,6 +3202,14 @@ class WarpEngine:
                 )
             except Exception as exc:  # noqa: BLE001 -- advertising is best-effort
                 report["heartbeat_error"] = str(exc)
+        # Persist the budget ledger + skip-list so the daily ceiling and the
+        # poison list survive a process restart -- an in-memory-only ledger
+        # would grant a fresh full budget on every relaunch.
+        if self._relay_state_saver is not None:
+            try:
+                self._relay_state_saver()
+            except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
+                _log.warning("relay state save failed: %s", exc)
         self._relay_report = report
         return report
 
@@ -3374,6 +3384,16 @@ class _SecretsFileIO:
     def __init__(self, path: Path) -> None:
         self._path = Path(path)
 
+    def transaction(self):
+        """Hold the shared per-file lock across a read-modify-write.
+
+        The same lock the settings-save path takes, so a BaseWallet key
+        mutation and a settings save can never interleave and clobber each
+        other (see gui.services.config_split.file_transaction)."""
+        from gui.services.config_split import file_transaction
+
+        return file_transaction(self._path)
+
     def read(self) -> dict:
         import yaml
 
@@ -3456,6 +3476,49 @@ class _WarpWorker(QObject):
         engine, self._engine = self._engine, None
         if engine is not None:
             engine.close()
+
+    # -- altruistic-relay ledger persistence (survives process restart) ----- #
+
+    def _relay_state_path(self) -> Optional[Path]:
+        try:
+            return Path(_job_db_path(self._config)).with_name(
+                "warp_relay_state.json"
+            )
+        except Exception:  # noqa: BLE001 -- no path is a safe "don't persist"
+            return None
+
+    def _load_relay_state(self) -> None:
+        """Populate ``_relay_state`` from disk (types restored: skiplist->set)."""
+        path = self._relay_state_path()
+        if path is None or not path.is_file():
+            return
+        import json
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._relay_state = {
+                "budget": dict(data.get("budget") or {}),
+                "failures": {str(k): int(v)
+                             for k, v in (data.get("failures") or {}).items()},
+                "skiplist": set(data.get("skiplist") or []),
+            }
+        except Exception as exc:  # noqa: BLE001 -- a bad ledger must not block start
+            _log.warning("could not load relay state from %s: %s", path, exc)
+
+    def _save_relay_state(self) -> None:
+        path = self._relay_state_path()
+        if path is None:
+            return
+        import json
+
+        from gui.services.config_split import _atomic_write_text
+
+        payload = {
+            "budget": self._relay_state.get("budget") or {},
+            "failures": self._relay_state.get("failures") or {},
+            "skiplist": sorted(self._relay_state.get("skiplist") or []),
+        }
+        _atomic_write_text(path, json.dumps(payload), newline="\n")
 
     @Slot()
     def tick(self) -> None:
@@ -3669,6 +3732,9 @@ class _WarpWorker(QObject):
         if params.altruistic_relay:
             from . import relayer as relayer_mod
 
+            # Refresh the ledger from disk before the relayer adopts it by
+            # reference, so a restart resumes today's spend and skip-list.
+            self._load_relay_state()
             relay_blob = warp_cfg.get("relay_private_key_dpapi")
             relay_key = (
                 keystore.load_evm_key(relay_blob, protector=protector)
@@ -3702,6 +3768,9 @@ class _WarpWorker(QObject):
             nostr_fetcher=None,
             relayer=relayer_obj,
             relay_key=relay_key,
+            relay_state_saver=(
+                self._save_relay_state if relayer_obj is not None else None
+            ),
         )
 
     # -- base wallet (operator commands; independent of the engine) --------- #

@@ -380,6 +380,45 @@ def is_already_delivered(exc: BaseException) -> bool:
     return "!nonce" in decode_revert_reason(exc)
 
 
+# Node error fragments that are NODE/OPERATOR conditions, not a deterministic
+# rejection of THIS message: they clear once connectivity or funding is
+# restored, so they must never poison a message's skip-list counter.
+_INFRA_RPC_FRAGMENTS = (
+    "insufficient funds",
+    "insufficient balance",
+    "gas required exceeds",
+    "intrinsic gas too low",
+    "max fee per gas",
+    "fee cap",
+    "max priority fee",
+    "replacement transaction underpriced",
+    "nonce too low",
+    "nonce too high",
+    "already known",
+    "timeout",
+    "rate limit",
+    "too many requests",
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Whether *exc* is a transport/node/operator condition, not a revert.
+
+    A plain :class:`EvmError` (never reached the node, or junk response) is
+    always infrastructure. An :class:`EvmRpcError` is infrastructure only when
+    its message names a node/operator condition (an unfunded key, a fee/nonce
+    problem, a rate limit) rather than a deterministic execution revert of
+    this message. Callers use this to retry rather than skip-list a message
+    that is perfectly deliverable once the transient condition clears.
+    """
+    if not isinstance(exc, EvmError):
+        return False
+    if not isinstance(exc, EvmRpcError):
+        return True                       # transport / junk: never message-specific
+    msg = str(getattr(exc, "rpc_message", "") or exc).lower()
+    return any(frag in msg for frag in _INFRA_RPC_FRAGMENTS)
+
+
 # --------------------------------------------------------------------------- #
 # Amount conversions (USDC 6-dec base units <-> CAT 3-dec mojos).
 # --------------------------------------------------------------------------- #
