@@ -72,6 +72,12 @@ SEL_BRIDGE_TO_CHIA = bytes.fromhex("cdb50da7")    # bridgeToChia(address,bytes32
 # docs/warp-unwrap-design.md §2.2.
 SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)
 SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
+SEL_EIP712_DOMAIN = bytes.fromhex("84b0196e")     # eip712Domain() (EIP-5267)
+
+# MessageReceived(bytes32 indexed nonce, ...) -- the Portal's delivery event.
+# Pinned against the real relay receipt in tests/fixtures_unwrap.json, not
+# derived from a guessed event signature.
+MESSAGE_RECEIVED_TOPIC0 = "08d1bf12867015b2874c8fcd6f1b0403eb05ca20867f81d40d3b232da098f9af"
 
 # MessageSent(bytes32 indexed nonce, address, bytes3, bytes32, bytes32[])
 MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7251a7a8"
@@ -303,6 +309,57 @@ def validator_message_digest(
     return keccak(b"\x19\x01" + sep + struct_hash)
 
 
+def parse_message_received(receipt: dict, portal_address: Any, nonce: Any) -> bool:
+    """Whether *receipt* carries the Portal's MessageReceived for *nonce*."""
+    want_nonce = _hx(nonce)
+    want_addr = _hx(portal_address)
+    for log in receipt.get("logs") or []:
+        if _hx(log.get("address", "")) != want_addr:
+            continue
+        topics = log.get("topics") or []
+        if len(topics) >= 2 and _hx(topics[0]) == MESSAGE_RECEIVED_TOPIC0 \
+                and _hx(topics[1]) == want_nonce:
+            return True
+    return False
+
+
+def unwrap_post_tip_base_units(mojo_amount: int, tip_bps: int, decimals: int, cat_decimals: int) -> int:
+    """What the receiver actually gets on Base: SCALE first, THEN tip.
+
+    Proven by execution against two real unwraps: the ERC20Bridge scales
+    CAT mojos to ERC-20 base units before taking its 30 bps tip, so the
+    result is not integral in mojos and the minimum viable unwrap is ONE
+    mojo (0.001 USDC -> 997 base units). This is the opposite order from
+    the inbound model -- :func:`post_tip_amount` works in mojos, raises on
+    1 mojo, and must never be reused here; a test pins the two apart.
+    """
+    mojo_amount = int(mojo_amount)
+    if mojo_amount < 1:
+        raise EvmError(f"unwrap amount must be at least 1 mojo, got {mojo_amount}")
+    scaled = mojo_amount * 10 ** (int(decimals) - int(cat_decimals))
+    tip = scaled * int(tip_bps) // 10_000
+    if scaled <= tip:
+        raise EvmError(f"amount {scaled} does not clear the tip {tip}")
+    return scaled - tip
+
+
+def decode_revert_reason(exc: BaseException) -> str:
+    """The human string inside an ABI ``Error(string)`` revert blob, if any.
+
+    Nodes differ: some put the reason in the message, some only in ``data``
+    as ``0x08c379a0 || abi.encode(string)``. Falls back to ``str(exc)``.
+    """
+    data = getattr(exc, "data", None)
+    if isinstance(data, str) and data.startswith("0x08c379a0"):
+        try:
+            blob = bytes.fromhex(data[2:])
+            strlen = int.from_bytes(blob[36:68], "big")
+            return blob[68:68 + strlen].decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 -- fall through to the message
+            pass
+    return str(exc)
+
+
 def is_already_delivered(exc: BaseException) -> bool:
     """Whether a relay revert means the message was already delivered.
 
@@ -311,7 +368,7 @@ def is_already_delivered(exc: BaseException) -> bool:
     relay is retryable. Only the Portal's own ``"!nonce"`` means someone
     (us or a third party) already delivered this message [V].
     """
-    return "!nonce" in str(exc)
+    return "!nonce" in decode_revert_reason(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -716,6 +773,56 @@ class EvmClient:
         every relay revert. Read it at gate time, never cached across a job.
         """
         return self._call_uint(self._net.portal_address, SEL_SIGNATURE_THRESHOLD)
+
+    def verify_eip712_domain(self) -> bytes:
+        """Read the Portal's EIP-712 domain live and return the separator.
+
+        Via ``eip712Domain()`` (EIP-5267) -- the three dedicated separator
+        getters all revert on the deployed Portal, proven by execution. The
+        decoded name/version/chainId/verifyingContract must equal the
+        deployment constants and the reconstructed separator must equal the
+        anchored one; any mismatch means a portal redeploy, and every gate
+        downstream of this must fail closed.
+        """
+        from eth_utils import keccak
+
+        net = self._net
+        raw = self._eth_call(net.portal_address, SEL_EIP712_DOMAIN)
+        if len(raw) < 5 * 32:
+            raise EvmError(f"eip712Domain() returned {len(raw)} bytes")
+        # head: fields(bytes1), name offset, version offset, chainId,
+        # verifyingContract, salt, extensions offset.
+        chain_id = int.from_bytes(raw[3 * 32:4 * 32], "big")
+        contract = raw[4 * 32 + 12:5 * 32]
+
+        def _dyn_string(offset_slot: int) -> str:
+            off = int.from_bytes(raw[offset_slot * 32:(offset_slot + 1) * 32], "big")
+            n = int.from_bytes(raw[off:off + 32], "big")
+            return raw[off + 32:off + 32 + n].decode("utf-8", "replace")
+
+        name, version = _dyn_string(1), _dyn_string(2)
+        if (
+            name != net.eip712_name
+            or version != net.eip712_version
+            or chain_id != net.evm_chain_id
+            or contract.hex() != net.portal_address[2:].lower()
+        ):
+            raise EvmError(
+                f"portal EIP-712 domain mismatch: ({name!r}, {version!r}, "
+                f"{chain_id}, 0x{contract.hex()}) -- a portal redeploy; "
+                "refusing every unwrap gate"
+            )
+        type_hash = keccak(
+            text="EIP712Domain(string name,string version,"
+                 "uint256 chainId,address verifyingContract)"
+        )
+        sep = keccak(
+            type_hash + keccak(text=name) + keccak(text=version)
+            + chain_id.to_bytes(32, "big") + b"\x00" * 12 + contract
+        )
+        if sep.hex() != net.eip712_domain_separator:
+            raise EvmError("reconstructed EIP-712 separator does not match the anchor")
+        return sep
 
     # -- fees / nonce -------------------------------------------------------- #
 

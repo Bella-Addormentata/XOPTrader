@@ -443,3 +443,117 @@ def test_validator_message_digest_shape():
         b"\x78" * 32, b"\x01" * 32, b"xch", b"\x02" * 32, "0x" + "ab" * 20, [b"\x03" * 32]
     )
     assert d1 != d3
+
+
+# --------------------------------------------------------------------------- #
+# Outbound goldens against the real delivered unwrap (fixtures_unwrap.json).
+# --------------------------------------------------------------------------- #
+
+def _fixture():
+    import json, pathlib
+    return json.loads(
+        (pathlib.Path(__file__).parent / "fixtures_unwrap.json").read_text()
+    )
+
+
+def test_the_real_relay_calldata_re_encodes_byte_for_byte():
+    """encode_receive_message + the packed sigs must reproduce the exact
+    772-byte input of the delivered relay transaction."""
+    fx = _fixture()
+    ours = evm.encode_receive_message(
+        bytes.fromhex(fx["nonce"]),
+        fx["source_chain"].encode(),
+        bytes.fromhex(fx["source"]),
+        fx["destination"],
+        [bytes.fromhex(c) for c in fx["contents"]],
+        bytes.fromhex(fx["sigs_packed"]),
+    )
+    assert ours.hex() == fx["calldata"]
+
+
+def test_the_six_real_signatures_recover_through_our_digest():
+    """End to end: our committed validator_message_digest + the anchored
+    separator recover the six real v||r||s signatures to addresses in
+    constants.evm_validator_addresses, in strictly ascending order. This
+    validates the digest construction, the packing layout, and the ordering
+    rule against reality in one test."""
+    eth_keys = pytest.importorskip("eth_keys")
+    fx = _fixture()
+
+    digest = evm.validator_message_digest(
+        bytes.fromhex(NET.eip712_domain_separator),
+        bytes.fromhex(fx["nonce"]),
+        fx["source_chain"].encode(),
+        bytes.fromhex(fx["source"]),
+        fx["destination"],
+        [bytes.fromhex(c) for c in fx["contents"]],
+    )
+
+    sigs = bytes.fromhex(fx["sigs_packed"])
+    assert len(sigs) == 6 * 65
+    validators = {a.lower() for a in NET.evm_validator_addresses}
+    recovered = []
+    for i in range(6):
+        chunk = sigs[i * 65:(i + 1) * 65]
+        v, r, s = chunk[0], chunk[1:33], chunk[33:65]
+        assert v in (27, 28)
+        sig = eth_keys.keys.Signature(vrs=(v - 27, int.from_bytes(r, "big"),
+                                           int.from_bytes(s, "big")))
+        addr = sig.recover_public_key_from_msg_hash(digest).to_address()
+        recovered.append(addr)
+        assert addr.lower() in validators, f"sig {i} recovered a non-validator"
+    ints = [int(a, 16) for a in recovered]
+    assert ints == sorted(ints), "signers must be strictly ascending"
+    assert len(set(ints)) == 6
+
+
+def test_message_received_parses_the_real_receipt_log():
+    fx = _fixture()
+    receipt = {"logs": fx["relay_logs"]}
+    assert evm.parse_message_received(receipt, NET.portal_address, fx["nonce"])
+    assert not evm.parse_message_received(receipt, NET.portal_address, "ab" * 32)
+    assert not evm.parse_message_received(
+        {"logs": []}, NET.portal_address, fx["nonce"]
+    )
+
+
+def test_verify_eip712_domain_against_the_captured_tuple():
+    fx = _fixture()
+    caller = FakeCaller({"eth_call": "0x" + fx["eip712_domain_raw"]})
+    c = evm.EvmClient(NET, caller=caller)
+    assert c.verify_eip712_domain().hex() == NET.eip712_domain_separator
+
+    # A redeploy (different verifying contract) must refuse.
+    blob = bytearray(bytes.fromhex(fx["eip712_domain_raw"]))
+    blob[4 * 32 + 12:5 * 32] = b"\x99" * 20
+    caller2 = FakeCaller({"eth_call": "0x" + bytes(blob).hex()})
+    with pytest.raises(evm.EvmError, match="redeploy"):
+        evm.EvmClient(NET, caller=caller2).verify_eip712_domain()
+
+
+def test_unwrap_tip_is_scale_then_tip_and_disagrees_with_the_inbound_model():
+    """Proven ordering: the bridge scales mojos to base units FIRST, then
+    takes 30 bps. One USDC mojo is viable (997 base units out); the inbound
+    post_tip_amount raises on it -- the two models must never be conflated."""
+    assert evm.unwrap_post_tip_base_units(1, 30, 6, 3) == 997
+    assert evm.unwrap_post_tip_base_units(5000, 30, 6, 3) == 4_985_000
+    # The real 18-decimal unwrap: 51,752 mojos -> tip 155256000000000000.
+    scaled = 51_752 * 10 ** 15
+    got = evm.unwrap_post_tip_base_units(51_752, 30, 18, 3)
+    assert scaled - got == 155_256_000_000_000_000
+
+    with pytest.raises(evm.EvmError):
+        evm.post_tip_amount(1, 30)          # the inbound model rejects 1 mojo
+    with pytest.raises(evm.EvmError):
+        evm.unwrap_post_tip_base_units(0, 30, 6, 3)
+
+
+def test_decode_revert_reason_reads_the_abi_error_blob():
+    payload = b"!nonce"
+    blob = (b"\x08\xc3\x79\xa0"
+            + (32).to_bytes(32, "big")
+            + len(payload).to_bytes(32, "big")
+            + payload + b"\x00" * (32 - len(payload)))
+    exc = evm.EvmRpcError("execution reverted", data="0x" + blob.hex())
+    assert evm.decode_revert_reason(exc) == "!nonce"
+    assert evm.is_already_delivered(exc)
