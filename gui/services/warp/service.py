@@ -131,6 +131,11 @@ _CANCELLABLE = frozenset(
 # because that is the flag saying "already sent, do not send again".
 _FUNDING_TX_UNKNOWN: str = "sent-id-unknown"
 
+# The only two states whose behaviour depends on whether the job is a rehearsal.
+# Everywhere else the flag is never consulted, so a row that predates the freeze
+# is harmless there and must not be refused.
+_DRY_RUN_SENSITIVE = frozenset({JobStatus.APPROVING, JobStatus.BRIDGING})
+
 
 # --------------------------------------------------------------------------- #
 # Parameters (parsed from the null-safe config dict).
@@ -620,7 +625,7 @@ class WarpEngine:
         # Rehearsal stop: the allowance approve is signed and durable, but never
         # broadcast. Skip straight to BRIDGING so the dry run also exercises
         # prepare_bridge (live toll, gas estimate, encoding, signing).
-        if self._params.dry_run:
+        if self._job_dry_run(job):
             return _advance(
                 JobStatus.BRIDGING,
                 state={"approve_raw": None},
@@ -673,7 +678,7 @@ class WarpEngine:
         # Base RPC, the wallet daemon, the receiver decode, the live message toll
         # and tip, gas estimation, nonce selection, ABI encoding and signing. The
         # only thing that does not happen is the broadcast.
-        if self._params.dry_run:
+        if self._job_dry_run(job):
             return _advance(
                 JobStatus.DRY_RUN_OK,
                 columns={"bridge_tx_hash": None},
@@ -1109,8 +1114,32 @@ class WarpEngine:
         return f"warp-job-{job.id}".encode()
 
     def _binding(self) -> Dict[str, Any]:
-        """The (network, hot wallet) identity a new job is frozen against."""
-        return {"network": self._net.name, "hot_address": _hx(self._hot_address)}
+        """The (network, hot wallet, rehearsal) identity a new job is frozen against."""
+        return {
+            "network": self._net.name,
+            "hot_address": _hx(self._hot_address),
+            # [WARP-DRYRUN-FREEZE 2026-08-08] Frozen, never re-read: a job
+            # created live must not become a rehearsal because the flag moved
+            # under it. See _job_dry_run.
+            "dry_run": bool(self._params.dry_run),
+        }
+
+    def _job_dry_run(self, job: WarpJob) -> bool:
+        """Whether *job* was created as a rehearsal, per the job itself.
+
+        Read from job state rather than live config. The rehearsal stops in
+        :meth:`_h_approving` and :meth:`_h_bridging` used ``self._params``, so
+        flipping ``warp.dry_run`` while a live job sat in BRIDGING closed it as
+        DRY_RUN_OK and nulled ``bridge_tx_hash`` -- freeing the slot and leaving
+        an audit trail reading "no funds moved" while real USDC was in flight.
+        ``dry_run`` defaults to true, so a plain restart was enough to do it.
+
+        Rows written before the freeze have no recorded value; those are refused
+        outright in the two states where it decides anything (see
+        :meth:`_binding_mismatch`), because neither default is safe there.
+        """
+        frozen = job.state.get("dry_run")
+        return bool(self._params.dry_run if frozen is None else frozen)
 
     def _binding_mismatch(self, job: WarpJob) -> Optional[str]:
         """Why this job must not be processed under the current config, or ``None``.
@@ -1131,6 +1160,20 @@ class WarpEngine:
                 f"job {job.id} was created on network {job.network!r} but warp is "
                 f"configured for {self._net.name!r}; resolve it under the original "
                 "configuration"
+            )
+        # Checked before the hot-wallet binding, which returns early on a match:
+        # a row created between the two freezes carries hot_address but not
+        # dry_run, and that is exactly the row this has to catch.
+        if job.status in _DRY_RUN_SENSITIVE and job.state.get("dry_run") is None:
+            # Neither default is safe here. Assume rehearsal and a live job is
+            # closed DRY_RUN_OK with its broadcast tx hash discarded; assume
+            # live and a rehearsal broadcasts real funds. Only the operator can
+            # say which this row is.
+            return (
+                f"job {job.id} is in {job.status} but predates the dry_run "
+                "freeze, so it cannot be proven to be a rehearsal or a live "
+                "bridge; check the Base hot wallet for a broadcast transaction "
+                "and resolve it manually"
             )
         bound = _hx(job.state.get("hot_address") or "")
         mine = _hx(self._hot_address)

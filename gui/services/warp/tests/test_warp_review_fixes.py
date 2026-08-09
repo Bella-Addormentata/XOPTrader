@@ -48,7 +48,9 @@ from .test_warp_service import (  # noqa: E402
     FakeCoin,
     build,
     default_params,
+    fake_sign_tx,
     make_ephemeral_blob,
+    message_sent_receipt,
     new_store,
     seed,
 )
@@ -668,6 +670,71 @@ def test_new_jobs_record_their_binding():
 # --------------------------------------------------------------------------- #
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
+
+def test_flipping_dry_run_cannot_close_a_live_broadcast_job(monkeypatch):
+    """[WARP-DRYRUN-FREEZE] A live job stays live when the config flips.
+
+    The rehearsal stops used to read self._params.dry_run. A job broadcast
+    live and sitting in BRIDGING would, the moment warp.dry_run went true,
+    be closed as DRY_RUN_OK with bridge_tx_hash nulled -- freeing the slot
+    and leaving an audit trail saying "no funds moved" while real USDC was
+    in flight, recoverable only by BaseScan forensics. dry_run defaults to
+    true, so restarting the GUI was enough to trigger it.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    # Engine now configured for rehearsal; the job was frozen live.
+    engine, ctx = build(store, params=default_params(dry_run=True))
+    seed(
+        store, JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"dry_run": False},
+    )
+
+    engine.step()                                   # phase 1: sign
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING
+    assert job.bridge_tx_hash == "0x" + "22" * 32
+
+    ctx.evm.receipt = message_sent_receipt("00" * 31 + "07")
+    out = engine.step()                             # phase 2: broadcast
+
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED, "a live job must not go DRY_RUN_OK"
+    assert ctx.evm.sent_raw == [b"\x02\xbb\xbb\xbb"], "the live job must still broadcast"
+    assert store.get_active_job().bridge_tx_hash == "0x" + "22" * 32
+
+
+def test_a_job_predating_the_dry_run_freeze_is_refused_not_guessed(monkeypatch):
+    """A row with no frozen dry_run cannot be resumed in APPROVING/BRIDGING.
+
+    Neither default is safe: assume rehearsal and a live job is closed with
+    its tx hash discarded; assume live and a rehearsal broadcasts real funds.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    # Bypass seed(), which freezes dry_run -- this is a pre-freeze row, whose
+    # state carries the old binding and nothing else.
+    store.create_job(
+        NET.name,
+        status=JobStatus.BRIDGING,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+        state={"network": NET.name, "hot_address": "ab" * 20},
+    )
+    assert "dry_run" not in store.get_active_job().state
+
+    engine.step()
+
+    # A binding mismatch is read-only: it refuses before the handler runs, so
+    # phase 1 never signs. Asserting on sent_raw alone would be vacuous here --
+    # a single BRIDGING step never broadcasts even on the happy path.
+    job = store.get_active_job()
+    assert "bridge_raw" not in job.state, "a job that cannot be classified must not sign"
+    assert job.bridge_tx_hash is None
+    assert ctx.evm.sent_raw == []
+    assert job.status == JobStatus.BRIDGING
+    assert engine._binding_error and "predates the dry_run freeze" in engine._binding_error
+
 
 def test_dry_run_signs_both_txs_and_never_broadcasts(monkeypatch):
     monkeypatch.setattr(

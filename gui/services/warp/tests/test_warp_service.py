@@ -298,7 +298,10 @@ HOT_ADDRESS = "0x" + "ab" * 20
 
 
 def seed(store, status, *, columns=None, state=None):
-    merged = {"network": NET.name, "hot_address": "ab" * 20}
+    # Mirrors WarpEngine._binding(), so fixtures look like rows the engine
+    # actually writes. dry_run defaults to False to match default_params();
+    # a test exercising the rehearsal path passes state={"dry_run": True}.
+    merged = {"network": NET.name, "hot_address": "ab" * 20, "dry_run": False}
     merged.update(state or {})
     return store.create_job(NET.name, status=status, columns=columns, state=merged)
 
