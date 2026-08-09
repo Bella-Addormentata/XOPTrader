@@ -229,6 +229,115 @@ def parse_signature_event(
     return ValidatorSig(index=index, pubkey=str(event["pubkey"]).lower(), sig=sig)
 
 
+# --------------------------------------------------------------------------- #
+# Outbound (unwrap): ECDSA signatures over the EIP-712 digest.
+#
+# Same relays, same event shape, same HRP-``s`` content encoding -- but the
+# payload is a 65-byte v||r||s secp256k1 signature, the author check is an
+# ecrecover against ``evm_validator_addresses``, and there is no ``c`` tag
+# gate: it is present but EMPTY for EVM destinations, so filtering on it
+# would drop every event. Proven by fetching all ten validators' events for
+# a real unwrap with this module's own fetcher.
+# --------------------------------------------------------------------------- #
+
+ECDSA_SIG_LEN = 65
+
+
+def outbound_routing_tag(nonce: bytes) -> str:
+    """The ``r`` tag for an unwrap: xch -> bse, nonce = the bridging coin id.
+
+    Deliberately NOT :func:`routing_tag_for`, which hardcodes
+    ``net.source_chain`` (the EVM chain) as the source and is inbound-only.
+    """
+    return encode_routing_tag(b"xch", b"bse", nonce)
+
+
+def decode_ecdsa_sig_content(content: str) -> bytes:
+    """Decode an ``s``-prefixed bech32m content to a 65-byte v||r||s signature."""
+    hrp, raw = cu.bech32m_decode_bytes(content.strip(), max_length=_SIG_BECH32_MAX)
+    if raw is None or hrp != HRP_SIG:
+        raise NostrError("content is not a valid 's'-prefixed bech32m signature")
+    if len(raw) != ECDSA_SIG_LEN:
+        raise NostrError(f"signature is {len(raw)} bytes, expected {ECDSA_SIG_LEN}")
+    return raw
+
+
+def recover_evm_signer(net: WarpNet, sig: bytes, digest: bytes) -> Optional[str]:
+    """The checksummed validator address a v||r||s signature recovers to.
+
+    ``None`` unless the recovered address is one of
+    ``net.evm_validator_addresses`` -- an unknown signer is an ignored event,
+    not an error. Malformed signatures return ``None`` rather than raising.
+    """
+    try:
+        from eth_keys import keys
+
+        v, r, s = sig[0], sig[1:33], sig[33:65]
+        if v not in (27, 28):
+            return None
+        signature = keys.Signature(
+            vrs=(v - 27, int.from_bytes(r, "big"), int.from_bytes(s, "big"))
+        )
+        addr = signature.recover_public_key_from_msg_hash(bytes(digest)).to_address()
+    except Exception:  # noqa: BLE001 -- malformed => not a valid signature
+        return None
+    for known in net.evm_validator_addresses:
+        if known.lower() == addr.lower():
+            return known
+    return None
+
+
+def collect_ecdsa_from_events(
+    net: WarpNet,
+    events: Sequence[dict],
+    *,
+    digest: bytes,
+    routing_tag: str,
+    have: Optional[Dict[str, bytes]] = None,
+) -> Dict[str, bytes]:
+    """Fold verified outbound signatures into ``{checksummed_address: sig65}``.
+
+    Pure, like :func:`collect_from_events`. Keyed by recovered address rather
+    than validator index: the relay orders by address, and unlike the BLS
+    path nothing downstream needs the index. First signature per address
+    wins. No ``c``-tag gate, by design.
+    """
+    collected: Dict[str, bytes] = dict(have or {})
+    for event in events:
+        if not isinstance(event, dict) or event.get("kind") != SIG_EVENT_KIND:
+            continue
+        if validator_index_for_pubkey(net, event.get("pubkey", "")) is None:
+            continue
+        if _first_tag(event.get("tags") or [], HRP_ROUTING) != routing_tag:
+            continue
+        try:
+            sig = decode_ecdsa_sig_content(str(event.get("content", "")))
+        except NostrError:
+            continue
+        addr = recover_evm_signer(net, sig, digest)
+        if addr is not None:
+            collected.setdefault(addr, sig)
+    return collected
+
+
+def ecdsa_sigs_for_relay(collected: Dict[str, bytes], threshold: int) -> list:
+    """``(address, v, r, s)`` tuples for exactly ``threshold`` signatures.
+
+    Takes the ``threshold`` lowest addresses -- any subset verifies, and a
+    deterministic choice keeps a resumed job's calldata identical. Raises
+    while short, which the caller treats as still-collecting.
+    """
+    if len(collected) < threshold:
+        raise NostrError(
+            f"have {len(collected)} of {threshold} validator signatures"
+        )
+    chosen = sorted(collected.items(), key=lambda kv: int(kv[0], 16))[:threshold]
+    return [
+        (addr, sig[0], sig[1:33], sig[33:65])
+        for addr, sig in chosen
+    ]
+
+
 def collect_from_events(
     net: WarpNet,
     events: Sequence[dict],
@@ -300,6 +409,22 @@ def build_filter(
     if authors:
         filt["authors"] = list(net.nostr_validator_keys)
     return filt
+
+
+@dataclass(frozen=True)
+class EcdsaSigResult:
+    """Outcome of an outbound (ECDSA) collection pass, keyed by address."""
+
+    collected: Dict[str, bytes]
+    threshold: int
+
+    @property
+    def count(self) -> int:
+        return len(self.collected)
+
+    @property
+    def complete(self) -> bool:
+        return len(self.collected) >= self.threshold
 
 
 @dataclass(frozen=True)
@@ -440,3 +565,48 @@ class NostrSigCollector:
             )
 
         return SigResult(collected=collected, threshold=threshold)
+
+    def collect_ecdsa(
+        self,
+        *,
+        nonce: bytes,
+        digest: bytes,
+        threshold: int,
+        have: Optional[Dict[str, bytes]] = None,
+        deadline_s: float = 20.0,
+        relay_offset: int = 0,
+    ) -> "EcdsaSigResult":
+        """The outbound sweep: same relay loop, ECDSA gates, no coin tag.
+
+        ``threshold`` comes from the live ``Portal.signatureThreshold()`` read
+        rather than the BLS constant -- the two quorums are independent and
+        the EVM one is owner-mutable. No portal-freshness logic on purpose:
+        outbound signatures never expire.
+        """
+        net = self._net
+        collected: Dict[str, bytes] = dict(have or {})
+        routing_tag = outbound_routing_tag(nonce)
+        filt = build_filter(net, routing_tag)
+
+        relays = list(net.nostr_relays)
+        if relays and relay_offset:
+            offset = relay_offset % len(relays)
+            relays = relays[offset:] + relays[:offset]
+
+        start = self._now()
+        for relay in relays:
+            if len(collected) >= threshold:
+                break
+            elapsed = self._now() - start
+            if elapsed >= deadline_s:
+                break
+            per = min(self._per_relay_timeout, max(1.0, deadline_s - elapsed))
+            try:
+                events = self._fetcher(relay, filt, per)
+            except Exception:  # noqa: BLE001 -- a dead relay must not abort the sweep
+                continue
+            collected = collect_ecdsa_from_events(
+                net, events, digest=digest, routing_tag=routing_tag, have=collected,
+            )
+
+        return EcdsaSigResult(collected=collected, threshold=int(threshold))

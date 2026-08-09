@@ -82,7 +82,9 @@ _ST_FAILED: Final[str] = "FAILED"
 _ST_CANCELLED: Final[str] = "CANCELLED"
 _ST_DRY_RUN_OK: Final[str] = "DRY_RUN_OK"
 _CANCELLABLE: Final[frozenset[str]] = frozenset(
-    {"AWAITING_DEPOSIT", "DEPOSIT_SEEN", "APPROVING"}
+    {"AWAITING_DEPOSIT", "DEPOSIT_SEEN", "APPROVING",
+     # The one cancellable outbound state: pure reads, nothing moved yet.
+     "UNWRAP_CHECKS"}
 )
 
 _STATUS_LABELS: Final[dict[str, str]] = {
@@ -100,6 +102,12 @@ _STATUS_LABELS: Final[dict[str, str]] = {
     "FAILED": "Failed",
     "CANCELLED": "Cancelled",
     "DRY_RUN_OK": "Dry run OK",
+    # Outbound (unwrap).
+    "UNWRAP_CHECKS": "Unwrap: checking gates",
+    "BURN_SENT": "Unwrap: burn sent",
+    "BURNING": "Unwrap: burning",
+    "COLLECTING_EVM_SIGS": "Unwrap: collecting signatures",
+    "RELAYING": "Unwrap: relaying to Base",
 }
 
 _WARP_PORTAL_URL: Final[str] = "https://www.warp.green"
@@ -223,6 +231,8 @@ class WarpWidget(QWidget):
     address_copy_requested = Signal(str)
     # Emitted when the user clicks "Bridge now" -> WarpService.request_bridge().
     bridge_now_requested = Signal()
+    # (amount_mojos, receiver_0x) -> WarpService.request_unwrap().
+    unwrap_requested = Signal(int, str)
     # Emitted for a per-job action -> WarpService.job_action(job_id, action).
     # ``action`` is one of "retry", "cancel", "sweep".
     job_action_requested = Signal(int, str)
@@ -389,6 +399,28 @@ class WarpWidget(QWidget):
         )
         self._portal_btn.clicked.connect(lambda: _open_url(_WARP_PORTAL_URL))
         ctrl_row.addWidget(self._portal_btn)
+
+        # -- Unwrap (Chia -> Base): burn wUSDC.b, release native USDC ------
+        unwrap_row = QHBoxLayout()
+        self._unwrap_amount = QLineEdit()
+        self._unwrap_amount.setPlaceholderText("USDC amount (min 0.001)")
+        self._unwrap_amount.setMaximumWidth(160)
+        unwrap_row.addWidget(self._unwrap_amount)
+        self._unwrap_dest = QLineEdit()
+        # Deliberately NO default destination: the receiver is curried into
+        # the burn puzzle, so a wrong address is unrecoverable by anyone.
+        # The operator types it, every time.
+        self._unwrap_dest.setPlaceholderText("Base destination (0x..., EIP-55)")
+        unwrap_row.addWidget(self._unwrap_dest, 1)
+        self._unwrap_btn = self._primary_button("🔥  Unwrap")
+        self._unwrap_btn.setToolTip(
+            "Burn wUSDC.b on Chia and release native USDC to the destination.\n"
+            "Irreversible once the burn is sent. Costs the 0.3% warp tip plus\n"
+            "the 0.001 XCH toll. Requires warp.max_unwrap_usdc to be set."
+        )
+        self._unwrap_btn.clicked.connect(self._on_unwrap_clicked)
+        unwrap_row.addWidget(self._unwrap_btn)
+        layout.addLayout(unwrap_row)
 
         self._docs_btn = self._link_button("Developer docs")
         self._docs_btn.setToolTip(_WARP_DOCS_URL)
@@ -672,6 +704,35 @@ class WarpWidget(QWidget):
     # ------------------------------------------------------------------
     # Actions
     # ------------------------------------------------------------------
+
+    def _on_unwrap_clicked(self) -> None:
+        """Parse to mojos and emit; the engine re-validates everything."""
+        from decimal import Decimal, InvalidOperation
+
+        text = (self._unwrap_amount.text() or "").strip()
+        dest = (self._unwrap_dest.text() or "").strip()
+        # Decimal, not float: float(text) * 1000 rounds sub-minimum inputs UP
+        # (0.0006 -> 1 mojo -- an unwrap the operator never typed), drifts on
+        # values like 5.0005, and overflows on 1e309 with an exception the old
+        # ValueError-only catch missed, crashing the click handler.
+        try:
+            amount = Decimal(text)
+        except InvalidOperation:
+            _log.warning("unwrap: amount %r is not a number", text)
+            self._unwrap_amount.setFocus()
+            return
+        if not amount.is_finite() or amount % Decimal("0.001") != 0:
+            _log.warning(
+                "unwrap: amount %r is not a whole 0.001-USDC increment", text
+            )
+            self._unwrap_amount.setFocus()
+            return
+        mojos = int(amount * 1000)
+        if mojos < 1:
+            _log.warning("unwrap: amount %r is below the 0.001 USDC minimum", text)
+            self._unwrap_amount.setFocus()
+            return
+        self.unwrap_requested.emit(mojos, dest)
 
     def _on_bridge_now(self) -> None:
         """Request an immediate bridge of the current Base USDC balance."""

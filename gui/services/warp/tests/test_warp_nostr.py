@@ -377,3 +377,99 @@ def test_collector_survives_dead_relay():
     res = collector.collect(nonce=nonce, portal_coin_id=coin, digest=digest, deadline_s=1000)
     # The dead first relay was skipped, not fatal; the signature still landed.
     assert 0 in res.collected
+
+
+# --------------------------------------------------------------------------- #
+# Outbound (ECDSA) collection, pinned against the real unwrap's signatures.
+# --------------------------------------------------------------------------- #
+
+def _unwrap_fixture():
+    import json, pathlib
+    return json.loads(
+        (pathlib.Path(__file__).parent / "fixtures_unwrap.json").read_text()
+    )
+
+
+def _real_digest_and_sigs():
+    from gui.services.warp import evm
+
+    fx = _unwrap_fixture()
+    digest = evm.validator_message_digest(
+        bytes.fromhex(NET.eip712_domain_separator),
+        bytes.fromhex(fx["nonce"]),
+        fx["source_chain"].encode(),
+        bytes.fromhex(fx["source"]),
+        fx["destination"],
+        [bytes.fromhex(c) for c in fx["contents"]],
+    )
+    packed = bytes.fromhex(fx["sigs_packed"])
+    sigs = [packed[i * 65:(i + 1) * 65] for i in range(len(packed) // 65)]
+    return fx, digest, sigs
+
+
+def _outbound_event(sig65: bytes, tag: str, *, pubkey=None) -> dict:
+    return {
+        "kind": 1,
+        "pubkey": pubkey or NET.nostr_validator_keys[0],
+        "tags": [["r", tag], ["c", ""]],          # empty c, as on the wire
+        "content": cu.bech32m_encode_bytes("s", sig65),
+    }
+
+
+def test_the_real_unwrap_signatures_collect_and_recover(monkeypatch=None):
+    pytest.importorskip("eth_keys")
+    fx, digest, sigs = _real_digest_and_sigs()
+    tag = nostr.outbound_routing_tag(bytes.fromhex(fx["nonce"]))
+
+    events = [
+        _outbound_event(s, tag, pubkey=NET.nostr_validator_keys[i % 10])
+        for i, s in enumerate(sigs)
+    ]
+    collected = nostr.collect_ecdsa_from_events(
+        NET, events, digest=digest, routing_tag=tag
+    )
+    assert len(collected) == 6
+    validators = {a.lower() for a in NET.evm_validator_addresses}
+    assert {a.lower() for a in collected} <= validators
+
+    # The relay tuple set re-packs into the exact on-chain blob.
+    from gui.services.warp import evm
+
+    tuples = nostr.ecdsa_sigs_for_relay(collected, 6)
+    assert evm.pack_validator_sigs(tuples).hex() == fx["sigs_packed"]
+
+
+def test_outbound_collection_rejects_what_it_must():
+    pytest.importorskip("eth_keys")
+    fx, digest, sigs = _real_digest_and_sigs()
+    tag = nostr.outbound_routing_tag(bytes.fromhex(fx["nonce"]))
+
+    tampered = bytes([sigs[0][0]]) + b"\x00" * 64
+    wrong_tag = nostr.outbound_routing_tag(b"\xab" * 32)
+    cases = [
+        _outbound_event(tampered, tag),                       # unrecoverable
+        _outbound_event(sigs[0], wrong_tag),                  # wrong message
+        _outbound_event(sigs[0][:64], tag),                   # wrong length
+        {**_outbound_event(sigs[0], tag), "pubkey": "ff" * 32},  # unknown author
+        {**_outbound_event(sigs[0], tag), "kind": 7},         # wrong kind
+    ]
+    collected = nostr.collect_ecdsa_from_events(
+        NET, cases, digest=digest, routing_tag=tag
+    )
+    assert collected == {}
+
+    # A signature over a DIFFERENT digest recovers to a non-validator: the
+    # ecrecover gate is what stops a valid-shape wrong-message signature.
+    other = nostr.collect_ecdsa_from_events(
+        NET, [_outbound_event(sigs[0], tag)], digest=b"\x00" * 32, routing_tag=tag
+    )
+    assert other == {}
+
+
+def test_ecdsa_sigs_for_relay_is_deterministic_and_bounded():
+    pytest.importorskip("eth_keys")
+    _fx, digest, sigs = _real_digest_and_sigs()
+    from gui.services.warp import evm as _evm
+
+    with pytest.raises(nostr.NostrError, match="have 0 of 6"):
+        nostr.ecdsa_sigs_for_relay({}, 6)

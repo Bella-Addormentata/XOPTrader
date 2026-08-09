@@ -76,6 +76,20 @@ class JobStatus:
     # on either chain, so this is a closed, successful, zero-risk end state.
     DRY_RUN_OK = "DRY_RUN_OK"
 
+    # -- Outbound (unwrap: wUSDC.b on Chia -> native USDC on Base) ---------- #
+    # The status vocabulary IS the direction: these states are disjoint from
+    # the inbound ones, so the dispatcher routes on status alone and no schema
+    # column is needed -- consistent with this module's evolving-payload rule
+    # (direction rides in the JSON state for display). The single active-slot
+    # index stays table-wide on purpose: both directions contend for the same
+    # Base gas balance and the same Chia wallet, and one bridge at a time is
+    # the operational model the runbook teaches (design doc §9 Q4).
+    UNWRAP_CHECKS = "UNWRAP_CHECKS"
+    BURN_SENT = "BURN_SENT"
+    BURNING = "BURNING"
+    COLLECTING_EVM_SIGS = "COLLECTING_EVM_SIGS"
+    RELAYING = "RELAYING"
+
 
 ALL_STATES: frozenset[str] = frozenset(
     v for k, v in vars(JobStatus).items() if not k.startswith("_") and isinstance(v, str)

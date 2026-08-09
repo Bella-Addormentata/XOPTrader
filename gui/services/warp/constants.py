@@ -67,6 +67,27 @@ class WarpNet:
     expected_asset_id: str  # wrapped-TAIL hash; must be non-empty (hard anchor)
     bridging_puzzle_hash: str  # network-independent; a09eb1ea...9037
 
+    # --- outbound (unwrap) ------------------------------------------------- #
+    # The Chia-side message toll: the cat_burner coin's amount, burned as the
+    # bundle's RESERVE_FEE (it doubles as the mempool fee -- design doc §4).
+    # Also the burn inner puzzle's curried BRIDGE_FEE, proven by evaluating the
+    # vendored bytecode against a real mainnet unwrap.
+    chia_toll_mojos: int
+    # sha256tree(get_cat_burner_puzzle(b"bse", erc20_bridge)) -- derived
+    # offline in the anchor tests AND read live from ERC20Bridge.burnPuzzleHash()
+    # at gate time. This is ALSO the outbound message's `source` field: the
+    # validators attest the cat_burner PUZZLE HASH, not any coin id.
+    burn_puzzle_hash: str
+    # EIP-712 domain fields, read live via eip712Domain() (EIP-5267) at gate
+    # time and asserted against these. The three separator getters
+    # (domainSeparator() and friends) all revert on the deployed Portal, so
+    # EIP-5267 is the only live read -- proven by execution.
+    eip712_name: str
+    eip712_version: str
+    # The reconstructed separator, anchored in tests; binds chainId 8453 and
+    # the portal address, so a redeploy changes it and the gate fails closed.
+    eip712_domain_separator: str
+
 
 MAINNET = WarpNet(
     name="mainnet",
@@ -159,4 +180,9 @@ MAINNET = WarpNet(
     # anchors
     expected_asset_id="fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d",
     bridging_puzzle_hash="a09eb1ea8c6e83c0166801dabcf4a70d361cc7f6d89c4a46bcd400ac57719037",
+    chia_toll_mojos=1_000_000_000,  # 0.001 XCH, both real mainnet unwraps
+    burn_puzzle_hash="6d64cf902916f73b90fa0a6412c7d1b43996c04fb3f245fcc2d767aa556c93a1",
+    eip712_name="warp.green Portal",
+    eip712_version="1",
+    eip712_domain_separator="9a1b113816cfc7af201f437d8ddea6c268c09303485630f6b38e9dbd28bd57eb",
 )

@@ -67,6 +67,18 @@ SEL_DECIMALS = bytes.fromhex("313ce567")          # decimals()
 SEL_MESSAGE_TOLL = bytes.fromhex("79c06b8b")      # messageToll()
 SEL_TIP = bytes.fromhex("2755cd2d")               # tip()
 SEL_BRIDGE_TO_CHIA = bytes.fromhex("cdb50da7")    # bridgeToChia(address,bytes32,uint256)
+# Outbound (unwrap) relay -- both verified against keccak in the tests, and
+# SEL_RECEIVE_MESSAGE against the deployed selector noted in
+# docs/warp-unwrap-design.md §2.2.
+SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)
+SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
+SEL_EIP712_DOMAIN = bytes.fromhex("84b0196e")     # eip712Domain() (EIP-5267)
+SEL_BURN_PUZZLE_HASH = bytes.fromhex("3f4710d3")  # burnPuzzleHash()
+
+# MessageReceived(bytes32 indexed nonce, ...) -- the Portal's delivery event.
+# Pinned against the real relay receipt in tests/fixtures_unwrap.json, not
+# derived from a guessed event signature.
+MESSAGE_RECEIVED_TOPIC0 = "08d1bf12867015b2874c8fcd6f1b0403eb05ca20867f81d40d3b232da098f9af"
 
 # MessageSent(bytes32 indexed nonce, address, bytes3, bytes32, bytes32[])
 MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7251a7a8"
@@ -75,6 +87,8 @@ MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7
 # always estimates live and applies headroom.
 _APPROVE_GAS_DEFAULT = 80_000
 _BRIDGE_GAS_DEFAULT = 300_000
+# A real relay measured 145,195; 250k default only when estimation is down.
+_RELAY_GAS_DEFAULT = 250_000
 
 # Node error fragments that mean "this exact transaction is already in the
 # mempool or already mined" -- rebroadcasting the stored raw is a no-op, so we
@@ -165,6 +179,200 @@ def encode_bridge_to_chia(asset: Any, receiver_ph: Any, mojo_amount: int) -> byt
         _enc_bytes32(receiver_ph),
         _enc_uint256(mojo_amount),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Outbound relay encoding (unwrap: Portal.receiveMessage).
+#
+# The only dynamic-ABI call in this module. Everything else is static words, so
+# the head/tail layout is written out longhand here and byte-compared against
+# eth_abi's independent encoder in the tests rather than pulling eth_abi into
+# the runtime path.
+# --------------------------------------------------------------------------- #
+
+def pack_validator_sigs(sigs: list) -> bytes:
+    """Pack validator signatures the way the Portal demands.
+
+    ``sigs`` is a list of ``(signer_address, v, r, s)`` with ``v`` in
+    {27, 28}, ``r``/``s`` 32 bytes each. The Portal requires (all verified
+    [V] in docs/warp-unwrap-design.md §2.2):
+
+    * layout ``v||r||s`` per signature -- NOT the usual r||s||v;
+    * recovered signers in strictly ascending address order
+      (``require(signer > lastSigner)``), so the pack sorts;
+    * the exact length ``signatureThreshold * 65`` -- not a minimum -- which
+      is the caller's check since only it knows the live threshold.
+    """
+    entries = []
+    seen = set()
+    for signer, v, r, s in sigs:
+        addr = int(_hx(signer), 16)
+        if addr in seen:
+            raise EvmError(f"duplicate validator signature from {signer}")
+        seen.add(addr)
+        v = int(v)
+        if v not in (27, 28):
+            raise EvmError(f"signature v must be 27 or 28, got {v}")
+        r, s = bytes(r), bytes(s)
+        if len(r) != 32 or len(s) != 32:
+            raise EvmError("signature r and s must be 32 bytes each")
+        entries.append((addr, bytes([v]) + r + s))
+    entries.sort(key=lambda e: e[0])
+    return b"".join(chunk for _addr, chunk in entries)
+
+
+def encode_receive_message(
+    nonce: Any,
+    source_chain: bytes,
+    source: Any,
+    destination: Any,
+    contents: list,
+    sigs_packed: bytes,
+) -> bytes:
+    """Calldata for ``Portal.receiveMessage(bytes32,bytes3,bytes32,address,bytes32[],bytes)``.
+
+    ``source`` is the Chia-side sender (the bridging coin's parent lineage --
+    a 32-byte word), ``destination`` the ERC20Bridge, ``contents`` the
+    validator-padded 32-byte memo atoms. Head is six slots; ``contents`` and
+    ``sigs`` are dynamic tails.
+    """
+    contents_words = [_enc_bytes32(c) for c in contents]
+    head_size = 6 * 32
+    contents_offset = head_size
+    contents_size = 32 + 32 * len(contents_words)
+    sigs_offset = contents_offset + contents_size
+
+    chain = bytes(source_chain)
+    if len(chain) != 3:
+        raise EvmError(f"source_chain must be 3 bytes, got {len(chain)}")
+
+    sigs = bytes(sigs_packed)
+    if len(sigs) % 65 != 0:
+        raise EvmError(f"packed sigs length {len(sigs)} is not a multiple of 65")
+    padded_sigs = sigs + b"\x00" * ((32 - len(sigs) % 32) % 32)
+
+    return (
+        SEL_RECEIVE_MESSAGE
+        + _enc_bytes32(nonce)
+        + chain + b"\x00" * 29                    # bytes3, right-padded
+        + _enc_bytes32(source)
+        + _enc_address(destination)
+        + _enc_uint256(contents_offset)
+        + _enc_uint256(sigs_offset)
+        + _enc_uint256(len(contents_words))
+        + b"".join(contents_words)
+        + _enc_uint256(len(sigs))
+        + padded_sigs
+    )
+
+
+# keccak256("Message(bytes32 nonce,bytes3 source_chain,bytes32 source,
+# address destination,bytes32[] contents)") -- anchored to keccak in the tests
+# and to the deployed Portal per docs/warp-unwrap-design.md §2.2.
+MESSAGE_TYPE_HASH = bytes.fromhex(
+    "9972dc9e80132460f6459b361feb003781068b85cac2d95d54bc2150f439b824"
+)
+
+
+def validator_message_digest(
+    domain_separator: bytes,
+    nonce: Any,
+    source_chain: bytes,
+    source: Any,
+    destination: Any,
+    contents: list,
+) -> bytes:
+    """The EIP-712 digest the validators sign for an outbound message.
+
+    ``domain_separator`` is read live from the Portal (it binds chainId and
+    the verifying contract; hardcoding it would silently break on a portal
+    redeploy). Unlike the inbound leg, nothing in this digest is mutable --
+    outbound signatures never expire [V].
+
+    Per EIP-712: value types pad to 32 (``bytes3`` right-pads), dynamic
+    arrays hash to ``keccak(concat(elements))``, and the digest is
+    ``keccak(0x1901 || domainSeparator || structHash)``.
+    """
+    from eth_utils import keccak
+
+    sep = bytes(domain_separator)
+    if len(sep) != 32:
+        raise EvmError(f"domain separator must be 32 bytes, got {len(sep)}")
+    chain = bytes(source_chain)
+    if len(chain) != 3:
+        raise EvmError(f"source_chain must be 3 bytes, got {len(chain)}")
+    struct_hash = keccak(
+        MESSAGE_TYPE_HASH
+        + _enc_bytes32(nonce)
+        + chain + b"\x00" * 29
+        + _enc_bytes32(source)
+        + _enc_address(destination)
+        + keccak(b"".join(_enc_bytes32(c) for c in contents))
+    )
+    return keccak(b"\x19\x01" + sep + struct_hash)
+
+
+def parse_message_received(receipt: dict, portal_address: Any, nonce: Any) -> bool:
+    """Whether *receipt* carries the Portal's MessageReceived for *nonce*."""
+    # _hx stringifies bytes into repr garbage; hex them first.
+    want_nonce = nonce.hex() if isinstance(nonce, (bytes, bytearray)) else _hx(nonce)
+    want_addr = _hx(portal_address)
+    for log in receipt.get("logs") or []:
+        if _hx(log.get("address", "")) != want_addr:
+            continue
+        topics = log.get("topics") or []
+        if len(topics) >= 2 and _hx(topics[0]) == MESSAGE_RECEIVED_TOPIC0 \
+                and _hx(topics[1]) == want_nonce:
+            return True
+    return False
+
+
+def unwrap_post_tip_base_units(mojo_amount: int, tip_bps: int, decimals: int, cat_decimals: int) -> int:
+    """What the receiver actually gets on Base: SCALE first, THEN tip.
+
+    Proven by execution against two real unwraps: the ERC20Bridge scales
+    CAT mojos to ERC-20 base units before taking its 30 bps tip, so the
+    result is not integral in mojos and the minimum viable unwrap is ONE
+    mojo (0.001 USDC -> 997 base units). This is the opposite order from
+    the inbound model -- :func:`post_tip_amount` works in mojos, raises on
+    1 mojo, and must never be reused here; a test pins the two apart.
+    """
+    mojo_amount = int(mojo_amount)
+    if mojo_amount < 1:
+        raise EvmError(f"unwrap amount must be at least 1 mojo, got {mojo_amount}")
+    scaled = mojo_amount * 10 ** (int(decimals) - int(cat_decimals))
+    tip = scaled * int(tip_bps) // 10_000
+    if scaled <= tip:
+        raise EvmError(f"amount {scaled} does not clear the tip {tip}")
+    return scaled - tip
+
+
+def decode_revert_reason(exc: BaseException) -> str:
+    """The human string inside an ABI ``Error(string)`` revert blob, if any.
+
+    Nodes differ: some put the reason in the message, some only in ``data``
+    as ``0x08c379a0 || abi.encode(string)``. Falls back to ``str(exc)``.
+    """
+    data = getattr(exc, "data", None)
+    if isinstance(data, str) and data.startswith("0x08c379a0"):
+        try:
+            blob = bytes.fromhex(data[2:])
+            strlen = int.from_bytes(blob[36:68], "big")
+            return blob[68:68 + strlen].decode("utf-8", "replace")
+        except Exception:  # noqa: BLE001 -- fall through to the message
+            pass
+    return str(exc)
+
+
+def is_already_delivered(exc: BaseException) -> bool:
+    """Whether a relay revert means the message was already delivered.
+
+    ``usedNonces[key] = true`` is written *before* the bridge call with no
+    try/catch, so a bridge-side revert rolls the nonce write back and the
+    relay is retryable. Only the Portal's own ``"!nonce"`` means someone
+    (us or a third party) already delivered this message [V].
+    """
+    return "!nonce" in decode_revert_reason(exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -561,6 +769,72 @@ class EvmClient:
         """``ERC20Bridge.tip()`` in basis points (immutable)."""
         return self._call_uint(self._net.erc20_bridge_address, SEL_TIP)
 
+    def get_signature_threshold(self) -> int:
+        """``Portal.signatureThreshold()`` -- owner-mutable, so always read live.
+
+        The relay's signature blob must be exactly ``threshold * 65`` bytes --
+        the contract checks equality, not a minimum -- so a stale count makes
+        every relay revert. Read it at gate time, never cached across a job.
+        """
+        return self._call_uint(self._net.portal_address, SEL_SIGNATURE_THRESHOLD)
+
+    def get_burn_puzzle_hash(self) -> bytes:
+        """``ERC20Bridge.burnPuzzleHash()`` -- the live half of the burn anchor."""
+        raw = self._eth_call(self._net.erc20_bridge_address, SEL_BURN_PUZZLE_HASH)
+        if len(raw) != 32:
+            raise EvmError(f"burnPuzzleHash() returned {len(raw)} bytes")
+        return raw
+
+    def verify_eip712_domain(self) -> bytes:
+        """Read the Portal's EIP-712 domain live and return the separator.
+
+        Via ``eip712Domain()`` (EIP-5267) -- the three dedicated separator
+        getters all revert on the deployed Portal, proven by execution. The
+        decoded name/version/chainId/verifyingContract must equal the
+        deployment constants and the reconstructed separator must equal the
+        anchored one; any mismatch means a portal redeploy, and every gate
+        downstream of this must fail closed.
+        """
+        from eth_utils import keccak
+
+        net = self._net
+        raw = self._eth_call(net.portal_address, SEL_EIP712_DOMAIN)
+        if len(raw) < 5 * 32:
+            raise EvmError(f"eip712Domain() returned {len(raw)} bytes")
+        # head: fields(bytes1), name offset, version offset, chainId,
+        # verifyingContract, salt, extensions offset.
+        chain_id = int.from_bytes(raw[3 * 32:4 * 32], "big")
+        contract = raw[4 * 32 + 12:5 * 32]
+
+        def _dyn_string(offset_slot: int) -> str:
+            off = int.from_bytes(raw[offset_slot * 32:(offset_slot + 1) * 32], "big")
+            n = int.from_bytes(raw[off:off + 32], "big")
+            return raw[off + 32:off + 32 + n].decode("utf-8", "replace")
+
+        name, version = _dyn_string(1), _dyn_string(2)
+        if (
+            name != net.eip712_name
+            or version != net.eip712_version
+            or chain_id != net.evm_chain_id
+            or contract.hex() != net.portal_address[2:].lower()
+        ):
+            raise EvmError(
+                f"portal EIP-712 domain mismatch: ({name!r}, {version!r}, "
+                f"{chain_id}, 0x{contract.hex()}) -- a portal redeploy; "
+                "refusing every unwrap gate"
+            )
+        type_hash = keccak(
+            text="EIP712Domain(string name,string version,"
+                 "uint256 chainId,address verifyingContract)"
+        )
+        sep = keccak(
+            type_hash + keccak(text=name) + keccak(text=version)
+            + chain_id.to_bytes(32, "big") + b"\x00" * 12 + contract
+        )
+        if sep.hex() != net.eip712_domain_separator:
+            raise EvmError("reconstructed EIP-712 separator does not match the anchor")
+        return sep
+
     # -- fees / nonce -------------------------------------------------------- #
 
     def get_nonce(self, address: str, *, pending: bool = True) -> int:
@@ -624,6 +898,39 @@ class EvmClient:
             )
         return build_approve_tx(
             self._net, amount_base_units=amount_base_units, nonce=nonce, fees=fees, gas=gas
+        )
+
+    def prepare_relay(
+        self,
+        *,
+        owner: str,
+        calldata: bytes,
+        nonce: Optional[int] = None,
+        fees: Optional[EIP1559Fees] = None,
+    ) -> UnsignedTx:
+        """Sign-ready ``Portal.receiveMessage`` -- non-payable, value 0.
+
+        Unlike the bridge, a relay replacement may safely take a FRESH nonce:
+        double delivery is impossible (``usedNonces`` makes the second attempt
+        revert ``!nonce``), so pinning is an optimisation, not a safety rail.
+        """
+        if nonce is None:
+            nonce = self.get_nonce(owner)
+        if fees is None:
+            fees = self.get_fee_data()
+        gas = self.estimate_gas(
+            from_address=owner, to=self._net.portal_address, value=0,
+            data=calldata, default=_RELAY_GAS_DEFAULT,
+        )
+        return UnsignedTx(
+            chain_id=self._net.evm_chain_id,
+            nonce=int(nonce),
+            to=_addr_bytes(self._net.portal_address),
+            value=0,
+            data=calldata,
+            gas=gas,
+            max_fee_per_gas=fees.max_fee_per_gas,
+            max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
         )
 
     def prepare_bridge(
