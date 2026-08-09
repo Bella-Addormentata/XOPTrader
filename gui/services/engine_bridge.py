@@ -150,6 +150,9 @@ class EngineBridge(QObject):
         self._warp_svc: WarpService = WarpService(
             config={},
             parent=self,
+            # The Base hot-wallet's key writes (create / rotate) go straight to
+            # secrets.yaml beside the config file, comment-preservingly.
+            secrets_path=self._config_path.parent / "secrets.yaml",
         )
 
         # -- Internal state -------------------------------------------------

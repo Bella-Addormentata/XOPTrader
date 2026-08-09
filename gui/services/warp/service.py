@@ -3059,6 +3059,32 @@ def _coinset_url(config: Optional[dict], net: constants.WarpNet) -> str:
     return (str(warp.get("coinset_url", "") or "").strip()) or net.coinset_url
 
 
+class _SecretsFileIO:
+    """``read()/write()`` over secrets.yaml for :class:`~gui.services.basewallet.BaseWallet`.
+
+    The write path reuses :func:`gui.services.config_split.dump_preserving` --
+    the same comment-preserving round-trip the settings page uses -- so the
+    operator's own annotations in secrets.yaml survive every key write.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def read(self) -> dict:
+        import yaml
+
+        if not self._path.is_file():
+            return {}
+        with open(self._path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh) or {}
+        return data if isinstance(data, dict) else {}
+
+    def write(self, data: dict) -> None:
+        from gui.services.config_split import dump_preserving
+
+        dump_preserving(self._path, data)
+
+
 # ===================================================================== #
 # Qt worker -- runs the blocking engine step on a background QThread.
 # ===================================================================== #
@@ -3074,11 +3100,20 @@ class _WarpWorker(QObject):
 
     snapshot_ready = Signal(dict)
 
-    def __init__(self, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QObject] = None,
+        *,
+        secrets_path: Optional[Path] = None,
+    ) -> None:
         super().__init__(parent)
         self._config: dict = {}
         self._engine: Optional[WarpEngine] = None
         self._engine_error: Optional[str] = None
+        # Base hot-wallet plumbing (independent of the engine -- see
+        # wallet_action). Set once before moveToThread, never mutated after.
+        self._secrets_path: Optional[Path] = secrets_path
+        self._last_wallet_notice: str = ""
 
     @Slot(dict)
     def set_config(self, config: dict) -> None:
@@ -3123,6 +3158,28 @@ class _WarpWorker(QObject):
             self._guarded(lambda engine: engine.job_action(job_id, action))
         )
 
+    @Slot(str, dict)
+    def wallet_action(self, action: str, payload: dict) -> None:
+        """Run one operator Base-wallet command and emit a fresh snapshot.
+
+        Deliberately NOT routed through :meth:`_guarded`: wallet commands must
+        work while the engine cannot build -- a missing hot-wallet key is the
+        engine's ordinary refusal, and ``create`` is how the operator fixes it.
+        """
+        payload = dict(payload or {})
+        error: Optional[str] = None
+        try:
+            notice = self._wallet_op(str(action), payload)
+            if notice:
+                self._last_wallet_notice = notice
+        except Exception as exc:  # noqa: BLE001 -- never kill the worker
+            error = str(exc)
+            _log.warning("wallet action %r failed: %s", action, exc)
+        snap = self._snapshot_or_error()
+        if error:
+            snap["wallet_action_error"] = error
+        self.snapshot_ready.emit(snap)
+
     # -- internals ---------------------------------------------------------- #
 
     def _guarded(self, fn: Callable[[WarpEngine], Any]) -> dict:
@@ -3146,19 +3203,27 @@ class _WarpWorker(QObject):
         return snap
 
     def _snapshot_or_error(self) -> dict:
+        snap: dict
         if self._engine is not None:
             try:
-                return self._engine.snapshot()
+                snap = self._engine.snapshot()
             except Exception as exc:  # noqa: BLE001
-                return {"enabled": self._config_enabled(), "error": str(exc)}
-        return {
-            # Report what the operator *asked* for, not what we managed to
-            # build. Otherwise a failed anchor renders as "Bridge disabled --
-            # set warp.enabled: true", which is both wrong and misleading
-            # advice; the documented banner for this is "blocked".
-            "enabled": self._config_enabled(),
-            "error": self._engine_error or "warp engine not built",
-        }
+                snap = {"enabled": self._config_enabled(), "error": str(exc)}
+        else:
+            snap = {
+                # Report what the operator *asked* for, not what we managed to
+                # build. Otherwise a failed anchor renders as "Bridge disabled --
+                # set warp.enabled: true", which is both wrong and misleading
+                # advice; the documented banner for this is "blocked".
+                "enabled": self._config_enabled(),
+                "error": self._engine_error or "warp engine not built",
+            }
+        # Base-wallet fields ride every snapshot, so the wallet page works in
+        # all three shapes (engine built, blocked, warp disabled).
+        snap["base_wallet"] = self._wallet_summary(snap.get("hot_wallet"))
+        if self._last_wallet_notice:
+            snap["wallet_notice"] = self._last_wallet_notice
+        return snap
 
     def _config_enabled(self) -> bool:
         """Whether ``warp.enabled`` is set, independent of whether it started."""
@@ -3268,6 +3333,144 @@ class _WarpWorker(QObject):
             nostr_fetcher=None,
         )
 
+    # -- base wallet (operator commands; independent of the engine) --------- #
+
+    def _base_wallet(self):
+        """Construct a :class:`~gui.services.basewallet.BaseWallet` over secrets.yaml.
+
+        Built fresh per use (the EVM client is a stateless HTTP wrapper) and
+        never through the engine, because the wallet must operate exactly when
+        the engine cannot: no key yet, or warp disabled.
+        """
+        from gui.services.basewallet import BaseWallet
+        from . import evm as evm_mod
+
+        if self._secrets_path is None:
+            raise WarpError("no secrets.yaml path configured for the wallet")
+        net = constants.MAINNET
+        params = warp_params_from_config(self._config)
+        rpc_url = params.base_rpc_url or net.evm_default_rpc_url
+        evm_client = evm_mod.EvmClient(net, rpc_url=rpc_url)
+        return BaseWallet(net, evm_client, _SecretsFileIO(self._secrets_path))
+
+    def _wallet_op(self, action: str, payload: dict) -> str:
+        """Dispatch one wallet command; returns the operator-facing notice."""
+        from gui.services.basewallet import BaseWalletError
+
+        wallet = self._base_wallet()
+        if action == "create":
+            address = wallet.create_wallet()
+            self._adopt_key_from_disk()
+            return (
+                f"Wallet created: {address}. Back up the key now (runbook: "
+                "hot-wallet key backup), then confirm the backup."
+            )
+        if action == "confirm_backup":
+            wallet.mark_backup_confirmed()
+            return "Key backup confirmed."
+        if action == "send_eth":
+            tx = wallet.send_eth(
+                str(payload.get("destination") or ""),
+                int(payload.get("amount_wei") or 0),
+            )
+            return f"ETH transfer broadcast: {tx}"
+        if action == "send_usdc":
+            tx = wallet.send_usdc(
+                str(payload.get("destination") or ""),
+                int(payload.get("amount_micros") or 0),
+            )
+            return f"USDC transfer broadcast: {tx}"
+        if action == "rotate":
+            out = wallet.rotate(open_job_check=self._wallet_open_job)
+            self._adopt_key_from_disk()
+            txs = ", ".join(out["sweep_txs"]) or "none (nothing to sweep)"
+            return (
+                f"Key rotated: {out['old_address']} -> {out['new_address']}. "
+                f"Sweep txs: {txs}. The old key is archived in secrets.yaml. "
+                "Back up the NEW key, then confirm the backup."
+            )
+        raise BaseWalletError(f"unknown wallet action: {action!r}")
+
+    def _wallet_open_job(self) -> Optional[WarpJob]:
+        """The rotation guard's open-job probe -- fail-closed.
+
+        With the engine built, ask its store. Without it a job can still be
+        open (warp disabled mid-job), so probe the DB directly; an unreadable
+        DB refuses rotation rather than sweeping out from under a frozen job.
+        A missing DB file means no job ever ran, which is safely ``None``.
+        """
+        from gui.services.basewallet import BaseWalletError
+
+        if self._engine is not None:
+            return self._engine._store.get_active_job()
+        db = Path(_job_db_path(self._config))
+        if not db.is_file():
+            return None
+        try:
+            store = WarpJobStore(str(db))
+        except Exception as exc:  # noqa: BLE001 -- fail closed, with the reason
+            raise BaseWalletError(
+                f"cannot read the warp job store ({exc}); refusing rotation"
+            ) from exc
+        try:
+            return store.get_active_job()
+        finally:
+            store.close()
+
+    def _adopt_key_from_disk(self) -> None:
+        """Point the worker's config at the key now on disk; rebuild the engine.
+
+        Without this the engine keeps signing with the pre-rotation key it was
+        built around (and after ``create``, keeps refusing to build at all)
+        until the next full config reload.
+        """
+        try:
+            secrets = _SecretsFileIO(self._secrets_path).read()
+            blob = (secrets.get("warp") or {}).get("evm_private_key_dpapi")
+        except Exception as exc:  # noqa: BLE001 -- adoption is best-effort
+            _log.warning("could not re-read secrets.yaml after key change: %s", exc)
+            return
+        if blob:
+            self._config.setdefault("warp", {})["evm_private_key_dpapi"] = blob
+        self._drop_engine()
+        self._engine_error = None
+
+    def _wallet_summary(self, hot: Optional[dict]) -> dict:
+        """Operator-facing wallet state for the Base Wallet page.
+
+        Balance reads ride the engine's own refresh when it is built (the
+        ``hot`` dict); with no engine they are read directly -- two RPCs per
+        ~30s tick, and only once a key exists.
+        """
+        out: Dict[str, Any] = {"configured": False}
+        if self._secrets_path is None:
+            out["error"] = "no secrets.yaml path configured"
+            return out
+        try:
+            warp_sec = _SecretsFileIO(self._secrets_path).read().get("warp") or {}
+        except Exception as exc:  # noqa: BLE001 -- the summary must never raise
+            out["error"] = f"secrets.yaml unreadable: {exc}"
+            return out
+        out["retired_count"] = len(warp_sec.get("retired_keys") or [])
+        out["backup_confirmed"] = bool(warp_sec.get("evm_key_backup_confirmed"))
+        if not warp_sec.get("evm_private_key_dpapi"):
+            return out
+        out["configured"] = True
+        if hot and hot.get("address") and not hot.get("error"):
+            out["address"] = str(hot.get("address"))
+            out["eth_wei"] = hot.get("eth_wei")
+            out["usdc_micros"] = hot.get("usdc_micros")
+            return out
+        try:
+            info = self._base_wallet().info()
+        except Exception as exc:  # noqa: BLE001 -- summary must never raise
+            out["error"] = str(exc)
+            return out
+        out["address"] = info.address
+        out["eth_wei"] = info.eth_wei
+        out["usdc_micros"] = info.usdc_micros
+        return out
+
 
 # ===================================================================== #
 # Main service -- lives on the GUI thread.
@@ -3294,8 +3497,15 @@ class WarpService(QObject):
     _trigger_bridge = Signal(object)
     _trigger_unwrap = Signal(int, str)
     _trigger_action = Signal(int, str)
+    _trigger_wallet = Signal(str, dict)
 
-    def __init__(self, config: Optional[dict] = None, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+        parent: Optional[QObject] = None,
+        *,
+        secrets_path: Optional[Path] = None,
+    ) -> None:
         super().__init__(parent)
         self._mutex = QMutex()
         self._snapshot: dict = {}
@@ -3303,7 +3513,9 @@ class WarpService(QObject):
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
-        self._worker = _WarpWorker()
+        self._worker = _WarpWorker(
+            secrets_path=Path(secrets_path) if secrets_path else None
+        )
         self._worker.moveToThread(self._thread)
 
         self._worker.snapshot_ready.connect(self._on_snapshot_ready)
@@ -3312,6 +3524,7 @@ class WarpService(QObject):
         self._trigger_bridge.connect(self._worker.request_bridge)
         self._trigger_unwrap.connect(self._worker.request_unwrap)
         self._trigger_action.connect(self._worker.job_action)
+        self._trigger_wallet.connect(self._worker.wallet_action)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -3365,6 +3578,13 @@ class WarpService(QObject):
         if not self._thread.isRunning():
             self.start()
         self._trigger_action.emit(int(job_id), str(action))
+
+    def wallet_action(self, action: str, payload: Optional[dict] = None) -> None:
+        """Queue one Base-wallet command (create / confirm_backup / send_eth /
+        send_usdc / rotate) onto the worker thread."""
+        if not self._thread.isRunning():
+            self.start()
+        self._trigger_wallet.emit(str(action), dict(payload or {}))
 
     def get_snapshot(self) -> dict:
         """Return the last snapshot without triggering work (mutex-guarded)."""

@@ -63,6 +63,7 @@ _NAV_ITEMS: Final[list[tuple[str, str]]] = [
     ("Wallet",     "\U0001F4B0"),   # 💰  money bag
     ("Reports",    "\U0001F4C4"),   # 📄  document (reports)
     ("Warp",       "\U0001F309"),   # 🌉  bridge
+    ("Base",       "\U0001F537"),   # 🔷  Base-network hot wallet
     ("Settings",   "\u2699\uFE0F"), # ⚙️  gear
 ]
 

@@ -100,6 +100,11 @@ try:
 except ImportError:
     WarpWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.base_wallet import BaseWalletWidget
+except ImportError:
+    BaseWalletWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -145,7 +150,8 @@ _PAGE_ANALYSIS: Final[int] = 4
 _PAGE_WALLET: Final[int] = 5
 _PAGE_REPORTS: Final[int] = 6
 _PAGE_WARP: Final[int] = 7
-_PAGE_SETTINGS: Final[int] = 8
+_PAGE_BASE_WALLET: Final[int] = 8
+_PAGE_SETTINGS: Final[int] = 9
 
 
 def _fmt_usd(value: float) -> str:
@@ -236,6 +242,7 @@ class MainWindow(QMainWindow):
         self._bot_log: Optional[QWidget] = None
         self._tab_order_panel: Optional[QWidget] = None
         self._warp_widget: Optional[QWidget] = None
+        self._base_wallet_widget: Optional[QWidget] = None
 
         # -- Settings persistence -------------------------------------------
         self._settings = QSettings(_ORG_NAME, _APP_NAME)
@@ -389,6 +396,16 @@ class MainWindow(QMainWindow):
                 warp_widget.unwrap_requested.connect(warp_svc.request_unwrap)
             if hasattr(warp_widget, "job_action_requested"):
                 warp_widget.job_action_requested.connect(warp_svc.job_action)
+
+        # -- Base Wallet widget -> WarpService wallet commands -------------
+        # Create / confirm-backup / send / rotate run on the same warp worker
+        # thread (the wallet is the bridge's hot wallet); guarded identically.
+        base_wallet_widget = self._unwrap(self._base_wallet_widget)
+        if base_wallet_widget is not None and warp_svc is not None:
+            if hasattr(base_wallet_widget, "wallet_action_requested"):
+                base_wallet_widget.wallet_action_requested.connect(
+                    warp_svc.wallet_action
+                )
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.
@@ -680,6 +697,12 @@ class MainWindow(QMainWindow):
         warp_widget = self._unwrap(self._warp_widget)
         if warp_widget is not None and hasattr(warp_widget, "update_data"):
             warp_widget.update_data(data)
+
+        # Base Wallet tab -- same snapshot; consumes data["warp"]["base_wallet"]
+        # plus the wallet_notice / wallet_action_error companions.
+        base_wallet_widget = self._unwrap(self._base_wallet_widget)
+        if base_wallet_widget is not None and hasattr(base_wallet_widget, "update_data"):
+            base_wallet_widget.update_data(data)
 
     def _on_bot_status_changed(self, status: str) -> None:
         """Update toolbar when bridge reports bot status change.
@@ -1467,8 +1490,12 @@ class MainWindow(QMainWindow):
             WarpWidget, "Warp Bridge"
         )
         self._stacked.addWidget(self._warp_widget)
+        self._base_wallet_widget = self._create_page_widget(        # index 8
+            BaseWalletWidget, "Base Wallet"
+        )
+        self._stacked.addWidget(self._base_wallet_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 8
+        self._stacked.addWidget(self._settings_widget)              # index 9
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)

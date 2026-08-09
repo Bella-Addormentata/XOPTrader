@@ -226,8 +226,17 @@ SECRET_KEYS: dict[str, set[str]] = {
     "monitoring": {"telegram_bot_token", "telegram_chat_id"},
     "coingecko": {"api_key"},
     "database": {"path"},
-    # warp bridge hot-wallet key, DPAPI-encrypted (gui/services/warp/keystore.py).
-    "warp": {"evm_private_key_dpapi"},
+    # warp bridge hot-wallet key material, DPAPI-encrypted
+    # (gui/services/warp/keystore.py). retired_keys carries the archived
+    # blobs from every rotation and evm_key_backup_confirmed rides with the
+    # key it describes; ALL of these must live here -- a settings save of the
+    # merged config would otherwise write them into git-tracked config.yaml.
+    "warp": {
+        "evm_private_key_dpapi",
+        "relay_private_key_dpapi",
+        "retired_keys",
+        "evm_key_backup_confirmed",
+    },
 }
 
 
