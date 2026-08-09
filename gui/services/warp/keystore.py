@@ -208,6 +208,15 @@ class EvmKey:
                 f"EVM private key must be 32 bytes, got {len(self.private_key)}"
             )
 
+    def __repr__(self) -> str:
+        # The generated dataclass repr renders private_key=b'\x..' in full.
+        # WarpEngine._guarded pipes arbitrary exception text into both the log
+        # and the GUI snapshot, so one traceback holding this object is all it
+        # would take.
+        return f"EvmKey(address={self.address})"
+
+    __str__ = __repr__
+
 
 def new_evm_key() -> EvmKey:
     """Generate a fresh random EVM hot-wallet key."""
@@ -247,8 +256,16 @@ def load_evm_key(
     blob_b64: str, *, protector: Optional[SecretProtector] = None
 ) -> EvmKey:
     """Recover an EVM key from its stored blob, re-deriving the address."""
+    from eth_account import Account
+
     raw = unprotect_secret(blob_b64, protector=protector)
-    return evm_key_from_hex(raw.hex())
+    if len(raw) != 32:
+        raise KeystoreError(f"EVM private key must be 32 bytes, got {len(raw)}")
+    # Deliberately not via evm_key_from_hex: that round-trips the key through an
+    # immutable str purely to parse it straight back, and Python cannot zero a
+    # str -- so the secret would linger on the heap, and in any crash dump, for
+    # the life of the process.
+    return EvmKey(raw, Account.from_key(raw).address)
 
 
 # --------------------------------------------------------------------------- #
@@ -267,6 +284,13 @@ class BlsKey:
             raise KeystoreError(
                 f"BLS private key must be 32 bytes, got {len(self.private_key)}"
             )
+
+    def __repr__(self) -> str:
+        # See EvmKey.__repr__. The public key alone is enough to identify which
+        # ephemeral key this is.
+        return f"BlsKey(public_key={self.public_key.hex()[:16]}...)"
+
+    __str__ = __repr__
 
 
 def new_bls_key() -> BlsKey:

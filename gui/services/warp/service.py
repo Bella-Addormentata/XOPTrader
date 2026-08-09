@@ -1738,6 +1738,22 @@ class WarpEngine:
         self._receiver_snap = self.effective_receiver()
         return snap
 
+    def close(self) -> None:
+        """Release the job store's sqlite connection.
+
+        [WARP-STORE-LEAK 2026-08-08] WarpJobStore.close() had no caller
+        anywhere: set_config drops the engine and _build_engine opens a fresh
+        store, so every config reload leaked a connection plus its WAL and SHM
+        handles against warp_jobs.db. Not a correctness bug -- the partial
+        unique index still holds -- but unbounded in a process left running for
+        days, and on Windows an open handle is also what turns the documented
+        hard-kill relaunch into a file still in use.
+        """
+        try:
+            self._store.close()
+        except Exception as exc:  # noqa: BLE001 -- teardown must not raise
+            _log.debug("warp: job store close failed: %s", exc)
+
     def snapshot(self) -> Dict[str, Any]:
         """A GUI-serializable snapshot of the whole warp subsystem.
 
@@ -1811,8 +1827,14 @@ class _WarpWorker(QObject):
     def set_config(self, config: dict) -> None:
         """Adopt a new config snapshot and force a lazy engine rebuild."""
         self._config = dict(config or {})
-        self._engine = None
+        self._drop_engine()
         self._engine_error = None
+
+    def _drop_engine(self) -> None:
+        """Discard the engine, closing its sqlite connection first."""
+        engine, self._engine = self._engine, None
+        if engine is not None:
+            engine.close()
 
     @Slot()
     def tick(self) -> None:
@@ -1920,7 +1942,29 @@ class _WarpWorker(QObject):
         except Exception as exc:  # noqa: BLE001 -- surfaced as a blocked banner
             raise WarpError(f"wrapped-asset anchor failed: {exc}") from exc
 
+        # The store opens a sqlite connection, and everything below it can still
+        # raise -- a missing hot-wallet key is the ordinary case. Without this,
+        # each failed build leaked a connection, and _ensure_engine is retried
+        # on every config reload.
         store = WarpJobStore(_job_db_path(self._config))
+        try:
+            return self._build_engine_with(net, params, store)
+        except Exception:
+            store.close()
+            raise
+
+    def _build_engine_with(
+        self, net: Any, params: WarpParams, store: WarpJobStore
+    ) -> WarpEngine:
+        """Construct the clients and the engine around an open *store*."""
+        from . import (
+            coinset as coinset_mod,
+            evm as evm_mod,
+            keystore,
+            wallet as wallet_mod,
+            watcher as watcher_mod,
+        )
+
         rpc_url = params.base_rpc_url or net.evm_default_rpc_url
         evm_client = evm_mod.EvmClient(net, rpc_url=rpc_url)
         coinset_client = coinset_mod.CoinsetClient(_coinset_url(self._config, net))
@@ -2021,6 +2065,13 @@ class WarpService(QObject):
             self._thread.quit()
             if not self._thread.wait(5_000):
                 _log.warning("WarpService worker thread did not exit in time.")
+        # Only quitting the thread left warp_jobs.db open. On Windows that is
+        # the handle that turns the documented hard-kill relaunch into "the
+        # process cannot access the file".
+        try:
+            self._worker._drop_engine()
+        except Exception as exc:  # noqa: BLE001 -- shutdown must not raise
+            _log.debug("warp: engine teardown failed: %s", exc)
 
     # -- public API --------------------------------------------------------- #
 

@@ -671,6 +671,48 @@ def test_new_jobs_record_their_binding():
 # F1 -- dry run signs everything and broadcasts nothing.
 # --------------------------------------------------------------------------- #
 
+def test_key_objects_never_render_their_private_key():
+    """[WARP-KEY-REPR] _guarded pipes exception text into the log and the GUI.
+
+    Both key types were plain frozen dataclasses, so the generated repr
+    rendered private_key=b'\\x..' in full. One traceback holding the object
+    was all it would have taken.
+    """
+    from gui.services.warp import keystore as ks
+
+    secret = b"\x11" * 32
+    evm = ks.evm_key_from_hex(secret.hex())
+    for text in (repr(evm), str(evm), f"{evm}", f"{[evm]}"):
+        assert secret.hex() not in text.lower()
+        assert "\\x11" not in text
+    assert evm.address in repr(evm)          # still identifiable
+
+    bls = ks.BlsKey(private_key=secret, public_key=b"\x22" * 48)
+    for text in (repr(bls), str(bls), f"{[bls]}"):
+        assert secret.hex() not in text.lower()
+        assert "\\x11" not in text
+
+
+def test_dropping_the_engine_closes_the_job_store(tmp_path, monkeypatch):
+    """[WARP-STORE-LEAK] WarpJobStore.close() had no caller anywhere.
+
+    set_config drops the engine and _build_engine opens a fresh store, so
+    every config reload leaked a connection plus its WAL/SHM handles.
+    """
+    from gui.services.warp.jobs import WarpJobStore
+
+    store = WarpJobStore(str(tmp_path / "warp_jobs.db"))
+    engine, _ctx = build(store)
+
+    worker = S._WarpWorker()
+    worker._engine = engine
+    worker._drop_engine()
+
+    assert worker._engine is None
+    with pytest.raises(Exception):           # the connection really is closed
+        store.get_active_job()
+
+
 def test_an_enabled_bridge_must_state_its_cap():
     """[WARP-CAP-FAIL-OPEN] A missing cap used to mean no cap at all.
 
