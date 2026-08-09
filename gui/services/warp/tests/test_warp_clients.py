@@ -295,6 +295,50 @@ def test_wallet_send_transaction_returns_record():
     assert body["wallet_id"] == 1
 
 
+def test_wallet_get_wallets_filters_by_type():
+    poster = FakePoster(
+        {"get_wallets": {"success": True, "wallets": [
+            {"id": 3, "type": 6, "name": "wUSDC.b"},
+        ]}}
+    )
+    w = _wallet(poster)
+    wallets = w.get_wallets(wallet_type=6)
+    assert wallets == [{"id": 3, "type": 6, "name": "wUSDC.b"}]
+    assert poster.body_for("get_wallets") == {"include_data": True, "type": 6}
+
+
+def test_wallet_cat_get_asset_id():
+    poster = FakePoster(
+        {"cat_get_asset_id": {"success": True, "asset_id": "fa4a" + "00" * 30}}
+    )
+    w = _wallet(poster)
+    assert w.cat_get_asset_id(3) == "fa4a" + "00" * 30
+    assert poster.body_for("cat_get_asset_id") == {"wallet_id": 3}
+
+
+def test_wallet_cat_spend_never_pins_coins():
+    """[UNWRAP-COIN-SELECTION] The request body must not carry a coins list.
+
+    Explicit coin lists bypass the daemon's select_coins, and default selection
+    is the only thing that honours the trade manager's offer locks -- pinning a
+    coin would double-spend collateral committed to an open offer. The absence
+    of the parameter IS the coin-conflict mitigation, so a test asserts it.
+    """
+    poster = FakePoster(
+        {"cat_spend": {"success": True,
+                       "transaction": {"name": "0xburntx", "transaction_id": "0xburntx"}}}
+    )
+    w = _wallet(poster)
+    tx = w.cat_spend(3, 5000, "xch1burninner", fee_mojos=1000, memos=["deadbeef"])
+    assert tx["name"] == "0xburntx"
+    body = poster.body_for("cat_spend")
+    assert body == {
+        "wallet_id": 3, "amount": 5000, "inner_address": "xch1burninner",
+        "fee": 1000, "memos": ["deadbeef"],
+    }
+    assert "coins" not in body
+
+
 def test_wallet_failure_is_raised():
     poster = FakePoster({"send_transaction": {"success": False, "error": "insufficient funds"}})
     w = _wallet(poster)

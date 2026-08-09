@@ -141,6 +141,61 @@ class WalletClient:
         tx = data.get("transaction")
         return tx if isinstance(tx, dict) else data
 
+    def get_wallets(self, *, wallet_type: Optional[int] = None) -> list[dict]:
+        """List the daemon's wallets; ``wallet_type=6`` filters to CAT wallets."""
+        body: dict[str, Any] = {"include_data": True}
+        if wallet_type is not None:
+            body["type"] = int(wallet_type)
+        data = self._post("get_wallets", body)
+        return list(data.get("wallets") or [])
+
+    def cat_get_asset_id(self, wallet_id: int) -> str:
+        """The TAIL hash (hex, no 0x) behind a CAT wallet."""
+        data = self._post("cat_get_asset_id", {"wallet_id": int(wallet_id)})
+        asset_id = data.get("asset_id")
+        if not asset_id:
+            raise WalletError(f"cat_get_asset_id({wallet_id}) returned no asset_id")
+        return str(asset_id)
+
+    def cat_spend(
+        self,
+        wallet_id: int,
+        amount_mojos: int,
+        inner_address: str,
+        *,
+        fee_mojos: int = 0,
+        memos: Optional[list[str]] = None,
+    ) -> dict:
+        """Move CAT units to an arbitrary inner puzzle hash (bech32m-encoded).
+
+        The daemon decodes ``inner_address`` and uses the result directly as the
+        CAT inner puzzle hash with no ownership check -- which is what lets the
+        unwrap deliver wUSDC.b to the burn inner puzzle without the bot holding
+        a signing key. The daemon does coin selection, lineage proofs, signing
+        and change.
+
+        Deliberately NO ``coins=[...]`` parameter, and one must never be added:
+        explicit coin lists bypass ``select_coins`` entirely, and default
+        selection is the only thing that honours the trade manager's offer
+        locks. Pinning a coin would happily double-spend collateral committed
+        to an open offer. This omission is the entire coin-conflict mitigation
+        (docs/warp-unwrap-design.md §6.1/§7).
+
+        Like send_transaction, this issues one RPC and never retries; the
+        caller owns de-duplication.
+        """
+        body: dict[str, Any] = {
+            "wallet_id": int(wallet_id),
+            "amount": int(amount_mojos),
+            "inner_address": str(inner_address),
+            "fee": int(fee_mojos),
+        }
+        if memos:
+            body["memos"] = list(memos)
+        data = self._post("cat_spend", body)
+        tx = data.get("transaction")
+        return tx if isinstance(tx, dict) else data
+
     def get_transaction(self, transaction_id: str) -> dict:
         data = self._post("get_transaction", {"transaction_id": str(transaction_id)})
         return data.get("transaction") or {}
