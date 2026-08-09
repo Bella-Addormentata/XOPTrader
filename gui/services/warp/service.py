@@ -125,6 +125,12 @@ _CANCELLABLE = frozenset(
     {JobStatus.AWAITING_DEPOSIT, JobStatus.DEPOSIT_SEEN, JobStatus.APPROVING}
 )
 
+# Stand-in for a funding transaction the wallet accepted without returning an
+# id. What matters downstream is not the id itself -- the security coin is
+# located by puzzle hash and amount -- but that ``funding_tx_id`` stays truthy,
+# because that is the flag saying "already sent, do not send again".
+_FUNDING_TX_UNKNOWN: str = "sent-id-unknown"
+
 
 # --------------------------------------------------------------------------- #
 # Parameters (parsed from the null-safe config dict).
@@ -786,7 +792,10 @@ class WarpEngine:
         existing = self._find_existing_funding(security_ph.hex(), expected)
         if existing:
             return _stay(
-                state={"funding_tx_id": existing},
+                # funding_amount travels with the id here too: a job that
+                # resumes through this branch would otherwise leave every
+                # later lookup recomputing the amount from live config.
+                state={"funding_tx_id": existing, "funding_amount": expected},
                 message="funding tx already in flight (dedupe hit)",
             )
 
@@ -795,7 +804,21 @@ class WarpEngine:
         record = self._wallet.send_transaction(
             1, expected, address, fee_mojos=p.chia_funding_fee_mojos
         )
+        # [WARP-DUP-FUND 2026-08-08] send_transaction returned, so the coin is
+        # on its way whether or not the wallet named the transaction. Persisting
+        # None would leave the `if prior:` guard above falsy on the next tick,
+        # and the dedupe scan cannot cover the gap because the coin is not on
+        # chain yet -- so the security coin would be funded a SECOND time, out
+        # of the operator's wallet. Keep the guard armed with a sentinel.
         tx_id = record.get("name") or record.get("transaction_id")
+        if not tx_id:
+            tx_id = _FUNDING_TX_UNKNOWN
+            _log.warning(
+                "warp: wallet accepted the funding send for job %s but named no "
+                "transaction; recording %r so the in-flight guard still holds",
+                job.id,
+                tx_id,
+            )
         return _stay(
             # Record what was actually sent. A later Sweep must look for *this*
             # amount, not whatever claim_fee_mojos happens to say at the time.

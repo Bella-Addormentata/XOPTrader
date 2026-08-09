@@ -172,6 +172,60 @@ def test_funding_claim_sends_once_when_the_scan_is_clean(monkeypatch):
     assert store.get_active_job().state["funding_tx_id"] == "funding-tx-1"
 
 
+def test_funding_claim_guards_even_when_the_wallet_names_no_transaction(monkeypatch):
+    """[WARP-DUP-FUND] A send the wallet does not name must still block a resend.
+
+    ``send_transaction`` returning neither ``name`` nor ``transaction_id``
+    used to persist ``None``, which is falsy -- so the next tick sailed past
+    the in-flight guard and funded the security coin a SECOND time out of the
+    operator's wallet.  The dedupe scan cannot cover it: the coin is not on
+    chain yet, which is the whole reason the guard exists.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_funding_claim(store)
+
+    def _unnamed_send(wallet_id, amount, address, fee_mojos=0):
+        ctx.wallet.sent.append((amount, address, fee_mojos))
+        return {"status": "SUCCESS"}          # accepted, but named nothing
+
+    ctx.wallet.send_transaction = _unnamed_send
+
+    engine.step()
+    assert len(ctx.wallet.sent) == 1
+    assert store.get_active_job().state["funding_tx_id"] == S._FUNDING_TX_UNKNOWN
+
+    engine.step()
+    assert len(ctx.wallet.sent) == 1, "the second tick must not re-fund the coin"
+
+
+def test_funding_dedupe_hit_also_records_the_amount(monkeypatch):
+    """The dedupe branch must persist funding_amount, not just the tx id.
+
+    Without it a job resuming through the dedupe path leaves Sweep and
+    _funding_provably_gone recomputing the expected amount from live config --
+    the exact drift the funding_amount field was introduced to prevent.
+    """
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
+    monkeypatch.setattr(claim_mod, "security_coin_puzzle_hash", lambda sk: b"\x5b" * 32)
+    store = new_store()
+    engine, ctx = build(store)
+    job, _sk = _seed_funding_claim(store)
+    expected = int(job.post_tip_mojos) + int(default_params().claim_fee_mojos)
+    monkeypatch.setattr(
+        S.WarpEngine, "_find_existing_funding", lambda self, ph, amt: "prior-tx"
+    )
+
+    engine.step()
+
+    state = store.get_active_job().state
+    assert ctx.wallet.sent == []
+    assert state["funding_tx_id"] == "prior-tx"
+    assert state["funding_amount"] == expected
+
+
 # --------------------------------------------------------------------------- #
 # F4 / F5 -- a resolved sweep frees the slot.
 # --------------------------------------------------------------------------- #
