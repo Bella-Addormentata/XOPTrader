@@ -563,10 +563,17 @@ class WarpEngine:
         if polls < limit:
             return None
         hours = polls * float(self._params.poll_interval_s) / 3600.0
+        # No Sweep suggestion for the Base-side states: they have no funding
+        # coin, and pointing the operator at Sweep there aimed them straight at
+        # the close-over-a-live-bridge hazard the sweep guard now blocks.
+        remedy = (
+            "Retry re-attempts it"
+            if job.status in (JobStatus.BRIDGING, JobStatus.BRIDGE_CONFIRMED)
+            else "Retry re-attempts it, Sweep recovers the funding coin"
+        )
         return (
             f"no progress in {job.status} after {polls} polls (~{hours:.1f}h); "
-            "handing over to the operator -- Retry re-attempts it, Sweep "
-            "recovers the funding coin"
+            f"handing over to the operator -- {remedy}"
         )
 
     def _apply_stay(self, job: WarpJob, result: _Step) -> dict:
@@ -870,6 +877,10 @@ class WarpEngine:
                     "bridge_fee_bumps": None,
                     "bridge_unmined_polls": None,
                     "bridge_fees": None,
+                    # Receipt-specific like the rest: left behind, attempt 2's
+                    # first ambiguous receipt inherits attempt 1's count and
+                    # goes terminal at a fraction of the documented budget.
+                    "bridge_status_polls": None,
                 },
                 message=f"bridge reverted; re-preparing (attempt {attempt})",
             )
@@ -1428,6 +1439,17 @@ class WarpEngine:
                 return {}
             if mined <= int(nonce):
                 return {}          # still live: replaying is safer than re-signing
+            if target == JobStatus.BRIDGING:
+                # A consumed nonce is ambiguous: someone else took it, or OUR
+                # bridge mined during the outage that failed the job. Only a
+                # receipt distinguishes them, and clearing on a mined bridge
+                # re-signs a second bridgeToChia at a fresh nonce -- a true
+                # double bridge against the same deposit. Keep everything: the
+                # resumed phase 2's rebroadcast is benign ("nonce too low") and
+                # _bridge_receipt routes the mined receipt to success/revert.
+                _mined_hash, receipt = self._bridge_receipt(job)
+                if receipt is not None:
+                    return {}
 
         if target == JobStatus.BRIDGING:
             return {
@@ -1819,6 +1841,48 @@ class WarpEngine:
         )
         return _job_dict(job)
 
+    def _refuse_while_bridge_unresolved(self, job: WarpJob, action: str) -> None:
+        """Refuse to close a job whose signed bridge is live or already mined.
+
+        [WARP-NONCE-AMBIGUITY 2026-08-09] ``get_nonce`` alone cannot tell the
+        two meanings of a consumed nonce apart: something *else* took it (the
+        deposit is untouched -- closing is fine) versus *our own transaction
+        mined* (real USDC is bridged and the job must be completed via Retry,
+        which rebroadcasts benignly and routes the receipt through phase 2).
+        The first version of this guard checked only liveness, so a mined
+        bridge could be abandoned -- and Sweep's no-key branch, which concluded
+        "nothing was ever funded" and closed, had no guard at all: the exact
+        bypass the abandon guard existed to block, one button over.
+
+        Raises unless the nonce is provably dead AND nothing this job signed
+        has a receipt. Callers must be same-binding (the nonce check reads the
+        configured hot wallet).
+        """
+        raw_nonce = job.state.get("bridge_tx_nonce")
+        if not (job.state.get("bridge_raw") and raw_nonce is not None):
+            return
+        try:
+            mined = int(self._evm.get_nonce(self._hot_address, pending=False))
+        except Exception as exc:  # noqa: BLE001 -- cannot prove it is dead
+            raise WarpError(
+                f"cannot {action}: unable to verify whether the signed bridge "
+                f"at nonce {raw_nonce} is still live ({exc}); try again when "
+                "the Base RPC is reachable"
+            ) from exc
+        if mined <= int(raw_nonce):
+            raise WarpError(
+                f"cannot {action}: this job's signed bridge is still live at "
+                f"nonce {raw_nonce}. Wait for it to mine (then Retry), or "
+                "clear the nonce with a self-send replacement from the hot "
+                f"wallet, then {action}"
+            )
+        _mined_hash, receipt = self._bridge_receipt(job)
+        if receipt is not None:
+            raise WarpError(
+                f"cannot {action}: this job's bridge mined at nonce {raw_nonce}. "
+                "Use Retry -- it picks up the receipt and completes the job"
+            )
+
     def _abandon_job(self, job: WarpJob) -> dict:
         """Close a FAILED job the machine cannot resolve, freeing the slot.
 
@@ -1866,22 +1930,8 @@ class WarpEngine:
         # hot wallet than the configured key, so the check would be meaningless;
         # the recovery blob records what to verify by hand instead.
         raw_nonce = job.state.get("bridge_tx_nonce")
-        if not mismatch and job.state.get("bridge_raw") and raw_nonce is not None:
-            try:
-                mined = int(self._evm.get_nonce(self._hot_address, pending=False))
-            except Exception as exc:  # noqa: BLE001 -- cannot prove it is dead
-                raise WarpError(
-                    f"cannot abandon: unable to verify whether the signed bridge "
-                    f"at nonce {raw_nonce} is still live ({exc}); try again when "
-                    "the Base RPC is reachable"
-                ) from exc
-            if mined <= int(raw_nonce):
-                raise WarpError(
-                    f"cannot abandon: this job's signed bridge is still live at "
-                    f"nonce {raw_nonce}. Wait for it to mine (then Retry), or "
-                    "clear the nonce with a self-send replacement from the hot "
-                    "wallet, then abandon"
-                )
+        if not mismatch:
+            self._refuse_while_bridge_unresolved(job, "abandon")
 
         recovery = {
             "bridge_nonce": job.bridge_nonce,
@@ -2026,6 +2076,13 @@ class WarpEngine:
                     "through the warp.green portal, which pays the attested Chia "
                     "receiver. This job is kept open deliberately as the record."
                 )
+            # Same guard as Abandon: this branch closes the job, and a FAILED
+            # BRIDGING row has no ephemeral key either -- concluding "nothing
+            # was ever funded" over a signed bridge that can still mine (or
+            # already did) frees the slot for a second bridge against the same
+            # deposit. Sweep is same-binding here: job_action checks the
+            # binding before calling, and the auto-sweep path always has a key.
+            self._refuse_while_bridge_unresolved(job, "sweep")
             resolved, status = True, "no ephemeral key: nothing was ever funded"
         coin_id: Optional[str] = None
         if blob:

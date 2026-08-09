@@ -285,6 +285,107 @@ def test_abandon_refuses_to_bury_a_live_signed_bridge(monkeypatch):
     assert out["status"] == JobStatus.CANCELLED
 
 
+def _seed_failed_bridging(store, *, prior=None, tx_hash=None):
+    return seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex(),
+                 **({"bridge_tx_hash": tx_hash} if tx_hash else {})},
+        state={"failed_from": JobStatus.BRIDGING,
+               "bridge_raw": "02bbbbbb", "bridge_tx_nonce": 3,
+               **({"bridge_prior_hashes": prior} if prior else {})},
+    )
+
+
+def test_sweep_cannot_bury_a_live_signed_bridge(monkeypatch):
+    """[WARP-NONCE-AMBIGUITY] Sweep reached the outcome Abandon refuses.
+
+    A FAILED BRIDGING job has no ephemeral key, so Sweep's no-key branch
+    concluded "nothing was ever funded" and closed the job -- freeing the slot
+    for a second bridge against the same deposit while the first job's signed
+    bridgeToChia could still mine. The exact double-bridge the abandon guard
+    blocks, one button over, and the expiry message pointed operators at it.
+    """
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store)
+
+    ctx.evm.mined_nonce = 3          # still open: the bridge may yet mine
+    with pytest.raises(S.WarpError, match="still live at nonce 3"):
+        engine.job_action(job.id, "sweep")
+
+    ctx.evm.mined_nonce = 9          # provably dead, and nothing of ours mined
+    out = engine.job_action(job.id, "sweep")
+    assert out["status"] == JobStatus.CANCELLED
+
+
+def test_retry_completes_a_mined_bridge_instead_of_double_signing(monkeypatch):
+    """[WARP-NONCE-AMBIGUITY] A consumed nonce with a receipt is a SUCCESS.
+
+    _retry_tx_reset read "nonce consumed" as "safe to re-sign", but our own
+    transaction mining consumes the nonce too. Clearing the raw then signed a
+    brand-new bridgeToChia at a fresh nonce -- a true double bridge -- while
+    the mined MessageSent nonce was never read. Retry must instead resume:
+    the rebroadcast is benign and phase 2 routes the receipt.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    h1 = "0x" + "aa" * 32
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store, prior=[h1], tx_hash="0x" + "22" * 32)
+
+    ctx.evm.mined_nonce = 9                          # consumed...
+    ctx.evm.receipts_by_hash = {h1: message_sent_receipt("00" * 31 + "07")}
+
+    engine.job_action(job.id, "retry")
+    state = store.get_job(job.id).state
+    assert state["bridge_raw"] == "02bbbbbb", "a mined bridge must not be re-signed"
+    assert state["bridge_prior_hashes"] == [h1]
+
+    out = engine.step()                              # ...and completed by resume
+    assert out["status"] == JobStatus.BRIDGE_CONFIRMED
+    job2 = store.get_active_job()
+    assert job2.bridge_nonce == "00" * 31 + "07"
+    assert job2.bridge_tx_hash == h1, "pinned to the signing that mined"
+
+
+def test_abandon_refuses_a_bridge_that_actually_mined(monkeypatch):
+    """The abandon guard's first version checked liveness only, so a mined
+    bridge -- nonce consumed by our own transaction -- passed it and was
+    closed over real bridged USDC with the MessageSent nonce unread."""
+    h1 = "0x" + "aa" * 32
+    store = new_store()
+    engine, ctx = build(store)
+    job = _seed_failed_bridging(store, prior=[h1], tx_hash="0x" + "22" * 32)
+
+    ctx.evm.mined_nonce = 9
+    ctx.evm.receipts_by_hash = {h1: message_sent_receipt("00" * 31 + "07")}
+
+    with pytest.raises(S.WarpError, match="Use Retry"):
+        engine.job_action(job.id, "abandon")
+
+
+def test_a_revert_re_prepare_resets_the_ambiguous_receipt_budget(monkeypatch):
+    """bridge_status_polls is receipt-specific bookkeeping like the rest."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_broadcast_bridge(store)
+
+    engine.step()                                    # phase 1: sign
+    ctx.evm.receipt = {"blockNumber": "0x10"}        # ambiguous
+    engine.step()
+    engine.step()
+    assert store.get_active_job().state["bridge_status_polls"] == 2
+
+    ctx.evm.receipt = {"blockNumber": "0x10", "status": "0x0"}   # reverted
+    engine.step()
+    state = store.get_active_job().state
+    assert state["bridge_attempt"] == 1
+    assert state.get("bridge_status_polls") is None, (
+        "attempt 2 must get the full ambiguous-receipt budget"
+    )
+
+
 def test_a_second_sweep_can_close_a_job_with_no_recorded_coin_id(monkeypatch):
     """[WARP-SWEEP-COIN-ID] The first sweep must record what it tried to spend.
 
