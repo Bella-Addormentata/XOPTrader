@@ -82,7 +82,9 @@ _ST_FAILED: Final[str] = "FAILED"
 _ST_CANCELLED: Final[str] = "CANCELLED"
 _ST_DRY_RUN_OK: Final[str] = "DRY_RUN_OK"
 _CANCELLABLE: Final[frozenset[str]] = frozenset(
-    {"AWAITING_DEPOSIT", "DEPOSIT_SEEN", "APPROVING"}
+    {"AWAITING_DEPOSIT", "DEPOSIT_SEEN", "APPROVING",
+     # The one cancellable outbound state: pure reads, nothing moved yet.
+     "UNWRAP_CHECKS"}
 )
 
 _STATUS_LABELS: Final[dict[str, str]] = {

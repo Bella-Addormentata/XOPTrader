@@ -98,10 +98,16 @@ class UnwrapFakeWallet(FakeWallet):
         self.cat_spends.append((wallet_id, amount, inner_address, fee_mojos))
         return {"name": f"burn-tx-{len(self.cat_spends)}"}
 
-    def get_transactions(self, wallet_id=1, *, start=0, end=50, reverse=True):
+    def get_transactions(self, wallet_id=1, *, start=0, end=50, reverse=True,
+                         confirmed=None):
         if int(wallet_id) == self.cat_wallet_id:
+            if confirmed is False:
+                return [t for t in self.cat_txs if not t.get("confirmed")]
             return list(self.cat_txs)
-        return super().get_transactions(wallet_id, start=start, end=end, reverse=reverse)
+        return super().get_transactions(
+            wallet_id, start=start, end=end, reverse=reverse,
+            confirmed=confirmed,
+        )
 
 
 def unwrap_sign_tx(unsigned, key):
@@ -288,12 +294,21 @@ def test_a_history_hit_is_trusted_over_resending():
     _to_burn_sent(store, engine, ctx)
     burn_ph = store.get_active_job().state["burn_cat_ph"]
     ctx.wallet.cat_txs = [
-        {"name": "prior-burn", "additions": [{"puzzle_hash": "0x" + burn_ph}]}
+        {"name": "prior-burn", "confirmed": False,
+         "additions": [{"puzzle_hash": "0x" + burn_ph, "amount": AMOUNT,
+                        "parent_coin_info": "0x" + "55" * 32}]}
     ]
 
     engine.step()
     assert ctx.wallet.cat_spends == []
-    assert store.get_active_job().state["burn_tx_id"] == "prior-burn"
+    state = store.get_active_job().state
+    assert state["burn_tx_id"] == "prior-burn"
+    # The scan yields provenance: the exact coin id the completion scan pins.
+    from gui.services.warp import clvm_utils as cu
+
+    assert state["burn_cat_coin_id"] == cu.coin_name(
+        b"\x55" * 32, bytes.fromhex(burn_ph), AMOUNT
+    ).hex()
 
 
 def test_a_nameless_cat_spend_still_arms_the_guard():
@@ -446,3 +461,160 @@ def test_our_relay_completes_only_with_the_event_and_depth(monkeypatch):
     out2 = engine2.step()
     assert out2["status"] == JobStatus.FAILED
     assert "MessageReceived" in (out2["last_error"] or "")
+
+
+# --------------------------------------------------------------------------- #
+# Review findings, pinned.
+# --------------------------------------------------------------------------- #
+
+def test_the_dedupe_scan_sees_a_send_paged_out_of_the_history_window():
+    """[UNWRAP-PENDING-SCAN] The daemon sorts confirmed-height descending and
+    unconfirmed records sort LAST -- on the busy quote-asset wallet, the
+    just-sent cat_spend pages out of any windowed scan, and the crash-window
+    dedupe would burn TWICE. The unconfirmed set must be queried explicitly."""
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _to_burn_sent(store, engine, ctx)
+    burn_ph = store.get_active_job().state["burn_cat_ph"]
+
+    in_flight = {"name": "in-flight", "confirmed": False,
+                 "additions": [{"puzzle_hash": "0x" + burn_ph, "amount": AMOUNT,
+                                "parent_coin_info": "0x" + "66" * 32}]}
+    real_get = ctx.wallet.get_transactions
+
+    def paged_out(wallet_id=1, *, start=0, end=50, reverse=True, confirmed=None):
+        if confirmed is False:
+            return [in_flight]
+        # The default windowed view: 200 newer confirmed rows pushed it out.
+        return [{"name": f"trade-{i}", "confirmed": True, "additions": []}
+                for i in range(200)]
+
+    ctx.wallet.get_transactions = paged_out
+    engine.step()
+
+    assert ctx.wallet.cat_spends == [], "the in-flight send must be found"
+    assert store.get_active_job().state["burn_tx_id"] == "in-flight"
+
+
+def test_sweep_never_closes_an_outbound_job(monkeypatch):
+    """[UNWRAP-SWEEP-BURY] The no-key sweep shortcut read 'nothing was ever
+    funded' over a live burn commitment and closed the job CANCELLED --
+    recording a falsehood while real wUSDC.b sat forward-only at the burn
+    puzzle hash. Outbound rows are closed by Abandon (which records the
+    recovery blob), never by Sweep."""
+    from .test_warp_service import seed
+
+    store = new_store()
+    engine, _ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(
+        store, JobStatus.FAILED,
+        columns={"amount_mojos": AMOUNT},
+        state={"direction": "out", "failed_from": JobStatus.BURN_SENT,
+               "burn_tx_id": "burn-tx-1", "burn_cat_ph": "aa" * 32},
+    )
+
+    out = engine.job_action(job.id, "sweep")
+
+    assert out["status"] == JobStatus.FAILED, "sweep must not bury the burn"
+    assert store.get_active_job() is not None
+    assert "Abandon closes it" in (store.get_job(job.id).state.get("sweep_status") or "")
+
+
+def test_burning_reuses_the_pinned_security_coin(monkeypatch):
+    """[UNWRAP-COIN-PIN] The persisted nonce is a pure function of ONE
+    security coin. Re-electing a different coin on a later tick would rebuild
+    the bundle with a different bridging coin id than the nonce the job polls
+    -- stalling forever on a value that can never appear."""
+    from gui.services.warp import claim as claim_mod
+    from gui.services.warp import drivers
+    from .test_warp_service import seed, make_ephemeral_blob
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    job = seed(
+        store, JobStatus.BURNING,
+        columns={"amount_mojos": AMOUNT},
+        state={"direction": "out", "receiver_evm": "ab" * 20,
+               "burn_cat_ph": "bb" * 32, "cat_wallet_id": 3},
+    )
+    blob, _sk = make_ephemeral_blob(job.id)
+    pinned_parent = b"\x5a" * 32
+    pinned = drivers.Coin(pinned_parent, b"\x5b" * 32, NET.chia_toll_mojos)
+    store.update_job(job.id, state_patch={
+        "ephemeral_blob": blob,
+        "security_coin_id": pinned.name().hex(),
+        "unwrap_nonce": "cd" * 32,
+    })
+    # The pinned coin exists unspent; a DIFFERENT coin also matches by ph+amount.
+    other = drivers.Coin(b"\x6a" * 32, b"\x5b" * 32, NET.chia_toll_mojos)
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: other)
+
+    # Keyed lookups: the nonce coin is NOT indexed yet (that is the resume
+    # window where re-election was reproduced); the pinned coin is.
+    pinned_record = SimpleNamespace(
+        coin=SimpleNamespace(
+            parent_coin_info=pinned_parent.hex(),
+            puzzle_hash=(b"\x5b" * 32).hex(),
+            amount=NET.chia_toll_mojos,
+        ),
+        spent=False, confirmed_block_index=100, spent_block_index=0,
+    )
+    records = {pinned.name().hex(): pinned_record}
+    ctx.coinset.get_coin_record_by_name = lambda name: records.get(name)
+    ctx.coinset.by_ph = [
+        SimpleNamespace(
+            coin=SimpleNamespace(parent_coin_info="77" * 32,
+                                 puzzle_hash="bb" * 32, amount=AMOUNT),
+            spent=False, confirmed_block_index=100, spent_block_index=0,
+        )
+    ]
+
+    built = {}
+    monkeypatch.setattr(claim_mod, "cat_lineage_proof_for",
+                        lambda coinset, parent: [b"\x33" * 32, b"\x44" * 32, AMOUNT])
+    def capture(req):
+        built["coin"] = req.security_coin
+        raise S.WarpPending("stop here")
+    monkeypatch.setattr(drivers, "build_burn_bundle", capture)
+
+    engine.step()
+    # The pinned record also satisfies the burn-CAT search in this fake, so
+    # the build reached capture() -- with the PINNED coin, not `other`.
+    assert built["coin"].name() == pinned.name()
+
+
+def test_wallet_resolution_transient_error_is_retryable():
+    """[UNWRAP-RESOLVE-RETRY] One flaky RPC must not FAIL the job; absence is
+    only proven when every candidate answered."""
+    from gui.services.warp.wallet import WalletError
+
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+
+    def flaky(wallet_id):
+        raise WalletError("rpc timeout")
+
+    ctx.wallet.cat_get_asset_id = flaky
+    request(engine)
+    out = engine.step()
+
+    assert out["status"] == JobStatus.UNWRAP_CHECKS, "retryable, not FAILED"
+    assert out["retry_count"] == 1
+
+
+def test_a_threshold_change_bounces_relay_back_to_collection(monkeypatch):
+    """[UNWRAP-THRESHOLD-DRIFT] The contract checks the sig blob length
+    EXACTLY; a threshold change since collection would revert every relay
+    forever. Signatures never expire, so re-collecting is lossless."""
+    from gui.services.warp import evm as evm_mod
+
+    monkeypatch.setattr(evm_mod, "sign_tx", unwrap_sign_tx)
+    store = new_store()
+    engine, ctx = build_unwrap(store, params=params_with_cap())
+    _seed_relaying(store)
+    ctx.evm.threshold = 7                     # owner raised it after collection
+
+    out = engine.step()
+
+    assert out["status"] == JobStatus.COLLECTING_EVM_SIGS
+    assert store.get_active_job().state.get("relay_sigs") is None

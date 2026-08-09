@@ -165,7 +165,10 @@ class FakeWallet:
         self.sent.append((amount, address, fee_mojos))
         return {"name": f"funding-tx-{len(self.sent)}"}
 
-    def get_transactions(self, wallet_id, start=0, end=200, reverse=True):
+    def get_transactions(self, wallet_id, start=0, end=200, reverse=True,
+                         confirmed=None):
+        if confirmed is False:
+            return [t for t in self.txs if not t.get("confirmed")]
         return list(self.txs)
 
 

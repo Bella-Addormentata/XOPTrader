@@ -610,10 +610,18 @@ class WarpEngine:
         # No Sweep suggestion for the Base-side states: they have no funding
         # coin, and pointing the operator at Sweep there aimed them straight at
         # the close-over-a-live-bridge hazard the sweep guard now blocks.
+        # Sweep is only suggested where a sweepable funding coin exists: the
+        # inbound Chia-side states. Suggesting it for BURN_SENT pointed the
+        # operator straight at burying a live burn commitment.
+        sweepable_pends = (
+            JobStatus.MESSAGE_SENT, JobStatus.FUNDING_CLAIM,
+            JobStatus.CLAIM_FUNDED, JobStatus.COLLECTING_SIGS,
+            JobStatus.CLAIMING, JobStatus.BURNING,
+        )
         remedy = (
-            "Retry re-attempts it"
-            if job.status in (JobStatus.BRIDGING, JobStatus.BRIDGE_CONFIRMED)
-            else "Retry re-attempts it, Sweep recovers the funding coin"
+            "Retry re-attempts it, Sweep recovers the funding coin"
+            if job.status in sweepable_pends
+            else "Retry re-attempts it"
         )
         return (
             f"no progress in {job.status} after {polls} polls (~{hours:.1f}h); "
@@ -1724,21 +1732,28 @@ class WarpEngine:
 
         want = self._net.expected_asset_id.lower()
         self._wallet.log_in()
-        matches = []
+        matches, errors = [], []
         for w in self._wallet.get_wallets(wallet_type=6):
             try:
                 wid = int(w.get("id"))
                 asset = _hx(self._wallet.cat_get_asset_id(wid)).lower()
-            except (WalletError, TypeError, ValueError):
+            except (WalletError, TypeError, ValueError) as exc:
+                errors.append(str(exc))
                 continue
             if asset == want:
                 matches.append(wid)
-        if len(matches) != 1:
-            raise WarpTerminal(
-                f"expected exactly one CAT wallet for asset "
-                f"{self._net.expected_asset_id}, found {matches or 'none'}"
+        if len(matches) == 1:
+            return matches[0]
+        if errors:
+            # One flaky RPC must not FAIL the job: absence is only proven
+            # when every candidate answered.
+            raise WarpError(
+                f"CAT wallet resolution degraded ({errors[0]}); retrying"
             )
-        return matches[0]
+        raise WarpTerminal(
+            f"expected exactly one CAT wallet for asset "
+            f"{self._net.expected_asset_id}, found {matches or 'none'}"
+        )
 
     def _h_unwrap_checks(self, job: WarpJob) -> _Step:
         """Every gate, ordered cheap-to-expensive, all before the cat_spend."""
@@ -1841,13 +1856,57 @@ class WarpEngine:
             message=f"all gates passed; sending {amount} mojos to the burn puzzle",
         )
 
-    def _find_existing_burn(self, wallet_id: int, burn_cat_ph_hex: str):
-        """A wallet-history transaction that already created the burn CAT."""
-        for tx in self._wallet.get_transactions(wallet_id, start=0, end=200):
-            for add in tx.get("additions") or []:
-                if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph_hex:
-                    return str(tx.get("name") or tx.get("transaction_id") or "found")
-        return None
+    def _find_existing_burn(self, wallet_id: int, burn_cat_ph_hex: str,
+                            amount: int):
+        """An in-flight or live transaction that already created OUR burn CAT.
+
+        Two hazards shaped this, both reproduced by review:
+
+        * The daemon's default sort is confirmed-height descending and
+          unconfirmed records sort LAST, so on a busy wallet (the quote-asset
+          CAT wallet trades constantly) the just-sent cat_spend pages out of
+          any windowed scan -- the crash-window dedupe would miss it and burn
+          twice. The UNCONFIRMED set is scanned first, explicitly.
+        * burn_cat_ph is a pure function of (net, receiver), so repeat unwraps
+          to the same address hit the SAME puzzle hash: a prior unwrap's
+          confirmed cat_spend must not be latched onto. Confirmed hits only
+          count if the created coin is not already spent, and the amount must
+          match; the returned coin id gives the completion scan provenance.
+
+        Returns ``(tx_id, coin_id_hex or None)`` or ``None``.
+        """
+        def _scan(txs):
+            for tx in txs:
+                for add in tx.get("additions") or []:
+                    if _hx(str(add.get("puzzle_hash") or "")) != burn_cat_ph_hex:
+                        continue
+                    if int(add.get("amount") or 0) != amount:
+                        continue
+                    parent = _hx(str(add.get("parent_coin_info") or ""))
+                    coin_id = None
+                    if parent:
+                        from . import clvm_utils as cu
+
+                        coin_id = cu.coin_name(
+                            bytes.fromhex(parent),
+                            bytes.fromhex(burn_cat_ph_hex),
+                            amount,
+                        ).hex()
+                    if tx.get("confirmed") and coin_id:
+                        rec = self._coinset.get_coin_record_by_name(coin_id)
+                        if rec is not None and rec.spent:
+                            continue          # a finished unwrap, not ours
+                    tx_id = str(tx.get("name") or tx.get("transaction_id") or "found")
+                    return tx_id, coin_id
+            return None
+
+        pending = self._wallet.get_transactions(
+            wallet_id, start=0, end=200, confirmed=False
+        )
+        hit = _scan(pending)
+        if hit:
+            return hit
+        return _scan(self._wallet.get_transactions(wallet_id, start=0, end=200))
 
     def _h_burn_sent(self, job: WarpJob) -> _Step:
         """THE COMMIT POINT: one cat_spend, guarded like the funding send."""
@@ -1855,14 +1914,28 @@ class WarpEngine:
         amount = int(job.amount_mojos)
         burn_cat_ph = job.state["burn_cat_ph"]
 
-        # a) Completion first (idempotent resume): the burn CAT exists.
-        for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
-            if int(rec.coin.amount) == amount and not rec.spent:
+        # a) Completion first (idempotent resume). Provenance when we have it:
+        # burn_cat_ph is (net, receiver)-scoped, not job-scoped, so a bare
+        # ph+amount match can adopt an OLDER job's stranded coin -- reproduced
+        # in review. The coin id captured from our own send wins; the scan is
+        # only the fallback for a send whose response carried no additions.
+        want_id = job.state.get("burn_cat_coin_id")
+        if want_id:
+            rec = self._coinset.get_coin_record_by_name(want_id)
+            if rec is not None and not rec.spent:
                 return _advance(
                     JobStatus.BURNING,
                     state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
                     message="burn CAT is on chain; the unwrap is now forward-only",
                 )
+        else:
+            for rec in self._coinset.get_coin_records_by_puzzle_hash(burn_cat_ph):
+                if int(rec.coin.amount) == amount and not rec.spent:
+                    return _advance(
+                        JobStatus.BURNING,
+                        state={"burn_cat_parent": _hx(rec.coin.parent_coin_info)},
+                        message="burn CAT is on chain; the unwrap is now forward-only",
+                    )
 
         # b) The persisted marker.
         prior = job.state.get("burn_tx_id")
@@ -1872,7 +1945,7 @@ class WarpEngine:
         # c) Fail-closed history scan -- a lost response must not burn twice.
         try:
             found = self._find_existing_burn(
-                int(job.state["cat_wallet_id"]), burn_cat_ph
+                int(job.state["cat_wallet_id"]), burn_cat_ph, amount
             )
         except Exception as exc:  # noqa: BLE001 -- cannot prove it was not sent
             raise WarpError(
@@ -1880,8 +1953,12 @@ class WarpEngine:
                 "irreversible cat_spend blindly"
             ) from exc
         if found:
+            tx_id, coin_id = found
+            patch = {"burn_tx_id": tx_id}
+            if coin_id:
+                patch["burn_cat_coin_id"] = coin_id
             return _stay(
-                state={"burn_tx_id": found},
+                state=patch,
                 message="cat_spend already in the wallet history (dedupe hit)",
             )
 
@@ -1901,8 +1978,24 @@ class WarpEngine:
                 "warp: daemon accepted the cat_spend for job %s but named no "
                 "transaction; recording %r so the guard holds", job.id, tx_id,
             )
+        # Provenance: the response's additions identify OUR burn CAT exactly,
+        # which is what keeps repeat unwraps to one receiver disentangled.
+        patch = {"burn_tx_id": tx_id}
+        for add in record.get("additions") or []:
+            if _hx(str(add.get("puzzle_hash") or "")) == burn_cat_ph \
+                    and int(add.get("amount") or 0) == amount:
+                parent = _hx(str(add.get("parent_coin_info") or ""))
+                if parent:
+                    from . import clvm_utils as cu
+
+                    patch["burn_cat_coin_id"] = cu.coin_name(
+                        bytes.fromhex(parent),
+                        bytes.fromhex(burn_cat_ph),
+                        amount,
+                    ).hex()
+                break
         return _stay(
-            state={"burn_tx_id": tx_id},
+            state=patch,
             message=f"cat_spend sent ({amount} mojos); the coin is forward-only",
         )
 
@@ -1946,7 +2039,31 @@ class WarpEngine:
             )
         sk = self._load_ephemeral_sk(job)
 
-        sec = claim.find_security_coin(self._coinset, sk, toll)
+        # The persisted nonce is a pure function of ONE security coin. If a
+        # different coin were elected on a later tick (double-funded rows, or
+        # index races), the rebuilt bundle would carry a different bridging
+        # coin id than the nonce the job polls -- stalling forever on a value
+        # that can never appear. Reproduced in review; hence the pin: once a
+        # coin is chosen, only that exact coin is used, and if it vanishes
+        # unspent the nonce is re-derived WITH the replacement, atomically.
+        sec = None
+        pinned = job.state.get("security_coin_id")
+        if pinned:
+            rec = self._coinset.get_coin_record_by_name(pinned)
+            if rec is not None and not rec.spent:
+                from . import drivers as _drv
+
+                sec = _drv.Coin(
+                    bytes.fromhex(_hx(rec.coin.parent_coin_info)),
+                    bytes.fromhex(_hx(rec.coin.puzzle_hash)),
+                    int(rec.coin.amount),
+                )
+            elif rec is not None and rec.spent:
+                raise WarpPending(
+                    "pinned toll coin is spent; awaiting the bridging coin index"
+                )
+        if sec is None:
+            sec = claim.find_security_coin(self._coinset, sk, toll)
         if sec is None:
             # Fund it -- the same marker/dedupe/send ladder as the claim path,
             # with funding_amount persisted so Sweep just works.
@@ -2000,12 +2117,16 @@ class WarpEngine:
             net=net, burn_cat_coin=burn_cat, cat_lineage_proof=lineage,
             security_coin=sec, security_sk=sk, receiver=receiver,
         ))
-        # Persist the nonce BEFORE pushing: it is deterministic, so a crash
-        # between persist and push re-derives the same value, and a crash
-        # after the push still knows what to poll.
+        # Persist the nonce AND the coin it derives from BEFORE pushing --
+        # together, always: a nonce without its coin is the incoherence the
+        # pin above exists to prevent. Deterministic, so a crash on either
+        # side of the push re-derives identical values.
         self._store.update_job(
             job.id, expected_status=job.status,
-            state_patch={"unwrap_nonce": out.nonce.hex()},
+            state_patch={
+                "unwrap_nonce": out.nonce.hex(),
+                "security_coin_id": sec.name().hex(),
+            },
         )
         kind, status = claim.push_burn_bundle(self._coinset, out.bundle)
         return _stay(
@@ -2084,6 +2205,20 @@ class WarpEngine:
 
         raw = job.state.get("relay_raw")
         if not raw:  # phase 1: encode + sign + persist, no broadcast
+            # The contract checks the sig blob length EXACTLY against the
+            # owner-mutable live threshold; a change since collection would
+            # make every relay revert forever. Signatures never expire, so
+            # bouncing back to collection is lossless.
+            live = int(self._evm.get_signature_threshold())
+            if live != int(job.state.get("relay_threshold") or live):
+                return _advance(
+                    JobStatus.COLLECTING_EVM_SIGS,
+                    state={"relay_sigs": None, "relay_threshold": None},
+                    message=(
+                        f"signatureThreshold changed to {live} since "
+                        "collection; re-selecting signatures"
+                    ),
+                )
             unsigned = self._evm.prepare_relay(
                 owner=self._hot_address, calldata=self._relay_calldata(job)
             )
@@ -2111,6 +2246,16 @@ class WarpEngine:
         if receipt is None:
             return self._relay_unmined_step(job)
         if evm.receipt_reverted(receipt):
+            # A mined-but-reverted own relay may be the front-run case:
+            # someone else delivered between our broadcast and inclusion.
+            # Receipts carry no revert reason, so replay the calldata as an
+            # eth_call -- a '!nonce' revert NOW proves delivery, and the
+            # receiver was paid either way.
+            try:
+                self._evm._eth_call(net.portal_address, self._relay_calldata(job))
+            except evm.EvmError as exc:
+                if evm.is_already_delivered(exc):
+                    return self._unwrap_delivered(job, by="a third-party relayer")
             attempt = int(job.state.get("relay_attempt", 0)) + 1
             if attempt >= _BRIDGE_MAX_ATTEMPTS:
                 raise WarpTerminal(
@@ -2603,7 +2748,10 @@ class WarpEngine:
             raise WarpError("receiver is not valid hex") from exc
         if rec_bytes == b"\x00" * 20:
             raise WarpError("receiver is the zero address")
-        if receiver != receiver.lower():
+        hex_part = receiver[2:]
+        if hex_part != hex_part.lower() and hex_part != hex_part.upper():
+            # Mixed case asserts an EIP-55 checksum; all-lower and all-upper
+            # carry no checksum information and are accepted as-is.
             from eth_utils import is_checksum_address
 
             if not is_checksum_address(receiver):
@@ -2767,7 +2915,21 @@ class WarpEngine:
         # Only a resolved sweep frees the slot. A transport failure leaves the
         # job FAILED so the operator can try again with the funds still known
         # recoverable.
-        close = resolved and job.status == JobStatus.FAILED
+        #
+        # Outbound rows are NEVER closed by sweep, resolved or not. Their
+        # no-key shape ("nothing was ever funded") is a live burn commitment
+        # -- a cat_spend in flight or a burn CAT sitting at the burn puzzle
+        # hash -- and closing over it records a falsehood while real wUSDC.b
+        # is forward-only (reproduced in review). Sweep recovers the toll
+        # where one exists; closing an outbound job is Abandon's job, which
+        # writes the recovery blob first.
+        outbound = job.state.get("direction") == "out"
+        close = resolved and job.status == JobStatus.FAILED and not outbound
+        if outbound and resolved:
+            status = (
+                f"{status}; outbound job left open -- Retry resumes it, "
+                "Abandon closes it with the recovery details recorded"
+            )
         patch: Dict[str, Any] = {"swept": resolved, "sweep_status": status}
         if coin_id and not job.state.get("security_coin_id"):
             # The follow-up Sweep proves the spend from this id. A job that

@@ -219,14 +219,23 @@ class WalletClient:
         start: int = 0,
         end: int = 50,
         reverse: bool = True,
+        confirmed: Optional[bool] = None,
     ) -> list[dict]:
-        data = self._post(
-            "get_transactions",
-            {
-                "wallet_id": int(wallet_id),
-                "start": int(start),
-                "end": int(end),
-                "reverse": bool(reverse),
-            },
-        )
+        """List wallet transactions; ``confirmed=False`` returns ONLY pending.
+
+        The pending filter matters more than it looks: the daemon's default
+        sort is confirmed-height descending, and unconfirmed records
+        (height 0) sort LAST -- so on a busy wallet a just-sent transaction
+        is paged out of any windowed scan. A dedupe scan that must see an
+        in-flight send has to ask for the unconfirmed set explicitly.
+        """
+        body: dict[str, Any] = {
+            "wallet_id": int(wallet_id),
+            "start": int(start),
+            "end": int(end),
+            "reverse": bool(reverse),
+        }
+        if confirmed is not None:
+            body["confirmed"] = bool(confirmed)
+        data = self._post("get_transactions", body)
         return list(data.get("transactions") or [])
