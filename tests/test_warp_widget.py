@@ -350,16 +350,22 @@ if __name__ == "__main__":
 # Unwrap controls
 # ---------------------------------------------------------------------------
 
-def test_unwrap_click_emits_mojos_and_destination(qapp):
+def test_unwrap_click_emits_mojos_destination_and_relay_mode(qapp):
     w = _make(qapp, {"enabled": True})
     got = []
-    w.unwrap_requested.connect(lambda mojos, dest: got.append((mojos, dest)))
+    w.unwrap_requested.connect(
+        lambda mojos, dest, external: got.append((mojos, dest, external))
+    )
 
     w._unwrap_amount.setText("5.000")
     w._unwrap_dest.setText("0x" + "ab" * 20)
     w._unwrap_btn.click()
+    # The Chia-only checkbox rides as the third argument.
+    w._unwrap_external.setChecked(True)
+    w._unwrap_btn.click()
 
-    assert got == [(5000, "0x" + "ab" * 20)]
+    assert got == [(5000, "0x" + "ab" * 20, False),
+                   (5000, "0x" + "ab" * 20, True)]
 
 
 def test_unwrap_click_refuses_a_non_numeric_amount(qapp):
@@ -385,7 +391,8 @@ def test_outbound_statuses_have_labels(qapp):
     from gui.widgets import warp as warp_widget_mod
 
     for status in ("UNWRAP_CHECKS", "BURN_SENT", "BURNING",
-                   "COLLECTING_EVM_SIGS", "RELAYING"):
+                   "COLLECTING_EVM_SIGS", "RELAYING",
+                   "AWAITING_EXTERNAL_RELAY"):
         assert status in warp_widget_mod._STATUS_LABELS
 
 
@@ -407,4 +414,5 @@ def test_unwrap_amount_parser_never_rounds_or_crashes(qapp):
     w._unwrap_btn.click()
     w._unwrap_amount.setText("5.001")
     w._unwrap_btn.click()
-    assert got == [(1, "0x" + "ab" * 20), (5001, "0x" + "ab" * 20)]
+    assert got == [(1, "0x" + "ab" * 20, False),
+                   (5001, "0x" + "ab" * 20, False)]

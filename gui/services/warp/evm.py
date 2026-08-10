@@ -74,6 +74,7 @@ SEL_RECEIVE_MESSAGE = bytes.fromhex("b2e7bebb")   # receiveMessage(bytes32,bytes
 SEL_SIGNATURE_THRESHOLD = bytes.fromhex("a82f2e26")  # signatureThreshold()
 SEL_EIP712_DOMAIN = bytes.fromhex("84b0196e")     # eip712Domain() (EIP-5267)
 SEL_BURN_PUZZLE_HASH = bytes.fromhex("3f4710d3")  # burnPuzzleHash()
+SEL_TRANSFER = bytes.fromhex("a9059cbb")          # transfer(address,uint256)
 
 # MessageReceived(bytes32 indexed nonce, ...) -- the Portal's delivery event.
 # Pinned against the real relay receipt in tests/fixtures_unwrap.json, not
@@ -166,6 +167,10 @@ def _enc_bytes32(value: Any) -> bytes:
 
 def encode_call(selector: bytes, *words: bytes) -> bytes:
     return selector + b"".join(words)
+
+
+def encode_transfer(to: Any, amount_base_units: int) -> bytes:
+    return encode_call(SEL_TRANSFER, _enc_address(to), _enc_uint256(amount_base_units))
 
 
 def encode_approve(spender: Any, amount_base_units: int) -> bytes:
@@ -373,6 +378,45 @@ def is_already_delivered(exc: BaseException) -> bool:
     (us or a third party) already delivered this message [V].
     """
     return "!nonce" in decode_revert_reason(exc)
+
+
+# Node error fragments that are NODE/OPERATOR conditions, not a deterministic
+# rejection of THIS message: they clear once connectivity or funding is
+# restored, so they must never poison a message's skip-list counter.
+_INFRA_RPC_FRAGMENTS = (
+    "insufficient funds",
+    "insufficient balance",
+    "gas required exceeds",
+    "intrinsic gas too low",
+    "max fee per gas",
+    "fee cap",
+    "max priority fee",
+    "replacement transaction underpriced",
+    "nonce too low",
+    "nonce too high",
+    "already known",
+    "timeout",
+    "rate limit",
+    "too many requests",
+)
+
+
+def is_infrastructure_error(exc: BaseException) -> bool:
+    """Whether *exc* is a transport/node/operator condition, not a revert.
+
+    A plain :class:`EvmError` (never reached the node, or junk response) is
+    always infrastructure. An :class:`EvmRpcError` is infrastructure only when
+    its message names a node/operator condition (an unfunded key, a fee/nonce
+    problem, a rate limit) rather than a deterministic execution revert of
+    this message. Callers use this to retry rather than skip-list a message
+    that is perfectly deliverable once the transient condition clears.
+    """
+    if not isinstance(exc, EvmError):
+        return False
+    if not isinstance(exc, EvmRpcError):
+        return True                       # transport / junk: never message-specific
+    msg = str(getattr(exc, "rpc_message", "") or exc).lower()
+    return any(frag in msg for frag in _INFRA_RPC_FRAGMENTS)
 
 
 # --------------------------------------------------------------------------- #

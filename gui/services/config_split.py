@@ -19,12 +19,95 @@ from __future__ import annotations
 
 import copy
 import logging
+import os
+import tempfile
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import yaml
 
 _log = logging.getLogger(__name__)
+
+
+# --------------------------------------------------------------------------- #
+# Per-file write serialization.
+#
+# secrets.yaml is a read-modify-write store touched from more than one thread:
+# the GUI settings page (preserving on-disk secrets it did not change) and the
+# warp worker (BaseWallet create/rotate/backup). Without a shared lock, a
+# settings save that read the file BEFORE a rotation wrote the new key can
+# merge onto its stale snapshot and write the OLD key back, stranding the
+# swept funds. A single re-entrant lock per resolved path makes each side's
+# whole read-modify-write atomic against the other.
+# --------------------------------------------------------------------------- #
+
+_file_locks: dict[str, threading.RLock] = {}
+_file_locks_guard = threading.Lock()
+
+
+def file_lock(path: Path) -> threading.RLock:
+    """The shared re-entrant lock for a config/secrets file, keyed by real path."""
+    key = str(Path(path).resolve())
+    with _file_locks_guard:
+        lock = _file_locks.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _file_locks[key] = lock
+        return lock
+
+
+@contextmanager
+def file_transaction(path: Path):
+    """Hold the per-file lock for a whole read-modify-write over *path*.
+
+    Both the settings-save path and BaseWallet's key mutations enter this
+    around their entire read...write span, so they can never interleave and
+    clobber each other's writes.
+    """
+    lock = file_lock(path)
+    lock.acquire()
+    try:
+        yield
+    finally:
+        lock.release()
+
+
+def _atomic_write_text(path: Path, text: str, *, newline: str) -> None:
+    """Write *text* to *path* atomically (unique temp + fsync + os.replace).
+
+    ``open(path, "w")`` truncates in place, so a crash or ENOSPC mid-write
+    leaves the file empty or partial. For secrets.yaml that window can erase
+    the ONLY at-rest copy of a hot-wallet key -- the exact loss rotate()'s
+    persist-before-broadcast ordering exists to prevent. os.replace is atomic
+    on the same filesystem, so a reader ever sees only the whole old file or
+    the whole new one, and a crash leaves the old file intact.
+
+    The temp file gets a unique name (``mkstemp``), so two writers never
+    collide on one staging path; and the destination ``os.replace`` runs
+    under the per-file lock, because on Windows a concurrent replace of the
+    same destination raises ``PermissionError``. The lock is re-entrant, so
+    callers already inside :func:`file_transaction` nest harmlessly.
+    """
+    path = Path(path)
+    with file_transaction(path):
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(path.parent), prefix=f".{path.name}.", suffix=".tmp"
+        )
+        tmp = Path(tmp_name)
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline=newline) as fh:
+                fh.write(text)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            try:
+                if tmp.exists():
+                    tmp.unlink()
+            except OSError:  # pragma: no cover -- best-effort temp cleanup
+                pass
 
 # ---------------------------------------------------------------------------
 # ruamel.yaml round-trip support (optional dependency)
@@ -192,8 +275,11 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
         else:
             _apply_map(template, data)
 
-        with open(path, "w", encoding="utf-8", newline=newline) as fh:
-            yaml_rt.dump(template, fh)
+        import io
+
+        buf = io.StringIO()
+        yaml_rt.dump(template, buf)
+        _atomic_write_text(path, buf.getvalue(), newline=newline)
     except Exception as exc:  # noqa: BLE001 - a save must never be lost
         _log.warning(
             "Comment-preserving write of %s failed (%s); falling back to "
@@ -204,14 +290,14 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
 
 
 def _dump_plain(path: Path, data: dict[str, Any]) -> None:
-    """Last-resort PyYAML writer (comment-destroying)."""
-    with open(path, "w", encoding="utf-8", newline=_detect_newline(path)) as fh:
-        yaml.safe_dump(
-            data, fh,
-            default_flow_style=False,
-            sort_keys=False,
-            allow_unicode=True,
-        )
+    """Last-resort PyYAML writer (comment-destroying), still atomic."""
+    text = yaml.safe_dump(
+        data,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    _atomic_write_text(path, text, newline=_detect_newline(path))
 
 # Top-level section → set of keys that belong in secrets.yaml.
 SECRET_KEYS: dict[str, set[str]] = {
@@ -226,8 +312,34 @@ SECRET_KEYS: dict[str, set[str]] = {
     "monitoring": {"telegram_bot_token", "telegram_chat_id"},
     "coingecko": {"api_key"},
     "database": {"path"},
-    # warp bridge hot-wallet key, DPAPI-encrypted (gui/services/warp/keystore.py).
-    "warp": {"evm_private_key_dpapi"},
+    # warp bridge hot-wallet key material, DPAPI-encrypted
+    # (gui/services/warp/keystore.py). retired_keys carries the archived
+    # blobs from every rotation and evm_key_backup_confirmed rides with the
+    # key it describes; ALL of these must live here -- a settings save of the
+    # merged config would otherwise write them into git-tracked config.yaml.
+    "warp": {
+        "evm_private_key_dpapi",
+        "relay_private_key_dpapi",
+        "retired_keys",
+        "evm_key_backup_confirmed",
+    },
+}
+
+# The subset of SECRET_KEYS written EXCLUSIVELY by BaseWallet (create/rotate/
+# confirm-backup), never by the Settings UI. split_and_save must strip these
+# from the public config (so they never leak to config.yaml) but must NOT
+# copy them from the incoming snapshot into secrets.yaml: the settings page
+# and ConfigService both cache secrets.yaml merged into memory at load, so a
+# later Save would otherwise round-trip a STALE pre-rotation key blob back
+# over the fresh one on disk -- destroying the only persisted copy of the
+# rotated funds key. The on-disk secrets.yaml is authoritative for these.
+WALLET_MANAGED_KEYS: dict[str, set[str]] = {
+    "warp": {
+        "evm_private_key_dpapi",
+        "relay_private_key_dpapi",
+        "retired_keys",
+        "evm_key_backup_confirmed",
+    },
 }
 
 
@@ -274,9 +386,18 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
         if section not in public:
             continue
         src = public[section]
+        managed = WALLET_MANAGED_KEYS.get(section, set())
         for k in list(keys):
-            if k in src:
-                secrets.setdefault(section, {})[k] = src.pop(k)
+            if k not in src:
+                continue
+            if k in managed:
+                # Strip from public (never leak to config.yaml) but do NOT
+                # carry the possibly-stale snapshot value into the secrets
+                # overlay: the on-disk secrets.yaml already holds the truth,
+                # written by BaseWallet, and must win.
+                src.pop(k)
+                continue
+            secrets.setdefault(section, {})[k] = src.pop(k)
         # Remove the section from public if it became empty.
         if not src:
             del public[section]
@@ -284,16 +405,38 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     # Write public config (comments in the existing file are preserved).
     dump_preserving(config_path, public)
 
-    # Write secrets — preserve any keys the user added manually.
+    # Write secrets — preserve any keys the user added manually. The whole
+    # read-existing / merge / write runs under the per-file lock so a
+    # concurrent BaseWallet key write cannot land between our read and write
+    # and be silently overwritten by our stale snapshot.
+    #
+    # Fail CLOSED on an existing file we cannot read as a mapping: the
+    # overlay deliberately excludes wallet-managed keys, so overwriting a
+    # present-but-corrupt secrets.yaml would erase the active/retired DPAPI
+    # blobs it still holds as text. A save must never destroy what it could
+    # not read; the operator fixes the file, then saves.
     secrets_path = config_path.parent / "secrets.yaml"
     if secrets:
-        if secrets_path.is_file():
-            try:
-                with open(secrets_path, "r", encoding="utf-8") as fh:
-                    existing = yaml.safe_load(fh) or {}
-                if isinstance(existing, dict):
-                    deep_merge(existing, secrets)
-                    secrets = existing
-            except Exception:
-                pass
-        dump_preserving(secrets_path, secrets)
+        with file_transaction(secrets_path):
+            if secrets_path.is_file():
+                existing = None
+                try:
+                    with open(secrets_path, "r", encoding="utf-8") as fh:
+                        existing = yaml.safe_load(fh)
+                except Exception as exc:
+                    raise ValueError(
+                        f"{secrets_path} exists but cannot be read/parsed "
+                        f"({exc}); refusing to overwrite it -- it may hold "
+                        "key material. Fix or move the file, then save again."
+                    ) from exc
+                if existing is None:
+                    existing = {}
+                if not isinstance(existing, dict):
+                    raise ValueError(
+                        f"{secrets_path} does not parse to a mapping (got "
+                        f"{type(existing).__name__}); refusing to overwrite "
+                        "it -- it may hold key material."
+                    )
+                deep_merge(existing, secrets)
+                secrets = existing
+            dump_preserving(secrets_path, secrets)

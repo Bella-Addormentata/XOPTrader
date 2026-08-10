@@ -89,6 +89,10 @@ class JobStatus:
     BURNING = "BURNING"
     COLLECTING_EVM_SIGS = "COLLECTING_EVM_SIGS"
     RELAYING = "RELAYING"
+    # Chia-only mode: the burn is done and the quorum is on Nostr, but the
+    # hot wallet holds no Base gas -- wait for an altruistic relayer (or for
+    # gas to appear, whichever first). Open, like every in-flight state.
+    AWAITING_EXTERNAL_RELAY = "AWAITING_EXTERNAL_RELAY"
 
 
 ALL_STATES: frozenset[str] = frozenset(

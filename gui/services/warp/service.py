@@ -160,12 +160,24 @@ _PENDING_MAX_POLLS: Dict[str, int] = {
     JobStatus.BURNING: 1440,            # ~6h -- funding + bundle + depth
     JobStatus.COLLECTING_EVM_SIGS: 1440,  # ~6h -- validator quorum
     JobStatus.RELAYING: 480,            # ~2h -- Base receipt/confirmations
+    # Generous on purpose: an altruistic relay is best-effort by nature and
+    # the message stays deliverable forever. The deadline exists to hand the
+    # wait back to the operator eventually (fund gas + Retry, or the portal),
+    # never because anything expires.
+    JobStatus.AWAITING_EXTERNAL_RELAY: 5760,  # ~24h -- volunteer relay wait
 }
 _SIG_COLLECT_DEADLINE_S: float = 12.0
 
 # ETH floor (wei) the hot wallet must hold before we sign approve/bridge: covers
 # the Portal message toll (1e13 wei) plus a comfortable Base gas margin.
 _MIN_GAS_WEI: int = 300_000_000_000_000  # 0.0003 ETH
+
+# Altruistic-relay cadence. The sweep hits the watcher plus (per candidate) the
+# Nostr relays, so it runs far below the ~30s tick; the activity refresh feeds
+# a GUI hint and can be lazier still.
+_RELAY_SWEEP_INTERVAL_S: float = 600.0
+_ACTIVITY_REFRESH_INTERVAL_S: float = 900.0
+_ACTIVITY_LOOKBACK: int = 100
 
 # Jobs may only be cancelled before the irreversible on-chain bridge is signed.
 _CANCELLABLE = frozenset(
@@ -229,6 +241,11 @@ class WarpParams:
     # existing enabled inbound config on upgrade.  0 == explicit unlimited.
     max_unwrap_micros: int = -1
     unwrap_chia_fee_mojos: int = 0
+    # Altruistic relay (opt-in): deliver strangers' stuck xch -> bse messages
+    # by paying their ~145k relay gas. Inert by default.
+    altruistic_relay: bool = False
+    relay_grace_min: float = 30.0
+    relay_daily_gas_budget_eth: float = 0.0002
 
 
 def _parse_unwrap_cap(warp: dict) -> int:
@@ -272,6 +289,42 @@ def _parse_usdc_config_value(key: str, raw: object) -> float:
     return value
 
 
+def _parse_positive_float(key: str, raw: object) -> float:
+    """A positive finite float from a config knob (same rigour as the USDC keys)."""
+    value = _parse_usdc_config_value(key, raw)
+    if value <= 0:
+        raise WarpError(f"warp.{key} must be positive (got {raw!r})")
+    return value
+
+
+def _parse_config_bool(key: str, raw: object, default: bool) -> bool:
+    """A strict boolean from a config knob -- ``bool()`` fails open.
+
+    A YAML-quoted ``"false"`` is a non-empty string, so ``bool(raw)`` reads
+    it as True -- which for ``altruistic_relay`` silently enables gas
+    spending, and for ``enabled`` starts a bridge the operator wrote
+    ``"false"`` for. Accept real booleans, 0/1, and the strings
+    "true"/"false" (case-insensitive); refuse everything else loudly.
+    """
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, int) and raw in (0, 1):
+        return bool(raw)
+    if isinstance(raw, str):
+        s = raw.strip().lower()
+        if s == "":
+            return default
+        if s == "true":
+            return True
+        if s == "false":
+            return False
+    raise WarpError(
+        f"warp.{key} must be a boolean (got {raw!r}); use true or false"
+    )
+
+
 def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     """Build :class:`WarpParams` from a config snapshot (all reads null-safe)."""
     warp = (config or {}).get("warp") or {}
@@ -300,7 +353,7 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
     # any settings widget either, so it can only be hand-edited.
     # Only enforced when the bridge is actually on: a disabled warp section
     # must not stop the GUI from loading a config.
-    enabled = bool(warp.get("enabled", False))
+    enabled = _parse_config_bool("enabled", warp.get("enabled"), False)
     raw_cap = warp.get("max_auto_bridge_usdc", None)
     blank_cap = raw_cap is None or str(raw_cap).strip() == ""
     if enabled and blank_cap:
@@ -331,9 +384,11 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
                 "micro-USDC and would disable the cap; set at least 0.000001"
             )
     return WarpParams(
-        enabled=bool(warp.get("enabled", False)),
-        dry_run=bool(warp.get("dry_run", True)),
-        auto_bridge=bool(warp.get("auto_bridge", False)),
+        enabled=enabled,
+        dry_run=_parse_config_bool("dry_run", warp.get("dry_run"), True),
+        auto_bridge=_parse_config_bool(
+            "auto_bridge", warp.get("auto_bridge"), False
+        ),
         base_rpc_url=str(warp.get("base_rpc_url", "") or ""),
         min_micros=int(round(min_usdc * scale)),
         max_micros=int(round(max_usdc * scale)),
@@ -345,6 +400,16 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         portal_hint=(str(warp.get("portal_hint")) if warp.get("portal_hint") else None),
         max_unwrap_micros=_parse_unwrap_cap(warp),
         unwrap_chia_fee_mojos=int(warp.get("unwrap_chia_fee_mojos", 0) or 0),
+        altruistic_relay=_parse_config_bool(
+            "altruistic_relay", warp.get("altruistic_relay"), False
+        ),
+        relay_grace_min=_parse_positive_float(
+            "relay_grace_min", warp.get("relay_grace_min", 30) or 30
+        ),
+        relay_daily_gas_budget_eth=_parse_positive_float(
+            "relay_daily_gas_budget_eth",
+            warp.get("relay_daily_gas_budget_eth", 0.0002) or 0.0002,
+        ),
     )
 
 
@@ -469,6 +534,10 @@ class WarpEngine:
         protector: Any,
         clock: Optional[Callable[[], float]] = None,
         nostr_fetcher: Optional[Callable[[str, dict, float], List[dict]]] = None,
+        relayer: Any = None,
+        relay_key: Any = None,
+        heartbeat_publisher: Optional[Callable[[str, dict, float], bool]] = None,
+        relay_state_saver: Optional[Callable[[], None]] = None,
     ) -> None:
         self._net = net
         self._store = store
@@ -482,6 +551,17 @@ class WarpEngine:
         self._protector = protector
         self._nostr_fetcher = nostr_fetcher
         self._clock = clock or time.time
+        # Altruistic relay (opt-in): the sweeper instance, the key it signs
+        # with (a dedicated gas-only key when configured, else the hot key),
+        # and an injectable heartbeat publisher for tests.
+        self._relayer = relayer
+        self._relay_key = relay_key
+        self._heartbeat_publisher = heartbeat_publisher
+        self._relay_state_saver = relay_state_saver
+        self._next_relay_sweep: float = 0.0
+        self._relay_report: Dict[str, Any] = {}
+        self._relay_activity: Dict[str, Any] = {}
+        self._next_activity_refresh: float = 0.0
         self._hot_address = evm_key.address
         self._hot_cache: Dict[str, Any] = {"address": evm_key.address}
         self._terminal_cache: Optional[tuple] = None
@@ -512,6 +592,7 @@ class WarpEngine:
             JobStatus.BURNING: self._h_burning,
             JobStatus.COLLECTING_EVM_SIGS: self._h_collecting_evm_sigs,
             JobStatus.RELAYING: self._h_relaying,
+            JobStatus.AWAITING_EXTERNAL_RELAY: self._h_awaiting_external_relay,
         }
 
     # -- clock -------------------------------------------------------------- #
@@ -1845,8 +1926,12 @@ class WarpEngine:
             raise WarpPending(
                 f"bridge liquidity {liquidity} < post-tip {post_tip} base units"
             )
-        if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
-            raise WarpPending("hot wallet ETH is below the relay gas floor")
+        # G9 is what an external-relay unwrap exists to not need: the operator
+        # holds only Chia assets, and delivery gas is a volunteer's. Every
+        # other gate still applies -- the burn itself is entirely Chia-side.
+        if not job.state.get("external_relay"):
+            if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
+                raise WarpPending("hot wallet ETH is below the relay gas floor")
         xch = self._wallet.get_wallet_balance(1)
         toll_need = net.chia_toll_mojos + p.unwrap_chia_fee_mojos
         if int(xch.get("spendable_balance") or 0) < toll_need:
@@ -2188,13 +2273,29 @@ class WarpEngine:
         if result.complete:
             tuples = nostr.ecdsa_sigs_for_relay(result.collected, threshold)
             packed = evm.pack_validator_sigs(tuples)
+            state = {
+                "evm_sigs": encoded,
+                "relay_sigs": packed.hex(),
+                "relay_threshold": threshold,
+            }
+            # External-relay mode only bites when the gas is actually absent:
+            # if the wallet can self-relay, it should -- faster for the
+            # operator and one less message in the network's stuck tail.
+            if (
+                job.state.get("external_relay")
+                and self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI
+            ):
+                return _advance(
+                    JobStatus.AWAITING_EXTERNAL_RELAY,
+                    state=state,
+                    message=(
+                        f"collected {result.count}/{threshold} EVM signatures; "
+                        "no Base gas -- awaiting an altruistic relayer"
+                    ),
+                )
             return _advance(
                 JobStatus.RELAYING,
-                state={
-                    "evm_sigs": encoded,
-                    "relay_sigs": packed.hex(),
-                    "relay_threshold": threshold,
-                },
+                state=state,
                 message=f"collected {result.count}/{threshold} EVM signatures",
             )
         return _stay(
@@ -2313,6 +2414,65 @@ class WarpEngine:
                 f"relay {confs}/{net.evm_confirmation_min_height} confirmations"
             )
         return self._unwrap_delivered(job, by="our relay", tx_hash=mined_hash)
+
+    def _h_awaiting_external_relay(self, job: WarpJob) -> _Step:
+        """Chia-only mode: wait for a stranger's relay, proven on-chain.
+
+        Delivery detection is an eth_call replay of OUR calldata: a ``!nonce``
+        revert is the Portal's own ``usedNonces`` refusal -- unforgeable
+        evidence the receiver was paid. The watcher's
+        ``destination_transaction_hash`` is recorded when present but is
+        display provenance, never the completion signal. Whenever the hot
+        wallet turns out to hold relay gas after all, the job switches to
+        self-relay -- whichever path completes first wins.
+        """
+        from . import evm
+
+        net = self._net
+
+        # Threshold drift invalidates the packed blob exactly as in RELAYING;
+        # signatures never expire, so bouncing back to collection is lossless.
+        live = int(self._evm.get_signature_threshold())
+        if live != int(job.state.get("relay_threshold") or live):
+            return _advance(
+                JobStatus.COLLECTING_EVM_SIGS,
+                state={"relay_sigs": None, "relay_threshold": None},
+                message=(
+                    f"signatureThreshold changed to {live} while waiting; "
+                    "re-selecting signatures"
+                ),
+            )
+
+        try:
+            self._evm._eth_call(net.portal_address, self._relay_calldata(job))
+        except evm.EvmError as exc:
+            if evm.is_already_delivered(exc):
+                return self._unwrap_delivered(
+                    job,
+                    by="an altruistic relayer",
+                    tx_hash=self._external_delivery_hash(job),
+                )
+            raise  # transport or an unexpected revert: retryable per taxonomy
+
+        if self._evm.get_eth_balance(self._hot_address) >= _MIN_GAS_WEI:
+            return _advance(
+                JobStatus.RELAYING,
+                message="hot wallet now holds relay gas; switching to self-relay",
+            )
+        raise WarpPending(
+            "message is live and deliverable; waiting for an altruistic "
+            "relayer (or fund the hot wallet with ~0.0003 ETH on Base to "
+            f"self-relay). Also claimable any time at {net.status_url}"
+        )
+
+    def _external_delivery_hash(self, job: WarpJob) -> Optional[str]:
+        """The watcher's destination tx hash -- display only, never the proof."""
+        try:
+            msg = self._watcher.get_message(job.bridge_nonce, source_chain="xch")
+            raw = msg.raw if msg is not None else {}
+            return str(raw.get("destination_transaction_hash") or "") or None
+        except Exception:  # noqa: BLE001 -- provenance is best-effort
+            return None
 
     def _unwrap_delivered(self, job: WarpJob, *, by: str, tx_hash=None) -> _Step:
         post_tip = job.state.get("post_tip_base_units")
@@ -2744,13 +2904,20 @@ class WarpEngine:
         return _job_dict(self._store.get_job(job.id))
 
 
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> dict:
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> dict:
         """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
 
         Refusals here are synchronous and create no job. Unlike Bridge now,
         the operator states an exact amount and destination -- there is no
         balance-sized default and no clamping: a cap violation refuses rather
         than silently shrinking what was typed.
+
+        ``external_relay`` is the Chia-only mode: skip the hot-wallet gas
+        gate and, if the gas really is absent after signature collection,
+        wait in ``AWAITING_EXTERNAL_RELAY`` for an altruistic relayer instead
+        of self-relaying.
         """
         p = self._params
         active = self._store.get_active_job()
@@ -2804,9 +2971,13 @@ class WarpEngine:
                 "direction": "out",
                 "manual": True,
                 "receiver_evm": rec_bytes.hex(),
+                "external_relay": bool(external_relay),
                 **self._binding(),
             },
-            event_message=f"unwrap requested: {amount} mojos -> {receiver}",
+            event_message=(
+                f"unwrap requested: {amount} mojos -> {receiver}"
+                + (" (external relay: no Base gas needed)" if external_relay else "")
+            ),
         )
         return _job_dict(job)
 
@@ -2975,6 +3146,142 @@ class WarpEngine:
         )
         return _job_dict(self._store.get_job(job.id))
 
+    def relay_sweep_if_due(self) -> Optional[dict]:
+        """One altruistic sweep (plus heartbeat) when enabled and due.
+
+        Never raises: this rides the worker tick behind the operator's own
+        job step and must not be able to break it. ``dry_run`` sweeps are
+        full rehearsals (fetch, verify, preflight, sign -- no broadcast) and
+        deliberately publish NO heartbeat: a rehearsal must not tell
+        Chia-only users that help is online.
+        """
+        if self._relayer is None:
+            return None
+        now = self._now()
+        if now < self._next_relay_sweep:
+            return None
+        self._next_relay_sweep = now + _RELAY_SWEEP_INTERVAL_S
+        # Nonce-collision guard. When the relay shares the engine's hot key
+        # (the no-dedicated-key fallback), broadcasting a relay grabs the same
+        # pending nonce the engine may hold a signed-but-unbroadcast tx at --
+        # the relay mines first and the engine's approve/bridge/relay then
+        # silently wedges on a benign 'nonce too low'. A dedicated relay key
+        # has its own nonce space and is unaffected; only the shared case is
+        # skipped, and only while a job actually occupies the slot.
+        if (
+            self._relay_key is not None
+            and str(self._relay_key.address).lower() == str(self._hot_address).lower()
+            and self._store.get_active_job() is not None
+        ):
+            self._relay_report = {
+                "at": now,
+                "skipped": "relay shares the hot key with an active bridge job",
+            }
+            return self._relay_report
+        broadcast = not self._params.dry_run
+        report: Dict[str, Any] = {"at": now, "broadcast": broadcast}
+        try:
+            entries = self._relayer.sweep(broadcast=broadcast)
+            report["entries"] = entries
+            report["relayed"] = sum(
+                1 for e in entries if e.get("action") == "relayed"
+            )
+        except Exception as exc:  # noqa: BLE001 -- must not break the tick
+            report["error"] = str(exc)
+            _log.warning("altruistic relay sweep failed: %s", exc)
+        if broadcast and self._relay_key is not None:
+            from . import nostr
+
+            try:
+                report["heartbeat_accepted"] = nostr.publish_heartbeat(
+                    self._net,
+                    self._relay_key.private_key,
+                    self._relay_key.address,
+                    created_at=now,
+                    publisher=self._heartbeat_publisher,
+                )
+            except Exception as exc:  # noqa: BLE001 -- advertising is best-effort
+                report["heartbeat_error"] = str(exc)
+        # Persist the budget ledger + skip-list so the daily ceiling and the
+        # poison list survive a process restart -- an in-memory-only ledger
+        # would grant a fresh full budget on every relaunch.
+        if self._relay_state_saver is not None:
+            try:
+                self._relay_state_saver()
+            except Exception as exc:  # noqa: BLE001 -- persistence is best-effort
+                _log.warning("relay state save failed: %s", exc)
+        self._relay_report = report
+        return report
+
+    def refresh_relay_activity_if_due(self) -> Optional[dict]:
+        """Refresh the cached liveness evidence for the GUI (never raises).
+
+        Two independent layers, joined by relayer address:
+
+        * on-chain third-party deliveries (unforgeable, but lagging), and
+        * verified Nostr heartbeats (fresh, but only a claim).
+
+        A heartbeat whose address also appears in the on-chain evidence is a
+        proven volunteer saying it is still running (``online_proven``).
+        """
+        now = self._now()
+        if now < self._next_activity_refresh:
+            return None
+        self._next_activity_refresh = now + _ACTIVITY_REFRESH_INTERVAL_S
+        out: Dict[str, Any] = {"checked_at": now}
+        try:
+            from . import relayer as relayer_mod
+
+            third = relayer_mod.recent_third_party_relays(
+                self._watcher.fetch_path, self._evm,
+                portal_address=self._net.portal_address,
+                lookback=_ACTIVITY_LOOKBACK,
+                # Our own late self-relays (hot key or the dedicated relay
+                # key) must never read back as volunteer evidence about us.
+                exclude_addresses=[
+                    self._hot_address,
+                    getattr(self._relay_key, "address", None),
+                ],
+            )
+            out["third_party"] = third[:10]
+            out["third_party_count"] = len(third)
+            out["last_third_party_at"] = max(
+                (t["delivered_at"] for t in third), default=None
+            )
+            # Join heartbeats against the FULL evidence set, not the truncated
+            # display slice -- a volunteer past the 10th recent delivery is
+            # still proven, and dropping it would silently downgrade a genuine
+            # "online (proven)" to a mere "online (claim)".
+            out["_proven_addrs"] = sorted({
+                str(t.get("relayer") or "").lower() for t in third
+            })
+        except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
+            out["error"] = str(exc)
+        try:
+            from . import nostr
+
+            beats = nostr.fetch_recent_heartbeats(
+                self._net, now=now, fetcher=self._nostr_fetcher,
+            )
+            proven = set(out.get("_proven_addrs") or [])
+            out["heartbeats"] = beats[:10]
+            out["online_now"] = bool(beats)
+            # Proven requires BOTH halves verified: the heartbeat must be
+            # cryptographically bound to the address it claims (evm_sig
+            # recovers to it), and that address must have receipt-verified
+            # late deliveries. An unbound heartbeat naming a proven address
+            # is exactly the spoof the binding exists to kill.
+            out["online_proven"] = any(
+                b.get("bound") and b["relayer"] in proven for b in beats
+            )
+        except Exception as exc:  # noqa: BLE001 -- evidence is best-effort
+            out.setdefault("error", str(exc))
+            out["online_now"] = False
+            out["online_proven"] = False
+        out.pop("_proven_addrs", None)  # internal join key; keep it out of the snapshot
+        self._relay_activity = out
+        return out
+
     def refresh_hot_wallet(self) -> Dict[str, Any]:
         """Refresh the cached Base hot-wallet balances (never raises).
 
@@ -3032,6 +3339,13 @@ class WarpEngine:
             "min_micros": self._params.min_micros,
             "max_micros": self._params.max_micros,
             "expected_asset_id": self._net.expected_asset_id,
+            "altruistic_relay": {
+                "enabled": self._relayer is not None,
+                "dry_run": self._params.dry_run,
+                "relayer_address": getattr(self._relay_key, "address", None),
+                "last_sweep": dict(self._relay_report),
+            },
+            "relay_activity": dict(self._relay_activity),
             **receiver,
         }
         if self._binding_error:
@@ -3059,6 +3373,56 @@ def _coinset_url(config: Optional[dict], net: constants.WarpNet) -> str:
     return (str(warp.get("coinset_url", "") or "").strip()) or net.coinset_url
 
 
+class _SecretsFileIO:
+    """``read()/write()`` over secrets.yaml for :class:`~gui.services.basewallet.BaseWallet`.
+
+    The write path reuses :func:`gui.services.config_split.dump_preserving` --
+    the same comment-preserving round-trip the settings page uses -- so the
+    operator's own annotations in secrets.yaml survive every key write.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = Path(path)
+
+    def transaction(self):
+        """Hold the shared per-file lock across a read-modify-write.
+
+        The same lock the settings-save path takes, so a BaseWallet key
+        mutation and a settings save can never interleave and clobber each
+        other (see gui.services.config_split.file_transaction)."""
+        from gui.services.config_split import file_transaction
+
+        return file_transaction(self._path)
+
+    def read(self) -> dict:
+        import yaml
+
+        if not self._path.is_file():
+            return {}
+        with open(self._path, "r", encoding="utf-8") as fh:
+            data = yaml.safe_load(fh)
+        if data is None:
+            return {}
+        if not isinstance(data, dict):
+            # A present-but-corrupt secrets.yaml (a manual edit left it parsing
+            # as a list/scalar). Masking it as {} would make create_wallet's
+            # overwrite guard read an empty store and rewrite the file from
+            # scratch, erasing whatever key blob it actually held. Fail loud;
+            # _wallet_summary surfaces this as an error banner, and the write
+            # side never runs.
+            raise ValueError(
+                f"{self._path} does not parse to a mapping "
+                f"(got {type(data).__name__}); refusing to treat a corrupt "
+                "secrets file as empty"
+            )
+        return data
+
+    def write(self, data: dict) -> None:
+        from gui.services.config_split import dump_preserving
+
+        dump_preserving(self._path, data)
+
+
 # ===================================================================== #
 # Qt worker -- runs the blocking engine step on a background QThread.
 # ===================================================================== #
@@ -3074,11 +3438,31 @@ class _WarpWorker(QObject):
 
     snapshot_ready = Signal(dict)
 
-    def __init__(self, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        parent: Optional[QObject] = None,
+        *,
+        secrets_path: Optional[Path] = None,
+    ) -> None:
         super().__init__(parent)
         self._config: dict = {}
         self._engine: Optional[WarpEngine] = None
         self._engine_error: Optional[str] = None
+        # Base hot-wallet plumbing (independent of the engine -- see
+        # wallet_action). Set once before moveToThread, never mutated after.
+        self._secrets_path: Optional[Path] = secrets_path
+        self._last_wallet_notice: str = ""
+        # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
+        # the GUI can tell a wallet-action-completion snapshot apart from the
+        # timer-driven ticks that carry the same cached value -- without it,
+        # the ~5s master tick clears the widget's post-click gate before the
+        # action finishes, re-enabling a duplicate irreversible transfer.
+        self._wallet_action_seq: int = 0
+        # The altruistic relay's daily-gas ledger, failure counts, and
+        # skip-list, owned by the worker so they survive an engine rebuild on
+        # config reload (the engine, and its relayer, are dropped and rebuilt;
+        # this dict is passed by reference into each new relayer).
+        self._relay_state: Dict[str, Any] = {}
 
     @Slot(dict)
     def set_config(self, config: dict) -> None:
@@ -3093,13 +3477,62 @@ class _WarpWorker(QObject):
         if engine is not None:
             engine.close()
 
+    # -- altruistic-relay ledger persistence (survives process restart) ----- #
+
+    def _relay_state_path(self) -> Optional[Path]:
+        try:
+            return Path(_job_db_path(self._config)).with_name(
+                "warp_relay_state.json"
+            )
+        except Exception:  # noqa: BLE001 -- no path is a safe "don't persist"
+            return None
+
+    def _load_relay_state(self) -> None:
+        """Populate ``_relay_state`` from disk (types restored: skiplist->set)."""
+        path = self._relay_state_path()
+        if path is None or not path.is_file():
+            return
+        import json
+
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self._relay_state = {
+                "budget": dict(data.get("budget") or {}),
+                "failures": {str(k): int(v)
+                             for k, v in (data.get("failures") or {}).items()},
+                "skiplist": set(data.get("skiplist") or []),
+            }
+        except Exception as exc:  # noqa: BLE001 -- a bad ledger must not block start
+            _log.warning("could not load relay state from %s: %s", path, exc)
+
+    def _save_relay_state(self) -> None:
+        path = self._relay_state_path()
+        if path is None:
+            return
+        import json
+
+        from gui.services.config_split import _atomic_write_text
+
+        payload = {
+            "budget": self._relay_state.get("budget") or {},
+            "failures": self._relay_state.get("failures") or {},
+            "skiplist": sorted(self._relay_state.get("skiplist") or []),
+        }
+        _atomic_write_text(path, json.dumps(payload), newline="\n")
+
     @Slot()
     def tick(self) -> None:
-        """Advance the active job one step and refresh the hot-wallet balances."""
+        """Advance the active job one step and refresh the hot-wallet balances.
+
+        The altruistic sweep and the activity refresh ride behind the job
+        step; both are internally throttled and contracted never to raise.
+        """
 
         def _run(engine: WarpEngine) -> None:
             engine.step()
             engine.refresh_hot_wallet()
+            engine.relay_sweep_if_due()
+            engine.refresh_relay_activity_if_due()
 
         self.snapshot_ready.emit(self._guarded(_run))
 
@@ -3109,11 +3542,15 @@ class _WarpWorker(QObject):
             self._guarded(lambda engine: engine.request_bridge(target_micros))
         )
 
-    @Slot(int, str)
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+    @Slot(int, str, bool)
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> None:
         self.snapshot_ready.emit(
             self._guarded(
-                lambda engine: engine.request_unwrap(int(amount_mojos), receiver)
+                lambda engine: engine.request_unwrap(
+                    int(amount_mojos), receiver, bool(external_relay)
+                )
             )
         )
 
@@ -3122,6 +3559,31 @@ class _WarpWorker(QObject):
         self.snapshot_ready.emit(
             self._guarded(lambda engine: engine.job_action(job_id, action))
         )
+
+    @Slot(str, dict)
+    def wallet_action(self, action: str, payload: dict) -> None:
+        """Run one operator Base-wallet command and emit a fresh snapshot.
+
+        Deliberately NOT routed through :meth:`_guarded`: wallet commands must
+        work while the engine cannot build -- a missing hot-wallet key is the
+        engine's ordinary refusal, and ``create`` is how the operator fixes it.
+        """
+        payload = dict(payload or {})
+        error: Optional[str] = None
+        try:
+            notice = self._wallet_op(str(action), payload)
+            if notice:
+                self._last_wallet_notice = notice
+        except Exception as exc:  # noqa: BLE001 -- never kill the worker
+            error = str(exc)
+            _log.warning("wallet action %r failed: %s", action, exc)
+        # Mark this action processed BEFORE snapshotting, so the emitted
+        # snapshot carries the bumped seq the GUI keys its gate off.
+        self._wallet_action_seq += 1
+        snap = self._snapshot_or_error()
+        if error:
+            snap["wallet_action_error"] = error
+        self.snapshot_ready.emit(snap)
 
     # -- internals ---------------------------------------------------------- #
 
@@ -3146,19 +3608,28 @@ class _WarpWorker(QObject):
         return snap
 
     def _snapshot_or_error(self) -> dict:
+        snap: dict
         if self._engine is not None:
             try:
-                return self._engine.snapshot()
+                snap = self._engine.snapshot()
             except Exception as exc:  # noqa: BLE001
-                return {"enabled": self._config_enabled(), "error": str(exc)}
-        return {
-            # Report what the operator *asked* for, not what we managed to
-            # build. Otherwise a failed anchor renders as "Bridge disabled --
-            # set warp.enabled: true", which is both wrong and misleading
-            # advice; the documented banner for this is "blocked".
-            "enabled": self._config_enabled(),
-            "error": self._engine_error or "warp engine not built",
-        }
+                snap = {"enabled": self._config_enabled(), "error": str(exc)}
+        else:
+            snap = {
+                # Report what the operator *asked* for, not what we managed to
+                # build. Otherwise a failed anchor renders as "Bridge disabled --
+                # set warp.enabled: true", which is both wrong and misleading
+                # advice; the documented banner for this is "blocked".
+                "enabled": self._config_enabled(),
+                "error": self._engine_error or "warp engine not built",
+            }
+        # Base-wallet fields ride every snapshot, so the wallet page works in
+        # all three shapes (engine built, blocked, warp disabled).
+        snap["base_wallet"] = self._wallet_summary(snap.get("hot_wallet"))
+        snap["wallet_action_seq"] = self._wallet_action_seq
+        if self._last_wallet_notice:
+            snap["wallet_notice"] = self._last_wallet_notice
+        return snap
 
     def _config_enabled(self) -> bool:
         """Whether ``warp.enabled`` is set, independent of whether it started."""
@@ -3254,6 +3725,35 @@ class _WarpWorker(QObject):
             raise WarpError("no EVM hot-wallet key configured (warp.evm_private_key_dpapi)")
         evm_key = keystore.load_evm_key(blob, protector=protector)
 
+        # Opt-in altruistic relay: a dedicated gas-only key wins when present
+        # (warp.relay_private_key_dpapi), else the hot key pays the gas.
+        relayer_obj = None
+        relay_key = None
+        if params.altruistic_relay:
+            from . import relayer as relayer_mod
+
+            # Refresh the ledger from disk before the relayer adopts it by
+            # reference, so a restart resumes today's spend and skip-list.
+            self._load_relay_state()
+            relay_blob = warp_cfg.get("relay_private_key_dpapi")
+            relay_key = (
+                keystore.load_evm_key(relay_blob, protector=protector)
+                if relay_blob else evm_key
+            )
+            relayer_obj = relayer_mod.AltruisticRelayer(
+                net=net,
+                evm_client=evm_client,
+                collector=nostr.NostrSigCollector(net),
+                watcher_fetch=watcher_client.fetch_path,
+                evm_key=relay_key,
+                grace_s=params.relay_grace_min * 60.0,
+                daily_gas_budget_wei=int(
+                    params.relay_daily_gas_budget_eth * 10 ** 18
+                ),
+                # Ledger/skip-list survive engine rebuilds (see _relay_state).
+                persistent=self._relay_state,
+            )
+
         return WarpEngine(
             net,
             store,
@@ -3266,7 +3766,205 @@ class _WarpWorker(QObject):
             evm_key=evm_key,
             protector=protector,
             nostr_fetcher=None,
+            relayer=relayer_obj,
+            relay_key=relay_key,
+            relay_state_saver=(
+                self._save_relay_state if relayer_obj is not None else None
+            ),
         )
+
+    # -- base wallet (operator commands; independent of the engine) --------- #
+
+    def _base_wallet(self):
+        """Construct a :class:`~gui.services.basewallet.BaseWallet` over secrets.yaml.
+
+        Built fresh per use (the EVM client is a stateless HTTP wrapper) and
+        never through the engine, because the wallet must operate exactly when
+        the engine cannot: no key yet, or warp disabled.
+        """
+        from gui.services.basewallet import BaseWallet
+        from . import evm as evm_mod
+
+        if self._secrets_path is None:
+            raise WarpError("no secrets.yaml path configured for the wallet")
+        net = constants.MAINNET
+        params = warp_params_from_config(self._config)
+        rpc_url = params.base_rpc_url or net.evm_default_rpc_url
+        evm_client = evm_mod.EvmClient(net, rpc_url=rpc_url)
+        return BaseWallet(net, evm_client, _SecretsFileIO(self._secrets_path))
+
+    def _wallet_op(self, action: str, payload: dict) -> str:
+        """Dispatch one wallet command; returns the operator-facing notice."""
+        from gui.services.basewallet import BaseWalletError
+
+        wallet = self._base_wallet()
+        if action == "create":
+            try:
+                address = wallet.create_wallet()
+            finally:
+                # create writes the key before returning; adopt regardless so
+                # a raise after the write still points the engine at it.
+                self._adopt_key_from_disk()
+            return (
+                f"Wallet created: {address}. Back up the key now (runbook: "
+                "hot-wallet key backup), then confirm the backup."
+            )
+        if action == "confirm_backup":
+            wallet.mark_backup_confirmed()
+            return "Key backup confirmed."
+        if action == "send_eth":
+            self._refuse_wallet_send_while_job_open("send_eth")
+            tx = wallet.send_eth(
+                str(payload.get("destination") or ""),
+                int(payload.get("amount_wei") or 0),
+            )
+            return f"ETH transfer broadcast: {tx}"
+        if action == "send_usdc":
+            self._refuse_wallet_send_while_job_open("send_usdc")
+            tx = wallet.send_usdc(
+                str(payload.get("destination") or ""),
+                int(payload.get("amount_micros") or 0),
+            )
+            return f"USDC transfer broadcast: {tx}"
+        if action == "recover_retired":
+            out = wallet.recover_retired(str(payload.get("address") or ""))
+            txs = ", ".join(out["sweep_txs"])
+            return (
+                f"Recovered {out['from']} -> {out['to']}: {txs}. "
+                f"({out['swept_usdc_micros']} USDC micros, "
+                f"{out['swept_eth_wei']} wei ETH swept.)"
+            )
+        if action == "rotate":
+            try:
+                out = wallet.rotate(open_job_check=self._wallet_open_job)
+            finally:
+                # rotate persists the NEW key before broadcasting the sweeps;
+                # if a sweep broadcast raised, the on-disk key already changed,
+                # so the engine must adopt it regardless or it keeps signing
+                # with the now-retired key. A pre-persist raise (open-job or
+                # gas gate) just re-reads the unchanged blob -- harmless.
+                self._adopt_key_from_disk()
+            txs = ", ".join(out["sweep_txs"]) or "none (nothing to sweep)"
+            return (
+                f"Key rotated: {out['old_address']} -> {out['new_address']}. "
+                f"Sweep txs: {txs}. The old key is archived in secrets.yaml. "
+                "Back up the NEW key, then confirm the backup."
+            )
+        raise BaseWalletError(f"unknown wallet action: {action!r}")
+
+    def _refuse_wallet_send_while_job_open(self, action: str) -> None:
+        """A manual send shares the hot wallet with the engine's bridge txs.
+
+        A send grabs the pending nonce, which does not see the engine's
+        signed-but-unbroadcast approve/bridge/relay raw; broadcasting the send
+        first reuses that nonce and wedges the bridge. Refuse while a job holds
+        the slot -- the operator resolves it first (Bridge already serialises
+        against a single active job for the same reason)."""
+        from gui.services.basewallet import BaseWalletError
+
+        open_job = self._wallet_open_job()
+        if open_job is not None:
+            raise BaseWalletError(
+                f"cannot {action}: warp job {getattr(open_job, 'id', '?')} "
+                f"({getattr(open_job, 'status', '?')}) is open and shares this "
+                "hot wallet; resolve it first so the send cannot race its "
+                "pending nonce"
+            )
+
+    def _wallet_open_job(self) -> Optional[WarpJob]:
+        """The rotation guard's open-job probe -- fail-closed.
+
+        With the engine built, ask its store. Without it a job can still be
+        open (warp disabled mid-job), so probe the DB directly; an unreadable
+        DB refuses rotation rather than sweeping out from under a frozen job.
+        A missing DB file means no job ever ran, which is safely ``None``.
+        """
+        from gui.services.basewallet import BaseWalletError
+
+        if self._engine is not None:
+            return self._engine._store.get_active_job()
+        db = Path(_job_db_path(self._config))
+        if not db.is_file():
+            return None
+        try:
+            store = WarpJobStore(str(db))
+        except Exception as exc:  # noqa: BLE001 -- fail closed, with the reason
+            raise BaseWalletError(
+                f"cannot read the warp job store ({exc}); refusing rotation"
+            ) from exc
+        try:
+            return store.get_active_job()
+        finally:
+            store.close()
+
+    def _adopt_key_from_disk(self) -> None:
+        """Bind the engine to the key now on disk -- drop-first, fail closed.
+
+        The engine is dropped BEFORE anything else: after a key mutation the
+        on-disk active key may have changed, and an engine still holding the
+        pre-rotation key must not sign another transaction no matter what
+        happens next. If the re-read then fails, the stale blob is purged
+        from the worker's config and ``_engine_error`` blocks rebuilds --
+        rebuilding from the old config would silently resurrect the retired
+        key, the exact binding violation the drop exists to prevent.
+        """
+        self._drop_engine()
+        try:
+            secrets = _SecretsFileIO(self._secrets_path).read()
+            blob = (secrets.get("warp") or {}).get("evm_private_key_dpapi")
+        except Exception as exc:  # noqa: BLE001 -- surfaced as a blocked banner
+            self._config.setdefault("warp", {}).pop("evm_private_key_dpapi", None)
+            self._engine_error = (
+                f"secrets.yaml unreadable after a key change ({exc}); the "
+                "bridge stays blocked until it can be re-read -- the on-disk "
+                "key may differ from the one the engine held"
+            )
+            _log.warning("could not re-read secrets.yaml after key change: %s", exc)
+            return
+        warp_cfg = self._config.setdefault("warp", {})
+        if blob:
+            warp_cfg["evm_private_key_dpapi"] = blob
+        else:
+            # No key on disk (e.g. the file was replaced): never rebuild with
+            # the stale one from the old config snapshot.
+            warp_cfg.pop("evm_private_key_dpapi", None)
+        self._engine_error = None
+
+    def _wallet_summary(self, hot: Optional[dict]) -> dict:
+        """Operator-facing wallet state for the Base Wallet page.
+
+        Balance reads ride the engine's own refresh when it is built (the
+        ``hot`` dict); with no engine they are read directly -- two RPCs per
+        ~30s tick, and only once a key exists.
+        """
+        out: Dict[str, Any] = {"configured": False}
+        if self._secrets_path is None:
+            out["error"] = "no secrets.yaml path configured"
+            return out
+        try:
+            warp_sec = _SecretsFileIO(self._secrets_path).read().get("warp") or {}
+        except Exception as exc:  # noqa: BLE001 -- the summary must never raise
+            out["error"] = f"secrets.yaml unreadable: {exc}"
+            return out
+        out["retired_count"] = len(warp_sec.get("retired_keys") or [])
+        out["backup_confirmed"] = bool(warp_sec.get("evm_key_backup_confirmed"))
+        if not warp_sec.get("evm_private_key_dpapi"):
+            return out
+        out["configured"] = True
+        if hot and hot.get("address") and not hot.get("error"):
+            out["address"] = str(hot.get("address"))
+            out["eth_wei"] = hot.get("eth_wei")
+            out["usdc_micros"] = hot.get("usdc_micros")
+            return out
+        try:
+            info = self._base_wallet().info()
+        except Exception as exc:  # noqa: BLE001 -- summary must never raise
+            out["error"] = str(exc)
+            return out
+        out["address"] = info.address
+        out["eth_wei"] = info.eth_wei
+        out["usdc_micros"] = info.usdc_micros
+        return out
 
 
 # ===================================================================== #
@@ -3292,10 +3990,17 @@ class WarpService(QObject):
     _trigger_tick = Signal()
     _trigger_params = Signal(dict)
     _trigger_bridge = Signal(object)
-    _trigger_unwrap = Signal(int, str)
+    _trigger_unwrap = Signal(int, str, bool)
     _trigger_action = Signal(int, str)
+    _trigger_wallet = Signal(str, dict)
 
-    def __init__(self, config: Optional[dict] = None, parent: Optional[QObject] = None) -> None:
+    def __init__(
+        self,
+        config: Optional[dict] = None,
+        parent: Optional[QObject] = None,
+        *,
+        secrets_path: Optional[Path] = None,
+    ) -> None:
         super().__init__(parent)
         self._mutex = QMutex()
         self._snapshot: dict = {}
@@ -3303,7 +4008,9 @@ class WarpService(QObject):
 
         self._thread = QThread(self)
         self._thread.setObjectName("WarpWorkerThread")
-        self._worker = _WarpWorker()
+        self._worker = _WarpWorker(
+            secrets_path=Path(secrets_path) if secrets_path else None
+        )
         self._worker.moveToThread(self._thread)
 
         self._worker.snapshot_ready.connect(self._on_snapshot_ready)
@@ -3312,6 +4019,7 @@ class WarpService(QObject):
         self._trigger_bridge.connect(self._worker.request_bridge)
         self._trigger_unwrap.connect(self._worker.request_unwrap)
         self._trigger_action.connect(self._worker.job_action)
+        self._trigger_wallet.connect(self._worker.wallet_action)
 
         self._trigger_params.emit(dict(config or {}))
 
@@ -3356,15 +4064,26 @@ class WarpService(QObject):
             self.start()
         self._trigger_bridge.emit(target_micros)
 
-    def request_unwrap(self, amount_mojos: int, receiver: str) -> None:
+    def request_unwrap(
+        self, amount_mojos: int, receiver: str, external_relay: bool = False
+    ) -> None:
         if not self._thread.isRunning():
             self.start()
-        self._trigger_unwrap.emit(int(amount_mojos), str(receiver))
+        self._trigger_unwrap.emit(
+            int(amount_mojos), str(receiver), bool(external_relay)
+        )
 
     def job_action(self, job_id: int, action: str) -> None:
         if not self._thread.isRunning():
             self.start()
         self._trigger_action.emit(int(job_id), str(action))
+
+    def wallet_action(self, action: str, payload: Optional[dict] = None) -> None:
+        """Queue one Base-wallet command (create / confirm_backup / send_eth /
+        send_usdc / rotate) onto the worker thread."""
+        if not self._thread.isRunning():
+            self.start()
+        self._trigger_wallet.emit(str(action), dict(payload or {}))
 
     def get_snapshot(self) -> dict:
         """Return the last snapshot without triggering work (mutex-guarded)."""
