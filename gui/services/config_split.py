@@ -409,16 +409,34 @@ def split_and_save(config_path: Path, full: dict[str, Any]) -> None:
     # read-existing / merge / write runs under the per-file lock so a
     # concurrent BaseWallet key write cannot land between our read and write
     # and be silently overwritten by our stale snapshot.
+    #
+    # Fail CLOSED on an existing file we cannot read as a mapping: the
+    # overlay deliberately excludes wallet-managed keys, so overwriting a
+    # present-but-corrupt secrets.yaml would erase the active/retired DPAPI
+    # blobs it still holds as text. A save must never destroy what it could
+    # not read; the operator fixes the file, then saves.
     secrets_path = config_path.parent / "secrets.yaml"
     if secrets:
         with file_transaction(secrets_path):
             if secrets_path.is_file():
+                existing = None
                 try:
                     with open(secrets_path, "r", encoding="utf-8") as fh:
-                        existing = yaml.safe_load(fh) or {}
-                    if isinstance(existing, dict):
-                        deep_merge(existing, secrets)
-                        secrets = existing
-                except Exception:
-                    pass
+                        existing = yaml.safe_load(fh)
+                except Exception as exc:
+                    raise ValueError(
+                        f"{secrets_path} exists but cannot be read/parsed "
+                        f"({exc}); refusing to overwrite it -- it may hold "
+                        "key material. Fix or move the file, then save again."
+                    ) from exc
+                if existing is None:
+                    existing = {}
+                if not isinstance(existing, dict):
+                    raise ValueError(
+                        f"{secrets_path} does not parse to a mapping (got "
+                        f"{type(existing).__name__}); refusing to overwrite "
+                        "it -- it may hold key material."
+                    )
+                deep_merge(existing, secrets)
+                secrets = existing
             dump_preserving(secrets_path, secrets)

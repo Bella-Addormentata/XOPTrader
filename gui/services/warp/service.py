@@ -3898,21 +3898,36 @@ class _WarpWorker(QObject):
             store.close()
 
     def _adopt_key_from_disk(self) -> None:
-        """Point the worker's config at the key now on disk; rebuild the engine.
+        """Bind the engine to the key now on disk -- drop-first, fail closed.
 
-        Without this the engine keeps signing with the pre-rotation key it was
-        built around (and after ``create``, keeps refusing to build at all)
-        until the next full config reload.
+        The engine is dropped BEFORE anything else: after a key mutation the
+        on-disk active key may have changed, and an engine still holding the
+        pre-rotation key must not sign another transaction no matter what
+        happens next. If the re-read then fails, the stale blob is purged
+        from the worker's config and ``_engine_error`` blocks rebuilds --
+        rebuilding from the old config would silently resurrect the retired
+        key, the exact binding violation the drop exists to prevent.
         """
+        self._drop_engine()
         try:
             secrets = _SecretsFileIO(self._secrets_path).read()
             blob = (secrets.get("warp") or {}).get("evm_private_key_dpapi")
-        except Exception as exc:  # noqa: BLE001 -- adoption is best-effort
+        except Exception as exc:  # noqa: BLE001 -- surfaced as a blocked banner
+            self._config.setdefault("warp", {}).pop("evm_private_key_dpapi", None)
+            self._engine_error = (
+                f"secrets.yaml unreadable after a key change ({exc}); the "
+                "bridge stays blocked until it can be re-read -- the on-disk "
+                "key may differ from the one the engine held"
+            )
             _log.warning("could not re-read secrets.yaml after key change: %s", exc)
             return
+        warp_cfg = self._config.setdefault("warp", {})
         if blob:
-            self._config.setdefault("warp", {})["evm_private_key_dpapi"] = blob
-        self._drop_engine()
+            warp_cfg["evm_private_key_dpapi"] = blob
+        else:
+            # No key on disk (e.g. the file was replaced): never rebuild with
+            # the stale one from the old config snapshot.
+            warp_cfg.pop("evm_private_key_dpapi", None)
         self._engine_error = None
 
     def _wallet_summary(self, hot: Optional[dict]) -> dict:
