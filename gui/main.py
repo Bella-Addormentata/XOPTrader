@@ -701,12 +701,23 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
     patched = False
     ssl = chia_root / "config" / "ssl" if chia_root else None
 
-    _PLACEHOLDER_FINGERPRINT = 1234567890
+    # Placeholders in BOTH template files count. config.example.yaml
+    # historically used 1234567890, but wallet_fingerprint is a secrets key
+    # and secrets.example.yaml ships 0 -- which wins the merge, so on every
+    # fresh install the merged view showed 0, the `== 1234567890` check
+    # never fired, and the engine then refused to start with
+    # "wallet_fingerprint must not be 0" DESPITE a successful detection.
+    _PLACEHOLDER_FINGERPRINTS = {None, 0, 1234567890}
 
     # --- wallet fingerprint ---
-    if fingerprint is not None and chia_section.get("wallet_fingerprint") == _PLACEHOLDER_FINGERPRINT:
+    fingerprint_patched = False
+    if (
+        fingerprint is not None
+        and chia_section.get("wallet_fingerprint") in _PLACEHOLDER_FINGERPRINTS
+    ):
         chia_section["wallet_fingerprint"] = fingerprint
         patched = True
+        fingerprint_patched = True
 
     # --- RPC ports (read from Chia's own config.yaml) ---
     if chia_root is not None:
@@ -752,16 +763,18 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
     data["chia"] = chia_section
     try:
         split_and_save(config_path, data)
-    except OSError as exc:
+    except (OSError, ValueError) as exc:
         _log.warning("Could not write auto-patched config: %s", exc)
         return False
 
+    # Report what was WRITTEN, not merely detected: the old message printed
+    # the detected fingerprint even when the patch was skipped, which made
+    # the fingerprint-never-patched bug read as a success in the log.
     _log.info(
-        "Auto-detected Chia settings written to %s "
-        "(root=%s, fingerprint=%s).",
+        "Auto-detected Chia settings written to %s (root=%s, fingerprint=%s).",
         config_path,
         chia_root,
-        fingerprint,
+        fingerprint if fingerprint_patched else "unchanged",
     )
     return True
 
