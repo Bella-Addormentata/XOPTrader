@@ -595,11 +595,35 @@ jobs:
           Stop-Process -Name xop_trader_gui -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 3
 
+          # Upgrade path: a SECOND install over the first must silently remove
+          # the previous version (PrepareToInstall) rather than stack a second
+          # copy. Plant a stale marker the new install does not ship and prove
+          # it is gone, and assert exactly one uninstaller registration
+          # remains -- an upgrade that failed to clean up leaves two.
+          Set-Content "C:\XOPSmoke\stale-from-old-version.txt" "should be removed on upgrade"
+          $up = Start-Process -FilePath ".\xop_trader-installer-windows-x64.exe" `
+                -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\XOPSmoke" `
+                -Wait -PassThru
+          if ($up.ExitCode -ne 0) { throw "upgrade install exited $($up.ExitCode)" }
+          if (Test-Path "C:\XOPSmoke\stale-from-old-version.txt") {
+            throw "stale file survived the upgrade -- previous version was not uninstalled first"
+          }
+          if (-not (Test-Path "C:\XOPSmoke\xop_trader_gui.exe")) {
+            throw "payload missing after upgrade"
+          }
+          $keys = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" `
+                  -ErrorAction SilentlyContinue |
+                  Where-Object { $_.PSChildName -like "*B4E3A1C2*" }
+          if (($keys | Measure-Object).Count -ne 1) {
+            throw "expected exactly one XOPTrader uninstall registration, found $(($keys|Measure-Object).Count)"
+          }
+          Write-Host "upgrade smoke test passed: old version cleaned up, single registration"
+
           $un = Start-Process -FilePath "C:\XOPSmoke\unins000.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
                 -Wait -PassThru
           if ($un.ExitCode -ne 0) { throw "uninstaller exited $($un.ExitCode)" }
-          Write-Host "installer smoke test passed: install + payload + first-run launch + uninstall"
+          Write-Host "installer smoke test passed: install + payload + first-run launch + upgrade + uninstall"
 
       - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4

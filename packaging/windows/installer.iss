@@ -90,6 +90,60 @@ Name: "{autodesktop}\XOPTrader"; Filename: "{app}\xop_trader_gui.exe"; \
   IconFilename: "{app}\icon.ico"; \
   Tasks: desktopicon
 
+; =============================================================================
+; Upgrade handling — silently uninstall any previous version first.
+;
+; Upgrade-in-place (same AppId) replaces shipped files but leaves STALE ones
+; behind: a renamed binary or a dropped DLL from an old release would linger
+; in {app} forever and could still be found/loaded. A clean uninstall-first
+; removes that class. It is deliberately automatic, not a question -- the
+; only sensible answer is yes, and it is safe by design:
+;   * the uninstaller removes only files it installed (its own log), and
+;   * user state lives in %LOCALAPPDATA%\XOPTrader (v0.9.2+), untouched;
+;     even legacy config/secrets an elevated v0.9.x first run wrote into
+;     {app} are NOT in the uninstall log, so they survive for the app's
+;     first-run migration to adopt.
+; =============================================================================
+[Code]
+function GetPreviousUninstaller(): String;
+var
+  key: String;
+  uninst: String;
+begin
+  { The uninstall key is "<resolved AppId>_is1". The AppId is declared with
+    a leading "{{" (Inno's escape for a literal "{"), so the RESOLVED value
+    uses single braces -- hardcode that here, because SetupSetting("AppId")
+    would return the raw double-brace text and never match. test_installer_
+    upgrade.py asserts this GUID stays in sync with the [Setup] AppId. }
+  key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
+         '{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}_is1';
+  uninst := '';
+  if not RegQueryStringValue(HKLM, key, 'UninstallString', uninst) then
+    RegQueryStringValue(HKCU, key, 'UninstallString', uninst);
+  Result := uninst;
+end;
+
+function PrepareToInstall(var NeedsRestart: Boolean): String;
+var
+  uninst: String;
+  code: Integer;
+begin
+  Result := '';
+  uninst := GetPreviousUninstaller();
+  if uninst <> '' then
+  begin
+    uninst := RemoveQuotes(uninst);
+    if FileExists(uninst) then
+    begin
+      { /VERYSILENT so the nested wizard never appears; failures are
+        non-fatal -- the file copy below overwrites everything shipped,
+        so a broken old uninstaller must not block the upgrade. }
+      Exec(uninst, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
+           '', SW_HIDE, ewWaitUntilTerminated, code);
+    end;
+  end;
+end;
+
 [Run]
 Filename: "{tmp}\VC_redist.x64.exe"; \
   Parameters: "/install /quiet /norestart"; \
