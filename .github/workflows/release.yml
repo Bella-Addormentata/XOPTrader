@@ -554,11 +554,39 @@ jobs:
           }
           $dlls = (Get-ChildItem "C:\XOPSmoke\*.dll").Count
           if ($dlls -lt 5) { throw "expected the engine runtime DLLs, found $dlls" }
+          # An installed payload is not a working app: v0.9.1 installed fine
+          # and then the engine never started -- every write (config
+          # bootstrap, engine.log, DB) targeted the unwritable install dir.
+          # LAUNCH the installed GUI as this (non-elevated) runner user and
+          # assert the first-run machinery actually ran: config bootstrapped
+          # into the per-user data dir and the engine was spawned there.
+          $env:QT_QPA_PLATFORM = "offscreen"
+          $gui = Start-Process -FilePath "C:\XOPSmoke\xop_trader_gui.exe" -PassThru
+          Start-Sleep -Seconds 60
+          $appdata = Join-Path $env:LOCALAPPDATA "XOPTrader"
+          if (-not (Test-Path "$appdata\config.yaml")) {
+            throw "config.yaml was not bootstrapped into $appdata"
+          }
+          if (-not (Test-Path "$appdata\engine.log")) {
+            throw "engine.log missing in $appdata -- the engine was never spawned"
+          }
+          $engineAlive = Get-Process -Name xop_trader -ErrorAction SilentlyContinue
+          $logBytes = (Get-Item "$appdata\engine.log").Length
+          if ((-not $engineAlive) -and ($logBytes -eq 0)) {
+            throw "engine not running and engine.log empty -- launch failed"
+          }
+          if (-not $engineAlive) {
+            Write-Warning "engine exited on the runner (no Chia here) -- log has $logBytes bytes, spawn itself worked"
+          }
+          Stop-Process -Name xop_trader     -Force -ErrorAction SilentlyContinue
+          Stop-Process -Name xop_trader_gui -Force -ErrorAction SilentlyContinue
+          Start-Sleep -Seconds 3
+
           $un = Start-Process -FilePath "C:\XOPSmoke\unins000.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
                 -Wait -PassThru
           if ($un.ExitCode -ne 0) { throw "uninstaller exited $($un.ExitCode)" }
-          Write-Host "installer smoke test passed: install + payload + uninstall"
+          Write-Host "installer smoke test passed: install + payload + first-run launch + uninstall"
 
       - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4

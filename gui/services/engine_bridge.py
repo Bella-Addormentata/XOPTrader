@@ -122,9 +122,19 @@ class EngineBridge(QObject):
     ) -> None:
         super().__init__(parent)
 
-        # Resolve paths with sensible defaults.
-        self._config_path: Path = Path(config_path or _DEFAULT_CONFIG_PATH).resolve()
-        self._db_path: Path = Path(db_path or _DEFAULT_DB_PATH).resolve()
+        # Resolve paths with sensible defaults. Frozen builds default into
+        # the per-user data dir (gui.utils.user_data_dir) -- the CWD of an
+        # installed launch is Program Files, where nothing may be written.
+        from gui.utils import default_config_path as _dcp
+
+        self._config_path: Path = (
+            Path(config_path).resolve() if config_path else _dcp()
+        )
+        self._db_path: Path = (
+            Path(db_path).resolve()
+            if db_path
+            else (self._config_path.parent / _DEFAULT_DB_PATH).resolve()
+        )
         self._metrics_url: str = metrics_url or _DEFAULT_METRICS_URL
 
         # -- Child services -------------------------------------------------
@@ -870,10 +880,14 @@ class EngineBridge(QObject):
                 launch_dir = self._determine_engine_launch_dir(engine_path)
                 self._ensure_engine_runtime_dirs(launch_dir)
 
-                # Keep logs next to the GUI executable when frozen.  This avoids
-                # writing logs into ephemeral extraction directories.
+                # Frozen: the log goes into the launch dir (the writable
+                # per-user data home). It used to go next to the GUI
+                # executable -- Program Files for an installed copy -- where
+                # open() raised PermissionError and the ONLY engine candidate
+                # was abandoned: the exact "engine never started" failure of
+                # the v0.9.x installers. Never _MEIPASS either (ephemeral).
                 if getattr(sys, "frozen", False):
-                    log_path = Path(sys.executable).parent / "engine.log"
+                    log_path = launch_dir / "engine.log"
                 else:
                     log_path = engine_path.parent / "engine.log"
                 log_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1007,9 +1021,18 @@ class EngineBridge(QObject):
         return (self._config_path.parent / candidate).resolve()
 
     def _determine_engine_launch_dir(self, engine_path: Path) -> Path:
-        """Return the working directory to use for the engine process."""
+        """Return the working directory to use for the engine process.
+
+        The engine writes ``data/`` and ``logs/`` relative to its CWD, so
+        the CWD must be writable. Config parent when a config exists (the
+        per-user data dir for installed builds); otherwise the engine's own
+        directory in dev, but never Program Files when frozen."""
         if self._config_path.is_file():
             return self._config_path.parent
+        if getattr(sys, "frozen", False):
+            from gui.utils import user_data_dir
+
+            return user_data_dir()
         return engine_path.parent
 
     def _ensure_engine_runtime_dirs(self, launch_dir: Path) -> None:

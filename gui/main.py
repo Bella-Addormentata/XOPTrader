@@ -20,7 +20,12 @@ from typing import Final, Optional
 
 from gui.app import XOPTraderApp
 from gui.services.engine_bridge import EngineBridge
-from gui.utils import bundle_dir, install_dir
+from gui.utils import (
+    bundle_dir,
+    default_config_path,
+    install_dir,
+    user_data_dir,
+)
 
 # Module-level logger.
 _log: logging.Logger = logging.getLogger(__name__)
@@ -454,7 +459,9 @@ def _bootstrap_config(config_path: Optional[Path]) -> None:
     config_path:
         The path supplied via ``--config``, or *None* for the default.
     """
-    target = Path(config_path or _DEFAULT_CONFIG_NAME).resolve()
+    target = (
+        Path(config_path).resolve() if config_path else default_config_path()
+    )
     if target.is_file():
         return
 
@@ -526,8 +533,32 @@ def _bootstrap_config_info(config_path: Optional[Path]) -> tuple[Path, bool]:
     tuple[Path, bool]
         ``(resolved_config_path, created_from_template)``
     """
-    target = Path(config_path or _DEFAULT_CONFIG_NAME).resolve()
+    target = (
+        Path(config_path).resolve() if config_path else default_config_path()
+    )
     existed_before = target.is_file()
+
+    # Migration from the v0.9.0/0.9.1 installed layout: if a previous run
+    # was launched elevated (the installer's post-install checkbox), it
+    # bootstrapped config.yaml/secrets.yaml straight into Program Files.
+    # Adopt that real, possibly operator-edited state into the writable
+    # home rather than starting them over from the examples.
+    if not existed_before and getattr(sys, "frozen", False):
+        legacy_dir = install_dir()
+        if legacy_dir != target.parent:
+            for name in (_DEFAULT_CONFIG_NAME, _DEFAULT_SECRETS_NAME):
+                legacy = legacy_dir / name
+                dest = target.parent / name
+                if legacy.is_file() and not dest.is_file():
+                    try:
+                        dest.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.copyfile(legacy, dest)
+                        _log.info("Migrated %s -> %s", legacy, dest)
+                    except OSError as exc:
+                        _log.warning(
+                            "Could not migrate %s: %s", legacy, exc
+                        )
+
     _bootstrap_config(config_path)
     created = (not existed_before) and target.is_file()
 
@@ -824,10 +855,12 @@ def main() -> None:
     )
     try:
         from logging.handlers import RotatingFileHandler
-        # install_dir(), not parent.parent: frozen, that resolved to the system
-        # temp root, so gui.log landed in /tmp/logs and vanished with the temp
-        # directory -- exactly when post-hoc diagnostics are wanted.
-        logs_dir = install_dir() / "logs"
+        # user_data_dir(), not install_dir(): an installed copy lives in
+        # Program Files, where a non-elevated process cannot create logs/ --
+        # the handler then silently failed and post-hoc diagnostics (exactly
+        # what an installed user needs) were lost. Dev resolves to the repo
+        # root as before.
+        logs_dir = user_data_dir() / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         _fh = RotatingFileHandler(
             logs_dir / "gui.log",
@@ -873,9 +906,14 @@ def main() -> None:
     window = MainWindow(dry_run=args.dry_run)
 
     # Wire up background services (config, metrics, database).
+    # cfg_path, not args.config: the bootstrap above resolved the real
+    # location (frozen builds: the per-user data dir). Passing the raw
+    # argument made the service layer re-derive its own default against
+    # the CWD -- a split brain the two paths only got away with in dev,
+    # where both mean the repo root.
     bridge = _start_services(
         app=app,
-        config_path=args.config,
+        config_path=cfg_path,
         db_path=args.db,
         prometheus_url=args.prometheus_url,
         dry_run=args.dry_run,

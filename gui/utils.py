@@ -8,6 +8,7 @@ ISO/IEC 5055 -- bounded arithmetic, explicit integer division constant.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 from typing import Any, Mapping, Optional
@@ -34,17 +35,73 @@ def bundle_dir() -> Path:
 
 
 def install_dir() -> Path:
-    """Root for files the user owns -- config, secrets, logs, database.
+    """Root of the installed/shipped files (the executable's directory).
 
     Frozen: the directory holding the executable.  Deliberately NOT
     ``_MEIPASS``: that is discarded when the process exits, so anything
     written there is lost, and its parent is the world-writable system temp
     directory, which must never be searched for configuration.
     Source checkout: the repository root.
+
+    NOTE: read side only. An installed copy typically lives under Program
+    Files, which a non-elevated process cannot write -- mutable state goes
+    to :func:`user_data_dir` instead.
     """
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parents[1]
+
+
+def _dir_writable(path: Path) -> bool:
+    """Whether this process can create files in *path* (probe, not guess).
+
+    ``os.access`` lies on Windows (it ignores ACLs), so actually try."""
+    probe = path / f".xop-write-probe-{os.getpid()}"
+    try:
+        probe.touch()
+        probe.unlink()
+        return True
+    except OSError:
+        return False
+
+
+def user_data_dir() -> Path:
+    """Writable home for the user's mutable state: config, secrets, DB, logs.
+
+    Source checkout: the repository root -- dev behaviour unchanged.
+    Frozen: the install dir when it is writable (portable unzip layouts keep
+    everything together), otherwise a per-user app-data directory. The
+    v0.9.0/0.9.1 installers put the app in Program Files and every write --
+    the first-run config bootstrap, ``engine.log``, the database -- targeted
+    the exe directory, so on a normal (non-elevated) launch the engine could
+    not even open its log file and silently never started.
+    """
+    base = install_dir()
+    if not getattr(sys, "frozen", False):
+        return base
+    if _dir_writable(base):
+        return base
+    if sys.platform == "win32":
+        root = os.environ.get("LOCALAPPDATA") or str(
+            Path.home() / "AppData" / "Local"
+        )
+        target = Path(root) / "XOPTrader"
+    else:
+        target = Path.home() / ".xoptrader"
+    target.mkdir(parents=True, exist_ok=True)
+    return target
+
+
+def default_config_path() -> Path:
+    """Where ``config.yaml`` lives when ``--config`` is not given.
+
+    Frozen: inside :func:`user_data_dir`. Source checkout: the current
+    working directory, exactly as before -- launching from the repo root
+    keeps resolving the repo's own config.yaml.
+    """
+    if getattr(sys, "frozen", False):
+        return user_data_dir() / "config.yaml"
+    return Path("config.yaml").resolve()
 
 
 # 1 XCH = 10^12 mojos.  CAT tokens use 10^3 mojos per unit.
