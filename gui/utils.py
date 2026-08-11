@@ -95,10 +95,17 @@ def user_data_dir() -> Path:
 def default_config_path() -> Path:
     """Where ``config.yaml`` lives when ``--config`` is not given.
 
+    ``XOP_CONFIG_PATH`` (env) wins when set -- the durable way to point an
+    installed build at an existing home (e.g. a repo checkout's config on a
+    dev machine), surviving upgrades the way shortcut edits cannot; the
+    same power-user pattern as ``XOP_ENGINE_PATH``.
     Frozen: inside :func:`user_data_dir`. Source checkout: the current
     working directory, exactly as before -- launching from the repo root
     keeps resolving the repo's own config.yaml.
     """
+    override = os.environ.get("XOP_CONFIG_PATH", "").strip()
+    if override:
+        return Path(override).resolve()
     if getattr(sys, "frozen", False):
         return user_data_dir() / "config.yaml"
     return Path("config.yaml").resolve()

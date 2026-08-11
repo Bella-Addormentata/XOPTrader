@@ -672,7 +672,7 @@ def test_build_engine_wires_the_relayer_and_key_fallback(tmp_path, monkeypatch):
 
     from gui.services.warp import keystore as ks
 
-    monkeypatch.setattr(S, "_job_db_path", lambda cfg: str(tmp_path / "j.db"))
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg, **kw: str(tmp_path / "j.db"))
     hot = ks.EvmKey(b"\x11" * 32, "0x" + "ab" * 20)
     gas_only = ks.EvmKey(b"\x22" * 32, "0x" + "cd" * 20)
 

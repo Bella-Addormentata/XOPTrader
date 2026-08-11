@@ -579,7 +579,7 @@ def test_the_real_engine_construction_path_actually_runs(tmp_path, monkeypatch):
 
     from gui.services.warp import keystore as ks
 
-    monkeypatch.setattr(S, "_job_db_path", lambda cfg: str(tmp_path / "warp_jobs.db"))
+    monkeypatch.setattr(S, "_job_db_path", lambda cfg, **kw: str(tmp_path / "warp_jobs.db"))
     worker = S._WarpWorker()
     worker.set_config({
         "warp": {

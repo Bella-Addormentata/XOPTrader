@@ -3359,13 +3359,22 @@ class WarpEngine:
 # Lazy engine construction helpers (run on the worker thread).
 # --------------------------------------------------------------------------- #
 
-def _job_db_path(config: Optional[dict]) -> str:
-    """Resolve the warp jobs DB path (own file; the engine DB stays read-only)."""
+def _job_db_path(
+    config: Optional[dict], *, anchor: Optional[Path] = None
+) -> str:
+    """Resolve the warp jobs DB path (own file; the engine DB stays read-only).
+
+    Relative paths (including the default) anchor to *anchor* -- the config
+    home -- when given. Without anchoring they resolve against the process
+    CWD, which for an installed build is the Program Files shortcut
+    directory: unwritable, so the store could never open. The last member
+    of the CWD-relative-default class fixed for installed mode.
+    """
     warp = (config or {}).get("warp") or {}
-    explicit = warp.get("jobs_db")
-    if explicit:
-        return str(explicit)
-    return str(Path("data") / jobs.DB_FILENAME)
+    raw = Path(str(warp.get("jobs_db") or (Path("data") / jobs.DB_FILENAME)))
+    if raw.is_absolute() or anchor is None:
+        return str(raw)
+    return str(Path(anchor) / raw)
 
 
 def _coinset_url(config: Optional[dict], net: constants.WarpNet) -> str:
@@ -3477,11 +3486,17 @@ class _WarpWorker(QObject):
         if engine is not None:
             engine.close()
 
+    def _config_home(self) -> Optional[Path]:
+        """The directory the config/secrets live in -- the anchor for
+        relative data paths. None only when no secrets path was wired
+        (tests), which preserves the old CWD-relative behaviour there."""
+        return self._secrets_path.parent if self._secrets_path else None
+
     # -- altruistic-relay ledger persistence (survives process restart) ----- #
 
     def _relay_state_path(self) -> Optional[Path]:
         try:
-            return Path(_job_db_path(self._config)).with_name(
+            return Path(_job_db_path(self._config, anchor=self._config_home())).with_name(
                 "warp_relay_state.json"
             )
         except Exception:  # noqa: BLE001 -- no path is a safe "don't persist"
@@ -3678,7 +3693,7 @@ class _WarpWorker(QObject):
         # raise -- a missing hot-wallet key is the ordinary case. Without this,
         # each failed build leaked a connection, and _ensure_engine is retried
         # on every config reload.
-        store = WarpJobStore(_job_db_path(self._config))
+        store = WarpJobStore(_job_db_path(self._config, anchor=self._config_home()))
         try:
             return self._build_engine_with(net, params, store)
         except Exception:
@@ -3883,7 +3898,7 @@ class _WarpWorker(QObject):
 
         if self._engine is not None:
             return self._engine._store.get_active_job()
-        db = Path(_job_db_path(self._config))
+        db = Path(_job_db_path(self._config, anchor=self._config_home()))
         if not db.is_file():
             return None
         try:

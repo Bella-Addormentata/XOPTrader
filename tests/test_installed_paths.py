@@ -162,3 +162,46 @@ def test_bridge_defaults_follow_the_config_home(tmp_path, monkeypatch):
     # And with NO config yet, frozen still refuses the exe dir.
     bridge._config_path = home / "missing.yaml"
     assert bridge._determine_engine_launch_dir(exe_dir / "xop_trader.exe") == home
+
+
+# --------------------------------------------------------------------------- #
+# XOP_CONFIG_PATH override and the warp jobs-DB anchor
+# --------------------------------------------------------------------------- #
+
+def test_xop_config_path_env_override_wins_everywhere(tmp_path, monkeypatch):
+    """The durable way to point an installed build at an existing home
+    (shortcut edits are reset by upgrades; the env var survives)."""
+    target = tmp_path / "repo" / "config.yaml"
+    target.parent.mkdir()
+    target.write_text("x: 1\n", encoding="utf-8")
+    monkeypatch.setenv("XOP_CONFIG_PATH", str(target))
+    # Wins unfrozen...
+    assert U.default_config_path() == target.resolve()
+    # ...and frozen, over the user-data-dir default.
+    exe_dir = tmp_path / "pf"
+    exe_dir.mkdir()
+    _freeze(monkeypatch, exe_dir)
+    monkeypatch.setattr(U, "_dir_writable", lambda p: False)
+    assert U.default_config_path() == target.resolve()
+
+
+def test_warp_jobs_db_anchors_to_the_config_home(tmp_path):
+    """The relative default (and relative explicit values) must resolve
+    against the config home, never the process CWD -- for an installed
+    build the CWD is the unwritable shortcut directory, so the warp job
+    store could never open."""
+    pytest.importorskip("PySide6")
+    from gui.services.warp import service as S
+
+    worker = S._WarpWorker(secrets_path=tmp_path / "home" / "secrets.yaml")
+    worker.set_config({"warp": {}})
+    default = Path(S._job_db_path(worker._config, anchor=worker._config_home()))
+    assert default == tmp_path / "home" / "data" / "warp_jobs.db"
+
+    worker.set_config({"warp": {"jobs_db": "custom/w.db"}})
+    rel = Path(S._job_db_path(worker._config, anchor=worker._config_home()))
+    assert rel == tmp_path / "home" / "custom" / "w.db"
+
+    worker.set_config({"warp": {"jobs_db": str(tmp_path / "abs.db")}})
+    abs_ = Path(S._job_db_path(worker._config, anchor=worker._config_home()))
+    assert abs_ == tmp_path / "abs.db", "absolute values pass through untouched"
