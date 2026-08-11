@@ -561,17 +561,30 @@ jobs:
           # assert the first-run machinery actually ran: config bootstrapped
           # into the per-user data dir and the engine was spawned there.
           $env:QT_QPA_PLATFORM = "offscreen"
-          $gui = Start-Process -FilePath "C:\XOPSmoke\xop_trader_gui.exe" -PassThru
+          # -WorkingDirectory pins the CWD to a neutral location: the v0.9.1
+          # bug class was CWD-relative defaults, and a launch from the repo
+          # checkout would mask it. The app must choose its own home.
+          $gui = Start-Process -FilePath "C:\XOPSmoke\xop_trader_gui.exe" `
+                -WorkingDirectory "C:\" -PassThru
           Start-Sleep -Seconds 60
-          $appdata = Join-Path $env:LOCALAPPDATA "XOPTrader"
-          if (-not (Test-Path "$appdata\config.yaml")) {
-            throw "config.yaml was not bootstrapped into $appdata"
+          # Two legitimate homes: the install dir itself when writable (the
+          # runner is elevated, so C:\XOPSmoke qualifies -- the portable
+          # layout), else %LOCALAPPDATA%\XOPTrader. Anything else -- notably
+          # the CWD -- is the bug class this gate exists for.
+          $homes = @("C:\XOPSmoke", (Join-Path $env:LOCALAPPDATA "XOPTrader"))
+          $home_ = $homes | Where-Object { Test-Path (Join-Path $_ "config.yaml") } | Select-Object -First 1
+          if (-not $home_) {
+            throw "config.yaml was not bootstrapped into any legitimate home ($($homes -join ', '))"
           }
-          if (-not (Test-Path "$appdata\engine.log")) {
-            throw "engine.log missing in $appdata -- the engine was never spawned"
+          Write-Host "app home resolved to: $home_"
+          if (Test-Path "C:\config.yaml") {
+            throw "config.yaml landed in the CWD -- the CWD-relative default is back"
+          }
+          if (-not (Test-Path (Join-Path $home_ "engine.log"))) {
+            throw "engine.log missing in $home_ -- the engine was never spawned"
           }
           $engineAlive = Get-Process -Name xop_trader -ErrorAction SilentlyContinue
-          $logBytes = (Get-Item "$appdata\engine.log").Length
+          $logBytes = (Get-Item (Join-Path $home_ "engine.log")).Length
           if ((-not $engineAlive) -and ($logBytes -eq 0)) {
             throw "engine not running and engine.log empty -- launch failed"
           }
