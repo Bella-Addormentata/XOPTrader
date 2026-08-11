@@ -37,7 +37,14 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 ; ---- UI ----
 WizardStyle=modern
-WizardSmallImageFile=icon.ico
+; NOTE: no WizardSmallImageFile. Inno accepts only BMP (or PNG on 6.3+)
+; there -- an .ico compiles fine (embedded raw) and then kills the
+; installer AT LAUNCH with "Bitmap image is not valid". The default
+; built-in wizard image is used instead; if branding is wanted later,
+; generate a real BMP/PNG, never point this at icon.ico. (v0.9.0's
+; installer shipped broken exactly this way; the smoke test in
+; release.yml now runs every built installer so this class cannot
+; reach a release again.)
 ; ---- Misc ----
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible

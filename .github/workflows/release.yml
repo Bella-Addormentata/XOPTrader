@@ -536,6 +536,30 @@ jobs:
 
           Copy-Item installer-staging\xop_trader-installer-windows-x64.exe .
 
+      # A compiled installer is not a working installer: v0.9.0 shipped one
+      # that died at launch ("Bitmap image is not valid" -- an .ico fed to
+      # WizardSmallImageFile compiles but cannot be decoded at run time).
+      # Actually EXECUTE every built installer: silent install, verify the
+      # payload landed, silent uninstall. Start-Process -Wait -PassThru is
+      # deliberate -- a bare & does not block on GUI-subsystem binaries.
+      - name: Smoke-test the installer (install, verify payload, uninstall)
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath ".\xop_trader-installer-windows-x64.exe" `
+                -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\XOPSmoke" `
+                -Wait -PassThru
+          if ($p.ExitCode -ne 0) { throw "installer exited $($p.ExitCode)" }
+          foreach ($f in "xop_trader_gui.exe","xop_trader.exe","config.example.yaml","icon.ico") {
+            if (-not (Test-Path "C:\XOPSmoke\$f")) { throw "missing $f after install" }
+          }
+          $dlls = (Get-ChildItem "C:\XOPSmoke\*.dll").Count
+          if ($dlls -lt 5) { throw "expected the engine runtime DLLs, found $dlls" }
+          $un = Start-Process -FilePath "C:\XOPSmoke\unins000.exe" `
+                -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
+                -Wait -PassThru
+          if ($un.ExitCode -ne 0) { throw "uninstaller exited $($un.ExitCode)" }
+          Write-Host "installer smoke test passed: install + payload + uninstall"
+
       - name: Upload Windows installer artifact
         uses: actions/upload-artifact@v4
         with:
