@@ -15,7 +15,14 @@ from gui import utils as U
 
 
 def _freeze(monkeypatch, exe_dir: Path) -> None:
+    """Simulate the frozen Windows install these tests describe.
+
+    sys.platform is pinned to win32 so the LOCALAPPDATA branch is exercised
+    deterministically on every CI platform -- without this, the Linux runner
+    took the POSIX branch (~/.xoptrader) and the assertions were wrong there.
+    """
     monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "win32")
     monkeypatch.setattr(sys, "executable", str(exe_dir / "xop_trader_gui.exe"))
 
 
@@ -51,6 +58,21 @@ def test_frozen_unwritable_install_dir_redirects_per_user(tmp_path, monkeypatch)
     assert home == appdata / "XOPTrader"
     assert home.is_dir(), "the data dir is created eagerly"
     assert U.default_config_path() == home / "config.yaml"
+
+
+def test_frozen_unwritable_install_dir_posix_branch(tmp_path, monkeypatch):
+    """The same redirect on POSIX lands in ~/.xoptrader."""
+    exe_dir = tmp_path / "opt" / "xoptrader"
+    exe_dir.mkdir(parents=True)
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(sys, "platform", "linux")
+    monkeypatch.setattr(sys, "executable", str(exe_dir / "xop_trader_gui"))
+    monkeypatch.setattr(U, "_dir_writable", lambda p: False)
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(U.Path, "home", staticmethod(lambda: fake_home))
+
+    assert U.user_data_dir() == fake_home / ".xoptrader"
 
 
 # --------------------------------------------------------------------------- #
