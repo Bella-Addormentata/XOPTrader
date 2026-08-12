@@ -616,13 +616,17 @@ jobs:
           if (-not (Test-Path "C:\XOPSmoke\xop_trader_gui.exe")) {
             throw "payload missing after upgrade"
           }
-          $after = @(Get-ChildItem "C:\XOPSmoke\unins*.exe").Count
-          if ($after -ne 1) {
-            throw "found $after uninstallers after upgrade -- the previous version was not uninstalled first"
+          $unins = @(Get-ChildItem "C:\XOPSmoke\unins*.exe")
+          if ($unins.Count -ne 1) {
+            throw "found $($unins.Count) uninstallers after upgrade -- the previous version was not uninstalled first"
           }
-          Write-Host "upgrade smoke test passed: previous version uninstalled first, single uninstaller"
+          Write-Host "upgrade smoke test passed: previous version uninstalled first, single uninstaller ($($unins[0].Name))"
 
-          $un = Start-Process -FilePath "C:\XOPSmoke\unins000.exe" `
+          # Discover the uninstaller name rather than assuming unins000.exe:
+          # the upgrade above legitimately renamed it (Inno's old uninstaller
+          # self-deletes asynchronously, so the re-install's uninstaller may
+          # land as unins001.exe while the old unins000.exe is still clearing).
+          $un = Start-Process -FilePath $unins[0].FullName `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `
                 -Wait -PassThru
           if ($un.ExitCode -ne 0) { throw "uninstaller exited $($un.ExitCode)" }
