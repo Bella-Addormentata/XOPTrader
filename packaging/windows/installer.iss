@@ -115,8 +115,13 @@ begin
     uses single braces -- hardcode that here, because SetupSetting("AppId")
     would return the raw double-brace text and never match. test_installer_
     upgrade.py asserts this GUID stays in sync with the [Setup] AppId. }
+  { The resolved AppId is "{GUID}}" -- Inno collapses the leading "{{" to a
+    single "{" but leaves the trailing "}}" as TWO literal braces, so the
+    uninstall subkey ends "...7F21}}_is1" (verified against the live
+    registry; a single "}" here finds nothing). test_installer_upgrade.py
+    derives this from the [Setup] AppId per Inno's escaping rule. }
   key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
-         '{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}_is1';
+         '{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}}_is1';
   uninst := '';
   { A 64-bit-mode install registers its uninstaller in the 64-bit registry
     view, but plain HKLM from [Code] reads the 32-bit (WOW6432Node) view --

@@ -18,19 +18,26 @@ ISS = (
 ).read_text(encoding="utf-8")
 
 
-def _appid_guid() -> str:
-    m = re.search(r"^AppId=\{\{([0-9A-Fa-f-]+)\}\}", ISS, re.MULTILINE)
+def _resolved_appid() -> str:
+    """The AppId Inno actually registers, per its escaping rule.
+
+    A leading ``{{`` collapses to a single ``{``; every other brace is
+    literal. So ``AppId={{GUID}}`` registers as ``{GUID}}`` -- single
+    leading brace, DOUBLE trailing brace -- which is what the live registry
+    shows. Deriving it here (rather than eyeballing braces) is exactly what
+    would have caught the single-``}`` lookup bug."""
+    m = re.search(r"^AppId=(\S+)", ISS, re.MULTILINE)
     assert m, "AppId not found in installer.iss"
-    return m.group(1).upper()
+    raw = m.group(1)
+    return (raw[1:] if raw.startswith("{{") else raw).upper()
 
 
-def test_uninstall_key_guid_matches_the_appid():
-    guid = _appid_guid()
-    # The [Code] lookup must target "<resolved AppId>_is1" with SINGLE braces.
-    assert f"{{{guid}}}_is1".upper() in ISS.upper(), (
-        "the hardcoded uninstall-registry key drifted from the AppId; "
-        "PrepareToInstall would find no previous version and skip the "
-        "clean uninstall-first"
+def test_uninstall_key_matches_the_resolved_appid():
+    key = f"{_resolved_appid()}_is1".upper()
+    assert key in ISS.upper(), (
+        f"the hardcoded uninstall-registry key must be {key!r} "
+        "(resolved AppId + _is1); a drift here makes PrepareToInstall find "
+        "no previous version and silently skip the clean uninstall-first"
     )
 
 
