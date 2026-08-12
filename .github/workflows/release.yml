@@ -595,29 +595,32 @@ jobs:
           Stop-Process -Name xop_trader_gui -Force -ErrorAction SilentlyContinue
           Start-Sleep -Seconds 3
 
-          # Upgrade path: a SECOND install over the first must silently remove
-          # the previous version (PrepareToInstall) rather than stack a second
-          # copy. Plant a stale marker the new install does not ship and prove
-          # it is gone, and assert exactly one uninstaller registration
-          # remains -- an upgrade that failed to clean up leaves two.
-          Set-Content "C:\XOPSmoke\stale-from-old-version.txt" "should be removed on upgrade"
+          # Upgrade path: installing again over the same directory must run
+          # the PREVIOUS uninstaller first (PrepareToInstall) rather than
+          # stack a second install on top.
+          #
+          # The discriminator, achievable with one built installer: Inno names
+          # uninstallers unins000.exe, unins001.exe, ... incrementing when a
+          # prior one is still present. A working uninstall-first removes the
+          # old unins000.exe, so the re-install writes a fresh unins000.exe and
+          # exactly ONE remains. A broken one leaves the old unins000.exe in
+          # place, so the re-install adds unins001.exe -- two. (A planted
+          # marker file is the wrong probe: Inno's uninstaller only removes
+          # files in its own log, never one we dropped by hand.)
+          $before = @(Get-ChildItem "C:\XOPSmoke\unins*.exe").Count
+          if ($before -ne 1) { throw "expected one uninstaller after first install, found $before" }
           $up = Start-Process -FilePath ".\xop_trader-installer-windows-x64.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\XOPSmoke" `
                 -Wait -PassThru
           if ($up.ExitCode -ne 0) { throw "upgrade install exited $($up.ExitCode)" }
-          if (Test-Path "C:\XOPSmoke\stale-from-old-version.txt") {
-            throw "stale file survived the upgrade -- previous version was not uninstalled first"
-          }
           if (-not (Test-Path "C:\XOPSmoke\xop_trader_gui.exe")) {
             throw "payload missing after upgrade"
           }
-          $keys = Get-ChildItem "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall" `
-                  -ErrorAction SilentlyContinue |
-                  Where-Object { $_.PSChildName -like "*B4E3A1C2*" }
-          if (($keys | Measure-Object).Count -ne 1) {
-            throw "expected exactly one XOPTrader uninstall registration, found $(($keys|Measure-Object).Count)"
+          $after = @(Get-ChildItem "C:\XOPSmoke\unins*.exe").Count
+          if ($after -ne 1) {
+            throw "found $after uninstallers after upgrade -- the previous version was not uninstalled first"
           }
-          Write-Host "upgrade smoke test passed: old version cleaned up, single registration"
+          Write-Host "upgrade smoke test passed: previous version uninstalled first, single uninstaller"
 
           $un = Start-Process -FilePath "C:\XOPSmoke\unins000.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART" `

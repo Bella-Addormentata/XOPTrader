@@ -118,8 +118,15 @@ begin
   key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
          '{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}_is1';
   uninst := '';
-  if not RegQueryStringValue(HKLM, key, 'UninstallString', uninst) then
-    RegQueryStringValue(HKCU, key, 'UninstallString', uninst);
+  { A 64-bit-mode install registers its uninstaller in the 64-bit registry
+    view, but plain HKLM from [Code] reads the 32-bit (WOW6432Node) view --
+    so the key was never found and the old version was never removed. Try
+    the 64-bit views first, then the 32-bit ones for a belt-and-braces
+    match against any earlier 32-bit-registered build. }
+  if not RegQueryStringValue(HKLM64, key, 'UninstallString', uninst) then
+    if not RegQueryStringValue(HKCU64, key, 'UninstallString', uninst) then
+      if not RegQueryStringValue(HKLM, key, 'UninstallString', uninst) then
+        RegQueryStringValue(HKCU, key, 'UninstallString', uninst);
   Result := uninst;
 end;
 
