@@ -55,3 +55,39 @@ def test_wizard_image_is_not_an_ico_again():
     # Regression guard for the v0.9.0 "Bitmap image is not valid" crash.
     assert "WizardSmallImageFile=icon.ico" not in ISS
     assert "WizardImageFile=icon.ico" not in ISS
+
+
+def test_code_section_uses_no_brace_comments():
+    """Regression guard for the v0.9.4 compile failure. An Inno ``{ }`` comment
+    ends at the FIRST ``}``, so a brace-comment whose prose contains a brace
+    truncates and the rest becomes invalid Pascal -- iscc then emits no
+    installer. Rather than police brace-in-comment (the truncation hides it),
+    ban ``{`` comments in [Code] outright: in Inno Pascal a ``{`` outside a
+    single-quoted string is ALWAYS a comment start (constants are written
+    ExpandConstant('{app}')), so ``//`` is the safe, unambiguous choice."""
+    body = ISS.split("[Code]", 1)
+    assert len(body) == 2, "no [Code] section found"
+    code = body[1]
+    # Stop at the next Inno section header, or a later section's constants
+    # (e.g. [Run]'s "{tmp}\\...") get scanned as if they were Pascal.
+    nxt = re.search(r"^\[[A-Za-z][A-Za-z0-9_]*\]\s*$", code, re.MULTILINE)
+    if nxt:
+        code = code[:nxt.start()]
+    i = 0
+    while i < len(code):
+        ch = code[i]
+        if ch == "/" and code[i + 1: i + 2] == "/":            # // to EOL
+            nl = code.find("\n", i)
+            i = len(code) if nl == -1 else nl + 1
+            continue
+        if ch == "'":                                          # 'literal'
+            j = code.find("'", i + 1)
+            i = len(code) if j == -1 else j + 1
+            continue
+        assert ch != "{", (
+            "a brace comment appears in [Code] near "
+            + repr(code[i:i + 60])
+            + " -- use // instead; brace comments truncate at the first inner "
+            "brace and silently break iscc"
+        )
+        i += 1

@@ -110,24 +110,22 @@ var
   key: String;
   uninst: String;
 begin
-  { The uninstall key is "<resolved AppId>_is1". The AppId is declared with
-    a leading "{{" (Inno's escape for a literal "{"), so the RESOLVED value
-    uses single braces -- hardcode that here, because SetupSetting("AppId")
-    would return the raw double-brace text and never match. test_installer_
-    upgrade.py asserts this GUID stays in sync with the [Setup] AppId. }
-  { The resolved AppId is "{GUID}}" -- Inno collapses the leading "{{" to a
-    single "{" but leaves the trailing "}}" as TWO literal braces, so the
-    uninstall subkey ends "...7F21}}_is1" (verified against the live
-    registry; a single "}" here finds nothing). test_installer_upgrade.py
-    derives this from the [Setup] AppId per Inno's escaping rule. }
+  // NB: use // line comments here, NOT brace comments -- an Inno { } comment
+  // ends at the first inner brace, and this explanation is all about braces.
+  // The resolved AppId is the [Setup] value with its leading escape collapsed:
+  // Inno turns the leading double-brace into one literal brace but leaves the
+  // trailing double-brace as two, so the uninstall subkey ends 7F21 + two
+  // closing braces + _is1 (verified against the live registry; one closing
+  // brace finds nothing). test_installer_upgrade.py derives this exact key
+  // from the AppId per Inno's escaping rule so it can never drift silently.
   key := 'Software\Microsoft\Windows\CurrentVersion\Uninstall\' +
          '{B4E3A1C2-7D56-4F89-A012-9E3C0B5D7F21}}_is1';
   uninst := '';
-  { A 64-bit-mode install registers its uninstaller in the 64-bit registry
-    view, but plain HKLM from [Code] reads the 32-bit (WOW6432Node) view --
-    so the key was never found and the old version was never removed. Try
-    the 64-bit views first, then the 32-bit ones for a belt-and-braces
-    match against any earlier 32-bit-registered build. }
+  // A 64-bit-mode install registers its uninstaller in the 64-bit registry
+  // view, but plain HKLM from [Code] reads the 32-bit (WOW6432Node) view --
+  // so the key was never found and the old version was never removed. Try
+  // the 64-bit views first, then the 32-bit ones as a fallback for any
+  // earlier 32-bit-registered build.
   if not RegQueryStringValue(HKLM64, key, 'UninstallString', uninst) then
     if not RegQueryStringValue(HKCU64, key, 'UninstallString', uninst) then
       if not RegQueryStringValue(HKLM, key, 'UninstallString', uninst) then
@@ -147,9 +145,9 @@ begin
     uninst := RemoveQuotes(uninst);
     if FileExists(uninst) then
     begin
-      { /VERYSILENT so the nested wizard never appears; failures are
-        non-fatal -- the file copy below overwrites everything shipped,
-        so a broken old uninstaller must not block the upgrade. }
+      // /VERYSILENT so the nested wizard never appears; failures are
+      // non-fatal -- the file copy below overwrites everything shipped,
+      // so a broken old uninstaller must not block the upgrade.
       Exec(uninst, '/VERYSILENT /SUPPRESSMSGBOXES /NORESTART',
            '', SW_HIDE, ewWaitUntilTerminated, code);
     end;

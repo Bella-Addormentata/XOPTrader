@@ -14,6 +14,16 @@ import pytest
 from gui import utils as U
 
 
+@pytest.fixture(autouse=True)
+def _hermetic_env(monkeypatch):
+    """Clear the XOP_* path overrides so these tests never depend on the
+    machine's real environment. On the operator's box XOP_CONFIG_PATH points
+    at the repo, which would otherwise win in default_config_path() and break
+    every frozen-home assertion here."""
+    monkeypatch.delenv("XOP_CONFIG_PATH", raising=False)
+    monkeypatch.delenv("XOP_ENGINE_PATH", raising=False)
+
+
 def _freeze(monkeypatch, exe_dir: Path) -> None:
     """Simulate the frozen Windows install these tests describe.
 
