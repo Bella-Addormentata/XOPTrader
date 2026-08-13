@@ -747,13 +747,22 @@ def _patch_chia_auto_detect(config_path: Path) -> bool:
                 chia_section[key] = resolved.as_posix()
                 patched = True
 
-        # Localhost connections don't need SSL verification.
-        # T8-14: Only override verify_ssl when the user has not explicitly
-        # set it.  Persisting False when the host later changes to a
-        # remote address would silently disable certificate validation.
+        # Localhost connections cannot pass standard SSL verification:
+        # Chia's RPC certificate comes from a private CA and is issued to
+        # "Chia", not "localhost", so peer verification fails with CURL
+        # error 60 and the engine never reads the wallet.
+        #
+        # This used to only fill the key in when ABSENT, which meant a
+        # fresh install -- whose config.example.yaml shipped
+        # `verify_ssl: true` -- was never corrected, and every new machine
+        # failed to reach its wallet (observed in the field 2026-08-13).
+        # We now also flip the TEMPLATE DEFAULT of true, but still never
+        # touch a value the operator changed away from the template, and
+        # never weaken verification for a remote host.
         host = str(chia_section.get("full_node_host", "localhost"))
         if host in ("localhost", "127.0.0.1", "::1"):
-            if "verify_ssl" not in chia_section:
+            current = chia_section.get("verify_ssl")
+            if current is None or current is True:
                 chia_section["verify_ssl"] = False
                 patched = True
 

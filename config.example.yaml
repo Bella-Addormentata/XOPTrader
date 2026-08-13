@@ -48,7 +48,19 @@ chia:
   wallet_host: "localhost"
   wallet_port: 9256
   # SSL verification for Chia RPC certificates.
-  verify_ssl: true
+  #
+  # FALSE is correct for the localhost defaults above, and is what every
+  # fresh install needs. Chia's RPC uses a PRIVATE CA whose certificate is
+  # issued to "Chia", not "localhost", so standard peer verification fails
+  # with CURL error 60 ("SSL peer certificate ... was not OK") and the bot
+  # can never read the wallet -- no balances, no prices, no trading. The
+  # connection is still mutually authenticated by the client certificate
+  # in secrets.yaml, and it never leaves the loopback interface.
+  #
+  # Set this to true ONLY if you point the hosts above at a REMOTE Chia
+  # node reachable over a network you do not fully control, and have a CA
+  # bundle that actually validates that host.
+  verify_ssl: false
 
 # --- dexie: REQUIRED ---------------------------------------------------------
 # All fields are REQUIRED.
