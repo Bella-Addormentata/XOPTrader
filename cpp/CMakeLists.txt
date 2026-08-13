@@ -29,8 +29,12 @@ if(DEFINED ENV{VCPKG_ROOT} AND NOT DEFINED CMAKE_TOOLCHAIN_FILE)
     message(STATUS "Auto-detected vcpkg toolchain: ${CMAKE_TOOLCHAIN_FILE}")
 endif()
 
+# Keep this in lockstep with gui/__init__.py __version__ -- ONE product, one
+# number. They drifted (engine 0.8.0 vs app 0.9.5), and engine.log's
+# "XOPTrader v0.8.0" then read as a stale binary during a live incident.
+# tests/test_version_sync.py fails the build if they diverge again.
 project(xop_trader
-    VERSION   0.8.0
+    VERSION   0.9.6
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )

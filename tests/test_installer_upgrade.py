@@ -41,6 +41,30 @@ def test_uninstall_key_matches_the_resolved_appid():
     )
 
 
+def test_running_app_is_closed_before_the_uninstall_first():
+    """A 24/7 bot is normally RUNNING when it is upgraded, and Inno cannot
+    delete a locked xop_trader_gui.exe -- so without closing the app first
+    the clean uninstall-first silently degrades to an in-place overlay
+    (observed on the 0.9.2 -> 0.9.5 upgrade). The helper must exist AND be
+    called from PrepareToInstall BEFORE the uninstaller runs."""
+    assert "procedure CloseRunningXOPTrader" in ISS
+    for exe in ("xop_trader_gui.exe", "xop_trader.exe"):
+        assert exe in ISS, f"{exe} is not terminated before the uninstall"
+    assert "CloseApplications=yes" in ISS, "Restart Manager fallback missing"
+
+    prep = ISS.split("function PrepareToInstall", 1)
+    assert len(prep) == 2, "PrepareToInstall not found"
+    body = prep[1]
+    call = body.find("CloseRunningXOPTrader()")
+    run_uninst = body.find("Exec(uninst")
+    assert call != -1, "PrepareToInstall never closes the running app"
+    assert run_uninst != -1, "PrepareToInstall never runs the old uninstaller"
+    assert call < run_uninst, (
+        "the app must be closed BEFORE the old uninstaller runs, otherwise "
+        "locked files defeat the clean uninstall"
+    )
+
+
 def test_previous_version_is_uninstalled_before_install():
     # The upgrade handler exists and runs the old uninstaller silently.
     assert "function PrepareToInstall" in ISS

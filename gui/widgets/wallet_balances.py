@@ -1022,10 +1022,24 @@ class WalletBalancesWidget(QWidget):
 
         self._alloc_updating = False
         self._update_allocation_sum_status()
+        unpriced = sorted(all_assets - set(current_values))
         if total_value <= 0.0:
             self._alloc_hint_label.setText(
                 "Waiting for market data — set targets now; current % will "
                 "fill in once mid prices arrive"
+            )
+        elif unpriced:
+            # PARTIAL pricing is the dangerous case: percentages are computed
+            # over the priced subset only, so a single priced asset reads as
+            # a confident "100%" while real holdings are missing entirely.
+            # Observed in the field -- wUSDC.b (hard $1 peg) showed 100% while
+            # XCH/BYC/DBX were unpriced because the engine could not reach the
+            # wallet RPC. Say so instead of presenting a plausible lie.
+            self._alloc_hint_label.setText(
+                "⚠ Current % covers only priced assets — "
+                f"no price yet for {', '.join(unpriced)}. "
+                "Percentages are NOT your true allocation until every asset "
+                "is priced (check the engine's wallet/market connection)."
             )
 
         # Surface the diagnostic snapshot directly in the panel so it's

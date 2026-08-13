@@ -607,12 +607,41 @@ jobs:
           # place, so the re-install adds unins001.exe -- two. (A planted
           # marker file is the wrong probe: Inno's uninstaller only removes
           # files in its own log, never one we dropped by hand.)
-          $before = @(Get-ChildItem "C:\XOPSmoke\unins*.exe").Count
-          if ($before -ne 1) { throw "expected one uninstaller after first install, found $before" }
+          $before = @(Get-ChildItem "C:\XOPSmoke\unins*.exe")
+          if ($before.Count -ne 1) { throw "expected one uninstaller after first install, found $($before.Count)" }
+          $beforeStamp = $before[0].LastWriteTime
+
+          # Upgrade WITH THE APP RUNNING -- the normal case for a 24/7 bot,
+          # and the one that broke in the field: a locked xop_trader_gui.exe
+          # stops the old uninstaller from removing anything, so the clean
+          # uninstall-first silently degrades to an in-place overlay. The
+          # previous version of this test always upgraded against a stopped
+          # app and therefore never exercised it.
+          $running = Start-Process -FilePath "C:\XOPSmoke\xop_trader_gui.exe" `
+                     -WorkingDirectory "C:\" -PassThru
+          Start-Sleep -Seconds 20
+          if ($running.HasExited) { Write-Warning "GUI exited before the upgrade test" }
+
           $up = Start-Process -FilePath ".\xop_trader-installer-windows-x64.exe" `
                 -ArgumentList "/VERYSILENT","/SUPPRESSMSGBOXES","/NORESTART","/DIR=C:\XOPSmoke" `
                 -Wait -PassThru
           if ($up.ExitCode -ne 0) { throw "upgrade install exited $($up.ExitCode)" }
+
+          # The installer must have closed the running app.
+          foreach ($n in "xop_trader_gui","xop_trader") {
+            if (Get-Process -Name $n -ErrorAction SilentlyContinue) {
+              throw "$n still running after the upgrade -- the installer did not close it"
+            }
+          }
+          # The decisive proof the uninstall-first actually fired: the old
+          # uninstaller was removed and a FRESH one written. (Counting alone
+          # passes even when nothing was uninstalled, which is exactly how
+          # the field failure slipped through.)
+          $afterFile = @(Get-ChildItem "C:\XOPSmoke\unins*.exe")[0]
+          if ($afterFile.LastWriteTime -le $beforeStamp) {
+            throw ("uninstaller not rewritten (still $($afterFile.LastWriteTime)) -- " +
+                   "the previous version was NOT uninstalled first")
+          }
           if (-not (Test-Path "C:\XOPSmoke\xop_trader_gui.exe")) {
             throw "payload missing after upgrade"
           }

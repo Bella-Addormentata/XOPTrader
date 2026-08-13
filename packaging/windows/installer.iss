@@ -37,6 +37,12 @@ Compression=lzma2/ultra64
 SolidCompression=yes
 ; ---- UI ----
 WizardStyle=modern
+; Let Restart Manager close anything holding the files we replace. Belt and
+; braces alongside the explicit termination in PrepareToInstall below: a
+; 24/7 trading bot is normally RUNNING when it gets upgraded, and a locked
+; xop_trader_gui.exe silently defeats the clean uninstall-first.
+CloseApplications=yes
+RestartApplications=no
 ; NOTE: no WizardSmallImageFile. Inno accepts only BMP (or PNG on 6.3+)
 ; there -- an .ico compiles fine (embedded raw) and then kills the
 ; installer AT LAUNCH with "Bitmap image is not valid". The default
@@ -133,12 +139,39 @@ begin
   Result := uninst;
 end;
 
+// Terminate a running XOPTrader before touching the install directory.
+// Without this the clean uninstall-first silently does nothing useful: the
+// old uninstaller cannot delete a running xop_trader_gui.exe (nor the
+// engine it spawned), so stale files survive the upgrade. Observed in the
+// field on the 0.9.2 -> 0.9.5 upgrade, where the payload was replaced but
+// the previous uninstaller was left untouched.
+//
+// Killing the bot mid-run is safe and expected for an upgrade: the engine
+// is crash-safe by design (persist-then-act), and the GUI already
+// hard-kills leftover engines on every startup.
+procedure CloseRunningXOPTrader();
+var
+  code: Integer;
+begin
+  // GUI first (with /T so the engine it spawned goes too), then any
+  // orphaned engine. Failures are ignored -- "not running" returns
+  // non-zero and is the common case.
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /T /IM xop_trader_gui.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, code);
+  Exec(ExpandConstant('{sys}\taskkill.exe'), '/F /IM xop_trader.exe',
+       '', SW_HIDE, ewWaitUntilTerminated, code);
+  // Give Windows a moment to release the file handles before the
+  // uninstaller tries to delete those binaries.
+  Sleep(1500);
+end;
+
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   uninst: String;
   code: Integer;
 begin
   Result := '';
+  CloseRunningXOPTrader();
   uninst := GetPreviousUninstaller();
   if uninst <> '' then
   begin
