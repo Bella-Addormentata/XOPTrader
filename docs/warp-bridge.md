@@ -140,8 +140,9 @@ key locally and stores it DPAPI-encrypted in `secrets.yaml`. Then click
   If the copied key is still the current clipboard value, the app clears it when
   the dialog closes. Clipboard history may retain it.
 
-The control remains available as **View key** after confirmation. Repeat this
-process after every key rotation, before funding the new address.
+The control remains available as **View key** after confirmation. After every
+key rotation, back up the new key immediately. Rotation has already swept any
+existing wallet balances to the new address before this dialog can be opened.
 
 > **Run this on the same Windows user account that runs the GUI.** DPAPI binds
 > the encrypted on-disk copy to your Windows account. A Windows profile or
@@ -396,7 +397,7 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
 
 | Key | Meaning |
 |---|---|
-| `evm_private_key_dpapi` | Base64 of the DPAPI-encrypted EVM hot-wallet private key. Generated in [3a](#3a-generate-or-import-the-hot-wallet-key). Never commit; never place in `config.yaml`. |
+| `evm_private_key_dpapi` | Base64 of the DPAPI-encrypted EVM hot-wallet private key. Generated in [3a](#3a-create-and-back-up-the-hot-wallet-key). Never commit; never place in `config.yaml`. |
 | `relay_private_key_dpapi` | Optional dedicated gas-only key for the altruistic relay. When present it — not the hot key — signs volunteer relays. Recommended hygiene. |
 | `retired_keys` | Written by the Base Wallet page's key rotation: every replaced key's blob, address and timestamp. **Archived forever, never deleted** — anything later landing at an old address stays recoverable. |
 | `evm_key_backup_confirmed` | Written by the Base Wallet page: whether the operator confirmed an offline backup of the current key. |
@@ -425,7 +426,7 @@ All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
 - **Banner: "blocked: no EVM hot-wallet key configured"** — `secrets.yaml` is
   missing `warp.evm_private_key_dpapi`, or the blob doesn't decrypt (generated
   under a different Windows account/machine). Regenerate on the correct account
-  ([3a](#3a-generate-or-import-the-hot-wallet-key)).
+  ([3a](#3a-create-and-back-up-the-hot-wallet-key)).
 - **Banner: "blocked: …DPAPI…" / KeystoreUnavailable** — you're not on Windows, or
   DPAPI failed. The bridge requires Windows.
 - **Banner: "blocked: wrapped-asset anchor failed"** — the offline derivation

@@ -4142,5 +4142,14 @@ class WarpService(QObject):
     def _on_key_backup_ready(
         self, address: str, recovery: object, action_seq: int
     ) -> None:
-        """Forward one-shot key material without storing it on the service."""
-        self.key_backup_ready.emit(str(address), recovery, int(action_seq))
+        """Forward one-shot key material, then scrub it as a fallback.
+
+        The live widget is a direct connection on this GUI thread, so its modal
+        completes before ``emit`` returns. The ``finally`` also covers a
+        disconnected or destroyed widget during shutdown.
+        """
+        try:
+            self.key_backup_ready.emit(str(address), recovery, int(action_seq))
+        finally:
+            if isinstance(recovery, bytearray):
+                recovery[:] = b"\x00" * len(recovery)
