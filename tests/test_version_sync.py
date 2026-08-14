@@ -10,6 +10,7 @@ to misread, so pin it."""
 from __future__ import annotations
 
 import re
+import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[1]
@@ -33,10 +34,15 @@ def _engine_version() -> str:
     return m.group(1)
 
 
-def test_engine_and_gui_versions_match():
-    gui, engine = _gui_version(), _engine_version()
-    assert gui == engine, (
-        f"version drift: gui/__init__.py is {gui} but cpp/CMakeLists.txt is "
-        f"{engine}. engine.log prints the C++ one, so a mismatch makes a "
-        "current engine look like a stale binary. Bump both together."
+def _package_version() -> str:
+    with open(REPO / "pyproject.toml", "rb") as stream:
+        return str(tomllib.load(stream)["project"]["version"])
+
+
+def test_product_versions_match():
+    gui, engine, package = _gui_version(), _engine_version(), _package_version()
+    assert gui == engine == package, (
+        f"version drift: gui/__init__.py={gui}, cpp/CMakeLists.txt={engine}, "
+        f"pyproject.toml={package}. engine.log prints the C++ version and Python "
+        "packaging reads pyproject.toml, so bump all three together."
     )
