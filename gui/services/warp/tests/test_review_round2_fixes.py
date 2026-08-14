@@ -233,15 +233,21 @@ def test_key_backup_dialog_is_masked_gated_and_clears_clipboard():
     from gui.widgets.base_wallet import _KeyBackupDialog
 
     _app = QApplication.instance() or QApplication([])
-    dialog = _KeyBackupDialog(DEST, bytearray(range(32)))
+    recovery = bytearray(range(32))
+    dialog = _KeyBackupDialog(DEST, recovery)
     assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog._key_field.text() == ""
     assert not dialog._confirm_btn.isEnabled()
 
     dialog._show_btn.click()
     assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Normal
+    assert dialog._key_field.text().startswith("0x000102")
     assert dialog._key_field.focusPolicy() == Qt.FocusPolicy.NoFocus
     assert dialog._key_field.contextMenuPolicy() == \
         Qt.ContextMenuPolicy.NoContextMenu
+    dialog._show_btn.click()
+    assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog._key_field.text() == ""
     dialog._saved_check.setChecked(True)
     assert dialog._confirm_btn.isEnabled()
 
@@ -253,6 +259,7 @@ def test_key_backup_dialog_is_masked_gated_and_clears_clipboard():
     dialog.reject()
     assert dialog._key_field.text() == ""
     assert clipboard.text() == ""
+    assert recovery == bytearray(32)
     dialog.deleteLater()
 
 

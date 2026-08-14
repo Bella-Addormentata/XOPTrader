@@ -136,8 +136,9 @@ key locally and stores it DPAPI-encrypted in `secrets.yaml`. Then click
   **Show** without copying.
 2. Verify that the backup is labelled with the Base wallet address shown in
   the same dialog.
-3. Tick the saved-securely checkbox and click **Confirm backup**. The clipboard
-  is cleared when the dialog closes.
+3. Tick **I saved this recovery key securely** and click **I saved it securely**.
+  If the copied key is still the current clipboard value, the app clears it when
+  the dialog closes. Clipboard history may retain it.
 
 The control remains available as **View key** after confirmation. Repeat this
 process after every key rotation, before funding the new address.
@@ -153,7 +154,7 @@ raw-key import is the only part that is not exposed in the GUI:
 From the repository root (the folder containing `gui\`), run the venv Python:
 
 ```bash
-.venv/Scripts/python.exe -c "from gui.services.warp import keystore; k = keystore.evm_key_from_hex('0x...'); print('ADDRESS  :', k.address); print('DPAPI    :', keystore.protect_evm_key(k))"
+.venv/Scripts/python.exe -c "from getpass import getpass; from gui.services.warp import keystore; k = keystore.evm_key_from_hex(getpass('Private key (input hidden): ')); print('ADDRESS  :', k.address); print('DPAPI    :', keystore.protect_evm_key(k))"
 ```
 
 It prints two things:
@@ -162,8 +163,8 @@ It prints two things:
 - **DPAPI** — the encrypted blob to paste into `secrets.yaml` (next step). The
   imported raw key is already your portable backup.
 
-Clear your terminal command history afterward so the imported key is not left
-on screen or in shell history.
+The prompt does not echo the key, and the key is not included in the process
+command line or shell history.
 
 ### 3b. Store an imported blob in `secrets.yaml`
 

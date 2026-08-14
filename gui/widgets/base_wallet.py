@@ -220,13 +220,13 @@ class _KeyBackupDialog(QDialog):
         parent: QWidget | None = None,
     ) -> None:
         super().__init__(parent)
-        raw = bytes(recovery)
-        if len(raw) != 32:
-            raise ValueError(f"recovery key must be 32 bytes, got {len(raw)}")
+        if len(recovery) != 32:
+            raise ValueError(f"recovery key must be 32 bytes, got {len(recovery)}")
 
         self.setWindowTitle("Back Up Base Wallet Key")
         self.setModal(True)
         self.setMinimumWidth(680)
+        self._recovery = recovery
         self._copied_digest: bytes | None = None
 
         layout = QVBoxLayout(self)
@@ -264,8 +264,7 @@ class _KeyBackupDialog(QDialog):
 
         layout.addWidget(QLabel("Private recovery key"))
         key_row = QHBoxLayout()
-        self._key_field = _mono_field("")
-        self._key_field.setText("0x" + raw.hex())
+        self._key_field = _mono_field("Hidden until Show is clicked")
         self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
         # All copying goes through _copy_key so the current clipboard can be
         # cleared on close. Prevent the read-only field's context menu and
@@ -288,8 +287,8 @@ class _KeyBackupDialog(QDialog):
         layout.addLayout(key_row)
 
         self._copy_notice = QLabel(
-            "Recovery key copied. The current clipboard is cleared when this "
-            "dialog closes; clipboard history may retain it."
+            "Recovery key copied. If unchanged, the current clipboard is cleared "
+            "when this dialog closes; clipboard history may retain it."
         )
         self._copy_notice.setWordWrap(True)
         self._copy_notice.setStyleSheet(f"color: {INFO_BLUE};")
@@ -314,16 +313,19 @@ class _KeyBackupDialog(QDialog):
 
     def _toggle_visibility(self) -> None:
         visible = self._key_field.echoMode() == QLineEdit.EchoMode.Password
-        self._key_field.setEchoMode(
-            QLineEdit.EchoMode.Normal if visible else QLineEdit.EchoMode.Password
-        )
+        if visible:
+            self._key_field.setText("0x" + self._recovery.hex())
+            self._key_field.setEchoMode(QLineEdit.EchoMode.Normal)
+        else:
+            self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
+            self._key_field.clear()
         self._show_btn.setText("Hide" if visible else "Show")
 
     def _copy_key(self) -> None:
         clipboard = QApplication.clipboard()
         if clipboard is not None:
-            text = self._key_field.text()
-            self._copied_digest = hashlib.sha256(text.encode("ascii")).digest()
+            text = "0x" + self._recovery.hex()
+            self._copied_digest = hashlib.sha256(text.encode("utf-8")).digest()
             clipboard.setText(text)
             del text
             self._copy_notice.setVisible(True)
@@ -339,6 +341,7 @@ class _KeyBackupDialog(QDialog):
         self._copied_digest = None
         self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
         self._key_field.clear()
+        self._recovery[:] = b"\x00" * len(self._recovery)
         super().done(result)
 
 
