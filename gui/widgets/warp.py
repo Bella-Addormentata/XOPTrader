@@ -480,10 +480,10 @@ class WarpWidget(QWidget):
         notice_layout.setContentsMargins(12, 8, 12, 8)
         notice_lbl = QLabel(
             "⚠️  <b>Important:</b> deposits must be <b>USDC on Base</b>. "
-            "The hot-wallet key is stored encrypted (DPAPI) in secrets.yaml; back "
-            "it up per the runbook. Bridging is disabled by default, and ships in "
-            "dry run — go live only after a clean dry-run rehearsal followed by a "
-            "small live test deposit."
+            "The hot-wallet key is stored encrypted (DPAPI) in secrets.yaml; use "
+            "<b>Base Wallet → Back up key</b> before funding it. Bridging is "
+            "disabled by default, and ships in dry run — go live only after a "
+            "clean dry-run rehearsal followed by a small live test deposit."
         )
         notice_lbl.setWordWrap(True)
         notice_lbl.setTextFormat(Qt.TextFormat.RichText)

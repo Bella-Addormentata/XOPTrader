@@ -100,6 +100,19 @@ def test_info_reads_balances_for_the_active_address():
     assert info.address.startswith("0x") and not info.backup_confirmed
 
 
+def test_recovery_key_is_a_scrub_capable_copy_of_the_active_key():
+    w, _io, _ev = _wallet()
+    active = w.active_key()
+
+    address, recovery = w.recovery_key()
+
+    assert address == active.address
+    assert isinstance(recovery, bytearray)
+    assert bytes(recovery) == active.private_key
+    recovery[:] = b"\x00" * len(recovery)
+    assert w.active_key().private_key == active.private_key
+
+
 # --------------------------------------------------------------------------- #
 # Transfers: validation and balance rails.
 # --------------------------------------------------------------------------- #
