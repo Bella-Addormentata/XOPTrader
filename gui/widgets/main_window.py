@@ -406,6 +406,11 @@ class MainWindow(QMainWindow):
                 base_wallet_widget.wallet_action_requested.connect(
                     warp_svc.wallet_action
                 )
+            if (hasattr(base_wallet_widget, "present_key_backup")
+                    and hasattr(warp_svc, "key_backup_ready")):
+                warp_svc.key_backup_ready.connect(
+                    base_wallet_widget.present_key_backup
+                )
 
         # Auto-populate the settings panel from the bridge's config file so
         # users can edit credentials without touching the file system manually.

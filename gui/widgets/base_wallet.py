@@ -5,7 +5,7 @@ the working intermediary between an exchange (e.g. Coinbase) and the warp
 bridge: ETH and USDC come in from the exchange, the bridge spends them,
 unwraps land back here, and the surplus goes out to the exchange.
 
-The page offers exactly four operations, all executed by
+The page offers five operations, all executed by
 :class:`gui.services.basewallet.BaseWallet` on the warp worker thread:
 
 * **Create wallet** -- generate the first DPAPI-encrypted key (refused if one
@@ -13,6 +13,8 @@ The page offers exactly four operations, all executed by
 * **Receive** -- display + copy the wallet's single static address. One key is
   one address on EVM chains; a "fresh receive address" only ever comes from
   key rotation.
+* **Back up key** -- reveal the active private key in a guarded, masked modal;
+    key bytes arrive over a one-shot signal and never enter a cached snapshot.
 * **Send** -- transfer ETH or USDC to an external address (EIP-55 validated,
   worst-case gas reserved, balance-checked -- all re-validated by the
   backend).
@@ -22,9 +24,10 @@ The page offers exactly four operations, all executed by
 The tab is fed by the warp snapshot forwarded through
 ``MainWindow._on_bridge_data`` (``data["warp"]["base_wallet"]`` plus the
 ``wallet_notice`` / ``wallet_action_error`` companions); it never reads key
-material and never performs chain I/O itself. Actions are surfaced as one Qt
-signal (``wallet_action_requested``) that the main window wires to
-``WarpService.wallet_action``.
+material from that snapshot and never performs chain I/O itself. Recovery key
+bytes use a separate one-shot signal and are cleared when the modal closes.
+Actions are surfaced as one Qt signal (``wallet_action_requested``) that the
+main window wires to ``WarpService.wallet_action``.
 
 ISO/IEC 5055  -- all public APIs carry type hints and docstrings.
 ISO/IEC 25000 -- degrades gracefully across all snapshot shapes (absent,
@@ -33,15 +36,19 @@ ISO/IEC 25000 -- degrades gracefully across all snapshot shapes (absent,
 
 from __future__ import annotations
 
+import hashlib
 import html as _html
 import logging
 from decimal import Decimal, InvalidOperation
 from typing import Any, Final, Optional
 
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtCore import Qt, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
+    QDialog,
+    QDialogButtonBox,
     QFrame,
     QHBoxLayout,
     QLabel,
@@ -203,6 +210,141 @@ def parse_asset_amount(text: str, *, decimals: int) -> Optional[int]:
         return None
 
 
+class _KeyBackupDialog(QDialog):
+    """Short-lived, masked view of one Base wallet recovery key."""
+
+    def __init__(
+        self,
+        address: str,
+        recovery: bytearray,
+        parent: QWidget | None = None,
+    ) -> None:
+        super().__init__(parent)
+        if len(recovery) != 32:
+            raise ValueError(f"recovery key must be 32 bytes, got {len(recovery)}")
+
+        self.setWindowTitle("Back Up Base Wallet Key")
+        self.setModal(True)
+        self.setMinimumWidth(680)
+        self._recovery = recovery
+        self._copied_digest: bytes | None = None
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(22, 22, 22, 22)
+        layout.setSpacing(12)
+
+        title = QLabel("Base wallet recovery key")
+        title_font = title.font()
+        title_font.setPointSize(13)
+        title_font.setBold(True)
+        title.setFont(title_font)
+        title.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        layout.addWidget(title)
+
+        warning = QLabel(
+            "<b>Anyone with this key controls this wallet.</b> Store it in an "
+            "offline backup or trusted password manager. Never send it in "
+            "chat, email, or a support request. Clipboard history and third-party "
+            "clipboard managers may retain copied keys; disable them first or "
+            "use Show without copying."
+        )
+        warning.setTextFormat(Qt.TextFormat.RichText)
+        warning.setWordWrap(True)
+        warning.setStyleSheet(
+            f"color: {WARNING_YELLOW}; background: {PANEL_BG}; "
+            f"border: 1px solid {WARNING_YELLOW}; border-radius: 4px; "
+            "padding: 10px;"
+        )
+        layout.addWidget(warning)
+
+        layout.addWidget(QLabel("Wallet address"))
+        address_field = _mono_field("")
+        address_field.setText(str(address))
+        layout.addWidget(address_field)
+
+        layout.addWidget(QLabel("Private recovery key"))
+        key_row = QHBoxLayout()
+        self._key_field = _mono_field("Hidden until Show is clicked")
+        self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
+        # All copying goes through _copy_key so the current clipboard can be
+        # cleared on close. Prevent the read-only field's context menu and
+        # keyboard selection from creating an untracked copy.
+        self._key_field.setContextMenuPolicy(
+            Qt.ContextMenuPolicy.NoContextMenu
+        )
+        self._key_field.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        key_row.addWidget(self._key_field, 1)
+
+        self._show_btn = QPushButton("Show")
+        self._show_btn.setFixedWidth(70)
+        self._show_btn.clicked.connect(self._toggle_visibility)
+        key_row.addWidget(self._show_btn)
+
+        self._copy_key_btn = QPushButton("Copy key")
+        self._copy_key_btn.setFixedWidth(90)
+        self._copy_key_btn.clicked.connect(self._copy_key)
+        key_row.addWidget(self._copy_key_btn)
+        layout.addLayout(key_row)
+
+        self._copy_notice = QLabel(
+            "Recovery key copied. If unchanged, the current clipboard is cleared "
+            "when this dialog closes; clipboard history may retain it."
+        )
+        self._copy_notice.setWordWrap(True)
+        self._copy_notice.setStyleSheet(f"color: {INFO_BLUE};")
+        self._copy_notice.setVisible(False)
+        layout.addWidget(self._copy_notice)
+
+        self._saved_check = QCheckBox(
+            "I saved this recovery key securely."
+        )
+        layout.addWidget(self._saved_check)
+
+        buttons = QDialogButtonBox()
+        self._confirm_btn = buttons.addButton(
+            "I saved it securely", QDialogButtonBox.ButtonRole.AcceptRole
+        )
+        buttons.addButton("Close", QDialogButtonBox.ButtonRole.RejectRole)
+        self._confirm_btn.setEnabled(False)
+        self._saved_check.toggled.connect(self._confirm_btn.setEnabled)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _toggle_visibility(self) -> None:
+        visible = self._key_field.echoMode() == QLineEdit.EchoMode.Password
+        if visible:
+            self._key_field.setText("0x" + self._recovery.hex())
+            self._key_field.setEchoMode(QLineEdit.EchoMode.Normal)
+        else:
+            self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
+            self._key_field.clear()
+        self._show_btn.setText("Hide" if visible else "Show")
+
+    def _copy_key(self) -> None:
+        clipboard = QApplication.clipboard()
+        if clipboard is not None:
+            text = "0x" + self._recovery.hex()
+            self._copied_digest = hashlib.sha256(text.encode("utf-8")).digest()
+            clipboard.setText(text)
+            del text
+            self._copy_notice.setVisible(True)
+
+    def done(self, result: int) -> None:
+        """Clear temporary UI and clipboard copies before releasing the dialog."""
+        clipboard = QApplication.clipboard()
+        if clipboard is not None and self._copied_digest is not None:
+            current = clipboard.text()
+            if hashlib.sha256(current.encode("utf-8")).digest() == self._copied_digest:
+                clipboard.clear()
+            del current
+        self._copied_digest = None
+        self._key_field.setEchoMode(QLineEdit.EchoMode.Password)
+        self._key_field.clear()
+        self._recovery[:] = b"\x00" * len(self._recovery)
+        super().done(result)
+
+
 class BaseWalletWidget(QWidget):
     """Operator page for the Base hot wallet (create / receive / send / rotate).
 
@@ -220,8 +362,8 @@ class BaseWalletWidget(QWidget):
         Parent widget.
     """
 
-    #: (action, payload) -> ``WarpService.wallet_action``. Actions: "create",
-    #: "confirm_backup", "send_eth", "send_usdc", "rotate".
+    #: (action, payload) -> ``WarpService.wallet_action``. Actions include
+    #: create, reveal/confirm backup, sends, and rotation.
     wallet_action_requested = Signal(str, dict)
     #: Informational; the widget also copies to the clipboard itself.
     address_copy_requested = Signal(str)
@@ -238,6 +380,7 @@ class BaseWalletWidget(QWidget):
         self._action_pending: bool = False
         self._last_seen_seq: int = 0
         self._pending_since_seq: int = 0
+        self._backup_dialog_open: bool = False
         self._build_ui()
         self._render()
 
@@ -269,6 +412,41 @@ class BaseWalletWidget(QWidget):
         """Repaint from the latest snapshot when the tab becomes visible."""
         super().showEvent(event)
         self._render()
+
+    @Slot(str, object, int)
+    def present_key_backup(
+        self, address: str, recovery: object, action_seq: int
+    ) -> None:
+        """Display one recovery key, then scrub it and optionally confirm."""
+        seq = int(action_seq)
+        self._last_seen_seq = max(self._last_seen_seq, seq)
+        if self._action_pending and seq > self._pending_since_seq:
+            self._action_pending = False
+        self._render()
+
+        if not isinstance(recovery, bytearray):
+            QMessageBox.critical(
+                self, "Key backup unavailable", "The recovery key payload is invalid."
+            )
+            return
+        raw = recovery
+        if self._backup_dialog_open:
+            raw[:] = b"\x00" * len(raw)
+            return
+
+        accepted = False
+        self._backup_dialog_open = True
+        try:
+            dialog = _KeyBackupDialog(str(address), raw, self)
+            accepted = dialog.exec() == QDialog.DialogCode.Accepted
+        except ValueError as exc:
+            QMessageBox.critical(self, "Key backup unavailable", str(exc))
+        finally:
+            raw[:] = b"\x00" * len(raw)
+            self._backup_dialog_open = False
+
+        if accepted:
+            self._emit_action("confirm_backup", {})
 
     # ------------------------------------------------------------------
     # UI construction
@@ -345,9 +523,9 @@ class BaseWalletWidget(QWidget):
             _body_label(
                 "No Base wallet exists yet. Creating one generates a fresh key "
                 "on this machine and stores it encrypted in secrets.yaml. "
-                "Afterwards, back up the key per the runbook — DPAPI "
-                "encryption is bound to this Windows user, so a machine "
-                "failure without a backup destroys access to the funds."
+                "Afterwards, use Back up key below before depositing funds. "
+                "DPAPI encryption is bound to this Windows user, so a machine "
+                "failure without that recovery key destroys access to the funds."
             )
         )
         self._create_btn = self._primary_button("\U0001F195  Create wallet")
@@ -403,19 +581,12 @@ class BaseWalletWidget(QWidget):
         self._backup_row = QWidget()
         backup_layout = QHBoxLayout(self._backup_row)
         backup_layout.setContentsMargins(0, 0, 0, 0)
-        backup_lbl = QLabel(
-            "⚠️  The key backup has not been confirmed. Back it up per the "
-            "runbook (it is DPAPI-bound to this Windows user), then confirm:"
-        )
-        backup_lbl.setWordWrap(True)
-        backup_lbl.setStyleSheet(f"color: {WARNING_YELLOW};")
-        backup_layout.addWidget(backup_lbl, 1)
-        self._backup_btn = self._small_button("Done")
-        self._backup_btn.setFixedWidth(90)
-        self._backup_btn.setToolTip(
-            "Record that the key has been backed up offline"
-        )
-        self._backup_btn.clicked.connect(self._on_confirm_backup)
+        self._backup_lbl = QLabel()
+        self._backup_lbl.setWordWrap(True)
+        backup_layout.addWidget(self._backup_lbl, 1)
+        self._backup_btn = self._small_button("Back up key")
+        self._backup_btn.setFixedWidth(120)
+        self._backup_btn.clicked.connect(self._on_backup_clicked)
         backup_layout.addWidget(self._backup_btn)
         layout.addWidget(self._backup_row)
 
@@ -529,10 +700,25 @@ class BaseWalletWidget(QWidget):
             )
         self._gas_lbl.setVisible(bool(low))
 
-        self._backup_row.setVisible(
-            configured and not bool(bw.get("backup_confirmed"))
-        )
-        self._backup_btn.setEnabled(not self._action_pending)
+        backup_confirmed = bool(bw.get("backup_confirmed"))
+        self._backup_row.setVisible(configured)
+        self._backup_btn.setEnabled(configured and not self._action_pending)
+        if backup_confirmed:
+            self._backup_lbl.setText(
+                "Key backup confirmed. Keep the recovery key offline and "
+                "separate from this Windows account."
+            )
+            self._backup_lbl.setStyleSheet(f"color: {PROFIT_GREEN};")
+            self._backup_btn.setText("View key")
+            self._backup_btn.setToolTip("Reveal the recovery key in a guarded dialog")
+        else:
+            self._backup_lbl.setText(
+                "Key backup not confirmed. Back it up before funding this wallet; "
+                "DPAPI recovery is bound to this Windows account."
+            )
+            self._backup_lbl.setStyleSheet(f"color: {WARNING_YELLOW};")
+            self._backup_btn.setText("Back up key")
+            self._backup_btn.setToolTip("Reveal and securely back up the recovery key")
 
         can_act = configured and not self._action_pending
         self._send_btn.setEnabled(can_act)
@@ -612,8 +798,8 @@ class BaseWalletWidget(QWidget):
     def _on_create_clicked(self) -> None:
         self._emit_action("create", {})
 
-    def _on_confirm_backup(self) -> None:
-        self._emit_action("confirm_backup", {})
+    def _on_backup_clicked(self) -> None:
+        self._emit_action("reveal_backup", {})
 
     def _on_send_clicked(self) -> None:
         """Parse, confirm with the exact amount + destination, then emit."""

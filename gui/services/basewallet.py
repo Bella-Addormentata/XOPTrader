@@ -139,6 +139,16 @@ class BaseWallet:
             self._warp_section(secrets)["evm_key_backup_confirmed"] = True
             self._io.write(secrets)
 
+    def recovery_key(self) -> tuple[str, bytearray]:
+        """Return the active address and a scrub-capable private-key copy.
+
+        This is the only backend path used by the GUI backup dialog. The
+        caller must keep the key out of snapshots and logs, then overwrite the
+        returned bytearray after the modal closes.
+        """
+        key = self.active_key()
+        return key.address, bytearray(key.private_key)
+
     # -- read side ----------------------------------------------------------- #
 
     def info(self) -> WalletInfo:

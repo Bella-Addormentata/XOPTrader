@@ -222,6 +222,119 @@ def test_pending_gate_survives_a_same_seq_timer_tick():
     w.deleteLater()
 
 
+def test_key_backup_dialog_is_masked_gated_and_clears_clipboard():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtCore import Qt
+    from PySide6.QtWidgets import QApplication, QLineEdit
+
+    from gui.widgets.base_wallet import _KeyBackupDialog
+
+    _app = QApplication.instance() or QApplication([])
+    recovery = bytearray(range(32))
+    dialog = _KeyBackupDialog(DEST, recovery)
+    assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog._key_field.text() == ""
+    assert not dialog._confirm_btn.isEnabled()
+
+    dialog._show_btn.click()
+    assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Normal
+    assert dialog._key_field.text().startswith("0x000102")
+    assert dialog._key_field.focusPolicy() == Qt.FocusPolicy.NoFocus
+    assert dialog._key_field.contextMenuPolicy() == \
+        Qt.ContextMenuPolicy.NoContextMenu
+    dialog._show_btn.click()
+    assert dialog._key_field.echoMode() == QLineEdit.EchoMode.Password
+    assert dialog._key_field.text() == ""
+    dialog._saved_check.setChecked(True)
+    assert dialog._confirm_btn.isEnabled()
+
+    dialog._copy_key_btn.click()
+    clipboard = QApplication.clipboard()
+    assert clipboard is not None and clipboard.text().startswith("0x000102")
+    assert isinstance(dialog._copied_digest, bytes)
+    assert not hasattr(dialog, "_copied_key")
+    dialog.reject()
+    assert dialog._key_field.text() == ""
+    assert clipboard.text() == ""
+    assert recovery == bytearray(32)
+    dialog.deleteLater()
+
+
+def test_backup_result_scrubs_the_key_and_emits_confirmation(monkeypatch):
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication, QDialog
+
+    from gui.widgets import base_wallet as widget_mod
+
+    _app = QApplication.instance() or QApplication([])
+    widget = widget_mod.BaseWalletWidget()
+    widget.show()
+    widget.update_data({"warp": {
+        "wallet_action_seq": 4,
+        "base_wallet": {
+            "configured": True,
+            "address": DEST,
+            "eth_wei": 10 ** 18,
+            "usdc_micros": 5_000_000,
+            "backup_confirmed": False,
+        },
+    }})
+    actions: list[tuple[str, dict]] = []
+    widget.wallet_action_requested.connect(
+        lambda action, payload: actions.append((action, payload))
+    )
+
+    widget._backup_btn.click()
+    assert actions == [("reveal_backup", {})]
+
+    seen: dict = {}
+
+    class AcceptingDialog:
+        def __init__(self, address, recovery, parent):
+            seen["address"] = address
+            seen["recovery"] = bytes(recovery)
+
+        def exec(self):
+            return QDialog.DialogCode.Accepted
+
+    monkeypatch.setattr(widget_mod, "_KeyBackupDialog", AcceptingDialog)
+    recovery = bytearray(range(32))
+    widget.present_key_backup(DEST, recovery, 5)
+
+    assert seen == {"address": DEST, "recovery": bytes(range(32))}
+    assert recovery == bytearray(32)
+    assert actions[-1] == ("confirm_backup", {})
+    assert widget._pending_since_seq == 5
+    widget.deleteLater()
+
+
+def test_duplicate_backup_payload_is_scrubbed_without_a_second_dialog():
+    pytest.importorskip("PySide6")
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PySide6.QtWidgets import QApplication
+
+    from gui.widgets.base_wallet import BaseWalletWidget
+
+    _app = QApplication.instance() or QApplication([])
+    widget = BaseWalletWidget()
+    widget._backup_dialog_open = True
+    recovery = bytearray(range(32))
+
+    widget.present_key_backup(DEST, recovery, 1)
+
+    assert recovery == bytearray(32)
+    assert widget._backup_dialog_open
+    widget.deleteLater()
+
+
 # --------------------------------------------------------------------------- #
 # [PR-73 Copilot] untrusted error text must never be interpreted as RichText.
 # --------------------------------------------------------------------------- #

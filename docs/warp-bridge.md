@@ -124,36 +124,53 @@ broadcast point it stops at.
 
 ## 3. One-time setup
 
-### 3a. Generate (or import) the hot-wallet key
+### 3a. Create and back up the hot-wallet key
 
-This version has **no in-GUI key generator** (see
-[Known limitations](#10-known-limitations)). You create the DPAPI blob once, by
-hand, with the shipped keystore helpers.
+Open **Base Wallet** in the GUI and click **Create wallet**. The app creates the
+key locally and stores it DPAPI-encrypted in `secrets.yaml`. Then click
+**Back up key**:
+
+1. Use **Show** or **Copy key** and save the `0x`-prefixed recovery key in a
+  trusted password manager or offline backup. Clipboard history and third-party
+  clipboard managers may retain copied values; disable them first or use
+  **Show** without copying.
+2. Verify that the backup is labelled with the Base wallet address shown in
+  the same dialog.
+3. Tick **I saved this recovery key securely** and click **I saved it securely**.
+  If the copied key is still the current clipboard value, the app clears it when
+  the dialog closes. Clipboard history may retain it.
+
+The control remains available as **View key** after confirmation. After every
+key rotation, back up the new key immediately. Rotation has already swept any
+existing wallet balances to the new address before this dialog can be opened.
 
 > **Run this on the same Windows user account that runs the GUI.** DPAPI binds
-> the ciphertext to your Windows account — a blob generated under a different
-> account (or on another machine) will fail to decrypt at runtime.
+> the encrypted on-disk copy to your Windows account. A Windows profile or
+> machine failure can therefore make `secrets.yaml` unusable; the recovery key
+> is the portable backup. Anyone with it controls the hot wallet.
+
+To **import an existing key** instead of creating one, use the console helper;
+raw-key import is the only part that is not exposed in the GUI:
 
 From the repository root (the folder containing `gui\`), run the venv Python:
 
 ```bash
-.venv/Scripts/python.exe -c "from gui.services.warp import keystore; k = keystore.new_evm_key(); print('ADDRESS  :', k.address); print('BACKUP   : 0x' + k.private_key.hex()); print('DPAPI    :', keystore.protect_evm_key(k))"
+.venv/Scripts/python.exe -c "from getpass import getpass; from gui.services.warp import keystore; k = keystore.evm_key_from_hex(getpass('Private key (input hidden): ')); print('ADDRESS  :', k.address); print('DPAPI    :', keystore.protect_evm_key(k))"
 ```
 
-To **import** an existing key instead of generating a fresh one, replace
-`keystore.new_evm_key()` with `keystore.evm_key_from_hex("0x...")`.
-
-It prints three things:
+It prints two things:
 
 - **ADDRESS** — the Base address you will fund with ETH (gas) and USDC.
-- **BACKUP** — the raw private key. **Write it down offline now**, then never
-  again. This is your only recovery if the DPAPI blob is ever lost (e.g. Windows
-  profile rebuild). Anyone with it controls the hot wallet — treat it like cash.
-- **DPAPI** — the encrypted blob to paste into `secrets.yaml` (next step).
+- **DPAPI** — the encrypted blob to paste into `secrets.yaml` (next step). The
+  imported raw key is already your portable backup.
 
-Clear your terminal scrollback afterward so the BACKUP line isn't left on screen.
+The prompt does not echo the key, and the key is not included in the process
+command line or shell history.
 
-### 3b. Store the blob in `secrets.yaml`
+### 3b. Store an imported blob in `secrets.yaml`
+
+Skip this section when the wallet was created in the GUI; it writes the blob
+for you.
 
 Open `secrets.yaml` (the sibling of your `config.yaml`; it is gitignored) and add:
 
@@ -380,7 +397,7 @@ Reused from your existing `chia:` section (no new keys): `wallet_host`,
 
 | Key | Meaning |
 |---|---|
-| `evm_private_key_dpapi` | Base64 of the DPAPI-encrypted EVM hot-wallet private key. Generated in [3a](#3a-generate-or-import-the-hot-wallet-key). Never commit; never place in `config.yaml`. |
+| `evm_private_key_dpapi` | Base64 of the DPAPI-encrypted EVM hot-wallet private key. Generated in [3a](#3a-create-and-back-up-the-hot-wallet-key). Never commit; never place in `config.yaml`. |
 | `relay_private_key_dpapi` | Optional dedicated gas-only key for the altruistic relay. When present it — not the hot key — signs volunteer relays. Recommended hygiene. |
 | `retired_keys` | Written by the Base Wallet page's key rotation: every replaced key's blob, address and timestamp. **Archived forever, never deleted** — anything later landing at an old address stays recoverable. |
 | `evm_key_backup_confirmed` | Written by the Base Wallet page: whether the operator confirmed an offline backup of the current key. |
@@ -409,7 +426,7 @@ All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
 - **Banner: "blocked: no EVM hot-wallet key configured"** — `secrets.yaml` is
   missing `warp.evm_private_key_dpapi`, or the blob doesn't decrypt (generated
   under a different Windows account/machine). Regenerate on the correct account
-  ([3a](#3a-generate-or-import-the-hot-wallet-key)).
+  ([3a](#3a-create-and-back-up-the-hot-wallet-key)).
 - **Banner: "blocked: …DPAPI…" / KeystoreUnavailable** — you're not on Windows, or
   DPAPI failed. The bridge requires Windows.
 - **Banner: "blocked: wrapped-asset anchor failed"** — the offline derivation
@@ -561,15 +578,11 @@ to signal.
 
 ## 10. Known limitations
 
-- **In-GUI key generation exists; the backup reveal does not.** The **Base
-  Wallet** page (🔷 in the sidebar) can create the hot-wallet key, send
-  ETH/USDC, and rotate the key (sweeping funds to a fresh key and archiving
-  the old blob in `warp.retired_keys` — never deleted). What it deliberately
-  does NOT do is display the raw private key: the offline backup still comes
-  from the console flow in [3a](#3a-generate-or-import-the-hot-wallet-key),
-  and the page nags until you confirm it happened. Remember DPAPI blobs are
-  bound to this Windows user — a machine failure without that backup
-  destroys access.
+- **Raw-key import remains console-only.** The **Base Wallet** page can create,
+  reveal/back up, send, and rotate the hot-wallet key. Importing an existing
+  private key still uses the console helper in
+  [3a](#3a-create-and-back-up-the-hot-wallet-key), followed by the manual
+  `secrets.yaml` step in 3b.
 - **Claim-by-Base-tx-hash recovery.** There is no in-app "claim this tx hash"
   box. The app only claims bridges it initiated (it tracks the job from deposit
   onward). If USDC is bridged out-of-band, or a job row is lost before the claim,

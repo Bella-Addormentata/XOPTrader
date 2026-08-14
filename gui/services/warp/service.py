@@ -3446,6 +3446,12 @@ class _WarpWorker(QObject):
     """
 
     snapshot_ready = Signal(dict)
+    # One-shot recovery material for the modal backup dialog. Deliberately
+    # separate from snapshot_ready: snapshots are cached and repeatedly
+    # forwarded through the GUI, so secret key bytes must never ride them.
+    # object is intentional: PySide carries the same Python bytearray through
+    # the queued signal, so the GUI can overwrite that exact object on close.
+    key_backup_ready = Signal(str, object, int)
 
     def __init__(
         self,
@@ -3585,8 +3591,13 @@ class _WarpWorker(QObject):
         """
         payload = dict(payload or {})
         error: Optional[str] = None
+        backup: tuple[str, bytearray] | None = None
         try:
-            notice = self._wallet_op(str(action), payload)
+            if str(action) == "reveal_backup":
+                backup = self._base_wallet().recovery_key()
+                notice = "Recovery key opened for offline backup."
+            else:
+                notice = self._wallet_op(str(action), payload)
             if notice:
                 self._last_wallet_notice = notice
         except Exception as exc:  # noqa: BLE001 -- never kill the worker
@@ -3599,6 +3610,11 @@ class _WarpWorker(QObject):
         if error:
             snap["wallet_action_error"] = error
         self.snapshot_ready.emit(snap)
+        if backup is not None and error is None:
+            address, recovery = backup
+            self.key_backup_ready.emit(
+                address, recovery, self._wallet_action_seq
+            )
 
     # -- internals ---------------------------------------------------------- #
 
@@ -3821,8 +3837,8 @@ class _WarpWorker(QObject):
                 # a raise after the write still points the engine at it.
                 self._adopt_key_from_disk()
             return (
-                f"Wallet created: {address}. Back up the key now (runbook: "
-                "hot-wallet key backup), then confirm the backup."
+                f"Wallet created: {address}. Use Back up key on the Base "
+                "Wallet page before funding it."
             )
         if action == "confirm_backup":
             wallet.mark_backup_confirmed()
@@ -3863,7 +3879,7 @@ class _WarpWorker(QObject):
             return (
                 f"Key rotated: {out['old_address']} -> {out['new_address']}. "
                 f"Sweep txs: {txs}. The old key is archived in secrets.yaml. "
-                "Back up the NEW key, then confirm the backup."
+                "Use Back up key to save and confirm the NEW recovery key."
             )
         raise BaseWalletError(f"unknown wallet action: {action!r}")
 
@@ -4000,6 +4016,7 @@ class WarpService(QObject):
     jobs_updated = Signal(list)
     hot_wallet_updated = Signal(dict)
     service_state = Signal(dict)
+    key_backup_ready = Signal(str, object, int)
 
     # -- Internal triggers (queued connections to the worker thread) ------- #
     _trigger_tick = Signal()
@@ -4029,6 +4046,7 @@ class WarpService(QObject):
         self._worker.moveToThread(self._thread)
 
         self._worker.snapshot_ready.connect(self._on_snapshot_ready)
+        self._worker.key_backup_ready.connect(self._on_key_backup_ready)
         self._trigger_tick.connect(self._worker.tick)
         self._trigger_params.connect(self._worker.set_config)
         self._trigger_bridge.connect(self._worker.request_bridge)
@@ -4094,8 +4112,11 @@ class WarpService(QObject):
         self._trigger_action.emit(int(job_id), str(action))
 
     def wallet_action(self, action: str, payload: Optional[dict] = None) -> None:
-        """Queue one Base-wallet command (create / confirm_backup / send_eth /
-        send_usdc / rotate) onto the worker thread."""
+        """Queue one Base-wallet command onto the worker thread.
+
+        Supported actions include create, reveal/confirm backup, sends, and
+        rotation. Recovery key bytes return only through key_backup_ready.
+        """
         if not self._thread.isRunning():
             self.start()
         self._trigger_wallet.emit(str(action), dict(payload or {}))
@@ -4116,3 +4137,19 @@ class WarpService(QObject):
         self.service_state.emit(dict(snap))
         self.hot_wallet_updated.emit(dict(snap.get("hot_wallet") or {}))
         self.jobs_updated.emit(list(snap.get("jobs") or []))
+
+    @Slot(str, object, int)
+    def _on_key_backup_ready(
+        self, address: str, recovery: object, action_seq: int
+    ) -> None:
+        """Forward one-shot key material, then scrub it as a fallback.
+
+        The live widget is a direct connection on this GUI thread, so its modal
+        completes before ``emit`` returns. The ``finally`` also covers a
+        disconnected or destroyed widget during shutdown.
+        """
+        try:
+            self.key_backup_ready.emit(str(address), recovery, int(action_seq))
+        finally:
+            if isinstance(recovery, bytearray):
+                recovery[:] = b"\x00" * len(recovery)

@@ -126,6 +126,50 @@ def test_create_writes_the_key_and_points_the_engine_at_it(tmp_path, monkeypatch
     assert "wallet_action_error" not in snap
 
 
+def test_reveal_backup_uses_a_transient_signal_not_the_snapshot(
+    tmp_path, monkeypatch
+):
+    worker, _evm, snaps, _secrets_path = _worker(tmp_path, monkeypatch)
+    revealed: list[tuple[str, bytearray, int]] = []
+    worker.key_backup_ready.connect(
+        lambda address, recovery, seq: revealed.append((address, recovery, seq))
+    )
+    worker.wallet_action("create", {})
+
+    worker.wallet_action("reveal_backup", {})
+
+    assert len(revealed) == 1
+    address, recovery, seq = revealed[0]
+    assert address.startswith("0x") and len(recovery) == 32
+    assert seq == snaps[-1]["wallet_action_seq"]
+    secret_hex = bytes(recovery).hex()
+    assert secret_hex not in repr(snaps[-1])
+    assert repr(bytes(recovery)) not in repr(snaps[-1])
+    assert "recovery key opened" in snaps[-1]["wallet_notice"].lower()
+    recovery[:] = b"\x00" * len(recovery)
+
+
+def test_service_forwarder_always_scrubs_the_recovery_key():
+    service = S.WarpService()
+    delivered: list[tuple[str, bytes, int]] = []
+    service.key_backup_ready.connect(
+        lambda address, recovery, seq: delivered.append(
+            (address, bytes(recovery), seq)
+        )
+    )
+    recovery = bytearray(range(32))
+
+    service._on_key_backup_ready("0x" + "ab" * 20, recovery, 7)
+
+    assert delivered == [("0x" + "ab" * 20, bytes(range(32)), 7)]
+    assert recovery == bytearray(32)
+
+    disconnected = bytearray(range(32))
+    service.key_backup_ready.disconnect()
+    service._on_key_backup_ready("0x" + "ab" * 20, disconnected, 8)
+    assert disconnected == bytearray(32)
+
+
 def test_a_failed_action_is_surfaced_and_the_prior_notice_survives(
     tmp_path, monkeypatch
 ):
