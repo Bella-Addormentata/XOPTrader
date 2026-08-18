@@ -123,14 +123,19 @@ def test_funding_claim_pends_named_when_collateral_locks(monkeypatch):
     monkeypatch.setattr(
         claim_mod, "security_coin_puzzle_hash", lambda sk: bytes(32)
     )
+    funding_fee = 25_000_000
     store = new_store()
-    engine, ctx = build(store)
+    engine, ctx = build(
+        store, params=params_with_cap(chia_funding_fee_mojos=funding_fee)
+    )
     job = seed(store, JobStatus.FUNDING_CLAIM, columns={"post_tip_mojos": 4985})
     blob, _ = make_ephemeral_blob(job.id)
     store.update_job(job.id, state_patch={"ephemeral_blob": blob})
 
-    # Wallet holds less than post_tip + claim fee.
-    ctx.wallet.balances[1]["spendable_balance"] = 4985
+    # One mojo under post_tip + claim fee + funding fee: a weakened check
+    # that omitted the funding fee would PASS this balance and send.
+    expected = 4985 + 100_000_000
+    ctx.wallet.balances[1]["spendable_balance"] = expected + funding_fee - 1
 
     out = engine.step()
     assert out["status"] == JobStatus.FUNDING_CLAIM, "pends in place"
@@ -149,7 +154,9 @@ def test_burning_pends_named_when_collateral_locks(monkeypatch):
 
     monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: None)
     store = new_store()
-    engine, ctx = build_unwrap(store, params=params_with_cap())
+    engine, ctx = build_unwrap(
+        store, params=params_with_cap(unwrap_chia_fee_mojos=_FEE)
+    )
     job = seed(
         store, JobStatus.BURNING,
         columns={"amount_mojos": 5000},
@@ -167,8 +174,10 @@ def test_burning_pends_named_when_collateral_locks(monkeypatch):
         )
     ]
 
-    # G10 passed long ago; the engine has since locked the XCH.
-    ctx.wallet.balances[1]["spendable_balance"] = _TOLL - 1
+    # G10 passed long ago; the engine has since locked the XCH.  One mojo
+    # under toll + fee: a weakened check that counted only the toll would
+    # PASS this balance and send -- this pins the fee term specifically.
+    ctx.wallet.balances[1]["spendable_balance"] = _TOLL + _FEE - 1
 
     out = engine.step()
     assert out["status"] == JobStatus.BURNING, "pends in place"
@@ -180,6 +189,7 @@ def test_burning_pends_named_when_collateral_locks(monkeypatch):
     engine.step()
     assert len(ctx.wallet.sent) == 1
     assert ctx.wallet.sent[0][0] == _TOLL
+    assert ctx.wallet.sent[0][2] == _FEE, "the toll send carries the fee"
 
 
 def test_burn_sent_pends_named_when_fee_collateral_locks():
