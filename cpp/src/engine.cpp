@@ -6389,80 +6389,97 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              pair_name, bumped_tiers, eff_min_units);
             }
 
-            // -- [S3 round-5] Re-enforce the XCH budget after the up-scale.
-            // The wallet caps above bound the POOLS, but the up-scale pass
-            // just raised every sub-minimum tier to min_base_mojos -- a
-            // nonzero budget smaller than one minimum offer would be
-            // enlarged past the cap and consume reserved funds.  Walk the
-            // XCH-consuming side tightest-first, keep tiers while their
-            // cumulative XCH cost fits confirmed-minus-reserve, drop the
-            // rest.  Bid tiers on XCH-quote pairs consume XCH equal to
-            // quote_mojos_for(size, price); ask tiers on XCH-base pairs
-            // consume their size directly.
-            if (pair_cfg
-                && (pair_cfg->base_asset_id == "xch"
-                    || pair_cfg->quote_asset_id == "xch"))
-            {
-                const Mojo reserve_mojos =
-                    (config_.strategy.fee_reserve_xch > 0.0)
-                        ? static_cast<Mojo>(std::llround(
-                              config_.strategy.fee_reserve_xch
-                              * static_cast<double>(kMojosPerXch)))
-                        : Mojo{0};
-                const Mojo xch_budget = std::max(
-                    Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
-                const bool xch_is_base =
-                    (pair_cfg->base_asset_id == "xch");
-
-                std::vector<Mojo> costs;
-                costs.reserve(pcs.ladder.size());
-                for (const auto& tq : pcs.ladder) {
-                    const bool consumes_xch = xch_is_base
-                        ? (tq.side == Side::Ask)
-                        : (tq.side == Side::Bid);
-                    if (!consumes_xch) continue;
-                    if (xch_is_base) {
-                        costs.push_back(tq.size);
-                    } else {
-                        // Conservative ceil: never under-count a cost.
-                        const double q = quote_mojos_for(
-                            static_cast<double>(tq.size),
-                            static_cast<double>(tq.price),
-                            static_cast<double>(
-                                pair_cfg->base_mojos_per_unit),
-                            static_cast<double>(
-                                pair_cfg->quote_mojos_per_unit));
-                        costs.push_back(
-                            (std::isfinite(q) && q >= 0.0
-                             && q < static_cast<double>(
-                                    std::numeric_limits<Mojo>::max()))
-                                ? static_cast<Mojo>(std::ceil(q))
-                                : std::numeric_limits<Mojo>::max());
+            // -- [S3 rounds 5+7] Re-enforce EVERY side's funding budget
+            // after the up-scale.  The wallet caps above bound the POOLS,
+            // but the up-scale pass just raised every sub-minimum tier to
+            // min_base_mojos -- a budget smaller than one minimum offer
+            // would be enlarged past its cap (into XCH reserve funds, or
+            // past a CAT wallet's balance).  For each side, resolve the
+            // funding asset's KNOWN budget, walk that side's tiers
+            // tightest-first, keep while the cumulative cost fits, drop
+            // the rest.  Ask tiers cost their base-mojo size directly;
+            // bid tiers cost quote_mojos_for(size, price), ceiled.
+            if (pair_cfg) {
+                // nullopt = never observed -> skip enforcement for that
+                // side (same availability contract as the caps above; the
+                // XCH balance is always present -- its refresh is not
+                // Step-8-gated -- and carries the fee reserve).
+                auto known_budget = [&](const std::string& asset_id)
+                    -> std::optional<Mojo> {
+                    if (asset_id == "xch") {
+                        const Mojo reserve_mojos =
+                            (config_.strategy.fee_reserve_xch > 0.0)
+                                ? static_cast<Mojo>(std::llround(
+                                      config_.strategy.fee_reserve_xch
+                                      * static_cast<double>(kMojosPerXch)))
+                                : Mojo{0};
+                        return std::max(
+                            Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
                     }
-                }
-                const std::size_t keep = tiers_within_budget(
-                    costs, xch_budget);
-                if (keep < costs.size()) {
+                    if (!config_.strategy.wallet_balance_caps_enabled) {
+                        return std::nullopt;  // CAT caps opted out
+                    }
+                    auto it = cached_wallet_balances_.find(asset_id);
+                    if (it == cached_wallet_balances_.end()) {
+                        return std::nullopt;  // never observed
+                    }
+                    return it->second.confirmed;
+                };
+
+                for (const Side side : {Side::Ask, Side::Bid}) {
+                    const bool is_ask = (side == Side::Ask);
+                    const std::string& funding_asset =
+                        is_ask ? pair_cfg->base_asset_id
+                               : pair_cfg->quote_asset_id;
+                    const auto budget = known_budget(funding_asset);
+                    if (!budget.has_value()) continue;
+
+                    std::vector<Mojo> costs;
+                    costs.reserve(pcs.ladder.size());
+                    for (const auto& tq : pcs.ladder) {
+                        if (tq.side != side) continue;
+                        if (is_ask) {
+                            costs.push_back(tq.size);
+                        } else {
+                            // Conservative ceil: never under-count a cost.
+                            const double q = quote_mojos_for(
+                                static_cast<double>(tq.size),
+                                static_cast<double>(tq.price),
+                                static_cast<double>(
+                                    pair_cfg->base_mojos_per_unit),
+                                static_cast<double>(
+                                    pair_cfg->quote_mojos_per_unit));
+                            costs.push_back(
+                                (std::isfinite(q) && q >= 0.0
+                                 && q < static_cast<double>(
+                                        std::numeric_limits<Mojo>::max()))
+                                    ? static_cast<Mojo>(std::ceil(q))
+                                    : std::numeric_limits<Mojo>::max());
+                        }
+                    }
+                    const std::size_t keep = tiers_within_budget(
+                        costs, *budget);
+                    if (keep >= costs.size()) continue;
+
                     std::size_t seen = 0;
                     const auto before = pcs.ladder.size();
                     pcs.ladder.erase(
                         std::remove_if(
                             pcs.ladder.begin(), pcs.ladder.end(),
                             [&](const TierQuote& tq) {
-                                const bool consumes_xch = xch_is_base
-                                    ? (tq.side == Side::Ask)
-                                    : (tq.side == Side::Bid);
-                                if (!consumes_xch) return false;
+                                if (tq.side != side) return false;
                                 return seen++ >= keep;
                             }),
                         pcs.ladder.end());
                     spdlog::warn(
-                        "[Engine] Step 7: {} dropped {} up-scaled tier(s): "
-                        "cumulative XCH cost exceeds "
-                        "confirmed-minus-reserve budget {:.6f} XCH",
+                        "[Engine] Step 7: {} dropped {} up-scaled {} "
+                        "tier(s): cumulative {} cost exceeds the known "
+                        "budget of {} mojos",
                         pair_name,
                         before - pcs.ladder.size(),
-                        static_cast<double>(xch_budget) / kMojosPerXch);
+                        is_ask ? "ASK" : "BID",
+                        funding_asset,
+                        *budget);
                 }
             }
 
