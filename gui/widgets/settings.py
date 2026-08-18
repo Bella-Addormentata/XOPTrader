@@ -2781,10 +2781,14 @@ class SettingsWidget(QWidget):
         remove_btn.setToolTip("Remove this trading pair")
         # Resolve the button's current row at click time rather than
         # capturing a row index at insert time.  Captured indices go
-        # stale when earlier rows are deleted.
+        # stale when earlier rows are deleted.  indexAt() expects
+        # VIEWPORT coordinates: btn.pos() is relative to the actions
+        # container (always ~(4,2), which maps to row 0 for every row),
+        # so ask for the container's position -- the container is the
+        # cell widget and its pos() is viewport-relative.
         remove_btn.clicked.connect(
             lambda _checked, btn=remove_btn: self._on_remove_pair(
-                self._pairs_table.indexAt(btn.pos()).row()
+                self._pairs_table.indexAt(btn.parentWidget().pos()).row()
             )
         )
         actions_layout.addWidget(remove_btn)

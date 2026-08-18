@@ -4374,6 +4374,24 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // [REVIVE-FRESHNESS 2026-08-18] Age of the CoinGecko FEED, not of
+        // the solve.  coingecko_last_fetch_ advances only on a SUCCESSFUL
+        // fetch (Step 1), while every downstream timestamp the staleness
+        // detectors look at (cex_updated_at, fair_value_updated_at) is
+        // re-stamped each heartbeat from the cache and so can never expire.
+        // The revive path must not quote from a frozen feed: pre-revive
+        // that state produced silence, and silence is the correct fallback.
+        // (A feed that returns fresh-but-wrong prices is not catchable at
+        // this layer; the outage/rate-limit case -- the common one -- is.)
+        const bool quote_anchor_feed_fresh = [&] {
+            if (coingecko_prices_.empty()) return false;
+            const double age_s = std::chrono::duration<double>(
+                std::chrono::steady_clock::now()
+                - coingecko_last_fetch_).count();
+            return age_s
+                <= config_.market_data.cex_freshness_threshold_sec;
+        }();
+
         // Volatility (hoisted above the centre computation: the A-S
         // reservation offset below needs the honest annualized sigma).
         double sigma = 0.0;
@@ -4830,6 +4848,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // Set inside the drift-guard block below, read by the deploy-idle
+        // floor after it: a side tapered all the way to 0.0 was deliberately
+        // STOPPED (acquired asset past target + max_factor*tol), and the
+        // floor must not re-inflate it back to min size.
+        bool drift_zeroed_bid = false;
+        bool drift_zeroed_ask = false;
+
         // -- Asset-level soft drift guard ---------------------------------
         // Acts as a "soft wall" on top of pair-level ratio rebalancing:
         // when an asset's actual portfolio fraction is more than `tol`
@@ -4911,6 +4936,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // Bid acquires base, spends quote.  Ask acquires quote, spends base.
             const double bid_scale = acquire_scale(base_key);
             const double ask_scale = acquire_scale(quote_key);
+            drift_zeroed_bid = (bid_scale <= 0.0);
+            drift_zeroed_ask = (ask_scale <= 0.0);
 
             if (bid_scale < 0.999 || ask_scale < 0.999) {
                 const Mojo old_bid = avail_capital;
@@ -4943,6 +4970,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // suppressed downstream by the dust filter.  Respects ratio
         // rebalance mode: only the "acquire" side is floored in non-neutral
         // modes (matches the intent of one-sided ratio rebalancing).
+        //
+        // Respects the drift guard's hard zero: a side tapered to exactly
+        // 0.0 was deliberately STOPPED because the acquired asset is past
+        // target + max_factor*tol.  Flooring that side back to min size
+        // would convert the stop into an indefinite min-size bleed (one
+        // more fill per heartbeat, forever) -- on a revived pair with no
+        // book to price against, that bleed is bounded only by the wallet.
         if (pair_cfg
             && config_.strategy.deploy_idle_inventory_enabled
             && pair_cfg->base_mojos_per_unit > 0
@@ -4973,7 +5007,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
             // Bid floor: requires quote-asset wallet to cover min_pool in base
             // units at the current mid.
-            if (floor_bid && min_pool > 0 && avail_capital < min_pool && market_mid > 0.0
+            if (drift_zeroed_bid && avail_capital < min_pool) {
+                spdlog::info("[Engine] Step 7: {} deploy-idle bid floor "
+                             "suppressed: drift guard hard-zeroed this "
+                             "side (acquired asset past its band)",
+                             pair_name);
+            }
+            if (floor_bid && !drift_zeroed_bid
+                && min_pool > 0 && avail_capital < min_pool && market_mid > 0.0
                 && pair_cfg->quote_mojos_per_unit > 0)
             {
                 const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
@@ -4998,7 +5039,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
 
             // Ask floor: requires base-asset wallet to cover min_pool directly.
-            if (floor_ask && min_pool > 0 && avail_inventory < min_pool) {
+            if (drift_zeroed_ask && avail_inventory < min_pool) {
+                spdlog::info("[Engine] Step 7: {} deploy-idle ask floor "
+                             "suppressed: drift guard hard-zeroed this "
+                             "side (acquired asset past its band)",
+                             pair_name);
+            }
+            if (floor_ask && !drift_zeroed_ask
+                && min_pool > 0 && avail_inventory < min_pool) {
                 const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
                 if (base_bal >= min_pool) {
                     spdlog::info("[Engine] Step 7: {} ask pool floored "
@@ -5436,16 +5484,19 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // zero), we cannot validate any prices.  Refuse to post offers
         // rather than risk mispricing -- unless the pair is opted into
         // revive_market AND a live external estimate anchored the centre
-        // this heartbeat (quote_has_external_est).  Reviving a dead book
-        // from a real anchor is safe: the centre is w_ext=1.0 external,
-        // the width floor and the fair-value band clamp both still bound
-        // every tier, and the outlier filter has already kept the stale
-        // junk out of pricing.  Reviving with NO anchor would be exactly
-        // the unguarded quoting this clear exists to stop, so that case
-        // still clears regardless of the flag.
+        // this heartbeat (quote_has_external_est) AND the feed behind it
+        // is genuinely fresh (quote_anchor_feed_fresh; the solve's own
+        // timestamps self-refresh and can never expire).  Reviving a dead
+        // book from a fresh anchor is bounded: the centre is w_ext=1.0
+        // external, the sigma-scaled width floor bounds every tier, and
+        // the fair-value band clamp additionally bounds it whenever the
+        // solve is trusted.  Reviving with no anchor, or from a frozen
+        // feed, would be exactly the unguarded quoting this clear exists
+        // to stop -- both cases still clear regardless of the flag.
         if (snap.best_bid <= 0 && snap.best_ask <= 0) {
             if (ladder_survives_empty_book(pair_cfg,
-                                           quote_has_external_est)) {
+                                           quote_has_external_est,
+                                           quote_anchor_feed_fresh)) {
                 spdlog::info("[Engine] Step 7: {} revive market: empty "
                              "filtered book but external anchor is live "
                              "(combined_sigma={:.0f}bps) -- quoting from "
@@ -5453,9 +5504,20 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              quote_combined_sigma_bps);
             } else {
                 if (pair_cfg && pair_cfg->revive_market) {
-                    spdlog::warn("[Engine] Step 7: {} revive_market set "
-                                 "but no external estimate -- refusing to "
-                                 "quote blind", pair_name);
+                    if (!quote_has_external_est) {
+                        spdlog::warn("[Engine] Step 7: {} revive_market "
+                                     "set but no external estimate -- "
+                                     "refusing to quote blind", pair_name);
+                    } else if (!quote_anchor_feed_fresh) {
+                        spdlog::warn("[Engine] Step 7: {} revive_market "
+                                     "set but the price feed is stale "
+                                     "(no successful CoinGecko fetch "
+                                     "within {:.0f}s) -- refusing to "
+                                     "quote from a frozen anchor",
+                                     pair_name,
+                                     config_.market_data
+                                         .cex_freshness_threshold_sec);
+                    }
                 }
                 spdlog::warn("[Engine] Step 7: {} no order-book reference "
                              "(bid={} ask={}) -- clearing ladder to prevent "

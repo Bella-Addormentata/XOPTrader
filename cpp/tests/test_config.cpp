@@ -646,31 +646,41 @@ TEST(ConfigParserTest, ReviveMarket_ParsesTrue) {
     EXPECT_TRUE(cfg.pairs[0].revive_market);
 }
 
-TEST(LadderSurvivesEmptyBook, RequiresBothFlagAndAnchor) {
+TEST(LadderSurvivesEmptyBook, RequiresFlagAndAnchorAndFreshFeed) {
     xop::PairConfig p;
 
-    // Neither flag nor anchor: the pre-revive behaviour, ladder clears.
+    // Without the opt-in, no combination of anchor/freshness quotes: an
+    // operator who did not ask for revival keeps the old behaviour.
     p.revive_market = false;
-    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true,  false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true,  true));
 
-    // Anchor without the opt-in: an operator who did not ask for revival
-    // must keep the old conservative behaviour.
-    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true));
-
-    // Opt-in without an anchor: this is quoting blind -- the exact thing
-    // the clear exists to stop.  The flag must NOT override it.
     p.revive_market = true;
-    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false));
 
-    // Opt-in with a live anchor: the one combination that quotes.
-    EXPECT_TRUE(xop::ladder_survives_empty_book(&p, true));
+    // Opt-in without an anchor: quoting blind -- the exact thing the
+    // clear exists to stop.  The flag must NOT override it.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, true));
+
+    // Opt-in with an anchor whose FEED is stale: the frozen-anchor trap.
+    // The solve keeps a self-refreshing timestamp, so the estimate looks
+    // alive long after the feed died; a revived ladder would stand at
+    // yesterday's price while the market walks away.  Must not quote.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true, false));
+
+    // Opt-in + live anchor + fresh feed: the one combination that quotes.
+    EXPECT_TRUE(xop::ladder_survives_empty_book(&p, true, true));
 }
 
 TEST(LadderSurvivesEmptyBook, NullPairConfigNeverSurvives) {
     // A pair name that resolves to no PairConfig (defensive: find_pair_config
     // returned nullptr) must behave like the flag is off.
-    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true));
-    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true,  true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true,  false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false, true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false, false));
 }
 
 }  // namespace

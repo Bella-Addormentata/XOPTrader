@@ -171,13 +171,25 @@ struct PairConfig {
 ///
 /// With both filtered book sides at zero the ladder is normally cleared --
 /// no reference exists to validate prices against.  A pair opted into
-/// revive_market keeps its ladder ONLY when a live external fair-value
-/// estimate anchored the quote centre this heartbeat; reviving without an
-/// anchor would be exactly the unguarded quoting the clear exists to stop.
+/// revive_market keeps its ladder ONLY when BOTH hold this heartbeat:
+///
+///  * a live external fair-value estimate anchored the quote centre
+///    (has_external_estimate), and
+///  * the price FEED behind that estimate is genuinely fresh
+///    (anchor_feed_fresh -- seconds since the last *successful* fetch,
+///    not the solve's self-refreshing timestamp).
+///
+/// The second condition is what stops the frozen-anchor loss: with the
+/// feed down, the solve keeps re-stamping the old price forever, every
+/// remaining price check keys off that same frozen number, and a revived
+/// ladder would stand at yesterday's price while the market walks away.
+/// A stale feed therefore reverts the pair to the pre-revive behaviour --
+/// silence -- which loses nothing.
 inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
-                                       bool has_external_estimate) {
+                                       bool has_external_estimate,
+                                       bool anchor_feed_fresh) {
     return pair_cfg != nullptr && pair_cfg->revive_market
-        && has_external_estimate;
+        && has_external_estimate && anchor_feed_fresh;
 }
 
 // ---------------------------------------------------------------------------
