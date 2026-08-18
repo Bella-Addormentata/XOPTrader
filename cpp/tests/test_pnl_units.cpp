@@ -205,4 +205,32 @@ TEST(AffordableBaseMojos, NoOverflowAtRealisticExtremes) {
     EXPECT_EQ(cap, static_cast<xop::Mojo>(9e12));
 }
 
+
+TEST(TryAffordableBaseMojos, DistinguishesUnavailableFromGenuineZero) {
+    // Unavailable (no mid): nullopt -- the caller SKIPS its cap.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch), 0.0,
+        static_cast<double>(kCatDenom)).has_value());
+
+    // Unavailable (overflow -- an effectively unlimited cap): nullopt.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        9e18, static_cast<double>(kBaseXch), 1e-9,
+        static_cast<double>(kBaseXch)).has_value());
+
+    // Genuine zero: a zero budget affords zero base mojos -- present, 0,
+    // and the cap MUST be applied (this is the fee-reserve-only wallet).
+    auto zero_budget = xop::try_affordable_base_mojos(
+        0.0, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    ASSERT_TRUE(zero_budget.has_value());
+    EXPECT_EQ(*zero_budget, 0);
+
+    // Genuine zero: a dust budget that funds less than one base mojo.
+    auto dust = xop::try_affordable_base_mojos(
+        500.0, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    ASSERT_TRUE(dust.has_value());
+    EXPECT_EQ(*dust, 0);
+}
+
 }  // namespace

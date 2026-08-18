@@ -13,6 +13,7 @@
 #include <cmath>
 #include <cstdint>
 #include <limits>
+#include <optional>
 #include <string>
 #include <chrono>
 
@@ -84,7 +85,8 @@ inline double quote_mojos_for(double size_base_mojos,
 // Returns 0 when the mid or either denomination is non-positive -- callers
 // treat 0 as "conversion unavailable, skip" (a pair with no mid is already
 // cleared by the no-order-book guard before posting).
-// Computation in double to avoid int64 overflow; rounded to nearest.
+// Computation in double to avoid int64 overflow; rounding policy is
+// explicit per public helper (affordability floors, reserves ceil).
 // ---------------------------------------------------------------------------
 namespace detail {
 // Shared core: quote mojos -> base mojos at the mid, UNROUNDED, with the
@@ -115,17 +117,35 @@ inline double base_mojos_at_mid(double quote_mojos,
 }  // namespace detail
 
 /// How many base mojos the quote amount can actually fund -- FLOORS, so a
-/// cap derived from it never admits a mojo the wallet cannot back.  0 means
-/// "conversion unavailable, skip the cap" (never zero a pool on it).
+/// cap derived from it never admits a mojo the wallet cannot back.
+///
+/// nullopt means the conversion is UNAVAILABLE (no mid, or the result
+/// overflows int64 -- an effectively unlimited cap): the caller must SKIP
+/// its cap rather than treat it as zero.  A present value of 0 is a
+/// legitimate zero cap (the budget funds less than one base mojo) and MUST
+/// be applied -- conflating the two is how a floor-raised pool survives on
+/// fee-reserve money.
+inline std::optional<Mojo> try_affordable_base_mojos(
+    double quote_mojos,
+    double quote_denom,
+    double market_mid,
+    double base_denom) noexcept
+{
+    const double result = detail::base_mojos_at_mid(
+        quote_mojos, quote_denom, market_mid, base_denom);
+    if (result < 0.0) return std::nullopt;
+    return static_cast<Mojo>(std::floor(result));
+}
+
+/// Convenience form for call sites whose skip-vs-zero distinction is
+/// handled elsewhere: unavailable collapses to 0.
 inline Mojo affordable_base_mojos(double quote_mojos,
                                   double quote_denom,
                                   double market_mid,
                                   double base_denom) noexcept
 {
-    const double result = detail::base_mojos_at_mid(
-        quote_mojos, quote_denom, market_mid, base_denom);
-    if (result < 0.0) return Mojo{0};
-    return static_cast<Mojo>(std::floor(result));
+    return try_affordable_base_mojos(
+        quote_mojos, quote_denom, market_mid, base_denom).value_or(Mojo{0});
 }
 
 /// The base-mojo size of a quote-side reserve -- CEILS, so a holdback

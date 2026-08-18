@@ -5089,12 +5089,19 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             if (pair_cfg->quote_asset_id == "xch"
                 && pair_cfg->base_mojos_per_unit > 0)
             {
-                const Mojo bid_cap_base = affordable_base_mojos(
+                // try_: nullopt (no mid / overflow) means SKIP -- the
+                // no-order-book guard owns the no-mid case, and an
+                // int64-overflowing cap is effectively unlimited.  A
+                // present 0 is a genuine zero cap (budget <= reserve, or
+                // it funds less than one base mojo) and must be applied,
+                // or a floor-raised pool survives on fee-reserve money.
+                const auto bid_cap = try_affordable_base_mojos(
                     static_cast<double>(xch_budget),
                     static_cast<double>(kMojosPerXch),
                     market_mid,
                     static_cast<double>(pair_cfg->base_mojos_per_unit));
-                if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                if (bid_cap.has_value() && avail_capital > bid_cap_base) {
                     const double pool_units =
                         static_cast<double>(avail_capital)
                         / static_cast<double>(pair_cfg->base_mojos_per_unit);
