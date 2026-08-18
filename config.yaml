@@ -55,9 +55,12 @@ pairs:
   name: XCH/DBX
   quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
 - base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
-  enabled: false
+  enabled: true
+  min_offer_size_units_override: 1.0
+  min_profit_margin_bps_override: 350
   name: wmilliETH.b/XCH
   quote_asset_id: xch
+  tier_spacing_bps_override: [350, 380, 420, 460, 490, 520]
 - base_asset_id: 4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f
   enabled: false
   name: wmilliETH/XCH
@@ -165,6 +168,7 @@ strategy:
   asset_target_allocations:
     BYC: 0.2
     DBX: 0.1
+    WMILLIETH.B: 0.03
     WUSDC.B: 0.25
     XCH: 0.45
   ratio_target_by_pair:
@@ -175,6 +179,7 @@ strategy:
   asset_target_tolerances:
     BYC: 0.1
     DBX: 0.04
+    WMILLIETH.B: 0.02
     WUSDC.B: 0.2
     XCH: 0.2
   ratio_band_enter_by_pair:
