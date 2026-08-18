@@ -3105,15 +3105,30 @@ AppConfig load_config(const std::string& path,
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
 
-    // Cross-section: revive_market quotes from the CoinGecko anchor and
-    // is freshness-gated by market_data.cex_freshness_threshold_sec.  A
-    // non-positive threshold legally disables CEX freshness decay for the
-    // published-mid blend -- but for revival it would read as "never
-    // fresh" and the revived pair would sit silent forever with only a
-    // per-heartbeat warning to explain why.  Loud, not silent.
-    if (cfg.market_data.cex_freshness_threshold_sec <= 0.0) {
+    // Cross-section: revive_market quotes from the fair-value solve, so
+    // every feed that can dominate that solve must be allowed to EXPIRE.
+    // Two legal "disable expiry" settings exist for other purposes, and
+    // each would let a revived ladder quote a frozen price forever:
+    //
+    //  * market_data.cex_freshness_threshold_sec <= 0 disables CEX
+    //    freshness decay for the published-mid blend -- but the revive
+    //    gate reads it as "never fresh" and the pair would sit silent
+    //    with only a per-heartbeat warning to explain why;
+    //  * strategy.fair_value_amm_max_age_sec <= 0 admits AMM edges of
+    //    ANY age into the graph (engine.cpp Step 7): CoinGecko can stay
+    //    fresh while a frozen TibetSwap edge pins the solve, and the
+    //    CEX-only runtime gate cannot see it.  With a finite max age a
+    //    frozen AMM edge ages out of the graph on its own (the AMM path
+    //    tracks genuine feed age), which is exactly the guarantee
+    //    revival needs.
+    //
+    // Loud, not silent: refuse both combinations at load.
+    if (cfg.market_data.cex_freshness_threshold_sec <= 0.0
+        || cfg.strategy.fair_value_amm_max_age_sec <= 0.0)
+    {
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
-            if (cfg.pairs[i].revive_market) {
+            if (!cfg.pairs[i].revive_market) continue;
+            if (cfg.market_data.cex_freshness_threshold_sec <= 0.0) {
                 throw ConfigError(
                     "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
                     + "): revive_market requires "
@@ -3125,6 +3140,16 @@ AppConfig load_config(const std::string& path,
                       "restore the threshold (default 120) or remove "
                       "revive_market from this pair.");
             }
+            throw ConfigError(
+                "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
+                + "): revive_market requires "
+                  "strategy.fair_value_amm_max_age_sec > 0 (got "
+                + std::to_string(cfg.strategy.fair_value_amm_max_age_sec)
+                + "). With AMM edge expiry disabled, a frozen TibetSwap "
+                  "feed could pin the fair-value solve while CoinGecko "
+                  "stays fresh, and the revived ladder would quote that "
+                  "frozen price; either restore the max age (default 300) "
+                  "or remove revive_market from this pair.");
         }
     }
 

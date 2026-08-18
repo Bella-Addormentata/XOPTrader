@@ -746,4 +746,36 @@ TEST(ConfigParserTest, DisabledFreshnessThresholdWithoutRevive_IsLegal) {
     EXPECT_DOUBLE_EQ(cfg.market_data.cex_freshness_threshold_sec, 0.0);
 }
 
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledAmmExpiry_Throws) {
+    // fair_value_amm_max_age_sec: 0 legally admits AMM edges of any age
+    // into the fair-value graph.  A revived pair quoting from that graph
+    // could then stand on a frozen TibetSwap price while CoinGecko stays
+    // fresh -- the one feed the runtime gate cannot see.  Refused at load.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  fair_value_amm_max_age_sec: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledAmmExpiryWithoutRevive_IsLegal) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  fair_value_amm_max_age_sec: 0");
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_amm_max_age_sec, 0.0);
+}
+
 }  // namespace

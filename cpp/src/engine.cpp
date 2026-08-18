@@ -4383,6 +4383,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // that state produced silence, and silence is the correct fallback.
         // (A feed that returns fresh-but-wrong prices is not catchable at
         // this layer; the outage/rate-limit case -- the common one -- is.)
+        // CEX freshness is checked here at runtime; AMM freshness needs no
+        // runtime twin because AMM edges carry genuine feed age and are
+        // dropped from the graph past fair_value_amm_max_age_sec -- and
+        // load_config refuses revive_market when that expiry is disabled,
+        // so a frozen TibetSwap edge cannot outlive its max age on a
+        // revived pair.
         const bool quote_anchor_feed_fresh =
             coingecko_feed_fresh_for_revival(
                 !coingecko_prices_.empty(),
