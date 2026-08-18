@@ -4633,17 +4633,27 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // caps, an Avellaneda+risk-sized pool can exceed what the CAT
         // wallet actually holds, producing offers the wallet can't back.
         if (pair_cfg && config_.strategy.wallet_balance_caps_enabled) {
-            auto cat_confirmed = [&](const std::string& asset_id) -> Mojo {
+            // nullopt = the balance has NEVER been observed (the cache is
+            // populated inside Step 8's per-pair loop, which skips empty
+            // ladders -- treating a miss as zero would cap this pair's
+            // ladder empty and deadlock it out of the very step that
+            // fills the cache).  A present entry with confirmed == 0 is a
+            // freshly observed zero and the cap applies.
+            auto cat_confirmed = [&](const std::string& asset_id)
+                -> std::optional<Mojo> {
                 auto it = cached_wallet_balances_.find(asset_id);
-                return (it != cached_wallet_balances_.end())
-                           ? it->second.confirmed
-                           : Mojo{0};
+                if (it == cached_wallet_balances_.end()) return std::nullopt;
+                return it->second.confirmed;
             };
 
             // Ask side: convert base wallet (in base mojos) directly.
+            // Present zero caps to zero; unknown skips (see cat_confirmed).
             if (pair_cfg->base_asset_id != "xch") {
-                const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
-                if (base_bal > 0 && avail_inventory > base_bal) {
+                const auto base_bal_opt =
+                    cat_confirmed(pair_cfg->base_asset_id);
+                const Mojo base_bal = base_bal_opt.value_or(Mojo{0});
+                if (base_bal_opt.has_value()
+                    && avail_inventory > base_bal) {
                     spdlog::warn("[Engine] Step 7: {} ask pool {:.4f} {} > "
                                  "confirmed {:.4f} {} -- CAPPED (CAT wallet)",
                                  pair_name,
@@ -4666,8 +4676,10 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 && pair_cfg->quote_mojos_per_unit > 0
                 && pair_cfg->base_mojos_per_unit > 0)
             {
-                const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
-                {
+                const auto quote_bal_opt =
+                    cat_confirmed(pair_cfg->quote_asset_id);
+                if (quote_bal_opt.has_value()) {
+                    const Mojo quote_bal = *quote_bal_opt;
                     const double quote_units =
                         static_cast<double>(quote_bal)
                         / static_cast<double>(pair_cfg->quote_mojos_per_unit);

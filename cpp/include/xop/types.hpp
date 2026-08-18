@@ -83,11 +83,17 @@ inline double quote_mojos_for(double size_base_mojos,
 // model inert (TODO.md S3).  The v0.7.38 XCH wallet cap on the same branch
 // compared the same mismatched units and could never fire.
 //
-// Returns 0 when the mid or either denomination is non-positive -- callers
-// treat 0 as "conversion unavailable, skip" (a pair with no mid is already
-// cleared by the no-order-book guard before posting).
-// Computation in double to avoid int64 overflow; rounding policy is
-// explicit per public helper (affordability floors, reserves ceil).
+// Availability contract (safety-critical -- see the round-3/4 review):
+//   * try_affordable_base_mojos: nullopt = unavailable (no mid, non-finite
+//     input, or an int64-overflowing -- effectively unlimited -- cap);
+//     callers SKIP their cap.  A present value, INCLUDING 0, is a genuine
+//     cap and must be applied.
+//   * affordable_base_mojos: convenience collapse (unavailable -> 0) for
+//     call sites whose skip-vs-zero distinction is handled elsewhere.
+//   * reserve_base_mojos: 0 = unavailable (skip the subtraction); an
+//     int64-overflowing reserve exceeds every pool and SATURATES.
+// Computation in double; rounding policy is explicit per public helper
+// (affordability floors, reserves ceil).
 // ---------------------------------------------------------------------------
 namespace detail {
 // Shared core: quote mojos -> base mojos at the mid, UNROUNDED, with the
