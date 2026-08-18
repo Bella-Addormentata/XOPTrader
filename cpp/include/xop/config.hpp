@@ -137,6 +137,18 @@ struct PairConfig {
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
 
+    // -- Market revival -----------------------------------------------------
+    // Opt-in for a pair whose third-party book is expected to be empty or
+    // stale (every offer outside the 20% outlier band).  Normally Step 7
+    // refuses to post a ladder with no order-book reference at all; with
+    // revive_market the ladder may survive an empty FILTERED book -- but
+    // ONLY while a live external fair-value estimate anchors the centre
+    // (CoinGecko/AMM via the fair-value graph).  The outlier filter itself
+    // is never bypassed: stale junk stays out of pricing, this only lets
+    // the bot quote from the anchor instead of going silent.  With no
+    // external estimate the pair still refuses to quote, flag or not.
+    bool   revive_market{false};
+
     // -- Stablecoin peg configuration ---------------------------------------
     // When is_stablecoin is true, the depeg detector monitors this pair
     // and can flag it as suspected-failed, pulling all quotes.
@@ -154,6 +166,19 @@ struct PairConfig {
     bool   stablecoin_flat_sizing{false};    // Skip adverse-selection sizing.
     bool   stablecoin_skip_gap_aware{false}; // Skip gap-aware spacing.
 };
+
+/// Step 7's empty-book decision, factored out so it is unit-testable.
+///
+/// With both filtered book sides at zero the ladder is normally cleared --
+/// no reference exists to validate prices against.  A pair opted into
+/// revive_market keeps its ladder ONLY when a live external fair-value
+/// estimate anchored the quote centre this heartbeat; reviving without an
+/// anchor would be exactly the unguarded quoting the clear exists to stop.
+inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
+                                       bool has_external_estimate) {
+    return pair_cfg != nullptr && pair_cfg->revive_market
+        && has_external_estimate;
+}
 
 // ---------------------------------------------------------------------------
 // Core Avellaneda-Stoikov / GLFT market-making algorithm parameters.

@@ -613,4 +613,64 @@ TEST(ConfigParserTest, PublishedMidBandRejectsNegativeValues) {
     EXPECT_THROW(xop::load_config(tmp2.path()), xop::ConfigError);
 }
 
+
+// ============================================================================
+// revive_market -- the empty-book quoting opt-in.
+//
+// A pair whose third-party book is expected to be dead (wmilliETH.b/XCH was
+// the motivating case: every live offer sat 20%+ from fair, so the outlier
+// filter emptied the book and Step 7 cleared the ladder every heartbeat).
+// The flag lets the ladder survive an empty FILTERED book, but only while a
+// live external estimate anchors the centre -- the predicate below is the
+// exact decision Step 7 executes, factored out so this file can pin it.
+// ============================================================================
+
+TEST(ConfigParserTest, ReviveMarket_DefaultsFalse) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].revive_market);
+}
+
+TEST(ConfigParserTest, ReviveMarket_ParsesTrue) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_TRUE(cfg.pairs[0].revive_market);
+}
+
+TEST(LadderSurvivesEmptyBook, RequiresBothFlagAndAnchor) {
+    xop::PairConfig p;
+
+    // Neither flag nor anchor: the pre-revive behaviour, ladder clears.
+    p.revive_market = false;
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false));
+
+    // Anchor without the opt-in: an operator who did not ask for revival
+    // must keep the old conservative behaviour.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true));
+
+    // Opt-in without an anchor: this is quoting blind -- the exact thing
+    // the clear exists to stop.  The flag must NOT override it.
+    p.revive_market = true;
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false));
+
+    // Opt-in with a live anchor: the one combination that quotes.
+    EXPECT_TRUE(xop::ladder_survives_empty_book(&p, true));
+}
+
+TEST(LadderSurvivesEmptyBook, NullPairConfigNeverSurvives) {
+    // A pair name that resolves to no PairConfig (defensive: find_pair_config
+    // returned nullptr) must behave like the flag is off.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false));
+}
+
 }  // namespace

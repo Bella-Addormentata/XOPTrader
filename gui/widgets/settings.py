@@ -615,11 +615,12 @@ class SettingsWidget(QWidget):
         layout.addLayout(toolbar)
 
         # -- Pairs table --
-        self._pairs_table = QTableWidget(0, 7)
+        self._pairs_table = QTableWidget(0, 8)
         self._pairs_table.setHorizontalHeaderLabels(
             [
                 "Enabled", "Name", "Base Asset", "Quote Asset",
-                "Ratio Target Override (%)", "Suggested (%)", "Actions",
+                "Ratio Target Override (%)", "Suggested (%)", "Revive",
+                "Actions",
             ]
         )
         header = self._pairs_table.horizontalHeader()
@@ -630,6 +631,7 @@ class SettingsWidget(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self._pairs_table.setAlternatingRowColors(True)
         self._pairs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -2178,6 +2180,18 @@ class SettingsWidget(QWidget):
             )
             merged["enabled"] = enabled
 
+            revive_container = self._pairs_table.cellWidget(row, 6)
+            revive_cb = (
+                revive_container.findChild(QCheckBox)
+                if revive_container else None
+            )
+            # Written only when set: an unticked box drops the key so the
+            # YAML stays clean for the pairs that never asked for revival.
+            if revive_cb is not None and revive_cb.isChecked():
+                merged["revive_market"] = True
+            else:
+                merged.pop("revive_market", None)
+
             ratio_text = ratio_item.text().strip() if ratio_item else ""
             ratio_text = ratio_text.replace("%", "")
             if ratio_text:
@@ -2731,6 +2745,30 @@ class SettingsWidget(QWidget):
         self._pairs_table.setItem(row, 5, suggested_item)
         self._apply_suggested_to_row(row)
 
+        # Revive-market opt-in.  For a pair whose third-party book is
+        # expected to be dead or stale: normally the engine refuses to quote
+        # with no order-book reference at all; with this set it quotes from
+        # the external fair-value anchor (CoinGecko/AMM) instead of going
+        # silent.  Junk offers stay filtered out of pricing either way, and
+        # the engine still refuses to quote when no anchor is live.
+        revive_cb = QCheckBox()
+        revive_cb.setChecked(bool(pair.get("revive_market", False)))
+        revive_cb.setToolTip(
+            "Revive a dead market: quote from the external fair-value "
+            "anchor (CoinGecko/AMM) even when every third-party offer is "
+            "stale or absent.  Without this, a pair whose book fails the "
+            "20% sanity filter posts nothing.  The engine still refuses "
+            "to quote if no external anchor is live.  Requires an engine "
+            "restart to take effect."
+        )
+        revive_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
+        revive_container = QWidget()
+        revive_layout = QHBoxLayout(revive_container)
+        revive_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        revive_layout.setContentsMargins(0, 0, 0, 0)
+        revive_layout.addWidget(revive_cb)
+        self._pairs_table.setCellWidget(row, 6, revive_container)
+
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
@@ -2750,7 +2788,7 @@ class SettingsWidget(QWidget):
             )
         )
         actions_layout.addWidget(remove_btn)
-        self._pairs_table.setCellWidget(row, 6, actions)
+        self._pairs_table.setCellWidget(row, 7, actions)
 
     def _on_add_pair(self) -> None:
         """Open the Add Pair dialog and append the result to the table."""

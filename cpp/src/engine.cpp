@@ -5434,13 +5434,35 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
         // SAFETY: When we have NO order-book reference at all (both sides
         // zero), we cannot validate any prices.  Refuse to post offers
-        // rather than risk mispricing.
+        // rather than risk mispricing -- unless the pair is opted into
+        // revive_market AND a live external estimate anchored the centre
+        // this heartbeat (quote_has_external_est).  Reviving a dead book
+        // from a real anchor is safe: the centre is w_ext=1.0 external,
+        // the width floor and the fair-value band clamp both still bound
+        // every tier, and the outlier filter has already kept the stale
+        // junk out of pricing.  Reviving with NO anchor would be exactly
+        // the unguarded quoting this clear exists to stop, so that case
+        // still clears regardless of the flag.
         if (snap.best_bid <= 0 && snap.best_ask <= 0) {
-            spdlog::warn("[Engine] Step 7: {} no order-book reference "
-                         "(bid={} ask={}) -- clearing ladder to prevent "
-                         "unguarded offers", pair_name,
-                         snap.best_bid, snap.best_ask);
-            pcs.ladder.clear();
+            if (ladder_survives_empty_book(pair_cfg,
+                                           quote_has_external_est)) {
+                spdlog::info("[Engine] Step 7: {} revive market: empty "
+                             "filtered book but external anchor is live "
+                             "(combined_sigma={:.0f}bps) -- quoting from "
+                             "the anchor", pair_name,
+                             quote_combined_sigma_bps);
+            } else {
+                if (pair_cfg && pair_cfg->revive_market) {
+                    spdlog::warn("[Engine] Step 7: {} revive_market set "
+                                 "but no external estimate -- refusing to "
+                                 "quote blind", pair_name);
+                }
+                spdlog::warn("[Engine] Step 7: {} no order-book reference "
+                             "(bid={} ask={}) -- clearing ladder to prevent "
+                             "unguarded offers", pair_name,
+                             snap.best_bid, snap.best_ask);
+                pcs.ladder.clear();
+            }
         }
 
         if (snap.best_bid > 0 || snap.best_ask > 0) {

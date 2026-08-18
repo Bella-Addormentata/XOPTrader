@@ -552,6 +552,12 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
             p.tier_size_pct_override = std::move(tp);
         }
 
+        // -- Market revival (optional) --------------------------------------
+        if (item["revive_market"] && item["revive_market"].IsDefined()
+            && !item["revive_market"].IsNull()) {
+            p.revive_market = item["revive_market"].as<bool>();
+        }
+
         // -- Stablecoin peg configuration (optional) ------------------------
         if (item["is_stablecoin"] && item["is_stablecoin"].IsDefined()
             && !item["is_stablecoin"].IsNull()) {
@@ -2349,6 +2355,9 @@ void log_config_summary(const AppConfig& cfg)
     for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
         out << "  " << i << ": " << cfg.pairs[i].name
             << (cfg.pairs[i].enabled ? " [enabled]" : " [disabled]");
+        if (cfg.pairs[i].revive_market) {
+            out << " [revive]";
+        }
         if (cfg.pairs[i].is_stablecoin) {
             out << " [stablecoin peg=" << cfg.pairs[i].peg_target
                 << " warn=" << cfg.pairs[i].depeg_warn_pct

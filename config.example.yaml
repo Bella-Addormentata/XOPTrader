@@ -111,6 +111,14 @@ pairs:
     quote_asset_id: "xch"
     name: "wmilliETH.b/XCH"
     enabled: true
+    # [OPTIONAL, default: false] Revive a dead market.  Normally a pair whose
+    # third-party offers all fail the 20% sanity filter has an empty book and
+    # the engine refuses to quote it at all.  With revive_market the ladder is
+    # priced from the external fair-value anchor (CoinGecko/AMM) instead of
+    # going silent.  The filter itself is never bypassed -- stale junk stays
+    # out of pricing -- and the engine still refuses to quote when no external
+    # anchor is live.  Editable per pair in Settings -> Trading Pairs.
+    revive_market: false
   - base_asset_id: "4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f"  # wmilliETH
     quote_asset_id: "xch"
     name: "wmilliETH/XCH"
