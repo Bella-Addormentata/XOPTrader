@@ -15,6 +15,7 @@
 #include <xop/types.hpp>
 
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -231,6 +232,18 @@ TEST(TryAffordableBaseMojos, DistinguishesUnavailableFromGenuineZero) {
         static_cast<double>(kCatDenom));
     ASSERT_TRUE(dust.has_value());
     EXPECT_EQ(*dust, 0);
+
+    // Unavailable (mid = +inf): a finite quote divided by +inf is a clean
+    // 0.0 that the result check alone cannot tell from a genuine zero --
+    // the INPUT check must reject it first.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch),
+        std::numeric_limits<double>::infinity(),
+        static_cast<double>(kCatDenom)).has_value());
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch),
+        std::numeric_limits<double>::quiet_NaN(),
+        static_cast<double>(kCatDenom)).has_value());
 }
 
 }  // namespace

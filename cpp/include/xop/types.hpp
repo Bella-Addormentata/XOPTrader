@@ -97,6 +97,13 @@ inline double base_mojos_at_mid(double quote_mojos,
                                 double market_mid,
                                 double base_denom) noexcept
 {
+    // Non-finite INPUTS must read as unavailable before any arithmetic:
+    // market_mid == +inf divides a finite quote to a clean 0.0, which the
+    // result check below cannot tell from a genuine zero cap.
+    if (!std::isfinite(quote_mojos) || !std::isfinite(quote_denom)
+        || !std::isfinite(market_mid) || !std::isfinite(base_denom)) {
+        return -1.0;
+    }
     if (quote_denom <= 0.0 || base_denom <= 0.0 || market_mid <= 0.0) {
         return -1.0;
     }

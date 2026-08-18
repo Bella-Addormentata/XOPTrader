@@ -4667,18 +4667,23 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 && pair_cfg->base_mojos_per_unit > 0)
             {
                 const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
-                if (quote_bal > 0) {
+                {
                     const double quote_units =
                         static_cast<double>(quote_bal)
                         / static_cast<double>(pair_cfg->quote_mojos_per_unit);
                     // Same conversion as the XCH-quote cap and the fee
                     // reserve: one formula, one definition (types.hpp).
-                    const Mojo bid_cap_base = affordable_base_mojos(
+                    // try_: a present 0 (zero or dust CAT balance -- the
+                    // floor of a 0.5..1-mojo affordability is 0) is a
+                    // genuine cap and must be applied; only a truly
+                    // unavailable conversion (no mid / overflow) skips.
+                    const auto bid_cap = try_affordable_base_mojos(
                         static_cast<double>(quote_bal),
                         static_cast<double>(pair_cfg->quote_mojos_per_unit),
                         market_mid,
                         static_cast<double>(pair_cfg->base_mojos_per_unit));
-                    if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                    const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                    if (bid_cap.has_value() && avail_capital > bid_cap_base) {
                         spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
                                      "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "
                                      "-- CAPPED (CAT wallet)",
@@ -5058,7 +5063,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // deducted upstream.  Applied here, after every pool-raising
         // transform, against confirmed-minus-reserve, it is the last word:
         // no later step in this function touches the pool sizes.
-        if (pair_cfg && xch_confirmed_balance_ > 0) {
+        //
+        // No `> 0` guard on the balance: the refresh KEEPS the previous
+        // cached value on RPC failure (see the Step 7 balance query), so a
+        // zero here means genuinely zero -- or never fetched yet at
+        // startup -- and both must cap pools to zero rather than let a
+        // strategy-sized pool through unchecked.
+        if (pair_cfg) {
             const Mojo reserve_mojos =
                 (config_.strategy.fee_reserve_xch > 0.0)
                     ? static_cast<Mojo>(std::llround(
