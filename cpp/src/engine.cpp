@@ -20,6 +20,7 @@
 //   ISO/IEC 25000      -- documented step sequencing, single-responsibility
 
 #include "xop/engine.hpp"
+#include "xop/feed_listings.hpp"
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
@@ -1813,7 +1814,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         if (now - coingecko_last_fetch_ >= interval) {
             try {
                 coingecko_prices_ = co_await coingecko_->fetch_prices();
-                coingecko_last_fetch_ = now;
+                // Stamp COMPLETION, not the pre-await capture: a slow or
+                // retried request would otherwise age fresh prices by its
+                // own duration, and the revive freshness gate could read
+                // them as stale the moment they arrive (acute at the
+                // now-legal threshold == polling interval boundary).
+                coingecko_last_fetch_ = std::chrono::steady_clock::now();
             } catch (const std::exception& ex) {
                 // Transient CoinGecko errors should not abort the cycle.
                 spdlog::warn("[Engine] Step 1: CoinGecko fetch failed: {}",
@@ -3918,47 +3924,16 @@ void Engine::update_fair_values()
 
     const auto& sc = config_.strategy;
 
-    // Symbol -> external listing.  units_per_coin is how many units of the
-    // pair's asset make one unit of the listed coin: wmilliETH is 1/1000 of
-    // an ETH, so 1000 pair-units per coin.
-    struct FeedListing { const char* id; double units_per_coin; };
-    static const std::unordered_map<std::string, FeedListing> kFeedListings = {
-        {"xch",       {"chia",           1.0}},
-        {"usdc",      {"usd-coin",       1.0}},
-        {"wusdc",     {"usd-coin",       1.0}},
-        {"dbx",       {"dexie-bucks",    1.0}},
-        {"eth",       {"ethereum",       1.0}},
-        {"weth",      {"ethereum",       1.0}},
-        {"millieth",  {"ethereum",    1000.0}},
-        {"wmillieth", {"ethereum",    1000.0}},
-    };
-
-    // Canonical leg key: lower-cased, with the ".b" bridge suffix removed so
-    // that "wUSDC.b" and "wUSDC" resolve to the same underlying asset.
+    // Symbol table + leg canonicalisation moved to xop/feed_listings.hpp
+    // so load_config()'s revive_market validation answers the same
+    // questions from the same table (a duplicate would drift).  Local
+    // aliases keep the call sites below unchanged.
+    const auto& kFeedListings = feed_listings();
     auto canonical = [](std::string s) {
-        for (auto& c : s) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        if (s.size() > 2 && s.compare(s.size() - 2, 2, ".b") == 0) {
-            s.erase(s.size() - 2);
-        }
-        return s;
+        return canonical_feed_symbol(std::move(s));
     };
-
-    // Split "BASE/QUOTE" into its two canonical leg keys.
-    auto split_legs = [&](const std::string& pair_name)
-        -> std::optional<std::pair<std::string, std::string>> {
-        const auto pos = pair_name.find('/');
-        if (pos == std::string::npos || pos == 0
-            || pos + 1 >= pair_name.size()) {
-            return std::nullopt;
-        }
-        auto base  = canonical(pair_name.substr(0, pos));
-        auto quote = canonical(pair_name.substr(pos + 1));
-        if (base.empty() || quote.empty() || base == quote) {
-            return std::nullopt;
-        }
-        return std::make_pair(std::move(base), std::move(quote));
+    auto split_legs = [](const std::string& pair_name) {
+        return split_pair_legs(pair_name);
     };
 
     // -- Step A: the graph's nodes, one entry per priceable enabled pair ----
@@ -4373,6 +4348,28 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 market_mid = blend.center;
             }
         }
+
+        // [REVIVE-FRESHNESS 2026-08-18] Age of the CoinGecko FEED, not of
+        // the solve.  coingecko_last_fetch_ advances only on a SUCCESSFUL
+        // fetch (Step 1), while every downstream timestamp the staleness
+        // detectors look at (cex_updated_at, fair_value_updated_at) is
+        // re-stamped each heartbeat from the cache and so can never expire.
+        // The revive path must not quote from a frozen feed: pre-revive
+        // that state produced silence, and silence is the correct fallback.
+        // (A feed that returns fresh-but-wrong prices is not catchable at
+        // this layer; the outage/rate-limit case -- the common one -- is.)
+        // CEX freshness is checked here at runtime; AMM freshness needs no
+        // runtime twin because AMM edges carry genuine feed age and are
+        // dropped from the graph past fair_value_amm_max_age_sec -- and
+        // load_config refuses revive_market when that expiry is disabled,
+        // so a frozen TibetSwap edge cannot outlive its max age on a
+        // revived pair.
+        const bool quote_anchor_feed_fresh =
+            coingecko_feed_fresh_for_revival(
+                !coingecko_prices_.empty(),
+                coingecko_last_fetch_,
+                std::chrono::steady_clock::now(),
+                config_.market_data.cex_freshness_threshold_sec);
 
         // Volatility (hoisted above the centre computation: the A-S
         // reservation offset below needs the honest annualized sigma).
@@ -4830,6 +4827,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
         }
 
+        // Set inside the drift-guard block below, read by the deploy-idle
+        // floor after it.  The raw scales (not booleans) so the floor's
+        // helper can distinguish a hard zero (STOPPED -- acquired asset
+        // past target + max_factor*tol; must not re-inflate) from a mere
+        // taper (still acquiring; may be floored).
+        double drift_bid_scale = 1.0;
+        double drift_ask_scale = 1.0;
+
         // -- Asset-level soft drift guard ---------------------------------
         // Acts as a "soft wall" on top of pair-level ratio rebalancing:
         // when an asset's actual portfolio fraction is more than `tol`
@@ -4911,6 +4916,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // Bid acquires base, spends quote.  Ask acquires quote, spends base.
             const double bid_scale = acquire_scale(base_key);
             const double ask_scale = acquire_scale(quote_key);
+            drift_bid_scale = bid_scale;
+            drift_ask_scale = ask_scale;
 
             if (bid_scale < 0.999 || ask_scale < 0.999) {
                 const Mojo old_bid = avail_capital;
@@ -4943,6 +4950,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // suppressed downstream by the dust filter.  Respects ratio
         // rebalance mode: only the "acquire" side is floored in non-neutral
         // modes (matches the intent of one-sided ratio rebalancing).
+        //
+        // Respects the drift guard's hard zero: a side tapered to exactly
+        // 0.0 was deliberately STOPPED because the acquired asset is past
+        // target + max_factor*tol.  Flooring that side back to min size
+        // would convert the stop into an indefinite min-size bleed (one
+        // more fill per heartbeat, forever) -- on a revived pair with no
+        // book to price against, that bleed is bounded only by the wallet.
         if (pair_cfg
             && config_.strategy.deploy_idle_inventory_enabled
             && pair_cfg->base_mojos_per_unit > 0
@@ -4973,7 +4987,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
             // Bid floor: requires quote-asset wallet to cover min_pool in base
             // units at the current mid.
-            if (floor_bid && min_pool > 0 && avail_capital < min_pool && market_mid > 0.0
+            if (floor_bid && drift_bid_scale <= 0.0
+                && avail_capital < min_pool) {
+                spdlog::info("[Engine] Step 7: {} deploy-idle bid floor "
+                             "suppressed: drift guard hard-zeroed this "
+                             "side (acquired asset past its band)",
+                             pair_name);
+            }
+            if (min_pool > 0 && market_mid > 0.0
                 && pair_cfg->quote_mojos_per_unit > 0)
             {
                 const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
@@ -4982,36 +5003,49 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     / static_cast<double>(pair_cfg->quote_mojos_per_unit);
                 const double required_quote_units =
                     config_.strategy.min_offer_size_units * market_mid;
-                if (quote_units >= required_quote_units) {
+                const Mojo floored = apply_deploy_idle_floor(
+                    avail_capital, min_pool, floor_bid, drift_bid_scale,
+                    quote_units >= required_quote_units);
+                if (floored != avail_capital) {
                     spdlog::info("[Engine] Step 7: {} bid pool floored "
                                  "{} -> {} base mojos (wallet has {:.4f} {}, "
                                  "needs {:.4f} for min {} units)",
                                  pair_name,
                                  avail_capital,
-                                 min_pool,
+                                 floored,
                                  quote_units,
                                  pair_cfg->quote_asset_id,
                                  required_quote_units,
                                  config_.strategy.min_offer_size_units);
-                    avail_capital = min_pool;
+                    avail_capital = floored;
                 }
             }
 
             // Ask floor: requires base-asset wallet to cover min_pool directly.
-            if (floor_ask && min_pool > 0 && avail_inventory < min_pool) {
+            if (floor_ask && drift_ask_scale <= 0.0
+                && avail_inventory < min_pool) {
+                spdlog::info("[Engine] Step 7: {} deploy-idle ask floor "
+                             "suppressed: drift guard hard-zeroed this "
+                             "side (acquired asset past its band)",
+                             pair_name);
+            }
+            if (min_pool > 0) {
                 const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
-                if (base_bal >= min_pool) {
+                const Mojo floored = apply_deploy_idle_floor(
+                    avail_inventory, min_pool, floor_ask, drift_ask_scale,
+                    base_bal >= min_pool);
+                if (floored != avail_inventory) {
                     spdlog::info("[Engine] Step 7: {} ask pool floored "
                                  "{} -> {} base mojos (wallet has {:.4f} {} "
                                  ">= min {} units)",
                                  pair_name,
                                  avail_inventory,
-                                 min_pool,
+                                 floored,
                                  static_cast<double>(base_bal)
                                      / static_cast<double>(pair_cfg->base_mojos_per_unit),
                                  pair_cfg->base_asset_id,
                                  config_.strategy.min_offer_size_units);
-                    avail_inventory = min_pool;
+                    avail_inventory = floored;
                 }
             }
         }
@@ -5434,13 +5468,49 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
         // SAFETY: When we have NO order-book reference at all (both sides
         // zero), we cannot validate any prices.  Refuse to post offers
-        // rather than risk mispricing.
+        // rather than risk mispricing -- unless the pair is opted into
+        // revive_market AND a live external estimate anchored the centre
+        // this heartbeat (quote_has_external_est) AND the feed behind it
+        // is genuinely fresh (quote_anchor_feed_fresh; the solve's own
+        // timestamps self-refresh and can never expire).  Reviving a dead
+        // book from a fresh anchor is bounded: the centre is w_ext=1.0
+        // external, the sigma-scaled width floor bounds every tier, and
+        // the fair-value band clamp additionally bounds it whenever the
+        // solve is trusted.  Reviving with no anchor, or from a frozen
+        // feed, would be exactly the unguarded quoting this clear exists
+        // to stop -- both cases still clear regardless of the flag.
         if (snap.best_bid <= 0 && snap.best_ask <= 0) {
-            spdlog::warn("[Engine] Step 7: {} no order-book reference "
-                         "(bid={} ask={}) -- clearing ladder to prevent "
-                         "unguarded offers", pair_name,
-                         snap.best_bid, snap.best_ask);
-            pcs.ladder.clear();
+            if (ladder_survives_empty_book(pair_cfg,
+                                           quote_has_external_est,
+                                           quote_anchor_feed_fresh)) {
+                spdlog::info("[Engine] Step 7: {} revive market: empty "
+                             "filtered book but external anchor is live "
+                             "(combined_sigma={:.0f}bps) -- quoting from "
+                             "the anchor", pair_name,
+                             quote_combined_sigma_bps);
+            } else {
+                if (pair_cfg && pair_cfg->revive_market) {
+                    if (!quote_has_external_est) {
+                        spdlog::warn("[Engine] Step 7: {} revive_market "
+                                     "set but no external estimate -- "
+                                     "refusing to quote blind", pair_name);
+                    } else if (!quote_anchor_feed_fresh) {
+                        spdlog::warn("[Engine] Step 7: {} revive_market "
+                                     "set but the price feed is stale "
+                                     "(no successful CoinGecko fetch "
+                                     "within {:.0f}s) -- refusing to "
+                                     "quote from a frozen anchor",
+                                     pair_name,
+                                     config_.market_data
+                                         .cex_freshness_threshold_sec);
+                    }
+                }
+                spdlog::warn("[Engine] Step 7: {} no order-book reference "
+                             "(bid={} ask={}) -- clearing ladder to prevent "
+                             "unguarded offers", pair_name,
+                             snap.best_bid, snap.best_ask);
+                pcs.ladder.clear();
+            }
         }
 
         if (snap.best_bid > 0 || snap.best_ask > 0) {

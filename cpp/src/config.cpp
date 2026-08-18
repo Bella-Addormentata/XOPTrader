@@ -15,6 +15,7 @@
 // ISO/IEC 25000 -- clear error messages citing the offending field.
 
 #include "xop/config.hpp"
+#include "xop/feed_listings.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -550,6 +551,12 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
                                   + std::to_string(tp_sum));
             }
             p.tier_size_pct_override = std::move(tp);
+        }
+
+        // -- Market revival (optional) --------------------------------------
+        if (item["revive_market"] && item["revive_market"].IsDefined()
+            && !item["revive_market"].IsNull()) {
+            p.revive_market = item["revive_market"].as<bool>();
         }
 
         // -- Stablecoin peg configuration (optional) ------------------------
@@ -2349,6 +2356,9 @@ void log_config_summary(const AppConfig& cfg)
     for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
         out << "  " << i << ": " << cfg.pairs[i].name
             << (cfg.pairs[i].enabled ? " [enabled]" : " [disabled]");
+        if (cfg.pairs[i].revive_market) {
+            out << " [revive]";
+        }
         if (cfg.pairs[i].is_stablecoin) {
             out << " [stablecoin peg=" << cfg.pairs[i].peg_target
                 << " warn=" << cfg.pairs[i].depeg_warn_pct
@@ -3095,6 +3105,180 @@ AppConfig load_config(const std::string& path,
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
+
+    // Cross-section: revive_market quotes from the fair-value solve with
+    // no order-book reference, so its whole safety envelope is carried by
+    // a handful of strategy/market-data knobs -- and several of them have
+    // legal "disable" settings (0 by convention, .inf by arithmetic) that
+    // exist for other purposes.  Any one of them being disabled lets a
+    // revived ladder quote a frozen or unbounded price:
+    //
+    //  * cex_freshness_threshold_sec -- the runtime gate reads a
+    //    non-positive value as "never fresh" and the pair sits silent;
+    //  * fair_value_amm_max_age_sec  -- <= 0 admits AMM edges of ANY age
+    //    into the graph, so a frozen TibetSwap edge can pin the solve
+    //    while CoinGecko stays fresh;
+    //  * quote_width_sigma_mult      -- 0 removes the sigma term from the
+    //    width floor, the bound the untrusted-solve branch explicitly
+    //    relies on in place of the fair-value clamp;
+    //  * fair_value_stale_sigma_bps_per_print -- 0 disables the term that
+    //    demotes a frozen transitive book edge, so a stale edge keeps
+    //    fixed weight in the solve forever.
+    //
+    // Loud, not silent: refuse the combination at load, naming the pair,
+    // the knob, and the way out.  Table-driven so the next knob someone
+    // finds is a one-line addition, not a new bug class.
+    {
+        const auto usable = [](double v) {
+            return std::isfinite(v) && v > 0.0;
+        };
+        struct ReviveSafetyKnob {
+            const char* name;
+            double      value;
+            double      default_value;
+            const char* why;
+        };
+        const ReviveSafetyKnob knobs[] = {
+            {"market_data.cex_freshness_threshold_sec",
+             cfg.market_data.cex_freshness_threshold_sec, 120.0,
+             "the revive path refuses to quote from a feed whose "
+             "freshness cannot be established"},
+            {"strategy.fair_value_amm_max_age_sec",
+             cfg.strategy.fair_value_amm_max_age_sec, 300.0,
+             "with AMM edge expiry disabled, a frozen TibetSwap feed "
+             "could pin the fair-value solve while CoinGecko stays fresh"},
+            {"strategy.quote_width_sigma_mult",
+             cfg.strategy.quote_width_sigma_mult, 1.0,
+             "the sigma-scaled width floor is the only price bound on a "
+             "revived ladder when the solve exceeds the clamp ceiling; "
+             "disabling it quotes an uncertain estimate tighter than its "
+             "own error bar"},
+            {"strategy.fair_value_stale_sigma_bps_per_print",
+             cfg.strategy.fair_value_stale_sigma_bps_per_print, 5.0,
+             "this is the term that demotes a frozen book edge; without "
+             "it a stale transitive edge keeps fixed weight in the solve "
+             "forever"},
+            {"strategy.fair_value_feed_sigma_bps",
+             cfg.strategy.fair_value_feed_sigma_bps, 100.0,
+             "anchors with sigma <= 0 are discarded by the solver "
+             "(Anchor.sigma_bps must be > 0 to be used), so the revived "
+             "pair would have no CoinGecko anchor and sit silent forever"},
+        };
+        for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+            if (!cfg.pairs[i].revive_market) continue;
+            for (const auto& k : knobs) {
+                if (usable(k.value)) continue;
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires a "
+                    "finite " + k.name + " > 0 (got "
+                    + std::to_string(k.value) + "): " + k.why
+                    + ". Either restore the knob (default "
+                    + std::to_string(k.default_value)
+                    + ") or remove revive_market from this pair.");
+            }
+
+            // Relational checks: the single-knob table cannot see these.
+            //
+            // The freshness window must COVER the polling cadence, or a
+            // perfectly healthy feed oscillates the pair: with a 300s
+            // poll and a 120s window, no fetch is even scheduled between
+            // 120s and 300s, so every revived ladder clears for ~180s of
+            // every successful cycle -- churn, not safety.
+            if (!cfg.coingecko.enabled) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "coingecko.enabled: true -- the revive freshness gate "
+                    "is anchored to the CoinGecko feed, and with the feed "
+                    "off the pair would sit silent forever.");
+            }
+            if (cfg.coingecko.coin_ids.empty()) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires a "
+                    "non-empty coingecko.coin_ids -- every fetch would "
+                    "return an empty price map and the pair would sit "
+                    "silent forever.");
+            }
+
+            // A non-empty list is not enough: the ids must actually cover
+            // THIS pair's legs, or update_fair_values() creates no anchor
+            // for it and the pair sits silent forever holding prices for
+            // coins it does not trade.  Resolved through the same table
+            // the engine uses (xop/feed_listings.hpp), so the two cannot
+            // drift.  Deliberately conservative: revival demands DIRECT
+            // anchors on both legs -- a transitively-anchored solve leans
+            // on other pairs' live books, which is exactly what a revived
+            // pair does not have.
+            {
+                const auto legs = split_pair_legs(cfg.pairs[i].name);
+                if (!legs) {
+                    throw ConfigError(
+                        "pairs[" + std::to_string(i) + "] ("
+                        + cfg.pairs[i].name + "): revive_market requires "
+                        "a \"BASE/QUOTE\" pair name with two distinct "
+                        "legs -- the CoinGecko anchors are resolved from "
+                        "the name.");
+                }
+                const auto& listings = feed_listings();
+                const std::string leg_names[2] = {legs->first, legs->second};
+                for (const auto& leg : leg_names) {
+                    const auto it = listings.find(leg);
+                    if (it == listings.end()) {
+                        throw ConfigError(
+                            "pairs[" + std::to_string(i) + "] ("
+                            + cfg.pairs[i].name + "): revive_market "
+                            "cannot anchor leg \"" + leg + "\" -- it has "
+                            "no CoinGecko feed mapping. Revival quotes "
+                            "from direct anchors on BOTH legs; known "
+                            "mappable symbols: xch, usdc/wusdc(.b), dbx, "
+                            "eth/weth, millieth/wmillieth(.b).");
+                    }
+                    const std::string feed_id = it->second.id;
+                    const auto& ids = cfg.coingecko.coin_ids;
+                    if (std::find(ids.begin(), ids.end(), feed_id)
+                        == ids.end()) {
+                        throw ConfigError(
+                            "pairs[" + std::to_string(i) + "] ("
+                            + cfg.pairs[i].name + "): revive_market needs "
+                            "coingecko.coin_ids to include \"" + feed_id
+                            + "\" (the feed for leg \"" + leg + "\"), "
+                            "or no anchor is created for this pair and it "
+                            "sits silent forever.");
+                    }
+                }
+            }
+            if (!cfg.strategy.quote_center_blend_enabled) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "strategy.quote_center_blend_enabled: true -- the "
+                    "revive gate only fires when the external estimate "
+                    "informs the ladder, and with the blend off "
+                    "quote_has_external_est is permanently false: the "
+                    "pair would sit silent forever.");
+            }
+            const double poll_sec =
+                static_cast<double>(cfg.coingecko.polling_interval_ms)
+                / 1000.0;
+            if (cfg.market_data.cex_freshness_threshold_sec < poll_sec) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "market_data.cex_freshness_threshold_sec ("
+                    + std::to_string(
+                          cfg.market_data.cex_freshness_threshold_sec)
+                    + "s) >= coingecko.polling_interval_ms ("
+                    + std::to_string(poll_sec)
+                    + "s) -- a window narrower than the polling cadence "
+                      "reads a healthy feed as stale between fetches and "
+                      "oscillates the revived ladder between quoting and "
+                      "silence. Widen the threshold (2x the interval "
+                      "leaves headroom for fetch jitter) or poll faster.");
+            }
+        }
+    }
 
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.

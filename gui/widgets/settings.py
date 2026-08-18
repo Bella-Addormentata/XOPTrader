@@ -615,11 +615,12 @@ class SettingsWidget(QWidget):
         layout.addLayout(toolbar)
 
         # -- Pairs table --
-        self._pairs_table = QTableWidget(0, 7)
+        self._pairs_table = QTableWidget(0, 8)
         self._pairs_table.setHorizontalHeaderLabels(
             [
                 "Enabled", "Name", "Base Asset", "Quote Asset",
-                "Ratio Target Override (%)", "Suggested (%)", "Actions",
+                "Ratio Target Override (%)", "Suggested (%)", "Revive",
+                "Actions",
             ]
         )
         header = self._pairs_table.horizontalHeader()
@@ -630,6 +631,7 @@ class SettingsWidget(QWidget):
         header.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
         header.setSectionResizeMode(6, QHeaderView.ResizeMode.ResizeToContents)
+        header.setSectionResizeMode(7, QHeaderView.ResizeMode.ResizeToContents)
         self._pairs_table.setAlternatingRowColors(True)
         self._pairs_table.setSelectionBehavior(
             QTableWidget.SelectionBehavior.SelectRows
@@ -2273,6 +2275,18 @@ class SettingsWidget(QWidget):
             )
             merged["enabled"] = enabled
 
+            revive_container = self._pairs_table.cellWidget(row, 6)
+            revive_cb = (
+                revive_container.findChild(QCheckBox)
+                if revive_container else None
+            )
+            # Written only when set: an unticked box drops the key so the
+            # YAML stays clean for the pairs that never asked for revival.
+            if revive_cb is not None and revive_cb.isChecked():
+                merged["revive_market"] = True
+            else:
+                merged.pop("revive_market", None)
+
             ratio_text = ratio_item.text().strip() if ratio_item else ""
             ratio_text = ratio_text.replace("%", "")
             if ratio_text:
@@ -2850,6 +2864,35 @@ class SettingsWidget(QWidget):
         self._pairs_table.setItem(row, 5, suggested_item)
         self._apply_suggested_to_row(row)
 
+        # Revive-market opt-in.  For a pair whose third-party book is
+        # expected to be dead or stale: normally the engine refuses to quote
+        # with no order-book reference at all; with this set it quotes from
+        # the external fair-value estimate instead of going silent.  Junk
+        # offers stay filtered out of pricing either way.  The runtime gate
+        # ALWAYS requires a recent successful CoinGecko fetch -- an AMM pool
+        # alone cannot satisfy it -- so the tooltip must say so, or an
+        # operator with an AMM-backed pair ticks the box and watches
+        # nothing happen.
+        revive_cb = QCheckBox()
+        revive_cb.setChecked(bool(pair.get("revive_market", False)))
+        revive_cb.setToolTip(
+            "Revive a dead market: quote from the external fair-value "
+            "estimate even when every third-party offer is stale or "
+            "absent.  Without this, a pair whose book fails the 20% "
+            "sanity filter posts nothing.  Requires a live CoinGecko "
+            "price feed: the engine refuses to quote when no recent "
+            "successful CoinGecko fetch exists, and an AMM pool alone "
+            "does not satisfy that gate.  Requires an engine restart "
+            "to take effect."
+        )
+        revive_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
+        revive_container = QWidget()
+        revive_layout = QHBoxLayout(revive_container)
+        revive_layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        revive_layout.setContentsMargins(0, 0, 0, 0)
+        revive_layout.addWidget(revive_cb)
+        self._pairs_table.setCellWidget(row, 6, revive_container)
+
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
@@ -2862,14 +2905,18 @@ class SettingsWidget(QWidget):
         remove_btn.setToolTip("Remove this trading pair")
         # Resolve the button's current row at click time rather than
         # capturing a row index at insert time.  Captured indices go
-        # stale when earlier rows are deleted.
+        # stale when earlier rows are deleted.  indexAt() expects
+        # VIEWPORT coordinates: btn.pos() is relative to the actions
+        # container (always ~(4,2), which maps to row 0 for every row),
+        # so ask for the container's position -- the container is the
+        # cell widget and its pos() is viewport-relative.
         remove_btn.clicked.connect(
             lambda _checked, btn=remove_btn: self._on_remove_pair(
-                self._pairs_table.indexAt(btn.pos()).row()
+                self._pairs_table.indexAt(btn.parentWidget().pos()).row()
             )
         )
         actions_layout.addWidget(remove_btn)
-        self._pairs_table.setCellWidget(row, 6, actions)
+        self._pairs_table.setCellWidget(row, 7, actions)
 
     def _on_add_pair(self) -> None:
         """Open the Add Pair dialog and append the result to the table."""

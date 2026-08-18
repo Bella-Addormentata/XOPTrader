@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -611,6 +612,506 @@ TEST(ConfigParserTest, PublishedMidBandRejectsNegativeValues) {
     TempYaml tmp2(with_strategy_keys(
         "\n  published_mid_band_spread_frac: -0.1"));
     EXPECT_THROW(xop::load_config(tmp2.path()), xop::ConfigError);
+}
+
+
+// ============================================================================
+// revive_market -- the empty-book quoting opt-in.
+//
+// A pair whose third-party book is expected to be dead (wmilliETH.b/XCH was
+// the motivating case: every live offer sat 20%+ from fair, so the outlier
+// filter emptied the book and Step 7 cleared the ladder every heartbeat).
+// The flag lets the ladder survive an empty FILTERED book, but only while a
+// live external estimate anchors the centre -- the predicate below is the
+// exact decision Step 7 executes, factored out so this file can pin it.
+// ============================================================================
+
+TEST(ConfigParserTest, ReviveMarket_DefaultsFalse) {
+    TempYaml tmp(kMinimalValidYaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_FALSE(cfg.pairs[0].revive_market);
+}
+
+TEST(ConfigParserTest, ReviveMarket_ParsesTrue) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    // revive_market now demands a live CoinGecko feed at load time whose
+    // ids cover BOTH legs of a mappable pair name.
+    auto npos_ = yaml.find("name: \"XCH/TEST\"");
+    ASSERT_NE(npos_, std::string::npos);
+    yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                 "name: \"XCH/wUSDC.b\"");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\"]\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    ASSERT_FALSE(cfg.pairs.empty());
+    EXPECT_TRUE(cfg.pairs[0].revive_market);
+}
+
+TEST(LadderSurvivesEmptyBook, RequiresFlagAndAnchorAndFreshFeed) {
+    xop::PairConfig p;
+
+    // Without the opt-in, no combination of anchor/freshness quotes: an
+    // operator who did not ask for revival keeps the old behaviour.
+    p.revive_market = false;
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true,  false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true,  true));
+
+    p.revive_market = true;
+
+    // Opt-in without an anchor: quoting blind -- the exact thing the
+    // clear exists to stop.  The flag must NOT override it.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, false, true));
+
+    // Opt-in with an anchor whose FEED is stale: the frozen-anchor trap.
+    // The solve keeps a self-refreshing timestamp, so the estimate looks
+    // alive long after the feed died; a revived ladder would stand at
+    // yesterday's price while the market walks away.  Must not quote.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(&p, true, false));
+
+    // Opt-in + live anchor + fresh feed: the one combination that quotes.
+    EXPECT_TRUE(xop::ladder_survives_empty_book(&p, true, true));
+}
+
+TEST(LadderSurvivesEmptyBook, NullPairConfigNeverSurvives) {
+    // A pair name that resolves to no PairConfig (defensive: find_pair_config
+    // returned nullptr) must behave like the flag is off.
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true,  true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, true,  false));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false, true));
+    EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false, false));
+}
+
+
+TEST(CoingeckoFeedFreshForRevival, PinsTheAgeArithmetic) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const double threshold = 120.0;
+
+    // Fresh: fetched 30s ago.
+    EXPECT_TRUE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(30), now, threshold));
+
+    // Boundary: exactly at the threshold still counts as fresh (<=).
+    EXPECT_TRUE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(120), now, threshold));
+
+    // Stale: one poll interval past the threshold.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(150), now, threshold));
+
+    // Never fetched successfully: a default-constructed time_point gives
+    // an enormous age -- must read stale, not fresh.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        true, clock::time_point{}, now, threshold));
+
+    // No prices cached at all: stale regardless of timestamps.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        false, now, now, threshold));
+}
+
+TEST(CoingeckoFeedFreshForRevival, DisabledThresholdReadsStaleNotFresh) {
+    // cex_freshness_threshold_sec <= 0 legally disables freshness decay
+    // for the published-mid blend.  For revival "no freshness check" would
+    // mean a frozen feed quotes forever, so the helper must be
+    // conservative -- and load_config refuses the combination anyway
+    // (tested below).
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, 0.0));
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, -1.0));
+}
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledFreshnessThreshold_Throws) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledFreshnessThresholdWithoutRevive_IsLegal) {
+    // The 0-disables-decay setting predates revive_market and must keep
+    // working for configs that never opted into revival.
+    std::string yaml(kMinimalValidYaml);
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.cex_freshness_threshold_sec, 0.0);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledAmmExpiry_Throws) {
+    // fair_value_amm_max_age_sec: 0 legally admits AMM edges of any age
+    // into the fair-value graph.  A revived pair quoting from that graph
+    // could then stand on a frozen TibetSwap price while CoinGecko stays
+    // fresh -- the one feed the runtime gate cannot see.  Refused at load.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  fair_value_amm_max_age_sec: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledAmmExpiryWithoutRevive_IsLegal) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  fair_value_amm_max_age_sec: 0");
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_amm_max_age_sec, 0.0);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWithInfiniteThresholds_Throws) {
+    // YAML .inf parses to +infinity, and inf <= 0.0 is false -- so an
+    // infinite "expiry" slid through the non-positive check while
+    // disabling the freshness arithmetic entirely (age <= inf is always
+    // true).  Both knobs must be refused when revival is on.
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: .inf\n";
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  fair_value_amm_max_age_sec: .inf");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(CoingeckoFeedFreshForRevival, NonFiniteThresholdReadsStale) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, inf));
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, nan));
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledWidthSigma_Throws) {
+    // quote_width_sigma_mult: 0 removes the sigma term from the width
+    // floor -- the one bound the untrusted-solve branch relies on in
+    // place of the fair-value clamp.  A revived ladder would quote an
+    // uncertain estimate tighter than its own error bar.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  quote_width_sigma_mult: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledStaleDemotion_Throws) {
+    // fair_value_stale_sigma_bps_per_print: 0 disables the term that
+    // demotes a frozen book edge -- a stale transitive edge would keep
+    // fixed weight in the solve forever.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  fair_value_stale_sigma_bps_per_print: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledWidthSigmaWithoutRevive_IsLegal) {
+    // Both knobs keep their legal 0 settings for configs that never
+    // opted into revival.
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  quote_width_sigma_mult: 0"
+                "\n  fair_value_stale_sigma_bps_per_print: 0");
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.quote_width_sigma_mult, 0.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_bps_per_print, 0.0);
+}
+
+
+TEST(ApplyDeployIdleFloor, HardZeroStaysStopped_TaperStillFloors) {
+    // The wallet-bleed regression: a drift-guard hard zero (scale 0.0)
+    // means STOPPED, and the floor must not re-inflate it -- on either
+    // side (the helper is side-agnostic; bid and ask both route through
+    // it).  A merely tapered side is still acquiring and may be floored.
+    const std::int64_t pool = 0, min_pool = 1000;
+
+    // Hard-stopped: pool stays zero even with the floor armed and the
+    // wallet able to back it.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 0.0, true),
+              0);
+
+    // Tapered but nonzero: the guard is slowing acquisition, not stopping
+    // it -- the floor may still raise the pool to one minimum offer.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 0.35, true),
+              min_pool);
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 1.0, true),
+              min_pool);
+}
+
+TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
+    const std::int64_t min_pool = 1000;
+
+    // Floor disarmed by ratio-rebalance mode: nothing happens.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, min_pool, false, 1.0, true), 0);
+
+    // Wallet cannot back one minimum offer: nothing happens.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, min_pool, true, 1.0, false), 0);
+
+    // Pool already at/above the minimum: left alone (never scaled DOWN).
+    EXPECT_EQ(xop::apply_deploy_idle_floor(5000, min_pool, true, 1.0, true),
+              5000);
+    EXPECT_EQ(xop::apply_deploy_idle_floor(min_pool, min_pool, true, 0.0,
+                                           true),
+              min_pool);
+
+    // Degenerate min_pool: no-op.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWindowNarrowerThanPolling_Throws) {
+    // A 300s poll with the default 120s freshness window means no fetch
+    // is even scheduled between 120s and 300s: a HEALTHY feed reads as
+    // stale for ~180s of every cycle and the revived ladder oscillates.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    auto npos_ = yaml.find("name: \"XCH/TEST\"");
+    ASSERT_NE(npos_, std::string::npos);
+    yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                 "name: \"XCH/wUSDC.b\"");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\"]\n"
+            "  polling_interval_ms: 300000\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+
+    // The same cadence is legal once the window covers it.
+    std::string ok(yaml);
+    ok += "\nmarket_data:\n  cex_freshness_threshold_sec: 600\n";
+    TempYaml tmp2(ok);
+    EXPECT_NO_THROW(xop::load_config(tmp2.path()));
+}
+
+TEST(ConfigParserTest, ReviveMarketWithCoingeckoDisabled_Throws) {
+    // The revive freshness gate is anchored to the CoinGecko feed; with
+    // the feed off, a revived pair would sit silent forever.  Loud, not
+    // silent.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\ncoingecko:\n  enabled: false\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, SlowPollingWithoutRevive_IsLegal) {
+    std::string yaml(kMinimalValidYaml);
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n"
+            "  polling_interval_ms: 300000\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.coingecko.polling_interval_ms, 300000u);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketNeverWorksCombos_Throw) {
+    // Three legal settings each make revival structurally impossible --
+    // the engine would start cleanly and clear the ladder forever,
+    // exactly the silent failure the cross-check exists to prevent:
+    // the blend switch off (quote_has_external_est permanently false),
+    // an empty coin id list (every fetch returns an empty map), and a
+    // zero feed sigma (the solver discards anchors with sigma <= 0).
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    auto with_revive = [&](const std::string& extra) {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        EXPECT_NE(npos_, std::string::npos);
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        yaml += "\ncoingecko:\n  enabled: true\n"
+                "  coin_ids: [\"chia\", \"usd-coin\"]\n";
+        yaml += extra;
+        return yaml;
+    };
+
+    {
+        std::string yaml = with_revive("");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  quote_center_blend_enabled: false");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        // Empty coin id list: build without the helper's non-empty list.
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: []\n";
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        std::string yaml = with_revive("");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  fair_value_feed_sigma_bps: 0");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, NeverWorksCombosWithoutRevive_AreLegal) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  quote_center_blend_enabled: false"
+                "\n  fair_value_feed_sigma_bps: 0");
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: []\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.strategy.quote_center_blend_enabled);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_feed_sigma_bps, 0.0);
+    EXPECT_TRUE(cfg.coingecko.coin_ids.empty());
+}
+
+
+TEST(ConfigParserTest, ReviveMarketCoinIdsMustCoverTheLegs) {
+    // A non-empty-but-unrelated id list previously loaded: with
+    // coin_ids: [bitcoin] no anchor is ever created for the pair's legs
+    // and the revived pair sits silent forever.  The legs resolve
+    // through the same table the engine uses (xop/feed_listings.hpp).
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    auto revive_pair = [&](const char* ids) {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        EXPECT_NE(npos_, std::string::npos);
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        yaml += std::string("\ncoingecko:\n  enabled: true\n  coin_ids: ")
+              + ids + "\n";
+        return yaml;
+    };
+
+    // Unrelated ids: fetches succeed, anchors never exist.
+    {
+        TempYaml tmp(revive_pair("[\"bitcoin\"]"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // One leg covered, the other missing: still refused.
+    {
+        TempYaml tmp(revive_pair("[\"chia\"]"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Both legs covered: loads.
+    {
+        TempYaml tmp(revive_pair("[\"chia\", \"usd-coin\"]"));
+        EXPECT_NO_THROW(xop::load_config(tmp.path()));
+    }
+}
+
+TEST(ConfigParserTest, ReviveMarketUnmappableLeg_Throws) {
+    // "TEST" has no CoinGecko feed mapping at all: no id list can anchor
+    // it, so revival is refused with a message naming the leg.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\", \"ethereum\"]\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
 }  // namespace

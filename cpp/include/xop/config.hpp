@@ -15,6 +15,8 @@
 #ifndef XOP_CONFIG_HPP
 #define XOP_CONFIG_HPP
 
+#include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -137,6 +139,18 @@ struct PairConfig {
     std::optional<double>   max_half_spread_bps_override;
     std::optional<double>   min_offer_size_units_override;
 
+    // -- Market revival -----------------------------------------------------
+    // Opt-in for a pair whose third-party book is expected to be empty or
+    // stale (every offer outside the 20% outlier band).  Normally Step 7
+    // refuses to post a ladder with no order-book reference at all; with
+    // revive_market the ladder may survive an empty FILTERED book -- but
+    // ONLY while a live external fair-value estimate anchors the centre
+    // (CoinGecko/AMM via the fair-value graph).  The outlier filter itself
+    // is never bypassed: stale junk stays out of pricing, this only lets
+    // the bot quote from the anchor instead of going silent.  With no
+    // external estimate the pair still refuses to quote, flag or not.
+    bool   revive_market{false};
+
     // -- Stablecoin peg configuration ---------------------------------------
     // When is_stablecoin is true, the depeg detector monitors this pair
     // and can flag it as suspected-failed, pulling all quotes.
@@ -154,6 +168,88 @@ struct PairConfig {
     bool   stablecoin_flat_sizing{false};    // Skip adverse-selection sizing.
     bool   stablecoin_skip_gap_aware{false}; // Skip gap-aware spacing.
 };
+
+/// Step 7's empty-book decision, factored out so it is unit-testable.
+///
+/// With both filtered book sides at zero the ladder is normally cleared --
+/// no reference exists to validate prices against.  A pair opted into
+/// revive_market keeps its ladder ONLY when BOTH hold this heartbeat:
+///
+///  * a live external fair-value estimate anchored the quote centre
+///    (has_external_estimate), and
+///  * the price FEED behind that estimate is genuinely fresh
+///    (anchor_feed_fresh -- seconds since the last *successful* fetch,
+///    not the solve's self-refreshing timestamp).
+///
+/// The second condition is what stops the frozen-anchor loss: with the
+/// feed down, the solve keeps re-stamping the old price forever, every
+/// remaining price check keys off that same frozen number, and a revived
+/// ladder would stand at yesterday's price while the market walks away.
+/// A stale feed therefore reverts the pair to the pre-revive behaviour --
+/// silence -- which loses nothing.
+inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
+                                       bool has_external_estimate,
+                                       bool anchor_feed_fresh) {
+    return pair_cfg != nullptr && pair_cfg->revive_market
+        && has_external_estimate && anchor_feed_fresh;
+}
+
+/// The revive path's feed-freshness derivation, factored out so the age
+/// arithmetic and its boundaries are unit-testable (the truth-table test
+/// above receives the result as a bool and cannot pin how it is computed).
+///
+/// `last_success` is the time of the last SUCCESSFUL CoinGecko fetch --
+/// never a solve timestamp, which self-refreshes from the cache and can
+/// never expire.  A default-constructed time_point (no fetch has ever
+/// succeeded) yields an enormous age and correctly reads as stale.
+///
+/// `threshold_sec <= 0` is a legal published-mid setting ("disable CEX
+/// freshness decay"), but for revival it cannot mean "always fresh" -- a
+/// frozen feed would quote forever -- so it conservatively reads as
+/// stale here, and load_config() refuses the combination loudly so an
+/// operator is told at startup instead of watching a silent pair.
+inline bool coingecko_feed_fresh_for_revival(
+    bool have_prices,
+    std::chrono::steady_clock::time_point last_success,
+    std::chrono::steady_clock::time_point now,
+    double threshold_sec) {
+    // Non-finite thresholds (.inf parses fine in YAML, and NaN comparisons
+    // are all false) would defeat the age check outright -- age <= inf is
+    // always true.  Conservative: not establishable means not fresh.
+    if (!have_prices
+        || !std::isfinite(threshold_sec)
+        || threshold_sec <= 0.0) {
+        return false;
+    }
+    const double age_s =
+        std::chrono::duration<double>(now - last_success).count();
+    return age_s <= threshold_sec;
+}
+
+/// The deploy-idle floor's per-side decision, factored out so the
+/// drift-guard interaction is unit-testable.
+///
+/// The floor exists to reverse upstream ALLOCATOR scaling: a side whose
+/// pool collapsed below one minimum-size offer despite the wallet holding
+/// balance to back it gets raised to `min_pool`.  But the drift guard's
+/// hard zero is a STOP, not starvation -- `drift_scale <= 0` means the
+/// acquired asset is past target + max_factor*tol and the guard tapered
+/// acquisition all the way off.  Re-inflating that side would convert the
+/// stop into a min-size bleed repeating every heartbeat, bounded only by
+/// the wallet (the exact regression the revive review caught).  A merely
+/// TAPERED side (0 < scale < 1) is still acquiring and may be floored.
+///
+/// Returns the pool value after the floor's decision.
+inline std::int64_t apply_deploy_idle_floor(std::int64_t pool,
+                                            std::int64_t min_pool,
+                                            bool floor_armed,
+                                            double drift_scale,
+                                            bool wallet_covers_min) {
+    if (!floor_armed || min_pool <= 0 || pool >= min_pool) return pool;
+    if (drift_scale <= 0.0) return pool;  // hard stop stays stopped
+    if (!wallet_covers_min) return pool;
+    return min_pool;
+}
 
 // ---------------------------------------------------------------------------
 // Core Avellaneda-Stoikov / GLFT market-making algorithm parameters.
