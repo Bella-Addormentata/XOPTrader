@@ -153,7 +153,20 @@ TEST(AffordableBaseMojos, MatchesTheCatQuoteCapFormula) {
     const auto cap = xop::affordable_base_mojos(
         38'320.0, static_cast<double>(kCatDenom), 2.5,
         static_cast<double>(kBaseXch));
-    EXPECT_EQ(cap, static_cast<xop::Mojo>(15.328 * 1e12));
+    // Exact integer literal: the helper rounds to nearest, and a
+    // static_cast of 15.328 * 1e12 would TRUNCATE an inexact double.
+    EXPECT_EQ(cap, 15'328'000'000'000LL);
+}
+
+TEST(AffordableBaseMojos, OverflowReadsAsUnavailable) {
+    // llround is UB outside int64; a dust-priced mid on a large balance
+    // can push the quotient past 9.2e18.  Out-of-range must read as 0
+    // ("conversion unavailable") so call sites skip -- a cap or reserve
+    // must never be produced by undefined behaviour.
+    const auto cap = xop::affordable_base_mojos(
+        9e18, static_cast<double>(kBaseXch), 1e-9,
+        static_cast<double>(kBaseXch));
+    EXPECT_EQ(cap, 0);
 }
 
 TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {

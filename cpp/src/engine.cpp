@@ -4661,17 +4661,17 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     market_mid,
                     static_cast<double>(pair_cfg->base_mojos_per_unit));
                 if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                    const double pool_units =
+                        static_cast<double>(avail_capital)
+                        / static_cast<double>(pair_cfg->base_mojos_per_unit);
                     spdlog::warn(
                         "[Engine] Step 7: {} bid pool {:.4f} {} units "
-                        "(> {:.6f} XCH at mid {:.6f}) exceeds confirmed "
+                        "(= {:.6f} XCH at mid {:.6f}) exceeds confirmed "
                         "{:.6f} XCH -- CAPPED",
                         pair_name,
-                        static_cast<double>(avail_capital)
-                            / static_cast<double>(
-                                  pair_cfg->base_mojos_per_unit),
+                        pool_units,
                         pair_cfg->base_asset_id,
-                        static_cast<double>(xch_confirmed_balance_)
-                            / kMojosPerXch,
+                        pool_units * market_mid,
                         market_mid,
                         static_cast<double>(xch_confirmed_balance_)
                             / kMojosPerXch);

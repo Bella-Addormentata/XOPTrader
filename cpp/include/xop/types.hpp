@@ -12,6 +12,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <limits>
 #include <string>
 #include <chrono>
 
@@ -94,8 +95,18 @@ inline Mojo affordable_base_mojos(double quote_mojos,
         return Mojo{0};
     }
     const double quote_units = quote_mojos / quote_denom;
-    return static_cast<Mojo>(std::llround(
-        (quote_units / market_mid) * base_denom));
+    const double result = (quote_units / market_mid) * base_denom;
+    // llround is UNDEFINED outside long long range, and this helper runs
+    // on live market inputs (a dust-priced mid can push the quotient past
+    // 9.2e18).  Non-finite or out-of-range reads as "conversion
+    // unavailable" -- call sites skip, same as the invalid-input cases.
+    // The double conversion of int64 max rounds UP, so >= is exact here.
+    if (!std::isfinite(result) || result < 0.0
+        || result >= static_cast<double>(
+               std::numeric_limits<std::int64_t>::max())) {
+        return Mojo{0};
+    }
+    return static_cast<Mojo>(std::llround(result));
 }
 
 /// Asset identifier.
