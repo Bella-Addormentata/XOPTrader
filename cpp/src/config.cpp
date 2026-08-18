@@ -3171,6 +3171,40 @@ AppConfig load_config(const std::string& path,
                     + std::to_string(k.default_value)
                     + ") or remove revive_market from this pair.");
             }
+
+            // Relational checks: the single-knob table cannot see these.
+            //
+            // The freshness window must COVER the polling cadence, or a
+            // perfectly healthy feed oscillates the pair: with a 300s
+            // poll and a 120s window, no fetch is even scheduled between
+            // 120s and 300s, so every revived ladder clears for ~180s of
+            // every successful cycle -- churn, not safety.
+            if (!cfg.coingecko.enabled) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "coingecko.enabled: true -- the revive freshness gate "
+                    "is anchored to the CoinGecko feed, and with the feed "
+                    "off the pair would sit silent forever.");
+            }
+            const double poll_sec =
+                static_cast<double>(cfg.coingecko.polling_interval_ms)
+                / 1000.0;
+            if (cfg.market_data.cex_freshness_threshold_sec < poll_sec) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "market_data.cex_freshness_threshold_sec ("
+                    + std::to_string(
+                          cfg.market_data.cex_freshness_threshold_sec)
+                    + "s) >= coingecko.polling_interval_ms ("
+                    + std::to_string(poll_sec)
+                    + "s) -- a window narrower than the polling cadence "
+                      "reads a healthy feed as stale between fetches and "
+                      "oscillates the revived ladder between quoting and "
+                      "silence. Widen the threshold (2x the interval "
+                      "leaves headroom for fetch jitter) or poll faster.");
+            }
         }
     }
 

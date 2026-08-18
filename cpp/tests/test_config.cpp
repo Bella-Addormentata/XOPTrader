@@ -641,6 +641,8 @@ TEST(ConfigParserTest, ReviveMarket_ParsesTrue) {
     auto pos = yaml.find(anchor);
     ASSERT_NE(pos, std::string::npos);
     yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    // revive_market now demands a live CoinGecko feed at load time.
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n";
     TempYaml tmp(yaml);
     auto cfg = xop::load_config(tmp.path());
     ASSERT_FALSE(cfg.pairs.empty());
@@ -918,6 +920,55 @@ TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
 
     // Degenerate min_pool: no-op.
     EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWindowNarrowerThanPolling_Throws) {
+    // A 300s poll with the default 120s freshness window means no fetch
+    // is even scheduled between 120s and 300s: a HEALTHY feed reads as
+    // stale for ~180s of every cycle and the revived ladder oscillates.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n"
+            "  polling_interval_ms: 300000\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+
+    // The same cadence is legal once the window covers it.
+    std::string ok(yaml);
+    ok += "\nmarket_data:\n  cex_freshness_threshold_sec: 600\n";
+    TempYaml tmp2(ok);
+    EXPECT_NO_THROW(xop::load_config(tmp2.path()));
+}
+
+TEST(ConfigParserTest, ReviveMarketWithCoingeckoDisabled_Throws) {
+    // The revive freshness gate is anchored to the CoinGecko feed; with
+    // the feed off, a revived pair would sit silent forever.  Loud, not
+    // silent.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\ncoingecko:\n  enabled: false\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, SlowPollingWithoutRevive_IsLegal) {
+    std::string yaml(kMinimalValidYaml);
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n"
+            "  polling_interval_ms: 300000\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.coingecko.polling_interval_ms, 300000u);
 }
 
 }  // namespace

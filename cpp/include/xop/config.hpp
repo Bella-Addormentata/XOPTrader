@@ -208,6 +208,24 @@ inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
 /// frozen feed would quote forever -- so it conservatively reads as
 /// stale here, and load_config() refuses the combination loudly so an
 /// operator is told at startup instead of watching a silent pair.
+inline bool coingecko_feed_fresh_for_revival(
+    bool have_prices,
+    std::chrono::steady_clock::time_point last_success,
+    std::chrono::steady_clock::time_point now,
+    double threshold_sec) {
+    // Non-finite thresholds (.inf parses fine in YAML, and NaN comparisons
+    // are all false) would defeat the age check outright -- age <= inf is
+    // always true.  Conservative: not establishable means not fresh.
+    if (!have_prices
+        || !std::isfinite(threshold_sec)
+        || threshold_sec <= 0.0) {
+        return false;
+    }
+    const double age_s =
+        std::chrono::duration<double>(now - last_success).count();
+    return age_s <= threshold_sec;
+}
+
 /// The deploy-idle floor's per-side decision, factored out so the
 /// drift-guard interaction is unit-testable.
 ///
@@ -231,24 +249,6 @@ inline std::int64_t apply_deploy_idle_floor(std::int64_t pool,
     if (drift_scale <= 0.0) return pool;  // hard stop stays stopped
     if (!wallet_covers_min) return pool;
     return min_pool;
-}
-
-inline bool coingecko_feed_fresh_for_revival(
-    bool have_prices,
-    std::chrono::steady_clock::time_point last_success,
-    std::chrono::steady_clock::time_point now,
-    double threshold_sec) {
-    // Non-finite thresholds (.inf parses fine in YAML, and NaN comparisons
-    // are all false) would defeat the age check outright -- age <= inf is
-    // always true.  Conservative: not establishable means not fresh.
-    if (!have_prices
-        || !std::isfinite(threshold_sec)
-        || threshold_sec <= 0.0) {
-        return false;
-    }
-    const double age_s =
-        std::chrono::duration<double>(now - last_success).count();
-    return age_s <= threshold_sec;
 }
 
 // ---------------------------------------------------------------------------
