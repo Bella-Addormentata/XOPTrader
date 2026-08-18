@@ -15,6 +15,7 @@
 #include <xop/types.hpp>
 
 #include <cmath>
+#include <limits>
 
 namespace {
 
@@ -105,6 +106,172 @@ TEST(QuoteMojosFor, CatCatPairProducesExpectedQuoteMojos) {
         static_cast<double>(kCatDenom));
 
     EXPECT_NEAR(quote_mojos, 100'100.0, 1.0);
+}
+
+
+// --------------------------------------------------------------------------
+// affordable_base_mojos: the inverse-direction conversion (quote -> base).
+//
+// Background [S3, TODO.md, fixed 2026-08-18]: Step 7 subtracted the XCH fee
+// reserve (1e12-scale XCH mojos) RAW from bid pools denominated in BASE
+// mojos (1e3/unit on CAT-base pairs).  On wmilliETH.b/XCH a 0.5 XCH reserve
+// (5e11 "mojos") annihilated any realistic pool every heartbeat, so the
+// Avellaneda/GLFT sizing model was inert and only floor mechanisms quoted.
+// The v0.7.38 XCH wallet cap on the same branch compared the same
+// mismatched units and could never fire.  These tests lock the conversion
+// in with the live pair's real numbers.
+// --------------------------------------------------------------------------
+
+TEST(AffordableBaseMojos, WmilliEthFeeReserveConvertsSanely) {
+    // 0.5 XCH reserve, mid 1.39 XCH per wmilliETH.b, CAT base (1e3/unit):
+    // (5e11 / 1e12) / 1.39 * 1e3 = 359.7 -> 360 base mojos (~0.36 units).
+    const auto reserve_base = xop::reserve_base_mojos(
+        5e11, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    EXPECT_EQ(reserve_base, 360);  // ceil(359.71): never under-reserve
+
+    // The affordability direction FLOORS the same quantity: a cap must
+    // never admit a mojo the wallet cannot back.
+    EXPECT_EQ(xop::affordable_base_mojos(
+                  5e11, static_cast<double>(kBaseXch), 1.39,
+                  static_cast<double>(kCatDenom)),
+              359);
+
+    // The pre-fix arithmetic subtracted 5e11 -- nine orders of magnitude
+    // larger than the correct figure, and larger than any realistic pool.
+    EXPECT_LT(reserve_base, 1'000);
+}
+
+TEST(AffordableBaseMojos, XchWalletCapNowReachable) {
+    // 83.499 XCH confirmed at mid 1.39: the wallet can back
+    // (83.499 / 1.39) * 1e3 = 60,071 base mojos (~60 units).  Pre-fix the
+    // cap compared a 1e3-scale pool against 8.35e13 and never fired.
+    const auto cap = xop::affordable_base_mojos(
+        83.499 * static_cast<double>(kBaseXch),
+        static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    EXPECT_NEAR(static_cast<double>(cap), 60'071.0, 1.0);
+}
+
+TEST(AffordableBaseMojos, MatchesTheCatQuoteCapFormula) {
+    // The CAT-quote bid cap used quote_units / mid * base_denom inline;
+    // the helper must reproduce it exactly.  38.32 wUSDC.b (1e3/unit) at
+    // mid 2.50 wUSDC per XCH, XCH base (1e12/unit):
+    // (38'320 / 1000) / 2.5 * 1e12 = 15.328 XCH in mojos.
+    const auto cap = xop::affordable_base_mojos(
+        38'320.0, static_cast<double>(kCatDenom), 2.5,
+        static_cast<double>(kBaseXch));
+    // Affordability FLOORS, and the double intermediate may land a hair
+    // under the exact 15.328e12 -- one mojo low is the safe direction, one
+    // mojo HIGH would claim funds the wallet does not have.
+    EXPECT_GE(cap, 15'327'999'999'999LL);
+    EXPECT_LE(cap, 15'328'000'000'000LL);
+}
+
+TEST(AffordableBaseMojos, OverflowReadsAsUnavailable) {
+    // llround is UB outside int64; a dust-priced mid on a large balance
+    // can push the quotient past 9.2e18.  Out-of-range must read as 0
+    // ("conversion unavailable") so call sites skip -- a cap or reserve
+    // must never be produced by undefined behaviour.
+    const auto cap = xop::affordable_base_mojos(
+        9e18, static_cast<double>(kBaseXch), 1e-9,
+        static_cast<double>(kBaseXch));
+    EXPECT_EQ(cap, 0);
+    // A RESERVE that overflows Mojo exceeds every representable pool: it
+    // must SATURATE so the subtraction empties the pool.  Mapping it to 0
+    // would skip the subtraction -- the opposite of "never under-reserve".
+    EXPECT_EQ(xop::reserve_base_mojos(
+                  9e18, static_cast<double>(kBaseXch), 1e-9,
+                  static_cast<double>(kBaseXch)),
+              std::numeric_limits<xop::Mojo>::max());
+}
+
+TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {
+    // A missing/invalid mid or denomination must return 0, which every
+    // call site treats as "skip" -- a cap of 0 must never zero a pool,
+    // and a reserve of 0 must never be silently enormous.
+    const double q = 5e11, qd = 1e12, bd = 1e3;
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, 0.0,  bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, -1.0, bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, 0.0, 1.39, bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, 1.39, 0.0), 0);
+    EXPECT_EQ(xop::reserve_base_mojos(q, qd, 0.0, bd), 0);
+    EXPECT_EQ(xop::reserve_base_mojos(q, 0.0, 1.39, bd), 0);
+}
+
+TEST(AffordableBaseMojos, NoOverflowAtRealisticExtremes) {
+    // 9,000 XCH balance, a dust-priced CAT (mid 1e-6 XCH/unit), CAT base:
+    // (9e15/1e12) / 1e-6 * 1e3 = 9e12 base mojos -- large but exact in
+    // double and well inside int64.
+    const auto cap = xop::affordable_base_mojos(
+        9e15, static_cast<double>(kBaseXch), 1e-6,
+        static_cast<double>(kCatDenom));
+    EXPECT_EQ(cap, static_cast<xop::Mojo>(9e12));
+}
+
+
+TEST(TryAffordableBaseMojos, DistinguishesUnavailableFromGenuineZero) {
+    // Unavailable (no mid): nullopt -- the caller SKIPS its cap.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch), 0.0,
+        static_cast<double>(kCatDenom)).has_value());
+
+    // Unavailable (overflow -- an effectively unlimited cap): nullopt.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        9e18, static_cast<double>(kBaseXch), 1e-9,
+        static_cast<double>(kBaseXch)).has_value());
+
+    // Genuine zero: a zero budget affords zero base mojos -- present, 0,
+    // and the cap MUST be applied (this is the fee-reserve-only wallet).
+    auto zero_budget = xop::try_affordable_base_mojos(
+        0.0, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    ASSERT_TRUE(zero_budget.has_value());
+    EXPECT_EQ(*zero_budget, 0);
+
+    // Genuine zero: a dust budget that funds less than one base mojo.
+    auto dust = xop::try_affordable_base_mojos(
+        500.0, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    ASSERT_TRUE(dust.has_value());
+    EXPECT_EQ(*dust, 0);
+
+    // Unavailable (mid = +inf): a finite quote divided by +inf is a clean
+    // 0.0 that the result check alone cannot tell from a genuine zero --
+    // the INPUT check must reject it first.
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch),
+        std::numeric_limits<double>::infinity(),
+        static_cast<double>(kCatDenom)).has_value());
+    EXPECT_FALSE(xop::try_affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch),
+        std::numeric_limits<double>::quiet_NaN(),
+        static_cast<double>(kCatDenom)).has_value());
+}
+
+
+TEST(TiersWithinBudget, NonzeroBudgetBelowOneMinimumOfferFundsZeroTiers) {
+    // The round-5 regression case: the up-scale pass raises a sub-minimum
+    // tier to min size AFTER the wallet caps, so a nonzero budget smaller
+    // than one minimum offer must fund ZERO tiers -- the tier is dropped,
+    // never enlarged past the cap into reserved funds.
+    EXPECT_EQ(xop::tiers_within_budget({1000}, 999), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({1000}, 1000), 1u);
+
+    // Cumulative: 400+400 fits a 999 budget, the third tier does not.
+    EXPECT_EQ(xop::tiers_within_budget({400, 400, 400}, 999), 2u);
+
+    // Degenerate and defensive cases.
+    EXPECT_EQ(xop::tiers_within_budget({}, 1000), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({0, 0}, 0), 2u);
+    EXPECT_EQ(xop::tiers_within_budget({1000}, -1), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({-5, 1000}, 5000), 0u);
+
+    // Overflow-safe: a saturated cost against a huge budget cannot wrap.
+    EXPECT_EQ(xop::tiers_within_budget(
+                  {std::numeric_limits<xop::Mojo>::max()},
+                  std::numeric_limits<xop::Mojo>::max() - 1),
+              0u);
 }
 
 }  // namespace
