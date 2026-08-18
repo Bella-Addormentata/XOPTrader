@@ -2347,7 +2347,12 @@ class SettingsWidget(QWidget):
             "single_cat_cap_pct": self._single_cat_cap.value(),
             "kelly_fraction": self._kelly_fraction.value(),
             "max_capital_per_pair_pct": self._max_capital_per_pair.value(),
-            "max_drawdown_pct": self._max_drawdown_pct.value(),
+            # [DRAWDOWN-EQUITY 2026-08-04 / hotfix 2026-08-18] The engine
+            # renamed this to max_drawdown_frac and treats the OLD key as a
+            # hard startup error -- this save line kept writing the old name
+            # for two weeks, and the first Settings save after the rename
+            # bricked engine startup mid-upgrade.  Never write the old key.
+            "max_drawdown_frac": self._max_drawdown_pct.value(),
             "loss_window_blocks": self._loss_window_blocks.value(),
             "max_window_loss_bps": self._max_window_loss_bps.value(),
         }
@@ -2564,7 +2569,8 @@ class SettingsWidget(QWidget):
                 float(risk.get("max_capital_per_pair_pct", 0.20))
             )
             self._max_drawdown_pct.setValue(
-                float(risk.get("max_drawdown_pct", 0.10))
+                float(risk.get("max_drawdown_frac",
+                               risk.get("max_drawdown_pct", 0.10)))
             )
             self._loss_window_blocks.setValue(
                 int(risk.get("loss_window_blocks", 1152))
@@ -3440,6 +3446,14 @@ class SettingsWidget(QWidget):
             cfg["strategy"]["ratio_target_by_pair"] = copy.deepcopy(
                 strategy_edits["ratio_target_by_pair"]
             )
+
+        # The deep-merge preserves unmanaged keys from the on-disk snapshot,
+        # which is exactly wrong for keys the ENGINE refuses to start on: a
+        # legacy risk.max_drawdown_pct loaded from a pre-rename (or
+        # previously poisoned) file would be resurrected into every save.
+        # Purge it unconditionally -- max_drawdown_frac carries the value.
+        if isinstance(cfg.get("risk"), dict):
+            cfg["risk"].pop("max_drawdown_pct", None)
 
         resolved = Path(dest).expanduser().resolve()
         try:
