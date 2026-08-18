@@ -3157,6 +3157,11 @@ AppConfig load_config(const std::string& path,
              "this is the term that demotes a frozen book edge; without "
              "it a stale transitive edge keeps fixed weight in the solve "
              "forever"},
+            {"strategy.fair_value_feed_sigma_bps",
+             cfg.strategy.fair_value_feed_sigma_bps, 100.0,
+             "anchors with sigma <= 0 are discarded by the solver "
+             "(Anchor.sigma_bps must be > 0 to be used), so the revived "
+             "pair would have no CoinGecko anchor and sit silent forever"},
         };
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
             if (!cfg.pairs[i].revive_market) continue;
@@ -3186,6 +3191,26 @@ AppConfig load_config(const std::string& path,
                     "coingecko.enabled: true -- the revive freshness gate "
                     "is anchored to the CoinGecko feed, and with the feed "
                     "off the pair would sit silent forever.");
+            }
+            if (cfg.coingecko.coin_ids.empty()) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires a "
+                    "non-empty coingecko.coin_ids -- every fetch would "
+                    "return an empty price map and the pair would sit "
+                    "silent forever. The list must also cover both of "
+                    "this pair's legs (e.g. chia plus the base asset's "
+                    "feed id).");
+            }
+            if (!cfg.strategy.quote_center_blend_enabled) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires "
+                    "strategy.quote_center_blend_enabled: true -- the "
+                    "revive gate only fires when the external estimate "
+                    "informs the ladder, and with the blend off "
+                    "quote_has_external_est is permanently false: the "
+                    "pair would sit silent forever.");
             }
             const double poll_sec =
                 static_cast<double>(cfg.coingecko.polling_interval_ms)

@@ -1813,7 +1813,12 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         if (now - coingecko_last_fetch_ >= interval) {
             try {
                 coingecko_prices_ = co_await coingecko_->fetch_prices();
-                coingecko_last_fetch_ = now;
+                // Stamp COMPLETION, not the pre-await capture: a slow or
+                // retried request would otherwise age fresh prices by its
+                // own duration, and the revive freshness gate could read
+                // them as stale the moment they arrive (acute at the
+                // now-legal threshold == polling interval boundary).
+                coingecko_last_fetch_ = std::chrono::steady_clock::now();
             } catch (const std::exception& ex) {
                 // Transient CoinGecko errors should not abort the cycle.
                 spdlog::warn("[Engine] Step 1: CoinGecko fetch failed: {}",

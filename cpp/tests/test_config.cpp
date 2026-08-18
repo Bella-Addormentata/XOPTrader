@@ -971,4 +971,74 @@ TEST(ConfigParserTest, SlowPollingWithoutRevive_IsLegal) {
     EXPECT_EQ(cfg.coingecko.polling_interval_ms, 300000u);
 }
 
+
+TEST(ConfigParserTest, ReviveMarketNeverWorksCombos_Throw) {
+    // Three legal settings each make revival structurally impossible --
+    // the engine would start cleanly and clear the ladder forever,
+    // exactly the silent failure the cross-check exists to prevent:
+    // the blend switch off (quote_has_external_est permanently false),
+    // an empty coin id list (every fetch returns an empty map), and a
+    // zero feed sigma (the solver discards anchors with sigma <= 0).
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    auto with_revive = [&](const std::string& extra) {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n";
+        yaml += extra;
+        return yaml;
+    };
+
+    {
+        std::string yaml = with_revive("");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  quote_center_blend_enabled: false");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        // Empty coin id list: build without the helper's non-empty list.
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: []\n";
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        std::string yaml = with_revive("");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  fair_value_feed_sigma_bps: 0");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, NeverWorksCombosWithoutRevive_AreLegal) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  quote_center_blend_enabled: false"
+                "\n  fair_value_feed_sigma_bps: 0");
+    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: []\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.strategy.quote_center_blend_enabled);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_feed_sigma_bps, 0.0);
+    EXPECT_TRUE(cfg.coingecko.coin_ids.empty());
+}
+
 }  // namespace
