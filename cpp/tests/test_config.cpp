@@ -683,4 +683,67 @@ TEST(LadderSurvivesEmptyBook, NullPairConfigNeverSurvives) {
     EXPECT_FALSE(xop::ladder_survives_empty_book(nullptr, false, false));
 }
 
+
+TEST(CoingeckoFeedFreshForRevival, PinsTheAgeArithmetic) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const double threshold = 120.0;
+
+    // Fresh: fetched 30s ago.
+    EXPECT_TRUE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(30), now, threshold));
+
+    // Boundary: exactly at the threshold still counts as fresh (<=).
+    EXPECT_TRUE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(120), now, threshold));
+
+    // Stale: one poll interval past the threshold.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        true, now - std::chrono::seconds(150), now, threshold));
+
+    // Never fetched successfully: a default-constructed time_point gives
+    // an enormous age -- must read stale, not fresh.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        true, clock::time_point{}, now, threshold));
+
+    // No prices cached at all: stale regardless of timestamps.
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(
+        false, now, now, threshold));
+}
+
+TEST(CoingeckoFeedFreshForRevival, DisabledThresholdReadsStaleNotFresh) {
+    // cex_freshness_threshold_sec <= 0 legally disables freshness decay
+    // for the published-mid blend.  For revival "no freshness check" would
+    // mean a frozen feed quotes forever, so the helper must be
+    // conservative -- and load_config refuses the combination anyway
+    // (tested below).
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, 0.0));
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, -1.0));
+}
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledFreshnessThreshold_Throws) {
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledFreshnessThresholdWithoutRevive_IsLegal) {
+    // The 0-disables-decay setting predates revive_market and must keep
+    // working for configs that never opted into revival.
+    std::string yaml(kMinimalValidYaml);
+    yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: 0\n";
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.market_data.cex_freshness_threshold_sec, 0.0);
+}
+
 }  // namespace

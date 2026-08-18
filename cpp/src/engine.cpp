@@ -4383,14 +4383,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // that state produced silence, and silence is the correct fallback.
         // (A feed that returns fresh-but-wrong prices is not catchable at
         // this layer; the outage/rate-limit case -- the common one -- is.)
-        const bool quote_anchor_feed_fresh = [&] {
-            if (coingecko_prices_.empty()) return false;
-            const double age_s = std::chrono::duration<double>(
-                std::chrono::steady_clock::now()
-                - coingecko_last_fetch_).count();
-            return age_s
-                <= config_.market_data.cex_freshness_threshold_sec;
-        }();
+        const bool quote_anchor_feed_fresh =
+            coingecko_feed_fresh_for_revival(
+                !coingecko_prices_.empty(),
+                coingecko_last_fetch_,
+                std::chrono::steady_clock::now(),
+                config_.market_data.cex_freshness_threshold_sec);
 
         // Volatility (hoisted above the centre computation: the A-S
         // reservation offset below needs the honest annualized sigma).
@@ -5007,7 +5005,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
             // Bid floor: requires quote-asset wallet to cover min_pool in base
             // units at the current mid.
-            if (drift_zeroed_bid && avail_capital < min_pool) {
+            if (floor_bid && drift_zeroed_bid && avail_capital < min_pool) {
                 spdlog::info("[Engine] Step 7: {} deploy-idle bid floor "
                              "suppressed: drift guard hard-zeroed this "
                              "side (acquired asset past its band)",
@@ -5039,7 +5037,7 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             }
 
             // Ask floor: requires base-asset wallet to cover min_pool directly.
-            if (drift_zeroed_ask && avail_inventory < min_pool) {
+            if (floor_ask && drift_zeroed_ask && avail_inventory < min_pool) {
                 spdlog::info("[Engine] Step 7: {} deploy-idle ask floor "
                              "suppressed: drift guard hard-zeroed this "
                              "side (acquired asset past its band)",

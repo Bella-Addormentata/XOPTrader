@@ -15,6 +15,7 @@
 #ifndef XOP_CONFIG_HPP
 #define XOP_CONFIG_HPP
 
+#include <chrono>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -190,6 +191,31 @@ inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
                                        bool anchor_feed_fresh) {
     return pair_cfg != nullptr && pair_cfg->revive_market
         && has_external_estimate && anchor_feed_fresh;
+}
+
+/// The revive path's feed-freshness derivation, factored out so the age
+/// arithmetic and its boundaries are unit-testable (the truth-table test
+/// above receives the result as a bool and cannot pin how it is computed).
+///
+/// `last_success` is the time of the last SUCCESSFUL CoinGecko fetch --
+/// never a solve timestamp, which self-refreshes from the cache and can
+/// never expire.  A default-constructed time_point (no fetch has ever
+/// succeeded) yields an enormous age and correctly reads as stale.
+///
+/// `threshold_sec <= 0` is a legal published-mid setting ("disable CEX
+/// freshness decay"), but for revival it cannot mean "always fresh" -- a
+/// frozen feed would quote forever -- so it conservatively reads as
+/// stale here, and load_config() refuses the combination loudly so an
+/// operator is told at startup instead of watching a silent pair.
+inline bool coingecko_feed_fresh_for_revival(
+    bool have_prices,
+    std::chrono::steady_clock::time_point last_success,
+    std::chrono::steady_clock::time_point now,
+    double threshold_sec) {
+    if (!have_prices || threshold_sec <= 0.0) return false;
+    const double age_s =
+        std::chrono::duration<double>(now - last_success).count();
+    return age_s <= threshold_sec;
 }
 
 // ---------------------------------------------------------------------------

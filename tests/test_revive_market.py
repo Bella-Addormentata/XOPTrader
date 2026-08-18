@@ -192,5 +192,62 @@ def test_ticking_dirties_the_pairs_tab(panel, cfg_path):
     assert panel._tab_dirty.get(1) is True  # Trading Pairs = tab index 1
 
 
+# --------------------------------------------------------------------------- #
+# Remove-button row targeting (regression for the coordinate-frame fix)
+# --------------------------------------------------------------------------- #
+
+def test_remove_button_removes_the_clicked_row_not_row_zero(
+        panel, cfg_path, qapp, monkeypatch):
+    """Clicking Remove on row N must remove row N's pair.
+
+    The old code resolved the row with ``indexAt(btn.pos())`` -- coordinates
+    relative to the actions CONTAINER, always ~(4, 2) -- which maps to row 0
+    for every row: Remove on any row deleted the FIRST pair, with only the
+    confirmation dialog's pair name as protection.
+    """
+    from PySide6.QtWidgets import QMessageBox, QPushButton
+
+    panel.load_config(str(cfg_path))
+    panel.resize(1200, 700)
+    panel.show()  # offscreen: realizes the table layout so indexAt works
+    qapp.processEvents()
+
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.Yes),
+    )
+
+    def names():
+        return [
+            panel._pairs_table.item(r, 1).text()
+            for r in range(panel._pairs_table.rowCount())
+        ]
+
+    before = names()
+    assert len(before) >= 3, "example config must have several pairs"
+    target = before[2]
+
+    container = panel._pairs_table.cellWidget(2, 7)
+    assert container is not None, "actions cell missing"
+    btn = container.findChild(QPushButton)
+    assert btn is not None
+    btn.click()
+    qapp.processEvents()
+
+    after = names()
+    assert target not in after, "the clicked row's pair must be removed"
+    assert after[0] == before[0], "row 0 must survive a click on row 2"
+
+    # And again after the table has shifted: rows re-resolve at click time.
+    target2 = after[1]
+    container2 = panel._pairs_table.cellWidget(1, 7)
+    btn2 = container2.findChild(QPushButton)
+    btn2.click()
+    qapp.processEvents()
+    final = names()
+    assert target2 not in final
+    assert final[0] == before[0]
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

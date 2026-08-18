@@ -3105,6 +3105,29 @@ AppConfig load_config(const std::string& path,
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
 
+    // Cross-section: revive_market quotes from the CoinGecko anchor and
+    // is freshness-gated by market_data.cex_freshness_threshold_sec.  A
+    // non-positive threshold legally disables CEX freshness decay for the
+    // published-mid blend -- but for revival it would read as "never
+    // fresh" and the revived pair would sit silent forever with only a
+    // per-heartbeat warning to explain why.  Loud, not silent.
+    if (cfg.market_data.cex_freshness_threshold_sec <= 0.0) {
+        for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
+            if (cfg.pairs[i].revive_market) {
+                throw ConfigError(
+                    "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
+                    + "): revive_market requires "
+                      "market_data.cex_freshness_threshold_sec > 0 (got "
+                    + std::to_string(
+                          cfg.market_data.cex_freshness_threshold_sec)
+                    + "). The revive path refuses to quote from a feed "
+                      "whose freshness cannot be established; either "
+                      "restore the threshold (default 120) or remove "
+                      "revive_market from this pair.");
+            }
+        }
+    }
+
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.
     log_config_summary(cfg);
