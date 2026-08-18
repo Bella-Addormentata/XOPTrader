@@ -822,4 +822,61 @@ TEST(CoingeckoFeedFreshForRevival, NonFiniteThresholdReadsStale) {
     EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, nan));
 }
 
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledWidthSigma_Throws) {
+    // quote_width_sigma_mult: 0 removes the sigma term from the width
+    // floor -- the one bound the untrusted-solve branch relies on in
+    // place of the fair-value clamp.  A revived ladder would quote an
+    // uncertain estimate tighter than its own error bar.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(), "\n  quote_width_sigma_mult: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, ReviveMarketWithDisabledStaleDemotion_Throws) {
+    // fair_value_stale_sigma_bps_per_print: 0 disables the term that
+    // demotes a frozen book edge -- a stale transitive edge would keep
+    // fixed weight in the solve forever.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  fair_value_stale_sigma_bps_per_print: 0");
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, DisabledWidthSigmaWithoutRevive_IsLegal) {
+    // Both knobs keep their legal 0 settings for configs that never
+    // opted into revival.
+    std::string yaml(kMinimalValidYaml);
+    const std::string skey = "\n  min_profit_margin_bps: 35.0";
+    auto spos = yaml.find(skey);
+    ASSERT_NE(spos, std::string::npos);
+    yaml.insert(spos + skey.size(),
+                "\n  quote_width_sigma_mult: 0"
+                "\n  fair_value_stale_sigma_bps_per_print: 0");
+    TempYaml tmp(yaml);
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_DOUBLE_EQ(cfg.strategy.quote_width_sigma_mult, 0.0);
+    EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_bps_per_print, 0.0);
+}
+
 }  // namespace

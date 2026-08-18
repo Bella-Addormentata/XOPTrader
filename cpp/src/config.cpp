@@ -3105,60 +3105,72 @@ AppConfig load_config(const std::string& path,
     cfg.recovery   = parse_recovery(root);
     cfg.buyer      = parse_buyer(root);
 
-    // Cross-section: revive_market quotes from the fair-value solve, so
-    // every feed that can dominate that solve must be allowed to EXPIRE.
-    // Two legal "disable expiry" settings exist for other purposes, and
-    // each would let a revived ladder quote a frozen price forever:
+    // Cross-section: revive_market quotes from the fair-value solve with
+    // no order-book reference, so its whole safety envelope is carried by
+    // a handful of strategy/market-data knobs -- and several of them have
+    // legal "disable" settings (0 by convention, .inf by arithmetic) that
+    // exist for other purposes.  Any one of them being disabled lets a
+    // revived ladder quote a frozen or unbounded price:
     //
-    //  * market_data.cex_freshness_threshold_sec <= 0 disables CEX
-    //    freshness decay for the published-mid blend -- but the revive
-    //    gate reads it as "never fresh" and the pair would sit silent
-    //    with only a per-heartbeat warning to explain why;
-    //  * strategy.fair_value_amm_max_age_sec <= 0 admits AMM edges of
-    //    ANY age into the graph (engine.cpp Step 7): CoinGecko can stay
-    //    fresh while a frozen TibetSwap edge pins the solve, and the
-    //    CEX-only runtime gate cannot see it.  With a finite max age a
-    //    frozen AMM edge ages out of the graph on its own (the AMM path
-    //    tracks genuine feed age), which is exactly the guarantee
-    //    revival needs.
+    //  * cex_freshness_threshold_sec -- the runtime gate reads a
+    //    non-positive value as "never fresh" and the pair sits silent;
+    //  * fair_value_amm_max_age_sec  -- <= 0 admits AMM edges of ANY age
+    //    into the graph, so a frozen TibetSwap edge can pin the solve
+    //    while CoinGecko stays fresh;
+    //  * quote_width_sigma_mult      -- 0 removes the sigma term from the
+    //    width floor, the bound the untrusted-solve branch explicitly
+    //    relies on in place of the fair-value clamp;
+    //  * fair_value_stale_sigma_bps_per_print -- 0 disables the term that
+    //    demotes a frozen transitive book edge, so a stale edge keeps
+    //    fixed weight in the solve forever.
     //
-    // Loud, not silent: refuse both combinations at load.
-    // "Usable expiry" means finite AND positive: 0 disables the check by
-    // convention, .inf disables it by arithmetic (age <= inf is always
-    // true; NaN comparisons are all false and would disarm the <= 0 test
-    // itself).  Both readings let a frozen feed quote forever, so both
-    // are refused when any pair opted into revival.
-    const auto usable_expiry = [](double v) {
-        return std::isfinite(v) && v > 0.0;
-    };
-    if (!usable_expiry(cfg.market_data.cex_freshness_threshold_sec)
-        || !usable_expiry(cfg.strategy.fair_value_amm_max_age_sec))
+    // Loud, not silent: refuse the combination at load, naming the pair,
+    // the knob, and the way out.  Table-driven so the next knob someone
+    // finds is a one-line addition, not a new bug class.
     {
+        const auto usable = [](double v) {
+            return std::isfinite(v) && v > 0.0;
+        };
+        struct ReviveSafetyKnob {
+            const char* name;
+            double      value;
+            double      default_value;
+            const char* why;
+        };
+        const ReviveSafetyKnob knobs[] = {
+            {"market_data.cex_freshness_threshold_sec",
+             cfg.market_data.cex_freshness_threshold_sec, 120.0,
+             "the revive path refuses to quote from a feed whose "
+             "freshness cannot be established"},
+            {"strategy.fair_value_amm_max_age_sec",
+             cfg.strategy.fair_value_amm_max_age_sec, 300.0,
+             "with AMM edge expiry disabled, a frozen TibetSwap feed "
+             "could pin the fair-value solve while CoinGecko stays fresh"},
+            {"strategy.quote_width_sigma_mult",
+             cfg.strategy.quote_width_sigma_mult, 1.0,
+             "the sigma-scaled width floor is the only price bound on a "
+             "revived ladder when the solve exceeds the clamp ceiling; "
+             "disabling it quotes an uncertain estimate tighter than its "
+             "own error bar"},
+            {"strategy.fair_value_stale_sigma_bps_per_print",
+             cfg.strategy.fair_value_stale_sigma_bps_per_print, 5.0,
+             "this is the term that demotes a frozen book edge; without "
+             "it a stale transitive edge keeps fixed weight in the solve "
+             "forever"},
+        };
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
             if (!cfg.pairs[i].revive_market) continue;
-            if (!usable_expiry(
-                    cfg.market_data.cex_freshness_threshold_sec)) {
+            for (const auto& k : knobs) {
+                if (usable(k.value)) continue;
                 throw ConfigError(
-                    "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
-                    + "): revive_market requires a finite "
-                      "market_data.cex_freshness_threshold_sec > 0 (got "
-                    + std::to_string(
-                          cfg.market_data.cex_freshness_threshold_sec)
-                    + "). The revive path refuses to quote from a feed "
-                      "whose freshness cannot be established; either "
-                      "restore the threshold (default 120) or remove "
-                      "revive_market from this pair.");
+                    "pairs[" + std::to_string(i) + "] ("
+                    + cfg.pairs[i].name + "): revive_market requires a "
+                    "finite " + k.name + " > 0 (got "
+                    + std::to_string(k.value) + "): " + k.why
+                    + ". Either restore the knob (default "
+                    + std::to_string(k.default_value)
+                    + ") or remove revive_market from this pair.");
             }
-            throw ConfigError(
-                "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
-                + "): revive_market requires a finite "
-                  "strategy.fair_value_amm_max_age_sec > 0 (got "
-                + std::to_string(cfg.strategy.fair_value_amm_max_age_sec)
-                + "). With AMM edge expiry disabled, a frozen TibetSwap "
-                  "feed could pin the fair-value solve while CoinGecko "
-                  "stays fresh, and the revived ladder would quote that "
-                  "frozen price; either restore the max age (default 300) "
-                  "or remove revive_market from this pair.");
         }
     }
 
