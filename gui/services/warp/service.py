@@ -1194,9 +1194,9 @@ class WarpEngine:
         spendable = int(bal.get("spendable_balance") or 0)
         if spendable < needed:
             raise WarpPending(
-                f"{context}: spendable XCH {spendable} < required {needed} "
-                "mojos (offer collateral may hold the rest; waiting for it "
-                "to free)"
+                f"{context}: spendable XCH {spendable} mojos < required "
+                f"{needed} mojos (offer collateral may hold the rest; "
+                "waiting for it to free)"
             )
 
     def _h_funding_claim(self, job: WarpJob) -> _Step:
@@ -2000,7 +2000,11 @@ class WarpEngine:
         # which is exactly why it survived until the 2026-08 fee study.
         toll_need = net.chia_toll_mojos + 2 * p.unwrap_chia_fee_mojos
         if int(xch.get("spendable_balance") or 0) < toll_need:
-            raise WarpPending(f"spendable XCH below toll+fees {toll_need}")
+            raise WarpPending(
+                f"spendable XCH below the unwrap budget of {toll_need} mojos "
+                "(toll + 2x unwrap_chia_fee_mojos: the fee is paid on both "
+                "the cat_spend and the toll funding send)"
+            )
 
         burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(net, receiver)
         state = {
@@ -2258,10 +2262,10 @@ class WarpEngine:
                     state={"funding_tx_id": existing, "funding_amount": toll},
                     message="toll funding already in flight (dedupe hit)",
                 )
-            self._wallet.log_in()
             self._require_spendable_xch(
                 toll + p.unwrap_chia_fee_mojos, context="toll funding"
             )
+            self._wallet.log_in()
             record = self._wallet.send_transaction(
                 1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
                 fee_mojos=p.unwrap_chia_fee_mojos,
