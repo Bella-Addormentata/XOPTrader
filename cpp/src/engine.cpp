@@ -4586,47 +4586,44 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                  config_.strategy.fee_reserve_xch);
                 }
             }
-            if (pair_cfg->quote_asset_id == "xch" && avail_capital > 0) {
-                const auto prev = avail_capital;
-                avail_capital = std::max(Mojo{0},
-                                         avail_capital - reserve_mojos);
-                if (avail_capital < prev) {
-                    spdlog::info("[Engine] Step 7: {} XCH fee reserve: "
-                                 "bid pool {:.6f} -> {:.6f} XCH "
-                                 "(reserved {:.3f} XCH for fees)",
-                                 pair_name,
-                                 static_cast<double>(prev) / kMojosPerXch,
-                                 static_cast<double>(avail_capital) / kMojosPerXch,
-                                 config_.strategy.fee_reserve_xch);
+            if (pair_cfg->quote_asset_id == "xch" && avail_capital > 0
+                && pair_cfg->base_mojos_per_unit > 0)
+            {
+                // [S3 2026-08-18] avail_capital is BASE-asset mojos (see the
+                // caps below), so the XCH reserve must be converted into the
+                // base mojos it could have bought at the mid before being
+                // subtracted.  The raw subtraction zeroed the pool every
+                // heartbeat on CAT-base pairs (1e12-scale reserve vs a
+                // 1e3-per-unit pool), leaving only floor mechanisms quoting.
+                // A missing mid converts to 0 -> no subtraction; such a pair
+                // is cleared by the no-order-book guard before posting.
+                const Mojo reserve_base = reserve_base_mojos(
+                    static_cast<double>(reserve_mojos),
+                    static_cast<double>(kMojosPerXch),
+                    market_mid,
+                    static_cast<double>(pair_cfg->base_mojos_per_unit));
+                if (reserve_base > 0) {
+                    const auto prev = avail_capital;
+                    avail_capital = std::max(Mojo{0},
+                                             avail_capital - reserve_base);
+                    if (avail_capital < prev) {
+                        spdlog::info(
+                            "[Engine] Step 7: {} XCH fee reserve: bid pool "
+                            "{:.4f} -> {:.4f} {} units (reserved {:.3f} XCH "
+                            "~= {} base mojos at mid {:.6f})",
+                            pair_name,
+                            static_cast<double>(prev)
+                                / static_cast<double>(
+                                      pair_cfg->base_mojos_per_unit),
+                            static_cast<double>(avail_capital)
+                                / static_cast<double>(
+                                      pair_cfg->base_mojos_per_unit),
+                            pair_cfg->base_asset_id,
+                            config_.strategy.fee_reserve_xch,
+                            reserve_base,
+                            market_mid);
+                    }
                 }
-            }
-        }
-
-        // -- [v0.7.38] Hard wallet-balance cap: prevent the Avellaneda model
-        // from sizing offers beyond what the wallet actually holds.
-        // q_max drives ask_size = q_max*(1+q/q_max) which can vastly exceed
-        // the confirmed XCH balance.  Without this cap, oversized sell offers
-        // drain XCH far faster than buy offers can replenish it.
-        if (pair_cfg && xch_confirmed_balance_ > 0) {
-            if (pair_cfg->base_asset_id == "xch"
-                && avail_inventory > xch_confirmed_balance_)
-            {
-                spdlog::warn("[Engine] Step 7: {} ask pool {:.6f} XCH > "
-                             "confirmed {:.6f} XCH -- CAPPED",
-                             pair_name,
-                             static_cast<double>(avail_inventory) / kMojosPerXch,
-                             static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
-                avail_inventory = xch_confirmed_balance_;
-            }
-            if (pair_cfg->quote_asset_id == "xch"
-                && avail_capital > xch_confirmed_balance_)
-            {
-                spdlog::warn("[Engine] Step 7: {} bid pool {:.6f} XCH > "
-                             "confirmed {:.6f} XCH -- CAPPED",
-                             pair_name,
-                             static_cast<double>(avail_capital) / kMojosPerXch,
-                             static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
-                avail_capital = xch_confirmed_balance_;
             }
         }
 
@@ -4636,17 +4633,27 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // caps, an Avellaneda+risk-sized pool can exceed what the CAT
         // wallet actually holds, producing offers the wallet can't back.
         if (pair_cfg && config_.strategy.wallet_balance_caps_enabled) {
-            auto cat_confirmed = [&](const std::string& asset_id) -> Mojo {
+            // nullopt = the balance has NEVER been observed (the cache is
+            // populated inside Step 8's per-pair loop, which skips empty
+            // ladders -- treating a miss as zero would cap this pair's
+            // ladder empty and deadlock it out of the very step that
+            // fills the cache).  A present entry with confirmed == 0 is a
+            // freshly observed zero and the cap applies.
+            auto cat_confirmed = [&](const std::string& asset_id)
+                -> std::optional<Mojo> {
                 auto it = cached_wallet_balances_.find(asset_id);
-                return (it != cached_wallet_balances_.end())
-                           ? it->second.confirmed
-                           : Mojo{0};
+                if (it == cached_wallet_balances_.end()) return std::nullopt;
+                return it->second.confirmed;
             };
 
             // Ask side: convert base wallet (in base mojos) directly.
+            // Present zero caps to zero; unknown skips (see cat_confirmed).
             if (pair_cfg->base_asset_id != "xch") {
-                const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
-                if (base_bal > 0 && avail_inventory > base_bal) {
+                const auto base_bal_opt =
+                    cat_confirmed(pair_cfg->base_asset_id);
+                const Mojo base_bal = base_bal_opt.value_or(Mojo{0});
+                if (base_bal_opt.has_value()
+                    && avail_inventory > base_bal) {
                     spdlog::warn("[Engine] Step 7: {} ask pool {:.4f} {} > "
                                  "confirmed {:.4f} {} -- CAPPED (CAT wallet)",
                                  pair_name,
@@ -4669,15 +4676,26 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                 && pair_cfg->quote_mojos_per_unit > 0
                 && pair_cfg->base_mojos_per_unit > 0)
             {
-                const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
-                if (quote_bal > 0) {
+                const auto quote_bal_opt =
+                    cat_confirmed(pair_cfg->quote_asset_id);
+                if (quote_bal_opt.has_value()) {
+                    const Mojo quote_bal = *quote_bal_opt;
                     const double quote_units =
                         static_cast<double>(quote_bal)
                         / static_cast<double>(pair_cfg->quote_mojos_per_unit);
-                    const Mojo bid_cap_base = static_cast<Mojo>(std::llround(
-                        (quote_units / market_mid)
-                        * static_cast<double>(pair_cfg->base_mojos_per_unit)));
-                    if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                    // Same conversion as the XCH-quote cap and the fee
+                    // reserve: one formula, one definition (types.hpp).
+                    // try_: a present 0 (zero or dust CAT balance -- the
+                    // floor of a 0.5..1-mojo affordability is 0) is a
+                    // genuine cap and must be applied; only a truly
+                    // unavailable conversion (no mid / overflow) skips.
+                    const auto bid_cap = try_affordable_base_mojos(
+                        static_cast<double>(quote_bal),
+                        static_cast<double>(pair_cfg->quote_mojos_per_unit),
+                        market_mid,
+                        static_cast<double>(pair_cfg->base_mojos_per_unit));
+                    const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                    if (bid_cap.has_value() && avail_capital > bid_cap_base) {
                         spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
                                      "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "
                                      "-- CAPPED (CAT wallet)",
@@ -5045,6 +5063,82 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                  pair_cfg->base_asset_id,
                                  config_.strategy.min_offer_size_units);
                     avail_inventory = floored;
+                }
+            }
+        }
+
+        // -- [v0.7.38 -> S3 round-2] FINAL XCH wallet caps ------------------
+        // The original cap ran early, BEFORE the drift guard, the ratio
+        // rebalance boost (underweight_scale up to 1.15x) and the deploy-
+        // idle floor -- each of which can RAISE a pool after capping -- and
+        // it capped at the FULL balance, silently restoring the fee reserve
+        // deducted upstream.  Applied here, after every pool-raising
+        // transform, against confirmed-minus-reserve, it is the last word:
+        // no later step in this function touches the pool sizes.
+        //
+        // No `> 0` guard on the balance: the refresh KEEPS the previous
+        // cached value on RPC failure (see the Step 7 balance query), so a
+        // zero here means genuinely zero -- or never fetched yet at
+        // startup -- and both must cap pools to zero rather than let a
+        // strategy-sized pool through unchecked.
+        if (pair_cfg) {
+            const Mojo reserve_mojos =
+                (config_.strategy.fee_reserve_xch > 0.0)
+                    ? static_cast<Mojo>(std::llround(
+                          config_.strategy.fee_reserve_xch
+                          * static_cast<double>(kMojosPerXch)))
+                    : Mojo{0};
+            const Mojo xch_budget = std::max(
+                Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
+
+            // Ask side of an XCH-base pair: the pool IS XCH mojos.
+            if (pair_cfg->base_asset_id == "xch"
+                && avail_inventory > xch_budget)
+            {
+                spdlog::warn("[Engine] Step 7: {} ask pool {:.6f} XCH > "
+                             "confirmed-minus-reserve {:.6f} XCH -- CAPPED",
+                             pair_name,
+                             static_cast<double>(avail_inventory)
+                                 / kMojosPerXch,
+                             static_cast<double>(xch_budget) / kMojosPerXch);
+                avail_inventory = xch_budget;
+            }
+
+            // Bid side of an XCH-quote pair: the pool is BASE mojos; cap
+            // at what the XCH budget can buy at the mid (floors -- never
+            // admits a mojo the wallet cannot back).  A cap of 0 from a
+            // missing mid must not zero the pool; the no-order-book guard
+            // owns that case.
+            if (pair_cfg->quote_asset_id == "xch"
+                && pair_cfg->base_mojos_per_unit > 0)
+            {
+                // try_: nullopt (no mid / overflow) means SKIP -- the
+                // no-order-book guard owns the no-mid case, and an
+                // int64-overflowing cap is effectively unlimited.  A
+                // present 0 is a genuine zero cap (budget <= reserve, or
+                // it funds less than one base mojo) and must be applied,
+                // or a floor-raised pool survives on fee-reserve money.
+                const auto bid_cap = try_affordable_base_mojos(
+                    static_cast<double>(xch_budget),
+                    static_cast<double>(kMojosPerXch),
+                    market_mid,
+                    static_cast<double>(pair_cfg->base_mojos_per_unit));
+                const Mojo bid_cap_base = bid_cap.value_or(Mojo{0});
+                if (bid_cap.has_value() && avail_capital > bid_cap_base) {
+                    const double pool_units =
+                        static_cast<double>(avail_capital)
+                        / static_cast<double>(pair_cfg->base_mojos_per_unit);
+                    spdlog::warn(
+                        "[Engine] Step 7: {} bid pool {:.4f} {} units "
+                        "(= {:.6f} XCH at mid {:.6f}) exceeds "
+                        "confirmed-minus-reserve {:.6f} XCH -- CAPPED",
+                        pair_name,
+                        pool_units,
+                        pair_cfg->base_asset_id,
+                        pool_units * market_mid,
+                        market_mid,
+                        static_cast<double>(xch_budget) / kMojosPerXch);
+                    avail_capital = bid_cap_base;
                 }
             }
         }
@@ -6295,6 +6389,100 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              pair_name, bumped_tiers, eff_min_units);
             }
 
+            // -- [S3 rounds 5+7] Re-enforce EVERY side's funding budget
+            // after the up-scale.  The wallet caps above bound the POOLS,
+            // but the up-scale pass just raised every sub-minimum tier to
+            // min_base_mojos -- a budget smaller than one minimum offer
+            // would be enlarged past its cap (into XCH reserve funds, or
+            // past a CAT wallet's balance).  For each side, resolve the
+            // funding asset's KNOWN budget, walk that side's tiers
+            // tightest-first, keep while the cumulative cost fits, drop
+            // the rest.  Ask tiers cost their base-mojo size directly;
+            // bid tiers cost quote_mojos_for(size, price), ceiled.
+            if (pair_cfg) {
+                // nullopt = never observed -> skip enforcement for that
+                // side (same availability contract as the caps above; the
+                // XCH balance is always present -- its refresh is not
+                // Step-8-gated -- and carries the fee reserve).
+                auto known_budget = [&](const std::string& asset_id)
+                    -> std::optional<Mojo> {
+                    if (asset_id == "xch") {
+                        const Mojo reserve_mojos =
+                            (config_.strategy.fee_reserve_xch > 0.0)
+                                ? static_cast<Mojo>(std::llround(
+                                      config_.strategy.fee_reserve_xch
+                                      * static_cast<double>(kMojosPerXch)))
+                                : Mojo{0};
+                        return std::max(
+                            Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
+                    }
+                    if (!config_.strategy.wallet_balance_caps_enabled) {
+                        return std::nullopt;  // CAT caps opted out
+                    }
+                    auto it = cached_wallet_balances_.find(asset_id);
+                    if (it == cached_wallet_balances_.end()) {
+                        return std::nullopt;  // never observed
+                    }
+                    return it->second.confirmed;
+                };
+
+                for (const Side side : {Side::Ask, Side::Bid}) {
+                    const bool is_ask = (side == Side::Ask);
+                    const std::string& funding_asset =
+                        is_ask ? pair_cfg->base_asset_id
+                               : pair_cfg->quote_asset_id;
+                    const auto budget = known_budget(funding_asset);
+                    if (!budget.has_value()) continue;
+
+                    std::vector<Mojo> costs;
+                    costs.reserve(pcs.ladder.size());
+                    for (const auto& tq : pcs.ladder) {
+                        if (tq.side != side) continue;
+                        if (is_ask) {
+                            costs.push_back(tq.size);
+                        } else {
+                            // Conservative ceil: never under-count a cost.
+                            const double q = quote_mojos_for(
+                                static_cast<double>(tq.size),
+                                static_cast<double>(tq.price),
+                                static_cast<double>(
+                                    pair_cfg->base_mojos_per_unit),
+                                static_cast<double>(
+                                    pair_cfg->quote_mojos_per_unit));
+                            costs.push_back(
+                                (std::isfinite(q) && q >= 0.0
+                                 && q < static_cast<double>(
+                                        std::numeric_limits<Mojo>::max()))
+                                    ? static_cast<Mojo>(std::ceil(q))
+                                    : std::numeric_limits<Mojo>::max());
+                        }
+                    }
+                    const std::size_t keep = tiers_within_budget(
+                        costs, *budget);
+                    if (keep >= costs.size()) continue;
+
+                    std::size_t seen = 0;
+                    const auto before = pcs.ladder.size();
+                    pcs.ladder.erase(
+                        std::remove_if(
+                            pcs.ladder.begin(), pcs.ladder.end(),
+                            [&](const TierQuote& tq) {
+                                if (tq.side != side) return false;
+                                return seen++ >= keep;
+                            }),
+                        pcs.ladder.end());
+                    spdlog::warn(
+                        "[Engine] Step 7: {} dropped {} up-scaled {} "
+                        "tier(s): cumulative {} cost exceeds the known "
+                        "budget of {} mojos",
+                        pair_name,
+                        before - pcs.ladder.size(),
+                        is_ask ? "ASK" : "BID",
+                        funding_asset,
+                        *budget);
+                }
+            }
+
             // Diagnostic: show what's in ladder before dust filtering
             uint32_t pre_bids = 0, pre_asks = 0;
             for (const auto& tq : pcs.ladder) {
@@ -6649,6 +6837,69 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                          config_.strategy.fee_reserve_xch,
                          config_.strategy.fee_reserve_xch * 2.0);
             xch_buy_only_mode = true;
+        }
+    }
+
+    // -- [S3 rounds 8-9] Liveness refresh for empty-ladder pairs --------
+    // The balance cache's only other writer sits BELOW the empty-ladder
+    // continue in the loop that follows, so a pair whose ladder is empty
+    // gets NO refresh from the main loop at all -- and the caps/trim can
+    // empty a ladder on a zero, missing, OR positive-but-sub-minimum
+    // cached balance.  Any conditional skip here reopens the deadlock for
+    // whichever case it skips (round 9: two positive sub-minimum sides
+    // starved each other out), so an empty ladder refreshes ALL of its
+    // CAT funding assets, unconditionally.  Deduped across pairs; XCH is
+    // exempt (its refresh runs in the poll loop and is not ladder-gated).
+    // Cost: at most two RPCs per empty-ladder pair per heartbeat.
+    {
+        std::set<std::string> refreshed;
+        for (auto& [pair_name, pcs] : cycle_) {
+            if (!pcs.ladder.empty()) continue;
+            const PairConfig* live_pc = find_pair_config(pair_name);
+            if (!live_pc) continue;
+            const std::string assets[2] = {live_pc->base_asset_id,
+                                           live_pc->quote_asset_id};
+            for (const auto& asset : assets) {
+                if (asset == "xch") continue;
+                if (!refreshed.insert(asset).second) continue;
+                const auto wid = offer_mgr_->resolve_wallet_id(asset);
+                if (wid <= 0) continue;
+                std::optional<Mojo> prior;
+                if (auto it = cached_wallet_balances_.find(asset);
+                    it != cached_wallet_balances_.end()) {
+                    prior = it->second.confirmed;
+                }
+                try {
+                    auto bal_json =
+                        co_await wallet_->get_wallet_balance(wid);
+                    Mojo spendable = 0, confirmed = 0, pending = 0;
+                    if (bal_json.contains("spendable_balance"))
+                        spendable =
+                            bal_json["spendable_balance"].get<Mojo>();
+                    if (bal_json.contains("confirmed_wallet_balance"))
+                        confirmed =
+                            bal_json["confirmed_wallet_balance"].get<Mojo>();
+                    if (bal_json.contains("pending_change"))
+                        pending =
+                            bal_json["pending_change"].get<Mojo>();
+                    cached_wallet_balances_[asset] =
+                        {spendable, confirmed, pending, block_height};
+                    // Log only transitions worth an operator's eye: a
+                    // balance appearing where the cache had none/zero.
+                    if (confirmed > 0
+                        && (!prior.has_value() || *prior <= 0)) {
+                        spdlog::info(
+                            "[Engine] Step 8: liveness refresh observed a "
+                            "deposit for {} ({} mojos confirmed) -- the "
+                            "pair can quote again next heartbeat",
+                            asset, confirmed);
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::debug(
+                        "[Engine] Step 8: liveness refresh for {} "
+                        "failed: {}", asset, e.what());
+                }
+            }
         }
     }
 

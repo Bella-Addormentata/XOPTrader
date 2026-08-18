@@ -154,12 +154,23 @@ class FakeWallet:
         self.sent: list = []
         self.txs: list = []
         self.next_address = ADDR
+        # Wallet 1 XCH balance; tests shrink spendable to model offer locks.
+        self.balances = {
+            1: {"confirmed_wallet_balance": 10 ** 12,
+                "spendable_balance": 10 ** 12},
+        }
 
     def log_in(self):
         self.logged_in += 1
 
     def get_next_address(self, wallet_id, new_address=True):
         return self.next_address
+
+    def get_wallet_balance(self, wallet_id):
+        return dict(self.balances.get(
+            int(wallet_id),
+            {"confirmed_wallet_balance": 0, "spendable_balance": 0},
+        ))
 
     def send_transaction(self, wallet_id, amount, address, fee_mojos=0):
         self.sent.append((amount, address, fee_mojos))
