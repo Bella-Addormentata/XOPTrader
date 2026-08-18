@@ -18,6 +18,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <limits>
 #include <string>
 
 namespace {
@@ -776,6 +777,49 @@ TEST(ConfigParserTest, DisabledAmmExpiryWithoutRevive_IsLegal) {
     TempYaml tmp(yaml);
     auto cfg = xop::load_config(tmp.path());
     EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_amm_max_age_sec, 0.0);
+}
+
+
+TEST(ConfigParserTest, ReviveMarketWithInfiniteThresholds_Throws) {
+    // YAML .inf parses to +infinity, and inf <= 0.0 is false -- so an
+    // infinite "expiry" slid through the non-positive check while
+    // disabling the freshness arithmetic entirely (age <= inf is always
+    // true).  Both knobs must be refused when revival is on.
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        yaml += "\nmarket_data:\n  cex_freshness_threshold_sec: .inf\n";
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        ASSERT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        const std::string skey = "\n  min_profit_margin_bps: 35.0";
+        auto spos = yaml.find(skey);
+        ASSERT_NE(spos, std::string::npos);
+        yaml.insert(spos + skey.size(),
+                    "\n  fair_value_amm_max_age_sec: .inf");
+        TempYaml tmp(yaml);
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(CoingeckoFeedFreshForRevival, NonFiniteThresholdReadsStale) {
+    using clock = std::chrono::steady_clock;
+    const auto now = clock::now();
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, inf));
+    EXPECT_FALSE(xop::coingecko_feed_fresh_for_revival(true, now, now, nan));
 }
 
 }  // namespace

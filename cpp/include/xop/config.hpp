@@ -16,6 +16,7 @@
 #define XOP_CONFIG_HPP
 
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <optional>
 #include <string>
@@ -212,7 +213,14 @@ inline bool coingecko_feed_fresh_for_revival(
     std::chrono::steady_clock::time_point last_success,
     std::chrono::steady_clock::time_point now,
     double threshold_sec) {
-    if (!have_prices || threshold_sec <= 0.0) return false;
+    // Non-finite thresholds (.inf parses fine in YAML, and NaN comparisons
+    // are all false) would defeat the age check outright -- age <= inf is
+    // always true.  Conservative: not establishable means not fresh.
+    if (!have_prices
+        || !std::isfinite(threshold_sec)
+        || threshold_sec <= 0.0) {
+        return false;
+    }
     const double age_s =
         std::chrono::duration<double>(now - last_success).count();
     return age_s <= threshold_sec;

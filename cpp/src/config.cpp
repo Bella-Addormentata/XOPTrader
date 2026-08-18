@@ -3123,15 +3123,24 @@ AppConfig load_config(const std::string& path,
     //    revival needs.
     //
     // Loud, not silent: refuse both combinations at load.
-    if (cfg.market_data.cex_freshness_threshold_sec <= 0.0
-        || cfg.strategy.fair_value_amm_max_age_sec <= 0.0)
+    // "Usable expiry" means finite AND positive: 0 disables the check by
+    // convention, .inf disables it by arithmetic (age <= inf is always
+    // true; NaN comparisons are all false and would disarm the <= 0 test
+    // itself).  Both readings let a frozen feed quote forever, so both
+    // are refused when any pair opted into revival.
+    const auto usable_expiry = [](double v) {
+        return std::isfinite(v) && v > 0.0;
+    };
+    if (!usable_expiry(cfg.market_data.cex_freshness_threshold_sec)
+        || !usable_expiry(cfg.strategy.fair_value_amm_max_age_sec))
     {
         for (std::size_t i = 0; i < cfg.pairs.size(); ++i) {
             if (!cfg.pairs[i].revive_market) continue;
-            if (cfg.market_data.cex_freshness_threshold_sec <= 0.0) {
+            if (!usable_expiry(
+                    cfg.market_data.cex_freshness_threshold_sec)) {
                 throw ConfigError(
                     "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
-                    + "): revive_market requires "
+                    + "): revive_market requires a finite "
                       "market_data.cex_freshness_threshold_sec > 0 (got "
                     + std::to_string(
                           cfg.market_data.cex_freshness_threshold_sec)
@@ -3142,7 +3151,7 @@ AppConfig load_config(const std::string& path,
             }
             throw ConfigError(
                 "pairs[" + std::to_string(i) + "] (" + cfg.pairs[i].name
-                + "): revive_market requires "
+                + "): revive_market requires a finite "
                   "strategy.fair_value_amm_max_age_sec > 0 (got "
                 + std::to_string(cfg.strategy.fair_value_amm_max_age_sec)
                 + "). With AMM edge expiry disabled, a frozen TibetSwap "
