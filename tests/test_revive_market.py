@@ -249,5 +249,16 @@ def test_remove_button_removes_the_clicked_row_not_row_zero(
     assert final[0] == before[0]
 
 
+def test_tooltip_states_the_coingecko_requirement(panel, cfg_path):
+    """The runtime gate always requires a fresh CoinGecko fetch; the
+    tooltip must say so, or an operator with an AMM-backed pair ticks
+    the box and watches nothing happen."""
+    panel.load_config(str(cfg_path))
+    row = _pair_row(panel, "wmilliETH.b/XCH")
+    tip = _revive_cb(panel, row).toolTip()
+    assert "CoinGecko" in tip
+    assert "AMM pool alone" in tip
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

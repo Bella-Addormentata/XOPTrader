@@ -879,4 +879,45 @@ TEST(ConfigParserTest, DisabledWidthSigmaWithoutRevive_IsLegal) {
     EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_stale_sigma_bps_per_print, 0.0);
 }
 
+
+TEST(ApplyDeployIdleFloor, HardZeroStaysStopped_TaperStillFloors) {
+    // The wallet-bleed regression: a drift-guard hard zero (scale 0.0)
+    // means STOPPED, and the floor must not re-inflate it -- on either
+    // side (the helper is side-agnostic; bid and ask both route through
+    // it).  A merely tapered side is still acquiring and may be floored.
+    const std::int64_t pool = 0, min_pool = 1000;
+
+    // Hard-stopped: pool stays zero even with the floor armed and the
+    // wallet able to back it.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 0.0, true),
+              0);
+
+    // Tapered but nonzero: the guard is slowing acquisition, not stopping
+    // it -- the floor may still raise the pool to one minimum offer.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 0.35, true),
+              min_pool);
+    EXPECT_EQ(xop::apply_deploy_idle_floor(pool, min_pool, true, 1.0, true),
+              min_pool);
+}
+
+TEST(ApplyDeployIdleFloor, RespectsArmingWalletAndExistingPool) {
+    const std::int64_t min_pool = 1000;
+
+    // Floor disarmed by ratio-rebalance mode: nothing happens.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, min_pool, false, 1.0, true), 0);
+
+    // Wallet cannot back one minimum offer: nothing happens.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, min_pool, true, 1.0, false), 0);
+
+    // Pool already at/above the minimum: left alone (never scaled DOWN).
+    EXPECT_EQ(xop::apply_deploy_idle_floor(5000, min_pool, true, 1.0, true),
+              5000);
+    EXPECT_EQ(xop::apply_deploy_idle_floor(min_pool, min_pool, true, 0.0,
+                                           true),
+              min_pool);
+
+    // Degenerate min_pool: no-op.
+    EXPECT_EQ(xop::apply_deploy_idle_floor(0, 0, true, 1.0, true), 0);
+}
+
 }  // namespace

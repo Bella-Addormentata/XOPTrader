@@ -208,6 +208,31 @@ inline bool ladder_survives_empty_book(const PairConfig* pair_cfg,
 /// frozen feed would quote forever -- so it conservatively reads as
 /// stale here, and load_config() refuses the combination loudly so an
 /// operator is told at startup instead of watching a silent pair.
+/// The deploy-idle floor's per-side decision, factored out so the
+/// drift-guard interaction is unit-testable.
+///
+/// The floor exists to reverse upstream ALLOCATOR scaling: a side whose
+/// pool collapsed below one minimum-size offer despite the wallet holding
+/// balance to back it gets raised to `min_pool`.  But the drift guard's
+/// hard zero is a STOP, not starvation -- `drift_scale <= 0` means the
+/// acquired asset is past target + max_factor*tol and the guard tapered
+/// acquisition all the way off.  Re-inflating that side would convert the
+/// stop into a min-size bleed repeating every heartbeat, bounded only by
+/// the wallet (the exact regression the revive review caught).  A merely
+/// TAPERED side (0 < scale < 1) is still acquiring and may be floored.
+///
+/// Returns the pool value after the floor's decision.
+inline std::int64_t apply_deploy_idle_floor(std::int64_t pool,
+                                            std::int64_t min_pool,
+                                            bool floor_armed,
+                                            double drift_scale,
+                                            bool wallet_covers_min) {
+    if (!floor_armed || min_pool <= 0 || pool >= min_pool) return pool;
+    if (drift_scale <= 0.0) return pool;  // hard stop stays stopped
+    if (!wallet_covers_min) return pool;
+    return min_pool;
+}
+
 inline bool coingecko_feed_fresh_for_revival(
     bool have_prices,
     std::chrono::steady_clock::time_point last_success,

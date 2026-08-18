@@ -4853,11 +4853,12 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         }
 
         // Set inside the drift-guard block below, read by the deploy-idle
-        // floor after it: a side tapered all the way to 0.0 was deliberately
-        // STOPPED (acquired asset past target + max_factor*tol), and the
-        // floor must not re-inflate it back to min size.
-        bool drift_zeroed_bid = false;
-        bool drift_zeroed_ask = false;
+        // floor after it.  The raw scales (not booleans) so the floor's
+        // helper can distinguish a hard zero (STOPPED -- acquired asset
+        // past target + max_factor*tol; must not re-inflate) from a mere
+        // taper (still acquiring; may be floored).
+        double drift_bid_scale = 1.0;
+        double drift_ask_scale = 1.0;
 
         // -- Asset-level soft drift guard ---------------------------------
         // Acts as a "soft wall" on top of pair-level ratio rebalancing:
@@ -4940,8 +4941,8 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
             // Bid acquires base, spends quote.  Ask acquires quote, spends base.
             const double bid_scale = acquire_scale(base_key);
             const double ask_scale = acquire_scale(quote_key);
-            drift_zeroed_bid = (bid_scale <= 0.0);
-            drift_zeroed_ask = (ask_scale <= 0.0);
+            drift_bid_scale = bid_scale;
+            drift_ask_scale = ask_scale;
 
             if (bid_scale < 0.999 || ask_scale < 0.999) {
                 const Mojo old_bid = avail_capital;
@@ -5011,14 +5012,14 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
             // Bid floor: requires quote-asset wallet to cover min_pool in base
             // units at the current mid.
-            if (floor_bid && drift_zeroed_bid && avail_capital < min_pool) {
+            if (floor_bid && drift_bid_scale <= 0.0
+                && avail_capital < min_pool) {
                 spdlog::info("[Engine] Step 7: {} deploy-idle bid floor "
                              "suppressed: drift guard hard-zeroed this "
                              "side (acquired asset past its band)",
                              pair_name);
             }
-            if (floor_bid && !drift_zeroed_bid
-                && min_pool > 0 && avail_capital < min_pool && market_mid > 0.0
+            if (min_pool > 0 && market_mid > 0.0
                 && pair_cfg->quote_mojos_per_unit > 0)
             {
                 const Mojo quote_bal = cat_confirmed(pair_cfg->quote_asset_id);
@@ -5027,43 +5028,49 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     / static_cast<double>(pair_cfg->quote_mojos_per_unit);
                 const double required_quote_units =
                     config_.strategy.min_offer_size_units * market_mid;
-                if (quote_units >= required_quote_units) {
+                const Mojo floored = apply_deploy_idle_floor(
+                    avail_capital, min_pool, floor_bid, drift_bid_scale,
+                    quote_units >= required_quote_units);
+                if (floored != avail_capital) {
                     spdlog::info("[Engine] Step 7: {} bid pool floored "
                                  "{} -> {} base mojos (wallet has {:.4f} {}, "
                                  "needs {:.4f} for min {} units)",
                                  pair_name,
                                  avail_capital,
-                                 min_pool,
+                                 floored,
                                  quote_units,
                                  pair_cfg->quote_asset_id,
                                  required_quote_units,
                                  config_.strategy.min_offer_size_units);
-                    avail_capital = min_pool;
+                    avail_capital = floored;
                 }
             }
 
             // Ask floor: requires base-asset wallet to cover min_pool directly.
-            if (floor_ask && drift_zeroed_ask && avail_inventory < min_pool) {
+            if (floor_ask && drift_ask_scale <= 0.0
+                && avail_inventory < min_pool) {
                 spdlog::info("[Engine] Step 7: {} deploy-idle ask floor "
                              "suppressed: drift guard hard-zeroed this "
                              "side (acquired asset past its band)",
                              pair_name);
             }
-            if (floor_ask && !drift_zeroed_ask
-                && min_pool > 0 && avail_inventory < min_pool) {
+            if (min_pool > 0) {
                 const Mojo base_bal = cat_confirmed(pair_cfg->base_asset_id);
-                if (base_bal >= min_pool) {
+                const Mojo floored = apply_deploy_idle_floor(
+                    avail_inventory, min_pool, floor_ask, drift_ask_scale,
+                    base_bal >= min_pool);
+                if (floored != avail_inventory) {
                     spdlog::info("[Engine] Step 7: {} ask pool floored "
                                  "{} -> {} base mojos (wallet has {:.4f} {} "
                                  ">= min {} units)",
                                  pair_name,
                                  avail_inventory,
-                                 min_pool,
+                                 floored,
                                  static_cast<double>(base_bal)
                                      / static_cast<double>(pair_cfg->base_mojos_per_unit),
                                  pair_cfg->base_asset_id,
                                  config_.strategy.min_offer_size_units);
-                    avail_inventory = min_pool;
+                    avail_inventory = floored;
                 }
             }
         }

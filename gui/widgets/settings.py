@@ -2748,18 +2748,23 @@ class SettingsWidget(QWidget):
         # Revive-market opt-in.  For a pair whose third-party book is
         # expected to be dead or stale: normally the engine refuses to quote
         # with no order-book reference at all; with this set it quotes from
-        # the external fair-value anchor (CoinGecko/AMM) instead of going
-        # silent.  Junk offers stay filtered out of pricing either way, and
-        # the engine still refuses to quote when no anchor is live.
+        # the external fair-value estimate instead of going silent.  Junk
+        # offers stay filtered out of pricing either way.  The runtime gate
+        # ALWAYS requires a recent successful CoinGecko fetch -- an AMM pool
+        # alone cannot satisfy it -- so the tooltip must say so, or an
+        # operator with an AMM-backed pair ticks the box and watches
+        # nothing happen.
         revive_cb = QCheckBox()
         revive_cb.setChecked(bool(pair.get("revive_market", False)))
         revive_cb.setToolTip(
             "Revive a dead market: quote from the external fair-value "
-            "anchor (CoinGecko/AMM) even when every third-party offer is "
-            "stale or absent.  Without this, a pair whose book fails the "
-            "20% sanity filter posts nothing.  The engine still refuses "
-            "to quote if no external anchor is live.  Requires an engine "
-            "restart to take effect."
+            "estimate even when every third-party offer is stale or "
+            "absent.  Without this, a pair whose book fails the 20% "
+            "sanity filter posts nothing.  Requires a live CoinGecko "
+            "price feed: the engine refuses to quote when no recent "
+            "successful CoinGecko fetch exists, and an AMM pool alone "
+            "does not satisfy that gate.  Requires an engine restart "
+            "to take effect."
         )
         revive_cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         revive_container = QWidget()
