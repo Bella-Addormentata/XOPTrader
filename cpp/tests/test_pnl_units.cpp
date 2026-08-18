@@ -124,10 +124,17 @@ TEST(QuoteMojosFor, CatCatPairProducesExpectedQuoteMojos) {
 TEST(AffordableBaseMojos, WmilliEthFeeReserveConvertsSanely) {
     // 0.5 XCH reserve, mid 1.39 XCH per wmilliETH.b, CAT base (1e3/unit):
     // (5e11 / 1e12) / 1.39 * 1e3 = 359.7 -> 360 base mojos (~0.36 units).
-    const auto reserve_base = xop::affordable_base_mojos(
+    const auto reserve_base = xop::reserve_base_mojos(
         5e11, static_cast<double>(kBaseXch), 1.39,
         static_cast<double>(kCatDenom));
-    EXPECT_EQ(reserve_base, 360);
+    EXPECT_EQ(reserve_base, 360);  // ceil(359.71): never under-reserve
+
+    // The affordability direction FLOORS the same quantity: a cap must
+    // never admit a mojo the wallet cannot back.
+    EXPECT_EQ(xop::affordable_base_mojos(
+                  5e11, static_cast<double>(kBaseXch), 1.39,
+                  static_cast<double>(kCatDenom)),
+              359);
 
     // The pre-fix arithmetic subtracted 5e11 -- nine orders of magnitude
     // larger than the correct figure, and larger than any realistic pool.
@@ -153,9 +160,11 @@ TEST(AffordableBaseMojos, MatchesTheCatQuoteCapFormula) {
     const auto cap = xop::affordable_base_mojos(
         38'320.0, static_cast<double>(kCatDenom), 2.5,
         static_cast<double>(kBaseXch));
-    // Exact integer literal: the helper rounds to nearest, and a
-    // static_cast of 15.328 * 1e12 would TRUNCATE an inexact double.
-    EXPECT_EQ(cap, 15'328'000'000'000LL);
+    // Affordability FLOORS, and the double intermediate may land a hair
+    // under the exact 15.328e12 -- one mojo low is the safe direction, one
+    // mojo HIGH would claim funds the wallet does not have.
+    EXPECT_GE(cap, 15'327'999'999'999LL);
+    EXPECT_LE(cap, 15'328'000'000'000LL);
 }
 
 TEST(AffordableBaseMojos, OverflowReadsAsUnavailable) {
@@ -167,6 +176,10 @@ TEST(AffordableBaseMojos, OverflowReadsAsUnavailable) {
         9e18, static_cast<double>(kBaseXch), 1e-9,
         static_cast<double>(kBaseXch));
     EXPECT_EQ(cap, 0);
+    EXPECT_EQ(xop::reserve_base_mojos(
+                  9e18, static_cast<double>(kBaseXch), 1e-9,
+                  static_cast<double>(kBaseXch)),
+              0);
 }
 
 TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {
@@ -178,6 +191,8 @@ TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {
     EXPECT_EQ(xop::affordable_base_mojos(q, qd, -1.0, bd), 0);
     EXPECT_EQ(xop::affordable_base_mojos(q, 0.0, 1.39, bd), 0);
     EXPECT_EQ(xop::affordable_base_mojos(q, qd, 1.39, 0.0), 0);
+    EXPECT_EQ(xop::reserve_base_mojos(q, qd, 0.0, bd), 0);
+    EXPECT_EQ(xop::reserve_base_mojos(q, 0.0, 1.39, bd), 0);
 }
 
 TEST(AffordableBaseMojos, NoOverflowAtRealisticExtremes) {

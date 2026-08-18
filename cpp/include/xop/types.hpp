@@ -86,27 +86,61 @@ inline double quote_mojos_for(double size_base_mojos,
 // cleared by the no-order-book guard before posting).
 // Computation in double to avoid int64 overflow; rounded to nearest.
 // ---------------------------------------------------------------------------
+namespace detail {
+// Shared core: quote mojos -> base mojos at the mid, UNROUNDED, with the
+// validity/overflow envelope.  Negative return means "unavailable".
+// float rounding of the result is a POLICY decision made per caller.
+inline double base_mojos_at_mid(double quote_mojos,
+                                double quote_denom,
+                                double market_mid,
+                                double base_denom) noexcept
+{
+    if (quote_denom <= 0.0 || base_denom <= 0.0 || market_mid <= 0.0) {
+        return -1.0;
+    }
+    const double quote_units = quote_mojos / quote_denom;
+    const double result = (quote_units / market_mid) * base_denom;
+    // std::floor/ceil-then-cast is UNDEFINED outside int64 range, and this
+    // runs on live market inputs (a dust-priced mid can push the quotient
+    // past 9.2e18).  Non-finite or out-of-range reads as "unavailable" --
+    // call sites skip, same as the invalid-input cases.  The double
+    // conversion of int64 max rounds UP, so >= is exact here.
+    if (!std::isfinite(result) || result < 0.0
+        || result >= static_cast<double>(
+               std::numeric_limits<std::int64_t>::max())) {
+        return -1.0;
+    }
+    return result;
+}
+}  // namespace detail
+
+/// How many base mojos the quote amount can actually fund -- FLOORS, so a
+/// cap derived from it never admits a mojo the wallet cannot back.  0 means
+/// "conversion unavailable, skip the cap" (never zero a pool on it).
 inline Mojo affordable_base_mojos(double quote_mojos,
                                   double quote_denom,
                                   double market_mid,
                                   double base_denom) noexcept
 {
-    if (quote_denom <= 0.0 || base_denom <= 0.0 || market_mid <= 0.0) {
-        return Mojo{0};
-    }
-    const double quote_units = quote_mojos / quote_denom;
-    const double result = (quote_units / market_mid) * base_denom;
-    // llround is UNDEFINED outside long long range, and this helper runs
-    // on live market inputs (a dust-priced mid can push the quotient past
-    // 9.2e18).  Non-finite or out-of-range reads as "conversion
-    // unavailable" -- call sites skip, same as the invalid-input cases.
-    // The double conversion of int64 max rounds UP, so >= is exact here.
-    if (!std::isfinite(result) || result < 0.0
-        || result >= static_cast<double>(
-               std::numeric_limits<std::int64_t>::max())) {
-        return Mojo{0};
-    }
-    return static_cast<Mojo>(std::llround(result));
+    const double result = detail::base_mojos_at_mid(
+        quote_mojos, quote_denom, market_mid, base_denom);
+    if (result < 0.0) return Mojo{0};
+    return static_cast<Mojo>(std::floor(result));
+}
+
+/// The base-mojo size of a quote-side reserve -- CEILS, so a holdback
+/// derived from it never under-reserves by a fractional mojo.  0 means
+/// "conversion unavailable, skip the subtraction" (a no-mid pair is
+/// already cleared by the no-order-book guard before posting).
+inline Mojo reserve_base_mojos(double quote_mojos,
+                               double quote_denom,
+                               double market_mid,
+                               double base_denom) noexcept
+{
+    const double result = detail::base_mojos_at_mid(
+        quote_mojos, quote_denom, market_mid, base_denom);
+    if (result < 0.0) return Mojo{0};
+    return static_cast<Mojo>(std::ceil(result));
 }
 
 /// Asset identifier.
