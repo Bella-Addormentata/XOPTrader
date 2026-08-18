@@ -177,10 +177,13 @@ TEST(AffordableBaseMojos, OverflowReadsAsUnavailable) {
         9e18, static_cast<double>(kBaseXch), 1e-9,
         static_cast<double>(kBaseXch));
     EXPECT_EQ(cap, 0);
+    // A RESERVE that overflows Mojo exceeds every representable pool: it
+    // must SATURATE so the subtraction empties the pool.  Mapping it to 0
+    // would skip the subtraction -- the opposite of "never under-reserve".
     EXPECT_EQ(xop::reserve_base_mojos(
                   9e18, static_cast<double>(kBaseXch), 1e-9,
                   static_cast<double>(kBaseXch)),
-              0);
+              std::numeric_limits<xop::Mojo>::max());
 }
 
 TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {
@@ -244,6 +247,31 @@ TEST(TryAffordableBaseMojos, DistinguishesUnavailableFromGenuineZero) {
         5e11, static_cast<double>(kBaseXch),
         std::numeric_limits<double>::quiet_NaN(),
         static_cast<double>(kCatDenom)).has_value());
+}
+
+
+TEST(TiersWithinBudget, NonzeroBudgetBelowOneMinimumOfferFundsZeroTiers) {
+    // The round-5 regression case: the up-scale pass raises a sub-minimum
+    // tier to min size AFTER the wallet caps, so a nonzero budget smaller
+    // than one minimum offer must fund ZERO tiers -- the tier is dropped,
+    // never enlarged past the cap into reserved funds.
+    EXPECT_EQ(xop::tiers_within_budget({1000}, 999), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({1000}, 1000), 1u);
+
+    // Cumulative: 400+400 fits a 999 budget, the third tier does not.
+    EXPECT_EQ(xop::tiers_within_budget({400, 400, 400}, 999), 2u);
+
+    // Degenerate and defensive cases.
+    EXPECT_EQ(xop::tiers_within_budget({}, 1000), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({0, 0}, 0), 2u);
+    EXPECT_EQ(xop::tiers_within_budget({1000}, -1), 0u);
+    EXPECT_EQ(xop::tiers_within_budget({-5, 1000}, 5000), 0u);
+
+    // Overflow-safe: a saturated cost against a huge budget cannot wrap.
+    EXPECT_EQ(xop::tiers_within_budget(
+                  {std::numeric_limits<xop::Mojo>::max()},
+                  std::numeric_limits<xop::Mojo>::max() - 1),
+              0u);
 }
 
 }  // namespace

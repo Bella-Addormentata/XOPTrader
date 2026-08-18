@@ -15,6 +15,7 @@
 #include <limits>
 #include <optional>
 #include <string>
+#include <vector>
 #include <chrono>
 
 namespace xop {
@@ -98,8 +99,8 @@ inline double base_mojos_at_mid(double quote_mojos,
                                 double base_denom) noexcept
 {
     // Non-finite INPUTS must read as unavailable before any arithmetic:
-    // market_mid == +inf divides a finite quote to a clean 0.0, which the
-    // result check below cannot tell from a genuine zero cap.
+    // market_mid == +inf divides a finite quote to a clean 0.0, which no
+    // result check can tell from a genuine zero cap.
     if (!std::isfinite(quote_mojos) || !std::isfinite(quote_denom)
         || !std::isfinite(market_mid) || !std::isfinite(base_denom)) {
         return -1.0;
@@ -109,16 +110,14 @@ inline double base_mojos_at_mid(double quote_mojos,
     }
     const double quote_units = quote_mojos / quote_denom;
     const double result = (quote_units / market_mid) * base_denom;
-    // std::floor/ceil-then-cast is UNDEFINED outside int64 range, and this
-    // runs on live market inputs (a dust-priced mid can push the quotient
-    // past 9.2e18).  Non-finite or out-of-range reads as "unavailable" --
-    // call sites skip, same as the invalid-input cases.  The double
-    // conversion of int64 max rounds UP, so >= is exact here.
-    if (!std::isfinite(result) || result < 0.0
-        || result >= static_cast<double>(
-               std::numeric_limits<std::int64_t>::max())) {
+    if (!std::isfinite(result) || result < 0.0) {
         return -1.0;
     }
+    // NOTE: an int64-overflowing result is returned RAW.  Overflow means
+    // opposite things to the two public helpers -- an overflowing CAP is
+    // effectively unlimited (skip it), an overflowing RESERVE exceeds
+    // every representable pool (saturate and empty the pool) -- so the
+    // range decision belongs to them, not here.
     return result;
 }
 }  // namespace detail
@@ -140,7 +139,14 @@ inline std::optional<Mojo> try_affordable_base_mojos(
 {
     const double result = detail::base_mojos_at_mid(
         quote_mojos, quote_denom, market_mid, base_denom);
-    if (result < 0.0) return std::nullopt;
+    // Out-of-range = effectively unlimited cap = unavailable: skipping is
+    // the only honest move (floor/cast past int64 is UB anyway).  The
+    // double conversion of int64 max rounds UP, so >= is exact.
+    if (result < 0.0
+        || result >= static_cast<double>(
+               std::numeric_limits<std::int64_t>::max())) {
+        return std::nullopt;
+    }
     return static_cast<Mojo>(std::floor(result));
 }
 
@@ -167,7 +173,43 @@ inline Mojo reserve_base_mojos(double quote_mojos,
     const double result = detail::base_mojos_at_mid(
         quote_mojos, quote_denom, market_mid, base_denom);
     if (result < 0.0) return Mojo{0};
+    // A VALID conversion that overflows Mojo means the reserve exceeds
+    // every representable pool: SATURATE so the subtraction empties the
+    // pool.  Mapping it to 0 would skip the subtraction entirely --
+    // the exact opposite of "never under-reserve".
+    if (result >= static_cast<double>(
+            std::numeric_limits<std::int64_t>::max())) {
+        return std::numeric_limits<Mojo>::max();
+    }
     return static_cast<Mojo>(std::ceil(result));
+}
+
+// ---------------------------------------------------------------------------
+// tiers_within_budget -- how many leading tiers a budget can fund.
+//
+// Given per-tier costs (in the budget's asset, ladder order: tightest
+// first) and a budget, returns the count of leading tiers whose cumulative
+// cost fits.  Exists because the min-size up-scale pass runs AFTER the
+// wallet caps and can enlarge tiers past them: the ladder trim that
+// re-enforces the budget uses this, and the "nonzero budget smaller than
+// one minimum offer" regression lives at this level (that budget funds
+// ZERO tiers -- the tier must be dropped, not enlarged past the cap).
+// Negative costs (defensive) stop the scan.  Overflow-safe: the running
+// total never exceeds budget, so `used > budget - c` cannot underflow for
+// non-negative inputs.
+// ---------------------------------------------------------------------------
+inline std::size_t tiers_within_budget(const std::vector<Mojo>& costs,
+                                       Mojo budget) noexcept
+{
+    if (budget < 0) return 0;
+    Mojo used = 0;
+    std::size_t n = 0;
+    for (const Mojo c : costs) {
+        if (c < 0 || used > budget - c) break;
+        used += c;
+        ++n;
+    }
+    return n;
 }
 
 /// Asset identifier.

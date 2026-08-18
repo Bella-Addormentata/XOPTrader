@@ -6377,6 +6377,83 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              pair_name, bumped_tiers, eff_min_units);
             }
 
+            // -- [S3 round-5] Re-enforce the XCH budget after the up-scale.
+            // The wallet caps above bound the POOLS, but the up-scale pass
+            // just raised every sub-minimum tier to min_base_mojos -- a
+            // nonzero budget smaller than one minimum offer would be
+            // enlarged past the cap and consume reserved funds.  Walk the
+            // XCH-consuming side tightest-first, keep tiers while their
+            // cumulative XCH cost fits confirmed-minus-reserve, drop the
+            // rest.  Bid tiers on XCH-quote pairs consume XCH equal to
+            // quote_mojos_for(size, price); ask tiers on XCH-base pairs
+            // consume their size directly.
+            if (pair_cfg
+                && (pair_cfg->base_asset_id == "xch"
+                    || pair_cfg->quote_asset_id == "xch"))
+            {
+                const Mojo reserve_mojos =
+                    (config_.strategy.fee_reserve_xch > 0.0)
+                        ? static_cast<Mojo>(std::llround(
+                              config_.strategy.fee_reserve_xch
+                              * static_cast<double>(kMojosPerXch)))
+                        : Mojo{0};
+                const Mojo xch_budget = std::max(
+                    Mojo{0}, xch_confirmed_balance_ - reserve_mojos);
+                const bool xch_is_base =
+                    (pair_cfg->base_asset_id == "xch");
+
+                std::vector<Mojo> costs;
+                costs.reserve(pcs.ladder.size());
+                for (const auto& tq : pcs.ladder) {
+                    const bool consumes_xch = xch_is_base
+                        ? (tq.side == Side::Ask)
+                        : (tq.side == Side::Bid);
+                    if (!consumes_xch) continue;
+                    if (xch_is_base) {
+                        costs.push_back(tq.size);
+                    } else {
+                        // Conservative ceil: never under-count a cost.
+                        const double q = quote_mojos_for(
+                            static_cast<double>(tq.size),
+                            static_cast<double>(tq.price),
+                            static_cast<double>(
+                                pair_cfg->base_mojos_per_unit),
+                            static_cast<double>(
+                                pair_cfg->quote_mojos_per_unit));
+                        costs.push_back(
+                            (std::isfinite(q) && q >= 0.0
+                             && q < static_cast<double>(
+                                    std::numeric_limits<Mojo>::max()))
+                                ? static_cast<Mojo>(std::ceil(q))
+                                : std::numeric_limits<Mojo>::max());
+                    }
+                }
+                const std::size_t keep = tiers_within_budget(
+                    costs, xch_budget);
+                if (keep < costs.size()) {
+                    std::size_t seen = 0;
+                    const auto before = pcs.ladder.size();
+                    pcs.ladder.erase(
+                        std::remove_if(
+                            pcs.ladder.begin(), pcs.ladder.end(),
+                            [&](const TierQuote& tq) {
+                                const bool consumes_xch = xch_is_base
+                                    ? (tq.side == Side::Ask)
+                                    : (tq.side == Side::Bid);
+                                if (!consumes_xch) return false;
+                                return seen++ >= keep;
+                            }),
+                        pcs.ladder.end());
+                    spdlog::warn(
+                        "[Engine] Step 7: {} dropped {} up-scaled tier(s): "
+                        "cumulative XCH cost exceeds "
+                        "confirmed-minus-reserve budget {:.6f} XCH",
+                        pair_name,
+                        before - pcs.ladder.size(),
+                        static_cast<double>(xch_budget) / kMojosPerXch);
+                }
+            }
+
             // Diagnostic: show what's in ladder before dust filtering
             uint32_t pre_bids = 0, pre_asks = 0;
             for (const auto& tq : pcs.ladder) {
