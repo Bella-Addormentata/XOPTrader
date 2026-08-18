@@ -6840,6 +6840,65 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
     }
 
+    // -- [S3 round-8] Liveness refresh for empty-ladder pairs -----------
+    // The balance cache's only other writer sits BELOW the empty-ladder
+    // continue in the loop that follows, so a pair whose ladder was
+    // emptied by a zero-or-missing cached CAT balance could never observe
+    // a later deposit: the caps would hold it empty forever.  Refresh
+    // exactly those entries here -- one RPC per zero-or-missing CAT
+    // funding asset of an empty-ladder pair per heartbeat, deduped across
+    // pairs.  XCH is exempt (its refresh runs in the poll loop and is not
+    // ladder-gated); known-funded entries refresh in the main loop as
+    // before.
+    {
+        std::set<std::string> refreshed;
+        for (auto& [pair_name, pcs] : cycle_) {
+            if (!pcs.ladder.empty()) continue;
+            const PairConfig* live_pc = find_pair_config(pair_name);
+            if (!live_pc) continue;
+            const std::string assets[2] = {live_pc->base_asset_id,
+                                           live_pc->quote_asset_id};
+            for (const auto& asset : assets) {
+                if (asset == "xch") continue;
+                if (!refreshed.insert(asset).second) continue;
+                auto it = cached_wallet_balances_.find(asset);
+                if (it != cached_wallet_balances_.end()
+                    && it->second.confirmed > 0) {
+                    continue;
+                }
+                const auto wid = offer_mgr_->resolve_wallet_id(asset);
+                if (wid <= 0) continue;
+                try {
+                    auto bal_json =
+                        co_await wallet_->get_wallet_balance(wid);
+                    Mojo spendable = 0, confirmed = 0, pending = 0;
+                    if (bal_json.contains("spendable_balance"))
+                        spendable =
+                            bal_json["spendable_balance"].get<Mojo>();
+                    if (bal_json.contains("confirmed_wallet_balance"))
+                        confirmed =
+                            bal_json["confirmed_wallet_balance"].get<Mojo>();
+                    if (bal_json.contains("pending_change"))
+                        pending =
+                            bal_json["pending_change"].get<Mojo>();
+                    cached_wallet_balances_[asset] =
+                        {spendable, confirmed, pending, block_height};
+                    if (confirmed > 0) {
+                        spdlog::info(
+                            "[Engine] Step 8: liveness refresh observed a "
+                            "deposit for {} ({} mojos confirmed) -- the "
+                            "pair can quote again next heartbeat",
+                            asset, confirmed);
+                    }
+                } catch (const std::exception& e) {
+                    spdlog::debug(
+                        "[Engine] Step 8: liveness refresh for {} "
+                        "failed: {}", asset, e.what());
+                }
+            }
+        }
+    }
+
     std::set<std::int64_t> pending_wallets_this_block;
     for (auto& [pair_name, pcs] : cycle_) {
         if (!pcs.quote_valid || pcs.ladder.empty()) continue;
