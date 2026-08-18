@@ -1176,6 +1176,29 @@ class WarpEngine:
             message="attested 'sent'; ephemeral security key generated",
         )
 
+    def _require_spendable_xch(self, needed: int, *, context: str) -> None:
+        """Pend with a NAMED shortfall when wallet 1 cannot cover *needed*.
+
+        The gates at UNWRAP_CHECKS run once, but the trading engine can lock
+        XCH into offer collateral between that gate and the spend that needs
+        it.  Without this re-check the send fails deep inside the wallet
+        daemon and the job retries on a generic error -- the operator sees a
+        silent stall instead of a message naming the missing mojos.  Always
+        WarpPending, never terminal: collateral frees when offers close, and
+        the job resumes on its own.  needed <= 0 is a no-op so the default
+        zero-fee paths add no wallet RPC.
+        """
+        if needed <= 0:
+            return
+        bal = self._wallet.get_wallet_balance(1)
+        spendable = int(bal.get("spendable_balance") or 0)
+        if spendable < needed:
+            raise WarpPending(
+                f"{context}: spendable XCH {spendable} < required {needed} "
+                "mojos (offer collateral may hold the rest; waiting for it "
+                "to free)"
+            )
+
     def _h_funding_claim(self, job: WarpJob) -> _Step:
         """Fund the security coin (post-tip + fee) -- dedupe-scan, never re-send."""
         from . import claim, clvm_utils as cu
@@ -1211,6 +1234,12 @@ class WarpEngine:
                 message="funding tx already in flight (dedupe hit)",
             )
 
+        # Re-check ON THE TICK THAT SENDS: the wrap gates ran long ago and
+        # the claim amount (post_tip + claim fee) comes out of spendable XCH.
+        self._require_spendable_xch(
+            expected + p.chia_funding_fee_mojos,
+            context="claim security-coin funding",
+        )
         self._wallet.log_in()
         address = cu.encode_puzzle_hash(security_ph, net.chia_prefix)
         record = self._wallet.send_transaction(
@@ -1963,9 +1992,15 @@ class WarpEngine:
             if self._evm.get_eth_balance(self._hot_address) < _MIN_GAS_WEI:
                 raise WarpPending("hot wallet ETH is below the relay gas floor")
         xch = self._wallet.get_wallet_balance(1)
-        toll_need = net.chia_toll_mojos + p.unwrap_chia_fee_mojos
+        # The extra Chia fee is paid TWICE per unwrap -- once on the
+        # cat_spend (BURN_SENT) and once on the toll-coin funding send
+        # (BURNING) -- so the gate must budget both.  Counting it once let
+        # a nonzero fee pass here and stall mid-burn with the CAT already
+        # committed to the burn address.  Harmless at the default fee of 0,
+        # which is exactly why it survived until the 2026-08 fee study.
+        toll_need = net.chia_toll_mojos + 2 * p.unwrap_chia_fee_mojos
         if int(xch.get("spendable_balance") or 0) < toll_need:
-            raise WarpPending(f"spendable XCH below toll+fee {toll_need}")
+            raise WarpPending(f"spendable XCH below toll+fees {toll_need}")
 
         burn_inner_ph = drivers.expected_burn_inner_puzzle_hash(net, receiver)
         state = {
@@ -2100,6 +2135,11 @@ class WarpEngine:
 
         # d) Send. Default coin selection ONLY -- it is what honours the trade
         # manager's offer locks (the client has no coins parameter, by design).
+        # The XCH fee (when configured) is re-checked on the sending tick;
+        # G10's budget ran at UNWRAP_CHECKS and collateral may have moved.
+        self._require_spendable_xch(
+            p.unwrap_chia_fee_mojos, context="cat_spend fee"
+        )
         self._wallet.log_in()
         record = self._wallet.cat_spend(
             int(job.state["cat_wallet_id"]),
@@ -2219,6 +2259,9 @@ class WarpEngine:
                     message="toll funding already in flight (dedupe hit)",
                 )
             self._wallet.log_in()
+            self._require_spendable_xch(
+                toll + p.unwrap_chia_fee_mojos, context="toll funding"
+            )
             record = self._wallet.send_transaction(
                 1, toll, cu.encode_puzzle_hash(ph, net.chia_prefix),
                 fee_mojos=p.unwrap_chia_fee_mojos,
