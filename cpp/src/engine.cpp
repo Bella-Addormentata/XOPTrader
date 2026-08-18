@@ -3927,11 +3927,10 @@ void Engine::update_fair_values()
     // Symbol table + leg canonicalisation moved to xop/feed_listings.hpp
     // so load_config()'s revive_market validation answers the same
     // questions from the same table (a duplicate would drift).  Local
-    // aliases keep the call sites below unchanged.
+    // aliases keep the call sites below unchanged.  (No `canonical` alias:
+    // split_pair_legs canonicalises internally, and an unused alias fails
+    // CI's -Werror=unused-but-set-variable.)
     const auto& kFeedListings = feed_listings();
-    auto canonical = [](std::string s) {
-        return canonical_feed_symbol(std::move(s));
-    };
     auto split_legs = [](const std::string& pair_name) {
         return split_pair_legs(pair_name);
     };
