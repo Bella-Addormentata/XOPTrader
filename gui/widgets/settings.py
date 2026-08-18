@@ -1424,7 +1424,12 @@ class SettingsWidget(QWidget):
             "XCH to hold back from offer allocation for paying on-chain "
             "fees (offer creation and cancellation).  Deducted from the "
             "capital pool before tier sizing, so offers never lock the "
-            "last N XCH of spendable balance.  Default: 1.0 XCH."
+            "last N XCH of spendable balance.  This unlocked XCH is also "
+            "what de facto funds warp.green bridge costs -- the 0.001 XCH "
+            "toll on every unwrap burn and the claim fee on every wrap -- "
+            "which draw from spendable balance outside the engine's "
+            "knowledge.  0.5 XCH covers ~500 unwrap tolls.  "
+            "Default: 1.0 XCH."
         )
         chia_form.addRow("XCH Fee Reserve:", self._fee_reserve_xch)
 

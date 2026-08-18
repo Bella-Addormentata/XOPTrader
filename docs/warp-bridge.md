@@ -452,6 +452,15 @@ All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
   cannot resolve that one, and it would otherwise hold the slot forever.
 - **Balances show "unavailable"** — the Base RPC is unreachable or rate-limiting.
   Set a private `base_rpc_url`.
+- **Fees, by chain of origin** — the message toll is paid in the SOURCE
+  chain's native asset: 0.001 XCH per unwrap burn (consensus-curried into the
+  burn puzzle; it doubles as the bundle's mempool fee, so no separate Chia fee
+  is needed at the default `unwrap_chia_fee_mojos: 0`) and ~0.00001 ETH per
+  wrap (owner-mutable `Portal.messageToll`, read live at signing). The 0.3%
+  tip is taken from the bridged asset itself in both directions and needs no
+  reserve. Warp's XCH draws (tolls + claim fees) come from SPENDABLE balance
+  outside the engine's fee-reserve accounting — `strategy.fee_reserve_xch`
+  is what keeps that XCH unlocked in practice.
 - **Low-gas warning** — top up the hot wallet's ETH on Base, or raise/lower
   `warp.min_base_eth` (Settings → Fees & Reserves) if the line is in the
   wrong place for how often this node relays.
