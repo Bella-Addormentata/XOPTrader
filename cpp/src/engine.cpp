@@ -6840,16 +6840,17 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         }
     }
 
-    // -- [S3 round-8] Liveness refresh for empty-ladder pairs -----------
+    // -- [S3 rounds 8-9] Liveness refresh for empty-ladder pairs --------
     // The balance cache's only other writer sits BELOW the empty-ladder
-    // continue in the loop that follows, so a pair whose ladder was
-    // emptied by a zero-or-missing cached CAT balance could never observe
-    // a later deposit: the caps would hold it empty forever.  Refresh
-    // exactly those entries here -- one RPC per zero-or-missing CAT
-    // funding asset of an empty-ladder pair per heartbeat, deduped across
-    // pairs.  XCH is exempt (its refresh runs in the poll loop and is not
-    // ladder-gated); known-funded entries refresh in the main loop as
-    // before.
+    // continue in the loop that follows, so a pair whose ladder is empty
+    // gets NO refresh from the main loop at all -- and the caps/trim can
+    // empty a ladder on a zero, missing, OR positive-but-sub-minimum
+    // cached balance.  Any conditional skip here reopens the deadlock for
+    // whichever case it skips (round 9: two positive sub-minimum sides
+    // starved each other out), so an empty ladder refreshes ALL of its
+    // CAT funding assets, unconditionally.  Deduped across pairs; XCH is
+    // exempt (its refresh runs in the poll loop and is not ladder-gated).
+    // Cost: at most two RPCs per empty-ladder pair per heartbeat.
     {
         std::set<std::string> refreshed;
         for (auto& [pair_name, pcs] : cycle_) {
@@ -6861,13 +6862,13 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             for (const auto& asset : assets) {
                 if (asset == "xch") continue;
                 if (!refreshed.insert(asset).second) continue;
-                auto it = cached_wallet_balances_.find(asset);
-                if (it != cached_wallet_balances_.end()
-                    && it->second.confirmed > 0) {
-                    continue;
-                }
                 const auto wid = offer_mgr_->resolve_wallet_id(asset);
                 if (wid <= 0) continue;
+                std::optional<Mojo> prior;
+                if (auto it = cached_wallet_balances_.find(asset);
+                    it != cached_wallet_balances_.end()) {
+                    prior = it->second.confirmed;
+                }
                 try {
                     auto bal_json =
                         co_await wallet_->get_wallet_balance(wid);
@@ -6883,7 +6884,10 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             bal_json["pending_change"].get<Mojo>();
                     cached_wallet_balances_[asset] =
                         {spendable, confirmed, pending, block_height};
-                    if (confirmed > 0) {
+                    // Log only transitions worth an operator's eye: a
+                    // balance appearing where the cache had none/zero.
+                    if (confirmed > 0
+                        && (!prior.has_value() || *prior <= 0)) {
                         spdlog::info(
                             "[Engine] Step 8: liveness refresh observed a "
                             "deposit for {} ({} mojos confirmed) -- the "
