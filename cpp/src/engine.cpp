@@ -20,6 +20,7 @@
 //   ISO/IEC 25000      -- documented step sequencing, single-responsibility
 
 #include "xop/engine.hpp"
+#include "xop/feed_listings.hpp"
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
@@ -3923,47 +3924,16 @@ void Engine::update_fair_values()
 
     const auto& sc = config_.strategy;
 
-    // Symbol -> external listing.  units_per_coin is how many units of the
-    // pair's asset make one unit of the listed coin: wmilliETH is 1/1000 of
-    // an ETH, so 1000 pair-units per coin.
-    struct FeedListing { const char* id; double units_per_coin; };
-    static const std::unordered_map<std::string, FeedListing> kFeedListings = {
-        {"xch",       {"chia",           1.0}},
-        {"usdc",      {"usd-coin",       1.0}},
-        {"wusdc",     {"usd-coin",       1.0}},
-        {"dbx",       {"dexie-bucks",    1.0}},
-        {"eth",       {"ethereum",       1.0}},
-        {"weth",      {"ethereum",       1.0}},
-        {"millieth",  {"ethereum",    1000.0}},
-        {"wmillieth", {"ethereum",    1000.0}},
-    };
-
-    // Canonical leg key: lower-cased, with the ".b" bridge suffix removed so
-    // that "wUSDC.b" and "wUSDC" resolve to the same underlying asset.
+    // Symbol table + leg canonicalisation moved to xop/feed_listings.hpp
+    // so load_config()'s revive_market validation answers the same
+    // questions from the same table (a duplicate would drift).  Local
+    // aliases keep the call sites below unchanged.
+    const auto& kFeedListings = feed_listings();
     auto canonical = [](std::string s) {
-        for (auto& c : s) {
-            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-        }
-        if (s.size() > 2 && s.compare(s.size() - 2, 2, ".b") == 0) {
-            s.erase(s.size() - 2);
-        }
-        return s;
+        return canonical_feed_symbol(std::move(s));
     };
-
-    // Split "BASE/QUOTE" into its two canonical leg keys.
-    auto split_legs = [&](const std::string& pair_name)
-        -> std::optional<std::pair<std::string, std::string>> {
-        const auto pos = pair_name.find('/');
-        if (pos == std::string::npos || pos == 0
-            || pos + 1 >= pair_name.size()) {
-            return std::nullopt;
-        }
-        auto base  = canonical(pair_name.substr(0, pos));
-        auto quote = canonical(pair_name.substr(pos + 1));
-        if (base.empty() || quote.empty() || base == quote) {
-            return std::nullopt;
-        }
-        return std::make_pair(std::move(base), std::move(quote));
+    auto split_legs = [](const std::string& pair_name) {
+        return split_pair_legs(pair_name);
     };
 
     // -- Step A: the graph's nodes, one entry per priceable enabled pair ----

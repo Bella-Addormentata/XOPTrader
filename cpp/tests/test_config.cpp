@@ -641,8 +641,14 @@ TEST(ConfigParserTest, ReviveMarket_ParsesTrue) {
     auto pos = yaml.find(anchor);
     ASSERT_NE(pos, std::string::npos);
     yaml.insert(pos + anchor.size(), "    revive_market: true\n");
-    // revive_market now demands a live CoinGecko feed at load time.
-    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n";
+    // revive_market now demands a live CoinGecko feed at load time whose
+    // ids cover BOTH legs of a mappable pair name.
+    auto npos_ = yaml.find("name: \"XCH/TEST\"");
+    ASSERT_NE(npos_, std::string::npos);
+    yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                 "name: \"XCH/wUSDC.b\"");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\"]\n";
     TempYaml tmp(yaml);
     auto cfg = xop::load_config(tmp.path());
     ASSERT_FALSE(cfg.pairs.empty());
@@ -934,7 +940,12 @@ TEST(ConfigParserTest, ReviveMarketWindowNarrowerThanPolling_Throws) {
     auto pos = yaml.find(anchor);
     ASSERT_NE(pos, std::string::npos);
     yaml.insert(pos + anchor.size(), "    revive_market: true\n");
-    yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n"
+    auto npos_ = yaml.find("name: \"XCH/TEST\"");
+    ASSERT_NE(npos_, std::string::npos);
+    yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                 "name: \"XCH/wUSDC.b\"");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\"]\n"
             "  polling_interval_ms: 300000\n";
     TempYaml tmp(yaml);
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
@@ -988,7 +999,12 @@ TEST(ConfigParserTest, ReviveMarketNeverWorksCombos_Throw) {
         auto pos = yaml.find(anchor);
         EXPECT_NE(pos, std::string::npos);
         yaml.insert(pos + anchor.size(), "    revive_market: true\n");
-        yaml += "\ncoingecko:\n  enabled: true\n  coin_ids: [\"chia\"]\n";
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        EXPECT_NE(npos_, std::string::npos);
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        yaml += "\ncoingecko:\n  enabled: true\n"
+                "  coin_ids: [\"chia\", \"usd-coin\"]\n";
         yaml += extra;
         return yaml;
     };
@@ -1039,6 +1055,63 @@ TEST(ConfigParserTest, NeverWorksCombosWithoutRevive_AreLegal) {
     EXPECT_FALSE(cfg.strategy.quote_center_blend_enabled);
     EXPECT_DOUBLE_EQ(cfg.strategy.fair_value_feed_sigma_bps, 0.0);
     EXPECT_TRUE(cfg.coingecko.coin_ids.empty());
+}
+
+
+TEST(ConfigParserTest, ReviveMarketCoinIdsMustCoverTheLegs) {
+    // A non-empty-but-unrelated id list previously loaded: with
+    // coin_ids: [bitcoin] no anchor is ever created for the pair's legs
+    // and the revived pair sits silent forever.  The legs resolve
+    // through the same table the engine uses (xop/feed_listings.hpp).
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+
+    auto revive_pair = [&](const char* ids) {
+        std::string yaml(kMinimalValidYaml);
+        auto pos = yaml.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+        auto npos_ = yaml.find("name: \"XCH/TEST\"");
+        EXPECT_NE(npos_, std::string::npos);
+        yaml.replace(npos_, std::string("name: \"XCH/TEST\"").size(),
+                     "name: \"XCH/wUSDC.b\"");
+        yaml += std::string("\ncoingecko:\n  enabled: true\n  coin_ids: ")
+              + ids + "\n";
+        return yaml;
+    };
+
+    // Unrelated ids: fetches succeed, anchors never exist.
+    {
+        TempYaml tmp(revive_pair("[\"bitcoin\"]"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // One leg covered, the other missing: still refused.
+    {
+        TempYaml tmp(revive_pair("[\"chia\"]"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    // Both legs covered: loads.
+    {
+        TempYaml tmp(revive_pair("[\"chia\", \"usd-coin\"]"));
+        EXPECT_NO_THROW(xop::load_config(tmp.path()));
+    }
+}
+
+TEST(ConfigParserTest, ReviveMarketUnmappableLeg_Throws) {
+    // "TEST" has no CoinGecko feed mapping at all: no id list can anchor
+    // it, so revival is refused with a message naming the leg.
+    std::string yaml(kMinimalValidYaml);
+    const std::string anchor =
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(), "    revive_market: true\n");
+    yaml += "\ncoingecko:\n  enabled: true\n"
+            "  coin_ids: [\"chia\", \"usd-coin\", \"ethereum\"]\n";
+    TempYaml tmp(yaml);
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
 }  // namespace

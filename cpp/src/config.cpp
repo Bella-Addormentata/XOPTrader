@@ -15,6 +15,7 @@
 // ISO/IEC 25000 -- clear error messages citing the offending field.
 
 #include "xop/config.hpp"
+#include "xop/feed_listings.hpp"
 
 #include <spdlog/spdlog.h>
 #include <yaml-cpp/yaml.h>
@@ -3198,9 +3199,55 @@ AppConfig load_config(const std::string& path,
                     + cfg.pairs[i].name + "): revive_market requires a "
                     "non-empty coingecko.coin_ids -- every fetch would "
                     "return an empty price map and the pair would sit "
-                    "silent forever. The list must also cover both of "
-                    "this pair's legs (e.g. chia plus the base asset's "
-                    "feed id).");
+                    "silent forever.");
+            }
+
+            // A non-empty list is not enough: the ids must actually cover
+            // THIS pair's legs, or update_fair_values() creates no anchor
+            // for it and the pair sits silent forever holding prices for
+            // coins it does not trade.  Resolved through the same table
+            // the engine uses (xop/feed_listings.hpp), so the two cannot
+            // drift.  Deliberately conservative: revival demands DIRECT
+            // anchors on both legs -- a transitively-anchored solve leans
+            // on other pairs' live books, which is exactly what a revived
+            // pair does not have.
+            {
+                const auto legs = split_pair_legs(cfg.pairs[i].name);
+                if (!legs) {
+                    throw ConfigError(
+                        "pairs[" + std::to_string(i) + "] ("
+                        + cfg.pairs[i].name + "): revive_market requires "
+                        "a \"BASE/QUOTE\" pair name with two distinct "
+                        "legs -- the CoinGecko anchors are resolved from "
+                        "the name.");
+                }
+                const auto& listings = feed_listings();
+                const std::string leg_names[2] = {legs->first, legs->second};
+                for (const auto& leg : leg_names) {
+                    const auto it = listings.find(leg);
+                    if (it == listings.end()) {
+                        throw ConfigError(
+                            "pairs[" + std::to_string(i) + "] ("
+                            + cfg.pairs[i].name + "): revive_market "
+                            "cannot anchor leg \"" + leg + "\" -- it has "
+                            "no CoinGecko feed mapping. Revival quotes "
+                            "from direct anchors on BOTH legs; known "
+                            "mappable symbols: xch, usdc/wusdc(.b), dbx, "
+                            "eth/weth, millieth/wmillieth(.b).");
+                    }
+                    const std::string feed_id = it->second.id;
+                    const auto& ids = cfg.coingecko.coin_ids;
+                    if (std::find(ids.begin(), ids.end(), feed_id)
+                        == ids.end()) {
+                        throw ConfigError(
+                            "pairs[" + std::to_string(i) + "] ("
+                            + cfg.pairs[i].name + "): revive_market needs "
+                            "coingecko.coin_ids to include \"" + feed_id
+                            + "\" (the feed for leg \"" + leg + "\"), "
+                            "or no anchor is created for this pair and it "
+                            "sits silent forever.");
+                    }
+                }
             }
             if (!cfg.strategy.quote_center_blend_enabled) {
                 throw ConfigError(
