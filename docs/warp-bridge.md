@@ -95,7 +95,11 @@ is completely untouched.
   limits; a free Alchemy/Infura Base key in `base_rpc_url` is more reliable.
 - **A little ETH on Base** in the hot wallet for gas: each bridge spends the
   Portal message toll (currently 0.00001 ETH, read live) plus gas for the ERC-20
-  `approve` and `bridgeToChia`. Keep ≥ 0.005 ETH; the tab warns below 0.001 ETH.
+  `approve` and `bridgeToChia`. Keep ≥ 0.005 ETH. The Warp and Base Wallet
+  tabs warn below `warp.min_base_eth` (default 0.005 ETH, editable in
+  **Settings → Fees & Reserves**) — that is the operator's own line, set
+  above the 0.0003 ETH the engine needs to sign a relay at all, so a refuel
+  happens before jobs start refusing.
 
 ### 2a. Run the tests first
 
@@ -386,6 +390,7 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `altruistic_relay` | `false` | Opt-in: volunteer this node to deliver **strangers'** stuck xch→bse messages by paying their ~145k relay gas (see [9c](#9c-altruistic-relay--chia-only-unwraps)). |
 | `relay_grace_min` | `30` | Never touch a stuck message younger than this — ~98% are delivered by their own senders within minutes. |
 | `relay_daily_gas_budget_eth` | `0.0002` | Hard daily ceiling on volunteer gas spend. |
+| `min_base_eth` | `0.005` | Base gas reserve the GUI warns below, in ETH. Not a hard gate — the engine's own floor is 0.0003 ETH, and this sits above it so you refuel first. `0` switches the warning off. Editable in **Settings → Fees & Reserves**. |
 
 `testnet` is **no longer supported**. A truthy `warp.testnet` raises a
 configuration error rather than silently running against mainnet — remove the key.
@@ -447,7 +452,9 @@ All four are in `SECRET_KEYS`, so a Settings-page save round-trips them into
   cannot resolve that one, and it would otherwise hold the slot forever.
 - **Balances show "unavailable"** — the Base RPC is unreachable or rate-limiting.
   Set a private `base_rpc_url`.
-- **Low-gas warning** — top up the hot wallet's ETH on Base.
+- **Low-gas warning** — top up the hot wallet's ETH on Base, or raise/lower
+  `warp.min_base_eth` (Settings → Fees & Reserves) if the line is in the
+  wrong place for how often this node relays.
 - **Job stuck at COLLECTING_SIGS** — validators haven't all published yet, or the
   portal singleton advanced (the service re-collects automatically). If it stays
   stuck long-term, a wrong signed-digest would make every signature fail local BLS

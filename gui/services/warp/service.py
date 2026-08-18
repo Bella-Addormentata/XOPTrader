@@ -246,6 +246,13 @@ class WarpParams:
     altruistic_relay: bool = False
     relay_grace_min: float = 30.0
     relay_daily_gas_budget_eth: float = 0.0002
+    # Operator-facing Base gas reserve: the ETH balance the hot wallet is
+    # meant to keep on hand for relay/bridge gas. Distinct from the hard
+    # _MIN_GAS_WEI floor, which is the protocol minimum required to sign at
+    # all -- this is the "top me up" line the GUI warns against, so an
+    # operator is told to refuel BEFORE jobs start refusing. 0 disables the
+    # warning.
+    min_base_eth: float = 0.005
 
 
 def _parse_unwrap_cap(warp: dict) -> int:
@@ -294,6 +301,21 @@ def _parse_positive_float(key: str, raw: object) -> float:
     value = _parse_usdc_config_value(key, raw)
     if value <= 0:
         raise WarpError(f"warp.{key} must be positive (got {raw!r})")
+    return value
+
+
+def _parse_non_negative_float(key: str, raw: object, default: float = 0.0) -> float:
+    """A finite float >= 0 from a config knob; absent/blank -> *default*.
+
+    Zero is meaningful here (it switches a warning off), so this cannot
+    reuse _parse_positive_float -- but junk and negatives still fail loudly
+    rather than silently disabling a balance guard.
+    """
+    if raw is None or str(raw).strip() == "":
+        return default
+    value = _parse_usdc_config_value(key, raw)
+    if value < 0:
+        raise WarpError(f"warp.{key} must be >= 0 (got {raw!r})")
     return value
 
 
@@ -409,6 +431,14 @@ def warp_params_from_config(config: Optional[dict]) -> WarpParams:
         relay_daily_gas_budget_eth=_parse_positive_float(
             "relay_daily_gas_budget_eth",
             warp.get("relay_daily_gas_budget_eth", 0.0002) or 0.0002,
+        ),
+        # The default is passed to the parser, not to .get(): a key that is
+        # present but blank or null ("min_base_eth:" with nothing after it)
+        # must fall back too, or it would resolve to 0 and silently switch
+        # the low-gas warning off -- the one outcome an emptied guard should
+        # never produce.
+        min_base_eth=_parse_non_negative_float(
+            "min_base_eth", warp.get("min_base_eth"), 0.005
         ),
     )
 
@@ -3339,6 +3369,10 @@ class WarpEngine:
             "min_micros": self._params.min_micros,
             "max_micros": self._params.max_micros,
             "expected_asset_id": self._net.expected_asset_id,
+            # The operator's Base gas reserve, in wei, so the GUI warns
+            # against the CONFIGURED floor instead of a hardcoded constant
+            # that could not be raised for a busier wallet.
+            "min_base_eth_wei": int(self._params.min_base_eth * 10 ** 18),
             "altruistic_relay": {
                 "enabled": self._relayer is not None,
                 "dry_run": self._params.dry_run,

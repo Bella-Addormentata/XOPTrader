@@ -600,6 +600,13 @@ warp:
   # run, and go live with a small deposit first (see docs/warp-bridge.md).
   dry_run: true
   base_rpc_url: "https://mainnet.base.org"  # [OPTIONAL] a private RPC (Alchemy/Infura) is more reliable
+  # [OPTIONAL, default: 0.005] Base ETH gas reserve, in ETH. The GUI warns on
+  # the Warp and Base Wallet pages when the hot wallet drops below this, so
+  # you refuel BEFORE jobs start refusing. Distinct from the engine's hard
+  # 0.0003 ETH floor, which is the minimum required to sign a relay at all --
+  # this is the operator's comfort line. Raise it if you relay often; set 0
+  # to switch the warning off. Editable in Settings -> Fees & Reserves.
+  min_base_eth: 0.005
   auto_bridge: false                     # [OPTIONAL, default: false] bridge deposits automatically
   min_auto_bridge_usdc: 100              # [OPTIONAL] AUTO-bridge floor only; "Bridge now" ignores it
   max_auto_bridge_usdc: 10000            # [REQUIRED when enabled] blast-radius cap, manual included; 'unlimited' to opt out
