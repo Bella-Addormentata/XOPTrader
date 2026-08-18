@@ -107,4 +107,74 @@ TEST(QuoteMojosFor, CatCatPairProducesExpectedQuoteMojos) {
     EXPECT_NEAR(quote_mojos, 100'100.0, 1.0);
 }
 
+
+// --------------------------------------------------------------------------
+// affordable_base_mojos: the inverse-direction conversion (quote -> base).
+//
+// Background [S3, TODO.md, fixed 2026-08-18]: Step 7 subtracted the XCH fee
+// reserve (1e12-scale XCH mojos) RAW from bid pools denominated in BASE
+// mojos (1e3/unit on CAT-base pairs).  On wmilliETH.b/XCH a 0.5 XCH reserve
+// (5e11 "mojos") annihilated any realistic pool every heartbeat, so the
+// Avellaneda/GLFT sizing model was inert and only floor mechanisms quoted.
+// The v0.7.38 XCH wallet cap on the same branch compared the same
+// mismatched units and could never fire.  These tests lock the conversion
+// in with the live pair's real numbers.
+// --------------------------------------------------------------------------
+
+TEST(AffordableBaseMojos, WmilliEthFeeReserveConvertsSanely) {
+    // 0.5 XCH reserve, mid 1.39 XCH per wmilliETH.b, CAT base (1e3/unit):
+    // (5e11 / 1e12) / 1.39 * 1e3 = 359.7 -> 360 base mojos (~0.36 units).
+    const auto reserve_base = xop::affordable_base_mojos(
+        5e11, static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    EXPECT_EQ(reserve_base, 360);
+
+    // The pre-fix arithmetic subtracted 5e11 -- nine orders of magnitude
+    // larger than the correct figure, and larger than any realistic pool.
+    EXPECT_LT(reserve_base, 1'000);
+}
+
+TEST(AffordableBaseMojos, XchWalletCapNowReachable) {
+    // 83.499 XCH confirmed at mid 1.39: the wallet can back
+    // (83.499 / 1.39) * 1e3 = 60,071 base mojos (~60 units).  Pre-fix the
+    // cap compared a 1e3-scale pool against 8.35e13 and never fired.
+    const auto cap = xop::affordable_base_mojos(
+        83.499 * static_cast<double>(kBaseXch),
+        static_cast<double>(kBaseXch), 1.39,
+        static_cast<double>(kCatDenom));
+    EXPECT_NEAR(static_cast<double>(cap), 60'071.0, 1.0);
+}
+
+TEST(AffordableBaseMojos, MatchesTheCatQuoteCapFormula) {
+    // The CAT-quote bid cap used quote_units / mid * base_denom inline;
+    // the helper must reproduce it exactly.  38.32 wUSDC.b (1e3/unit) at
+    // mid 2.50 wUSDC per XCH, XCH base (1e12/unit):
+    // (38'320 / 1000) / 2.5 * 1e12 = 15.328 XCH in mojos.
+    const auto cap = xop::affordable_base_mojos(
+        38'320.0, static_cast<double>(kCatDenom), 2.5,
+        static_cast<double>(kBaseXch));
+    EXPECT_EQ(cap, static_cast<xop::Mojo>(15.328 * 1e12));
+}
+
+TEST(AffordableBaseMojos, UnavailableConversionReturnsZero) {
+    // A missing/invalid mid or denomination must return 0, which every
+    // call site treats as "skip" -- a cap of 0 must never zero a pool,
+    // and a reserve of 0 must never be silently enormous.
+    const double q = 5e11, qd = 1e12, bd = 1e3;
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, 0.0,  bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, -1.0, bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, 0.0, 1.39, bd), 0);
+    EXPECT_EQ(xop::affordable_base_mojos(q, qd, 1.39, 0.0), 0);
+}
+
+TEST(AffordableBaseMojos, NoOverflowAtRealisticExtremes) {
+    // 9,000 XCH balance, a dust-priced CAT (mid 1e-6 XCH/unit), CAT base:
+    // (9e15/1e12) / 1e-6 * 1e3 = 9e12 base mojos -- large but exact in
+    // double and well inside int64.
+    const auto cap = xop::affordable_base_mojos(
+        9e15, static_cast<double>(kBaseXch), 1e-6,
+        static_cast<double>(kCatDenom));
+    EXPECT_EQ(cap, static_cast<xop::Mojo>(9e12));
+}
+
 }  // namespace

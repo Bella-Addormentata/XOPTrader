@@ -4586,18 +4586,43 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                                  config_.strategy.fee_reserve_xch);
                 }
             }
-            if (pair_cfg->quote_asset_id == "xch" && avail_capital > 0) {
-                const auto prev = avail_capital;
-                avail_capital = std::max(Mojo{0},
-                                         avail_capital - reserve_mojos);
-                if (avail_capital < prev) {
-                    spdlog::info("[Engine] Step 7: {} XCH fee reserve: "
-                                 "bid pool {:.6f} -> {:.6f} XCH "
-                                 "(reserved {:.3f} XCH for fees)",
-                                 pair_name,
-                                 static_cast<double>(prev) / kMojosPerXch,
-                                 static_cast<double>(avail_capital) / kMojosPerXch,
-                                 config_.strategy.fee_reserve_xch);
+            if (pair_cfg->quote_asset_id == "xch" && avail_capital > 0
+                && pair_cfg->base_mojos_per_unit > 0)
+            {
+                // [S3 2026-08-18] avail_capital is BASE-asset mojos (see the
+                // caps below), so the XCH reserve must be converted into the
+                // base mojos it could have bought at the mid before being
+                // subtracted.  The raw subtraction zeroed the pool every
+                // heartbeat on CAT-base pairs (1e12-scale reserve vs a
+                // 1e3-per-unit pool), leaving only floor mechanisms quoting.
+                // A missing mid converts to 0 -> no subtraction; such a pair
+                // is cleared by the no-order-book guard before posting.
+                const Mojo reserve_base = affordable_base_mojos(
+                    static_cast<double>(reserve_mojos),
+                    static_cast<double>(kMojosPerXch),
+                    market_mid,
+                    static_cast<double>(pair_cfg->base_mojos_per_unit));
+                if (reserve_base > 0) {
+                    const auto prev = avail_capital;
+                    avail_capital = std::max(Mojo{0},
+                                             avail_capital - reserve_base);
+                    if (avail_capital < prev) {
+                        spdlog::info(
+                            "[Engine] Step 7: {} XCH fee reserve: bid pool "
+                            "{:.4f} -> {:.4f} {} units (reserved {:.3f} XCH "
+                            "~= {} base mojos at mid {:.6f})",
+                            pair_name,
+                            static_cast<double>(prev)
+                                / static_cast<double>(
+                                      pair_cfg->base_mojos_per_unit),
+                            static_cast<double>(avail_capital)
+                                / static_cast<double>(
+                                      pair_cfg->base_mojos_per_unit),
+                            pair_cfg->base_asset_id,
+                            config_.strategy.fee_reserve_xch,
+                            reserve_base,
+                            market_mid);
+                    }
                 }
             }
         }
@@ -4618,15 +4643,40 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                              static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
                 avail_inventory = xch_confirmed_balance_;
             }
+            // [S3 2026-08-18] Same unit mismatch as the reserve above:
+            // the bid pool is BASE mojos, the XCH balance is 1e12-scale.
+            // The raw comparison could never fire on a CAT-base pair (a
+            // 1e3-per-unit pool never numerically exceeds an XCH balance),
+            // so the "never post offers the wallet can't back" protection
+            // was dead exactly where sizing needed it.  Convert the XCH
+            // balance into the base mojos it could buy at the mid --
+            // mirroring the CAT-quote cap below -- and skip when no mid
+            // is available (cap of 0 must not zero the pool).
             if (pair_cfg->quote_asset_id == "xch"
-                && avail_capital > xch_confirmed_balance_)
+                && pair_cfg->base_mojos_per_unit > 0)
             {
-                spdlog::warn("[Engine] Step 7: {} bid pool {:.6f} XCH > "
-                             "confirmed {:.6f} XCH -- CAPPED",
-                             pair_name,
-                             static_cast<double>(avail_capital) / kMojosPerXch,
-                             static_cast<double>(xch_confirmed_balance_) / kMojosPerXch);
-                avail_capital = xch_confirmed_balance_;
+                const Mojo bid_cap_base = affordable_base_mojos(
+                    static_cast<double>(xch_confirmed_balance_),
+                    static_cast<double>(kMojosPerXch),
+                    market_mid,
+                    static_cast<double>(pair_cfg->base_mojos_per_unit));
+                if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
+                    spdlog::warn(
+                        "[Engine] Step 7: {} bid pool {:.4f} {} units "
+                        "(> {:.6f} XCH at mid {:.6f}) exceeds confirmed "
+                        "{:.6f} XCH -- CAPPED",
+                        pair_name,
+                        static_cast<double>(avail_capital)
+                            / static_cast<double>(
+                                  pair_cfg->base_mojos_per_unit),
+                        pair_cfg->base_asset_id,
+                        static_cast<double>(xch_confirmed_balance_)
+                            / kMojosPerXch,
+                        market_mid,
+                        static_cast<double>(xch_confirmed_balance_)
+                            / kMojosPerXch);
+                    avail_capital = bid_cap_base;
+                }
             }
         }
 
@@ -4674,9 +4724,13 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
                     const double quote_units =
                         static_cast<double>(quote_bal)
                         / static_cast<double>(pair_cfg->quote_mojos_per_unit);
-                    const Mojo bid_cap_base = static_cast<Mojo>(std::llround(
-                        (quote_units / market_mid)
-                        * static_cast<double>(pair_cfg->base_mojos_per_unit)));
+                    // Same conversion as the XCH-quote cap and the fee
+                    // reserve: one formula, one definition (types.hpp).
+                    const Mojo bid_cap_base = affordable_base_mojos(
+                        static_cast<double>(quote_bal),
+                        static_cast<double>(pair_cfg->quote_mojos_per_unit),
+                        market_mid,
+                        static_cast<double>(pair_cfg->base_mojos_per_unit));
                     if (bid_cap_base > 0 && avail_capital > bid_cap_base) {
                         spdlog::warn("[Engine] Step 7: {} bid pool {:.4f} {} "
                                      "(={:.4f} {} @ {:.6f}) > wallet {:.4f} {} "

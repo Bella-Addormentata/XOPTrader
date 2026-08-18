@@ -10,6 +10,7 @@
 #ifndef XOP_TYPES_HPP
 #define XOP_TYPES_HPP
 
+#include <cmath>
 #include <cstdint>
 #include <string>
 #include <chrono>
@@ -61,6 +62,40 @@ inline double quote_mojos_for(double size_base_mojos,
     const double denom = base_denom * static_cast<double>(kMojosPerXch);
     if (denom <= 0.0) return 0.0;
     return size_base_mojos * price_pseudo * quote_denom / denom;
+}
+
+// ---------------------------------------------------------------------------
+// affordable_base_mojos -- how many BASE-asset mojos a quote-mojo amount can
+//                          buy at the current mid.
+//
+//   base_mojos = (quote_mojos / quote_denom) / market_mid * base_denom
+//
+// where market_mid is quote units per base unit (plain, NOT pseudo-price).
+//
+// This is the ONLY place this conversion should be written.  It exists
+// because Step 7 had the inverse-direction twin of the v0.7.45 bug: the XCH
+// fee reserve (1e12-scale XCH mojos) was subtracted RAW from bid pools
+// denominated in BASE mojos (1e3/unit on CAT-base pairs), zeroing the pool
+// every heartbeat on any CAT-base/XCH-quote pair and leaving the sizing
+// model inert (TODO.md S3).  The v0.7.38 XCH wallet cap on the same branch
+// compared the same mismatched units and could never fire.
+//
+// Returns 0 when the mid or either denomination is non-positive -- callers
+// treat 0 as "conversion unavailable, skip" (a pair with no mid is already
+// cleared by the no-order-book guard before posting).
+// Computation in double to avoid int64 overflow; rounded to nearest.
+// ---------------------------------------------------------------------------
+inline Mojo affordable_base_mojos(double quote_mojos,
+                                  double quote_denom,
+                                  double market_mid,
+                                  double base_denom) noexcept
+{
+    if (quote_denom <= 0.0 || base_denom <= 0.0 || market_mid <= 0.0) {
+        return Mojo{0};
+    }
+    const double quote_units = quote_mojos / quote_denom;
+    return static_cast<Mojo>(std::llround(
+        (quote_units / market_mid) * base_denom));
 }
 
 /// Asset identifier.
