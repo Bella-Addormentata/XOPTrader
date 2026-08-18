@@ -391,7 +391,7 @@ class SettingsWidget(QWidget):
             ("Strategy", self._build_strategy_tab),           # 2
             ("Risk Management", self._build_risk_tab),        # 3
             ("Monitoring", self._build_monitoring_tab),       # 4
-            ("Fees", self._build_fees_tab),                   # 5
+            ("Fees & Reserves", self._build_fees_tab),        # 5
             ("Arbitrage", self._build_arbitrage_tab),         # 6
             ("Depeg & Aging", self._build_depeg_aging_tab),   # 7
             ("CoinGecko", self._build_coingecko_tab),         # 8
@@ -761,19 +761,14 @@ class SettingsWidget(QWidget):
         bal_form = QFormLayout(bal_group)
         bal_form.setSpacing(8)
 
-        self._fee_reserve_xch = QDoubleSpinBox()
-        self._fee_reserve_xch.setRange(0.0, 100.0)
-        self._fee_reserve_xch.setSingleStep(0.5)
-        self._fee_reserve_xch.setDecimals(2)
-        self._fee_reserve_xch.setValue(1.0)
-        self._fee_reserve_xch.setSuffix(" XCH")
-        self._fee_reserve_xch.setToolTip(
-            "XCH to hold back from offer allocation for paying on-chain "
-            "fees (offer creation and cancellation).  Deducted from the "
-            "capital pool before tier sizing, so offers never lock the "
-            "last N XCH of spendable balance.  Default: 1.0 XCH."
+        # The XCH fee reserve used to live here.  It moved to the
+        # "Fees & Reserves" tab, next to the fee budget it exists to fund,
+        # so every "hold this much back for fees" knob is in one place.
+        moved_hint = QLabel("XCH Fee Reserve \u2192 Fees & Reserves tab")
+        moved_hint.setStyleSheet(
+            f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;"
         )
-        bal_form.addRow("XCH Fee Reserve:", self._fee_reserve_xch)
+        bal_form.addRow("", moved_hint)
 
         self._min_reserve_units = QDoubleSpinBox()
         self._min_reserve_units.setRange(0.0, 10_000.0)
@@ -818,7 +813,7 @@ class SettingsWidget(QWidget):
             widget.valueChanged.connect(lambda _v, ti=2: self._mark_dirty(ti))
         for widget in (
             self._q_max, self._min_profit_bps, self._offer_ttl,
-            self._num_tiers, self._fee_reserve_xch,
+            self._num_tiers,
             self._min_reserve_units, self._min_trading_units,
         ):
             widget.valueChanged.connect(lambda _v, ti=2: self._mark_dirty(ti))
@@ -1288,7 +1283,15 @@ class SettingsWidget(QWidget):
     # -------------------------------------------------------------------
 
     def _build_fees_tab(self) -> QWidget:
-        """Build the Fees tab: fee budget and adaptive fee settings."""
+        """Build the Fees & Reserves tab.
+
+        Two halves of one question.  The top half is what the bot may SPEND
+        on fees (budget, range, adaptive selection); the bottom half is what
+        it must KEEP so it can still pay them -- the XCH floors on Chia and
+        the ETH gas reserve on Base.  A bot that trades its last mojo into
+        an offer holds inventory it cannot move, so these floors are the
+        difference between a slow day and a stuck wallet.
+        """
         page = QWidget()
         layout = QVBoxLayout(page)
         layout.setContentsMargins(16, 14, 16, 14)
@@ -1403,6 +1406,96 @@ class SettingsWidget(QWidget):
         adaptive_form.addRow("", self._adaptive_fee_enabled)
 
         layout.addWidget(adaptive_group)
+
+        # -- Chia balance reserves --
+        # strategy.* keys; grouped here because they answer the same
+        # question as the budget above, from the other side of the ledger.
+        chia_group = QGroupBox("Chia Balance Reserves (XCH)")
+        chia_form = QFormLayout(chia_group)
+        chia_form.setSpacing(8)
+
+        self._fee_reserve_xch = QDoubleSpinBox()
+        self._fee_reserve_xch.setRange(0.0, 100.0)
+        self._fee_reserve_xch.setSingleStep(0.5)
+        self._fee_reserve_xch.setDecimals(2)
+        self._fee_reserve_xch.setValue(1.0)
+        self._fee_reserve_xch.setSuffix(" XCH")
+        self._fee_reserve_xch.setToolTip(
+            "XCH to hold back from offer allocation for paying on-chain "
+            "fees (offer creation and cancellation).  Deducted from the "
+            "capital pool before tier sizing, so offers never lock the "
+            "last N XCH of spendable balance.  This unlocked XCH is also "
+            "what de facto funds warp.green bridge costs -- the 0.001 XCH "
+            "toll on every unwrap burn and the claim fee on every wrap -- "
+            "which draw from spendable balance outside the engine's "
+            "knowledge.  0.5 XCH covers ~500 unwrap tolls.  "
+            "Default: 1.0 XCH."
+        )
+        chia_form.addRow("XCH Fee Reserve:", self._fee_reserve_xch)
+
+        self._fee_min_spendable_xch = QDoubleSpinBox()
+        self._fee_min_spendable_xch.setRange(0.0, 100.0)
+        self._fee_min_spendable_xch.setSingleStep(0.01)
+        self._fee_min_spendable_xch.setDecimals(4)
+        self._fee_min_spendable_xch.setValue(0.01)
+        self._fee_min_spendable_xch.setSuffix(" XCH")
+        self._fee_min_spendable_xch.setToolTip(
+            "Hard gate on posting offers: when spendable XCH is below this, "
+            "the bot stops creating new offers rather than spending its "
+            "last mojos on fees.  Unlike the reserve above -- which shrinks "
+            "the capital pool -- this simply refuses to act.  "
+            "Default: 0.01 XCH."
+        )
+        chia_form.addRow("Min Spendable (maker):", self._fee_min_spendable_xch)
+
+        self._taker_min_spendable_xch = QDoubleSpinBox()
+        self._taker_min_spendable_xch.setRange(0.0, 100.0)
+        self._taker_min_spendable_xch.setSingleStep(0.05)
+        self._taker_min_spendable_xch.setDecimals(3)
+        self._taker_min_spendable_xch.setValue(0.25)
+        self._taker_min_spendable_xch.setSuffix(" XCH")
+        self._taker_min_spendable_xch.setToolTip(
+            "Preflight floor for strategies that TAKE offers (arbitrage, "
+            "rebalancing).  Taking costs more than making -- the spend has "
+            "to clear alongside whatever else is already in flight -- so "
+            "this sits well above the maker gate.  Default: 0.25 XCH."
+        )
+        chia_form.addRow("Min Spendable (taker):", self._taker_min_spendable_xch)
+
+        layout.addWidget(chia_group)
+
+        # -- Base gas reserve --
+        base_group = QGroupBox("Base Gas Reserve (ETH)")
+        base_form = QFormLayout(base_group)
+        base_form.setSpacing(8)
+
+        self._min_base_eth = QDoubleSpinBox()
+        self._min_base_eth.setRange(0.0, 1.0)
+        self._min_base_eth.setSingleStep(0.001)
+        self._min_base_eth.setDecimals(4)
+        self._min_base_eth.setValue(0.005)
+        self._min_base_eth.setSuffix(" ETH")
+        self._min_base_eth.setToolTip(
+            "Base ETH the hot wallet should keep on hand for gas.  The Warp "
+            "and Base Wallet pages warn when the balance falls below it, so "
+            "you refuel BEFORE work starts refusing.  This is your comfort "
+            "line, not the protocol limit: the engine needs roughly 0.0003 "
+            "ETH to sign a relay at all, so keep this comfortably above "
+            "that.  0 switches the warning off.  Default: 0.005 ETH."
+        )
+        base_form.addRow("Min Base ETH:", self._min_base_eth)
+
+        base_hint = QLabel(
+            "Gas pays for bridge relays, wallet sends and key rotation. "
+            "Only meaningful when the warp.green bridge is enabled."
+        )
+        base_hint.setWordWrap(True)
+        base_hint.setStyleSheet(
+            f"color: {_C.TEXT_SECONDARY}; font-size: 9pt;"
+        )
+        base_form.addRow("", base_hint)
+
+        layout.addWidget(base_group)
         layout.addStretch(1)
 
         # Wire dirty tracking (tab index 5).
@@ -1415,6 +1508,8 @@ class SettingsWidget(QWidget):
         for widget in (
             self._daily_budget_mojos, self._fee_to_gain_max_ratio,
             self._min_fee_mojos, self._max_fee_mojos,
+            self._fee_reserve_xch, self._fee_min_spendable_xch,
+            self._taker_min_spendable_xch, self._min_base_eth,
         ):
             widget.valueChanged.connect(lambda _v, ti=5: self._mark_dirty(ti))
         self._fee_window_blocks.valueChanged.connect(
@@ -2223,6 +2318,8 @@ class SettingsWidget(QWidget):
             "tier_spacing_bps": tier_spacing,
             "tier_size_pct": tier_size,
             "fee_reserve_xch": self._fee_reserve_xch.value(),
+            "fee_min_spendable_xch": self._fee_min_spendable_xch.value(),
+            "taker_min_spendable_xch": self._taker_min_spendable_xch.value(),
             "min_reserve_units": self._min_reserve_units.value(),
             "min_trading_units": self._min_trading_units.value(),
             "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
@@ -2301,6 +2398,14 @@ class SettingsWidget(QWidget):
             "max_fee_mojos": int(self._max_fee_mojos.value()),
             "adaptive_enabled": self._adaptive_fee_enabled.isChecked(),
             "fee_window_blocks": self._fee_window_blocks.value(),
+        }
+
+        # -- warp --
+        # One key only.  save_config() deep-merges this onto the on-disk
+        # snapshot, so writing the whole section here would be the only way
+        # to clobber the bridge settings the GUI does not expose.
+        cfg["warp"] = {
+            "min_base_eth": self._min_base_eth.value(),
         }
 
         # -- inventory_aging --
@@ -2414,6 +2519,12 @@ class SettingsWidget(QWidget):
 
             self._fee_reserve_xch.setValue(
                 float(strat.get("fee_reserve_xch", 1.0))
+            )
+            self._fee_min_spendable_xch.setValue(
+                float(strat.get("fee_min_spendable_xch", 0.01))
+            )
+            self._taker_min_spendable_xch.setValue(
+                float(strat.get("taker_min_spendable_xch", 0.25))
             )
             self._min_reserve_units.setValue(
                 float(strat.get("min_reserve_units", 1.0))
@@ -2560,6 +2671,12 @@ class SettingsWidget(QWidget):
                 int(fees.get("fee_window_blocks", 1662))
             )
 
+            # -- warp --
+            warp = cfg.get("warp", {})
+            self._min_base_eth.setValue(
+                float(warp.get("min_base_eth", 0.005))
+            )
+
             # -- inventory_aging --
             aging = cfg.get("inventory_aging", {})
             self._aging_enabled.setChecked(bool(aging.get("enabled", False)))
@@ -2610,7 +2727,7 @@ class SettingsWidget(QWidget):
             self._pairs_table,
             self._gamma, self._kappa, self._phi, self._q_max,
             self._min_profit_bps, self._offer_ttl, self._num_tiers,
-            self._tier_table, self._fee_reserve_xch,
+            self._tier_table,
             self._min_reserve_units, self._min_trading_units,
             self._auto_rebalance,
             self._soft_limit, self._hard_limit, self._single_cat_cap,
@@ -2628,6 +2745,8 @@ class SettingsWidget(QWidget):
             self._fee_to_gain_max_ratio, self._min_fee_mojos,
             self._max_fee_mojos, self._adaptive_fee_enabled,
             self._fee_window_blocks,
+            self._fee_reserve_xch, self._fee_min_spendable_xch,
+            self._taker_min_spendable_xch, self._min_base_eth,
             # Arbitrage
             self._arb_enabled,
             self._tri_min_profit_bps, self._tri_slippage_bps,

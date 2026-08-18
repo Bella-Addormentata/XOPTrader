@@ -84,7 +84,11 @@ LOSS_RED: Final[str] = _C.LOSS_RED
 # ---------------------------------------------------------------------------
 _USDC_MICROS: Final[int] = 1_000_000          # USDC has 6 decimals
 _WEI_PER_ETH: Final[int] = 10 ** 18           # ETH has 18 decimals
-_LOW_GAS_WEI: Final[int] = 1_000_000_000_000_000  # 0.001 ETH -- warn below
+#: Fallback gas-warning floor, used only until a snapshot arrives (or when
+#: warp is disabled and publishes no config). The live threshold comes from
+#: warp.min_base_eth via the snapshot -- a hardcoded constant could not be
+#: raised for a wallet that relays more often.
+_LOW_GAS_WEI_FALLBACK: Final[int] = 5_000_000_000_000_000  # 0.005 ETH
 
 _log = logging.getLogger(__name__)
 
@@ -692,11 +696,14 @@ class BaseWalletWidget(QWidget):
         )
 
         wei = bw.get("eth_wei")
-        low = configured and isinstance(wei, int) and wei < _LOW_GAS_WEI
+        floor = self._gas_floor_wei()
+        low = configured and isinstance(wei, int) and floor > 0 and wei < floor
         if low:
             self._gas_lbl.setText(
-                "⚠️  Low gas: sends and rotation need ETH on Base for fees. "
-                "Fund the wallet with ~0.005 ETH."
+                f"⚠️  Low gas: {_eth(wei)} ETH is below the configured reserve "
+                f"of {_eth(floor)} ETH. Sends, rotation and bridge relays all "
+                "need Base ETH — top the wallet up "
+                "(Settings → Fees & Reserves)."
             )
         self._gas_lbl.setVisible(bool(low))
 
@@ -732,6 +739,17 @@ class BaseWalletWidget(QWidget):
             self._rotate_btn.setToolTip(
                 "Sweep everything to a fresh key and archive the old one."
             )
+
+    def _gas_floor_wei(self) -> int:
+        """The operator's configured Base gas reserve, in wei.
+
+        Falls back to a built-in default only while no snapshot has arrived;
+        an explicit 0 in config legitimately disables the warning."""
+        raw = self._snap.get("min_base_eth_wei")
+        try:
+            return int(raw)
+        except (TypeError, ValueError):
+            return _LOW_GAS_WEI_FALLBACK
 
     def _render_banner(
         self, snap: dict, bw: dict, *, configured: bool, error: Any

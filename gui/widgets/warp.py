@@ -75,7 +75,8 @@ LOSS_RED: Final[str] = _C.LOSS_RED
 _USDC_MICROS: Final[int] = 1_000_000        # USDC has 6 decimals
 _WUSDC_MOJOS_PER_UNIT: Final[int] = 1_000   # wUSDC.b CAT has 3 decimals
 _WEI_PER_ETH: Final[float] = 1e18
-_LOW_GAS_WEI: Final[int] = 1_000_000_000_000_000  # 0.001 ETH -- warn below this
+#: Fallback only; the live floor is warp.min_base_eth from the snapshot.
+_LOW_GAS_WEI_FALLBACK: Final[int] = 5_000_000_000_000_000  # 0.005 ETH
 
 # Job-status string constants (mirror gui.services.warp.jobs.JobStatus values,
 # kept as local literals so the widget imports no heavy warp module at GUI boot).
@@ -627,12 +628,17 @@ class WarpWidget(QWidget):
         self._eth_lbl.setTextFormat(Qt.TextFormat.RichText)
 
         wei = hot.get("eth_wei")
-        low = isinstance(wei, int) and wei < _LOW_GAS_WEI
+        try:
+            floor = int(self._snap.get("min_base_eth_wei"))
+        except (TypeError, ValueError):
+            floor = _LOW_GAS_WEI_FALLBACK
+        low = isinstance(wei, int) and floor > 0 and wei < floor
         if low:
             self._gas_lbl.setText(
-                "⚠️  Low gas: this wallet needs a small amount of ETH on "
-                "Base to pay for the approve + bridge transactions. Fund it with "
-                "~0.005 ETH."
+                f"⚠️  Low gas: {_eth(wei)} ETH is below the configured "
+                f"reserve of {_eth(floor)} ETH. This wallet needs Base ETH to "
+                "pay for the approve + bridge transactions — top it up "
+                "(Settings → Fees & Reserves)."
             )
         self._gas_lbl.setVisible(bool(low))
 
