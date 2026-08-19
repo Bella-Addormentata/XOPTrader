@@ -41,6 +41,9 @@ def _io_transaction(secrets_io: Any):
 
 _ETH_TRANSFER_GAS = 21_000
 _ERC20_TRANSFER_GAS_DEFAULT = 80_000
+#: deposit()/withdraw() on MilliETH: mint/burn + ETH transfer; estimated
+#: first, this is only the estimator fallback.
+_MILLIETH_GAS_DEFAULT = 90_000
 
 
 class BaseWalletError(RuntimeError):
@@ -75,6 +78,7 @@ class WalletInfo:
     address: str
     eth_wei: int
     usdc_micros: int
+    millieth_units: int  # MilliETH ERC-20, 3-decimal units
     retired_count: int
     backup_confirmed: bool
 
@@ -160,6 +164,11 @@ class BaseWallet:
             usdc_micros=int(
                 self._evm.get_erc20_balance(self._net.usdc_address, key.address)
             ),
+            millieth_units=int(
+                self._evm.get_erc20_balance(
+                    self._net.milli_eth_address, key.address
+                )
+            ),
             retired_count=len(secrets.get("retired_keys") or []),
             backup_confirmed=bool(secrets.get("evm_key_backup_confirmed")),
         )
@@ -216,6 +225,88 @@ class BaseWallet:
         )
         unsigned = self._prepare(key, to=self._net.usdc_address, value=0,
                                  data=data, gas=gas)
+        signed = evm.sign_tx(unsigned, key.private_key)
+        self._evm.send_raw_transaction(signed.raw)
+        return signed.tx_hash
+
+    # -- ETH <-> milliETH conversion (MilliETH.sol, no fees) ------------------ #
+
+    #: MilliETH's conversion granularity: deposit() reverts unless msg.value
+    #: is a multiple of 1e12 wei (18-decimal ETH -> 6 effective decimals:
+    #: the 1000x ratio plus the token's own 3 decimals).
+    WRAP_GRANULARITY_WEI = 10 ** 12
+
+    def wrap_eth(self, amount_wei: int, *, reserve_wei: int = 0) -> str:
+        """ETH -> milliETH via ``MilliETH.deposit()`` (1000/ETH, no fee).
+
+        ``reserve_wei`` is the ETH that must REMAIN after amount plus
+        worst-case gas: the relay-gas floor.  Wrapping the gas reserve into
+        an ERC-20 would strand the wallet unable to move anything at all --
+        including unwrapping the milliETH back.
+        """
+        from .warp import evm
+
+        key = self.active_key()
+        amount_wei = int(amount_wei)
+        if amount_wei <= 0:
+            raise BaseWalletError("amount must be positive")
+        if amount_wei % self.WRAP_GRANULARITY_WEI:
+            raise BaseWalletError(
+                "amount must be a multiple of 0.000001 ETH (1e12 wei) -- "
+                "MilliETH's conversion granularity; the contract reverts "
+                "on anything finer"
+            )
+        if not getattr(self._net, "milli_eth_address", ""):
+            raise BaseWalletError("milliETH is not configured on this network")
+        data = evm.encode_millieth_deposit()
+        gas = self._evm.estimate_gas(
+            from_address=key.address, to=self._net.milli_eth_address,
+            value=amount_wei, data=data, default=_MILLIETH_GAS_DEFAULT,
+        )
+        unsigned = self._prepare(key, to=self._net.milli_eth_address,
+                                 value=amount_wei, data=data, gas=gas)
+        cost = amount_wei + unsigned.gas * unsigned.max_fee_per_gas
+        balance = int(self._evm.get_eth_balance(key.address))
+        if balance - cost < int(reserve_wei):
+            raise BaseWalletError(
+                f"wrapping {amount_wei} wei would leave less than the "
+                f"{reserve_wei} wei relay-gas reserve (balance {balance}, "
+                "worst-case cost includes gas); wrap less or top up"
+            )
+        signed = evm.sign_tx(unsigned, key.private_key)
+        self._evm.send_raw_transaction(signed.raw)
+        return signed.tx_hash
+
+    def unwrap_millieth(self, amount_units: int) -> str:
+        """milliETH -> ETH via ``withdraw(uint256)`` (units are 3-decimal).
+
+        The refund replenishes the gas reserve, so no reserve gate here --
+        only that the wallet can pay THIS transaction's worst-case gas.
+        """
+        from .warp import evm
+
+        key = self.active_key()
+        amount_units = int(amount_units)
+        if amount_units <= 0:
+            raise BaseWalletError("amount must be positive")
+        if not getattr(self._net, "milli_eth_address", ""):
+            raise BaseWalletError("milliETH is not configured on this network")
+        held = int(self._evm.get_erc20_balance(
+            self._net.milli_eth_address, key.address))
+        if amount_units > held:
+            raise BaseWalletError(
+                f"amount {amount_units} exceeds the milliETH balance {held}"
+            )
+        data = evm.encode_millieth_withdraw(amount_units)
+        gas = self._evm.estimate_gas(
+            from_address=key.address, to=self._net.milli_eth_address,
+            value=0, data=data, default=_MILLIETH_GAS_DEFAULT,
+        )
+        unsigned = self._prepare(key, to=self._net.milli_eth_address,
+                                 value=0, data=data, gas=gas)
+        if unsigned.gas * unsigned.max_fee_per_gas > int(
+                self._evm.get_eth_balance(key.address)):
+            raise BaseWalletError("worst-case gas exceeds the ETH balance")
         signed = evm.sign_tx(unsigned, key.private_key)
         self._evm.send_raw_transaction(signed.raw)
         return signed.tx_hash

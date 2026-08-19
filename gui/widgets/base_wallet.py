@@ -163,6 +163,14 @@ def _eth(wei: Any) -> str:
         return "—"
 
 
+def _millieth(units: Any) -> str:
+    """Format 3-decimal milliETH units, or an em dash when unknown."""
+    try:
+        return f"{int(units) / 1000:,.3f}"
+    except (TypeError, ValueError):
+        return "\u2014"
+
+
 def _short(value: Any, head: int = 10, tail: int = 6) -> str:
     """Middle-truncate a long hex/address string for compact display."""
     s = str(value or "")
@@ -567,10 +575,13 @@ class BaseWalletWidget(QWidget):
         self._usdc_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
         self._eth_lbl = QLabel()
         self._eth_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        self._millieth_lbl = QLabel()
+        self._millieth_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
         self._retired_lbl = QLabel()
         self._retired_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
         bal_row.addWidget(self._usdc_lbl)
         bal_row.addWidget(self._eth_lbl)
+        bal_row.addWidget(self._millieth_lbl)
         bal_row.addWidget(self._retired_lbl)
         bal_row.addStretch(1)
         layout.addLayout(bal_row)
@@ -634,6 +645,36 @@ class BaseWalletWidget(QWidget):
 
         layout.addWidget(_separator())
 
+        # -- Convert (ETH <-> milliETH) -----------------------------------
+        layout.addWidget(_section_label("Convert"))
+        layout.addWidget(
+            _body_label(
+                "Wrap ETH into milliETH (warp.green's 1000-per-ETH bridge "
+                "asset, no fee) or unwrap milliETH back to ETH. Wrapped "
+                "milliETH is what bridges to Chia as wmilliETH.b; unwrapping "
+                "refuels gas. ETH amounts are floored to 0.000001 ETH (the "
+                "contract's granularity), and wrapping always leaves the "
+                "relay-gas minimum untouched."
+            )
+        )
+        convert_row = QHBoxLayout()
+        self._convert_amount = _mono_field("Amount", read_only=False)
+        self._convert_amount.setMaximumWidth(160)
+        convert_row.addWidget(self._convert_amount)
+        self._convert_dir = QComboBox()
+        self._convert_dir.addItems(
+            ["ETH \u2192 milliETH", "milliETH \u2192 ETH"]
+        )
+        self._convert_dir.setStyleSheet(self._send_asset.styleSheet())
+        convert_row.addWidget(self._convert_dir)
+        self._convert_btn = self._primary_button("\u21c4  Convert")
+        self._convert_btn.clicked.connect(self._on_convert_clicked)
+        convert_row.addWidget(self._convert_btn)
+        convert_row.addStretch(1)
+        layout.addLayout(convert_row)
+
+        layout.addWidget(_separator())
+
         # -- Rotate -----------------------------------------------------
         layout.addWidget(_section_label("Rotate Key"))
         layout.addWidget(
@@ -687,9 +728,14 @@ class BaseWalletWidget(QWidget):
             self._usdc_lbl.setTextFormat(Qt.TextFormat.RichText)
             self._eth_lbl.setText(f"ETH (gas): <b>{_eth(bw.get('eth_wei'))}</b>")
             self._eth_lbl.setTextFormat(Qt.TextFormat.RichText)
+            self._millieth_lbl.setText(
+                f"milliETH: <b>{_millieth(bw.get('millieth_units'))}</b>"
+            )
+            self._millieth_lbl.setTextFormat(Qt.TextFormat.RichText)
         else:
             self._usdc_lbl.setText("USDC: —")
             self._eth_lbl.setText("ETH (gas): —")
+            self._millieth_lbl.setText("milliETH: —")
         retired = bw.get("retired_count") or 0
         self._retired_lbl.setText(
             f"Retired keys: {retired}" if retired else ""
@@ -729,6 +775,7 @@ class BaseWalletWidget(QWidget):
 
         can_act = configured and not self._action_pending
         self._send_btn.setEnabled(can_act)
+        self._convert_btn.setEnabled(can_act)
         self._rotate_btn.setEnabled(can_act)
         if not configured:
             tip = "Create a wallet first."
@@ -854,6 +901,57 @@ class BaseWalletWidget(QWidget):
             self._emit_action(
                 "send_eth", {"destination": dest, "amount_wei": units}
             )
+
+    def _on_convert_clicked(self) -> None:
+        """Parse, floor to granularity, confirm with exact amounts, emit."""
+        wrap = self._convert_dir.currentIndex() == 0  # ETH -> milliETH
+        text = (self._convert_amount.text() or "").strip()
+        if wrap:
+            units = parse_asset_amount(text, decimals=18)
+            if units is None or units <= 0:
+                _log.warning("convert: amount %r is not a valid ETH amount",
+                             text)
+                self._convert_amount.setFocus()
+                return
+            # Floor to the contract's 1e12-wei granularity rather than
+            # bouncing the operator for a sub-granule tail.
+            units -= units % 10 ** 12
+            if units <= 0:
+                self._convert_amount.setFocus()
+                return
+            human_in = _exact_amount(units, 18)
+            human_out = _millieth(units // 10 ** 12)
+            prompt = (
+                f"Wrap {human_in} ETH into {human_out} milliETH "
+                "(MilliETH contract, no fee)?\n\nThe relay-gas minimum "
+                "is always left untouched; the action is refused if the "
+                "amount plus worst-case gas would dip below it."
+            )
+            action, payload = "wrap_eth", {"amount_wei": units}
+        else:
+            units = parse_asset_amount(text, decimals=3)
+            if units is None or units <= 0:
+                _log.warning(
+                    "convert: amount %r is not a valid milliETH amount", text)
+                self._convert_amount.setFocus()
+                return
+            human_in = _millieth(units)
+            human_out = _exact_amount(units * 10 ** 12, 18)
+            prompt = (
+                f"Unwrap {human_in} milliETH back into {human_out} ETH "
+                "(MilliETH contract, no fee)?"
+            )
+            action, payload = "unwrap_millieth", {"amount_units": units}
+        answer = QMessageBox.question(
+            self,
+            "Confirm conversion",
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._emit_action(action, payload)
 
     def _on_rotate_clicked(self) -> None:
         """Confirm the full consequences, then request the rotation."""

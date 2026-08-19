@@ -38,6 +38,7 @@ class FakeEvm:
     def __init__(self) -> None:
         self.eth = 10 ** 16               # 0.01 ETH
         self.usdc = 5_000_000             # 5 USDC
+        self.millieth = 2_500             # 2.5 milliETH (3-decimal units)
         self.sent: list = []
         self.fees = SimpleNamespace(max_fee_per_gas=1_000_000_000,
                                     max_priority_fee_per_gas=1_000_000)
@@ -46,6 +47,8 @@ class FakeEvm:
         return self.eth
 
     def get_erc20_balance(self, token, addr):
+        if str(token).lower() == C.MAINNET.milli_eth_address.lower():
+            return self.millieth
         return self.usdc
 
     def get_nonce(self, addr, *, pending=True):
@@ -197,3 +200,79 @@ def test_rotation_with_dust_only_skips_the_eth_sweep():
     out = w.rotate(open_job_check=lambda: None)
     assert out["sweep_txs"] == [] and out["swept_eth_wei"] == 0
     assert len(io.data["warp"]["retired_keys"]) == 1
+# --------------------------------------------------------------------------- #
+# ETH <-> milliETH conversion (MilliETH.sol wrapper).
+# --------------------------------------------------------------------------- #
+
+def test_millieth_encoders_are_selector_anchored():
+    """WETH-style selectors, pinned so a refactor cannot silently re-derive
+    them wrong: deposit() = d0e30db0, withdraw(uint256) = 2e1a7d4d."""
+    from gui.services.warp import evm
+
+    assert evm.encode_millieth_deposit() == bytes.fromhex("d0e30db0")
+    data = evm.encode_millieth_withdraw(1_234)
+    assert data[:4] == bytes.fromhex("2e1a7d4d")
+    assert len(data) == 4 + 32
+    assert int.from_bytes(data[4:], "big") == 1_234
+
+
+def test_wrap_eth_enforces_the_contract_granularity():
+    """MilliETH.deposit() reverts on amounts not divisible by 1e12 wei;
+    the wallet refuses first, and nothing is broadcast."""
+    w, _io, ev = _wallet()
+    with pytest.raises(BaseWalletError, match="granularity"):
+        w.wrap_eth(10 ** 12 + 1)
+    assert ev.sent == []
+    tx = w.wrap_eth(2 * 10 ** 12)
+    assert tx.startswith("0x") and len(ev.sent) == 1
+
+
+def test_wrap_eth_never_wraps_the_relay_gas_reserve():
+    """Wrapping the gas floor into an ERC-20 would strand the wallet unable
+    to move anything -- including unwrapping the milliETH back."""
+    w, _io, ev = _wallet()
+    # Balance covers the amount + worst-case gas but NOT the reserve on top.
+    amount = 5 * 10 ** 12
+    gas_cost = 60_000 * ev.fees.max_fee_per_gas
+    ev.eth = amount + gas_cost + 100
+    with pytest.raises(BaseWalletError, match="relay-gas reserve"):
+        w.wrap_eth(amount, reserve_wei=200)
+    assert ev.sent == []
+    # With the reserve satisfied the same wrap goes through.
+    ev.eth = amount + gas_cost + 200
+    assert w.wrap_eth(amount, reserve_wei=200).startswith("0x")
+
+
+def test_wrap_eth_refuses_nonpositive_amounts():
+    w, _io, ev = _wallet()
+    for bad in (0, -(10 ** 12)):
+        with pytest.raises(BaseWalletError, match="positive"):
+            w.wrap_eth(bad)
+    assert ev.sent == []
+
+
+def test_unwrap_millieth_checks_the_token_balance():
+    w, _io, ev = _wallet()
+    with pytest.raises(BaseWalletError, match="exceeds the milliETH balance"):
+        w.unwrap_millieth(ev.millieth + 1)
+    assert ev.sent == []
+    tx = w.unwrap_millieth(ev.millieth)
+    assert tx.startswith("0x") and len(ev.sent) == 1
+
+
+def test_unwrap_millieth_needs_gas_headroom():
+    """The refund replenishes gas, but THIS transaction still needs to be
+    payable up front."""
+    w, _io, ev = _wallet()
+    ev.eth = 0
+    with pytest.raises(BaseWalletError, match="worst-case gas"):
+        w.unwrap_millieth(100)
+    assert ev.sent == []
+
+
+def test_info_reports_the_millieth_balance():
+    w, _io, ev = _wallet()
+    info = w.info()
+    assert info.millieth_units == ev.millieth
+    assert info.usdc_micros == ev.usdc, "USDC read must stay token-keyed"
+
