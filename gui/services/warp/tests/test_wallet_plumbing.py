@@ -346,6 +346,8 @@ def test_parse_asset_amount_exact_or_refused():
     assert parse_asset_amount("0.0000001", decimals=6) is None
     for bad in ("abc", "", "-1", "0", "nan", "inf", "1e309"):
         assert parse_asset_amount(bad, decimals=6) is None, bad
+
+
 def test_conversions_refuse_while_the_job_store_is_unreadable(
     tmp_path, monkeypatch
 ):

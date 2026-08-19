@@ -187,7 +187,9 @@ def test_qr_dialog_is_released_after_close(qapp, monkeypatch):
     for _ in range(3):
         w._on_qr_clicked()
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
-    assert w.findChildren(QDialog) == [],         "closed QR dialogs must not accumulate on the page"
+    assert w.findChildren(QDialog) == [], (
+        "closed QR dialogs must not accumulate on the page"
+    )
     w.deleteLater()
 
 

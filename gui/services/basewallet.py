@@ -173,15 +173,6 @@ class BaseWallet:
             backup_confirmed=bool(secrets.get("evm_key_backup_confirmed")),
         )
 
-    def erc20_balance(self, token_address: str, holder: str) -> int:
-        """One raw ERC-20 balance read. Touches no key material.
-
-        Exists so summary paths that already KNOW the address can read a
-        single token balance without info()'s full sweep (secrets read +
-        DPAPI + ETH + USDC + milliETH RPCs).
-        """
-        return int(self._evm.get_erc20_balance(token_address, holder))
-
     # -- transfers ----------------------------------------------------------- #
 
     def _prepare(self, key, *, to: str, value: int, data: bytes, gas: int,

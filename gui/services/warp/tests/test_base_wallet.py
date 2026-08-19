@@ -203,6 +203,8 @@ def test_rotation_with_dust_only_skips_the_eth_sweep():
     out = w.rotate(open_job_check=lambda: None)
     assert out["sweep_txs"] == [] and out["swept_eth_wei"] == 0
     assert len(io.data["warp"]["retired_keys"]) == 1
+
+
 # --------------------------------------------------------------------------- #
 # ETH <-> milliETH conversion (MilliETH.sol wrapper).
 # --------------------------------------------------------------------------- #
@@ -278,6 +280,8 @@ def test_info_reports_the_millieth_balance():
     info = w.info()
     assert info.millieth_units == ev.millieth
     assert info.usdc_micros == ev.usdc, "USDC read must stay token-keyed"
+
+
 def test_rotation_refuses_pre_swap_when_millieth_gas_is_unaffordable():
     """Wrap-then-rotate with near-zero ETH is exactly the strand the
     refuse-before-the-key-swap rule exists for: archiving the key first
