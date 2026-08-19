@@ -4083,12 +4083,15 @@ class _WarpWorker(QObject):
             out["address"] = str(hot.get("address"))
             out["eth_wei"] = hot.get("eth_wei")
             out["usdc_micros"] = hot.get("usdc_micros")
-            # The engine's hot-wallet refresh predates milliETH; read it
-            # directly (one extra RPC per ~30s tick) and stay silent on
+            # The engine's hot-wallet refresh predates milliETH; read
+            # JUST that token balance -- the address is already in hand, so
+            # this is genuinely one extra RPC (info() would re-read secrets
+            # through DPAPI and re-fetch ETH+USDC on every tick). Silent on
             # failure -- the summary must never raise.
             try:
-                out["millieth_units"] = int(
-                    self._base_wallet().info().millieth_units)
+                out["millieth_units"] = self._base_wallet().erc20_balance(
+                    constants.MAINNET.milli_eth_address, out["address"]
+                )
             except Exception:  # noqa: BLE001
                 pass
             return out

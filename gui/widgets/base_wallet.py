@@ -946,8 +946,10 @@ class BaseWalletWidget(QWidget):
         if wrap:
             units = parse_asset_amount(text, decimals=18)
             if units is None or units <= 0:
-                _log.warning("convert: amount %r is not a valid ETH amount",
-                             text)
+                _log.warning(
+                    "convert: amount %r is not a valid ETH amount",
+                    text,
+                )
                 self._convert_amount.setFocus()
                 return
             # Floor to the contract's 1e12-wei granularity rather than
@@ -957,7 +959,9 @@ class BaseWalletWidget(QWidget):
                 self._convert_amount.setFocus()
                 return
             human_in = _exact_amount(units, 18)
-            human_out = _millieth(units // 10 ** 12)
+            # Confirmations show EXACT amounts (decimal string, no float
+            # path) -- _millieth() is the display formatter, not this.
+            human_out = _exact_amount(units // 10 ** 12, 3)
             prompt = (
                 f"Wrap {human_in} ETH into {human_out} milliETH "
                 "(MilliETH contract, no fee)?\n\nThe relay-gas minimum "
@@ -969,10 +973,12 @@ class BaseWalletWidget(QWidget):
             units = parse_asset_amount(text, decimals=3)
             if units is None or units <= 0:
                 _log.warning(
-                    "convert: amount %r is not a valid milliETH amount", text)
+                    "convert: amount %r is not a valid milliETH amount",
+                    text,
+                )
                 self._convert_amount.setFocus()
                 return
-            human_in = _millieth(units)
+            human_in = _exact_amount(units, 3)
             human_out = _exact_amount(units * 10 ** 12, 18)
             prompt = (
                 f"Unwrap {human_in} milliETH back into {human_out} ETH "
