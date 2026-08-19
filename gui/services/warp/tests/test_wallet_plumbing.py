@@ -36,7 +36,7 @@ class FakeEvm:
         return self.usdc
 
     def get_nonce(self, addr, *, pending=True):
-        return 7
+        return 7 + (getattr(self, "unmined", 0) if pending else 0)
 
     def get_fee_data(self, **kw):
         return self.fees

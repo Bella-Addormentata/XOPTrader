@@ -193,6 +193,7 @@ class BaseWallet:
 
         destination = validate_destination(destination)
         key = self.active_key()
+        self._require_settled(key.address, "send ETH")
         amount_wei = int(amount_wei)
         if amount_wei <= 0:
             raise BaseWalletError("amount must be positive")
@@ -210,6 +211,7 @@ class BaseWallet:
 
         destination = validate_destination(destination)
         key = self.active_key()
+        self._require_settled(key.address, "send USDC")
         amount_micros = int(amount_micros)
         if amount_micros <= 0:
             raise BaseWalletError("amount must be positive")
@@ -236,6 +238,53 @@ class BaseWallet:
     #: the 1000x ratio plus the token's own 3 decimals).
     WRAP_GRANULARITY_WEI = 10 ** 12
 
+    def _require_settled(self, address: str, doing: str) -> None:
+        """Refuse while the address has broadcast-but-unmined transactions.
+
+        Every balance this class validates against is read at the LATEST
+        block, but the GUI re-enables actions the moment a transaction
+        broadcasts. Inside that window the balances lie: a wrap-then-rotate
+        would read zero milliETH and archive the very key the tokens are
+        about to land on, and two quick wraps would both validate against
+        the same ETH balance and cumulatively breach the relay-gas floor.
+        The pending-vs-latest nonce gap counts exactly those outstanding
+        transactions, statelessly. Base mines ~2s blocks, so the refusal
+        window is seconds.
+
+        Two honest limits. The gap only counts OUTGOING transactions from
+        ``address``: inbound transfers in flight (an exchange deposit, a
+        retired-key recovery sweep) are invisible to any nonce check --
+        rotation handles the in-app case by also checking the retired
+        keys, and anything else that mines into an archived key stays
+        recoverable via recover_retired(). And the reading is only as
+        good as the RPC endpoint's mempool view: a load-balanced provider
+        without shared pending state can report pending == latest during
+        the window. A reading that is outright incoherent (pending BELOW
+        latest, e.g. a provider answering the pending tag with null)
+        fails closed rather than silently disarming the guard.
+
+        Latest is read before pending so a transaction mining or being
+        broadcast between the two calls can only widen the gap (refuse,
+        safe), never fake coherence.
+        """
+        latest = int(self._evm.get_nonce(address, pending=False))
+        pending = int(self._evm.get_nonce(address, pending=True))
+        outstanding = pending - latest
+        if outstanding < 0:
+            raise BaseWalletError(
+                f"cannot {doing}: the RPC returned an incoherent nonce "
+                f"view for {address} (pending {pending} < latest "
+                f"{latest}), so balance reads cannot be trusted. Check "
+                "the Base RPC endpoint and retry."
+            )
+        if outstanding > 0:
+            raise BaseWalletError(
+                f"cannot {doing}: {outstanding} transaction(s) from "
+                f"{address} are broadcast but not yet mined, so balance "
+                "reads cannot be trusted yet. Base blocks land in "
+                "seconds -- retry shortly."
+            )
+
     def wrap_eth(self, amount_wei: int, *, reserve_wei: int = 0) -> str:
         """ETH -> milliETH via ``MilliETH.deposit()`` (1000/ETH, no fee).
 
@@ -247,6 +296,7 @@ class BaseWallet:
         from .warp import evm
 
         key = self.active_key()
+        self._require_settled(key.address, "wrap ETH")
         amount_wei = int(amount_wei)
         if amount_wei <= 0:
             raise BaseWalletError("amount must be positive")
@@ -286,6 +336,7 @@ class BaseWallet:
         from .warp import evm
 
         key = self.active_key()
+        self._require_settled(key.address, "unwrap milliETH")
         amount_units = int(amount_units)
         if amount_units <= 0:
             raise BaseWalletError("amount must be positive")
@@ -314,10 +365,10 @@ class BaseWallet:
     # -- rotation ------------------------------------------------------------ #
 
     def rotate(self, *, open_job_check) -> dict:
-        """New key; sweep USDC then ETH to it; archive the old blob.
+        """New key; sweep milliETH, USDC, then ETH to it; archive the old blob.
 
         ``open_job_check()`` must return the open warp job or ``None`` --
-        injected because the wallet must not import the job store. Both sweep
+        injected because the wallet must not import the job store. The sweep
         transactions are signed against consecutive nonces with worst-case gas
         reserved up front; whatever dust the reserve strands stays at the
         archived key, which is recoverable, unlike an underfunded sweep.
@@ -332,6 +383,21 @@ class BaseWallet:
             )
 
         old = self.active_key()
+        self._require_settled(old.address, "rotate")
+        # recover_retired() sweeps from retired keys INTO the active key;
+        # those pending inbounds never bump the active address's nonce, so
+        # a rotate right after a recovery would read the active key's
+        # balances BEFORE the sweeps land, archive it, and re-strand the
+        # recovered funds on the freshly retired key. The retired keys'
+        # own outgoing nonces see exactly those sweeps.
+        for entry in (self._io.read().get("warp") or {}).get(
+                "retired_keys") or []:
+            retired_addr = str(entry.get("address") or "")
+            if retired_addr:
+                self._require_settled(
+                    retired_addr,
+                    "rotate (a retired-key recovery is still settling)",
+                )
         eth = int(self._evm.get_eth_balance(old.address))
         usdc = int(self._evm.get_erc20_balance(self._net.usdc_address, old.address))
         # Wrapping introduced a third asset; a rotation that ignored it
@@ -511,6 +577,7 @@ class BaseWallet:
                 "the retired address is the active address; nothing to recover"
             )
 
+        self._require_settled(old.address, "recover the retired key")
         eth = int(self._evm.get_eth_balance(old.address))
         usdc = int(self._evm.get_erc20_balance(self._net.usdc_address, old.address))
         millieth = int(self._evm.get_erc20_balance(

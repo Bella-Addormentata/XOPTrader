@@ -38,7 +38,8 @@ class FakeEvm:
     def __init__(self) -> None:
         self.eth = 10 ** 16               # 0.01 ETH
         self.usdc = 5_000_000             # 5 USDC
-        self.millieth = 2_500             # 2.5 milliETH (3-decimal units)
+        self.millieth = 2_500
+        self.unmined = 0             # 2.5 milliETH (3-decimal units)
         self.sent: list = []
         self.fees = SimpleNamespace(max_fee_per_gas=1_000_000_000,
                                     max_priority_fee_per_gas=1_000_000)
@@ -52,7 +53,12 @@ class FakeEvm:
         return self.usdc
 
     def get_nonce(self, addr, *, pending=True):
-        return 7
+        # self.unmined models broadcast-but-unmined txs: the pending tag
+        # sees them, the latest tag does not. An int applies to every
+        # address; a dict is per-address (negative = incoherent reading).
+        u = (self.unmined.get(addr, 0) if isinstance(self.unmined, dict)
+             else self.unmined)
+        return 7 + (u if pending else 0)
 
     def get_fee_data(self, **kw):
         return self.fees
@@ -328,3 +334,69 @@ def test_recovery_preflights_all_sweeps_before_broadcasting_any():
     with pytest.raises(BaseWalletError, match="USDC"):
         w.recover_retired(old_addr)
     assert ev.sent == [], "nothing may broadcast when the full preflight fails"
+
+
+def test_money_moving_actions_refuse_while_a_wallet_tx_is_unmined():
+    """Between broadcast and mining, latest-block balances lie (the GUI
+    re-enables actions as soon as a tx broadcasts). A wrap-then-rotate in
+    that window would read zero milliETH and archive the key the tokens
+    are about to land on; two quick wraps would both validate against the
+    same ETH balance and cumulatively breach the relay-gas floor. The
+    pending-vs-latest nonce gap must refuse all of it, statelessly."""
+    w, io, ev = _wallet()
+    ev.unmined = 1
+    dest = "0x" + "ab" * 20
+    for label, act in (
+        ("wrap", lambda: w.wrap_eth(10 ** 12)),
+        ("unwrap", lambda: w.unwrap_millieth(1)),
+        ("rotate", lambda: w.rotate(open_job_check=lambda: None)),
+        ("send_eth", lambda: w.send_eth(dest, 10 ** 12)),
+        ("send_usdc", lambda: w.send_usdc(dest, 1)),
+    ):
+        with pytest.raises(BaseWalletError, match="not yet mined"):
+            act()
+    assert ev.sent == [], "nothing may broadcast on stale balances"
+    assert (io.data["warp"].get("retired_keys") or []) == [], \
+        "the key swap must not have happened"
+
+
+def test_recovery_refuses_while_the_retired_key_has_unmined_txs():
+    """A recovery retried while a prior attempt's sweep is still pending
+    would read stale balances and enqueue duplicate transfers -- the
+    settled-state guard closes that window too."""
+    w, io, ev = _wallet()
+    w.rotate(open_job_check=lambda: None)
+    addr = w.retired_balances()[0]["address"]
+    ev.sent.clear()
+    ev.unmined = 1
+    with pytest.raises(BaseWalletError, match="not yet mined"):
+        w.recover_retired(addr)
+    assert ev.sent == []
+
+
+def test_rotate_refuses_while_a_retired_key_recovery_is_settling():
+    """recover_retired() sweeps INTO the active key without bumping its
+    nonce; rotating before those sweeps mine would archive the active key
+    and re-strand the recovered funds on it. Rotation must watch the
+    retired keys' outgoing nonces too."""
+    w, io, ev = _wallet()
+    out = w.rotate(open_job_check=lambda: None)     # retires key #1
+    retired = out["old_address"]
+    ev.sent.clear()
+    ev.unmined = {retired: 1}                       # a recovery in flight
+    with pytest.raises(BaseWalletError, match="still settling"):
+        w.rotate(open_job_check=lambda: None)
+    assert ev.sent == []
+    assert len(io.data["warp"]["retired_keys"]) == 1, \
+        "the second key swap must not have happened"
+
+
+def test_an_incoherent_nonce_reading_fails_closed():
+    """A provider answering the pending tag with null (coerced to 0)
+    would make the gap negative and silently disarm the guard forever;
+    it must refuse instead."""
+    w, io, ev = _wallet()
+    ev.unmined = {w.active_key().address: -1}
+    with pytest.raises(BaseWalletError, match="incoherent"):
+        w.wrap_eth(10 ** 12)
+    assert ev.sent == []
