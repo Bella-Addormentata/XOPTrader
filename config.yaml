@@ -15,11 +15,13 @@ pairs:
   min_offer_size_units_override: 1.0
   name: XCH/wUSDC.b
   quote_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  ratio_target_override: 0.6429
 - base_asset_id: xch
   enabled: true
   min_offer_size_units_override: 1.0
   name: XCH/BYC
   quote_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
+  ratio_target_override: 0.6923
 - base_asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   depeg_bail_pct: 10.0
   depeg_sustained_blocks: 30
@@ -49,18 +51,22 @@ pairs:
   - 8
   - 20
   - 40
+  ratio_target_override: 0.44439999999999996
 - base_asset_id: xch
   enabled: true
   min_offer_size_units_override: 1.0
   name: XCH/DBX
   quote_asset_id: db1a9020d48d9d4ad22631b66ab4b9ebd3637ef7758ad38881348c5d24c38f20
+  ratio_target_override: 0.8181999999999999
 - base_asset_id: f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6
   enabled: true
   min_offer_size_units_override: 1.0
   min_profit_margin_bps_override: 350
   name: wmilliETH.b/XCH
+  q_max_override: 6
   quote_asset_id: xch
   tier_spacing_bps_override: [350, 380, 420, 460, 490, 520]
+  revive_market: true
 - base_asset_id: 4cb15a8ecc85068fb1f98c09a5e489d1ad61b2af79690ce00f9fc4803c8b597f
   enabled: false
   name: wmilliETH/XCH
@@ -167,26 +173,28 @@ strategy:
   comp_pid_max_offset: 3
   asset_target_allocations:
     BYC: 0.2
-    DBX: 0.1
-    WMILLIETH.B: 0.03
-    WUSDC.B: 0.25
+    DBX: 0.05
+    WMILLIETH.B: 0.1
+    WUSDC.B: 0.2
     XCH: 0.45
   ratio_target_by_pair:
-    BYC/wUSDC.b: 0.4444444444444444
+    BYC/wUSDC.b: 0.5
     XCH/BYC: 0.6923076923076923
-    XCH/DBX: 0.8181818181818182
-    XCH/wUSDC.b: 0.6428571428571429
+    XCH/DBX: 0.9
+    XCH/wUSDC.b: 0.6923076923076923
+    wmilliETH.b/XCH: 0.18181818181818182
   asset_target_tolerances:
     BYC: 0.1
     DBX: 0.04
-    WMILLIETH.B: 0.02
+    WMILLIETH.B: 0.05
     WUSDC.B: 0.2
     XCH: 0.2
   ratio_band_enter_by_pair:
-    BYC/wUSDC.b: 0.4126984126984127
+    BYC/wUSDC.b: 0.49
     XCH/BYC: 0.23776223776223776
-    XCH/DBX: 0.17715617715617715
-    XCH/wUSDC.b: 0.28571428571428575
+    XCH/DBX: 0.16470588235294115
+    XCH/wUSDC.b: 0.3076923076923077
+    wmilliETH.b/XCH: 0.19318181818181818
 risk:
   soft_limit_pct: 0.6
   hard_limit_pct: 0.8
@@ -434,3 +442,4 @@ warp:
   min_auto_bridge_usdc: 100    # auto floor only; manual ignores it
   max_auto_bridge_usdc: 5      # blast radius for the $1 round-trip test
   max_unwrap_usdc: 2           # unwrap cap for the test; raise deliberately later
+  min_base_eth: 0.005
