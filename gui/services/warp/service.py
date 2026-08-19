@@ -3373,6 +3373,9 @@ class WarpEngine:
             snap["usdc_micros"] = self._evm.get_erc20_balance(
                 self._net.usdc_address, self._hot_address
             )
+            snap["millieth_units"] = int(self._evm.get_erc20_balance(
+                self._net.milli_eth_address, self._hot_address
+            ))
         except Exception as exc:  # noqa: BLE001 -- surface, don't abort the tick
             snap["error"] = str(exc)
         self._hot_cache = snap
@@ -4083,17 +4086,12 @@ class _WarpWorker(QObject):
             out["address"] = str(hot.get("address"))
             out["eth_wei"] = hot.get("eth_wei")
             out["usdc_micros"] = hot.get("usdc_micros")
-            # The engine's hot-wallet refresh predates milliETH; read
-            # JUST that token balance -- the address is already in hand, so
-            # this is genuinely one extra RPC (info() would re-read secrets
-            # through DPAPI and re-fetch ETH+USDC on every tick). Silent on
-            # failure -- the summary must never raise.
-            try:
-                out["millieth_units"] = self._base_wallet().erc20_balance(
-                    constants.MAINNET.milli_eth_address, out["address"]
-                )
-            except Exception:  # noqa: BLE001
-                pass
+            # Pure pass-through: the engine's refresh_hot_wallet reads
+            # milliETH alongside ETH/USDC, so the hot path stays exactly
+            # what its test pins -- zero wallet builds, zero extra RPCs
+            # here. (An older hot dict without the key simply omits it.)
+            if "millieth_units" in hot:
+                out["millieth_units"] = hot.get("millieth_units")
             return out
         try:
             info = self._base_wallet().info()

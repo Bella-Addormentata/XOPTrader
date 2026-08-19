@@ -254,10 +254,21 @@ def test_summary_rides_the_engine_balances_without_extra_rpc(
         lambda: (_ for _ in ()).throw(AssertionError("summary hit the RPC path")),
     )
     out = worker._wallet_summary(
-        {"address": "0x" + "ab" * 20, "eth_wei": 5, "usdc_micros": 7}
+        {"address": "0x" + "ab" * 20, "eth_wei": 5, "usdc_micros": 7,
+         "millieth_units": 42}
     )
     assert (out["address"], out["eth_wei"], out["usdc_micros"]) == \
         ("0x" + "ab" * 20, 5, 7)
+    # milliETH rides the same hot dict -- a pure pass-through, no wallet
+    # build (the monkeypatched _base_wallet above raises if touched).
+    assert out["millieth_units"] == 42
+
+    # An older hot dict without the key simply omits it -- never a raise,
+    # never a wallet build.
+    out2 = worker._wallet_summary(
+        {"address": "0x" + "ab" * 20, "eth_wei": 5, "usdc_micros": 7}
+    )
+    assert "millieth_units" not in out2
 
 
 def test_summary_never_raises_when_the_balance_read_fails(tmp_path, monkeypatch):

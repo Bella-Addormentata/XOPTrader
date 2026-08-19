@@ -80,5 +80,95 @@ def test_dialog_carries_the_code_the_address_and_the_warning(qapp):
         w.deleteLater()
 
 
+def test_convert_wrap_floors_and_emits_the_exact_payload(qapp, monkeypatch):
+    """The GUI floor and the emitted payload are the safety-critical pair:
+    a wrong floor either bounces the operator (contract revert) or wraps
+    a different amount than the dialog showed."""
+    from PySide6.QtWidgets import QMessageBox
+
+    w = BaseWalletWidget()
+    prompts = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: prompts.append(a[2]) or
+                     QMessageBox.StandardButton.Yes),
+    )
+    emitted = []
+    w.wallet_action_requested.connect(lambda a, p: emitted.append((a, p)))
+
+    # 0.0049000000005 ETH has a sub-granule tail; the floor must trim it.
+    w._convert_dir.setCurrentIndex(0)
+    w._convert_amount.setText("0.0049000000005")
+    w._on_convert_clicked()
+
+    assert emitted, "confirmed wrap must emit the action"
+    action, payload = emitted[-1]
+    assert action == "wrap_eth"
+    wei = payload["amount_wei"]
+    assert wei == 4_900_000_000_000_000, "floored to the 1e12 granularity"
+    assert wei % 10 ** 12 == 0
+    # The dialog showed EXACTLY the floored amount, both denominations.
+    assert "0.0049" in prompts[-1]
+    assert "4.9" in prompts[-1], "milliETH out shown exactly"
+    w.deleteLater()
+
+
+def test_convert_unwrap_emits_exact_units(qapp, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    w = BaseWalletWidget()
+    prompts = []
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: prompts.append(a[2]) or
+                     QMessageBox.StandardButton.Yes),
+    )
+    emitted = []
+    w.wallet_action_requested.connect(lambda a, p: emitted.append((a, p)))
+
+    w._convert_dir.setCurrentIndex(1)
+    w._convert_amount.setText("2.5")
+    w._on_convert_clicked()
+
+    action, payload = emitted[-1]
+    assert action == "unwrap_millieth"
+    assert payload["amount_units"] == 2_500
+    assert "2.5" in prompts[-1] and "0.0025" in prompts[-1]
+    w.deleteLater()
+
+
+def test_convert_declined_emits_nothing(qapp, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    w = BaseWalletWidget()
+    monkeypatch.setattr(
+        QMessageBox, "question",
+        staticmethod(lambda *a, **k: QMessageBox.StandardButton.No),
+    )
+    emitted = []
+    w.wallet_action_requested.connect(lambda a, p: emitted.append((a, p)))
+    w._convert_dir.setCurrentIndex(0)
+    w._convert_amount.setText("0.001")
+    w._on_convert_clicked()
+    assert emitted == [], "No must mean no"
+    w.deleteLater()
+
+
+def test_qr_button_disabled_without_an_address(qapp):
+    """An unconfigured wallet has nothing to encode; the button greys out
+    with Copy instead of silently no-opping."""
+    w = BaseWalletWidget()
+    w.update_data({"warp": {"base_wallet": {"configured": False}}})
+    w._render()
+    assert not w._qr_btn.isEnabled()
+    w.update_data({"warp": {"base_wallet": {
+        "configured": True, "address": _ADDR,
+        "eth_wei": 10 ** 15, "usdc_micros": 0, "millieth_units": 0,
+    }}})
+    w._render()
+    assert w._qr_btn.isEnabled()
+    w.deleteLater()
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

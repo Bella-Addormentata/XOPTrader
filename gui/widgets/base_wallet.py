@@ -186,9 +186,10 @@ def qr_payload(address: str) -> str:
 def qr_png(address: str, *, scale: int = 8) -> bytes:
     """PNG bytes of the address QR (segno: pure-Python, no imaging stack).
 
-    Error level M and a quiet-zone border per the QR spec defaults --
-    phone cameras at desk distance read this reliably at scale 8
-    (~330x330 px for an EVM address).
+    Error level M; the quiet zone is segno's default four modules, per
+    the QR spec -- a slimmer border reads as style and costs scanner
+    reliability. Phone cameras at desk distance read this reliably at
+    scale 8 (~380x380 px for an EVM address).
     """
     import io
 
@@ -196,7 +197,7 @@ def qr_png(address: str, *, scale: int = 8) -> bytes:
 
     buf = io.BytesIO()
     segno.make(qr_payload(address), error="m").save(
-        buf, kind="png", scale=scale, border=2
+        buf, kind="png", scale=scale
     )
     return buf.getvalue()
 
@@ -759,6 +760,7 @@ class BaseWalletWidget(QWidget):
         self._addr_field.setText(address)
         self._addr_field.setCursorPosition(0)
         self._copy_btn.setEnabled(bool(address))
+        self._qr_btn.setEnabled(bool(address))
 
         if configured and not error:
             self._usdc_lbl.setText(f"USDC: <b>{_usdc(bw.get('usdc_micros'))}</b>")
