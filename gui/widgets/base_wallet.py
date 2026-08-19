@@ -171,6 +171,36 @@ def _millieth(units: Any) -> str:
         return "\u2014"
 
 
+def qr_payload(address: str) -> str:
+    """The string a receive-QR encodes: the plain checksummed address.
+
+    Deliberately NOT an ethereum: URI -- exchange scanners (the Coinbase
+    app's withdraw flow included) all accept a bare address, while URI
+    schemes are inconsistently parsed and some embed a chain id that
+    scanners reject.  The network warning lives in the dialog text, where
+    a human actually reads it.
+    """
+    return str(address or "").strip()
+
+
+def qr_png(address: str, *, scale: int = 8) -> bytes:
+    """PNG bytes of the address QR (segno: pure-Python, no imaging stack).
+
+    Error level M and a quiet-zone border per the QR spec defaults --
+    phone cameras at desk distance read this reliably at scale 8
+    (~330x330 px for an EVM address).
+    """
+    import io
+
+    import segno
+
+    buf = io.BytesIO()
+    segno.make(qr_payload(address), error="m").save(
+        buf, kind="png", scale=scale, border=2
+    )
+    return buf.getvalue()
+
+
 def _short(value: Any, head: int = 10, tail: int = 6) -> str:
     """Middle-truncate a long hex/address string for compact display."""
     s = str(value or "")
@@ -567,6 +597,13 @@ class BaseWalletWidget(QWidget):
         self._copy_btn.setToolTip("Copy the Base address to the clipboard")
         self._copy_btn.clicked.connect(self._on_copy_address)
         addr_row.addWidget(self._copy_btn)
+        self._qr_btn = self._small_button("QR")
+        self._qr_btn.setToolTip(
+            "Show this address as a QR code -- scan it from an exchange "
+            "app's withdraw screen (Base network only)"
+        )
+        self._qr_btn.clicked.connect(self._on_qr_clicked)
+        addr_row.addWidget(self._qr_btn)
         layout.addLayout(addr_row)
 
         bal_row = QHBoxLayout()
@@ -976,6 +1013,62 @@ class BaseWalletWidget(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._emit_action("rotate", {})
+
+    def build_qr_dialog(self, address: str) -> "QDialog":
+        """The receive-QR dialog: code, address, and the network warning.
+
+        Factored from the click handler so offscreen tests can construct
+        and inspect it without a modal exec().
+        """
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QDialog, QVBoxLayout
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Receive on Base")
+        v = QVBoxLayout(dlg)
+        pix = QPixmap()
+        pix.loadFromData(qr_png(address))
+        qr_lbl = QLabel()
+        qr_lbl.setObjectName("qr_image")
+        qr_lbl.setPixmap(pix)
+        qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(qr_lbl)
+        addr_lbl = QLabel(address)
+        addr_lbl.setObjectName("qr_address")
+        addr_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        addr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        addr_lbl.setStyleSheet("font-family: Consolas, monospace;")
+        v.addWidget(addr_lbl)
+        warn = QLabel(
+            "<b>Base network only.</b> In your exchange app, choose "
+            "<b>Base</b> as the withdrawal network before scanning. "
+            "This wallet's tooling operates on Base; funds sent to this "
+            "address over any other network will not appear here and "
+            "need manual recovery."
+        )
+        warn.setObjectName("qr_warning")
+        warn.setWordWrap(True)
+        warn.setStyleSheet(f"color: {WARNING_YELLOW};")
+        v.addWidget(warn)
+        return dlg
+
+    def _on_qr_clicked(self) -> None:
+        address = (self._addr_field.text() or "").strip()
+        if not address.startswith("0x"):
+            _log.warning("QR requested with no wallet address present")
+            return
+        try:
+            dlg = self.build_qr_dialog(address)
+        except Exception as exc:  # noqa: BLE001 -- a QR must never crash the page
+            _log.error("QR dialog failed: %s", exc)
+            QMessageBox.warning(
+                self, "QR unavailable",
+                f"Could not render the QR code: {exc}",
+            )
+            return
+        dlg.exec()
 
     def _on_copy_address(self) -> None:
         """Copy the Base address to the clipboard."""
