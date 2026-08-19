@@ -50,6 +50,14 @@ class WarpNet:
     portal_address: str
     erc20_bridge_address: str
     usdc_address: str  # the Base USDC ERC-20; always set
+    # warp.green's MilliETH wrapper on Base: deposit() mints 1000 milliETH
+    # (3 decimals) per ETH, withdraw() burns back to ETH, no fees; ETH
+    # amounts must be multiples of 1e12 wei (the 6-decimal conversion).
+    # Address verified against docs.warp.green's Base deployments table
+    # 2026-08-19 (same table that anchors portal_address and
+    # erc20_bridge_address above).
+    milli_eth_address: str
+    milli_eth_decimals: int  # 3: smallest unit = 0.001 milliETH = 1e12 wei
     usdc_decimals: int
     cat_decimals: int  # wrapped CAT precision (3 on Chia); 1 USDC unit / 10**(6-3) mojos
     evm_confirmation_min_height: int
@@ -133,6 +141,8 @@ MAINNET = WarpNet(
     portal_address="0x382bd36d1dE6Fe0a3D9943004D3ca5Ee389627EE",
     erc20_bridge_address="0x8412f06e811b858Ea9edcf81a5E5882dbf70aC96",
     usdc_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+    milli_eth_address="0xf2D5d8eC69E2faed5eB4De90749c87ee314a4B12",
+    milli_eth_decimals=3,
     usdc_decimals=6,
     cat_decimals=3,
     evm_confirmation_min_height=64,

@@ -5,21 +5,26 @@ the working intermediary between an exchange (e.g. Coinbase) and the warp
 bridge: ETH and USDC come in from the exchange, the bridge spends them,
 unwraps land back here, and the surplus goes out to the exchange.
 
-The page offers five operations, all executed by
+The page offers six operations, all executed by
 :class:`gui.services.basewallet.BaseWallet` on the warp worker thread:
 
 * **Create wallet** -- generate the first DPAPI-encrypted key (refused if one
   already exists; rotation is the only way to replace a key).
-* **Receive** -- display + copy the wallet's single static address. One key is
-  one address on EVM chains; a "fresh receive address" only ever comes from
-  key rotation.
+* **Receive** -- display + copy the wallet's single static address, or show
+  it as a QR code for an exchange app's withdraw screen (plain checksummed
+  address, Base-network-only warning in the dialog). One key is one address
+  on EVM chains; a "fresh receive address" only ever comes from key rotation.
 * **Back up key** -- reveal the active private key in a guarded, masked modal;
     key bytes arrive over a one-shot signal and never enter a cached snapshot.
 * **Send** -- transfer ETH or USDC to an external address (EIP-55 validated,
   worst-case gas reserved, balance-checked -- all re-validated by the
   backend).
-* **Rotate key** -- new key, sweep USDC then ETH to it, archive the old blob
-  in ``warp.retired_keys`` forever. Refused while any warp job is open.
+* **Convert** -- wrap ETH into milliETH (MilliETH.sol, 1000/ETH, no fee) or
+  unwrap it back; amounts floored to the contract's 1e12-wei granularity and
+  the relay-gas floor never wrappable.
+* **Rotate key** -- new key, sweep milliETH, USDC, then ETH to it, archive
+  the old blob in ``warp.retired_keys`` forever. Refused while any warp job
+  is open or any wallet transaction is still unmined.
 
 The tab is fed by the warp snapshot forwarded through
 ``MainWindow._on_bridge_data`` (``data["warp"]["base_wallet"]`` plus the
@@ -161,6 +166,45 @@ def _eth(wei: Any) -> str:
         return f"{int(wei) / _WEI_PER_ETH:.6f}"
     except (TypeError, ValueError):
         return "—"
+
+
+def _millieth(units: Any) -> str:
+    """Format 3-decimal milliETH units, or an em dash when unknown."""
+    try:
+        return f"{int(units) / 1000:,.3f}"
+    except (TypeError, ValueError):
+        return "\u2014"
+
+
+def qr_payload(address: str) -> str:
+    """The string a receive-QR encodes: the plain checksummed address.
+
+    Deliberately NOT an ethereum: URI -- exchange scanners (the Coinbase
+    app's withdraw flow included) all accept a bare address, while URI
+    schemes are inconsistently parsed and some embed a chain id that
+    scanners reject.  The network warning lives in the dialog text, where
+    a human actually reads it.
+    """
+    return str(address or "").strip()
+
+
+def qr_png(address: str, *, scale: int = 8) -> bytes:
+    """PNG bytes of the address QR (segno: pure-Python, no imaging stack).
+
+    Error level M; the quiet zone is segno's default four modules, per
+    the QR spec -- a slimmer border reads as style and costs scanner
+    reliability. Phone cameras at desk distance read this reliably at
+    scale 8 (~380x380 px for an EVM address).
+    """
+    import io
+
+    import segno
+
+    buf = io.BytesIO()
+    segno.make(qr_payload(address), error="m").save(
+        buf, kind="png", scale=scale
+    )
+    return buf.getvalue()
 
 
 def _short(value: Any, head: int = 10, tail: int = 6) -> str:
@@ -559,6 +603,13 @@ class BaseWalletWidget(QWidget):
         self._copy_btn.setToolTip("Copy the Base address to the clipboard")
         self._copy_btn.clicked.connect(self._on_copy_address)
         addr_row.addWidget(self._copy_btn)
+        self._qr_btn = self._small_button("QR")
+        self._qr_btn.setToolTip(
+            "Show this address as a QR code -- scan it from an exchange "
+            "app's withdraw screen (Base network only)"
+        )
+        self._qr_btn.clicked.connect(self._on_qr_clicked)
+        addr_row.addWidget(self._qr_btn)
         layout.addLayout(addr_row)
 
         bal_row = QHBoxLayout()
@@ -567,10 +618,13 @@ class BaseWalletWidget(QWidget):
         self._usdc_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
         self._eth_lbl = QLabel()
         self._eth_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
+        self._millieth_lbl = QLabel()
+        self._millieth_lbl.setStyleSheet(f"color: {TEXT_PRIMARY};")
         self._retired_lbl = QLabel()
         self._retired_lbl.setStyleSheet(f"color: {TEXT_SECONDARY};")
         bal_row.addWidget(self._usdc_lbl)
         bal_row.addWidget(self._eth_lbl)
+        bal_row.addWidget(self._millieth_lbl)
         bal_row.addWidget(self._retired_lbl)
         bal_row.addStretch(1)
         layout.addLayout(bal_row)
@@ -634,6 +688,36 @@ class BaseWalletWidget(QWidget):
 
         layout.addWidget(_separator())
 
+        # -- Convert (ETH <-> milliETH) -----------------------------------
+        layout.addWidget(_section_label("Convert"))
+        layout.addWidget(
+            _body_label(
+                "Wrap ETH into milliETH (warp.green's 1000-per-ETH bridge "
+                "asset, no fee) or unwrap milliETH back to ETH. Wrapped "
+                "milliETH is what bridges to Chia as wmilliETH.b; unwrapping "
+                "refuels gas. ETH amounts are floored to 0.000001 ETH (the "
+                "contract's granularity), and wrapping always leaves the "
+                "relay-gas minimum untouched."
+            )
+        )
+        convert_row = QHBoxLayout()
+        self._convert_amount = _mono_field("Amount", read_only=False)
+        self._convert_amount.setMaximumWidth(160)
+        convert_row.addWidget(self._convert_amount)
+        self._convert_dir = QComboBox()
+        self._convert_dir.addItems(
+            ["ETH \u2192 milliETH", "milliETH \u2192 ETH"]
+        )
+        self._convert_dir.setStyleSheet(self._send_asset.styleSheet())
+        convert_row.addWidget(self._convert_dir)
+        self._convert_btn = self._primary_button("\u21c4  Convert")
+        self._convert_btn.clicked.connect(self._on_convert_clicked)
+        convert_row.addWidget(self._convert_btn)
+        convert_row.addStretch(1)
+        layout.addLayout(convert_row)
+
+        layout.addWidget(_separator())
+
         # -- Rotate -----------------------------------------------------
         layout.addWidget(_section_label("Rotate Key"))
         layout.addWidget(
@@ -681,15 +765,21 @@ class BaseWalletWidget(QWidget):
         self._addr_field.setText(address)
         self._addr_field.setCursorPosition(0)
         self._copy_btn.setEnabled(bool(address))
+        self._qr_btn.setEnabled(bool(address))
 
         if configured and not error:
             self._usdc_lbl.setText(f"USDC: <b>{_usdc(bw.get('usdc_micros'))}</b>")
             self._usdc_lbl.setTextFormat(Qt.TextFormat.RichText)
             self._eth_lbl.setText(f"ETH (gas): <b>{_eth(bw.get('eth_wei'))}</b>")
             self._eth_lbl.setTextFormat(Qt.TextFormat.RichText)
+            self._millieth_lbl.setText(
+                f"milliETH: <b>{_millieth(bw.get('millieth_units'))}</b>"
+            )
+            self._millieth_lbl.setTextFormat(Qt.TextFormat.RichText)
         else:
             self._usdc_lbl.setText("USDC: —")
             self._eth_lbl.setText("ETH (gas): —")
+            self._millieth_lbl.setText("milliETH: —")
         retired = bw.get("retired_count") or 0
         self._retired_lbl.setText(
             f"Retired keys: {retired}" if retired else ""
@@ -729,6 +819,7 @@ class BaseWalletWidget(QWidget):
 
         can_act = configured and not self._action_pending
         self._send_btn.setEnabled(can_act)
+        self._convert_btn.setEnabled(can_act)
         self._rotate_btn.setEnabled(can_act)
         if not configured:
             tip = "Create a wallet first."
@@ -855,6 +946,63 @@ class BaseWalletWidget(QWidget):
                 "send_eth", {"destination": dest, "amount_wei": units}
             )
 
+    def _on_convert_clicked(self) -> None:
+        """Parse, floor to granularity, confirm with exact amounts, emit."""
+        wrap = self._convert_dir.currentIndex() == 0  # ETH -> milliETH
+        text = (self._convert_amount.text() or "").strip()
+        if wrap:
+            units = parse_asset_amount(text, decimals=18)
+            if units is None or units <= 0:
+                _log.warning(
+                    "convert: amount %r is not a valid ETH amount",
+                    text,
+                )
+                self._convert_amount.setFocus()
+                return
+            # Floor to the contract's 1e12-wei granularity rather than
+            # bouncing the operator for a sub-granule tail.
+            units -= units % 10 ** 12
+            if units <= 0:
+                self._convert_amount.setFocus()
+                return
+            human_in = _exact_amount(units, 18)
+            # Confirmations show EXACT amounts (decimal string, no float
+            # path) -- _millieth() is the display formatter, not this.
+            human_out = _exact_amount(units // 10 ** 12, 3)
+            prompt = (
+                f"Wrap {human_in} ETH into {human_out} milliETH "
+                "(MilliETH contract, no fee)?\n\nThe relay-gas minimum "
+                "is always left untouched; the action is refused if the "
+                "amount plus worst-case gas would dip below it."
+            )
+            action, payload = "wrap_eth", {"amount_wei": units}
+        else:
+            units = parse_asset_amount(text, decimals=3)
+            if units is None or units <= 0:
+                _log.warning(
+                    "convert: amount %r is not a valid milliETH amount",
+                    text,
+                )
+                self._convert_amount.setFocus()
+                return
+            human_in = _exact_amount(units, 3)
+            human_out = _exact_amount(units * 10 ** 12, 18)
+            prompt = (
+                f"Unwrap {human_in} milliETH back into {human_out} ETH "
+                "(MilliETH contract, no fee)?"
+            )
+            action, payload = "unwrap_millieth", {"amount_units": units}
+        answer = QMessageBox.question(
+            self,
+            "Confirm conversion",
+            prompt,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        self._emit_action(action, payload)
+
     def _on_rotate_clicked(self) -> None:
         """Confirm the full consequences, then request the rotation."""
         answer = QMessageBox.warning(
@@ -862,14 +1010,15 @@ class BaseWalletWidget(QWidget):
             "Rotate the hot-wallet key?",
             (
                 "This will:\n\n"
-                "  •  generate a fresh key and sweep ALL USDC, then all ETH\n"
-                "      (minus gas), to its address;\n"
+                "  •  generate a fresh key and sweep ALL milliETH and\n"
+                "      USDC, then all ETH (minus gas), to its address;\n"
                 "  •  archive the old key in secrets.yaml (never deleted);\n"
                 "  •  CHANGE the deposit address — update exchange\n"
                 "      allowlists; in-flight deposits to the old address land\n"
                 "      at the archived key (recoverable via the runbook);\n"
                 "  •  require a fresh key backup afterwards.\n\n"
-                "It is refused while any warp bridge job is open.\n\n"
+                "It is refused while any warp bridge job is open or a\n"
+                "wallet transaction is still unmined.\n\n"
                 "Rotate now?"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
@@ -878,6 +1027,66 @@ class BaseWalletWidget(QWidget):
         if answer != QMessageBox.StandardButton.Yes:
             return
         self._emit_action("rotate", {})
+
+    def build_qr_dialog(self, address: str) -> "QDialog":
+        """The receive-QR dialog: code, address, and the network warning.
+
+        Factored from the click handler so offscreen tests can construct
+        and inspect it without a modal exec().
+        """
+        from PySide6.QtGui import QPixmap
+        from PySide6.QtWidgets import QDialog, QVBoxLayout
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Receive on Base")
+        v = QVBoxLayout(dlg)
+        pix = QPixmap()
+        pix.loadFromData(qr_png(address))
+        qr_lbl = QLabel()
+        qr_lbl.setObjectName("qr_image")
+        qr_lbl.setPixmap(pix)
+        qr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        v.addWidget(qr_lbl)
+        addr_lbl = QLabel(address)
+        addr_lbl.setObjectName("qr_address")
+        addr_lbl.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        addr_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        addr_lbl.setStyleSheet("font-family: Consolas, monospace;")
+        v.addWidget(addr_lbl)
+        warn = QLabel(
+            "<b>Base network only.</b> In your exchange app, choose "
+            "<b>Base</b> as the withdrawal network before scanning. "
+            "This wallet's tooling operates on Base; funds sent to this "
+            "address over any other network will not appear here and "
+            "need manual recovery."
+        )
+        warn.setObjectName("qr_warning")
+        warn.setWordWrap(True)
+        warn.setStyleSheet(f"color: {WARNING_YELLOW};")
+        v.addWidget(warn)
+        return dlg
+
+    def _on_qr_clicked(self) -> None:
+        address = (self._addr_field.text() or "").strip()
+        if not address.startswith("0x"):
+            _log.warning("QR requested with no wallet address present")
+            return
+        try:
+            dlg = self.build_qr_dialog(address)
+        except Exception as exc:  # noqa: BLE001 -- a QR must never crash the page
+            _log.error("QR dialog failed: %s", exc)
+            QMessageBox.warning(
+                self, "QR unavailable",
+                f"Could not render the QR code: {exc}",
+            )
+            return
+        dlg.exec()
+        # Modal children are only hidden by exec() returning, not freed;
+        # without this every open would pile another dialog + pixmap onto
+        # the page until it is destroyed.
+        dlg.deleteLater()
 
     def _on_copy_address(self) -> None:
         """Copy the Base address to the clipboard."""

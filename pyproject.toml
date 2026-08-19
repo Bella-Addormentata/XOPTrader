@@ -23,6 +23,9 @@ gui = [
     # Round-trip YAML: the GUI config writer preserves config.yaml comments.
     # Without it saves fall back to PyYAML and strip every comment.
     "ruamel.yaml>=0.18,<0.19",
+    # Receive-address QR on the Base Wallet page. Pure Python (no imaging
+    # stack), BSD-3.
+    "segno>=1.6,<2",
     # warp.green bridge (gui/services/warp). All imported lazily inside warp
     # code paths, so the GUI still boots if these are absent or the bridge is
     # disabled. clvm = pure-python SExp/serialize; chia_rs = BLS + coin oracle;

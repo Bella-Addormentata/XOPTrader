@@ -41,6 +41,9 @@ def _io_transaction(secrets_io: Any):
 
 _ETH_TRANSFER_GAS = 21_000
 _ERC20_TRANSFER_GAS_DEFAULT = 80_000
+#: deposit()/withdraw() on MilliETH: mint/burn + ETH transfer; estimated
+#: first, this is only the estimator fallback.
+_MILLIETH_GAS_DEFAULT = 90_000
 
 
 class BaseWalletError(RuntimeError):
@@ -75,6 +78,7 @@ class WalletInfo:
     address: str
     eth_wei: int
     usdc_micros: int
+    millieth_units: int  # MilliETH ERC-20, 3-decimal units
     retired_count: int
     backup_confirmed: bool
 
@@ -160,6 +164,11 @@ class BaseWallet:
             usdc_micros=int(
                 self._evm.get_erc20_balance(self._net.usdc_address, key.address)
             ),
+            millieth_units=int(
+                self._evm.get_erc20_balance(
+                    self._net.milli_eth_address, key.address
+                )
+            ),
             retired_count=len(secrets.get("retired_keys") or []),
             backup_confirmed=bool(secrets.get("evm_key_backup_confirmed")),
         )
@@ -184,6 +193,7 @@ class BaseWallet:
 
         destination = validate_destination(destination)
         key = self.active_key()
+        self._require_settled(key.address, "send ETH")
         amount_wei = int(amount_wei)
         if amount_wei <= 0:
             raise BaseWalletError("amount must be positive")
@@ -201,6 +211,7 @@ class BaseWallet:
 
         destination = validate_destination(destination)
         key = self.active_key()
+        self._require_settled(key.address, "send USDC")
         amount_micros = int(amount_micros)
         if amount_micros <= 0:
             raise BaseWalletError("amount must be positive")
@@ -220,13 +231,144 @@ class BaseWallet:
         self._evm.send_raw_transaction(signed.raw)
         return signed.tx_hash
 
+    # -- ETH <-> milliETH conversion (MilliETH.sol, no fees) ------------------ #
+
+    #: MilliETH's conversion granularity: deposit() reverts unless msg.value
+    #: is a multiple of 1e12 wei (18-decimal ETH -> 6 effective decimals:
+    #: the 1000x ratio plus the token's own 3 decimals).
+    WRAP_GRANULARITY_WEI = 10 ** 12
+
+    def _require_settled(self, address: str, doing: str) -> None:
+        """Refuse while the address has broadcast-but-unmined transactions.
+
+        Every balance this class validates against is read at the LATEST
+        block, but the GUI re-enables actions the moment a transaction
+        broadcasts. Inside that window the balances lie: a wrap-then-rotate
+        would read zero milliETH and archive the very key the tokens are
+        about to land on, and two quick wraps would both validate against
+        the same ETH balance and cumulatively breach the relay-gas floor.
+        The pending-vs-latest nonce gap counts exactly those outstanding
+        transactions, statelessly. Base mines ~2s blocks, so the refusal
+        window is seconds.
+
+        Two honest limits. The gap only counts OUTGOING transactions from
+        ``address``: inbound transfers in flight (an exchange deposit, a
+        retired-key recovery sweep) are invisible to any nonce check --
+        rotation handles the in-app case by also checking the retired
+        keys, and anything else that mines into an archived key stays
+        recoverable via recover_retired(). And the reading is only as
+        good as the RPC endpoint's mempool view: a load-balanced provider
+        without shared pending state can report pending == latest during
+        the window. A reading that is outright incoherent (pending BELOW
+        latest, e.g. a provider answering the pending tag with null)
+        fails closed rather than silently disarming the guard.
+
+        Latest is read before pending so a transaction mining or being
+        broadcast between the two calls can only widen the gap (refuse,
+        safe), never fake coherence.
+        """
+        latest = int(self._evm.get_nonce(address, pending=False))
+        pending = int(self._evm.get_nonce(address, pending=True))
+        outstanding = pending - latest
+        if outstanding < 0:
+            raise BaseWalletError(
+                f"cannot {doing}: the RPC returned an incoherent nonce "
+                f"view for {address} (pending {pending} < latest "
+                f"{latest}), so balance reads cannot be trusted. Check "
+                "the Base RPC endpoint and retry."
+            )
+        if outstanding > 0:
+            raise BaseWalletError(
+                f"cannot {doing}: {outstanding} transaction(s) from "
+                f"{address} are broadcast but not yet mined, so balance "
+                "reads cannot be trusted yet. Base blocks land in "
+                "seconds -- retry shortly."
+            )
+
+    def wrap_eth(self, amount_wei: int, *, reserve_wei: int = 0) -> str:
+        """ETH -> milliETH via ``MilliETH.deposit()`` (1000/ETH, no fee).
+
+        ``reserve_wei`` is the ETH that must REMAIN after amount plus
+        worst-case gas: the relay-gas floor.  Wrapping the gas reserve into
+        an ERC-20 would strand the wallet unable to move anything at all --
+        including unwrapping the milliETH back.
+        """
+        from .warp import evm
+
+        key = self.active_key()
+        self._require_settled(key.address, "wrap ETH")
+        amount_wei = int(amount_wei)
+        if amount_wei <= 0:
+            raise BaseWalletError("amount must be positive")
+        if amount_wei % self.WRAP_GRANULARITY_WEI:
+            raise BaseWalletError(
+                "amount must be a multiple of 0.000001 ETH (1e12 wei) -- "
+                "MilliETH's conversion granularity; the contract reverts "
+                "on anything finer"
+            )
+        if not getattr(self._net, "milli_eth_address", ""):
+            raise BaseWalletError("milliETH is not configured on this network")
+        data = evm.encode_millieth_deposit()
+        gas = self._evm.estimate_gas(
+            from_address=key.address, to=self._net.milli_eth_address,
+            value=amount_wei, data=data, default=_MILLIETH_GAS_DEFAULT,
+        )
+        unsigned = self._prepare(key, to=self._net.milli_eth_address,
+                                 value=amount_wei, data=data, gas=gas)
+        cost = amount_wei + unsigned.gas * unsigned.max_fee_per_gas
+        balance = int(self._evm.get_eth_balance(key.address))
+        if balance - cost < int(reserve_wei):
+            raise BaseWalletError(
+                f"wrapping {amount_wei} wei would leave less than the "
+                f"{reserve_wei} wei relay-gas reserve (balance {balance}, "
+                "worst-case cost includes gas); wrap less or top up"
+            )
+        signed = evm.sign_tx(unsigned, key.private_key)
+        self._evm.send_raw_transaction(signed.raw)
+        return signed.tx_hash
+
+    def unwrap_millieth(self, amount_units: int) -> str:
+        """milliETH -> ETH via ``withdraw(uint256)`` (units are 3-decimal).
+
+        The refund replenishes the gas reserve, so no reserve gate here --
+        only that the wallet can pay THIS transaction's worst-case gas.
+        """
+        from .warp import evm
+
+        key = self.active_key()
+        self._require_settled(key.address, "unwrap milliETH")
+        amount_units = int(amount_units)
+        if amount_units <= 0:
+            raise BaseWalletError("amount must be positive")
+        if not getattr(self._net, "milli_eth_address", ""):
+            raise BaseWalletError("milliETH is not configured on this network")
+        held = int(self._evm.get_erc20_balance(
+            self._net.milli_eth_address, key.address))
+        if amount_units > held:
+            raise BaseWalletError(
+                f"amount {amount_units} exceeds the milliETH balance {held}"
+            )
+        data = evm.encode_millieth_withdraw(amount_units)
+        gas = self._evm.estimate_gas(
+            from_address=key.address, to=self._net.milli_eth_address,
+            value=0, data=data, default=_MILLIETH_GAS_DEFAULT,
+        )
+        unsigned = self._prepare(key, to=self._net.milli_eth_address,
+                                 value=0, data=data, gas=gas)
+        if unsigned.gas * unsigned.max_fee_per_gas > int(
+                self._evm.get_eth_balance(key.address)):
+            raise BaseWalletError("worst-case gas exceeds the ETH balance")
+        signed = evm.sign_tx(unsigned, key.private_key)
+        self._evm.send_raw_transaction(signed.raw)
+        return signed.tx_hash
+
     # -- rotation ------------------------------------------------------------ #
 
     def rotate(self, *, open_job_check) -> dict:
-        """New key; sweep USDC then ETH to it; archive the old blob.
+        """New key; sweep milliETH, USDC, then ETH to it; archive the old blob.
 
         ``open_job_check()`` must return the open warp job or ``None`` --
-        injected because the wallet must not import the job store. Both sweep
+        injected because the wallet must not import the job store. The sweep
         transactions are signed against consecutive nonces with worst-case gas
         reserved up front; whatever dust the reserve strands stays at the
         archived key, which is recoverable, unlike an underfunded sweep.
@@ -241,14 +383,62 @@ class BaseWallet:
             )
 
         old = self.active_key()
+        self._require_settled(old.address, "rotate")
+        # recover_retired() sweeps from retired keys INTO the active key;
+        # those pending inbounds never bump the active address's nonce, so
+        # a rotate right after a recovery would read the active key's
+        # balances BEFORE the sweeps land, archive it, and re-strand the
+        # recovered funds on the freshly retired key. The retired keys'
+        # own outgoing nonces see exactly those sweeps.
+        for entry in (self._io.read().get("warp") or {}).get(
+                "retired_keys") or []:
+            retired_addr = str(entry.get("address") or "")
+            if retired_addr:
+                self._require_settled(
+                    retired_addr,
+                    "rotate (a retired-key recovery is still settling)",
+                )
         eth = int(self._evm.get_eth_balance(old.address))
         usdc = int(self._evm.get_erc20_balance(self._net.usdc_address, old.address))
+        # Wrapping introduced a third asset; a rotation that ignored it
+        # would archive the key with its whole milliETH balance stranded
+        # and invisible in-app.
+        millieth = int(self._evm.get_erc20_balance(
+            self._net.milli_eth_address, old.address))
 
         new_key = keystore.new_evm_key()
         txs: List[str] = []
         nonce = self._evm.get_nonce(old.address)
         fees = self._evm.get_fee_data()
         reserved = 0
+
+        millieth_unsigned = None
+        if millieth > 0:
+            m_data = evm.encode_transfer(new_key.address, millieth)
+            m_gas = self._evm.estimate_gas(
+                from_address=old.address, to=self._net.milli_eth_address,
+                value=0, data=m_data, default=_ERC20_TRANSFER_GAS_DEFAULT,
+            )
+            m_gas_cost = m_gas * fees.max_fee_per_gas
+            # Same refuse-before-the-key-swap rule as USDC below: an
+            # underfunded sweep after the swap strands the balance at an
+            # address the GUI can no longer spend from.
+            if eth < reserved + m_gas_cost:
+                raise BaseWalletError(
+                    f"cannot rotate: sweeping {millieth} milliETH units "
+                    f"needs ~{m_gas_cost} wei of gas but the wallet holds "
+                    f"only {eth} wei of ETH. Fund the wallet with a little "
+                    "Base ETH first (or unwrap some milliETH), then rotate."
+                )
+            millieth_unsigned = evm.UnsignedTx(
+                chain_id=self._net.evm_chain_id, nonce=nonce,
+                to=bytes.fromhex(self._net.milli_eth_address[2:]), value=0,
+                data=m_data, gas=m_gas,
+                max_fee_per_gas=fees.max_fee_per_gas,
+                max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            )
+            reserved += m_gas_cost
+            nonce += 1
 
         usdc_unsigned = None
         if usdc > 0:
@@ -264,11 +454,12 @@ class BaseWallet:
             # the whole USDC balance stranded at an address the GUI can no
             # longer spend from. A wallet with USDC but ~no ETH (the state
             # unwraps leave behind) is exactly this case.
-            if eth < usdc_gas_cost:
+            if eth < reserved + usdc_gas_cost:
                 raise BaseWalletError(
                     f"cannot rotate: sweeping {usdc} USDC needs ~{usdc_gas_cost} "
-                    f"wei of gas but the wallet holds only {eth} wei of ETH. "
-                    "Fund the wallet with a little Base ETH first, then rotate."
+                    f"wei of gas (on top of {reserved} already reserved) but "
+                    f"the wallet holds only {eth} wei of ETH. Fund the wallet "
+                    "with a little Base ETH first, then rotate."
                 )
             usdc_unsigned = evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
@@ -310,7 +501,7 @@ class BaseWallet:
             warp["evm_key_backup_confirmed"] = False
             self._io.write(secrets)
 
-        for unsigned in (usdc_unsigned, eth_unsigned):
+        for unsigned in (millieth_unsigned, usdc_unsigned, eth_unsigned):
             if unsigned is None:
                 continue
             signed = evm.sign_tx(unsigned, old.private_key)
@@ -321,12 +512,14 @@ class BaseWallet:
                   old.address, new_key.address, len(txs))
         return {"old_address": old.address, "new_address": new_key.address,
                 "sweep_txs": txs, "swept_usdc_micros": usdc,
+                "swept_millieth_units": millieth,
                 "swept_eth_wei": max(0, eth_amount)}
 
     # -- retired-key recovery ------------------------------------------------ #
 
     def retired_balances(self) -> List[dict]:
-        """Per archived key: its address and current ETH/USDC balances.
+        """Per archived key: its address and current ETH/USDC/milliETH
+        balances.
 
         The in-app view of what a past rotation may have left behind (a crash
         between the key swap and a sweep broadcast, or a partial sweep). Read
@@ -342,6 +535,10 @@ class BaseWallet:
                 row["usdc_micros"] = int(
                     self._evm.get_erc20_balance(self._net.usdc_address, addr)
                 )
+                row["millieth_units"] = int(
+                    self._evm.get_erc20_balance(
+                        self._net.milli_eth_address, addr)
+                )
             except Exception as exc:  # noqa: BLE001 -- a bad row must not hide the rest
                 row["error"] = str(exc)
             out.append(row)
@@ -351,11 +548,17 @@ class BaseWallet:
         """Sweep a retired key's balance back to the active key.
 
         The in-app escape from a strand: whenever the retired address still
-        holds enough ETH to pay one transfer's gas, this moves its USDC and
-        then its ETH to the current active address. It cannot conjure gas --
-        an address holding USDC but zero ETH must be funded with a little ETH
-        first (send some to it), after which this sweeps both. Signs with the
-        retired key loaded from its archived blob; the archive is untouched.
+        holds enough ETH to pay every transfer's gas, this moves its
+        milliETH, USDC, and then its ETH to the current active address. It
+        cannot conjure gas -- an address holding tokens but zero ETH must be
+        funded with a little ETH first (send some to it), after which this
+        sweeps everything. All sweeps are preflighted (gas estimated and
+        affordability checked) BEFORE anything is broadcast, so a refusal
+        always means nothing moved -- a gas shortfall can never strand a
+        half-swept key. (An RPC failure mid-broadcast can still leave some
+        sweeps pending, as anywhere; retries are nonce-safe because nonces
+        are pending-aware.) Signs with the retired key loaded from its
+        archived blob; the archive is untouched.
         """
         from .warp import evm, keystore
 
@@ -375,12 +578,44 @@ class BaseWallet:
                 "the retired address is the active address; nothing to recover"
             )
 
+        self._require_settled(old.address, "recover the retired key")
         eth = int(self._evm.get_eth_balance(old.address))
         usdc = int(self._evm.get_erc20_balance(self._net.usdc_address, old.address))
+        millieth = int(self._evm.get_erc20_balance(
+            self._net.milli_eth_address, old.address))
         fees = self._evm.get_fee_data()
         nonce = self._evm.get_nonce(old.address)
         reserved = 0
-        txs: List[str] = []
+        # Preflight-then-broadcast, exactly like rotate(): every sweep is
+        # built and its gas checked cumulatively BEFORE the first broadcast.
+        # Broadcasting as we go would let a later gas refusal report the
+        # whole action failed after milliETH already moved -- and a retry
+        # against the pending tx could read stale balances and enqueue a
+        # duplicate transfer at the next nonce.
+        unsigned_txs: List[object] = []
+
+        if millieth > 0:
+            m_data = evm.encode_transfer(dest, millieth)
+            m_gas = self._evm.estimate_gas(
+                from_address=old.address, to=self._net.milli_eth_address,
+                value=0, data=m_data, default=_ERC20_TRANSFER_GAS_DEFAULT,
+            )
+            m_gas_cost = m_gas * fees.max_fee_per_gas
+            if eth < m_gas_cost:
+                raise BaseWalletError(
+                    f"retired {address} holds {millieth} milliETH units but "
+                    f"only {eth} wei ETH (~{m_gas_cost} needed for gas). "
+                    "Send it a little Base ETH, then recover again."
+                )
+            unsigned_txs.append(evm.UnsignedTx(
+                chain_id=self._net.evm_chain_id, nonce=nonce,
+                to=bytes.fromhex(self._net.milli_eth_address[2:]), value=0,
+                data=m_data, gas=m_gas,
+                max_fee_per_gas=fees.max_fee_per_gas,
+                max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            ))
+            reserved += m_gas_cost
+            nonce += 1
 
         if usdc > 0:
             data = evm.encode_transfer(dest, usdc)
@@ -389,41 +624,44 @@ class BaseWallet:
                 data=data, default=_ERC20_TRANSFER_GAS_DEFAULT,
             )
             usdc_gas_cost = gas * fees.max_fee_per_gas
-            if eth < usdc_gas_cost:
+            if eth < reserved + usdc_gas_cost:
                 raise BaseWalletError(
                     f"retired {address} holds {usdc} USDC but only {eth} wei ETH "
-                    f"(~{usdc_gas_cost} needed for gas). Send it a little Base "
-                    "ETH, then recover again."
+                    f"(~{usdc_gas_cost} more needed for gas). Send it a little "
+                    "Base ETH, then recover again."
                 )
-            unsigned = evm.UnsignedTx(
+            unsigned_txs.append(evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(self._net.usdc_address[2:]), value=0,
                 data=data, gas=gas, max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
-            )
-            signed = evm.sign_tx(unsigned, old.private_key)
-            self._evm.send_raw_transaction(signed.raw)
-            txs.append(signed.tx_hash)
+            ))
             reserved += usdc_gas_cost
             nonce += 1
 
         eth_amount = eth - reserved - _ETH_TRANSFER_GAS * fees.max_fee_per_gas
         if eth_amount > 0:
-            unsigned = evm.UnsignedTx(
+            unsigned_txs.append(evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(dest[2:]), value=eth_amount, data=b"",
                 gas=_ETH_TRANSFER_GAS, max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
+            ))
+
+        if not unsigned_txs:
+            raise BaseWalletError(
+                f"retired {address} holds nothing sweepable "
+                f"(ETH {eth} wei, USDC {usdc}, milliETH {millieth})"
             )
+
+        # Full preflight passed: sign and broadcast in order.
+        txs: List[str] = []
+        for unsigned in unsigned_txs:
             signed = evm.sign_tx(unsigned, old.private_key)
             self._evm.send_raw_transaction(signed.raw)
             txs.append(signed.tx_hash)
-
-        if not txs:
-            raise BaseWalletError(
-                f"retired {address} holds nothing sweepable "
-                f"(ETH {eth} wei, USDC {usdc})"
-            )
         _log.info("recovered retired %s -> %s (%d txs)", address, dest, len(txs))
         return {"from": old.address, "to": dest, "sweep_txs": txs,
-                "swept_usdc_micros": usdc, "swept_eth_wei": max(0, eth_amount)}
+                "swept_usdc_micros": usdc,
+                "swept_millieth_units": millieth,
+                "swept_eth_wei": max(0, eth_amount)}

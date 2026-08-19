@@ -177,6 +177,25 @@ def encode_approve(spender: Any, amount_base_units: int) -> bytes:
     return encode_call(SEL_APPROVE, _enc_address(spender), _enc_uint256(amount_base_units))
 
 
+def encode_millieth_deposit() -> bytes:
+    """``deposit()`` -- the classic WETH-style payable mint.
+
+    keccak("deposit()")[:4] = d0e30db0.  MilliETH.sol mints msg.value/1e12
+    units (1000 milliETH per ETH at 3 decimals) and REVERTS unless
+    msg.value is a multiple of 1e12 wei; callers validate first.
+    """
+    return encode_call(bytes.fromhex("d0e30db0"))
+
+
+def encode_millieth_withdraw(amount_units: int) -> bytes:
+    """``withdraw(uint256)`` -- burn milliETH units, receive ETH.
+
+    keccak("withdraw(uint256)")[:4] = 2e1a7d4d.  amount is in the token's
+    own 3-decimal units (1 unit = 0.001 milliETH = 1e12 wei of ETH back).
+    """
+    return encode_call(bytes.fromhex("2e1a7d4d"), _enc_uint256(int(amount_units)))
+
+
 def encode_bridge_to_chia(asset: Any, receiver_ph: Any, mojo_amount: int) -> bytes:
     return encode_call(
         SEL_BRIDGE_TO_CHIA,

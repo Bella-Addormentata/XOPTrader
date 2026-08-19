@@ -3373,6 +3373,9 @@ class WarpEngine:
             snap["usdc_micros"] = self._evm.get_erc20_balance(
                 self._net.usdc_address, self._hot_address
             )
+            snap["millieth_units"] = int(self._evm.get_erc20_balance(
+                self._net.milli_eth_address, self._hot_address
+            ))
         except Exception as exc:  # noqa: BLE001 -- surface, don't abort the tick
             snap["error"] = str(exc)
         self._hot_cache = snap
@@ -3938,12 +3941,29 @@ class _WarpWorker(QObject):
                 int(payload.get("amount_micros") or 0),
             )
             return f"USDC transfer broadcast: {tx}"
+        if action == "wrap_eth":
+            self._refuse_wallet_send_while_job_open("wrap_eth")
+            # Hard floor: never wrap the relay-gas minimum away.  The GUI's
+            # min_base_eth banner warns at the operator's comfort line; this
+            # gate only protects the protocol floor the engine cannot sign
+            # below (_MIN_GAS_WEI), so a small test wallet can still wrap
+            # most of its ETH.
+            tx = wallet.wrap_eth(
+                int(payload.get("amount_wei") or 0),
+                reserve_wei=_MIN_GAS_WEI,
+            )
+            return f"ETH wrapped to milliETH: {tx}"
+        if action == "unwrap_millieth":
+            self._refuse_wallet_send_while_job_open("unwrap_millieth")
+            tx = wallet.unwrap_millieth(int(payload.get("amount_units") or 0))
+            return f"milliETH unwrapped to ETH: {tx}"
         if action == "recover_retired":
             out = wallet.recover_retired(str(payload.get("address") or ""))
             txs = ", ".join(out["sweep_txs"])
             return (
                 f"Recovered {out['from']} -> {out['to']}: {txs}. "
                 f"({out['swept_usdc_micros']} USDC micros, "
+                f"{out.get('swept_millieth_units', 0)} milliETH units, "
                 f"{out['swept_eth_wei']} wei ETH swept.)"
             )
         if action == "rotate":
@@ -4067,6 +4087,12 @@ class _WarpWorker(QObject):
             out["address"] = str(hot.get("address"))
             out["eth_wei"] = hot.get("eth_wei")
             out["usdc_micros"] = hot.get("usdc_micros")
+            # Pure pass-through: the engine's refresh_hot_wallet reads
+            # milliETH alongside ETH/USDC, so the hot path stays exactly
+            # what its test pins -- zero wallet builds, zero extra RPCs
+            # here. (An older hot dict without the key simply omits it.)
+            if "millieth_units" in hot:
+                out["millieth_units"] = hot.get("millieth_units")
             return out
         try:
             info = self._base_wallet().info()
@@ -4076,6 +4102,7 @@ class _WarpWorker(QObject):
         out["address"] = info.address
         out["eth_wei"] = info.eth_wei
         out["usdc_micros"] = info.usdc_micros
+        out["millieth_units"] = info.millieth_units
         return out
 
 
