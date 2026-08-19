@@ -36,8 +36,9 @@ def _wallet(ev=None):
 def test_rotation_refuses_when_gas_cannot_cover_the_usdc_sweep():
     w, io, ev = _wallet()
     ev.usdc = 500_000_000                 # 500 USDC
+    ev.millieth = 0        # keep the refusal on the USDC branch under test
     ev.eth = 10                            # far below one sweep's gas
-    with pytest.raises(BaseWalletError, match="Fund the wallet"):
+    with pytest.raises(BaseWalletError, match="USDC"):
         w.rotate(open_job_check=lambda: None)
     # The irreversible key swap must NOT have happened.
     assert ev.sent == []
@@ -79,6 +80,7 @@ def test_recover_retired_refuses_a_gasless_usdc_strand_clearly():
     w, io, ev = _wallet()
     out = w.rotate(open_job_check=lambda: None)
     old_addr = out["old_address"]
+    ev.millieth = 0        # keep the refusal on the USDC branch under test
     ev.eth = 1
     ev.usdc = 3_000_000
     with pytest.raises(BaseWalletError, match="Send it a little Base"):

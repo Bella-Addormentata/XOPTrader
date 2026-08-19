@@ -38,8 +38,8 @@ class FakeEvm:
     def __init__(self) -> None:
         self.eth = 10 ** 16               # 0.01 ETH
         self.usdc = 5_000_000             # 5 USDC
-        self.millieth = 2_500
-        self.unmined = 0             # 2.5 milliETH (3-decimal units)
+        self.millieth = 2_500             # 2.5 milliETH (3-decimal units)
+        self.unmined = 0                  # broadcast-but-unmined txs (see get_nonce)
         self.sent: list = []
         self.fees = SimpleNamespace(max_fee_per_gas=1_000_000_000,
                                     max_priority_fee_per_gas=1_000_000)

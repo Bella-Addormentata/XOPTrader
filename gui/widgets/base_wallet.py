@@ -1010,14 +1010,15 @@ class BaseWalletWidget(QWidget):
             "Rotate the hot-wallet key?",
             (
                 "This will:\n\n"
-                "  •  generate a fresh key and sweep ALL USDC, then all ETH\n"
-                "      (minus gas), to its address;\n"
+                "  •  generate a fresh key and sweep ALL milliETH and\n"
+                "      USDC, then all ETH (minus gas), to its address;\n"
                 "  •  archive the old key in secrets.yaml (never deleted);\n"
                 "  •  CHANGE the deposit address — update exchange\n"
                 "      allowlists; in-flight deposits to the old address land\n"
                 "      at the archived key (recoverable via the runbook);\n"
                 "  •  require a fresh key backup afterwards.\n\n"
-                "It is refused while any warp bridge job is open.\n\n"
+                "It is refused while any warp bridge job is open or a\n"
+                "wallet transaction is still unmined.\n\n"
                 "Rotate now?"
             ),
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
