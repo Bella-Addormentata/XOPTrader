@@ -3963,6 +3963,7 @@ class _WarpWorker(QObject):
             return (
                 f"Recovered {out['from']} -> {out['to']}: {txs}. "
                 f"({out['swept_usdc_micros']} USDC micros, "
+                f"{out.get('swept_millieth_units', 0)} milliETH units, "
                 f"{out['swept_eth_wei']} wei ETH swept.)"
             )
         if action == "rotate":

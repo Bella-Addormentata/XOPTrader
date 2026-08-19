@@ -49,6 +49,7 @@ def test_rotation_refuses_when_gas_cannot_cover_the_usdc_sweep():
 def test_rotation_still_proceeds_with_gas_and_dust():
     w, io, ev = _wallet()
     ev.usdc = 0
+    ev.millieth = 0
     ev.eth = 1000                          # dust-only, nothing to sweep
     out = w.rotate(open_job_check=lambda: None)
     assert out["sweep_txs"] == []
@@ -69,8 +70,9 @@ def test_recover_retired_sweeps_a_stranded_key_back_to_active():
     ev.usdc = 3_000_000
     rec = w.recover_retired(old_addr)
     assert rec["from"] == old_addr and rec["to"] == out["new_address"]
-    assert len(rec["sweep_txs"]) == 2, "USDC then ETH"
+    assert len(rec["sweep_txs"]) == 3, "milliETH, USDC, then ETH"
     assert rec["swept_usdc_micros"] == 3_000_000
+    assert rec["swept_millieth_units"] == ev.millieth
 
 
 def test_recover_retired_refuses_a_gasless_usdc_strand_clearly():

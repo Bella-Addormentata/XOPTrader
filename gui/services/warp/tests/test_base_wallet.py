@@ -171,10 +171,12 @@ def test_rotation_archives_sweeps_and_reserves_gas():
     assert w.active_key().address == out["new_address"] != old_addr
     assert io.data["warp"]["evm_key_backup_confirmed"] is False
 
-    # Two sweeps: USDC first, then ETH minus BOTH worst-case gas reserves.
-    assert len(out["sweep_txs"]) == 2 and len(ev.sent) == 2
+    # Three sweeps: milliETH, then USDC, then ETH minus ALL worst-case
+    # gas reserves (two ERC-20 transfers + the ETH transfer).
+    assert len(out["sweep_txs"]) == 3 and len(ev.sent) == 3
     assert out["swept_usdc_micros"] == ev.usdc
-    reserve = 60_000 * 1_000_000_000 + 21_000 * 1_000_000_000
+    assert out["swept_millieth_units"] == ev.millieth
+    reserve = 2 * 60_000 * 1_000_000_000 + 21_000 * 1_000_000_000
     assert out["swept_eth_wei"] == ev.eth - reserve
 
 
@@ -196,6 +198,7 @@ def test_rotation_persists_the_new_key_before_broadcasting():
 def test_rotation_with_dust_only_skips_the_eth_sweep():
     w, io, ev = _wallet()
     ev.usdc = 0
+    ev.millieth = 0
     ev.eth = 1000                                   # far below any gas reserve
     out = w.rotate(open_job_check=lambda: None)
     assert out["sweep_txs"] == [] and out["swept_eth_wei"] == 0
@@ -275,4 +278,30 @@ def test_info_reports_the_millieth_balance():
     info = w.info()
     assert info.millieth_units == ev.millieth
     assert info.usdc_micros == ev.usdc, "USDC read must stay token-keyed"
+def test_rotation_refuses_pre_swap_when_millieth_gas_is_unaffordable():
+    """Wrap-then-rotate with near-zero ETH is exactly the strand the
+    refuse-before-the-key-swap rule exists for: archiving the key first
+    would leave the whole milliETH balance at an address the GUI can no
+    longer spend from."""
+    w, io, ev = _wallet()
+    ev.usdc = 0
+    ev.eth = 1000                     # cannot pay the milliETH sweep's gas
+    assert ev.millieth > 0
+    with pytest.raises(BaseWalletError, match="milliETH"):
+        w.rotate(open_job_check=lambda: None)
+    assert io.data["warp"].get("retired_keys") in (None, []), \
+        "the key swap must NOT have happened"
+    assert ev.sent == []
 
+
+def test_retired_balances_and_recovery_carry_millieth():
+    w, io, ev = _wallet()
+    w.rotate(open_job_check=lambda: None)           # archives key #1
+
+    rows = w.retired_balances()
+    assert rows and rows[0]["millieth_units"] == ev.millieth
+
+    out = w.recover_retired(rows[0]["address"])
+    assert out["swept_millieth_units"] == ev.millieth
+    # milliETH sweep + USDC sweep + ETH sweep from the retired key.
+    assert len(out["sweep_txs"]) == 3

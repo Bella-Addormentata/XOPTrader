@@ -206,7 +206,7 @@ def test_rotate_archives_sweeps_and_adopts_the_new_key(tmp_path, monkeypatch):
     assert on_disk["evm_private_key_dpapi"] != old_blob
     assert worker._config["warp"]["evm_private_key_dpapi"] == \
         on_disk["evm_private_key_dpapi"]
-    assert len(evm.sent) == 2, "USDC sweep then ETH sweep"
+    assert len(evm.sent) == 3, "milliETH, USDC, then ETH sweeps"
     snap = snaps[-1]
     assert "rotated" in snap["wallet_notice"].lower()
     assert snap["base_wallet"]["retired_count"] == 1
@@ -346,3 +346,49 @@ def test_parse_asset_amount_exact_or_refused():
     assert parse_asset_amount("0.0000001", decimals=6) is None
     for bad in ("abc", "", "-1", "0", "nan", "inf", "1e309"):
         assert parse_asset_amount(bad, decimals=6) is None, bad
+def test_conversions_refuse_while_the_job_store_is_unreadable(
+    tmp_path, monkeypatch
+):
+    """Same fail-closed nonce guard as sends and rotation: an unreadable
+    job DB might hide an open job whose signed-but-unbroadcast txs the
+    conversion's nonce grab would wedge."""
+    worker, evm, snaps, _sp = _worker(tmp_path, monkeypatch)
+    worker.wallet_action("create", {})
+    (tmp_path / "warp_jobs.db").write_bytes(b"this is not a sqlite database")
+    for action, payload in (
+        ("wrap_eth", {"amount_wei": 10 ** 12}),
+        ("unwrap_millieth", {"amount_units": 1}),
+    ):
+        evm.sent.clear()
+        worker.wallet_action(action, payload)
+        assert evm.sent == [], f"{action} must not broadcast"
+        # The fail-closed job-store guard fires before the open-job check
+        # proper, with its own message -- either way the action is refused
+        # with the job store named.
+        assert "job store" in (snaps[-1]["wallet_action_error"] or "")
+
+
+def test_wrap_eth_dispatch_passes_the_relay_gas_floor(tmp_path, monkeypatch):
+    """The dispatcher must hand _MIN_GAS_WEI to wrap_eth as the reserve.
+
+    Proven behaviourally: a wrap that leaves LESS than _MIN_GAS_WEI after
+    worst-case gas is refused with the reserve named, and one that leaves
+    exactly the floor broadcasts. A dispatcher that dropped the reserve
+    (or passed 0) would let the first case through.
+    """
+    from gui.services.warp.service import _MIN_GAS_WEI
+
+    worker, evm, snaps, _sp = _worker(tmp_path, monkeypatch)
+    worker.wallet_action("create", {})
+    amount = 5 * 10 ** 12
+    gas_cost = 60_000 * evm.fees.max_fee_per_gas
+
+    evm.eth = amount + gas_cost + _MIN_GAS_WEI - 1
+    worker.wallet_action("wrap_eth", {"amount_wei": amount})
+    assert evm.sent == []
+    assert "relay-gas reserve" in (snaps[-1]["wallet_action_error"] or "")
+
+    evm.eth = amount + gas_cost + _MIN_GAS_WEI
+    worker.wallet_action("wrap_eth", {"amount_wei": amount})
+    assert len(evm.sent) == 1
+    assert "wrapped" in (snaps[-1]["wallet_notice"] or "").lower()
