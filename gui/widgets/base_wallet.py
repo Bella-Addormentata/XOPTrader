@@ -5,21 +5,26 @@ the working intermediary between an exchange (e.g. Coinbase) and the warp
 bridge: ETH and USDC come in from the exchange, the bridge spends them,
 unwraps land back here, and the surplus goes out to the exchange.
 
-The page offers five operations, all executed by
+The page offers six operations, all executed by
 :class:`gui.services.basewallet.BaseWallet` on the warp worker thread:
 
 * **Create wallet** -- generate the first DPAPI-encrypted key (refused if one
   already exists; rotation is the only way to replace a key).
-* **Receive** -- display + copy the wallet's single static address. One key is
-  one address on EVM chains; a "fresh receive address" only ever comes from
-  key rotation.
+* **Receive** -- display + copy the wallet's single static address, or show
+  it as a QR code for an exchange app's withdraw screen (plain checksummed
+  address, Base-network-only warning in the dialog). One key is one address
+  on EVM chains; a "fresh receive address" only ever comes from key rotation.
 * **Back up key** -- reveal the active private key in a guarded, masked modal;
     key bytes arrive over a one-shot signal and never enter a cached snapshot.
 * **Send** -- transfer ETH or USDC to an external address (EIP-55 validated,
   worst-case gas reserved, balance-checked -- all re-validated by the
   backend).
-* **Rotate key** -- new key, sweep USDC then ETH to it, archive the old blob
-  in ``warp.retired_keys`` forever. Refused while any warp job is open.
+* **Convert** -- wrap ETH into milliETH (MilliETH.sol, 1000/ETH, no fee) or
+  unwrap it back; amounts floored to the contract's 1e12-wei granularity and
+  the relay-gas floor never wrappable.
+* **Rotate key** -- new key, sweep milliETH, USDC, then ETH to it, archive
+  the old blob in ``warp.retired_keys`` forever. Refused while any warp job
+  is open or any wallet transaction is still unmined.
 
 The tab is fed by the warp snapshot forwarded through
 ``MainWindow._on_bridge_data`` (``data["warp"]["base_wallet"]`` plus the

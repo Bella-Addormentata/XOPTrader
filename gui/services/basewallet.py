@@ -518,7 +518,8 @@ class BaseWallet:
     # -- retired-key recovery ------------------------------------------------ #
 
     def retired_balances(self) -> List[dict]:
-        """Per archived key: its address and current ETH/USDC balances.
+        """Per archived key: its address and current ETH/USDC/milliETH
+        balances.
 
         The in-app view of what a past rotation may have left behind (a crash
         between the key swap and a sweep broadcast, or a partial sweep). Read
