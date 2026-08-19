@@ -1077,6 +1077,10 @@ class BaseWalletWidget(QWidget):
             )
             return
         dlg.exec()
+        # Modal children are only hidden by exec() returning, not freed;
+        # without this every open would pile another dialog + pixmap onto
+        # the page until it is destroyed.
+        dlg.deleteLater()
 
     def _on_copy_address(self) -> None:
         """Copy the Base address to the clipboard."""

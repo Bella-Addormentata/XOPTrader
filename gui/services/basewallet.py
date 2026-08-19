@@ -490,11 +490,17 @@ class BaseWallet:
         """Sweep a retired key's balance back to the active key.
 
         The in-app escape from a strand: whenever the retired address still
-        holds enough ETH to pay one transfer's gas, this moves its USDC and
-        then its ETH to the current active address. It cannot conjure gas --
-        an address holding USDC but zero ETH must be funded with a little ETH
-        first (send some to it), after which this sweeps both. Signs with the
-        retired key loaded from its archived blob; the archive is untouched.
+        holds enough ETH to pay every transfer's gas, this moves its
+        milliETH, USDC, and then its ETH to the current active address. It
+        cannot conjure gas -- an address holding tokens but zero ETH must be
+        funded with a little ETH first (send some to it), after which this
+        sweeps everything. All sweeps are preflighted (gas estimated and
+        affordability checked) BEFORE anything is broadcast, so a refusal
+        always means nothing moved -- a gas shortfall can never strand a
+        half-swept key. (An RPC failure mid-broadcast can still leave some
+        sweeps pending, as anywhere; retries are nonce-safe because nonces
+        are pending-aware.) Signs with the retired key loaded from its
+        archived blob; the archive is untouched.
         """
         from .warp import evm, keystore
 
@@ -521,7 +527,13 @@ class BaseWallet:
         fees = self._evm.get_fee_data()
         nonce = self._evm.get_nonce(old.address)
         reserved = 0
-        txs: List[str] = []
+        # Preflight-then-broadcast, exactly like rotate(): every sweep is
+        # built and its gas checked cumulatively BEFORE the first broadcast.
+        # Broadcasting as we go would let a later gas refusal report the
+        # whole action failed after milliETH already moved -- and a retry
+        # against the pending tx could read stale balances and enqueue a
+        # duplicate transfer at the next nonce.
+        unsigned_txs: List[object] = []
 
         if millieth > 0:
             m_data = evm.encode_transfer(dest, millieth)
@@ -536,16 +548,13 @@ class BaseWallet:
                     f"only {eth} wei ETH (~{m_gas_cost} needed for gas). "
                     "Send it a little Base ETH, then recover again."
                 )
-            unsigned = evm.UnsignedTx(
+            unsigned_txs.append(evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(self._net.milli_eth_address[2:]), value=0,
                 data=m_data, gas=m_gas,
                 max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
-            )
-            signed = evm.sign_tx(unsigned, old.private_key)
-            self._evm.send_raw_transaction(signed.raw)
-            txs.append(signed.tx_hash)
+            ))
             reserved += m_gas_cost
             nonce += 1
 
@@ -562,35 +571,36 @@ class BaseWallet:
                     f"(~{usdc_gas_cost} more needed for gas). Send it a little "
                     "Base ETH, then recover again."
                 )
-            unsigned = evm.UnsignedTx(
+            unsigned_txs.append(evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(self._net.usdc_address[2:]), value=0,
                 data=data, gas=gas, max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
-            )
-            signed = evm.sign_tx(unsigned, old.private_key)
-            self._evm.send_raw_transaction(signed.raw)
-            txs.append(signed.tx_hash)
+            ))
             reserved += usdc_gas_cost
             nonce += 1
 
         eth_amount = eth - reserved - _ETH_TRANSFER_GAS * fees.max_fee_per_gas
         if eth_amount > 0:
-            unsigned = evm.UnsignedTx(
+            unsigned_txs.append(evm.UnsignedTx(
                 chain_id=self._net.evm_chain_id, nonce=nonce,
                 to=bytes.fromhex(dest[2:]), value=eth_amount, data=b"",
                 gas=_ETH_TRANSFER_GAS, max_fee_per_gas=fees.max_fee_per_gas,
                 max_priority_fee_per_gas=fees.max_priority_fee_per_gas,
-            )
-            signed = evm.sign_tx(unsigned, old.private_key)
-            self._evm.send_raw_transaction(signed.raw)
-            txs.append(signed.tx_hash)
+            ))
 
-        if not txs:
+        if not unsigned_txs:
             raise BaseWalletError(
                 f"retired {address} holds nothing sweepable "
                 f"(ETH {eth} wei, USDC {usdc}, milliETH {millieth})"
             )
+
+        # Full preflight passed: sign and broadcast in order.
+        txs: List[str] = []
+        for unsigned in unsigned_txs:
+            signed = evm.sign_tx(unsigned, old.private_key)
+            self._evm.send_raw_transaction(signed.raw)
+            txs.append(signed.tx_hash)
         _log.info("recovered retired %s -> %s (%d txs)", address, dest, len(txs))
         return {"from": old.address, "to": dest, "sweep_txs": txs,
                 "swept_usdc_micros": usdc,

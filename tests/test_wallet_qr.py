@@ -170,5 +170,26 @@ def test_qr_button_disabled_without_an_address(qapp):
     w.deleteLater()
 
 
+def test_qr_dialog_is_released_after_close(qapp, monkeypatch):
+    """exec() only hides a parented modal; the handler must schedule it
+    for deletion or every open piles another dialog + QR pixmap onto the
+    page for the page's whole lifetime."""
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QDialog
+
+    w = BaseWalletWidget()
+    w.update_data({"warp": {"base_wallet": {
+        "configured": True, "address": _ADDR,
+        "eth_wei": 10 ** 15, "usdc_micros": 0, "millieth_units": 0,
+    }}})
+    w._render()
+    monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+    for _ in range(3):
+        w._on_qr_clicked()
+    QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+    assert w.findChildren(QDialog) == [],         "closed QR dialogs must not accumulate on the page"
+    w.deleteLater()
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

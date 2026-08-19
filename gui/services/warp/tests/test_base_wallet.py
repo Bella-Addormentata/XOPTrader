@@ -305,3 +305,22 @@ def test_retired_balances_and_recovery_carry_millieth():
     assert out["swept_millieth_units"] == ev.millieth
     # milliETH sweep + USDC sweep + ETH sweep from the retired key.
     assert len(out["sweep_txs"]) == 3
+
+
+def test_recovery_preflights_all_sweeps_before_broadcasting_any():
+    """The retired key can afford the milliETH sweep's gas but not the
+    USDC sweep's on top of it: recovery must refuse WITHOUT broadcasting
+    the milliETH transfer. A partial sweep reported as failure invites a
+    retry that reads stale balances against the pending tx and enqueues
+    a duplicate transfer at the next nonce."""
+    w, io, ev = _wallet()
+    w.rotate(open_job_check=lambda: None)
+    old_addr = w.retired_balances()[0]["address"]
+    ev.sent.clear()
+    ev.usdc = 3_000_000
+    ev.millieth = 2_500
+    # Exactly ONE ERC-20 sweep's worth of gas -- not two.
+    ev.eth = 60_000 * ev.fees.max_fee_per_gas
+    with pytest.raises(BaseWalletError, match="USDC"):
+        w.recover_retired(old_addr)
+    assert ev.sent == [], "nothing may broadcast when the full preflight fails"
