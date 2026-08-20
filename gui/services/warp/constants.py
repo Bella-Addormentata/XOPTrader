@@ -72,7 +72,7 @@ class WarpNet:
     status_url: str
 
     # --- correctness anchors ---------------------------------------------- #
-    expected_asset_id: str  # wrapped-TAIL hash; must be non-empty (hard anchor)
+    expected_asset_id: str  # wUSDC.b wrapped-TAIL hash (hard anchor; see assets)
     bridging_puzzle_hash: str  # network-independent; a09eb1ea...9037
 
     # --- outbound (unwrap) ------------------------------------------------- #
@@ -95,6 +95,42 @@ class WarpNet:
     # The reconstructed separator, anchored in tests; binds chainId 8453 and
     # the portal address, so a redeploy changes it and the gate fails closed.
     eip712_domain_separator: str
+
+    # --- bridgeable assets -------------------------------------------------- #
+    # Every ERC-20 the pipeline may bridge, keyed by symbol. USDC's entry
+    # mirrors the legacy scalars (usdc_address / usdc_decimals /
+    # expected_asset_id), which remain during the migration because ~10 call
+    # sites still read them; new code reads this table. Adding an asset here
+    # requires its offline-derived wrapped-TAIL anchor -- the engine refuses
+    # to build if any listed asset's derivation disagrees.
+    assets: "Tuple[Tuple[str, WarpAsset], ...]" = ()
+
+    def asset(self, symbol: str) -> "WarpAsset":
+        """The descriptor for ``symbol``; KeyError on unknown assets."""
+        for key, spec in self.assets:
+            if key == symbol:
+                return spec
+        raise KeyError(f"{self.name} has no bridgeable asset {symbol!r}")
+
+
+@dataclass(frozen=True)
+class WarpAsset:
+    """One bridgeable ERC-20 and its wrapped-CAT identity, pinned offline.
+
+    ``expected_asset_id`` is the sha256tree of the wrapped TAIL derived from
+    (portal launcher, source chain, ERC20Bridge, ``erc20_address``) -- the
+    same derivation :func:`drivers.derive_wrapped_asset_id` performs, and the
+    same anchor discipline as :attr:`WarpNet.expected_asset_id`: a wrong or
+    missing value must refuse to run, never fall back. The engine verifies
+    EVERY listed asset's derivation at construction, so a typo here is a
+    blocked engine with a banner, not a claim minting an untradeable CAT.
+    """
+
+    symbol: str
+    erc20_address: str
+    erc20_decimals: int
+    # sha256tree(wrapped TAIL); pinned offline, verified at engine build.
+    expected_asset_id: str
 
 
 MAINNET = WarpNet(
@@ -189,6 +225,27 @@ MAINNET = WarpNet(
     status_url="https://status.warp.green/",
     # anchors
     expected_asset_id="fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d",
+    assets=(
+        ("USDC", WarpAsset(
+            symbol="USDC",
+            # Exact-casing mirror of usdc_address above (anchored by test).
+            erc20_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
+            erc20_decimals=6,
+            expected_asset_id="fa4a180ac326e67ea289b869e3448256f6af05721f7cf934"
+                              "cb9901baa6b7a99d",
+        )),
+        # wmilliETH.b: the SAME CAT the enabled wmilliETH.b/XCH trading pair
+        # quotes (config.yaml base_asset_id), so bridged tokens land directly
+        # as ask-side inventory. Derived offline from milli_eth_address on
+        # 2026-08-19 and pinned; the anchor test re-derives it.
+        ("milliETH", WarpAsset(
+            symbol="milliETH",
+            erc20_address="0xf2D5d8eC69E2faed5eB4De90749c87ee314a4B12",
+            erc20_decimals=3,
+            expected_asset_id="f322a205c034fe28681829fa5a2e483ac421f0952eb129"
+                              "2945c8db06e0a471a6",
+        )),
+    ),
     bridging_puzzle_hash="a09eb1ea8c6e83c0166801dabcf4a70d361cc7f6d89c4a46bcd400ac57719037",
     chia_toll_mojos=1_000_000_000,  # 0.001 XCH, both real mainnet unwraps
     burn_puzzle_hash="6d64cf902916f73b90fa0a6412c7d1b43996c04fb3f245fcc2d767aa556c93a1",
