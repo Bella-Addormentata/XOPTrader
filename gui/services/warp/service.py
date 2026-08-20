@@ -3671,9 +3671,8 @@ class _WarpWorker(QObject):
         """
 
         def _run(engine: WarpEngine) -> None:
-            p = self._rebalance_params
-            engine.auto_bridge_suppressed = bool(
-                p.enabled and p.usdc is not None and not self._rebalance_error
+            engine.auto_bridge_suppressed = (
+                self._legacy_auto_bridge_suppressed()
             )
             engine.step()
             self._rebalance_tick(engine)
@@ -3681,6 +3680,22 @@ class _WarpWorker(QObject):
             engine.refresh_relay_activity_if_due()
 
         self.snapshot_ready.emit(self._guarded(_run))
+
+    def _legacy_auto_bridge_suppressed(self) -> bool:
+        """Whether the engine's own auto-bridge must stand down this tick.
+
+        True while a USDC band owns bridging -- and ALSO while a rebalance
+        config FAILED to parse. Falling back to the legacy auto job there
+        would be a fail-open on a money path: the operator asked for
+        band-managed bridging, and a typo would instead bridge the whole
+        balance up to the cap, untargeted. Both the refusal and the reason
+        reach the Warp banner, so the wallet simply holds until the config
+        is fixed.
+        """
+        if self._rebalance_error:
+            return True
+        p = self._rebalance_params
+        return bool(p.enabled and p.usdc is not None)
 
     def _wallet_settled(self, engine: "WarpEngine") -> bool:
         """Whether the hot wallet has no broadcast-but-unmined transactions.

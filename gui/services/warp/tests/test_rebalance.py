@@ -399,5 +399,46 @@ def test_worker_passes_automatic_to_both_job_actuators():
     assert eng2.calls == [("unwrap", 90_270, eng2._hot_address, True)]
 
 
+def test_a_malformed_band_does_not_fall_back_to_legacy_auto_bridge(
+    tmp_path, monkeypatch
+):
+    """Fail-closed on a money path: with auto_bridge on and a MALFORMED
+    enabled rebalance block, the planner is disabled -- but the legacy
+    auto-bridge must not take over and bridge the whole balance up to the
+    cap, untargeted. The operator asked for band-managed bridging; the
+    banner explains the hold."""
+    from types import SimpleNamespace
+
+    worker = S._WarpWorker(secrets_path=tmp_path / "secrets.yaml")
+    worker.set_config({"warp": {
+        "enabled": True,
+        "auto_bridge": True,
+        "jobs_db": str(tmp_path / "warp_jobs.db"),
+        # tolerance below the tip floor -> RebalanceConfigError
+        "rebalance": {"enabled": True,
+                      "usdc": {"target": 100, "tolerance_pct": 0.1}},
+    }})
+    assert worker._rebalance_error, "the malformed block must banner"
+    assert worker._rebalance_params.enabled is False
+    assert worker._legacy_auto_bridge_suppressed() is True
+
+    # And the engine honours it: no untargeted auto job gets opened.
+    eng = S.WarpEngine.__new__(S.WarpEngine)
+    eng._params = SimpleNamespace(
+        enabled=True, auto_bridge=True, dry_run=False, min_micros=1)
+    eng._net = SimpleNamespace()
+    eng._store = SimpleNamespace(get_active_job=lambda: None)
+    eng._evm = SimpleNamespace(get_erc20_balance=lambda *a, **k: 10 ** 9)
+    eng._hot_address = "0x" + "ab" * 20
+    eng.auto_bridge_suppressed = worker._legacy_auto_bridge_suppressed()
+    assert eng.maybe_start_auto_job() is None
+
+    # A healthy config with no band leaves the legacy path alone.
+    worker.set_config({"warp": {"enabled": True, "auto_bridge": True,
+                                "jobs_db": str(tmp_path / "warp_jobs.db")}})
+    assert worker._rebalance_error == ""
+    assert worker._legacy_auto_bridge_suppressed() is False
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
