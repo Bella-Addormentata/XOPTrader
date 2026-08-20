@@ -34,7 +34,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Optional
+from typing import Any, Optional
 
 #: ETH wrap granularity (MilliETH.deposit() reverts on anything finer).
 _WRAP_GRANULARITY_WEI = 10 ** 12
@@ -82,7 +82,7 @@ class RebalanceAction:
 
 
 def parse_rebalance_config(
-    warp_cfg: dict, *, min_gas_wei: int
+    warp_cfg: Any, *, min_gas_wei: int
 ) -> RebalanceParams:
     """Parse ``warp.rebalance`` fail-closed.
 

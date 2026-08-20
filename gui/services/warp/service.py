@@ -3676,20 +3676,55 @@ class _WarpWorker(QObject):
                 p.enabled and p.usdc is not None and not self._rebalance_error
             )
             engine.step()
-            engine.refresh_hot_wallet()
+            self._rebalance_tick(engine)
             engine.relay_sweep_if_due()
             engine.refresh_relay_activity_if_due()
-            self._maybe_rebalance(engine)
 
         self.snapshot_ready.emit(self._guarded(_run))
 
-    def _maybe_rebalance(self, engine: "WarpEngine") -> None:
+    def _wallet_settled(self, engine: "WarpEngine") -> bool:
+        """Whether the hot wallet has no broadcast-but-unmined transactions.
+
+        latest before pending, as in :meth:`BaseWallet._require_settled`, so
+        a tx landing between the two reads can only widen the gap. Any RPC
+        failure reads as UNSETTLED: unknown settlement must not authorise
+        an automatic transfer.
+        """
+        try:
+            addr = engine._hot_address
+            latest = int(engine._evm.get_nonce(addr, pending=False))
+            pending = int(engine._evm.get_nonce(addr, pending=True))
+            return pending == latest
+        except Exception as exc:  # noqa: BLE001 -- fail closed, never raise
+            _log.debug("rebalance: settlement unknown (%s)", exc)
+            return False
+
+    def _rebalance_tick(self, engine: "WarpEngine") -> None:
+        """Refresh the hot wallet ONCE per tick and consult the planner.
+
+        The settle check must precede the balance read -- a tx mining
+        between them would make the nonces agree while the cache was still
+        pre-mine -- and the snapshot's refresh is the same one planning
+        consumes, so the two nonce reads are the only added RPC, and only
+        while the rebalancer is live.
+        """
+        p = self._rebalance_params
+        if not p.enabled or self._rebalance_error:
+            engine.refresh_hot_wallet()          # snapshot only
+            return
+        settled = self._wallet_settled(engine)
+        engine.refresh_hot_wallet()
+        self._maybe_rebalance(engine, settled=settled)
+
+    def _maybe_rebalance(
+        self, engine: "WarpEngine", *, settled: Optional[bool] = None
+    ) -> None:
         """One planner consult per tick; at most one action per cooldown.
 
         Runs only while no warp job is active, never in dry-run, and only
-        on settled balances (the wallet-level unmined guard refuses the
-        wrap/unwrap legs on its own; bridge/unwrap jobs re-check everything
-        in their gates). Contracted never to raise: a failed action is a
+        on settled balances -- ``settled`` comes from :meth:`_rebalance_tick`,
+        which checks it BEFORE the balance refresh this reads; passing None
+        re-derives it. Contracted never to raise: a failed action is a
         logged banner and a cooldown, not a crashed tick.
         """
         p = self._rebalance_params
@@ -3707,21 +3742,15 @@ class _WarpWorker(QObject):
             # Settled balances only: the ETH actuators re-check the nonce
             # gap inside the wallet, but the bridge/unwrap JOB paths do
             # not -- with a transfer pending, the confirmed cache could
-            # size a bridge against funds already leaving. Checked BEFORE
-            # the balance read below: a tx mining between a balance read
-            # and this check would make the nonces agree while the cached
-            # balances were still pre-mine. latest before pending, as in
-            # BaseWallet._require_settled, so a tx landing between the
-            # two calls can only widen the gap. Not a failure, so no
-            # cooldown: the next tick re-checks.
-            addr = engine._hot_address
-            latest = int(engine._evm.get_nonce(addr, pending=False))
-            pending = int(engine._evm.get_nonce(addr, pending=True))
-            if pending != latest:
+            # size a bridge against funds already leaving. Not a failure,
+            # so no cooldown: the next tick re-checks.
+            if settled is None:
+                settled = self._wallet_settled(engine)
+            if not settled:
                 return
-            # Plan only from balances read AFTER the settled check -- a tx
-            # mining after it just makes this read fresher.
-            hot = engine.refresh_hot_wallet() or {}
+            # The cache was refreshed by _rebalance_tick AFTER the settle
+            # check, so it cannot be pre-mine relative to that check.
+            hot = getattr(engine, "_hot_cache", None) or {}
             if hot.get("error") or hot.get("eth_wei") is None:
                 return
             action = rb.plan(
@@ -3748,21 +3777,15 @@ class _WarpWorker(QObject):
                     "let an ETH refuel land first"
                 )
                 return
-            # Every action starts the cooldown, success or not: a failing
-            # actuator must not be retried every tick against live money.
-            self._rebalance_next_ok = now + p.cooldown_s
             reason = action.reason
-            _log.info("rebalance: %s", action.reason)
-            if action.kind == "bridge_usdc":
-                engine.request_bridge(
-                    target_micros=action.amount, automatic=True
-                )
-            elif action.kind == "unwrap_usdc":
+            mojos = action.amount
+            if action.kind == "unwrap_usdc":
                 # Preflight spendable wUSDC.b and clamp: an exact-size job
                 # bigger than held inventory would go FAILED, and FAILED
                 # deliberately retains the single active slot -- an
                 # automatic action must never squat it waiting for an
-                # operator.
+                # operator. Resolved BEFORE the cooldown is armed so a
+                # nothing-to-do skip does not delay the next consult.
                 wallet_id = engine._resolve_cat_wallet_id()
                 bal = engine._wallet.get_wallet_balance(wallet_id)
                 spendable = int(bal.get("spendable_balance") or 0)
@@ -3779,6 +3802,16 @@ class _WarpWorker(QObject):
                         f"{action.reason} (clamped to {mojos} mojos by "
                         "spendable wUSDC.b inventory)"
                     )
+            # Committed to acting: the cooldown starts here, success or
+            # not, so a failing actuator cannot be retried every tick
+            # against live money. Skips above leave it untouched.
+            self._rebalance_next_ok = now + p.cooldown_s
+            _log.info("rebalance: %s", reason)
+            if action.kind == "bridge_usdc":
+                engine.request_bridge(
+                    target_micros=action.amount, automatic=True
+                )
+            elif action.kind == "unwrap_usdc":
                 # Receiver is ALWAYS our own hot wallet -- never config.
                 engine.request_unwrap(
                     mojos, engine._hot_address, automatic=True
@@ -3911,10 +3944,12 @@ class _WarpWorker(QObject):
 
     def _config_enabled(self) -> bool:
         """Whether ``warp.enabled`` is set, independent of whether it started."""
-        warp = (self._config or {}).get("warp") or {}
-        # A malformed warp block (list/string) must read as disabled, not
-        # raise: this runs inside the snapshot path, and an exception here
-        # would swallow the very banner that reports the malformation.
+        # The raw value, not `or {}`: every non-dict shape (None, [], "")
+        # must reach the type guard below rather than be masked into an
+        # empty mapping. A malformed warp block reads as disabled, never
+        # raises -- this runs inside the snapshot path, and an exception
+        # here would swallow the very banner reporting the malformation.
+        warp = (self._config or {}).get("warp")
         if not isinstance(warp, dict):
             return False
         return bool(warp.get("enabled", False))
