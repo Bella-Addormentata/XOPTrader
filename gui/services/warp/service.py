@@ -3689,18 +3689,25 @@ class _WarpWorker(QObject):
             now = time.monotonic()
             if now < self._rebalance_next_ok:
                 return
-            hot = getattr(engine, "_hot_cache", None) or {}
-            if hot.get("error") or hot.get("eth_wei") is None:
-                return
             # Settled balances only: the ETH actuators re-check the nonce
             # gap inside the wallet, but the bridge/unwrap JOB paths do
             # not -- with a transfer pending, the confirmed cache could
-            # size a bridge against funds already leaving. Not a failure,
-            # so no cooldown: the next tick re-checks.
+            # size a bridge against funds already leaving. Checked BEFORE
+            # the balance read below: a tx mining between a balance read
+            # and this check would make the nonces agree while the cached
+            # balances were still pre-mine. latest before pending, as in
+            # BaseWallet._require_settled, so a tx landing between the
+            # two calls can only widen the gap. Not a failure, so no
+            # cooldown: the next tick re-checks.
             addr = engine._hot_address
-            if int(engine._evm.get_nonce(addr, pending=True)) != int(
-                engine._evm.get_nonce(addr, pending=False)
-            ):
+            latest = int(engine._evm.get_nonce(addr, pending=False))
+            pending = int(engine._evm.get_nonce(addr, pending=True))
+            if pending != latest:
+                return
+            # Plan only from balances read AFTER the settled check -- a tx
+            # mining after it just makes this read fresher.
+            hot = engine.refresh_hot_wallet() or {}
+            if hot.get("error") or hot.get("eth_wei") is None:
                 return
             action = rb.plan(
                 params=p,
@@ -3716,6 +3723,7 @@ class _WarpWorker(QObject):
             # Every action starts the cooldown, success or not: a failing
             # actuator must not be retried every tick against live money.
             self._rebalance_next_ok = now + p.cooldown_s
+            reason = action.reason
             _log.info("rebalance: %s", action.reason)
             if action.kind == "bridge_usdc":
                 engine.request_bridge(target_micros=action.amount)
@@ -3734,6 +3742,13 @@ class _WarpWorker(QObject):
                         "rebalance skipped: no spendable wUSDC.b to unwrap"
                     )
                     return
+                if mojos < action.amount:
+                    # The banner must report what actually moved, not the
+                    # planned amount the inventory could not cover.
+                    reason = (
+                        f"{action.reason} (clamped to {mojos} mojos by "
+                        "spendable wUSDC.b inventory)"
+                    )
                 # Receiver is ALWAYS our own hot wallet -- never config.
                 engine.request_unwrap(mojos, engine._hot_address)
             elif action.kind == "wrap_eth":
@@ -3742,7 +3757,7 @@ class _WarpWorker(QObject):
                 )
             elif action.kind == "unwrap_millieth":
                 self._base_wallet().unwrap_millieth(action.amount)
-            self._rebalance_last = action.reason
+            self._rebalance_last = reason
         except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
             # Cooldown on ANY failure, including before the plan (e.g.
             # garbage in the hot cache): a broken consult must not retry

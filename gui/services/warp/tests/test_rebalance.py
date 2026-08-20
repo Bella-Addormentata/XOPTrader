@@ -182,6 +182,13 @@ class FakeEngine:
                 self.unmined if pending else 0))
         self.calls: list = []
 
+    def refresh_hot_wallet(self):
+        self.refreshes = getattr(self, "refreshes", 0) + 1
+        fresh = getattr(self, "fresh_cache", None)
+        if fresh is not None:
+            self._hot_cache = fresh
+        return self._hot_cache
+
     def request_bridge(self, target_micros=None):
         self.calls.append(("bridge", target_micros))
 
@@ -487,6 +494,36 @@ def test_malformed_warp_block_still_emits_the_banner_snapshot(tmp_path):
     assert snaps, "the snapshot must still be emitted"
     reb = snaps[-1].get("rebalance") or {}
     assert reb.get("error"), "the parse failure must reach the banner"
+
+
+def test_planning_uses_balances_read_after_the_settle_check():
+    """A tx mining between a balance read and the nonce check makes the
+    nonces agree while the old cache is pre-mine: the consult must re-read
+    balances AFTER the gap check and plan from that."""
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache = {"eth_wei": 10 ** 16, "usdc_micros": 150_000_000,
+                      "millieth_units": 0, "error": None}   # stale pre-mine
+    eng.fresh_cache = {"eth_wei": 10 ** 16, "usdc_micros": 100_000_000,
+                       "millieth_units": 0, "error": None}  # post-refresh
+    w._maybe_rebalance(eng)
+    assert eng.refreshes == 1
+    assert eng.calls == [], (
+        "the fresh in-band balances must be planned from, not the stale "
+        "pre-mine excess")
+
+
+def test_clamped_unwrap_banners_the_actual_amount():
+    from types import SimpleNamespace
+
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache["usdc_micros"] = 10_000_000
+    eng._resolve_cat_wallet_id = lambda: 7
+    eng._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 40_000})
+    w._maybe_rebalance(eng)
+    assert "clamped to 40000 mojos" in w._rebalance_last
 
 
 if __name__ == "__main__":  # pragma: no cover
