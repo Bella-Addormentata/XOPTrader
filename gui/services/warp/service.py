@@ -840,9 +840,12 @@ class WarpEngine:
     def _job_asset(self, job: WarpJob):
         """The bridgeable asset *job* was created for, from its frozen state.
 
-        Jobs stamp their asset at creation, exactly like the network and
-        hot-wallet binding, so a config edit mid-flight cannot re-point a
-        live job at a different token. Rows written before asset stamping
+        Jobs stamp their asset at creation and re-freeze it with the
+        amounts at DEPOSIT_SEEN, so a config edit mid-flight cannot
+        re-point a live job at a different token. (Unlike the network and
+        hot-wallet binding this is not yet policed by _binding_mismatch --
+        it does not need to be while USDC is the only asset a job can be
+        created for; B2 adds that check with the second asset.) Rows written before asset stamping
         existed carry no symbol and are USDC by definition -- that was the
         only asset the pipeline could bridge. An unknown symbol is terminal
         rather than a silent fallback: guessing the token here would size
@@ -863,6 +866,17 @@ class WarpEngine:
 
         net, p = self._net, self._params
         spec = self._job_asset(job)
+        # min_micros/max_micros are scaled by USDC's decimals
+        # (warp_params_from_config), but the balance below is in THIS
+        # asset's base units -- for a 3-decimal token the blast-radius cap
+        # would read 1000x too permissive. Per-asset caps land in B2; until
+        # then a non-USDC job is refused rather than run uncapped.
+        if spec.symbol != "USDC":
+            raise WarpTerminal(
+                f"{spec.symbol} bridging is not enabled yet: warp's amount "
+                "caps are still denominated in USDC, and applying them to "
+                f"{spec.symbol} base units would mis-scale the blast radius"
+            )
 
         have = self._evm.get_erc20_balance(spec.erc20_address, self._hot_address)
         target = job.state.get("target_micros")
@@ -919,7 +933,8 @@ class WarpEngine:
             # they were computed from; _binding_mismatch refuses to resume this
             # job under any other key. This is the last state where that is still
             # a free choice -- nothing has been signed yet.
-            state={"tip_bps": tip_bps, **self._binding()},
+            state={"tip_bps": tip_bps, "asset": spec.symbol,
+                   **self._binding()},
             message=(
                 f"deposit {amount_base} micros seen; bridging {mojo_amount} mojos "
                 f"(post-tip {post_tip}) to {address}{clamp_note}"
@@ -1802,6 +1817,12 @@ class WarpEngine:
                 mojo_amount=int(job.amount_mojos),
                 nonce=int(nonce) if nonce is not None else None,
                 fees=fees,
+                # The replacement must bridge the SAME token as the
+                # transaction it replaces: re-signing at the pinned nonce
+                # without the asset would swap a stuck milliETH bridge for
+                # a USDC one, and the attested-source anchor would then
+                # kill the job AFTER real funds had moved.
+                asset=self._job_asset(job),
             ),
             self._evm_key.private_key,
         )

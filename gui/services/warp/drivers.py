@@ -1075,6 +1075,19 @@ def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
         raise WarpDriverError(
             f"{net.name}.expected_asset_id is empty; refusing to build a claim"
         )
+    # A caller-supplied id may only be one this deployment already pins and
+    # re-derives at engine construction (verify_wrapped_asset_anchor). That
+    # keeps this last gate before minting as strict as the single global
+    # constant it replaced: a request cannot introduce an id of its own.
+    known = {(net.expected_asset_id or "").lower()} | {
+        (spec.expected_asset_id or "").lower()
+        for _key, spec in (getattr(net, "assets", ()) or ())
+    }
+    if expected not in known:
+        raise WarpDriverError(
+            f"claim expects wrapped id {expected}, which {net.name} does not "
+            "pin for any bridgeable asset -- refusing to mint"
+        )
     if tail_hash.hex() != expected:
         raise WarpDriverError(
             f"derived wrapped-TAIL {tail_hash.hex()} != configured asset id "

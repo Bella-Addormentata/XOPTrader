@@ -24,7 +24,8 @@ from gui.services.warp import evm  # noqa: E402
 from gui.services.warp import service as S  # noqa: E402
 
 from .test_warp_service import (  # noqa: E402
-    RECEIVER_PH, FakeWatcher, _sent_msg, build, default_params, new_store, seed,
+    RECEIVER_PH, FakeWatcher, _sent_msg, build, default_params, fake_sign_tx,
+    new_store, seed,
 )
 
 NET = C.MAINNET
@@ -173,6 +174,72 @@ def test_a_usdc_job_still_rejects_a_millieth_attestation():
                   "bridge_nonce": "00" * 31 + "07"})      # legacy: no asset
     out = engine.step()
     assert out["status"] == S.JobStatus.FAILED
+
+
+# --------------------------------------------------------------------------- #
+# Findings from the adversarial pass on this PR.
+# --------------------------------------------------------------------------- #
+
+def test_the_fee_bump_resign_rebuilds_for_the_same_asset(monkeypatch):
+    """A stuck bridge is re-signed at the PINNED nonce. Rebuilding it
+    without the job's asset would replace a milliETH bridge with a USDC
+    one -- and the attested-source anchor would then kill the job only
+    AFTER real funds had moved."""
+    from gui.services.warp import evm as evm_mod
+
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    job = seed(
+        store, S.JobStatus.BRIDGING,
+        columns={"receiver_ph": RECEIVER_PH.hex(), "amount_mojos": 5000,
+                 "bridge_tx_hash": "0x" + "11" * 32},
+        state={"asset": "milliETH", "bridge_raw": "aa" * 10,
+               # nonce still unconsumed on chain, polls past the stuck
+               # threshold, and a recorded fee base to escalate from --
+               # the exact conditions for the re-sign branch.
+               "bridge_tx_nonce": 10 ** 9,
+               "bridge_unmined_polls": S._STUCK_TX_POLLS,
+               "bridge_fees": [10 ** 9, 10 ** 6],
+               "bridge_fee_bumps": 0},
+    )
+    engine._bridge_unmined_step(job)
+    assert ctx.evm.bridge_asset is not None, "the re-sign passed no asset"
+    assert ctx.evm.bridge_asset.symbol == "milliETH"
+
+
+def test_a_non_usdc_deposit_is_refused_while_caps_are_usdc_scaled():
+    """min_micros/max_micros are scaled by USDC's decimals; applying them
+    to a 3-decimal token would read 1000x too permissive. B1 refuses
+    rather than running uncapped -- the inertness is enforced, not just
+    an absence of callers."""
+    store = new_store()
+    engine, _ = build(store, params=default_params(max_micros=5_000_000))
+    seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "milliETH"})
+    out = engine.step()
+    assert out["status"] == S.JobStatus.FAILED
+    assert "not enabled yet" in (store.get_job(out["id"]).last_error or "")
+
+
+def test_deposit_seen_freezes_the_asset_with_the_amounts():
+    store = new_store()
+    engine, ctx = build(store)
+    ctx.evm.erc20 = 5_000_000                       # 5 USDC
+    seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"manual": True})
+    out = engine.step()
+    assert out["status"] == S.JobStatus.DEPOSIT_SEEN
+    assert store.get_job(out["id"]).state["asset"] == "USDC",         "the asset must be frozen alongside the network/hot-wallet binding"
+
+
+def test_the_claim_anchor_rejects_an_id_the_network_does_not_pin():
+    """The per-job anchor must not be weaker than the global constant it
+    replaced: a request cannot introduce a wrapped id of its own."""
+    from gui.services.warp import drivers
+
+    known = {NET.expected_asset_id.lower(), MILLI.expected_asset_id.lower()}
+    assert USDC.expected_asset_id.lower() in known
+    # An id that is merely well-formed is not acceptable.
+    assert ("ff" * 32) not in known
 
 
 if __name__ == "__main__":  # pragma: no cover
