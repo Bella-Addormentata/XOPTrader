@@ -106,11 +106,30 @@ class WarpNet:
     assets: "Tuple[Tuple[str, WarpAsset], ...]" = ()
 
     def asset(self, symbol: str) -> "WarpAsset":
-        """The descriptor for ``symbol``; KeyError on unknown assets."""
+        """The descriptor for ``symbol``; KeyError on unknown assets.
+
+        Matches the table key or the descriptor's own symbol, case
+        -insensitively: a job persists a NAME, and a name should not stop
+        resolving because a constant was re-cased.
+        """
+        want = str(symbol or "").strip().lower()
         for key, spec in self.assets:
-            if key == symbol:
+            if want in (key.lower(), spec.symbol.lower()):
                 return spec
         raise KeyError(f"{self.name} has no bridgeable asset {symbol!r}")
+
+    def asset_by_wrapped_id(self, wrapped_id: str) -> "WarpAsset":
+        """The descriptor for a wrapped-CAT id -- the asset's true identity.
+
+        The TAIL is derived from the token contract and the deployment
+        constants, so it identifies the bridged asset even if the table
+        key or symbol is later renamed. Jobs resolve by this, not by name.
+        """
+        want = str(wrapped_id or "").strip().lower()
+        for _key, spec in self.assets:
+            if spec.expected_asset_id.lower() == want:
+                return spec
+        raise KeyError(f"{self.name} pins no asset with wrapped id {wrapped_id!r}")
 
 
 @dataclass(frozen=True)

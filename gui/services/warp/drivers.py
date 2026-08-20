@@ -833,6 +833,12 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
                 f"asset {key} has an empty erc20_address; an empty address "
                 "would silently derive against the legacy USDC default"
             )
+        if key != spec.symbol:
+            raise WarpDriverError(
+                f"asset table key {key!r} != its descriptor symbol "
+                f"{spec.symbol!r}; the two name the same asset and drift "
+                "between them would make persisted names unresolvable"
+            )
         if int(spec.erc20_decimals) < int(net.cat_decimals):
             raise WarpDriverError(
                 f"asset {key} has {spec.erc20_decimals} decimals, fewer than "

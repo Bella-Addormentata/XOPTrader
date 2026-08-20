@@ -468,24 +468,27 @@ def _advance(
     return _Step(next_status=next_status, columns=columns, state=state, message=message)
 
 
-def _asset_fingerprint(spec) -> str:
-    """The asset TERMS a job is frozen against: contract, precision, TAIL.
+def _asset_fingerprint(spec, cat_decimals: int) -> str:
+    """The asset TERMS a job is frozen against.
 
-    Persisted next to the symbol so a job resumed after a constants change
-    (or against a different build) refuses rather than silently adopting
-    the new meaning of the same name.
+    Contract, BOTH precisions (every conversion is
+    ``10 ** (erc20 - cat)``, so freezing one half would let the ratio move)
+    and the wrapped TAIL. Version-tagged so a future field can be added
+    without stranding jobs written by an older build: an unrecognised
+    version is treated as unfingerprinted rather than as corruption.
     """
-    return (f"{spec.erc20_address.lower()}:{int(spec.erc20_decimals)}:"
-            f"{spec.expected_asset_id.lower()}")
+    return (f"v1:{spec.erc20_address.lower()}:{int(spec.erc20_decimals)}"
+            f":{int(cat_decimals)}:{spec.expected_asset_id.lower()}")
 
 
-def _asset_stamp(spec) -> dict:
+def _asset_stamp(spec, cat_decimals: int) -> dict:
     """The asset fields every new job records: the name AND the terms.
 
-    Stamped together at creation so a job cannot exist in a state where
-    the symbol is present but unverifiable -- see :meth:`_job_asset`.
+    The name is advisory (it makes rows readable); the fingerprint is the
+    identity :meth:`_job_asset` actually resolves against.
     """
-    return {"asset": spec.symbol, "asset_fingerprint": _asset_fingerprint(spec)}
+    return {"asset": spec.symbol,
+            "asset_fingerprint": _asset_fingerprint(spec, cat_decimals)}
 
 
 def _stay(
@@ -860,57 +863,56 @@ class WarpEngine:
     def _job_asset(self, job: WarpJob):
         """The bridgeable asset *job* was created for, from its frozen state.
 
-        Jobs stamp their asset at creation and re-freeze it with the
-        amounts at DEPOSIT_SEEN, so a config edit mid-flight cannot
-        re-point a live job at a different token. (Unlike the network and
-        hot-wallet binding this is not yet policed by _binding_mismatch --
-        it does not need to be while USDC is the only asset a job can be
-        created for; B2 adds that check with the second asset.) Rows written before asset stamping
-        existed carry no symbol and are USDC by definition -- that was the
-        only asset the pipeline could bridge. An unknown symbol is terminal
-        rather than a silent fallback: guessing the token here would size
-        amounts and derive the wrapped TAIL against the wrong asset.
+        Resolution is by the wrapped-CAT id recorded in the job's
+        fingerprint -- the asset's true identity, derived from its token
+        contract, and stable across a rename of the table key or symbol.
+        The persisted symbol is advisory and used only for rows old enough
+        to predate fingerprinting, where USDC was the only asset the
+        pipeline could bridge.
+
+        This refuses rather than guessing in exactly one situation: the
+        job's asset is no longer pinned by this deployment, or its terms
+        no longer match. That is a genuine "stop and fetch an operator"
+        condition. A row with no fingerprint is NOT such a case -- it is
+        simply older than the field, and is resolved by name.
         """
-        stamped = "asset" in job.state
-        if not stamped:
-            symbol = "USDC"          # legacy row: the only asset there was
-        else:
-            symbol = str(job.state.get("asset") or "").strip()
-            if not symbol:
-                # Present but empty is corruption, not history. Defaulting
-                # here would approve and bridge it as USDC.
+        raw = str(job.state.get("asset_fingerprint") or "").strip()
+        parts = raw.split(":") if raw else []
+        if parts and parts[0] == "v1" and len(parts) == 5:
+            _v, addr, erc20_dec, cat_dec, tail = parts
+            try:
+                spec = self._net.asset_by_wrapped_id(tail)
+            except KeyError:
                 raise WarpTerminal(
-                    f"job {job.id} carries an empty asset field; refusing to "
-                    "assume USDC for a row that recorded something else"
+                    f"job {job.id} was frozen against wrapped asset {tail}, "
+                    f"which {self._net.name} no longer pins -- refusing to "
+                    "resume against a different asset than the one its funds "
+                    "moved under"
+                ) from None
+            if (spec.erc20_address.lower() != addr
+                    or int(spec.erc20_decimals) != int(erc20_dec)
+                    or int(self._net.cat_decimals) != int(cat_dec)):
+                raise WarpTerminal(
+                    f"job {job.id} froze {spec.symbol} as {raw}, but this "
+                    f"build resolves that wrapped id to "
+                    f"{_asset_fingerprint(spec, self._net.cat_decimals)} -- "
+                    "the asset's terms changed under a live job"
                 )
+            return spec
+
+        # No fingerprint, or one written by a newer/older format: fall back
+        # to the recorded name. Never terminal for want of a fingerprint --
+        # a job past its bridge cannot be retried, abandoned or cancelled,
+        # so a hard stop here would strand real funds and hold the single
+        # active-job slot for nothing.
+        symbol = str(job.state.get("asset") or "USDC").strip() or "USDC"
         try:
-            spec = self._net.asset(symbol)
+            return self._net.asset(symbol)
         except KeyError:
             raise WarpTerminal(
                 f"job {job.id} names asset {symbol!r}, which {self._net.name} "
                 "does not list as bridgeable -- refusing to guess"
             ) from None
-
-        # The symbol alone is a NAME, not the terms: re-resolving it against
-        # today's constants would silently re-point an in-flight job if an
-        # address, precision or wrapped id ever moved under the same symbol.
-        # Every job that records an asset records its terms too, so a
-        # stamped row without a usable fingerprint is corrupt, not old --
-        # the no-fingerprint path belongs to legacy rows alone.
-        frozen = str(job.state.get("asset_fingerprint") or "").strip()
-        if stamped and not frozen:
-            raise WarpTerminal(
-                f"job {job.id} names asset {symbol} but recorded no "
-                "fingerprint for it; refusing to resolve the name against "
-                "constants it was never checked against"
-            )
-        if frozen and frozen != _asset_fingerprint(spec):
-            raise WarpTerminal(
-                f"job {job.id} froze {symbol} as {frozen}, but this build "
-                f"resolves it to {_asset_fingerprint(spec)} -- the asset's "
-                "terms changed under a live job; refusing to resume"
-            )
-        return spec
 
     def _h_awaiting_deposit(self, job: WarpJob) -> _Step:
         """Watch the hot wallet for a deposit of the JOB's asset; freeze
@@ -986,7 +988,7 @@ class WarpEngine:
             # they were computed from; _binding_mismatch refuses to resume this
             # job under any other key. This is the last state where that is still
             # a free choice -- nothing has been signed yet.
-            state={"tip_bps": tip_bps, **_asset_stamp(spec),
+            state={"tip_bps": tip_bps, **_asset_stamp(spec, self._net.cat_decimals),
                    **self._binding()},
             message=(
                 f"deposit {amount_base} micros seen; bridging {mojo_amount} mojos "
@@ -2940,7 +2942,7 @@ class WarpEngine:
         job = self._store.create_job(
             net.name,
             status=JobStatus.AWAITING_DEPOSIT,
-            state={"auto": True, **_asset_stamp(net.asset("USDC")),
+            state={"auto": True, **_asset_stamp(net.asset("USDC"), net.cat_decimals),
                    **self._binding()},
             event_message="auto-bridge: deposit detected",
         )
@@ -2970,10 +2972,11 @@ class WarpEngine:
         if automatic:
             state: Dict[str, Any] = {
                 "auto": True, "rebalance": True,
-                **_asset_stamp(self._net.asset("USDC")), **self._binding()
+                **_asset_stamp(self._net.asset("USDC"), self._net.cat_decimals), **self._binding()
             }
         else:
-            state = {"manual": True, **_asset_stamp(self._net.asset("USDC")),
+            state = {"manual": True, **_asset_stamp(self._net.asset("USDC"),
+                            self._net.cat_decimals),
                      **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
@@ -3215,7 +3218,7 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
-                **_asset_stamp(self._net.asset("USDC")),
+                **_asset_stamp(self._net.asset("USDC"), self._net.cat_decimals),
                 "manual": not automatic,
                 **({"rebalance": True} if automatic else {}),
                 # Lets _h_unwrap_checks re-derive the still-needed amount
