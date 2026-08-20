@@ -3692,6 +3692,16 @@ class _WarpWorker(QObject):
             hot = getattr(engine, "_hot_cache", None) or {}
             if hot.get("error") or hot.get("eth_wei") is None:
                 return
+            # Settled balances only: the ETH actuators re-check the nonce
+            # gap inside the wallet, but the bridge/unwrap JOB paths do
+            # not -- with a transfer pending, the confirmed cache could
+            # size a bridge against funds already leaving. Not a failure,
+            # so no cooldown: the next tick re-checks.
+            addr = engine._hot_address
+            if int(engine._evm.get_nonce(addr, pending=True)) != int(
+                engine._evm.get_nonce(addr, pending=False)
+            ):
+                return
             action = rb.plan(
                 params=p,
                 eth_wei=int(hot.get("eth_wei") or 0),

@@ -126,6 +126,11 @@ def parse_rebalance_config(
                 f"warp.rebalance.{key} must be a mapping with target and "
                 "tolerance_pct"
             )
+        if isinstance(block.get("target"), bool) or                 isinstance(block.get("tolerance_pct"), bool):
+            raise RebalanceConfigError(
+                f"warp.rebalance.{key} target/tolerance_pct must be numbers, "
+                "not booleans (float(True) would read as 1)"
+            )
         try:
             target = float(block["target"])
             tol = float(block["tolerance_pct"])

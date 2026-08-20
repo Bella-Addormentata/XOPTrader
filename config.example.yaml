@@ -631,7 +631,7 @@ warp:
   # Acts only outside target*(1 +/- tolerance_pct/100), moves back to
   # target, one action per cooldown, only while no warp job is active.
   # The ETH band bottom must clear the relay-gas floor (0.0003 ETH) and
-  # its half-width must exceed twice that floor (gas-churn guard).
+  # its half-width must be at least twice that floor (gas-churn guard).
   # rebalance:
   #   enabled: true
   #   cooldown_s: 600

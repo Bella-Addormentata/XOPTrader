@@ -176,6 +176,10 @@ class FakeEngine:
             "millieth_units": 0, "error": None,
         }
         self._hot_address = "0x" + "ab" * 20
+        self.unmined = 0
+        self._evm = SimpleNamespace(
+            get_nonce=lambda addr, pending=True: 7 + (
+                self.unmined if pending else 0))
         self.calls: list = []
 
     def request_bridge(self, target_micros=None):
@@ -391,6 +395,30 @@ def test_an_unset_unwrap_cap_skips_the_deficit_instead_of_refuse_looping():
     assert _plan(usdc_micros=50_000_000, max_unwrap_micros=-1) is None
     a = _plan(usdc_micros=50_000_000, max_unwrap_micros=0)
     assert a is not None and a.kind == "unwrap_usdc"
+
+
+def test_boolean_band_values_refuse():
+    """YAML true/false must not read as 1/0: usdc: {target: true, ...}
+    would pass as a 1-USDC target and bridge nearly the whole wallet."""
+    with pytest.raises(rb.RebalanceConfigError, match="not booleans"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True,
+                 usdc={"target": True, "tolerance_pct": True}),
+            min_gas_wei=MIN_GAS)
+
+
+def test_unsettled_balances_skip_the_consult_without_cooldown():
+    """The job actuators (bridge/unwrap) never see the wallet's nonce
+    guard, so the worker must skip planning while pending != latest --
+    silently, with no cooldown: the next tick re-checks."""
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng.unmined = 1
+    w._maybe_rebalance(eng)
+    assert eng.calls == [] and w._rebalance_next_ok == 0.0
+    eng.unmined = 0
+    w._maybe_rebalance(eng)
+    assert eng.calls, "settles -> the same consult acts"
 
 
 if __name__ == "__main__":  # pragma: no cover
