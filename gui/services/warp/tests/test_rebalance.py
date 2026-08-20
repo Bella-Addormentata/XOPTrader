@@ -341,5 +341,48 @@ def test_garbage_hot_cache_banners_and_cools_down_before_planning():
     assert eng.calls == []
 
 
+def test_numeric_overflow_and_fractional_cooldowns_fail_closed():
+    for bad in ({"target": 1e308, "tolerance_pct": 20},
+                {"target": 10 ** 400, "tolerance_pct": 20}):
+        with pytest.raises(rb.RebalanceConfigError):
+            rb.parse_rebalance_config(
+                _cfg(enabled=True, eth=bad), min_gas_wei=MIN_GAS)
+    for bad_cd in (60.9, float("inf")):
+        with pytest.raises(rb.RebalanceConfigError):
+            rb.parse_rebalance_config(
+                _cfg(enabled=True, cooldown_s=bad_cd,
+                     usdc={"target": 100, "tolerance_pct": 20}),
+                min_gas_wei=MIN_GAS)
+
+
+def test_eth_bands_narrower_than_the_action_gas_refuse():
+    """Each wrap/unwrap pays gas from ETH, so a band narrower than the
+    action cost would churn: reach target, pay gas, drop below the band,
+    unwrap again, forever."""
+    with pytest.raises(rb.RebalanceConfigError, match="half-width"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True, eth={"target": 0.01, "tolerance_pct": 0.1}),
+            min_gas_wei=MIN_GAS)
+
+
+def test_a_usdc_band_suppresses_the_legacy_auto_bridge():
+    """With auto_bridge on, engine.step() consults maybe_start_auto_job
+    BEFORE the rebalancer -- an untargeted job would bridge the whole
+    balance/cap instead of only the excess above target. The worker marks
+    the engine while a USDC band owns bridging."""
+    from types import SimpleNamespace
+
+    eng = S.WarpEngine.__new__(S.WarpEngine)
+    eng._params = SimpleNamespace(
+        enabled=True, auto_bridge=True, dry_run=False, min_micros=1)
+    eng._net = SimpleNamespace()
+    eng._store = SimpleNamespace(get_active_job=lambda: None)
+    eng._evm = SimpleNamespace(
+        get_erc20_balance=lambda *a, **k: 10 ** 9)
+    eng._hot_address = "0x" + "ab" * 20
+    eng.auto_bridge_suppressed = True
+    assert eng.maybe_start_auto_job() is None,         "suppressed: the band owns bridging"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

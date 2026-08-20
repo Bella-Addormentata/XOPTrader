@@ -2769,6 +2769,12 @@ class WarpEngine:
         p, net = self._params, self._net
         if not (p.enabled and p.auto_bridge):
             return None
+        # A worker-managed USDC target band owns bridging: the legacy
+        # auto-start would race it, opening an UNTARGETED job for any
+        # balance above the minimum and bridging the full balance/cap
+        # instead of only the amount above the target.
+        if getattr(self, "auto_bridge_suppressed", False):
+            return None
         # A dry run cannot spend the balance, and DRY_RUN_OK is a closed state
         # that frees the slot -- so auto-bridging a rehearsal has no fixed point
         # and would open jobs forever. Rehearsal is a manual "Bridge now".
@@ -3578,7 +3584,7 @@ class _WarpWorker(QObject):
         # rebalancer WITH a banner, never a silently-defaulted band.
         try:
             self._rebalance_params = rb.parse_rebalance_config(
-                self._config.get("warp") or {}, min_gas_wei=_MIN_GAS_WEI
+                self._config.get("warp"), min_gas_wei=_MIN_GAS_WEI
             )
             self._rebalance_error = ""
         except rb.RebalanceConfigError as exc:
@@ -3650,6 +3656,10 @@ class _WarpWorker(QObject):
         """
 
         def _run(engine: WarpEngine) -> None:
+            p = self._rebalance_params
+            engine.auto_bridge_suppressed = bool(
+                p.enabled and p.usdc is not None and not self._rebalance_error
+            )
             engine.step()
             engine.refresh_hot_wallet()
             engine.relay_sweep_if_due()

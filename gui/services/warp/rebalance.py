@@ -129,7 +129,7 @@ def parse_rebalance_config(
         try:
             target = float(block["target"])
             tol = float(block["tolerance_pct"])
-        except (KeyError, TypeError, ValueError) as exc:
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise RebalanceConfigError(
                 f"warp.rebalance.{key} requires numeric target and "
                 f"tolerance_pct ({exc})"
@@ -146,7 +146,13 @@ def parse_rebalance_config(
             raise RebalanceConfigError(
                 f"warp.rebalance.{key}.tolerance_pct must be in (0, 100]"
             )
-        scaled = int(target * scale)
+        try:
+            scaled = int(target * scale)
+        except OverflowError:
+            raise RebalanceConfigError(
+                f"warp.rebalance.{key}.target of {target} overflows when "
+                "scaled to base units"
+            ) from None
         if scaled < 1:
             raise RebalanceConfigError(
                 f"warp.rebalance.{key}.target of {target} is below one base "
@@ -162,6 +168,12 @@ def parse_rebalance_config(
             "warp.rebalance.enabled is true but no asset block (usdc/eth) "
             "is configured; state at least one target or disable it"
         )
+    if eth is not None and (eth.target * eth.tolerance_pct / 100.0) <             2 * min_gas_wei:
+        raise RebalanceConfigError(
+            "warp.rebalance.eth band half-width must be at least twice the "
+            f"relay-gas floor ({2 * min_gas_wei} wei): each wrap/unwrap pays "
+            "gas from ETH, and a band narrower than the action cost churns"
+        )
     if eth is not None and eth.low <= min_gas_wei:
         raise RebalanceConfigError(
             f"warp.rebalance.eth band bottom ({eth.low} wei) must stay above "
@@ -170,8 +182,11 @@ def parse_rebalance_config(
         )
     raw_cooldown = raw.get("cooldown_s", 600)
     try:
-        cooldown = int(raw_cooldown)
-    except (TypeError, ValueError):
+        cd_f = float(raw_cooldown)
+        if not (math.isfinite(cd_f) and cd_f == int(cd_f)):
+            raise ValueError("not a finite whole number")
+        cooldown = int(cd_f)
+    except (TypeError, ValueError, OverflowError):
         raise RebalanceConfigError(
             f"warp.rebalance.cooldown_s must be an integer number of seconds "
             f"(got {raw_cooldown!r})"
