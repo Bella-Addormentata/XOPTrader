@@ -152,6 +152,10 @@ class ClaimRequest:
     security_coin: Coin              # bot-funded ephemeral coin, amount == post_tip + claim_fee
     ephemeral_sk: bytes              # 32-byte BLS private key controlling security_coin
     claim_fee: int
+    # The wrapped-CAT id THIS job expects, so the anchor below checks the
+    # asset the job was created for rather than a single global constant.
+    # Empty keeps the legacy behaviour (the network's USDC anchor).
+    expected_asset_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -1066,14 +1070,15 @@ def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
     # Unconditional: defence in depth behind verify_wrapped_asset_anchor(), which
     # already ran at engine construction. This one additionally covers the
     # attested erc20_contract, which the offline anchor cannot see.
-    if not net.expected_asset_id:
+    expected = (req.expected_asset_id or net.expected_asset_id or "").lower()
+    if not expected:
         raise WarpDriverError(
             f"{net.name}.expected_asset_id is empty; refusing to build a claim"
         )
-    if tail_hash.hex() != net.expected_asset_id:
+    if tail_hash.hex() != expected:
         raise WarpDriverError(
             f"derived wrapped-TAIL {tail_hash.hex()} != configured asset id "
-            f"{net.expected_asset_id}"
+            f"{expected}"
         )
     mint_payout_inner = get_cat_mint_and_payout_inner_puzzle(receiver_ph)
     eve_cat_puzzle = construct_cat_puzzle(tail_hash, mint_payout_inner)

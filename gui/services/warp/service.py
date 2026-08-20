@@ -837,13 +837,34 @@ class WarpEngine:
     # State handlers (each: read -> one side effect -> returned _Step).
     # ================================================================== #
 
+    def _job_asset(self, job: WarpJob):
+        """The bridgeable asset *job* was created for, from its frozen state.
+
+        Jobs stamp their asset at creation, exactly like the network and
+        hot-wallet binding, so a config edit mid-flight cannot re-point a
+        live job at a different token. Rows written before asset stamping
+        existed carry no symbol and are USDC by definition -- that was the
+        only asset the pipeline could bridge. An unknown symbol is terminal
+        rather than a silent fallback: guessing the token here would size
+        amounts and derive the wrapped TAIL against the wrong asset.
+        """
+        symbol = str(job.state.get("asset") or "USDC")
+        try:
+            return self._net.asset(symbol)
+        except KeyError:
+            raise WarpTerminal(
+                f"job {job.id} names asset {symbol!r}, which {self._net.name} "
+                "does not list as bridgeable -- refusing to guess"
+            ) from None
+
     def _h_awaiting_deposit(self, job: WarpJob) -> _Step:
         """Watch the hot wallet for a USDC deposit; freeze amounts on arrival."""
         from . import evm
 
         net, p = self._net, self._params
+        spec = self._job_asset(job)
 
-        have = self._evm.get_erc20_balance(net.usdc_address, self._hot_address)
+        have = self._evm.get_erc20_balance(spec.erc20_address, self._hot_address)
         target = job.state.get("target_micros")
         want = min(int(target), have) if target else have
 
@@ -860,7 +881,8 @@ class WarpEngine:
         # treated as automatic, i.e. the conservative side.
         manual = bool(job.state.get("manual"))
         if want <= 0:
-            raise WarpPending(f"awaiting a USDC deposit (have {have})")
+            raise WarpPending(
+                f"awaiting a {spec.symbol} deposit (have {have})")
         if not manual and p.min_micros > 0 and want < p.min_micros:
             raise WarpPending(
                 f"awaiting auto-bridge deposit >= {p.min_micros} micros (have {have})"
@@ -870,10 +892,10 @@ class WarpEngine:
         if eth < _MIN_GAS_WEI:
             raise WarpRetryable(f"insufficient ETH for gas: {eth} < {_MIN_GAS_WEI} wei")
 
-        mojo_amount = evm.bridgeable_mojo(want, net)
+        mojo_amount = evm.bridgeable_mojo(want, net, spec)
         if mojo_amount <= 0:
             raise WarpPending("deposit below one bridgeable mojo")
-        amount_base = evm.mojo_to_base_units(mojo_amount, net)
+        amount_base = evm.mojo_to_base_units(mojo_amount, net, spec)
         tip_bps = self._evm.get_tip_bps()
         post_tip = evm.post_tip_amount(mojo_amount, tip_bps)
         address, receiver_ph = self._resolve_receiver()
@@ -921,8 +943,9 @@ class WarpEngine:
         """Ensure the bridge allowance (skip if sufficient); two-phase approve."""
         from . import evm
 
+        spec = self._job_asset(job)
         needed = int(job.amount_usdc_micros or 0)
-        allowance = self._evm.get_bridge_allowance(self._hot_address)
+        allowance = self._evm.get_bridge_allowance(self._hot_address, asset=spec)
         if allowance >= needed:
             return _advance(
                 JobStatus.BRIDGING,
@@ -933,7 +956,7 @@ class WarpEngine:
         raw = job.state.get("approve_raw")
         if not raw:  # phase 1: sign + persist, no broadcast
             unsigned = self._evm.prepare_approve(
-                owner=self._hot_address, amount_base_units=needed
+                owner=self._hot_address, amount_base_units=needed, asset=spec
             )
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
@@ -997,12 +1020,14 @@ class WarpEngine:
         from . import evm
 
         net = self._net
+        spec = self._job_asset(job)
         raw = job.state.get("bridge_raw")
         if not raw:  # phase 1: sign at a live toll/nonce + persist, no broadcast
             unsigned = self._evm.prepare_bridge(
                 owner=self._hot_address,
                 receiver_ph=bytes.fromhex(job.receiver_ph),
                 mojo_amount=int(job.amount_mojos),
+                asset=spec,
             )
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
@@ -1124,10 +1149,11 @@ class WarpEngine:
             raise WarpTerminal(
                 f"attested amount {msg.amount_mojos} != post-tip {job.post_tip_mojos}"
             )
-        if _word(msg.erc20_source) != _word(net.usdc_address):
+        spec = self._job_asset(job)
+        if _word(msg.erc20_source) != _word(spec.erc20_address):
             raise WarpTerminal(
-                f"attested source token {_hx(msg.erc20_source)} != configured "
-                f"USDC {_hx(net.usdc_address)}"
+                f"attested source token {_hx(msg.erc20_source)} != this job's "
+                f"{spec.symbol} {_hx(spec.erc20_address)}"
             )
 
         # Persist-then-act: generate the ephemeral security key locally; it lands
@@ -1402,6 +1428,10 @@ class WarpEngine:
             security_coin=coin,
             ephemeral_sk=sk,
             claim_fee=claim_fee,
+            # Anchor the claim against the asset THIS job bridged, not a
+            # single global constant: the TAIL derived from the attested
+            # token must match the job's own expected wrapped id.
+            expected_asset_id=self._job_asset(job).expected_asset_id,
         )
         final_id = push.claim.final_cat_coin_id.hex()
         if push.accepted:
@@ -2837,7 +2867,7 @@ class WarpEngine:
         job = self._store.create_job(
             net.name,
             status=JobStatus.AWAITING_DEPOSIT,
-            state={"auto": True, **self._binding()},
+            state={"auto": True, "asset": "USDC", **self._binding()},
             event_message="auto-bridge: deposit detected",
         )
         return _job_dict(job)
@@ -2865,10 +2895,11 @@ class WarpEngine:
         # bridge a sub-floor amount if the balance dropped after the consult.
         if automatic:
             state: Dict[str, Any] = {
-                "auto": True, "rebalance": True, **self._binding()
+                "auto": True, "rebalance": True, "asset": "USDC",
+                **self._binding()
             }
         else:
-            state = {"manual": True, **self._binding()}
+            state = {"manual": True, "asset": "USDC", **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
         job = self._store.create_job(
@@ -3110,6 +3141,7 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
+                "asset": "USDC",
                 "manual": not automatic,
                 **({"rebalance": True} if automatic else {}),
                 # Lets _h_unwrap_checks re-derive the still-needed amount

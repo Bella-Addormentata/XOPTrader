@@ -105,20 +105,24 @@ class FakeEvm:
     def get_tip_bps(self):
         return self.tip_bps
 
-    def get_bridge_allowance(self, owner):
+    def get_bridge_allowance(self, owner, asset=None):
+        self.allowance_asset = asset
         return self.allowance
 
-    def prepare_approve(self, *, owner, amount_base_units):
+    def prepare_approve(self, *, owner, amount_base_units, asset=None):
         self.prepared.append(("approve", amount_base_units))
+        self.approve_asset = asset
         return {"kind": "approve", "amount": amount_base_units}
 
-    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None, fees=None):
+    def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None,
+                       fees=None, asset=None):
         # Mirrors the real UnsignedTx closely enough for the fee-escalation
         # path, which reads the fee legs back off the unsigned transaction.
         # nonce/fees are recorded so tests can assert a replacement pinned the
         # nonce and escalated the fee -- discarding them made the escalation
         # test unable to fail against a replacement signed at a fresh nonce.
         self.prepared.append(("bridge", mojo_amount, nonce, fees))
+        self.bridge_asset = asset
         return SimpleNamespace(
             kind="bridge",
             mojo=mojo_amount,

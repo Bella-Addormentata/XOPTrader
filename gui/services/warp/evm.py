@@ -32,7 +32,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
-from .constants import WarpNet
+from .constants import WarpAsset, WarpNet
 
 # (method, params) -> JSON-RPC ``result`` (envelope already unwrapped).
 Caller = Callable[[str, list], Any]
@@ -442,23 +442,38 @@ def is_infrastructure_error(exc: BaseException) -> bool:
 # Amount conversions (USDC 6-dec base units <-> CAT 3-dec mojos).
 # --------------------------------------------------------------------------- #
 
-def _mojo_factor(net: WarpNet) -> int:
-    return 10 ** (net.usdc_decimals - net.cat_decimals)
+def _asset_decimals(net: WarpNet, asset: Optional["WarpAsset"]) -> int:
+    return asset.erc20_decimals if asset is not None else net.usdc_decimals
 
 
-def mojo_to_base_units(mojo: int, net: WarpNet) -> int:
+def _mojo_factor(net: WarpNet, asset: Optional["WarpAsset"] = None) -> int:
+    """ERC20 base units per wrapped-CAT mojo for *asset* (default: USDC).
+
+    USDC is 6-decimal against 3-decimal CATs, so the factor is 1000;
+    milliETH is itself 3-decimal, so its factor is 1. Passing the asset
+    DESCRIPTOR rather than a bare address keeps the scale welded to the
+    token -- mixing one asset's address with another's decimals would
+    mis-size a bridge by three orders of magnitude.
+    """
+    return 10 ** (_asset_decimals(net, asset) - net.cat_decimals)
+
+
+def mojo_to_base_units(mojo: int, net: WarpNet,
+                       asset: Optional["WarpAsset"] = None) -> int:
     """CAT mojos -> ERC20 base units pulled by ``bridgeToChia`` (mojo * factor)."""
-    return int(mojo) * _mojo_factor(net)
+    return int(mojo) * _mojo_factor(net, asset)
 
 
-def base_units_to_mojo(base_units: int, net: WarpNet) -> int:
+def base_units_to_mojo(base_units: int, net: WarpNet,
+                       asset: Optional["WarpAsset"] = None) -> int:
     """ERC20 base units -> CAT mojos (floor; sub-mojo dust is unbridgeable)."""
-    return int(base_units) // _mojo_factor(net)
+    return int(base_units) // _mojo_factor(net, asset)
 
 
-def bridgeable_mojo(base_units: int, net: WarpNet) -> int:
-    """Largest whole CAT mojo amount fundable by ``base_units`` of USDC."""
-    return base_units_to_mojo(base_units, net)
+def bridgeable_mojo(base_units: int, net: WarpNet,
+                    asset: Optional["WarpAsset"] = None) -> int:
+    """Largest whole CAT mojo amount fundable by ``base_units`` of the asset."""
+    return base_units_to_mojo(base_units, net, asset)
 
 
 def post_tip_amount(mojo: int, tip_bps: int) -> int:
@@ -647,13 +662,14 @@ def build_approve_tx(
     fees: EIP1559Fees,
     gas: int,
     spender: Optional[str] = None,
+    asset: Optional["WarpAsset"] = None,
 ) -> UnsignedTx:
-    """Sign-ready ``approve(bridge, amount)`` on the USDC token contract."""
+    """Sign-ready ``approve(bridge, amount)`` on the asset's token contract."""
     data = encode_approve(spender or net.erc20_bridge_address, amount_base_units)
     return UnsignedTx(
         chain_id=net.evm_chain_id,
         nonce=int(nonce),
-        to=_addr_bytes(net.usdc_address),
+        to=_addr_bytes(asset.erc20_address if asset else net.usdc_address),
         value=0,
         data=data,
         gas=int(gas),
@@ -671,10 +687,12 @@ def build_bridge_tx(
     nonce: int,
     fees: EIP1559Fees,
     gas: int,
-    asset: Optional[str] = None,
+    asset: Optional["WarpAsset"] = None,
 ) -> UnsignedTx:
     """Sign-ready ``bridgeToChia`` on the ERC20Bridge; ``value`` is the exact toll."""
-    data = encode_bridge_to_chia(asset or net.usdc_address, receiver_ph, mojo_amount)
+    data = encode_bridge_to_chia(
+        asset.erc20_address if asset else net.usdc_address,
+        receiver_ph, mojo_amount)
     return UnsignedTx(
         chain_id=net.evm_chain_id,
         nonce=int(nonce),
@@ -819,8 +837,10 @@ class EvmClient:
         usdc = self.get_erc20_balance(self._net.usdc_address, owner) if self._net.usdc_address else 0
         return EvmBalances(eth_wei=self.get_eth_balance(owner), usdc_units=usdc)
 
-    def get_bridge_allowance(self, owner: str) -> int:
-        return self.get_allowance(self._net.usdc_address, owner, self._net.erc20_bridge_address)
+    def get_bridge_allowance(self, owner: str,
+                             asset: Optional["WarpAsset"] = None) -> int:
+        token = asset.erc20_address if asset else self._net.usdc_address
+        return self.get_allowance(token, owner, self._net.erc20_bridge_address)
 
     # -- live protocol parameters ------------------------------------------- #
 
@@ -950,17 +970,21 @@ class EvmClient:
 
     # -- high-level tx preparation ------------------------------------------ #
 
-    def prepare_approve(self, *, owner: str, amount_base_units: int, gas: Optional[int] = None) -> UnsignedTx:
+    def prepare_approve(self, *, owner: str, amount_base_units: int,
+                        gas: Optional[int] = None,
+                        asset: Optional["WarpAsset"] = None) -> UnsignedTx:
         nonce = self.get_nonce(owner)
         fees = self.get_fee_data()
+        token = asset.erc20_address if asset else self._net.usdc_address
         if gas is None:
             data = encode_approve(self._net.erc20_bridge_address, amount_base_units)
             gas = self.estimate_gas(
-                from_address=owner, to=self._net.usdc_address, value=0, data=data,
+                from_address=owner, to=token, value=0, data=data,
                 default=_APPROVE_GAS_DEFAULT,
             )
         return build_approve_tx(
-            self._net, amount_base_units=amount_base_units, nonce=nonce, fees=fees, gas=gas
+            self._net, amount_base_units=amount_base_units, nonce=nonce,
+            fees=fees, gas=gas, asset=asset,
         )
 
     def prepare_relay(
@@ -1006,6 +1030,7 @@ class EvmClient:
         toll_wei: Optional[int] = None,
         nonce: Optional[int] = None,
         fees: Optional[EIP1559Fees] = None,
+        asset: Optional["WarpAsset"] = None,
     ) -> UnsignedTx:
         """Build an unsigned bridgeToChia.
 
@@ -1019,14 +1044,18 @@ class EvmClient:
         if fees is None:
             fees = self.get_fee_data()
         if gas is None:
-            data = encode_bridge_to_chia(self._net.usdc_address, receiver_ph, mojo_amount)
+            # The SAME asset feeds the gas estimate and the built tx; a
+            # mismatch would estimate one token and bridge another.
+            data = encode_bridge_to_chia(
+                asset.erc20_address if asset else self._net.usdc_address,
+                receiver_ph, mojo_amount)
             gas = self.estimate_gas(
                 from_address=owner, to=self._net.erc20_bridge_address, value=toll, data=data,
                 default=_BRIDGE_GAS_DEFAULT,
             )
         return build_bridge_tx(
             self._net, receiver_ph=receiver_ph, mojo_amount=mojo_amount, toll_wei=toll,
-            nonce=nonce, fees=fees, gas=gas,
+            nonce=nonce, fees=fees, gas=gas, asset=asset,
         )
 
     # -- broadcast / receipts ------------------------------------------------ #
