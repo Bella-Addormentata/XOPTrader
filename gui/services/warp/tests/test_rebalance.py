@@ -462,5 +462,32 @@ def test_auto_unwrap_clamps_to_spendable_and_skips_when_empty():
     assert "no spendable" in w2._rebalance_last
 
 
+def test_usdc_half_width_must_absorb_one_mojo():
+    """target 0.002 / tol 20% gives a 400-micro half-width: breachable by
+    a sub-mojo amount no action can move -- permanently breached, silently
+    planning nothing. Refused at parse; a 1%-of-100-USDC band passes."""
+    with pytest.raises(rb.RebalanceConfigError, match="one"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True, usdc={"target": 0.002, "tolerance_pct": 20}),
+            min_gas_wei=MIN_GAS)
+    p = rb.parse_rebalance_config(
+        _cfg(enabled=True, usdc={"target": 100, "tolerance_pct": 1}),
+        min_gas_wei=MIN_GAS)
+    assert p.usdc.target == 100_000_000
+
+
+def test_malformed_warp_block_still_emits_the_banner_snapshot(tmp_path):
+    """A warp: list used to raise inside _config_enabled() on the snapshot
+    path, so the very banner reporting the malformation was never emitted."""
+    worker = S._WarpWorker(secrets_path=tmp_path / "secrets.yaml")
+    snaps: list = []
+    worker.snapshot_ready.connect(snaps.append)
+    worker.set_config({"warp": ["not", "a", "mapping"]})
+    worker.tick()
+    assert snaps, "the snapshot must still be emitted"
+    reb = snaps[-1].get("rebalance") or {}
+    assert reb.get("error"), "the parse failure must reach the banner"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

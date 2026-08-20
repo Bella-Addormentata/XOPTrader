@@ -178,6 +178,15 @@ def parse_rebalance_config(
             "band must absorb the bridge's unwrap tip, 0.3% today, or a "
             "deficit action can never land inside it)"
         )
+    # And the half-width must absorb one wUSDC.b mojo (1000 micros), the
+    # action granularity: a narrower band can be breached by a sub-mojo
+    # amount that no bridge or unwrap can move -- permanently breached,
+    # silently planning nothing.
+    if usdc is not None and (usdc.target * usdc.tolerance_pct / 100.0) < 1000:
+        raise RebalanceConfigError(
+            "warp.rebalance.usdc band half-width must be at least one "
+            "wUSDC.b mojo (0.001 USDC)"
+        )
     eth = band("eth", 10 ** 18)
     if usdc is None and eth is None:
         raise RebalanceConfigError(

@@ -3865,6 +3865,11 @@ class _WarpWorker(QObject):
     def _config_enabled(self) -> bool:
         """Whether ``warp.enabled`` is set, independent of whether it started."""
         warp = (self._config or {}).get("warp") or {}
+        # A malformed warp block (list/string) must read as disabled, not
+        # raise: this runs inside the snapshot path, and an exception here
+        # would swallow the very banner that reports the malformation.
+        if not isinstance(warp, dict):
+            return False
         return bool(warp.get("enabled", False))
 
     def _ensure_engine(self) -> Optional[WarpEngine]:

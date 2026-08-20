@@ -632,6 +632,8 @@ warp:
   # target, one action per cooldown, only while no warp job is active.
   # The ETH band bottom must clear the relay-gas floor (0.0003 ETH) and
   # its half-width must be at least twice that floor (gas-churn guard).
+  # USDC tolerance_pct must be at least 1 (the band must absorb the
+  # 0.3% unwrap tip) and the half-width at least 0.001 USDC (one mojo).
   # rebalance:
   #   enabled: true
   #   cooldown_s: 600
