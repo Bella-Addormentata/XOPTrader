@@ -575,7 +575,10 @@ class WarpWidget(QWidget):
         else:
             colour = PROFIT_GREEN
             network = snap.get("network") or "mainnet"
-            auto = "on" if snap.get("auto_bridge") else "off"
+            if (snap.get("rebalance") or {}).get("owns_bridging"):
+                auto = "managed by the target-band rebalancer"
+            else:
+                auto = "on" if snap.get("auto_bridge") else "off"
             text = (
                 f"Bridge <b>active</b> on {network}. Automatic bridging of "
                 f"detected deposits is <b>{auto}</b>."

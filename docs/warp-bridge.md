@@ -630,6 +630,19 @@ What bounds it:
   own hot address, read from the engine; a deficit is clamped to spendable
   wUSDC.b (skipped when there is none) and grossed up by the immutable 30 bps
   tip so the credited amount actually reaches the target.
+* **It owns automatic bridging.** While the rebalancer is enabled (or its
+  config failed to parse), `warp.auto_bridge` stands down -- otherwise the
+  legacy auto-start, which runs earlier in the tick, could open an untargeted
+  full-balance job, and with ETH under the gas floor that job would pend on
+  the single slot while the milliETH refuel that would have fixed the gas
+  never ran. Configure a `usdc` band to keep automatic bridging; with an
+  ETH-only band, USDC moves only on an operator's **Bridge now**. The Warp
+  banner says "managed by the target-band rebalancer" so the state is visible.
+* **A pending automatic unwrap re-checks itself.** Inbound deposits do not
+  touch this wallet's nonce, so one can land while an unwrap job waits at the
+  gate; the job re-derives the still-needed amount immediately before the
+  commit point and trims -- or cancels cleanly -- rather than overshooting the
+  target and paying to bridge the excess back.
 * **Same caps as manual actions** (`max_auto_bridge_usdc`, `max_unwrap_usdc`,
   the auto-bridge dust floor), and automatic jobs are recorded with
   `rebalance` provenance rather than as operator clicks.

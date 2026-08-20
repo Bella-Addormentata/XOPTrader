@@ -66,8 +66,9 @@ class FakeEngine:
         self.calls.append(("bridge", target_micros, automatic))
 
     def request_unwrap(self, mojos, receiver, external_relay=False,
-                       *, automatic=False):
+                       *, automatic=False, rebalance_target_micros=0):
         self.calls.append(("unwrap", mojos, receiver, automatic))
+        self.unwrap_target = rebalance_target_micros
 
 
 def _worker_with(params):
@@ -438,6 +439,80 @@ def test_a_malformed_band_does_not_fall_back_to_legacy_auto_bridge(
                                 "jobs_db": str(tmp_path / "warp_jobs.db")}})
     assert worker._rebalance_error == ""
     assert worker._legacy_auto_bridge_suppressed() is False
+
+
+def test_an_eth_only_band_also_suppresses_the_legacy_auto_bridge():
+    """step() runs before the consult, so a legacy USDC job could open
+    first; with ETH under the bridge gas floor it pends forever holding
+    the single slot and the milliETH refuel never runs -- a deadlock only
+    an operator could clear. An enabled rebalancer owns bridging outright."""
+    w = _worker_with(rb.RebalanceParams(
+        enabled=True, eth=rb.AssetBand(target=10 ** 16, tolerance_pct=20)))
+    assert w._legacy_auto_bridge_suppressed() is True
+    assert _worker_with(rb.RebalanceParams())._legacy_auto_bridge_suppressed()         is False
+
+
+def test_an_automatic_unwrap_carries_its_target_for_the_gate_recheck():
+    from types import SimpleNamespace
+
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache["usdc_micros"] = 10_000_000
+    eng._resolve_cat_wallet_id = lambda: 7
+    eng._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 10 ** 9})
+    w._maybe_rebalance(eng)
+    assert eng.unwrap_target == PARAMS.usdc.target
+
+
+def _trim_engine(held_micros):
+    from types import SimpleNamespace
+    from gui.services.warp import constants as C
+
+    eng = S.WarpEngine.__new__(S.WarpEngine)
+    eng._net = C.MAINNET
+    eng._hot_address = "0x" + "cd" * 20
+    eng._evm = SimpleNamespace(
+        get_erc20_balance=lambda token, addr: held_micros)
+    return eng
+
+
+def test_a_gate_recheck_cancels_a_rebalance_unwrap_the_deposit_made_moot():
+    """Inbound deposits do not bump our nonce, so the settled-wallet guard
+    cannot see them: the deficit must be re-derived at the gate, while
+    CANCELLED still frees the slot cleanly (pre-commit)."""
+    from types import SimpleNamespace
+
+    job = SimpleNamespace(
+        amount_mojos=50_000,
+        state={"receiver_evm": "ab" * 20,
+               "rebalance_target_micros": 100_000_000})
+    step, amount = _trim_engine(120_000_000)._rebalance_unwrap_trim(job, 50_000)
+    assert step is not None and step.next_status == S.JobStatus.CANCELLED
+    assert "no longer needed" in step.message
+
+
+def test_a_gate_recheck_trims_a_partially_covered_rebalance_unwrap():
+    from types import SimpleNamespace
+
+    job = SimpleNamespace(
+        amount_mojos=90_270,
+        state={"receiver_evm": "ab" * 20,
+               "rebalance_target_micros": 100_000_000})
+    # 60 USDC arrived: 40 USDC still short, grossed up by the 30 bps tip.
+    step, amount = _trim_engine(60_000_000)._rebalance_unwrap_trim(job, 90_270)
+    assert step is None
+    assert amount == 40_120, "ceil(40e6 / 0.9970) // 1000"
+    assert amount < 90_270
+
+
+def test_a_manual_unwrap_is_never_trimmed():
+    from types import SimpleNamespace
+
+    job = SimpleNamespace(amount_mojos=50_000,
+                          state={"receiver_evm": "ab" * 20, "manual": True})
+    step, amount = _trim_engine(0)._rebalance_unwrap_trim(job, 50_000)
+    assert step is None and amount == 50_000
 
 
 if __name__ == "__main__":  # pragma: no cover
