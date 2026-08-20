@@ -247,5 +247,99 @@ def test_a_failing_actuator_banners_and_cools_down_instead_of_raising():
     assert w._rebalance_next_ok > 0, "failure still starts the cooldown"
 
 
+def test_malformed_shapes_and_quoted_booleans_fail_closed():
+    """Falsey-but-present blocks, quoted booleans, bad cooldowns and
+    sub-unit targets must all raise (-> banner), never silently default."""
+    for warp_cfg in ([], "warp", 0):
+        with pytest.raises(rb.RebalanceConfigError):
+            rb.parse_rebalance_config(warp_cfg, min_gas_wei=MIN_GAS)
+    for bad_block in ([], "", 0):
+        with pytest.raises(rb.RebalanceConfigError):
+            rb.parse_rebalance_config(
+                {"rebalance": bad_block}, min_gas_wei=MIN_GAS)
+    # YAML-quoted "false" stays FALSE; junk refuses.
+    p = rb.parse_rebalance_config(
+        _cfg(enabled="false", usdc={"target": 100, "tolerance_pct": 20}),
+        min_gas_wei=MIN_GAS)
+    assert p.enabled is False
+    with pytest.raises(rb.RebalanceConfigError, match="boolean"):
+        rb.parse_rebalance_config(_cfg(enabled="junk"), min_gas_wei=MIN_GAS)
+    for bad_cd in (0, "ten", None):
+        with pytest.raises(rb.RebalanceConfigError):
+            rb.parse_rebalance_config(
+                _cfg(enabled=True, cooldown_s=bad_cd,
+                     usdc={"target": 100, "tolerance_pct": 20}),
+                min_gas_wei=MIN_GAS)
+    with pytest.raises(rb.RebalanceConfigError, match="below one base unit"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True,
+                 usdc={"target": 0.0000001, "tolerance_pct": 20}),
+            min_gas_wei=MIN_GAS)
+    with pytest.raises(rb.RebalanceConfigError, match="finite"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True,
+                 usdc={"target": float("inf"), "tolerance_pct": 20}),
+            min_gas_wei=MIN_GAS)
+
+
+def test_sub_mojo_bridge_excess_plans_nothing():
+    """1-999 micros of excess is below one CAT mojo: a job for it would
+    pend forever on 'deposit below one bridgeable mojo', squatting the
+    single active-job slot. Reachable only with a tiny band (0.002 USDC
+    target here), which the parser allows."""
+    tiny = rb.RebalanceParams(
+        enabled=True, usdc=rb.AssetBand(target=2_000, tolerance_pct=20))
+    assert _plan(params=tiny, usdc_micros=2_500,
+                 min_bridge_micros=0) is None
+    a = _plan(params=tiny, usdc_micros=5_000, min_bridge_micros=0)
+    assert a is not None and a.amount == 3_000, "a full mojo still bridges"
+
+
+class FakeWallet:
+    def __init__(self):
+        self.calls: list = []
+
+    def wrap_eth(self, amount_wei, *, reserve_wei=0):
+        self.calls.append(("wrap_eth", amount_wei, reserve_wei))
+        return "0x" + "aa" * 32
+
+    def unwrap_millieth(self, amount_units):
+        self.calls.append(("unwrap_millieth", amount_units))
+        return "0x" + "bb" * 32
+
+
+def test_worker_drives_the_eth_actuators_with_the_relay_gas_reserve():
+    w = _worker_with(PARAMS)
+    wallet = FakeWallet()
+    w._base_wallet = lambda: wallet
+    eng = FakeEngine()
+    eng._hot_cache["eth_wei"] = 3 * 10 ** 16       # above the band
+    w._maybe_rebalance(eng)
+    assert wallet.calls == [("wrap_eth", 2 * 10 ** 16, S._MIN_GAS_WEI)], (
+        "the wrap must carry the relay-gas reserve")
+    assert eng.calls == []
+
+    w2 = _worker_with(PARAMS)
+    wallet2 = FakeWallet()
+    w2._base_wallet = lambda: wallet2
+    eng2 = FakeEngine()
+    eng2._hot_cache["eth_wei"] = 10 ** 15          # below the band
+    eng2._hot_cache["millieth_units"] = 100
+    w2._maybe_rebalance(eng2)
+    assert wallet2.calls == [("unwrap_millieth", 100)]
+
+
+def test_garbage_hot_cache_banners_and_cools_down_before_planning():
+    """An exception BEFORE the plan (unparseable balance) must still start
+    the cooldown -- a broken consult may not retry and log every tick."""
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache["eth_wei"] = "garbage"
+    w._maybe_rebalance(eng)                        # must not raise
+    assert "rebalance failed" in w._rebalance_last
+    assert w._rebalance_next_ok > 0
+    assert eng.calls == []
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

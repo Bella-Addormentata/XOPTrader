@@ -3710,6 +3710,10 @@ class _WarpWorker(QObject):
                 self._base_wallet().unwrap_millieth(action.amount)
             self._rebalance_last = action.reason
         except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
+            # Cooldown on ANY failure, including before the plan (e.g.
+            # garbage in the hot cache): a broken consult must not retry
+            # and log every tick.
+            self._rebalance_next_ok = time.monotonic() + p.cooldown_s
             self._rebalance_last = f"rebalance failed: {exc}"
             _log.warning("rebalance action failed: %s", exc)
 

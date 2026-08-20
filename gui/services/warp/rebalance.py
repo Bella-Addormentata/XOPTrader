@@ -32,6 +32,7 @@ Design rules, in the codebase's established shapes:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -85,10 +86,34 @@ def parse_rebalance_config(
     malformed asset block -> :class:`RebalanceConfigError`, never a silent
     default: an unbounded or mis-scaled band moves real money.
     """
-    raw = warp_cfg.get("rebalance") or {}
+    if warp_cfg is None:
+        return RebalanceParams()
+    if not isinstance(warp_cfg, dict):
+        raise RebalanceConfigError("the warp config block must be a mapping")
+    raw = warp_cfg.get("rebalance")
+    if raw is None:
+        return RebalanceParams()
+    # A present-but-falsey block ([], "", 0) is malformed, not absent --
+    # it must banner, not silently disable.
     if not isinstance(raw, dict):
         raise RebalanceConfigError("warp.rebalance must be a mapping")
-    enabled = bool(raw.get("enabled", False))
+    # Strict boolean, same rule as _parse_config_bool: a YAML-quoted
+    # "false" is a non-empty string and bool() would fail OPEN into
+    # money-moving behaviour.
+    raw_enabled = raw.get("enabled", False)
+    if isinstance(raw_enabled, bool):
+        enabled = raw_enabled
+    elif isinstance(raw_enabled, int) and raw_enabled in (0, 1):
+        enabled = bool(raw_enabled)
+    elif (isinstance(raw_enabled, str)
+          and raw_enabled.strip().lower() in ("true", "false", "")):
+        enabled = raw_enabled.strip().lower() == "true"
+    elif raw_enabled is None:
+        enabled = False
+    else:
+        raise RebalanceConfigError(
+            f"warp.rebalance.enabled must be a boolean (got {raw_enabled!r})"
+        )
     if not enabled:
         return RebalanceParams()
 
@@ -109,6 +134,10 @@ def parse_rebalance_config(
                 f"warp.rebalance.{key} requires numeric target and "
                 f"tolerance_pct ({exc})"
             ) from None
+        if not (math.isfinite(target) and math.isfinite(tol)):
+            raise RebalanceConfigError(
+                f"warp.rebalance.{key} target/tolerance_pct must be finite"
+            )
         if target <= 0:
             raise RebalanceConfigError(
                 f"warp.rebalance.{key}.target must be positive"
@@ -117,7 +146,14 @@ def parse_rebalance_config(
             raise RebalanceConfigError(
                 f"warp.rebalance.{key}.tolerance_pct must be in (0, 100]"
             )
-        return AssetBand(target=int(target * scale), tolerance_pct=tol)
+        scaled = int(target * scale)
+        if scaled < 1:
+            raise RebalanceConfigError(
+                f"warp.rebalance.{key}.target of {target} is below one base "
+                "unit after scaling; a zero-unit band would rebalance the "
+                "whole balance to zero"
+            )
+        return AssetBand(target=scaled, tolerance_pct=tol)
 
     usdc = band("usdc", 10 ** 6)
     eth = band("eth", 10 ** 18)
@@ -132,7 +168,14 @@ def parse_rebalance_config(
             f"the relay-gas floor ({min_gas_wei} wei): the ETH target doubles "
             "as the gas reserve"
         )
-    cooldown = int(raw.get("cooldown_s", 600) or 600)
+    raw_cooldown = raw.get("cooldown_s", 600)
+    try:
+        cooldown = int(raw_cooldown)
+    except (TypeError, ValueError):
+        raise RebalanceConfigError(
+            f"warp.rebalance.cooldown_s must be an integer number of seconds "
+            f"(got {raw_cooldown!r})"
+        ) from None
     if cooldown < 60:
         raise RebalanceConfigError(
             "warp.rebalance.cooldown_s must be at least 60 seconds"
@@ -209,7 +252,10 @@ def plan(
         excess = usdc_micros - params.usdc.target
         if max_bridge_micros > 0:
             excess = min(excess, max_bridge_micros)
-        if excess >= max(min_bridge_micros, 1):
+        # The protocol floor is one CAT mojo (1000 micros), not one micro:
+        # a sub-mojo job would sit pending forever, squatting the single
+        # active-job slot.
+        if excess >= max(min_bridge_micros, _USDC_MICROS_PER_MOJO):
             return RebalanceAction(
                 "bridge_usdc", int(excess),
                 f"USDC {usdc_micros} above band {params.usdc.high}; bridging "
