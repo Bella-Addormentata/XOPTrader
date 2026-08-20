@@ -401,7 +401,3 @@ def test_worker_passes_automatic_to_both_job_actuators():
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(pytest.main([__file__, "-v"]))

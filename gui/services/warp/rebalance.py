@@ -171,7 +171,24 @@ def parse_rebalance_config(
             )
         return AssetBand(target=scaled, tolerance_pct=tol)
 
-    usdc = band("usdc", 10 ** 6)
+    usdc_band = band("usdc", 10 ** 6)
+    eth_band = band("eth", 10 ** 18)
+    for key, spec in (("usdc", usdc_band), ("eth", eth_band)):
+        if spec is None:
+            continue
+        try:
+            # Evaluating both bounds here is the whole check: a target that
+            # scales finite can still make target*(1 +/- tol) overflow, and
+            # that would raise on every planner consult rather than failing
+            # the config.
+            int(spec.low), int(spec.high)
+        except (OverflowError, ValueError):
+            raise RebalanceConfigError(
+                f"warp.rebalance.{key} band bounds overflow; state a target "
+                "in a sane range"
+            ) from None
+
+    usdc = usdc_band
     # The unwrap receiver gets the POST-TIP amount: ERC20Bridge.tip() is
     # 30 bps, immutable on the deployed contract (unlike the Portal's
     # owner-mutable message toll), so a band tighter than the tip stays
@@ -193,7 +210,7 @@ def parse_rebalance_config(
             "warp.rebalance.usdc band half-width must be at least one "
             "wUSDC.b mojo (0.001 USDC)"
         )
-    eth = band("eth", 10 ** 18)
+    eth = eth_band
     if usdc is None and eth is None:
         raise RebalanceConfigError(
             "warp.rebalance.enabled is true but no asset block (usdc/eth) "

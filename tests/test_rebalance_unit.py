@@ -295,5 +295,16 @@ def test_usdc_half_width_must_absorb_one_mojo():
     assert p.usdc.target == 100_000_000
 
 
+def test_bands_whose_bounds_overflow_refuse_at_parse():
+    """A target can scale finite while target*(1 +/- tol) still overflows;
+    that must fail the config, not raise OverflowError inside every
+    planner consult."""
+    with pytest.raises(rb.RebalanceConfigError, match="overflow"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True,
+                 usdc={"target": 1e302, "tolerance_pct": 100}),
+            min_gas_wei=MIN_GAS)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

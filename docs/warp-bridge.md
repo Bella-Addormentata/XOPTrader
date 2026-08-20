@@ -482,9 +482,12 @@ a mid-job surprise.
 
 ## 9b. Unwrap (Chia -> Base)
 
-The return leg burns wUSDC.b and releases native USDC on Base. Operator-only:
-no auto-unwrap exists, and `warp.max_unwrap_usdc` must be set (or `unlimited`,
-stated explicitly) before the Unwrap button does anything.
+The return leg burns wUSDC.b and releases native USDC on Base. Operator-driven
+by default: `warp.max_unwrap_usdc` must be set (or `unlimited`, stated
+explicitly) before the Unwrap button does anything. The one automatic caller is
+the opt-in [target-band rebalancer](#9d-target-band-rebalancer), which is off
+unless configured, pays out **only to this wallet's own hot address**, obeys
+that same cap, and is bounded by every gate below.
 
 * **The commit point is the `cat_spend`.** Every gate -- burn anchors (offline
   and live), the EIP-712 domain, wallet resolution, spendable balance, live
@@ -595,6 +598,53 @@ That cannot be manufactured without actually delivering a genuinely stuck
 message at one's own gas cost — which is the behaviour the badge exists
 to signal.
 
+## 9d. Target-band rebalancer
+
+Optional and **off unless configured** (`warp.rebalance.enabled`). It keeps the
+Base hot wallet inside operator-stated bands so a deposit from an exchange ends
+up where it is needed without a click: excess USDC bridges to Chia as trading
+float, a USDC deficit unwraps back, excess ETH wraps into milliETH, and an ETH
+deficit refuels gas from held milliETH.
+
+```yaml
+warp:
+  rebalance:
+    enabled: true
+    cooldown_s: 600                          # >= 60; starts on failure too
+    usdc: {target: 100, tolerance_pct: 20}   # tolerance >= 1 (see below)
+    eth:  {target: 0.01, tolerance_pct: 20}
+```
+
+What bounds it:
+
+* **Deadband, back to target.** Nothing happens inside the band; outside it the
+  balance is moved back to the *target*, so the ~0.6% round-trip (tip + tolls)
+  is paid rarely and never in a loop.
+* **One action per consult, one per cooldown**, and only while **no warp job is
+  active**, never in dry-run, and only when the hot wallet has **no unmined
+  transactions** (checked before the balance read that planning uses).
+* **Priorities:** ETH deficit (gas safety) > USDC deficit > ETH excess > USDC
+  excess. Both USDC actions are skipped outright while ETH is below the
+  relay-gas floor -- their jobs would pend on gas and hold the single job slot.
+* **Destination is never configurable.** An automatic unwrap pays this wallet's
+  own hot address, read from the engine; a deficit is clamped to spendable
+  wUSDC.b (skipped when there is none) and grossed up by the immutable 30 bps
+  tip so the credited amount actually reaches the target.
+* **Same caps as manual actions** (`max_auto_bridge_usdc`, `max_unwrap_usdc`,
+  the auto-bridge dust floor), and automatic jobs are recorded with
+  `rebalance` provenance rather than as operator clicks.
+* **Fail-closed config.** An enabled block must state a valid band: USDC
+  `tolerance_pct` >= 1 (it has to absorb the unwrap tip) with a half-width of at
+  least one mojo, and the ETH band bottom must clear the relay-gas floor with a
+  half-width of at least twice it (each wrap/unwrap pays gas from ETH).
+  Anything malformed disables the rebalancer **with a banner on the Warp tab**,
+  never a silent default.
+
+**Rollout:** enable the ETH block and the USDC *excess* leg first. Leave the
+USDC band off until the first live 0.001-USDC micro-unwrap protocol test has
+succeeded -- the deficit leg fires real burns through the commit point in
+[9b](#9b-unwrap-chia---base).
+
 ## 10. Known limitations
 
 - **Raw-key import remains console-only.** The **Base Wallet** page can create,
@@ -642,14 +692,17 @@ refuses to close it** and says so, naming the nonce. That is deliberate: closing
 it would discard the only in-app record of live funds. Recover the message
 through the warp.green portal, which pays the attested Chia receiver.
 
-### Both directions exist; the unwrap is operator-only
+### Both directions exist; the unwrap is operator-driven
 
 The return leg (Chia → Base) is wired: the **Unwrap** controls on the Warp
 tab, including the Chia-only mode ([9c](#9c-altruistic-relay--chia-only-unwraps)).
-There is no auto-unwrap and none is planned — the return leg's commit point
-(the `cat_spend`) is irreversible in a way the deposit leg's is not, so it
-stays behind an explicit operator action with a stated cap
-(`warp.max_unwrap_usdc`). Design and executed evidence:
+The commit point (the `cat_spend`) is irreversible in a way the deposit leg's
+is not, so an unwrap always requires either an explicit operator action or the
+opt-in [target-band rebalancer](#9d-target-band-rebalancer) — and in both cases
+a stated cap (`warp.max_unwrap_usdc`). The rebalancer adds no new authority: it
+can only pay **this wallet's own hot address**, only while no job is active and
+the wallet is settled, at most one action per cooldown, clamped to spendable
+inventory. Design and executed evidence:
 [warp-unwrap-design.md](warp-unwrap-design.md).
 
 Also out of scope for this version: the Ethereum-mainnet path (that mints a
