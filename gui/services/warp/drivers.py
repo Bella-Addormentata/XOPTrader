@@ -461,11 +461,25 @@ def derive_wrapped_asset_id(net: WarpNet, token_address: str = "") -> bytes:
     ``_h_message_sent`` separately anchors that the attested source token equals
     ``net.usdc_address``, so the two can never diverge unnoticed.
     """
+    token = (token_address or net.usdc_address).strip()
+    if token[:2] in ("0x", "0X"):
+        token = token[2:]
+    try:
+        token_bytes = bytes.fromhex(token)
+    except ValueError:
+        raise WarpDriverError(
+            f"malformed ERC-20 token address {token_address!r}"
+        ) from None
+    if len(token_bytes) != 20:
+        raise WarpDriverError(
+            f"ERC-20 token address must be 20 bytes, got "
+            f"{len(token_bytes)}: {token_address!r}"
+        )
     tail = get_wrapped_tail(
         bytes.fromhex(net.portal_launcher_id),
         net.source_chain.encode(),
         bytes.fromhex(net.erc20_bridge_address[2:]),
-        bytes.fromhex((token_address or net.usdc_address)[2:]),
+        token_bytes,
     )
     return cu.sha256tree(tail)
 
@@ -810,7 +824,10 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
                 f"{net.name} asset {key} has an empty expected_asset_id; "
                 "refusing to run without its wrapped-asset anchor"
             )
-        asset_derived = derive_wrapped_asset_id(net, spec.erc20_address)
+        try:
+            asset_derived = derive_wrapped_asset_id(net, spec.erc20_address)
+        except WarpDriverError as exc:
+            raise WarpDriverError(f"asset {key}: {exc}") from None
         if asset_derived.hex() != spec.expected_asset_id:
             raise WarpDriverError(
                 f"asset {key}: derived wrapped id {asset_derived.hex()} != "

@@ -165,10 +165,9 @@ def test_load_puzzle_rejects_hash_mismatch(monkeypatch):
 
 def test_every_listed_asset_tail_derives_to_its_pinned_id():
     """Per-asset anchor: each WarpNet.assets entry's wrapped TAIL must
-    re-derive offline to its pinned expected_asset_id. For milliETH the
-    pinned id is ALSO the enabled wmilliETH.b/XCH pair's base_asset_id
-    (config.yaml), so this single test proves bridged tokens land as the
-    exact CAT the trading engine quotes."""
+    re-derive offline to its pinned expected_asset_id. The pinned milliETH
+    id is asserted against config.yaml's actual trading pair separately in
+    test_millieth_pin_matches_the_enabled_trading_pair."""
     for key, spec in C.MAINNET.assets:
         derived = drivers.derive_wrapped_asset_id(
             C.MAINNET, spec.erc20_address).hex()
@@ -177,6 +176,46 @@ def test_every_listed_asset_tail_derives_to_its_pinned_id():
         C.MAINNET.expected_asset_id), "USDC entry mirrors the legacy anchor"
     assert C.MAINNET.asset("milliETH").expected_asset_id == (
         "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6")
+
+
+def test_derivation_normalizes_the_token_prefix_and_rejects_garbage():
+    """A caller passing an unprefixed hex address must derive the SAME id
+    (the old [2:] slice silently dropped a byte and derived a wrong one);
+    non-hex or wrong-length input raises WarpDriverError, and the per-asset
+    verification names the offending asset."""
+    import dataclasses
+
+    spec = C.MAINNET.asset("milliETH")
+    with_prefix = drivers.derive_wrapped_asset_id(
+        C.MAINNET, spec.erc20_address)
+    without = drivers.derive_wrapped_asset_id(
+        C.MAINNET, spec.erc20_address[2:])
+    assert with_prefix == without
+    for bad in ("0xnothex", "0x1234", "zz" * 20):
+        with pytest.raises(drivers.WarpDriverError):
+            drivers.derive_wrapped_asset_id(C.MAINNET, bad)
+    mangled = dataclasses.replace(spec, erc20_address="0xnothex")
+    broken = dataclasses.replace(
+        C.MAINNET,
+        assets=(("USDC", C.MAINNET.asset("USDC")), ("milliETH", mangled)),
+    )
+    with pytest.raises(drivers.WarpDriverError, match="milliETH"):
+        drivers.verify_wrapped_asset_anchor(broken)
+
+
+def test_millieth_pin_matches_the_enabled_trading_pair():
+    """The invariant that makes bridged milliETH tradable: the descriptor's
+    pinned id equals the ACTUAL wmilliETH.b pair's base_asset_id read from
+    this repo's config.yaml -- not a second hardcoded copy."""
+    import yaml
+    from pathlib import Path
+
+    cfg_path = Path(__file__).resolve().parents[4] / "config.yaml"
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    pairs = [p for p in (cfg.get("pairs") or [])
+             if "wmilliETH.b" in str(p.get("name", ""))]
+    assert pairs, "the wmilliETH.b pair is missing from config.yaml"
+    assert pairs[0]["base_asset_id"] ==         C.MAINNET.asset("milliETH").expected_asset_id
 
 
 def test_anchor_verification_covers_every_listed_asset():
