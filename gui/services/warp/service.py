@@ -71,6 +71,7 @@ from PySide6.QtCore import (
 
 from . import constants
 from . import jobs
+from . import rebalance as rb
 from .jobs import JobStatus, WarpJob, WarpJobStore
 
 _log: logging.Logger = logging.getLogger(__name__)
@@ -1916,6 +1917,45 @@ class WarpEngine:
             f"{self._net.expected_asset_id}, found {matches or 'none'}"
         )
 
+    def _rebalance_unwrap_trim(self, job: WarpJob, amount: int):
+        """Re-derive an automatic unwrap's size just before the commit.
+
+        The deficit a rebalance job was sized from is a snapshot, and an
+        inbound deposit does NOT touch this wallet's nonce -- so one can
+        land while the job waits at the gate and shrink or erase the need.
+        Burning the stale amount would overshoot the target and pay to
+        bridge the excess back. Returns ``(step, amount)``: a step means
+        stop here (nothing has been committed yet, so CANCELLED frees the
+        slot cleanly); otherwise the possibly-reduced amount to burn.
+        Manual unwraps carry no target and are never touched.
+        """
+        target = job.state.get("rebalance_target_micros")
+        if not target:
+            return None, amount
+        held = int(self._evm.get_erc20_balance(
+            self._net.usdc_address, self._hot_address))
+        still_needed = int(target) - held
+        if still_needed <= 0:
+            return _advance(
+                JobStatus.CANCELLED,
+                message=("rebalance unwrap no longer needed: the USDC target "
+                         "was met while the job waited"),
+            ), amount
+        # The planner's tip gross-up, re-derived from the live shortfall.
+        grossed = -(-still_needed * 10_000 // (10_000 - rb._UNWRAP_TIP_BPS))
+        needed_mojos = grossed // 1000
+        if needed_mojos < 1:
+            return _advance(
+                JobStatus.CANCELLED,
+                message=("rebalance unwrap no longer needed: the remaining "
+                         "shortfall is below one mojo"),
+            ), amount
+        if needed_mojos < amount:
+            _log.info("rebalance unwrap trimmed %d -> %d mojos (a deposit "
+                      "landed while the job waited)", amount, needed_mojos)
+            return None, int(needed_mojos)
+        return None, amount
+
     def _h_unwrap_checks(self, job: WarpJob) -> _Step:
         """Every gate, ordered cheap-to-expensive, all before the cat_spend."""
         from . import clvm_utils as cu, drivers, evm
@@ -1923,6 +1963,11 @@ class WarpEngine:
         net, p = self._net, self._params
         receiver = bytes.fromhex(job.state["receiver_evm"])
         amount = int(job.amount_mojos)
+
+        # G0 (rebalance jobs only): re-derive the size at the gate.
+        step, amount = self._rebalance_unwrap_trim(job, amount)
+        if step is not None:
+            return step
 
         # G1/G2: the burn anchor, offline then live. A mismatch on either is
         # a code defect or a bridge redeploy -- both stop everything.
@@ -2768,6 +2813,12 @@ class WarpEngine:
         p, net = self._params, self._net
         if not (p.enabled and p.auto_bridge):
             return None
+        # A worker-managed USDC target band owns bridging: the legacy
+        # auto-start would race it, opening an UNTARGETED job for any
+        # balance above the minimum and bridging the full balance/cap
+        # instead of only the amount above the target.
+        if getattr(self, "auto_bridge_suppressed", False):
+            return None
         # A dry run cannot spend the balance, and DRY_RUN_OK is a closed state
         # that frees the slot -- so auto-bridging a rehearsal has no fixed point
         # and would open jobs forever. Rehearsal is a manual "Bridge now".
@@ -2791,7 +2842,9 @@ class WarpEngine:
         )
         return _job_dict(job)
 
-    def request_bridge(self, target_micros: Optional[int] = None) -> dict:
+    def request_bridge(
+        self, target_micros: Optional[int] = None, *, automatic: bool = False
+    ) -> dict:
         """Operator "Bridge now": open a job (raises if one is already active).
 
         A manual job bridges whatever is in the hot wallet, ignoring
@@ -2806,14 +2859,24 @@ class WarpEngine:
                 "resolve it first -- Retry, Cancel, Sweep or Abandon from the "
                 "jobs table"
             )
-        state: Dict[str, Any] = {"manual": True, **self._binding()}
+        # Provenance matters twice over: the audit trail must say WHY the
+        # funds moved, and _h_awaiting_deposit re-checks the auto min_micros
+        # floor only for non-manual jobs -- a rebalance stamped manual could
+        # bridge a sub-floor amount if the balance dropped after the consult.
+        if automatic:
+            state: Dict[str, Any] = {
+                "auto": True, "rebalance": True, **self._binding()
+            }
+        else:
+            state = {"manual": True, **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
         job = self._store.create_job(
             self._net.name,
             status=JobStatus.AWAITING_DEPOSIT,
             state=state,
-            event_message="manual bridge requested",
+            event_message=("rebalance: automatic bridge requested"
+                           if automatic else "manual bridge requested"),
         )
         return _job_dict(job)
 
@@ -2982,7 +3045,8 @@ class WarpEngine:
 
 
     def request_unwrap(
-        self, amount_mojos: int, receiver: str, external_relay: bool = False
+        self, amount_mojos: int, receiver: str, external_relay: bool = False,
+        *, automatic: bool = False, rebalance_target_micros: int = 0
     ) -> dict:
         """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
 
@@ -3046,13 +3110,20 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
-                "manual": True,
+                "manual": not automatic,
+                **({"rebalance": True} if automatic else {}),
+                # Lets _h_unwrap_checks re-derive the still-needed amount
+                # just before the commit point instead of trusting a
+                # possibly-stale snapshot.
+                **({"rebalance_target_micros": int(rebalance_target_micros)}
+                   if automatic and rebalance_target_micros else {}),
                 "receiver_evm": rec_bytes.hex(),
                 "external_relay": bool(external_relay),
                 **self._binding(),
             },
             event_message=(
-                f"unwrap requested: {amount} mojos -> {receiver}"
+                ("rebalance: automatic " if automatic else "")
+                + f"unwrap requested: {amount} mojos -> {receiver}"
                 + (" (external relay: no Base gas needed)" if external_relay else "")
             ),
         )
@@ -3551,6 +3622,10 @@ class _WarpWorker(QObject):
         # wallet_action). Set once before moveToThread, never mutated after.
         self._secrets_path: Optional[Path] = secrets_path
         self._last_wallet_notice: str = ""
+        self._rebalance_params = rb.RebalanceParams()
+        self._rebalance_error: str = ""
+        self._rebalance_next_ok: float = 0.0
+        self._rebalance_last: str = ""
         # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
         # the GUI can tell a wallet-action-completion snapshot apart from the
         # timer-driven ticks that carry the same cached value -- without it,
@@ -3569,6 +3644,17 @@ class _WarpWorker(QObject):
         self._config = dict(config or {})
         self._drop_engine()
         self._engine_error = None
+        # Fail-closed rebalance parse: a malformed block disables the
+        # rebalancer WITH a banner, never a silently-defaulted band.
+        try:
+            self._rebalance_params = rb.parse_rebalance_config(
+                self._config.get("warp"), min_gas_wei=_MIN_GAS_WEI
+            )
+            self._rebalance_error = ""
+        except rb.RebalanceConfigError as exc:
+            self._rebalance_params = rb.RebalanceParams()
+            self._rebalance_error = str(exc)
+            _log.error("rebalance disabled: %s", exc)
 
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
@@ -3634,12 +3720,189 @@ class _WarpWorker(QObject):
         """
 
         def _run(engine: WarpEngine) -> None:
+            engine.auto_bridge_suppressed = (
+                self._legacy_auto_bridge_suppressed()
+            )
             engine.step()
-            engine.refresh_hot_wallet()
+            self._rebalance_tick(engine)
             engine.relay_sweep_if_due()
             engine.refresh_relay_activity_if_due()
 
         self.snapshot_ready.emit(self._guarded(_run))
+
+    def _legacy_auto_bridge_suppressed(self) -> bool:
+        """Whether the engine's own auto-bridge must stand down this tick.
+
+        True whenever the rebalancer is enabled -- it then owns every
+        automatic bridge, sized to the USDC band (configure one to keep
+        automatic bridging; an ETH-only band means USDC moves only on an
+        operator's Bridge now) -- and ALSO while a rebalance config FAILED
+        to parse. Falling back to the legacy auto job in either case is a
+        fail-open on a money path: the operator asked for band-managed
+        bridging, and a typo would instead bridge the whole balance up to
+        the cap, untargeted. The Warp banner reports both states, so the
+        wallet simply holds until the config is fixed.
+        """
+        if self._rebalance_error:
+            return True
+        # ANY enabled band, not just a USDC one. With an ETH-only band the
+        # legacy auto-start could still open a USDC job first (step() runs
+        # before the consult); if ETH is under the bridge gas floor that
+        # job pends forever holding the single slot, and the milliETH
+        # refuel that would have fixed the gas can never run -- a deadlock
+        # whose only exit is an operator. An enabled rebalancer therefore
+        # owns automatic bridging outright.
+        return bool(self._rebalance_params.enabled)
+
+    def _wallet_settled(self, engine: "WarpEngine") -> bool:
+        """Whether the hot wallet has no broadcast-but-unmined transactions.
+
+        latest before pending, as in :meth:`BaseWallet._require_settled`, so
+        a tx landing between the two reads can only widen the gap. Any RPC
+        failure reads as UNSETTLED: unknown settlement must not authorise
+        an automatic transfer.
+        """
+        try:
+            addr = engine._hot_address
+            latest = int(engine._evm.get_nonce(addr, pending=False))
+            pending = int(engine._evm.get_nonce(addr, pending=True))
+            return pending == latest
+        except Exception as exc:  # noqa: BLE001 -- fail closed, never raise
+            _log.debug("rebalance: settlement unknown (%s)", exc)
+            return False
+
+    def _rebalance_tick(self, engine: "WarpEngine") -> None:
+        """Refresh the hot wallet ONCE per tick and consult the planner.
+
+        The settle check must precede the balance read -- a tx mining
+        between them would make the nonces agree while the cache was still
+        pre-mine -- and the snapshot's refresh is the same one planning
+        consumes, so the two nonce reads are the only added RPC, and only
+        while the rebalancer is live.
+        """
+        p = self._rebalance_params
+        if not p.enabled or self._rebalance_error:
+            engine.refresh_hot_wallet()          # snapshot only
+            return
+        settled = self._wallet_settled(engine)
+        engine.refresh_hot_wallet()
+        self._maybe_rebalance(engine, settled=settled)
+
+    def _maybe_rebalance(
+        self, engine: "WarpEngine", *, settled: Optional[bool] = None
+    ) -> None:
+        """One planner consult per tick; at most one action per cooldown.
+
+        Runs only while no warp job is active, never in dry-run, and only
+        on settled balances -- ``settled`` comes from :meth:`_rebalance_tick`,
+        which checks it BEFORE the balance refresh this reads; passing None
+        re-derives it. Contracted never to raise: a failed action is a
+        logged banner and a cooldown, not a crashed tick.
+        """
+        p = self._rebalance_params
+        if not p.enabled or self._rebalance_error:
+            return
+        try:
+            ep = engine._params
+            if not ep.enabled or ep.dry_run:
+                return
+            if engine._store.get_active_job() is not None:
+                return
+            now = time.monotonic()
+            if now < self._rebalance_next_ok:
+                return
+            # Settled balances only: the ETH actuators re-check the nonce
+            # gap inside the wallet, but the bridge/unwrap JOB paths do
+            # not -- with a transfer pending, the confirmed cache could
+            # size a bridge against funds already leaving. Not a failure,
+            # so no cooldown: the next tick re-checks.
+            if settled is None:
+                settled = self._wallet_settled(engine)
+            if not settled:
+                return
+            # The cache was refreshed by _rebalance_tick AFTER the settle
+            # check, so it cannot be pre-mine relative to that check.
+            hot = getattr(engine, "_hot_cache", None) or {}
+            if hot.get("error") or hot.get("eth_wei") is None:
+                return
+            action = rb.plan(
+                params=p,
+                eth_wei=int(hot.get("eth_wei") or 0),
+                usdc_micros=int(hot.get("usdc_micros") or 0),
+                millieth_units=int(hot.get("millieth_units") or 0),
+                max_bridge_micros=int(ep.max_micros or 0),
+                max_unwrap_micros=int(ep.max_unwrap_micros),
+                min_bridge_micros=int(ep.min_micros or 0),
+            )
+            if action is None:
+                return
+            # Both USDC actions create a JOB whose gas gates would pend a
+            # gasless wallet indefinitely -- squatting the single active
+            # slot. Skip (no cooldown: a refuel should act promptly) and
+            # say why.
+            if action.kind in ("bridge_usdc", "unwrap_usdc") and int(
+                hot.get("eth_wei") or 0
+            ) < _MIN_GAS_WEI:
+                self._rebalance_last = (
+                    f"rebalance skipped: {action.kind} needs Base gas but "
+                    "ETH is below the relay-gas floor; fund the wallet or "
+                    "let an ETH refuel land first"
+                )
+                return
+            reason = action.reason
+            mojos = action.amount
+            if action.kind == "unwrap_usdc":
+                # Preflight spendable wUSDC.b and clamp: an exact-size job
+                # bigger than held inventory would go FAILED, and FAILED
+                # deliberately retains the single active slot -- an
+                # automatic action must never squat it waiting for an
+                # operator. Resolved BEFORE the cooldown is armed so a
+                # nothing-to-do skip does not delay the next consult.
+                wallet_id = engine._resolve_cat_wallet_id()
+                bal = engine._wallet.get_wallet_balance(wallet_id)
+                spendable = int(bal.get("spendable_balance") or 0)
+                mojos = min(action.amount, spendable)
+                if mojos < 1:
+                    self._rebalance_last = (
+                        "rebalance skipped: no spendable wUSDC.b to unwrap"
+                    )
+                    return
+                if mojos < action.amount:
+                    # The banner must report what actually moved, not the
+                    # planned amount the inventory could not cover.
+                    reason = (
+                        f"{action.reason} (clamped to {mojos} mojos by "
+                        "spendable wUSDC.b inventory)"
+                    )
+            # Committed to acting: the cooldown starts here, success or
+            # not, so a failing actuator cannot be retried every tick
+            # against live money. Skips above leave it untouched.
+            self._rebalance_next_ok = now + p.cooldown_s
+            _log.info("rebalance: %s", reason)
+            if action.kind == "bridge_usdc":
+                engine.request_bridge(
+                    target_micros=action.amount, automatic=True
+                )
+            elif action.kind == "unwrap_usdc":
+                # Receiver is ALWAYS our own hot wallet -- never config.
+                engine.request_unwrap(
+                    mojos, engine._hot_address, automatic=True,
+                    rebalance_target_micros=p.usdc.target if p.usdc else 0,
+                )
+            elif action.kind == "wrap_eth":
+                self._base_wallet().wrap_eth(
+                    action.amount, reserve_wei=_MIN_GAS_WEI
+                )
+            elif action.kind == "unwrap_millieth":
+                self._base_wallet().unwrap_millieth(action.amount)
+            self._rebalance_last = reason
+        except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
+            # Cooldown on ANY failure, including before the plan (e.g.
+            # garbage in the hot cache): a broken consult must not retry
+            # and log every tick.
+            self._rebalance_next_ok = time.monotonic() + p.cooldown_s
+            self._rebalance_last = f"rebalance failed: {exc}"
+            _log.warning("rebalance action failed: %s", exc)
 
     @Slot(object)
     def request_bridge(self, target_micros: object) -> None:
@@ -3744,11 +4007,27 @@ class _WarpWorker(QObject):
         snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
+        if self._rebalance_params.enabled or self._rebalance_error:
+            snap["rebalance"] = {
+                "enabled": self._rebalance_params.enabled,
+                "error": self._rebalance_error,
+                "last": self._rebalance_last,
+                # The tab's "automatic bridging is on/off" line would
+                # otherwise misdescribe a suppressed legacy auto-bridge.
+                "owns_bridging": self._legacy_auto_bridge_suppressed(),
+            }
         return snap
 
     def _config_enabled(self) -> bool:
         """Whether ``warp.enabled`` is set, independent of whether it started."""
-        warp = (self._config or {}).get("warp") or {}
+        # The raw value, not `or {}`: every non-dict shape (None, [], "")
+        # must reach the type guard below rather than be masked into an
+        # empty mapping. A malformed warp block reads as disabled, never
+        # raises -- this runs inside the snapshot path, and an exception
+        # here would swallow the very banner reporting the malformation.
+        warp = (self._config or {}).get("warp")
+        if not isinstance(warp, dict):
+            return False
         return bool(warp.get("enabled", False))
 
     def _ensure_engine(self) -> Optional[WarpEngine]:

@@ -623,6 +623,28 @@ warp:
   auto_bridge: false                     # [OPTIONAL, default: false] bridge deposits automatically
   min_auto_bridge_usdc: 100              # [OPTIONAL] AUTO-bridge floor only; "Bridge now" ignores it
   max_auto_bridge_usdc: 10000            # [REQUIRED when enabled] blast-radius cap, manual included; 'unlimited' to opt out
+
+  # Target-band rebalancer (optional; ships inert). Keeps the Base hot
+  # wallet at stated targets: excess USDC auto-bridges to Chia, a USDC
+  # deficit auto-unwraps back (requires max_unwrap_usdc), excess ETH
+  # wraps into milliETH, and an ETH deficit refuels from held milliETH.
+  # Acts only outside target*(1 +/- tolerance_pct/100), moves back to
+  # target, one action per cooldown, only while no warp job is active.
+  # The ETH band bottom must clear the relay-gas floor (0.0003 ETH) and
+  # its half-width must be at least twice that floor (gas-churn guard).
+  # USDC tolerance_pct must be at least 1 (the band must absorb the
+  # 0.3% unwrap tip) and the half-width at least 0.001 USDC (one mojo).
+  # While enabled, the rebalancer OWNS automatic bridging: auto_bridge
+  # above stands down, and bridging happens per the usdc band (so with an
+  # eth-only band, USDC moves only on an operator's "Bridge now").
+  # ROLLOUT: leave the usdc block off until the first live 0.001-USDC
+  # micro-unwrap protocol test has succeeded -- the deficit leg fires
+  # real burns. The ETH block and the excess-bridge leg are safe first.
+  # rebalance:
+  #   enabled: true
+  #   cooldown_s: 600
+  #   usdc: {target: 100, tolerance_pct: 20}
+  #   eth:  {target: 0.01, tolerance_pct: 20}
   claim_fee_mojos: 100000000             # [OPTIONAL] XCH fee reserved for the Chia claim spend (0.0001 XCH)
   chia_funding_fee_mojos: 0              # [OPTIONAL] extra fee on the wallet->claim funding send
   poll_interval_s: 15                    # [OPTIONAL, default: 15] background tick cadence
