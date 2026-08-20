@@ -3720,6 +3720,19 @@ class _WarpWorker(QObject):
             )
             if action is None:
                 return
+            # Both USDC actions create a JOB whose gas gates would pend a
+            # gasless wallet indefinitely -- squatting the single active
+            # slot. Skip (no cooldown: a refuel should act promptly) and
+            # say why.
+            if action.kind in ("bridge_usdc", "unwrap_usdc") and int(
+                hot.get("eth_wei") or 0
+            ) < _MIN_GAS_WEI:
+                self._rebalance_last = (
+                    f"rebalance skipped: {action.kind} needs Base gas but "
+                    "ETH is below the relay-gas floor; fund the wallet or "
+                    "let an ETH refuel land first"
+                )
+                return
             # Every action starts the cooldown, success or not: a failing
             # actuator must not be retried every tick against live money.
             self._rebalance_next_ok = now + p.cooldown_s

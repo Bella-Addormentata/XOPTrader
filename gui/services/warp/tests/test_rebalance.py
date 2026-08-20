@@ -526,5 +526,26 @@ def test_clamped_unwrap_banners_the_actual_amount():
     assert "clamped to 40000 mojos" in w._rebalance_last
 
 
+def test_usdc_jobs_are_skipped_while_eth_is_below_the_gas_floor():
+    """A gasless wallet with no milliETH to refuel from must NOT open a
+    USDC job: both job types pend on their gas gates and would squat the
+    single active slot. Skipped without cooldown so a refuel acts
+    promptly."""
+    from types import SimpleNamespace
+
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache.update(
+        {"eth_wei": S._MIN_GAS_WEI - 1, "usdc_micros": 10_000_000,
+         "millieth_units": 0})
+    eng._resolve_cat_wallet_id = lambda: 7
+    eng._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 10 ** 9})
+    w._maybe_rebalance(eng)
+    assert eng.calls == []
+    assert "relay-gas floor" in w._rebalance_last
+    assert w._rebalance_next_ok == 0.0, "no cooldown: a refuel acts promptly"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
