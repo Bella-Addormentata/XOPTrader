@@ -236,7 +236,12 @@ def plan(
     # 2. USDC deficit: pull the reserve back from Chia (wUSDC.b unwrap to
     #    the hot wallet). Clamped to the operator's unwrap cap; below one
     #    CAT mojo there is nothing to move.
-    if params.usdc is not None and usdc_micros < params.usdc.low:
+    # max_unwrap_micros < 0 is the "never configured" sentinel: the
+    # actuator (request_unwrap) refuses without a stated cap, so planning
+    # a deficit unwrap would just refuse-and-retry every cooldown. 0 stays
+    # explicitly unlimited.
+    if (params.usdc is not None and usdc_micros < params.usdc.low
+            and max_unwrap_micros >= 0):
         deficit = params.usdc.target - usdc_micros
         if max_unwrap_micros > 0:
             deficit = min(deficit, max_unwrap_micros)

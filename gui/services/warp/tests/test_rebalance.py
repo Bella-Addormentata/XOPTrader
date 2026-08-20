@@ -384,5 +384,14 @@ def test_a_usdc_band_suppresses_the_legacy_auto_bridge():
     assert eng.maybe_start_auto_job() is None,         "suppressed: the band owns bridging"
 
 
+def test_an_unset_unwrap_cap_skips_the_deficit_instead_of_refuse_looping():
+    """max_unwrap_micros = -1 means never configured: request_unwrap would
+    refuse, so planning it would refuse-and-retry every cooldown forever.
+    0 stays explicitly unlimited."""
+    assert _plan(usdc_micros=50_000_000, max_unwrap_micros=-1) is None
+    a = _plan(usdc_micros=50_000_000, max_unwrap_micros=0)
+    assert a is not None and a.kind == "unwrap_usdc"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

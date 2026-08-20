@@ -3698,7 +3698,7 @@ class _WarpWorker(QObject):
                 usdc_micros=int(hot.get("usdc_micros") or 0),
                 millieth_units=int(hot.get("millieth_units") or 0),
                 max_bridge_micros=int(ep.max_micros or 0),
-                max_unwrap_micros=max(0, int(ep.max_unwrap_micros or 0)),
+                max_unwrap_micros=int(ep.max_unwrap_micros),
                 min_bridge_micros=int(ep.min_micros or 0),
             )
             if action is None:

@@ -386,6 +386,9 @@ claimed through warp.green's own UI (see [Known limitations](#10-known-limitatio
 | `chia_receiver_address` | `""` | Where wUSDC.b lands. Blank ⇒ the bot's own wallet address, resolved once at startup and shown in the tab. |
 | `expected_asset_id` | `fa4a180a…a6b7a99d` | Correctness anchor, checked **at startup** before any client is built. A mismatch blocks the engine with a banner. |
 | `max_unwrap_usdc` | *unset* | Unwrap blast-radius cap. Must be stated (or `unlimited`, explicitly) before the Unwrap button does anything. |
+| `rebalance.enabled` | `false` | Target-band rebalancer master switch. Fail-closed: enabling with a malformed block disables it with a banner. |
+| `rebalance.usdc` / `rebalance.eth` | unset | `{target, tolerance_pct}` per asset (USDC units / ETH). Acts only outside the band, back to target: USDC excess bridges, USDC deficit unwraps to the hot wallet (needs `max_unwrap_usdc`), ETH excess wraps to milliETH, ETH deficit unwraps held milliETH. ETH band bottom must clear the relay-gas floor; half-width > 2x that floor. |
+| `rebalance.cooldown_s` | `600` | Minimum seconds between automatic actions (min 60); starts on failure too. |
 | `unwrap_chia_fee_mojos` | `0` | Extra XCH fee on the burn bundle, on top of the 0.001 XCH toll. |
 | `altruistic_relay` | `false` | Opt-in: volunteer this node to deliver **strangers'** stuck xch→bse messages by paying their ~145k relay gas (see [9c](#9c-altruistic-relay--chia-only-unwraps)). |
 | `relay_grace_min` | `30` | Never touch a stuck message younger than this — ~98% are delivered by their own senders within minutes. |

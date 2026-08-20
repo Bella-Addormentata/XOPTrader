@@ -583,6 +583,22 @@ class WarpWidget(QWidget):
         # A rejected Bridge now / Retry / Sweep is otherwise silent: the worker
         # swallows the exception so it cannot kill the thread, which left the
         # operator watching a click do nothing.
+        # Rebalancer state: a malformed config or failed automatic action
+        # must be a visible banner, not just a log line.
+        reb = snap.get("rebalance") or {}
+        if reb.get("error"):
+            text += (
+                f"<br><span style='color:{WARNING_YELLOW};'>Rebalancer "
+                f"disabled: {_html.escape(str(reb['error']))}</span>"
+            )
+        elif reb.get("last"):
+            last = str(reb["last"])
+            colour_last = WARNING_YELLOW if last.startswith(
+                "rebalance failed") else TEXT_SECONDARY
+            text += (
+                f"<br><span style='color:{colour_last};'>Rebalancer: "
+                f"{_html.escape(last)}</span>"
+            )
         action_error = snap.get("action_error")
         if action_error:
             text += (
