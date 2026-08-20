@@ -71,6 +71,7 @@ from PySide6.QtCore import (
 
 from . import constants
 from . import jobs
+from . import rebalance as rb
 from .jobs import JobStatus, WarpJob, WarpJobStore
 
 _log: logging.Logger = logging.getLogger(__name__)
@@ -3551,6 +3552,10 @@ class _WarpWorker(QObject):
         # wallet_action). Set once before moveToThread, never mutated after.
         self._secrets_path: Optional[Path] = secrets_path
         self._last_wallet_notice: str = ""
+        self._rebalance_params = rb.RebalanceParams()
+        self._rebalance_error: str = ""
+        self._rebalance_next_ok: float = 0.0
+        self._rebalance_last: str = ""
         # Monotonic count of PROCESSED wallet actions. Rides every snapshot so
         # the GUI can tell a wallet-action-completion snapshot apart from the
         # timer-driven ticks that carry the same cached value -- without it,
@@ -3569,6 +3574,17 @@ class _WarpWorker(QObject):
         self._config = dict(config or {})
         self._drop_engine()
         self._engine_error = None
+        # Fail-closed rebalance parse: a malformed block disables the
+        # rebalancer WITH a banner, never a silently-defaulted band.
+        try:
+            self._rebalance_params = rb.parse_rebalance_config(
+                self._config.get("warp") or {}, min_gas_wei=_MIN_GAS_WEI
+            )
+            self._rebalance_error = ""
+        except rb.RebalanceConfigError as exc:
+            self._rebalance_params = rb.RebalanceParams()
+            self._rebalance_error = str(exc)
+            _log.error("rebalance disabled: %s", exc)
 
     def _drop_engine(self) -> None:
         """Discard the engine, closing its sqlite connection first."""
@@ -3638,8 +3654,64 @@ class _WarpWorker(QObject):
             engine.refresh_hot_wallet()
             engine.relay_sweep_if_due()
             engine.refresh_relay_activity_if_due()
+            self._maybe_rebalance(engine)
 
         self.snapshot_ready.emit(self._guarded(_run))
+
+    def _maybe_rebalance(self, engine: "WarpEngine") -> None:
+        """One planner consult per tick; at most one action per cooldown.
+
+        Runs only while no warp job is active, never in dry-run, and only
+        on settled balances (the wallet-level unmined guard refuses the
+        wrap/unwrap legs on its own; bridge/unwrap jobs re-check everything
+        in their gates). Contracted never to raise: a failed action is a
+        logged banner and a cooldown, not a crashed tick.
+        """
+        p = self._rebalance_params
+        if not p.enabled or self._rebalance_error:
+            return
+        try:
+            ep = engine._params
+            if not ep.enabled or ep.dry_run:
+                return
+            if engine._store.get_active_job() is not None:
+                return
+            now = time.monotonic()
+            if now < self._rebalance_next_ok:
+                return
+            hot = getattr(engine, "_hot_cache", None) or {}
+            if hot.get("error") or hot.get("eth_wei") is None:
+                return
+            action = rb.plan(
+                params=p,
+                eth_wei=int(hot.get("eth_wei") or 0),
+                usdc_micros=int(hot.get("usdc_micros") or 0),
+                millieth_units=int(hot.get("millieth_units") or 0),
+                max_bridge_micros=int(ep.max_micros or 0),
+                max_unwrap_micros=max(0, int(ep.max_unwrap_micros or 0)),
+                min_bridge_micros=int(ep.min_micros or 0),
+            )
+            if action is None:
+                return
+            # Every action starts the cooldown, success or not: a failing
+            # actuator must not be retried every tick against live money.
+            self._rebalance_next_ok = now + p.cooldown_s
+            _log.info("rebalance: %s", action.reason)
+            if action.kind == "bridge_usdc":
+                engine.request_bridge(target_micros=action.amount)
+            elif action.kind == "unwrap_usdc":
+                # Receiver is ALWAYS our own hot wallet -- never config.
+                engine.request_unwrap(action.amount, engine._hot_address)
+            elif action.kind == "wrap_eth":
+                self._base_wallet().wrap_eth(
+                    action.amount, reserve_wei=_MIN_GAS_WEI
+                )
+            elif action.kind == "unwrap_millieth":
+                self._base_wallet().unwrap_millieth(action.amount)
+            self._rebalance_last = action.reason
+        except Exception as exc:  # noqa: BLE001 -- banner + cooldown, never a crash
+            self._rebalance_last = f"rebalance failed: {exc}"
+            _log.warning("rebalance action failed: %s", exc)
 
     @Slot(object)
     def request_bridge(self, target_micros: object) -> None:
@@ -3744,6 +3816,12 @@ class _WarpWorker(QObject):
         snap["wallet_action_seq"] = self._wallet_action_seq
         if self._last_wallet_notice:
             snap["wallet_notice"] = self._last_wallet_notice
+        if self._rebalance_params.enabled or self._rebalance_error:
+            snap["rebalance"] = {
+                "enabled": self._rebalance_params.enabled,
+                "error": self._rebalance_error,
+                "last": self._rebalance_last,
+            }
         return snap
 
     def _config_enabled(self) -> bool:
