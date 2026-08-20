@@ -42,6 +42,10 @@ _WRAP_GRANULARITY_WEI = 10 ** 12
 _WEI_PER_MILLIETH_UNIT = 10 ** 12
 #: wUSDC.b mojos per USDC micro-unit factor (6 ERC-20 decimals -> 3 CAT).
 _USDC_MICROS_PER_MOJO = 1000
+#: ERC20Bridge.tip() in basis points -- immutable on the deployed contract
+#: (a redeploy is refused by the anchor gates), which is what lets the
+#: deficit leg gross requests up by a constant instead of a chain read.
+_UNWRAP_TIP_BPS = 30
 
 
 class RebalanceConfigError(ValueError):
@@ -270,9 +274,14 @@ def plan(
     if (params.usdc is not None and usdc_micros < params.usdc.low
             and max_unwrap_micros >= 0):
         deficit = params.usdc.target - usdc_micros
+        # The receiver is credited POST-TIP, so requesting the nominal
+        # deficit would land 30 bps short of target every time. Gross up
+        # (ceiling) so the credited amount reaches the target within one
+        # mojo; the operator's cap applies to the grossed-up burn size.
+        grossed = -(-deficit * 10_000 // (10_000 - _UNWRAP_TIP_BPS))
         if max_unwrap_micros > 0:
-            deficit = min(deficit, max_unwrap_micros)
-        mojos = deficit // _USDC_MICROS_PER_MOJO
+            grossed = min(grossed, max_unwrap_micros)
+        mojos = grossed // _USDC_MICROS_PER_MOJO
         if mojos >= 1:
             return RebalanceAction(
                 "unwrap_usdc", int(mojos),

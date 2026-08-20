@@ -125,12 +125,18 @@ def test_usdc_excess_respects_the_blast_radius_cap_and_dust_floor():
     assert _plan(usdc_micros=121_000_000, min_bridge_micros=50_000_000) is None
 
 
-def test_usdc_deficit_unwraps_toward_target_in_mojos():
+def test_usdc_deficit_unwraps_grossed_up_to_actually_land_on_target():
+    """The receiver is credited post-tip: the request must be grossed up
+    by the immutable 30 bps or every deficit action lands short and the
+    'back to target' contract is false."""
     a = _plan(usdc_micros=50_000_000)
     assert a.kind == "unwrap_usdc"
-    assert a.amount == 50_000, "50 USDC deficit = 50_000 wUSDC.b mojos"
+    assert a.amount == 50_150, "ceil(50 USDC / 0.9970) in mojos"
+    credited_micros = (a.amount * 1000) * (10_000 - 30) // 10_000
+    assert abs(credited_micros - 50_000_000) <= 1000, (
+        "post-tip credit reaches the deficit within one mojo")
     capped = _plan(usdc_micros=0, max_unwrap_micros=10_000_000)
-    assert capped.amount == 10_000
+    assert capped.amount == 10_000, "the cap bounds the grossed-up burn"
     assert _plan(usdc_micros=79_999_999, max_unwrap_micros=500) is None
 
 
@@ -601,7 +607,8 @@ def test_worker_passes_automatic_to_both_job_actuators():
     eng2._wallet = SimpleNamespace(
         get_wallet_balance=lambda wid: {"spendable_balance": 10 ** 9})
     w2._maybe_rebalance(eng2)
-    assert eng2.calls == [("unwrap", 90_000, eng2._hot_address, True)]
+    # 90-USDC deficit grossed up by the 30 bps tip: ceil(90e6/0.9970)//1000.
+    assert eng2.calls == [("unwrap", 90_270, eng2._hot_address, True)]
 
 
 if __name__ == "__main__":  # pragma: no cover
