@@ -30,6 +30,7 @@ chia_rs = pytest.importorskip("chia_rs")
 
 from gui.services.warp import clvm_utils as cu  # noqa: E402
 from gui.services.warp import constants as C  # noqa: E402
+from gui.services.warp import drivers  # noqa: E402
 
 
 # --------------------------------------------------------------------------- #
@@ -161,6 +162,46 @@ def test_load_puzzle_rejects_hash_mismatch(monkeypatch):
 # --------------------------------------------------------------------------- #
 # The load-bearing anchor: wUSDC.b wrapped-asset id.
 # --------------------------------------------------------------------------- #
+
+def test_every_listed_asset_tail_derives_to_its_pinned_id():
+    """Per-asset anchor: each WarpNet.assets entry's wrapped TAIL must
+    re-derive offline to its pinned expected_asset_id. For milliETH the
+    pinned id is ALSO the enabled wmilliETH.b/XCH pair's base_asset_id
+    (config.yaml), so this single test proves bridged tokens land as the
+    exact CAT the trading engine quotes."""
+    for key, spec in C.MAINNET.assets:
+        derived = drivers.derive_wrapped_asset_id(
+            C.MAINNET, spec.erc20_address).hex()
+        assert derived == spec.expected_asset_id, key
+    assert C.MAINNET.asset("USDC").expected_asset_id == (
+        C.MAINNET.expected_asset_id), "USDC entry mirrors the legacy anchor"
+    assert C.MAINNET.asset("milliETH").expected_asset_id == (
+        "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6")
+
+
+def test_anchor_verification_covers_every_listed_asset():
+    """A typo'd NEW asset entry must block the engine, not surface at claim
+    time: verify_wrapped_asset_anchor re-derives every assets entry."""
+    import dataclasses
+
+    bad_asset = dataclasses.replace(
+        C.MAINNET.asset("milliETH"), expected_asset_id="ff" * 32)
+    broken = dataclasses.replace(
+        C.MAINNET,
+        assets=(("USDC", C.MAINNET.asset("USDC")), ("milliETH", bad_asset)),
+    )
+    with pytest.raises(drivers.WarpDriverError, match="milliETH"):
+        drivers.verify_wrapped_asset_anchor(broken)
+
+    empty_asset = dataclasses.replace(
+        C.MAINNET.asset("milliETH"), expected_asset_id="")
+    broken2 = dataclasses.replace(
+        C.MAINNET,
+        assets=(("USDC", C.MAINNET.asset("USDC")), ("milliETH", empty_asset)),
+    )
+    with pytest.raises(drivers.WarpDriverError, match="milliETH"):
+        drivers.verify_wrapped_asset_anchor(broken2)
+
 
 def test_wrapped_usdc_b_tail_matches_asset_id():
     derived = _mainnet_usdc_tail_hash()
