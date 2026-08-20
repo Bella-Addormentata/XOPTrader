@@ -228,7 +228,8 @@ MAINNET = WarpNet(
     assets=(
         ("USDC", WarpAsset(
             symbol="USDC",
-            erc20_address="0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+            # Exact-casing mirror of usdc_address above (anchored by test).
+            erc20_address="0x833589fcd6edb6e08f4c7c32d4f71b54bda02913",
             erc20_decimals=6,
             expected_asset_id="fa4a180ac326e67ea289b869e3448256f6af05721f7cf934"
                               "cb9901baa6b7a99d",

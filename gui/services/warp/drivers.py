@@ -824,6 +824,11 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
                 f"{net.name} asset {key} has an empty expected_asset_id; "
                 "refusing to run without its wrapped-asset anchor"
             )
+        if not str(spec.erc20_address or "").strip():
+            raise WarpDriverError(
+                f"asset {key} has an empty erc20_address; an empty address "
+                "would silently derive against the legacy USDC default"
+            )
         try:
             asset_derived = derive_wrapped_asset_id(net, spec.erc20_address)
         except WarpDriverError as exc:

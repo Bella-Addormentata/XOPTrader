@@ -176,6 +176,15 @@ def test_every_listed_asset_tail_derives_to_its_pinned_id():
         C.MAINNET.expected_asset_id), "USDC entry mirrors the legacy anchor"
     assert C.MAINNET.asset("milliETH").expected_asset_id == (
         "f322a205c034fe28681829fa5a2e483ac421f0952eb1292945c8db06e0a471a6")
+    # The migration mirror: the table entries must match the legacy
+    # scalars in address and decimals too, or old and new call sites
+    # could target different contracts or unit scales.
+    assert C.MAINNET.asset("USDC").erc20_address == C.MAINNET.usdc_address
+    assert C.MAINNET.asset("USDC").erc20_decimals == C.MAINNET.usdc_decimals
+    assert C.MAINNET.asset("milliETH").erc20_address == (
+        C.MAINNET.milli_eth_address)
+    assert C.MAINNET.asset("milliETH").erc20_decimals == (
+        C.MAINNET.milli_eth_decimals)
 
 
 def test_derivation_normalizes_the_token_prefix_and_rejects_garbage():
@@ -194,6 +203,13 @@ def test_derivation_normalizes_the_token_prefix_and_rejects_garbage():
     for bad in ("0xnothex", "0x1234", "zz" * 20):
         with pytest.raises(drivers.WarpDriverError):
             drivers.derive_wrapped_asset_id(C.MAINNET, bad)
+    empty = dataclasses.replace(spec, erc20_address="")
+    broken_empty = dataclasses.replace(
+        C.MAINNET,
+        assets=(("USDC", C.MAINNET.asset("USDC")), ("milliETH", empty)),
+    )
+    with pytest.raises(drivers.WarpDriverError, match="empty erc20_address"):
+        drivers.verify_wrapped_asset_anchor(broken_empty)
     mangled = dataclasses.replace(spec, erc20_address="0xnothex")
     broken = dataclasses.replace(
         C.MAINNET,
@@ -213,9 +229,10 @@ def test_millieth_pin_matches_the_enabled_trading_pair():
     cfg_path = Path(__file__).resolve().parents[4] / "config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
     pairs = [p for p in (cfg.get("pairs") or [])
-             if "wmilliETH.b" in str(p.get("name", ""))]
-    assert pairs, "the wmilliETH.b pair is missing from config.yaml"
-    assert pairs[0]["base_asset_id"] ==         C.MAINNET.asset("milliETH").expected_asset_id
+             if p.get("name") == "wmilliETH.b/XCH" and p.get("enabled")]
+    assert pairs, "the ENABLED wmilliETH.b/XCH pair is missing from config.yaml"
+    assert pairs[0]["base_asset_id"] == (
+        C.MAINNET.asset("milliETH").expected_asset_id)
 
 
 def test_anchor_verification_covers_every_listed_asset():
