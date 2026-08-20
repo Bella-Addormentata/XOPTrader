@@ -634,6 +634,9 @@ warp:
   # its half-width must be at least twice that floor (gas-churn guard).
   # USDC tolerance_pct must be at least 1 (the band must absorb the
   # 0.3% unwrap tip) and the half-width at least 0.001 USDC (one mojo).
+  # ROLLOUT: leave the usdc block off until the first live 0.001-USDC
+  # micro-unwrap protocol test has succeeded -- the deficit leg fires
+  # real burns. The ETH block and the excess-bridge leg are safe first.
   # rebalance:
   #   enabled: true
   #   cooldown_s: 600

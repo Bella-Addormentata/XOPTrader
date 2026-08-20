@@ -2798,7 +2798,9 @@ class WarpEngine:
         )
         return _job_dict(job)
 
-    def request_bridge(self, target_micros: Optional[int] = None) -> dict:
+    def request_bridge(
+        self, target_micros: Optional[int] = None, *, automatic: bool = False
+    ) -> dict:
         """Operator "Bridge now": open a job (raises if one is already active).
 
         A manual job bridges whatever is in the hot wallet, ignoring
@@ -2813,14 +2815,24 @@ class WarpEngine:
                 "resolve it first -- Retry, Cancel, Sweep or Abandon from the "
                 "jobs table"
             )
-        state: Dict[str, Any] = {"manual": True, **self._binding()}
+        # Provenance matters twice over: the audit trail must say WHY the
+        # funds moved, and _h_awaiting_deposit re-checks the auto min_micros
+        # floor only for non-manual jobs -- a rebalance stamped manual could
+        # bridge a sub-floor amount if the balance dropped after the consult.
+        if automatic:
+            state: Dict[str, Any] = {
+                "auto": True, "rebalance": True, **self._binding()
+            }
+        else:
+            state = {"manual": True, **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
         job = self._store.create_job(
             self._net.name,
             status=JobStatus.AWAITING_DEPOSIT,
             state=state,
-            event_message="manual bridge requested",
+            event_message=("rebalance: automatic bridge requested"
+                           if automatic else "manual bridge requested"),
         )
         return _job_dict(job)
 
@@ -2989,7 +3001,8 @@ class WarpEngine:
 
 
     def request_unwrap(
-        self, amount_mojos: int, receiver: str, external_relay: bool = False
+        self, amount_mojos: int, receiver: str, external_relay: bool = False,
+        *, automatic: bool = False
     ) -> dict:
         """Operator-triggered unwrap: wUSDC.b -> native USDC at *receiver*.
 
@@ -3053,13 +3066,15 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
-                "manual": True,
+                "manual": not automatic,
+                **({"rebalance": True} if automatic else {}),
                 "receiver_evm": rec_bytes.hex(),
                 "external_relay": bool(external_relay),
                 **self._binding(),
             },
             event_message=(
-                f"unwrap requested: {amount} mojos -> {receiver}"
+                ("rebalance: automatic " if automatic else "")
+                + f"unwrap requested: {amount} mojos -> {receiver}"
                 + (" (external relay: no Base gas needed)" if external_relay else "")
             ),
         )
@@ -3739,7 +3754,9 @@ class _WarpWorker(QObject):
             reason = action.reason
             _log.info("rebalance: %s", action.reason)
             if action.kind == "bridge_usdc":
-                engine.request_bridge(target_micros=action.amount)
+                engine.request_bridge(
+                    target_micros=action.amount, automatic=True
+                )
             elif action.kind == "unwrap_usdc":
                 # Preflight spendable wUSDC.b and clamp: an exact-size job
                 # bigger than held inventory would go FAILED, and FAILED
@@ -3763,7 +3780,9 @@ class _WarpWorker(QObject):
                         "spendable wUSDC.b inventory)"
                     )
                 # Receiver is ALWAYS our own hot wallet -- never config.
-                engine.request_unwrap(mojos, engine._hot_address)
+                engine.request_unwrap(
+                    mojos, engine._hot_address, automatic=True
+                )
             elif action.kind == "wrap_eth":
                 self._base_wallet().wrap_eth(
                     action.amount, reserve_wei=_MIN_GAS_WEI

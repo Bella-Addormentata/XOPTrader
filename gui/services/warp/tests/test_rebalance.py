@@ -189,11 +189,12 @@ class FakeEngine:
             self._hot_cache = fresh
         return self._hot_cache
 
-    def request_bridge(self, target_micros=None):
-        self.calls.append(("bridge", target_micros))
+    def request_bridge(self, target_micros=None, *, automatic=False):
+        self.calls.append(("bridge", target_micros, automatic))
 
-    def request_unwrap(self, mojos, receiver, external_relay=False):
-        self.calls.append(("unwrap", mojos, receiver))
+    def request_unwrap(self, mojos, receiver, external_relay=False,
+                       *, automatic=False):
+        self.calls.append(("unwrap", mojos, receiver, automatic))
 
 
 def _worker_with(params):
@@ -209,7 +210,7 @@ def test_worker_executes_one_action_and_cools_down():
     w = _worker_with(PARAMS)
     eng = FakeEngine()
     w._maybe_rebalance(eng)
-    assert eng.calls == [("bridge", 50_000_000)]
+    assert eng.calls == [("bridge", 50_000_000, True)]
     # Immediately again: cooldown suppresses even though still out of band.
     w._maybe_rebalance(eng)
     assert len(eng.calls) == 1
@@ -301,8 +302,9 @@ def test_malformed_shapes_and_quoted_booleans_fail_closed():
 def test_sub_mojo_bridge_excess_plans_nothing():
     """1-999 micros of excess is below one CAT mojo: a job for it would
     pend forever on 'deposit below one bridgeable mojo', squatting the
-    single active-job slot. Reachable only with a tiny band (0.002 USDC
-    target here), which the parser allows."""
+    single active-job slot. The parser REJECTS such tiny bands (see
+    test_usdc_half_width_must_absorb_one_mojo); RebalanceParams is built
+    directly here to keep the planner defensive in depth anyway."""
     tiny = rb.RebalanceParams(
         enabled=True, usdc=rb.AssetBand(target=2_000, tolerance_pct=20))
     assert _plan(params=tiny, usdc_micros=2_500,
@@ -455,7 +457,7 @@ def test_auto_unwrap_clamps_to_spendable_and_skips_when_empty():
     eng._wallet = SimpleNamespace(
         get_wallet_balance=lambda wid: {"spendable_balance": 40_000})
     w._maybe_rebalance(eng)
-    assert eng.calls == [("unwrap", 40_000, eng._hot_address)], (
+    assert eng.calls == [("unwrap", 40_000, eng._hot_address, True)], (
         "clamped to spendable, not the full 90_000-mojo deficit")
 
     w2 = _worker_with(PARAMS)
@@ -545,6 +547,61 @@ def test_usdc_jobs_are_skipped_while_eth_is_below_the_gas_floor():
     assert eng.calls == []
     assert "relay-gas floor" in w._rebalance_last
     assert w._rebalance_next_ok == 0.0, "no cooldown: a refuel acts promptly"
+
+
+def test_automatic_jobs_carry_rebalance_provenance_not_manual():
+    """manual: True would mis-record the audit trail AND bypass the
+    _h_awaiting_deposit auto min_micros recheck -- a rebalance bridge
+    could move a sub-floor amount if the balance dropped post-consult."""
+    from types import SimpleNamespace
+
+    class PermissiveJob:
+        """Any attribute _job_dict asks for reads as None."""
+
+        def __init__(self, state):
+            self.state = state
+            self.status = "AWAITING_DEPOSIT"
+
+        def __getattr__(self, name):
+            return None
+
+    created = {}
+    eng = S.WarpEngine.__new__(S.WarpEngine)
+    eng._net = SimpleNamespace(name="mainnet")
+    eng._store = SimpleNamespace(
+        get_active_job=lambda: None,
+        create_job=lambda name, **kw: created.update(kw) or PermissiveJob(
+            kw.get("state") or {}),
+    )
+    eng._binding = lambda: {"network": "mainnet"}
+    eng.request_bridge(target_micros=5_000_000, automatic=True)
+    assert created["state"].get("rebalance") is True
+    assert not created["state"].get("manual"), (
+        "automatic bridges must NOT be stamped manual")
+    assert "rebalance" in created["event_message"]
+
+    created.clear()
+    eng.request_bridge(target_micros=5_000_000)
+    assert created["state"].get("manual") is True
+    assert "manual" in created["event_message"]
+
+
+def test_worker_passes_automatic_to_both_job_actuators():
+    from types import SimpleNamespace
+
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    w._maybe_rebalance(eng)                          # USDC excess -> bridge
+    assert eng.calls == [("bridge", 50_000_000, True)]
+
+    w2 = _worker_with(PARAMS)
+    eng2 = FakeEngine()
+    eng2._hot_cache["usdc_micros"] = 10_000_000
+    eng2._resolve_cat_wallet_id = lambda: 7
+    eng2._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 10 ** 9})
+    w2._maybe_rebalance(eng2)
+    assert eng2.calls == [("unwrap", 90_000, eng2._hot_address, True)]
 
 
 if __name__ == "__main__":  # pragma: no cover
