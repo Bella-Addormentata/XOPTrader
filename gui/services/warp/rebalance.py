@@ -168,10 +168,12 @@ def parse_rebalance_config(
         return AssetBand(target=scaled, tolerance_pct=tol)
 
     usdc = band("usdc", 10 ** 6)
-    # The unwrap receiver gets the POST-TIP amount (0.3% today, read live
-    # and owner-mutable), so a band tighter than the tip stays breached
-    # after a to-target action and loops every cooldown. 1% headroom
-    # covers the live tip with margin without needing a chain read here.
+    # The unwrap receiver gets the POST-TIP amount: ERC20Bridge.tip() is
+    # 30 bps, immutable on the deployed contract (unlike the Portal's
+    # owner-mutable message toll), so a band tighter than the tip stays
+    # breached after a to-target action and loops every cooldown. The 1%
+    # floor covers it with margin and holds for any redeploy up to 100 bps
+    # -- the anchor gates would refuse a redeployed bridge anyway.
     if usdc is not None and usdc.tolerance_pct < 1.0:
         raise RebalanceConfigError(
             "warp.rebalance.usdc.tolerance_pct must be at least 1 (the "
