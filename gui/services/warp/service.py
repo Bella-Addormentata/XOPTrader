@@ -468,6 +468,17 @@ def _advance(
     return _Step(next_status=next_status, columns=columns, state=state, message=message)
 
 
+def _asset_fingerprint(spec) -> str:
+    """The asset TERMS a job is frozen against: contract, precision, TAIL.
+
+    Persisted next to the symbol so a job resumed after a constants change
+    (or against a different build) refuses rather than silently adopting
+    the new meaning of the same name.
+    """
+    return (f"{spec.erc20_address.lower()}:{int(spec.erc20_decimals)}:"
+            f"{spec.expected_asset_id.lower()}")
+
+
 def _stay(
     *,
     columns: Optional[Dict[str, Any]] = None,
@@ -851,17 +862,41 @@ class WarpEngine:
         rather than a silent fallback: guessing the token here would size
         amounts and derive the wrapped TAIL against the wrong asset.
         """
-        symbol = str(job.state.get("asset") or "USDC")
+        if "asset" not in job.state:
+            symbol = "USDC"          # legacy row: the only asset there was
+        else:
+            symbol = str(job.state.get("asset") or "").strip()
+            if not symbol:
+                # Present but empty is corruption, not history. Defaulting
+                # here would approve and bridge it as USDC.
+                raise WarpTerminal(
+                    f"job {job.id} carries an empty asset field; refusing to "
+                    "assume USDC for a row that recorded something else"
+                )
         try:
-            return self._net.asset(symbol)
+            spec = self._net.asset(symbol)
         except KeyError:
             raise WarpTerminal(
                 f"job {job.id} names asset {symbol!r}, which {self._net.name} "
                 "does not list as bridgeable -- refusing to guess"
             ) from None
 
+        # The symbol alone is a NAME, not the terms: re-resolving it against
+        # today's constants would silently re-point an in-flight job if an
+        # address, precision or wrapped id ever moved under the same symbol.
+        # Jobs that recorded a fingerprint must still match it.
+        frozen = job.state.get("asset_fingerprint")
+        if frozen and str(frozen) != _asset_fingerprint(spec):
+            raise WarpTerminal(
+                f"job {job.id} froze {symbol} as {frozen}, but this build "
+                f"resolves it to {_asset_fingerprint(spec)} -- the asset's "
+                "terms changed under a live job; refusing to resume"
+            )
+        return spec
+
     def _h_awaiting_deposit(self, job: WarpJob) -> _Step:
-        """Watch the hot wallet for a USDC deposit; freeze amounts on arrival."""
+        """Watch the hot wallet for a deposit of the JOB's asset; freeze
+        amounts on arrival."""
         from . import evm
 
         net, p = self._net, self._params
@@ -934,6 +969,7 @@ class WarpEngine:
             # job under any other key. This is the last state where that is still
             # a free choice -- nothing has been signed yet.
             state={"tip_bps": tip_bps, "asset": spec.symbol,
+                   "asset_fingerprint": _asset_fingerprint(spec),
                    **self._binding()},
             message=(
                 f"deposit {amount_base} micros seen; bridging {mojo_amount} mojos "

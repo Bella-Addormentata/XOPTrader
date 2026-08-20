@@ -228,18 +228,123 @@ def test_deposit_seen_freezes_the_asset_with_the_amounts():
     seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"manual": True})
     out = engine.step()
     assert out["status"] == S.JobStatus.DEPOSIT_SEEN
-    assert store.get_job(out["id"]).state["asset"] == "USDC",         "the asset must be frozen alongside the network/hot-wallet binding"
+    assert store.get_job(out["id"]).state["asset"] == "USDC", (
+        "the asset must be frozen alongside the binding")
 
 
 def test_the_claim_anchor_rejects_an_id_the_network_does_not_pin():
-    """The per-job anchor must not be weaker than the global constant it
-    replaced: a request cannot introduce a wrapped id of its own."""
+    """Exercises the real validator: a ClaimRequest cannot introduce a
+    wrapped id this deployment does not pin, so the per-job anchor is no
+    weaker than the global constant it replaced."""
     from gui.services.warp import drivers
 
-    known = {NET.expected_asset_id.lower(), MILLI.expected_asset_id.lower()}
-    assert USDC.expected_asset_id.lower() in known
-    # An id that is merely well-formed is not acceptable.
-    assert ("ff" * 32) not in known
+    # Both pinned ids are accepted, and normalise to lower case.
+    pinned = drivers._require_pinned_asset_id
+    assert pinned(NET, USDC.expected_asset_id) == USDC.expected_asset_id.lower()
+    assert pinned(NET, MILLI.expected_asset_id) == MILLI.expected_asset_id.lower()
+    assert pinned(NET, MILLI.expected_asset_id.upper()) == (
+        MILLI.expected_asset_id.lower()), "case is normalised"
+    # An empty request falls back to the network anchor (legacy behaviour).
+    assert pinned(NET, "") == NET.expected_asset_id.lower()
+    # A well-formed but unpinned id is refused before any work happens.
+    with pytest.raises(drivers.WarpDriverError, match="does not pin"):
+        drivers._require_pinned_asset_id(NET, "ff" * 32)
+
+
+def test_an_asset_below_cat_precision_is_refused_at_startup_and_in_maths():
+    """10 ** negative is a float in Python; money arithmetic must never go
+    floating. Caught at the refuse-to-start gate, with a hard guard in the
+    conversion helper for descriptors built by hand."""
+    import dataclasses
+
+    from gui.services.warp import drivers
+
+    coarse = dataclasses.replace(MILLI, erc20_decimals=2)   # < cat_decimals 3
+    with pytest.raises(ValueError, match="CAT decimals"):
+        evm._mojo_factor(NET, coarse)
+
+    broken = dataclasses.replace(
+        NET, assets=(("USDC", USDC), ("milliETH", coarse)))
+    with pytest.raises(drivers.WarpDriverError, match="decimals"):
+        drivers.verify_wrapped_asset_anchor(broken)
+
+
+def test_an_empty_asset_field_is_terminal_not_a_usdc_default():
+    """Only an ABSENT field is legacy. A present-but-empty value is
+    corruption, and defaulting it would bridge as USDC."""
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": ""})
+    with pytest.raises(S.WarpTerminal, match="empty asset"):
+        eng._job_asset(job)
+
+
+def test_a_job_refuses_to_resume_if_its_assets_terms_changed():
+    """The symbol is a NAME. A job frozen against one contract/precision/
+    TAIL must not silently adopt a different meaning of that name."""
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT,
+               state={"asset": "USDC",
+                      "asset_fingerprint": "0xdead:6:" + "ff" * 32})
+    with pytest.raises(S.WarpTerminal, match="terms changed"):
+        eng._job_asset(job)
+
+    # The fingerprint this build actually produces resolves cleanly.
+    # (Fresh store: the job table allows only one active job.)
+    store2, eng2, _ctx2 = _engine()
+    ok = seed(store2, S.JobStatus.AWAITING_DEPOSIT,
+              state={"asset": "USDC",
+                     "asset_fingerprint": S._asset_fingerprint(USDC)})
+    assert eng2._job_asset(ok).symbol == "USDC"
+
+
+def test_deposit_freeze_records_the_asset_terms():
+    store = new_store()
+    engine, ctx = build(store)
+    ctx.evm.erc20 = 5_000_000
+    seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"manual": True})
+    out = engine.step()
+    st = store.get_job(out["id"]).state
+    assert st["asset"] == "USDC"
+    assert st["asset_fingerprint"] == S._asset_fingerprint(USDC)
+
+
+def test_the_approving_phase_uses_the_jobs_asset_for_both_calls():
+    """A regression querying or approving USDC here would otherwise pass
+    every other test in this file."""
+    from gui.services.warp import evm as evm_mod
+
+    store = new_store()
+    engine, ctx = build(store)
+    ctx.evm.allowance = 0                       # force the approve path
+    seed(store, S.JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5000, "amount_mojos": 5000},
+         state={"asset": "milliETH"})
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(evm_mod, "sign_tx", fake_sign_tx)
+        engine.step()
+    assert ctx.evm.allowance_asset is not None
+    assert ctx.evm.allowance_asset.symbol == "milliETH", "allowance lookup"
+    assert ctx.evm.approve_asset is not None
+    assert ctx.evm.approve_asset.symbol == "milliETH", "prepared approval"
+
+
+def test_the_first_bridging_signature_uses_the_jobs_asset():
+    """The fee-bump replacement is covered separately; this pins the FIRST
+    bridgeToChia, which is the transaction that actually moves funds."""
+    from gui.services.warp import evm as evm_mod
+
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, S.JobStatus.BRIDGING,
+         columns={"receiver_ph": RECEIVER_PH.hex(), "amount_mojos": 5000},
+         state={"asset": "milliETH"})
+    import pytest as _pytest
+    with _pytest.MonkeyPatch.context() as mp:
+        mp.setattr(evm_mod, "sign_tx", fake_sign_tx)
+        engine.step()
+    assert ctx.evm.bridge_asset is not None
+    assert ctx.evm.bridge_asset.symbol == "milliETH"
 
 
 if __name__ == "__main__":  # pragma: no cover

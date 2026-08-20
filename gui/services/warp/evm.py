@@ -455,7 +455,18 @@ def _mojo_factor(net: WarpNet, asset: Optional["WarpAsset"] = None) -> int:
     token -- mixing one asset's address with another's decimals would
     mis-size a bridge by three orders of magnitude.
     """
-    return 10 ** (_asset_decimals(net, asset) - net.cat_decimals)
+    decimals = _asset_decimals(net, asset)
+    if decimals < net.cat_decimals:
+        # 10 ** negative is a FLOAT in Python, which would silently turn
+        # every amount conversion below into float arithmetic on money.
+        # Assets are validated at engine construction too; this is the
+        # last-resort guard for a descriptor built by hand.
+        raise ValueError(
+            f"asset decimals {decimals} < CAT decimals {net.cat_decimals}: "
+            "wrapped amounts would lose precision and the factor would not "
+            "be an integer"
+        )
+    return 10 ** (decimals - net.cat_decimals)
 
 
 def mojo_to_base_units(mojo: int, net: WarpNet,
