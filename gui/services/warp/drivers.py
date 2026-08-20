@@ -464,17 +464,17 @@ def derive_wrapped_asset_id(net: WarpNet, token_address: str = "") -> bytes:
     token = (token_address or net.usdc_address).strip()
     if token[:2] in ("0x", "0X"):
         token = token[2:]
-    try:
-        token_bytes = bytes.fromhex(token)
-    except ValueError:
+    # bytes.fromhex() tolerates ASCII whitespace between byte pairs, so a
+    # mangled "f2 D5 ..." would decode to 20 bytes here yet be invalid for
+    # every later EVM call -- require exactly 40 hex digits, nothing else.
+    if len(token) != 40 or any(
+        c not in "0123456789abcdefABCDEF" for c in token
+    ):
         raise WarpDriverError(
-            f"malformed ERC-20 token address {token_address!r}"
-        ) from None
-    if len(token_bytes) != 20:
-        raise WarpDriverError(
-            f"ERC-20 token address must be 20 bytes, got "
-            f"{len(token_bytes)}: {token_address!r}"
+            f"malformed ERC-20 token address {token_address!r}: expected "
+            "exactly 40 hex digits (plus optional 0x prefix)"
         )
+    token_bytes = bytes.fromhex(token)
     tail = get_wrapped_tail(
         bytes.fromhex(net.portal_launcher_id),
         net.source_chain.encode(),

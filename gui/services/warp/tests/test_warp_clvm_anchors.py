@@ -200,7 +200,10 @@ def test_derivation_normalizes_the_token_prefix_and_rejects_garbage():
     without = drivers.derive_wrapped_asset_id(
         C.MAINNET, spec.erc20_address[2:])
     assert with_prefix == without
-    for bad in ("0xnothex", "0x1234", "zz" * 20):
+    spaced = "0x" + " ".join(
+        C.MAINNET.asset("milliETH").erc20_address[2:][i:i + 2]
+        for i in range(0, 40, 2))
+    for bad in ("0xnothex", "0x1234", "zz" * 20, spaced):
         with pytest.raises(drivers.WarpDriverError):
             drivers.derive_wrapped_asset_id(C.MAINNET, bad)
     empty = dataclasses.replace(spec, erc20_address="")
