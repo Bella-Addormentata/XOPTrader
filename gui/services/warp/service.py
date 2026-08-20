@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -479,6 +479,15 @@ def _asset_fingerprint(spec) -> str:
             f"{spec.expected_asset_id.lower()}")
 
 
+def _asset_stamp(spec) -> dict:
+    """The asset fields every new job records: the name AND the terms.
+
+    Stamped together at creation so a job cannot exist in a state where
+    the symbol is present but unverifiable -- see :meth:`_job_asset`.
+    """
+    return {"asset": spec.symbol, "asset_fingerprint": _asset_fingerprint(spec)}
+
+
 def _stay(
     *,
     columns: Optional[Dict[str, Any]] = None,
@@ -862,7 +871,8 @@ class WarpEngine:
         rather than a silent fallback: guessing the token here would size
         amounts and derive the wrapped TAIL against the wrong asset.
         """
-        if "asset" not in job.state:
+        stamped = "asset" in job.state
+        if not stamped:
             symbol = "USDC"          # legacy row: the only asset there was
         else:
             symbol = str(job.state.get("asset") or "").strip()
@@ -884,9 +894,17 @@ class WarpEngine:
         # The symbol alone is a NAME, not the terms: re-resolving it against
         # today's constants would silently re-point an in-flight job if an
         # address, precision or wrapped id ever moved under the same symbol.
-        # Jobs that recorded a fingerprint must still match it.
-        frozen = job.state.get("asset_fingerprint")
-        if frozen and str(frozen) != _asset_fingerprint(spec):
+        # Every job that records an asset records its terms too, so a
+        # stamped row without a usable fingerprint is corrupt, not old --
+        # the no-fingerprint path belongs to legacy rows alone.
+        frozen = str(job.state.get("asset_fingerprint") or "").strip()
+        if stamped and not frozen:
+            raise WarpTerminal(
+                f"job {job.id} names asset {symbol} but recorded no "
+                "fingerprint for it; refusing to resolve the name against "
+                "constants it was never checked against"
+            )
+        if frozen and frozen != _asset_fingerprint(spec):
             raise WarpTerminal(
                 f"job {job.id} froze {symbol} as {frozen}, but this build "
                 f"resolves it to {_asset_fingerprint(spec)} -- the asset's "
@@ -968,8 +986,7 @@ class WarpEngine:
             # they were computed from; _binding_mismatch refuses to resume this
             # job under any other key. This is the last state where that is still
             # a free choice -- nothing has been signed yet.
-            state={"tip_bps": tip_bps, "asset": spec.symbol,
-                   "asset_fingerprint": _asset_fingerprint(spec),
+            state={"tip_bps": tip_bps, **_asset_stamp(spec),
                    **self._binding()},
             message=(
                 f"deposit {amount_base} micros seen; bridging {mojo_amount} mojos "
@@ -1963,7 +1980,6 @@ class WarpEngine:
     def _claim_contents(self, job: WarpJob) -> List[bytes]:
         return [bytes.fromhex(_hx(c)) for c in job.state.get("message_contents", [])]
 
-
     # ================================================================== #
     # Outbound (unwrap) handlers: wUSDC.b on Chia -> native USDC on Base.
     #
@@ -2924,7 +2940,8 @@ class WarpEngine:
         job = self._store.create_job(
             net.name,
             status=JobStatus.AWAITING_DEPOSIT,
-            state={"auto": True, "asset": "USDC", **self._binding()},
+            state={"auto": True, **_asset_stamp(net.asset("USDC")),
+                   **self._binding()},
             event_message="auto-bridge: deposit detected",
         )
         return _job_dict(job)
@@ -2952,11 +2969,12 @@ class WarpEngine:
         # bridge a sub-floor amount if the balance dropped after the consult.
         if automatic:
             state: Dict[str, Any] = {
-                "auto": True, "rebalance": True, "asset": "USDC",
-                **self._binding()
+                "auto": True, "rebalance": True,
+                **_asset_stamp(self._net.asset("USDC")), **self._binding()
             }
         else:
-            state = {"manual": True, "asset": "USDC", **self._binding()}
+            state = {"manual": True, **_asset_stamp(self._net.asset("USDC")),
+                     **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
         job = self._store.create_job(
@@ -3131,7 +3149,6 @@ class WarpEngine:
         )
         return _job_dict(self._store.get_job(job.id))
 
-
     def request_unwrap(
         self, amount_mojos: int, receiver: str, external_relay: bool = False,
         *, automatic: bool = False, rebalance_target_micros: int = 0
@@ -3198,7 +3215,7 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
-                "asset": "USDC",
+                **_asset_stamp(self._net.asset("USDC")),
                 "manual": not automatic,
                 **({"rebalance": True} if automatic else {}),
                 # Lets _h_unwrap_checks re-derive the still-needed amount

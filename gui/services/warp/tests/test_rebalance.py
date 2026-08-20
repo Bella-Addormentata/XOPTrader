@@ -362,7 +362,10 @@ def test_automatic_jobs_carry_rebalance_provenance_not_manual():
 
     created = {}
     eng = S.WarpEngine.__new__(S.WarpEngine)
-    eng._net = SimpleNamespace(name="mainnet")
+    # request_bridge now stamps the asset TERMS, so the fake network must
+    # resolve descriptors like the real one.
+    from gui.services.warp import constants as _C
+    eng._net = SimpleNamespace(name="mainnet", asset=_C.MAINNET.asset)
     eng._store = SimpleNamespace(
         get_active_job=lambda: None,
         create_job=lambda name, **kw: created.update(kw) or PermissiveJob(

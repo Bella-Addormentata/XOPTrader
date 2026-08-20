@@ -104,7 +104,7 @@ def test_a_job_without_an_asset_reads_as_usdc():
 
 def test_a_stamped_job_resolves_to_its_own_asset():
     store, eng, ctx = _engine()
-    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "milliETH"})
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state=S._asset_stamp(MILLI))
     spec = eng._job_asset(job)
     assert spec.symbol == "milliETH"
     assert spec.erc20_address == NET.milli_eth_address
@@ -145,7 +145,7 @@ def test_the_attested_source_anchor_compares_against_the_jobs_asset():
     seed(store, S.JobStatus.MESSAGE_SENT,
          columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985,
                   "bridge_nonce": "00" * 31 + "07"},
-         state={"asset": "milliETH"})
+         state=S._asset_stamp(MILLI))
     out = engine.step()
     assert out["status"] == S.JobStatus.FAILED
     assert "milliETH" in (store.get_job(out["id"]).last_error or "")
@@ -158,7 +158,7 @@ def test_the_attested_source_anchor_compares_against_the_jobs_asset():
     seed(store2, S.JobStatus.MESSAGE_SENT,
          columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985,
                   "bridge_nonce": "00" * 31 + "07"},
-         state={"asset": "milliETH"})
+         state=S._asset_stamp(MILLI))
     out2 = engine2.step()
     assert out2["status"] == S.JobStatus.FUNDING_CLAIM
 
@@ -194,7 +194,7 @@ def test_the_fee_bump_resign_rebuilds_for_the_same_asset(monkeypatch):
         store, S.JobStatus.BRIDGING,
         columns={"receiver_ph": RECEIVER_PH.hex(), "amount_mojos": 5000,
                  "bridge_tx_hash": "0x" + "11" * 32},
-        state={"asset": "milliETH", "bridge_raw": "aa" * 10,
+        state={**S._asset_stamp(MILLI), "bridge_raw": "aa" * 10,
                # nonce still unconsumed on chain, polls past the stuck
                # threshold, and a recorded fee base to escalate from --
                # the exact conditions for the re-sign branch.
@@ -215,7 +215,7 @@ def test_a_non_usdc_deposit_is_refused_while_caps_are_usdc_scaled():
     an absence of callers."""
     store = new_store()
     engine, _ = build(store, params=default_params(max_micros=5_000_000))
-    seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "milliETH"})
+    seed(store, S.JobStatus.AWAITING_DEPOSIT, state=S._asset_stamp(MILLI))
     out = engine.step()
     assert out["status"] == S.JobStatus.FAILED
     assert "not enabled yet" in (store.get_job(out["id"]).last_error or "")
@@ -318,7 +318,7 @@ def test_the_approving_phase_uses_the_jobs_asset_for_both_calls():
     ctx.evm.allowance = 0                       # force the approve path
     seed(store, S.JobStatus.APPROVING,
          columns={"amount_usdc_micros": 5000, "amount_mojos": 5000},
-         state={"asset": "milliETH"})
+         state=S._asset_stamp(MILLI))
     import pytest as _pytest
     with _pytest.MonkeyPatch.context() as mp:
         mp.setattr(evm_mod, "sign_tx", fake_sign_tx)
@@ -338,13 +338,43 @@ def test_the_first_bridging_signature_uses_the_jobs_asset():
     engine, ctx = build(store)
     seed(store, S.JobStatus.BRIDGING,
          columns={"receiver_ph": RECEIVER_PH.hex(), "amount_mojos": 5000},
-         state={"asset": "milliETH"})
+         state=S._asset_stamp(MILLI))
     import pytest as _pytest
     with _pytest.MonkeyPatch.context() as mp:
         mp.setattr(evm_mod, "sign_tx", fake_sign_tx)
         engine.step()
     assert ctx.evm.bridge_asset is not None
     assert ctx.evm.bridge_asset.symbol == "milliETH"
+
+
+def test_a_stamped_job_without_a_fingerprint_is_terminal():
+    """Every job that records an asset records its terms too, so a stamped
+    row missing (or carrying an empty) fingerprint is corrupt, not old --
+    resolving the bare name is exactly the re-pointing the stamp prevents.
+    The no-fingerprint path belongs to legacy rows alone."""
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "USDC"})
+    with pytest.raises(S.WarpTerminal, match="no.*fingerprint"):
+        eng._job_asset(job)
+
+    store2, eng2, _c2 = _engine()
+    blank = seed(store2, S.JobStatus.AWAITING_DEPOSIT,
+                 state={"asset": "USDC", "asset_fingerprint": "   "})
+    with pytest.raises(S.WarpTerminal, match="no.*fingerprint"):
+        eng2._job_asset(blank)
+
+
+def test_every_creation_path_stamps_the_terms_not_just_the_name():
+    """The gap this closes: a job created with only a symbol and then
+    resumed after a constants change would adopt the new terms while
+    still sitting in AWAITING_DEPOSIT."""
+    store, eng, ctx = _engine()
+    out = eng.request_bridge()
+    st = store.get_job(out["id"]).state
+    assert st["asset"] == "USDC"
+    assert st["asset_fingerprint"] == S._asset_fingerprint(USDC)
+    # ...and the resolver accepts what the creator wrote.
+    assert eng._job_asset(store.get_job(out["id"])).symbol == "USDC"
 
 
 if __name__ == "__main__":  # pragma: no cover
