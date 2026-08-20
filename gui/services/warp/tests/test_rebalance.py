@@ -232,9 +232,14 @@ def test_worker_stays_quiet_on_unreadable_balances():
 def test_auto_unwrap_receiver_is_always_the_engines_own_hot_wallet():
     """An edited config must never redirect an automatic unwrap: the
     receiver comes from the engine, not from any parameter."""
+    from types import SimpleNamespace
+
     w = _worker_with(PARAMS)
     eng = FakeEngine()
     eng._hot_cache["usdc_micros"] = 10_000_000       # deep deficit
+    eng._resolve_cat_wallet_id = lambda: 7
+    eng._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 10 ** 9})
     w._maybe_rebalance(eng)
     assert eng.calls and eng.calls[0][0] == "unwrap"
     assert eng.calls[0][2] == eng._hot_address
@@ -419,6 +424,42 @@ def test_unsettled_balances_skip_the_consult_without_cooldown():
     eng.unmined = 0
     w._maybe_rebalance(eng)
     assert eng.calls, "settles -> the same consult acts"
+
+
+def test_usdc_bands_tighter_than_the_tip_refuse():
+    """The unwrap receiver gets the post-tip amount, so a 0.1% band can
+    never be landed inside by a to-target action -- it would loop."""
+    with pytest.raises(rb.RebalanceConfigError, match="tip"):
+        rb.parse_rebalance_config(
+            _cfg(enabled=True, usdc={"target": 100, "tolerance_pct": 0.1}),
+            min_gas_wei=MIN_GAS)
+
+
+def test_auto_unwrap_clamps_to_spendable_and_skips_when_empty():
+    """A FAILED job retains the single active slot; an automatic unwrap
+    sized above held wUSDC.b must clamp (or skip at zero), never open a
+    job destined to fail."""
+    from types import SimpleNamespace
+
+    w = _worker_with(PARAMS)
+    eng = FakeEngine()
+    eng._hot_cache["usdc_micros"] = 10_000_000     # 90-USDC deficit
+    eng._resolve_cat_wallet_id = lambda: 7
+    eng._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 40_000})
+    w._maybe_rebalance(eng)
+    assert eng.calls == [("unwrap", 40_000, eng._hot_address)], (
+        "clamped to spendable, not the full 90_000-mojo deficit")
+
+    w2 = _worker_with(PARAMS)
+    eng2 = FakeEngine()
+    eng2._hot_cache["usdc_micros"] = 10_000_000
+    eng2._resolve_cat_wallet_id = lambda: 7
+    eng2._wallet = SimpleNamespace(
+        get_wallet_balance=lambda wid: {"spendable_balance": 0})
+    w2._maybe_rebalance(eng2)
+    assert eng2.calls == []
+    assert "no spendable" in w2._rebalance_last
 
 
 if __name__ == "__main__":  # pragma: no cover

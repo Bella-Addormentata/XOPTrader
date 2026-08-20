@@ -3720,8 +3720,22 @@ class _WarpWorker(QObject):
             if action.kind == "bridge_usdc":
                 engine.request_bridge(target_micros=action.amount)
             elif action.kind == "unwrap_usdc":
+                # Preflight spendable wUSDC.b and clamp: an exact-size job
+                # bigger than held inventory would go FAILED, and FAILED
+                # deliberately retains the single active slot -- an
+                # automatic action must never squat it waiting for an
+                # operator.
+                wallet_id = engine._resolve_cat_wallet_id()
+                bal = engine._wallet.get_wallet_balance(wallet_id)
+                spendable = int(bal.get("spendable_balance") or 0)
+                mojos = min(action.amount, spendable)
+                if mojos < 1:
+                    self._rebalance_last = (
+                        "rebalance skipped: no spendable wUSDC.b to unwrap"
+                    )
+                    return
                 # Receiver is ALWAYS our own hot wallet -- never config.
-                engine.request_unwrap(action.amount, engine._hot_address)
+                engine.request_unwrap(mojos, engine._hot_address)
             elif action.kind == "wrap_eth":
                 self._base_wallet().wrap_eth(
                     action.amount, reserve_wei=_MIN_GAS_WEI
