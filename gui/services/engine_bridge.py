@@ -401,7 +401,14 @@ class EngineBridge(QObject):
                 # it, while the id comes from the pair config and cannot
                 # drift.  MetricsService.get_inventory existed but nothing
                 # had ever called it.
-                base_id = str(pair_cfg.get("base_asset_id", "") or "")
+                # Lower-cased to match the label the engine publishes:
+                # config.cpp normalises asset ids at load (T3-29) before
+                # they reach Prometheus, while ConfigService.get_pairs()
+                # returns whatever the YAML says and the Settings UI
+                # accepts uppercase.  A case-sensitive label lookup would
+                # then miss and show Inventory as zero -- which reads as
+                # real data rather than as a lookup failure.
+                base_id = str(pair_cfg.get("base_asset_id", "") or "").strip().lower()
                 if base_id:
                     inv = self._metrics_svc.get_inventory(base_id)
                     pair_md["inventory_mojos"] = float(

@@ -196,3 +196,20 @@ def test_pnl_uses_the_quote_divisor_not_the_xch_one():
         "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
     body = source.split("def _refresh_pairs_table")[1].split("def ")[0]
     assert 'mojos_per_unit_for_pair(pair_name, "quote")' in body
+
+
+def test_the_asset_id_is_lowercased_to_match_the_published_label():
+    """config.cpp lowercases ids (T3-29) before they become metric labels.
+
+    ConfigService returns the YAML spelling and the Settings UI accepts
+    uppercase, so an uppercase id would miss the case-sensitive lookup and
+    render Inventory as 0 -- indistinguishable from a real zero balance.
+    """
+    from pathlib import Path
+    root = Path(__file__).resolve().parent.parent
+    cpp = (root / "cpp" / "src" / "config.cpp").read_text(encoding="utf-8")
+    assert "to_lower(p.base_asset_id)" in cpp, "engine no longer normalises"
+    bridge = (root / "gui" / "services" / "engine_bridge.py").read_text(
+        encoding="utf-8")
+    line = [l for l in bridge.split(chr(10)) if "base_id = str(" in l]
+    assert line and ".lower()" in line[0], "asset id not normalised for lookup"
