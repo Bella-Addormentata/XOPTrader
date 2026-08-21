@@ -448,6 +448,13 @@ class WalletBalancesWidget(QWidget):
         # the fixed-height panels would spread down the page.
         root.addStretch(1)
 
+        # Fit them EMPTY too.  This page starts with no wallet data -- the
+        # main window forwards an empty mapping on startup -- and an unfitted
+        # table keeps its ~480px default size hint, so the page would open
+        # with a large outer scroll range holding nothing.
+        _fit_table_to_contents(self._table)
+        _fit_table_to_contents(self._alloc_table)
+
     def _make_summary_card(
         self, title: str, value: str, layout: QHBoxLayout
     ) -> QLabel:
@@ -503,6 +510,9 @@ class WalletBalancesWidget(QWidget):
             self._status_label.setText(
                 "No wallet data — check Chia wallet connection"
             )
+            # Returning here skips the fit at the end of this method, so the
+            # table must be sized on the way out as well.
+            _fit_table_to_contents(self._table)
             return
 
         self._table.setRowCount(len(balances))

@@ -119,12 +119,39 @@ def test_the_helper_tracks_rows_being_added(app):
     app.setStyleSheet(theme.get_stylesheet())
     w = WalletBalancesWidget()
     table = w._alloc_table
-    # Baseline must be the FITTED empty height.  Reading it before the first
-    # fit gets the widget's default size hint (480px), which is larger than a
-    # populated table and inverts the comparison.
-    _fit_table_to_contents(table)
+    # No manual fit here any more: the widget fits both tables at
+    # construction, so this baseline is the real empty height.  Fitting it by
+    # hand was masking the startup case the next test covers.
     empty = table.height()
     table.setRowCount(6)
     _fit_table_to_contents(table)
     assert table.height() > empty
     assert table.height() == _content_height(table)
+
+
+def test_the_page_opens_fitted_before_any_wallet_data(app):
+    """Startup forwards an empty mapping; the tables must already be sized.
+
+    Unfitted they keep a ~480px default size hint each, so the page opened
+    with a large outer scroll range holding nothing.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    w = WalletBalancesWidget()
+    for table in (w._table, w._alloc_table):
+        assert table.height() == _content_height(table)
+        assert table.height() < 200, "still at the unfitted default"
+
+
+def test_the_startup_empty_update_leaves_the_table_fitted(app):
+    """update_balances returns early when there is nothing to show.
+
+    That early return skips the fit at the end of the method, which is the
+    path the page takes on startup.  Note it deliberately does NOT clear an
+    existing table -- an empty payload keeps the last known balances and only
+    changes the status label -- so this asserts the no-data-yet case.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    w = WalletBalancesWidget()
+    w.update_balances({}, market_data={}, stuck_offers=0)
+    assert w._table.height() == _content_height(w._table)
+    assert w._table.height() < 200, "left at the unfitted default"
