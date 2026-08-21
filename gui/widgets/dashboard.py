@@ -946,7 +946,13 @@ class DashboardWidget(QWidget):
             oldest first.  The feed is capped at
             :data:`_ACTIVITY_FEED_MAX`.
         """
+        # clear() drops the scrollbar to 0/0, and _on_feed_scroll reads
+        # that as "at the bottom", silently re-arming auto-scroll.  A user
+        # who had scrolled up to read an older fill would be yanked back to
+        # the bottom on the next snapshot.  Preserve their position.
+        was_auto_scroll = self._auto_scroll
         self._activity_list.clear()
+        self._auto_scroll = was_auto_scroll
         for trade in trades:
             ts = trade.get("timestamp", "")
             icon = trade.get("icon", "\u2022")   # bullet fallback

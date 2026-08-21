@@ -90,3 +90,55 @@ def test_the_feed_is_actually_connected():
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
     assert "trades_loaded.connect(self._on_trades_for_activity)" in source
+
+
+def test_scrolling_up_is_not_undone_by_the_next_snapshot(app):
+    """clear() drops the scrollbar to 0/0, which reads as "at the bottom".
+
+    Without preserving the flag, a user reading an older fill is yanked back
+    to the bottom every refresh tick.
+    """
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_trades([{"timestamp": "16:54:15", "icon": "x",
+                         "message": f"FILL {i}"} for i in range(40)])
+    dash._auto_scroll = False               # user scrolled up to read
+    dash.update_trades([{"timestamp": "16:55:00", "icon": "x",
+                         "message": f"FILL {i}"} for i in range(40)])
+    assert dash._auto_scroll is False, "auto-scroll was silently re-armed"
+
+
+def test_a_snapshot_that_renders_to_nothing_keeps_the_previous_feed(app):
+    """Bad rows must not discard a good feed.
+
+    activity_event already skips a malformed row; the caller must not then
+    replace the whole feed with the resulting empty list.
+    """
+    from gui.widgets.main_window import activity_event
+
+    bad = {"pair_name": "XCH/wUSDC.b", "side": "bid",
+           "price_mojos": "nope", "size_mojos": "nope"}
+    rows = [bad, bad]
+    events = [e for e in (activity_event(t) for t in rows) if e is not None]
+    assert rows and not events, "fixture no longer exercises the guard"
+
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    body = source.split("def _on_trades_for_activity")[1].split("\n    def ")[0]
+    assert "if rows and not events" in body, (
+        "an unrenderable snapshot would clear the feed"
+    )
+
+
+def test_the_feed_does_not_add_a_second_refresh_mechanism():
+    """DatabaseService._on_auto_refresh already re-issues the trades query.
+
+    A count-driven query duplicated it and pushed the same 1000 rows through
+    the Trade Log and chart handlers again.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    assert "_refresh_activity_on_new_fill" not in source

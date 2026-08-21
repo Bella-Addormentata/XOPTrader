@@ -252,9 +252,6 @@ class MainWindow(QMainWindow):
         self.metrics_service = metrics_service
         self.db_service = db_service
         self._bridge: Optional[Any] = None  # Set via set_bridge()
-        # Last observed 24h fill count, so the activity feed can refresh when
-        # a fill actually lands.  None until the first bridge payload.
-        self._last_fill_count: Optional[int] = None
 
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
@@ -657,7 +654,6 @@ class MainWindow(QMainWindow):
             fill_count_24h = int(
                 self._pnl_display.get("fills_24h", offers.get("filled", 0))
             )
-            self._refresh_activity_on_new_fill(fill_count_24h)
 
             card_data = {
                 "Total P&L": self._total_pnl_payload(),
@@ -1066,28 +1062,6 @@ class MainWindow(QMainWindow):
             "24h P&L": self._pnl_24h_payload(),
         })
 
-    def _refresh_activity_on_new_fill(self, fill_count: int) -> None:
-        """Re-query trades when the fill count moves, and only then.
-
-        A timer would be the obvious approach and is the wrong one here: the
-        trades query is shared with the chart, whose per-pair merge is heavy
-        enough that it is already chunked across event-loop slices at
-        startup.  Polling it every few seconds would pay that cost forever to
-        show something that changes about thirty times a day.
-
-        The first observation only records the baseline -- the startup seed
-        has already populated the feed, so re-querying immediately would
-        duplicate that work for nothing.
-        """
-        previous = self._last_fill_count
-        self._last_fill_count = fill_count
-        if previous is None or fill_count <= previous:
-            return
-        bridge = getattr(self, "_bridge", None)
-        db = getattr(bridge, "database_service", None) if bridge else None
-        if db is not None and hasattr(db, "query_trades"):
-            db.query_trades(limit=1000)
-
     def _on_trades_for_activity(self, trades: list) -> None:
         """Render recent fills into the dashboard's activity feed.
 
@@ -1104,9 +1078,14 @@ class MainWindow(QMainWindow):
         if dashboard is None or not hasattr(dashboard, "update_trades"):
             return
 
-        events = [e for e in (activity_event(t)
-                              for t in list(trades)[:_ACTIVITY_FEED_ROWS][::-1])
-                  if e is not None]
+        rows = list(trades)[:_ACTIVITY_FEED_ROWS][::-1]
+        events = [e for e in (activity_event(t) for t in rows) if e is not None]
+        if rows and not events:
+            # Input existed but nothing rendered.  Replacing the feed with an
+            # empty list here would discard a good snapshot because of bad
+            # rows -- the opposite of the "one malformed row must not empty
+            # the feed" rule that activity_event follows.
+            return
         dashboard.update_trades(events)
 
     def _on_pnl_display(self, display: dict) -> None:
