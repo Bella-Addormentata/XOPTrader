@@ -34,7 +34,7 @@ endif()
 # "XOPTrader v0.8.0" then read as a stale binary during a live incident.
 # tests/test_version_sync.py fails the build if they diverge again.
 project(xop_trader
-    VERSION   0.9.12
+    VERSION   0.9.13
     LANGUAGES CXX
     DESCRIPTION "CHIA DEX market-making bot — XOPTrader C++ engine"
 )
