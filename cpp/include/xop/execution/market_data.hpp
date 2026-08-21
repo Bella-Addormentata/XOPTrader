@@ -429,8 +429,9 @@ struct PairState {
 
     // The same treatment for the last-trade print itself.  dex_print_age is
     // derived from the ORDER-BOOK mid, so it stops advancing precisely when
-    // the book empties -- the one state in which the last trade becomes the
-    // mid.  These two fields age the print directly.  A default-constructed
+    // no usable two-sided quote remains -- an empty book, or a one-sided one,
+    // which is where the last trade becomes the mid.  These two fields age
+    // the print directly.  A default-constructed
     // last_trade_changed_at means "never observed to move": the print's age
     // is unknown, not zero, and compute_mid refuses it on that basis.
     double      last_trade_print{0.0};

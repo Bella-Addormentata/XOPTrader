@@ -62,9 +62,12 @@ namespace {
 // re-stamped on every heartbeat, so it records when we last LOOKED.  The
 // per-pair change-clock does, with one deliberate asymmetry -- a print we
 // have never watched move has an UNKNOWN age, not a zero one, so it is
-// refused.  In practice that means the fallback is unavailable for a pair
-// until it trades once after a restart, which is the conservative side of a
-// path that only opens when the third-party book is empty.
+// refused.  Concretely the clock starts only when the REPORTED PRICE
+// CHANGES: a pair that keeps trading at the same price never initialises it,
+// so the fallback stays unavailable until the print MOVES -- not merely until
+// the pair trades again.  That is the conservative side of a path which opens
+// whenever no usable TWO-SIDED quote remains: an empty book, but equally a
+// one-sided one, since Case 2 forms a mid only when both sides are present.
 // -------------------------------------------------------------------------
 bool last_trade_is_fresh(const PairState& ps,
                          double max_age_sec) {
@@ -1057,14 +1060,32 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     //
     // Falls through to the last trade below, which is a real print rather
     // than half a book.
-    // Case 3: No usable two-sided quotes -- fall back to last trade, but
-    // only while that print is young enough to be evidence of location.
+    // Case 3: No usable two-sided quote -- an empty book, or a one-sided
+    // one, since Case 2 forms a mid only when both sides are present -- so
+    // fall back to the last trade, but only while that print is young enough
+    // to be evidence of location.
     // This is the one blend leg that is a historical print, and it enters at
     // full DEX weight, so an unaged fallback silently anchors the mid to
     // whenever the pair last traded.  Refusing leaves the mid to the CEX and
     // AMM legs, which carry their own freshness tapers; if none survive, the
     // pair publishes no mid and the no-order-book guard stops it quoting --
     // the correct outcome when we cannot locate fair value.
+    //
+    // BLAST RADIUS -- this is NOT monotonic de-risking, and the original
+    // change description was wrong to call it that.  Refusing the print moves
+    // the mid toward the CEX and AMM legs, in whichever direction they sit.
+    // In the motivating wmilliETH.b case the stale print sat BELOW them, so
+    // the mid RISES -- and because the engine centres both sides on the
+    // published mid (engine.cpp:2953 feeding compute_quotes at :3018), BIDS
+    // RISE WITH IT.  We bid higher than before, not lower.
+    //
+    // That is the intended correction: the old bid was anchored to a 13-day
+    // -old trade well below fair.  It is deliberately left unguarded here --
+    // the published-mid band still clamps how far the centre may travel, and
+    // accumulation is braked by the pair's drift target and
+    // single_cat_cap_pct, which are the mechanisms meant to bound buying.  A
+    // stale print is not an accumulation brake and must not be relied on as
+    // one.
     else if (ps.dex_last_trade > 0.0
              && last_trade_is_fresh(ps, cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
