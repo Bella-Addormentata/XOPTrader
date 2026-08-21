@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS
+from gui.theme import COLORS, fit_row_height
 
 log = logging.getLogger(__name__)
 
@@ -640,6 +640,7 @@ class SettingsWidget(QWidget):
             lambda _r, _c, ti=1: self._mark_dirty(ti)
         )
         self._pairs_table.verticalHeader().setVisible(False)
+        fit_row_height(self._pairs_table)   # rows must fit the Remove button
         layout.addWidget(self._pairs_table, stretch=1)
 
         return page
@@ -2902,7 +2903,10 @@ class SettingsWidget(QWidget):
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
-        actions_layout.setContentsMargins(4, 2, 4, 2)
+        # 1px vertically, not 2: these margins sit on TOP of the button's
+        # own height inside the row, and were what pushed the wrapped widget
+        # past the row on a large font.
+        actions_layout.setContentsMargins(4, 1, 4, 1)
         actions_layout.setSpacing(4)
 
         remove_btn = QPushButton("Remove")

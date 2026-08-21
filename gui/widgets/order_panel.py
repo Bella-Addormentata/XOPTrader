@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS, MONO_FONT_FAMILY
+from gui.theme import COLORS, MONO_FONT_FAMILY, fit_row_height
 from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price, num, text
 
 # ---------------------------------------------------------------------------
@@ -293,6 +293,7 @@ class OrderPanel(QWidget):
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
+        fit_row_height(table)   # rows must fit the compact Cancel button
         table.setShowGrid(True)
         table.setSortingEnabled(True)
         # Sorting is re-enabled after every fill, which re-sorts by the

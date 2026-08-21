@@ -608,6 +608,40 @@ QSlider::handle:vertical:hover {{
 # Theme application helper
 # ---------------------------------------------------------------------------
 
+def fit_row_height(table) -> None:
+    """Size *table*'s rows to the current UI font.
+
+    Qt's default section size is a constant (30px here) that does not move
+    when the operator changes the font size, while the text and any control
+    inside a row does.  At the +6 delta a compact button needs 31px on Linux,
+    more once a cell layout adds margins, so the row -- not the control -- is
+    what has to give.
+
+    Deriving a height from font metrics does NOT work: QWidget.font() reports
+    the widget's own font, not the size a stylesheet applies, so the metrics
+    stay at the base size whatever delta is in force.  Measure a real styled
+    control instead.  Rows keep their 30px look at the default size and grow
+    only where a large font genuinely needs it -- on Linux at +6 the compact
+    button alone is 31px, which is what turned CI red.
+    """
+    from PySide6.QtWidgets import QPushButton
+
+    # Measure a real compact button under the CURRENT stylesheet rather than
+    # guessing.  ResizeToContents would also fit, but it honours the
+    # QTableView::item min-height (32px) and padding, inflating every row to
+    # ~53px -- chunkier rows to solve a too-tall control, which is backwards.
+    probe = QPushButton("X")
+    probe.setProperty("compact", True)
+    probe.ensurePolished()
+    needed = probe.sizeHint().height() + 4      # cell layout margins
+    probe.deleteLater()
+    # Never shrink below the existing 30px look; only grow where a large font
+    # actually demands it.
+    table.verticalHeader().setDefaultSectionSize(
+        max(30, needed)
+    )
+
+
 def apply_theme(
     app: QApplication,
     font_size_delta: int = 0,

@@ -19,7 +19,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest  # noqa: E402
 
 from PySide6.QtWidgets import (  # noqa: E402
-    QApplication, QCheckBox, QLabel, QPushButton, QTableWidget,
+    QApplication, QCheckBox, QHBoxLayout, QLabel, QPushButton,
+    QTableWidget, QWidget,
 )
 
 import gui.theme as theme  # noqa: E402
@@ -35,8 +36,28 @@ def app():
 
 def _row_height(delta: int = 0) -> int:
     table = QTableWidget(1, 1)
+    theme.fit_row_height(table)          # as both production tables do
     table.ensurePolished()
     return table.verticalHeader().defaultSectionSize()
+
+
+def _wrapped_cell_height() -> int:
+    """The button as production actually places it: inside a cell layout.
+
+    settings.py wraps Remove in a QWidget + QHBoxLayout with vertical
+    margins, so the bare button height understates what the row must hold.
+    Testing the bare widget passed while the real cell still overflowed.
+    """
+    btn = QPushButton("Remove")
+    btn.setObjectName("dangerButton")
+    btn.setProperty("compact", True)
+    cell = QWidget()
+    layout = QHBoxLayout(cell)
+    layout.setContentsMargins(4, 1, 4, 1)
+    layout.setSpacing(4)
+    layout.addWidget(btn)
+    cell.ensurePolished()
+    return cell.sizeHint().height()
 
 
 def _button_height(compact: bool, delta: int = 0) -> int:
@@ -64,6 +85,23 @@ def test_it_still_fits_at_every_offered_font_size(app, delta):
     """A hard-coded pixel height would clip here; the style must scale."""
     app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
     assert _button_height(compact=True, delta=delta) <= _row_height(delta)
+
+
+@pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
+def test_the_wrapped_action_cell_fits_too(app, delta):
+    """The bare button is not what the row holds -- the cell widget is.
+
+    This is the case that turned CI red: on Linux at +6 the button alone is
+    31px, and the cell layout's margins put the wrapper past a 30px row.
+    """
+    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
+    assert _wrapped_cell_height() <= _row_height(delta)
+
+
+def test_rows_keep_their_size_at_the_default_font(app):
+    """Growing every row to fix a large-font case would be a regression."""
+    app.setStyleSheet(theme.get_stylesheet())
+    assert _row_height(0) == 30
 
 
 def test_the_compact_button_keeps_its_danger_palette(app):
