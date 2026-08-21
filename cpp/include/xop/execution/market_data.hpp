@@ -566,13 +566,21 @@ public:
 
     /// Ingest a CEX reference mid-price for a pair.
     ///
-    /// CALL THIS ONLY WHEN A PRICE FETCH ACTUALLY SUCCEEDED.  `observed_at`
-    /// is stored verbatim and is what every CEX freshness gate measures
-    /// against -- compute_mid's weight taper, detect_stale, and the
-    /// cex_age_seconds heartbeat -- so re-ingesting a cached sample with a
-    /// fresh timestamp makes the data look permanently new and every one of
-    /// those gates unreachable.  This is the same failure ingest_amm_mid
-    /// documents below; the CEX path had it too.
+    /// Re-ingesting a cached price is EXPECTED: the engine derives cex_mid
+    /// from its CoinGecko cache on every heartbeat, and a failed fetch
+    /// leaves that cache in place deliberately.  What must not be recycled
+    /// is the TIMESTAMP.
+    ///
+    /// `observed_at` must be when the price was FETCHED, not when it was
+    /// re-ingested.  It is what every CEX freshness gate measures against --
+    /// compute_mid's weight taper, detect_stale, and the cex_age heartbeat
+    /// -- so stamping the re-ingest instead makes a cached sample look
+    /// permanently new and puts all three gates out of reach.  That was the
+    /// bug this parameter exists to close, and ingest_amm_mid below records
+    /// the same failure on the AMM path.
+    ///
+    /// A default-constructed value is NOT stored as-is; it falls back to
+    /// now(), so do not pass one alongside cached data.
     ///
     /// @param pair_name    Trading pair identifier (must match dexie pair name).
     /// @param cex_mid      CEX mid-price (quote per base).
