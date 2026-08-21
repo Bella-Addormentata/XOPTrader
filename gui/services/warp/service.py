@@ -926,7 +926,10 @@ class WarpEngine:
         # asset's base units -- for a 3-decimal token the blast-radius cap
         # would read 1000x too permissive. Per-asset caps land in B2; until
         # then a non-USDC job is refused rather than run uncapped.
-        if spec.symbol != "USDC":
+        # Identity, not name: the symbol is advisory, so re-casing the USDC
+        # descriptor would strand a live job here, and naming some other
+        # descriptor "USDC" would walk straight through the gate.
+        if spec.expected_asset_id.lower() != (net.expected_asset_id or "").lower():
             raise WarpTerminal(
                 f"{spec.symbol} bridging is not enabled yet: warp's amount "
                 "caps are still denominated in USDC, and applying them to "

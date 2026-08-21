@@ -381,5 +381,36 @@ def test_every_creation_path_stamps_the_terms_not_just_the_name():
     assert store5.get_job(out["id"]).state["asset_fingerprint"] == expect
 
 
+def test_the_inertness_gate_follows_identity_not_the_display_name():
+    """B1 only enables the legacy USDC asset. Keying that on the SYMBOL
+    would strand a live job whenever the descriptor is re-cased, and would
+    wave through anything else that happened to be named USDC."""
+    import dataclasses
+
+    # Renamed/re-cased USDC still bridges: same wrapped id, same asset.
+    renamed = dataclasses.replace(USDC, symbol="usdc.b")
+    net2 = dataclasses.replace(NET, assets=(("usdc.b", renamed),
+                                            ("milliETH", MILLI)))
+    store = new_store()
+    engine, ctx = build(store)
+    engine._net = net2
+    ctx.evm.erc20 = 5_000_000
+    seed(store, S.JobStatus.AWAITING_DEPOSIT,
+         state={"manual": True, **S._asset_stamp(renamed, net2.cat_decimals)})
+    assert engine.step()["status"] == S.JobStatus.DEPOSIT_SEEN
+
+    # An impostor named USDC but carrying another wrapped id is refused.
+    impostor = dataclasses.replace(MILLI, symbol="USDC")
+    net3 = dataclasses.replace(NET, assets=(("USDC", impostor),))
+    store2 = new_store()
+    engine2, ctx2 = build(store2)
+    engine2._net = net3
+    seed(store2, S.JobStatus.AWAITING_DEPOSIT,
+         state={"manual": True, **S._asset_stamp(impostor, net3.cat_decimals)})
+    out = engine2.step()
+    assert out["status"] == S.JobStatus.FAILED
+    assert "not enabled yet" in (store2.get_job(out["id"]).last_error or "")
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
