@@ -774,7 +774,11 @@ class OrderPanel(QWidget):
                 if not isinstance(btn_cancel, QPushButton):
                     btn_cancel = QPushButton("Cancel")
                     btn_cancel.setObjectName("dangerButton")
-                    btn_cancel.setFixedHeight(24)
+                    # compact BEFORE the widget is polished: the property
+                    # selector is evaluated when the style is applied, and
+                    # the base rule's min-height would otherwise make this
+                    # taller than the row it sits in.
+                    btn_cancel.setProperty("compact", True)
                     # One connection for the button's lifetime; the offer
                     # it acts on is read from the property below, so a
                     # reused button can never cancel a stale offer.

@@ -1,0 +1,142 @@
+"""UI controls must stay proportionate to the text and their row.
+
+The base ``QPushButton`` rule sets ``min-height: 28px`` and ``padding: 8px
+20px``. A widget-level ``setFixedHeight()`` cannot shrink that -- the
+stylesheet wins -- so the Cancel button in the orders table rendered 46px tall
+inside a 30px row. The ``compact`` property opts a button out of those metrics.
+
+These tests pin the fix at the size level rather than by inspecting source, and
+pin that it still holds when the operator changes the UI font size.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+
+import pytest  # noqa: E402
+
+from PySide6.QtWidgets import (  # noqa: E402
+    QApplication, QCheckBox, QLabel, QPushButton, QTableWidget,
+)
+
+import gui.theme as theme  # noqa: E402
+
+NEWLINE = chr(10)
+
+
+@pytest.fixture(scope="module")
+def app():
+    existing = QApplication.instance()
+    yield existing or QApplication(sys.argv)
+
+
+def _row_height(delta: int = 0) -> int:
+    table = QTableWidget(1, 1)
+    table.ensurePolished()
+    return table.verticalHeader().defaultSectionSize()
+
+
+def _button_height(compact: bool, delta: int = 0) -> int:
+    btn = QPushButton("Cancel")
+    btn.setObjectName("dangerButton")
+    if compact:
+        btn.setProperty("compact", True)
+    btn.ensurePolished()
+    return btn.sizeHint().height()
+
+
+def test_an_uncompact_button_really_does_overflow_the_row(app):
+    """The bug, pinned: without the property the button exceeds its row."""
+    app.setStyleSheet(theme.get_stylesheet())
+    assert _button_height(compact=False) > _row_height()
+
+
+def test_the_compact_button_fits_its_row(app):
+    app.setStyleSheet(theme.get_stylesheet())
+    assert _button_height(compact=True) <= _row_height()
+
+
+@pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
+def test_it_still_fits_at_every_offered_font_size(app, delta):
+    """A hard-coded pixel height would clip here; the style must scale."""
+    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
+    assert _button_height(compact=True, delta=delta) <= _row_height(delta)
+
+
+def test_the_compact_button_keeps_its_danger_palette(app):
+    """Compact changes metrics only -- the red variant must survive it."""
+    app.setStyleSheet(theme.get_stylesheet())
+    css = theme.get_stylesheet()
+    # The ID rules carry the colours and must not set metrics, or they would
+    # outrank the compact attribute selector and re-break the sizing.
+    danger = css.split("QPushButton#dangerButton {")[1].split("}")[0]
+    assert "background-color" in danger
+    assert "min-height" not in danger and "padding" not in danger
+
+
+# ---------------------------------------------------------------------------
+# Check/radio indicators
+#
+# The indicator was a hard-coded 20px box with a 2px border -- 24px beside 16px
+# text, half again the height of the label it marks, and unaffected by the
+# operator's font-size setting.
+# ---------------------------------------------------------------------------
+
+def _text_height() -> int:
+    lbl = QLabel("Xg")
+    lbl.ensurePolished()
+    return lbl.sizeHint().height()
+
+
+def _checkbox_height() -> int:
+    cb = QCheckBox()
+    cb.ensurePolished()
+    return cb.sizeHint().height()
+
+
+def test_the_checkbox_is_not_taller_than_its_own_label(app):
+    app.setStyleSheet(theme.get_stylesheet())
+    assert _checkbox_height() <= _text_height() + 2
+
+
+@pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
+def test_the_indicator_scales_with_the_font(app, delta):
+    """A hard-coded box stays put while the text grows around it."""
+    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
+    assert _checkbox_height() <= _text_height() + 2
+
+
+def test_a_checkbox_fits_inside_a_table_row(app):
+    """The pairs table puts one in column 0."""
+    app.setStyleSheet(theme.get_stylesheet())
+    assert _checkbox_height() <= _row_height()
+
+
+def _rule_value(css, header, prop):
+    """Value of *prop* inside the rule whose header line is *header*.
+
+    Anchored on a leading newline: the combined
+    "QCheckBox::indicator, QRadioButton::indicator {" rule also CONTAINS
+    the substring "QRadioButton::indicator {", so an unanchored split reads
+    the wrong rule and silently asserts nothing.
+    """
+    block = css.split(NEWLINE + header)[1].split("}")[0]
+    return int(block.split(prop + ":")[1].split("px")[0].strip())
+
+
+def test_the_radio_indicator_stays_round(app):
+    """Its radius must follow the box, or it renders as a rounded square."""
+    for delta in (-2, 0, 2, 4, 6):
+        css = theme.get_stylesheet(font_size_delta=delta)
+        box = _rule_value(
+            css, "QCheckBox::indicator, QRadioButton::indicator {", "width")
+        radius = _rule_value(
+            css, "QRadioButton::indicator {", "border-radius")
+        # A circle needs half the BORDERED box (1px border each side).
+        assert radius * 2 >= box + 2, (
+            "delta=%d: box %dpx + 2px border, radius %dpx"
+            % (delta, box, radius)
+        )

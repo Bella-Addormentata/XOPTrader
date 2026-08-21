@@ -2907,7 +2907,7 @@ class SettingsWidget(QWidget):
 
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("dangerButton")
-        remove_btn.setFixedHeight(24)
+        remove_btn.setProperty("compact", True)   # see theme.py, same reason
         remove_btn.setToolTip("Remove this trading pair")
         # Resolve the button's current row at click time rather than
         # capturing a row index at insert time.  Captured indices go

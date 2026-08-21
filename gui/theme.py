@@ -142,6 +142,15 @@ def get_stylesheet(
     mfs = max(7, _BASE_MONO_FONT_SIZE + font_size_delta)
     # Slightly smaller secondary size for captions, hints, etc.
     sfs = max(7, fs - 1)
+    # Check/radio indicator box.  Was a hard-coded 20px with a 2px border --
+    # a 24px box beside 16px text, half again the height of the label it
+    # marks, and unmoved by the operator's font-size setting.  Scale it with
+    # the UI font so it stays proportionate at every size.
+    cbi = max(11, 13 + font_size_delta)
+    # Round UP to half the BORDERED box (box + 1px border each side):
+    # rounding down leaves a half-pixel of square on the radio.  Qt
+    # clamps an over-large radius to half, so the ceiling is safe.
+    cbi_r = (cbi + 3) // 2
 
     return f"""
 /* ===================================================================
@@ -281,6 +290,25 @@ QPushButton#dangerButton:hover {{
 
 QPushButton#dangerButton:pressed {{
     background-color: #D32F2F;
+}}
+
+/* Compact variant for buttons that live INSIDE a table row.
+
+   The base QPushButton rule above sets min-height 28px and 8px/20px padding,
+   which is taller than a table row -- and a widget-level setFixedHeight()
+   cannot shrink it, because the stylesheet's min-height wins over the size
+   hint.  That is why the in-row Cancel button rendered taller than the row it
+   sat on.  Opt out with the dynamic property compact=true.
+
+   An attribute selector outranks the plain type selector above, and the
+   #dangerButton ID rules outrank both -- but those set only colours, so the
+   red variants keep their palette and pick up these metrics. */
+QPushButton[compact="true"] {{
+    padding: 1px 8px;
+    min-height: 0px;
+    border-radius: 4px;
+    font-size: {sfs}pt;
+    font-weight: 500;
 }}
 
 /* ----- Tab widget & tab bar ----- */
@@ -514,9 +542,9 @@ QCheckBox, QRadioButton {{
 }}
 
 QCheckBox::indicator, QRadioButton::indicator {{
-    width: 20px;
-    height: 20px;
-    border: 2px solid {c.BORDER};
+    width: {cbi}px;
+    height: {cbi}px;
+    border: 1px solid {c.BORDER};
     background-color: {c.ELEVATED_BG};
 }}
 
@@ -525,7 +553,7 @@ QCheckBox::indicator {{
 }}
 
 QRadioButton::indicator {{
-    border-radius: 10px;
+    border-radius: {cbi_r}px;
 }}
 
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
