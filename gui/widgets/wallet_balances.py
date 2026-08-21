@@ -107,6 +107,31 @@ _SUGGESTED_ALLOC_TOOLTIP: Final[str] = (
 )
 
 
+def _fit_table_to_contents(table: QTableWidget) -> None:
+    """Size *table* to its rows so it never scrolls on its own.
+
+    This page is already inside a QScrollArea (main_window builds it with
+    scrollable=True), so a table that scrolls internally puts a second
+    scrollbar inside the first.  Nested scrollbars are worse than untidy: the
+    wheel acts on whichever widget happens to sit under the pointer, and rows
+    can stay hidden inside a panel that looks complete -- on a page whose
+    whole job is showing how much money is where.
+
+    Height is recomputed from the CURRENT row heights rather than a per-row
+    constant, so it stays correct when the operator changes the UI font size.
+    """
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    rows = sum(
+        table.rowHeight(r)
+        for r in range(table.rowCount())
+        if not table.isRowHidden(r)
+    )
+    header = table.horizontalHeader().height()
+    # Both tables stretch their columns to the viewport, so no horizontal
+    # scrollbar appears and none needs reserving here.
+    table.setFixedHeight(header + rows + 2 * table.frameWidth())
+
+
 class _SuggestedAllocationWorker(QObject):
     """Computes the advisory per-asset portfolio allocation off the UI
     thread (dexie HTTP fetch + read-only SQLite reads), following the
@@ -283,7 +308,9 @@ class WalletBalancesWidget(QWidget):
             }}
             """
         )
-        root.addWidget(self._table, stretch=1)
+        # No stretch: the table now takes exactly its content height and the
+        # page's own scroll area supplies the scrolling.
+        root.addWidget(self._table)
 
         # -- Target allocation panel --
         self._alloc_frame = QFrame()
@@ -416,6 +443,10 @@ class WalletBalancesWidget(QWidget):
             f"color: {TEXT_SECONDARY}; font-size: 11px;"
         )
         root.addWidget(self._status_label)
+
+        # Absorbs the leftover space when the tables are short; without it
+        # the fixed-height panels would spread down the page.
+        root.addStretch(1)
 
     def _make_summary_card(
         self, title: str, value: str, layout: QHBoxLayout
@@ -554,6 +585,7 @@ class WalletBalancesWidget(QWidget):
         self._status_label.setText(
             f"Last update: {len(balances)} wallet(s) loaded"
         )
+        _fit_table_to_contents(self._table)
         self._refresh_deployed_view()
         self._refresh_allocation_table()
 
@@ -945,6 +977,7 @@ class WalletBalancesWidget(QWidget):
 
         if not all_assets:
             self._alloc_table.setRowCount(0)
+            _fit_table_to_contents(self._alloc_table)
             self._alloc_sum_label.setText("Target sum: —")
             self._alloc_hint_label.setText("No wallets detected yet")
             return
@@ -1021,6 +1054,7 @@ class WalletBalancesWidget(QWidget):
                 self._alloc_table.setItem(row, col, item)
 
         self._alloc_updating = False
+        _fit_table_to_contents(self._alloc_table)
         self._update_allocation_sum_status()
         unpriced = sorted(all_assets - set(current_values))
         if total_value <= 0.0:
@@ -1404,6 +1438,8 @@ class WalletBalancesWidget(QWidget):
         """Reset the widget to its initial empty state."""
         self._table.setRowCount(0)
         self._alloc_table.setRowCount(0)
+        _fit_table_to_contents(self._table)
+        _fit_table_to_contents(self._alloc_table)
         self._target_allocations.clear()
         self._target_tolerances.clear()
         self._last_balances = {}
