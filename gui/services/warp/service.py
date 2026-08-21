@@ -56,7 +56,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
@@ -468,6 +468,46 @@ def _advance(
     return _Step(next_status=next_status, columns=columns, state=state, message=message)
 
 
+def _canon_addr(address: str) -> str:
+    """An ERC-20 address in one canonical form: bare, lower-case hex.
+
+    This codebase accepts both ``0x``-prefixed and bare addresses as the
+    same address, so a fingerprint must not encode the difference -- a
+    formatting-only edit to a descriptor would otherwise read as changed
+    terms and terminally strand a live job.
+    """
+    a = str(address or "").strip().lower()
+    return a[2:] if a.startswith("0x") else a
+
+
+def _asset_fingerprint(spec, cat_decimals: int) -> str:
+    """The asset TERMS a job is frozen against.
+
+    Contract, BOTH precisions (every conversion is
+    ``10 ** (erc20 - cat)``, so freezing one half would let the ratio move)
+    and the wrapped TAIL.
+
+    Version-tagged so the format can change. An unrecognised version is
+    NOT treated as unfingerprinted: :meth:`_job_asset` routes it through
+    attestation recovery and stops the job when no attested evidence
+    exists. Only a row with neither field takes the legacy-USDC path, so
+    a future migration must convert existing stamps rather than assume
+    old readers will fall back gracefully.
+    """
+    return (f"v1:{_canon_addr(spec.erc20_address)}:{int(spec.erc20_decimals)}"
+            f":{int(cat_decimals)}:{spec.expected_asset_id.strip().lower()}")
+
+
+def _asset_stamp(spec, cat_decimals: int) -> dict:
+    """The asset fields every new job records: the name AND the terms.
+
+    The name is advisory (it makes rows readable); the fingerprint is the
+    identity :meth:`_job_asset` actually resolves against.
+    """
+    return {"asset": spec.symbol,
+            "asset_fingerprint": _asset_fingerprint(spec, cat_decimals)}
+
+
 def _stay(
     *,
     columns: Optional[Dict[str, Any]] = None,
@@ -837,13 +877,162 @@ class WarpEngine:
     # State handlers (each: read -> one side effect -> returned _Step).
     # ================================================================== #
 
+    def _job_asset(self, job: WarpJob, attested=None):
+        """The bridgeable asset *job* was created for, from its frozen state.
+
+        Resolution is by the wrapped-CAT id recorded in the job's
+        fingerprint -- the asset's true identity, derived from its token
+        contract, and stable across a rename of the table key or symbol.
+        The persisted symbol is advisory: it makes rows readable and is
+        never used to resolve one. A row carrying a name WITHOUT usable
+        terms is a partial write, and is recovered only from attested
+        contents (or stopped); a row carrying neither field predates
+        stamping, when USDC was the only asset the pipeline could bridge,
+        and resolves to USDC directly.
+
+        It refuses rather than guessing when the job's asset is no longer
+        pinned by this deployment, when its terms no longer match, and
+        when a name was recorded without terms and no attested contents
+        exist to recover from. Those are "stop and fetch an operator"
+        conditions: a wrong guess here moves the wrong funds.
+
+        Note the corollary of identity-by-wrapped-id: a row whose NAME
+        disagrees with its fingerprint resolves to the fingerprint's
+        asset. The name is a label, not a claim about identity.
+        """
+        raw = str(job.state.get("asset_fingerprint") or "").strip()
+        stamped = "asset" in job.state
+
+        if raw:
+            parts = raw.split(":")
+            if parts[0] == "v1" and len(parts) == 5:
+                _v, addr, erc20_dec, cat_dec, tail = parts
+                try:
+                    erc20_dec_i, cat_dec_i = int(erc20_dec), int(cat_dec)
+                except ValueError:
+                    # Never leak a bare exception: step() classifies unknown
+                    # errors as RETRYABLE, so a corrupt stamp would retry
+                    # every tick forever.
+                    return self._asset_from_attestation(
+                        job, f"non-integer precision in {raw!r}", attested)
+                try:
+                    spec = self._net.asset_by_wrapped_id(tail)
+                except KeyError:
+                    raise WarpTerminal(
+                        f"job {job.id} was frozen against wrapped asset "
+                        f"{tail}, which {self._net.name} no longer pins -- "
+                        "refusing to resume against a different asset than "
+                        "the one its funds moved under"
+                    ) from None
+                if (_canon_addr(spec.erc20_address) != _canon_addr(addr)
+                        or int(spec.erc20_decimals) != erc20_dec_i
+                        or int(self._net.cat_decimals) != cat_dec_i):
+                    raise WarpTerminal(
+                        f"job {job.id} froze {spec.symbol} as {raw}, but this "
+                        "build resolves that wrapped id to "
+                        f"{_asset_fingerprint(spec, self._net.cat_decimals)}"
+                        " -- the asset's terms changed under a live job"
+                    )
+                return spec
+            return self._asset_from_attestation(
+                job, f"unrecognised stamp format {raw!r}", attested)
+
+        if stamped:
+            # Every writer records the terms with the name, so a name alone
+            # is a partial write, not an old row. Resolving it by name would
+            # let a job adopt edited contract/precision/TAIL terms -- and for
+            # a committed job could sign a replacement for a DIFFERENT token
+            # at the original nonce.
+            return self._asset_from_attestation(
+                job, "asset recorded without its terms", attested)
+
+        # Neither field: the row predates asset stamping, and USDC was the
+        # only asset the pipeline could bridge when it was written. Resolve
+        # it through the network's legacy wrapped-id anchor rather than the
+        # literal name, so legacy rows get the same rename stability as
+        # stamped ones -- a renamed key would otherwise raise KeyError,
+        # which step() classifies as retryable and would spin forever.
+        try:
+            return self._net.asset_by_wrapped_id(self._net.expected_asset_id)
+        except KeyError:
+            raise WarpTerminal(
+                f"job {job.id} predates asset stamping, but "
+                f"{self._net.name} no longer pins its legacy wrapped asset "
+                f"{self._net.expected_asset_id}"
+            ) from None
+
+    def _asset_from_attestation(self, job: WarpJob, why: str, attested=None):
+        """Last resort for a job whose stamp cannot be read.
+
+        Recovers the asset from the ATTESTED message contents when the job
+        has them -- ``contents[0]`` is the ERC-20 the validators witnessed,
+        which is durable on-chain evidence rather than a mutable local
+        name. Without that evidence there is nothing trustworthy left to
+        resolve from, so the job stops for an operator instead of guessing:
+        a wrong guess here moves the wrong funds, which is worse than a
+        job that needs manual recovery.
+        """
+        tokens = [_hx(item)[-40:]
+                  for item in (job.state.get("message_contents") or [])[:1]]
+        if attested is not None:
+            # MESSAGE_SENT resolves the asset BEFORE the attestation is
+            # persisted, so the live message is the only evidence available
+            # at the one point a post-bridge job would otherwise strand.
+            live = _hx(getattr(attested, "erc20_source", "") or "")[-40:]
+            contents = list(getattr(attested, "contents", None) or [])
+            first = _hx(contents[0])[-40:] if contents else ""
+            if live and first and live != first:
+                raise WarpTerminal(
+                    f"job {job.id} cannot be recovered: the attestation is "
+                    f"self-inconsistent (source {live} != contents {first})"
+                )
+            if live:
+                tokens.append(live)
+        for token in tokens:
+            for _key, spec in (self._net.assets or ()):
+                if _canon_addr(spec.erc20_address) == token:
+                    # Honest about what this costs: for a recovered job the
+                    # attested-source anchor below compares the attestation
+                    # against an asset derived FROM that attestation, so it
+                    # can no longer catch a wrong-asset bridge. The evidence
+                    # is validator-signed, which is why this beats both
+                    # guessing by name and stranding the funds.
+                    _log.error(
+                        "job %s has an unreadable asset stamp (%s); "
+                        "recovered %s from attested evidence -- its "
+                        "source anchor is self-referential from here",
+                        job.id, why, spec.symbol,
+                    )
+                    return spec
+        raise WarpTerminal(
+            f"job {job.id} has an unreadable asset stamp ({why}) and no "
+            "attested contents to recover its asset from; refusing to guess "
+            "-- resolve it manually before any further bridging"
+        )
+
     def _h_awaiting_deposit(self, job: WarpJob) -> _Step:
-        """Watch the hot wallet for a USDC deposit; freeze amounts on arrival."""
+        """Watch the hot wallet for a deposit of the JOB's asset; freeze
+        amounts on arrival."""
         from . import evm
 
         net, p = self._net, self._params
+        spec = self._job_asset(job)
+        # min_micros/max_micros are scaled by USDC's decimals
+        # (warp_params_from_config), but the balance below is in THIS
+        # asset's base units -- for a 3-decimal token the blast-radius cap
+        # would read 1000x too permissive. Per-asset caps land in B2; until
+        # then a non-USDC job is refused rather than run uncapped.
+        # Identity, not name: the symbol is advisory, so re-casing the USDC
+        # descriptor would strand a live job here, and naming some other
+        # descriptor "USDC" would walk straight through the gate.
+        if spec.expected_asset_id.lower() != (net.expected_asset_id or "").lower():
+            raise WarpTerminal(
+                f"{spec.symbol} bridging is not enabled yet: warp's amount "
+                "caps are still denominated in USDC, and applying them to "
+                f"{spec.symbol} base units would mis-scale the blast radius"
+            )
 
-        have = self._evm.get_erc20_balance(net.usdc_address, self._hot_address)
+        have = self._evm.get_erc20_balance(spec.erc20_address, self._hot_address)
         target = job.state.get("target_micros")
         want = min(int(target), have) if target else have
 
@@ -860,7 +1049,8 @@ class WarpEngine:
         # treated as automatic, i.e. the conservative side.
         manual = bool(job.state.get("manual"))
         if want <= 0:
-            raise WarpPending(f"awaiting a USDC deposit (have {have})")
+            raise WarpPending(
+                f"awaiting a {spec.symbol} deposit (have {have})")
         if not manual and p.min_micros > 0 and want < p.min_micros:
             raise WarpPending(
                 f"awaiting auto-bridge deposit >= {p.min_micros} micros (have {have})"
@@ -870,10 +1060,10 @@ class WarpEngine:
         if eth < _MIN_GAS_WEI:
             raise WarpRetryable(f"insufficient ETH for gas: {eth} < {_MIN_GAS_WEI} wei")
 
-        mojo_amount = evm.bridgeable_mojo(want, net)
+        mojo_amount = evm.bridgeable_mojo(want, net, spec)
         if mojo_amount <= 0:
             raise WarpPending("deposit below one bridgeable mojo")
-        amount_base = evm.mojo_to_base_units(mojo_amount, net)
+        amount_base = evm.mojo_to_base_units(mojo_amount, net, spec)
         tip_bps = self._evm.get_tip_bps()
         post_tip = evm.post_tip_amount(mojo_amount, tip_bps)
         address, receiver_ph = self._resolve_receiver()
@@ -897,7 +1087,8 @@ class WarpEngine:
             # they were computed from; _binding_mismatch refuses to resume this
             # job under any other key. This is the last state where that is still
             # a free choice -- nothing has been signed yet.
-            state={"tip_bps": tip_bps, **self._binding()},
+            state={"tip_bps": tip_bps, **_asset_stamp(spec, self._net.cat_decimals),
+                   **self._binding()},
             message=(
                 f"deposit {amount_base} micros seen; bridging {mojo_amount} mojos "
                 f"(post-tip {post_tip}) to {address}{clamp_note}"
@@ -921,8 +1112,9 @@ class WarpEngine:
         """Ensure the bridge allowance (skip if sufficient); two-phase approve."""
         from . import evm
 
+        spec = self._job_asset(job)
         needed = int(job.amount_usdc_micros or 0)
-        allowance = self._evm.get_bridge_allowance(self._hot_address)
+        allowance = self._evm.get_bridge_allowance(self._hot_address, asset=spec)
         if allowance >= needed:
             return _advance(
                 JobStatus.BRIDGING,
@@ -933,7 +1125,7 @@ class WarpEngine:
         raw = job.state.get("approve_raw")
         if not raw:  # phase 1: sign + persist, no broadcast
             unsigned = self._evm.prepare_approve(
-                owner=self._hot_address, amount_base_units=needed
+                owner=self._hot_address, amount_base_units=needed, asset=spec
             )
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
@@ -997,12 +1189,14 @@ class WarpEngine:
         from . import evm
 
         net = self._net
+        spec = self._job_asset(job)
         raw = job.state.get("bridge_raw")
         if not raw:  # phase 1: sign at a live toll/nonce + persist, no broadcast
             unsigned = self._evm.prepare_bridge(
                 owner=self._hot_address,
                 receiver_ph=bytes.fromhex(job.receiver_ph),
                 mojo_amount=int(job.amount_mojos),
+                asset=spec,
             )
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
@@ -1124,10 +1318,11 @@ class WarpEngine:
             raise WarpTerminal(
                 f"attested amount {msg.amount_mojos} != post-tip {job.post_tip_mojos}"
             )
-        if _word(msg.erc20_source) != _word(net.usdc_address):
+        spec = self._job_asset(job, attested=msg)
+        if _word(msg.erc20_source) != _word(spec.erc20_address):
             raise WarpTerminal(
-                f"attested source token {_hx(msg.erc20_source)} != configured "
-                f"USDC {_hx(net.usdc_address)}"
+                f"attested source token {_hx(msg.erc20_source)} != this job's "
+                f"{spec.symbol} {_hx(spec.erc20_address)}"
             )
 
         # Persist-then-act: generate the ephemeral security key locally; it lands
@@ -1205,6 +1400,13 @@ class WarpEngine:
         from . import claim, clvm_utils as cu
 
         net, p = self._net, self._params
+        # Resolve the asset BEFORE any XCH leaves the wallet. The claim
+        # anchors on it later, but funding runs first: without this, a job
+        # whose asset was removed from the deployment (or whose frozen
+        # precision changed) would spend the operator's security coin and
+        # only then fail unresolvable, committing funds to a claim that can
+        # never be built. Fail-closed means failing before the send.
+        self._job_asset(job)
         sk = self._load_ephemeral_sk(job)
         expected = self._funded_amount(job)
 
@@ -1402,6 +1604,10 @@ class WarpEngine:
             security_coin=coin,
             ephemeral_sk=sk,
             claim_fee=claim_fee,
+            # Anchor the claim against the asset THIS job bridged, not a
+            # single global constant: the TAIL derived from the attested
+            # token must match the job's own expected wrapped id.
+            expected_asset_id=self._job_asset(job).expected_asset_id,
         )
         final_id = push.claim.final_cat_coin_id.hex()
         if push.accepted:
@@ -1772,6 +1978,12 @@ class WarpEngine:
                 mojo_amount=int(job.amount_mojos),
                 nonce=int(nonce) if nonce is not None else None,
                 fees=fees,
+                # The replacement must bridge the SAME token as the
+                # transaction it replaces: re-signing at the pinned nonce
+                # without the asset would swap a stuck milliETH bridge for
+                # a USDC one, and the attested-source anchor would then
+                # kill the job AFTER real funds had moved.
+                asset=self._job_asset(job),
             ),
             self._evm_key.private_key,
         )
@@ -1875,7 +2087,6 @@ class WarpEngine:
 
     def _claim_contents(self, job: WarpJob) -> List[bytes]:
         return [bytes.fromhex(_hx(c)) for c in job.state.get("message_contents", [])]
-
 
     # ================================================================== #
     # Outbound (unwrap) handlers: wUSDC.b on Chia -> native USDC on Base.
@@ -2837,7 +3048,8 @@ class WarpEngine:
         job = self._store.create_job(
             net.name,
             status=JobStatus.AWAITING_DEPOSIT,
-            state={"auto": True, **self._binding()},
+            state={"auto": True, **_asset_stamp(net.asset("USDC"), net.cat_decimals),
+                   **self._binding()},
             event_message="auto-bridge: deposit detected",
         )
         return _job_dict(job)
@@ -2865,10 +3077,13 @@ class WarpEngine:
         # bridge a sub-floor amount if the balance dropped after the consult.
         if automatic:
             state: Dict[str, Any] = {
-                "auto": True, "rebalance": True, **self._binding()
+                "auto": True, "rebalance": True,
+                **_asset_stamp(self._net.asset("USDC"), self._net.cat_decimals), **self._binding()
             }
         else:
-            state = {"manual": True, **self._binding()}
+            state = {"manual": True, **_asset_stamp(self._net.asset("USDC"),
+                            self._net.cat_decimals),
+                     **self._binding()}
         if target_micros:
             state["target_micros"] = int(target_micros)
         job = self._store.create_job(
@@ -3043,7 +3258,6 @@ class WarpEngine:
         )
         return _job_dict(self._store.get_job(job.id))
 
-
     def request_unwrap(
         self, amount_mojos: int, receiver: str, external_relay: bool = False,
         *, automatic: bool = False, rebalance_target_micros: int = 0
@@ -3110,6 +3324,7 @@ class WarpEngine:
             columns={"amount_mojos": amount, "amount_usdc_micros": micros},
             state={
                 "direction": "out",
+                **_asset_stamp(self._net.asset("USDC"), self._net.cat_decimals),
                 "manual": not automatic,
                 **({"rebalance": True} if automatic else {}),
                 # Lets _h_unwrap_checks re-derive the still-needed amount

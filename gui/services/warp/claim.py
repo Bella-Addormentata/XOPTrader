@@ -371,6 +371,7 @@ def build_and_push_claim(
     security_coin: drivers.Coin,
     ephemeral_sk: bytes,
     claim_fee: int,
+    expected_asset_id: str = "",
 ) -> ClaimPush:
     """Assemble the five-spend claim from synced state and push it (idempotent).
 
@@ -393,6 +394,7 @@ def build_and_push_claim(
         security_coin=security_coin,
         ephemeral_sk=ephemeral_sk,
         claim_fee=claim_fee,
+        expected_asset_id=expected_asset_id,
     )
     claim = drivers.build_claim_bundle(req)
     kind, status = _push_bundle(coinset, claim.bundle.to_json())

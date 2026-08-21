@@ -152,6 +152,10 @@ class ClaimRequest:
     security_coin: Coin              # bot-funded ephemeral coin, amount == post_tip + claim_fee
     ephemeral_sk: bytes              # 32-byte BLS private key controlling security_coin
     claim_fee: int
+    # The wrapped-CAT id THIS job expects, so the anchor below checks the
+    # asset the job was created for rather than a single global constant.
+    # Empty keeps the legacy behaviour (the network's USDC anchor).
+    expected_asset_id: str = ""
 
 
 @dataclass(frozen=True)
@@ -818,7 +822,24 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
     # Every listed bridgeable asset must derive to its pinned id -- the same
     # refuse-to-start discipline, per asset, so a typo in a NEW asset entry
     # can never survive to a live claim or burn.
+    # The table key is an alias for humans; identity is the wrapped id
+    # (jobs resolve by it), so a key need not equal its descriptor symbol.
+    # That makes uniqueness of the wrapped id load-bearing: two entries
+    # pinning one id would each pass the per-entry checks below, while
+    # lookups returned whichever came first -- so a job stamped from the
+    # other would resolve to a descriptor it never froze and die with
+    # "terms changed".
+    seen_ids: dict = {}
     for key, spec in getattr(net, "assets", ()) or ():
+        wid = (spec.expected_asset_id or "").strip().lower()
+        if wid and wid in seen_ids:
+            raise WarpDriverError(
+                f"assets {seen_ids[wid]!r} and {key!r} both pin wrapped id "
+                f"{wid}; the table is ambiguous and a job stamped from one "
+                "could resolve to the other"
+            )
+        if wid:
+            seen_ids[wid] = key
         if not spec.expected_asset_id:
             raise WarpDriverError(
                 f"{net.name} asset {key} has an empty expected_asset_id; "
@@ -828,6 +849,12 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
             raise WarpDriverError(
                 f"asset {key} has an empty erc20_address; an empty address "
                 "would silently derive against the legacy USDC default"
+            )
+        if int(spec.erc20_decimals) < int(net.cat_decimals):
+            raise WarpDriverError(
+                f"asset {key} has {spec.erc20_decimals} decimals, fewer than "
+                f"the {net.cat_decimals}-decimal wrapped CAT: amounts could "
+                "not round-trip and the mojo factor would not be an integer"
             )
         try:
             asset_derived = derive_wrapped_asset_id(net, spec.erc20_address)
@@ -964,6 +991,32 @@ def _token_amount(contents: Sequence[bytes]) -> int:
     return int.from_bytes(contents[2], "big")
 
 
+def _require_pinned_asset_id(net: WarpNet, requested: str = "") -> str:
+    """The wrapped id a claim may anchor to, lower-cased.
+
+    ``requested`` (the job's asset) must be one this deployment already
+    pins and re-derives at engine construction, so a ClaimRequest can
+    never introduce an id of its own -- keeping the last gate before
+    minting exactly as strict as the single global constant it replaced.
+    """
+    expected = (requested or net.expected_asset_id or "").lower()
+    if not expected:
+        raise WarpDriverError(
+            f"{net.name}.expected_asset_id is empty; refusing to build a claim"
+        )
+    known = {(net.expected_asset_id or "").lower()} | {
+        (spec.expected_asset_id or "").lower()
+        for _key, spec in (getattr(net, "assets", ()) or ())
+    }
+    known.discard("")
+    if expected not in known:
+        raise WarpDriverError(
+            f"claim expects wrapped id {expected}, which {net.name} does not "
+            "pin for any bridgeable asset -- refusing to mint"
+        )
+    return expected
+
+
 def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
     """Assemble the five-spend claim, refusing on any correctness-anchor miss."""
     net = req.net
@@ -1066,14 +1119,11 @@ def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
     # Unconditional: defence in depth behind verify_wrapped_asset_anchor(), which
     # already ran at engine construction. This one additionally covers the
     # attested erc20_contract, which the offline anchor cannot see.
-    if not net.expected_asset_id:
-        raise WarpDriverError(
-            f"{net.name}.expected_asset_id is empty; refusing to build a claim"
-        )
-    if tail_hash.hex() != net.expected_asset_id:
+    expected = _require_pinned_asset_id(net, req.expected_asset_id)
+    if tail_hash.hex() != expected:
         raise WarpDriverError(
             f"derived wrapped-TAIL {tail_hash.hex()} != configured asset id "
-            f"{net.expected_asset_id}"
+            f"{expected}"
         )
     mint_payout_inner = get_cat_mint_and_payout_inner_puzzle(receiver_ph)
     eve_cat_puzzle = construct_cat_puzzle(tail_hash, mint_payout_inner)
