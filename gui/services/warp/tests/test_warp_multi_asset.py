@@ -614,5 +614,37 @@ def test_a_self_inconsistent_attestation_cannot_be_used_for_recovery():
     assert "self-inconsistent" in (store.get_job(out["id"]).last_error or "")
 
 
+def test_a_legacy_row_survives_a_full_rename_of_usdc():
+    """Legacy rows carry no fingerprint, so they resolve through the
+    network's wrapped-id anchor rather than the literal name -- otherwise
+    renaming the USDC entry would raise KeyError, which step() classifies
+    as retryable and would spin forever."""
+    import dataclasses
+
+    renamed = dataclasses.replace(USDC, symbol="wUSDC.b")
+    net2 = dataclasses.replace(NET, assets=(("wUSDC.b", renamed),
+                                            ("milliETH", MILLI)))
+    store, eng, ctx = _engine()
+    eng._net = net2
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={})
+    assert eng._job_asset(job).expected_asset_id == USDC.expected_asset_id
+
+
+def test_an_ambiguous_asset_table_is_refused_at_startup():
+    """Two entries pinning one wrapped id each pass the per-entry checks,
+    while lookups return whichever comes first -- so a job stamped from
+    the other resolves to a descriptor it never froze."""
+    import dataclasses
+
+    from gui.services.warp import drivers
+
+    twin = dataclasses.replace(USDC, symbol="USDC.alias")
+    ambiguous = dataclasses.replace(
+        NET, assets=(("USDC", USDC), ("USDC.alias", twin),
+                     ("milliETH", MILLI)))
+    with pytest.raises(drivers.WarpDriverError, match="ambiguous"):
+        drivers.verify_wrapped_asset_anchor(ambiguous)
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))

@@ -942,8 +942,19 @@ class WarpEngine:
                 job, "asset recorded without its terms", attested)
 
         # Neither field: the row predates asset stamping, and USDC was the
-        # only asset the pipeline could bridge when it was written.
-        return self._net.asset("USDC")
+        # only asset the pipeline could bridge when it was written. Resolve
+        # it through the network's legacy wrapped-id anchor rather than the
+        # literal name, so legacy rows get the same rename stability as
+        # stamped ones -- a renamed key would otherwise raise KeyError,
+        # which step() classifies as retryable and would spin forever.
+        try:
+            return self._net.asset_by_wrapped_id(self._net.expected_asset_id)
+        except KeyError:
+            raise WarpTerminal(
+                f"job {job.id} predates asset stamping, but "
+                f"{self._net.name} no longer pins its legacy wrapped asset "
+                f"{self._net.expected_asset_id}"
+            ) from None
 
     def _asset_from_attestation(self, job: WarpJob, why: str, attested=None):
         """Last resort for a job whose stamp cannot be read.

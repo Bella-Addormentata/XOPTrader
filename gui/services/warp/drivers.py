@@ -824,7 +824,22 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
     # can never survive to a live claim or burn.
     # The table key is an alias for humans; identity is the wrapped id
     # (jobs resolve by it), so a key need not equal its descriptor symbol.
+    # That makes uniqueness of the wrapped id load-bearing: two entries
+    # pinning one id would each pass the per-entry checks below, while
+    # lookups returned whichever came first -- so a job stamped from the
+    # other would resolve to a descriptor it never froze and die with
+    # "terms changed".
+    seen_ids: dict = {}
     for key, spec in getattr(net, "assets", ()) or ():
+        wid = (spec.expected_asset_id or "").strip().lower()
+        if wid and wid in seen_ids:
+            raise WarpDriverError(
+                f"assets {seen_ids[wid]!r} and {key!r} both pin wrapped id "
+                f"{wid}; the table is ambiguous and a job stamped from one "
+                "could resolve to the other"
+            )
+        if wid:
+            seen_ids[wid] = key
         if not spec.expected_asset_id:
             raise WarpDriverError(
                 f"{net.name} asset {key} has an empty expected_asset_id; "
