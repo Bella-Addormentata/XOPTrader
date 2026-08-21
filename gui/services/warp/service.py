@@ -878,24 +878,6 @@ class WarpEngine:
         """
         raw = str(job.state.get("asset_fingerprint") or "").strip()
         stamped = "asset" in job.state
-        # Once a Base transaction exists the job's funds are committed, and
-        # a terminal here cannot be retried, abandoned or cancelled -- it
-        # would strand them AND hold the single active-job slot. Before
-        # that point refusing is free, so an unreadable stamp fails closed.
-        committed = bool(job.bridge_tx_hash or job.state.get("bridge_raw"))
-
-        def _bad_stamp(why: str):
-            if not committed:
-                return WarpTerminal(
-                    f"job {job.id} carries an unreadable asset stamp "
-                    f"({why}); refusing to resolve it by name"
-                )
-            _log.error(
-                "job %s has an unreadable asset stamp (%s); its funds are "
-                "already committed, so resolving by recorded name instead "
-                "of stranding it", job.id, why,
-            )
-            return None
 
         if raw:
             parts = raw.split(":")
@@ -904,50 +886,72 @@ class WarpEngine:
                 try:
                     erc20_dec_i, cat_dec_i = int(erc20_dec), int(cat_dec)
                 except ValueError:
-                    # Never let this escape as a plain exception: step()
-                    # classifies unknown errors as RETRYABLE, so a corrupt
-                    # stamp would retry every tick forever.
-                    err = _bad_stamp(f"non-integer precision in {raw!r}")
-                    if err:
-                        raise err
-                else:
-                    try:
-                        spec = self._net.asset_by_wrapped_id(tail)
-                    except KeyError:
-                        raise WarpTerminal(
-                            f"job {job.id} was frozen against wrapped asset "
-                            f"{tail}, which {self._net.name} no longer pins "
-                            "-- refusing to resume against a different asset "
-                            "than the one its funds moved under"
-                        ) from None
-                    if (spec.erc20_address.lower() != addr
-                            or int(spec.erc20_decimals) != erc20_dec_i
-                            or int(self._net.cat_decimals) != cat_dec_i):
-                        raise WarpTerminal(
-                            f"job {job.id} froze {spec.symbol} as {raw}, but "
-                            "this build resolves that wrapped id to "
-                            f"{_asset_fingerprint(spec, self._net.cat_decimals)}"
-                            " -- the asset's terms changed under a live job"
-                        )
-                    return spec
-            else:
-                err = _bad_stamp(f"unrecognised format {raw!r}")
-                if err:
-                    raise err
+                    # Never leak a bare exception: step() classifies unknown
+                    # errors as RETRYABLE, so a corrupt stamp would retry
+                    # every tick forever.
+                    return self._asset_from_attestation(
+                        job, f"non-integer precision in {raw!r}")
+                try:
+                    spec = self._net.asset_by_wrapped_id(tail)
+                except KeyError:
+                    raise WarpTerminal(
+                        f"job {job.id} was frozen against wrapped asset "
+                        f"{tail}, which {self._net.name} no longer pins -- "
+                        "refusing to resume against a different asset than "
+                        "the one its funds moved under"
+                    ) from None
+                if (spec.erc20_address.lower() != addr
+                        or int(spec.erc20_decimals) != erc20_dec_i
+                        or int(self._net.cat_decimals) != cat_dec_i):
+                    raise WarpTerminal(
+                        f"job {job.id} froze {spec.symbol} as {raw}, but this "
+                        "build resolves that wrapped id to "
+                        f"{_asset_fingerprint(spec, self._net.cat_decimals)}"
+                        " -- the asset's terms changed under a live job"
+                    )
+                return spec
+            return self._asset_from_attestation(
+                job, f"unrecognised stamp format {raw!r}")
 
-        # Legacy rows carry neither field; USDC was the only asset the
-        # pipeline could bridge when they were written. A committed job
-        # with an unreadable stamp also lands here, deliberately.
-        if not stamped and not raw:
-            return self._net.asset("USDC")
-        symbol = str(job.state.get("asset") or "USDC").strip() or "USDC"
-        try:
-            return self._net.asset(symbol)
-        except KeyError:
-            raise WarpTerminal(
-                f"job {job.id} names asset {symbol!r}, which {self._net.name} "
-                "does not list as bridgeable -- refusing to guess"
-            ) from None
+        if stamped:
+            # Every writer records the terms with the name, so a name alone
+            # is a partial write, not an old row. Resolving it by name would
+            # let a job adopt edited contract/precision/TAIL terms -- and for
+            # a committed job could sign a replacement for a DIFFERENT token
+            # at the original nonce.
+            return self._asset_from_attestation(
+                job, "asset recorded without its terms")
+
+        # Neither field: the row predates asset stamping, and USDC was the
+        # only asset the pipeline could bridge when it was written.
+        return self._net.asset("USDC")
+
+    def _asset_from_attestation(self, job: WarpJob, why: str):
+        """Last resort for a job whose stamp cannot be read.
+
+        Recovers the asset from the ATTESTED message contents when the job
+        has them -- ``contents[0]`` is the ERC-20 the validators witnessed,
+        which is durable on-chain evidence rather than a mutable local
+        name. Without that evidence there is nothing trustworthy left to
+        resolve from, so the job stops for an operator instead of guessing:
+        a wrong guess here moves the wrong funds, which is worse than a
+        job that needs manual recovery.
+        """
+        for item in (job.state.get("message_contents") or [])[:1]:
+            token = _hx(item)[-40:]
+            for _key, spec in (self._net.assets or ()):
+                if spec.erc20_address[2:].lower() == token:
+                    _log.error(
+                        "job %s has an unreadable asset stamp (%s); "
+                        "recovered %s from the attested message contents",
+                        job.id, why, spec.symbol,
+                    )
+                    return spec
+        raise WarpTerminal(
+            f"job {job.id} has an unreadable asset stamp ({why}) and no "
+            "attested contents to recover its asset from; refusing to guess "
+            "-- resolve it manually before any further bridging"
+        )
 
     def _h_awaiting_deposit(self, job: WarpJob) -> _Step:
         """Watch the hot wallet for a deposit of the JOB's asset; freeze

@@ -111,12 +111,12 @@ def test_a_stamped_job_resolves_to_its_own_asset():
     assert spec.erc20_decimals == 3
 
 
-def test_an_unknown_asset_is_terminal_not_a_silent_fallback():
-    """Guessing here would size amounts and derive the wrapped TAIL against
-    the wrong token."""
+def test_an_unknown_name_is_terminal_like_any_other_partial_write():
+    """The name is advisory now, so an unknown one is not special-cased --
+    it fails as what it is: a row recording a name without its terms."""
     store, eng, ctx = _engine()
     job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "DOGE"})
-    with pytest.raises(S.WarpTerminal, match="DOGE"):
+    with pytest.raises(S.WarpTerminal, match="without its terms"):
         eng._job_asset(job)
 
 
@@ -269,34 +269,23 @@ def test_an_asset_below_cat_precision_is_refused_at_startup_and_in_maths():
         drivers.verify_wrapped_asset_anchor(broken)
 
 
-def test_a_nameless_unfingerprinted_row_can_only_be_legacy_usdc():
-    """With identity carried by the fingerprint, a row with neither is
-    necessarily old -- USDC was the only asset the pipeline could bridge
-    when such rows were written. An unknown NAME is still terminal, because
-    that names something this deployment does not bridge."""
+def test_a_row_with_neither_field_is_legacy_usdc():
+    """Rows predating asset stamping carry neither field, and USDC was the
+    only asset the pipeline could bridge when they were written."""
     store, eng, ctx = _engine()
-    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": ""})
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={})
     assert eng._job_asset(job).symbol == "USDC"
 
-    store2, eng2, _c2 = _engine()
-    bad = seed(store2, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "DOGE"})
-    with pytest.raises(S.WarpTerminal, match="DOGE"):
-        eng2._job_asset(bad)
 
-
-def test_a_stamped_job_without_a_fingerprint_resolves_by_name():
-    """A missing fingerprint means the row predates the field, not that it
-    is corrupt. Refusing it would be worse than useless: a job past its
-    bridge cannot be retried, abandoned or cancelled, so a hard stop would
-    strand real funds AND hold the single active-job slot."""
+def test_a_name_without_terms_is_a_partial_write_not_a_legacy_row():
+    """Every writer records terms with the name, so a name alone is
+    corruption. Resolving it by name would let the job adopt edited
+    contract/precision/TAIL terms -- and for a committed job could sign a
+    replacement for a DIFFERENT token at the original nonce."""
     store, eng, ctx = _engine()
     job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={"asset": "USDC"})
-    assert eng._job_asset(job).symbol == "USDC"
-
-    store2, eng2, _c2 = _engine()
-    blank = seed(store2, S.JobStatus.AWAITING_DEPOSIT,
-                 state={"asset": "USDC", "asset_fingerprint": "   "})
-    assert eng2._job_asset(blank).symbol == "USDC"
+    with pytest.raises(S.WarpTerminal, match="without its terms"):
+        eng._job_asset(job)
 
 
 def test_identity_is_the_wrapped_id_so_a_rename_cannot_strand_a_job():
@@ -361,22 +350,27 @@ def test_a_corrupt_precision_is_terminal_not_an_infinite_retry():
         eng._job_asset(job)
 
 
-def test_an_unreadable_stamp_never_strands_a_committed_job():
-    """After the bridge exists the job's funds are committed and FAILED is
-    a dead end -- Retry re-fails, Abandon and Sweep are refused while the
-    signed bridge is live, and the row holds the single job slot. There the
-    resolver falls back to the recorded name instead of stranding it."""
+def test_an_unreadable_stamp_recovers_from_the_attested_contents():
+    """contents[0] is the ERC-20 the validators witnessed -- durable
+    on-chain evidence. A job that has it can be resumed safely even when
+    its local stamp is unreadable."""
+    usdc_word = "00" * 12 + USDC.erc20_address[2:].lower()
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.CLAIMING,
+               state={"asset": "USDC", "asset_fingerprint": "v9:whatever",
+                      "message_contents": [usdc_word, "cd" * 32, "1379"]})
+    assert eng._job_asset(job).expected_asset_id == USDC.expected_asset_id
+
+
+def test_without_attested_evidence_an_unreadable_stamp_stops_the_job():
+    """A wrong guess moves the wrong funds, which is worse than a job that
+    needs manual recovery -- so there is no name-based last resort."""
     store, eng, ctx = _engine()
     job = seed(store, S.JobStatus.BRIDGING,
                columns={"bridge_tx_hash": "0x" + "ab" * 32},
                state={"asset": "USDC", "asset_fingerprint": "v9:whatever"})
-    assert eng._job_asset(job).symbol == "USDC"
-
-    store2, eng2, _c2 = _engine()
-    signed = seed(store2, S.JobStatus.BRIDGING,
-                  state={"asset": "USDC", "bridge_raw": "aa" * 8,
-                         "asset_fingerprint": f"v1:0xabc:six:3:{'ff' * 32}"})
-    assert eng2._job_asset(signed).symbol == "USDC"
+    with pytest.raises(S.WarpTerminal, match="no attested contents"):
+        eng._job_asset(job)
 
 
 def test_every_creation_path_stamps_the_terms_not_just_the_name():
