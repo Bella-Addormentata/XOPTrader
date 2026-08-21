@@ -1395,6 +1395,13 @@ class WarpEngine:
         from . import claim, clvm_utils as cu
 
         net, p = self._net, self._params
+        # Resolve the asset BEFORE any XCH leaves the wallet. The claim
+        # anchors on it later, but funding runs first: without this, a job
+        # whose asset was removed from the deployment (or whose frozen
+        # precision changed) would spend the operator's security coin and
+        # only then fail unresolvable, committing funds to a claim that can
+        # never be built. Fail-closed means failing before the send.
+        self._job_asset(job)
         sk = self._load_ephemeral_sk(job)
         expected = self._funded_amount(job)
 

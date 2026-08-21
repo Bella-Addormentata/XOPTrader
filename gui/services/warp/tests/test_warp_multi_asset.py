@@ -646,5 +646,22 @@ def test_an_ambiguous_asset_table_is_refused_at_startup():
         drivers.verify_wrapped_asset_anchor(ambiguous)
 
 
+def test_funding_refuses_before_spending_when_the_asset_is_unresolvable():
+    """Funding runs before the claim's anchor, so an unresolvable asset
+    must stop the job BEFORE the security coin is sent -- otherwise the
+    operator's XCH is committed to a claim that can never be built."""
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, S.JobStatus.FUNDING_CLAIM,
+         columns={"post_tip_mojos": 4985, "receiver_ph": RECEIVER_PH.hex()},
+         state={"asset": "milliETH",
+                "asset_fingerprint": f"v1:0xdead:3:3:{'ff' * 32}"})
+    out = engine.step()
+    assert out["status"] == S.JobStatus.FAILED
+    assert "no longer pins" in (store.get_job(out["id"]).last_error or "")
+    assert not getattr(ctx.wallet, "sent", None), "nothing may be spent"
+    assert not getattr(ctx.wallet, "sends", None), "nothing may be spent"
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
