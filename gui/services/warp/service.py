@@ -485,9 +485,14 @@ def _asset_fingerprint(spec, cat_decimals: int) -> str:
 
     Contract, BOTH precisions (every conversion is
     ``10 ** (erc20 - cat)``, so freezing one half would let the ratio move)
-    and the wrapped TAIL. Version-tagged so a future field can be added
-    without stranding jobs written by an older build: an unrecognised
-    version is treated as unfingerprinted rather than as corruption.
+    and the wrapped TAIL.
+
+    Version-tagged so the format can change. An unrecognised version is
+    NOT treated as unfingerprinted: :meth:`_job_asset` routes it through
+    attestation recovery and stops the job when no attested evidence
+    exists. Only a row with neither field takes the legacy-USDC path, so
+    a future migration must convert existing stamps rather than assume
+    old readers will fall back gracefully.
     """
     return (f"v1:{_canon_addr(spec.erc20_address)}:{int(spec.erc20_decimals)}"
             f":{int(cat_decimals)}:{spec.expected_asset_id.strip().lower()}")
