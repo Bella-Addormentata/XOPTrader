@@ -1095,11 +1095,17 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // does NOT cover this path: the clamp below runs only when dex_best_bid
     // AND dex_best_ask are both present, which is precisely what reaching
     // Case 3 tells us we do not have.  This is asserted directly by
-    // PublishedMidBandTest.OneSidedBook_NoClamp.  On this path the centre is
-    // whatever the CEX and AMM legs say.
+    // PublishedMidBandTest.OneSidedBook_NoClamp.  Note that NEITHER Case 3
+    // outcome is banded: accepting a fresh print leaves the unclamped
+    // DEX/CEX/AMM blend, and refusing one leaves the centre to the CEX and
+    // AMM legs alone.  Refusing narrows what feeds the centre; it does not
+    // add a price-layer bound, because there is none on this path either way.
     //
     // What does bound it: those legs must survive their own freshness tapers
-    // to be used at all, and if none survives the pair publishes no mid and
+    // to be used at all -- and note the CEX taper only became effective with
+    // S6, which stopped a frozen CoinGecko cache re-stamping cex_updated_at
+    // every heartbeat; before that it could not have rejected a stale feed at
+    // all.  If none survives the pair publishes no mid and
     // the no-order-book guard stops it quoting.  Past that, buying is bounded
     // at the SIZING layer -- the pair's drift target and single_cat_cap_pct --
     // not at the price layer.  A stale print is not an accumulation brake and
