@@ -4355,9 +4355,17 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
         // [REVIVE-FRESHNESS 2026-08-18] Age of the CoinGecko FEED, not of
         // the solve.  coingecko_last_fetch_ advances only on a SUCCESSFUL
-        // fetch (Step 1), while every downstream timestamp the staleness
-        // detectors look at (cex_updated_at, fair_value_updated_at) is
-        // re-stamped each heartbeat from the cache and so can never expire.
+        // fetch (Step 1).
+        //
+        // [S6 2026-08-21] cex_updated_at is no longer one of the timestamps
+        // that cannot expire: ingest_cex_reference now stores the real
+        // observation time, so the CEX tapers age honestly.  This gate is
+        // still not redundant -- it is FEED-level and runs before any
+        // per-pair CEX sample need exist, so it also covers a revived pair
+        // that carries no cex_mid at all.  fair_value_updated_at IS still
+        // re-stamped every heartbeat from cached solver output
+        // (market_data.cpp:493), so that one still cannot expire on its own.
+        //
         // The revive path must not quote from a frozen feed: pre-revive
         // that state produced silence, and silence is the correct fallback.
         // (A feed that returns fresh-but-wrong prices is not catchable at
