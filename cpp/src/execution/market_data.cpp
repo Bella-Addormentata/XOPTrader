@@ -74,11 +74,13 @@ bool last_trade_is_fresh(const PairState& ps,
     if (ps.last_trade_changed_at == Timestamp{}) {
         return false;  // never observed to move: age unknown
     }
-    const auto age = std::chrono::duration_cast<std::chrono::seconds>(
+    // Fractional seconds: duration_cast<seconds> truncates, so a 0.9 s age
+    // read as 0 and passed a 0.5 s threshold.
+    const auto age = std::chrono::duration<double>(
                          std::chrono::system_clock::now()
                          - ps.last_trade_changed_at)
                          .count();
-    return static_cast<double>(age) <= max_age_sec;
+    return age <= max_age_sec;
 }
 
 // -------------------------------------------------------------------------
@@ -408,12 +410,19 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // at epoch -- we have not yet watched it move, so its age is unknown.
     if (last_trade > 0.0) {
         constexpr double kPrintMoveThreshold = 1e-4;  // 1 bp
-        if (ps.last_trade_print > 0.0
-            && std::abs(last_trade / ps.last_trade_print - 1.0)
-                   > kPrintMoveThreshold) {
+        if (ps.last_trade_print <= 0.0) {
+            // First sighting: anchor the reference, but leave the clock at
+            // epoch -- we have not yet watched this price move.
+            ps.last_trade_print = last_trade;
+        } else if (std::abs(last_trade / ps.last_trade_print - 1.0)
+                       > kPrintMoveThreshold) {
+            // Re-anchor ONLY on a material move.  Assigning on every sample
+            // would compare each print with the one immediately before it,
+            // so an unbounded number of sub-threshold steps could walk the
+            // price arbitrarily far while the clock never advanced.
             ps.last_trade_changed_at = std::chrono::system_clock::now();
+            ps.last_trade_print = last_trade;
         }
-        ps.last_trade_print = last_trade;
     }
     ps.dex_last_trade = last_trade;
     ps.volume_24h    = vol_24h;
