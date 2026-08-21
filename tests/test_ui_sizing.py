@@ -178,3 +178,57 @@ def test_the_radio_indicator_stays_round(app):
             "delta=%d: box %dpx + 2px border, radius %dpx"
             % (delta, box, radius)
         )
+
+
+# ---------------------------------------------------------------------------
+# Hit target
+#
+# A checkbox WITH a label is easy to hit -- the text is part of the button.
+# An unlabeled one is exactly as big as its indicator, so making the indicator
+# proportionate shrank the pointer target with it: 21x15, down from 24x24.
+# The two pairs-table toggles are unlabeled.
+# ---------------------------------------------------------------------------
+
+def _hit_target(widget) -> tuple[int, int]:
+    return (max(widget.minimumSize().width(), widget.sizeHint().width()),
+            max(widget.minimumSize().height(), widget.sizeHint().height()))
+
+
+@pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
+def test_an_unlabeled_checkbox_keeps_a_usable_target(app, delta):
+    """Asserted on the WIDGET, deliberately not on the indicator."""
+    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
+    cb = QCheckBox()
+    theme.ensure_hit_target(cb)
+    cb.ensurePolished()
+    width, height = _hit_target(cb)
+    assert width >= theme.MIN_HIT_TARGET_PX
+    assert height >= theme.MIN_HIT_TARGET_PX
+
+
+def test_the_target_grows_without_growing_the_indicator(app):
+    """Both properties at once: small box, comfortable target."""
+    app.setStyleSheet(theme.get_stylesheet())
+    bare = QCheckBox()
+    bare.ensurePolished()
+    indicator = bare.sizeHint().height()
+
+    padded = QCheckBox()
+    theme.ensure_hit_target(padded)
+    padded.ensurePolished()
+
+    assert indicator <= _text_height() + 2, "indicator stopped being proportionate"
+    assert _hit_target(padded)[1] >= theme.MIN_HIT_TARGET_PX
+    assert _hit_target(padded)[1] > indicator, "target is no bigger than the box"
+
+
+def test_both_pairs_table_toggles_get_the_target():
+    """They are the unlabeled ones; a new one must not miss this."""
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "settings.py").read_text(encoding="utf-8")
+    # Every bare QCheckBox() in settings.py must be followed by the call.
+    for chunk in source.split("QCheckBox()")[1:]:
+        assert "ensure_hit_target" in chunk.split("QCheckBox")[0], (
+            "an unlabeled QCheckBox in settings.py has no hit target"
+        )

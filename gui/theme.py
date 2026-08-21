@@ -608,6 +608,26 @@ QSlider::handle:vertical:hover {{
 # Theme application helper
 # ---------------------------------------------------------------------------
 
+#: Minimum comfortable pointer target, in px, for a control with no label.
+MIN_HIT_TARGET_PX = 24
+
+
+def ensure_hit_target(widget, size: int = MIN_HIT_TARGET_PX) -> None:
+    """Keep *widget* clickable even when its visual indicator is small.
+
+    A checkbox with a LABEL is easy to hit: the text is part of the button,
+    and QAbstractButton treats the whole widget rect as the target.  An
+    unlabeled one is exactly as big as its indicator, so shrinking the
+    indicator shrinks the target with it -- proportionate indicators made the
+    pairs-table toggles a 21x15 pointer target, down from 24x24.
+
+    Setting a minimum size restores the target without enlarging the drawn
+    indicator: the box stays proportionate to the text, the clickable area
+    does not.
+    """
+    widget.setMinimumSize(size, size)
+
+
 def fit_row_height(table) -> None:
     """Size *table*'s rows to the current UI font.
 
