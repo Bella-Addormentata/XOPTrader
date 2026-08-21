@@ -421,6 +421,18 @@ class MainWindow(QMainWindow):
             settings.pnl_baseline_changed.connect(self._on_pnl_baseline_changed)
         if settings is not None and hasattr(settings, "load_config"):
             cfg_path = bridge.config_service.path
+            # The advisory offer-sizing calculator is loaded by path out of
+            # the application bundle, so it cannot derive config/database
+            # locations from its own __file__ -- hand it the resolved ones.
+            sizing_db = str(getattr(bridge, "db_path", "") or "") or None
+            if hasattr(settings, "set_sizing_db_path"):
+                settings.set_sizing_db_path(sizing_db)
+            sizing_wallet = self._unwrap(self._wallet_balances)
+            if sizing_wallet is not None and hasattr(
+                    sizing_wallet, "set_sizing_paths"):
+                sizing_wallet.set_sizing_paths(
+                    str(cfg_path) if cfg_path.is_file() else None, sizing_db
+                )
             if cfg_path.is_file():
                 settings.load_config(str(cfg_path))
             else:

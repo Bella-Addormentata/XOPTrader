@@ -231,6 +231,16 @@ class EngineBridge(QObject):
         return self._database_svc
 
     @property
+    def db_path(self) -> Path:
+        """The resolved database path, as ConfigService.path is for config.
+
+        Exposed so widgets can hand real paths to the offer-sizing
+        calculator: loaded from the application bundle, that module cannot
+        derive them from its own __file__.
+        """
+        return self._db_path
+
+    @property
     def warp_service(self) -> WarpService:
         """Return the owned WarpService instance."""
         return self._warp_svc

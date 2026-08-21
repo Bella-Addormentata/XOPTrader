@@ -124,9 +124,15 @@ class _SuggestedTargetsWorker(QObject):
     ready = Signal(dict)   # {pair_name: {"ratio", "artifact", "reason"}}
     failed = Signal(str)
 
-    def __init__(self, config_path: Optional[str]) -> None:
+    def __init__(self, config_path: Optional[str],
+                 db_path: Optional[str] = None) -> None:
         super().__init__()
+        # config_path alone was not enough: the database default is also
+        # derived from offer_sizing's __file__, which lives under _MEIPASS in
+        # an installed build, so this failed with "database not found at
+        # <_MEI temp dir>/data/xop_trader.db".
         self._config_path = config_path
+        self._db_path = db_path
 
     @Slot()
     def run(self) -> None:
@@ -135,7 +141,8 @@ class _SuggestedTargetsWorker(QObject):
 
             sizing = load_offer_sizing()
             result = sizing.compute_suggested_targets(
-                config_path=self._config_path
+                config_path=self._config_path,
+                db_path=self._db_path,
             )
             self.ready.emit(dict(result.get("pairs", {})))
         except Exception as exc:  # fail soft -> "n/a" in the table
@@ -311,6 +318,10 @@ class SettingsWidget(QWidget):
 
         # Internal state for dirty-tracking and reset.
         self._config_path: Optional[str] = None
+        # Database location for the advisory calculator, supplied by
+        # main_window; see _SuggestedTargetsWorker for why it cannot be
+        # derived from the bundled module's own location.
+        self._sizing_db_path: Optional[str] = None
         self._last_saved_time: Optional[str] = None
         self._clean_snapshot: dict[str, Any] = {}
         self._dirty: bool = False
@@ -2977,7 +2988,8 @@ class SettingsWidget(QWidget):
             "…", _SUGGESTED_TOOLTIP_BASE + "\n\nComputing…"
         )
         thread = QThread(self)
-        worker = _SuggestedTargetsWorker(self._config_path)
+        worker = _SuggestedTargetsWorker(self._config_path,
+                                         self._sizing_db_path)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.ready.connect(self._on_suggested_ready)
@@ -3328,6 +3340,10 @@ class SettingsWidget(QWidget):
     # ===================================================================
     # Public API: load_config / save_config
     # ===================================================================
+
+    def set_sizing_db_path(self, db_path: Optional[str]) -> None:
+        """Tell the advisory targets calculator where the database lives."""
+        self._sizing_db_path = db_path
 
     def load_config(self, path: str) -> None:
         """Load a YAML configuration file and populate all widgets.
