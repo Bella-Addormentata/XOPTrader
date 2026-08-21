@@ -877,34 +877,69 @@ class WarpEngine:
         simply older than the field, and is resolved by name.
         """
         raw = str(job.state.get("asset_fingerprint") or "").strip()
-        parts = raw.split(":") if raw else []
-        if parts and parts[0] == "v1" and len(parts) == 5:
-            _v, addr, erc20_dec, cat_dec, tail = parts
-            try:
-                spec = self._net.asset_by_wrapped_id(tail)
-            except KeyError:
-                raise WarpTerminal(
-                    f"job {job.id} was frozen against wrapped asset {tail}, "
-                    f"which {self._net.name} no longer pins -- refusing to "
-                    "resume against a different asset than the one its funds "
-                    "moved under"
-                ) from None
-            if (spec.erc20_address.lower() != addr
-                    or int(spec.erc20_decimals) != int(erc20_dec)
-                    or int(self._net.cat_decimals) != int(cat_dec)):
-                raise WarpTerminal(
-                    f"job {job.id} froze {spec.symbol} as {raw}, but this "
-                    f"build resolves that wrapped id to "
-                    f"{_asset_fingerprint(spec, self._net.cat_decimals)} -- "
-                    "the asset's terms changed under a live job"
-                )
-            return spec
+        stamped = "asset" in job.state
+        # Once a Base transaction exists the job's funds are committed, and
+        # a terminal here cannot be retried, abandoned or cancelled -- it
+        # would strand them AND hold the single active-job slot. Before
+        # that point refusing is free, so an unreadable stamp fails closed.
+        committed = bool(job.bridge_tx_hash or job.state.get("bridge_raw"))
 
-        # No fingerprint, or one written by a newer/older format: fall back
-        # to the recorded name. Never terminal for want of a fingerprint --
-        # a job past its bridge cannot be retried, abandoned or cancelled,
-        # so a hard stop here would strand real funds and hold the single
-        # active-job slot for nothing.
+        def _bad_stamp(why: str):
+            if not committed:
+                return WarpTerminal(
+                    f"job {job.id} carries an unreadable asset stamp "
+                    f"({why}); refusing to resolve it by name"
+                )
+            _log.error(
+                "job %s has an unreadable asset stamp (%s); its funds are "
+                "already committed, so resolving by recorded name instead "
+                "of stranding it", job.id, why,
+            )
+            return None
+
+        if raw:
+            parts = raw.split(":")
+            if parts[0] == "v1" and len(parts) == 5:
+                _v, addr, erc20_dec, cat_dec, tail = parts
+                try:
+                    erc20_dec_i, cat_dec_i = int(erc20_dec), int(cat_dec)
+                except ValueError:
+                    # Never let this escape as a plain exception: step()
+                    # classifies unknown errors as RETRYABLE, so a corrupt
+                    # stamp would retry every tick forever.
+                    err = _bad_stamp(f"non-integer precision in {raw!r}")
+                    if err:
+                        raise err
+                else:
+                    try:
+                        spec = self._net.asset_by_wrapped_id(tail)
+                    except KeyError:
+                        raise WarpTerminal(
+                            f"job {job.id} was frozen against wrapped asset "
+                            f"{tail}, which {self._net.name} no longer pins "
+                            "-- refusing to resume against a different asset "
+                            "than the one its funds moved under"
+                        ) from None
+                    if (spec.erc20_address.lower() != addr
+                            or int(spec.erc20_decimals) != erc20_dec_i
+                            or int(self._net.cat_decimals) != cat_dec_i):
+                        raise WarpTerminal(
+                            f"job {job.id} froze {spec.symbol} as {raw}, but "
+                            "this build resolves that wrapped id to "
+                            f"{_asset_fingerprint(spec, self._net.cat_decimals)}"
+                            " -- the asset's terms changed under a live job"
+                        )
+                    return spec
+            else:
+                err = _bad_stamp(f"unrecognised format {raw!r}")
+                if err:
+                    raise err
+
+        # Legacy rows carry neither field; USDC was the only asset the
+        # pipeline could bridge when they were written. A committed job
+        # with an unreadable stamp also lands here, deliberately.
+        if not stamped and not raw:
+            return self._net.asset("USDC")
         symbol = str(job.state.get("asset") or "USDC").strip() or "USDC"
         try:
             return self._net.asset(symbol)

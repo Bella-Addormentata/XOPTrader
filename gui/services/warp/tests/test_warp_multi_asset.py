@@ -339,12 +339,44 @@ def test_a_changed_precision_ratio_is_refused():
         eng._job_asset(job)
 
 
-def test_an_unrecognised_fingerprint_version_falls_back_not_forward():
-    """A future field must not strand jobs written by an older build."""
+def test_an_unreadable_stamp_fails_closed_before_funds_move():
+    """Refusing costs nothing before a Base transaction exists, so an
+    unreadable stamp is terminal there -- it cannot be a legacy row, since
+    those carry no fingerprint at all."""
     store, eng, ctx = _engine()
     job = seed(store, S.JobStatus.AWAITING_DEPOSIT,
                state={"asset": "USDC", "asset_fingerprint": "v9:whatever"})
+    with pytest.raises(S.WarpTerminal, match="unreadable asset stamp"):
+        eng._job_asset(job)
+
+
+def test_a_corrupt_precision_is_terminal_not_an_infinite_retry():
+    """step() classifies unknown exceptions as RETRYABLE, so a ValueError
+    escaping the parser would retry every tick forever."""
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT,
+               state={"asset": "USDC",
+                      "asset_fingerprint": f"v1:0xabc:six:3:{'ff' * 32}"})
+    with pytest.raises(S.WarpTerminal, match="non-integer precision"):
+        eng._job_asset(job)
+
+
+def test_an_unreadable_stamp_never_strands_a_committed_job():
+    """After the bridge exists the job's funds are committed and FAILED is
+    a dead end -- Retry re-fails, Abandon and Sweep are refused while the
+    signed bridge is live, and the row holds the single job slot. There the
+    resolver falls back to the recorded name instead of stranding it."""
+    store, eng, ctx = _engine()
+    job = seed(store, S.JobStatus.BRIDGING,
+               columns={"bridge_tx_hash": "0x" + "ab" * 32},
+               state={"asset": "USDC", "asset_fingerprint": "v9:whatever"})
     assert eng._job_asset(job).symbol == "USDC"
+
+    store2, eng2, _c2 = _engine()
+    signed = seed(store2, S.JobStatus.BRIDGING,
+                  state={"asset": "USDC", "bridge_raw": "aa" * 8,
+                         "asset_fingerprint": f"v1:0xabc:six:3:{'ff' * 32}"})
+    assert eng2._job_asset(signed).symbol == "USDC"
 
 
 def test_every_creation_path_stamps_the_terms_not_just_the_name():
