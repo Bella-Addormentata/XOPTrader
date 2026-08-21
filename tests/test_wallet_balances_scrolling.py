@@ -94,13 +94,33 @@ def test_the_page_grows_so_the_outer_area_scrolls_instead(app):
         app.processEvents()
 
 
-@pytest.mark.parametrize("delta", [-2, 0, 4])
-def test_it_holds_when_the_font_size_changes(app, delta):
-    """Height comes from real row heights, not a per-row constant."""
-    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
-    w = WalletBalancesWidget()
-    w.update_balances(_balances(8), market_data={}, stuck_offers=0)
-    assert w._table.height() == _content_height(w._table)
+def test_the_fit_tracks_real_row_heights(app):
+    """Height comes from real row heights, not a per-row constant.
+
+    Varying the GLOBAL font delta does not work here: this widget pins its
+    table and header fonts in local QSS, which overrides the application
+    stylesheet, so every delta produced identical geometry and an earlier
+    parameterised version of this test passed without exercising anything.
+    Vary the table's own font instead, and prove the geometry moved before
+    claiming the fit followed it.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    heights = []
+    for row_px in (18, 30, 44):
+        w = WalletBalancesWidget()
+        # Drive the row height directly.  Neither the global delta nor
+        # setFont() reaches these tables -- the widget's local QSS pins the
+        # font size and overrides both -- and this is the quantity the fit
+        # actually sums, so it is the honest lever.
+        w._table.verticalHeader().setDefaultSectionSize(row_px)
+        w.update_balances(_balances(8), market_data={}, stuck_offers=0)
+        assert w._table.height() == _content_height(w._table)
+        heights.append(w._table.height())
+
+    assert len(set(heights)) > 1, (
+        "row geometry never changed across font sizes, so this test would "
+        "pass even if the fit ignored row heights entirely"
+    )
 
 
 def test_clearing_collapses_the_tables_again(app):
