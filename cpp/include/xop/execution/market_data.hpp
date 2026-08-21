@@ -335,6 +335,16 @@ struct MarketDataConfig {
     /// Default 300 s (5 min).  0 = disable freshness check.
     double amm_freshness_threshold_sec{300.0};
 
+    /// Max age (seconds) of an unchanged dexie last-trade print before it is
+    /// refused as a mid reference.  <= 0 disables the gate.
+    ///
+    /// The last trade is the ONLY leg of the published-mid blend that is a
+    /// historical print rather than a live quote, and it enters at the full
+    /// DEX weight.  Without this, a print of any age -- one case measured at
+    /// 13 days -- carried 70% of the mid whenever the third-party book was
+    /// empty, which is exactly the state a thin or bid-only pair sits in.
+    double dex_last_trade_max_age_sec{1800.0};
+
     // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
 
     /// When true, compute_mid() prefers an order-book-derived mid-price
@@ -416,6 +426,15 @@ struct PairState {
     // the price itself so a frozen book is detectable.
     double       last_dex_print{0.0}; // Last materially-different dex mid
     std::int32_t dex_print_age{0};    // Heartbeats since it last moved
+
+    // The same treatment for the last-trade print itself.  dex_print_age is
+    // derived from the ORDER-BOOK mid, so it stops advancing precisely when
+    // the book empties -- the one state in which the last trade becomes the
+    // mid.  These two fields age the print directly.  A default-constructed
+    // last_trade_changed_at means "never observed to move": the print's age
+    // is unknown, not zero, and compute_mid refuses it on that basis.
+    double      last_trade_print{0.0};
+    Timestamp   last_trade_changed_at{};
 
     // --- AMM reference (TibetSwap implied price) ---
     double      amm_mid{0.0};       // AMM implied mid-price (0 if unavailable)

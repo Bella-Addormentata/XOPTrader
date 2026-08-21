@@ -106,6 +106,14 @@ jobs:
       - name: Build
         run: cmake --build build --config Debug --parallel
 
+      # ---- Run the C++ suite -----------------------------------------------
+      # The build above already produces xop_tests, so running it here costs
+      # only the test time.  Without this, ctest ran solely in the release
+      # workflow (release.yml), which meant a C++ change could merge with a
+      # red suite and only fail at tag time -- after review had passed.
+      - name: C++ tests
+        run: ctest --test-dir build --build-config Debug --output-on-failure
+
   # ---------------------------------------------------------------------------
   # Job 2 — Python syntax check
   # ---------------------------------------------------------------------------

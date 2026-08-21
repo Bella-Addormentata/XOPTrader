@@ -100,12 +100,12 @@
 ### S3: XCH fee reserve subtracted from base-denominated bid pool
 - **Files:** `cpp/src/engine.cpp:4590-4603`
 - **Issue:** When `quote_asset_id=='xch'`, `reserve_mojos = fee_reserve_xch * kMojosPerXch` (1e12-scale) is subtracted from `avail_capital`, but `avail_capital = pcs.risk_quote.bid_size` is BASE-asset mojos (proven by lines 4681-4696: compared against `bid_cap_base`, divided by `base_mojos_per_unit`). On CAT-base pairs (wmilliETH.b/XCH, 1000 mojos/unit) even a 0.001 XCH reserve zeroes the bid pool every heartbeat, making Avellaneda q_max/gamma/kappa sizing inert; only floor mechanisms quote. The base=='xch' branch (4576-4589) is coincidentally correct.
-- **Status:** `[ ]` — Verified 2026-08-18, no fix since PR #79. Fix: convert the reserve into base-mojo terms via mid price, or reserve against the wallet XCH balance instead of the quote-sized pool.
+- **Status:** `[x]` — RESOLVED (PR #81). `engine.cpp` now converts the reserve through `reserve_base_mojos()` before subtracting it from the base-denominated pool, under an explicit `[S3 2026-08-18]` comment; a missing mid converts to 0 so no subtraction happens. Re-verified 2026-08-21..
 
 ### S4: Warp unwrap G10 gate budgets the Chia fee once but pays it twice
 - **Files:** `gui/services/warp/service.py`
 - **Issue:** G10 gate (line 1966) computes `toll_need = net.chia_toll_mojos + p.unwrap_chia_fee_mojos` (fee counted once), but the fee is paid on both the burn `cat_spend` (line 2108) and the toll-coin funding `send_transaction` (line 2224). Neither send site re-checks spendable XCH after the UNWRAP_CHECKS gate; an offer locking coins between gate and send makes the second spend fail.
-- **Status:** `[ ]` — Verified 2026-08-18. Fix: gate on `toll + 2*fee` and re-check spendable at BURNING and FUNDING_CLAIM.
+- **Status:** `[x]` — RESOLVED. `service.py` now gates on `toll_need = net.chia_toll_mojos + 2 * p.unwrap_chia_fee_mojos`, and the sending ticks re-check spendable XCH with named pends. Re-verified 2026-08-21 against the merged code; the entry was stale.
 
 ### S5: Published mid blends stale last-trade with no staleness gate
 - **Files:** `cpp/src/execution/market_data.cpp:1009-1012, 1188-1189`
@@ -120,12 +120,13 @@
 ### S7: Dexie ticker parse swaps bid and ask
 - **Files:** `cpp/src/rpc/dexie_client.cpp:616-638`
 - **Issue:** `prices.buy[0]` is labeled best bid (`t.price_buy`) and `prices.sell[0]` best ask when the sides are inverted, producing constant "Crossed book" warnings that market_data.cpp:361-371 rationalizes as "normal on Dexie". Harmless for the published mid only because `ingest_competing_offers` overwrites from the real book (market_data.cpp:1529-1530) — but OFI (engine.cpp:1937-1943) and the offer_manager ticker mid (offer_manager.cpp:2297) still consume the swapped sides.
-- **Status:** `[ ]` — Verified 2026-08-18 (`git log -S price_buy` since 2026-04-21: no fix). Fix: swap the labels at parse and delete the crossed-book rationalization.
+- **Status:** `[x]` — NOT A DEFECT (closed 2026-08-21). The audit read `parse_ticker_` in isolation and missed the direction-handling layer between it and every consumer: `get_ticker` (`dexie_client.cpp:790-840`) already applies the invert+swap for Case A (`td.price_buy = invert_price(raw_sell); td.price_sell = invert_price(raw_buy)`), added in 04e96e1 "dexie inversion fix" (2026-04-03). `parse_ticker_` is a raw JSON transcriber holding Dexie's native XCH-per-CAT values, which are not yet bid/ask in our convention.
+  **Do not apply the swap this entry originally proposed** — it would double-invert and put bid/ask backwards on XCH/wUSDC.b, XCH/BYC and XCH/DBX simultaneously. Follow-up worth doing instead: a regression test for the dexie RPC layer (none exists) and the clarifying comment now in `dexie_client.hpp`.
 
 ### S8: wmilliETH.b has no drift target — accumulation brakes unreachable
 - **Files:** `config.yaml:168-187`; `cpp/src/engine.cpp:4891-4917`
 - **Issue:** `strategy.asset_target_allocations` omits WMILLIETH.B (and `ratio_target_by_pair`/`ratio_band_enter_by_pair` omit wmilliETH.b/XCH) even though the pair is enabled; `acquire_scale` returns 1.0 for missing keys (engine.cpp:4891-4893) and is applied to the bid side (:4917), so accumulation is never tapered. Remaining limits are portfolio-fraction denominated (`single_cat_cap_pct` 0.25, soft/hard 0.6/0.8) — unreachable for a small CAT position on a large wallet.
-- **Status:** `[ ]` — Verified 2026-08-18. Fix: add WMILLIETH.B target/tolerance and a wmilliETH.b/XCH ratio target, or add a per-pair absolute inventory cap.
+- **Status:** `[x]` — RESOLVED. `config.yaml` now carries `asset_target_allocations.WMILLIETH.B` plus `ratio_target_by_pair` and `ratio_band_enter_by_pair` entries for `wmilliETH.b/XCH`, so `acquire_scale` no longer returns 1.0 for the pair and the accumulation brake is reachable. Re-verified 2026-08-21.
 
 ---
 
