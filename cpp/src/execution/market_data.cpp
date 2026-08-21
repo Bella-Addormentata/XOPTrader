@@ -1055,7 +1055,7 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // pair publishes no mid and the no-order-book guard stops it quoting --
     // the correct outcome when we cannot locate fair value.
     else if (ps.dex_last_trade > 0.0
-             && last_trade_is_fresh(ps, config_.dex_last_trade_max_age_sec)) {
+             && last_trade_is_fresh(ps, cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
     }
 
@@ -1235,7 +1235,7 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
         dex_mid = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
     } else if (ps.dex_last_trade > 0.0
                && last_trade_is_fresh(ps,
-                                      config_.dex_last_trade_max_age_sec)) {
+                                      cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
     }
 
