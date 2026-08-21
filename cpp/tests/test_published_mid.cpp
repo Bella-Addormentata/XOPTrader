@@ -141,16 +141,40 @@ TEST(PublishedMidBandTest, WideBook_BandScalesWithSpread) {
 //
 //   dex: ask-only book, last trade 1.00 -> dex_mid = 1.00 (last-trade path)
 //   raw blend: 0.7 * 1.00 + 0.3 * 1.50 = 1.15, published unclamped.
+//
+// The last-trade age gate is disabled here deliberately: this test's subject
+// is the CLAMP, and it reaches the blend through the last-trade path only
+// incidentally.  The gate's own behaviour is covered by LastTradeStalenessTest
+// below, and their interaction by OneSidedBook_UnagedPrint_CexGoverns.
 // ---------------------------------------------------------------------------
 TEST(PublishedMidBandTest, OneSidedBook_NoClamp) {
     State state;
-    MarketDataFeed feed(band_cfg(), state);
+    auto cfg = band_cfg();
+    cfg.dex_last_trade_max_age_sec = 0.0;   // not this test's subject
+    MarketDataFeed feed(cfg, state);
 
     feed.ingest_dexie("XCH/DBX", 0.0, 1.01, 1.00, 100.0);
     feed.ingest_cex_reference("XCH/DBX", 1.50);
     feed.refresh({"XCH/DBX"});
 
     EXPECT_NEAR(feed.get_mid_price("XCH/DBX"), 1.15, 1e-9);
+}
+
+// ---------------------------------------------------------------------------
+// The interaction the gate introduces: a one-sided book routes to the
+// last-trade path, and with the gate live an unaged print is refused there
+// too -- so the external reference governs alone.  Still no clamp, because a
+// lone side asserts no interval.
+// ---------------------------------------------------------------------------
+TEST(PublishedMidBandTest, OneSidedBook_UnagedPrint_CexGoverns) {
+    State state;
+    MarketDataFeed feed(band_cfg(), state);   // gate at its default
+
+    feed.ingest_dexie("XCH/DBX", 0.0, 1.01, 1.00, 100.0);
+    feed.ingest_cex_reference("XCH/DBX", 1.50);
+    feed.refresh({"XCH/DBX"});
+
+    EXPECT_NEAR(feed.get_mid_price("XCH/DBX"), 1.50, 1e-9);
 }
 
 // ---------------------------------------------------------------------------
