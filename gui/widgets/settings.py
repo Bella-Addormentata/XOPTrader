@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS, ensure_hit_target, fit_row_height
+from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
 
 log = logging.getLogger(__name__)
 
@@ -2807,10 +2807,9 @@ class SettingsWidget(QWidget):
         self._pairs_table.insertRow(row)
 
         # Enabled checkbox -- centred in cell.
-        cb = QCheckBox()
-        # Unlabeled: without this the clickable area shrinks with the
-        # indicator and only the small box toggles the row.
-        ensure_hit_target(cb)
+        # Unlabeled: a plain QCheckBox would shrink its clickable area
+        # with the indicator, so only the small box would toggle the row.
+        cb = HitTargetCheckBox()
         cb.setChecked(bool(pair.get("enabled", True)))
         cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         cb_container = QWidget()
@@ -2883,8 +2882,7 @@ class SettingsWidget(QWidget):
         # alone cannot satisfy it -- so the tooltip must say so, or an
         # operator with an AMM-backed pair ticks the box and watches
         # nothing happen.
-        revive_cb = QCheckBox()
-        ensure_hit_target(revive_cb)          # unlabeled, same reason
+        revive_cb = HitTargetCheckBox()   # unlabeled, same reason
         revive_cb.setChecked(bool(pair.get("revive_market", False)))
         revive_cb.setToolTip(
             "Revive a dead market: quote from the external fair-value "

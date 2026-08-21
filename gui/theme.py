@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from PySide6.QtGui import QFont, QFontDatabase
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox
 
 
 # ---------------------------------------------------------------------------
@@ -612,20 +612,29 @@ QSlider::handle:vertical:hover {{
 MIN_HIT_TARGET_PX = 24
 
 
-def ensure_hit_target(widget, size: int = MIN_HIT_TARGET_PX) -> None:
-    """Keep *widget* clickable even when its visual indicator is small.
+class HitTargetCheckBox(QCheckBox):
+    """An unlabeled checkbox whose WHOLE rect toggles it.
 
-    A checkbox with a LABEL is easy to hit: the text is part of the button,
-    and QAbstractButton treats the whole widget rect as the target.  An
-    unlabeled one is exactly as big as its indicator, so shrinking the
-    indicator shrinks the target with it -- proportionate indicators made the
-    pairs-table toggles a 21x15 pointer target, down from 24x24.
+    A checkbox with a label is easy to hit -- the text is part of the button.
+    An unlabeled one is exactly as big as its indicator, so making the
+    indicator proportionate to the text shrank the pointer target with it:
+    21x15, down from 24x24.
 
-    Setting a minimum size restores the target without enlarging the drawn
-    indicator: the box stays proportionate to the text, the clickable area
-    does not.
+    Enlarging the widget is not enough on its own.  QCheckBox does NOT hit
+    test against its whole rect; it uses ``SE_CheckBoxClickRect``, which
+    tracks the indicator.  Verified with QTest.mouseClick: with only a 24x24
+    minimum size, a click at the centre toggled while clicks at the right
+    edge and the bottom-right corner did nothing.  So the minimum size sets
+    the area and ``hitButton`` makes that area actually respond.
     """
-    widget.setMinimumSize(size, size)
+
+    def __init__(self, size: int = MIN_HIT_TARGET_PX, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(size, size)
+
+    def hitButton(self, pos) -> bool:      # noqa: N802 (Qt naming)
+        """Treat the entire widget as the button, label or no label."""
+        return self.rect().contains(pos)
 
 
 def fit_row_height(table) -> None:

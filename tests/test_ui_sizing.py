@@ -18,6 +18,8 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest  # noqa: E402
 
+from PySide6.QtCore import QPoint, Qt  # noqa: E402
+from PySide6.QtTest import QTest  # noqa: E402
 from PySide6.QtWidgets import (  # noqa: E402
     QApplication, QCheckBox, QHBoxLayout, QLabel, QPushButton,
     QTableWidget, QWidget,
@@ -189,46 +191,65 @@ def test_the_radio_indicator_stays_round(app):
 # The two pairs-table toggles are unlabeled.
 # ---------------------------------------------------------------------------
 
-def _hit_target(widget) -> tuple[int, int]:
-    return (max(widget.minimumSize().width(), widget.sizeHint().width()),
-            max(widget.minimumSize().height(), widget.sizeHint().height()))
+def _clicks_at(widget, x: int, y: int) -> bool:
+    """Whether a real click at (x, y) toggles *widget*.
+
+    Asserted with QTest rather than inferred from sizeHint()/minimumSize().
+    Inferring is what hid the original bug: QCheckBox hit tests against
+    SE_CheckBoxClickRect, not its own rect, so a widget can be 24x24 while
+    only the ~15px indicator responds -- and a size-based test cannot see
+    the difference.
+    """
+    before = widget.isChecked()
+    QTest.mouseClick(widget, Qt.MouseButton.LeftButton,
+                     Qt.KeyboardModifier.NoModifier, QPoint(x, y))
+    QApplication.processEvents()
+    return widget.isChecked() != before
 
 
 @pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
-def test_an_unlabeled_checkbox_keeps_a_usable_target(app, delta):
-    """Asserted on the WIDGET, deliberately not on the indicator."""
+def test_every_corner_of_an_unlabeled_checkbox_toggles_it(app, delta):
     app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
-    cb = QCheckBox()
-    theme.ensure_hit_target(cb)
-    cb.ensurePolished()
-    width, height = _hit_target(cb)
-    assert width >= theme.MIN_HIT_TARGET_PX
-    assert height >= theme.MIN_HIT_TARGET_PX
+    size = theme.MIN_HIT_TARGET_PX
+    cb = theme.HitTargetCheckBox()
+    cb.resize(size, size)
+    cb.show()
+    app.processEvents()
+    for x, y in ((size // 2, size // 2), (size - 2, size // 2),
+                 (size - 2, size - 2), (1, 1)):
+        assert _clicks_at(cb, x, y), f"click at ({x},{y}) did not toggle"
 
 
-def test_the_target_grows_without_growing_the_indicator(app):
-    """Both properties at once: small box, comfortable target."""
+def test_a_plain_checkbox_shows_why_the_subclass_is_needed(app):
+    """Pins the defect: a mere minimum size does NOT widen the target."""
+    app.setStyleSheet(theme.get_stylesheet())
+    plain = QCheckBox()
+    plain.setMinimumSize(theme.MIN_HIT_TARGET_PX, theme.MIN_HIT_TARGET_PX)
+    plain.resize(theme.MIN_HIT_TARGET_PX, theme.MIN_HIT_TARGET_PX)
+    plain.show()
+    app.processEvents()
+    assert _clicks_at(plain, 12, 12), "centre should always toggle"
+    # The corner is inside the widget but outside SE_CheckBoxClickRect.
+    assert not _clicks_at(plain, 22, 22), (
+        "a plain QCheckBox toggled at its corner -- if Qt changed this, the "
+        "HitTargetCheckBox subclass may no longer be necessary"
+    )
+
+
+def test_the_indicator_stays_proportionate_to_the_text(app):
+    """The target grows; the drawn box must not."""
     app.setStyleSheet(theme.get_stylesheet())
     bare = QCheckBox()
     bare.ensurePolished()
-    indicator = bare.sizeHint().height()
-
-    padded = QCheckBox()
-    theme.ensure_hit_target(padded)
-    padded.ensurePolished()
-
-    assert indicator <= _text_height() + 2, "indicator stopped being proportionate"
-    assert _hit_target(padded)[1] >= theme.MIN_HIT_TARGET_PX
-    assert _hit_target(padded)[1] > indicator, "target is no bigger than the box"
+    assert bare.sizeHint().height() <= _text_height() + 2
 
 
-def test_both_pairs_table_toggles_get_the_target():
-    """They are the unlabeled ones; a new one must not miss this."""
+def test_both_pairs_table_toggles_use_the_subclass():
+    """A future unlabeled checkbox must not silently miss this."""
     from pathlib import Path
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "widgets", "settings.py").read_text(encoding="utf-8")
-    # Every bare QCheckBox() in settings.py must be followed by the call.
-    for chunk in source.split("QCheckBox()")[1:]:
-        assert "ensure_hit_target" in chunk.split("QCheckBox")[0], (
-            "an unlabeled QCheckBox in settings.py has no hit target"
-        )
+    assert "QCheckBox()" not in source, (
+        "a bare unlabeled QCheckBox in settings.py has no enlarged hit target"
+    )
+    assert source.count("HitTargetCheckBox()") == 2
