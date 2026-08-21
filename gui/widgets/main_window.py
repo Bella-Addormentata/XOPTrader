@@ -109,7 +109,16 @@ except ImportError:
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
 from gui.theme import COLORS as _C
-from gui.utils import mojos_to_xch_float
+from gui.utils import (
+    format_price,
+    mojos_per_unit_for_pair,
+    mojos_to_xch,
+    mojos_to_xch_float,
+)
+
+#: Rows shown in the dashboard's RECENT ACTIVITY feed.  A glance
+#: panel, not a record -- the Trade Log tab holds the full history.
+_ACTIVITY_FEED_ROWS: Final[int] = 25
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
 LIGHT_GREEN: Final[str] = _C.LIGHT_GREEN
@@ -182,6 +191,37 @@ def _placeholder_widget(label: str) -> QWidget:
     return widget
 
 
+def activity_event(trade: dict) -> Optional[dict]:
+    """One activity-feed event from a ``trade_log`` row, or None if unusable.
+
+    Amounts go through the same helpers the Trade Log uses rather than being
+    re-derived: ``price_mojos`` is scaled by 10^12 for EVERY pair, while
+    ``size_mojos`` uses the pair's own base units, and duplicating that rule
+    is how two views of one fill drift apart.
+
+    Returns None for a row that cannot be rendered; one malformed row must
+    not empty the whole feed.
+    """
+    pair = str(trade.get("pair_name", "") or "")
+    side = str(trade.get("side", "") or "").lower()
+    try:
+        price = format_price(int(trade.get("price_mojos", 0) or 0), pair)
+        size = mojos_to_xch(
+            int(trade.get("size_mojos", 0) or 0),
+            mojos_per_unit=mojos_per_unit_for_pair(pair, "base"),
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
+    stamp = str(trade.get("timestamp", "") or "")
+    # "2026-08-21T16:54:15.943Z" -> "16:54:15"
+    clock = stamp[11:19] if len(stamp) >= 19 else stamp
+    return {
+        "timestamp": clock,
+        "icon": "▲" if side == "bid" else "▼",
+        "message": f"{side.upper():4s} {size} @ {price}  {pair}",
+    }
+
+
 class MainWindow(QMainWindow):
     """Top-level application window for the XOPTrader GUI.
 
@@ -212,6 +252,9 @@ class MainWindow(QMainWindow):
         self.metrics_service = metrics_service
         self.db_service = db_service
         self._bridge: Optional[Any] = None  # Set via set_bridge()
+        # Last observed 24h fill count, so the activity feed can refresh when
+        # a fill actually lands.  None until the first bridge payload.
+        self._last_fill_count: Optional[int] = None
 
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
@@ -312,6 +355,10 @@ class MainWindow(QMainWindow):
             db.trades_loaded.connect(self._trade_log.load_trades)
         if self._chart is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_chart)
+        # The dashboard's RECENT ACTIVITY feed.  It was built but never
+        # connected to anything, so it could not display a single row.
+        if hasattr(db, "trades_loaded"):
+            db.trades_loaded.connect(self._on_trades_for_activity)
         # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
         # Balances tab's Deployed % column and summary line.
         _wallet_widget = self._unwrap(self._wallet_balances)
@@ -610,6 +657,7 @@ class MainWindow(QMainWindow):
             fill_count_24h = int(
                 self._pnl_display.get("fills_24h", offers.get("filled", 0))
             )
+            self._refresh_activity_on_new_fill(fill_count_24h)
 
             card_data = {
                 "Total P&L": self._total_pnl_payload(),
@@ -1017,6 +1065,49 @@ class MainWindow(QMainWindow):
             "Total P&L": self._total_pnl_payload(),
             "24h P&L": self._pnl_24h_payload(),
         })
+
+    def _refresh_activity_on_new_fill(self, fill_count: int) -> None:
+        """Re-query trades when the fill count moves, and only then.
+
+        A timer would be the obvious approach and is the wrong one here: the
+        trades query is shared with the chart, whose per-pair merge is heavy
+        enough that it is already chunked across event-loop slices at
+        startup.  Polling it every few seconds would pay that cost forever to
+        show something that changes about thirty times a day.
+
+        The first observation only records the baseline -- the startup seed
+        has already populated the feed, so re-querying immediately would
+        duplicate that work for nothing.
+        """
+        previous = self._last_fill_count
+        self._last_fill_count = fill_count
+        if previous is None or fill_count <= previous:
+            return
+        bridge = getattr(self, "_bridge", None)
+        db = getattr(bridge, "database_service", None) if bridge else None
+        if db is not None and hasattr(db, "query_trades"):
+            db.query_trades(limit=1000)
+
+    def _on_trades_for_activity(self, trades: list) -> None:
+        """Render recent fills into the dashboard's activity feed.
+
+        The query returns newest-first; the feed reads top-down oldest-first,
+        so the slice is reversed.  Only the newest few are shown -- this is a
+        glance panel, and the Trade Log tab is the full record.
+
+        Amounts go through the same helpers the Trade Log uses rather than
+        being re-derived here: price_mojos is scaled by 10^12 for every pair
+        while size_mojos uses the pair's own base units, and duplicating that
+        rule is how the two views drift apart.
+        """
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is None or not hasattr(dashboard, "update_trades"):
+            return
+
+        events = [e for e in (activity_event(t)
+                              for t in list(trades)[:_ACTIVITY_FEED_ROWS][::-1])
+                  if e is not None]
+        dashboard.update_trades(events)
 
     def _on_pnl_display(self, display: dict) -> None:
         """Receive restart-proof P&L figures from the database service."""

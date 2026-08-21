@@ -932,16 +932,21 @@ class DashboardWidget(QWidget):
         self._pairs_table.setSortingEnabled(True)
 
     def update_trades(self, trades: list[dict[str, Any]]) -> None:
-        """Append new events to the activity feed.
+        """Show *trades* in the activity feed, replacing what is there.
+
+        REPLACES rather than appends.  The source is a database snapshot of
+        the most recent fills, re-delivered whole on every refresh, so
+        appending would repeat every row each time the query re-ran.
 
         Parameters
         ----------
         trades:
             List of event dicts, each containing ``"timestamp"`` (ISO or
-            Unix float), ``"icon"`` (emoji / text glyph), and ``"message"``.
-            Events are appended in order; the feed is capped at
+            Unix float), ``"icon"`` (emoji / text glyph), and ``"message"``,
+            oldest first.  The feed is capped at
             :data:`_ACTIVITY_FEED_MAX`.
         """
+        self._activity_list.clear()
         for trade in trades:
             ts = trade.get("timestamp", "")
             icon = trade.get("icon", "\u2022")   # bullet fallback
