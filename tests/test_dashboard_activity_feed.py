@@ -103,10 +103,23 @@ def test_scrolling_up_is_not_undone_by_the_next_snapshot(app):
     dash = DashboardWidget()
     dash.update_trades([{"timestamp": "16:54:15", "icon": "x",
                          "message": f"FILL {i}"} for i in range(40)])
-    dash._auto_scroll = False               # user scrolled up to read
+    dash._activity_list.setFixedHeight(100)   # force a real scrollbar
+    dash.show()
+    QApplication.processEvents()
+    bar = dash._activity_list.verticalScrollBar()
+    bar.setValue(bar.maximum() // 2)          # user scrolls up to read
+    dash._auto_scroll = False
+    parked_at = bar.value()
+    assert parked_at > 0, "fixture produced no scroll range"
+
     dash.update_trades([{"timestamp": "16:55:00", "icon": "x",
                          "message": f"FILL {i}"} for i in range(40)])
+    QApplication.processEvents()
     assert dash._auto_scroll is False, "auto-scroll was silently re-armed"
+    # The flag alone is not enough: clear() also loses the position, which
+    # would drop the reader at the TOP of the rebuilt list.
+    assert bar.value() == parked_at, "reader's position was not preserved"
+    dash.hide()
 
 
 def test_a_snapshot_that_renders_to_nothing_keeps_the_previous_feed(app):
