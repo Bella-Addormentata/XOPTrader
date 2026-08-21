@@ -110,6 +110,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 from gui.theme import COLORS as _C
 from gui.utils import (
+    MOJOS_PER_XCH,
     format_price,
     mojos_per_unit_for_pair,
     mojos_to_xch,
@@ -255,6 +256,11 @@ class MainWindow(QMainWindow):
         # Last observed 24h fill count, so the activity feed can refresh when
         # a fill actually lands.  None until the first bridge payload.
         self._last_fill_count: Optional[int] = None
+        # Dashboard per-pair table inputs: our own book/fills from the DB,
+        # plus the latest live snapshot to pair them with.
+        self._pair_summary: dict = {}
+        self._last_market_data: dict = {}
+        self._last_xch_usd: float = 0.0
 
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
@@ -359,6 +365,11 @@ class MainWindow(QMainWindow):
         # connected to anything, so it could not display a single row.
         if hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_activity)
+        # Per-pair table: OUR resting book and OUR fills.
+        if hasattr(db, "pair_summary_loaded"):
+            db.pair_summary_loaded.connect(self._on_pair_summary)
+        if hasattr(db, "query_pair_summary"):
+            db.query_pair_summary()
         # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
         # Balances tab's Deployed % column and summary line.
         _wallet_widget = self._unwrap(self._wallet_balances)
@@ -528,6 +539,12 @@ class MainWindow(QMainWindow):
             if mid > 0:
                 xch_usd = mid / 1_000_000_000_000.0
                 break
+
+        # Feed the dashboard's per-pair table: the live half (mid, spread,
+        # our inventory) pairs with the DB half already cached.
+        self._last_market_data = market_data
+        self._last_xch_usd = xch_usd
+        self._refresh_pairs_table()
 
         # Charts update -- feed pair-aware snapshots with timestamp X-axis.
         chart = self._unwrap(self._chart)
@@ -1087,6 +1104,54 @@ class MainWindow(QMainWindow):
         db = getattr(bridge, "database_service", None) if bridge else None
         if db is not None and hasattr(db, "query_trades"):
             db.query_trades(limit=1000)
+
+    def _on_pair_summary(self, summary: dict) -> None:
+        """Cache our own per-pair book/fill figures for the dashboard table."""
+        self._pair_summary = dict(summary or {})
+        self._refresh_pairs_table()
+
+    def _refresh_pairs_table(self) -> None:
+        """Rebuild the dashboard's per-pair table.
+
+        Combines the live market snapshot (mid, spread, our inventory) with
+        the database view of our own resting offers and fills.  Every price
+        here is OURS, not the third-party book: bid and ask are the best
+        prices we are currently showing.
+
+        All mojo conversion happens here so the rule lives in one place.
+        price_mojos is scaled by 1e12 for every pair, while inventory is in
+        the base asset's own mojos.
+        """
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is None or not hasattr(dashboard, "update_pairs_table"):
+            return
+        market = self._last_market_data or {}
+        if not market:
+            return
+
+        rows: list[dict] = []
+        for pair_name in sorted(market):
+            md = market.get(pair_name) or {}
+            ours = self._pair_summary.get(pair_name, {})
+            quote_symbol = (pair_name.split("/", 1)[1]
+                            if "/" in pair_name else "")
+            try:
+                base_mpu = float(mojos_per_unit_for_pair(pair_name, "base"))
+            except Exception:
+                base_mpu = float(MOJOS_PER_XCH)
+            rows.append({
+                "pair": pair_name,
+                "mid_price": float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "spread_bps": float(md.get("spread_bps", 0.0) or 0.0),
+                "inventory": float(md.get("inventory_mojos", 0.0) or 0.0) / base_mpu,
+                "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "ask": float(ours.get("ask_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "fills_24h": int(ours.get("fills_24h", 0) or 0),
+                "pnl": float(ours.get("pnl_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "quote_symbol": quote_symbol,
+            })
+
+        dashboard.update_pairs_table(rows, self._last_xch_usd)
 
     def _on_trades_for_activity(self, trades: list) -> None:
         """Render recent fills into the dashboard's activity feed.

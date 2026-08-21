@@ -395,6 +395,18 @@ class EngineBridge(QObject):
                     if float(pair_md.get("mid_price", 0.0) or 0.0) <= 0.0:
                         pair_md["mid_price"] = last_px
                         pair_md["mid_price_source"] = "last_trade"
+                # Our own holding of the pair's BASE asset, in that
+                # asset's mojos.  Keyed by asset_id rather than by wallet
+                # name: the display name is whatever the Chia client calls
+                # it, while the id comes from the pair config and cannot
+                # drift.  MetricsService.get_inventory existed but nothing
+                # had ever called it.
+                base_id = str(pair_cfg.get("base_asset_id", "") or "")
+                if base_id:
+                    inv = self._metrics_svc.get_inventory(base_id)
+                    pair_md["inventory_mojos"] = float(
+                        inv.get("balance", 0.0) or 0.0
+                    )
                 market_data[pair_name] = pair_md
 
         # Build per-pair order book data from the latest market-data

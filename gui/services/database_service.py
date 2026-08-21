@@ -117,6 +117,7 @@ class _DatabaseWorker(QObject):
     pnl_display_ready = Signal(dict)
     pnl_history_ready = Signal(list)
     deployed_ready = Signal(dict)
+    pair_summary_ready = Signal(dict)
     last_trade_prices_ready = Signal(dict)
     query_error = Signal(str)
 
@@ -685,6 +686,93 @@ class _DatabaseWorker(QObject):
             "offer_counts": offer_counts,
             "pending_offers": pending_total,
         })
+
+    #: How far back a 'pending' offer_log row still counts as our live
+    #: quote.  Wide enough for a quiet pair between re-quotes, short enough
+    #: to exclude never-resolved rows days old.  A side with nothing recent
+    #: is shown as absent rather than as an old price.
+    _OUR_BOOK_WINDOW_H: int = 6
+
+    @Slot()
+    def fetch_pair_summary(self) -> None:
+        """Per-pair view of OUR OWN book and fills, for the dashboard table.
+
+        Deliberately not the third-party market: ``bid``/``ask`` are the best
+        prices WE are currently resting, taken from ``offer_log`` rows still
+        pending.  Best bid is the HIGHEST price we will pay; best ask the
+        LOWEST we will accept.
+
+        Emits ``pair_summary_ready`` with
+        ``{pair: {"bid_mojos", "ask_mojos", "fills_24h", "pnl_mojos"}}``.
+        Prices stay in mojos here; the display layer converts, so the scaling
+        rule lives in one place.
+        """
+        summary: dict[str, dict[str, float]] = {}
+
+        # RECENCY WINDOW.  offer_log holds rows still marked 'pending' that
+        # were never resolved -- measured 2026-08-21: an XCH/BYC "ask" from
+        # 2026-08-13 and a bid from 2026-08-08, eight days stale at block
+        # 9144382 against a chain at 9182224.  Taking the best price over all
+        # pending rows therefore reported a SELF-CROSSED book (bid 1.4857
+        # above ask 1.4534), which is alarming and false.  Only offers posted
+        # recently describe what we are actually showing the market.
+        #
+        # created_at here is space-separated ("2026-08-21 20:46:24"), NOT the
+        # ISO form trade_log uses; the cutoff below must match this table's
+        # format or the text comparison silently misbehaves.
+        book_cutoff = (
+            datetime.now(timezone.utc) - timedelta(hours=_OUR_BOOK_WINDOW_H)
+        ).strftime("%Y-%m-%d %H:%M:%S")
+        book = self._execute_query(
+            """
+            SELECT pair_name, side,
+                   MAX(price_mojos) AS best_bid,
+                   MIN(price_mojos) AS best_ask
+            FROM offer_log
+            WHERE status = 'pending' AND created_at >= ?
+            GROUP BY pair_name, side
+            """,
+            [book_cutoff],
+        )
+        for row in (book or []):
+            pair = str(row["pair_name"] or "")
+            if not pair:
+                continue
+            entry = summary.setdefault(pair, {})
+            side = str(row["side"] or "").strip().lower()
+            if side == "bid":
+                entry["bid_mojos"] = float(row["best_bid"] or 0.0)
+            elif side == "ask":
+                entry["ask_mojos"] = float(row["best_ask"] or 0.0)
+
+        # 24h window. The bound MUST be ISO with a "T": timestamps are stored
+        # as "2026-08-21T16:54:15.943Z" and compared as text, so SQLite's own
+        # datetime('now','-1 day') -- which yields a SPACE separator -- sorts
+        # below every stamp on the boundary day and silently widens the
+        # window (measured: 49 rows returned where 35 were in range).
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(days=1)
+        ).strftime("%Y-%m-%dT%H:%M:%S")
+        fills = self._execute_query(
+            """
+            SELECT pair_name,
+                   COUNT(*)                                AS fills,
+                   COALESCE(SUM(realized_pnl_mojos), 0)    AS pnl_mojos
+            FROM trade_log
+            WHERE timestamp >= ?
+            GROUP BY pair_name
+            """,
+            [cutoff],
+        )
+        for row in (fills or []):
+            pair = str(row["pair_name"] or "")
+            if not pair:
+                continue
+            entry = summary.setdefault(pair, {})
+            entry["fills_24h"] = float(row["fills"] or 0)
+            entry["pnl_mojos"] = float(row["pnl_mojos"] or 0.0)
+
+        self.pair_summary_ready.emit(summary)
 
     @Slot()
     def fetch_reports(self) -> None:
@@ -1327,6 +1415,7 @@ class DatabaseService(QObject):
     pnl_display_loaded = Signal(dict)
     pnl_history_loaded = Signal(list)
     deployed_loaded = Signal(dict)
+    pair_summary_loaded = Signal(dict)
     last_trade_prices_loaded = Signal(dict)
     query_error = Signal(str)
 
@@ -1344,6 +1433,7 @@ class DatabaseService(QObject):
     _trigger_pnl_display = Signal(str)
     _trigger_pnl_history = Signal(int)
     _trigger_deployed = Signal()
+    _trigger_pair_summary = Signal()
     _trigger_last_trade_prices = Signal()
 
     def __init__(
@@ -1376,6 +1466,7 @@ class DatabaseService(QObject):
         self._worker.pnl_display_ready.connect(self.pnl_display_loaded)
         self._worker.pnl_history_ready.connect(self.pnl_history_loaded)
         self._worker.deployed_ready.connect(self.deployed_loaded)
+        self._worker.pair_summary_ready.connect(self.pair_summary_loaded)
         self._worker.last_trade_prices_ready.connect(self.last_trade_prices_loaded)
         self._worker.query_error.connect(self._on_worker_error)
 
@@ -1395,6 +1486,7 @@ class DatabaseService(QObject):
         self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
         self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
         self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
+        self._trigger_pair_summary.connect(self._worker.fetch_pair_summary)
         self._trigger_last_trade_prices.connect(self._worker.fetch_last_trade_prices)
 
         # -- Auto-refresh timer ---------------------------------------------
@@ -1413,6 +1505,7 @@ class DatabaseService(QObject):
         # Whether deployed-capital data was ever requested; auto-refresh
         # keeps it current once the Balances tab has asked for it.
         self._deployed_requested: bool = False
+        self._pair_summary_requested: bool = False
         # Same for the Orders panel's whole-table offer aggregates.
         self._offer_summary_requested: bool = False
 
@@ -1626,6 +1719,16 @@ class DatabaseService(QObject):
             self._deployed_requested = True
         self._trigger_deployed.emit()
 
+    def query_pair_summary(self) -> None:
+        """Request the per-pair view of our own book and fills.
+
+        Results arrive on :pyattr:`pair_summary_loaded`.  Re-issued on every
+        auto-refresh tick once requested, like the Deployed % figures.
+        """
+        with QMutexLocker(self._mutex):
+            self._pair_summary_requested = True
+        self._trigger_pair_summary.emit()
+
     def query_last_trade_prices(self) -> None:
         """Request the most recent fill price per pair.
 
@@ -1666,6 +1769,7 @@ class DatabaseService(QObject):
             offer_params = self._last_offer_params
             pnl_baseline = self._last_pnl_baseline
             deployed_requested = self._deployed_requested
+            pair_summary_requested = self._pair_summary_requested
             offer_summary_requested = self._offer_summary_requested
 
         if trade_params is not None:
@@ -1685,6 +1789,10 @@ class DatabaseService(QObject):
         # Keep the Balances tab's Deployed % figures current.
         if deployed_requested:
             self._trigger_deployed.emit()
+
+        # Keep the dashboard's per-pair table current.
+        if pair_summary_requested:
+            self._trigger_pair_summary.emit()
 
         # Also refresh the trade summary on each tick.
         self._trigger_summary.emit()

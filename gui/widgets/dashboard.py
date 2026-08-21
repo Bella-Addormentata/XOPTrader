@@ -875,6 +875,20 @@ class DashboardWidget(QWidget):
             container, _, _ = _make_dot_label(p.get("name", "?"), colour)
             self._pairs_status_container.addWidget(container)
 
+    @staticmethod
+    def _format_optional_price(value: float) -> str:
+        """A price, or an em dash when we have none.
+
+        Rendering a missing quote as "0.000000" reads as a real price of
+        zero -- on the side of a pair we are simply not quoting, that is
+        worse than saying nothing.
+        """
+        try:
+            number = float(value or 0.0)
+        except (TypeError, ValueError):
+            return "—"
+        return f"{number:.6f}" if number > 0.0 else "—"
+
     def update_pairs_table(
         self,
         pairs_data: list[dict[str, Any]],
@@ -899,17 +913,21 @@ class DashboardWidget(QWidget):
         for row, data in enumerate(pairs_data):
             values: list[tuple[str, str]] = [
                 (data.get("pair", ""),              ""),
-                (f"{data.get('mid_price', 0):.6f}", ""),
+                (self._format_optional_price(data.get('mid_price', 0)),     ""),
                 (f"{data.get('spread_bps', 0):.1f}",""),
                 (f"{data.get('inventory', 0):.4f}", ""),
-                (f"{data.get('bid', 0):.6f}",       ""),
-                (f"{data.get('ask', 0):.6f}",       ""),
+                (self._format_optional_price(data.get('bid', 0)),           ""),
+                (self._format_optional_price(data.get('ask', 0)),           ""),
                 (f"{data.get('fills_24h', 0):,}",   ""),
             ]
-            # PnL column: append USD equivalent when rate is available
+            # PnL column, in the pair's OWN quote currency.  realized_pnl
+            # is quote mojos, so XCH/BYC settles in BYC and XCH/wUSDC.b in
+            # wUSDC.b -- labelling every pair "XCH" and multiplying by the
+            # XCH/USD rate would misprice all but the XCH-quoted ones.
             pnl_val = data.get('pnl', 0)
-            pnl_text = f"{pnl_val:+,.4f} XCH"
-            if xch_usd_rate > 0:
+            quote = str(data.get("quote_symbol", "") or "")
+            pnl_text = f"{pnl_val:+,.4f} {quote}".rstrip()
+            if quote.upper() == "XCH" and xch_usd_rate > 0:
                 pnl_text = f"${pnl_val * xch_usd_rate:+,.2f} ({pnl_val:+,.4f} XCH)"
             values.append((pnl_text, ""))
 
