@@ -617,8 +617,12 @@ private:
     /// MarketDataFeed::ingest_cex_reference so the CEX freshness gates
     /// measure the age of the DATA rather than the age of the re-ingest.
     /// Steady-clock cannot serve: Timestamp is a system_clock time_point.
-    /// Default-constructed until the first success, which reads downstream
-    /// as "never observed" -- correct, because it has not been.
+    /// Default-constructed until the first success.  Note that passing that
+    /// value would NOT read as "never observed": ingest_cex_reference maps
+    /// Timestamp{} to now(), matching ingest_amm_mid.  It cannot be passed,
+    /// because the only call site sits behind `if (!coingecko_prices_.empty())`
+    /// and that cache is populated only by a successful fetch -- so the first
+    /// ingest always carries a real observation time.
     std::chrono::system_clock::time_point coingecko_last_success_at_{};
 
     /// TibetSwap AMM reserve client -- the producer for
