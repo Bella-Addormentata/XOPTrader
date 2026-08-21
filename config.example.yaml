@@ -541,6 +541,12 @@ market_data:
 
   # CEX data freshness: seconds before CEX weight decays to zero
   cex_freshness_threshold_sec: 120.0
+  # Max age (seconds) of an UNCHANGED dexie last-trade print before it is
+  # refused as a mid reference. The print is the only blend leg that is
+  # history rather than a live quote and it enters at full DEX weight, so
+  # an unaged fallback anchors the mid to whenever the pair last traded.
+  # Set <= 0 to disable the gate.
+  dex_last_trade_max_age_sec: 1800.0
 
   # Order-book-derived mid-price: use depth-weighted VWAP micro-price from
   # competing offers instead of simple BBO midpoint.  Gives more authority

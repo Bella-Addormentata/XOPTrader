@@ -150,6 +150,18 @@ struct TickerData {
     double volume_quote_daily = 0.0;
 
     /// Best buy / sell / last price at depth-0.
+    ///
+    /// As produced by ``parse_ticker_`` these are RAW Dexie values in the
+    /// market's own denomination (XCH per CAT); they are NOT yet bid/ask in
+    /// our quote-per-base convention.  ``get_ticker`` applies the invert and
+    /// swap for Case A (``dexie_client.cpp`` "Invert and swap bid/ask"), so
+    /// only values returned by ``get_ticker`` satisfy bid == price_buy and
+    /// ask == price_sell.
+    ///
+    /// Do NOT "correct" the apparent side labels inside ``parse_ticker_``.
+    /// A 2026-08 audit (TODO S7) read that function in isolation and
+    /// proposed exactly that swap; applying it would double-invert and put
+    /// bid and ask backwards on every Case A pair at once.
     double price_buy  = 0.0;
     double price_sell = 0.0;
     double price_last = 0.0;

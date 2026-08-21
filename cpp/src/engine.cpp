@@ -262,6 +262,7 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     md_cfg.competitor_alert_threshold_bps = config_.market_data.competitor_alert_threshold_bps;
     md_cfg.asymmetric_skew_factor       = config_.market_data.asymmetric_skew_factor;
     md_cfg.cex_freshness_threshold_sec  = config_.market_data.cex_freshness_threshold_sec;
+    md_cfg.dex_last_trade_max_age_sec   = config_.market_data.dex_last_trade_max_age_sec;
     md_cfg.amm_blend_weight             = config_.strategy.amm_blend_weight;
     md_cfg.amm_freshness_threshold_sec  = 300.0;  // 5 min default
     md_cfg.orderbook_mid_enabled        = config_.market_data.orderbook_mid_enabled;

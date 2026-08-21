@@ -2698,6 +2698,7 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
 
     // CEX freshness.
     read_dbl ("cex_freshness_threshold_sec",   cfg.cex_freshness_threshold_sec);
+    read_dbl ("dex_last_trade_max_age_sec",    cfg.dex_last_trade_max_age_sec);
 
     // Order-book-derived mid-price.
     read_bool("orderbook_mid_enabled",         cfg.orderbook_mid_enabled);
