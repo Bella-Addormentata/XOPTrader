@@ -75,6 +75,13 @@ def test_the_page_grows_so_the_outer_area_scrolls_instead(app):
     w = WalletBalancesWidget()
     w.update_balances(_balances(20), market_data={}, stuck_offers=0)
 
+    # showEvent() kicks off the real suggested-allocation worker, which
+    # fetches from dexie and reads SQLite on its own QThread.  A unit test
+    # must not depend on an external service, and a thread outliving the
+    # widget aborts the interpreter -- the same failure mode as the
+    # ownership bug handled below.  Stub it before anything is shown.
+    w._refresh_suggested_allocation = lambda: None
+
     scroll = QScrollArea()
     scroll.setWidgetResizable(True)
     scroll.setWidget(w)          # ownership moves to the scroll area
