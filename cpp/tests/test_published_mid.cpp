@@ -243,7 +243,7 @@ TEST(PublishedMidBandTest, DexOnly_Unchanged) {
 // anchors the mid to whenever the pair last traded.  The fallback opens
 // whenever no usable two-sided quote remains -- an empty book, or the
 // one-sided book a thin or bid-only pair sits in (see
-// OneSidedBook_UnagedPrint_CexGoverns below) -- which is where a 13-day-old
+// OneSidedBook_UnagedPrint_CexGoverns above) -- which is where a 13-day-old
 // print was measured dragging a mid 8%+ below fair.
 // ---------------------------------------------------------------------------
 TEST(LastTradeStalenessTest, FirstSightingHasUnknownAgeAndIsRefused) {

@@ -1079,13 +1079,22 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // published mid (engine.cpp:2953 feeding compute_quotes at :3018), BIDS
     // RISE WITH IT.  We bid higher than before, not lower.
     //
-    // That is the intended correction: the old bid was anchored to a 13-day
-    // -old trade well below fair.  It is deliberately left unguarded here --
-    // the published-mid band still clamps how far the centre may travel, and
-    // accumulation is braked by the pair's drift target and
-    // single_cat_cap_pct, which are the mechanisms meant to bound buying.  A
-    // stale print is not an accumulation brake and must not be relied on as
-    // one.
+    // That is the intended correction: the old bid was anchored to a
+    // 13-day-old trade well below fair.  It is left unguarded here, and it is
+    // worth being exact about what that means, because the published-mid band
+    // does NOT cover this path: the clamp below runs only when dex_best_bid
+    // AND dex_best_ask are both present, which is precisely what reaching
+    // Case 3 tells us we do not have.  PublishedMidBandTest.OneSidedBook_
+    // NoClamp asserts that directly.  On this path the centre is whatever the
+    // CEX and AMM legs say.
+    //
+    // What does bound it: those legs must survive their own freshness tapers
+    // to be used at all, and if none survives the pair publishes no mid and
+    // the no-order-book guard stops it quoting.  Past that, buying is bounded
+    // at the SIZING layer -- the pair's drift target and single_cat_cap_pct --
+    // not at the price layer.  A stale print is not an accumulation brake and
+    // must not be relied on as one.  Whether this path should carry a band of
+    // its own is a real open question, tracked as S9.
     else if (ps.dex_last_trade > 0.0
              && last_trade_is_fresh(ps, cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
