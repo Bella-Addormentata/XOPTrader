@@ -55,6 +55,35 @@ namespace xop {
 namespace {
 
 // -------------------------------------------------------------------------
+// Is the last-trade print young enough to locate fair value?
+//
+// The print is the only leg of the published-mid blend that is history
+// rather than a live quote, and dex_updated_at cannot answer this: it is
+// re-stamped on every heartbeat, so it records when we last LOOKED.  The
+// per-pair change-clock does, with one deliberate asymmetry -- a print we
+// have never watched move has an UNKNOWN age, not a zero one, so it is
+// refused.  In practice that means the fallback is unavailable for a pair
+// until it trades once after a restart, which is the conservative side of a
+// path that only opens when the third-party book is empty.
+// -------------------------------------------------------------------------
+bool last_trade_is_fresh(const PairState& ps,
+                         double max_age_sec) {
+    if (max_age_sec <= 0.0) {
+        return true;  // gate disabled, same convention as the other tapers
+    }
+    if (ps.last_trade_changed_at == Timestamp{}) {
+        return false;  // never observed to move: age unknown
+    }
+    // Fractional seconds: duration_cast<seconds> truncates, so a 0.9 s age
+    // read as 0 and passed a 0.5 s threshold.
+    const auto age = std::chrono::duration<double>(
+                         std::chrono::system_clock::now()
+                         - ps.last_trade_changed_at)
+                         .count();
+    return age <= max_age_sec;
+}
+
+// -------------------------------------------------------------------------
 // The depth-weighted VWAP micro-price now lives in orderbook_mid.cpp as
 // xop::compute_orderbook_mid().  It moved out of this anonymous namespace so
 // that the invariant (best_bid <= mid <= best_ask), the spread-dependent
@@ -375,6 +404,28 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
 
     ps.dex_best_bid  = best_bid;
     ps.dex_best_ask  = best_ask;
+    // Age the print by its VALUE, not by when we polled: dex_updated_at is
+    // re-stamped every heartbeat, so it cannot answer "how old is this
+    // trade?".  A first sighting deliberately leaves last_trade_changed_at
+    // at epoch -- we have not yet watched it move, so its age is unknown.
+    if (last_trade > 0.0) {
+        // ANY change is a new print.  No noise threshold here, unlike the
+        // order-book mid: this field moves only when Dexie reports a new
+        // last trade, so a change of even a fraction of a basis point is
+        // evidence that the pair traded again -- which is exactly what the
+        // freshness gate needs to know.  (An earlier cut borrowed the 1 bp
+        // filter from the mid-freeze counter; that both ignored real prints
+        // and, by re-anchoring on every sample, let a run of sub-threshold
+        // steps drift the price arbitrarily while the clock stood still.)
+        //
+        // An UNCHANGED value proves nothing: polling cannot distinguish a
+        // fresh trade at the same price from the previous trade being
+        // re-reported, so it correctly leaves the clock alone.
+        if (ps.last_trade_print > 0.0 && last_trade != ps.last_trade_print) {
+            ps.last_trade_changed_at = std::chrono::system_clock::now();
+        }
+        ps.last_trade_print = last_trade;
+    }
     ps.dex_last_trade = last_trade;
     ps.volume_24h    = vol_24h;
     ps.dex_updated_at = std::chrono::system_clock::now();
@@ -1006,8 +1057,16 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     //
     // Falls through to the last trade below, which is a real print rather
     // than half a book.
-    // Case 3: No usable two-sided quotes -- fall back to last trade.
-    else if (ps.dex_last_trade > 0.0) {
+    // Case 3: No usable two-sided quotes -- fall back to last trade, but
+    // only while that print is young enough to be evidence of location.
+    // This is the one blend leg that is a historical print, and it enters at
+    // full DEX weight, so an unaged fallback silently anchors the mid to
+    // whenever the pair last traded.  Refusing leaves the mid to the CEX and
+    // AMM legs, which carry their own freshness tapers; if none survive, the
+    // pair publishes no mid and the no-order-book guard stops it quoting --
+    // the correct outcome when we cannot locate fair value.
+    else if (ps.dex_last_trade > 0.0
+             && last_trade_is_fresh(ps, cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
     }
 
@@ -1185,7 +1244,9 @@ void MarketDataFeed::check_arbitrage(PairState& ps) {
     double dex_mid = 0.0;
     if (ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0) {
         dex_mid = (ps.dex_best_bid + ps.dex_best_ask) / 2.0;
-    } else if (ps.dex_last_trade > 0.0) {
+    } else if (ps.dex_last_trade > 0.0
+               && last_trade_is_fresh(ps,
+                                      cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;
     }
 

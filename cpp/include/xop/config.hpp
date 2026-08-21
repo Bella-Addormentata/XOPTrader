@@ -1832,6 +1832,13 @@ struct MarketDataSettings {
     /// Seconds before CEX data weight decays to zero.
     double cex_freshness_threshold_sec{120.0};
 
+    /// Max age (seconds) of an unchanged dexie last-trade print before it is
+    /// refused as a mid reference.  <= 0 disables the gate.  The print is the
+    /// only blend leg that is history rather than a live quote, and it enters
+    /// at full DEX weight, so an unaged fallback anchors the mid to whenever
+    /// the pair last traded.
+    double dex_last_trade_max_age_sec{1800.0};
+
     // -- Order-book-derived mid-price (depth-weighted VWAP micro-price) -----
 
     /// When true, the aggregator prefers a depth-weighted VWAP micro-price
