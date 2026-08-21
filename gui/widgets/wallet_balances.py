@@ -117,8 +117,16 @@ def _fit_table_to_contents(table: QTableWidget) -> None:
     can stay hidden inside a panel that looks complete -- on a page whose
     whole job is showing how much money is where.
 
-    Height is recomputed from the CURRENT row heights rather than a per-row
-    constant, so it stays correct when the operator changes the UI font size.
+    Height is summed from the CURRENT row heights rather than a per-row
+    constant, so it follows whatever the rows actually measure.
+
+    That is deliberately a statement about row GEOMETRY, not about the UI
+    font-size setting: this widget pins its table and header fonts in local
+    QSS, which overrides the application stylesheet, so changing that setting
+    does not move these rows at all today (tracked as S10 in TODO.md).
+    The fit is correct either way -- it reads the rows rather than assuming
+    a height -- but it must not be read as evidence that the accessibility
+    setting reaches this page.
     """
     table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     rows = sum(
