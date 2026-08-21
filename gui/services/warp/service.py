@@ -872,7 +872,7 @@ class WarpEngine:
     # State handlers (each: read -> one side effect -> returned _Step).
     # ================================================================== #
 
-    def _job_asset(self, job: WarpJob):
+    def _job_asset(self, job: WarpJob, attested=None):
         """The bridgeable asset *job* was created for, from its frozen state.
 
         Resolution is by the wrapped-CAT id recorded in the job's
@@ -909,7 +909,7 @@ class WarpEngine:
                     # errors as RETRYABLE, so a corrupt stamp would retry
                     # every tick forever.
                     return self._asset_from_attestation(
-                        job, f"non-integer precision in {raw!r}")
+                        job, f"non-integer precision in {raw!r}", attested)
                 try:
                     spec = self._net.asset_by_wrapped_id(tail)
                 except KeyError:
@@ -930,7 +930,7 @@ class WarpEngine:
                     )
                 return spec
             return self._asset_from_attestation(
-                job, f"unrecognised stamp format {raw!r}")
+                job, f"unrecognised stamp format {raw!r}", attested)
 
         if stamped:
             # Every writer records the terms with the name, so a name alone
@@ -939,13 +939,13 @@ class WarpEngine:
             # a committed job could sign a replacement for a DIFFERENT token
             # at the original nonce.
             return self._asset_from_attestation(
-                job, "asset recorded without its terms")
+                job, "asset recorded without its terms", attested)
 
         # Neither field: the row predates asset stamping, and USDC was the
         # only asset the pipeline could bridge when it was written.
         return self._net.asset("USDC")
 
-    def _asset_from_attestation(self, job: WarpJob, why: str):
+    def _asset_from_attestation(self, job: WarpJob, why: str, attested=None):
         """Last resort for a job whose stamp cannot be read.
 
         Recovers the asset from the ATTESTED message contents when the job
@@ -956,13 +956,35 @@ class WarpEngine:
         a wrong guess here moves the wrong funds, which is worse than a
         job that needs manual recovery.
         """
-        for item in (job.state.get("message_contents") or [])[:1]:
-            token = _hx(item)[-40:]
+        tokens = [_hx(item)[-40:]
+                  for item in (job.state.get("message_contents") or [])[:1]]
+        if attested is not None:
+            # MESSAGE_SENT resolves the asset BEFORE the attestation is
+            # persisted, so the live message is the only evidence available
+            # at the one point a post-bridge job would otherwise strand.
+            live = _hx(getattr(attested, "erc20_source", "") or "")[-40:]
+            contents = list(getattr(attested, "contents", None) or [])
+            first = _hx(contents[0])[-40:] if contents else ""
+            if live and first and live != first:
+                raise WarpTerminal(
+                    f"job {job.id} cannot be recovered: the attestation is "
+                    f"self-inconsistent (source {live} != contents {first})"
+                )
+            if live:
+                tokens.append(live)
+        for token in tokens:
             for _key, spec in (self._net.assets or ()):
                 if _canon_addr(spec.erc20_address) == token:
+                    # Honest about what this costs: for a recovered job the
+                    # attested-source anchor below compares the attestation
+                    # against an asset derived FROM that attestation, so it
+                    # can no longer catch a wrong-asset bridge. The evidence
+                    # is validator-signed, which is why this beats both
+                    # guessing by name and stranding the funds.
                     _log.error(
                         "job %s has an unreadable asset stamp (%s); "
-                        "recovered %s from the attested message contents",
+                        "recovered %s from attested evidence -- its "
+                        "source anchor is self-referential from here",
                         job.id, why, spec.symbol,
                     )
                     return spec
@@ -1280,7 +1302,7 @@ class WarpEngine:
             raise WarpTerminal(
                 f"attested amount {msg.amount_mojos} != post-tip {job.post_tip_mojos}"
             )
-        spec = self._job_asset(job)
+        spec = self._job_asset(job, attested=msg)
         if _word(msg.erc20_source) != _word(spec.erc20_address):
             raise WarpTerminal(
                 f"attested source token {_hx(msg.erc20_source)} != this job's "

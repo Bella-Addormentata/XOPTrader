@@ -577,5 +577,42 @@ def test_attested_recovery_matches_a_bare_hex_address():
     assert eng._job_asset(job).expected_asset_id == USDC.expected_asset_id
 
 
+def test_message_sent_recovers_from_the_live_attestation():
+    """The one point a post-bridge job would strand for nothing: at
+    MESSAGE_SENT the watcher has just handed over a validator-signed
+    attestation, but it is not persisted until the advance -- so the
+    resolver must accept the live message as evidence."""
+    usdc_word = "00" * 12 + USDC.erc20_address[2:].lower()
+    store = new_store()
+    engine, _ = build(store, watcher=FakeWatcher(_sent_msg()))
+    seed(store, S.JobStatus.MESSAGE_SENT,
+         columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985,
+                  "bridge_nonce": "00" * 31 + "07"},
+         state={"asset": "USDC", "asset_fingerprint": "v9:unreadable"})
+    out = engine.step()
+    assert out["status"] == S.JobStatus.FUNDING_CLAIM, (
+        "a recoverable job must not be stranded at the one state that "
+        "holds the evidence")
+    assert usdc_word
+
+
+def test_a_self_inconsistent_attestation_cannot_be_used_for_recovery():
+    """Recovery leans on the attestation, so its two views of the token
+    must agree before it is trusted."""
+    milli_word = "00" * 12 + MILLI.erc20_address[2:].lower()
+    usdc_word = "00" * 12 + USDC.erc20_address[2:].lower()
+    store = new_store()
+    engine, _ = build(store, watcher=FakeWatcher(_sent_msg(
+        erc20_source=milli_word,
+        contents=[usdc_word, RECEIVER_PH.hex(), "1379"])))
+    seed(store, S.JobStatus.MESSAGE_SENT,
+         columns={"receiver_ph": RECEIVER_PH.hex(), "post_tip_mojos": 4985,
+                  "bridge_nonce": "00" * 31 + "07"},
+         state={"asset": "USDC", "asset_fingerprint": "v9:unreadable"})
+    out = engine.step()
+    assert out["status"] == S.JobStatus.FAILED
+    assert "self-inconsistent" in (store.get_job(out["id"]).last_error or "")
+
+
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-v"]))
