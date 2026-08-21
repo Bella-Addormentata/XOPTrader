@@ -79,3 +79,30 @@ def test_the_gui_workers_pass_their_paths():
     assert "db_path=self._db_path" in settings
     # And the widget must actually hand the worker its stored path.
     assert "_SuggestedTargetsWorker(self._config_path," in settings
+
+
+def test_frozen_detection_does_not_sniff_the_path():
+    """A checkout under a directory containing "_MEI" is not a bundle.
+
+    Matching that substring made the documented no-argument CLI refuse to run
+    beside a config.yaml and database that were both present.
+    """
+    sizing = _load_sizing()
+    assert sizing._FROZEN == bool(getattr(sys, "frozen", False))
+    source = (REPO_ROOT / "scripts" / "offer_sizing.py").read_text(
+        encoding="utf-8")
+    detection = source.split("_FROZEN =")[1].split(chr(10))[0]
+    assert "sys" in detection and "frozen" in detection
+    assert "REPO_ROOT" not in detection
+
+
+def test_the_paths_are_re_pushed_when_settings_saves_a_config():
+    """A one-time snapshot would keep reading the previous config file."""
+    source = (REPO_ROOT / "gui" / "widgets" / "main_window.py").read_text(
+        encoding="utf-8")
+    assert "_push_sizing_paths" in source
+    # It must run on the save signal, not only at wiring time.
+    saved = source.split("config_saved.connect(bridge.update_config_path)")[1]
+    assert "_push_sizing_paths" in saved.split("def ")[0], (
+        "config_saved does not re-push the sizing paths"
+    )

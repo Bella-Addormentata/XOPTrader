@@ -50,7 +50,13 @@ CONFIG_PATH = REPO_ROOT / "config.yaml"
 # Frozen callers therefore MUST pass explicit paths; the GUI knows them
 # (ConfigService.path and EngineBridge.db_path).  Rather than let a bundled
 # default produce a mystifying temp-directory error, refuse it by name.
-_FROZEN = bool(getattr(sys, "frozen", False)) or "_MEI" in str(REPO_ROOT)
+# PyInstaller sets sys.frozen in the frozen PROCESS, however this module is
+# loaded, so it answers the question directly.  An earlier version also
+# matched "_MEI" anywhere in the path, which misfires on an ordinary checkout
+# living under a directory that happens to contain that substring: the
+# documented no-argument CLI would then refuse to run beside a config.yaml and
+# database that are both right there.
+_FROZEN = bool(getattr(sys, "frozen", False))
 
 
 def _require_explicit(kind: str, value):
