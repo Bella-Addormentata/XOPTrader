@@ -115,7 +115,7 @@
 ### S6: CoinGecko staleness blindness in the general published-mid path
 - **Files:** `cpp/src/engine.cpp:1815-1827, 2069-2100`; `cpp/src/execution/market_data.cpp:405-406`
 - **Issue:** A failed CoinGecko fetch is swallowed, leaving the stale cache (`coingecko_last_fetch_` advances only on success), yet every heartbeat re-derives `cex_mid` from that cache and calls `ingest_cex_reference`, which stamps `cex_updated_at = now()` — so the `cex_freshness_threshold_sec` taper (market_data.cpp:1041-1048) always sees age ~0 and can never fire.
-- **Status:** `[ ]` — Verified 2026-08-18. `revive_market` got a real success-stamped gate today (engine.cpp:4353-4370 via `coingecko_last_fetch_`); the general blend path needs the same: stamp `cex_updated_at` from actual fetch time, or stop re-ingesting on failed fetches.
+- **Status:** `[x]` — FIXED (PR #88). `ingest_cex_reference` now takes an `observed_at` and stores it VERBATIM, mirroring `ingest_amm_mid`, which already solved this exact bug on the AMM leg. The engine stamps `coingecko_last_success_at_` only in the fetch success path and passes it, so a failed fetch no longer refreshes the sample's apparent age: every CEX gate — `compute_mid`'s weight taper, `detect_stale`, and the `cex_age_seconds` heartbeat — now measures the age of the DATA rather than the age of the re-ingest. A default-constructed stamp falls back to `now()`, so "never observed" cannot read downstream as a 56-year-old sample.
 
 ### S7: Dexie ticker parse swaps bid and ask
 - **Files:** `cpp/src/rpc/dexie_client.cpp:616-638`

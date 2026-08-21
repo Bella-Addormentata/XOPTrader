@@ -443,7 +443,8 @@ void MarketDataFeed::ingest_block_height(BlockHeight block_height) {
 }
 
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
-                                           double             cex_mid) {
+                                           double             cex_mid,
+                                           Timestamp          observed_at) {
     if (cex_mid <= 0.0) {
         spdlog::warn("ingest_cex_reference: pair={} invalid cex_mid={:.6f}",
                      pair_name, cex_mid);
@@ -454,7 +455,16 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
     PairState& ps = get_or_create_pair(pair_name);
 
     ps.cex_mid        = cex_mid;
-    ps.cex_updated_at = std::chrono::system_clock::now();
+    // Stored VERBATIM, for the same reason spelled out in ingest_amm_mid:
+    // the engine re-derives cex_mid from its CoinGecko CACHE every heartbeat,
+    // and a failed fetch leaves that cache in place.  Stamping now() here
+    // meant the sample always looked 0 seconds old, so the freshness taper
+    // below could never reduce the CEX weight no matter how long the feed had
+    // been down.  A default-constructed timestamp means "never observed", so
+    // fall back to now() rather than let it read as the epoch.
+    ps.cex_updated_at = (observed_at != Timestamp{})
+                      ? observed_at
+                      : std::chrono::system_clock::now();
 
     spdlog::debug("ingest_cex_reference: pair={} cex_mid={:.6f}",
                   pair_name, cex_mid);
