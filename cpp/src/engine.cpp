@@ -1820,6 +1820,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 // them as stale the moment they arrive (acute at the
                 // now-legal threshold == polling interval boundary).
                 coingecko_last_fetch_ = std::chrono::steady_clock::now();
+                coingecko_last_success_at_ = std::chrono::system_clock::now();
             } catch (const std::exception& ex) {
                 // Transient CoinGecko errors should not abort the cycle.
                 spdlog::warn("[Engine] Step 1: CoinGecko fetch failed: {}",
@@ -2094,7 +2095,11 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // Pairs with no CoinGecko mapping (BYC) are silently skipped.
 
             if (derived && cex_mid > 0.0) {
-                market_data_->ingest_cex_reference(pair.name, cex_mid);
+                // Pass the fetch time, not the re-ingest time: this runs
+                // every heartbeat off the cached prices, and a failed fetch
+                // leaves that cache untouched.
+                market_data_->ingest_cex_reference(
+                    pair.name, cex_mid, coingecko_last_success_at_);
                 spdlog::debug("[Engine] Step 1: {} CoinGecko cex_mid={:.6f}",
                               pair.name, cex_mid);
             }

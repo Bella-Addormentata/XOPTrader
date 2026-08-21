@@ -613,6 +613,14 @@ private:
     /// Timestamp of the last successful CoinGecko fetch.
     std::chrono::steady_clock::time_point coingecko_last_fetch_;
 
+    /// Wall-clock instant of that same successful fetch, passed to
+    /// MarketDataFeed::ingest_cex_reference so the CEX freshness gates
+    /// measure the age of the DATA rather than the age of the re-ingest.
+    /// Steady-clock cannot serve: Timestamp is a system_clock time_point.
+    /// Default-constructed until the first success, which reads downstream
+    /// as "never observed" -- correct, because it has not been.
+    std::chrono::system_clock::time_point coingecko_last_success_at_{};
+
     /// TibetSwap AMM reserve client -- the producer for
     /// ArbitrageDetector::set_tibetswap_reserves().
     std::shared_ptr<rpc::TibetSwapClient> tibetswap_;

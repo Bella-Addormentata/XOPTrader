@@ -209,4 +209,65 @@ TEST(PublishedMidBandTest, DexOnly_Unchanged) {
     EXPECT_NEAR(feed.get_mid_price("XCH/wUSDC.b"), 1.005, 1e-9);
 }
 
+
+// ---------------------------------------------------------------------------
+// S6: the CEX freshness taper must be reachable.
+//
+// The engine re-derives cex_mid from its CoinGecko CACHE every heartbeat, and
+// a failed fetch leaves that cache in place.  While ingest_cex_reference
+// stamped now(), the sample always looked 0 seconds old, so the taper below
+// could never reduce the CEX weight however long the feed had been down.
+// ---------------------------------------------------------------------------
+TEST(CexStalenessTest, AnAgedSampleLosesItsWeight) {
+    State state;
+    auto cfg = band_cfg();
+    cfg.cex_freshness_threshold_sec = 120.0;   // taper live
+    MarketDataFeed feed(cfg, state);
+
+    // Two-sided book so the DEX leg stands alone once the CEX leg tapers out.
+    feed.ingest_dexie("XCH/wUSDC.b", 1.00, 1.01, 1.005, 100.0);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.20,
+                              std::chrono::system_clock::now()
+                                  - std::chrono::seconds(600));
+    feed.refresh({"XCH/wUSDC.b"});
+
+    // Fully tapered: the mid is the book's own mid, not a blend toward 1.20.
+    EXPECT_NEAR(feed.get_mid_price("XCH/wUSDC.b"), 1.005, 1e-9);
+}
+
+TEST(CexStalenessTest, AFreshSampleStillCounts) {
+    State state;
+    auto cfg = band_cfg();
+    cfg.cex_freshness_threshold_sec = 120.0;
+    MarketDataFeed feed(cfg, state);
+
+    feed.ingest_dexie("XCH/wUSDC.b", 1.00, 1.01, 1.005, 100.0);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.20,
+                              std::chrono::system_clock::now());
+    feed.refresh({"XCH/wUSDC.b"});
+
+    // The CEX leg pulls the mid above the book mid (then band-clamped).
+    EXPECT_GT(feed.get_mid_price("XCH/wUSDC.b"), 1.005);
+}
+
+TEST(CexStalenessTest, ReIngestingACachedSampleDoesNotRefreshIt) {
+    // The actual regression: calling ingest repeatedly with the SAME
+    // observation time must not make the sample look new again.
+    State state;
+    auto cfg = band_cfg();
+    cfg.cex_freshness_threshold_sec = 120.0;
+    MarketDataFeed feed(cfg, state);
+
+    const auto fetched_at = std::chrono::system_clock::now()
+                          - std::chrono::seconds(600);
+    feed.ingest_dexie("XCH/wUSDC.b", 1.00, 1.01, 1.005, 100.0);
+    for (int heartbeat = 0; heartbeat < 5; ++heartbeat) {
+        feed.ingest_cex_reference("XCH/wUSDC.b", 1.20, fetched_at);
+    }
+    feed.refresh({"XCH/wUSDC.b"});
+
+    EXPECT_NEAR(feed.get_mid_price("XCH/wUSDC.b"), 1.005, 1e-9);
+}
+
+
 }  // namespace

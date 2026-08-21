@@ -566,10 +566,23 @@ public:
 
     /// Ingest a CEX reference mid-price for a pair.
     ///
-    /// @param pair_name  Trading pair identifier (must match dexie pair name).
-    /// @param cex_mid    CEX mid-price (quote per base).
+    /// CALL THIS ONLY WHEN A PRICE FETCH ACTUALLY SUCCEEDED.  `observed_at`
+    /// is stored verbatim and is what every CEX freshness gate measures
+    /// against -- compute_mid's weight taper, detect_stale, and the
+    /// cex_age_seconds heartbeat -- so re-ingesting a cached sample with a
+    /// fresh timestamp makes the data look permanently new and every one of
+    /// those gates unreachable.  This is the same failure ingest_amm_mid
+    /// documents below; the CEX path had it too.
+    ///
+    /// @param pair_name    Trading pair identifier (must match dexie pair name).
+    /// @param cex_mid      CEX mid-price (quote per base).
+    /// @param observed_at  When the price was actually fetched.  Defaults to
+    ///                     now() for callers that fetch synchronously at the
+    ///                     call site; the engine passes its real fetch time.
     void ingest_cex_reference(const std::string& pair_name,
-                              double             cex_mid);
+                              double             cex_mid,
+                              Timestamp          observed_at
+                                  = Timestamp::clock::now());
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.
