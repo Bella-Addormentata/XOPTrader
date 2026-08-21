@@ -468,6 +468,18 @@ def _advance(
     return _Step(next_status=next_status, columns=columns, state=state, message=message)
 
 
+def _canon_addr(address: str) -> str:
+    """An ERC-20 address in one canonical form: bare, lower-case hex.
+
+    This codebase accepts both ``0x``-prefixed and bare addresses as the
+    same address, so a fingerprint must not encode the difference -- a
+    formatting-only edit to a descriptor would otherwise read as changed
+    terms and terminally strand a live job.
+    """
+    a = str(address or "").strip().lower()
+    return a[2:] if a.startswith("0x") else a
+
+
 def _asset_fingerprint(spec, cat_decimals: int) -> str:
     """The asset TERMS a job is frozen against.
 
@@ -477,8 +489,8 @@ def _asset_fingerprint(spec, cat_decimals: int) -> str:
     without stranding jobs written by an older build: an unrecognised
     version is treated as unfingerprinted rather than as corruption.
     """
-    return (f"v1:{spec.erc20_address.lower()}:{int(spec.erc20_decimals)}"
-            f":{int(cat_decimals)}:{spec.expected_asset_id.lower()}")
+    return (f"v1:{_canon_addr(spec.erc20_address)}:{int(spec.erc20_decimals)}"
+            f":{int(cat_decimals)}:{spec.expected_asset_id.strip().lower()}")
 
 
 def _asset_stamp(spec, cat_decimals: int) -> dict:
@@ -873,11 +885,15 @@ class WarpEngine:
         stamping, when USDC was the only asset the pipeline could bridge,
         and resolves to USDC directly.
 
-        This refuses rather than guessing in exactly one situation: the
-        job's asset is no longer pinned by this deployment, or its terms
-        no longer match. That is a genuine "stop and fetch an operator"
-        condition. A row with no fingerprint is NOT such a case -- it is
-        simply older than the field, and is resolved by name.
+        It refuses rather than guessing when the job's asset is no longer
+        pinned by this deployment, when its terms no longer match, and
+        when a name was recorded without terms and no attested contents
+        exist to recover from. Those are "stop and fetch an operator"
+        conditions: a wrong guess here moves the wrong funds.
+
+        Note the corollary of identity-by-wrapped-id: a row whose NAME
+        disagrees with its fingerprint resolves to the fingerprint's
+        asset. The name is a label, not a claim about identity.
         """
         raw = str(job.state.get("asset_fingerprint") or "").strip()
         stamped = "asset" in job.state
@@ -903,7 +919,7 @@ class WarpEngine:
                         "refusing to resume against a different asset than "
                         "the one its funds moved under"
                     ) from None
-                if (spec.erc20_address.lower() != addr
+                if (_canon_addr(spec.erc20_address) != _canon_addr(addr)
                         or int(spec.erc20_decimals) != erc20_dec_i
                         or int(self._net.cat_decimals) != cat_dec_i):
                     raise WarpTerminal(
@@ -943,15 +959,7 @@ class WarpEngine:
         for item in (job.state.get("message_contents") or [])[:1]:
             token = _hx(item)[-40:]
             for _key, spec in (self._net.assets or ()):
-                # The optional 0x is normalised, not assumed: a bare
-                # 40-hex address is valid elsewhere in this codebase, and
-                # slicing it blindly would drop a byte and make a valid
-                # attested token unmatchable -- turning recovery into a
-                # terminal.
-                known = spec.erc20_address.lower()
-                if known.startswith("0x"):
-                    known = known[2:]
-                if known == token:
+                if _canon_addr(spec.erc20_address) == token:
                     _log.error(
                         "job %s has an unreadable asset stamp (%s); "
                         "recovered %s from the attested message contents",

@@ -477,13 +477,50 @@ def test_the_claiming_path_forwards_the_jobs_wrapped_id(monkeypatch):
     assert seen.get("expected_asset_id") == USDC.expected_asset_id
 
 
-def test_the_claim_builder_accepts_a_millieth_anchor():
-    """The forwarded id must also be one build_claim_bundle will accept,
-    or the threading above would merely relocate the failure."""
-    from gui.services.warp import drivers
+def test_build_claim_bundle_honours_the_per_job_asset_id():
+    """Exercises the real builder, not just the validator: a milliETH
+    claim must BUILD against milliETH's pinned id, and the same request
+    must be REFUSED when handed another pinned asset's id. A regression
+    that dropped or misused req.expected_asset_id would otherwise pass."""
+    from gui.services.warp import drivers as d
 
-    assert drivers._require_pinned_asset_id(NET, MILLI.expected_asset_id) == (
-        MILLI.expected_asset_id.lower())
+    from .test_warp_drivers import _make_request, _RECEIVER_PH, _TOKEN_AMOUNT
+
+    milli_contents = [
+        bytes(12) + bytes.fromhex(MILLI.erc20_address[2:]),
+        _RECEIVER_PH,
+        _TOKEN_AMOUNT.to_bytes(32, "big"),
+    ]
+
+    # Success: the TAIL derived from the attested token matches the id the
+    # job froze, so the bundle builds.
+    ok = _make_request(contents=milli_contents,
+                       expected_asset_id=MILLI.expected_asset_id)
+    bundle = d.build_claim_bundle(ok)
+    assert bundle.final_cat_coin_id, "a milliETH claim must build"
+
+    # Refusal: same attested milliETH message, but the job claims USDC's
+    # wrapped id -- a known, pinned id, so only the per-job comparison can
+    # catch it.
+    wrong = _make_request(contents=milli_contents,
+                          expected_asset_id=USDC.expected_asset_id)
+    with pytest.raises(d.WarpDriverError):
+        d.build_claim_bundle(wrong)
+
+
+def test_a_formatting_only_address_edit_does_not_strand_a_job():
+    """0x-prefixed and bare addresses are the same address everywhere else
+    in this codebase, so the fingerprint must not encode the difference."""
+    import dataclasses
+
+    store, eng, ctx = _engine()
+    bare = dataclasses.replace(USDC, erc20_address=USDC.erc20_address[2:])
+    job = seed(store, S.JobStatus.AWAITING_DEPOSIT,
+               state=S._asset_stamp(bare, NET.cat_decimals))
+    # Same asset, prefixed representation: still resolves.
+    assert eng._job_asset(job).expected_asset_id == USDC.expected_asset_id
+    assert (S._asset_fingerprint(bare, NET.cat_decimals)
+            == S._asset_fingerprint(USDC, NET.cat_decimals))
 
 
 def test_the_approving_phase_uses_the_jobs_asset_for_both_calls(monkeypatch):
