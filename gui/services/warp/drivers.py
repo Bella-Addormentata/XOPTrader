@@ -822,6 +822,8 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
     # Every listed bridgeable asset must derive to its pinned id -- the same
     # refuse-to-start discipline, per asset, so a typo in a NEW asset entry
     # can never survive to a live claim or burn.
+    # The table key is an alias for humans; identity is the wrapped id
+    # (jobs resolve by it), so a key need not equal its descriptor symbol.
     for key, spec in getattr(net, "assets", ()) or ():
         if not spec.expected_asset_id:
             raise WarpDriverError(
@@ -832,12 +834,6 @@ def verify_wrapped_asset_anchor(net: WarpNet, configured: str = "") -> bytes:
             raise WarpDriverError(
                 f"asset {key} has an empty erc20_address; an empty address "
                 "would silently derive against the legacy USDC default"
-            )
-        if key != spec.symbol:
-            raise WarpDriverError(
-                f"asset table key {key!r} != its descriptor symbol "
-                f"{spec.symbol!r}; the two name the same asset and drift "
-                "between them would make persisted names unresolvable"
             )
         if int(spec.erc20_decimals) < int(net.cat_decimals):
             raise WarpDriverError(

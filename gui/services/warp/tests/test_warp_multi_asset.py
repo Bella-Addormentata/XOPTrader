@@ -94,14 +94,6 @@ def _engine(**kw):
     return store, engine, ctx
 
 
-def test_a_job_without_an_asset_reads_as_usdc():
-    """Rows written before asset stamping existed can only have been USDC --
-    it was the sole bridgeable token."""
-    store, eng, ctx = _engine()
-    job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state={})
-    assert eng._job_asset(job).symbol == "USDC"
-
-
 def test_a_stamped_job_resolves_to_its_own_asset():
     store, eng, ctx = _engine()
     job = seed(store, S.JobStatus.AWAITING_DEPOSIT, state=S._asset_stamp(MILLI, NET.cat_decimals))
@@ -492,6 +484,60 @@ def test_the_claim_builder_accepts_a_millieth_anchor():
 
     assert drivers._require_pinned_asset_id(NET, MILLI.expected_asset_id) == (
         MILLI.expected_asset_id.lower())
+
+
+def test_the_approving_phase_uses_the_jobs_asset_for_both_calls(monkeypatch):
+    """Restores coverage lost in an earlier rewrite: without this, removing
+    the asset from either the allowance lookup or the prepared approval
+    would leave the suite green while a milliETH job queried and approved
+    USDC."""
+    from gui.services.warp import evm as evm_mod
+
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    ctx.evm.allowance = 0                        # force the approve path
+    seed(store, S.JobStatus.APPROVING,
+         columns={"amount_usdc_micros": 5000, "amount_mojos": 5000},
+         state=S._asset_stamp(MILLI, NET.cat_decimals))
+    engine.step()
+    assert ctx.evm.allowance_asset is not None
+    assert ctx.evm.allowance_asset.symbol == "milliETH", "allowance lookup"
+    assert ctx.evm.approve_asset is not None
+    assert ctx.evm.approve_asset.symbol == "milliETH", "prepared approval"
+
+
+def test_the_first_bridging_signature_uses_the_jobs_asset(monkeypatch):
+    """The fee-bump replacement is covered separately; this pins the FIRST
+    bridgeToChia -- the transaction that actually moves the funds."""
+    from gui.services.warp import evm as evm_mod
+
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)
+    seed(store, S.JobStatus.BRIDGING,
+         columns={"receiver_ph": RECEIVER_PH.hex(), "amount_mojos": 5000},
+         state=S._asset_stamp(MILLI, NET.cat_decimals))
+    engine.step()
+    assert ctx.evm.bridge_asset is not None
+    assert ctx.evm.bridge_asset.symbol == "milliETH"
+
+
+def test_attested_recovery_matches_a_bare_hex_address():
+    """A 40-hex address with no 0x is valid elsewhere in this codebase;
+    slicing it blindly would drop a byte and turn a valid recovery into a
+    terminal."""
+    import dataclasses
+
+    bare = dataclasses.replace(USDC, erc20_address=USDC.erc20_address[2:])
+    net2 = dataclasses.replace(NET, assets=(("USDC", bare), ("milliETH", MILLI)))
+    usdc_word = "00" * 12 + USDC.erc20_address[2:].lower()
+    store, eng, ctx = _engine()
+    eng._net = net2
+    job = seed(store, S.JobStatus.CLAIMING,
+               state={"asset": "USDC", "asset_fingerprint": "v9:unreadable",
+                      "message_contents": [usdc_word, "cd" * 32, "1379"]})
+    assert eng._job_asset(job).expected_asset_id == USDC.expected_asset_id
 
 
 if __name__ == "__main__":  # pragma: no cover

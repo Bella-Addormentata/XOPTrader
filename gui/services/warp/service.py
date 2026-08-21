@@ -866,9 +866,12 @@ class WarpEngine:
         Resolution is by the wrapped-CAT id recorded in the job's
         fingerprint -- the asset's true identity, derived from its token
         contract, and stable across a rename of the table key or symbol.
-        The persisted symbol is advisory and used only for rows old enough
-        to predate fingerprinting, where USDC was the only asset the
-        pipeline could bridge.
+        The persisted symbol is advisory: it makes rows readable and is
+        never used to resolve one. A row carrying a name WITHOUT usable
+        terms is a partial write, and is recovered only from attested
+        contents (or stopped); a row carrying neither field predates
+        stamping, when USDC was the only asset the pipeline could bridge,
+        and resolves to USDC directly.
 
         This refuses rather than guessing in exactly one situation: the
         job's asset is no longer pinned by this deployment, or its terms
@@ -940,7 +943,15 @@ class WarpEngine:
         for item in (job.state.get("message_contents") or [])[:1]:
             token = _hx(item)[-40:]
             for _key, spec in (self._net.assets or ()):
-                if spec.erc20_address[2:].lower() == token:
+                # The optional 0x is normalised, not assumed: a bare
+                # 40-hex address is valid elsewhere in this codebase, and
+                # slicing it blindly would drop a byte and make a valid
+                # attested token unmatchable -- turning recovery into a
+                # terminal.
+                known = spec.erc20_address.lower()
+                if known.startswith("0x"):
+                    known = known[2:]
+                if known == token:
                     _log.error(
                         "job %s has an unreadable asset stamp (%s); "
                         "recovered %s from the attested message contents",
