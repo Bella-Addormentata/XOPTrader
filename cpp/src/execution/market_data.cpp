@@ -1084,9 +1084,9 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // worth being exact about what that means, because the published-mid band
     // does NOT cover this path: the clamp below runs only when dex_best_bid
     // AND dex_best_ask are both present, which is precisely what reaching
-    // Case 3 tells us we do not have.  PublishedMidBandTest.OneSidedBook_
-    // NoClamp asserts that directly.  On this path the centre is whatever the
-    // CEX and AMM legs say.
+    // Case 3 tells us we do not have.  This is asserted directly by
+    // PublishedMidBandTest.OneSidedBook_NoClamp.  On this path the centre is
+    // whatever the CEX and AMM legs say.
     //
     // What does bound it: those legs must survive their own freshness tapers
     // to be used at all, and if none survives the pair publishes no mid and
