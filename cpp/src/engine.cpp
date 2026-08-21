@@ -4364,8 +4364,10 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
         // still not redundant -- it is FEED-level and runs before any
         // per-pair CEX sample need exist, so it also covers a revived pair
         // that carries no cex_mid at all.  fair_value_updated_at IS still
-        // re-stamped every heartbeat from cached solver output
-        // (market_data.cpp:493), so that one still cannot expire on its own.
+        // re-stamped every heartbeat from cached solver output (see
+        // MarketDataFeed::ingest_fair_value), so that one still cannot expire
+        // on its own.  Named by symbol, not by line: the line number this
+        // originally cited went stale the moment a merge shifted the file.
         //
         // The revive path must not quote from a frozen feed: pre-revive
         // that state produced silence, and silence is the correct fallback.
