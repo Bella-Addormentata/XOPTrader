@@ -142,11 +142,29 @@ def test_the_checkbox_is_not_taller_than_its_own_label(app):
     assert _checkbox_height() <= _text_height() + 2
 
 
-@pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
-def test_the_indicator_scales_with_the_font(app, delta):
-    """A hard-coded box stays put while the text grows around it."""
-    app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
-    assert _checkbox_height() <= _text_height() + 2
+def test_the_indicator_scales_with_the_font(app):
+    """It must TRACK the text, not merely stay under it.
+
+    An upper bound alone is not a scaling test: a hard-coded 13px indicator
+    would satisfy "no taller than the text" at every delta while having
+    stopped responding to the setting entirely.  Compare the measurements
+    across deltas so that regression fails here.
+    """
+    measured = []
+    for delta in (-2, 0, 2, 4, 6):
+        app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
+        measured.append((delta, _checkbox_height(), _text_height()))
+
+    for delta, box, text in measured:
+        assert box <= text + 2, f"delta={delta}: indicator {box}px vs text {text}px"
+
+    boxes = [box for _d, box, _t in measured]
+    assert len(set(boxes)) > 1, (
+        f"indicator was {boxes[0]}px at every font size -- it no longer "
+        "responds to font_size_delta"
+    )
+    assert boxes == sorted(boxes), f"indicator did not grow with the font: {boxes}"
+    assert boxes[-1] > boxes[0], "largest font gave no larger indicator"
 
 
 def test_a_checkbox_fits_inside_a_table_row(app):
