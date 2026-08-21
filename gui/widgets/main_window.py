@@ -1147,7 +1147,12 @@ class MainWindow(QMainWindow):
                 "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "ask": float(ours.get("ask_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "fills_24h": int(ours.get("fills_24h", 0) or 0),
-                "pnl": float(ours.get("pnl_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                # realized_pnl is QUOTE mojos (engine.cpp computes it via
+                # quote_mojos_for with quote_denom), so a CAT-quoted pair
+                # divides by 1000, not 1e12 -- using the XCH divisor
+                # understated wUSDC.b and BYC P&L by a factor of a billion.
+                "pnl": (float(ours.get("pnl_mojos", 0.0) or 0.0)
+                        / float(mojos_per_unit_for_pair(pair_name, "quote"))),
                 "quote_symbol": quote_symbol,
             })
 

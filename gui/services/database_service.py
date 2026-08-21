@@ -97,6 +97,17 @@ def _mojos_per_unit(symbol: str) -> float:
 # Worker -- runs queries on a background QThread
 # ===================================================================
 
+#: How far back a 'pending' offer_log row still counts as our live quote.
+#: Wide enough for a quiet pair between re-quotes, short enough to exclude
+#: never-resolved rows days old.  A side with nothing recent is reported as
+#: absent rather than as an old price.
+#:
+#: Module scope, not a class attribute: a bare name inside a method does NOT
+#: resolve from the enclosing class namespace, so referring to it that way
+#: raised NameError before either query ran and left the table empty.
+_OUR_BOOK_WINDOW_H: int = 6
+
+
 class _DatabaseWorker(QObject):
     """Background worker that executes SQLite queries and emits results.
 
@@ -686,12 +697,6 @@ class _DatabaseWorker(QObject):
             "offer_counts": offer_counts,
             "pending_offers": pending_total,
         })
-
-    #: How far back a 'pending' offer_log row still counts as our live
-    #: quote.  Wide enough for a quiet pair between re-quotes, short enough
-    #: to exclude never-resolved rows days old.  A side with nothing recent
-    #: is shown as absent rather than as an old price.
-    _OUR_BOOK_WINDOW_H: int = 6
 
     @Slot()
     def fetch_pair_summary(self) -> None:

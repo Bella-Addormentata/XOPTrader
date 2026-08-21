@@ -439,8 +439,14 @@ class MetricsService(QObject):
         with QMutexLocker(self._mutex):
             m = self._latest
         return {
-            "balance": _labelled(m, "xop_inventory_balance_mojos", "asset_id", asset_id),
-            "cost_basis": _labelled(m, "xop_inventory_cost_basis_mojos", "asset_id", asset_id),
+            # Names must match the engine EXACTLY -- the parser preserves
+            # them verbatim.  metrics.cpp exports "xop_inventory_balance" and
+            # "xop_inventory_cost_basis", both documented "in mojos"; the
+            # "_mojos" suffixes here matched nothing, so every lookup
+            # silently returned 0.  Nothing had ever called this method, so
+            # the zeros went unnoticed.
+            "balance": _labelled(m, "xop_inventory_balance", "asset_id", asset_id),
+            "cost_basis": _labelled(m, "xop_inventory_cost_basis", "asset_id", asset_id),
             "underwater": _labelled(m, "xop_inventory_underwater", "asset_id", asset_id),
         }
 
