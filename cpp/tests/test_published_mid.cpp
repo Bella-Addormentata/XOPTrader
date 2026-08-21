@@ -304,4 +304,36 @@ TEST(LastTradeStalenessTest, TheGateCanBeDisabled) {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// The SECOND gate: check_arbitrage uses the same fallback, so a stale print
+// must not produce divergence signals either.  Without this, the arbitrage
+// path could keep firing off a print the published mid already refuses.
+// ---------------------------------------------------------------------------
+TEST(LastTradeStalenessTest, ArbitrageIgnoresAStalePrint) {
+    State state;
+    auto cfg = band_cfg();
+    cfg.cex_freshness_threshold_sec = 0.0;
+    cfg.dex_last_trade_max_age_sec  = 0.5;
+    MarketDataFeed feed(cfg, state);
+
+    int signals = 0;
+    feed.set_arb_callback([&](const ArbitrageSignal&) { ++signals; });
+
+    // Empty book -> the arbitrage path takes the last-trade fallback too.
+    // A moved print plus a far-away CEX reference is a divergence.
+    feed.ingest_dexie("XCH/wUSDC.b", 0.0, 0.0, 1.000, 100.0);
+    feed.ingest_dexie("XCH/wUSDC.b", 0.0, 0.0, 1.005, 100.0);
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.50);
+    feed.refresh({"XCH/wUSDC.b"});
+    const int while_fresh = signals;
+
+    // Age the same print past the gate and refresh again: no NEW signal,
+    // because the fallback is now refused on this path as well.
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100));
+    feed.refresh({"XCH/wUSDC.b"});
+    EXPECT_EQ(signals, while_fresh);
+}
+
+
 }  // namespace

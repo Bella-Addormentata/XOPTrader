@@ -745,6 +745,39 @@ TEST(ConfigParserTest, ReviveMarketWithDisabledFreshnessThreshold_Throws) {
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
+TEST(ConfigParserTest, DexLastTradeMaxAge_ParsesAndDefaults) {
+    // The propagation path itself, not just the gate: this knob was
+    // advertised as configurable while nothing read it, so production sat
+    // pinned to the default no matter what the YAML said.
+    {
+        std::string yaml(kMinimalValidYaml);
+        yaml += "
+market_data:
+  dex_last_trade_max_age_sec: 42.5
+";
+        TempYaml tmp(yaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.dex_last_trade_max_age_sec, 42.5);
+    }
+    {
+        // Omitted: the documented default, and <= 0 stays legal as a
+        // deliberate disable (same convention as the other tapers).
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.dex_last_trade_max_age_sec, 1800.0);
+    }
+    {
+        std::string yaml(kMinimalValidYaml);
+        yaml += "
+market_data:
+  dex_last_trade_max_age_sec: 0
+";
+        TempYaml tmp(yaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.market_data.dex_last_trade_max_age_sec, 0.0);
+    }
+}
+
 TEST(ConfigParserTest, DisabledFreshnessThresholdWithoutRevive_IsLegal) {
     // The 0-disables-decay setting predates revive_market and must keep
     // working for configs that never opted into revival.
