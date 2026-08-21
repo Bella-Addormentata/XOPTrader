@@ -110,7 +110,7 @@
 ### S5: Published mid blends stale last-trade with no staleness gate
 - **Files:** `cpp/src/execution/market_data.cpp:1009-1012, 1188-1189`
 - **Issue:** `compute_mid` Case 3 falls back to `ps.dex_last_trade` at 0.70 weight with zero age check; no timestamp is stored for the print at all (market_data.hpp:406) and `dex_updated_at` is re-stamped `now()` every heartbeat (market_data.cpp:380, 1542). A 13-day-old trade dragged wmilliETH.b's mid 8%+ below fair.
-- **Status:** `[ ]` — Verified 2026-08-18. Fix: carry the dexie trade timestamp through `ingest_dexie` and age-taper or refuse the fallback; the `dex_print_age` heartbeat counter (market_data.cpp:1544+) exists but nothing gates on it ("Signal only — no consumer gates on it yet").
+- **Status:** `[x]` — FIXED (PR #87). `PairState` carries the print's own change-clock (`last_trade_print` / `last_trade_changed_at`), maintained in `ingest_dexie` by VALUE rather than poll time, and `compute_mid` refuses the fallback past `market_data.dex_last_trade_max_age_sec` (default 1800 s, `<= 0` disables). `check_arbitrage` gates the identical fallback. A print never observed to move is refused: its age is unknown, not zero.
 
 ### S6: CoinGecko staleness blindness in the general published-mid path
 - **Files:** `cpp/src/engine.cpp:1815-1827, 2069-2100`; `cpp/src/execution/market_data.cpp:405-406`

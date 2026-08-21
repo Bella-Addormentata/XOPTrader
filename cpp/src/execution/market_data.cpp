@@ -409,20 +409,22 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
     // at epoch -- we have not yet watched it move, so its age is unknown.
     if (last_trade > 0.0) {
-        constexpr double kPrintMoveThreshold = 1e-4;  // 1 bp
-        if (ps.last_trade_print <= 0.0) {
-            // First sighting: anchor the reference, but leave the clock at
-            // epoch -- we have not yet watched this price move.
-            ps.last_trade_print = last_trade;
-        } else if (std::abs(last_trade / ps.last_trade_print - 1.0)
-                       > kPrintMoveThreshold) {
-            // Re-anchor ONLY on a material move.  Assigning on every sample
-            // would compare each print with the one immediately before it,
-            // so an unbounded number of sub-threshold steps could walk the
-            // price arbitrarily far while the clock never advanced.
+        // ANY change is a new print.  No noise threshold here, unlike the
+        // order-book mid: this field moves only when Dexie reports a new
+        // last trade, so a change of even a fraction of a basis point is
+        // evidence that the pair traded again -- which is exactly what the
+        // freshness gate needs to know.  (An earlier cut borrowed the 1 bp
+        // filter from the mid-freeze counter; that both ignored real prints
+        // and, by re-anchoring on every sample, let a run of sub-threshold
+        // steps drift the price arbitrarily while the clock stood still.)
+        //
+        // An UNCHANGED value proves nothing: polling cannot distinguish a
+        // fresh trade at the same price from the previous trade being
+        // re-reported, so it correctly leaves the clock alone.
+        if (ps.last_trade_print > 0.0 && last_trade != ps.last_trade_print) {
             ps.last_trade_changed_at = std::chrono::system_clock::now();
-            ps.last_trade_print = last_trade;
         }
+        ps.last_trade_print = last_trade;
     }
     ps.dex_last_trade = last_trade;
     ps.volume_24h    = vol_24h;
