@@ -1086,8 +1086,12 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // the mid toward the CEX and AMM legs, in whichever direction they sit.
     // In the motivating wmilliETH.b case the stale print sat BELOW them, so
     // the mid RISES -- and because the engine centres both sides on the
-    // published mid (engine.cpp:2953 feeding compute_quotes at :3018), BIDS
-    // RISE WITH IT.  We bid higher than before, not lower.
+    // published mid, BIDS RISE WITH IT: Engine::step_compute_quotes reads
+    // get_mid_price and hands that value straight to
+    // Strategy::compute_quotes, which derives both sides from it.  We bid
+    // higher than before, not lower.  (Named by symbol rather than by line:
+    // the numbers this first cited had already drifted onto a log statement
+    // and a margin calculation.)
     //
     // That is the intended correction: the old bid was anchored to a
     // 13-day-old trade well below fair.  It is left unguarded here, and it is
