@@ -327,6 +327,12 @@ TEST(LastTradeStalenessTest, ArbitrageIgnoresAStalePrint) {
     feed.ingest_cex_reference("XCH/wUSDC.b", 1.50);
     feed.refresh({"XCH/wUSDC.b"});
     const int while_fresh = signals;
+    // Without this the test passes vacuously: if the fresh phase never
+    // emitted, the final EXPECT_EQ holds at 0 == 0 and the fallback this
+    // test exists to cover is never exercised at all.
+    ASSERT_GT(while_fresh, 0)
+        << "setup emitted no signal, so the staleness assertion below "
+           "would prove nothing";
 
     // Age the same print past the gate and refresh again: no NEW signal,
     // because the fallback is now refused on this path as well.

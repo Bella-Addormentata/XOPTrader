@@ -751,10 +751,10 @@ TEST(ConfigParserTest, DexLastTradeMaxAge_ParsesAndDefaults) {
     // pinned to the default no matter what the YAML said.
     {
         std::string yaml(kMinimalValidYaml);
-        yaml += "
+        yaml += R"(
 market_data:
   dex_last_trade_max_age_sec: 42.5
-";
+)";
         TempYaml tmp(yaml);
         auto cfg = xop::load_config(tmp.path());
         EXPECT_DOUBLE_EQ(cfg.market_data.dex_last_trade_max_age_sec, 42.5);
@@ -768,10 +768,10 @@ market_data:
     }
     {
         std::string yaml(kMinimalValidYaml);
-        yaml += "
+        yaml += R"(
 market_data:
   dex_last_trade_max_age_sec: 0
-";
+)";
         TempYaml tmp(yaml);
         auto cfg = xop::load_config(tmp.path());
         EXPECT_DOUBLE_EQ(cfg.market_data.dex_last_trade_max_age_sec, 0.0);
