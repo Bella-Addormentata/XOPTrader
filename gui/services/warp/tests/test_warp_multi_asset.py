@@ -24,8 +24,8 @@ from gui.services.warp import evm  # noqa: E402
 from gui.services.warp import service as S  # noqa: E402
 
 from .test_warp_service import (  # noqa: E402
-    RECEIVER_PH, FakeWatcher, _sent_msg, build, default_params, fake_sign_tx,
-    new_store, seed,
+    PORTAL, RECEIVER_PH, FakeCoin, FakeWatcher, _seed_claiming, _sent_msg,
+    build, default_params, fake_sign_tx, new_store, seed,
 )
 
 NET = C.MAINNET
@@ -436,6 +436,62 @@ def test_the_inertness_gate_follows_identity_not_the_display_name():
     out = engine2.step()
     assert out["status"] == S.JobStatus.FAILED
     assert "not enabled yet" in (store2.get_job(out["id"]).last_error or "")
+
+
+def test_the_claiming_path_forwards_the_jobs_wrapped_id(monkeypatch):
+    """The claim's per-job anchor is only worth having if it is actually
+    threaded: dropping the expected_asset_id argument would leave the rest
+    of the suite green while every non-USDC job failed AFTER its Base funds
+    had moved and its Chia claim was funded."""
+    from types import SimpleNamespace
+
+    from gui.services.warp import claim as claim_mod
+
+    coin = FakeCoin(bytes([0x5a]) * 32)
+    monkeypatch.setattr(claim_mod, "find_security_coin", lambda *a, **k: coin)
+    monkeypatch.setattr(
+        claim_mod, "sync_portal",
+        lambda coinset, net, *, hint, max_hops=64: SimpleNamespace(
+            coin_id=PORTAL),
+    )
+    monkeypatch.setattr(claim_mod, "claim_landed", lambda coinset, cid: True)
+
+    seen = {}
+
+    def fake_push(coinset, net, **kw):
+        seen.update(kw)
+        return SimpleNamespace(
+            claim=SimpleNamespace(final_cat_coin_id=bytes([0xfe]) * 32),
+            accepted=True, status="accepted",
+        )
+
+    monkeypatch.setattr(claim_mod, "build_and_push_claim", fake_push)
+
+    store = new_store()
+    engine, ctx = build(store)
+    _seed_claiming(store, **S._asset_stamp(MILLI, NET.cat_decimals))
+    ctx.coinset.record = SimpleNamespace(confirmed_block_index=100)
+    engine.step()
+
+    assert seen.get("expected_asset_id") == MILLI.expected_asset_id, (
+        "the claim must be anchored to THIS job's wrapped asset")
+    # ...and a USDC job forwards its own, not milliETH's.
+    seen.clear()
+    store2 = new_store()
+    engine2, ctx2 = build(store2)
+    _seed_claiming(store2, **S._asset_stamp(USDC, NET.cat_decimals))
+    ctx2.coinset.record = SimpleNamespace(confirmed_block_index=100)
+    engine2.step()
+    assert seen.get("expected_asset_id") == USDC.expected_asset_id
+
+
+def test_the_claim_builder_accepts_a_millieth_anchor():
+    """The forwarded id must also be one build_claim_bundle will accept,
+    or the threading above would merely relocate the failure."""
+    from gui.services.warp import drivers
+
+    assert drivers._require_pinned_asset_id(NET, MILLI.expected_asset_id) == (
+        MILLI.expected_asset_id.lower())
 
 
 if __name__ == "__main__":  # pragma: no cover
