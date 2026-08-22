@@ -104,6 +104,7 @@ OnChainReconciler::reconcile_balances(
             // Step 3: Query full node for unspent coins at each puzzle hash.
             Mojo on_chain_total = 0;
             std::size_t on_chain_count = 0;
+            bool scan_complete = true;
 
             for (const auto& ph : puzzle_hashes) {
                 try {
@@ -120,12 +121,24 @@ OnChainReconciler::reconcile_balances(
                         }
                     }
                 } catch (const std::exception& e) {
+                    scan_complete = false;
                     logger_->warn("reconcile_balances: full node query failed "
                                   "for puzzle_hash {}...{}: {}",
                                   ph.substr(0, 8),
                                   ph.substr(ph.size() > 8 ? ph.size() - 4 : 0),
                                   e.what());
                 }
+            }
+
+            // A partial scan cannot support a shortfall claim: with one
+            // address missing from the sum, on_chain < spendable is exactly
+            // what a transient node error looks like -- the same false
+            // positive this rework exists to remove, re-created by an RPC
+            // hiccup.  Skip the comparison and say so.
+            if (!scan_complete) {
+                logger_->info("reconcile_balances: wallet={} scan incomplete "
+                              "-- comparison skipped this run", label);
+                continue;
             }
 
             // Step 4: Compare LIKE FOR LIKE.
