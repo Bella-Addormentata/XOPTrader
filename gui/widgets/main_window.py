@@ -1559,7 +1559,6 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(self._splitter)
 
-    @staticmethod
     def _push_sizing_paths(self) -> None:
         """Hand the advisory calculator the bridge's CURRENT paths.
 
