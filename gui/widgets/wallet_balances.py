@@ -476,7 +476,7 @@ class WalletBalancesWidget(QWidget):
                 border: 1px solid {PRIMARY_GREEN};
                 border-radius: 4px;
                 padding: 4px 8px;
-                font-size: {scaled_px(11)}px;
+                font-size: 11px;
                 font-weight: bold;
             }}
             QPushButton:hover {{

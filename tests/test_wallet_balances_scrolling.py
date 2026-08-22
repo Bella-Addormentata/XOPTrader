@@ -115,12 +115,13 @@ def test_the_page_grows_so_the_outer_area_scrolls_instead(app):
 def test_the_fit_tracks_real_row_heights(app):
     """Height comes from real row heights, not a per-row constant.
 
-    Varying the GLOBAL font delta does not work here: this widget pins its
-    table and header fonts in local QSS, which overrides the application
-    stylesheet, so every delta produced identical geometry and an earlier
-    parameterised version of this test passed without exercising anything.
-    Vary the table's own font instead, and prove the geometry moved before
-    claiming the fit followed it.
+    Historical note: before S10 the local QSS pinned 12px/11px fonts, so
+    the GLOBAL delta could not reach these tables and an earlier version of
+    this test passed vacuously.  S10 derives the local QSS from
+    theme.scaled_px(), so the delta DOES reach them now (covered by
+    test_the_font_size_setting_reaches_this_page).  This test keeps driving
+    row height directly because its subject is narrower: the fit must track
+    whatever the rows measure, however they came to measure it.
     """
     app.setStyleSheet(theme.get_stylesheet())
     heights = []
@@ -351,6 +352,29 @@ def test_the_font_size_setting_reaches_this_page(app):
             "rows ignored the font-size delta -- S10 has regressed"
         )
         assert bigger._table.height() > base_h, "the fit did not follow"
+
+        # The QSS itself must scale -- row height alone would still pass if
+        # the stylesheets reverted to pinned 12px/11px, which IS the S10
+        # failure.  The applied stylesheet is the mechanism, so assert on it
+        # for BOTH tables.
+        for table in (bigger._table, bigger._alloc_table):
+            sheet = table.styleSheet()
+            assert "font-size: 16px" in sheet, (
+                "table QSS is not scaled at delta 4 (expected 12+4)"
+            )
+            assert "font-size: 15px" in sheet, (
+                "header QSS is not scaled at delta 4 (expected 11+4)"
+            )
+            assert "font-size: 12px" not in sheet
+        # And the allocation table's geometry follows its scaled rows.
+        bigger._alloc_table.setRowCount(3)
+        from gui.widgets.wallet_balances import _fit_table_to_contents
+        _fit_table_to_contents(bigger._alloc_table)
+        base._alloc_table.setRowCount(3)
+        _fit_table_to_contents(base._alloc_table)
+        assert (bigger._alloc_table.height() > base._alloc_table.height()), (
+            "allocation table did not grow with the delta"
+        )
     finally:
         theme.apply_theme(app, font_size_delta=0)
         app.setStyleSheet(theme.get_stylesheet())
