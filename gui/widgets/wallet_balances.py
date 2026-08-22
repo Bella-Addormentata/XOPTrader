@@ -117,13 +117,27 @@ class _SuggestedAllocationWorker(QObject):
     ready = Signal(dict)   # payload of offer_sizing.suggested_portfolio_allocation
     failed = Signal(str)
 
+    def __init__(self, config_path: Optional[str] = None,
+                 db_path: Optional[str] = None) -> None:
+        super().__init__()
+        # Passed explicitly because offer_sizing is loaded BY PATH out of the
+        # PyInstaller bundle: its __file__-relative defaults point at the
+        # per-launch _MEIPASS temp directory, which holds no config.yaml and
+        # no database.  Calling with no paths is what produced
+        # "Suggested % unavailable: [Errno 2] ... \_MEI00004b102\config.yaml".
+        self._config_path = config_path
+        self._db_path = db_path
+
     @Slot()
     def run(self) -> None:
         try:
             from gui.utils import load_offer_sizing  # noqa: WPS433
 
             sizing = load_offer_sizing()
-            self.ready.emit(dict(sizing.suggested_portfolio_allocation()))
+            self.ready.emit(dict(sizing.suggested_portfolio_allocation(
+                config_path=self._config_path,
+                db_path=self._db_path,
+            )))
         except Exception as exc:  # fail soft -> "n/a" in the table
             self.failed.emit(str(exc))
 
@@ -171,6 +185,11 @@ class WalletBalancesWidget(QWidget):
         # would otherwise garbage-collect the unparented QObject before
         # the thread invokes it.
         self._suggest_worker: Optional[_SuggestedAllocationWorker] = None
+        # Real config/database locations, supplied by main_window.  Without
+        # them the calculator falls back to bundle-relative defaults that do
+        # not exist in an installed build (see _SuggestedAllocationWorker).
+        self._sizing_config_path: Optional[str] = None
+        self._sizing_db_path: Optional[str] = None
         # Restore persisted targets before the UI is built so the first
         # render already has them.
         self._load_target_allocations()
@@ -1080,7 +1099,9 @@ class WalletBalancesWidget(QWidget):
             return
         self._suggested_status = "pending"
         thread = QThread(self)
-        worker = _SuggestedAllocationWorker()
+        worker = _SuggestedAllocationWorker(
+            self._sizing_config_path, self._sizing_db_path
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.ready.connect(self._on_suggested_ready)
@@ -1093,6 +1114,43 @@ class WalletBalancesWidget(QWidget):
         self._suggest_thread = thread
         self._suggest_worker = worker
         thread.start()
+
+    def stop_background_work(self, timeout_ms: int = 2000) -> None:
+        """Join the advisory worker thread before this widget is destroyed.
+
+        A QThread still running when its C++ object is destroyed makes Qt
+        call qFatal("QThread: Destroyed while thread is still running") and
+        the process ABORTS -- reproduced against PySide6 6.11: the run exits
+        via the MSVC abort path instead of returning from main().
+
+        The worker blocks on a dexie fetch with a 30s timeout, so quit()
+        alone cannot return promptly: it only asks the thread's event loop to
+        exit, while run() is mid-request.  Wait briefly, then terminate as a
+        last resort -- an abrupt stop of a READ-ONLY advisory query during
+        shutdown is strictly better than aborting the application.
+
+        Child widgets do not receive closeEvent when the top-level window
+        closes, which is why this is public and called by MainWindow.
+        """
+        thread = self._suggest_thread
+        if thread is None:
+            return
+        thread.quit()
+        if not thread.wait(timeout_ms):
+            thread.terminate()
+            thread.wait(1000)
+        self._suggest_thread = None
+        self._suggest_worker = None
+
+    def set_sizing_paths(self, config_path: Optional[str],
+                         db_path: Optional[str]) -> None:
+        """Tell the advisory calculator where config and the database live.
+
+        Called by main_window once the bridge has resolved both.  A refresh
+        already in flight keeps its own paths; the next one picks these up.
+        """
+        self._sizing_config_path = config_path
+        self._sizing_db_path = db_path
 
     @Slot()
     def _on_suggest_thread_finished(self) -> None:
