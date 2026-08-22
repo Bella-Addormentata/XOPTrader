@@ -323,7 +323,19 @@ void MetricsExporter::register_metrics()
 
     paused_gauge_ = &prometheus::BuildGauge()
         .Name("xop_bot_paused")
-        .Help("1 when trading is paused by GUI, 0 otherwise")
+        .Help("1 while the GUI pause flag is active -- the pause the GUI "
+              "Resume button can clear.  Breaker and protection pauses are "
+              "on xop_posting_gated instead")
+        .Register(*registry_)
+        .Add({});
+
+    posting_gated_gauge_ = &prometheus::BuildGauge()
+        .Name("xop_posting_gated")
+        .Help("1 when offer posting is disabled for ANY reason -- GUI "
+              "pause, a latched risk breaker (max-drawdown, rolling-window "
+              "loss, ledger divergence), the wallet circuit breaker, a "
+              "flash-crash episode, or XCH recovery mode -- 0 when the "
+              "engine is actually posting")
         .Register(*registry_)
         .Add({});
 
@@ -681,6 +693,13 @@ void MetricsExporter::update_stuck_offers(int count)
             static_cast<double>(count - stuck_offers_last_observed_));
     }
     stuck_offers_last_observed_ = count;
+}
+
+void MetricsExporter::update_posting_gated(bool gated)
+{
+    if (posting_gated_gauge_) {
+        posting_gated_gauge_->Set(gated ? 1.0 : 0.0);
+    }
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

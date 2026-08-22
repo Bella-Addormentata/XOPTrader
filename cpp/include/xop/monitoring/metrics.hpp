@@ -260,8 +260,17 @@ public:
     /// Update the count of stuck offers (beyond TTL + stuck-age threshold).
     void update_stuck_offers(int count);
 
-    /// Update the bot-paused gauge (1 = paused by GUI, 0 = running).
+    /// Update the bot-paused gauge.  COMMAND-side contract: 1 while the
+    /// GUI pause flag is active -- the one pause the GUI Resume button can
+    /// clear.  Breaker/protection pauses are NOT included here; they are
+    /// on the posting-gated gauge below.
     void update_bot_paused(bool is_paused);
+
+    /// Update the posting-gated gauge.  STATE-side contract: 1 when offer
+    /// posting is disabled for ANY reason (GUI pause, latched risk
+    /// breaker, wallet circuit breaker, flash-crash episode, or XCH
+    /// recovery); 0 when the engine is actually posting.
+    void update_posting_gated(bool gated);
 
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
@@ -370,6 +379,7 @@ private:
     int stuck_offers_last_observed_{0};
     int stuck_offers_peak_observed_{0};
     prometheus::Gauge* paused_gauge_{nullptr};
+    prometheus::Gauge* posting_gated_gauge_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------

@@ -301,6 +301,9 @@ class MainWindow(QMainWindow):
         self._connected: bool = False
         self._bot_running: bool = False
         self._bot_paused: bool = False
+        # True when the current Paused status is owned by the GUI flag (the
+        # pause Resume can clear), False when a risk breaker holds it.
+        self._gui_pause_owns_it: bool = True
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
         self._last_engine_start_failure: str = ""
@@ -858,6 +861,18 @@ class MainWindow(QMainWindow):
             colour = _C.WARNING_YELLOW
             self._bot_running = True
             self._bot_paused = True
+            # Which pause?  Resume can only clear the GUI flag; a breaker
+            # pause needs a restart, and offering Resume for it makes the
+            # button a lie.  The gauge is command-side truth.
+            gui_flag = True
+            try:
+                if self._bridge is not None:
+                    gui_flag = self._bridge.metrics_service.is_paused()
+            except Exception:
+                pass
+            self._gui_pause_owns_it = gui_flag
+            if not gui_flag:
+                self._bot_status_label.setText("Paused (breaker)")
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
             self._bot_running = False
@@ -1648,8 +1663,11 @@ class MainWindow(QMainWindow):
             )
 
         # Enable pause only when the bot is running and not already paused.
+        # Resume only clears the GUI flag, so it is offered only for a pause
+        # the GUI actually owns -- a breaker pause requires a restart.
         can_pause = self._bot_running and not self._bot_paused
-        can_resume = self._bot_paused
+        can_resume = self._bot_paused and getattr(
+            self, "_gui_pause_owns_it", True)
         self._pause_resume_btn.setEnabled(can_pause or can_resume)
         self._act_pause_trading.setEnabled(can_pause)
         self._act_resume_trading.setEnabled(can_resume)
