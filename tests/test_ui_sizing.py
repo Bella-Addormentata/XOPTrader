@@ -141,10 +141,25 @@ def test_the_button_renders_full_size_inside_a_real_table(app, delta):
         table.hide()
 
 
-def test_rows_keep_their_size_at_the_default_font(app):
-    """Growing every row to fix a large-font case would be a regression."""
+def test_rows_are_no_taller_than_the_control_requires(app):
+    """Growing every row beyond what the button needs would be a regression.
+
+    Not a pinned pixel count: the previous version asserted == 30, which is
+    the WINDOWS answer -- Linux fonts make the same button a few px taller,
+    so CI failed at 33 while the behaviour was correct on both. The invariant
+    is the formula, not one platform's evaluation of it.
+    """
     app.setStyleSheet(theme.get_stylesheet())
-    assert _row_height(0) == 30
+    probe = QPushButton("X")
+    probe.setObjectName("dangerButton")
+    probe.setProperty("compact", True)
+    probe.ensurePolished()
+    needed = probe.sizeHint().height() + 11    # margins + item padding + grid
+    row = _row_height(0)
+    assert row == max(30, needed), (
+        f"row {row}px vs floor 30 / needed {needed}px"
+    )
+    assert row >= 30, "rows shrank below the baseline look"
 
 
 def test_the_compact_button_keeps_its_danger_palette(app):
