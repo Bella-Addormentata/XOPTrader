@@ -128,6 +128,13 @@
 - **Issue:** `strategy.asset_target_allocations` omits WMILLIETH.B (and `ratio_target_by_pair`/`ratio_band_enter_by_pair` omit wmilliETH.b/XCH) even though the pair is enabled; `acquire_scale` returns 1.0 for missing keys (engine.cpp:4891-4893) and is applied to the bid side (:4917), so accumulation is never tapered. Remaining limits are portfolio-fraction denominated (`single_cat_cap_pct` 0.25, soft/hard 0.6/0.8) — unreachable for a small CAT position on a large wallet.
 - **Status:** `[x]` — RESOLVED. `config.yaml` now carries `asset_target_allocations.WMILLIETH.B` plus `ratio_target_by_pair` and `ratio_band_enter_by_pair` entries for `wmilliETH.b/XCH`, so `acquire_scale` no longer returns 1.0 for the pair and the accumulation brake is reachable. Re-verified 2026-08-21.
 
+### S12: One spurious print latches a GLOBAL offer halt for ~1000 blocks
+- **Files:** `cpp/src/risk/limits.cpp` (`check_flash_crash`), `cpp/src/engine.cpp` (flash-crash state machine)
+- **Issue:** `check_flash_crash` scans the ENTIRE retained price history tracking a running maximum, and returns true if any later price sits `flash_crash_threshold_pct` (0.20) below it. The maximum never decays and no outlier is rejected, so a single bad print pins it permanently. In the `Crash` branch `any_pair_crashing` is evaluated FIRST and short-circuits, so `is_stable_after_crash()` is never consulted while it holds — the recovery machinery cannot run.
+- **Observed 2026-08-22:** one XCH/BYC print of 2.3419 at 09:43:34 UTC (versus ~1.57 either side, fully retraced within minutes) set the running max. Every subsequent price ~1.63 reads as a 30% drawdown from it, so the detector reported a crash continuously. Step 8 stayed gated **for every pair**, not just XCH/BYC, for 4+ hours — while all five pairs measured stable within 5% with full history. The state can only clear when the print falls out of the 1000-entry buffer (`kDefaultPriceHistoryCapacity`), which is a function of elapsed blocks, not of market conditions.
+- **Compounding:** the same print marked the book up an instant before the equity peak was sampled, contributing to the `$262.11` peak that then tripped the max-drawdown breaker (see S13-adjacent note in this session). One tick both halted posting and caused the pause.
+- **Status:** `[ ]` — OPEN. Options: decay or window the running maximum (e.g. only consider the last N entries rather than all retained history), reject single-sample outliers before the detector sees them, or evaluate stability even while `any_pair_crashing` holds so a retraced spike can clear. A restart also clears it, since the history is in-memory — but that is a workaround, not a fix.
+
 ---
 
 ## Resolved since 2026-04 (audit evidence)
