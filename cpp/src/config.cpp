@@ -2435,6 +2435,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_window_loss = " << cfg.risk.max_window_loss_bps << " bps"
         << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n"
         << "  flash_crash    = " << cfg.risk.flash_crash_threshold_pct * 100.0 << "%\n"
+        << "  flash_window   = " << cfg.risk.flash_crash_window_blocks
+        << " blocks (0 = whole history)\n"
         << "  recovery_ph1   = " << cfg.risk.recovery_stable_blocks_phase1 << " blocks\n"
         << "  recovery_ph2   = " << cfg.risk.recovery_stable_blocks_phase2 << " blocks\n"
         << "  recovery_band  = " << cfg.risk.recovery_stability_band_pct * 100.0 << "%\n"
