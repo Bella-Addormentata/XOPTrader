@@ -46,9 +46,13 @@ from gui.widgets.status_bar import StatusBar
 # Each of these will live in gui/widgets/<name>.py once implemented.
 # Import guards let the window load even if the files are not yet present.
 try:
-    from gui.widgets.dashboard import DashboardWidget
+    from gui.widgets.dashboard import (
+        _ACTIVITY_FEED_MAX,
+        DashboardWidget,
+    )
 except ImportError:
     DashboardWidget = None  # type: ignore[assignment,misc]
+    _ACTIVITY_FEED_MAX = 20  # widget unavailable; keep the module importable
 
 try:
     from gui.widgets.chart import ChartWidget
@@ -116,9 +120,11 @@ from gui.utils import (
     mojos_to_xch_float,
 )
 
-#: Rows shown in the dashboard's RECENT ACTIVITY feed.  A glance
-#: panel, not a record -- the Trade Log tab holds the full history.
-_ACTIVITY_FEED_ROWS: Final[int] = 25
+#: Rows converted for the dashboard's RECENT ACTIVITY feed.  Taken from the
+#: widget's own cap rather than restated: a separate 25 here meant five rows
+#: were built and then deterministically discarded by update_trades(), and
+#: the documented count did not match what the panel rendered.
+_ACTIVITY_FEED_ROWS: Final[int] = _ACTIVITY_FEED_MAX
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
 LIGHT_GREEN: Final[str] = _C.LIGHT_GREEN

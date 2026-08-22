@@ -189,3 +189,16 @@ def test_same_block_fills_come_back_newest_first(app, tmp_path):
 
     ids = [r["id"] for r in got]
     assert ids == [5, 4, 3], f"same-block fills not newest-first: {ids}"
+
+
+def test_the_feed_limits_are_one_source_of_truth():
+    """Converting more rows than the widget keeps is silently wasted work.
+
+    main_window converted 25 while update_trades() capped at 20, so five
+    events were built and then deterministically discarded -- and the
+    documented count did not match what the panel rendered.
+    """
+    from gui.widgets.dashboard import _ACTIVITY_FEED_MAX
+    from gui.widgets.main_window import _ACTIVITY_FEED_ROWS
+
+    assert _ACTIVITY_FEED_ROWS == _ACTIVITY_FEED_MAX
