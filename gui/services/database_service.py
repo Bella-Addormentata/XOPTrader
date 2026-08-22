@@ -730,9 +730,18 @@ class _DatabaseWorker(QObject):
         })
 
     @Slot(int)
-    def set_book_ttl_blocks(self, blocks: int) -> None:
-        """Record the configured offer TTL used to size the live-quote window."""
-        self._book_ttl_blocks = int(blocks or 0)
+    def fetch_pair_summary_for(self, offer_ttl_blocks: int) -> None:
+        """Set the TTL and run the summary, as ONE queued operation.
+
+        Two connections -- a setter plus a lambda -- were wrong twice over.
+        A lambda has no receiver object, so Qt runs it in the EMITTING
+        thread: both SQLite aggregates executed on the UI thread every
+        refresh instead of on the worker. And splitting the state update
+        from the query left them separately queued, so the fetch could run
+        before the connection was open or with the previous TTL.
+        """
+        self._book_ttl_blocks = int(offer_ttl_blocks or 0)
+        self.fetch_pair_summary()
 
     @Slot()
     def fetch_pair_summary(self) -> None:
@@ -1528,9 +1537,9 @@ class DatabaseService(QObject):
         self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
         self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
         self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
-        self._trigger_pair_summary.connect(self._worker.set_book_ttl_blocks)
-        self._trigger_pair_summary.connect(
-            lambda _ttl: self._worker.fetch_pair_summary())
+        # Bound worker slot, like every other trigger above: that is what
+        # makes Qt queue it onto the worker thread.
+        self._trigger_pair_summary.connect(self._worker.fetch_pair_summary_for)
         self._trigger_last_trade_prices.connect(self._worker.fetch_last_trade_prices)
 
         # -- Auto-refresh timer ---------------------------------------------

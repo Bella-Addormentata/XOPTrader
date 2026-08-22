@@ -1169,7 +1169,9 @@ class MainWindow(QMainWindow):
                     else float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH
                 ),
                 "spread_bps": float(md.get("spread_bps", 0.0) or 0.0),
-                "inventory": float(md.get("inventory_mojos", 0.0) or 0.0) / base_mpu,
+                # Already display units (the wallet service divides by the
+                # asset's own factor), so it must NOT be divided again.
+                "inventory": float(md.get("inventory_units", 0.0) or 0.0),
                 "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "ask": float(ours.get("ask_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "fills_24h": int(ours.get("fills_24h", 0) or 0),

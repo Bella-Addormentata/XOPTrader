@@ -83,7 +83,7 @@ def test_our_book_query_excludes_never_resolved_rows():
     from pathlib import Path
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "services", "database_service.py").read_text(encoding="utf-8")
-    body = source.split("def fetch_pair_summary")[1].split("def fetch_reports")[0]
+    body = source.split("def fetch_pair_summary(self)")[1].split("def fetch_reports")[0]
     assert "created_at >= ?" in body, "our-book query has no recency window"
     assert "our_book_window_hours(" in body, "window is not TTL-derived"
 
@@ -98,7 +98,7 @@ def test_the_two_tables_use_their_own_timestamp_formats():
     from pathlib import Path
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "services", "database_service.py").read_text(encoding="utf-8")
-    body = source.split("def fetch_pair_summary")[1].split("def fetch_reports")[0]
+    body = source.split("def fetch_pair_summary(self)")[1].split("def fetch_reports")[0]
     assert '"%Y-%m-%d %H:%M:%S"' in body      # offer_log
     assert '"%Y-%m-%dT%H:%M:%S"' in body      # trade_log
 
@@ -289,3 +289,55 @@ def test_the_usd_rate_is_not_taken_from_a_stale_fallback():
     assert 'mid_price_source' in block and "continue" in block, (
         "the XCH/USD rate still accepts a last_trade backfill"
     )
+
+
+def test_the_holding_lookup_handles_the_standard_wallet(app):
+    """wallet_type 0 is FALSY -- `row.get(...) or -1` silently discards it.
+
+    That idiom made every XCH wallet look like type -1, so Inventory would
+    have read zero on every XCH pair while looking like a real balance.
+    """
+    from gui.services.engine_bridge import _holding_for_asset
+
+    balances = {
+        "Chia Wallet": {"wallet_type": 0.0, "asset_id": "", "confirmed": 16.5},
+        "milliETH": {"wallet_type": 6.0, "asset_id": "F322A205",
+                     "confirmed": 0.35},
+        "malformed": {"wallet_type": None, "asset_id": None, "confirmed": 1.0},
+    }
+    assert _holding_for_asset(balances, "xch") == 16.5
+    # Ids are compared case-insensitively: the wallet stores what it resolved,
+    # the config stores what the operator typed.
+    assert _holding_for_asset(balances, "f322a205") == 0.35
+    assert _holding_for_asset(balances, "F322A205") == 0.35
+    # A true zero, not a failed lookup dressed up as one.
+    assert _holding_for_asset(balances, "deadbeef") == 0.0
+    assert _holding_for_asset({}, "xch") == 0.0
+
+
+def test_inventory_comes_from_the_wallet_not_the_state_gauge():
+    """xop_inventory_balance is published from State::get_all_positions(),
+
+    while reward receipts and wallet reconciliation update InventoryTracker
+    without synchronising State -- so the gauge can report a pre-change
+    balance until the engine restarts. The wallet RPC is authoritative.
+    """
+    from pathlib import Path
+    bridge = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "services", "engine_bridge.py").read_text(encoding="utf-8")
+    assert "_holding_for_asset(" in bridge
+    assert "inventory_units" in bridge
+    assert "get_inventory(base_id)" not in bridge, "still reading the gauge"
+
+
+def test_the_summary_query_is_queued_to_the_worker_thread():
+    """A lambda has no receiver, so Qt runs it in the EMITTING thread.
+
+    That put both SQLite aggregates on the UI thread every refresh, and left
+    the TTL update separately queued so the fetch could race it.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "services", "database_service.py").read_text(encoding="utf-8")
+    assert "_trigger_pair_summary.connect(self._worker.fetch_pair_summary_for)" in source
+    assert "lambda _ttl" not in source, "lambda connection is back"
