@@ -67,28 +67,17 @@ def test_both_entry_points_route_through_the_guard():
     assert source.count('_require_explicit("database", db_path)') == 2
 
 
-def test_the_gui_workers_pass_their_paths():
-    """The wallet and settings workers must forward what they are given."""
-    wallet = (REPO_ROOT / "gui" / "widgets" / "wallet_balances.py").read_text(
-        encoding="utf-8")
-    assert "config_path=self._config_path" in wallet
-    assert "db_path=self._db_path" in wallet
-
-    settings = (REPO_ROOT / "gui" / "widgets" / "settings.py").read_text(
-        encoding="utf-8")
-    assert "db_path=self._db_path" in settings
-    # And the widget must actually hand the worker its stored path.
-    assert "_SuggestedTargetsWorker(self._config_path," in settings
-
-
 def test_frozen_detection_does_not_sniff_the_path():
     """A checkout under a directory containing "_MEI" is not a bundle.
+
+    Behavioural coverage of the guard itself lives in
+    tests/test_sizing_path_wiring.py; this pins only that the DETECTION
+    does not consult the module path.
 
     Matching that substring made the documented no-argument CLI refuse to run
     beside a config.yaml and database that were both present.
     """
     sizing = _load_sizing()
-    assert sizing._FROZEN == bool(getattr(sys, "frozen", False))
     source = (REPO_ROOT / "scripts" / "offer_sizing.py").read_text(
         encoding="utf-8")
     detection = source.split("_FROZEN =")[1].split(chr(10))[0]

@@ -580,6 +580,12 @@ class EngineBridge(QObject):
         self._config_path = resolved
         success = self._config_svc.switch_path(resolved)
         if success:
+            # The database path is config-relative and was resolved ONCE at
+            # construction, so without this a switched config left _db_path
+            # pointing into the previous config's directory -- handing
+            # consumers a new config paired with the old database.
+            self._apply_configured_database_path()
+        if success:
             _log.info("Config path updated and reloaded.")
         else:
             self.error.emit(

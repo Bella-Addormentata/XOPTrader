@@ -426,12 +426,15 @@ class MainWindow(QMainWindow):
             # Re-query the DB-derived P&L display whenever the user resets
             # or clears the display baseline on the Settings page.
             settings.pnl_baseline_changed.connect(self._on_pnl_baseline_changed)
+        # Unconditionally, BEFORE the Settings-widget branch below: the
+        # wallet page needs these paths too, and SettingsWidget is a guarded
+        # import.  Nesting this inside that branch meant a failed Settings
+        # import silently left the calculator on its bundle-relative
+        # defaults -- exactly the fault this change exists to remove.
+        self._push_sizing_paths()
+
         if settings is not None and hasattr(settings, "load_config"):
             cfg_path = bridge.config_service.path
-            # The advisory offer-sizing calculator is loaded by path out of
-            # the application bundle, so it cannot derive config/database
-            # locations from its own __file__ -- hand it the resolved ones.
-            self._push_sizing_paths()
             if cfg_path.is_file():
                 settings.load_config(str(cfg_path))
             else:

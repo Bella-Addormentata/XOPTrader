@@ -60,7 +60,15 @@ _FROZEN = bool(getattr(sys, "frozen", False))
 
 
 def _require_explicit(kind: str, value):
-    """Return *value*, or explain why the bundled default cannot serve."""
+    """Return *value*, or explain why the bundled default cannot serve.
+
+    An empty or whitespace-only value counts as ABSENT, not as a path.  Both
+    call sites read ``_require_explicit(...) or DEFAULT``, so returning ""
+    here fell straight through to the bundle-relative default while frozen --
+    silently restoring the very failure this guard exists to prevent.
+    """
+    if isinstance(value, str) and not value.strip():
+        value = None
     if value is not None:
         return value
     if _FROZEN:
