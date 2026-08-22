@@ -1584,6 +1584,7 @@ class MainWindow(QMainWindow):
         if wallet is not None and hasattr(wallet, "set_sizing_paths"):
             wallet.set_sizing_paths(cfg, db)
 
+    @staticmethod
     def _create_page_widget(
         widget_class: Optional[type],
         fallback_label: str,
