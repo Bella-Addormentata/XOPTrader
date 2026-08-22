@@ -271,3 +271,33 @@ def test_both_pairs_table_toggles_use_the_subclass():
         "a bare unlabeled QCheckBox in settings.py has no enlarged hit target"
     )
     assert source.count("HitTargetCheckBox()") == 2
+
+
+def test_the_row_probe_measures_the_style_production_uses(app):
+    """Both in-row buttons are #dangerButton, whose ID rule wins on weight.
+
+    Measuring a style the real control does not use would leave row height
+    depending on the two weights coincidentally sharing vertical metrics.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    real = QPushButton("Remove")
+    real.setObjectName("dangerButton")
+    real.setProperty("compact", True)
+    real.ensurePolished()
+
+    table = QTableWidget(1, 1)
+    theme.fit_row_height(table)
+    row = table.verticalHeader().defaultSectionSize()
+    assert row >= real.sizeHint().height(), (
+        f"row {row}px cannot hold its own button ({real.sizeHint().height()}px)"
+    )
+
+
+def test_the_danger_rule_is_documented_accurately():
+    """The comment claimed the ID rules set only colours; they set weight too."""
+    css = theme.get_stylesheet()
+    block = css.split("QPushButton#dangerButton {")[1].split("}")[0]
+    assert "font-weight" in block, "danger rule no longer sets weight"
+    from pathlib import Path
+    source = Path(theme.__file__).read_text(encoding="utf-8")
+    assert "those set only colours" not in source

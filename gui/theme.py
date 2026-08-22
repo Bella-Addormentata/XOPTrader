@@ -301,8 +301,12 @@ QPushButton#dangerButton:pressed {{
    sat on.  Opt out with the dynamic property compact=true.
 
    An attribute selector outranks the plain type selector above, and the
-   #dangerButton ID rules outrank both -- but those set only colours, so the
-   red variants keep their palette and pick up these metrics. */
+   #dangerButton ID rules outrank both.  Those ID rules set the palette AND
+   font-weight: 600, so the weight below is the one property here that a
+   danger button does NOT get; padding, min-height, border-radius and
+   font-size all apply.  (An earlier version of this comment claimed the ID
+   rules set only colours, which is wrong and would mislead the next person
+   sizing a control against them.) */
 QPushButton[compact="true"] {{
     padding: 1px 8px;
     min-height: 0px;
@@ -659,7 +663,14 @@ def fit_row_height(table) -> None:
     # guessing.  ResizeToContents would also fit, but it honours the
     # QTableView::item min-height (32px) and padding, inflating every row to
     # ~53px -- chunkier rows to solve a too-tall control, which is backwards.
+    # Measure the SAME style the production controls use.  Both in-row
+    # buttons are #dangerButton, whose ID rule wins on font-weight (600 vs
+    # the compact rule's 500).  Both weights happen to yield identical
+    # heights with the current font -- verified across every delta -- but
+    # measuring a style the real control does not use leaves the row height
+    # depending on that coincidence.
     probe = QPushButton("X")
+    probe.setObjectName("dangerButton")
     probe.setProperty("compact", True)
     probe.ensurePolished()
     needed = probe.sizeHint().height() + 4      # cell layout margins
