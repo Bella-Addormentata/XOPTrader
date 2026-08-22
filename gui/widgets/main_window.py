@@ -564,9 +564,6 @@ class MainWindow(QMainWindow):
             bot_log.error_detected.connect(self._on_bot_error)
 
     def _on_bridge_data(self, data: dict) -> None:
-        # Ownership of a pause can change without a status transition;
-        # keep the Resume control truthful on every tick.
-        self._refresh_pause_ownership()
         """Handle aggregated data snapshot from EngineBridge.
 
         Distributes metrics to dashboard, charts, status bar, and toolbar.
@@ -577,6 +574,9 @@ class MainWindow(QMainWindow):
             Aggregated snapshot with keys: pnl, health, offers, risk,
             market_data, trade_summary, config, bot_status.
         """
+        # Ownership of a pause can change without a status transition;
+        # keep the Resume control truthful on every tick.
+        self._refresh_pause_ownership()
         pnl = data.get("pnl", {})
         health = data.get("health", {})
 
@@ -1632,6 +1632,10 @@ class MainWindow(QMainWindow):
         protection gate has cleared.
         """
         if not self._bot_paused:
+            # Pause-scoped state: left stale, a protection-only pause that
+            # cleared would disable Resume on the NEXT GUI pause until a
+            # later tick recomputed the reasons.
+            self._gui_pause_owns_it = True
             return
         reasons = {"gui"}
         try:
