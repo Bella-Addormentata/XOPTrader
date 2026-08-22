@@ -193,7 +193,12 @@ OnChainReconciler::reconcile_balances(
                     ++missing_count;
                 }
             }
-            const Mojo diff = -missing_sum;
+            // Two distinct figures, kept separate: the AGGREGATE difference
+            // (context; positive surplus at reused addresses is normal) and
+            // the identity-matched MISSING sum (the alert condition).
+            // Folding the second into a field named like the first is how a
+            // report ends up printing arithmetic that does not add up.
+            const Mojo aggregate_diff = on_chain_total - wallet_spendable;
 
             if (missing_count > 0) {
                 BalanceDiscrepancy disc;
@@ -202,7 +207,9 @@ OnChainReconciler::reconcile_balances(
                 disc.wallet_confirmed  = wallet_confirmed;
                 disc.wallet_spendable  = wallet_spendable;
                 disc.on_chain_total    = on_chain_total;
-                disc.difference        = diff;
+                disc.difference        = aggregate_diff;
+                disc.missing_sum       = missing_sum;
+                disc.missing_count     = missing_count;
                 disc.on_chain_coin_count = on_chain_count;
                 discrepancies.push_back(disc);
 
@@ -215,10 +222,13 @@ OnChainReconciler::reconcile_balances(
                               wallet_spendable, on_chain_total,
                               wallet_confirmed, on_chain_count);
             } else {
-                logger_->info("reconcile_balances: wallet={} balance OK "
-                              "(every spendable coin found on-chain; "
-                              "{} mojos across {} coins)",
-                              label, wallet_spendable, wallet_coins.size());
+                // Normal outcome, including benign surplus at reused
+                // addresses: debug, not info -- an OK line per wallet per
+                // run is exactly the recurring noise this rework removes.
+                logger_->debug("reconcile_balances: wallet={} balance OK "
+                               "(every spendable coin found on-chain; "
+                               "{} mojos across {} coins)",
+                               label, wallet_spendable, wallet_coins.size());
             }
         } catch (const std::exception& e) {
             logger_->warn("reconcile_balances: failed for wallet {} ({}): {}",
