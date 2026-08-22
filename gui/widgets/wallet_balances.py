@@ -107,6 +107,63 @@ _SUGGESTED_ALLOC_TOOLTIP: Final[str] = (
 )
 
 
+def _fit_table_to_contents(table: QTableWidget) -> None:
+    """Size *table* to its rows so it never scrolls on its own.
+
+    This page is already inside a QScrollArea (main_window builds it with
+    scrollable=True), so a table that scrolls internally puts a second
+    scrollbar inside the first.  Nested scrollbars are worse than untidy: the
+    wheel acts on whichever widget happens to sit under the pointer, and rows
+    can stay hidden inside a panel that looks complete -- on a page whose
+    whole job is showing how much money is where.
+
+    Height is summed from the CURRENT row heights rather than a per-row
+    constant, so it follows whatever the rows actually measure.
+
+    That is deliberately a statement about row GEOMETRY, not about the UI
+    font-size setting: this widget pins its table and header fonts in local
+    QSS, which overrides the application stylesheet, so changing that setting
+    does not move these rows at all today (tracked as S10 in TODO.md).
+    The fit is correct either way -- it reads the rows rather than assuming
+    a height -- but it must not be read as evidence that the accessibility
+    setting reaches this page.
+    """
+    table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+    rows = sum(
+        table.rowHeight(r)
+        for r in range(table.rowCount())
+        if not table.isRowHidden(r)
+    )
+    header = table.horizontalHeader().height()
+
+    # Reserve the HORIZONTAL scrollbar when it is showing.  Stretch mode does
+    # not rule one out: sections still honour minimumSectionSize, so a narrow
+    # enough window brings the bar back -- reproduced at a 300px table width.
+    # Since the vertical bar is off, any height it steals clips the last row
+    # outright instead of becoming scrollable.
+    # Reserve from the RANGE, not from isVisible().  This page normally sits
+    # hidden in the stack while balance updates keep arriving, and a hidden
+    # widget reports isVisible() False even once its content overflows --
+    # measured: range 0..1 while hidden, then the bar appears on opening with
+    # no further rangeChanged to trigger a refit, leaving the last row
+    # clipped.  A nonzero range means the content overflows, hidden or not.
+    hbar = table.horizontalScrollBar()
+    overflows = bool(hbar) and hbar.maximum() > hbar.minimum()
+    reserved = hbar.sizeHint().height() if overflows else 0
+
+    wanted = header + rows + 2 * table.frameWidth() + reserved
+    if table.height() != wanted:
+        # Guarded: setFixedHeight can itself change the scroll range, and an
+        # unguarded refit on that signal would recurse.
+        table.setFixedHeight(wanted)
+
+    if not table.property("_refit_connected"):
+        table.setProperty("_refit_connected", True)
+        # The bar appears and disappears as the window is resized, so the
+        # reservation has to be re-evaluated when the range changes.
+        hbar.rangeChanged.connect(lambda *_: _fit_table_to_contents(table))
+
+
 class _SuggestedAllocationWorker(QObject):
     """Computes the advisory per-asset portfolio allocation off the UI
     thread (dexie HTTP fetch + read-only SQLite reads), following the
@@ -302,7 +359,9 @@ class WalletBalancesWidget(QWidget):
             }}
             """
         )
-        root.addWidget(self._table, stretch=1)
+        # No stretch: the table now takes exactly its content height and the
+        # page's own scroll area supplies the scrolling.
+        root.addWidget(self._table)
 
         # -- Target allocation panel --
         self._alloc_frame = QFrame()
@@ -436,6 +495,17 @@ class WalletBalancesWidget(QWidget):
         )
         root.addWidget(self._status_label)
 
+        # Absorbs the leftover space when the tables are short; without it
+        # the fixed-height panels would spread down the page.
+        root.addStretch(1)
+
+        # Fit them EMPTY too.  This page starts with no wallet data -- the
+        # main window forwards an empty mapping on startup -- and an unfitted
+        # table keeps its ~480px default size hint, so the page would open
+        # with a large outer scroll range holding nothing.
+        _fit_table_to_contents(self._table)
+        _fit_table_to_contents(self._alloc_table)
+
     def _make_summary_card(
         self, title: str, value: str, layout: QHBoxLayout
     ) -> QLabel:
@@ -491,6 +561,9 @@ class WalletBalancesWidget(QWidget):
             self._status_label.setText(
                 "No wallet data — check Chia wallet connection"
             )
+            # Returning here skips the fit at the end of this method, so the
+            # table must be sized on the way out as well.
+            _fit_table_to_contents(self._table)
             return
 
         self._table.setRowCount(len(balances))
@@ -573,6 +646,7 @@ class WalletBalancesWidget(QWidget):
         self._status_label.setText(
             f"Last update: {len(balances)} wallet(s) loaded"
         )
+        _fit_table_to_contents(self._table)
         self._refresh_deployed_view()
         self._refresh_allocation_table()
 
@@ -964,6 +1038,7 @@ class WalletBalancesWidget(QWidget):
 
         if not all_assets:
             self._alloc_table.setRowCount(0)
+            _fit_table_to_contents(self._alloc_table)
             self._alloc_sum_label.setText("Target sum: —")
             self._alloc_hint_label.setText("No wallets detected yet")
             return
@@ -1040,6 +1115,7 @@ class WalletBalancesWidget(QWidget):
                 self._alloc_table.setItem(row, col, item)
 
         self._alloc_updating = False
+        _fit_table_to_contents(self._alloc_table)
         self._update_allocation_sum_status()
         unpriced = sorted(all_assets - set(current_values))
         if total_value <= 0.0:
@@ -1462,6 +1538,8 @@ class WalletBalancesWidget(QWidget):
         """Reset the widget to its initial empty state."""
         self._table.setRowCount(0)
         self._alloc_table.setRowCount(0)
+        _fit_table_to_contents(self._table)
+        _fit_table_to_contents(self._alloc_table)
         self._target_allocations.clear()
         self._target_tolerances.clear()
         self._last_balances = {}
