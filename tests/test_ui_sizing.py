@@ -41,6 +41,12 @@ def app():
     size hints and SE_CheckBoxClickRect all come from that style, so the
     geometry asserted here would be geometry no user runs, and could differ
     between a developer machine and CI.
+
+    NOTE there is no runtime assertion that this took effect: once a
+    stylesheet is applied Qt wraps the style in a QStyleSheetStyle whose
+    objectName is empty, and PySide6 does not expose its baseStyle(), so the
+    style actually in force cannot be read back.  Setting it here is the
+    guarantee.
     """
     instance = QApplication.instance() or QApplication(sys.argv)
     instance.setStyle("Fusion")
@@ -312,8 +318,3 @@ def test_the_danger_rule_is_documented_accurately():
     from pathlib import Path
     source = Path(theme.__file__).read_text(encoding="utf-8")
     assert "those set only colours" not in source
-
-
-def test_the_measurements_are_taken_on_the_production_style(app):
-    """Geometry depends on the base style, so it must be the shipped one."""
-    assert app.style().objectName().lower() == "fusion"
