@@ -12127,10 +12127,15 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // the wallet-circuit and flash-crash gates stopped posting for hours
     // with no operator surface at all.
     metrics_->update_bot_paused(gui_pause_active_);
+    // dry_run_ is included: step_manage_offers returns unconditionally
+    // without posting in dry-run, and a gauge claiming "actually posting"
+    // there would be false every cycle.  Transient in-step aborts (e.g.
+    // the wallet not yet synced this cycle) are documented as outside the
+    // gauge's contract rather than silently misrepresented.
     metrics_->update_posting_gated(
         gui_pause_active_ || breaker_pause_active_ || wallet_circuit_open_
         || flash_crash_state_ != FlashCrashState::Normal
-        || xch_recovery_mode_);
+        || xch_recovery_mode_ || dry_run_);
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {

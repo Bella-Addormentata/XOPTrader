@@ -331,11 +331,12 @@ void MetricsExporter::register_metrics()
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
-        .Help("1 when offer posting is disabled for ANY reason -- GUI "
+        .Help("1 when offer posting is disabled by a standing gate -- GUI "
               "pause, a latched risk breaker (max-drawdown, rolling-window "
               "loss, ledger divergence), the wallet circuit breaker, a "
-              "flash-crash episode, or XCH recovery mode -- 0 when the "
-              "engine is actually posting")
+              "flash-crash episode, XCH recovery mode, or dry-run.  0 means "
+              "no standing gate; transient per-cycle aborts (e.g. wallet "
+              "not yet synced) are not reflected here")
         .Register(*registry_)
         .Add({});
 
@@ -697,9 +698,13 @@ void MetricsExporter::update_stuck_offers(int count)
 
 void MetricsExporter::update_posting_gated(bool gated)
 {
-    if (posting_gated_gauge_) {
-        posting_gated_gauge_->Set(gated ? 1.0 : 0.0);
-    }
+    // Same locked lifecycle check as every neighbouring updater: shutdown()
+    // resets registry_ under this mutex, destroying the gauge, so an
+    // unguarded update racing shutdown dereferences a stale pointer.
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+
+    posting_gated_gauge_->Set(gated ? 1.0 : 0.0);
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

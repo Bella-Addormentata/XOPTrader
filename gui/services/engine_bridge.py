@@ -806,8 +806,14 @@ class EngineBridge(QObject):
         if new_status == STATUS_RUNNING and self._metrics_svc.is_analysis_active():
             new_status = STATUS_ANALYZING
 
-        # Check if the engine has been paused via GUI pause flag.
-        if new_status in (STATUS_RUNNING, STATUS_ANALYZING) and self._metrics_svc.is_paused():
+        # Any standing posting gate surfaces as Paused: the GUI-only gauge
+        # meant a breaker pause left the status at Running, so the window's
+        # ownership branch (Resume enabled or not) was dead code and the
+        # display lied.  The window distinguishes WHO owns the pause via
+        # is_paused(); posting_gated() covers breakers, wallet circuit,
+        # flash-crash, XCH recovery and dry-run as well.
+        if (new_status in (STATUS_RUNNING, STATUS_ANALYZING)
+                and self._metrics_svc.posting_gated()):
             new_status = STATUS_PAUSED
 
         self._update_status(new_status)

@@ -872,7 +872,10 @@ class MainWindow(QMainWindow):
                 pass
             self._gui_pause_owns_it = gui_flag
             if not gui_flag:
-                self._bot_status_label.setText("Paused (breaker)")
+                # Owned by a breaker or protection gate (flash-crash,
+                # wallet circuit, recovery, dry-run) -- not by the GUI
+                # flag, so Resume cannot clear it.
+                self._bot_status_label.setText("Paused (protection)")
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
             self._bot_running = False
