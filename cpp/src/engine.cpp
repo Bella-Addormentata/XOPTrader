@@ -12119,12 +12119,15 @@ void Engine::step_export_metrics(BlockHeight block_height)
     risk.max_drawdown = total.max_drawdown;
     metrics_->update_risk(risk, {});
 
-    // Paused state gauge: the operator-facing question this answers is
-    // "is the bot posting offers?", so it must reflect EVERY posting gate,
-    // not a favoured subset.  The audit found two gates with no operator
-    // surface at all: the wallet circuit breaker and the flash-crash latch
-    // each stopped posting for hours while this gauge read 0.
-    metrics_->update_bot_paused(
+    // Two gauges with two contracts, per review.  xop_bot_paused is
+    // COMMAND-side: the GUI flag, the one pause the Resume button can
+    // clear -- folding breaker state into it made the GUI offer a resume
+    // that could not work.  xop_posting_gated is STATE-side: every gate on
+    // Step 8, answering "is the bot actually posting?" -- the audit found
+    // the wallet-circuit and flash-crash gates stopped posting for hours
+    // with no operator surface at all.
+    metrics_->update_bot_paused(gui_pause_active_);
+    metrics_->update_posting_gated(
         gui_pause_active_ || breaker_pause_active_ || wallet_circuit_open_
         || flash_crash_state_ != FlashCrashState::Normal
         || xch_recovery_mode_);

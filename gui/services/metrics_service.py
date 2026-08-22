@@ -673,11 +673,10 @@ class MetricsService(QObject):
         return _scalar(m, "xop_fees_paid_24h_mojos")
 
     def is_paused(self) -> bool:
-        """Return whether the engine is paused by GUI flag.
+        """Whether the GUI pause flag is active (the pause Resume can clear).
 
-        Returns
-        -------
-        bool
+        Command-side state only.  For "is the engine actually posting?",
+        use :meth:`posting_gated`.
         """
         with QMutexLocker(self._mutex):
             m = self._latest
@@ -686,6 +685,23 @@ class MetricsService(QObject):
         for _labels, value in inner.items():
             return value >= 1.0
         return False
+
+    def posting_gated(self) -> bool:
+        """Whether offer posting is disabled for ANY reason.
+
+        Reads ``xop_posting_gated`` (GUI pause, risk breakers, wallet
+        circuit breaker, flash-crash, XCH recovery).  Falls back to the
+        GUI-pause gauge against an engine that predates the split, which
+        understates gating exactly as that engine itself did.
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        inner = m.get("xop_posting_gated")
+        if inner:
+            for _labels, value in inner.items():
+                return value >= 1.0
+        return self.is_paused()
 
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.
