@@ -577,6 +577,14 @@ class MainWindow(QMainWindow):
         # Status bar update.
         pnl_total = int(pnl.get("total", 0))
         block_height = int(health.get("block_height", 0))
+        # The orders panels' Age (blocks) column: set_current_block existed
+        # with no caller, so _current_block stayed 0 and every age rendered
+        # as 0 since the panel was built.
+        if block_height > 0:
+            for panel in (self._order_panel, self._tab_order_panel):
+                target = self._unwrap(panel)
+                if target is not None and hasattr(target, "set_current_block"):
+                    target.set_current_block(block_height)
 
         # Compute average spread from all pairs.
         market_data = data.get("market_data", {})
