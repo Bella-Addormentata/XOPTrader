@@ -85,7 +85,7 @@ def test_our_book_query_excludes_never_resolved_rows():
         "gui", "services", "database_service.py").read_text(encoding="utf-8")
     body = source.split("def fetch_pair_summary")[1].split("def fetch_reports")[0]
     assert "created_at >= ?" in body, "our-book query has no recency window"
-    assert "_OUR_BOOK_WINDOW_H" in body
+    assert "our_book_window_hours(" in body, "window is not TTL-derived"
 
 
 def test_the_two_tables_use_their_own_timestamp_formats():
@@ -248,6 +248,44 @@ def test_the_pairs_table_is_actually_connected():
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
     assert "pair_summary_loaded.connect(self._on_pair_summary)" in source
-    assert "db.query_pair_summary()" in source
+    assert "db.query_pair_summary(" in source
     # And something must actually push rows into the widget.
     assert "dashboard.update_pairs_table(" in source
+
+
+def test_the_book_window_follows_the_configured_ttl():
+    """A fixed window has a false-negative mode.
+
+    The engine permits an offer until a hard TTL of 2x the configured value,
+    and Settings allows up to 1000 blocks (~10.4h), so a legitimately resting
+    quote would age out of a fixed 6h window and its side would wrongly show
+    as absent.
+    """
+    from gui.services.database_service import our_book_window_hours
+
+    # Never narrower than the floor, whatever the config says.
+    assert our_book_window_hours(0) >= 6.0
+    assert our_book_window_hours(None) >= 6.0
+
+    for ttl in (400, 1000):
+        hard_ttl_hours = ttl * 2 * 18.75 / 3600.0
+        assert our_book_window_hours(ttl) > hard_ttl_hours, (
+            f"ttl={ttl}: window would hide an offer still inside its hard TTL"
+        )
+    # And it must actually widen, not sit at the floor for every setting.
+    assert our_book_window_hours(1000) > our_book_window_hours(400)
+
+
+def test_the_usd_rate_is_not_taken_from_a_stale_fallback():
+    """The table refuses a last_trade mid; the P&L conversion must too.
+
+    Otherwise a months-old fill reappears as a dollar figure, which is worse
+    for looking authoritative.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    block = source.split("xch_usd = 0.0")[1].split("self._last_market_data")[0]
+    assert 'mid_price_source' in block and "continue" in block, (
+        "the XCH/USD rate still accepts a last_trade backfill"
+    )

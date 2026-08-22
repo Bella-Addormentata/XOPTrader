@@ -369,7 +369,15 @@ class MainWindow(QMainWindow):
         if hasattr(db, "pair_summary_loaded"):
             db.pair_summary_loaded.connect(self._on_pair_summary)
         if hasattr(db, "query_pair_summary"):
-            db.query_pair_summary()
+            ttl_blocks = 0
+            try:
+                cfg = bridge.config_service.get_full_config() or {}
+                ttl_blocks = int(
+                    (cfg.get("strategy") or {}).get("offer_ttl_blocks", 0) or 0
+                )
+            except Exception:      # config not loaded yet; the default applies
+                ttl_blocks = 0
+            db.query_pair_summary(ttl_blocks)
         # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
         # Balances tab's Deployed % column and summary line.
         _wallet_widget = self._unwrap(self._wallet_balances)
@@ -536,6 +544,12 @@ class MainWindow(QMainWindow):
         for pair_key in ("XCH/wUSDC.b", "XCH/wUSDC"):
             pair_md = market_data.get(pair_key, {})
             mid = pair_md.get("mid_price", 0.0)
+            # A last_trade backfill is NOT a live rate.  The pairs table
+            # already refuses to show one as a Mid Price; converting P&L to
+            # dollars with the same months-old fill would reintroduce it as a
+            # headline number, which is worse for being denominated in $.
+            if str(pair_md.get("mid_price_source", "")) == "last_trade":
+                continue
             if mid > 0:
                 xch_usd = mid / 1_000_000_000_000.0
                 break

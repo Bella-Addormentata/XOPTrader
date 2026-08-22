@@ -97,15 +97,43 @@ def _mojos_per_unit(symbol: str) -> float:
 # Worker -- runs queries on a background QThread
 # ===================================================================
 
-#: How far back a 'pending' offer_log row still counts as our live quote.
-#: Wide enough for a quiet pair between re-quotes, short enough to exclude
-#: never-resolved rows days old.  A side with nothing recent is reported as
-#: absent rather than as an old price.
+#: Fallback window for "is this pending row still our live quote", used when
+#: the caller supplies no TTL-derived value.
 #:
 #: Module scope, not a class attribute: a bare name inside a method does NOT
 #: resolve from the enclosing class namespace, so referring to it that way
 #: raised NameError before either query ran and left the table empty.
-_OUR_BOOK_WINDOW_H: int = 6
+_OUR_BOOK_WINDOW_H: float = 6.0
+
+#: Mainnet target block time, for converting a block-denominated TTL to a
+#: wall-clock window.
+_SECONDS_PER_BLOCK: float = 18.75
+
+#: Safety factor on the derived window.  The engine permits an offer until a
+#: HARD ttl of 2x the configured soft TTL, and block time is a target rather
+#: than a guarantee, so the window must sit comfortably beyond both.
+_BOOK_WINDOW_SAFETY: float = 1.5
+
+
+def our_book_window_hours(offer_ttl_blocks: int | None) -> float:
+    """Hours a 'pending' row may age before it stops counting as our quote.
+
+    Derived from the configured TTL rather than fixed, because a fixed window
+    has a false-negative mode: Settings allows offer_ttl_blocks up to 1000,
+    whose 2x hard TTL is ~10.4h, so a legitimately resting quote would age
+    out of a 6h window and its side would render as absent.
+
+    NOTE the limitation this does not solve: age cannot distinguish a ghost
+    row from a live offer.  offer_log holds rows still marked 'pending' that
+    were never resolved (oldest here: 2026-08-08), and only the offer
+    reconciliation path can authoritatively retire those -- tracked as S11.
+    This window is a display heuristic sized so it never hides a valid quote.
+    """
+    if not offer_ttl_blocks or offer_ttl_blocks <= 0:
+        return _OUR_BOOK_WINDOW_H
+    hard_ttl_blocks = offer_ttl_blocks * 2
+    hours = (hard_ttl_blocks * _SECONDS_PER_BLOCK / 3600.0) * _BOOK_WINDOW_SAFETY
+    return max(_OUR_BOOK_WINDOW_H, hours)
 
 
 class _DatabaseWorker(QObject):
@@ -136,6 +164,9 @@ class _DatabaseWorker(QObject):
         super().__init__(parent)
         self._conn: Optional[sqlite3.Connection] = None
         self._db_path: str = ""
+        #: Configured offer TTL in blocks, supplied by the caller so the
+        #: live-quote window tracks the setting instead of a magic constant.
+        self._book_ttl_blocks: int = 0
 
     # -- Connection management ----------------------------------------------
 
@@ -698,6 +729,11 @@ class _DatabaseWorker(QObject):
             "pending_offers": pending_total,
         })
 
+    @Slot(int)
+    def set_book_ttl_blocks(self, blocks: int) -> None:
+        """Record the configured offer TTL used to size the live-quote window."""
+        self._book_ttl_blocks = int(blocks or 0)
+
     @Slot()
     def fetch_pair_summary(self) -> None:
         """Per-pair view of OUR OWN book and fills, for the dashboard table.
@@ -725,8 +761,9 @@ class _DatabaseWorker(QObject):
         # created_at here is space-separated ("2026-08-21 20:46:24"), NOT the
         # ISO form trade_log uses; the cutoff below must match this table's
         # format or the text comparison silently misbehaves.
+        window_h = our_book_window_hours(self._book_ttl_blocks)
         book_cutoff = (
-            datetime.now(timezone.utc) - timedelta(hours=_OUR_BOOK_WINDOW_H)
+            datetime.now(timezone.utc) - timedelta(hours=window_h)
         ).strftime("%Y-%m-%d %H:%M:%S")
         book = self._execute_query(
             """
@@ -1438,7 +1475,7 @@ class DatabaseService(QObject):
     _trigger_pnl_display = Signal(str)
     _trigger_pnl_history = Signal(int)
     _trigger_deployed = Signal()
-    _trigger_pair_summary = Signal()
+    _trigger_pair_summary = Signal(int)
     _trigger_last_trade_prices = Signal()
 
     def __init__(
@@ -1491,7 +1528,9 @@ class DatabaseService(QObject):
         self._trigger_pnl_display.connect(self._worker.fetch_pnl_display)
         self._trigger_pnl_history.connect(self._worker.fetch_pnl_history)
         self._trigger_deployed.connect(self._worker.fetch_deployed_capital)
-        self._trigger_pair_summary.connect(self._worker.fetch_pair_summary)
+        self._trigger_pair_summary.connect(self._worker.set_book_ttl_blocks)
+        self._trigger_pair_summary.connect(
+            lambda _ttl: self._worker.fetch_pair_summary())
         self._trigger_last_trade_prices.connect(self._worker.fetch_last_trade_prices)
 
         # -- Auto-refresh timer ---------------------------------------------
@@ -1511,6 +1550,7 @@ class DatabaseService(QObject):
         # keeps it current once the Balances tab has asked for it.
         self._deployed_requested: bool = False
         self._pair_summary_requested: bool = False
+        self._book_ttl_blocks: int = 0
         # Same for the Orders panel's whole-table offer aggregates.
         self._offer_summary_requested: bool = False
 
@@ -1724,15 +1764,19 @@ class DatabaseService(QObject):
             self._deployed_requested = True
         self._trigger_deployed.emit()
 
-    def query_pair_summary(self) -> None:
+    def query_pair_summary(self, offer_ttl_blocks: int = 0) -> None:
         """Request the per-pair view of our own book and fills.
 
         Results arrive on :pyattr:`pair_summary_loaded`.  Re-issued on every
         auto-refresh tick once requested, like the Deployed % figures.
+
+        ``offer_ttl_blocks`` sizes the window in which a pending row still
+        counts as our live quote; see :func:`our_book_window_hours`.
         """
         with QMutexLocker(self._mutex):
             self._pair_summary_requested = True
-        self._trigger_pair_summary.emit()
+            self._book_ttl_blocks = int(offer_ttl_blocks or 0)
+        self._trigger_pair_summary.emit(int(offer_ttl_blocks or 0))
 
     def query_last_trade_prices(self) -> None:
         """Request the most recent fill price per pair.
@@ -1797,7 +1841,7 @@ class DatabaseService(QObject):
 
         # Keep the dashboard's per-pair table current.
         if pair_summary_requested:
-            self._trigger_pair_summary.emit()
+            self._trigger_pair_summary.emit(self._book_ttl_blocks)
 
         # Also refresh the trade summary on each tick.
         self._trigger_summary.emit()
