@@ -564,6 +564,9 @@ class MainWindow(QMainWindow):
             bot_log.error_detected.connect(self._on_bot_error)
 
     def _on_bridge_data(self, data: dict) -> None:
+        # Ownership of a pause can change without a status transition;
+        # keep the Resume control truthful on every tick.
+        self._refresh_pause_ownership()
         """Handle aggregated data snapshot from EngineBridge.
 
         Distributes metrics to dashboard, charts, status bar, and toolbar.
@@ -861,20 +864,7 @@ class MainWindow(QMainWindow):
             colour = _C.WARNING_YELLOW
             self._bot_running = True
             self._bot_paused = True
-            # Which pause?  Resume can only clear the GUI flag, so it is
-            # offered only when the GUI flag is the SOLE active gate: with
-            # a breaker latched alongside it, removing the flag would leave
-            # posting gated while the button claimed success.
-            reasons = {"gui"}
-            try:
-                if self._bridge is not None:
-                    reasons = (self._bridge.metrics_service
-                               .posting_gate_reasons() - {"dry_run"})
-            except Exception:
-                pass
-            self._gui_pause_owns_it = (reasons == {"gui"} or not reasons)
-            if not self._gui_pause_owns_it:
-                self._bot_status_label.setText("Paused (protection)")
+            self._refresh_pause_ownership()
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
             self._bot_running = False
@@ -1628,6 +1618,36 @@ class MainWindow(QMainWindow):
         # Keep File menu items in sync with the toolbar button.
         self._act_start_trading.setEnabled(not self._bot_running)
         self._act_stop_trading.setEnabled(self._bot_running)
+
+    def _refresh_pause_ownership(self) -> None:
+        """Recompute who owns the current pause, and re-arm the controls.
+
+        Called from the Paused status branch AND from every bridge data
+        tick: the gate-reason set can change while the status STRING stays
+        "Paused" (a breaker trips under an existing GUI pause, or a
+        flash-crash/wallet-circuit gate clears at runtime), and the bridge
+        emits bot_status_changed only on string transitions -- so a
+        transition-only snapshot goes stale in both directions: Resume
+        left enabled over a latched breaker, or left disabled after the
+        protection gate has cleared.
+        """
+        if not self._bot_paused:
+            return
+        reasons = {"gui"}
+        try:
+            if self._bridge is not None:
+                reasons = (self._bridge.metrics_service
+                           .posting_gate_reasons() - {"dry_run"})
+        except Exception:
+            pass
+        owns = (reasons == {"gui"} or not reasons)
+        if owns != getattr(self, "_gui_pause_owns_it", True):
+            self._gui_pause_owns_it = owns
+            self._act_resume_trading.setEnabled(self._bot_paused and owns)
+            self._pause_resume_btn.setEnabled(self._bot_paused and owns)
+        self._gui_pause_owns_it = owns
+        self._bot_status_label.setText(
+            "Paused" if owns else "Paused (protection)")
 
     def _style_pause_resume_button(self) -> None:
         """Apply the correct colour and label to the pause/resume button."""
