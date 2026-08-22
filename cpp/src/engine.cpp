@@ -1711,19 +1711,25 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
-    } else if (state_->status() == BotStatus::Paused) {
-        // The max-drawdown breaker (Step 13) sets BotStatus::Paused and its
-        // comment promises this "stops new offer creation in subsequent
-        // cycles" -- but nothing here ever read that status, so the promise
-        // held only while some OTHER gate happened to be active.  Observed
-        // 2026-08-22: breaker tripped 04:43 and posting stopped -- because
-        // the flash-crash latch was engaged at the same moment; when that
-        // cleared at 11:55 the engine resumed quoting for 2.5 hours while
-        // alerting "engine PAUSED. Manual intervention required" every 15
-        // minutes.  A breaker whose pause does not pause is worse than no
-        // breaker, because the operator stands down believing it worked.
-        spdlog::warn("[Engine] Step 8 SKIPPED: BotStatus is Paused "
-                     "(circuit breaker) -- no new offers posted");
+    } else if (breaker_pause_active_) {
+        // A dedicated flag, not BotStatus.  Two reasons, both observed on
+        // 2026-08-22.  First, nothing in this path ever read BotStatus, so
+        // the max-drawdown "pause" only held while the flash-crash latch
+        // happened to be engaged; when that cleared, the engine resumed
+        // quoting for 2.5 hours while alerting "engine PAUSED" every 15
+        // minutes.  Second, BotStatus cannot carry breaker state anyway:
+        // check_pause_flag() flips any Paused back to Running when the GUI
+        // flag is removed, without knowing who owns the pause -- so a GUI
+        // toggle would silently override a tripped breaker.  This flag is
+        // set by every risk breaker and cleared only by restart, which is
+        // what "manual intervention required" already means here.
+        if (!breaker_skip_warned_) {
+            spdlog::warn("[Engine] Step 8 SKIPPED: risk breaker pause is "
+                         "active -- no new offers until restart");
+            breaker_skip_warned_ = true;
+        } else {
+            spdlog::debug("[Engine] Step 8 SKIPPED: risk breaker pause");
+        }
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
         try {
             co_await step_manage_offers(block_height);
@@ -11581,6 +11587,8 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
                           asset.substr(0, 12));
             state_->set_status(BotStatus::Paused);
+            breaker_pause_active_ = true;
+            breaker_skip_warned_  = false;
             alerts_->send_alert(AlertRule::CircuitBreaker,
                 msg + " Engine PAUSED. Manual reconciliation required.");
         }
@@ -12204,6 +12212,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 // subsequent cycles while keeping connections open for
                 // monitoring.
                 state_->set_status(BotStatus::Paused);
+            breaker_pause_active_ = true;
+            breaker_skip_warned_  = false;
             }
 
             if (breaker_realert_gate_.should_alert(
@@ -12319,6 +12329,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                                  : anchor_fallback_usd);
 
                 state_->set_status(BotStatus::Paused);
+            breaker_pause_active_ = true;
+            breaker_skip_warned_  = false;
 
                 alerts_->send_alert(AlertRule::CircuitBreaker,
                     "Rolling-window circuit breaker triggered: lost $" +
