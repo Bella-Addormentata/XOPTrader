@@ -1639,8 +1639,9 @@ RiskConfig parse_risk(const YAML::Node& root)
             && !node["flash_crash_window_blocks"].IsNull()) {
         int64_t v = node["flash_crash_window_blocks"].as<int64_t>();
         if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
-            throw ConfigError(sec + ".flash_crash_window_blocks must be >= 0; got "
-                              + std::to_string(v));
+            throw ConfigError(sec + ".flash_crash_window_blocks must be in [0, "
+                              + std::to_string(std::numeric_limits<uint32_t>::max())
+                              + "]; got " + std::to_string(v));
         }
         cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
     }
