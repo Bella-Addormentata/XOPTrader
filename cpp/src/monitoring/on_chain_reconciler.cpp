@@ -50,7 +50,16 @@ OnChainReconciler::reconcile_balances(
 {
     std::vector<BalanceDiscrepancy> discrepancies;
 
+    // The caller labels wallets per PAIR/side, so one physical wallet (the
+    // XCH wallet backs every XCH pair) arrives several times under
+    // different labels.  Reconciling it once is correct; re-reporting the
+    // same wallet four times per run was a quarter of this monitor's noise.
+    std::unordered_set<std::int64_t> seen_wallet_ids;
+
     for (const auto& [label, wid] : wallet_ids) {
+        if (!seen_wallet_ids.insert(wid).second) {
+            continue;
+        }
         try {
             // Step 1: Get wallet-reported balance.
             auto bal_json = co_await wallet_->get_wallet_balance(wid);
@@ -63,11 +72,17 @@ OnChainReconciler::reconcile_balances(
             // Step 2: Get spendable coins from wallet to collect puzzle hashes.
             auto coins_json = co_await wallet_->get_spendable_coins(wid);
 
-            // Collect unique puzzle hashes from our coins.
+            // Collect unique puzzle hashes from our coins, and sum the
+            // spendable amounts: that sum is the only figure the address
+            // set below can honestly be compared against.
             std::unordered_set<std::string> puzzle_hashes;
+            Mojo wallet_spendable = 0;
             for (const auto& coin_rec : coins_json) {
                 const auto& coin_obj = coin_rec.contains("coin")
                     ? coin_rec["coin"] : coin_rec;
+                if (coin_obj.contains("amount")) {
+                    wallet_spendable += coin_obj["amount"].get<Mojo>();
+                }
                 if (coin_obj.contains("puzzle_hash")) {
                     std::string ph =
                         coin_obj["puzzle_hash"].get<std::string>();
@@ -113,28 +128,53 @@ OnChainReconciler::reconcile_balances(
                 }
             }
 
-            // Step 4: Compare.
-            Mojo diff = on_chain_total - wallet_confirmed;
+            // Step 4: Compare LIKE FOR LIKE.
+            //
+            // The old comparison -- on-chain coins at SPENDABLE-derived
+            // addresses versus confirmed_wallet_balance -- was structurally
+            // apples-to-oranges for a market maker: confirmed includes
+            // coins locked in open offers, whose addresses never enter the
+            // scan while all their coins are locked.  Every run reported
+            // the same phantom shortfalls (~7,800 warnings, ~100% false)
+            // and the one real divergence in the log was buried by them.
+            //
+            // The address set is derived from the spendable coins, so the
+            // honest baseline is the spendable SUM.  On-chain may hold
+            // MORE at those addresses (locked or change coins sharing a
+            // reused address) -- normal here, logged at debug.  What must
+            // never happen is the chain holding LESS than the wallet
+            // believes spendable: those coins do not exist, and acting on
+            // them will fail.  That is the direction this monitor alerts.
+            Mojo diff = on_chain_total - wallet_spendable;
 
-            if (diff != 0) {
+            if (diff < 0) {
                 BalanceDiscrepancy disc;
                 disc.wallet_label      = label;
                 disc.wallet_id         = wid;
                 disc.wallet_confirmed  = wallet_confirmed;
+                disc.wallet_spendable  = wallet_spendable;
                 disc.on_chain_total    = on_chain_total;
                 disc.difference        = diff;
                 disc.on_chain_coin_count = on_chain_count;
                 discrepancies.push_back(disc);
 
-                logger_->warn("reconcile_balances: DISCREPANCY wallet={} "
-                              "wallet_confirmed={} on_chain={} diff={} "
-                              "({} coins on-chain)",
-                              label, wallet_confirmed, on_chain_total,
-                              diff, on_chain_count);
+                logger_->warn("reconcile_balances: SHORTFALL wallet={} "
+                              "spendable={} on_chain={} diff={} "
+                              "(confirmed={} for context, {} coins on-chain)"
+                              " -- the chain is missing coins the wallet "
+                              "counts as spendable",
+                              label, wallet_spendable, on_chain_total,
+                              diff, wallet_confirmed, on_chain_count);
+            } else if (diff > 0) {
+                // Locked or change coins sharing a reused address: expected
+                // for a market maker with open offers, not an alert.
+                logger_->debug("reconcile_balances: wallet={} on-chain "
+                               "exceeds spendable by {} (locked/change at "
+                               "shared addresses)", label, diff);
             } else {
                 logger_->info("reconcile_balances: wallet={} balance OK "
-                              "({} mojos, {} coins)",
-                              label, wallet_confirmed, on_chain_count);
+                              "({} mojos spendable, {} coins)",
+                              label, wallet_spendable, on_chain_count);
             }
         } catch (const std::exception& e) {
             logger_->warn("reconcile_balances: failed for wallet {} ({}): {}",

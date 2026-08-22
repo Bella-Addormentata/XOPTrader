@@ -55,9 +55,10 @@ using json = nlohmann::json;
 struct BalanceDiscrepancy {
     std::string wallet_label;        ///< Human-readable label (e.g. "xch", asset_id).
     std::int64_t wallet_id{0};       ///< Wallet RPC wallet ID.
-    Mojo wallet_confirmed{0};        ///< Balance reported by wallet RPC.
-    Mojo on_chain_total{0};          ///< Sum of unspent coins from full node.
-    Mojo difference{0};              ///< on_chain - wallet (positive = wallet under-reports).
+    Mojo wallet_confirmed{0};        ///< confirmed_wallet_balance, for context only.
+    Mojo wallet_spendable{0};        ///< Sum of the SPENDABLE coins scanned.
+    Mojo on_chain_total{0};          ///< Unspent coins at those coins' addresses.
+    Mojo difference{0};              ///< on_chain - spendable (negative = the chain is MISSING coins the wallet counts).
     std::size_t on_chain_coin_count{0}; ///< Number of unspent coins found.
 };
 

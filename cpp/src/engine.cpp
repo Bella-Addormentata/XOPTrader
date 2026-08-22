@@ -8938,11 +8938,11 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                                  "found {} balance discrepancies",
                                  balance_discreps.size());
                     for (const auto& d : balance_discreps) {
-                        spdlog::warn("  {} (wid={}): wallet={} on_chain={} "
-                                     "diff={}",
+                        spdlog::warn("  {} (wid={}): spendable={} "
+                                     "on_chain={} diff={} (confirmed={})",
                                      d.wallet_label, d.wallet_id,
-                                     d.wallet_confirmed, d.on_chain_total,
-                                     d.difference);
+                                     d.wallet_spendable, d.on_chain_total,
+                                     d.difference, d.wallet_confirmed);
                     }
                 }
             } catch (const std::exception& e) {
