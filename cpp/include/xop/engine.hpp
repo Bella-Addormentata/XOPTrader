@@ -816,6 +816,20 @@ private:
     /// True when the circuit breaker has tripped (wallet assumed unreachable).
     bool wallet_circuit_open_{false};
 
+    /// Set by every RISK-BREAKER pause (max-drawdown, rolling-window loss,
+    /// ledger divergence) and never cleared at runtime: manual intervention
+    /// means a restart, matching the in-memory peak re-anchor semantics.
+    /// A separate flag because BotStatus is NOT a safe carrier for breaker
+    /// state -- check_pause_flag() flips any Paused status back to Running
+    /// when the GUI flag is removed, without knowing who owns the pause, so
+    /// a GUI toggle after a breaker trip would silently resume posting.
+    bool breaker_pause_active_{false};
+
+    /// The Step 8 skip warning fires once per breaker trip, then drops to
+    /// debug -- re-warning every block for an indefinite pause is the same
+    /// log spam Step 13 rate-limits.
+    bool breaker_skip_warned_{false};
+
     /// Timestamp of the last wallet recovery probe (to throttle retries).
     std::chrono::steady_clock::time_point wallet_last_probe_{};
 

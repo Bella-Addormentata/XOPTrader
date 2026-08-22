@@ -1643,6 +1643,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // -- XCH Recovery Mode: check balance and enter/exit recovery. ---------
     // Runs before Steps 7-8 so that recovery can gate offer posting.
     // When active, cancels offers and takes cheap XCH asks instead.
+    //
+    // DELIBERATELY NOT gated on breaker_pause_active_: this step exists to
+    // keep the wallet fee-liquid, and a breaker pause still needs fees to
+    // cancel offers and settle in-flight state.  Starving it during a pause
+    // could leave the engine unable to wind anything down.  Its XCH-buying
+    // arm is bounded by its own recovery thresholds.  If a future audit
+    // wants takes stopped here too, that is a policy change to make
+    // explicitly, not a gate to add by symmetry.
     if (!wallet_circuit_open_) {
         try {
             co_await step_xch_recovery(block_height);
@@ -1697,7 +1705,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     // Give active drift correction first use of spendable balances before
     // passive market-making offers lock those coins in new pending offers.
-    if (!wallet_circuit_open_) {
+    // Gated on the risk-breaker latch: the drift corrector INITIATES taker
+    // trades, and a pause that stops passive posting while active taking
+    // continues is not a pause -- the audit found the latch gated Step 8
+    // alone while every taker path kept trading.
+    if (!wallet_circuit_open_ && !breaker_pause_active_) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
@@ -1711,6 +1723,25 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
+    } else if (breaker_pause_active_) {
+        // A dedicated flag, not BotStatus.  Two reasons, both observed on
+        // 2026-08-22.  First, nothing in this path ever read BotStatus, so
+        // the max-drawdown "pause" only held while the flash-crash latch
+        // happened to be engaged; when that cleared, the engine resumed
+        // quoting for 2.5 hours while alerting "engine PAUSED" every 15
+        // minutes.  Second, BotStatus cannot carry breaker state anyway:
+        // check_pause_flag() flips any Paused back to Running when the GUI
+        // flag is removed, without knowing who owns the pause -- so a GUI
+        // toggle would silently override a tripped breaker.  This flag is
+        // set by every risk breaker and cleared only by restart, which is
+        // what "manual intervention required" already means here.
+        if (!breaker_skip_warned_) {
+            spdlog::warn("[Engine] Step 8 SKIPPED: risk breaker pause is "
+                         "active -- no new offers until restart");
+            breaker_skip_warned_ = true;
+        } else {
+            spdlog::debug("[Engine] Step 8 SKIPPED: risk breaker pause");
+        }
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
         try {
             co_await step_manage_offers(block_height);
@@ -1736,9 +1767,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     } // end of !xch_recovery_mode_ block
 
-    try { co_await step_check_arbitrage(block_height); }
-    catch (const std::exception& e) {
-        spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());
+    if (!breaker_pause_active_) {
+        try { co_await step_check_arbitrage(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());
+        }
+    } else {
+        spdlog::debug("[Engine] Step 9 SKIPPED: risk breaker pause "
+                      "(arbitrage executes takes, not just detection)");
     }
 
     try { step_run_hedging(block_height); }
@@ -11570,6 +11606,15 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
                           asset.substr(0, 12));
             state_->set_status(BotStatus::Paused);
+            if (!breaker_pause_active_) {
+                // Latch on the false-to-true TRANSITION only.  Persistent
+                // conditions re-enter this block every heartbeat, and an
+                // unconditional reset of the warn flag re-fired the
+                // "SKIPPED" warning every block -- the spam the once-per-
+                // trip design exists to avoid.
+                breaker_pause_active_ = true;
+                breaker_skip_warned_  = false;
+            }
             alerts_->send_alert(AlertRule::CircuitBreaker,
                 msg + " Engine PAUSED. Manual reconciliation required.");
         }
@@ -12076,8 +12121,23 @@ void Engine::step_export_metrics(BlockHeight block_height)
     risk.max_drawdown = total.max_drawdown;
     metrics_->update_risk(risk, {});
 
-    // Paused state gauge
+    // Two gauges with two contracts, per review.  xop_bot_paused is
+    // COMMAND-side: the GUI flag, the one pause the Resume button can
+    // clear -- folding breaker state into it made the GUI offer a resume
+    // that could not work.  xop_posting_gated is STATE-side: every gate on
+    // Step 8, answering "is the bot actually posting?" -- the audit found
+    // the wallet-circuit and flash-crash gates stopped posting for hours
+    // with no operator surface at all.
     metrics_->update_bot_paused(gui_pause_active_);
+    // Per-reason gates: the aggregate alone could not serve its two
+    // consumers -- folding dry-run in made the bridge display a healthy
+    // dry-run engine as "Paused (protection)", and without reasons the GUI
+    // could not tell "GUI flag only" (Resume works) from "GUI flag AND a
+    // latched breaker" (Resume must stay disabled).
+    metrics_->update_posting_gates(
+        gui_pause_active_, breaker_pause_active_, wallet_circuit_open_,
+        flash_crash_state_ != FlashCrashState::Normal,
+        xch_recovery_mode_, dry_run_);
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {
@@ -12181,6 +12241,20 @@ void Engine::step_check_alerts(BlockHeight block_height)
             // (measured spam every ~10-30 s during the 04:14 episode).
             const bool first_trip =
                 (state_->status() != BotStatus::Paused);
+            // Latch INDEPENDENTLY of BotStatus: if the GUI pause already
+            // holds the status at Paused, first_trip is false -- the alert
+            // below still says "manual intervention required", and without
+            // this the breaker never latched, so removing the GUI pause
+            // resumed posting straight through a breached breaker.
+            if (!breaker_pause_active_) {
+                // Latch on the false-to-true TRANSITION only.  Persistent
+                // conditions re-enter this block every heartbeat, and an
+                // unconditional reset of the warn flag re-fired the
+                // "SKIPPED" warning every block -- the spam the once-per-
+                // trip design exists to avoid.
+                breaker_pause_active_ = true;
+                breaker_skip_warned_  = false;
+            }
             if (first_trip) {
                 spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
                               "equity ${:.2f} is {:.2f}% below peak "
@@ -12252,8 +12326,15 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // ISO/IEC 27001:2022: time-windowed monitoring catches slow loss spirals
     //   that individual HWM drawdown or flash-crash checks may miss.
     // ISO/IEC 5055: deque bounded by loss_window_blocks; no UB division.
-    if (config_.risk.max_window_loss_bps > 0.0
-            && state_->status() == BotStatus::Running) {
+    // NOT gated on BotStatus.  Gating on Running had two failure modes,
+    // both review-found: the breach could not LATCH during a GUI pause, so
+    // removing the pause bought one posting round through a breached
+    // breaker before Step 13 ran again; and the window deque was not even
+    // FED while paused, so the loss history restarted with a gap on every
+    // resume.  Evaluation is cheap; it now runs whenever the check is
+    // enabled, and the transition-guarded latch below keeps a persisting
+    // breach from re-alerting every block.
+    if (config_.risk.max_window_loss_bps > 0.0) {
 
         // 1. Append current snapshot.
         pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
@@ -12296,26 +12377,36 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 const BlockHeight window_actual =
                     block_height - pnl_window_usd_.front().first;
 
-                spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT BREAKER "
-                              "-- loss=${:.4f} over {} blocks "
-                              "> threshold=${:.4f} ({:.1f} bps of "
-                              "${:.4f} anchor) -- transitioning to Paused "
-                              "state",
-                              window_loss_usd, window_actual,
-                              threshold_usd,
-                              config_.risk.max_window_loss_bps,
-                              (equity_usd > 0.0) ? equity_usd
-                                                 : anchor_fallback_usd);
-
-                state_->set_status(BotStatus::Paused);
-
-                alerts_->send_alert(AlertRule::CircuitBreaker,
-                    "Rolling-window circuit breaker triggered: lost $" +
-                    std::to_string(window_loss_usd) + " in " +
-                    std::to_string(window_actual) + " blocks (limit " +
-                    std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
-                    " bps = $" + std::to_string(threshold_usd) +
-                    ") -- engine PAUSED.  Manual intervention required.");
+                if (!breaker_pause_active_) {
+                    // Full trip -- error, status, latch, alert -- on the
+                    // false-to-true transition only.  A breach persisting
+                    // while already latched is a debug line, mirroring the
+                    // drawdown breaker's re-alert suppression.
+                    spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT "
+                                  "BREAKER -- loss=${:.4f} over {} blocks "
+                                  "> threshold=${:.4f} ({:.1f} bps of "
+                                  "${:.4f} anchor) -- transitioning to "
+                                  "Paused state",
+                                  window_loss_usd, window_actual,
+                                  threshold_usd,
+                                  config_.risk.max_window_loss_bps,
+                                  (equity_usd > 0.0) ? equity_usd
+                                                     : anchor_fallback_usd);
+                    state_->set_status(BotStatus::Paused);
+                    breaker_pause_active_ = true;
+                    breaker_skip_warned_  = false;
+                    alerts_->send_alert(AlertRule::CircuitBreaker,
+                        "Rolling-window circuit breaker triggered: lost $" +
+                        std::to_string(window_loss_usd) + " in " +
+                        std::to_string(window_actual) + " blocks (limit " +
+                        std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
+                        " bps = $" + std::to_string(threshold_usd) +
+                        ") -- engine PAUSED.  Manual intervention required.");
+                } else {
+                    spdlog::debug("[Engine] Step 13: rolling-window breach "
+                                  "persists while latched (loss=${:.4f})",
+                                  window_loss_usd);
+                }
             }
         }
     }
@@ -12461,8 +12552,19 @@ void Engine::check_pause_flag()
         // Transition Paused -> Running.
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
-            state_->set_status(BotStatus::Running);
-            spdlog::info("[Engine] Pause flag removed -- resuming trading");
+            if (breaker_pause_active_) {
+                // The breaker owns this pause.  Flipping the status to
+                // Running here while Step 8 stays gated would have the GUI
+                // report a trading engine that is not trading -- the exact
+                // inverse of the bypass this PR fixes.  Status stays Paused
+                // until the restart the breaker already requires.
+                spdlog::info("[Engine] Pause flag removed, but a risk "
+                             "breaker holds the pause -- status stays "
+                             "Paused until restart");
+            } else {
+                state_->set_status(BotStatus::Running);
+                spdlog::info("[Engine] Pause flag removed -- resuming trading");
+            }
         }
     }
 }
