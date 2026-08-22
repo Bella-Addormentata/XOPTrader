@@ -781,6 +781,12 @@ TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
         TempYaml tmp(with_window("-5"));
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
     }
+    {
+        // window=1 selects one sample, runs zero comparisons, and silently
+        // disables the detector -- rejected rather than accepted as a trap.
+        TempYaml tmp(with_window("1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
 }
 
 TEST(ConfigParserTest, DexLastTradeMaxAge_ParsesAndDefaults) {

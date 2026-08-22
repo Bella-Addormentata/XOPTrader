@@ -1643,6 +1643,14 @@ RiskConfig parse_risk(const YAML::Node& root)
                               + std::to_string(std::numeric_limits<uint32_t>::max())
                               + "]; got " + std::to_string(v));
         }
+        // A drawdown needs two samples.  window=1 would select a single
+        // entry, run zero comparisons, and silently DISABLE the detector --
+        // only 0 (whole history) is a documented special value.
+        if (v == 1) {
+            throw ConfigError(sec + ".flash_crash_window_blocks must be 0 "
+                              "(whole history) or >= 2; a one-sample window "
+                              "can never detect a drop");
+        }
         cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
     }
 
