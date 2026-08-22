@@ -115,21 +115,22 @@ def test_the_page_grows_so_the_outer_area_scrolls_instead(app):
 def test_the_fit_tracks_real_row_heights(app):
     """Height comes from real row heights, not a per-row constant.
 
-    Varying the GLOBAL font delta does not work here: this widget pins its
-    table and header fonts in local QSS, which overrides the application
-    stylesheet, so every delta produced identical geometry and an earlier
-    parameterised version of this test passed without exercising anything.
-    Vary the table's own font instead, and prove the geometry moved before
-    claiming the fit followed it.
+    Historical note: before S10 the local QSS pinned 12px/11px fonts, so
+    the GLOBAL delta could not reach these tables and an earlier version of
+    this test passed vacuously.  S10 derives the local QSS from
+    theme.scaled_px(), so the delta DOES reach them now (covered by
+    test_the_font_size_setting_reaches_this_page).  This test keeps driving
+    row height directly because its subject is narrower: the fit must track
+    whatever the rows measure, however they came to measure it.
     """
     app.setStyleSheet(theme.get_stylesheet())
     heights = []
     for row_px in (18, 30, 44):
         w = WalletBalancesWidget()
-        # Drive the row height directly.  Neither the global delta nor
-        # setFont() reaches these tables -- the widget's local QSS pins the
-        # font size and overrides both -- and this is the quantity the fit
-        # actually sums, so it is the honest lever.
+        # Drive the row height directly: it is the quantity the fit
+        # actually sums, so it is the sharpest lever for THIS test's subject
+        # regardless of how the rows came to be that size.  (Font-delta
+        # coverage lives in test_the_font_size_setting_reaches_this_page.)
         w._table.verticalHeader().setDefaultSectionSize(row_px)
         w.update_balances(_balances(8), market_data={}, stuck_offers=0)
         assert w._table.height() == _content_height(w._table)
@@ -328,3 +329,52 @@ def test_the_early_return_fit_is_what_restores_a_wrong_height(app):
     assert table.height() == _content_height(table), (
         "the empty-payload path did not refit the table"
     )
+
+
+def test_the_font_size_setting_reaches_this_page(app):
+    """S10: local QSS pinned 12px/11px fonts, overriding the application
+    stylesheet -- the operator's font setting changed nothing here. The
+    pixel sizes now derive from theme.scaled_px(), and rows follow.
+    """
+    try:
+        theme.apply_theme(app, font_size_delta=0)
+        base = WalletBalancesWidget()
+        base._refresh_suggested_allocation = lambda: None
+        base.update_balances(_balances(4), market_data={}, stuck_offers=0)
+        base_row, base_h = base._table.rowHeight(0), base._table.height()
+
+        theme.apply_theme(app, font_size_delta=4)
+        bigger = WalletBalancesWidget()
+        bigger._refresh_suggested_allocation = lambda: None
+        bigger.update_balances(_balances(4), market_data={}, stuck_offers=0)
+
+        assert bigger._table.rowHeight(0) > base_row, (
+            "rows ignored the font-size delta -- S10 has regressed"
+        )
+        assert bigger._table.height() > base_h, "the fit did not follow"
+
+        # The QSS itself must scale -- row height alone would still pass if
+        # the stylesheets reverted to pinned 12px/11px, which IS the S10
+        # failure.  The applied stylesheet is the mechanism, so assert on it
+        # for BOTH tables.
+        for table in (bigger._table, bigger._alloc_table):
+            sheet = table.styleSheet()
+            assert "font-size: 16px" in sheet, (
+                "table QSS is not scaled at delta 4 (expected 12+4)"
+            )
+            assert "font-size: 15px" in sheet, (
+                "header QSS is not scaled at delta 4 (expected 11+4)"
+            )
+            assert "font-size: 12px" not in sheet
+        # And the allocation table's geometry follows its scaled rows.
+        bigger._alloc_table.setRowCount(3)
+        from gui.widgets.wallet_balances import _fit_table_to_contents
+        _fit_table_to_contents(bigger._alloc_table)
+        base._alloc_table.setRowCount(3)
+        _fit_table_to_contents(base._alloc_table)
+        assert (bigger._alloc_table.height() > base._alloc_table.height()), (
+            "allocation table did not grow with the delta"
+        )
+    finally:
+        theme.apply_theme(app, font_size_delta=0)
+        app.setStyleSheet(theme.get_stylesheet())
