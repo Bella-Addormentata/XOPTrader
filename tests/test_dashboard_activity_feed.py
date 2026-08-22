@@ -37,8 +37,13 @@ def _row(**over):
 def test_a_fill_renders_with_the_trade_logs_own_scaling(app):
     from gui.widgets.main_window import activity_event
 
+    from datetime import datetime
+
     event = activity_event(_row())
-    assert event["timestamp"] == "16:54:15"
+    # The clock is LOCAL time now; compute the expectation the same way.
+    expected = (datetime.fromisoformat("2026-08-21T16:54:15.943+00:00")
+                .astimezone().strftime("%H:%M:%S"))
+    assert event["timestamp"] == expected
     # price_mojos / 1e12 = 1.486, and a stablecoin-quoted pair shows "$".
     assert "$1.4860" in event["message"]
     # size_mojos / base units = 1 XCH.
@@ -239,10 +244,14 @@ def test_the_pipeline_from_signal_to_widget_actually_runs(app):
                 captured.append(events)
 
         window._dashboard = _Dash()
+        # NEWEST FIRST, as fetch_trades orders them (block DESC, id DESC).
+        # The first fixture had them ascending while claiming this, so the
+        # order assertion tested the reversal against an inverted premise.
         rows = [{"timestamp": f"2026-08-22T15:16:{i:02d}.000Z",
                  "pair_name": "XCH/wUSDC.b", "side": "bid",
                  "price_mojos": 1_486_000_000_000,
-                 "size_mojos": 1_000_000_000_000} for i in range(30)]
+                 "size_mojos": 1_000_000_000_000}
+                for i in range(29, -1, -1)]
         window._on_trades_for_activity(rows)   # newest-first, as the DB emits
 
         assert len(captured) == 1, "the feed was never handed the events"
