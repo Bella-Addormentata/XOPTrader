@@ -127,10 +127,10 @@ def test_the_fit_tracks_real_row_heights(app):
     heights = []
     for row_px in (18, 30, 44):
         w = WalletBalancesWidget()
-        # Drive the row height directly.  Neither the global delta nor
-        # setFont() reaches these tables -- the widget's local QSS pins the
-        # font size and overrides both -- and this is the quantity the fit
-        # actually sums, so it is the honest lever.
+        # Drive the row height directly: it is the quantity the fit
+        # actually sums, so it is the sharpest lever for THIS test's subject
+        # regardless of how the rows came to be that size.  (Font-delta
+        # coverage lives in test_the_font_size_setting_reaches_this_page.)
         w._table.verticalHeader().setDefaultSectionSize(row_px)
         w.update_balances(_balances(8), market_data={}, stuck_offers=0)
         assert w._table.height() == _content_height(w._table)
