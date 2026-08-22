@@ -1570,8 +1570,20 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
             }
 
             // Check crash signal for this pair.
+            // [S12] Windowed: an aged spike stops counting once it
+            // leaves the window.  NOTE the recovery timeline that follows:
+            // by the time the spike exits a 100-entry window, that same
+            // window already holds 100 stable post-spike samples, so BOTH
+            // stability phases are satisfied concurrently -- Crash ->
+            // Recovery on that evaluation and Recovery -> Normal on the
+            // next, ~window+1 blocks after the spike rather than
+            // window+50+100 sequentially.  That is intentional: resumption
+            // still requires exactly what phase 2 always demanded, the
+            // last 100 blocks inside the stability band; the phases only
+            // run sequentially when a pair re-crashes DURING recovery.
             if (PreTradeCheck::check_flash_crash(price_vec,
-                    config_.risk.flash_crash_threshold_pct)) {
+                    config_.risk.flash_crash_threshold_pct,
+                    config_.risk.flash_crash_window_blocks)) {
                 any_pair_crashing = true;
                 if (crash_pair_name.empty()) crash_pair_name = pair.name;
             }

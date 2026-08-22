@@ -136,9 +136,61 @@ TEST(FlashCrashTest, NoCrash_SmallDrop) {
 }
 
 TEST(FlashCrashTest, DetectsEarlyDropFollowedByRecovery) {
-    // 100 -> 70 (30% drop) then recovery to 110
+    // 100 -> 70 (30% drop) then recovery to 110.  With NO window (the
+    // default), the whole history is scanned and the old drop still trips.
     std::vector<xop::Mojo> prices = {100, 90, 70, 80, 95, 110};
     EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20));
+}
+
+// ---------------------------------------------------------------------------
+// [S12] The window: a "flash" crash is a RECENT event.
+//
+// Observed 2026-08-22: one junk dexie print (a crossed ticker; mid 2.3419 in
+// a ~1.57 market, retraced within minutes) pinned the whole-history running
+// maximum, so the detector reported a crash until the ~1000-entry buffer
+// evicted the print -- and because the Crash state consults this signal
+// before the stability checks, posting stayed halted globally for hours.
+// ---------------------------------------------------------------------------
+
+TEST(FlashCrashTest, Window_AnAgedSpikeStopsCounting) {
+    // The S12 shape: one spike far in the past, market flat since.
+    std::vector<xop::Mojo> prices;
+    prices.push_back(157);
+    prices.push_back(234);                       // the junk print
+    for (int i = 0; i < 200; ++i) prices.push_back(163);
+
+    // Whole history: still "crashing" (234 -> 163 is a 30% drawdown).
+    EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20));
+    // Inside a 100-block window the spike is gone and the market is flat.
+    EXPECT_FALSE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 100));
+}
+
+TEST(FlashCrashTest, Window_ARecentCollapseStillTrips) {
+    // Flat, then a genuine 30% drop within the window.
+    std::vector<xop::Mojo> prices(150, 100);
+    for (int i = 0; i < 10; ++i) prices.push_back(70);
+    EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 100));
+}
+
+TEST(FlashCrashTest, Window_ThePeakOutsideTheWindowDoesNotCount) {
+    // 100-era peak, then a long 79 plateau: 21% below the old peak, but the
+    // peak is only visible if the scan reaches back past the window.  The
+    // SAME data must trip or not trip purely on how far the window reaches.
+    std::vector<xop::Mojo> prices;
+    for (int i = 0; i < 50; ++i) prices.push_back(100);
+    for (int i = 0; i < 100; ++i) prices.push_back(79);
+    EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 150));
+    EXPECT_FALSE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 100));
+}
+
+TEST(FlashCrashTest, Window_ZeroMeansWholeHistory) {
+    std::vector<xop::Mojo> prices = {100, 90, 70, 80, 95, 110};
+    EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 0));
+}
+
+TEST(FlashCrashTest, Window_LargerThanHistoryIsHarmless) {
+    std::vector<xop::Mojo> prices = {100, 75};
+    EXPECT_TRUE(xop::PreTradeCheck::check_flash_crash(prices, 0.20, 5000));
 }
 
 TEST(FlashCrashTest, MonotonicallyRising_NoCrash) {
