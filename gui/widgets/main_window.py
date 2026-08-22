@@ -1141,7 +1141,19 @@ class MainWindow(QMainWindow):
                 base_mpu = float(MOJOS_PER_XCH)
             rows.append({
                 "pair": pair_name,
-                "mid_price": float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH,
+                # Only the engine's live gauge counts as a Mid Price.  The
+                # bridge backfills this field from the last fill when the
+                # gauge is absent and marks it mid_price_source=last_trade;
+                # that fill is NOT age-bounded (XCH/wUSDC's most recent is
+                # from April), so presenting it here would label a
+                # four-month-old trade as the current mid -- the same
+                # failure S5 fixed in the engine's own blend.  Absent gauge
+                # renders as an em dash instead.
+                "mid_price": (
+                    0.0
+                    if str(md.get("mid_price_source", "")) == "last_trade"
+                    else float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH
+                ),
                 "spread_bps": float(md.get("spread_bps", 0.0) or 0.0),
                 "inventory": float(md.get("inventory_mojos", 0.0) or 0.0) / base_mpu,
                 "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,

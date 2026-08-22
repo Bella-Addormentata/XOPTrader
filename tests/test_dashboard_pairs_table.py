@@ -213,3 +213,41 @@ def test_the_asset_id_is_lowercased_to_match_the_published_label():
         encoding="utf-8")
     line = [l for l in bridge.split(chr(10)) if "base_id = str(" in l]
     assert line and ".lower()" in line[0], "asset id not normalised for lookup"
+
+
+def test_a_last_trade_backfill_is_not_shown_as_the_mid_price(app):
+    """The bridge backfills mid_price from the last fill and marks it.
+
+    That fill has no recency bound -- XCH/wUSDC's most recent is from April --
+    so displaying it would label a four-month-old trade as the current mid.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    body = source.split("def _refresh_pairs_table")[1].split("\n    def ")[0]
+    assert 'mid_price_source' in body, "the source marker is ignored"
+
+    # And the widget must render the resulting 0.0 as an em dash, never 0.000000.
+    from gui.widgets.dashboard import DashboardWidget
+    dash = DashboardWidget()
+    dash.update_pairs_table([{
+        "pair": "XCH/wUSDC", "mid_price": 0.0, "spread_bps": 0.0,
+        "inventory": 0.0, "bid": 0.0, "ask": 0.0,
+        "fills_24h": 0, "pnl": 0.0, "quote_symbol": "wUSDC",
+    }])
+    assert dash._pairs_table.item(0, 1).text() == "\u2014"
+
+
+def test_the_pairs_table_is_actually_connected():
+    """The original defect was an implemented method with no caller.
+
+    Calling update_pairs_table directly cannot catch that, so assert the
+    wiring itself -- mirroring the activity feed's connection test.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    assert "pair_summary_loaded.connect(self._on_pair_summary)" in source
+    assert "db.query_pair_summary()" in source
+    # And something must actually push rows into the widget.
+    assert "dashboard.update_pairs_table(" in source
