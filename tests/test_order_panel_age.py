@@ -142,7 +142,10 @@ def test_fill_minutes_sort_numerically_in_both_directions(app):
         assert col == ["100.0", "9.0", "—"], f"descending: {col}"
         table.sortItems(10, Qt.SortOrder.AscendingOrder)
         col = [table.item(r, 10).text() for r in range(3)]
-        assert col == ["—", "9.0", "100.0"], f"ascending: {col}"
+        # Missing stays at the BOTTOM in either direction: the item reads
+        # the live sort indicator, since a static -inf sentinel would float
+        # em dashes to the top of every ascending sort.
+        assert col == ["9.0", "100.0", "—"], f"ascending: {col}"
     finally:
         panel.hide()
 
@@ -157,5 +160,36 @@ def test_fill_minutes_are_right_aligned_like_the_other_numerics(app):
     try:
         flags = panel._table.item(0, 10).textAlignment()
         assert flags & Qt.AlignmentFlag.AlignRight, "Fill (min) left-aligned"
+    finally:
+        panel.hide()
+
+
+def test_a_terminal_offer_without_a_resolution_block_shows_unknown_age(app):
+    """The engine persists resolved_block=0 on some cancel paths.  Aging
+    such a row against the live tip forever is the original bug in a
+    subtler form; unknown renders as an em dash."""
+    panel = _panel(app)
+    panel.set_current_block(9_999_999)
+    panel.update_offers([_offer(status="cancelled", resolved_block=0,
+                                resolved_at="2026-08-22 10:00:00")])
+    try:
+        assert panel._table.item(0, 9).text() == "—"
+    finally:
+        panel.hide()
+
+
+def test_age_sorts_numerically(app):
+    from PySide6.QtCore import Qt
+
+    panel = _panel(app)
+    panel.set_current_block(9_184_500)
+    panel.update_offers([
+        _offer(offer_id="0x1", created_block=9_184_491),   # age 9
+        _offer(offer_id="0x2", created_block=9_184_400),   # age 100
+    ])
+    try:
+        panel._table.sortItems(9, Qt.SortOrder.DescendingOrder)
+        ages = [panel._table.item(r, 9).text() for r in range(2)]
+        assert ages == ["100", "9"], f"lexicographic sort: {ages}"
     finally:
         panel.hide()
