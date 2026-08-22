@@ -141,8 +141,15 @@ def _fit_table_to_contents(table: QTableWidget) -> None:
     # enough window brings the bar back -- reproduced at a 300px table width.
     # Since the vertical bar is off, any height it steals clips the last row
     # outright instead of becoming scrollable.
+    # Reserve from the RANGE, not from isVisible().  This page normally sits
+    # hidden in the stack while balance updates keep arriving, and a hidden
+    # widget reports isVisible() False even once its content overflows --
+    # measured: range 0..1 while hidden, then the bar appears on opening with
+    # no further rangeChanged to trigger a refit, leaving the last row
+    # clipped.  A nonzero range means the content overflows, hidden or not.
     hbar = table.horizontalScrollBar()
-    reserved = hbar.sizeHint().height() if (hbar and hbar.isVisible()) else 0
+    overflows = bool(hbar) and hbar.maximum() > hbar.minimum()
+    reserved = hbar.sizeHint().height() if overflows else 0
 
     wanted = header + rows + 2 * table.frameWidth() + reserved
     if table.height() != wanted:

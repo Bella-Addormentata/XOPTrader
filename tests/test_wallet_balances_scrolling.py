@@ -44,8 +44,19 @@ def _balances(n: int) -> dict:
 
 
 def _content_height(table) -> int:
+    """What the fit should produce: rows, header, frame, and any reserved
+    horizontal scrollbar.
+
+    Mirrors the production formula deliberately, including the reservation.
+    Omitting it made these assertions disagree with the implementation by
+    exactly the scrollbar height whenever the content overflowed.
+    """
     rows = sum(table.rowHeight(r) for r in range(table.rowCount()))
-    return rows + table.horizontalHeader().height() + 2 * table.frameWidth()
+    bar = table.horizontalScrollBar()
+    reserved = (bar.sizeHint().height()
+                if bar and bar.maximum() > bar.minimum() else 0)
+    return (rows + table.horizontalHeader().height()
+            + 2 * table.frameWidth() + reserved)
 
 
 def test_the_balances_table_shows_every_row_without_scrolling(app):
@@ -166,7 +177,7 @@ def test_the_page_opens_fitted_before_any_wallet_data(app):
     w = WalletBalancesWidget()
     for table in (w._table, w._alloc_table):
         assert table.height() == _content_height(table)
-        assert table.height() < 200, "still at the unfitted default"
+        assert table.height() < 220, "still at the unfitted default"
 
 
 def test_the_startup_empty_update_leaves_the_table_fitted(app):
@@ -181,7 +192,7 @@ def test_the_startup_empty_update_leaves_the_table_fitted(app):
     w = WalletBalancesWidget()
     w.update_balances({}, market_data={}, stuck_offers=0)
     assert w._table.height() == _content_height(w._table)
-    assert w._table.height() < 200, "left at the unfitted default"
+    assert w._table.height() < 220, "left at the unfitted default"
 
 
 def test_a_narrow_window_does_not_clip_the_last_row(app):
@@ -220,3 +231,51 @@ def test_a_narrow_window_does_not_clip_the_last_row(app):
         assert saw_scrollbar, "fixture never produced a horizontal scrollbar"
     finally:
         w.hide()
+
+
+def test_a_page_that_overflows_while_hidden_is_not_clipped_when_opened(app):
+    """This page sits hidden in the stack while updates keep arriving.
+
+    A hidden widget reports isVisible() False even once its content
+    overflows, and opening it need not emit another rangeChanged -- so a
+    visibility-based reservation left the newly shown bar eating the last
+    row. The range is nonzero whether or not anything is on screen.
+    """
+    from PySide6.QtWidgets import QStackedWidget
+
+    app.setStyleSheet(theme.get_stylesheet())
+    stack = QStackedWidget()
+    front = WalletBalancesWidget()
+    front._refresh_suggested_allocation = lambda: None
+    page = WalletBalancesWidget()
+    page._refresh_suggested_allocation = lambda: None
+    stack.addWidget(front)
+    stack.addWidget(page)
+    stack.setCurrentIndex(0)              # the wallet page is HIDDEN
+    stack.resize(300, 800)
+    stack.show()
+    app.processEvents()
+
+    try:
+        page.update_balances(_balances(6), market_data={}, stuck_offers=0)
+        table = page._table
+        table.setFixedWidth(250)          # force horizontal overflow
+        app.processEvents()
+        bar = table.horizontalScrollBar()
+
+        def needed() -> int:
+            rows = sum(table.rowHeight(r) for r in range(table.rowCount()))
+            extra = (bar.sizeHint().height()
+                     if bar.maximum() > bar.minimum() else 0)
+            return (rows + table.horizontalHeader().height()
+                    + 2 * table.frameWidth() + extra)
+
+        assert bar.maximum() > bar.minimum(), "fixture produced no overflow"
+        assert not bar.isVisible(), "fixture did not keep the page hidden"
+        assert table.height() >= needed(), "space not reserved while hidden"
+
+        stack.setCurrentIndex(1)          # user opens the page
+        app.processEvents()
+        assert table.height() >= needed(), "last row clipped on opening"
+    finally:
+        stack.hide()
