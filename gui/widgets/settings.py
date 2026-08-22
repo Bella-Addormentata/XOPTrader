@@ -3341,6 +3341,33 @@ class SettingsWidget(QWidget):
     # Public API: load_config / save_config
     # ===================================================================
 
+    def stop_background_work(self, timeout_ms: int = 2000) -> None:
+        """Join the advisory worker thread before this widget is destroyed.
+
+        A QThread still running when its C++ object is destroyed makes Qt
+        call qFatal("QThread: Destroyed while thread is still running") and
+        the process ABORTS -- reproduced against PySide6 6.11: the run exits
+        via the MSVC abort path instead of returning from main().
+
+        The worker blocks on a dexie fetch with a 30s timeout, so quit()
+        alone cannot return promptly: it only asks the thread's event loop to
+        exit, while run() is mid-request.  Wait briefly, then terminate as a
+        last resort -- an abrupt stop of a READ-ONLY advisory query during
+        shutdown is strictly better than aborting the application.
+
+        Child widgets do not receive closeEvent when the top-level window
+        closes, which is why this is public and called by MainWindow.
+        """
+        thread = self._suggest_thread
+        if thread is None:
+            return
+        thread.quit()
+        if not thread.wait(timeout_ms):
+            thread.terminate()
+            thread.wait(1000)
+        self._suggest_thread = None
+        self._suggest_worker = None
+
     def set_sizing_db_path(self, db_path: Optional[str]) -> None:
         """Tell the advisory targets calculator where the database lives."""
         self._sizing_db_path = db_path

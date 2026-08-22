@@ -2088,5 +2088,13 @@ class MainWindow(QMainWindow):
 
         self._status_timer.stop()
         self._metrics_timer.stop()
+        # Join widget-owned worker threads BEFORE teardown.  Qt aborts the
+        # process (qFatal) if a QThread is destroyed while still running, and
+        # nothing else knows about these: EngineBridge.shutdown() owns the
+        # services, not the pages' own threads.
+        for page in (self._wallet_balances, self._settings_widget):
+            widget = self._unwrap(page)
+            if widget is not None and hasattr(widget, "stop_background_work"):
+                widget.stop_background_work()
         self._save_state()
         super().closeEvent(event)
