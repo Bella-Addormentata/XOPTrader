@@ -1821,6 +1821,7 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
                 // them as stale the moment they arrive (acute at the
                 // now-legal threshold == polling interval boundary).
                 coingecko_last_fetch_ = std::chrono::steady_clock::now();
+                coingecko_last_success_at_ = std::chrono::system_clock::now();
             } catch (const std::exception& ex) {
                 // Transient CoinGecko errors should not abort the cycle.
                 spdlog::warn("[Engine] Step 1: CoinGecko fetch failed: {}",
@@ -2095,7 +2096,11 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
             // Pairs with no CoinGecko mapping (BYC) are silently skipped.
 
             if (derived && cex_mid > 0.0) {
-                market_data_->ingest_cex_reference(pair.name, cex_mid);
+                // Pass the fetch time, not the re-ingest time: this runs
+                // every heartbeat off the cached prices, and a failed fetch
+                // leaves that cache untouched.
+                market_data_->ingest_cex_reference(
+                    pair.name, cex_mid, coingecko_last_success_at_);
                 spdlog::debug("[Engine] Step 1: {} CoinGecko cex_mid={:.6f}",
                               pair.name, cex_mid);
             }
@@ -4351,9 +4356,19 @@ void Engine::step_generate_ladder([[maybe_unused]] BlockHeight block_height)
 
         // [REVIVE-FRESHNESS 2026-08-18] Age of the CoinGecko FEED, not of
         // the solve.  coingecko_last_fetch_ advances only on a SUCCESSFUL
-        // fetch (Step 1), while every downstream timestamp the staleness
-        // detectors look at (cex_updated_at, fair_value_updated_at) is
-        // re-stamped each heartbeat from the cache and so can never expire.
+        // fetch (Step 1).
+        //
+        // [S6 2026-08-21] cex_updated_at is no longer one of the timestamps
+        // that cannot expire: ingest_cex_reference now stores the real
+        // observation time, so the CEX tapers age honestly.  This gate is
+        // still not redundant -- it is FEED-level and runs before any
+        // per-pair CEX sample need exist, so it also covers a revived pair
+        // that carries no cex_mid at all.  fair_value_updated_at IS still
+        // re-stamped every heartbeat from cached solver output (see
+        // MarketDataFeed::ingest_fair_value), so that one still cannot expire
+        // on its own.  Named by symbol, not by line: the line number this
+        // originally cited went stale the moment a merge shifted the file.
+        //
         // The revive path must not quote from a frozen feed: pre-revive
         // that state produced silence, and silence is the correct fallback.
         // (A feed that returns fresh-but-wrong prices is not catchable at

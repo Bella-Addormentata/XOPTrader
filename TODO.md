@@ -115,7 +115,7 @@
 ### S6: CoinGecko staleness blindness in the general published-mid path
 - **Files:** `cpp/src/engine.cpp:1815-1827, 2069-2100`; `cpp/src/execution/market_data.cpp:405-406`
 - **Issue:** A failed CoinGecko fetch is swallowed, leaving the stale cache (`coingecko_last_fetch_` advances only on success), yet every heartbeat re-derives `cex_mid` from that cache and calls `ingest_cex_reference`, which stamps `cex_updated_at = now()` — so the `cex_freshness_threshold_sec` taper (market_data.cpp:1041-1048) always sees age ~0 and can never fire.
-- **Status:** `[ ]` — Verified 2026-08-18. `revive_market` got a real success-stamped gate today (engine.cpp:4353-4370 via `coingecko_last_fetch_`); the general blend path needs the same: stamp `cex_updated_at` from actual fetch time, or stop re-ingesting on failed fetches.
+- **Status:** `[x]` — FIXED (PR #88). `ingest_cex_reference` now takes an `observed_at` and stores it VERBATIM, mirroring `ingest_amm_mid`, which already solved this exact bug on the AMM leg. The engine stamps `coingecko_last_success_at_` only in the fetch success path and passes it, so a failed fetch no longer refreshes the sample's apparent age: every CEX gate — `compute_mid`'s weight taper, `detect_stale`, and the `cex_age_seconds` heartbeat — now measures the age of the DATA rather than the age of the re-ingest. A default-constructed stamp falls back to `now()`, so "never observed" cannot read downstream as a 56-year-old sample.
 
 ### S7: Dexie ticker parse swaps bid and ask
 - **Files:** `cpp/src/rpc/dexie_client.cpp:616-638`
@@ -127,6 +127,11 @@
 - **Files:** `config.yaml:168-187`; `cpp/src/engine.cpp:4891-4917`
 - **Issue:** `strategy.asset_target_allocations` omits WMILLIETH.B (and `ratio_target_by_pair`/`ratio_band_enter_by_pair` omit wmilliETH.b/XCH) even though the pair is enabled; `acquire_scale` returns 1.0 for missing keys (engine.cpp:4891-4893) and is applied to the bid side (:4917), so accumulation is never tapered. Remaining limits are portfolio-fraction denominated (`single_cat_cap_pct` 0.25, soft/hard 0.6/0.8) — unreachable for a small CAT position on a large wallet.
 - **Status:** `[x]` — RESOLVED. `config.yaml` now carries `asset_target_allocations.WMILLIETH.B` plus `ratio_target_by_pair` and `ratio_band_enter_by_pair` entries for `wmilliETH.b/XCH`, so `acquire_scale` no longer returns 1.0 for the pair and the accumulation brake is reachable. Re-verified 2026-08-21.
+
+### S9: The last-trade fallback path carries no published-mid band
+- **Files:** `cpp/src/execution/market_data.cpp` (Case 3, and the clamp below it)
+- **Issue:** The published-mid band clamps only when `dex_best_bid` AND `dex_best_ask` are both present, but Case 3 is reached precisely when they are not. **Neither** Case 3 outcome is banded: accepting a fresh print leaves the unclamped DEX/CEX/AMM blend, and refusing one leaves the centre to CEX/AMM alone. `PublishedMidBandTest.OneSidedBook_NoClamp` asserts exactly this. Surfaced reviewing PR #89, where a comment of mine wrongly claimed the band covered this path.
+- **Status:** `[ ]` — OPEN. Decide whether the fallback path should carry a band of its own (around the refused print, or around the AMM leg) or whether the sizing-layer brakes are the right control. Not urgent, with one dependency worth recording: the CEX and AMM legs have to pass their own freshness tapers to be used at all, and if none survives the pair publishes no mid and stops quoting — but the CEX half of that only holds since **S6** (PR #88). Before S6 a frozen CoinGecko cache re-stamped `cex_updated_at` every heartbeat, so the CEX taper could not reject a stale feed and this path had even less protection than it appears. Any decision here should not re-introduce that assumption without checking it.
 
 ### S10: The wallet balances page ignores the UI font-size setting
 - **Files:** `gui/widgets/wallet_balances.py` (local QSS on both tables)

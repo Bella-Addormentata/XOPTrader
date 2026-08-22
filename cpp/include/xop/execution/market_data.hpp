@@ -429,8 +429,9 @@ struct PairState {
 
     // The same treatment for the last-trade print itself.  dex_print_age is
     // derived from the ORDER-BOOK mid, so it stops advancing precisely when
-    // the book empties -- the one state in which the last trade becomes the
-    // mid.  These two fields age the print directly.  A default-constructed
+    // no usable two-sided quote remains -- an empty book, or a one-sided one,
+    // which is where the last trade becomes the mid.  These two fields age
+    // the print directly.  A default-constructed
     // last_trade_changed_at means "never observed to move": the print's age
     // is unknown, not zero, and compute_mid refuses it on that basis.
     double      last_trade_print{0.0};
@@ -585,10 +586,31 @@ public:
 
     /// Ingest a CEX reference mid-price for a pair.
     ///
-    /// @param pair_name  Trading pair identifier (must match dexie pair name).
-    /// @param cex_mid    CEX mid-price (quote per base).
+    /// Re-ingesting a cached price is EXPECTED: the engine derives cex_mid
+    /// from its CoinGecko cache on every heartbeat, and a failed fetch
+    /// leaves that cache in place deliberately.  What must not be recycled
+    /// is the TIMESTAMP.
+    ///
+    /// `observed_at` must be when the price was FETCHED, not when it was
+    /// re-ingested.  It is what every CEX freshness gate measures against --
+    /// compute_mid's weight taper, detect_stale, and the cex_age heartbeat
+    /// -- so stamping the re-ingest instead makes a cached sample look
+    /// permanently new and puts all three gates out of reach.  That was the
+    /// bug this parameter exists to close, and ingest_amm_mid below records
+    /// the same failure on the AMM path.
+    ///
+    /// A default-constructed value is NOT stored as-is; it falls back to
+    /// now(), so do not pass one alongside cached data.
+    ///
+    /// @param pair_name    Trading pair identifier (must match dexie pair name).
+    /// @param cex_mid      CEX mid-price (quote per base).
+    /// @param observed_at  When the price was actually fetched.  Defaults to
+    ///                     now() for callers that fetch synchronously at the
+    ///                     call site; the engine passes its real fetch time.
     void ingest_cex_reference(const std::string& pair_name,
-                              double             cex_mid);
+                              double             cex_mid,
+                              Timestamp          observed_at
+                                  = Timestamp::clock::now());
 
     /// Ingest the TibetSwap AMM implied mid-price for a pair.
     /// The implied price is computed from pool reserves: output_reserve / input_reserve.

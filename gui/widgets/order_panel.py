@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS, MONO_FONT_FAMILY
+from gui.theme import COLORS, MONO_FONT_FAMILY, fit_row_height
 from gui.utils import mojos_to_xch, mojos_per_unit_for_pair, format_price, num, text
 
 # ---------------------------------------------------------------------------
@@ -293,6 +293,7 @@ class OrderPanel(QWidget):
         table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
         table.verticalHeader().setVisible(False)
+        fit_row_height(table)   # rows must fit the compact Cancel button
         table.setShowGrid(True)
         table.setSortingEnabled(True)
         # Sorting is re-enabled after every fill, which re-sorts by the
@@ -774,7 +775,11 @@ class OrderPanel(QWidget):
                 if not isinstance(btn_cancel, QPushButton):
                     btn_cancel = QPushButton("Cancel")
                     btn_cancel.setObjectName("dangerButton")
-                    btn_cancel.setFixedHeight(24)
+                    # compact BEFORE the widget is polished: the property
+                    # selector is evaluated when the style is applied, and
+                    # the base rule's min-height would otherwise make this
+                    # taller than the row it sits in.
+                    btn_cancel.setProperty("compact", True)
                     # One connection for the button's lifetime; the offer
                     # it acts on is read from the property below, so a
                     # reused button can never cancel a stale offer.
