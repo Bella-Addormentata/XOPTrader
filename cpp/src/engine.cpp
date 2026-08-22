@@ -12102,8 +12102,9 @@ void Engine::step_export_metrics(BlockHeight block_height)
     risk.max_drawdown = total.max_drawdown;
     metrics_->update_risk(risk, {});
 
-    // Paused state gauge
-    metrics_->update_bot_paused(gui_pause_active_);
+    // Paused state gauge: what the operator sees must match what Step 8
+    // does, so the breaker latch counts as paused too.
+    metrics_->update_bot_paused(gui_pause_active_ || breaker_pause_active_);
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {
@@ -12510,8 +12511,19 @@ void Engine::check_pause_flag()
         // Transition Paused ÃƒÆ’Ã†â€™Ãƒâ€ Ã¢â‚¬â„¢ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã¢â‚¬Å¡Ãƒâ€šÃ‚Â ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¾Ãƒâ€šÃ‚Â¢ Running.
         gui_pause_active_ = false;
         if (state_->status() == BotStatus::Paused) {
-            state_->set_status(BotStatus::Running);
-            spdlog::info("[Engine] Pause flag removed -- resuming trading");
+            if (breaker_pause_active_) {
+                // The breaker owns this pause.  Flipping the status to
+                // Running here while Step 8 stays gated would have the GUI
+                // report a trading engine that is not trading -- the exact
+                // inverse of the bypass this PR fixes.  Status stays Paused
+                // until the restart the breaker already requires.
+                spdlog::info("[Engine] Pause flag removed, but a risk "
+                             "breaker holds the pause -- status stays "
+                             "Paused until restart");
+            } else {
+                state_->set_status(BotStatus::Running);
+                spdlog::info("[Engine] Pause flag removed -- resuming trading");
+            }
         }
     }
 }
