@@ -11587,8 +11587,15 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             spdlog::error("[Engine] LEDGER CONTROL: pausing on {}",
                           asset.substr(0, 12));
             state_->set_status(BotStatus::Paused);
-            breaker_pause_active_ = true;
-            breaker_skip_warned_  = false;
+            if (!breaker_pause_active_) {
+                // Latch on the false-to-true TRANSITION only.  Persistent
+                // conditions re-enter this block every heartbeat, and an
+                // unconditional reset of the warn flag re-fired the
+                // "SKIPPED" warning every block -- the spam the once-per-
+                // trip design exists to avoid.
+                breaker_pause_active_ = true;
+                breaker_skip_warned_  = false;
+            }
             alerts_->send_alert(AlertRule::CircuitBreaker,
                 msg + " Engine PAUSED. Manual reconciliation required.");
         }
@@ -12200,6 +12207,20 @@ void Engine::step_check_alerts(BlockHeight block_height)
             // (measured spam every ~10-30 s during the 04:14 episode).
             const bool first_trip =
                 (state_->status() != BotStatus::Paused);
+            // Latch INDEPENDENTLY of BotStatus: if the GUI pause already
+            // holds the status at Paused, first_trip is false -- the alert
+            // below still says "manual intervention required", and without
+            // this the breaker never latched, so removing the GUI pause
+            // resumed posting straight through a breached breaker.
+            if (!breaker_pause_active_) {
+                // Latch on the false-to-true TRANSITION only.  Persistent
+                // conditions re-enter this block every heartbeat, and an
+                // unconditional reset of the warn flag re-fired the
+                // "SKIPPED" warning every block -- the spam the once-per-
+                // trip design exists to avoid.
+                breaker_pause_active_ = true;
+                breaker_skip_warned_  = false;
+            }
             if (first_trip) {
                 spdlog::error("[Engine] Step 13: MAX DRAWDOWN BREACHED -- "
                               "equity ${:.2f} is {:.2f}% below peak "
@@ -12212,8 +12233,6 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 // subsequent cycles while keeping connections open for
                 // monitoring.
                 state_->set_status(BotStatus::Paused);
-            breaker_pause_active_ = true;
-            breaker_skip_warned_  = false;
             }
 
             if (breaker_realert_gate_.should_alert(
@@ -12329,8 +12348,15 @@ void Engine::step_check_alerts(BlockHeight block_height)
                                                  : anchor_fallback_usd);
 
                 state_->set_status(BotStatus::Paused);
-            breaker_pause_active_ = true;
-            breaker_skip_warned_  = false;
+            if (!breaker_pause_active_) {
+                // Latch on the false-to-true TRANSITION only.  Persistent
+                // conditions re-enter this block every heartbeat, and an
+                // unconditional reset of the warn flag re-fired the
+                // "SKIPPED" warning every block -- the spam the once-per-
+                // trip design exists to avoid.
+                breaker_pause_active_ = true;
+                breaker_skip_warned_  = false;
+            }
 
                 alerts_->send_alert(AlertRule::CircuitBreaker,
                     "Rolling-window circuit breaker triggered: lost $" +
