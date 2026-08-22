@@ -260,8 +260,9 @@ public:
     /// Update the count of stuck offers (beyond TTL + stuck-age threshold).
     void update_stuck_offers(int count);
 
-    /// Update the bot-paused gauge (1 = ANY trading pause: the GUI flag
-    /// or a latched risk breaker; 0 = posting enabled).
+    /// Update the bot-paused gauge (1 = offer posting disabled for ANY
+    /// reason: GUI pause, risk breaker, wallet circuit breaker,
+    /// flash-crash episode, or XCH recovery; 0 = actually posting).
     void update_bot_paused(bool is_paused);
 
     /// Update the rolling 24-hour blockchain fees gauge (mojos).

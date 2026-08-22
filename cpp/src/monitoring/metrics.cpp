@@ -323,7 +323,7 @@ void MetricsExporter::register_metrics()
 
     paused_gauge_ = &prometheus::BuildGauge()
         .Name("xop_bot_paused")
-        .Help("1 when trading is paused for ANY reason -- the GUI pause flag or a latched risk breaker (max-drawdown, rolling-window loss, ledger divergence) -- 0 otherwise")
+        .Help("1 when offer posting is disabled for ANY reason -- GUI pause, a latched risk breaker (max-drawdown, rolling-window loss, ledger divergence), the wallet circuit breaker, a flash-crash episode, or XCH recovery mode -- 0 when the engine is actually posting")
         .Register(*registry_)
         .Add({});
 

@@ -12119,9 +12119,15 @@ void Engine::step_export_metrics(BlockHeight block_height)
     risk.max_drawdown = total.max_drawdown;
     metrics_->update_risk(risk, {});
 
-    // Paused state gauge: what the operator sees must match what Step 8
-    // does, so the breaker latch counts as paused too.
-    metrics_->update_bot_paused(gui_pause_active_ || breaker_pause_active_);
+    // Paused state gauge: the operator-facing question this answers is
+    // "is the bot posting offers?", so it must reflect EVERY posting gate,
+    // not a favoured subset.  The audit found two gates with no operator
+    // surface at all: the wallet circuit breaker and the flash-crash latch
+    // each stopped posting for hours while this gauge read 0.
+    metrics_->update_bot_paused(
+        gui_pause_active_ || breaker_pause_active_ || wallet_circuit_open_
+        || flash_crash_state_ != FlashCrashState::Normal
+        || xch_recovery_mode_);
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {
