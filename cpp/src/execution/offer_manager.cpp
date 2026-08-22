@@ -1,4 +1,4 @@
-﻿/**
+/**
  * @file offer_manager.cpp
  * @brief Implementation of the CHIA DEX offer lifecycle manager.
  *
@@ -146,12 +146,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         int ask_count = 0;
 
         // -- XCH fee reserve pre-check (batch mode) ------------------------
-        // Verify XCH spendable >= 2Ã— fee_reserve_xch before posting.
+        // Verify XCH spendable >= 2x fee_reserve_xch before posting.
         // ALL offers lock XCH UTXOs for on-chain fees, even buy-XCH
-        // offers.  Use 2Ã— reserve as the creation floor so that
+        // offers.  Use 2x reserve as the creation floor so that
         // worst-case UTXO locking still preserves the reserve.
         //
-        // Recovery zone: when spendable is between 1Ã— and 2Ã— reserve,
+        // Recovery zone: when spendable is between 1x and 2x reserve,
         // allow buy-XCH offers through to escape the low-balance
         // deadlock (can't buy XCH because can't create offers because
         // not enough XCH).  Buy-XCH offers will net-increase XCH
@@ -169,7 +169,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    // Check recovery zone: 1Ã— reserve â‰¤ spendable < 2Ã—.
+                    // Check recovery zone: 1x reserve <= spendable < 2x.
                     const auto recovery_floor = static_cast<Mojo>(
                         std::llround(effective_reserve
                                      * static_cast<double>(kMojosPerXch)));
@@ -207,7 +207,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         }
 
         // -- XCH fee reserve guard (batch mode, UTXO-aware) ----------------
-        // Check XCH spendable balance after bids; skip asks if below 2Ã— reserve.
+        // Check XCH spendable balance after bids; skip asks if below 2x reserve.
         // No buy-XCH exemption: UTXO locking is direction-agnostic.
         if (bid_count > 0 && !asks.empty()
             && effective_reserve > 0.0) {
@@ -342,12 +342,12 @@ asio::awaitable<int> OfferManager::post_quotes(
         // -- XCH fee reserve pre-creation guard (per-offer, UTXO-aware) ----
         // Check XCH spendable BEFORE each individual offer creation.
         // The Chia wallet locks entire UTXOs for fee coins -- a single
-        // create_offer can lock far more than the 5M mojo fee.  Use 2Ã—
+        // create_offer can lock far more than the 5M mojo fee.  Use 2x
         // the reserve as the creation floor so that even after worst-case
         // UTXO locking, the reserve is preserved.  This prevents the
-        // create â†’ drain â†’ cancel â†’ create churn cycle.
+        // create -> drain -> cancel -> create churn cycle.
         //
-        // Recovery zone: when spendable is between 1Ã— and 2Ã— reserve,
+        // Recovery zone: when spendable is between 1x and 2x reserve,
         // allow buy-XCH offers through to escape the low-balance
         // deadlock.  Buy-XCH offers net-increase XCH when filled.
         if (effective_reserve > 0.0) {
@@ -356,12 +356,12 @@ asio::awaitable<int> OfferManager::post_quotes(
                 Mojo xch_spendable = 0;
                 if (xch_bal.contains("spendable_balance"))
                     xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
-                // 2Ã— reserve: survive worst-case UTXO lock.
+                // 2x reserve: survive worst-case UTXO lock.
                 const auto creation_floor = static_cast<Mojo>(std::llround(
                     effective_reserve * 2.0
                     * static_cast<double>(kMojosPerXch)));
                 if (xch_spendable < creation_floor) {
-                    // Check recovery zone: 1Ã— â‰¤ spendable < 2Ã—.
+                    // Check recovery zone: 1x <= spendable < 2x.
                     const auto recovery_floor = static_cast<Mojo>(
                         std::llround(effective_reserve
                                      * static_cast<double>(kMojosPerXch)));
@@ -508,9 +508,9 @@ asio::awaitable<int> OfferManager::post_quotes(
         // the offered amount.  A 0.03 XCH offer can lock a 13 XCH UTXO.
         // Even non-XCH offers lock XCH for fee coins.  Check the actual
         // wallet spendable balance after each creation and stop if below
-        // the 2Ã— reserve floor.
+        // the 2x reserve floor.
         //
-        // Recovery zone: if between 1Ã— and 2Ã— reserve, only stop
+        // Recovery zone: if between 1x and 2x reserve, only stop
         // non-buy-XCH tiers.  Buy-XCH tiers are allowed through to
         // help the engine escape the low-balance state.
         if (effective_reserve > 0.0) {
@@ -1265,14 +1265,14 @@ asio::awaitable<void> OfferManager::ensure_wallet_ids()
 // Scholarly basis:
 //   - Gao & Wang (2020): optimal cancel threshold is a function of the
 //     fractional deviation from the current fair price.
-//   - AÃ¯t-Sahalia & Saglam (2017): stale-quote risk increases with the
+//   - Ait-Sahalia & Saglam (2017): stale-quote risk increases with the
 //     magnitude of price deviation, not uniformly across all tiers.
 //
 // Direction-aware approach:
 //   Only *adverse* deviations trigger cancellation.  An adverse move is
 //   one that makes our offer more generous than intended:
-//     - Bid: new optimal < old price â†’ our bid is too high (overpaying)
-//     - Ask: new optimal > old price â†’ our ask is too low (underselling)
+//     - Bid: new optimal < old price -> our bid is too high (overpaying)
+//     - Ask: new optimal > old price -> our ask is too low (underselling)
 //   Favorable deviations (bid drifted below optimal, ask drifted above)
 //   make the offer more conservative and are safe to leave live.
 //
@@ -1343,7 +1343,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         const bool past_hard_ttl = (age >= hard_ttl);
 
         // Hard TTL: absolute expiration regardless of price.
-        // Safety backstop â€” offers should never live indefinitely.
+        // Safety backstop -- offers should never live indefinitely.
         if (past_hard_ttl) {
             tc.staleness       = TierStaleness::Expired;
             tc.price_deviation = 1.0;  // maximal
@@ -1415,16 +1415,16 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // Determine if the deviation is adverse (makes our offer
         // more generous than intended) or favorable (more conservative).
         //   Bid: adverse when new_p < old_p (signed_dev < 0)
-        //        â†’ our old bid is higher than the new optimal, overpaying.
+        //        -> our old bid is higher than the new optimal, overpaying.
         //   Ask: adverse when new_p > old_p (signed_dev > 0)
-        //        â†’ our old ask is lower than the new optimal, underselling.
+        //        -> our old ask is lower than the new optimal, underselling.
         tc.adverse = (po.side == Side::Bid)
             ? (signed_dev < 0.0)
             : (signed_dev > 0.0);
 
         // Crossing detection: a Bid at or above best_ask (or Ask at or below
         // best_bid) faces immediate adverse selection and must be cancelled
-        // urgently.  Using model mid as the threshold is too conservative â€”
+        // urgently.  Using model mid as the threshold is too conservative --
         // a bid between mid and best_ask is a valid competitive bid, not a
         // crossed offer.  When BBO is unavailable, fall back to mid with a
         // generous buffer (5%) to avoid false positives.
@@ -1440,7 +1440,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                     tc.crossed = true;
                 }
             } else if (mid_price > 0) {
-                // BBO unavailable: fall back to mid Â±5% buffer.
+                // BBO unavailable: fall back to mid +/-5% buffer.
                 constexpr double kCrossBuffer = 0.05;
                 if (po.side == Side::Bid && old_p > mid_p * (1.0 + kCrossBuffer)) {
                     tc.crossed = true;
@@ -1452,11 +1452,11 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
 
         // Classification logic (cancel-reduction optimisations):
         //
-        //   1. Crossed mid-price â†’ always Stale (urgent cancel, no age guard).
+        //   1. Crossed mid-price -> always Stale (urgent cancel, no age guard).
         //
-        //   2. Soft TTL zone (soft TTL â‰¤ age < hard TTL):
+        //   2. Soft TTL zone (soft TTL <= age < hard TTL):
         //      The offer is old.  Apply a gentler adverse threshold
-        //      (kSoftTtlAdverseThreshold = 0.2%) â€” even a small drift
+        //      (kSoftTtlAdverseThreshold = 0.2%) -- even a small drift
         //      on an aged offer should trigger a refresh.  But if the
         //      offer is still perfectly priced, keep it.
         //
@@ -1469,9 +1469,9 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         //   4. Tier-scaled threshold (normal zone):
         //      Outer tiers tolerate more movement because they are further
         //      from mid and capture larger spreads.
-        //      threshold = kSelectiveRefreshThreshold Ã— (1 + tier Ã— scale)
-        //        tier 0 â†’ 0.50%   tier 1 â†’ 0.75%
-        //        tier 2 â†’ 1.00%   tier 3 â†’ 1.25%
+        //      threshold = kSelectiveRefreshThreshold x (1 + tier x scale)
+        //        tier 0 -> 0.50%   tier 1 -> 0.75%
+        //        tier 2 -> 1.00%   tier 3 -> 1.25%
 
         if (tc.crossed) {
             // (1) Urgent: offer crossed mid-price.
@@ -1501,7 +1501,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // When the market allocator changes allocation fractions, existing
         // offers may be significantly oversized relative to the new optimal.
         // If the pending offer's size is > 2x the new ladder's optimal size,
-        // override Freshâ†’Stale to trigger a cancel+repost with correct sizing.
+        // override Fresh->Stale to trigger a cancel+repost with correct sizing.
         // Respects the minimum age guard: only apply past kMinRefreshAgeBlocks.
         if (tc.staleness == TierStaleness::Fresh
             && age >= kMinRefreshAgeBlocks) {
@@ -1513,7 +1513,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
                 if (size_ratio > kSizeStaleThreshold) {
                     tc.staleness = TierStaleness::Stale;
                     logger_->debug("classify_tier_staleness({}): tier {} {} "
-                                   "size oversized {:.1f}x ({}â†’{}) -- marking "
+                                   "size oversized {:.1f}x ({}->{}) -- marking "
                                    "stale", pair_name, po.tier,
                                    to_string(po.side), size_ratio,
                                    po.size, sz_it->second);
@@ -1526,7 +1526,7 @@ std::vector<TierClassification> OfferManager::classify_tier_staleness(
         // offers to track the BBO.  A "favorable" drift (bid drifted low,
         // ask drifted high) is normally safe, but under anchor mode it
         // means we're deep in the book instead of near the top.  Override
-        // Freshâ†’Stale when the ABSOLUTE deviation exceeds the tier-scaled
+        // Fresh->Stale when the ABSOLUTE deviation exceeds the tier-scaled
         // threshold, regardless of direction.
         if (anchor_active
             && tc.staleness == TierStaleness::Fresh
@@ -1846,7 +1846,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
     // removed an offer from State (e.g., during wallet desync, pagination
     // race, or restart), but the wallet still holds it as PENDING_ACCEPT
     // with coins locked.  Without adoption the engine sees 0 pending
-    // offers yet 0 spendable XCH â€” a permanent deadlock.
+    // offers yet 0 spendable XCH -- a permanent deadlock.
     //
     // Gao & Wang (2020): tracking an offer we created is always cheaper
     // than leaving coins locked invisibly.  Worst case the UTXO liberation
@@ -1869,13 +1869,13 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             state_->upsert_offer(*parsed);
             ++adopted_count;
             logger_->warn("[reconcile] ADOPTED untracked wallet offer {} "
-                          "({} {} on {}) â€” wallet has it PENDING_ACCEPT "
+                          "({} {} on {}) -- wallet has it PENDING_ACCEPT "
                           "but engine lost tracking",
                           trade_id.substr(0, 12),
                           (parsed->side == Side::Bid) ? "BID" : "ASK",
                           parsed->size, parsed->pair_name);
         } else {
-            // Can't determine pair/side â€” adopt with minimal metadata.
+            // Can't determine pair/side -- adopt with minimal metadata.
             // UTXO liberation can still cancel it to free locked coins.
             PendingOffer po;
             po.offer_id         = trade_id;
@@ -1889,7 +1889,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
             state_->upsert_offer(po);
             ++adopted_count;
             logger_->warn("[reconcile] ADOPTED unparseable wallet offer {} "
-                          "â€” tracking to prevent coin-lock deadlock",
+                          "-- tracking to prevent coin-lock deadlock",
                           trade_id.substr(0, 12));
         }
     }
@@ -1908,12 +1908,12 @@ asio::awaitable<std::vector<std::string>> OfferManager::reconcile_offers(
 // evaluate_orphan -- cost-aware evaluation of an untracked wallet offer
 //
 // Scholarly basis:
-//   GuÃ©ant, Lehalle & Fernandez-Tapia (2013) â€” cancel only when expected
+//   Gueant, Lehalle & Fernandez-Tapia (2013) -- cancel only when expected
 //     adverse selection loss exceeds the cancellation cost.
-//   Gao & Wang (2020) â€” the zero-offer gap during cancelâ†’repost is the
+//   Gao & Wang (2020) -- the zero-offer gap during cancel->repost is the
 //     primary adverse selection cost for latent market makers.  Keeping a
 //     slightly stale offer is cheaper than having no presence.
-//   AÃ¯t-Sahalia & Saglam (2017) â€” stale-quote risk = f(price_deviation,
+//   Ait-Sahalia & Saglam (2017) -- stale-quote risk = f(price_deviation,
 //     remaining_lifetime, offer_size).  Cancellation threshold should
 //     scale with all three factors.
 //
@@ -1943,7 +1943,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     }
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested assetâ†’amount maps.
+    // Parse offered and requested asset->amount maps.
     // Chia wallet format: { "asset_id_hex_or_xch": amount_int, ... }
     std::unordered_map<std::string, Mojo> offered;    // we give
     std::unordered_map<std::string, Mojo> requested;  // we get
@@ -1985,7 +1985,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
         bool requested_quote = requested.count(quote) > 0;
 
         if (offered_base && requested_quote) {
-            // We gave base, got quote â†’ ASK (we sold base).
+            // We gave base, got quote -> ASK (we sold base).
             eval.pair_name = pname;
             eval.side      = Side::Ask;
             eval.size      = offered.at(base);
@@ -2002,7 +2002,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
             break;
         }
         if (offered_quote && requested_base) {
-            // We gave quote, got base â†’ BID (we bought base).
+            // We gave quote, got base -> BID (we bought base).
             eval.pair_name = pname;
             eval.side      = Side::Bid;
             eval.size      = requested.at(base);
@@ -2060,7 +2060,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     // ---- Price deviation check --------------------------------------------
     auto mid_it = mid_prices.find(eval.pair_name);
     if (mid_it == mid_prices.end() || mid_it->second <= 0) {
-        // No market data available for this pair â€” can't evaluate.
+        // No market data available for this pair -- can't evaluate.
         // Conservatively cancel.
         eval.disposition = OrphanDisposition::Cancel;
         eval.reason = "no current mid-price available for " + eval.pair_name;
@@ -2076,8 +2076,8 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     eval.price_deviation = std::abs(signed_dev);
 
     // Adverse direction:
-    //   BID too high (signed_dev > 0) â†’ overpaying, adverse.
-    //   ASK too low  (signed_dev < 0) â†’ underselling, adverse.
+    //   BID too high (signed_dev > 0) -> overpaying, adverse.
+    //   ASK too low  (signed_dev < 0) -> underselling, adverse.
     eval.adverse = (eval.side == Side::Bid)
         ? (signed_dev > 0.0)
         : (signed_dev < 0.0);
@@ -2097,8 +2097,8 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                 else ++ask_count;
             }
         }
-        // If we have more bids than asks, we're accumulating â†’ asks help.
-        // If we have more asks than bids, we're depleting â†’ bids help.
+        // If we have more bids than asks, we're accumulating -> asks help.
+        // If we have more asks than bids, we're depleting -> bids help.
         const bool helps_inventory =
             (bid_count > ask_count && eval.side == Side::Ask) ||
             (ask_count > bid_count && eval.side == Side::Bid);
@@ -2113,7 +2113,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     // From Gao & Wang (2020), the optimal decision is:
     //   cancel if expected_adverse_loss > cancel_cost
     //
-    // expected_adverse_loss = deviation Ã— size Ã— adverse_fill_prob
+    // expected_adverse_loss = deviation x size x adverse_fill_prob
     // cancel_cost = fee + liquidity_opportunity_cost
     //
     // For simplicity and robustness, we use the threshold approach:
@@ -2124,7 +2124,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
     eval.cancel_cost = static_cast<Mojo>(current_fee_mojos_);
 
     if (!eval.adverse) {
-        // Favorable deviation â€” our offer is more conservative than
+        // Favorable deviation -- our offer is more conservative than
         // the current optimal.  Safe to keep: a bid below mid is fine,
         // an ask above mid is fine.
         eval.disposition = OrphanDisposition::Adopt;
@@ -2133,13 +2133,13 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                                   eval.price_deviation * 100.0,
                                   eval.pair_name);
     } else if (eval.price_deviation <= effective_threshold * 0.5) {
-        // Small adverse deviation â€” well within tolerance.
+        // Small adverse deviation -- well within tolerance.
         eval.disposition = OrphanDisposition::Adopt;
         eval.reason = fmt::format("small adverse {:.2f}% < {:.1f}% half-threshold",
                                   eval.price_deviation * 100.0,
                                   effective_threshold * 50.0);
     } else if (eval.price_deviation <= effective_threshold) {
-        // Moderate adverse â€” cheaper to keep than cancel, but flag
+        // Moderate adverse -- cheaper to keep than cancel, but flag
         // for early refresh on the next heartbeat.
         eval.disposition = OrphanDisposition::AdoptStale;
         eval.expected_loss = static_cast<Mojo>(std::llround(
@@ -2150,7 +2150,7 @@ OrphanEvaluation OfferManager::evaluate_orphan(
                                   effective_threshold * 100.0,
                                   eval.inventory_helper ? " (inventory helper)" : "");
     } else {
-        // Large adverse deviation â€” expected loss exceeds cancel cost.
+        // Large adverse deviation -- expected loss exceeds cancel cost.
         eval.expected_loss = static_cast<Mojo>(std::llround(
             eval.price_deviation * static_cast<double>(eval.size)));
         eval.disposition = OrphanDisposition::Cancel;
@@ -2173,9 +2173,9 @@ OrphanEvaluation OfferManager::evaluate_orphan(
 // market presence.
 //
 // Scholarly basis:
-//   GuÃ©ant, Lehalle & Fernandez-Tapia (2013) â€” cost-aware cancellation
-//   Gao & Wang (2020) â€” zero-offer gap avoidance for latent market makers
-//   AÃ¯t-Sahalia & Saglam (2017) â€” stale-quote risk scaling
+//   Gueant, Lehalle & Fernandez-Tapia (2013) -- cost-aware cancellation
+//   Gao & Wang (2020) -- zero-offer gap avoidance for latent market makers
+//   Ait-Sahalia & Saglam (2017) -- stale-quote risk scaling
 // ---------------------------------------------------------------------------
 
 asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
@@ -2326,7 +2326,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 po.side            = eval.side;
                 po.price           = eval.price;
                 po.size            = eval.size;
-                po.tier            = 0;  // Unknown original tier â€” assign 0.
+                po.tier            = 0;  // Unknown original tier -- assign 0.
                 po.fee_mojos       = current_fee_mojos_;
                 // Approximate creation block from age.
                 if (current_block > 0 && wo->record.contains("created_at_time")) {
@@ -2363,7 +2363,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 if (eval.disposition == OrphanDisposition::Adopt) {
                     ++adopted;
                     logger_->info("[startup_reconcile] ADOPTED orphan {} "
-                                  "({} {} on {} @ {} mojos) â€” {}",
+                                  "({} {} on {} @ {} mojos) -- {}",
                                   wo->trade_id.substr(0, 24),
                                   (eval.side == Side::Bid) ? "BID" : "ASK",
                                   eval.size, eval.pair_name, eval.price,
@@ -2371,7 +2371,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 } else {
                     ++adopted_stale;
                     logger_->info("[startup_reconcile] ADOPTED-STALE orphan {} "
-                                  "({} {} on {} @ {} mojos) â€” {}",
+                                  "({} {} on {} @ {} mojos) -- {}",
                                   wo->trade_id.substr(0, 24),
                                   (eval.side == Side::Bid) ? "BID" : "ASK",
                                   eval.size, eval.pair_name, eval.price,
@@ -2385,7 +2385,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 // Cancel this orphan on-chain.
                 const char* label = (eval.disposition == OrphanDisposition::Unknown)
                     ? "UNKNOWN" : "CANCEL";
-                logger_->warn("[startup_reconcile] {} orphan {} â€” {}",
+                logger_->warn("[startup_reconcile] {} orphan {} -- {}",
                               label, wo->trade_id.substr(0, 24), eval.reason);
 
                 bool cancel_ok = false;
@@ -2435,7 +2435,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                     // etc.).  Force-adopt to prevent deadlock: the wallet
                     // still holds this offer as PENDING_ACCEPT, locking
                     // coins.  If we don't track it, the engine sees 0
-                    // pending offers but 0 spendable XCH â€” permanent
+                    // pending offers but 0 spendable XCH -- permanent
                     // stall.  Adopting lets UTXO liberation or the next
                     // cancel cycle free the locked coins.
                     auto parsed = try_parse_wallet_offer(
@@ -2457,7 +2457,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                     ++adopted;
                     logger_->warn(
                         "[startup_reconcile] FORCE-ADOPTED uncancellable "
-                        "orphan {} ({} {} on {}) â€” cancel failed, tracking "
+                        "orphan {} ({} {} on {}) -- cancel failed, tracking "
                         "to prevent deadlock",
                         wo->trade_id.substr(0, 24),
                         (eval.side == Side::Bid) ? "BID" : "ASK",
@@ -2976,7 +2976,7 @@ std::optional<PendingOffer> OfferManager::try_parse_wallet_offer(
     const std::string trade_id = trade_record["trade_id"].get<std::string>();
     const auto& summary = trade_record["summary"];
 
-    // Parse offered and requested asset â†’ amount maps.
+    // Parse offered and requested asset -> amount maps.
     std::unordered_map<std::string, Mojo> offered;
     std::unordered_map<std::string, Mojo> requested;
 
@@ -3228,7 +3228,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
             xch_spendable = xch_bal["spendable_balance"].get<Mojo>();
 
         if (xch_spendable > 0) {
-            // Try descending fee tiers: 2Ã— dynamic fee, 1Ã— dynamic fee,
+            // Try descending fee tiers: 2x dynamic fee, 1x dynamic fee,
             // half, quarter, down to 1 mojo.  If the wallet reports
             // insufficient funds at a given tier, halve and retry.
             // This lets us cancel even when spendable is far below the

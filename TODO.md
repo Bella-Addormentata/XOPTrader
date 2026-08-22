@@ -136,7 +136,7 @@
 ### S10: The wallet balances page ignores the UI font-size setting
 - **Files:** `gui/widgets/wallet_balances.py` (local QSS on both tables)
 - **Issue:** The balances and target-allocation tables pin `font-size: 12px` and `11px` for headers in widget-level stylesheets, which override the application stylesheet built by `theme.get_stylesheet(font_size_delta=...)`. Measured 2026-08-21: row height and total table height are byte-identical at deltas -2, 0 and +4. An operator who enlarges the UI font gets no change on this page. Surfaced reviewing PR #92, where a parameterised test appeared to cover font scaling but exercised the same geometry three times.
-- **Status:** `[ ]` — OPEN. Either drop the local font sizes and let the theme supply them, or derive them from the same delta. Low risk, but it silently defeats an accessibility setting the app advertises.
+- **Status:** `[x]` — FIXED (PR #97). `apply_theme()` records the active delta and exposes `theme.scaled_px()`; the wallet page's table/header QSS and row heights derive from it, so the setting reaches the page (verified: delta 4 grows rows 30→34 and the fitted height follows). Widgets built before a theme change keep their old sizes until recreated, like any local QSS.
 
 ### S11: offer_log keeps never-resolved 'pending' rows
 - **Files:** `cpp/src/execution/offer_manager.cpp` (reconciliation), `gui/services/database_service.py` (consumers)
@@ -151,6 +151,21 @@
 - **Observed 2026-08-22:** one XCH/BYC print of 2.3419 (versus ~1.57 either side, fully retraced within minutes) set the running max. It entered the feed at 09:28:17 UTC, block 9184230 (`logs/xop_trader.*.log`, `MarketDataFeed: pair=XCH/BYC mid=2.341920`); the 09:43:34 stamp sometimes quoted for it is the snapshots-table persistence time, fifteen minutes later. The ingest line shows the source: dexie delivered a CROSSED book that tick (`bid=3.904229 ask=2.320784 last=2.341920`), so the outlier is a junk ticker snapshot, not a trade. Every subsequent price ~1.63 reads as a 30% drawdown from it, so the detector reported a crash continuously. Step 8 stayed gated **for every pair**, not just XCH/BYC, for 4+ hours — while all five pairs measured stable within 5% with full history. The state can only clear when the print falls out of the 1000-entry buffer (`kDefaultPriceHistoryCapacity`), which is a function of elapsed blocks, not of market conditions.
 - **Compounding:** the same print also fed the max-drawdown breach, from the OTHER side than first assumed. XCH/BYC is BYC-per-XCH, so 2.3419 against ~1.64 DEVALUES the BYC holding: 79.3 BYC fell from ~$73 to ~$51 of marks, about $22 of the $36.90 drawdown that tripped the breaker minutes later. The print played no part in setting the `$262.11` peak, which predates it by hours. One junk tick therefore both suppressed posting (this latch) and supplied most of the drawdown that paused the engine. The breaker's peak is in-memory and re-anchors on restart (`cpp/include/xop/engine.hpp`, `peak_equity_hwm_usd_`).
 - **Status:** `[x]` — FIXED (PR #96). `check_flash_crash` now scans a window (`risk.flash_crash_window_blocks`, default 100 = `recovery_stable_blocks_phase2`; 0 restores whole-history), so an aged, retraced spike stops holding `any_pair_crashing` and the existing stability machinery runs. The 2026-08-22 latch replays as: junk print trips Crash; ~100 blocks (~31 min) later the spike exits the window, whose samples already satisfy BOTH stability phases — Recovery on that evaluation, Normal on the next, ~32 min total instead of >5 h pinned to buffer eviction. Outlier rejection at ingest (the crossed-ticker source) remains a possible second layer, deliberately not bundled into this fix.
+
+### S13: Wallet mutations fail in post-submit sync flaps -- stale quotes stay live
+- **Files:** `cpp/src/engine.cpp` (Step 8 loop), `cpp/src/rpc/chia_rpc.cpp:617`, `cpp/src/execution/offer_manager.cpp:1595`
+- **Issue:** "Wallet needs to be fully synced" accounts for ~4,000 of 4,514 error lines (88%). Submitting one pair's offers flips the wallet into a transient syncing state; the sequential Step-8 loop issues the NEXT pair's cancels/creates ~76 ms later with no per-mutation sync re-check or backoff (measured: 6/6 offers created, then 4 consecutive selective_cancel failures 76 ms after). Failed cancels leave stale quotes live on Dexie at old prices — pick-off exposure — and feed S14. The only sync gate (engine.cpp:6585) fired 8 times against ~4,000 errors.
+- **Status:** `[ ]` — OPEN. Sync-aware retry with short backoff around mutation RPCs, and/or reorder Step 8 to run all cancels before any creates. Touches live order handling: NOT to be fixed casually.
+
+### S14: Stuck-offer forced cancel retries forever with no escalation
+- **Files:** `cpp/src/engine.cpp:7109-7121`, `cpp/src/execution/offer_manager.cpp:3206`
+- **Issue:** The forced-cancel loop retries with the SAME fee indefinitely: worst case one offer re-warned 158 times over ~36 h (age 851 → 7,782 blocks), fee frozen at 5,000 mojos on every attempt. While stuck, coins stay locked (170 "entering XCH-buy-only mode" warnings) and the quote stays live. Mostly downstream of S13.
+- **Status:** `[ ]` — OPEN. Escalation ladder: retry with escalated fee → delete_unconfirmed_transactions + re-cancel → mark unrecoverable and alert ONCE. Rate-limit the per-offer warning. Touches live order handling.
+
+### S15: Spread-cap warning fires every block, including while paused
+- **Files:** `cpp/src/engine.cpp:3456`
+- **Issue:** 11,798 warnings (~14% of all warnings), the largest single shape in the log; 3,358 on 2026-08-22 alone while the engine was PAUSED — spreads recomputed and warned for quotes that will never post. Also indicates the vol/regime multiplier chain stays pinned above the cap for days.
+- **Status:** `[ ]` — OPEN. Demote per-block to debug; warn on capped/uncapped TRANSITION with duration + worst overshoot; skip (or silence) Step-5 warnings while Paused. Separately investigate why the multiplier chain latches above the cap.
 
 ---
 

@@ -62,14 +62,14 @@ std::string expand_tilde(const std::string& path)
 // [T4-04] Expand `${VAR}` environment-variable references in a string value.
 //
 // Syntax:
-//   ${VAR}            — replaced with the value of environment variable VAR.
+//   ${VAR}            -- replaced with the value of environment variable VAR.
 //                       Throws ConfigError if VAR is not set.
-//   ${VAR:-default}   — replaced with VAR's value, or "default" if unset.
+//   ${VAR:-default}   -- replaced with VAR's value, or "default" if unset.
 //
 // Unmatched or malformed `${...}` sequences are left unchanged so that
 // non-env-var uses of `$` (e.g., in asset IDs) are never silently altered.
 //
-// ISO/IEC 27001:2022 — enables externalization of secrets (SSL paths,
+// ISO/IEC 27001:2022 -- enables externalization of secrets (SSL paths,
 // Telegram tokens, API keys) from plaintext YAML into the OS environment.
 std::string expand_env_vars(const std::string& input)
 {
@@ -82,7 +82,7 @@ std::string expand_env_vars(const std::string& input)
         if (i + 1 < input.size() && input[i] == '$' && input[i + 1] == '{') {
             const auto close = input.find('}', i + 2);
             if (close == std::string::npos) {
-                // No closing brace — not an env-var reference; copy literally.
+                // No closing brace -- not an env-var reference; copy literally.
                 result += input[i];
                 ++i;
                 continue;
@@ -349,7 +349,7 @@ ChiaConfig parse_chia(const YAML::Node& root)
     cfg.wallet_cert_path = expand_tilde(read_string(node, "wallet_cert_path", sec));
     cfg.wallet_key_path  = expand_tilde(read_string(node, "wallet_key_path", sec));
 
-    // CA certificate — required; used for SSL peer verification.
+    // CA certificate -- required; used for SSL peer verification.
     cfg.ca_cert_path = expand_tilde(read_string(node, "ca_cert_path", sec));
 
     // SSL verification defaults to true when omitted.
@@ -1343,7 +1343,7 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     }
 
     // -- Smart orphan management (optional) --
-    // Guéant, Lehalle & Fernandez-Tapia (2013): cost-aware orphan evaluation.
+    // Gueant, Lehalle & Fernandez-Tapia (2013): cost-aware orphan evaluation.
     if (node["orphan_adopt_enabled"] && node["orphan_adopt_enabled"].IsDefined()
         && !node["orphan_adopt_enabled"].IsNull()) {
         cfg.orphan_adopt_enabled = node["orphan_adopt_enabled"].as<bool>();
@@ -1612,7 +1612,7 @@ RiskConfig parse_risk(const YAML::Node& root)
 
     // max_window_loss_bps: max loss in bps within the window, in [0, 10000].
     // A value of 0 disables the rolling-window circuit breaker.
-    // Upper-bound 10000 (= 100%) prevents float→Mojo overflow at the use site.
+    // Upper-bound 10000 (= 100%) prevents float->Mojo overflow at the use site.
     if (node["max_window_loss_bps"] && node["max_window_loss_bps"].IsDefined()
             && !node["max_window_loss_bps"].IsNull()) {
         cfg.max_window_loss_bps = node["max_window_loss_bps"].as<double>();
@@ -1654,7 +1654,7 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
     }
 
-    // recovery_stable_blocks_phase1: blocks that must be stable for Crash→Recovery.
+    // recovery_stable_blocks_phase1: blocks that must be stable for Crash->Recovery.
     if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
             && !node["recovery_stable_blocks_phase1"].IsNull()) {
         int64_t v = node["recovery_stable_blocks_phase1"].as<int64_t>();
@@ -1665,7 +1665,7 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.recovery_stable_blocks_phase1 = static_cast<uint32_t>(v);
     }
 
-    // recovery_stable_blocks_phase2: blocks that must be stable for Recovery→Normal.
+    // recovery_stable_blocks_phase2: blocks that must be stable for Recovery->Normal.
     if (node["recovery_stable_blocks_phase2"] && node["recovery_stable_blocks_phase2"].IsDefined()
             && !node["recovery_stable_blocks_phase2"].IsNull()) {
         int64_t v = node["recovery_stable_blocks_phase2"].as<int64_t>();

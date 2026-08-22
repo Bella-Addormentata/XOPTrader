@@ -806,8 +806,12 @@ class EngineBridge(QObject):
         if new_status == STATUS_RUNNING and self._metrics_svc.is_analysis_active():
             new_status = STATUS_ANALYZING
 
-        # Check if the engine has been paused via GUI pause flag.
-        if new_status in (STATUS_RUNNING, STATUS_ANALYZING) and self._metrics_svc.is_paused():
+        # Any standing posting gate EXCEPT dry-run surfaces as Paused.
+        # Dry-run is an operating mode, not a pause: folding it in showed a
+        # healthy dry-run engine as "Paused (protection)".  The window
+        # distinguishes WHO owns a pause via posting_gate_reasons().
+        gate_reasons = self._metrics_svc.posting_gate_reasons() - {"dry_run"}
+        if new_status in (STATUS_RUNNING, STATUS_ANALYZING) and gate_reasons:
             new_status = STATUS_PAUSED
 
         self._update_status(new_status)

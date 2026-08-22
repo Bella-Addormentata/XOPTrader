@@ -301,6 +301,9 @@ class MainWindow(QMainWindow):
         self._connected: bool = False
         self._bot_running: bool = False
         self._bot_paused: bool = False
+        # True when the current Paused status is owned by the GUI flag (the
+        # pause Resume can clear), False when a risk breaker holds it.
+        self._gui_pause_owns_it: bool = True
         self._dry_run: bool = dry_run
         self._start_time: float = time.monotonic()
         self._last_engine_start_failure: str = ""
@@ -571,12 +574,23 @@ class MainWindow(QMainWindow):
             Aggregated snapshot with keys: pnl, health, offers, risk,
             market_data, trade_summary, config, bot_status.
         """
+        # Ownership of a pause can change without a status transition;
+        # keep the Resume control truthful on every tick.
+        self._refresh_pause_ownership()
         pnl = data.get("pnl", {})
         health = data.get("health", {})
 
         # Status bar update.
         pnl_total = int(pnl.get("total", 0))
         block_height = int(health.get("block_height", 0))
+        # The orders panels' Age (blocks) column: set_current_block existed
+        # with no caller, so _current_block stayed 0 and every age rendered
+        # as 0 since the panel was built.
+        if block_height > 0:
+            for panel in (self._order_panel, self._tab_order_panel):
+                target = self._unwrap(panel)
+                if target is not None and hasattr(target, "set_current_block"):
+                    target.set_current_block(block_height)
 
         # Compute average spread from all pairs.
         market_data = data.get("market_data", {})
@@ -858,6 +872,7 @@ class MainWindow(QMainWindow):
             colour = _C.WARNING_YELLOW
             self._bot_running = True
             self._bot_paused = True
+            self._refresh_pause_ownership()
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
             self._bot_running = False
@@ -1612,6 +1627,40 @@ class MainWindow(QMainWindow):
         self._act_start_trading.setEnabled(not self._bot_running)
         self._act_stop_trading.setEnabled(self._bot_running)
 
+    def _refresh_pause_ownership(self) -> None:
+        """Recompute who owns the current pause, and re-arm the controls.
+
+        Called from the Paused status branch AND from every bridge data
+        tick: the gate-reason set can change while the status STRING stays
+        "Paused" (a breaker trips under an existing GUI pause, or a
+        flash-crash/wallet-circuit gate clears at runtime), and the bridge
+        emits bot_status_changed only on string transitions -- so a
+        transition-only snapshot goes stale in both directions: Resume
+        left enabled over a latched breaker, or left disabled after the
+        protection gate has cleared.
+        """
+        if not self._bot_paused:
+            # Pause-scoped state: left stale, a protection-only pause that
+            # cleared would disable Resume on the NEXT GUI pause until a
+            # later tick recomputed the reasons.
+            self._gui_pause_owns_it = True
+            return
+        reasons = {"gui"}
+        try:
+            if self._bridge is not None:
+                reasons = (self._bridge.metrics_service
+                           .posting_gate_reasons() - {"dry_run"})
+        except Exception:
+            pass
+        owns = (reasons == {"gui"} or not reasons)
+        if owns != getattr(self, "_gui_pause_owns_it", True):
+            self._gui_pause_owns_it = owns
+            self._act_resume_trading.setEnabled(self._bot_paused and owns)
+            self._pause_resume_btn.setEnabled(self._bot_paused and owns)
+        self._gui_pause_owns_it = owns
+        self._bot_status_label.setText(
+            "Paused" if owns else "Paused (protection)")
+
     def _style_pause_resume_button(self) -> None:
         """Apply the correct colour and label to the pause/resume button."""
         if self._bot_paused:
@@ -1648,8 +1697,11 @@ class MainWindow(QMainWindow):
             )
 
         # Enable pause only when the bot is running and not already paused.
+        # Resume only clears the GUI flag, so it is offered only for a pause
+        # the GUI actually owns -- a breaker pause requires a restart.
         can_pause = self._bot_running and not self._bot_paused
-        can_resume = self._bot_paused
+        can_resume = self._bot_paused and getattr(
+            self, "_gui_pause_owns_it", True)
         self._pause_resume_btn.setEnabled(can_pause or can_resume)
         self._act_pause_trading.setEnabled(can_pause)
         self._act_resume_trading.setEnabled(can_resume)

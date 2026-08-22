@@ -19,6 +19,7 @@
 #include "xop/monitoring/on_chain_reconciler.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <unordered_set>
 
@@ -50,7 +51,16 @@ OnChainReconciler::reconcile_balances(
 {
     std::vector<BalanceDiscrepancy> discrepancies;
 
+    // The caller labels wallets per PAIR/side, so one physical wallet (the
+    // XCH wallet backs every XCH pair) arrives several times under
+    // different labels.  Reconciling it once is correct; re-reporting the
+    // same wallet four times per run was a quarter of this monitor's noise.
+    std::unordered_set<std::int64_t> seen_wallet_ids;
+
     for (const auto& [label, wid] : wallet_ids) {
+        if (!seen_wallet_ids.insert(wid).second) {
+            continue;
+        }
         try {
             // Step 1: Get wallet-reported balance.
             auto bal_json = co_await wallet_->get_wallet_balance(wid);
@@ -63,11 +73,43 @@ OnChainReconciler::reconcile_balances(
             // Step 2: Get spendable coins from wallet to collect puzzle hashes.
             auto coins_json = co_await wallet_->get_spendable_coins(wid);
 
-            // Collect unique puzzle hashes from our coins.
+            // Collect unique puzzle hashes AND each spendable coin's
+            // identity (parent, puzzle hash, amount).  Identities, not
+            // totals: locked or change coins sharing a reused address
+            // inflate the on-chain sum, and that surplus can exactly mask
+            // a spendable coin that is MISSING on-chain -- the aggregate
+            // subtraction reported OK in the one case this monitor exists
+            // to catch.
+            auto canon = [](std::string h) {
+                if (h.size() > 2 && h[0] == '0'
+                        && (h[1] == 'x' || h[1] == 'X')) {
+                    h = h.substr(2);
+                }
+                std::transform(h.begin(), h.end(), h.begin(),
+                               [](unsigned char c) {
+                                   return static_cast<char>(std::tolower(c));
+                               });
+                return h;
+            };
+            auto coin_key = [&canon](const nlohmann::json& c) {
+                return canon(c.value("parent_coin_info", std::string{}))
+                     + ":" + canon(c.value("puzzle_hash", std::string{}))
+                     + ":" + std::to_string(
+                           c.contains("amount") ? c["amount"].get<Mojo>()
+                                                : Mojo{0});
+            };
+
             std::unordered_set<std::string> puzzle_hashes;
+            std::vector<std::pair<std::string, Mojo>> wallet_coins;
+            Mojo wallet_spendable = 0;
             for (const auto& coin_rec : coins_json) {
                 const auto& coin_obj = coin_rec.contains("coin")
                     ? coin_rec["coin"] : coin_rec;
+                if (coin_obj.contains("amount")) {
+                    wallet_spendable += coin_obj["amount"].get<Mojo>();
+                    wallet_coins.emplace_back(coin_key(coin_obj),
+                                              coin_obj["amount"].get<Mojo>());
+                }
                 if (coin_obj.contains("puzzle_hash")) {
                     std::string ph =
                         coin_obj["puzzle_hash"].get<std::string>();
@@ -89,6 +131,8 @@ OnChainReconciler::reconcile_balances(
             // Step 3: Query full node for unspent coins at each puzzle hash.
             Mojo on_chain_total = 0;
             std::size_t on_chain_count = 0;
+            bool scan_complete = true;
+            std::unordered_set<std::string> on_chain_keys;
 
             for (const auto& ph : puzzle_hashes) {
                 try {
@@ -102,9 +146,11 @@ OnChainReconciler::reconcile_balances(
                             on_chain_total +=
                                 rec["coin"]["amount"].get<Mojo>();
                             ++on_chain_count;
+                            on_chain_keys.insert(coin_key(rec["coin"]));
                         }
                     }
                 } catch (const std::exception& e) {
+                    scan_complete = false;
                     logger_->warn("reconcile_balances: full node query failed "
                                   "for puzzle_hash {}...{}: {}",
                                   ph.substr(0, 8),
@@ -113,28 +159,76 @@ OnChainReconciler::reconcile_balances(
                 }
             }
 
-            // Step 4: Compare.
-            Mojo diff = on_chain_total - wallet_confirmed;
+            // A partial scan cannot support a shortfall claim: with one
+            // address missing from the sum, on_chain < spendable is exactly
+            // what a transient node error looks like -- the same false
+            // positive this rework exists to remove, re-created by an RPC
+            // hiccup.  Skip the comparison and say so.
+            if (!scan_complete) {
+                logger_->info("reconcile_balances: wallet={} scan incomplete "
+                              "-- comparison skipped this run", label);
+                continue;
+            }
 
-            if (diff != 0) {
+            // Step 4: Compare COIN BY COIN.
+            //
+            // Each earlier simplification failed differently.  Sums against
+            // confirmed_wallet_balance were apples-to-oranges (locked coins
+            // inflate confirmed; their addresses never enter the scan):
+            // ~7,800 phantom warnings.  Sums against the spendable SUM
+            // fixed that but could MASK the real fault: locked or change
+            // coins at a reused address inflate the on-chain side, and that
+            // surplus can exactly offset a spendable coin missing from the
+            // chain -- reporting OK in the one case this monitor exists to
+            // catch.
+            //
+            // So: every spendable coin the wallet claims must exist as an
+            // unspent on-chain record, matched by identity (parent, puzzle
+            // hash, amount).  Totals are context only.
+            Mojo missing_sum = 0;
+            std::size_t missing_count = 0;
+            for (const auto& [key, amount] : wallet_coins) {
+                if (on_chain_keys.find(key) == on_chain_keys.end()) {
+                    missing_sum += amount;
+                    ++missing_count;
+                }
+            }
+            // Two distinct figures, kept separate: the AGGREGATE difference
+            // (context; positive surplus at reused addresses is normal) and
+            // the identity-matched MISSING sum (the alert condition).
+            // Folding the second into a field named like the first is how a
+            // report ends up printing arithmetic that does not add up.
+            const Mojo aggregate_diff = on_chain_total - wallet_spendable;
+
+            if (missing_count > 0) {
                 BalanceDiscrepancy disc;
                 disc.wallet_label      = label;
                 disc.wallet_id         = wid;
                 disc.wallet_confirmed  = wallet_confirmed;
+                disc.wallet_spendable  = wallet_spendable;
                 disc.on_chain_total    = on_chain_total;
-                disc.difference        = diff;
+                disc.difference        = aggregate_diff;
+                disc.missing_sum       = missing_sum;
+                disc.missing_count     = missing_count;
                 disc.on_chain_coin_count = on_chain_count;
                 discrepancies.push_back(disc);
 
-                logger_->warn("reconcile_balances: DISCREPANCY wallet={} "
-                              "wallet_confirmed={} on_chain={} diff={} "
-                              "({} coins on-chain)",
-                              label, wallet_confirmed, on_chain_total,
-                              diff, on_chain_count);
+                logger_->warn("reconcile_balances: SHORTFALL wallet={} "
+                              "-- {} spendable coin(s) totalling {} mojos "
+                              "have no unspent on-chain record "
+                              "(spendable={} on_chain_sum={} confirmed={} "
+                              "for context, {} coins on-chain)",
+                              label, missing_count, missing_sum,
+                              wallet_spendable, on_chain_total,
+                              wallet_confirmed, on_chain_count);
             } else {
-                logger_->info("reconcile_balances: wallet={} balance OK "
-                              "({} mojos, {} coins)",
-                              label, wallet_confirmed, on_chain_count);
+                // Normal outcome, including benign surplus at reused
+                // addresses: debug, not info -- an OK line per wallet per
+                // run is exactly the recurring noise this rework removes.
+                logger_->debug("reconcile_balances: wallet={} balance OK "
+                               "(every spendable coin found on-chain; "
+                               "{} mojos across {} coins)",
+                               label, wallet_spendable, wallet_coins.size());
             }
         } catch (const std::exception& e) {
             logger_->warn("reconcile_balances: failed for wallet {} ({}): {}",

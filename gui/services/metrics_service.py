@@ -673,11 +673,10 @@ class MetricsService(QObject):
         return _scalar(m, "xop_fees_paid_24h_mojos")
 
     def is_paused(self) -> bool:
-        """Return whether the engine is paused by GUI flag.
+        """Whether the GUI pause flag is active (the pause Resume can clear).
 
-        Returns
-        -------
-        bool
+        Command-side state only.  For "is the engine actually posting?",
+        use :meth:`posting_gated`.
         """
         with QMutexLocker(self._mutex):
             m = self._latest
@@ -686,6 +685,41 @@ class MetricsService(QObject):
         for _labels, value in inner.items():
             return value >= 1.0
         return False
+
+    def posting_gate_reasons(self) -> set[str]:
+        """The STANDING gates currently disabling offer posting.
+
+        Reads the labelled ``xop_posting_gate`` family; possible members:
+        ``gui``, ``breaker``, ``wallet_circuit``, ``flash_crash``,
+        ``xch_recovery``, ``dry_run``.  An empty set means no standing gate
+        -- NOT proof that an offer was posted: transient per-cycle aborts
+        (e.g. wallet not yet synced) are outside this signal's contract.
+        Falls back to the GUI-pause gauge against an engine predating the
+        family, which understates gating exactly as that engine did.
+        """
+        with QMutexLocker(self._mutex):
+            m = self._latest
+
+        inner = m.get("xop_posting_gate")
+        if inner:
+            reasons: set[str] = set()
+            for labels, value in inner.items():
+                if value >= 1.0:
+                    for key, val in labels:
+                        if key == "reason":
+                            reasons.add(val)
+            return reasons
+        return {"gui"} if self.is_paused() else set()
+
+    def posting_gated(self) -> bool:
+        """Whether any STANDING gate currently disables offer posting.
+
+        Standing gates: GUI pause, latched risk breaker, wallet circuit
+        breaker, flash-crash episode, XCH recovery, dry-run.  False is not
+        proof posting occurred -- transient per-cycle aborts are outside
+        this contract.
+        """
+        return bool(self.posting_gate_reasons())
 
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.

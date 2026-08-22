@@ -323,12 +323,12 @@ ArbitrageDetector::scan_cex_dex(
         const double bridge    = cfg_.bridge_fee_bps;
 
         // Slippage estimate: square-root price impact model per Almgren
-        // et al. (2005) and Gatheral (2010).  Linear impact (λ·Q) is
+        // et al. (2005) and Gatheral (2010).  Linear impact (lambda*Q) is
         // inconsistent with no-dynamic-arbitrage conditions and empirically
-        // rejected in favour of impact ∝ √(trade_size / depth).
+        // rejected in favour of impact  ~  sqrt(trade_size / depth).
         //
-        // T5-CR10: impact_bps = η · √(trade_size / available_depth)
-        //   where η = 10.0 bps calibration constant (same order-of-magnitude
+        // T5-CR10: impact_bps = eta * sqrt(trade_size / available_depth)
+        //   where eta = 10.0 bps calibration constant (same order-of-magnitude
         //   as the previous linear model at ratio = 1.0, but produces higher
         //   slippage for small trades and lower for large trades, matching
         //   empirical concave impact functions).
@@ -641,8 +641,8 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
     // get_rate_directed("A", "B") uses bid/ask data when available for
     // conservative profit estimation (Kozhan & Tham 2012).  When we sell
     // A to get B:
-    //   - Direct pair "A/B" exists: we sell base (A) → use bid price.
-    //   - Inverse pair "B/A" exists: we buy base (B) → use 1/ask price.
+    //   - Direct pair "A/B" exists: we sell base (A) -> use bid price.
+    //   - Inverse pair "B/A" exists: we buy base (B) -> use 1/ask price.
     // Both directions yield a rate <= mid, reducing phantom profit from
     // ignoring spreads.  Falls back to mid-price when bid/ask unavailable.
     //
@@ -667,8 +667,8 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
     };
 
     // Spread-aware rate: sell `base` to buy `quote`.
-    // Direct pair "base/quote": selling base → bid price.
-    // Inverse pair "quote/base": buying base of that pair → 1/ask.
+    // Direct pair "base/quote": selling base -> bid price.
+    // Inverse pair "quote/base": buying base of that pair -> 1/ask.
     auto get_rate_directed = [&](const std::string& base,
                                  const std::string& quote) -> double {
         const std::string direct = base + "/" + quote;
@@ -703,7 +703,7 @@ ArbitrageDetector::scan_triangular(const PairPriceMap& all_pair_prices,
     // depth data is available (effectively unconstrained).
     auto get_depth = [&](const std::string& pair_key) -> double {
         if (pair_depths.empty() || pair_key.empty()) {
-            return 1e9;  // no depth data → unconstrained
+            return 1e9;  // no depth data -> unconstrained
         }
         auto it = pair_depths.find(pair_key);
         if (it != pair_depths.end() && it->second > 0.0) {
