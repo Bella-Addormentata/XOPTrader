@@ -67,7 +67,8 @@ namespace {
 // so the fallback stays unavailable until the print MOVES -- not merely until
 // the pair trades again.  That is the conservative side of a path which opens
 // whenever no usable TWO-SIDED quote remains: an empty book, but equally a
-// one-sided one, since Case 2 forms a mid only when both sides are present.
+// one-sided one: a mid is formed only from a two-sided book, so a lone
+// resting side does not produce one.
 // -------------------------------------------------------------------------
 bool last_trade_is_fresh(const PairState& ps,
                          double max_age_sec) {
@@ -1000,8 +1001,11 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // Priority cascade:
 //   0. Order-book VWAP micro-price (depth-weighted, when enabled)
 //   1. Dexie two-sided quotes -> dex_mid = (bid + ask) / 2
-//   2. Dexie one-sided (bid-only or ask-only) -> dex_mid = available side
-//   3. Dexie last trade (no live quotes) -> dex_mid = last_trade
+//   2. Dexie one-sided (bid-only or ask-only) -> NO dex mid; falls to 3.
+//      (This used to publish the surviving side as the mid.)
+//   3. Dexie last trade -- reached with no quotes OR with a one-sided
+//      book -> dex_mid = last_trade, but only while that print is
+//      young enough (dex_last_trade_max_age_sec); otherwise no dex mid.
 //   4. No dexie data at all -> dex_mid = 0
 //
 // Blending:
@@ -1071,9 +1075,9 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // Falls through to the last trade below, which is a real print rather
     // than half a book.
     // Case 3: No usable two-sided quote -- an empty book, or a one-sided
-    // one, since Case 2 forms a mid only when both sides are present -- so
-    // fall back to the last trade, but only while that print is young enough
-    // to be evidence of location.
+    // one, which Case 2 above deliberately refuses to turn into a mid --
+    // so fall back to the last trade, but only while that print is young
+    // enough to be evidence of location.
     // This is the one blend leg that is a historical print, and it enters at
     // full DEX weight, so an unaged fallback silently anchors the mid to
     // whenever the pair last traded.  Refusing leaves the mid to the CEX and
@@ -1088,7 +1092,7 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // the mid RISES -- and because the engine centres both sides on the
     // published mid, BIDS RISE WITH IT: Engine::step_compute_quotes reads
     // get_mid_price and hands that value straight to
-    // Strategy::compute_quotes, which derives both sides from it.  We bid
+    // StrategyBase::compute_quotes, which derives both sides from it.  We bid
     // higher than before, not lower.  (Named by symbol rather than by line:
     // the numbers this first cited had already drifted onto a log statement
     // and a margin calculation.)
@@ -1109,8 +1113,11 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // to be used at all -- and note the CEX taper only became effective with
     // S6, which stopped a frozen CoinGecko cache re-stamping cex_updated_at
     // every heartbeat; before that it could not have rejected a stale feed at
-    // all.  If none survives the pair publishes no mid and
-    // the no-order-book guard stops it quoting.  Past that, buying is bounded
+    // all.  If none survives the pair publishes no mid, and Step 4 marks
+    // the quote invalid on a non-positive mid (engine.cpp: `if (mid <=
+    // 0.0) { pcs.quote_valid = false; }`) so nothing is posted.  That is
+    // a different mechanism from the no-order-book guard, which gates
+    // posting when a ladder has no book reference at all.  Past that, buying is bounded
     // at the SIZING layer -- the pair's drift target and single_cat_cap_pct --
     // not at the price layer.  A stale print is not an accumulation brake and
     // must not be relied on as one.  Whether this path should carry a band of
