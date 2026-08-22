@@ -152,6 +152,21 @@
 - **Compounding:** the same print also fed the max-drawdown breach, from the OTHER side than first assumed. XCH/BYC is BYC-per-XCH, so 2.3419 against ~1.64 DEVALUES the BYC holding: 79.3 BYC fell from ~$73 to ~$51 of marks, about $22 of the $36.90 drawdown that tripped the breaker minutes later. The print played no part in setting the `$262.11` peak, which predates it by hours. One junk tick therefore both suppressed posting (this latch) and supplied most of the drawdown that paused the engine. The breaker's peak is in-memory and re-anchors on restart (`cpp/include/xop/engine.hpp`, `peak_equity_hwm_usd_`).
 - **Status:** `[ ]` — OPEN. Options: decay or window the running maximum (e.g. only consider the last N entries rather than all retained history), reject single-sample outliers before the detector sees them, or evaluate stability even while `any_pair_crashing` holds so a retraced spike can clear. A restart also clears it, since the history is in-memory — but that is a workaround, not a fix.
 
+### S13: Wallet mutations fail in post-submit sync flaps -- stale quotes stay live
+- **Files:** `cpp/src/engine.cpp` (Step 8 loop), `cpp/src/rpc/chia_rpc.cpp:617`, `cpp/src/execution/offer_manager.cpp:1595`
+- **Issue:** "Wallet needs to be fully synced" accounts for ~4,000 of 4,514 error lines (88%). Submitting one pair's offers flips the wallet into a transient syncing state; the sequential Step-8 loop issues the NEXT pair's cancels/creates ~76 ms later with no per-mutation sync re-check or backoff (measured: 6/6 offers created, then 4 consecutive selective_cancel failures 76 ms after). Failed cancels leave stale quotes live on Dexie at old prices — pick-off exposure — and feed S14. The only sync gate (engine.cpp:6585) fired 8 times against ~4,000 errors.
+- **Status:** `[ ]` — OPEN. Sync-aware retry with short backoff around mutation RPCs, and/or reorder Step 8 to run all cancels before any creates. Touches live order handling: NOT to be fixed casually.
+
+### S14: Stuck-offer forced cancel retries forever with no escalation
+- **Files:** `cpp/src/engine.cpp:7109-7121`, `cpp/src/execution/offer_manager.cpp:3206`
+- **Issue:** The forced-cancel loop retries with the SAME fee indefinitely: worst case one offer re-warned 158 times over ~36 h (age 851 → 7,782 blocks), fee frozen at 5,000 mojos on every attempt. While stuck, coins stay locked (170 "entering XCH-buy-only mode" warnings) and the quote stays live. Mostly downstream of S13.
+- **Status:** `[ ]` — OPEN. Escalation ladder: retry with escalated fee → delete_unconfirmed_transactions + re-cancel → mark unrecoverable and alert ONCE. Rate-limit the per-offer warning. Touches live order handling.
+
+### S15: Spread-cap warning fires every block, including while paused
+- **Files:** `cpp/src/engine.cpp:3456`
+- **Issue:** 11,798 warnings (~14% of all warnings), the largest single shape in the log; 3,358 on 2026-08-22 alone while the engine was PAUSED — spreads recomputed and warned for quotes that will never post. Also indicates the vol/regime multiplier chain stays pinned above the cap for days.
+- **Status:** `[ ]` — OPEN. Demote per-block to debug; warn on capped/uncapped TRANSITION with duration + worst overshoot; skip (or silence) Step-5 warnings while Paused. Separately investigate why the multiplier chain latches above the cap.
+
 ---
 
 ## Resolved since 2026-04 (audit evidence)
