@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from typing import Optional
 
 from PySide6.QtGui import QFont, QFontDatabase
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QCheckBox
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +142,15 @@ def get_stylesheet(
     mfs = max(7, _BASE_MONO_FONT_SIZE + font_size_delta)
     # Slightly smaller secondary size for captions, hints, etc.
     sfs = max(7, fs - 1)
+    # Check/radio indicator box.  Was a hard-coded 20px with a 2px border --
+    # a 24px box beside 16px text, half again the height of the label it
+    # marks, and unmoved by the operator's font-size setting.  Scale it with
+    # the UI font so it stays proportionate at every size.
+    cbi = max(11, 13 + font_size_delta)
+    # Round UP to half the BORDERED box (box + 1px border each side):
+    # rounding down leaves a half-pixel of square on the radio.  Qt
+    # clamps an over-large radius to half, so the ceiling is safe.
+    cbi_r = (cbi + 3) // 2
 
     return f"""
 /* ===================================================================
@@ -283,6 +292,29 @@ QPushButton#dangerButton:pressed {{
     background-color: #D32F2F;
 }}
 
+/* Compact variant for buttons that live INSIDE a table row.
+
+   The base QPushButton rule above sets min-height 28px and 8px/20px padding,
+   which is taller than a table row -- and a widget-level setFixedHeight()
+   cannot shrink it, because the stylesheet's min-height wins over the size
+   hint.  That is why the in-row Cancel button rendered taller than the row it
+   sat on.  Opt out with the dynamic property compact=true.
+
+   An attribute selector outranks the plain type selector above, and the
+   #dangerButton ID rules outrank both.  Those ID rules set the palette AND
+   font-weight: 600, so the weight below is the one property here that a
+   danger button does NOT get; padding, min-height, border-radius and
+   font-size all apply.  (An earlier version of this comment claimed the ID
+   rules set only colours, which is wrong and would mislead the next person
+   sizing a control against them.) */
+QPushButton[compact="true"] {{
+    padding: 1px 8px;
+    min-height: 0px;
+    border-radius: 4px;
+    font-size: {sfs}pt;
+    font-weight: 500;
+}}
+
 /* ----- Tab widget & tab bar ----- */
 QTabWidget::pane {{
     background-color: {c.PANEL_BG};
@@ -345,7 +377,12 @@ QTreeView, QTableView {{
 }}
 
 QTreeView::item, QTableView::item {{
-    padding: 10px 14px;
+    /* Vertical padding is subtracted from the CELL RECT before Qt places a
+       cell widget, so 10px top+bottom left 9px of a 30px row for controls:
+       the in-row Cancel/Remove buttons rendered as 7px slivers.  Text
+       rendering is unaffected either way (fixed-height rows centre it), so
+       only controls ever saw the difference.  Keep the horizontal inset. */
+    padding: 4px 14px;
     min-height: 32px;
 }}
 
@@ -514,9 +551,9 @@ QCheckBox, QRadioButton {{
 }}
 
 QCheckBox::indicator, QRadioButton::indicator {{
-    width: 20px;
-    height: 20px;
-    border: 2px solid {c.BORDER};
+    width: {cbi}px;
+    height: {cbi}px;
+    border: 1px solid {c.BORDER};
     background-color: {c.ELEVATED_BG};
 }}
 
@@ -525,7 +562,7 @@ QCheckBox::indicator {{
 }}
 
 QRadioButton::indicator {{
-    border-radius: 10px;
+    border-radius: {cbi_r}px;
 }}
 
 QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
@@ -579,6 +616,81 @@ QSlider::handle:vertical:hover {{
 # ---------------------------------------------------------------------------
 # Theme application helper
 # ---------------------------------------------------------------------------
+
+#: Minimum comfortable pointer target, in px, for a control with no label.
+MIN_HIT_TARGET_PX = 24
+
+
+class HitTargetCheckBox(QCheckBox):
+    """An unlabeled checkbox whose WHOLE rect toggles it.
+
+    A checkbox with a label is easy to hit -- the text is part of the button.
+    An unlabeled one is exactly as big as its indicator, so making the
+    indicator proportionate to the text shrank the pointer target with it:
+    21x15, down from 24x24.
+
+    Enlarging the widget is not enough on its own.  QCheckBox does NOT hit
+    test against its whole rect; it uses ``SE_CheckBoxClickRect``, which
+    tracks the indicator.  Verified with QTest.mouseClick: with only a 24x24
+    minimum size, a click at the centre toggled while clicks at the right
+    edge and the bottom-right corner did nothing.  So the minimum size sets
+    the area and ``hitButton`` makes that area actually respond.
+    """
+
+    def __init__(self, size: int = MIN_HIT_TARGET_PX, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(size, size)
+
+    def hitButton(self, pos) -> bool:      # noqa: N802 (Qt naming)
+        """Treat the entire widget as the button, label or no label."""
+        return self.rect().contains(pos)
+
+
+def fit_row_height(table) -> None:
+    """Size *table*'s rows to the current UI font.
+
+    Qt's default section size is a constant (30px here) that does not move
+    when the operator changes the font size, while the text and any control
+    inside a row does.  At the +6 delta a compact button needs 31px on Linux,
+    more once a cell layout adds margins, so the row -- not the control -- is
+    what has to give.
+
+    Deriving a height from font metrics does NOT work: QWidget.font() reports
+    the widget's own font, not the size a stylesheet applies, so the metrics
+    stay at the base size whatever delta is in force.  Measure a real styled
+    control instead.  Rows keep their 30px look at the default size and grow
+    only where a large font genuinely needs it -- on Linux at +6 the compact
+    button alone is 31px, which is what turned CI red.
+    """
+    from PySide6.QtWidgets import QPushButton
+
+    # Measure a real compact button under the CURRENT stylesheet rather than
+    # guessing.  ResizeToContents would also fit, but it honours the
+    # QTableView::item min-height (32px) and padding, inflating every row to
+    # ~53px -- chunkier rows to solve a too-tall control, which is backwards.
+    # Measure the SAME style the production controls use.  Both in-row
+    # buttons are #dangerButton, whose ID rule wins on font-weight (600 vs
+    # the compact rule's 500).  Both weights happen to yield identical
+    # heights with the current font -- verified across every delta -- but
+    # measuring a style the real control does not use leaves the row height
+    # depending on that coincidence.
+    probe = QPushButton("X")
+    probe.setObjectName("dangerButton")
+    probe.setProperty("compact", True)
+    probe.ensurePolished()
+    # The row must hold: the control, the cell layout margins (1px top and
+    # bottom), the QTableView::item vertical padding (4px top and bottom --
+    # Qt subtracts it from the cell rect BEFORE placing a cell widget), and
+    # the grid line.  Measuring only the control is how the buttons ended up
+    # rendered at 7px inside rows that looked tall enough.
+    needed = probe.sizeHint().height() + 2 + 8 + 1
+    probe.deleteLater()
+    # Never shrink below the existing 30px look; only grow where a large font
+    # actually demands it.
+    table.verticalHeader().setDefaultSectionSize(
+        max(30, needed)
+    )
+
 
 def apply_theme(
     app: QApplication,

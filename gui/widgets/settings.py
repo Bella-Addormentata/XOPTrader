@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS
+from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
 
 log = logging.getLogger(__name__)
 
@@ -651,6 +651,7 @@ class SettingsWidget(QWidget):
             lambda _r, _c, ti=1: self._mark_dirty(ti)
         )
         self._pairs_table.verticalHeader().setVisible(False)
+        fit_row_height(self._pairs_table)   # rows must fit the Remove button
         layout.addWidget(self._pairs_table, stretch=1)
 
         return page
@@ -2817,7 +2818,9 @@ class SettingsWidget(QWidget):
         self._pairs_table.insertRow(row)
 
         # Enabled checkbox -- centred in cell.
-        cb = QCheckBox()
+        # Unlabeled: a plain QCheckBox would shrink its clickable area
+        # with the indicator, so only the small box would toggle the row.
+        cb = HitTargetCheckBox()
         cb.setChecked(bool(pair.get("enabled", True)))
         cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         cb_container = QWidget()
@@ -2890,7 +2893,7 @@ class SettingsWidget(QWidget):
         # alone cannot satisfy it -- so the tooltip must say so, or an
         # operator with an AMM-backed pair ticks the box and watches
         # nothing happen.
-        revive_cb = QCheckBox()
+        revive_cb = HitTargetCheckBox()   # unlabeled, same reason
         revive_cb.setChecked(bool(pair.get("revive_market", False)))
         revive_cb.setToolTip(
             "Revive a dead market: quote from the external fair-value "
@@ -2913,12 +2916,15 @@ class SettingsWidget(QWidget):
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
-        actions_layout.setContentsMargins(4, 2, 4, 2)
+        # 1px vertically, not 2: these margins sit on TOP of the button's
+        # own height inside the row, and were what pushed the wrapped widget
+        # past the row on a large font.
+        actions_layout.setContentsMargins(4, 1, 4, 1)
         actions_layout.setSpacing(4)
 
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("dangerButton")
-        remove_btn.setFixedHeight(24)
+        remove_btn.setProperty("compact", True)   # see theme.py, same reason
         remove_btn.setToolTip("Remove this trading pair")
         # Resolve the button's current row at click time rather than
         # capturing a row index at insert time.  Captured indices go
