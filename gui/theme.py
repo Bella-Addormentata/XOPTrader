@@ -377,7 +377,12 @@ QTreeView, QTableView {{
 }}
 
 QTreeView::item, QTableView::item {{
-    padding: 10px 14px;
+    /* Vertical padding is subtracted from the CELL RECT before Qt places a
+       cell widget, so 10px top+bottom left 9px of a 30px row for controls:
+       the in-row Cancel/Remove buttons rendered as 7px slivers.  Text
+       rendering is unaffected either way (fixed-height rows centre it), so
+       only controls ever saw the difference.  Keep the horizontal inset. */
+    padding: 4px 14px;
     min-height: 32px;
 }}
 
@@ -673,7 +678,12 @@ def fit_row_height(table) -> None:
     probe.setObjectName("dangerButton")
     probe.setProperty("compact", True)
     probe.ensurePolished()
-    needed = probe.sizeHint().height() + 4      # cell layout margins
+    # The row must hold: the control, the cell layout margins (1px top and
+    # bottom), the QTableView::item vertical padding (4px top and bottom --
+    # Qt subtracts it from the cell rect BEFORE placing a cell widget), and
+    # the grid line.  Measuring only the control is how the buttons ended up
+    # rendered at 7px inside rows that looked tall enough.
+    needed = probe.sizeHint().height() + 2 + 8 + 1
     probe.deleteLater()
     # Never shrink below the existing 30px look; only grow where a large font
     # actually demands it.

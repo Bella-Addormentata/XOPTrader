@@ -107,14 +107,38 @@ def test_it_still_fits_at_every_offered_font_size(app, delta):
 
 
 @pytest.mark.parametrize("delta", [-2, 0, 2, 4, 6])
-def test_the_wrapped_action_cell_fits_too(app, delta):
-    """The bare button is not what the row holds -- the cell widget is.
+def test_the_button_renders_full_size_inside_a_real_table(app, delta):
+    """Measured IN the table, not standalone.
 
-    This is the case that turned CI red: on Linux at +6 the button alone is
-    31px, and the cell layout's margins put the wrapper past a 30px row.
+    A standalone wrapper measurement said everything fit while the placed
+    button rendered at 7px: QTableView::item vertical padding is subtracted
+    from the cell rect before Qt places a cell widget, and only an actual
+    setCellWidget placement sees that.
     """
+    from PySide6.QtWidgets import QTableWidgetItem
+
     app.setStyleSheet(theme.get_stylesheet(font_size_delta=delta))
-    assert _wrapped_cell_height() <= _row_height(delta)
+    table = QTableWidget(1, 2)
+    theme.fit_row_height(table)
+    table.setItem(0, 0, QTableWidgetItem("x"))
+    button = QPushButton("Remove")
+    button.setObjectName("dangerButton")
+    button.setProperty("compact", True)
+    cell = QWidget()
+    layout = QHBoxLayout(cell)
+    layout.setContentsMargins(4, 1, 4, 1)
+    layout.addWidget(button)
+    table.setCellWidget(0, 1, cell)
+    table.resize(420, 220)
+    table.show()
+    QApplication.processEvents()
+    try:
+        assert button.height() >= button.sizeHint().height(), (
+            f"button rendered {button.height()}px of its "
+            f"{button.sizeHint().height()}px inside the row"
+        )
+    finally:
+        table.hide()
 
 
 def test_rows_keep_their_size_at_the_default_font(app):
