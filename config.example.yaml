@@ -324,6 +324,15 @@ risk:
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
   max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 
+  # Flash-crash detector: how many blocks of price history the drawdown
+  # scan considers (one entry per block; ~18.75 s each).  0 scans the whole
+  # retained buffer (~1000 blocks) -- the pre-S12 behaviour, under which a
+  # single junk ticker print held a GLOBAL posting halt until the buffer
+  # evicted it, hours after the market had retraced.  Default 100 matches
+  # recovery_stable_blocks_phase2: a drop no longer visible inside the
+  # recovery window is not a FLASH crash.
+  flash_crash_window_blocks: 100  # [OPTIONAL, default: 100]
+
   # Circuit-breaker auto-rebalance (enables loss manager for stuck positions)
   circuit_breaker_enabled: true          # [OPTIONAL, default: true]
   circuit_breaker_hard_limit_ratio: 0.80 # [OPTIONAL, default: 0.80]

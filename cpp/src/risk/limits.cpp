@@ -342,16 +342,30 @@ std::optional<Quote> PreTradeCheck::apply_limits(
 // ---------------------------------------------------------------------------
 
 bool PreTradeCheck::check_flash_crash(const std::vector<Mojo>& price_history,
-                                      double threshold) noexcept
+                                      double threshold,
+                                      std::size_t window) noexcept
 {
     if (price_history.size() < 2) {
         return false;  // not enough data to detect a crash
     }
 
-    // Track the running maximum as we scan chronologically.
-    Mojo running_max = price_history[0];
+    // [S12] Restrict the scan to the most recent `window` entries when one
+    // is given.  The running maximum below never decays, so over the whole
+    // retained history one junk print (observed 2026-08-22: a crossed dexie
+    // ticker put a 2.3419 mid in a ~1.57 market) reads as a live crash until
+    // the buffer evicts it ~1000 blocks later -- and the Crash state
+    // consults this signal BEFORE the stability checks, so recovery never
+    // ran.  A windowed scan lets an aged, retraced spike stop counting while
+    // a genuine recent collapse still trips.
+    const std::size_t start =
+        (window > 0 && price_history.size() > window)
+            ? price_history.size() - window
+            : 0;
 
-    for (std::size_t i = 1; i < price_history.size(); ++i) {
+    // Track the running maximum as we scan chronologically.
+    Mojo running_max = price_history[start];
+
+    for (std::size_t i = start + 1; i < price_history.size(); ++i) {
         // Update running max with the current price.
         if (price_history[i] > running_max) {
             running_max = price_history[i];

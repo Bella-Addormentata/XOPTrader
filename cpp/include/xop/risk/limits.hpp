@@ -171,8 +171,18 @@ public:
     /// @param threshold      Fractional drop that triggers the breaker (default 0.20).
     /// @return               true if a flash crash is detected.
     [[nodiscard]]
+    /// @param window  Consider only the most recent `window` entries
+    ///                (one entry per block).  0 scans the ENTIRE retained
+    ///                history -- the pre-S12 behaviour, under which a single
+    ///                junk print pinned the running maximum for the life of
+    ///                the ~1000-entry buffer and, because the Crash branch
+    ///                consults this before the stability checks, held a
+    ///                GLOBAL posting halt for hours after the market had
+    ///                retraced.  A "flash" crash is a recent event; the
+    ///                window makes the detector say so.
     static bool check_flash_crash(const std::vector<Mojo>& price_history,
-                                  double threshold = 0.20) noexcept;
+                                  double threshold = 0.20,
+                                  std::size_t window = 0) noexcept;
 
     // -- Emergency playbook helpers -----------------------------------------
 

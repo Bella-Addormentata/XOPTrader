@@ -1571,7 +1571,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
             // Check crash signal for this pair.
             if (PreTradeCheck::check_flash_crash(price_vec,
-                    config_.risk.flash_crash_threshold_pct)) {
+                    config_.risk.flash_crash_threshold_pct,
+                    config_.risk.flash_crash_window_blocks)) {
                 any_pair_crashing = true;
                 if (crash_pair_name.empty()) crash_pair_name = pair.name;
             }

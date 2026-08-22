@@ -1252,6 +1252,12 @@ struct RiskConfig {
 
     // -- Flash crash detection (T7-07, T7-08) --------------------------------
     double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
+    /// Blocks of history the crash detector scans (one entry per block).
+    /// 0 scans the whole retained buffer (~1000 blocks) -- the pre-S12
+    /// behaviour, under which one junk print held a global posting halt
+    /// for hours.  Default matches recovery_stable_blocks_phase2: a drop
+    /// no longer visible inside the recovery window is not a FLASH crash.
+    uint32_t flash_crash_window_blocks{100};
     uint32_t recovery_stable_blocks_phase1{50};     ///< Blocks stable for Crash→Recovery.
     uint32_t recovery_stable_blocks_phase2{100};    ///< Blocks stable for Recovery→Normal.
     double   recovery_stability_band_pct{0.05};     ///< Max price deviation in recovery.

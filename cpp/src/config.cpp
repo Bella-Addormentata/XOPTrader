@@ -1632,6 +1632,19 @@ RiskConfig parse_risk(const YAML::Node& root)
         }
     }
 
+    // flash_crash_window_blocks: how much history the crash detector scans.
+    // 0 = the whole retained buffer (pre-S12 behaviour), permitted but
+    // deliberate: it restores the latch-on-one-print failure mode.
+    if (node["flash_crash_window_blocks"] && node["flash_crash_window_blocks"].IsDefined()
+            && !node["flash_crash_window_blocks"].IsNull()) {
+        int64_t v = node["flash_crash_window_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".flash_crash_window_blocks must be >= 0; got "
+                              + std::to_string(v));
+        }
+        cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
+    }
+
     // recovery_stable_blocks_phase1: blocks that must be stable for Crash→Recovery.
     if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
             && !node["recovery_stable_blocks_phase1"].IsNull()) {
