@@ -66,14 +66,22 @@ _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
 _LAST_TRADE_CACHE_TTL_S: Final[float] = 30.0
 
 
-def _holding_for_asset(balances: dict, base_asset_id: str) -> float:
-    """Our confirmed holding of *base_asset_id*, in display units.
+def _holding_for_asset(balances: dict, base_asset_id: str):
+    """Our confirmed holding of *base_asset_id* in display units, or None.
 
     The standard XCH wallet carries no asset id -- wallet_service resolves
     ids for CAT wallets only -- so "xch" is matched by wallet_type instead.
-    Returns 0.0 when no wallet holds the asset, which is a true zero rather
-    than a failed lookup.
+
+    Returns None for UNKNOWN rather than 0.0: the balance cache is empty
+    until the first async RPC lands, a failed fetch yields an empty result,
+    and a partial fetch can omit one wallet.  Reporting 0.0 in those cases
+    would state that we hold nothing, which is a much stronger claim than
+    "not known yet" -- and on this column a confident zero is exactly the
+    kind of wrong number an operator would act on.  A wallet that matched
+    and really holds nothing still returns 0.0.
     """
+    if not balances:
+        return None
     want = str(base_asset_id or "").strip().lower()
     for _name, row in (balances or {}).items():
         if not isinstance(row, dict):
@@ -91,7 +99,7 @@ def _holding_for_asset(balances: dict, base_asset_id: str) -> float:
                 return float(row.get("confirmed", 0.0) or 0.0)
         elif str(row.get("asset_id", "") or "").lower() == want:
             return float(row.get("confirmed", 0.0) or 0.0)
-    return 0.0
+    return None
 
 
 class EngineBridge(QObject):
@@ -450,9 +458,13 @@ class EngineBridge(QObject):
                 # not be divided again downstream.
                 base_id = str(pair_cfg.get("base_asset_id", "") or "").strip().lower()
                 if base_id:
-                    pair_md["inventory_units"] = _holding_for_asset(
+                    holding = _holding_for_asset(
                         wallet_balances_snapshot, base_id
                     )
+                    # Omit the key entirely when unknown, so a consumer that
+                    # defaults a missing key cannot turn it into a zero.
+                    if holding is not None:
+                        pair_md["inventory_units"] = holding
                 market_data[pair_name] = pair_md
 
         # Build per-pair order book data from the latest market-data

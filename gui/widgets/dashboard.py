@@ -14,7 +14,7 @@ from __future__ import annotations
 import time
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Any, Sequence
+from typing import Any, Optional, Sequence
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QTimer, Signal, Slot
@@ -401,6 +401,35 @@ def _make_dot_label(
 # ---------------------------------------------------------------------------
 # DashboardWidget -- top-level overview page
 # ---------------------------------------------------------------------------
+
+class _NumericItem(QTableWidgetItem):
+    """A cell that displays formatted text but sorts by its real value.
+
+    QTableWidgetItem compares DisplayRole as a string, so a populated table
+    with sorting enabled ordered "9" above "100". Prices, spread, inventory,
+    fill counts and P&L are all numeric, so every one of those columns
+    mis-sorted once the table had data in it.
+
+    An absent value (rendered as an em dash) sorts BELOW every real number,
+    so descending order puts live quotes first and unquoted sides last.
+    """
+
+    __slots__ = ()
+
+    def __init__(self, text: str, value: Optional[float]) -> None:
+        super().__init__(text)
+        self.setData(
+            Qt.ItemDataRole.UserRole,
+            float("-inf") if value is None else float(value),
+        )
+
+    def __lt__(self, other: QTableWidgetItem) -> bool:   # noqa: D105
+        mine = self.data(Qt.ItemDataRole.UserRole)
+        theirs = other.data(Qt.ItemDataRole.UserRole)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return float(mine) < float(theirs)
+
 
 class DashboardWidget(QWidget):
     """Full-page dashboard presenting key trading metrics, status, pairs
@@ -876,6 +905,23 @@ class DashboardWidget(QWidget):
             self._pairs_status_container.addWidget(container)
 
     @staticmethod
+    def _format_optional_units(value) -> str:
+        """An asset amount, or an em dash when the holding is UNKNOWN.
+
+        None means the wallet snapshot could not answer -- empty cache before
+        the first RPC, a failed fetch, or a partial result missing this
+        wallet.  Rendering that as 0.0000 would claim we hold nothing, which
+        is a different and much more alarming statement than "not known yet".
+        A real zero balance still renders as 0.0000.
+        """
+        if value is None:
+            return "—"
+        try:
+            return f"{float(value):.4f}"
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
     def _format_optional_price(value: float) -> str:
         """A price, or an em dash when we have none.
 
@@ -911,14 +957,28 @@ class DashboardWidget(QWidget):
         self._pairs_table.setRowCount(len(pairs_data))
 
         for row, data in enumerate(pairs_data):
-            values: list[tuple[str, str]] = [
-                (data.get("pair", ""),              ""),
-                (self._format_optional_price(data.get('mid_price', 0)),     ""),
-                (f"{data.get('spread_bps', 0):.1f}",""),
-                (f"{data.get('inventory', 0):.4f}", ""),
-                (self._format_optional_price(data.get('bid', 0)),           ""),
-                (self._format_optional_price(data.get('ask', 0)),           ""),
-                (f"{data.get('fills_24h', 0):,}",   ""),
+            # (display text, sort value).  None means "no value" and sorts
+            # below every real number; the pair name sorts as text.
+            def _num(key: str):
+                raw = data.get(key, None)
+                try:
+                    val = float(raw)
+                except (TypeError, ValueError):
+                    return None
+                return None if val <= 0.0 else val
+
+            values: list[tuple[str, Optional[float]]] = [
+                (data.get("pair", ""), None),
+                (self._format_optional_price(data.get('mid_price', 0)),
+                 _num('mid_price')),
+                (f"{data.get('spread_bps', 0):.1f}",
+                 float(data.get('spread_bps', 0) or 0.0)),
+                (self._format_optional_units(data.get('inventory', None)),
+                 data.get('inventory', None)),
+                (self._format_optional_price(data.get('bid', 0)), _num('bid')),
+                (self._format_optional_price(data.get('ask', 0)), _num('ask')),
+                (f"{data.get('fills_24h', 0):,}",
+                 float(data.get('fills_24h', 0) or 0)),
             ]
             # PnL column, in the pair's OWN quote currency.  realized_pnl
             # is quote mojos, so XCH/BYC settles in BYC and XCH/wUSDC.b in
@@ -929,10 +989,11 @@ class DashboardWidget(QWidget):
             pnl_text = f"{pnl_val:+,.4f} {quote}".rstrip()
             if quote.upper() == "XCH" and xch_usd_rate > 0:
                 pnl_text = f"${pnl_val * xch_usd_rate:+,.2f} ({pnl_val:+,.4f} XCH)"
-            values.append((pnl_text, ""))
+            values.append((pnl_text, float(pnl_val or 0.0)))
 
-            for col, (text, _) in enumerate(values):
-                item = QTableWidgetItem(text)
+            for col, (text, sort_value) in enumerate(values):
+                item = (QTableWidgetItem(text) if col == 0
+                        else _NumericItem(text, sort_value))
                 item.setFlags(
                     item.flags() & ~Qt.ItemFlag.ItemIsEditable
                 )

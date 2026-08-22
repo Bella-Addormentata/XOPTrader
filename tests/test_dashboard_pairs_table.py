@@ -310,9 +310,11 @@ def test_the_holding_lookup_handles_the_standard_wallet(app):
     # the config stores what the operator typed.
     assert _holding_for_asset(balances, "f322a205") == 0.35
     assert _holding_for_asset(balances, "F322A205") == 0.35
-    # A true zero, not a failed lookup dressed up as one.
-    assert _holding_for_asset(balances, "deadbeef") == 0.0
-    assert _holding_for_asset({}, "xch") == 0.0
+    # An unmatched asset or an empty snapshot is UNKNOWN, not zero -- see
+    # test_an_unknown_holding_survives_the_bridge_boundary. Returning 0.0
+    # here would have the column state a holding of nothing.
+    assert _holding_for_asset(balances, "deadbeef") is None
+    assert _holding_for_asset({}, "xch") is None
 
 
 def test_inventory_comes_from_the_wallet_not_the_state_gauge():
@@ -341,3 +343,88 @@ def test_the_summary_query_is_queued_to_the_worker_thread():
         "gui", "services", "database_service.py").read_text(encoding="utf-8")
     assert "_trigger_pair_summary.connect(self._worker.fetch_pair_summary_for)" in source
     assert "lambda _ttl" not in source, "lambda connection is back"
+
+
+# ---------------------------------------------------------------------------
+# Sorting, unknown values, and stale gauges
+# ---------------------------------------------------------------------------
+
+def _row(pair, **over):
+    row = {"pair": pair, "mid_price": 1.0, "spread_bps": 1.0, "inventory": 1.0,
+           "bid": 1.0, "ask": 1.0, "fills_24h": 1, "pnl": 1.0,
+           "quote_symbol": "X"}
+    row.update(over)
+    return row
+
+
+def test_numeric_columns_sort_by_value_not_by_text(app):
+    """QTableWidgetItem compares DisplayRole as a string.
+
+    With the table populated and sorting enabled, "9" sorted above "100" in
+    every numeric column.
+    """
+    from PySide6.QtCore import Qt
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_pairs_table([_row("A", fills_24h=9, mid_price=9.0, pnl=9.0),
+                             _row("B", fills_24h=100, mid_price=100.0, pnl=100.0)])
+    for col in (1, 6, 7):          # mid price, fills, pnl
+        dash._pairs_table.sortItems(col, Qt.SortOrder.DescendingOrder)
+        first = dash._pairs_table.item(0, 0).text()
+        assert first == "B", f"column {col} sorted lexicographically"
+
+
+def test_an_unknown_holding_is_not_rendered_as_zero(app):
+    """None means the wallet snapshot could not answer.
+
+    Showing 0.0000 would state we hold nothing, which is a much stronger
+    claim than "not known yet" -- and one an operator might act on.
+    """
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_pairs_table([_row("A", inventory=None)])
+    assert dash._pairs_table.item(0, 3).text() == "—"
+    dash.update_pairs_table([_row("A", inventory=0.0)])
+    assert dash._pairs_table.item(0, 3).text() == "0.0000", (
+        "a real zero balance must still show as zero"
+    )
+
+
+def test_absent_values_sort_below_real_ones(app):
+    """Descending order should surface live quotes, not em dashes."""
+    from PySide6.QtCore import Qt
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_pairs_table([_row("A", ask=9.0), _row("B", ask=0.0)])
+    dash._pairs_table.sortItems(5, Qt.SortOrder.DescendingOrder)
+    assert dash._pairs_table.item(0, 5).text() != "—"
+    assert dash._pairs_table.item(1, 5).text() == "—"
+
+
+def test_an_unknown_holding_survives_the_bridge_boundary():
+    """The bridge must omit the key, not send a zero."""
+    from gui.services.engine_bridge import _holding_for_asset
+
+    assert _holding_for_asset({}, "xch") is None, "empty snapshot is unknown"
+    assert _holding_for_asset({"w": {"wallet_type": 6.0, "asset_id": "aa",
+                                     "confirmed": 0.0}}, "bb") is None
+    # A matched wallet holding nothing is a REAL zero.
+    assert _holding_for_asset({"w": {"wallet_type": 6.0, "asset_id": "aa",
+                                     "confirmed": 0.0}}, "aa") == 0.0
+
+
+def test_gauge_columns_are_withheld_when_metrics_are_down():
+    """MetricsService keeps its last snapshot and only flips the flag.
+
+    Without honouring it, Mid/Spread and the USD conversion would present a
+    dead feed's last values as current.
+    """
+    from pathlib import Path
+    source = Path(__file__).resolve().parent.parent.joinpath(
+        "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
+    assert 'data.get("metrics_connected"' in source
+    body = source.split("def _refresh_pairs_table")[1].split("\n    def ")[0]
+    assert "_metrics_live" in body, "gauge columns ignore the liveness flag"

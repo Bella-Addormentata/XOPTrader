@@ -261,6 +261,10 @@ class MainWindow(QMainWindow):
         self._pair_summary: dict = {}
         self._last_market_data: dict = {}
         self._last_xch_usd: float = 0.0
+        # Whether the metrics scrape is currently live.  Gauge-derived
+        # columns are withheld when it is not; wallet- and DB-derived ones
+        # remain valid because they do not come through Prometheus.
+        self._metrics_live: bool = True
 
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
@@ -557,7 +561,12 @@ class MainWindow(QMainWindow):
         # Feed the dashboard's per-pair table: the live half (mid, spread,
         # our inventory) pairs with the DB half already cached.
         self._last_market_data = market_data
-        self._last_xch_usd = xch_usd
+        # MetricsService leaves _latest untouched when a scrape fails and only
+        # flips this flag, so without it the last good snapshot would be
+        # presented as live indefinitely after the endpoint drops.
+        self._metrics_live = bool(data.get("metrics_connected", True))
+        # A rate derived from a dead feed must not price P&L either.
+        self._last_xch_usd = xch_usd if self._metrics_live else 0.0
         self._refresh_pairs_table()
 
         # Charts update -- feed pair-aware snapshots with timestamp X-axis.
@@ -1163,15 +1172,24 @@ class MainWindow(QMainWindow):
                 # four-month-old trade as the current mid -- the same
                 # failure S5 fixed in the engine's own blend.  Absent gauge
                 # renders as an em dash instead.
+                # Gauge-derived, so withheld entirely when the metrics
+                # scrape is down -- a stale mid is indistinguishable from a
+                # live one on screen, and this column is read as "now".
                 "mid_price": (
                     0.0
-                    if str(md.get("mid_price_source", "")) == "last_trade"
+                    if (not self._metrics_live
+                        or str(md.get("mid_price_source", "")) == "last_trade")
                     else float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH
                 ),
-                "spread_bps": float(md.get("spread_bps", 0.0) or 0.0),
+                "spread_bps": (float(md.get("spread_bps", 0.0) or 0.0)
+                               if self._metrics_live else 0.0),
                 # Already display units (the wallet service divides by the
                 # asset's own factor), so it must NOT be divided again.
-                "inventory": float(md.get("inventory_units", 0.0) or 0.0),
+                # None (key absent) means the wallet snapshot could not
+                # answer; the widget renders that as an em dash rather than
+                # as a holding of zero.
+                "inventory": (float(md["inventory_units"])
+                              if "inventory_units" in md else None),
                 "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "ask": float(ours.get("ask_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
                 "fills_24h": int(ours.get("fills_24h", 0) or 0),
