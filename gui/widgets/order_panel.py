@@ -56,11 +56,74 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Filled At",     145),
     ("Created\nBlock", 100),
     ("Age\n(blocks)",   90),
+    ("Fill\n(min)",     80),
     ("Actions",        80),
 ]
 
 # Offer status values used throughout the system.
 _STATUSES: list[str] = ["All", "Pending", "Filled", "Cancelled", "Expired"]
+
+
+class _SortByUserRoleItem(QTableWidgetItem):
+    """Sorts on the numeric UserRole value instead of the display text.
+
+    The default comparator sorts DisplayRole as STRINGS, so "9.0" ordered
+    above "100.0".  Missing values (an em dash) must sort BELOW real values
+    in EITHER direction, and a static sentinel cannot do that: -inf is
+    smallest, which is last descending but FIRST ascending.  __lt__ has no
+    direction parameter, so the item reads the table's live sort indicator
+    -- already set by the time Qt compares during a header-click sort -- and
+    presents the missing value as +inf ascending / -inf descending, both of
+    which land at the bottom.
+    """
+
+    __slots__ = ()
+
+    #: UserRole sentinel meaning "no value"; resolved per sort direction.
+    MISSING = None
+
+    def _key(self) -> float:
+        value = self.data(Qt.ItemDataRole.UserRole)
+        if value is not None:
+            return float(value)
+        table = self.tableWidget()
+        if table is not None:
+            order = table.horizontalHeader().sortIndicatorOrder()
+            if order == Qt.SortOrder.AscendingOrder:
+                return float("inf")
+        return float("-inf")
+
+    def __lt__(self, other):          # noqa: D105
+        if isinstance(other, _SortByUserRoleItem):
+            return self._key() < other._key()
+        return super().__lt__(other)
+
+
+def _fill_latency_minutes(offer: dict) -> tuple[str, float]:
+    """('12.3', 12.3) minutes from listing to acceptance, or an em dash.
+
+    Only a FILLED offer has a fill latency.  A cancelled or expired offer
+    also carries resolved_at, but that measures how long it sat unwanted --
+    a different quantity that would poison fill-latency analysis if the
+    column mixed them in.  Wall-clock stamps are used (created_at and
+    resolved_at, both written by the engine in UTC) rather than block
+    heights, because block intervals vary and the point is minutes.
+    """
+    if text(offer, "status").strip().lower() != "filled":
+        return ("—", -1.0)
+    created = text(offer, "created_at").strip()
+    resolved = text(offer, "resolved_at").strip()
+    if not created or not resolved:
+        return ("—", -1.0)
+    try:
+        from datetime import datetime
+        parse = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
+        delta = (parse(resolved) - parse(created)).total_seconds() / 60.0
+    except ValueError:
+        return ("—", -1.0)
+    if delta < 0:
+        return ("—", -1.0)      # clock skew: refuse rather than mislead
+    return (f"{delta:.1f}", delta)
 
 # ---------------------------------------------------------------------------
 # Row budget
@@ -655,14 +718,14 @@ class OrderPanel(QWidget):
         item = self._table.item(row, col)
         if item is None:
             item = QTableWidgetItem(text)
-            if col in (0, 1, 5, 7, 10):
-                pass  # default alignment / font
+            if col in (0, 1, 5, 7, 11):
+                pass  # default alignment / font (11 = Actions)
             elif col in (2, 6):
                 item.setFont(self._mono_bold)
             elif col in (3, 4):
                 item.setFont(self._mono_font)
                 item.setTextAlignment(self._RIGHT)
-            else:  # 8, 9 -- numeric block columns
+            else:  # 8, 9, 10 -- numeric columns (blocks, age, fill minutes)
                 item.setTextAlignment(self._RIGHT)
             self._table.setItem(row, col, item)
         else:
@@ -756,21 +819,70 @@ class OrderPanel(QWidget):
             )
 
             # -- Age (blocks) --
-            age: int = max(0, self._current_block - created_block) if created_block else 0
-            item_age = self._item(row_idx, 9, str(age))
-            item_age.setData(Qt.ItemDataRole.UserRole, age)
-            # Highlight stale offers that exceed the TTL threshold.
-            if age > self._offer_ttl:
+            # A RESOLVED offer's age freezes at its resolution block; live
+            # offers age against the tip (which main_window now supplies --
+            # set_current_block previously had no caller, so this column
+            # showed 0 for every offer).  A TERMINAL row without a recorded
+            # resolution block -- the engine persists 0 on some cancel
+            # paths -- has an UNKNOWN age: aging it against the live tip
+            # forever would just be a subtler version of the original bug.
+            resolved_block: int = num(offer, "resolved_block")
+            is_terminal = status.lower() in ("filled", "cancelled", "expired")
+            if is_terminal and resolved_block <= 0:
+                age_text, age_val = "—", None
+            else:
+                age_end = resolved_block if resolved_block > 0 else self._current_block
+                if created_block and age_end:
+                    age = max(0, age_end - created_block)
+                    age_text, age_val = str(age), float(age)
+                else:
+                    # No tip yet (first render precedes the health payload,
+                    # and the wiring skips nonpositive heights) or no
+                    # created_block: the age is UNKNOWN.  Showing 0 here is
+                    # indistinguishable from a genuinely new offer -- the
+                    # misleading constant this column showed for months.
+                    age_text, age_val = "—", None
+            existing_age = table.item(row_idx, 9)
+            if not isinstance(existing_age, _SortByUserRoleItem):
+                item_age = _SortByUserRoleItem(age_text)
+                item_age.setTextAlignment(self._RIGHT)
+                table.setItem(row_idx, 9, item_age)
+            else:
+                item_age = existing_age
+                item_age.setText(age_text)
+            item_age.setData(Qt.ItemDataRole.UserRole, age_val)
+            # Highlight stale offers that exceed the TTL threshold.  An
+            # unknown age (age_val None) gets no highlight: staleness cannot
+            # be judged without an age.
+            if age_val is not None and age_val > self._offer_ttl:
                 item_age.setForeground(self._loss_color)
-            elif age > int(self._offer_ttl * 0.8):
+            elif age_val is not None and age_val > int(self._offer_ttl * 0.8):
                 item_age.setForeground(self._warn_color)
             else:
                 # Reused row: clear any warning colour from a previous offer.
                 item_age.setData(Qt.ItemDataRole.ForegroundRole, None)
 
+            # -- Fill latency (listed -> accepted), for fill analysis --
+            # A dedicated item type: _item() would build a plain
+            # QTableWidgetItem, whose comparator sorts the display STRING.
+            fill_min_text, fill_min_val = _fill_latency_minutes(offer)
+            existing = table.item(row_idx, 10)
+            if not isinstance(existing, _SortByUserRoleItem):
+                item_fill = _SortByUserRoleItem(fill_min_text)
+                item_fill.setTextAlignment(self._RIGHT)
+                table.setItem(row_idx, 10, item_fill)
+            else:
+                item_fill = existing
+                item_fill.setText(fill_min_text)
+            item_fill.setData(
+                Qt.ItemDataRole.UserRole,
+                None if fill_min_val < 0 else fill_min_val,
+            )
+            item_fill.setForeground(self._secondary_color)
+
             # -- Actions (cancel button for pending offers) --
-            self._item(row_idx, 10, "")
-            btn_cancel = table.cellWidget(row_idx, 10)
+            self._item(row_idx, 11, "")
+            btn_cancel = table.cellWidget(row_idx, 11)
             if status.lower() == "pending":
                 if not isinstance(btn_cancel, QPushButton):
                     btn_cancel = QPushButton("Cancel")
@@ -784,10 +896,10 @@ class OrderPanel(QWidget):
                     # it acts on is read from the property below, so a
                     # reused button can never cancel a stale offer.
                     btn_cancel.clicked.connect(self._on_cancel_button)
-                    table.setCellWidget(row_idx, 10, btn_cancel)
+                    table.setCellWidget(row_idx, 11, btn_cancel)
                 btn_cancel.setProperty("offer_id", oid)
             elif btn_cancel is not None:
-                table.removeCellWidget(row_idx, 10)
+                table.removeCellWidget(row_idx, 11)
 
     # ------------------------------------------------------------------
     # Internal: summary
