@@ -46,9 +46,13 @@ from gui.widgets.status_bar import StatusBar
 # Each of these will live in gui/widgets/<name>.py once implemented.
 # Import guards let the window load even if the files are not yet present.
 try:
-    from gui.widgets.dashboard import DashboardWidget
+    from gui.widgets.dashboard import (
+        _ACTIVITY_FEED_MAX,
+        DashboardWidget,
+    )
 except ImportError:
     DashboardWidget = None  # type: ignore[assignment,misc]
+    _ACTIVITY_FEED_MAX = 20  # widget unavailable; keep the module importable
 
 try:
     from gui.widgets.chart import ChartWidget
@@ -109,7 +113,18 @@ except ImportError:
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
 from gui.theme import COLORS as _C
-from gui.utils import mojos_to_xch_float
+from gui.utils import (
+    format_price,
+    mojos_per_unit_for_pair,
+    mojos_to_xch,
+    mojos_to_xch_float,
+)
+
+#: Rows converted for the dashboard's RECENT ACTIVITY feed.  Taken from the
+#: widget's own cap rather than restated: a separate 25 here meant five rows
+#: were built and then deterministically discarded by update_trades(), and
+#: the documented count did not match what the panel rendered.
+_ACTIVITY_FEED_ROWS: Final[int] = _ACTIVITY_FEED_MAX
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
 LIGHT_GREEN: Final[str] = _C.LIGHT_GREEN
@@ -180,6 +195,49 @@ def _placeholder_widget(label: str) -> QWidget:
     lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 16px;")
     layout.addWidget(lbl)
     return widget
+
+
+def activity_event(trade: dict) -> Optional[dict]:
+    """One activity-feed event from a ``trade_log`` row, or None if unusable.
+
+    Amounts go through the same helpers the Trade Log uses rather than being
+    re-derived: ``price_mojos`` is scaled by 10^12 for EVERY pair, while
+    ``size_mojos`` uses the pair's own base units, and duplicating that rule
+    is how two views of one fill drift apart.
+
+    Returns None for a row that cannot be rendered; one malformed row must
+    not empty the whole feed.
+    """
+    pair = str(trade.get("pair_name", "") or "")
+    side = str(trade.get("side", "") or "").lower()
+    try:
+        price = format_price(int(trade.get("price_mojos", 0) or 0), pair)
+        size = mojos_to_xch(
+            int(trade.get("size_mojos", 0) or 0),
+            mojos_per_unit=mojos_per_unit_for_pair(pair, "base"),
+        )
+    except (TypeError, ValueError, KeyError):
+        return None
+    stamp = str(trade.get("timestamp", "") or "")
+    # trade_log stamps are UTC ISO ("2026-08-21T16:54:15.943Z").  Convert to
+    # LOCAL time before display: every other clock on the dashboard is local,
+    # and a bare "16:54:15" that is five hours off the status line reads as a
+    # different (wrong) event time, not as a timezone.
+    clock = stamp
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            clock = parsed.astimezone().strftime("%H:%M:%S")
+        elif len(stamp) >= 19:
+            clock = stamp[11:19]      # naive stamp: display as recorded
+    except ValueError:
+        if len(stamp) >= 19:
+            clock = stamp[11:19]
+    return {
+        "timestamp": clock,
+        "icon": "▲" if side == "bid" else "▼",
+        "message": f"{side.upper():4s} {size} @ {price}  {pair}",
+    }
 
 
 class MainWindow(QMainWindow):
@@ -312,6 +370,10 @@ class MainWindow(QMainWindow):
             db.trades_loaded.connect(self._trade_log.load_trades)
         if self._chart is not None and hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_chart)
+        # The dashboard's RECENT ACTIVITY feed.  It was built but never
+        # connected to anything, so it could not display a single row.
+        if hasattr(db, "trades_loaded"):
+            db.trades_loaded.connect(self._on_trades_for_activity)
         # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
         # Balances tab's Deployed % column and summary line.
         _wallet_widget = self._unwrap(self._wallet_balances)
@@ -1031,6 +1093,32 @@ class MainWindow(QMainWindow):
             "Total P&L": self._total_pnl_payload(),
             "24h P&L": self._pnl_24h_payload(),
         })
+
+    def _on_trades_for_activity(self, trades: list) -> None:
+        """Render recent fills into the dashboard's activity feed.
+
+        The query returns newest-first; the feed reads top-down oldest-first,
+        so the slice is reversed.  Only the newest few are shown -- this is a
+        glance panel, and the Trade Log tab is the full record.
+
+        Amounts go through the same helpers the Trade Log uses rather than
+        being re-derived here: price_mojos is scaled by 10^12 for every pair
+        while size_mojos uses the pair's own base units, and duplicating that
+        rule is how the two views drift apart.
+        """
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is None or not hasattr(dashboard, "update_trades"):
+            return
+
+        rows = list(trades)[:_ACTIVITY_FEED_ROWS][::-1]
+        events = [e for e in (activity_event(t) for t in rows) if e is not None]
+        if rows and not events:
+            # Input existed but nothing rendered.  Replacing the feed with an
+            # empty list here would discard a good snapshot because of bad
+            # rows -- the opposite of the "one malformed row must not empty
+            # the feed" rule that activity_event follows.
+            return
+        dashboard.update_trades(events)
 
     def _on_pnl_display(self, display: dict) -> None:
         """Receive restart-proof P&L figures from the database service."""

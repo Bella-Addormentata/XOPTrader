@@ -220,9 +220,13 @@ class _DatabaseWorker(QObject):
 
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         safe_limit = min(max(1, limit), _MAX_ROWS)
+        # id DESC is the tie-breaker, matching the latest-row query below.
+        # block_height alone leaves same-block fills in undefined order, so
+        # a consumer taking the newest N (the dashboard feed does) could
+        # shuffle them and drop the newest rows at the LIMIT cutoff.
         sql = (
             f"SELECT * FROM trade_log{where} "
-            f"ORDER BY block_height DESC LIMIT ?"
+            f"ORDER BY block_height DESC, id DESC LIMIT ?"
         )
         params.append(safe_limit)
 
