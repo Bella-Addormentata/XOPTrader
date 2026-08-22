@@ -375,6 +375,13 @@ class MainWindow(QMainWindow):
             self._tab_order_panel.cancel_all_requested.connect(bridge.cancel_all_offers)
         if self._settings_widget is not None and hasattr(self._settings_widget, "config_saved"):
             self._settings_widget.config_saved.connect(bridge.update_config_path)
+            # Connected AFTER update_config_path so it runs once the bridge
+            # has switched: saving a config from Settings changes where the
+            # advisory calculator must read, and a one-time snapshot taken at
+            # set_bridge() would keep pointing at the previous file.
+            self._settings_widget.config_saved.connect(
+                lambda *_: self._push_sizing_paths()
+            )
         wallet_widget = self._unwrap(self._wallet_balances)
         if (wallet_widget is not None
             and hasattr(wallet_widget, "allocation_targets_applied")
@@ -419,6 +426,13 @@ class MainWindow(QMainWindow):
             # Re-query the DB-derived P&L display whenever the user resets
             # or clears the display baseline on the Settings page.
             settings.pnl_baseline_changed.connect(self._on_pnl_baseline_changed)
+        # Unconditionally, BEFORE the Settings-widget branch below: the
+        # wallet page needs these paths too, and SettingsWidget is a guarded
+        # import.  Nesting this inside that branch meant a failed Settings
+        # import silently left the calculator on its bundle-relative
+        # defaults -- exactly the fault this change exists to remove.
+        self._push_sizing_paths()
+
         if settings is not None and hasattr(settings, "load_config"):
             cfg_path = bridge.config_service.path
             if cfg_path.is_file():
@@ -1548,6 +1562,31 @@ class MainWindow(QMainWindow):
 
         outer_layout.addWidget(self._splitter)
 
+    def _push_sizing_paths(self) -> None:
+        """Hand the advisory calculator the bridge's CURRENT paths.
+
+        Called at wiring time and again whenever Settings saves a config, so
+        a switched config file is picked up.  The calculator is loaded by
+        path out of the application bundle and cannot derive these from its
+        own __file__.
+        """
+        bridge = getattr(self, "_bridge", None)
+        if bridge is None:
+            return
+        try:
+            cfg_path = bridge.config_service.path
+        except Exception:          # bridge still starting up
+            return
+        db = str(getattr(bridge, "db_path", "") or "") or None
+        cfg = str(cfg_path) if cfg_path and cfg_path.is_file() else None
+
+        settings = self._unwrap(self._settings_widget)
+        if settings is not None and hasattr(settings, "set_sizing_db_path"):
+            settings.set_sizing_db_path(db)
+        wallet = self._unwrap(self._wallet_balances)
+        if wallet is not None and hasattr(wallet, "set_sizing_paths"):
+            wallet.set_sizing_paths(cfg, db)
+
     @staticmethod
     def _create_page_widget(
         widget_class: Optional[type],
@@ -2049,5 +2088,13 @@ class MainWindow(QMainWindow):
 
         self._status_timer.stop()
         self._metrics_timer.stop()
+        # Join widget-owned worker threads BEFORE teardown.  Qt aborts the
+        # process (qFatal) if a QThread is destroyed while still running, and
+        # nothing else knows about these: EngineBridge.shutdown() owns the
+        # services, not the pages' own threads.
+        for page in (self._wallet_balances, self._settings_widget):
+            widget = self._unwrap(page)
+            if widget is not None and hasattr(widget, "stop_background_work"):
+                widget.stop_background_work()
         self._save_state()
         super().closeEvent(event)

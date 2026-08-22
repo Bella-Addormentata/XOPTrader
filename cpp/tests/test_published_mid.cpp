@@ -298,10 +298,11 @@ TEST(CexStalenessTest, ReIngestingACachedSampleDoesNotRefreshIt) {
 //
 // It is the only leg of the blend that is a historical print rather than a
 // live quote, and it enters at the full DEX weight, so an unaged fallback
-// anchors the mid to whenever the pair last traded.  The fallback only opens
-// when the third-party book is empty -- exactly the state a thin or bid-only
-// pair sits in, which is where a 13-day-old print was measured dragging a
-// mid 8%+ below fair.
+// anchors the mid to whenever the pair last traded.  The fallback opens
+// whenever no usable two-sided quote remains -- an empty book, or the
+// one-sided book a thin or bid-only pair sits in (see
+// OneSidedBook_UnagedPrint_CexGoverns above) -- which is where a 13-day-old
+// print was measured dragging a mid 8%+ below fair.
 // ---------------------------------------------------------------------------
 TEST(LastTradeStalenessTest, FirstSightingHasUnknownAgeAndIsRefused) {
     State state;
@@ -314,6 +315,25 @@ TEST(LastTradeStalenessTest, FirstSightingHasUnknownAgeAndIsRefused) {
 
     // The print is refused, so the mid is the CEX leg alone rather than a
     // 70% weighting of an undateable print.
+    EXPECT_NEAR(feed.get_mid_price("XCH/wUSDC.b"), 1.20, 1e-9);
+}
+
+TEST(LastTradeStalenessTest, RepeatedPrintsAtOneUnchangedPriceStayUnusable) {
+    // The clock starts on a price CHANGE, not on a trade.  A pair that keeps
+    // printing the SAME price is never observed to move, so its age stays
+    // unknown and the fallback stays shut however many times it prints.
+    // Locked in deliberately: the alternative -- treating an unmoved print as
+    // fresh -- is the bug the gate exists to prevent.
+    State state;
+    MarketDataFeed feed(band_cfg(), state);
+
+    for (int heartbeat = 0; heartbeat < 5; ++heartbeat) {
+        feed.ingest_dexie("XCH/wUSDC.b", 0.0, 0.0, 1.005, 100.0);
+    }
+    feed.ingest_cex_reference("XCH/wUSDC.b", 1.20);
+    feed.refresh({"XCH/wUSDC.b"});
+
+    // CEX alone: five prints, no movement, still unusable.
     EXPECT_NEAR(feed.get_mid_price("XCH/wUSDC.b"), 1.20, 1e-9);
 }
 
