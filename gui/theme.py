@@ -692,6 +692,28 @@ def fit_row_height(table) -> None:
     )
 
 
+#: The font-size delta most recently applied by apply_theme().  Widgets
+#: that carry LOCAL stylesheets (which override the application sheet) read
+#: it through scaled_px() so their hard pixel sizes follow the operator's
+#: setting instead of silently ignoring it -- the S10 defect.
+_active_font_delta: int = 0
+
+
+def active_font_delta() -> int:
+    """The delta apply_theme() last applied (0 before any call)."""
+    return _active_font_delta
+
+
+def scaled_px(base_px: int) -> int:
+    """*base_px* adjusted by the active font-size delta, floored at 7px.
+
+    For widget-local QSS only: the application stylesheet already scales
+    itself.  Read at construction time -- a widget built before a theme
+    change keeps its old sizes until recreated, same as any local QSS.
+    """
+    return max(7, base_px + _active_font_delta)
+
+
 def apply_theme(
     app: QApplication,
     font_size_delta: int = 0,
@@ -714,6 +736,9 @@ def apply_theme(
         CHIA palette when *None*.
     """
     palette = colors if colors is not None else COLORS
+
+    global _active_font_delta
+    _active_font_delta = font_size_delta
 
     # Use Fusion style as the base -- it renders identically on every
     # platform and responds well to QSS overrides.

@@ -136,7 +136,7 @@
 ### S10: The wallet balances page ignores the UI font-size setting
 - **Files:** `gui/widgets/wallet_balances.py` (local QSS on both tables)
 - **Issue:** The balances and target-allocation tables pin `font-size: 12px` and `11px` for headers in widget-level stylesheets, which override the application stylesheet built by `theme.get_stylesheet(font_size_delta=...)`. Measured 2026-08-21: row height and total table height are byte-identical at deltas -2, 0 and +4. An operator who enlarges the UI font gets no change on this page. Surfaced reviewing PR #92, where a parameterised test appeared to cover font scaling but exercised the same geometry three times.
-- **Status:** `[ ]` — OPEN. Either drop the local font sizes and let the theme supply them, or derive them from the same delta. Low risk, but it silently defeats an accessibility setting the app advertises.
+- **Status:** `[x]` — FIXED (PR #97). `apply_theme()` records the active delta and exposes `theme.scaled_px()`; the wallet page's table/header QSS and row heights derive from it, so the setting reaches the page (verified: delta 4 grows rows 30→34 and the fitted height follows). Widgets built before a theme change keep their old sizes until recreated, like any local QSS.
 
 ### S11: offer_log keeps never-resolved 'pending' rows
 - **Files:** `cpp/src/execution/offer_manager.cpp` (reconciliation), `gui/services/database_service.py` (consumers)

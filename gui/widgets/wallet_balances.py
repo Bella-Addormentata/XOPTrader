@@ -30,7 +30,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS as _C
+from gui.theme import scaled_px, COLORS as _C
 from gui.theme import MONO_FONT_FAMILY
 
 # ---------------------------------------------------------------------------
@@ -120,13 +120,10 @@ def _fit_table_to_contents(table: QTableWidget) -> None:
     Height is summed from the CURRENT row heights rather than a per-row
     constant, so it follows whatever the rows actually measure.
 
-    That is deliberately a statement about row GEOMETRY, not about the UI
-    font-size setting: this widget pins its table and header fonts in local
-    QSS, which overrides the application stylesheet, so changing that setting
-    does not move these rows at all today (tracked as S10 in TODO.md).
-    The fit is correct either way -- it reads the rows rather than assuming
-    a height -- but it must not be read as evidence that the accessibility
-    setting reaches this page.
+    That is a statement about row GEOMETRY: the fit reads the rows rather
+    than assuming a height.  Since S10 was fixed the local QSS derives its
+    pixel sizes from theme.scaled_px(), so the font-size setting reaches
+    this page too -- rows grow with the text and the fit follows them.
     """
     table.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     rows = sum(
@@ -327,6 +324,12 @@ class WalletBalancesWidget(QWidget):
         self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setAlternatingRowColors(True)
         self._table.verticalHeader().setVisible(False)
+        # Rows follow the scaled font: 12px text sits in a 30px row at the
+        # default delta (12 + 18), and grows with it so enlarged text is not
+        # clipped by a fixed row.
+        self._table.verticalHeader().setDefaultSectionSize(
+            max(30, scaled_px(12) + 18)
+        )
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -341,7 +344,7 @@ class WalletBalancesWidget(QWidget):
                 border-radius: 4px;
                 gridline-color: {BORDER};
                 font-family: {_MONO};
-                font-size: 12px;
+                font-size: {scaled_px(12)}px;
             }}
             QTableWidget::item {{
                 padding: 6px 10px;
@@ -354,7 +357,7 @@ class WalletBalancesWidget(QWidget):
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
                 padding: 6px 10px;
-                font-size: 11px;
+                font-size: {scaled_px(11)}px;
                 font-weight: bold;
             }}
             """
@@ -397,6 +400,9 @@ class WalletBalancesWidget(QWidget):
             QTableWidget.SelectionBehavior.SelectRows
         )
         self._alloc_table.verticalHeader().setVisible(False)
+        self._alloc_table.verticalHeader().setDefaultSectionSize(
+            max(30, scaled_px(12) + 18)   # same rule as the balances table
+        )
         self._alloc_table.horizontalHeader().setStretchLastSection(True)
         self._alloc_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Stretch
@@ -410,14 +416,14 @@ class WalletBalancesWidget(QWidget):
                 border-radius: 4px;
                 gridline-color: {BORDER};
                 font-family: {_MONO};
-                font-size: 12px;
+                font-size: {scaled_px(12)}px;
             }}
             QHeaderView::section {{
                 background-color: {ELEVATED_BG};
                 color: {TEXT_SECONDARY};
                 border: 1px solid {BORDER};
                 padding: 4px 8px;
-                font-size: 11px;
+                font-size: {scaled_px(11)}px;
                 font-weight: bold;
             }}
             """
@@ -470,7 +476,7 @@ class WalletBalancesWidget(QWidget):
                 border: 1px solid {PRIMARY_GREEN};
                 border-radius: 4px;
                 padding: 4px 8px;
-                font-size: 11px;
+                font-size: {scaled_px(11)}px;
                 font-weight: bold;
             }}
             QPushButton:hover {{

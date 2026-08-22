@@ -328,3 +328,29 @@ def test_the_early_return_fit_is_what_restores_a_wrong_height(app):
     assert table.height() == _content_height(table), (
         "the empty-payload path did not refit the table"
     )
+
+
+def test_the_font_size_setting_reaches_this_page(app):
+    """S10: local QSS pinned 12px/11px fonts, overriding the application
+    stylesheet -- the operator's font setting changed nothing here. The
+    pixel sizes now derive from theme.scaled_px(), and rows follow.
+    """
+    try:
+        theme.apply_theme(app, font_size_delta=0)
+        base = WalletBalancesWidget()
+        base._refresh_suggested_allocation = lambda: None
+        base.update_balances(_balances(4), market_data={}, stuck_offers=0)
+        base_row, base_h = base._table.rowHeight(0), base._table.height()
+
+        theme.apply_theme(app, font_size_delta=4)
+        bigger = WalletBalancesWidget()
+        bigger._refresh_suggested_allocation = lambda: None
+        bigger.update_balances(_balances(4), market_data={}, stuck_offers=0)
+
+        assert bigger._table.rowHeight(0) > base_row, (
+            "rows ignored the font-size delta -- S10 has regressed"
+        )
+        assert bigger._table.height() > base_h, "the fit did not follow"
+    finally:
+        theme.apply_theme(app, font_size_delta=0)
+        app.setStyleSheet(theme.get_stylesheet())
