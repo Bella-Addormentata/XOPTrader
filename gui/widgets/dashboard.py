@@ -1028,6 +1028,16 @@ class DashboardWidget(QWidget):
             oldest first.  The feed is capped at
             :data:`_ACTIVITY_FEED_MAX`.
         """
+        # clear() drops the scrollbar to 0/0.  Two things follow, and
+        # restoring only the first is not enough:
+        #   * _on_feed_scroll reads 0 >= maximum-5 as "at the bottom" and
+        #     silently re-arms auto-scroll; and
+        #   * the value itself is lost, so a reader who had paused
+        #     auto-scroll lands at the TOP of the rebuilt list instead.
+        # Preserve both, so a paused reader stays where they were.
+        scrollbar = self._activity_list.verticalScrollBar()
+        was_auto_scroll = self._auto_scroll
+        previous_value = scrollbar.value()
         self._activity_list.clear()
         for trade in trades:
             ts = trade.get("timestamp", "")
@@ -1043,9 +1053,14 @@ class DashboardWidget(QWidget):
         while self._activity_list.count() > _ACTIVITY_FEED_MAX:
             self._activity_list.takeItem(0)
 
-        # Auto-scroll if the user is at the bottom
+        # Restore the reader's position before deciding where to leave them:
+        # the value survives the rebuild, clamped to the new maximum in case
+        # the snapshot is shorter than the one it replaced.
+        self._auto_scroll = was_auto_scroll
         if self._auto_scroll:
             self._activity_list.scrollToBottom()
+        else:
+            scrollbar.setValue(min(previous_value, scrollbar.maximum()))
 
     def update_wallet_balances(
         self,

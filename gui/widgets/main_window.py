@@ -46,9 +46,13 @@ from gui.widgets.status_bar import StatusBar
 # Each of these will live in gui/widgets/<name>.py once implemented.
 # Import guards let the window load even if the files are not yet present.
 try:
-    from gui.widgets.dashboard import DashboardWidget
+    from gui.widgets.dashboard import (
+        _ACTIVITY_FEED_MAX,
+        DashboardWidget,
+    )
 except ImportError:
     DashboardWidget = None  # type: ignore[assignment,misc]
+    _ACTIVITY_FEED_MAX = 20  # widget unavailable; keep the module importable
 
 try:
     from gui.widgets.chart import ChartWidget
@@ -117,9 +121,11 @@ from gui.utils import (
     mojos_to_xch_float,
 )
 
-#: Rows shown in the dashboard's RECENT ACTIVITY feed.  A glance
-#: panel, not a record -- the Trade Log tab holds the full history.
-_ACTIVITY_FEED_ROWS: Final[int] = 25
+#: Rows converted for the dashboard's RECENT ACTIVITY feed.  Taken from the
+#: widget's own cap rather than restated: a separate 25 here meant five rows
+#: were built and then deterministically discarded by update_trades(), and
+#: the documented count did not match what the panel rendered.
+_ACTIVITY_FEED_ROWS: Final[int] = _ACTIVITY_FEED_MAX
 
 PRIMARY_GREEN: Final[str] = _C.PRIMARY_GREEN
 LIGHT_GREEN: Final[str] = _C.LIGHT_GREEN
@@ -269,9 +275,6 @@ class MainWindow(QMainWindow):
         self.metrics_service = metrics_service
         self.db_service = db_service
         self._bridge: Optional[Any] = None  # Set via set_bridge()
-        # Last observed 24h fill count, so the activity feed can refresh when
-        # a fill actually lands.  None until the first bridge payload.
-        self._last_fill_count: Optional[int] = None
         # Dashboard per-pair table inputs: our own book/fills from the DB,
         # plus the latest live snapshot to pair them with.
         self._pair_summary: dict = {}
@@ -713,7 +716,6 @@ class MainWindow(QMainWindow):
             fill_count_24h = int(
                 self._pnl_display.get("fills_24h", offers.get("filled", 0))
             )
-            self._refresh_activity_on_new_fill(fill_count_24h)
 
             card_data = {
                 "Total P&L": self._total_pnl_payload(),
@@ -1122,28 +1124,6 @@ class MainWindow(QMainWindow):
             "24h P&L": self._pnl_24h_payload(),
         })
 
-    def _refresh_activity_on_new_fill(self, fill_count: int) -> None:
-        """Re-query trades when the fill count moves, and only then.
-
-        A timer would be the obvious approach and is the wrong one here: the
-        trades query is shared with the chart, whose per-pair merge is heavy
-        enough that it is already chunked across event-loop slices at
-        startup.  Polling it every few seconds would pay that cost forever to
-        show something that changes about thirty times a day.
-
-        The first observation only records the baseline -- the startup seed
-        has already populated the feed, so re-querying immediately would
-        duplicate that work for nothing.
-        """
-        previous = self._last_fill_count
-        self._last_fill_count = fill_count
-        if previous is None or fill_count <= previous:
-            return
-        bridge = getattr(self, "_bridge", None)
-        db = getattr(bridge, "database_service", None) if bridge else None
-        if db is not None and hasattr(db, "query_trades"):
-            db.query_trades(limit=1000)
-
     def _on_pair_summary(self, summary: dict) -> None:
         """Cache our own per-pair book/fill figures for the dashboard table."""
         self._pair_summary = dict(summary or {})
@@ -1246,9 +1226,14 @@ class MainWindow(QMainWindow):
         if dashboard is None or not hasattr(dashboard, "update_trades"):
             return
 
-        events = [e for e in (activity_event(t)
-                              for t in list(trades)[:_ACTIVITY_FEED_ROWS][::-1])
-                  if e is not None]
+        rows = list(trades)[:_ACTIVITY_FEED_ROWS][::-1]
+        events = [e for e in (activity_event(t) for t in rows) if e is not None]
+        if rows and not events:
+            # Input existed but nothing rendered.  Replacing the feed with an
+            # empty list here would discard a good snapshot because of bad
+            # rows -- the opposite of the "one malformed row must not empty
+            # the feed" rule that activity_event follows.
+            return
         dashboard.update_trades(events)
 
     def _on_pnl_display(self, display: dict) -> None:
