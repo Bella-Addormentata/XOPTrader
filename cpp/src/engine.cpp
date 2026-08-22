@@ -1711,6 +1711,19 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
+    } else if (state_->status() == BotStatus::Paused) {
+        // The max-drawdown breaker (Step 13) sets BotStatus::Paused and its
+        // comment promises this "stops new offer creation in subsequent
+        // cycles" -- but nothing here ever read that status, so the promise
+        // held only while some OTHER gate happened to be active.  Observed
+        // 2026-08-22: breaker tripped 04:43 and posting stopped -- because
+        // the flash-crash latch was engaged at the same moment; when that
+        // cleared at 11:55 the engine resumed quoting for 2.5 hours while
+        // alerting "engine PAUSED. Manual intervention required" every 15
+        // minutes.  A breaker whose pause does not pause is worse than no
+        // breaker, because the operator stands down believing it worked.
+        spdlog::warn("[Engine] Step 8 SKIPPED: BotStatus is Paused "
+                     "(circuit breaker) -- no new offers posted");
     } else if (flash_crash_state_ == FlashCrashState::Normal) {
         try {
             co_await step_manage_offers(block_height);
