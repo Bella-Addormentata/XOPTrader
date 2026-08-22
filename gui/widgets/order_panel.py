@@ -64,6 +64,25 @@ _COLUMNS: list[tuple[str, int]] = [
 _STATUSES: list[str] = ["All", "Pending", "Filled", "Cancelled", "Expired"]
 
 
+class _SortByUserRoleItem(QTableWidgetItem):
+    """Sorts on the numeric UserRole value instead of the display text.
+
+    The default comparator sorts DisplayRole as STRINGS, so "9.0" ordered
+    above "100.0" and the em-dash rows floated above real values in a
+    descending sort.  Missing values carry -inf, which pins them below
+    every real latency in either direction.
+    """
+
+    __slots__ = ()
+
+    def __lt__(self, other):          # noqa: D105
+        mine = self.data(Qt.ItemDataRole.UserRole)
+        theirs = other.data(Qt.ItemDataRole.UserRole)
+        if mine is None or theirs is None:
+            return super().__lt__(other)
+        return float(mine) < float(theirs)
+
+
 def _fill_latency_minutes(offer: dict) -> tuple[str, float]:
     """('12.3', 12.3) minutes from listing to acceptance, or an em dash.
 
@@ -683,14 +702,14 @@ class OrderPanel(QWidget):
         item = self._table.item(row, col)
         if item is None:
             item = QTableWidgetItem(text)
-            if col in (0, 1, 5, 7, 10):
-                pass  # default alignment / font
+            if col in (0, 1, 5, 7, 11):
+                pass  # default alignment / font (11 = Actions)
             elif col in (2, 6):
                 item.setFont(self._mono_bold)
             elif col in (3, 4):
                 item.setFont(self._mono_font)
                 item.setTextAlignment(self._RIGHT)
-            else:  # 8, 9 -- numeric block columns
+            else:  # 8, 9, 10 -- numeric columns (blocks, age, fill minutes)
                 item.setTextAlignment(self._RIGHT)
             self._table.setItem(row, col, item)
         else:
@@ -805,9 +824,21 @@ class OrderPanel(QWidget):
                 item_age.setData(Qt.ItemDataRole.ForegroundRole, None)
 
             # -- Fill latency (listed -> accepted), for fill analysis --
+            # A dedicated item type: _item() would build a plain
+            # QTableWidgetItem, whose comparator sorts the display STRING.
             fill_min_text, fill_min_val = _fill_latency_minutes(offer)
-            item_fill = self._item(row_idx, 10, fill_min_text)
-            item_fill.setData(Qt.ItemDataRole.UserRole, fill_min_val)
+            existing = table.item(row_idx, 10)
+            if not isinstance(existing, _SortByUserRoleItem):
+                item_fill = _SortByUserRoleItem(fill_min_text)
+                item_fill.setTextAlignment(self._RIGHT)
+                table.setItem(row_idx, 10, item_fill)
+            else:
+                item_fill = existing
+                item_fill.setText(fill_min_text)
+            item_fill.setData(
+                Qt.ItemDataRole.UserRole,
+                float("-inf") if fill_min_val < 0 else fill_min_val,
+            )
             item_fill.setForeground(self._secondary_color)
 
             # -- Actions (cancel button for pending offers) --

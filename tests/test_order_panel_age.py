@@ -117,3 +117,45 @@ def test_the_cancel_button_lives_in_the_new_last_column(app):
         assert panel._table.cellWidget(0, 10) is None
     finally:
         panel.hide()
+
+
+def test_fill_minutes_sort_numerically_in_both_directions(app):
+    """The default comparator sorts DisplayRole strings: '9.0' above
+    '100.0', and em dashes floating above real values descending."""
+    from PySide6.QtCore import Qt
+
+    panel = _panel(app)
+    panel.set_current_block(9_184_100)
+    panel.update_offers([
+        _offer(offer_id="0xaaa", status="filled",
+               created_at="2026-08-22 09:00:00",
+               resolved_at="2026-08-22 09:09:00"),      # 9.0 min
+        _offer(offer_id="0xbbb", status="filled",
+               created_at="2026-08-22 09:00:00",
+               resolved_at="2026-08-22 10:40:00"),      # 100.0 min
+        _offer(offer_id="0xccc"),                        # pending: em dash
+    ])
+    table = panel._table
+    try:
+        table.sortItems(10, Qt.SortOrder.DescendingOrder)
+        col = [table.item(r, 10).text() for r in range(3)]
+        assert col == ["100.0", "9.0", "—"], f"descending: {col}"
+        table.sortItems(10, Qt.SortOrder.AscendingOrder)
+        col = [table.item(r, 10).text() for r in range(3)]
+        assert col == ["—", "9.0", "100.0"], f"ascending: {col}"
+    finally:
+        panel.hide()
+
+
+def test_fill_minutes_are_right_aligned_like_the_other_numerics(app):
+    from PySide6.QtCore import Qt
+
+    panel = _panel(app)
+    panel.update_offers([_offer(status="filled",
+                                created_at="2026-08-22 09:00:00",
+                                resolved_at="2026-08-22 09:09:00")])
+    try:
+        flags = panel._table.item(0, 10).textAlignment()
+        assert flags & Qt.AlignmentFlag.AlignRight, "Fill (min) left-aligned"
+    finally:
+        panel.hide()
