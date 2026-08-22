@@ -219,8 +219,20 @@ def activity_event(trade: dict) -> Optional[dict]:
     except (TypeError, ValueError, KeyError):
         return None
     stamp = str(trade.get("timestamp", "") or "")
-    # "2026-08-21T16:54:15.943Z" -> "16:54:15"
-    clock = stamp[11:19] if len(stamp) >= 19 else stamp
+    # trade_log stamps are UTC ISO ("2026-08-21T16:54:15.943Z").  Convert to
+    # LOCAL time before display: every other clock on the dashboard is local,
+    # and a bare "16:54:15" that is five hours off the status line reads as a
+    # different (wrong) event time, not as a timezone.
+    clock = stamp
+    try:
+        parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+        if parsed.tzinfo is not None:
+            clock = parsed.astimezone().strftime("%H:%M:%S")
+        elif len(stamp) >= 19:
+            clock = stamp[11:19]      # naive stamp: display as recorded
+    except ValueError:
+        if len(stamp) >= 19:
+            clock = stamp[11:19]
     return {
         "timestamp": clock,
         "icon": "▲" if side == "bid" else "▼",

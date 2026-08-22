@@ -202,3 +202,58 @@ def test_the_feed_limits_are_one_source_of_truth():
     from gui.widgets.main_window import _ACTIVITY_FEED_ROWS
 
     assert _ACTIVITY_FEED_ROWS == _ACTIVITY_FEED_MAX
+
+
+def test_the_feed_clock_is_local_time(app):
+    """trade_log stamps are UTC; every other dashboard clock is local.
+
+    A bare UTC HH:MM:SS five hours off the status line reads as a different
+    event time, not as a timezone.
+    """
+    from datetime import datetime, timezone
+    from gui.widgets.main_window import activity_event
+
+    stamp = "2026-08-22T15:16:22.883Z"
+    event = activity_event({**{"timestamp": stamp}, "pair_name": "XCH/BYC",
+                            "side": "bid", "price_mojos": 1_486_000_000_000,
+                            "size_mojos": 1_000_000_000_000})
+    expected = (datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                .astimezone().strftime("%H:%M:%S"))
+    assert event["timestamp"] == expected
+    # And on any box not running UTC, that differs from the raw slice.
+    if expected != "15:16:22":
+        assert event["timestamp"] != "15:16:22"
+
+
+def test_the_pipeline_from_signal_to_widget_actually_runs(app):
+    """No test invoked _on_trades_for_activity; the greps could not notice a
+    broken slice, reversal, or dashboard handoff."""
+    from gui.widgets.main_window import MainWindow
+
+    window = MainWindow()
+    try:
+        captured = []
+
+        class _Dash:
+            def update_trades(self, events):
+                captured.append(events)
+
+        window._dashboard = _Dash()
+        rows = [{"timestamp": f"2026-08-22T15:16:{i:02d}.000Z",
+                 "pair_name": "XCH/wUSDC.b", "side": "bid",
+                 "price_mojos": 1_486_000_000_000,
+                 "size_mojos": 1_000_000_000_000} for i in range(30)]
+        window._on_trades_for_activity(rows)   # newest-first, as the DB emits
+
+        assert len(captured) == 1, "the feed was never handed the events"
+        events = captured[0]
+        from gui.widgets.dashboard import _ACTIVITY_FEED_MAX
+        assert len(events) == _ACTIVITY_FEED_MAX, "cap not applied"
+        # DB emits newest-first; the feed reads top-down oldest-first.
+        assert events[0]["timestamp"] < events[-1]["timestamp"], (
+            "slice was not reversed into chronological order"
+        )
+    finally:
+        window.close()
+        window.deleteLater()
+        app.processEvents()
