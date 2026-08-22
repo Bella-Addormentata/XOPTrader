@@ -279,3 +279,52 @@ def test_a_page_that_overflows_while_hidden_is_not_clipped_when_opened(app):
         assert table.height() >= needed(), "last row clipped on opening"
     finally:
         stack.hide()
+
+
+def test_narrowing_after_population_grows_the_height_via_rangechanged(app):
+    """The ONLY thing that refits on a later resize is the rangeChanged
+    connection -- deleting it left every test in this file green while a
+    narrowed window clipped the last row in production.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    w = WalletBalancesWidget()
+    w._refresh_suggested_allocation = lambda: None
+    w.update_balances(_balances(6), market_data={}, stuck_offers=0)
+    table = w._table
+    w.show()
+    app.processEvents()
+    try:
+        table.setFixedWidth(1000)        # wide: no horizontal overflow
+        app.processEvents()
+        before = table.height()
+        bar = table.horizontalScrollBar()
+        assert bar.maximum() <= bar.minimum(), "fixture overflowed while wide"
+
+        table.setFixedWidth(250)         # narrow: overflow appears
+        app.processEvents()
+        assert bar.maximum() > bar.minimum(), "fixture produced no overflow"
+        assert table.height() > before, (
+            "no refit followed the range change -- the reservation only "
+            "happens if something re-runs the fit, and nothing did"
+        )
+        assert table.height() == _content_height(table)
+    finally:
+        w.hide()
+
+
+def test_the_early_return_fit_is_what_restores_a_wrong_height(app):
+    """update_balances({}) returns before the main fit; the fit on that path
+    is a separate line, and the previous test passed with it deleted because
+    construction had already fitted the table.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    w = WalletBalancesWidget()
+    w._refresh_suggested_allocation = lambda: None
+    table = w._table
+    table.setFixedHeight(480)            # knock it out of fit deliberately
+    assert table.height() != _content_height(table)
+
+    w.update_balances({}, market_data={}, stuck_offers=0)
+    assert table.height() == _content_height(table), (
+        "the empty-payload path did not refit the table"
+    )
