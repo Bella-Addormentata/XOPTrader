@@ -1643,6 +1643,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // -- XCH Recovery Mode: check balance and enter/exit recovery. ---------
     // Runs before Steps 7-8 so that recovery can gate offer posting.
     // When active, cancels offers and takes cheap XCH asks instead.
+    //
+    // DELIBERATELY NOT gated on breaker_pause_active_: this step exists to
+    // keep the wallet fee-liquid, and a breaker pause still needs fees to
+    // cancel offers and settle in-flight state.  Starving it during a pause
+    // could leave the engine unable to wind anything down.  Its XCH-buying
+    // arm is bounded by its own recovery thresholds.  If a future audit
+    // wants takes stopped here too, that is a policy change to make
+    // explicitly, not a gate to add by symmetry.
     if (!wallet_circuit_open_) {
         try {
             co_await step_xch_recovery(block_height);
@@ -1697,7 +1705,11 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     // Give active drift correction first use of spendable balances before
     // passive market-making offers lock those coins in new pending offers.
-    if (!wallet_circuit_open_) {
+    // Gated on the risk-breaker latch: the drift corrector INITIATES taker
+    // trades, and a pause that stops passive posting while active taking
+    // continues is not a pause -- the audit found the latch gated Step 8
+    // alone while every taker path kept trading.
+    if (!wallet_circuit_open_ && !breaker_pause_active_) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
@@ -1755,9 +1767,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     } // end of !xch_recovery_mode_ block
 
-    try { co_await step_check_arbitrage(block_height); }
-    catch (const std::exception& e) {
-        spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());
+    if (!breaker_pause_active_) {
+        try { co_await step_check_arbitrage(block_height); }
+        catch (const std::exception& e) {
+            spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());
+        }
+    } else {
+        spdlog::debug("[Engine] Step 9 SKIPPED: risk breaker pause "
+                      "(arbitrage executes takes, not just detection)");
     }
 
     try { step_run_hedging(block_height); }
