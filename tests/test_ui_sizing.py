@@ -32,8 +32,19 @@ NEWLINE = chr(10)
 
 @pytest.fixture(scope="module")
 def app():
-    existing = QApplication.instance()
-    yield existing or QApplication(sys.argv)
+    """A QApplication on the SAME base style production uses.
+
+    theme.apply_theme() sets Fusion (theme.py) and gui/app.py relies on it,
+    but these tests apply only the stylesheet -- so without this they measure
+    whatever base style the host platform supplies, and a fixture reused from
+    another test module could bring a different one again.  Row defaults,
+    size hints and SE_CheckBoxClickRect all come from that style, so the
+    geometry asserted here would be geometry no user runs, and could differ
+    between a developer machine and CI.
+    """
+    instance = QApplication.instance() or QApplication(sys.argv)
+    instance.setStyle("Fusion")
+    yield instance
 
 
 def _row_height(delta: int = 0) -> int:
@@ -301,3 +312,8 @@ def test_the_danger_rule_is_documented_accurately():
     from pathlib import Path
     source = Path(theme.__file__).read_text(encoding="utf-8")
     assert "those set only colours" not in source
+
+
+def test_the_measurements_are_taken_on_the_production_style(app):
+    """Geometry depends on the base style, so it must be the shipped one."""
+    assert app.style().objectName().lower() == "fusion"
