@@ -85,7 +85,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from gui.theme import COLORS
+from gui.theme import COLORS, HitTargetCheckBox, fit_row_height
 
 log = logging.getLogger(__name__)
 
@@ -124,9 +124,15 @@ class _SuggestedTargetsWorker(QObject):
     ready = Signal(dict)   # {pair_name: {"ratio", "artifact", "reason"}}
     failed = Signal(str)
 
-    def __init__(self, config_path: Optional[str]) -> None:
+    def __init__(self, config_path: Optional[str],
+                 db_path: Optional[str] = None) -> None:
         super().__init__()
+        # config_path alone was not enough: the database default is also
+        # derived from offer_sizing's __file__, which lives under _MEIPASS in
+        # an installed build, so this failed with "database not found at
+        # <_MEI temp dir>/data/xop_trader.db".
         self._config_path = config_path
+        self._db_path = db_path
 
     @Slot()
     def run(self) -> None:
@@ -135,7 +141,8 @@ class _SuggestedTargetsWorker(QObject):
 
             sizing = load_offer_sizing()
             result = sizing.compute_suggested_targets(
-                config_path=self._config_path
+                config_path=self._config_path,
+                db_path=self._db_path,
             )
             self.ready.emit(dict(result.get("pairs", {})))
         except Exception as exc:  # fail soft -> "n/a" in the table
@@ -311,6 +318,10 @@ class SettingsWidget(QWidget):
 
         # Internal state for dirty-tracking and reset.
         self._config_path: Optional[str] = None
+        # Database location for the advisory calculator, supplied by
+        # main_window; see _SuggestedTargetsWorker for why it cannot be
+        # derived from the bundled module's own location.
+        self._sizing_db_path: Optional[str] = None
         self._last_saved_time: Optional[str] = None
         self._clean_snapshot: dict[str, Any] = {}
         self._dirty: bool = False
@@ -640,6 +651,7 @@ class SettingsWidget(QWidget):
             lambda _r, _c, ti=1: self._mark_dirty(ti)
         )
         self._pairs_table.verticalHeader().setVisible(False)
+        fit_row_height(self._pairs_table)   # rows must fit the Remove button
         layout.addWidget(self._pairs_table, stretch=1)
 
         return page
@@ -2806,7 +2818,9 @@ class SettingsWidget(QWidget):
         self._pairs_table.insertRow(row)
 
         # Enabled checkbox -- centred in cell.
-        cb = QCheckBox()
+        # Unlabeled: a plain QCheckBox would shrink its clickable area
+        # with the indicator, so only the small box would toggle the row.
+        cb = HitTargetCheckBox()
         cb.setChecked(bool(pair.get("enabled", True)))
         cb.stateChanged.connect(lambda _s, ti=1: self._mark_dirty(ti))
         cb_container = QWidget()
@@ -2879,7 +2893,7 @@ class SettingsWidget(QWidget):
         # alone cannot satisfy it -- so the tooltip must say so, or an
         # operator with an AMM-backed pair ticks the box and watches
         # nothing happen.
-        revive_cb = QCheckBox()
+        revive_cb = HitTargetCheckBox()   # unlabeled, same reason
         revive_cb.setChecked(bool(pair.get("revive_market", False)))
         revive_cb.setToolTip(
             "Revive a dead market: quote from the external fair-value "
@@ -2902,12 +2916,15 @@ class SettingsWidget(QWidget):
         # Action buttons.
         actions = QWidget()
         actions_layout = QHBoxLayout(actions)
-        actions_layout.setContentsMargins(4, 2, 4, 2)
+        # 1px vertically, not 2: these margins sit on TOP of the button's
+        # own height inside the row, and were what pushed the wrapped widget
+        # past the row on a large font.
+        actions_layout.setContentsMargins(4, 1, 4, 1)
         actions_layout.setSpacing(4)
 
         remove_btn = QPushButton("Remove")
         remove_btn.setObjectName("dangerButton")
-        remove_btn.setFixedHeight(24)
+        remove_btn.setProperty("compact", True)   # see theme.py, same reason
         remove_btn.setToolTip("Remove this trading pair")
         # Resolve the button's current row at click time rather than
         # capturing a row index at insert time.  Captured indices go
@@ -2977,7 +2994,8 @@ class SettingsWidget(QWidget):
             "…", _SUGGESTED_TOOLTIP_BASE + "\n\nComputing…"
         )
         thread = QThread(self)
-        worker = _SuggestedTargetsWorker(self._config_path)
+        worker = _SuggestedTargetsWorker(self._config_path,
+                                         self._sizing_db_path)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.ready.connect(self._on_suggested_ready)
@@ -3328,6 +3346,37 @@ class SettingsWidget(QWidget):
     # ===================================================================
     # Public API: load_config / save_config
     # ===================================================================
+
+    def stop_background_work(self, timeout_ms: int = 2000) -> None:
+        """Join the advisory worker thread before this widget is destroyed.
+
+        A QThread still running when its C++ object is destroyed makes Qt
+        call qFatal("QThread: Destroyed while thread is still running") and
+        the process ABORTS -- reproduced against PySide6 6.11: the run exits
+        via the MSVC abort path instead of returning from main().
+
+        The worker blocks on a dexie fetch with a 30s timeout, so quit()
+        alone cannot return promptly: it only asks the thread's event loop to
+        exit, while run() is mid-request.  Wait briefly, then terminate as a
+        last resort -- an abrupt stop of a READ-ONLY advisory query during
+        shutdown is strictly better than aborting the application.
+
+        Child widgets do not receive closeEvent when the top-level window
+        closes, which is why this is public and called by MainWindow.
+        """
+        thread = self._suggest_thread
+        if thread is None:
+            return
+        thread.quit()
+        if not thread.wait(timeout_ms):
+            thread.terminate()
+            thread.wait(1000)
+        self._suggest_thread = None
+        self._suggest_worker = None
+
+    def set_sizing_db_path(self, db_path: Optional[str]) -> None:
+        """Tell the advisory targets calculator where the database lives."""
+        self._sizing_db_path = db_path
 
     def load_config(self, path: str) -> None:
         """Load a YAML configuration file and populate all widgets.

@@ -62,9 +62,13 @@ namespace {
 // re-stamped on every heartbeat, so it records when we last LOOKED.  The
 // per-pair change-clock does, with one deliberate asymmetry -- a print we
 // have never watched move has an UNKNOWN age, not a zero one, so it is
-// refused.  In practice that means the fallback is unavailable for a pair
-// until it trades once after a restart, which is the conservative side of a
-// path that only opens when the third-party book is empty.
+// refused.  Concretely the clock starts only when the REPORTED PRICE
+// CHANGES: a pair that keeps trading at the same price never initialises it,
+// so the fallback stays unavailable until the print MOVES -- not merely until
+// the pair trades again.  That is the conservative side of a path which opens
+// whenever no usable TWO-SIDED quote remains: an empty book, but equally a
+// one-sided one: a mid is formed only from a two-sided book, so a lone
+// resting side does not produce one.
 // -------------------------------------------------------------------------
 bool last_trade_is_fresh(const PairState& ps,
                          double max_age_sec) {
@@ -443,7 +447,8 @@ void MarketDataFeed::ingest_block_height(BlockHeight block_height) {
 }
 
 void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
-                                           double             cex_mid) {
+                                           double             cex_mid,
+                                           Timestamp          observed_at) {
     if (cex_mid <= 0.0) {
         spdlog::warn("ingest_cex_reference: pair={} invalid cex_mid={:.6f}",
                      pair_name, cex_mid);
@@ -454,7 +459,16 @@ void MarketDataFeed::ingest_cex_reference(const std::string& pair_name,
     PairState& ps = get_or_create_pair(pair_name);
 
     ps.cex_mid        = cex_mid;
-    ps.cex_updated_at = std::chrono::system_clock::now();
+    // Stored VERBATIM, for the same reason spelled out in ingest_amm_mid:
+    // the engine re-derives cex_mid from its CoinGecko CACHE every heartbeat,
+    // and a failed fetch leaves that cache in place.  Stamping now() here
+    // meant the sample always looked 0 seconds old, so the freshness taper
+    // below could never reduce the CEX weight no matter how long the feed had
+    // been down.  A default-constructed timestamp means "never observed", so
+    // fall back to now() rather than let it read as the epoch.
+    ps.cex_updated_at = (observed_at != Timestamp{})
+                      ? observed_at
+                      : std::chrono::system_clock::now();
 
     spdlog::debug("ingest_cex_reference: pair={} cex_mid={:.6f}",
                   pair_name, cex_mid);
@@ -987,8 +1001,11 @@ void MarketDataFeed::set_whale_max_spread_multiplier(double multiplier) {
 // Priority cascade:
 //   0. Order-book VWAP micro-price (depth-weighted, when enabled)
 //   1. Dexie two-sided quotes -> dex_mid = (bid + ask) / 2
-//   2. Dexie one-sided (bid-only or ask-only) -> dex_mid = available side
-//   3. Dexie last trade (no live quotes) -> dex_mid = last_trade
+//   2. Dexie one-sided (bid-only or ask-only) -> NO dex mid; falls to 3.
+//      (This used to publish the surviving side as the mid.)
+//   3. Dexie last trade -- reached with no quotes OR with a one-sided
+//      book -> dex_mid = last_trade, but only while that print is
+//      young enough (dex_last_trade_max_age_sec); otherwise no dex mid.
 //   4. No dexie data at all -> dex_mid = 0
 //
 // Blending:
@@ -1057,14 +1074,54 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     //
     // Falls through to the last trade below, which is a real print rather
     // than half a book.
-    // Case 3: No usable two-sided quotes -- fall back to last trade, but
-    // only while that print is young enough to be evidence of location.
+    // Case 3: No usable two-sided quote -- an empty book, or a one-sided
+    // one, which Case 2 above deliberately refuses to turn into a mid --
+    // so fall back to the last trade, but only while that print is young
+    // enough to be evidence of location.
     // This is the one blend leg that is a historical print, and it enters at
     // full DEX weight, so an unaged fallback silently anchors the mid to
     // whenever the pair last traded.  Refusing leaves the mid to the CEX and
     // AMM legs, which carry their own freshness tapers; if none survive, the
     // pair publishes no mid and the no-order-book guard stops it quoting --
     // the correct outcome when we cannot locate fair value.
+    //
+    // BLAST RADIUS -- this is NOT monotonic de-risking, and the original
+    // change description was wrong to call it that.  Refusing the print moves
+    // the mid toward the CEX and AMM legs, in whichever direction they sit.
+    // In the motivating wmilliETH.b case the stale print sat BELOW them, so
+    // the mid RISES -- and because the engine centres both sides on the
+    // published mid, BIDS RISE WITH IT: Engine::step_compute_quotes reads
+    // get_mid_price and hands that value straight to
+    // StrategyBase::compute_quotes, which derives both sides from it.  We bid
+    // higher than before, not lower.  (Named by symbol rather than by line:
+    // the numbers this first cited had already drifted onto a log statement
+    // and a margin calculation.)
+    //
+    // That is the intended correction: the old bid was anchored to a
+    // 13-day-old trade well below fair.  It is left unguarded here, and it is
+    // worth being exact about what that means, because the published-mid band
+    // does NOT cover this path: the clamp below runs only when dex_best_bid
+    // AND dex_best_ask are both present, which is precisely what reaching
+    // Case 3 tells us we do not have.  This is asserted directly by
+    // PublishedMidBandTest.OneSidedBook_NoClamp.  Note that NEITHER Case 3
+    // outcome is banded: accepting a fresh print leaves the unclamped
+    // DEX/CEX/AMM blend, and refusing one leaves the centre to the CEX and
+    // AMM legs alone.  Refusing narrows what feeds the centre; it does not
+    // add a price-layer bound, because there is none on this path either way.
+    //
+    // What does bound it: those legs must survive their own freshness tapers
+    // to be used at all -- and note the CEX taper only became effective with
+    // S6, which stopped a frozen CoinGecko cache re-stamping cex_updated_at
+    // every heartbeat; before that it could not have rejected a stale feed at
+    // all.  If none survives the pair publishes no mid, and Step 4 marks
+    // the quote invalid on a non-positive mid (engine.cpp: `if (mid <=
+    // 0.0) { pcs.quote_valid = false; }`) so nothing is posted.  That is
+    // a different mechanism from the no-order-book guard, which gates
+    // posting when a ladder has no book reference at all.  Past that, buying is bounded
+    // at the SIZING layer -- the pair's drift target and single_cat_cap_pct --
+    // not at the price layer.  A stale print is not an accumulation brake and
+    // must not be relied on as one.  Whether this path should carry a band of
+    // its own is a real open question, tracked as S9.
     else if (ps.dex_last_trade > 0.0
              && last_trade_is_fresh(ps, cfg.dex_last_trade_max_age_sec)) {
         dex_mid = ps.dex_last_trade;

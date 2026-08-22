@@ -27,6 +27,7 @@ No Qt imports here -- the GUI wraps these calls in its own worker thread.
 from __future__ import annotations
 
 import sqlite3
+import sys
 from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -38,6 +39,46 @@ import yaml
 REPO_ROOT = Path(__file__).resolve().parent.parent
 DB_PATH = REPO_ROOT / "data" / "xop_trader.db"
 CONFIG_PATH = REPO_ROOT / "config.yaml"
+
+# The defaults above are for CLI use from a checkout.  The GUI loads this
+# module BY PATH out of the PyInstaller bundle, where __file__ lives under
+# sys._MEIPASS -- a per-launch temp directory holding the bundled scripts and
+# nothing else.  REPO_ROOT is then that temp directory, so the defaults name a
+# config.yaml and a database that have never existed, and every caller failed
+# with "No such file or directory: ...\_MEI00004b102\config.yaml".
+#
+# Frozen callers therefore MUST pass explicit paths; the GUI knows them
+# (ConfigService.path and EngineBridge.db_path).  Rather than let a bundled
+# default produce a mystifying temp-directory error, refuse it by name.
+# PyInstaller sets sys.frozen in the frozen PROCESS, however this module is
+# loaded, so it answers the question directly.  An earlier version also
+# matched "_MEI" anywhere in the path, which misfires on an ordinary checkout
+# living under a directory that happens to contain that substring: the
+# documented no-argument CLI would then refuse to run beside a config.yaml and
+# database that are both right there.
+_FROZEN = bool(getattr(sys, "frozen", False))
+
+
+def _require_explicit(kind: str, value):
+    """Return *value*, or explain why the bundled default cannot serve.
+
+    An empty or whitespace-only value counts as ABSENT, not as a path.  Both
+    call sites read ``_require_explicit(...) or DEFAULT``, so returning ""
+    here fell straight through to the bundle-relative default while frozen --
+    silently restoring the very failure this guard exists to prevent.
+    """
+    if isinstance(value, str) and not value.strip():
+        value = None
+    if value is not None:
+        return value
+    if _FROZEN:
+        raise RuntimeError(
+            f"{kind} path not supplied. This module was loaded from an "
+            f"application bundle ({REPO_ROOT}), which contains no {kind}; the "
+            "caller must pass an explicit path rather than rely on the "
+            "checkout-relative default."
+        )
+    return None
 
 DEXIE_TICKERS_URL = "https://api.dexie.space/v2/prices/tickers"
 
@@ -74,7 +115,8 @@ def _mojos_per_unit(asset_id: str) -> int:
 
 
 def _load_config(path: Path | str | None = None) -> dict:
-    with open(path or CONFIG_PATH, encoding="utf-8") as fh:
+    resolved = _require_explicit("config", path) or CONFIG_PATH
+    with open(resolved, encoding="utf-8") as fh:
         return yaml.safe_load(fh)
 
 
@@ -542,7 +584,7 @@ def compute_suggested_targets(config_path: Path | str | None = None,
     tickers = _fetch_dexie_tickers()
     usd = _usd_prices(tickers)
 
-    resolved_db = Path(db_path) if db_path else DB_PATH
+    resolved_db = Path(_require_explicit("database", db_path) or DB_PATH)
     if not resolved_db.exists():
         raise FileNotFoundError(f"database not found at {resolved_db}")
 
@@ -623,7 +665,7 @@ def suggested_portfolio_allocation(config_path: Path | str | None = None,
     tickers = _fetch_dexie_tickers()
     usd = _usd_prices(tickers)
 
-    resolved_db = Path(db_path) if db_path else DB_PATH
+    resolved_db = Path(_require_explicit("database", db_path) or DB_PATH)
     if not resolved_db.exists():
         raise FileNotFoundError(f"database not found at {resolved_db}")
 
