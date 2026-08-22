@@ -12293,8 +12293,15 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // ISO/IEC 27001:2022: time-windowed monitoring catches slow loss spirals
     //   that individual HWM drawdown or flash-crash checks may miss.
     // ISO/IEC 5055: deque bounded by loss_window_blocks; no UB division.
-    if (config_.risk.max_window_loss_bps > 0.0
-            && state_->status() == BotStatus::Running) {
+    // NOT gated on BotStatus.  Gating on Running had two failure modes,
+    // both review-found: the breach could not LATCH during a GUI pause, so
+    // removing the pause bought one posting round through a breached
+    // breaker before Step 13 ran again; and the window deque was not even
+    // FED while paused, so the loss history restarted with a gap on every
+    // resume.  Evaluation is cheap; it now runs whenever the check is
+    // enabled, and the transition-guarded latch below keeps a persisting
+    // breach from re-alerting every block.
+    if (config_.risk.max_window_loss_bps > 0.0) {
 
         // 1. Append current snapshot.
         pnl_window_usd_.push_back({block_height, total.total_pnl_usd});
@@ -12337,35 +12344,36 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 const BlockHeight window_actual =
                     block_height - pnl_window_usd_.front().first;
 
-                spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT BREAKER "
-                              "-- loss=${:.4f} over {} blocks "
-                              "> threshold=${:.4f} ({:.1f} bps of "
-                              "${:.4f} anchor) -- transitioning to Paused "
-                              "state",
-                              window_loss_usd, window_actual,
-                              threshold_usd,
-                              config_.risk.max_window_loss_bps,
-                              (equity_usd > 0.0) ? equity_usd
-                                                 : anchor_fallback_usd);
-
-                state_->set_status(BotStatus::Paused);
-            if (!breaker_pause_active_) {
-                // Latch on the false-to-true TRANSITION only.  Persistent
-                // conditions re-enter this block every heartbeat, and an
-                // unconditional reset of the warn flag re-fired the
-                // "SKIPPED" warning every block -- the spam the once-per-
-                // trip design exists to avoid.
-                breaker_pause_active_ = true;
-                breaker_skip_warned_  = false;
-            }
-
-                alerts_->send_alert(AlertRule::CircuitBreaker,
-                    "Rolling-window circuit breaker triggered: lost $" +
-                    std::to_string(window_loss_usd) + " in " +
-                    std::to_string(window_actual) + " blocks (limit " +
-                    std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
-                    " bps = $" + std::to_string(threshold_usd) +
-                    ") -- engine PAUSED.  Manual intervention required.");
+                if (!breaker_pause_active_) {
+                    // Full trip -- error, status, latch, alert -- on the
+                    // false-to-true transition only.  A breach persisting
+                    // while already latched is a debug line, mirroring the
+                    // drawdown breaker's re-alert suppression.
+                    spdlog::error("[Engine] Step 13: ROLLING-WINDOW CIRCUIT "
+                                  "BREAKER -- loss=${:.4f} over {} blocks "
+                                  "> threshold=${:.4f} ({:.1f} bps of "
+                                  "${:.4f} anchor) -- transitioning to "
+                                  "Paused state",
+                                  window_loss_usd, window_actual,
+                                  threshold_usd,
+                                  config_.risk.max_window_loss_bps,
+                                  (equity_usd > 0.0) ? equity_usd
+                                                     : anchor_fallback_usd);
+                    state_->set_status(BotStatus::Paused);
+                    breaker_pause_active_ = true;
+                    breaker_skip_warned_  = false;
+                    alerts_->send_alert(AlertRule::CircuitBreaker,
+                        "Rolling-window circuit breaker triggered: lost $" +
+                        std::to_string(window_loss_usd) + " in " +
+                        std::to_string(window_actual) + " blocks (limit " +
+                        std::to_string(static_cast<int>(config_.risk.max_window_loss_bps)) +
+                        " bps = $" + std::to_string(threshold_usd) +
+                        ") -- engine PAUSED.  Manual intervention required.");
+                } else {
+                    spdlog::debug("[Engine] Step 13: rolling-window breach "
+                                  "persists while latched (loss=${:.4f})",
+                                  window_loss_usd);
+                }
             }
         }
     }
