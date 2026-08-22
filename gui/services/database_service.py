@@ -785,7 +785,14 @@ class _DatabaseWorker(QObject):
             """,
             [book_cutoff],
         )
-        for row in (book or []):
+        if book is None:
+            # Query error (already logged by _execute_query).  Emitting an
+            # empty summary would render every pair as "0 fills, +0.0000"
+            # in profit green -- a confident claim of a quiet book, when the
+            # truth is "the database could not be read".  Keep the previous
+            # data on screen instead.
+            return
+        for row in book:
             pair = str(row["pair_name"] or "")
             if not pair:
                 continue
@@ -815,7 +822,9 @@ class _DatabaseWorker(QObject):
             """,
             [cutoff],
         )
-        for row in (fills or []):
+        if fills is None:
+            return          # same reasoning as the book query above
+        for row in fills:
             pair = str(row["pair_name"] or "")
             if not pair:
                 continue

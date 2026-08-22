@@ -428,3 +428,59 @@ def test_gauge_columns_are_withheld_when_metrics_are_down():
     assert 'data.get("metrics_connected"' in source
     body = source.split("def _refresh_pairs_table")[1].split("\n    def ")[0]
     assert "_metrics_live" in body, "gauge columns ignore the liveness flag"
+
+
+def test_a_withheld_spread_is_an_em_dash_not_a_zero(app):
+    """0.0 is a real spread claim; a dead metrics feed has no claim to make."""
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_pairs_table([_row("A", spread_bps=None)])
+    assert dash._pairs_table.item(0, 2).text() == "—"
+    dash.update_pairs_table([_row("A", spread_bps=0.0)])
+    assert dash._pairs_table.item(0, 2).text() == "0.0", (
+        "a genuinely zero spread must still display as zero"
+    )
+
+
+def test_a_failed_query_does_not_render_as_a_quiet_book(app, tmp_path):
+    """_execute_query returns None on error; emitting anyway turned a DB
+    failure into '0 fills, +0.0000' in profit green on every pair."""
+    from gui.services.database_service import _DatabaseWorker
+
+    worker = _DatabaseWorker()
+    worker.open(str(tmp_path / "does_not_exist.db"))   # ro open fails
+    captured = []
+    worker.pair_summary_ready.connect(captured.append)
+    worker.fetch_pair_summary()
+    assert captured == [], "a failed query still emitted a summary"
+
+
+def test_pnl_sorts_by_dollar_value_not_raw_magnitude(app):
+    """0.6 wUSDC.b is $0.60; 0.5 XCH at $1.50 is $0.75.
+
+    Sorting the raw numbers ranks 0.6 above 0.5 -- magnitudes across four
+    different quote currencies, not values.
+    """
+    from PySide6.QtCore import Qt
+    from gui.widgets.dashboard import DashboardWidget
+
+    dash = DashboardWidget()
+    dash.update_pairs_table([
+        _row("USDC-PAIR", pnl=0.6, quote_symbol="wUSDC.b", pnl_sort_usd=0.6),
+        _row("XCH-PAIR", pnl=0.5, quote_symbol="XCH", pnl_sort_usd=0.75),
+    ])
+    dash._pairs_table.sortItems(7, Qt.SortOrder.DescendingOrder)
+    assert dash._pairs_table.item(0, 0).text() == "XCH-PAIR", (
+        "P&L sorted by raw magnitude across currencies"
+    )
+
+
+def test_the_usd_sort_key_refuses_unknown_quotes():
+    """An unknown rate sorts to the bottom; it does not pose as a number."""
+    from gui.widgets.main_window import _pnl_usd_sort_key
+
+    assert _pnl_usd_sort_key(0.5, "wUSDC.b", 0.0) == 0.5
+    assert _pnl_usd_sort_key(0.5, "XCH", 1.5) == 0.75
+    assert _pnl_usd_sort_key(0.5, "XCH", 0.0) is None, "no rate, no key"
+    assert _pnl_usd_sort_key(0.5, "BYC", 1.5) is None, "BYC rate is unknown"

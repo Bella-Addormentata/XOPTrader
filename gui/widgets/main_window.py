@@ -192,6 +192,22 @@ def _placeholder_widget(label: str) -> QWidget:
     return widget
 
 
+def _pnl_usd_sort_key(pnl_quote: float, quote_symbol: str,
+                      xch_usd: float) -> Optional[float]:
+    """P&L converted to USD for SORTING, or None when the rate is unknown.
+
+    wUSDC.b/wUSDC are $1 by construction; XCH uses the live rate when one
+    exists.  Everything else returns None rather than a guess -- an unknown
+    sorts to the bottom, it does not masquerade as a small number.
+    """
+    symbol = (quote_symbol or "").strip().upper()
+    if symbol in ("WUSDC.B", "WUSDC"):
+        return pnl_quote
+    if symbol == "XCH" and xch_usd > 0:
+        return pnl_quote * xch_usd
+    return None
+
+
 def activity_event(trade: dict) -> Optional[dict]:
     """One activity-feed event from a ``trade_log`` row, or None if unusable.
 
@@ -1141,9 +1157,10 @@ class MainWindow(QMainWindow):
         here is OURS, not the third-party book: bid and ask are the best
         prices we are currently showing.
 
-        All mojo conversion happens here so the rule lives in one place.
-        price_mojos is scaled by 1e12 for every pair, while inventory is in
-        the base asset's own mojos.
+        Price conversion happens here so the rule lives in one place:
+        price_mojos is scaled by 1e12 for every pair.  Inventory arrives
+        ALREADY in display units from the wallet service (which divides by
+        each asset's own factor) and must not be converted again.
         """
         dashboard = self._unwrap(self._dashboard)
         if dashboard is None or not hasattr(dashboard, "update_pairs_table"):
@@ -1158,10 +1175,6 @@ class MainWindow(QMainWindow):
             ours = self._pair_summary.get(pair_name, {})
             quote_symbol = (pair_name.split("/", 1)[1]
                             if "/" in pair_name else "")
-            try:
-                base_mpu = float(mojos_per_unit_for_pair(pair_name, "base"))
-            except Exception:
-                base_mpu = float(MOJOS_PER_XCH)
             rows.append({
                 "pair": pair_name,
                 # Only the engine's live gauge counts as a Mid Price.  The
@@ -1181,8 +1194,12 @@ class MainWindow(QMainWindow):
                         or str(md.get("mid_price_source", "")) == "last_trade")
                     else float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH
                 ),
+                # None, not 0.0: a withheld gauge must render as an em
+                # dash.  A hard zero is a real spread claim -- and a
+                # confidently wrong one -- exactly what the liveness gate
+                # exists to prevent.
                 "spread_bps": (float(md.get("spread_bps", 0.0) or 0.0)
-                               if self._metrics_live else 0.0),
+                               if self._metrics_live else None),
                 # Already display units (the wallet service divides by the
                 # asset's own factor), so it must NOT be divided again.
                 # None (key absent) means the wallet snapshot could not
@@ -1199,6 +1216,15 @@ class MainWindow(QMainWindow):
                 # understated wUSDC.b and BYC P&L by a factor of a billion.
                 "pnl": (float(ours.get("pnl_mojos", 0.0) or 0.0)
                         / float(mojos_per_unit_for_pair(pair_name, "quote"))),
+                # Sort key in USD.  The column displays figures in four
+                # different quote currencies, so sorting the raw numbers
+                # ranks magnitudes, not value: 0.6 wUSDC.b would outrank
+                # 0.5 XCH.  Convert where the quote's USD rate is known;
+                # unknown quotes sort below, alongside the em dashes.
+                "pnl_sort_usd": _pnl_usd_sort_key(
+                    (float(ours.get("pnl_mojos", 0.0) or 0.0)
+                     / float(mojos_per_unit_for_pair(pair_name, "quote"))),
+                    quote_symbol, self._last_xch_usd),
                 "quote_symbol": quote_symbol,
             })
 

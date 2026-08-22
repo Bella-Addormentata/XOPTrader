@@ -971,8 +971,9 @@ class DashboardWidget(QWidget):
                 (data.get("pair", ""), None),
                 (self._format_optional_price(data.get('mid_price', 0)),
                  _num('mid_price')),
-                (f"{data.get('spread_bps', 0):.1f}",
-                 float(data.get('spread_bps', 0) or 0.0)),
+                (("—" if data.get('spread_bps') is None
+                  else f"{data.get('spread_bps', 0):.1f}"),
+                 data.get('spread_bps')),
                 (self._format_optional_units(data.get('inventory', None)),
                  data.get('inventory', None)),
                 (self._format_optional_price(data.get('bid', 0)), _num('bid')),
@@ -989,7 +990,9 @@ class DashboardWidget(QWidget):
             pnl_text = f"{pnl_val:+,.4f} {quote}".rstrip()
             if quote.upper() == "XCH" and xch_usd_rate > 0:
                 pnl_text = f"${pnl_val * xch_usd_rate:+,.2f} ({pnl_val:+,.4f} XCH)"
-            values.append((pnl_text, float(pnl_val or 0.0)))
+            # Sort by the USD key when supplied; a raw cross-currency
+            # magnitude is not an ordering of value.
+            values.append((pnl_text, data.get("pnl_sort_usd")))
 
             for col, (text, sort_value) in enumerate(values):
                 item = (QTableWidgetItem(text) if col == 0
