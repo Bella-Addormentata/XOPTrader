@@ -836,7 +836,12 @@ class OrderPanel(QWidget):
                     age = max(0, age_end - created_block)
                     age_text, age_val = str(age), float(age)
                 else:
-                    age_text, age_val = "0", 0.0
+                    # No tip yet (first render precedes the health payload,
+                    # and the wiring skips nonpositive heights) or no
+                    # created_block: the age is UNKNOWN.  Showing 0 here is
+                    # indistinguishable from a genuinely new offer -- the
+                    # misleading constant this column showed for months.
+                    age_text, age_val = "—", None
             existing_age = table.item(row_idx, 9)
             if not isinstance(existing_age, _SortByUserRoleItem):
                 item_age = _SortByUserRoleItem(age_text)

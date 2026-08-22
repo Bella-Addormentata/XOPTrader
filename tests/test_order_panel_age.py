@@ -193,3 +193,14 @@ def test_age_sorts_numerically(app):
         assert ages == ["100", "9"], f"lexicographic sort: {ages}"
     finally:
         panel.hide()
+
+
+def test_no_tip_yet_means_unknown_not_zero(app):
+    """Before the first health payload the tip is 0; a numeric 0 would be
+    indistinguishable from a genuinely new offer."""
+    panel = _panel(app)          # set_current_block never called
+    panel.update_offers([_offer()])
+    try:
+        assert panel._table.item(0, 9).text() == "—"
+    finally:
+        panel.hide()
