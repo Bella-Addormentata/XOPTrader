@@ -3,13 +3,13 @@
 //
 // Aggregation pipeline (executed once per block via refresh()):
 //
-//   ingest_dexie()           ──┐
-//   ingest_block_height()    ──┼──> PairState ──> compute_mid()
-//   ingest_cex_reference()   ──┘                  compute_spread_bps()
+//   ingest_dexie()           --+
+//   ingest_block_height()    --+--> PairState --> compute_mid()
+//   ingest_cex_reference()   --+                  compute_spread_bps()
 //                                                 detect_stale()
 //                                                 check_arbitrage()
 //                                                 append_price_history()
-//                                                 publish_snapshot() ──> State
+//                                                 publish_snapshot() --> State
 //
 // Thread safety:
 //   Independent shared_mutexes protect independent data maps.  Most methods
@@ -367,8 +367,8 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // asks/bids (e.g. 978 million for a $2.38 asset) can appear from
     // mis-priced offers.  If accepted, the inflated mid poisons the price
     // history and triggers the flash-crash circuit breaker when normal
-    // prices return.  Reject any bid/ask that is more than 10× or less
-    // than 0.1× the CEX reference (when available).
+    // prices return.  Reject any bid/ask that is more than 10x or less
+    // than 0.1x the CEX reference (when available).
     {
         std::shared_lock lock(mtx_pairs_);
         auto it = pairs_.find(pair_name);
@@ -378,13 +378,13 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
             constexpr double kMinRatio = 0.1;
             if (best_bid > 0.0 && (best_bid > cex * kMaxRatio || best_bid < cex * kMinRatio)) {
                 spdlog::warn("[MarketData] Outlier bid rejected for {}: "
-                             "bid={:.6f} vs cex_mid={:.6f} (ratio={:.1f}×)",
+                             "bid={:.6f} vs cex_mid={:.6f} (ratio={:.1f}x)",
                              pair_name, best_bid, cex, best_bid / cex);
                 best_bid = 0.0;  // discard
             }
             if (best_ask > 0.0 && (best_ask > cex * kMaxRatio || best_ask < cex * kMinRatio)) {
                 spdlog::warn("[MarketData] Outlier ask rejected for {}: "
-                             "ask={:.6f} vs cex_mid={:.6f} (ratio={:.1f}×)",
+                             "ask={:.6f} vs cex_mid={:.6f} (ratio={:.1f}x)",
                              pair_name, best_ask, cex, best_ask / cex);
                 best_ask = 0.0;  // discard
             }
@@ -394,12 +394,12 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // Dexie is a peer-to-peer atomic-swap marketplace with NO matching
     // engine, so crossed books (bid >= ask) occur naturally when there
     // are un-taken offers on both sides.  Unlike a centralised exchange,
-    // this does NOT indicate bad data — it just means no one has taken
+    // this does NOT indicate bad data -- it just means no one has taken
     // the arbitrage yet.  Accept the data and let the price guard in
     // Step 7 clamp our offers safely outside the cross.
     if (best_bid > 0.0 && best_ask > 0.0 && best_bid >= best_ask) {
         spdlog::info("[MarketData] Crossed book for {}: bid={:.6f} >= "
-                     "ask={:.6f} (normal on Dexie — no matching engine)",
+                     "ask={:.6f} (normal on Dexie -- no matching engine)",
                      pair_name, best_bid, best_ask);
     }
 
@@ -1050,7 +1050,7 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
 
     // Case 0: Prefer order-book-derived VWAP micro-price when available.
     // This is computed from the top N levels of dust-filtered competing
-    // offers and weights by depth — more robust than simple BBO midpoint.
+    // offers and weights by depth -- more robust than simple BBO midpoint.
     if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0) {
         dex_mid = ps.orderbook_mid;
         spdlog::debug("[MarketData] {} using orderbook_mid={:.6f}",
@@ -1476,7 +1476,7 @@ void MarketDataFeed::ingest_competing_offers(
     // Snapshot the current reference price for outlier detection.
     // Prefer CEX mid (pure external reference, unaffected by DEX noise);
     // fall back to aggregated mid_price when CEX is unavailable (BYC, DBX).
-    // Zero means no reference yet (first cycle) — outlier filter is skipped.
+    // Zero means no reference yet (first cycle) -- outlier filter is skipped.
     const double ref_price = [&] {
         std::shared_lock plk(mtx_pairs_);
         auto it = pairs_.find(pair_name);
@@ -1500,8 +1500,8 @@ void MarketDataFeed::ingest_competing_offers(
         // Scale threshold proportionally for non-XCH denominations.
         // Bid-side offers are denominated in the QUOTE asset, so use
         // quote_mojos_per_unit; ask-side offers are in the BASE asset.
-        //   Ask (offered=base): XCH 1e12 mpu → min ~1 XCH = 1e12 mojos
-        //   Bid (offered=quote): wUSDC 1e3 mpu → min ~1 wUSDC = 1e3 mojos
+        //   Ask (offered=base): XCH 1e12 mpu -> min ~1 XCH = 1e12 mojos
+        //   Bid (offered=quote): wUSDC 1e3 mpu -> min ~1 wUSDC = 1e3 mojos
         //
         // NOTE: The lower-bound floor used to be `side_mpu` (one full unit),
         // but that masked the `min_competitor_offer_size` config knob on
@@ -2092,8 +2092,8 @@ void MarketDataFeed::detect_and_update_whale(const std::string& pair_name,
 // -------------------------------------------------------------------------
 // compute_whale_spread_multiplier -- linear interpolation over event count
 //
-// 0 events → 1.0 (no widening)
-// >= whale_window_blocks events → whale_max_spread_multiplier
+// 0 events -> 1.0 (no widening)
+// >= whale_window_blocks events -> whale_max_spread_multiplier
 // -------------------------------------------------------------------------
 
 double MarketDataFeed::compute_whale_spread_multiplier(
@@ -2287,9 +2287,9 @@ PairState& MarketDataFeed::get_or_create_pair(const std::string& pair_name) {
 }
 
 // =========================================================================
-// VPIN — Volume-Synchronized Probability of Informed Trading
+// VPIN -- Volume-Synchronized Probability of Informed Trading
 //
-// Reference: Easley, López de Prado & O'Hara (2012). "Flow Toxicity and
+// Reference: Easley, Lopez de Prado & O'Hara (2012). "Flow Toxicity and
 // Liquidity in a High-frequency World."
 //
 // Trades are accumulated into volume bars (buckets) of fixed size.  When a
@@ -2353,7 +2353,7 @@ void MarketDataFeed::ingest_trade_for_vpin(const std::string& pair_name,
             const double capacity = bucket_size - current_total;
 
             if (capacity <= 0.0) {
-                // Current bucket is already full — push and start fresh.
+                // Current bucket is already full -- push and start fresh.
                 vs.current_bucket.complete = true;
                 vs.completed.push_back(vs.current_bucket);
                 vs.current_bucket = VpinBucket{};
@@ -2416,7 +2416,7 @@ void MarketDataFeed::recompute_vpin(const std::string& pair_name)
         bucket_size = config_.vpin_bucket_size;
     }
     if (bucket_size <= 0.0) {
-        return;  // VPIN disabled — warning was already logged in ingest_trade_for_vpin.
+        return;  // VPIN disabled -- warning was already logged in ingest_trade_for_vpin.
     }
 
     // VPIN = (1/N) * SUM |buy_i - sell_i| / bucket_size
@@ -2430,7 +2430,7 @@ void MarketDataFeed::recompute_vpin(const std::string& pair_name)
     //   flag high toxicity even with zero informed traders present.
     //   Treat as a lagged volatility/volume proxy, not an independent
     //   information signal.
-    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §7.
+    //   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, sec 7.
     double sum_abs_imbalance = 0.0;
     double total_buy  = 0.0;
     double total_sell = 0.0;
@@ -2479,7 +2479,7 @@ double MarketDataFeed::get_vpin(const std::string& pair_name) const
 }
 
 // =========================================================================
-// OFI — Order Flow Imbalance
+// OFI -- Order Flow Imbalance
 //
 // Reference: Cont, Kukanov & Stoikov (2014). "The Price Impact of Order
 // Book Events."
@@ -2497,8 +2497,8 @@ double MarketDataFeed::get_vpin(const std::string& pair_name) const
 //
 //   OFI_t = delta_bid - delta_ask
 //
-// Positive OFI → buy pressure (bids strengthening faster than asks).
-// Negative OFI → sell pressure (asks strengthening faster than bids).
+// Positive OFI -> buy pressure (bids strengthening faster than asks).
+// Negative OFI -> sell pressure (asks strengthening faster than bids).
 //
 // COUNTER-RESEARCH NOTE (CR-2, Xu, Lehalle & Alfonsi 2023) -- FIXED:
 //   This implementation now supports multi-level OFI via an overloaded
@@ -2507,7 +2507,7 @@ double MarketDataFeed::get_vpin(const std::string& pair_name) const
 //   On CHIA's shallow book (typically 2-5 levels), multi-level OFI
 //   explains 10-30% more return variance than best-level alone.
 //   The best-level-only path is preserved for backward compatibility.
-//   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, §8.1.
+//   See: docs/CODE REVIEWS/COUNTERRESEARCH-20260325-1, sec 8.1.
 // =========================================================================
 
 void MarketDataFeed::ingest_book_snapshot_for_ofi(
@@ -2777,15 +2777,15 @@ double MarketDataFeed::get_normalized_ofi(const std::string& pair_name) const
 // Uses the whale detector's dominant_side to skew the spread multiplier.
 // The average widening is preserved: (bid_mult + ask_mult) / 2 = symmetric_mult,
 // but the risk-bearing side gets a larger share of the spread (and bid_mult *
-// ask_mult < symmetric_mult^2 whenever asymmetric_skew_factor α > 0).
+// ask_mult < symmetric_mult^2 whenever asymmetric_skew_factor alpha > 0).
 //
-// The asymmetric_skew_factor (α ∈ [0,1]) controls the split:
-//   α = 0.0 → symmetric (same multiplier on both sides)
-//   α = 1.0 → fully asymmetric (all extra widening on informed side)
+// The asymmetric_skew_factor (alpha  in  [0,1]) controls the split:
+//   alpha = 0.0 -> symmetric (same multiplier on both sides)
+//   alpha = 1.0 -> fully asymmetric (all extra widening on informed side)
 //
 // For whale buying (dominant_side = Bid, i.e. taker bought from us):
-//   ask_mult = 1 + (m - 1) * (1 + α)    (widen ask: we're selling into a bid)
-//   bid_mult = 1 + (m - 1) * (1 - α)    (tighten bid: we want to buy cheap)
+//   ask_mult = 1 + (m - 1) * (1 + alpha)    (widen ask: we're selling into a bid)
+//   bid_mult = 1 + (m - 1) * (1 - alpha)    (tighten bid: we want to buy cheap)
 //
 // The average of the two multipliers equals the original symmetric one.
 // =========================================================================
@@ -2807,17 +2807,17 @@ AsymmetricMultipliers MarketDataFeed::get_asymmetric_spread_multipliers(
         alpha = std::clamp(config_.asymmetric_skew_factor, 0.0, 1.0);
     }
 
-    // high_side gets (1 + α) share, low_side gets (1 - α) share.
+    // high_side gets (1 + alpha) share, low_side gets (1 - alpha) share.
     const double high_mult = 1.0 + excess * (1.0 + alpha);
     const double low_mult  = 1.0 + excess * (1.0 - alpha);
 
     AsymmetricMultipliers am;
     if (wm->dominant_side == Side::Bid) {
-        // Whale is buying → widen ask (adverse-selection risk on our ask).
+        // Whale is buying -> widen ask (adverse-selection risk on our ask).
         am.ask_multiplier = high_mult;
         am.bid_multiplier = low_mult;
     } else {
-        // Whale is selling → widen bid (adverse-selection risk on our bid).
+        // Whale is selling -> widen bid (adverse-selection risk on our bid).
         am.bid_multiplier = high_mult;
         am.ask_multiplier = low_mult;
     }
