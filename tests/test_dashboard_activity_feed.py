@@ -155,3 +155,37 @@ def test_the_feed_does_not_add_a_second_refresh_mechanism():
     source = Path(__file__).resolve().parent.parent.joinpath(
         "gui", "widgets", "main_window.py").read_text(encoding="utf-8")
     assert "_refresh_activity_on_new_fill" not in source
+
+
+def test_same_block_fills_come_back_newest_first(app, tmp_path):
+    """block_height alone is not a total order.
+
+    Several fills routinely land in one block, so without an id tie-breaker
+    the newest-N slice the feed takes could shuffle them -- or drop the
+    newest at the LIMIT cutoff.
+    """
+    import sqlite3
+    from gui.services.database_service import _DatabaseWorker
+
+    db = tmp_path / "trades.db"
+    con = sqlite3.connect(str(db))
+    con.execute("""CREATE TABLE trade_log (id INTEGER PRIMARY KEY,
+                   timestamp TEXT, pair_name TEXT, side TEXT,
+                   price_mojos INTEGER, size_mojos INTEGER,
+                   block_height INTEGER)""")
+    con.executemany(
+        "INSERT INTO trade_log VALUES (?,?,?,?,?,?,?)",
+        [(i, "2026-08-21T16:0%d:00.000Z" % i, "XCH/wUSDC.b", "bid",
+          1_486_000_000_000, 1_000_000_000_000, 9181181) for i in range(1, 6)],
+    )
+    con.commit()
+    con.close()
+
+    worker = _DatabaseWorker()
+    worker.open(str(db))
+    got = []
+    worker.trades_ready.connect(lambda rows: got.extend(rows))
+    worker.fetch_trades("", "", None, None, 3)
+
+    ids = [r["id"] for r in got]
+    assert ids == [5, 4, 3], f"same-block fills not newest-first: {ids}"
