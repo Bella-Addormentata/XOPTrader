@@ -114,6 +114,7 @@ except ImportError:
 # ---------------------------------------------------------------------------
 from gui.theme import COLORS as _C
 from gui.utils import (
+    MOJOS_PER_XCH,
     format_price,
     mojos_per_unit_for_pair,
     mojos_to_xch,
@@ -197,6 +198,22 @@ def _placeholder_widget(label: str) -> QWidget:
     return widget
 
 
+def _pnl_usd_sort_key(pnl_quote: float, quote_symbol: str,
+                      xch_usd: float) -> Optional[float]:
+    """P&L converted to USD for SORTING, or None when the rate is unknown.
+
+    wUSDC.b/wUSDC are $1 by construction; XCH uses the live rate when one
+    exists.  Everything else returns None rather than a guess -- an unknown
+    sorts to the bottom, it does not masquerade as a small number.
+    """
+    symbol = (quote_symbol or "").strip().upper()
+    if symbol in ("WUSDC.B", "WUSDC"):
+        return pnl_quote
+    if symbol == "XCH" and xch_usd > 0:
+        return pnl_quote * xch_usd
+    return None
+
+
 def activity_event(trade: dict) -> Optional[dict]:
     """One activity-feed event from a ``trade_log`` row, or None if unusable.
 
@@ -270,6 +287,15 @@ class MainWindow(QMainWindow):
         self.metrics_service = metrics_service
         self.db_service = db_service
         self._bridge: Optional[Any] = None  # Set via set_bridge()
+        # Dashboard per-pair table inputs: our own book/fills from the DB,
+        # plus the latest live snapshot to pair them with.
+        self._pair_summary: dict = {}
+        self._last_market_data: dict = {}
+        self._last_xch_usd: float = 0.0
+        # Whether the metrics scrape is currently live.  Gauge-derived
+        # columns are withheld when it is not; wallet- and DB-derived ones
+        # remain valid because they do not come through Prometheus.
+        self._metrics_live: bool = True
 
         # -- Runtime state --------------------------------------------------
         self._connected: bool = False
@@ -374,6 +400,19 @@ class MainWindow(QMainWindow):
         # connected to anything, so it could not display a single row.
         if hasattr(db, "trades_loaded"):
             db.trades_loaded.connect(self._on_trades_for_activity)
+        # Per-pair table: OUR resting book and OUR fills.
+        if hasattr(db, "pair_summary_loaded"):
+            db.pair_summary_loaded.connect(self._on_pair_summary)
+        if hasattr(db, "query_pair_summary"):
+            ttl_blocks = 0
+            try:
+                cfg = bridge.config_service.get_full_config() or {}
+                ttl_blocks = int(
+                    (cfg.get("strategy") or {}).get("offer_ttl_blocks", 0) or 0
+                )
+            except Exception:      # config not loaded yet; the default applies
+                ttl_blocks = 0
+            db.query_pair_summary(ttl_blocks)
         # [DEPLOYED 2026-08-04] Per-asset resting-offer amounts for the
         # Balances tab's Deployed % column and summary line.
         _wallet_widget = self._unwrap(self._wallet_balances)
@@ -554,9 +593,26 @@ class MainWindow(QMainWindow):
         for pair_key in ("XCH/wUSDC.b", "XCH/wUSDC"):
             pair_md = market_data.get(pair_key, {})
             mid = pair_md.get("mid_price", 0.0)
+            # A last_trade backfill is NOT a live rate.  The pairs table
+            # already refuses to show one as a Mid Price; converting P&L to
+            # dollars with the same months-old fill would reintroduce it as a
+            # headline number, which is worse for being denominated in $.
+            if str(pair_md.get("mid_price_source", "")) == "last_trade":
+                continue
             if mid > 0:
                 xch_usd = mid / 1_000_000_000_000.0
                 break
+
+        # Feed the dashboard's per-pair table: the live half (mid, spread,
+        # our inventory) pairs with the DB half already cached.
+        self._last_market_data = market_data
+        # MetricsService leaves _latest untouched when a scrape fails and only
+        # flips this flag, so without it the last good snapshot would be
+        # presented as live indefinitely after the endpoint drops.
+        self._metrics_live = bool(data.get("metrics_connected", True))
+        # A rate derived from a dead feed must not price P&L either.
+        self._last_xch_usd = xch_usd if self._metrics_live else 0.0
+        self._refresh_pairs_table()
 
         # Charts update -- feed pair-aware snapshots with timestamp X-axis.
         chart = self._unwrap(self._chart)
@@ -1093,6 +1149,92 @@ class MainWindow(QMainWindow):
             "Total P&L": self._total_pnl_payload(),
             "24h P&L": self._pnl_24h_payload(),
         })
+
+    def _on_pair_summary(self, summary: dict) -> None:
+        """Cache our own per-pair book/fill figures for the dashboard table."""
+        self._pair_summary = dict(summary or {})
+        self._refresh_pairs_table()
+
+    def _refresh_pairs_table(self) -> None:
+        """Rebuild the dashboard's per-pair table.
+
+        Combines the live market snapshot (mid, spread, our inventory) with
+        the database view of our own resting offers and fills.  Every price
+        here is OURS, not the third-party book: bid and ask are the best
+        prices we are currently showing.
+
+        Price conversion happens here so the rule lives in one place:
+        price_mojos is scaled by 1e12 for every pair.  Inventory arrives
+        ALREADY in display units from the wallet service (which divides by
+        each asset's own factor) and must not be converted again.
+        """
+        dashboard = self._unwrap(self._dashboard)
+        if dashboard is None or not hasattr(dashboard, "update_pairs_table"):
+            return
+        market = self._last_market_data or {}
+        if not market:
+            return
+
+        rows: list[dict] = []
+        for pair_name in sorted(market):
+            md = market.get(pair_name) or {}
+            ours = self._pair_summary.get(pair_name, {})
+            quote_symbol = (pair_name.split("/", 1)[1]
+                            if "/" in pair_name else "")
+            rows.append({
+                "pair": pair_name,
+                # Only the engine's live gauge counts as a Mid Price.  The
+                # bridge backfills this field from the last fill when the
+                # gauge is absent and marks it mid_price_source=last_trade;
+                # that fill is NOT age-bounded (XCH/wUSDC's most recent is
+                # from April), so presenting it here would label a
+                # four-month-old trade as the current mid -- the same
+                # failure S5 fixed in the engine's own blend.  Absent gauge
+                # renders as an em dash instead.
+                # Gauge-derived, so withheld entirely when the metrics
+                # scrape is down -- a stale mid is indistinguishable from a
+                # live one on screen, and this column is read as "now".
+                "mid_price": (
+                    0.0
+                    if (not self._metrics_live
+                        or str(md.get("mid_price_source", "")) == "last_trade")
+                    else float(md.get("mid_price", 0.0) or 0.0) / MOJOS_PER_XCH
+                ),
+                # None, not 0.0: a withheld gauge must render as an em
+                # dash.  A hard zero is a real spread claim -- and a
+                # confidently wrong one -- exactly what the liveness gate
+                # exists to prevent.
+                "spread_bps": (float(md.get("spread_bps", 0.0) or 0.0)
+                               if self._metrics_live else None),
+                # Already display units (the wallet service divides by the
+                # asset's own factor), so it must NOT be divided again.
+                # None (key absent) means the wallet snapshot could not
+                # answer; the widget renders that as an em dash rather than
+                # as a holding of zero.
+                "inventory": (float(md["inventory_units"])
+                              if "inventory_units" in md else None),
+                "bid": float(ours.get("bid_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "ask": float(ours.get("ask_mojos", 0.0) or 0.0) / MOJOS_PER_XCH,
+                "fills_24h": int(ours.get("fills_24h", 0) or 0),
+                # realized_pnl is QUOTE mojos (engine.cpp computes it via
+                # quote_mojos_for with quote_denom), so a CAT-quoted pair
+                # divides by 1000, not 1e12 -- using the XCH divisor
+                # understated wUSDC.b and BYC P&L by a factor of a billion.
+                "pnl": (float(ours.get("pnl_mojos", 0.0) or 0.0)
+                        / float(mojos_per_unit_for_pair(pair_name, "quote"))),
+                # Sort key in USD.  The column displays figures in four
+                # different quote currencies, so sorting the raw numbers
+                # ranks magnitudes, not value: 0.6 wUSDC.b would outrank
+                # 0.5 XCH.  Convert where the quote's USD rate is known;
+                # unknown quotes sort below, alongside the em dashes.
+                "pnl_sort_usd": _pnl_usd_sort_key(
+                    (float(ours.get("pnl_mojos", 0.0) or 0.0)
+                     / float(mojos_per_unit_for_pair(pair_name, "quote"))),
+                    quote_symbol, self._last_xch_usd),
+                "quote_symbol": quote_symbol,
+            })
+
+        dashboard.update_pairs_table(rows, self._last_xch_usd)
 
     def _on_trades_for_activity(self, trades: list) -> None:
         """Render recent fills into the dashboard's activity feed.

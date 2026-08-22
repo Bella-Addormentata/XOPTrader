@@ -66,6 +66,42 @@ _DEFAULT_METRICS_URL: Final[str] = "http://localhost:9090/metrics"
 _LAST_TRADE_CACHE_TTL_S: Final[float] = 30.0
 
 
+def _holding_for_asset(balances: dict, base_asset_id: str):
+    """Our confirmed holding of *base_asset_id* in display units, or None.
+
+    The standard XCH wallet carries no asset id -- wallet_service resolves
+    ids for CAT wallets only -- so "xch" is matched by wallet_type instead.
+
+    Returns None for UNKNOWN rather than 0.0: the balance cache is empty
+    until the first async RPC lands, a failed fetch yields an empty result,
+    and a partial fetch can omit one wallet.  Reporting 0.0 in those cases
+    would state that we hold nothing, which is a much stronger claim than
+    "not known yet" -- and on this column a confident zero is exactly the
+    kind of wrong number an operator would act on.  A wallet that matched
+    and really holds nothing still returns 0.0.
+    """
+    if not balances:
+        return None
+    want = str(base_asset_id or "").strip().lower()
+    for _name, row in (balances or {}).items():
+        if not isinstance(row, dict):
+            continue
+        if want == "xch":
+            # NOT `or -1`: the standard wallet's type IS 0, which is falsy,
+            # so that idiom turned every XCH wallet into -1 and matched
+            # nothing -- Inventory would have read zero on every XCH pair.
+            raw_type = row.get("wallet_type", -1)
+            try:
+                wallet_type = int(raw_type) if raw_type is not None else -1
+            except (TypeError, ValueError):
+                wallet_type = -1
+            if wallet_type == 0:
+                return float(row.get("confirmed", 0.0) or 0.0)
+        elif str(row.get("asset_id", "") or "").lower() == want:
+            return float(row.get("confirmed", 0.0) or 0.0)
+    return None
+
+
 class EngineBridge(QObject):
     """Facade that aggregates all data-source services for the GUI.
 
@@ -387,6 +423,8 @@ class EngineBridge(QObject):
         """
         # Collect per-pair market data from configured pairs.
         pairs = self._config_svc.get_pairs()
+        # One snapshot, reused per pair and re-used for the payload below.
+        wallet_balances_snapshot = self._wallet_svc.get_balances()
         market_data: dict[str, dict[str, float]] = {}
         last_trade_prices = self._get_last_trade_prices()
         for pair_cfg in pairs:
@@ -405,6 +443,38 @@ class EngineBridge(QObject):
                     if float(pair_md.get("mid_price", 0.0) or 0.0) <= 0.0:
                         pair_md["mid_price"] = last_px
                         pair_md["mid_price_source"] = "last_trade"
+                # Our own holding of the pair's BASE asset, in that
+                # asset's mojos.  Keyed by asset_id rather than by wallet
+                # name: the display name is whatever the Chia client calls
+                # it, while the id comes from the pair config and cannot
+                # drift.  MetricsService.get_inventory existed but nothing
+                # had ever called it.
+                # Our holding of the pair's BASE asset, taken from the
+                # WALLET rather than from xop_inventory_balance.  That gauge
+                # is published from State::get_all_positions(), while
+                # balance-changing paths (reward receipts, wallet
+                # reconciliation) update InventoryTracker without
+                # synchronising State -- so it can report a pre-change
+                # balance until the engine restarts.  The wallet RPC is
+                # authoritative and already keyed by asset id.
+                #
+                # Ids are lower-cased on both sides: the Settings UI accepts
+                # uppercase while wallet_service lower-cases what it
+                # resolves, and a case-sensitive comparison would silently
+                # find nothing and show zero.
+                #
+                # These balances are already in DISPLAY UNITS (wallet_service
+                # divides by 1e12 for XCH and 1000 for a CAT), so they must
+                # not be divided again downstream.
+                base_id = str(pair_cfg.get("base_asset_id", "") or "").strip().lower()
+                if base_id:
+                    holding = _holding_for_asset(
+                        wallet_balances_snapshot, base_id
+                    )
+                    # Omit the key entirely when unknown, so a consumer that
+                    # defaults a missing key cannot turn it into a zero.
+                    if holding is not None:
+                        pair_md["inventory_units"] = holding
                 market_data[pair_name] = pair_md
 
         # Build per-pair order book data from the latest market-data
@@ -445,7 +515,7 @@ class EngineBridge(QObject):
             "spendable_reserve": self._metrics_svc.get_spendable_reserve(),
             "stuck_offers": self._metrics_svc.get_stuck_offers(),
             "fees_paid_24h": self._metrics_svc.get_fees_paid_24h(),
-            "wallet_balances": self._wallet_svc.get_balances(),
+            "wallet_balances": wallet_balances_snapshot,
             "warp": self._warp_svc.get_snapshot(),
             "metrics_connected": self._metrics_svc.is_connected,
         }
