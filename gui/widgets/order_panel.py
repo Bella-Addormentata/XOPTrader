@@ -56,11 +56,39 @@ _COLUMNS: list[tuple[str, int]] = [
     ("Filled At",     145),
     ("Created\nBlock", 100),
     ("Age\n(blocks)",   90),
+    ("Fill\n(min)",     80),
     ("Actions",        80),
 ]
 
 # Offer status values used throughout the system.
 _STATUSES: list[str] = ["All", "Pending", "Filled", "Cancelled", "Expired"]
+
+
+def _fill_latency_minutes(offer: dict) -> tuple[str, float]:
+    """('12.3', 12.3) minutes from listing to acceptance, or an em dash.
+
+    Only a FILLED offer has a fill latency.  A cancelled or expired offer
+    also carries resolved_at, but that measures how long it sat unwanted --
+    a different quantity that would poison fill-latency analysis if the
+    column mixed them in.  Wall-clock stamps are used (created_at and
+    resolved_at, both written by the engine in UTC) rather than block
+    heights, because block intervals vary and the point is minutes.
+    """
+    if text(offer, "status").strip().lower() != "filled":
+        return ("—", -1.0)
+    created = text(offer, "created_at").strip()
+    resolved = text(offer, "resolved_at").strip()
+    if not created or not resolved:
+        return ("—", -1.0)
+    try:
+        from datetime import datetime
+        parse = lambda s: datetime.fromisoformat(s.replace("Z", "+00:00"))
+        delta = (parse(resolved) - parse(created)).total_seconds() / 60.0
+    except ValueError:
+        return ("—", -1.0)
+    if delta < 0:
+        return ("—", -1.0)      # clock skew: refuse rather than mislead
+    return (f"{delta:.1f}", delta)
 
 # ---------------------------------------------------------------------------
 # Row budget
@@ -756,7 +784,15 @@ class OrderPanel(QWidget):
             )
 
             # -- Age (blocks) --
-            age: int = max(0, self._current_block - created_block) if created_block else 0
+            # A RESOLVED offer's age freezes at its resolution block:
+            # measuring a filled offer against the current tip grows forever
+            # and says nothing.  Live offers age against the tip -- which
+            # main_window now actually supplies; set_current_block existed
+            # with no caller, so this column showed 0 for every offer since
+            # the panel was built.
+            resolved_block: int = num(offer, "resolved_block")
+            age_end: int = resolved_block if resolved_block > 0 else self._current_block
+            age: int = max(0, age_end - created_block) if (created_block and age_end) else 0
             item_age = self._item(row_idx, 9, str(age))
             item_age.setData(Qt.ItemDataRole.UserRole, age)
             # Highlight stale offers that exceed the TTL threshold.
@@ -768,9 +804,15 @@ class OrderPanel(QWidget):
                 # Reused row: clear any warning colour from a previous offer.
                 item_age.setData(Qt.ItemDataRole.ForegroundRole, None)
 
+            # -- Fill latency (listed -> accepted), for fill analysis --
+            fill_min_text, fill_min_val = _fill_latency_minutes(offer)
+            item_fill = self._item(row_idx, 10, fill_min_text)
+            item_fill.setData(Qt.ItemDataRole.UserRole, fill_min_val)
+            item_fill.setForeground(self._secondary_color)
+
             # -- Actions (cancel button for pending offers) --
-            self._item(row_idx, 10, "")
-            btn_cancel = table.cellWidget(row_idx, 10)
+            self._item(row_idx, 11, "")
+            btn_cancel = table.cellWidget(row_idx, 11)
             if status.lower() == "pending":
                 if not isinstance(btn_cancel, QPushButton):
                     btn_cancel = QPushButton("Cancel")
@@ -784,10 +826,10 @@ class OrderPanel(QWidget):
                     # it acts on is read from the property below, so a
                     # reused button can never cancel a stale offer.
                     btn_cancel.clicked.connect(self._on_cancel_button)
-                    table.setCellWidget(row_idx, 10, btn_cancel)
+                    table.setCellWidget(row_idx, 11, btn_cancel)
                 btn_cancel.setProperty("offer_id", oid)
             elif btn_cancel is not None:
-                table.removeCellWidget(row_idx, 10)
+                table.removeCellWidget(row_idx, 11)
 
     # ------------------------------------------------------------------
     # Internal: summary
