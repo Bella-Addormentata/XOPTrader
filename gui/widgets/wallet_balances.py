@@ -135,9 +135,26 @@ def _fit_table_to_contents(table: QTableWidget) -> None:
         if not table.isRowHidden(r)
     )
     header = table.horizontalHeader().height()
-    # Both tables stretch their columns to the viewport, so no horizontal
-    # scrollbar appears and none needs reserving here.
-    table.setFixedHeight(header + rows + 2 * table.frameWidth())
+
+    # Reserve the HORIZONTAL scrollbar when it is showing.  Stretch mode does
+    # not rule one out: sections still honour minimumSectionSize, so a narrow
+    # enough window brings the bar back -- reproduced at a 300px table width.
+    # Since the vertical bar is off, any height it steals clips the last row
+    # outright instead of becoming scrollable.
+    hbar = table.horizontalScrollBar()
+    reserved = hbar.sizeHint().height() if (hbar and hbar.isVisible()) else 0
+
+    wanted = header + rows + 2 * table.frameWidth() + reserved
+    if table.height() != wanted:
+        # Guarded: setFixedHeight can itself change the scroll range, and an
+        # unguarded refit on that signal would recurse.
+        table.setFixedHeight(wanted)
+
+    if not table.property("_refit_connected"):
+        table.setProperty("_refit_connected", True)
+        # The bar appears and disappears as the window is resized, so the
+        # reservation has to be re-evaluated when the range changes.
+        hbar.rangeChanged.connect(lambda *_: _fit_table_to_contents(table))
 
 
 class _SuggestedAllocationWorker(QObject):

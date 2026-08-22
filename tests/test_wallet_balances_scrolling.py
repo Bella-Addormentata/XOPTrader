@@ -182,3 +182,41 @@ def test_the_startup_empty_update_leaves_the_table_fitted(app):
     w.update_balances({}, market_data={}, stuck_offers=0)
     assert w._table.height() == _content_height(w._table)
     assert w._table.height() < 200, "left at the unfitted default"
+
+
+def test_a_narrow_window_does_not_clip_the_last_row(app):
+    """Stretch mode does not rule out a horizontal scrollbar.
+
+    Sections still honour minimumSectionSize, so a narrow enough window
+    brings the bar back -- reproduced at a 300px table width. With the
+    vertical bar switched off, any height it steals clips the last row
+    outright instead of becoming scrollable.
+    """
+    app.setStyleSheet(theme.get_stylesheet())
+    w = WalletBalancesWidget()
+    w._refresh_suggested_allocation = lambda: None
+    w.update_balances(_balances(6), market_data={}, stuck_offers=0)
+    table = w._table
+    w.show()
+    app.processEvents()
+
+    def needed() -> int:
+        rows = sum(table.rowHeight(r) for r in range(table.rowCount()))
+        bar = table.horizontalScrollBar()
+        extra = bar.sizeHint().height() if bar.isVisible() else 0
+        return (rows + table.horizontalHeader().height()
+                + 2 * table.frameWidth() + extra)
+
+    try:
+        saw_scrollbar = False
+        for width in (1000, 300, 150, 1000):
+            table.setFixedWidth(width)
+            app.processEvents()
+            saw_scrollbar |= table.horizontalScrollBar().isVisible()
+            assert table.height() >= needed(), (
+                f"width {width}px: {table.height()}px cannot show "
+                f"{needed()}px of content -- last row clipped"
+            )
+        assert saw_scrollbar, "fixture never produced a horizontal scrollbar"
+    finally:
+        w.hide()
