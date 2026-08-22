@@ -329,6 +329,19 @@ void MetricsExporter::register_metrics()
         .Register(*registry_)
         .Add({});
 
+    posting_gate_family_ = &prometheus::BuildGauge()
+        .Name("xop_posting_gate")
+        .Help("1 while the named standing gate disables offer posting; "
+              "reason label is one of gui, breaker, wallet_circuit, "
+              "flash_crash, xch_recovery, dry_run")
+        .Register(*registry_);
+    gate_gui_            = &posting_gate_family_->Add({{"reason", "gui"}});
+    gate_breaker_        = &posting_gate_family_->Add({{"reason", "breaker"}});
+    gate_wallet_circuit_ = &posting_gate_family_->Add({{"reason", "wallet_circuit"}});
+    gate_flash_crash_    = &posting_gate_family_->Add({{"reason", "flash_crash"}});
+    gate_xch_recovery_   = &posting_gate_family_->Add({{"reason", "xch_recovery"}});
+    gate_dry_run_        = &posting_gate_family_->Add({{"reason", "dry_run"}});
+
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
         .Help("1 when offer posting is disabled by a standing gate -- GUI "
@@ -696,15 +709,26 @@ void MetricsExporter::update_stuck_offers(int count)
     stuck_offers_last_observed_ = count;
 }
 
-void MetricsExporter::update_posting_gated(bool gated)
+void MetricsExporter::update_posting_gates(bool gui, bool breaker,
+                                           bool wallet_circuit,
+                                           bool flash_crash,
+                                           bool xch_recovery, bool dry_run)
 {
     // Same locked lifecycle check as every neighbouring updater: shutdown()
-    // resets registry_ under this mutex, destroying the gauge, so an
-    // unguarded update racing shutdown dereferences a stale pointer.
+    // resets registry_ under this mutex, destroying the gauges, so an
+    // unguarded update racing shutdown dereferences stale pointers.
     std::unique_lock lock(mtx_);
     if (!running_) return;
 
-    posting_gated_gauge_->Set(gated ? 1.0 : 0.0);
+    gate_gui_->Set(gui ? 1.0 : 0.0);
+    gate_breaker_->Set(breaker ? 1.0 : 0.0);
+    gate_wallet_circuit_->Set(wallet_circuit ? 1.0 : 0.0);
+    gate_flash_crash_->Set(flash_crash ? 1.0 : 0.0);
+    gate_xch_recovery_->Set(xch_recovery ? 1.0 : 0.0);
+    gate_dry_run_->Set(dry_run ? 1.0 : 0.0);
+    posting_gated_gauge_->Set(
+        (gui || breaker || wallet_circuit || flash_crash || xch_recovery
+         || dry_run) ? 1.0 : 0.0);
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

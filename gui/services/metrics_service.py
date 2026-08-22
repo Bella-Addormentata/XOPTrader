@@ -686,22 +686,40 @@ class MetricsService(QObject):
             return value >= 1.0
         return False
 
-    def posting_gated(self) -> bool:
-        """Whether offer posting is disabled for ANY reason.
+    def posting_gate_reasons(self) -> set[str]:
+        """The STANDING gates currently disabling offer posting.
 
-        Reads ``xop_posting_gated`` (GUI pause, risk breakers, wallet
-        circuit breaker, flash-crash, XCH recovery).  Falls back to the
-        GUI-pause gauge against an engine that predates the split, which
-        understates gating exactly as that engine itself did.
+        Reads the labelled ``xop_posting_gate`` family; possible members:
+        ``gui``, ``breaker``, ``wallet_circuit``, ``flash_crash``,
+        ``xch_recovery``, ``dry_run``.  An empty set means no standing gate
+        -- NOT proof that an offer was posted: transient per-cycle aborts
+        (e.g. wallet not yet synced) are outside this signal's contract.
+        Falls back to the GUI-pause gauge against an engine predating the
+        family, which understates gating exactly as that engine did.
         """
         with QMutexLocker(self._mutex):
             m = self._latest
 
-        inner = m.get("xop_posting_gated")
+        inner = m.get("xop_posting_gate")
         if inner:
-            for _labels, value in inner.items():
-                return value >= 1.0
-        return self.is_paused()
+            reasons: set[str] = set()
+            for labels, value in inner.items():
+                if value >= 1.0:
+                    for key, val in labels:
+                        if key == "reason":
+                            reasons.add(val)
+            return reasons
+        return {"gui"} if self.is_paused() else set()
+
+    def posting_gated(self) -> bool:
+        """Whether any STANDING gate currently disables offer posting.
+
+        Standing gates: GUI pause, latched risk breaker, wallet circuit
+        breaker, flash-crash episode, XCH recovery, dry-run.  False is not
+        proof posting occurred -- transient per-cycle aborts are outside
+        this contract.
+        """
+        return bool(self.posting_gate_reasons())
 
     def get_history(self) -> list[dict[str, dict[tuple[tuple[str, str], ...], float]]]:
         """Return a copy of the metrics history buffer.

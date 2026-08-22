@@ -266,11 +266,17 @@ public:
     /// on the posting-gated gauge below.
     void update_bot_paused(bool is_paused);
 
-    /// Update the posting-gated gauge.  STATE-side contract: 1 when offer
-    /// posting is disabled for ANY reason (GUI pause, latched risk
-    /// breaker, wallet circuit breaker, flash-crash episode, or XCH
-    /// recovery); 0 when the engine is actually posting.
-    void update_posting_gated(bool gated);
+    /// Update the posting-gate gauges.  STATE-side, STANDING gates only:
+    /// the aggregate xop_posting_gated is 1 when any standing gate holds
+    /// (GUI pause, latched risk breaker, wallet circuit breaker,
+    /// flash-crash episode, XCH recovery, or dry-run), and the labelled
+    /// family xop_posting_gate{reason=...} carries each gate separately so
+    /// consumers can tell WHICH gate holds.  0 on the aggregate means no
+    /// standing gate -- NOT proof an offer was posted: transient per-cycle
+    /// aborts (e.g. wallet not yet synced) are outside this contract.
+    void update_posting_gates(bool gui, bool breaker, bool wallet_circuit,
+                              bool flash_crash, bool xch_recovery,
+                              bool dry_run);
 
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
@@ -380,6 +386,13 @@ private:
     int stuck_offers_peak_observed_{0};
     prometheus::Gauge* paused_gauge_{nullptr};
     prometheus::Gauge* posting_gated_gauge_{nullptr};
+    prometheus::Family<prometheus::Gauge>* posting_gate_family_{nullptr};
+    prometheus::Gauge* gate_gui_{nullptr};
+    prometheus::Gauge* gate_breaker_{nullptr};
+    prometheus::Gauge* gate_wallet_circuit_{nullptr};
+    prometheus::Gauge* gate_flash_crash_{nullptr};
+    prometheus::Gauge* gate_xch_recovery_{nullptr};
+    prometheus::Gauge* gate_dry_run_{nullptr};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------

@@ -861,20 +861,19 @@ class MainWindow(QMainWindow):
             colour = _C.WARNING_YELLOW
             self._bot_running = True
             self._bot_paused = True
-            # Which pause?  Resume can only clear the GUI flag; a breaker
-            # pause needs a restart, and offering Resume for it makes the
-            # button a lie.  The gauge is command-side truth.
-            gui_flag = True
+            # Which pause?  Resume can only clear the GUI flag, so it is
+            # offered only when the GUI flag is the SOLE active gate: with
+            # a breaker latched alongside it, removing the flag would leave
+            # posting gated while the button claimed success.
+            reasons = {"gui"}
             try:
                 if self._bridge is not None:
-                    gui_flag = self._bridge.metrics_service.is_paused()
+                    reasons = (self._bridge.metrics_service
+                               .posting_gate_reasons() - {"dry_run"})
             except Exception:
                 pass
-            self._gui_pause_owns_it = gui_flag
-            if not gui_flag:
-                # Owned by a breaker or protection gate (flash-crash,
-                # wallet circuit, recovery, dry-run) -- not by the GUI
-                # flag, so Resume cannot clear it.
+            self._gui_pause_owns_it = (reasons == {"gui"} or not reasons)
+            if not self._gui_pause_owns_it:
                 self._bot_status_label.setText("Paused (protection)")
         elif status in ("Analyzing",):
             colour = _C.INFO_BLUE
