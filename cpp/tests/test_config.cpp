@@ -745,6 +745,50 @@ TEST(ConfigParserTest, ReviveMarketWithDisabledFreshnessThreshold_Throws) {
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
+TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
+    // kMinimalValidYaml already carries a risk: section, so the knob is
+    // INJECTED into it rather than appended as a duplicate root key --
+    // yaml-cpp resolves duplicate keys to whichever it meets first, which
+    // would silently test the wrong value.
+    const auto with_window = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "risk:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  flash_crash_window_blocks: " + value + "\n");
+        return yaml;
+    };
+
+    {
+        TempYaml tmp(with_window("240"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_window_blocks, 240u);
+    }
+    {
+        // Omitted: the documented default.
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_window_blocks, 100u);
+    }
+    {
+        // 0 is the deliberate whole-history opt-out, not an error.
+        TempYaml tmp(with_window("0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.flash_crash_window_blocks, 0u);
+    }
+    {
+        TempYaml tmp(with_window("-5"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        // window=1 selects one sample, runs zero comparisons, and silently
+        // disables the detector -- rejected rather than accepted as a trap.
+        TempYaml tmp(with_window("1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
 TEST(ConfigParserTest, DexLastTradeMaxAge_ParsesAndDefaults) {
     // The propagation path itself, not just the gate: this knob was
     // advertised as configurable while nothing read it, so production sat

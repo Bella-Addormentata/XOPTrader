@@ -1632,6 +1632,28 @@ RiskConfig parse_risk(const YAML::Node& root)
         }
     }
 
+    // flash_crash_window_blocks: how much history the crash detector scans.
+    // 0 = the whole retained buffer (pre-S12 behaviour), permitted but
+    // deliberate: it restores the latch-on-one-print failure mode.
+    if (node["flash_crash_window_blocks"] && node["flash_crash_window_blocks"].IsDefined()
+            && !node["flash_crash_window_blocks"].IsNull()) {
+        int64_t v = node["flash_crash_window_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".flash_crash_window_blocks must be in [0, "
+                              + std::to_string(std::numeric_limits<uint32_t>::max())
+                              + "]; got " + std::to_string(v));
+        }
+        // A drawdown needs two samples.  window=1 would select a single
+        // entry, run zero comparisons, and silently DISABLE the detector --
+        // only 0 (whole history) is a documented special value.
+        if (v == 1) {
+            throw ConfigError(sec + ".flash_crash_window_blocks must be 0 "
+                              "(whole history) or >= 2; a one-sample window "
+                              "can never detect a drop");
+        }
+        cfg.flash_crash_window_blocks = static_cast<uint32_t>(v);
+    }
+
     // recovery_stable_blocks_phase1: blocks that must be stable for Crash->Recovery.
     if (node["recovery_stable_blocks_phase1"] && node["recovery_stable_blocks_phase1"].IsDefined()
             && !node["recovery_stable_blocks_phase1"].IsNull()) {
@@ -2413,6 +2435,8 @@ void log_config_summary(const AppConfig& cfg)
         << "  max_window_loss = " << cfg.risk.max_window_loss_bps << " bps"
         << (cfg.risk.max_window_loss_bps == 0.0 ? " (disabled)" : "") << "\n"
         << "  flash_crash    = " << cfg.risk.flash_crash_threshold_pct * 100.0 << "%\n"
+        << "  flash_window   = " << cfg.risk.flash_crash_window_blocks
+        << " blocks (0 = whole history)\n"
         << "  recovery_ph1   = " << cfg.risk.recovery_stable_blocks_phase1 << " blocks\n"
         << "  recovery_ph2   = " << cfg.risk.recovery_stable_blocks_phase2 << " blocks\n"
         << "  recovery_band  = " << cfg.risk.recovery_stability_band_pct * 100.0 << "%\n"
