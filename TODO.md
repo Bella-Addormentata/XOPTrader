@@ -178,3 +178,15 @@
 - **T8-26 PnLTracker database tests** — DONE: `test_pnl_tracker.cpp` (11 tests, commit e4405a9) covers DB rehydration, trade_id idempotency, USD conversion, CSV export; snapshot insert/query covered in test_database.cpp:520-562; equity-curve API removed by the P&L overhaul (drawdown breaker now on portfolio equity, 692c1fd).
 - **S1 Phantom offer removal** — DONE: cae2bfd (see New findings S1 above); the MEMORY.md "proven, unfixed" index line is stale.
 - **S2 CI red since 2026-04-08** — DONE: PR #70 / 206d55c (see New findings S2 above); recent runs green as of 2026-08-18.
+
+### S16: Taker paths lack floor-aware XCH pre-checks
+- **Files:** `cpp/src/engine.cpp` (Step 9c ~9203, 9e ~9796, 9f ~10322)
+- **Status:** `[ ]` -- Found 2026-08-23 by the coin-lock-ledger adversarial
+  review (minor): Step 9c's crossed-book taker lifts asks with NO balance
+  check at all (on a quote=XCH pair it spends XCH principal + fee straight
+  from the pool; bounded per cycle by max_take_xch, so not incident-class).
+  9e and the 9f drift corrector check spendable >= cost but omit the fee
+  and do not require the fee-reserve floor to survive. Takers are instant
+  spends, not standing locks, so they stay outside the cycle ledger by
+  design -- but each should get a floor-aware pre-check:
+  spendable - cost - fee >= fee_reserve_xch.

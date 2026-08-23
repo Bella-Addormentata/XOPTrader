@@ -771,7 +771,23 @@ TEST(ConfigParserTest, XchCycleCommitFrac_ParsesDefaultsAndRejects) {
         EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.5);
     }
     {
+        // The documented bounds are inclusive; an operator sets exactly
+        // these during an incident (0.0 = post nothing, 1.0 = floor-only).
+        TempYaml tmp(with_frac("0.0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.0);
+    }
+    {
+        TempYaml tmp(with_frac("1.0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 1.0);
+    }
+    {
         TempYaml tmp(with_frac("1.5"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_frac(".nan"));
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
     }
     {

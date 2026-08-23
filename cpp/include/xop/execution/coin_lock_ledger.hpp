@@ -12,13 +12,29 @@
 // EVERY offer -- including offers whose principal is not XCH at all.
 //
 // This ledger fixes both by accounting for our own locks: it is seeded once
-// per posting cycle from the wallet's actual free-coin list, simulates the
-// wallet's coin selection for each candidate offer (smallest single covering
-// coin, else largest-first accumulation), and refuses any lock that would
-// leave the remaining pool below the floor or push the cycle's committed
-// total past the cap.  Pure and synchronous so it is unit-testable in
-// isolation (tests/test_coin_lock_ledger.cpp); the async snapshot fetch
-// lives in OfferManager::begin_xch_lock_cycle().
+// per posting cycle from the wallet's actual free-coin list and simulates
+// coin selection for each candidate lock.  Two separated meanings (review):
+//
+//   THE POOL MODELS PHYSICS.  Every lock -- offer principal, offer fee,
+//   cancel fee -- removes its selected coins, and the FLOOR is enforced
+//   against what remains.  note_lock() is the unconditional drain for
+//   spends that happen regardless of budget (cancel fees).
+//
+//   THE CAP MODELS POLICY.  Only OFFER locks (try_lock) count against the
+//   per-cycle commitment cap: the configured knob is "the fraction of free
+//   XCH one posting cycle may lock into offers", and cancel fees consuming
+//   the posting budget starved requotes.
+//
+// Selection is knapsack-aware conservative: the charge is the LARGER of
+// (a) the smallest single covering coin and (b), when the sub-need coins
+// sum past the need -- the case where Chia's wallet prefers knapsacking
+// smaller coins -- a smallest-first accumulation of those sub-need coins.
+// A pure smallest-covering model under-estimated exactly that case and
+// left the floor soft.
+//
+// Pure and synchronous so it is unit-testable in isolation
+// (tests/test_coin_lock_ledger.cpp); the async snapshot fetch lives in
+// OfferManager::begin_xch_lock_cycle().
 //
 // A default-constructed ledger is INACTIVE and admits everything: the
 // snapshot fetch is best-effort, and failing open leaves the pre-existing
@@ -45,7 +61,7 @@ public:
     /// @param free_coin_mojos  Amounts of the wallet's spendable coins.
     /// @param floor_mojos      Unlocked total that must survive the cycle.
     /// @param commit_frac      Fraction of (total - floor) one cycle may
-    ///                         commit; clamped to [0, 1].
+    ///                         lock INTO OFFERS; clamped to [0, 1].
     CoinLockLedger(std::vector<Mojo> free_coin_mojos,
                    Mojo              floor_mojos,
                    double            commit_frac)
@@ -70,106 +86,141 @@ public:
 
     [[nodiscard]] bool active() const noexcept { return active_; }
     [[nodiscard]] Mojo remaining() const noexcept { return remaining_; }
+    /// XCH locked into OFFERS this cycle (cancel-fee drains excluded).
     [[nodiscard]] Mojo committed() const noexcept { return committed_; }
 
-    /// Charge a lock that will happen REGARDLESS of budget -- cancel
-    /// fees.  Same wallet-shaped selection as try_lock, but never refuses:
-    /// the pool simply reflects reality, so posting later in the cycle is
-    /// gated against what cancellations actually consumed (review: the
-    /// cycle snapshot is taken before Step 8's cancellation passes, and a
-    /// secure cancel locks an XCH fee coin the snapshot still counts as
-    /// free).  A need the pool cannot cover drains the pool entirely.
-    void note_lock(Mojo principal_mojos, Mojo fee_mojos)
-    {
-        if (!active_) {
-            return;
-        }
-        if (principal_mojos < 0) principal_mojos = 0;
-        if (fee_mojos < 0) fee_mojos = 0;
-        const Mojo need = saturating_add(principal_mojos, fee_mojos);
-        if (need == 0) {
-            return;
-        }
-
-        const auto it = std::lower_bound(coins_.begin(), coins_.end(), need);
-        if (it != coins_.end()) {
-            const Mojo locked = *it;
-            coins_.erase(it);
-            remaining_ -= locked;
-            committed_ = saturating_add(committed_, locked);
-            return;
-        }
-        Mojo covered = 0;
-        while (!coins_.empty() && covered < need) {
-            const Mojo c = coins_.back();
-            covered = saturating_add(covered, c);
-            coins_.pop_back();
-            remaining_ -= c;
-            committed_ = saturating_add(committed_, c);
-        }
-    }
-
-    /// Admit-or-refuse one offer's XCH lock.  On admit, the selected coins
-    /// leave the pool and count against the cycle cap.  Refusal locks
-    /// nothing.  Over-counting is the deliberate failure direction: a
-    /// create_offer that later fails leaves the ledger over-committed for
-    /// the rest of the cycle, which only makes posting MORE conservative.
+    /// Admit-or-refuse one OFFER's XCH lock against both the cycle cap and
+    /// the pool floor.  On admit, the selected coins leave the pool and the
+    /// charge counts against the cap.  Refusal locks nothing.
+    /// Over-counting after a failed create is the deliberate conservative
+    /// direction.
     [[nodiscard]] bool try_lock(Mojo principal_mojos, Mojo fee_mojos)
     {
         if (!active_) {
             return true;
         }
-        if (principal_mojos < 0) principal_mojos = 0;
-        if (fee_mojos < 0) fee_mojos = 0;
-        const Mojo need = saturating_add(principal_mojos, fee_mojos);
+        const Mojo need = clamp_need(principal_mojos, fee_mojos);
         if (need == 0) {
             return true;
         }
-
-        // Wallet-shaped selection: the smallest single coin that covers the
-        // need; otherwise accumulate largest-first until covered.
-        Mojo        locked = 0;
-        bool        single = false;
-        std::size_t single_idx = 0;
-        std::size_t take_from_back = 0;
-
-        const auto it = std::lower_bound(coins_.begin(), coins_.end(), need);
-        if (it != coins_.end()) {
-            locked = *it;
-            single = true;
-            single_idx = static_cast<std::size_t>(it - coins_.begin());
-        } else {
-            Mojo covered = 0;
-            while (take_from_back < coins_.size() && covered < need) {
-                const Mojo c = coins_[coins_.size() - 1 - take_from_back];
-                covered = saturating_add(covered, c);
-                locked  = saturating_add(locked, c);
-                ++take_from_back;
-            }
-            if (covered < need) {
-                return false;  // pool cannot fund this lock at all
-            }
+        const Selection sel = select_for(need);
+        if (!sel.covered) {
+            return false;  // pool cannot fund this lock at all
         }
-
-        if (saturating_add(committed_, locked) > cap_) {
-            return false;  // cycle commitment cap
+        if (saturating_add(committed_, sel.locked) > cap_) {
+            return false;  // per-cycle OFFER commitment cap
         }
-        if (remaining_ - locked < floor_) {
-            return false;  // would leave the pool below the floor
+        // The floor is a live, independent check: cancel-fee drains
+        // (note_lock) shrink the pool without consuming the cap, so the cap
+        // passing does NOT imply the floor holds.  Pinned by
+        // FloorRefusesAfterCancelDrainsEvenWhenCapAdmits.
+        if (remaining_ - sel.locked < floor_) {
+            return false;
         }
-
-        if (single) {
-            coins_.erase(coins_.begin()
-                         + static_cast<std::ptrdiff_t>(single_idx));
-        } else {
-            coins_.resize(coins_.size() - take_from_back);
-        }
-        remaining_ -= locked;
-        committed_ = saturating_add(committed_, locked);
+        apply(sel);
+        committed_ = saturating_add(committed_, sel.locked);
         return true;
     }
 
+    /// Unconditional pool drain for spends that happen REGARDLESS of
+    /// budget -- cancel fees (review: cancels run after the cycle snapshot,
+    /// and a secure cancel locks a whole XCH fee coin the snapshot still
+    /// counts as free).  Never refuses, never consumes the offer cap; a
+    /// need the pool cannot cover drains the pool entirely.
+    void note_lock(Mojo principal_mojos, Mojo fee_mojos)
+    {
+        if (!active_) {
+            return;
+        }
+        const Mojo need = clamp_need(principal_mojos, fee_mojos);
+        if (need == 0) {
+            return;
+        }
+        const Selection sel = select_for(need);
+        if (sel.covered) {
+            apply(sel);
+            return;
+        }
+        coins_.clear();
+        remaining_ = 0;
+    }
+
 private:
+    struct Selection {
+        bool        covered{false};
+        Mojo        locked{0};
+        bool        single{false};
+        std::size_t single_idx{0};
+        std::size_t prefix_count{0};  // smallest-first count when !single
+    };
+
+    [[nodiscard]] static Mojo clamp_need(Mojo principal, Mojo fee) noexcept
+    {
+        if (principal < 0) principal = 0;
+        if (fee < 0) fee = 0;
+        return saturating_add(principal, fee);
+    }
+
+    /// Knapsack-aware conservative selection (see header).  coins_ is
+    /// sorted ascending, so sub-need coins are a prefix and the smallest
+    /// single covering coin is the first element at/after the boundary.
+    [[nodiscard]] Selection select_for(Mojo need) const
+    {
+        Selection single_sel;
+        const auto it = std::lower_bound(coins_.begin(), coins_.end(), need);
+        if (it != coins_.end()) {
+            single_sel.covered    = true;
+            single_sel.locked     = *it;
+            single_sel.single     = true;
+            single_sel.single_idx =
+                static_cast<std::size_t>(it - coins_.begin());
+        }
+
+        // Knapsack model: smallest-first accumulation, applicable when the
+        // sub-need coins alone can cover the need (Chia prefers them then).
+        Selection prefix_sel;
+        {
+            Mojo        covered = 0;
+            std::size_t count   = 0;
+            const auto  sub_need_end =
+                static_cast<std::size_t>(it - coins_.begin());
+            while (count < sub_need_end && covered < need) {
+                covered = saturating_add(covered, coins_[count]);
+                ++count;
+            }
+            if (covered >= need) {
+                prefix_sel.covered      = true;
+                prefix_sel.locked       = covered;
+                prefix_sel.prefix_count = count;
+            }
+        }
+
+        if (single_sel.covered && prefix_sel.covered) {
+            return prefix_sel.locked > single_sel.locked ? prefix_sel
+                                                         : single_sel;
+        }
+        if (single_sel.covered) {
+            return single_sel;
+        }
+        if (prefix_sel.covered) {
+            return prefix_sel;
+        }
+        return Selection{};  // pool cannot cover the need
+    }
+
+    void apply(const Selection& sel)
+    {
+        if (sel.single) {
+            coins_.erase(coins_.begin()
+                         + static_cast<std::ptrdiff_t>(sel.single_idx));
+        } else {
+            coins_.erase(coins_.begin(),
+                         coins_.begin()
+                             + static_cast<std::ptrdiff_t>(sel.prefix_count));
+        }
+        remaining_ -= sel.locked;
+    }
+
     [[nodiscard]] static Mojo saturating_add(Mojo a, Mojo b) noexcept
     {
         if (a > std::numeric_limits<Mojo>::max() - b) {
@@ -182,7 +233,7 @@ private:
     Mojo              floor_{0};
     Mojo              cap_{std::numeric_limits<Mojo>::max()};
     Mojo              remaining_{0};
-    Mojo              committed_{0};
+    Mojo              committed_{0};  // OFFER locks only
     bool              active_{false};
 };
 

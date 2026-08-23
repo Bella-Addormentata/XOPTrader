@@ -659,7 +659,25 @@ private:
     /// lock.  Refusals lock nothing and are logged once per cycle at warn.
     bool xch_ledger_admits(const json&       offer_dict,
                            const PairConfig& pair,
+                           Side              side,
                            const char*       context);
+
+public:
+    /// The XCH this offer_dict spends: the negative amount on wallet id 1,
+    /// 0 otherwise.  Static and public so the extraction that the whole
+    /// incident protection rides on is unit-testable in isolation
+    /// (review: a silent regression here degrades the ledger to fee-only
+    /// accounting while every existing test stays green).
+    [[nodiscard]] static Mojo xch_principal_from_offer_dict(
+        const json& offer_dict);
+
+    /// Coin amounts from a get_spendable_coins response, tolerating both
+    /// the {"coin": {...}} wrapper and bare coin objects; entries without
+    /// an amount are skipped.  Static/public for the same reason.
+    [[nodiscard]] static std::vector<Mojo> spendable_amounts_from_coin_records(
+        const std::vector<json>& records);
+
+private:
 
     /// Cancel forwarders that charge the cycle ledger for the fee coin a
     /// cancellation locks (review: cancels run after the cycle snapshot,
@@ -674,6 +692,12 @@ private:
 
     CoinLockLedger xch_cycle_ledger_;
     bool           xch_ledger_refusal_logged_{false};
+    /// True when the ledger refused a side during the current post_quotes
+    /// call.  The T5-08 asymmetric guard treats it like reserve_breached:
+    /// the surviving side is buy-XCH by construction (buy-XCH offers bypass
+    /// the ledger), so the one-sided book is deliberate, and cancelling it
+    /// would burn fees in a livelock (review).
+    bool           xch_ledger_suppressed_{false};
 
     // -- Internal helpers ---------------------------------------------------
 
