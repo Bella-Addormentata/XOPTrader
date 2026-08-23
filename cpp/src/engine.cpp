@@ -11065,7 +11065,19 @@ void Engine::post_ledger_genesis(
         // step_check_ledger_invariant), so skipping a zero balance here is
         // safe -- but it must still be anchored when it IS opened later,
         // which the at_block stamp below provides.
-        if (balance <= 0) continue;
+        //
+        // EXCEPTION ([S19] review round 5): the bridge asset gets a
+        // zero-valued opening.  Without one, the FIRST deposit into an
+        // empty asset could never book: the scan requires an opening, and
+        // by the restart that creates one the (now-positive) balance --
+        // mint included -- IS the opening, so the chronology filter then
+        // rightly drops the historical job.  A 0-mojo opening anchors the
+        // timeline BEFORE the flow, so the deposit books as external
+        // capital.
+        const bool is_bridge_asset =
+            config_.accounting.bridge_ingest_enabled
+            && asset == AssetId{config_.accounting.bridge_asset_id};
+        if (balance < 0 || (balance == 0 && !is_bridge_asset)) continue;
         if (db_->has_ledger_opening(asset)) continue;   // once, ever
 
         DbLedgerEntry e;
@@ -12230,8 +12242,13 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 // nothing corrects.  Residual NON-bridge transfers of the
                 // asset fall to the ledger divergence control, exactly the
                 // pre-S19 behaviour for every asset.
-                if (config_.accounting.bridge_ingest_enabled
+                if (config_.accounting.ledger_enabled
+                    && config_.accounting.bridge_ingest_enabled
                     && aid == config_.accounting.bridge_asset_id) {
+                    // With ledger_enabled: false the bridge scan is a
+                    // no-op (no writer), so the exclusion must not apply
+                    // or the asset would have NO quantity maintainer
+                    // (review round 5).
                     continue;
                 }
                 if (bal.pending_change != 0) continue;  // coins in flight
