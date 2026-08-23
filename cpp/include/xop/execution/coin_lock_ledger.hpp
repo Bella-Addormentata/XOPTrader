@@ -76,7 +76,12 @@ public:
         for (Mojo c : coins_) {
             remaining_ = saturating_add(remaining_, c);
         }
-        if (commit_frac < 0.0) commit_frac = 0.0;
+        // NaN-proof clamp: !(x >= 0) catches NaN without <cmath>, and a
+        // NaN reaching the multiplication below would be undefined
+        // behaviour at the float-to-Mojo conversion.  Garbage input fails
+        // CLOSED (cap 0: no spend-side posting) -- the config parser
+        // rejects non-finite values, this guards independent callers.
+        if (!(commit_frac >= 0.0)) commit_frac = 0.0;
         if (commit_frac > 1.0) commit_frac = 1.0;
         const Mojo commitable =
             remaining_ > floor_ ? remaining_ - floor_ : Mojo{0};

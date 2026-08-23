@@ -22,10 +22,12 @@ TEST(CoinLockLedgerTest, ReplaysTheIncidentBatchExactly) {
     // CAT-principal bids (fee-coin locks only) and hit spendable=0 in 73
     // seconds because every stale wallet re-query approved the next offer.
     // Exact modeled trace (review: pin equalities, not inequalities, so
-    // cap-arithmetic drift cannot hide): 5 asks lock a 2-XCH coin each;
-    // bid 1 locks the 0.59 tail coin; bid 2 locks a 2-XCH coin
-    // (committed 12.59); bids 3-5 refused at the 14.09 cap.  7 admitted,
-    // exactly 2 XCH remaining -- production admitted all 10 and hit zero.
+    // cap-arithmetic drift cannot hide): 5 spend-side asks lock a 2-XCH
+    // coin each (committed 10, the only cap charges); buy-XCH bids go
+    // through the cap-exempt floor-only path -- bid 1 locks the 0.59 tail
+    // coin, bid 2 a 2-XCH coin, and bid 3 is refused at the FLOOR (the
+    // remaining 2-XCH coin must survive).  7 admitted, exactly 2 XCH
+    // remaining -- production admitted all 10 and hit zero.
     std::vector<Mojo> coins(7, 2 * kXch);
     const Mojo tail = kXch * 59 / 100;
     coins.push_back(tail);
