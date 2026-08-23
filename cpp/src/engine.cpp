@@ -11595,7 +11595,8 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     }
 
     std::vector<accounting::BridgeJobRow> jobs;
-    while (sqlite3_step(stmt) == SQLITE_ROW) {
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         accounting::BridgeJobRow r;
         r.id             = sqlite3_column_int64(stmt, 0);
         r.amount_mojos   = sqlite3_column_int64(stmt, 1);
@@ -11610,6 +11611,16 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         r.state_json = sj ? sj : "{}";
         r.created_at = ca ? ca : "";
         jobs.push_back(std::move(r));
+    }
+    // A truncated scan must not be processed as a complete snapshot:
+    // SQLITE_BUSY mid-scan (the GUI's WAL writers are expected) would
+    // otherwise silently drop the tail and let the invariant absorb the
+    // omitted flows as adjustments (review round 4).
+    if (step_rc != SQLITE_DONE) {
+        spdlog::warn("[Engine] Bridge ingest: scan of {} ended with rc={} "
+                     "-- partial snapshot discarded, retrying next "
+                     "heartbeat", acc.bridge_jobs_db_path, step_rc);
+        return;
     }
     // Handles released by the RAII guards at scope exit; the booking
     // below deliberately runs after the scan so the read-only handle is
@@ -11670,6 +11681,18 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             continue;
         }
 
+        // A HISTORICAL flow the divergence control already absorbed as
+        // a blind adjust converges rather than corrupts (review round 4):
+        // booking the bridge leg makes the books overshoot the wallet by
+        // the flow, and the invariant's next cycle posts the opposite
+        // adjust.  End state: old adjust + bridge leg + counter-adjust
+        // net to zero, the flow is explained by its proper event type,
+        // net deposits is correct, and the adjust SUM returns to ~0 for
+        // that flow -- at the cost of one expected LedgerDivergence
+        // alert during catch-up.  Reclassification machinery to rewrite
+        // the old adjust in place was considered and declined: it would
+        // edit journaled history, and the three-entry form is exactly
+        // how a correcting entry is supposed to look.
         if (!accounting::iso_strictly_after(row.flow_at, opening_time)) {
             spdlog::debug("[Engine] Bridge ingest: job {} flowed at or "
                           "before the {} ledger opening ({}) -- already "
@@ -12198,6 +12221,19 @@ void Engine::step_update_pnl(BlockHeight block_height)
             for (const auto& [aid, bal] : cached_wallet_balances_) {
                 if (inventory_reconciled_assets_.count(aid)) continue;
                 if (tracked_assets.find(aid) == tracked_assets.end()) continue;
+                // [S19 review round 4] The bridge asset has a dedicated
+                // external-flow mechanism now (step_ingest_bridge_flows
+                // books mints/burns into inventory itself).  Reconciling
+                // it here raced that scan: set-to-wallet absorbs a mint,
+                // then a delayed scan (jobs DB briefly locked) record_buys
+                // the same mint again -- a permanent double-apply that
+                // nothing corrects.  Residual NON-bridge transfers of the
+                // asset fall to the ledger divergence control, exactly the
+                // pre-S19 behaviour for every asset.
+                if (config_.accounting.bridge_ingest_enabled
+                    && aid == config_.accounting.bridge_asset_id) {
+                    continue;
+                }
                 if (bal.pending_change != 0) continue;  // coins in flight
                 // Stale snapshot: skip WITHOUT consuming the one-shot so it
                 // is retried once Step 8 refreshes the balance.
