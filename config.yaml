@@ -437,7 +437,7 @@ buyer:
 # until it is flipped to false AND the GUI is restarted.
 warp:
   enabled: true
-  dry_run: true                # flip to false only after the rehearsal passes
+  dry_run: false               # rehearsal passed 2026-08-23 (job 1 DRY_RUN_OK)
   auto_bridge: false           # leg 2 is a manual "Bridge now" click
   min_auto_bridge_usdc: 100    # auto floor only; manual ignores it
   max_auto_bridge_usdc: 5      # blast radius for the $1 round-trip test
