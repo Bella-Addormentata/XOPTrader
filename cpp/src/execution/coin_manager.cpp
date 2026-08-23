@@ -215,15 +215,24 @@ CoinManager::SplitPlan CoinManager::plan_split_for_coin(
     Mojo amount_mojos, int needed, Mojo target_amount_mojos, Mojo fee)
 {
     SplitPlan plan;
+    // The funding gate subtracts instead of adding: target + fee could
+    // overflow signed Mojo for arguments near the type limit (review).
     if (amount_mojos <= 0 || needed <= 0 || target_amount_mojos <= 0
-        || fee < 0 || amount_mojos < target_amount_mojos + fee) {
+        || fee < 0 || fee >= amount_mojos
+        || amount_mojos - fee < target_amount_mojos) {
         return plan;
     }
 
     // Preferred: as many target-denomination coins as still improve the pool.
-    const int max_from_coin =
-        static_cast<int>((amount_mojos - fee) / target_amount_mojos);
-    int candidate = std::min({needed, max_from_coin, kMaxCoinsPerSplit});
+    // Cap the quotient in the Mojo domain BEFORE narrowing: a small target
+    // against a large coin overflows int, and that conversion is
+    // implementation-defined (review).
+    const Mojo raw_from_coin = (amount_mojos - fee) / target_amount_mojos;
+    const int  max_from_coin =
+        raw_from_coin > static_cast<Mojo>(kMaxCoinsPerSplit)
+            ? kMaxCoinsPerSplit
+            : static_cast<int>(raw_from_coin);
+    int candidate = std::min(needed, max_from_coin);
     while (candidate > 0
            && !split_improves_pool_ready_count(
                amount_mojos, candidate, target_amount_mojos, fee)) {
@@ -435,7 +444,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
         logger_->info("ensure_split: created {} coins of {} mojos each "
                       "(fee {} mojos, tx={})",
-                      batch, target_amount_mojos, fee,
+                      plan.batch, plan.split_amount, fee,
                       result.tx_id.empty() ? "(none)" :
                       result.tx_id.substr(0, 16));
 
