@@ -117,6 +117,8 @@ asio::awaitable<int> OfferManager::post_quotes(
     const double effective_reserve = (fee_reserve_override > 0.0)
         ? fee_reserve_override
         : strategy_cfg_.fee_reserve_xch;
+    // Per-call state for the T5-08 exemption below.
+    xch_ledger_suppressed_ = false;
     // Lazy-init the wallet-ID cache on first call.
     if (!wallet_ids_resolved_) {
         co_await init_wallet_id_map();
@@ -248,8 +250,17 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Exception: when XCH reserve is breached and the posted side buys
         // XCH, the other side was *intentionally* suppressed.  Do not
         // cancel in that case -- the one-sided book is by design.
-        const bool bid_side_exempt = reserve_breached && bids_buy_xch;
-        const bool ask_side_exempt = reserve_breached && asks_buy_xch;
+        // A ledger suppression is DELIBERATE like a reserve breach, so the
+        // exemption below spares the surviving side from cancellation --
+        // but only when that survivor buys XCH (buy-XCH offers are
+        // cap-exempt yet floor-checked, so they too can be refused and set
+        // this flag; a surviving spend side is never exempted).  Without
+        // the exemption, cancelling the survivor would burn create+cancel
+        // fees every cycle in a livelock (review).
+        const bool bid_side_exempt =
+            (reserve_breached || xch_ledger_suppressed_) && bids_buy_xch;
+        const bool ask_side_exempt =
+            (reserve_breached || xch_ledger_suppressed_) && asks_buy_xch;
         if (bid_count > 0 && ask_count == 0 && !asks.empty()
             && !bid_side_exempt) {
             logger_->warn("Asymmetric ladder: {} bids posted but 0/{} asks "
@@ -265,7 +276,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
-                        co_await wallet_->cancel_offer(
+                        co_await cancel_offer_charged(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
@@ -300,7 +311,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
-                        co_await wallet_->cancel_offer(
+                        co_await cancel_offer_charged(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
@@ -332,6 +343,51 @@ asio::awaitable<int> OfferManager::post_quotes(
     int created_count = 0;
     bool bid_funds_exhausted = false;
     bool ask_funds_exhausted = false;
+
+    // [XCH-LOCK-LEDGER] Ladder preflight (review round 8): ladders order
+    // all bids before all asks, so in this non-batch path a mid-ladder
+    // cap exhaustion could admit every bid and then refuse every ask,
+    // leaving a one-sided book with no T5-08 cleanup (the guard exists
+    // only in the batch branch).  Run the whole ladder against a COPY of
+    // the cycle ledger first; a side whose every tier would be refused is
+    // dropped up front, and if the surviving side does not buy XCH it is
+    // dropped too -- the same exemption rule the batch guard applies.
+    if (xch_cycle_ledger_.active()) {
+        // Local: the batch branch's equivalents are scoped inside it.
+        const bool bids_buy_xch = (pair.base_asset_id == "xch");
+        const bool asks_buy_xch = (pair.quote_asset_id == "xch");
+        CoinLockLedger probe = xch_cycle_ledger_;
+        int  admit_bid = 0, admit_ask = 0;
+        bool any_bid = false, any_ask = false;
+        for (const auto& tier : quotes) {
+            json probe_dict = build_offer_dict(pair, tier);
+            if (probe_dict.empty()) {
+                continue;
+            }
+            const bool ok =
+                xch_ledger_probe_admits(probe, probe_dict, pair, tier.side);
+            if (tier.side == Side::Bid) {
+                any_bid = true;
+                if (ok) ++admit_bid;
+            } else {
+                any_ask = true;
+                if (ok) ++admit_ask;
+            }
+        }
+        const PreflightDrops drops = preflight_side_drops(
+            any_bid, admit_bid, any_ask, admit_ask,
+            bids_buy_xch, asks_buy_xch);
+        if (drops.drop_asks || drops.drop_bids) {
+            ask_funds_exhausted = ask_funds_exhausted || drops.drop_asks;
+            bid_funds_exhausted = bid_funds_exhausted || drops.drop_bids;
+            xch_ledger_suppressed_ = true;
+            logger_->warn("XCH lock ledger preflight: {} dropping{}{} up "
+                          "front (one-sided guard)",
+                          pair.name,
+                          drops.drop_bids ? " bids" : "",
+                          drops.drop_asks ? " asks" : "");
+        }
+    }
 
     for (const auto& tier : quotes) {
         // Skip further tiers on the side that already reported
@@ -417,6 +473,13 @@ asio::awaitable<int> OfferManager::post_quotes(
         if (offer_dict.empty()) {
             logger_->warn("Skipping tier {} {} -- could not build offer_dict",
                           tier.tier_index, to_string(tier.side));
+            continue;
+        }
+
+        // [XCH-LOCK-LEDGER] Self-accounted whole-coin budget; the wallet's
+        // spendable_balance lags our own just-created offers, so re-querying
+        // it (below) cannot stop a fast batch on its own.
+        if (!xch_ledger_admits(offer_dict, pair, tier.side, "tier create")) {
             continue;
         }
 
@@ -902,7 +965,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         bool cancel_ok = false;
         bool needs_emergency = false;
         try {
-            co_await wallet_->cancel_offer(
+            co_await cancel_offer_charged(
                 po.offer_id, current_fee_mojos_, /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
@@ -962,7 +1025,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
     bool bulk_ok = false;
     std::string bulk_err;
     try {
-        co_await wallet_->cancel_offers(current_fee_mojos_, /*secure=*/true);
+        co_await cancel_offers_charged(current_fee_mojos_, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
@@ -984,7 +1047,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
             bool cancel_ok = false;
             bool needs_emergency = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     po.offer_id, current_fee_mojos_, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
                 cancel_ok = true;
@@ -1583,7 +1646,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
         bool cancel_ok = false;
         bool needs_emergency = false;
         try {
-            co_await wallet_->cancel_offer(
+            co_await cancel_offer_charged(
                 offer_id, current_fee_mojos_, /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
@@ -2401,7 +2464,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 } else {
                 bool needs_emergency = false;
                 try {
-                    co_await wallet_->cancel_offer(wo->trade_id,
+                    co_await cancel_offer_charged(wo->trade_id,
                                                    current_fee_mojos_,
                                                    /*secure=*/true);
                     cancel_ok = true;
@@ -2645,6 +2708,164 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
 // [T7-10] post_merged_side -- merge same-side tiers into one RPC call
 // ---------------------------------------------------------------------------
 
+asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
+{
+    // Reset first: a stale ledger from the previous cycle must never gate
+    // this one, and an RPC failure below leaves the ledger inactive.
+    xch_cycle_ledger_ = CoinLockLedger{};
+    xch_ledger_refusal_logged_ = false;
+    try {
+        auto coins = co_await wallet_->get_spendable_coins(1);
+        // Parsed by the same helper the unit tests exercise, so schema
+        // handling cannot silently diverge from the tested path (review).
+        std::vector<Mojo> amounts = spendable_amounts_from_coin_records(coins);
+        const auto floor = static_cast<Mojo>(std::llround(
+            strategy_cfg_.fee_reserve_xch
+            * static_cast<double>(kMojosPerXch)));
+        xch_cycle_ledger_ = CoinLockLedger(
+            std::move(amounts), floor, strategy_cfg_.xch_cycle_commit_frac);
+        logger_->debug("XCH lock ledger: {} free coins, {} mojos free, "
+                       "floor {} mojos, commit_frac {:.2f}",
+                       coins.size(), xch_cycle_ledger_.remaining(), floor,
+                       strategy_cfg_.xch_cycle_commit_frac);
+    } catch (const std::exception& e) {
+        logger_->warn("XCH lock ledger snapshot failed ({}) -- this cycle "
+                      "runs on the wallet-requery guards only", e.what());
+    }
+}
+
+asio::awaitable<json> OfferManager::cancel_offer_charged(
+    const std::string& trade_id, std::uint64_t fee, bool secure)
+{
+    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+}
+
+asio::awaitable<json> OfferManager::cancel_offers_charged(std::uint64_t fee,
+                                                          bool          secure)
+{
+    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    co_return co_await wallet_->cancel_offers(fee, secure);
+}
+
+Mojo OfferManager::xch_principal_from_offer_dict(const json& offer_dict)
+{
+    if (!offer_dict.contains("1")) {
+        return 0;
+    }
+    const auto v = offer_dict["1"].get<std::int64_t>();
+    return v < 0 ? static_cast<Mojo>(-v) : Mojo{0};
+}
+
+std::vector<Mojo> OfferManager::spendable_amounts_from_coin_records(
+    const std::vector<json>& records)
+{
+    std::vector<Mojo> amounts;
+    amounts.reserve(records.size());
+    for (const auto& cr : records) {
+        const auto& coin = cr.contains("coin") ? cr["coin"] : cr;
+        if (coin.contains("amount")) {
+            amounts.push_back(coin["amount"].get<Mojo>());
+        }
+    }
+    return amounts;
+}
+
+OfferManager::PreflightDrops OfferManager::preflight_side_drops(
+    bool any_bid, int admit_bid, bool any_ask, int admit_ask,
+    bool bids_buy_xch, bool asks_buy_xch)
+{
+    PreflightDrops drops;
+    const bool asks_doomed = any_ask && admit_ask == 0 && admit_bid > 0;
+    const bool bids_doomed = any_bid && admit_bid == 0 && admit_ask > 0;
+    if (asks_doomed) {
+        drops.drop_asks = true;
+        if (!bids_buy_xch) {
+            drops.drop_bids = true;
+        }
+    } else if (bids_doomed) {
+        drops.drop_bids = true;
+        if (!asks_buy_xch) {
+            drops.drop_asks = true;
+        }
+    }
+    return drops;
+}
+
+bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
+                                           const json&       offer_dict,
+                                           const PairConfig& pair,
+                                           Side              side) const
+{
+    if (!probe.active()) {
+        return true;
+    }
+    const bool buys_xch =
+        (side == Side::Bid && pair.base_asset_id == "xch")
+        || (side == Side::Ask && pair.quote_asset_id == "xch");
+    if (buys_xch) {
+        return probe.try_lock_floor_only(0, current_fee_mojos_);
+    }
+    return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
+                          current_fee_mojos_);
+}
+
+bool OfferManager::xch_ledger_admits(const json&       offer_dict,
+                                     const PairConfig& pair,
+                                     Side              side,
+                                     const char*       context)
+{
+    if (!xch_cycle_ledger_.active()) {
+        return true;
+    }
+    // Buy-XCH offers are CAP-exempt but never FLOOR-exempt (review round
+    // 3).  Cap-exempt mirrors the pre-existing recovery-zone and
+    // xch_buy_only_mode escapes: buy-XCH offers net-increase XCH when
+    // filled, and vetoing them on the spend budget re-created the low-XCH
+    // starvation deadlock those paths exist to prevent.  Floor-checked
+    // because an unconditional bypass re-opened the incident from the
+    // other side: fee-coin locks alone could drain the pool to zero.
+    // Below the floor, the remaining escapes are the ones that spend no
+    // XCH at all: resting-offer fills, TTL expiries, and the xch_recovery
+    // taker (which pays wUSDC.b).
+    const bool buys_xch =
+        (side == Side::Bid && pair.base_asset_id == "xch")
+        || (side == Side::Ask && pair.quote_asset_id == "xch");
+    if (buys_xch) {
+        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_)) {
+            return true;
+        }
+        xch_ledger_suppressed_ = true;
+        if (!xch_ledger_refusal_logged_) {
+            logger_->warn("XCH lock ledger: refusing buy-XCH {} for {} -- "
+                          "even a fee-coin lock would breach the reserve "
+                          "floor (remaining={})",
+                          context, pair.name, xch_cycle_ledger_.remaining());
+            xch_ledger_refusal_logged_ = true;
+        }
+        return false;
+    }
+    const Mojo principal = xch_principal_from_offer_dict(offer_dict);
+    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
+        return true;
+    }
+    xch_ledger_suppressed_ = true;
+    if (!xch_ledger_refusal_logged_) {
+        logger_->warn(
+            "XCH lock ledger: refusing {} for {} (principal={} fee={} "
+            "committed={} remaining={}) -- whole-coin locking would breach "
+            "the floor or cycle cap; further refusals this cycle at debug",
+            context, pair.name, principal, current_fee_mojos_,
+            xch_cycle_ledger_.committed(), xch_cycle_ledger_.remaining());
+        xch_ledger_refusal_logged_ = true;
+    } else {
+        logger_->debug("XCH lock ledger: refusing {} for {} "
+                       "(principal={} fee={})",
+                       context, pair.name, principal, current_fee_mojos_);
+    }
+    return false;
+}
+
 asio::awaitable<int> OfferManager::post_merged_side(
     const PairConfig&              pair,
     const std::vector<TierQuote>&  tiers,
@@ -2673,6 +2894,13 @@ asio::awaitable<int> OfferManager::post_merged_side(
 
     if (merged_dict.empty()) co_return 0;
 
+    // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
+    // leg is the sum of every tier's, so the ledger charge is exact.
+    if (!xch_ledger_admits(merged_dict, pair, tiers.front().side,
+                           "merged batch")) {
+        co_return 0;
+    }
+
     // Create the merged offer via RPC.
     // co_await cannot appear inside a catch handler in a C++20 coroutine,
     // so capture any exception info here and perform the fallback after the
@@ -2697,6 +2925,19 @@ asio::awaitable<int> OfferManager::post_merged_side(
         for (const auto& tier : tiers) {
             json single_dict = build_offer_dict(pair, tier);
             if (single_dict.empty()) continue;
+            // [XCH-LOCK-LEDGER] Re-charged per tier (review round 3):
+            // the merged attempt charged ONE combined selection, but each
+            // fallback tier is a separate wallet offer with its own
+            // whole-coin principal + fee-coin selection, so skipping the
+            // charge under-counts real locks and can breach both cap and
+            // floor.  Over-counting after the failed merged create is the
+            // contract's deliberate conservative direction; the cost is a
+            // quieter cycle after a transient batch failure, healed at the
+            // next reseed.
+            if (!xch_ledger_admits(single_dict, pair, tier.side,
+                                   "batch fallback")) {
+                continue;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
@@ -3207,7 +3448,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                           context, offer_id.substr(0, 12));
             bool zero_ok = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     offer_id, 0, /*secure=*/true);
                 zero_ok = true;
             } catch (const std::exception& e) {
@@ -3246,7 +3487,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                 bool rpc_failed = false;
                 bool insufficient = false;
                 try {
-                    co_await wallet_->cancel_offer(
+                    co_await cancel_offer_charged(
                         offer_id,
                         static_cast<std::uint64_t>(attempt_fee),
                         /*secure=*/true);
@@ -3285,7 +3526,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                           context, offer_id.substr(0, 12));
             bool secure_zero_ok = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     offer_id, 0, /*secure=*/true);
                 secure_zero_ok = true;
             } catch (const rpc::ChiaRPCError& e) {
@@ -3307,7 +3548,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
         // offer on-chain.  Better than leaving funds locked forever.
         logger_->warn("{}: zero XCH spendable -- local-only (insecure) "
                       "cancel for {}", context, offer_id.substr(0, 12));
-        co_await wallet_->cancel_offer(
+        co_await cancel_offer_charged(
             offer_id, 0, /*secure=*/false);
         logger_->warn("{}: local-only cancelled {} "
                       "(INSECURE -- offer may still be taken on-chain)",
