@@ -218,6 +218,37 @@ public:
                                                 Mojo target_amount_mojos,
                                                 Mojo fee);
 
+    /// One coin's viable split, chosen by plan_split_for_coin().
+    /// batch == 0 means the coin has no improving split.
+    struct SplitPlan {
+        Mojo split_amount{0};  ///< denomination of each created coin
+        int  batch{0};         ///< number of coins to create (0 = no plan)
+    };
+
+    /// Decide how (whether) to split one free coin to improve the pool.
+    ///
+    /// Preferred plan: `batch` coins of the pool target denomination, largest
+    /// improving batch first (the historical behaviour).  Fallback
+    /// [COIN-POOL-DEADLOCK 2026-08-23]: when the spendable value
+    /// (amount - fee) lies in [target, 1.5*target), the only fundable
+    /// target plan is batch 1, whose change (amount - fee - target) falls
+    /// below the pool-ready band -- "no improvement", so such coins were
+    /// refused forever.  On the live wallet every free XCH coin was ~2.0
+    /// XCH against the 1.5 target, so ensure_split failed 76 times while
+    /// offer whole-coin locking starved spendable XCH to zero.  For that
+    /// window the planner splits into two in-band halves of
+    /// (amount - fee) / 2 instead (batch=1 -- the wallet's change output
+    /// IS the other half), so no dust is created and the ready count goes
+    /// 1 -> 2.  Above the window the target path resumes because the
+    /// post-fee change re-enters the band; the exact boundaries are the
+    /// pool-ready predicates on the post-fee value, not literal source
+    /// amounts.
+    static SplitPlan plan_split_for_coin(Mojo amount_mojos,
+                                         int  needed,
+                                         Mojo target_amount_mojos,
+                                         Mojo fee);
+
+
     /**
      * @brief Count pool-ready spendable coins for a wallet.
      *

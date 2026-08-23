@@ -49,6 +49,7 @@ namespace {
 
 constexpr Mojo kPoolReadyMinDivisor = 2;
 constexpr Mojo kPoolReadyMaxMultiple = 2;
+constexpr int  kMaxCoinsPerSplit     = 500;  // Chia wallet per-tx limit
 
 }  // namespace
 
@@ -210,6 +211,63 @@ std::size_t CoinManager::count_pool_ready_coins(
         }));
 }
 
+CoinManager::SplitPlan CoinManager::plan_split_for_coin(
+    Mojo amount_mojos, int needed, Mojo target_amount_mojos, Mojo fee)
+{
+    SplitPlan plan;
+    // The funding gate subtracts instead of adding: target + fee could
+    // overflow signed Mojo for arguments near the type limit (review).
+    if (amount_mojos <= 0 || needed <= 0 || target_amount_mojos <= 0
+        || fee < 0 || fee >= amount_mojos
+        || amount_mojos - fee < target_amount_mojos) {
+        return plan;
+    }
+
+    // Preferred: as many target-denomination coins as still improve the pool.
+    // Cap the quotient in the Mojo domain BEFORE narrowing: a small target
+    // against a large coin overflows int, and that conversion is
+    // implementation-defined (review).
+    const Mojo raw_from_coin = (amount_mojos - fee) / target_amount_mojos;
+    const int  max_from_coin =
+        raw_from_coin > static_cast<Mojo>(kMaxCoinsPerSplit)
+            ? kMaxCoinsPerSplit
+            : static_cast<int>(raw_from_coin);
+    int candidate = std::min(needed, max_from_coin);
+    while (candidate > 0
+           && !split_improves_pool_ready_count(
+               amount_mojos, candidate, target_amount_mojos, fee)) {
+        --candidate;
+    }
+    if (candidate >= 1) {
+        plan.split_amount = target_amount_mojos;
+        plan.batch        = candidate;
+        return plan;
+    }
+
+    // [COIN-POOL-DEADLOCK 2026-08-23] Fallback for the window where the
+    // post-fee value (amount - fee) lies in [target, 1.5*target): the
+    // batch-1 target split's change (amount - fee - target) lands below
+    // the band, so no target plan improves -- but two equal halves of
+    // (amount - fee) both land IN the band.  batch=1 of half: the wallet's
+    // change output is the other half (same size, +1 mojo when odd), so
+    // nothing dusty is created and the pool-ready count goes 1 -> 2.  The
+    // is_pool_ready_coin checks below are the authoritative boundary,
+    // exact to integer rounding (review: with fee > 0 the literal
+    // source-amount interval is shifted by the fee).
+    const Mojo half   = (amount_mojos - fee) / 2;
+    const Mojo change = amount_mojos - fee - half;
+    const int  current_ready =
+        is_pool_ready_coin(amount_mojos, target_amount_mojos) ? 1 : 0;
+    if (half > 0
+        && is_pool_ready_coin(half, target_amount_mojos)
+        && is_pool_ready_coin(change, target_amount_mojos)
+        && 2 > current_ready) {
+        plan.split_amount = half;
+        plan.batch        = 1;
+    }
+    return plan;
+}
+
 bool CoinManager::split_improves_pool_ready_count(Mojo source_amount_mojos,
                                                   int  batch,
                                                   Mojo target_amount_mojos,
@@ -329,9 +387,8 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
     // so only ~1 coin could be created per block).
     //
     // Strategy: sort free coins by amount descending, pick the largest one,
-    // and split it into as many target-denomination coins as it can fund
-    // (up to the number needed and the Chia 500-coin-per-tx limit).
-    constexpr int kMaxCoinsPerSplit = 500;  // Chia wallet limit
+    // and take its best improving split (target denominations, or the
+    // half-split fallback -- see plan_split_for_coin).
 
     // Sort free coins by amount descending to find best candidate.
     std::sort(free_coins.begin(), free_coins.end(),
@@ -339,35 +396,22 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
                   return a.amount > b.amount;
               });
 
-    // Find the largest coin that can produce at least 1 new coin.
+    // Find the largest coin with an improving split plan.
     const CoinInfo* source_coin = nullptr;
-    int batch = 0;
+    SplitPlan plan;
     for (const auto& c : free_coins) {
-        if (c.coin_name.empty() || c.amount < target_amount_mojos + fee) {
+        if (c.coin_name.empty()) {
             continue;
         }
-        // How many target-denomination coins can this coin produce?
-        int max_from_coin = static_cast<int>(
-            (c.amount - fee) / target_amount_mojos);
-        if (max_from_coin < 1) continue;
-
-        int candidate_batch = std::min({needed, max_from_coin, kMaxCoinsPerSplit});
-        while (candidate_batch > 0
-               && !split_improves_pool_ready_count(
-                   c.amount, candidate_batch, target_amount_mojos, fee)) {
-            --candidate_batch;
-        }
-
-        if (candidate_batch < 1) {
+        plan = plan_split_for_coin(c.amount, needed, target_amount_mojos, fee);
+        if (plan.batch < 1) {
             continue;
         }
-
-        batch = candidate_batch;
         source_coin = &c;
         break;  // Largest coin first -- best candidate.
     }
 
-    if (!source_coin || batch < 1) {
+    if (!source_coin || plan.batch < 1) {
         logger_->error("ensure_split: no coin can improve the pool-ready "
                        "count for target {} mojos (+ {} fee). "
                        "Largest free coin: {} mojos",
@@ -381,17 +425,17 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
                   "coins of {} mojos each (need {}, fee={})",
                   source_coin->coin_name.substr(0, 16),
                   source_coin->amount,
-                  batch, target_amount_mojos, needed, fee);
+                  plan.batch, plan.split_amount, needed, fee);
 
     try {
         json split_resp = co_await wallet_->split_coins(
             wallet_id,
             source_coin->coin_name,
-            batch,
-            target_amount_mojos,
+            plan.batch,
+            plan.split_amount,
             fee);
 
-        result.coins_created = batch;
+        result.coins_created = plan.batch;
         result.fee_paid      = fee;
         result.success       = true;
 
@@ -404,7 +448,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
         logger_->info("ensure_split: created {} coins of {} mojos each "
                       "(fee {} mojos, tx={})",
-                      batch, target_amount_mojos, fee,
+                      plan.batch, plan.split_amount, fee,
                       result.tx_id.empty() ? "(none)" :
                       result.tx_id.substr(0, 16));
 
