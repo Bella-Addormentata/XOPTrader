@@ -568,7 +568,8 @@ private:
     /// never double-book.  GIPS/TWR: the USD accumulates as net deposits
     /// outside trading P&L, and the drawdown peak shifts with each flow
     /// completed while this process is alive.
-    void step_ingest_bridge_flows(BlockHeight block_height);
+    asio::awaitable<void> step_ingest_bridge_flows(
+        BlockHeight block_height);
 
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
@@ -852,6 +853,16 @@ private:
     /// recovery paths resume maintaining it instead of both sides
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
+
+    /// [S19 review round 17] Booked bridge flows (signed CAT mojos)
+    /// whose quantity has not yet been folded into InventoryTracker by
+    /// the wallet-truth reconcile.  The peak rescale is attributed from
+    /// THIS, clamped onto the actual reconcile delta: fills also move
+    /// the bridge asset's wallet balance (fill processing tracks only
+    /// the base side), and crediting the peak for the full delta would
+    /// launder trading results into the GIPS anchor.  In-memory only: a
+    /// restart re-anchors the peak from live equity anyway.
+    Mojo bridge_unapplied_flow_mojos_{0};
 
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)

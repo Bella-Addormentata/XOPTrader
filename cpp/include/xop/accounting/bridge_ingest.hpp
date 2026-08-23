@@ -77,6 +77,16 @@ struct BridgeJobRow {
     /// a pre-opening burn drift past the opening filter (review round 3).
     std::string  flow_at;
     std::string  state_json;        ///< Evolving payload; carries direction.
+    /// ISO-8601 UTC of the job's first broadcast event (CLAIMING /
+    /// BURN_SENT) -- a LOWER BOUND on when the wallet could have
+    /// changed.  warp_events.ts records GUI-persist time, which lags
+    /// the on-chain effect by up to minutes; the opening filter must
+    /// compare against the earliest possible wallet change or a genesis
+    /// falling inside that lag window double-books the flow (review
+    /// round 17).  Empty when no broadcast event exists (fall back to
+    /// flow_at).
+    std::string  flow_lb;
+
     /// ISO-8601 UTC creation stamp (immutable, never rewritten).  Part of
     /// the ledger identity: a recreated jobs DB restarts AUTOINCREMENT,
     /// and "bridge:job:1" alone would collide with a genuinely new flow,

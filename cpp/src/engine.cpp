@@ -1850,7 +1850,7 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // mint must be explained flow (a 'bridge_deposit' entry) by the time
     // the books are tied to the wallet, not divergence for a blind
     // adjusting entry to absorb.
-    try { step_ingest_bridge_flows(block_height); }
+    try { co_await step_ingest_bridge_flows(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Bridge ingestion failed: {}", e.what());
     }
@@ -11576,20 +11576,21 @@ bool Engine::bridge_accounting_operational() const
 // events.  See accounting/bridge_ingest.hpp for the design rationale and
 // engine.hpp for the contract.  Synchronous on purpose: one read-only
 // SQLite open of a small GUI-owned database per heartbeat, no RPC.
-void Engine::step_ingest_bridge_flows(BlockHeight block_height)
+asio::awaitable<void> Engine::step_ingest_bridge_flows(
+    BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
-    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) return;
-    if (!db_ || !inventory_ || !pnl_) return;
-    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) return;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (!db_ || !inventory_ || !pnl_) co_return;
+    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) co_return;
 
     // Same stand-down conditions as the invariant control: without a
     // genesis baseline (or with known-incomplete books) posting bridge
     // legs would only deepen the inconsistency.
-    if (!ledger_genesis_done_ || ledger_incomplete_) return;
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
 
     const AssetId asset{acc.bridge_asset_id};
-    if (!ledger_opened_assets_.count(asset)) return;
+    if (!ledger_opened_assets_.count(asset)) co_return;
 
     // The GUI owns warp_jobs.db; the engine only ever reads it.
     // SQLITE_OPEN_READONLY refuses to create the file and makes writes
@@ -11652,7 +11653,10 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
                                             'RELAYING',
                                             'AWAITING_EXTERNAL_RELAY')), ''),
                COALESCE(j.state, '{}'),
-               COALESCE(j.created_at, '')
+               COALESCE(j.created_at, ''),
+               COALESCE((SELECT MIN(e.ts) FROM warp_events e
+                         WHERE e.job_id = j.id
+                           AND e.status IN ('CLAIMING', 'BURN_SENT')), '')
         FROM warp_jobs j
         WHERE EXISTS (SELECT 1 FROM warp_events e
                       WHERE e.job_id = j.id
@@ -11685,9 +11689,12 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             sqlite3_column_text(stmt, 4));
         const char* ca = reinterpret_cast<const char*>(
             sqlite3_column_text(stmt, 5));
+        const char* lb = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 6));
         r.flow_at    = fa ? fa : "";
         r.state_json = sj ? sj : "{}";
         r.created_at = ca ? ca : "";
+        r.flow_lb    = lb ? lb : "";
         jobs.push_back(std::move(r));
     }
     // A truncated scan must not be processed as a complete snapshot:
@@ -11726,30 +11733,54 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         jobs.clear();
     }
 
-    // Booking requires a CONTEMPORANEOUS wallet snapshot (review round
-    // 12): Step 8's cache writers sit inside step_manage_offers, which
-    // is skipped during GUI/breaker/flash-crash pauses.  Journaling a
-    // flow against a stale balance would let the invariant score two
-    // observations against the old figure and post an erroneous
-    // counter-adjust; with booking deferred, books and the stale
-    // snapshot AGREE (both exclude the flow) until posting resumes,
-    // and the first fresh heartbeat books and reconciles cleanly.
+    // Fresh wallet truth ON DEMAND (review round 17): Step 8's cache
+    // writers live inside step_manage_offers, which is skipped during
+    // GUI/breaker/flash-crash pauses -- the previous same-block gate
+    // therefore made booking impossible for the ENTIRE paused period,
+    // leaving the ledger and Net Deposits stale exactly when the
+    // operator inspects them.  Fetching the balance here also closes
+    // the earlier ordering races outright: the snapshot now postdates
+    // every job already visible in this scan's list, so booking and
+    // reconciling in the same pass is safe and the old booked==0
+    // deferral is gone.
     bool snapshot_current = false;
     if (auto sit = cached_wallet_balances_.find(asset);
         sit != cached_wallet_balances_.end()) {
         snapshot_current = sit->second.as_of_block == block_height
             && sit->second.pending_change == 0;
     }
+    if (!snapshot_current && offer_mgr_ && wallet_ && wallet_->is_open()) {
+        const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
+        if (wid > 0) {
+            try {
+                auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                WalletBalanceEntry e{};
+                e.spendable = bal_json.value("spendable_balance",
+                                             static_cast<Mojo>(0));
+                e.confirmed = bal_json.value("confirmed_wallet_balance",
+                                             static_cast<Mojo>(0));
+                e.pending_change = bal_json.value("pending_change",
+                                                  static_cast<Mojo>(0));
+                e.as_of_block = block_height;
+                cached_wallet_balances_[asset] = e;
+                snapshot_current = e.pending_change == 0;
+            } catch (const std::exception& ex) {
+                spdlog::debug("[Engine] Bridge ingest: on-demand balance "
+                              "fetch failed ({}) -- deferring this "
+                              "heartbeat", ex.what());
+            }
+        }
+    }
     if (!snapshot_current && !jobs.empty()) {
-        spdlog::debug("[Engine] Bridge ingest: no contemporaneous wallet "
-                      "snapshot (Step 8 gated?) -- booking deferred this "
-                      "heartbeat");
+        spdlog::debug("[Engine] Bridge ingest: no usable wallet snapshot "
+                      "-- booking deferred this heartbeat");
         jobs.clear();
     }
 
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
+    double      prefolded_flow_usd = 0.0;   // flows already inside inventory
 
     for (const auto& row : jobs) {
         // Skip warnings fire ONCE per job (review round 10): skipped
@@ -11808,10 +11839,19 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // the old adjust in place was considered and declined: it would
         // edit journaled history, and the three-entry form is exactly
         // how a correcting entry is supposed to look.
-        if (!accounting::iso_strictly_after(row.flow_at, opening_time)) {
-            spdlog::debug("[Engine] Bridge ingest: job {} flowed at or "
-                          "before the {} ledger opening ({}) -- already "
-                          "inside the opening balance, not booked",
+        // Compare the BROADCAST lower bound against the opening
+        // (review round 17): warp_events.ts is GUI-persist time, and
+        // the wallet changes at broadcast confirmation, up to minutes
+        // earlier.  A genesis inside that lag window would otherwise
+        // read the flow as post-opening and double-book net deposits
+        // permanently.  Skipping degrades to an adjust -- the
+        // established safe direction.
+        const std::string& flow_floor =
+            row.flow_lb.empty() ? row.flow_at : row.flow_lb;
+        if (!accounting::iso_strictly_after(flow_floor, opening_time)) {
+            spdlog::debug("[Engine] Bridge ingest: job {} may predate the "
+                          "{} ledger opening ({}) -- treated as inside "
+                          "the opening balance, not booked",
                           row.id, asset.substr(0, 12), opening_time);
             continue;
         }
@@ -11844,7 +11884,7 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             // write failure just retries next heartbeat (review round 1).
             spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
                           "job {} -- will retry next heartbeat", row.id);
-            return;
+            co_return;
         }
         if (*inserted == 0) continue;    // already booked (restart/re-scan)
 
@@ -11857,9 +11897,22 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // 3. External capital, kept out of trading P&L (GIPS/TWR).
         pnl_->add_net_deposit_usd(val.flow_usd);
 
-        // 4. The GIPS peak adjustment happens at the wallet-truth
-        // reconcile below, measured directly across the inventory
-        // mutation -- no per-flow bookkeeping needed (review round 16).
+        // 4. GIPS attribution (review round 17): remember how much of
+        // the NEXT inventory delta is external flow.  Fills also move
+        // this asset's wallet balance (only the base side is tracked at
+        // fill time), so the reconcile below must not credit the peak
+        // for trading-caused deltas.  If inventory ALREADY matches the
+        // wallet (an earlier reconcile folded the mint before its job
+        // became visible), the flow is pre-folded: aggregate it for one
+        // inference-based rescale after the loop -- provably safe there
+        // because inventory equals wallet truth and prices are this
+        // heartbeat's.
+        if (inventory_->net_inventory(asset)
+                == cached_wallet_balances_[asset].confirmed) {
+            prefolded_flow_usd += val.flow_usd;
+        } else {
+            bridge_unapplied_flow_mojos_ += flow.delta_mojos;
+        }
 
         ++booked;
         booked_usd += val.flow_usd;
@@ -11873,6 +11926,26 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         spdlog::info("[Engine] Bridge ingest: booked {} flow(s), net "
                      "${:+.6f} external capital at block {}",
                      booked, booked_usd, block_height);
+    }
+
+    // One aggregated rescale for flows that were PRE-FOLDED into
+    // inventory before their jobs became visible (round 17): equity
+    // already contains them, inventory provably matched wallet truth at
+    // booking, and prices are this heartbeat's, so inferring the
+    // pre-flow equity is safe here -- and aggregating avoids the
+    // round-7 compounding error.
+    if (prefolded_flow_usd != 0.0 && peak_equity_hwm_usd_ > 0.0) {
+        const double e_now = compute_portfolio_equity_usd();
+        const double e_pre = e_now - prefolded_flow_usd;
+        if (e_now > 0.0 && e_pre > 0.0) {
+            const double rescaled =
+                peak_equity_hwm_usd_ * (e_now / e_pre);
+            spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
+                         "{:.2f} -> {:.2f} for ${:+.6f} of pre-folded "
+                         "flow", peak_equity_hwm_usd_, rescaled,
+                         prefolded_flow_usd);
+            peak_equity_hwm_usd_ = rescaled;
+        }
     }
 
     // Single-writer inventory maintenance (review rounds 4-6): the scan
@@ -11891,60 +11964,68 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     if (auto bit = cached_wallet_balances_.find(asset);
         bit != cached_wallet_balances_.end()) {
         const auto& bal = bit->second;
-        // CURRENT-heartbeat snapshots only (review round 8): Step 8
-        // stamps block_height before this scan runs, so equality means
-        // the snapshot postdates every Step 2 fill of this cycle.  An
-        // older snapshot -- Step 8 skipped during pauses -- could
-        // predate a fill and overwrite it; in that case the reconcile
-        // simply defers to the next heartbeat Step 8 runs.
-        //
-        // ALSO defer on any pass that BOOKED a flow (review round 9):
-        // the GUI can record a booking-eligible transition between
-        // Step 8's wallet query and this scan, in which case even the
-        // current-heartbeat snapshot predates the flow and reconciling
-        // would set inventory below truth.  Next heartbeat Step 8
-        // re-queries after the flow's on-chain effect, and the
-        // still-pending peak rescale is consumed then.  (The invariant
-        // sees at most one transient divergence observation this
-        // heartbeat -- below its 2-observation action gate.)
-        const bool fresh = booked == 0
+        // The on-demand fetch above guarantees a current-heartbeat
+        // snapshot that postdates every job in this scan (round 17), so
+        // booking and reconciling in the same pass is safe.
+        const bool fresh = snapshot_current
             && bal.as_of_block == block_height
             && bal.pending_change == 0;
         if (fresh && bal.confirmed >= 0) {
             const Mojo tracked = inventory_->net_inventory(asset);
             if (tracked != bal.confirmed) {
-                // GIPS anchor adjustment, MEASURED (review round 16):
-                // equity is sampled immediately before and after the
-                // mutation, so the peak scales by exactly the equity
-                // change this external-capital reconcile causes -- same
-                // prices on both sides of the measurement.  The drawdown
-                // fraction the breaker tests is preserved by
-                // construction, with no flow classification, baseline
-                // timestamp, pending accumulator, or double-count: an
-                // inventory that already matches produces factor 1.0.
-                // (The earlier inferred-equity design distorted under
-                // delayed reconciliation, double-fold races, startup
-                // races, and restart catch-up -- the five round-16
-                // threads.)
+                // GIPS anchor adjustment, FLOW-ATTRIBUTED (review round
+                // 17): the raw wallet-vs-inventory delta mixes external
+                // flows with ordinary fills (fills move this asset's
+                // wallet balance but only the base side is tracked at
+                // fill time), so the peak rescales ONLY for the portion
+                // explained by booked-but-unfolded flows -- the clamp of
+                // bridge_unapplied_flow_mojos_ onto the actual delta.
+                // The fill residual legitimately moves drawdown: it is
+                // trading.  e_before is measured this heartbeat, so no
+                // market-move distortion enters the factor.
+                const Mojo raw_delta = bal.confirmed - tracked;
+                const Mojo lo = raw_delta < 0 ? raw_delta : Mojo{0};
+                const Mojo hi = raw_delta > 0 ? raw_delta : Mojo{0};
+                const Mojo flow_part = std::clamp(
+                    bridge_unapplied_flow_mojos_, lo, hi);
+                bridge_unapplied_flow_mojos_ -= flow_part;
+                const double flow_part_usd =
+                    (static_cast<double>(flow_part) / mojos_per_unit)
+                    * usd_per_unit;
+
                 const double e_before = compute_portfolio_equity_usd();
                 inventory_->adjust_quantity(asset, bal.confirmed,
                                             numeraire_pseudo);
-                const double e_after = compute_portfolio_equity_usd();
-                if (e_before > 0.0 && e_after > 0.0
-                    && peak_equity_hwm_usd_ > 0.0) {
-                    const double rescaled =
-                        peak_equity_hwm_usd_ * (e_after / e_before);
-                    spdlog::info("[Engine] Bridge ingest: drawdown peak "
-                                 "rescaled {:.2f} -> {:.2f} (measured "
-                                 "equity {:.2f} -> {:.2f} across the "
-                                 "external-capital reconcile)",
-                                 peak_equity_hwm_usd_, rescaled,
-                                 e_before, e_after);
-                    peak_equity_hwm_usd_ = rescaled;
-                } else {
-                    spdlog::info("[Engine] Bridge ingest: peak rescale "
-                                 "skipped (equity not yet valued this "
-                                 "early in the run)");
+
+                if (flow_part_usd != 0.0 && peak_equity_hwm_usd_ > 0.0) {
+                    if (e_before > 0.0
+                        && e_before + flow_part_usd >= 0.0) {
+                        // Zero IS a valid post-flow equity (round 17): a
+                        // full withdrawal scales the peak to ~0 instead
+                        // of stranding the stale high-water mark.
+                        const double rescaled = peak_equity_hwm_usd_
+                            * ((e_before + flow_part_usd) / e_before);
+                        spdlog::info("[Engine] Bridge ingest: drawdown "
+                                     "peak rescaled {:.2f} -> {:.2f} for "
+                                     "${:+.6f} of flow (raw delta {} "
+                                     "mojos, flow part {} mojos)",
+                                     peak_equity_hwm_usd_, rescaled,
+                                     flow_part_usd, raw_delta, flow_part);
+                        peak_equity_hwm_usd_ = rescaled;
+                    } else if (e_before <= 0.0 && flow_part_usd > 0.0) {
+                        // Deposit into ZERO equity: re-anchor fresh (a
+                        // ratio would divide by zero).
+                        const double e_after =
+                            compute_portfolio_equity_usd();
+                        spdlog::info("[Engine] Bridge ingest: peak "
+                                     "re-anchored to {:.2f} (deposit "
+                                     "into zero equity)", e_after);
+                        peak_equity_hwm_usd_ = e_after;
+                    } else {
+                        spdlog::info("[Engine] Bridge ingest: peak "
+                                     "rescale skipped (equity not yet "
+                                     "valued this early in the run)");
+                    }
                 }
                 inv_changed = true;
                 spdlog::info("[Engine] Bridge ingest: reconciled {} "
@@ -11974,6 +12055,7 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     if (booked > 0 || inv_changed) {
         persist_inventory_state();
     }
+    co_return;
 }
 
 void Engine::step_check_ledger_invariant(BlockHeight block_height)
