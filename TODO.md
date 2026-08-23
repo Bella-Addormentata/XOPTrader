@@ -1,7 +1,7 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-18 (v0.9.8+)** — full re-verification of every open item against the current codebase (grep, file reads, `git log -S`) following four months of landed work: PR #66 accounting/quoting/safety overhaul (da8f6c1), the P&L overhaul (e4405a9), drawdown-breaker recalibration to portfolio equity (692c1fd), the warp.green bridge + Base wallet subsystem (PRs through #78), fee reserves (PR #79), and revive_market (PR #80).
+**Last audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
 **Source:** Consolidated from all code reviews in `docs/CODE REVIEWS/` plus the 2026-08 live-operation sessions.
 
 **Status Key:** `[ ]` = Not started | `[~]` = In progress | `[x]` = Complete
