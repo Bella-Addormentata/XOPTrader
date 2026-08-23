@@ -505,8 +505,10 @@ private:
     ///                  opening balance (offers restored from a prior run can
     ///                  settle during downtime and are detected afterwards),
     ///                  so their legs must be suppressed or they double-count.
-    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances,
-                             BlockHeight at_block);
+    void post_ledger_genesis(
+        const std::unordered_map<AssetId, Mojo>& balances,
+        BlockHeight at_block,
+        const std::unordered_map<AssetId, std::string>& observed_at);
 
     /// Post the balanced legs of a settled fill (base, quote and fee).
     /// Idempotent on the fill's trade id.

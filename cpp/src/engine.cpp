@@ -1030,6 +1030,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Collect confirmed balances so opening entries can be
             // posted once, from wallet truth, at ledger genesis.
             std::unordered_map<AssetId, Mojo> genesis_balances;
+            // [S19 review round 12] Per-asset balance OBSERVATION times:
+            // the opening's entry_time must reflect when the balance was
+            // read, not when post_ledger_genesis later writes the row --
+            // a flow completing between the two was absent from the
+            // balance yet predated the row's stamp, permanently failing
+            // the bridge chronology test.  Captured AFTER the RPC
+            // returns, biasing the irreducible in-flight race toward
+            // skip (degrades to an adjust) over double-book.
+            std::unordered_map<AssetId, std::string> genesis_observed_at;
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
                 if (wid <= 0) continue;
@@ -1060,6 +1069,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     if (confirmed > 0) {
                         genesis_balances[AssetId{aid}] = confirmed;
                     }
+                    genesis_observed_at[AssetId{aid}] =
+                        PnLTracker::timestamp_to_iso(
+                            std::chrono::system_clock::now());
 
                     // Use 1 as synthetic cost basis -- the actual value
                     // doesn't affect inventory_ratio because that method
@@ -1096,7 +1108,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Establish opening balances (no-op after the first
             // run -- the 'opening' legs already exist).  Anchored to the
             // startup block so downtime fills are not counted twice.
-            post_ledger_genesis(genesis_balances, startup_block_);
+            post_ledger_genesis(genesis_balances, startup_block_,
+                                genesis_observed_at);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
@@ -11070,7 +11083,8 @@ void Engine::persist_inventory_state() noexcept
 
 void Engine::post_ledger_genesis(
     const std::unordered_map<AssetId, Mojo>& balances,
-    BlockHeight at_block)
+    BlockHeight at_block,
+    const std::unordered_map<AssetId, std::string>& observed_at)
 {
     if (!config_.accounting.ledger_enabled || !db_) return;
 
@@ -11099,7 +11113,13 @@ void Engine::post_ledger_genesis(
         if (db_->has_ledger_opening(asset)) continue;   // once, ever
 
         DbLedgerEntry e;
-        e.entry_time   = now_iso;
+        // The opening's entry_time is the balance OBSERVATION time when
+        // known (review round 12): the bridge chronology test compares
+        // flow times against it, and the later write time would wrongly
+        // classify an in-between flow as already inside the opening.
+        const auto oit = observed_at.find(asset);
+        e.entry_time   = (oit != observed_at.end() && !oit->second.empty())
+                           ? oit->second : now_iso;
         e.event_type   = "opening";
         e.event_id     = "genesis:" + asset;
         e.leg          = "opening";
@@ -11710,6 +11730,27 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         spdlog::warn("[Engine] Bridge ingest: no opening timestamp for {} "
                      "despite ledger_opened_assets_ -- booking skipped "
                      "this heartbeat", asset.substr(0, 12));
+        jobs.clear();
+    }
+
+    // Booking requires a CONTEMPORANEOUS wallet snapshot (review round
+    // 12): Step 8's cache writers sit inside step_manage_offers, which
+    // is skipped during GUI/breaker/flash-crash pauses.  Journaling a
+    // flow against a stale balance would let the invariant score two
+    // observations against the old figure and post an erroneous
+    // counter-adjust; with booking deferred, books and the stale
+    // snapshot AGREE (both exclude the flow) until posting resumes,
+    // and the first fresh heartbeat books and reconciles cleanly.
+    bool snapshot_current = false;
+    if (auto sit = cached_wallet_balances_.find(asset);
+        sit != cached_wallet_balances_.end()) {
+        snapshot_current = sit->second.as_of_block == block_height
+            && sit->second.pending_change == 0;
+    }
+    if (!snapshot_current && !jobs.empty()) {
+        spdlog::debug("[Engine] Bridge ingest: no contemporaneous wallet "
+                      "snapshot (Step 8 gated?) -- booking deferred this "
+                      "heartbeat");
         jobs.clear();
     }
 

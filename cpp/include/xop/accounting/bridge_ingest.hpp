@@ -93,7 +93,7 @@ struct BridgeFlow {
     bool        inbound{false};
     Mojo        delta_mojos{0};     ///< Signed: + mint, - burn.
     std::string event_type;         ///< bridge_deposit | bridge_withdrawal.
-    std::string event_id;           ///< "bridge:job:<id>".
+    std::string event_id;           ///< "bridge:job:<id>:<created_at>".
     /// The job's asset fingerprint from its state payload, verbatim
     /// ("v1:<erc20>:<erc20_dec>:<cat_dec>:<chia_asset_id>"; empty when the
     /// job predates fingerprints).  The caller MUST check it against the
@@ -104,12 +104,16 @@ struct BridgeFlow {
     std::string asset_fingerprint;
 };
 
-/// Classify one COMPLETED warp job into a ledger flow.  Returns
-/// valid=false (book nothing) when the row cannot be classified: bad id,
-/// unparseable state JSON (skip rather than guess a direction), or a
-/// non-positive quantity for the indicated direction.  DRY_RUN_OK /
-/// FAILED / CANCELLED jobs move nothing cross-chain and must be filtered
-/// out by the caller's status predicate before this runs.
+/// Classify one booking-eligible warp job into a ledger flow: inbound
+/// rows at COMPLETED, outbound rows from the first burn-confirmed status
+/// onward (the caller selects by EXISTENCE of the historical
+/// booking-point event, so a post-burn job later moved to FAILED still
+/// classifies).  Returns valid=false (book nothing) when the row cannot
+/// be classified: bad id, unparseable state JSON (skip rather than guess
+/// a direction), unknown direction value, or a non-positive quantity for
+/// the indicated direction.  Jobs that never reached a booking point
+/// (pre-burn FAILED / CANCELLED, DRY_RUN_OK) have no such event and must
+/// be excluded by the caller's selection before this runs.
 [[nodiscard]] inline BridgeFlow classify_bridge_job(const BridgeJobRow& row)
 {
     BridgeFlow f{};
