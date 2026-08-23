@@ -34,7 +34,9 @@ BridgeJobRow inbound_job() {
     r.post_tip_mojos = kJob2Minted;
     r.updated_at     = "2026-08-23T18:31:12+00:00";
     // Inbound jobs carry no "direction" key; that absence IS the marker.
-    r.state_json     = R"({"phase": "done", "claim_block": 9189949})";
+    // The fingerprint is the live job 2 shape (v1:<erc20>:<dec>:<dec>:<id>).
+    r.state_json     = R"({"phase": "done", "claim_block": 9189949,
+        "asset_fingerprint": "v1:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"})";
     return r;
 }
 
@@ -44,7 +46,8 @@ BridgeJobRow outbound_job() {
     r.amount_mojos   = 20'000;             // burned CAT mojos
     r.post_tip_mojos = 0;
     r.updated_at     = "2026-08-24T02:00:00+00:00";
-    r.state_json     = R"({"direction": "out", "receiver_evm": "3b04"})";
+    r.state_json     = R"({"direction": "out", "receiver_evm": "3b04",
+        "asset_fingerprint": "v1:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"})";
     return r;
 }
 
@@ -92,6 +95,58 @@ TEST(BridgeClassifyTest, NonPositiveQuantitiesAreRefused) {
     EXPECT_FALSE(classify_bridge_job(bad_id).valid);
 }
 
+TEST(BridgeClassifyTest, UnknownDirectionIsRefusedNotDefaulted) {
+    // (review round 1) Any present direction other than exactly "out" is
+    // unclassifiable -- a typo or future enum value must never default
+    // to a signed booking.
+    auto r = inbound_job();
+    r.state_json = R"({"direction": "outt"})";
+    EXPECT_FALSE(classify_bridge_job(r).valid);
+    r.state_json = R"({"direction": "in"})";
+    EXPECT_FALSE(classify_bridge_job(r).valid);
+    r.state_json = R"({"direction": ""})";   // empty string == absent
+    EXPECT_TRUE(classify_bridge_job(r).valid);
+}
+
+TEST(BridgeClassifyTest, FingerprintIsCapturedForTheCaller) {
+    const auto f = classify_bridge_job(inbound_job());
+    ASSERT_TRUE(f.valid);
+    EXPECT_NE(f.asset_fingerprint.find("fa4a180a"), std::string::npos);
+}
+
+TEST(BridgeFingerprintTest, LiveJobFingerprintMatchesConfiguredAsset) {
+    const xop::AccountingConfig acc{};
+    const auto f = classify_bridge_job(inbound_job());
+    ASSERT_TRUE(f.valid);
+    EXPECT_TRUE(fingerprint_matches_asset(f.asset_fingerprint,
+                                          acc.bridge_asset_id));
+}
+
+TEST(BridgeFingerprintTest, ForeignAssetDoesNotMatch) {
+    // A milliETH job must never book at the $1 numeraire (review round 1).
+    const std::string milli_fp =
+        "v1:0000000000000000000000000000000000000000:18:3:"
+        "b1a2c3d4e5f60718293a4b5c6d7e8f901a2b3c4d5e6f708192a3b4c5d6e7f809";
+    const xop::AccountingConfig acc{};
+    EXPECT_FALSE(fingerprint_matches_asset(milli_fp, acc.bridge_asset_id));
+}
+
+TEST(BridgeFingerprintTest, AbsentOrMalformedFingerprintNeverMatches) {
+    const xop::AccountingConfig acc{};
+    EXPECT_FALSE(fingerprint_matches_asset("", acc.bridge_asset_id));
+    EXPECT_FALSE(fingerprint_matches_asset("no-colons-here",
+                                           acc.bridge_asset_id));
+    EXPECT_FALSE(fingerprint_matches_asset("v1:", acc.bridge_asset_id));
+    EXPECT_FALSE(fingerprint_matches_asset("v1:abc:6:3:",
+                                           acc.bridge_asset_id));
+}
+
+TEST(BridgeFingerprintTest, MatchIsCaseInsensitive) {
+    EXPECT_TRUE(fingerprint_matches_asset("v1:x:6:3:ABCDEF12", "abcdef12"));
+    EXPECT_TRUE(fingerprint_matches_asset("v1:x:6:3:abcdef12", "ABCDEF12"));
+    EXPECT_FALSE(fingerprint_matches_asset("v1:x:6:3:abcdef13", "abcdef12"));
+}
+
 TEST(BridgeClassifyTest, InboundIgnoresGrossAmount) {
     // The gross deposit is 5,000 but only 4,985 arrived on-chain; booking
     // the gross would manufacture 15 mojos of phantom divergence.
@@ -125,6 +180,16 @@ TEST(BridgeValueTest, DegenerateInputsZeroOut) {
     EXPECT_EQ(value_bridge_flow(1'000, std::nan(""),
                                 1.0).fmv_pseudo_price, 0);
     EXPECT_EQ(value_bridge_flow(1'000, 1e3, 1e13).fmv_pseudo_price, 0);
+}
+
+TEST(BridgeValueTest, PseudoPriceScaleCannotOverflowMojo) {
+    // (review round 1) The 1e12 scale overflows int64 above ~$9.2M/unit;
+    // the guard must reject BEFORE the cast (which would be UB), while
+    // legitimate large-but-safe prices still value.
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3, 1e7).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3, 9.3e6).fmv_pseudo_price, 0);
+    const auto ok = value_bridge_flow(1'000, 1e3, 9.0e6);
+    EXPECT_GT(ok.fmv_pseudo_price, 0);
 }
 
 // ============================================================================
@@ -184,6 +249,30 @@ TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
     EXPECT_FALSE(completed_during_process("", "2026-08-23T19:08:00Z"));
     EXPECT_FALSE(completed_during_process("2026-08-23T19:31:12Z", ""));
     EXPECT_FALSE(completed_during_process("yesterday", "today"));
+}
+
+// ============================================================================
+// Opening filter (review round 1: fresh/reset-ledger double-count guard)
+// ============================================================================
+
+TEST(BridgeOpeningFilterTest, JobAfterOpeningBooks) {
+    EXPECT_TRUE(iso_strictly_after(
+        "2026-08-23T19:31:12+00:00", "2026-08-01T00:00:00Z"));
+}
+
+TEST(BridgeOpeningFilterTest, JobAtOrBeforeOpeningSkips) {
+    // A tie skips ON PURPOSE: under-booking degrades to the pre-S19
+    // divergence-adjust behaviour, double-booking permanently overstates
+    // net deposits.
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-08-01T00:00:00Z", "2026-08-01T00:00:00+00:00"));
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-07-31T23:59:59Z", "2026-08-01T00:00:00Z"));
+}
+
+TEST(BridgeOpeningFilterTest, MalformedTimestampsFailClosed) {
+    EXPECT_FALSE(iso_strictly_after("", "2026-08-01T00:00:00Z"));
+    EXPECT_FALSE(iso_strictly_after("2026-08-23T19:31:12Z", ""));
 }
 
 // ============================================================================

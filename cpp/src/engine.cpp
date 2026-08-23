@@ -56,6 +56,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -11526,22 +11527,41 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     // this host) or a transiently locked one is a clean no-op: unbooked
     // flows simply remain wallet-vs-books divergence for the invariant to
     // absorb -- the pre-S19 behaviour, not a new failure mode.
-    sqlite3* wdb = nullptr;
-    int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &wdb,
+    sqlite3* raw_db = nullptr;
+    int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &raw_db,
                              SQLITE_OPEN_READONLY, nullptr);
+    // RAII: sqlite3_open_v2 hands back a handle even on failure, and an
+    // exception between prepare and finalize must not leak either handle
+    // (review round 1).
+    const std::unique_ptr<sqlite3, int (*)(sqlite3*)> wdb_guard(
+        raw_db, &sqlite3_close);
+    sqlite3* const wdb = raw_db;
     if (rc != SQLITE_OK) {
         spdlog::debug("[Engine] Bridge ingest: cannot open {} read-only "
                       "({}) -- skipping this heartbeat",
                       acc.bridge_jobs_db_path,
                       wdb ? sqlite3_errmsg(wdb) : "out of memory");
-        if (wdb) sqlite3_close(wdb);
         return;
     }
-    // The GUI holds WAL writers; brief waits are expected and cheap.
-    sqlite3_busy_timeout(wdb, 2000);
+    // This runs on the engine's io_context thread: a locked database
+    // this heartbeat is a clean skip, not worth blocking the event loop
+    // for (review round 1).  The GUI's WAL writers hold locks only
+    // briefly.
+    sqlite3_busy_timeout(wdb, 250);
 
-    // Only COMPLETED moves value cross-chain: FAILED/CANCELLED recovered
-    // or never sent funds, and DRY_RUN_OK deliberately broadcast nothing.
+    // Inbound books at COMPLETED (the mint lands with completion).
+    // Outbound books as soon as the Chia burn is IRREVERSIBLY on-chain:
+    // COLLECTING_EVM_SIGS is entered only after the burn confirms
+    // (gui/services/warp/service.py _h_burning), while COMPLETED waits
+    // for Base-side delivery -- minutes normally, UNBOUNDED for
+    // AWAITING_EXTERNAL_RELAY -- during which the invariant would absorb
+    // the burn as blind adjust churn, exactly what this step exists to
+    // prevent (review round 1).  The three extra statuses are
+    // outbound-only vocabulary, so no direction ambiguity enters.
+    // FAILED/CANCELLED recovered or never sent funds, DRY_RUN_OK
+    // deliberately broadcast nothing; a post-burn FAILED job stays
+    // unbooked until the operator resolves it (the slot is held and the
+    // divergence control covers the gap meanwhile -- documented choice).
     static constexpr const char* kJobsSql = R"SQL(
         SELECT id,
                COALESCE(amount_mojos, 0),
@@ -11549,17 +11569,19 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
                COALESCE(updated_at, ''),
                COALESCE(state, '{}')
         FROM warp_jobs
-        WHERE status = 'COMPLETED'
+        WHERE status IN ('COMPLETED', 'COLLECTING_EVM_SIGS', 'RELAYING',
+                         'AWAITING_EXTERNAL_RELAY')
         ORDER BY id;
     )SQL";
 
     sqlite3_stmt* stmt = nullptr;
     rc = sqlite3_prepare_v2(wdb, kJobsSql, -1, &stmt, nullptr);
+    const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> stmt_guard(
+        stmt, &sqlite3_finalize);
     if (rc != SQLITE_OK) {
         spdlog::warn("[Engine] Bridge ingest: prepare failed on {} ({}) -- "
                      "skipping this heartbeat",
                      acc.bridge_jobs_db_path, sqlite3_errmsg(wdb));
-        sqlite3_close(wdb);
         return;
     }
 
@@ -11577,14 +11599,29 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         r.state_json = sj ? sj : "{}";
         jobs.push_back(std::move(r));
     }
-    sqlite3_finalize(stmt);
-    sqlite3_close(wdb);
+    // Handles released by the RAII guards at scope exit; the booking
+    // below deliberately runs after the scan so the read-only handle is
+    // not held across ledger writes.
 
     // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
     // AccountingConfig peg-monitor doctrine), so no price feed is needed
     // and a flow can never be deferred for want of an FMV.
     const double usd_per_unit   = 1.0;
     const double mojos_per_unit = (asset == "xch") ? 1e12 : 1e3;
+
+    // Jobs completed at or before the asset's opening are already inside
+    // the opening balance (the opening records the live wallet, mint
+    // included); booking them again would double-count on a fresh or
+    // reset ledger (review round 1).  Ties skip: under-booking degrades
+    // to the pre-S19 adjust behaviour, double-booking permanently
+    // overstates net deposits.
+    const std::string opening_time = db_->ledger_opening_time(asset);
+    if (opening_time.empty()) {
+        spdlog::warn("[Engine] Bridge ingest: no opening timestamp for {} "
+                     "despite ledger_opened_assets_ -- skipping this "
+                     "heartbeat", asset.substr(0, 12));
+        return;
+    }
 
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
@@ -11593,10 +11630,31 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     for (const auto& row : jobs) {
         const auto flow = accounting::classify_bridge_job(row);
         if (!flow.valid) {
-            spdlog::warn("[Engine] Bridge ingest: COMPLETED job {} is "
-                         "unclassifiable (bad state or non-positive "
-                         "quantity) -- left for the divergence control",
-                         row.id);
+            spdlog::warn("[Engine] Bridge ingest: job {} is "
+                         "unclassifiable (bad state, unknown direction, or "
+                         "non-positive quantity) -- left for the "
+                         "divergence control", row.id);
+            continue;
+        }
+
+        // The warp GUI can bridge more than one asset; only jobs whose
+        // fingerprint resolves to the configured bridge asset book here.
+        // A milliETH job valued at the $1 numeraire would be badly wrong
+        // (review round 1).  Strict: no fingerprint, no booking.
+        if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
+                                                   acc.bridge_asset_id)) {
+            spdlog::warn("[Engine] Bridge ingest: job {} asset fingerprint "
+                         "'{}' does not resolve to the configured bridge "
+                         "asset -- skipped (left for the divergence "
+                         "control)", row.id, flow.asset_fingerprint);
+            continue;
+        }
+
+        if (!accounting::iso_strictly_after(row.updated_at, opening_time)) {
+            spdlog::debug("[Engine] Bridge ingest: job {} completed at or "
+                          "before the {} ledger opening ({}) -- already "
+                          "inside the opening balance, not booked",
+                          row.id, asset.substr(0, 12), opening_time);
             continue;
         }
 
@@ -11620,12 +11678,14 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
 
         const auto inserted = db_->append_ledger_entries({e});
         if (!inserted) {
-            // Mirror the fill path: a dropped leg leaves the books
-            // permanently short, so stand the control down honestly.
-            ledger_incomplete_ = true;
+            // Unlike the fill path (which latches ledger_incomplete_
+            // because a wallet-side effect already happened and the leg
+            // is lost), nothing here is half-applied: the scan re-derives
+            // every candidate from warp_jobs.db each heartbeat and the
+            // event_id dedupe makes re-booking safe, so a transient
+            // write failure just retries next heartbeat (review round 1).
             spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
-                          "job {} -- invariant control disabled until "
-                          "restart", row.id);
+                          "job {} -- will retry next heartbeat", row.id);
             return;
         }
         if (*inserted == 0) continue;    // already booked (restart/re-scan)
@@ -11651,16 +11711,39 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
 
         // 4. GIPS anchor shift: the drawdown peak moves WITH the flow so
         // a deposit cannot mask losses (nor a withdrawal fake them).
-        // Only for flows completing while this process is alive: after a
-        // restart the peak re-seeds from an equity that already contains
-        // the flow, and shifting again would double-count it.
+        // PROPORTIONAL, not additive (review round 1): the breaker tests
+        // the FRACTION (peak - equity) / peak, and an additive shift
+        // preserves the dollar gap while inflating that fraction on
+        // withdrawals (peak $158, equity $150, unwrap $100: 5.1% dd
+        // becomes $8/$58 = 13.8% -- a false trip) and diluting it on
+        // deposits.  Scaling by equity_after / equity_before preserves
+        // the fraction exactly.  Equity already contains the flow by
+        // booking time (mint claimed / burn confirmed), so
+        // equity_before = equity_now - flow.  Only for flows completing
+        // while this process is alive: after a restart the peak re-seeds
+        // from an equity that already contains the flow.  Skipped (with
+        // a log) while equity is not yet valued -- the startup grace
+        // covers those cycles.
         if (accounting::completed_during_process(row.updated_at,
                                                  engine_start_iso_)) {
-            peak_equity_hwm_usd_ =
-                std::max(0.0, peak_equity_hwm_usd_ + val.flow_usd);
-            spdlog::info("[Engine] Bridge ingest: drawdown peak shifted "
-                         "{:+.6f} USD for job {} (GIPS flow adjustment)",
-                         val.flow_usd, row.id);
+            const double equity_now    = compute_portfolio_equity_usd();
+            const double equity_before = equity_now - val.flow_usd;
+            if (equity_now > 0.0 && equity_before > 0.0
+                && peak_equity_hwm_usd_ > 0.0) {
+                const double rescaled =
+                    peak_equity_hwm_usd_ * (equity_now / equity_before);
+                spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                             "rescaled {:.2f} -> {:.2f} for job {} flow "
+                             "${:+.6f} (fraction-preserving GIPS "
+                             "adjustment)",
+                             peak_equity_hwm_usd_, rescaled, row.id,
+                             val.flow_usd);
+                peak_equity_hwm_usd_ = rescaled;
+            } else {
+                spdlog::info("[Engine] Bridge ingest: peak rescale "
+                             "skipped for job {} (equity not yet valued "
+                             "this early in the run)", row.id);
+            }
         }
 
         ++booked;

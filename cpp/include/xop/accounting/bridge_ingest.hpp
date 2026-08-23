@@ -25,6 +25,14 @@
 // the ledger's UNIQUE(event_id, leg, asset_id) via event_id
 // "bridge:job:<id>" -- re-scans and restarts are no-ops.
 //
+// KNOWN LIMITATION (review round 1, deferred).  A job is not bound to
+// the ENGINE's wallet: warp.chia_receiver_address is operator-configured,
+// and a wrap delivered to a foreign address would still book here as
+// engine capital (the divergence control would then post a compensating
+// adjust).  Today the receiver is the engine wallet by construction; if
+// that ever changes, the booking must compare the job's receiver_ph
+// against the engine wallet's puzzle hashes before booking.
+//
 // VALUATION.  wUSDC.b is the $1.00 numeraire: the peg is MONITORED, not
 // priced in (AccountingConfig peg-monitor doctrine), so usd_per_unit is
 // exactly 1.0 and the flow's USD is embedded in the ledger note for
@@ -45,6 +53,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 #include <nlohmann/json.hpp>
@@ -73,6 +82,14 @@ struct BridgeFlow {
     Mojo        delta_mojos{0};     ///< Signed: + mint, - burn.
     std::string event_type;         ///< bridge_deposit | bridge_withdrawal.
     std::string event_id;           ///< "bridge:job:<id>".
+    /// The job's asset fingerprint from its state payload, verbatim
+    /// ("v1:<erc20>:<erc20_dec>:<cat_dec>:<chia_asset_id>"; empty when the
+    /// job predates fingerprints).  The caller MUST check it against the
+    /// configured bridge asset via fingerprint_matches_asset before
+    /// booking -- the warp GUI can bridge more than one asset, and a
+    /// milliETH job valued at the $1 numeraire would be badly wrong
+    /// (review round 1).
+    std::string asset_fingerprint;
 };
 
 /// Classify one COMPLETED warp job into a ledger flow.  Returns
@@ -89,7 +106,17 @@ struct BridgeFlow {
     bool outbound = false;
     try {
         const auto st = nlohmann::json::parse(row.state_json);
-        outbound = st.value("direction", std::string{}) == "out";
+        // STRICT direction vocabulary (review round 1): absent or empty
+        // means inbound (the historical marker), "out" means outbound,
+        // and any other present value is unclassifiable -- a typo or a
+        // future enum value must never default to a signed booking.
+        const auto direction = st.value("direction", std::string{});
+        if (direction == "out") {
+            outbound = true;
+        } else if (!direction.empty()) {
+            return f;   // unknown direction: refuse to guess a sign
+        }
+        f.asset_fingerprint = st.value("asset_fingerprint", std::string{});
     } catch (const nlohmann::json::exception&) {
         return f;   // unreadable state: refuse to guess a direction
     }
@@ -108,6 +135,33 @@ struct BridgeFlow {
     f.event_id = "bridge:job:" + std::to_string(row.id);
     f.valid    = true;
     return f;
+}
+
+/// Whether a job's asset fingerprint resolves to `asset_id`.  The
+/// fingerprint's LAST ':'-separated segment is the expected Chia asset id
+/// (gui/services/warp/service.py::_asset_fingerprint); the comparison is
+/// case-insensitive because the GUI lowercases and config might not.
+/// STRICT: an empty or malformed fingerprint does NOT match -- with no
+/// stated identity the engine refuses to book rather than assume the
+/// configured asset (every live job row carries a fingerprint).
+[[nodiscard]] inline bool fingerprint_matches_asset(
+    const std::string& fingerprint, const std::string& asset_id) noexcept
+{
+    if (fingerprint.empty() || asset_id.empty()) return false;
+    const auto pos = fingerprint.rfind(':');
+    if (pos == std::string::npos || pos + 1 >= fingerprint.size()) {
+        return false;
+    }
+    const std::string tail = fingerprint.substr(pos + 1);
+    if (tail.size() != asset_id.size()) return false;
+    for (std::size_t i = 0; i < tail.size(); ++i) {
+        const auto lower = [](char c) {
+            return (c >= 'A' && c <= 'Z')
+                 ? static_cast<char>(c - 'A' + 'a') : c;
+        };
+        if (lower(tail[i]) != lower(asset_id[i])) return false;
+    }
+    return true;
 }
 
 // ---------------------------------------------------------------------------
@@ -132,9 +186,17 @@ struct BridgeValuation {
     BridgeValuation v{};
     if (delta_mojos == 0) return v;
     if (!(mojos_per_unit > 0.0) || !(usd_per_unit > 0.0)) return v;  // NaN-safe
-    if (!(usd_per_unit < 1e12)) return v;                            // Inf-guard
+    // The 1e12 pseudo-price scale overflows Mojo above ~$9.2M/unit, and
+    // converting an out-of-range double to int64 is UB -- bound the SCALED
+    // value against Mojo max before the cast (review round 1).  Also
+    // rejects Inf.
+    const double scaled = usd_per_unit * 1e12 + 0.5;
+    if (!(scaled < static_cast<double>(
+              std::numeric_limits<Mojo>::max()))) {
+        return v;
+    }
 
-    v.fmv_pseudo_price = static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
+    v.fmv_pseudo_price = static_cast<Mojo>(scaled);
     v.flow_usd = (static_cast<double>(delta_mojos) / mojos_per_unit)
                * usd_per_unit;
     return v;
@@ -172,6 +234,24 @@ struct BridgeValuation {
                                  nullptr);
     if (!std::isfinite(v) || !(std::fabs(v) < 1e15)) return 0.0;
     return v;
+}
+
+/// Whether ISO-8601 UTC timestamp `a` is STRICTLY after `b`, comparing the
+/// 19-char "YYYY-MM-DDTHH:MM:SS" prefix (suffix-style-indifferent, same as
+/// completed_during_process below).  Malformed or missing timestamps fail
+/// closed (false).  Used by the opening filter: a job completed at or
+/// before the asset's ledger opening is already INSIDE the opening balance
+/// (the opening records the live wallet, mint included), and booking it
+/// again would double-count -- the fresh/reset-ledger scenario (review
+/// round 1).  Ties skip on purpose: an under-booked flow degrades to the
+/// pre-S19 divergence-adjust behaviour, while a double-booked one
+/// permanently overstates net deposits.
+[[nodiscard]] inline bool iso_strictly_after(
+    const std::string& a, const std::string& b) noexcept
+{
+    constexpr std::size_t kPrefix = 19;
+    if (a.size() < kPrefix || b.size() < kPrefix) return false;
+    return a.compare(0, kPrefix, b, 0, kPrefix) > 0;
 }
 
 // ---------------------------------------------------------------------------

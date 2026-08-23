@@ -1169,10 +1169,13 @@ class MainWindow(QMainWindow):
             }
         usd = float(display.get("net_deposits_usd", 0.0))
         flows = int(display.get("bridge_flows", 0))
+        # Not _fmt_usd: capital carries no "+" (it is not a gain), and a
+        # net-negative figure reads "-$20.00", not "$-20.00".
+        text = f"-${abs(usd):,.2f}" if usd < 0 else f"${usd:,.2f}"
         return {
             "value": usd,
             "spark": usd,
-            "display_text": _fmt_usd(usd),
+            "display_text": text,
             "secondary_text": (
                 f"external capital · {flows:,} bridge flow(s)"
                 if flows else "no bridge flows yet"
