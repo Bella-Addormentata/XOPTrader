@@ -102,6 +102,23 @@ TEST(CoinLockLedgerTest, KnapsackOfSmallerCoinsIsChargedWhenWalletPrefersIt) {
     EXPECT_EQ(ledger.remaining(), kXch * 11 / 10);
 }
 
+TEST(CoinLockLedgerTest, OvershootingKnapsackAccepts500Coins) {
+    // (review round 10) The strict <500 rule applies only to the
+    // exact-total branch; chia's knapsack fallback accepts an OVERSHOOTING
+    // 500-coin result.  500 two-mojo coins vs need 999: the wallet locks
+    // the 500 small coins (covering 1000), not the 1000-mojo coin -- and
+    // so must the model, or a later lock diverges on identity.
+    std::vector<Mojo> coins(500, 2);
+    coins.push_back(1'000);
+    CoinLockLedger ledger(coins, 0, 1.0);
+
+    ASSERT_TRUE(ledger.try_lock(999, 0));
+    EXPECT_EQ(ledger.committed(), 1'000);    // the dust total, overshooting
+    EXPECT_EQ(ledger.remaining(), 1'000);    // the big coin survives
+    ASSERT_TRUE(ledger.try_lock(2, 0));      // must now lock the 1000 coin
+    EXPECT_EQ(ledger.remaining(), 0);
+}
+
 TEST(CoinLockLedgerTest, ExactSingleCoinMatchWinsOverKnapsack) {
     // (review round 8) The wallet takes an EXACT one-coin match before any
     // smaller-coin knapsacking: {0.6, 0.6, 1.0} with need 1.0 removes the

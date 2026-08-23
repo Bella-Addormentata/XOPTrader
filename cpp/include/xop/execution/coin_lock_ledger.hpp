@@ -245,12 +245,16 @@ private:
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
-            // The wallet only accepts a smaller-coin match STRICTLY under
-            // its per-spend coin-count limit (chia's exact-all-smaller
-            // branch requires len(smaller_coins) < 500); at or past it,
-            // it falls back to a covering coin (review rounds 7-8).
+            // Coin-count limits mirror chia's two branches (review rounds
+            // 7-10): the exact-all-smaller branch requires STRICTLY fewer
+            // than 500 coins, while the knapsack/largest-first fallback
+            // accepts an overshooting result of up to 500 coins and only
+            // rejects above that.
             constexpr std::size_t kMaxSelectionCoins = 500;
-            if (covered >= need && count < kMaxSelectionCoins) {
+            const bool count_ok =
+                covered == need ? count < kMaxSelectionCoins
+                                : count <= kMaxSelectionCoins;
+            if (covered >= need && count_ok) {
                 tail_sel.covered      = true;
                 tail_sel.locked       = covered;
                 tail_sel.prefix_count = count;   // largest sub-need coins

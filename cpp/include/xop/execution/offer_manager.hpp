@@ -679,6 +679,7 @@ public:
 
 private:
 
+public:
     /// Pure decision table for the ladder preflight (public + static so
     /// the branches that can make an entire ladder disappear are unit
     /// tested): a side whose every tier would be refused is dropped, and
