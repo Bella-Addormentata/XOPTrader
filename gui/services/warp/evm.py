@@ -585,8 +585,18 @@ def is_allowance_revert(exc: BaseException) -> bool:
     every token wording covered (OpenZeppelin "transfer amount exceeds
     allowance" / "insufficient allowance", Circle's FiatToken) while any
     other revert -- toll, pause, receiver -- stays fatal.
+
+    The reason is read through :func:`decode_revert_reason`, not ``str``:
+    nodes differ on where they put it (message vs the ABI ``Error(string)``
+    blob in ``data``), and matching the message alone silently re-breaks
+    the dry run on reason-in-data providers.  Known residual limit: a token
+    using OZ v5 *custom errors* (``ERC20InsufficientAllowance`` selector)
+    carries no reason string at all and cannot be recognised here -- fine
+    for USDC's FiatToken (require strings), worth revisiting if a
+    custom-error token is ever bridged.
     """
-    return _is_execution_revert(exc) and "allowance" in str(exc).lower()
+    return (_is_execution_revert(exc)
+            and "allowance" in decode_revert_reason(exc).lower())
 
 
 def receipt_status(receipt: dict) -> Optional[int]:

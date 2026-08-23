@@ -627,6 +627,52 @@ def test_live_bridging_still_raises_on_the_allowance_revert(monkeypatch):
     assert ctx.evm.bridge_gas is None
 
 
+def test_dry_run_fallback_follows_the_frozen_flag_when_params_say_live(monkeypatch):
+    """_job_dry_run: the flag frozen at DEPOSIT_SEEN wins over live params.
+    A job frozen as a rehearsal must keep its fallback even after the
+    operator flips warp.dry_run to false and restarts mid-job."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(dry_run=False))
+    ctx.evm.prepare_bridge_error = evm_mod.EvmRpcError(
+        "execution reverted: ERC20: transfer amount exceeds allowance")
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+         state={"dry_run": True})           # frozen rehearsal, live params
+
+    engine.step()
+    job = store.get_active_job()
+    assert job.state["bridge_gas_defaulted"] is True
+    assert ctx.evm.bridge_gas == evm_mod.BRIDGE_GAS_DEFAULT
+
+    out = engine.step()
+    assert out["status"] == JobStatus.DRY_RUN_OK   # still a rehearsal
+    assert ctx.evm.sent_raw == []
+
+
+def test_dry_run_fallback_refuses_a_live_job_even_when_params_say_rehearsal(monkeypatch):
+    """The fund-relevant direction: a job frozen LIVE must never take the
+    default-gas fallback just because params.dry_run flipped to true --
+    phase 2 of a live job broadcasts, and a default-gas signing would go
+    on-chain after the node already called the transaction doomed."""
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(dry_run=True))
+    ctx.evm.prepare_bridge_error = evm_mod.EvmRpcError(
+        "execution reverted: ERC20: transfer amount exceeds allowance")
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+         state={"dry_run": False})          # frozen live, rehearsal params
+
+    engine.step()
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING      # stayed, retryable
+    assert job.retry_count == 1
+    assert "allowance" in (job.last_error or "")
+    assert ctx.evm.bridge_gas is None            # no fallback signing
+    assert ctx.evm.sent_raw == []
+
+
 def test_bridging_revert_reprepares(monkeypatch):
     monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
     store = new_store()

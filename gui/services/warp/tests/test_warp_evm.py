@@ -573,3 +573,53 @@ def test_is_allowance_revert_variants():
     assert not evm.is_allowance_revert(E("connection refused"))
     # The word alone is not enough without revert markers.
     assert not evm.is_allowance_revert(RuntimeError("allowance"))
+
+
+def test_is_allowance_revert_reads_the_reason_from_data_only_nodes():
+    """Some nodes answer message "execution reverted" with the reason only
+    in ``data`` (the shape decode_revert_reason exists for).  The predicate
+    must engage there too, or the dry-run fallback silently re-breaks on
+    those providers."""
+    payload = b"ERC20: insufficient allowance"
+    blob = (b"\x08\xc3\x79\xa0"
+            + (32).to_bytes(32, "big")
+            + len(payload).to_bytes(32, "big")
+            + payload + b"\x00" * (-len(payload) % 32))
+    exc = evm.EvmRpcError("execution reverted", data="0x" + blob.hex())
+    assert "allowance" not in str(exc).lower()   # the message alone would miss
+    assert evm.is_allowance_revert(exc)
+
+
+def test_prepare_bridge_with_explicit_gas_skips_estimation():
+    """The dry-run allowance fallback relies on this contract: an explicit
+    ``gas`` means no eth_estimateGas call (whose revert is the very thing
+    being avoided).  The service tests' FakeEvm mirrors the contract; this
+    pins it on the real client in both directions."""
+    fees = evm.EIP1559Fees(max_fee_per_gas=2_000_000_000,
+                           max_priority_fee_per_gas=1_000_000)
+
+    calls: list = []
+
+    def recording_caller(method, params):
+        calls.append(method)
+        if method == "eth_estimateGas":
+            return "0x30d40"  # 200_000
+        raise AssertionError(f"unexpected RPC {method}")
+
+    client = evm.EvmClient(NET, caller=recording_caller)
+
+    # Everything pinned incl. gas -> zero RPC traffic.
+    tx = client.prepare_bridge(
+        owner="0x" + "ab" * 20, receiver_ph=bytes(32), mojo_amount=1000,
+        gas=123_456, toll_wei=1, nonce=7, fees=fees,
+    )
+    assert calls == []
+    assert tx.gas == 123_456
+
+    # Same call without gas -> exactly one eth_estimateGas.
+    tx = client.prepare_bridge(
+        owner="0x" + "ab" * 20, receiver_ph=bytes(32), mojo_amount=1000,
+        toll_wei=1, nonce=7, fees=fees,
+    )
+    assert calls == ["eth_estimateGas"]
+    assert tx.gas == 200_000 * 5 // 4   # estimation headroom
