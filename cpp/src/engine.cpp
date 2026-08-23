@@ -2979,6 +2979,10 @@ void Engine::step_update_analytics(BlockHeight block_height)
                     spdlog::error("[Engine] Step 3: {} FLAGGED as suspected "
                                   "failure -- all quotes suppressed",
                                   pair.name);
+                } else {
+                    spdlog::debug("[Engine] Step 3: suspected-failure flag "
+                                  "persists for {} -- quotes remain "
+                                  "suppressed", pair.name);
                 }
             } else if (changed) {
                 spdlog::info("[Engine] Step 3: {} depeg state recovered to "
