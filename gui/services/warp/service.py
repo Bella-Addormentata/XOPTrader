@@ -1192,12 +1192,39 @@ class WarpEngine:
         spec = self._job_asset(job)
         raw = job.state.get("bridge_raw")
         if not raw:  # phase 1: sign at a live toll/nonce + persist, no broadcast
-            unsigned = self._evm.prepare_bridge(
-                owner=self._hot_address,
-                receiver_ph=bytes.fromhex(job.receiver_ph),
-                mojo_amount=int(job.amount_mojos),
-                asset=spec,
-            )
+            gas_defaulted = False
+            try:
+                unsigned = self._evm.prepare_bridge(
+                    owner=self._hot_address,
+                    receiver_ph=bytes.fromhex(job.receiver_ph),
+                    mojo_amount=int(job.amount_mojos),
+                    asset=spec,
+                )
+            except Exception as exc:
+                # [WARP-DRYRUN-ALLOWANCE 2026-08-22] A rehearsal signs the
+                # approve but deliberately never broadcasts it, so the chain's
+                # allowance is still zero and the bridge gas estimate ALWAYS
+                # reverts at the token's allowance guard on a fresh wallet.
+                # Observed on the first real dry run (job 1): the
+                # [WARP-ESTIMATE-REVERT] re-raise left the job retrying
+                # forever, so DRY_RUN_OK was unreachable on exactly the wallet
+                # the rehearsal exists to validate.  That revert is the
+                # rehearsal's PROOF -- RPC round-tripped, calldata decoded,
+                # contract executed to the transferFrom guard -- so sign at
+                # the default gas instead; the transaction is never broadcast
+                # in a rehearsal.  Any OTHER revert still fails, exactly as
+                # live.
+                if not (self._job_dry_run(job)
+                        and evm.is_allowance_revert(exc)):
+                    raise
+                gas_defaulted = True
+                unsigned = self._evm.prepare_bridge(
+                    owner=self._hot_address,
+                    receiver_ph=bytes.fromhex(job.receiver_ph),
+                    mojo_amount=int(job.amount_mojos),
+                    asset=spec,
+                    gas=evm.BRIDGE_GAS_DEFAULT,
+                )
             signed = evm.sign_tx(unsigned, self._evm_key.private_key)
             return _stay(
                 columns={"bridge_tx_hash": signed.tx_hash},
@@ -1213,6 +1240,9 @@ class WarpEngine:
                         unsigned.max_fee_per_gas,
                         unsigned.max_priority_fee_per_gas,
                     ],
+                    # Recorded so DRY_RUN_OK can report the estimate was
+                    # substituted, keeping the rehearsal summary honest.
+                    "bridge_gas_defaulted": gas_defaulted or None,
                 },
                 message="bridge signed; broadcasting next tick",
             )
@@ -1223,6 +1253,11 @@ class WarpEngine:
         # and tip, gas estimation, nonce selection, ABI encoding and signing. The
         # only thing that does not happen is the broadcast.
         if self._job_dry_run(job):
+            gas_note = (
+                " (bridge gas defaulted: the estimate needs the approve's "
+                "allowance on-chain, which a rehearsal never broadcasts)"
+                if job.state.get("bridge_gas_defaulted") else ""
+            )
             return _advance(
                 JobStatus.DRY_RUN_OK,
                 columns={"bridge_tx_hash": None},
@@ -1230,6 +1265,7 @@ class WarpEngine:
                 message=(
                     "dry run OK: both Base transactions signed but NOT broadcast; "
                     "no funds moved. Set warp.dry_run: false to go live"
+                    + gas_note
                 ),
             )
 

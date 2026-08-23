@@ -88,6 +88,11 @@ class FakeEvm:
         self.prepared: list = []
         self.erc20_calls = 0
         self.raise_erc20: Exception | None = None
+        # Raised by prepare_bridge only when the caller did NOT pin a gas
+        # limit -- mirrors the real client, where an explicit gas skips the
+        # eth_estimateGas that produces the revert.
+        self.prepare_bridge_error: Exception | None = None
+        self.bridge_gas: int | None = None
         # Mined transaction count. fake_sign_tx signs at nonce 3, so a default
         # of 0 means "our nonce has not been consumed by anything else".
         self.mined_nonce = 0
@@ -115,7 +120,10 @@ class FakeEvm:
         return {"kind": "approve", "amount": amount_base_units}
 
     def prepare_bridge(self, *, owner, receiver_ph, mojo_amount, nonce=None,
-                       fees=None, asset=None):
+                       fees=None, asset=None, gas=None):
+        if gas is None and self.prepare_bridge_error is not None:
+            raise self.prepare_bridge_error
+        self.bridge_gas = gas
         # Mirrors the real UnsignedTx closely enough for the fee-escalation
         # path, which reads the fee legs back off the unsigned transaction.
         # nonce/fees are recorded so tests can assert a replacement pinned the
@@ -541,6 +549,82 @@ def test_bridging_two_phase_parses_message_nonce(monkeypatch):
     assert out["status"] == JobStatus.BRIDGE_CONFIRMED
     assert store.get_active_job().bridge_nonce == nonce_hex
     assert ctx.evm.sent_raw == [b"\x02\xbb\xbb\xbb"]
+
+
+def test_dry_run_bridging_treats_the_allowance_revert_as_proof(monkeypatch):
+    """[WARP-DRYRUN-ALLOWANCE] A rehearsal signs the approve but never
+    broadcasts it, so on a fresh wallet the bridge gas estimate ALWAYS
+    reverts at the token's allowance guard.  Observed live 2026-08-22 (job
+    1 retried forever; DRY_RUN_OK unreachable).  The machine re-prepares at
+    the default gas -- the transaction is never broadcast in a rehearsal --
+    and the dry run completes, with the substitution recorded and reported.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(dry_run=True))
+    ctx.evm.prepare_bridge_error = evm_mod.EvmRpcError(
+        "execution reverted: ERC20: transfer amount exceeds allowance")
+    jid = seed(store, JobStatus.BRIDGING,
+               columns={"amount_mojos": 5000,
+                        "receiver_ph": RECEIVER_PH.hex()},
+               state={"dry_run": True}).id
+
+    engine.step()                          # phase 1: fallback signs at default
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING
+    assert job.state["bridge_gas_defaulted"] is True
+    assert ctx.evm.bridge_gas == evm_mod.BRIDGE_GAS_DEFAULT
+
+    out = engine.step()                    # rehearsal stop
+    assert out["status"] == JobStatus.DRY_RUN_OK
+    assert ctx.evm.sent_raw == []          # nothing was ever broadcast
+    events = store.get_events(jid)
+    assert any("gas defaulted" in (e.message or "") for e in events), [
+        e.message for e in events]
+
+
+def test_dry_run_bridging_still_fails_on_a_non_allowance_revert(monkeypatch):
+    """Only the allowance revert is expected in a rehearsal.  Any other
+    reason (toll, pause, receiver) must keep failing exactly as live, or
+    the rehearsal would certify a bridge call that is actually broken.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store, params=default_params(dry_run=True))
+    ctx.evm.prepare_bridge_error = evm_mod.EvmRpcError(
+        "execution reverted: message toll too low")
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()},
+         state={"dry_run": True})
+
+    engine.step()
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING      # stayed, retryable
+    assert job.retry_count == 1
+    assert "toll" in (job.last_error or "")
+    assert ctx.evm.bridge_gas is None            # no fallback signing
+
+
+def test_live_bridging_still_raises_on_the_allowance_revert(monkeypatch):
+    """Live jobs keep [WARP-ESTIMATE-REVERT] semantics: an allowance revert
+    during a live estimation means the approve has not actually taken
+    effect -- retry until it has, never sign at a default and broadcast a
+    transaction the node already called doomed.
+    """
+    monkeypatch.setattr(evm_mod, "sign_tx", fake_sign_tx)
+    store = new_store()
+    engine, ctx = build(store)                   # default_params: dry_run False
+    ctx.evm.prepare_bridge_error = evm_mod.EvmRpcError(
+        "execution reverted: ERC20: transfer amount exceeds allowance")
+    seed(store, JobStatus.BRIDGING,
+         columns={"amount_mojos": 5000, "receiver_ph": RECEIVER_PH.hex()})
+
+    engine.step()
+    job = store.get_active_job()
+    assert job.status == JobStatus.BRIDGING      # stayed, retryable
+    assert job.retry_count == 1
+    assert "allowance" in (job.last_error or "")
+    assert ctx.evm.bridge_gas is None
 
 
 def test_bridging_revert_reprepares(monkeypatch):

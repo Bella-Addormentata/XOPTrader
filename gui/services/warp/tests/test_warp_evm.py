@@ -557,3 +557,19 @@ def test_decode_revert_reason_reads_the_abi_error_blob():
     exc = evm.EvmRpcError("execution reverted", data="0x" + blob.hex())
     assert evm.decode_revert_reason(exc) == "!nonce"
     assert evm.is_already_delivered(exc)
+
+
+def test_is_allowance_revert_variants():
+    """Execution reverts naming the allowance guard -- and only those."""
+    E = evm.EvmRpcError
+    assert evm.is_allowance_revert(
+        E("execution reverted: ERC20: transfer amount exceeds allowance"))
+    assert evm.is_allowance_revert(
+        E("execution reverted: ERC20: insufficient allowance"))
+    # A revert for any other reason is a real failure.
+    assert not evm.is_allowance_revert(
+        E("execution reverted: message toll too low"))
+    # A transport error says nothing about the transaction.
+    assert not evm.is_allowance_revert(E("connection refused"))
+    # The word alone is not enough without revert markers.
+    assert not evm.is_allowance_revert(RuntimeError("allowance"))

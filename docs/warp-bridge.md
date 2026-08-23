@@ -237,6 +237,16 @@ signing. The only thing it does not do is broadcast.
    Chia address, and the wUSDC.b asset id all populate.
 2. Click **Bridge now**. Watch the job advance:
    `AWAITING_DEPOSIT → DEPOSIT_SEEN → APPROVING → BRIDGING → DRY_RUN_OK`.
+
+   One estimate is substituted on the way: the **bridge leg's gas** is signed
+   at the fixed default, because its live estimate cannot exist in a dry run —
+   the approve that would grant the allowance is signed but deliberately never
+   broadcast, so the node's simulation of `bridgeToChia` reverts at the
+   token's allowance guard. That specific revert is treated as the pass signal
+   (it proves the RPC, the calldata, and the contract executed to the
+   `transferFrom` check); any *other* revert reason still fails the job. The
+   approve leg's gas estimate is live and real. The `DRY_RUN_OK` message notes
+   the substitution.
 3. Check the frozen numbers on the row: USDC in should be exactly your test
    amount (clamped to `max_auto_bridge_usdc` if lower), and the wUSDC.b out
    figure should be that amount less the 0.3% bridge tip.
