@@ -669,6 +669,14 @@ struct StrategyConfig {
     /// before the engine will post new offers.  Range [0, 1].  Default 0.25.
     double   min_spendable_reserve_pct{0.25};
 
+    /// [XCH-LOCK-LEDGER 2026-08-23] Fraction of the cycle's free XCH
+    /// (above the fee reserve) that one posting cycle may lock into
+    /// offers, measured in WHOLE-COIN terms by the coin-lock ledger.
+    /// Range [0, 1].  Default 0.5: one cycle can never commit more than
+    /// half the free coin value, so no single requote burst can walk
+    /// spendable XCH to zero the way the 2026-08-23 incident did.
+    double   xch_cycle_commit_frac{0.5};
+
     /// Extra blocks beyond offer_ttl_blocks before an offer is considered
     /// "stuck" and eligible for forced cancellation + alerting.
     uint32_t stuck_offer_age_blocks{30};

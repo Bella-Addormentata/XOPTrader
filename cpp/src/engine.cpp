@@ -6693,6 +6693,16 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         co_return;
     }
 
+    // [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock budget
+    // from the wallet's real free-coin list before any pair posts.  This is
+    // the cross-pair commitment cap the 2026-08-23 zero-spendable incident
+    // showed was missing: per-pair reserve projections modelled notional
+    // fills while the wallet locked whole ~2-XCH coins (plus an XCH fee
+    // coin per offer, even for CAT-principal offers), and the wallet's own
+    // spendable_balance lags just-created offers, so per-offer re-queries
+    // approved a batch all the way to zero.
+    co_await offer_mgr_->begin_xch_lock_cycle();
+
     // -- T4-03: Dynamic fee selection ----------------------------------------
     // Ask the FeeTracker for the recommended fee and push it into the
     // OfferManager so that every subsequent create/cancel uses the

@@ -895,6 +895,14 @@ StrategyConfig parse_strategy(const YAML::Node& root)
         }
     }
 
+    if (node["xch_cycle_commit_frac"] && node["xch_cycle_commit_frac"].IsDefined()
+        && !node["xch_cycle_commit_frac"].IsNull()) {
+        cfg.xch_cycle_commit_frac = node["xch_cycle_commit_frac"].as<double>();
+        if (cfg.xch_cycle_commit_frac < 0.0 || cfg.xch_cycle_commit_frac > 1.0) {
+            throw ConfigError("strategy.xch_cycle_commit_frac must be in [0, 1]");
+        }
+    }
+
     // Stuck offer age (extra blocks beyond TTL).
     if (node["stuck_offer_age_blocks"] && node["stuck_offer_age_blocks"].IsDefined()
         && !node["stuck_offer_age_blocks"].IsNull()) {

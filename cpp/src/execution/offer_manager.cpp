@@ -420,6 +420,13 @@ asio::awaitable<int> OfferManager::post_quotes(
             continue;
         }
 
+        // [XCH-LOCK-LEDGER] Self-accounted whole-coin budget; the wallet's
+        // spendable_balance lags our own just-created offers, so re-querying
+        // it (below) cannot stop a fast batch on its own.
+        if (!xch_ledger_admits(offer_dict, pair, "tier create")) {
+            continue;
+        }
+
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         json result;
         try {
@@ -2645,6 +2652,70 @@ json OfferManager::build_offer_dict(const PairConfig& pair,
 // [T7-10] post_merged_side -- merge same-side tiers into one RPC call
 // ---------------------------------------------------------------------------
 
+asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
+{
+    // Reset first: a stale ledger from the previous cycle must never gate
+    // this one, and an RPC failure below leaves the ledger inactive.
+    xch_cycle_ledger_ = CoinLockLedger{};
+    xch_ledger_refusal_logged_ = false;
+    try {
+        auto coins = co_await wallet_->get_spendable_coins(1);
+        std::vector<Mojo> amounts;
+        amounts.reserve(coins.size());
+        for (const auto& cr : coins) {
+            const auto& coin = cr.contains("coin") ? cr["coin"] : cr;
+            if (coin.contains("amount")) {
+                amounts.push_back(coin["amount"].get<Mojo>());
+            }
+        }
+        const auto floor = static_cast<Mojo>(std::llround(
+            strategy_cfg_.fee_reserve_xch
+            * static_cast<double>(kMojosPerXch)));
+        xch_cycle_ledger_ = CoinLockLedger(
+            std::move(amounts), floor, strategy_cfg_.xch_cycle_commit_frac);
+        logger_->debug("XCH lock ledger: {} free coins, {} mojos free, "
+                       "floor {} mojos, commit_frac {:.2f}",
+                       coins.size(), xch_cycle_ledger_.remaining(), floor,
+                       strategy_cfg_.xch_cycle_commit_frac);
+    } catch (const std::exception& e) {
+        logger_->warn("XCH lock ledger snapshot failed ({}) -- this cycle "
+                      "runs on the wallet-requery guards only", e.what());
+    }
+}
+
+bool OfferManager::xch_ledger_admits(const json&       offer_dict,
+                                     const PairConfig& pair,
+                                     const char*       context)
+{
+    if (!xch_cycle_ledger_.active()) {
+        return true;
+    }
+    Mojo principal = 0;
+    if (offer_dict.contains("1")) {
+        const auto v = offer_dict["1"].get<std::int64_t>();
+        if (v < 0) {
+            principal = static_cast<Mojo>(-v);
+        }
+    }
+    if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
+        return true;
+    }
+    if (!xch_ledger_refusal_logged_) {
+        logger_->warn(
+            "XCH lock ledger: refusing {} for {} (principal={} fee={} "
+            "committed={} remaining={}) -- whole-coin locking would breach "
+            "the floor or cycle cap; further refusals this cycle at debug",
+            context, pair.name, principal, current_fee_mojos_,
+            xch_cycle_ledger_.committed(), xch_cycle_ledger_.remaining());
+        xch_ledger_refusal_logged_ = true;
+    } else {
+        logger_->debug("XCH lock ledger: refusing {} for {} "
+                       "(principal={} fee={})",
+                       context, pair.name, principal, current_fee_mojos_);
+    }
+    return false;
+}
+
 asio::awaitable<int> OfferManager::post_merged_side(
     const PairConfig&              pair,
     const std::vector<TierQuote>&  tiers,
@@ -2673,6 +2744,12 @@ asio::awaitable<int> OfferManager::post_merged_side(
 
     if (merged_dict.empty()) co_return 0;
 
+    // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
+    // leg is the sum of every tier's, so the ledger charge is exact.
+    if (!xch_ledger_admits(merged_dict, pair, "merged batch")) {
+        co_return 0;
+    }
+
     // Create the merged offer via RPC.
     // co_await cannot appear inside a catch handler in a C++20 coroutine,
     // so capture any exception info here and perform the fallback after the
@@ -2697,6 +2774,12 @@ asio::awaitable<int> OfferManager::post_merged_side(
         for (const auto& tier : tiers) {
             json single_dict = build_offer_dict(pair, tier);
             if (single_dict.empty()) continue;
+            // [XCH-LOCK-LEDGER] The merged charge above already counted this
+            // XCH; charging again per-tier over-counts, which is the
+            // deliberate conservative direction for a failed-batch retry.
+            if (!xch_ledger_admits(single_dict, pair, "batch fallback")) {
+                continue;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;

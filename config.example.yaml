@@ -208,6 +208,10 @@ strategy:
   taker_min_spendable_xch: 0.25        # [OPTIONAL, default: 0.25] Preflight floor for take_offer-based strategies
   block_time_seconds: 52.0             # [OPTIONAL, default: 52.0] CHIA block-time assumption for freshness checks
   min_spendable_reserve_pct: 0.10      # [OPTIONAL, default: 0.25] Suppress side when spendable/confirmed < this
+  xch_cycle_commit_frac: 0.5           # [OPTIONAL, default: 0.5] Max fraction of free XCH (whole-coin terms,
+                                       # above the fee reserve) one posting cycle may lock into offers.
+                                       # The coin-lock ledger counts actual UTXO + fee-coin locks, so a
+                                       # requote burst can no longer walk spendable XCH to zero.
                                        #   Lower if most inventory is locked in offers (e.g. depleted CATs).
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)

@@ -49,6 +49,8 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
+
+#include "xop/execution/coin_lock_ledger.hpp"
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -641,7 +643,27 @@ public:
         Side                  side,
         const PairConfig&     pair);
 
+    /// [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock
+    /// budget from the wallet's actual free-coin list.  Called by the
+    /// engine at the start of every Step 8 cycle.  Best-effort: on RPC
+    /// failure the ledger stays inactive (admits everything) and the
+    /// pre-existing wallet-requery guards remain the backstop.
+    asio::awaitable<void> begin_xch_lock_cycle();
+
 private:
+    /// Admit-or-refuse one offer against the cycle's XCH coin-lock ledger.
+    /// The XCH principal is read straight from the offer_dict the wallet
+    /// will receive (negative amount on wallet id 1), so every creation
+    /// path -- per-tier, merged batch, batch fallback -- shares one
+    /// accounting, and CAT-principal offers still charge their fee-coin
+    /// lock.  Refusals lock nothing and are logged once per cycle at warn.
+    bool xch_ledger_admits(const json&       offer_dict,
+                           const PairConfig& pair,
+                           const char*       context);
+
+    CoinLockLedger xch_cycle_ledger_;
+    bool           xch_ledger_refusal_logged_{false};
+
     // -- Internal helpers ---------------------------------------------------
 
     /**
