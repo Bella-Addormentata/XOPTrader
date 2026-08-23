@@ -435,7 +435,7 @@ asio::awaitable<SplitResult> CoinManager::ensure_split(
 
         logger_->info("ensure_split: created {} coins of {} mojos each "
                       "(fee {} mojos, tx={})",
-                      batch, target_amount_mojos, fee,
+                      plan.batch, plan.split_amount, fee,
                       result.tx_id.empty() ? "(none)" :
                       result.tx_id.substr(0, 16));
 
