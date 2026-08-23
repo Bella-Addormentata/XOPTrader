@@ -102,6 +102,23 @@ TEST(CoinLockLedgerTest, KnapsackOfSmallerCoinsIsChargedWhenWalletPrefersIt) {
     EXPECT_EQ(ledger.remaining(), kXch * 11 / 10);
 }
 
+TEST(CoinLockLedgerTest, KnapsackIdentityIsPreservedAcrossLocks) {
+    // (review round 5) {4,4,9} with needs 8 then 4: the wallet knapsacks
+    // {4,4} for the first need and must lock 9 for the second, ending at
+    // 0 -- so with floor 4 the SECOND lock must be refused.  A max-charge
+    // model locked 9 first and 4 second, reported 4 remaining, and let
+    // both through: identity fidelity, not just value, keeps the floor
+    // honest across a sequence.
+    std::vector<Mojo> coins = {4 * kXch, 4 * kXch, 9 * kXch};
+    CoinLockLedger ledger(coins, 4 * kXch, 1.0);
+
+    ASSERT_TRUE(ledger.try_lock(8 * kXch, 0));   // locks the two 4s
+    EXPECT_EQ(ledger.committed(), 8 * kXch);
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
+    EXPECT_FALSE(ledger.try_lock(4 * kXch, 0));  // would lock 9, floor 4
+    EXPECT_EQ(ledger.remaining(), 9 * kXch);
+}
+
 TEST(CoinLockLedgerTest, OneGiantCoinIsRefusedRatherThanZeroed) {
     // A single 44-XCH coin covering a 1-XCH ask would leave the wallet at
     // literal zero spendable -- the ledger models exactly that and refuses,

@@ -25,12 +25,13 @@
 //   XCH one posting cycle may lock into offers", and cancel fees consuming
 //   the posting budget starved requotes.
 //
-// Selection is knapsack-aware conservative: the charge is the LARGER of
-// (a) the smallest single covering coin and (b), when the sub-need coins
-// sum past the need -- the case where Chia's wallet prefers knapsacking
-// smaller coins -- a smallest-first accumulation of those sub-need coins.
-// A pure smallest-covering model under-estimated exactly that case and
-// left the floor soft.
+// Selection is wallet-shaped: when the sub-need coins sum past the need
+// -- the case where Chia's wallet knapsacks smaller coins -- a
+// smallest-first accumulation of those coins is used (authoritative, not
+// merely a bigger charge: modelling different coin identities than the
+// wallet locks makes later admissions undercount); otherwise the smallest
+// single covering coin.  A pure smallest-covering model under-estimated
+// the knapsack case and left the floor soft.
 //
 // Pure and synchronous so it is unit-testable in isolation
 // (tests/test_coin_lock_ledger.cpp); the async snapshot fetch lives in
@@ -194,9 +195,11 @@ private:
         return saturating_add(principal, fee);
     }
 
-    /// Knapsack-aware conservative selection (see header).  coins_ is
-    /// sorted ascending, so sub-need coins are a prefix and the smallest
-    /// single covering coin is the first element at/after the boundary.
+    /// Wallet-shaped selection (see header).  coins_ is sorted ascending,
+    /// so sub-need coins are a prefix and the smallest single covering
+    /// coin is the first element at/after the boundary.  The knapsack
+    /// prefix, when applicable, is what the wallet will actually lock --
+    /// identity fidelity matters as much as value (review round 5).
     [[nodiscard]] Selection select_for(Mojo need) const
     {
         Selection single_sel;
@@ -228,15 +231,17 @@ private:
             }
         }
 
-        if (single_sel.covered && prefix_sel.covered) {
-            return prefix_sel.locked > single_sel.locked ? prefix_sel
-                                                         : single_sel;
+        // When the knapsack model applies, it is AUTHORITATIVE, not merely
+        // a bigger charge: the wallet will pick those smaller coins, and
+        // modelling a different identity (review round 5: {4,4,9} with
+        // needs 8 then 4 -- the wallet locks {4,4} then 9 and ends at 0,
+        // while a max-charge model locked 9 then 4 and reported 4 left)
+        // makes LATER admissions undercount even when this one over-counts.
+        if (prefix_sel.covered) {
+            return prefix_sel;
         }
         if (single_sel.covered) {
             return single_sel;
-        }
-        if (prefix_sel.covered) {
-            return prefix_sel;
         }
         return Selection{};  // pool cannot cover the need
     }

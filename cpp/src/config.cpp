@@ -917,8 +917,15 @@ StrategyConfig parse_strategy(const YAML::Node& root)
     if (node["fee_reserve_xch"] && node["fee_reserve_xch"].IsDefined()
         && !node["fee_reserve_xch"].IsNull()) {
         cfg.fee_reserve_xch = node["fee_reserve_xch"].as<double>();
-        if (cfg.fee_reserve_xch < 0.0) {
-            throw ConfigError(sec + ".fee_reserve_xch must be >= 0");
+        // Non-finite values pass a bare < 0 check and reach llround (a
+        // domain error that on common implementations turns the reserve
+        // floor into 0, silently disabling it); a huge finite value
+        // overflows the mojo conversion.  1e6 XCH is far beyond any
+        // wallet and well inside Mojo range.
+        if (!std::isfinite(cfg.fee_reserve_xch) || cfg.fee_reserve_xch < 0.0
+            || cfg.fee_reserve_xch > 1'000'000.0) {
+            throw ConfigError(sec + ".fee_reserve_xch must be a finite "
+                              "value in [0, 1e6]");
         }
     }
     if (node["fee_min_spendable_xch"] && node["fee_min_spendable_xch"].IsDefined()
