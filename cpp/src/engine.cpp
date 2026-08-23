@@ -11820,15 +11820,20 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const Mojo numeraire_pseudo =
         static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
     bool inv_changed = false;
+    bool reconciled  = false;
     if (auto bit = cached_wallet_balances_.find(asset);
         bit != cached_wallet_balances_.end()) {
         const auto& bal = bit->second;
-        constexpr BlockHeight kBalanceMaxAgeBlocks = 10;
-        const bool fresh = bal.as_of_block != 0
-            && block_height >= bal.as_of_block
-            && block_height - bal.as_of_block <= kBalanceMaxAgeBlocks
+        // CURRENT-heartbeat snapshots only (review round 8): Step 8
+        // stamps block_height before this scan runs, so equality means
+        // the snapshot postdates every Step 2 fill of this cycle.  An
+        // older snapshot -- Step 8 skipped during pauses -- could
+        // predate a fill and overwrite it; in that case the reconcile
+        // simply defers to the next heartbeat Step 8 runs.
+        const bool fresh = bal.as_of_block == block_height
             && bal.pending_change == 0;
         if (fresh && bal.confirmed >= 0) {
+            reconciled = true;
             const Mojo tracked = inventory_->net_inventory(asset);
             if (tracked != bal.confirmed) {
                 inventory_->adjust_quantity(asset, bal.confirmed,
@@ -11841,8 +11846,12 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             if (state_) {
                 const Mojo pos = state_->get_position(asset).balance;
                 if (bal.confirmed > pos) {
+                    // Unit-mojo basis (Mojo{1}), the State convention for
+                    // quote assets everywhere else (review round 8: the
+                    // 1e12 pseudo price made every deposited mojo worth
+                    // 1e12 in State::inventory_skew).
                     state_->record_buy(asset, bal.confirmed - pos,
-                                       numeraire_pseudo);
+                                       Mojo{1});
                 } else if (bal.confirmed < pos
                            && !state_->record_sell(
                                   asset, pos - bal.confirmed)) {
@@ -11854,19 +11863,22 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         }
     }
 
-    // Single fraction-preserving peak rescale for this scan's live
-    // flows, AFTER the reconcile above -- equity is computed from
-    // InventoryTracker records, so the flows must be folded in first.
-    // The breaker tests (peak - equity) / peak; scaling by
-    // equity_after / equity_before preserves that fraction exactly,
-    // where equity_before = equity_now - sum(live flows).  An additive
-    // shift preserved only the dollar gap and could false-trip on a
-    // withdrawal (peak $158, equity $150, unwrap $100: 5.1% -> 13.8%).
-    // Skipped with a log while equity is not yet valued -- the startup
-    // grace covers those cycles.
-    if (live_flow_usd != 0.0) {
+    // Single fraction-preserving peak rescale, consumed only once
+    // wallet truth has ACTUALLY folded this scan's flows into inventory
+    // (review round 8): equity is computed from InventoryTracker, so
+    // rescaling while the reconcile deferred would subtract the flow
+    // from an equity that does not contain it yet -- and the ledger
+    // dedupe means the flow would never re-enter the accumulator.  The
+    // pending sum is a member, carried across heartbeats until a
+    // reconcile lands.  The breaker tests (peak - equity) / peak;
+    // scaling by equity_after / equity_before preserves that fraction
+    // exactly.  An additive shift preserved only the dollar gap and
+    // could false-trip on a withdrawal (peak $158, equity $150, unwrap
+    // $100: 5.1% -> 13.8%).
+    pending_peak_flow_usd_ += live_flow_usd;
+    if (reconciled && pending_peak_flow_usd_ != 0.0) {
         const double equity_now    = compute_portfolio_equity_usd();
-        const double equity_before = equity_now - live_flow_usd;
+        const double equity_before = equity_now - pending_peak_flow_usd_;
         if (equity_now > 0.0 && equity_before > 0.0
             && peak_equity_hwm_usd_ > 0.0) {
             const double rescaled =
@@ -11874,13 +11886,16 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
                          "{:.2f} -> {:.2f} for ${:+.6f} of live bridge "
                          "flow (fraction-preserving GIPS adjustment)",
-                         peak_equity_hwm_usd_, rescaled, live_flow_usd);
+                         peak_equity_hwm_usd_, rescaled,
+                         pending_peak_flow_usd_);
             peak_equity_hwm_usd_ = rescaled;
         } else {
-            spdlog::info("[Engine] Bridge ingest: peak rescale skipped "
+            spdlog::info("[Engine] Bridge ingest: peak rescale dropped "
                          "for ${:+.6f} of live flow (equity not yet "
-                         "valued this early in the run)", live_flow_usd);
+                         "valued; the startup grace re-anchors instead)",
+                         pending_peak_flow_usd_);
         }
+        pending_peak_flow_usd_ = 0.0;
     }
 
     if (booked > 0 || inv_changed) {

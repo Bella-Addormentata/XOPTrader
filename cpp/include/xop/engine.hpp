@@ -841,6 +841,14 @@ private:
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
 
+    /// [S19 review round 8] Live bridge flows (signed USD) whose
+    /// fraction-preserving peak rescale has not yet been applied --
+    /// carried across heartbeats until the wallet-truth reconcile
+    /// actually folds them into inventory (equity's source), then
+    /// consumed in one aggregate rescale.  In-memory only: a restart
+    /// re-anchors the peak from live equity anyway.
+    double pending_peak_flow_usd_{0.0};
+
     /// [S19 2026-08-23] Process start time, ISO-8601 UTC.  Bridge flows
     /// completing at or after this instant shift the drawdown peak; older
     /// flows are already inside the startup peak anchor (which re-seeds

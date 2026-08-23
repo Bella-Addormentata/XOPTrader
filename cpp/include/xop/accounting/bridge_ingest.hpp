@@ -23,7 +23,9 @@
 // minted quantity is post_tip_mojos (inbound, after the warp.green tip) and
 // the burned quantity is amount_mojos (outbound).  Idempotency comes from
 // the ledger's UNIQUE(event_id, leg, asset_id) via event_id
-// "bridge:job:<id>" -- re-scans and restarts are no-ops.
+// "bridge:job:<id>:<created_at>" (the immutable creation stamp guards
+// against a recreated jobs DB reusing AUTOINCREMENT ids) -- re-scans
+// and restarts are no-ops.
 //
 // KNOWN LIMITATION (review round 1, deferred).  A job is not bound to
 // the ENGINE's wallet: warp.chia_receiver_address is operator-configured,
