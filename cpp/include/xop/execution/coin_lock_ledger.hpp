@@ -27,11 +27,13 @@
 //
 // Selection is wallet-shaped: when the sub-need coins sum past the need
 // -- the case where Chia's wallet knapsacks smaller coins -- a
-// smallest-first accumulation of those coins is used (authoritative, not
-// merely a bigger charge: modelling different coin identities than the
-// wallet locks makes later admissions undercount); otherwise the smallest
-// single covering coin.  A pure smallest-covering model under-estimated
-// the knapsack case and left the floor soft.
+// largest-first accumulation of those sub-need coins is used (matching
+// chia coin_selection.py's descending sort and largest-first fallback;
+// authoritative rather than a bigger-charge candidate, because modelling
+// different coin identities than the wallet locks makes later admissions
+// undercount); otherwise the smallest single covering coin.  The real
+// knapsack is randomized, so this is a bounded approximation -- see
+// select_for for the layers that bound the divergence.
 //
 // Pure and synchronous so it is unit-testable in isolation
 // (tests/test_coin_lock_ledger.cpp); the async snapshot fetch lives in
@@ -185,7 +187,8 @@ private:
         Mojo        locked{0};
         bool        single{false};
         std::size_t single_idx{0};
-        std::size_t prefix_count{0};  // smallest-first count when !single
+        std::size_t prefix_count{0};  // how many sub-need coins (largest-first)
+        std::size_t tail_start{0};    // index of the first removed coin
     };
 
     [[nodiscard]] static Mojo clamp_need(Mojo principal, Mojo fee) noexcept
@@ -212,22 +215,35 @@ private:
                 static_cast<std::size_t>(it - coins_.begin());
         }
 
-        // Knapsack model: smallest-first accumulation, applicable when the
-        // sub-need coins alone can cover the need (Chia prefers them then).
-        Selection prefix_sel;
+        // Knapsack model, applicable when the sub-need coins alone can
+        // cover the need (Chia prefers them then).  Accumulation is
+        // LARGEST-first among the sub-need coins, matching the descending
+        // sort chia's coin_selection.py applies before its knapsack and
+        // its documented largest-first fallback.  EXACTNESS IS UNATTAINABLE:
+        // the real knapsack samples random subsets, so no deterministic
+        // model can track the wallet's coin identities perfectly.  The
+        // divergence is bounded by three layers: the ledger reseeds from
+        // the real coin list every cycle (~1 min), the pre-existing
+        // per-offer wallet re-query guards remain as backstops, and the
+        // ledger fails open when the snapshot is unavailable.  The floor
+        // is defence-in-depth against the incident's systematic walk to
+        // zero, not a byte-exact wallet simulation.
+        Selection tail_sel;
         {
             Mojo        covered = 0;
             std::size_t count   = 0;
             const auto  sub_need_end =
                 static_cast<std::size_t>(it - coins_.begin());
             while (count < sub_need_end && covered < need) {
-                covered = saturating_add(covered, coins_[count]);
+                covered = saturating_add(
+                    covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
             if (covered >= need) {
-                prefix_sel.covered      = true;
-                prefix_sel.locked       = covered;
-                prefix_sel.prefix_count = count;
+                tail_sel.covered      = true;
+                tail_sel.locked       = covered;
+                tail_sel.prefix_count = count;   // largest sub-need coins
+                tail_sel.tail_start   = sub_need_end - count;
             }
         }
 
@@ -237,8 +253,8 @@ private:
         // needs 8 then 4 -- the wallet locks {4,4} then 9 and ends at 0,
         // while a max-charge model locked 9 then 4 and reported 4 left)
         // makes LATER admissions undercount even when this one over-counts.
-        if (prefix_sel.covered) {
-            return prefix_sel;
+        if (tail_sel.covered) {
+            return tail_sel;
         }
         if (single_sel.covered) {
             return single_sel;
@@ -252,9 +268,10 @@ private:
             coins_.erase(coins_.begin()
                          + static_cast<std::ptrdiff_t>(sel.single_idx));
         } else {
-            coins_.erase(coins_.begin(),
-                         coins_.begin()
-                             + static_cast<std::ptrdiff_t>(sel.prefix_count));
+            coins_.erase(
+                coins_.begin() + static_cast<std::ptrdiff_t>(sel.tail_start),
+                coins_.begin() + static_cast<std::ptrdiff_t>(
+                                     sel.tail_start + sel.prefix_count));
         }
         remaining_ -= sel.locked;
     }

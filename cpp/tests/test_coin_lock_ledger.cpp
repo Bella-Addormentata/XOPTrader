@@ -73,18 +73,18 @@ TEST(CoinLockLedgerTest, SmallestCoveringCoinIsSelected) {
     EXPECT_EQ(ledger.remaining(), 13 * kXch);
 }
 
-TEST(CoinLockLedgerTest, AccumulationOrderIsSmallestFirstAndPinned) {
-    // Distinguishable coins so a selection-order mutation fails (review:
-    // three equal coins could not tell largest-first from smallest-first).
-    // Need 5 against {1, 2, 4}: no single coin covers; smallest-first
-    // accumulation locks all three (7); largest-first would lock {4, 2}
-    // (6, remaining 1) -- the equalities below kill that mutant.
+TEST(CoinLockLedgerTest, AccumulationOrderIsLargestFirstAndPinned) {
+    // Distinguishable coins so a selection-order mutation fails.  Need 5
+    // against {1, 2, 4}: no single coin covers; LARGEST-first accumulation
+    // (chia coin_selection.py's descending sort / fallback order) locks
+    // {4, 2} = 6 with the 1-coin left; smallest-first would lock all
+    // three (7, remaining 0) -- the equalities below kill that mutant.
     std::vector<Mojo> coins = {kXch, 2 * kXch, 4 * kXch};
     CoinLockLedger ledger(coins, 0, 1.0);
 
     ASSERT_TRUE(ledger.try_lock(5 * kXch, 0));
-    EXPECT_EQ(ledger.committed(), 7 * kXch);
-    EXPECT_EQ(ledger.remaining(), 0);
+    EXPECT_EQ(ledger.committed(), 6 * kXch);
+    EXPECT_EQ(ledger.remaining(), kXch);
 }
 
 TEST(CoinLockLedgerTest, KnapsackOfSmallerCoinsIsChargedWhenWalletPrefersIt) {
