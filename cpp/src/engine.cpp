@@ -11874,6 +11874,10 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         e.note         = accounting::bridge_note(val.flow_usd, usd_per_unit,
                                                  row.id);
 
+        if (bridge_booked_event_ids_.count(flow.event_id)) {
+            continue;   // known-booked: no write transaction (round 18)
+        }
+
         const auto inserted = db_->append_ledger_entries({e});
         if (!inserted) {
             // Unlike the fill path (which latches ledger_incomplete_
@@ -11882,11 +11886,22 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             // every candidate from warp_jobs.db each heartbeat and the
             // event_id dedupe makes re-booking safe, so a transient
             // write failure just retries next heartbeat (review round 1).
+            // BREAK, not return (round 18): rows inserted earlier in
+            // this pass still reconcile and persist below, and a
+            // persistent failure must not leave the single-writer asset
+            // without its maintainer.
             spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
-                          "job {} -- will retry next heartbeat", row.id);
-            co_return;
+                          "job {} -- remaining rows retry next heartbeat",
+                          row.id);
+            break;
         }
-        if (*inserted == 0) continue;    // already booked (restart/re-scan)
+        if (*inserted == 0) {
+            // Already booked before this process (restart/re-scan): warm
+            // the cache so the no-op write transaction happens once.
+            bridge_booked_event_ids_.insert(flow.event_id);
+            continue;
+        }
+        bridge_booked_event_ids_.insert(flow.event_id);
 
         // 2. Inventory is NOT mutated per flow.  Add-based mutations
         // raced every recovery path that also writes this asset (Step 8
@@ -11928,13 +11943,22 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                      booked, booked_usd, block_height);
     }
 
-    // One aggregated rescale for flows that were PRE-FOLDED into
-    // inventory before their jobs became visible (round 17): equity
-    // already contains them, inventory provably matched wallet truth at
-    // booking, and prices are this heartbeat's, so inferring the
-    // pre-flow equity is safe here -- and aggregating avoids the
-    // round-7 compounding error.
-    if (prefolded_flow_usd != 0.0 && peak_equity_hwm_usd_ > 0.0) {
+    // Pre-folded flows (folded into inventory before their jobs became
+    // visible) use an ASYMMETRIC rule grounded in the peak's
+    // monotonicity (round 18).  A pre-folded DEPOSIT is NOT rescaled:
+    // Step 13's max() has likely already absorbed the flow-inclusive
+    // equity into the peak during the fold-to-book gap, and multiplying
+    // again would overshoot (100 -> 200 -> 400); skipping errs toward a
+    // HIGHER peak, which can false-trip but can never mask losses.  A
+    // pre-folded WITHDRAWAL still shrinks the peak: max() never lowers
+    // it, so no prior downward adjustment can have happened and the
+    // single shrink is exact.
+    if (prefolded_flow_usd > 0.0) {
+        spdlog::info("[Engine] Bridge ingest: ${:+.6f} of pre-folded "
+                     "deposit left to the peak's own max() anchor (no "
+                     "rescale -- conservative direction)",
+                     prefolded_flow_usd);
+    } else if (prefolded_flow_usd < 0.0 && peak_equity_hwm_usd_ > 0.0) {
         const double e_now = compute_portfolio_equity_usd();
         const double e_pre = e_now - prefolded_flow_usd;
         if (e_now > 0.0 && e_pre > 0.0) {
@@ -11942,7 +11966,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                 peak_equity_hwm_usd_ * (e_now / e_pre);
             spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
                          "{:.2f} -> {:.2f} for ${:+.6f} of pre-folded "
-                         "flow", peak_equity_hwm_usd_, rescaled,
+                         "withdrawal", peak_equity_hwm_usd_, rescaled,
                          prefolded_flow_usd);
             peak_equity_hwm_usd_ = rescaled;
         }
@@ -11983,12 +12007,17 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                 // The fill residual legitimately moves drawdown: it is
                 // trading.  e_before is measured this heartbeat, so no
                 // market-move distortion enters the factor.
+                // FULL unapplied consumption, not a clamp onto the net
+                // delta (round 18): the booking gate guarantees the
+                // wallet already contains every booked flow, so after
+                // this mutation the flows are fully folded -- clamping
+                // let an opposing same-interval fill eat part of the
+                // flow credit and masked the trading loss (+100 deposit
+                // with a -20 fill must credit +100 and show -20 as
+                // drawdown).
                 const Mojo raw_delta = bal.confirmed - tracked;
-                const Mojo lo = raw_delta < 0 ? raw_delta : Mojo{0};
-                const Mojo hi = raw_delta > 0 ? raw_delta : Mojo{0};
-                const Mojo flow_part = std::clamp(
-                    bridge_unapplied_flow_mojos_, lo, hi);
-                bridge_unapplied_flow_mojos_ -= flow_part;
+                const Mojo flow_part = bridge_unapplied_flow_mojos_;
+                bridge_unapplied_flow_mojos_ = 0;
                 const double flow_part_usd =
                     (static_cast<double>(flow_part) / mojos_per_unit)
                     * usd_per_unit;
