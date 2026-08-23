@@ -203,3 +203,14 @@
   not $0.75) -- consider requiring depeg confirmation from a second source
   (TibetSwap reserves) before bail-out, mirroring the S12 flash-crash
   junk-print lesson.
+
+### S18: Max-drawdown re-alert gate not holding while breaker-latched
+- **Files:** `cpp/src/engine.cpp` (Step 13 drawdown breaker alerting)
+- **Status:** `[ ]` -- Observed live 2026-08-23 10:43:51 / 10:44:12 /
+  10:44:53: three ALERT:CRITICAL max-drawdown alerts in 62 seconds while
+  breaker_pause_active_ was already latched, despite the configured
+  realert=30min gate (which held correctly on 2026-08-22 during the
+  v0.9.10 incident, ~15-30 min cadence). Suspect the re-alert timestamp
+  resets on some per-evaluation path when the state is already Paused, or
+  the gate only covers the un-latched trip path. Alert once per 30 min as
+  documented, regardless of latch state.
