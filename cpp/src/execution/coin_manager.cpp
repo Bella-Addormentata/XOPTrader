@@ -244,12 +244,16 @@ CoinManager::SplitPlan CoinManager::plan_split_for_coin(
         return plan;
     }
 
-    // [COIN-POOL-DEADLOCK 2026-08-23] Fallback for the [target+fee,
-    // 1.5*target) window: the batch-1 target split's change lands below the
-    // band, so no target plan improves -- but two equal halves both land IN
-    // the band.  batch=1 of half: the wallet's change output is the other
-    // half (same size, +1 mojo when odd), so nothing dusty is created and
-    // the pool-ready count goes 1 -> 2.
+    // [COIN-POOL-DEADLOCK 2026-08-23] Fallback for the window where the
+    // post-fee value (amount - fee) lies in [target, 1.5*target): the
+    // batch-1 target split's change (amount - fee - target) lands below
+    // the band, so no target plan improves -- but two equal halves of
+    // (amount - fee) both land IN the band.  batch=1 of half: the wallet's
+    // change output is the other half (same size, +1 mojo when odd), so
+    // nothing dusty is created and the pool-ready count goes 1 -> 2.  The
+    // is_pool_ready_coin checks below are the authoritative boundary,
+    // exact to integer rounding (review: with fee > 0 the literal
+    // source-amount interval is shifted by the fee).
     const Mojo half   = (amount_mojos - fee) / 2;
     const Mojo change = amount_mojos - fee - half;
     const int  current_ready =
