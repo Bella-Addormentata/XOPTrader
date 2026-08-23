@@ -841,6 +841,13 @@ private:
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
 
+    /// [S19 review round 10] Job ids whose skip condition
+    /// (unclassifiable / foreign fingerprint / missing transition event)
+    /// has already been warned about -- such jobs stay in the scan
+    /// forever, and one legitimate milliETH job must not warn on every
+    /// heartbeat for the lifetime of the database.
+    std::set<std::int64_t> bridge_warned_jobs_;
+
     /// [S19 review round 8] Live bridge flows (signed USD) whose
     /// fraction-preserving peak rescale has not yet been applied --
     /// carried across heartbeats until the wallet-truth reconcile

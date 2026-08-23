@@ -11561,6 +11561,13 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     // this host) or a transiently locked one is a clean no-op: unbooked
     // flows simply remain wallet-vs-books divergence for the invariant to
     // absorb -- the pre-S19 behaviour, not a new failure mode.
+    // The scan portion below may fail (missing/locked DB, truncated
+    // read); those paths skip BOOKING only.  The wallet-truth reconcile
+    // at the tail still runs (review round 10) -- with Step 8 and
+    // Step 11 both excluding this asset, a permanently unreadable jobs
+    // DB must not leave its inventory without any maintainer.
+    std::vector<accounting::BridgeJobRow> jobs;
+
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &raw_db,
                              SQLITE_OPEN_READONLY, nullptr);
@@ -11572,11 +11579,10 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     sqlite3* const wdb = raw_db;
     if (rc != SQLITE_OK) {
         spdlog::debug("[Engine] Bridge ingest: cannot open {} read-only "
-                      "({}) -- skipping this heartbeat",
+                      "({}) -- booking skipped this heartbeat",
                       acc.bridge_jobs_db_path,
                       wdb ? sqlite3_errmsg(wdb) : "out of memory");
-        return;
-    }
+    } else {
     // This runs on the engine's io_context thread: a locked database
     // this heartbeat is a clean skip, not worth blocking the event loop
     // for (review round 1).  The GUI's WAL writers hold locks only
@@ -11627,12 +11633,10 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         stmt, &sqlite3_finalize);
     if (rc != SQLITE_OK) {
         spdlog::warn("[Engine] Bridge ingest: prepare failed on {} ({}) -- "
-                     "skipping this heartbeat",
+                     "booking skipped this heartbeat",
                      acc.bridge_jobs_db_path, sqlite3_errmsg(wdb));
-        return;
-    }
+    } else {
 
-    std::vector<accounting::BridgeJobRow> jobs;
     int step_rc = SQLITE_OK;
     while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
         accounting::BridgeJobRow r;
@@ -11656,10 +11660,12 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     // omitted flows as adjustments (review round 4).
     if (step_rc != SQLITE_DONE) {
         spdlog::warn("[Engine] Bridge ingest: scan of {} ended with rc={} "
-                     "-- partial snapshot discarded, retrying next "
-                     "heartbeat", acc.bridge_jobs_db_path, step_rc);
-        return;
+                     "-- partial snapshot discarded, booking skipped "
+                     "this heartbeat", acc.bridge_jobs_db_path, step_rc);
+        jobs.clear();
     }
+    }  // prepare ok
+    }  // open ok
     // Handles released by the RAII guards at scope exit; the booking
     // below deliberately runs after the scan so the read-only handle is
     // not held across ledger writes.
@@ -11679,9 +11685,9 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const std::string opening_time = db_->ledger_opening_time(asset);
     if (opening_time.empty()) {
         spdlog::warn("[Engine] Bridge ingest: no opening timestamp for {} "
-                     "despite ledger_opened_assets_ -- skipping this "
-                     "heartbeat", asset.substr(0, 12));
-        return;
+                     "despite ledger_opened_assets_ -- booking skipped "
+                     "this heartbeat", asset.substr(0, 12));
+        jobs.clear();
     }
 
     const auto  now = std::chrono::system_clock::now();
@@ -11690,12 +11696,29 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     double      live_flow_usd = 0.0;   // in-process flows this scan (GIPS)
 
     for (const auto& row : jobs) {
+        // Skip warnings fire ONCE per job (review round 10): skipped
+        // jobs stay in the scan forever, and a single legitimate
+        // foreign-asset job must not warn every heartbeat for the
+        // lifetime of the database.
+        const bool first_skip_notice =
+            bridge_warned_jobs_.count(row.id) == 0;
+        const auto skip_notice =
+            [&](const char* what, const std::string& detail) {
+                if (first_skip_notice) {
+                    bridge_warned_jobs_.insert(row.id);
+                    spdlog::warn("[Engine] Bridge ingest: job {} {}{} -- "
+                                 "skipped (left for the divergence "
+                                 "control)", row.id, what, detail);
+                } else {
+                    spdlog::debug("[Engine] Bridge ingest: job {} still "
+                                  "skipped ({})", row.id, what);
+                }
+            };
+
         const auto flow = accounting::classify_bridge_job(row);
         if (!flow.valid) {
-            spdlog::warn("[Engine] Bridge ingest: job {} is "
-                         "unclassifiable (bad state, unknown direction, or "
-                         "non-positive quantity) -- left for the "
-                         "divergence control", row.id);
+            skip_notice("is unclassifiable (bad state, unknown direction, "
+                        "or non-positive quantity)", "");
             continue;
         }
 
@@ -11705,18 +11728,15 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // (review round 1).  Strict: no fingerprint, no booking.
         if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
                                                    acc.bridge_asset_id)) {
-            spdlog::warn("[Engine] Bridge ingest: job {} asset fingerprint "
-                         "'{}' does not resolve to the configured bridge "
-                         "asset -- skipped (left for the divergence "
-                         "control)", row.id, flow.asset_fingerprint);
+            skip_notice("has an asset fingerprint that does not resolve "
+                        "to the configured bridge asset: ",
+                        flow.asset_fingerprint);
             continue;
         }
 
         if (row.flow_at.empty()) {
-            spdlog::warn("[Engine] Bridge ingest: job {} has no recorded "
-                         "transition event -- chronology unknowable, not "
-                         "booked (left for the divergence control)",
-                         row.id);
+            skip_notice("has no recorded transition event (chronology "
+                        "unknowable)", "");
             continue;
         }
 

@@ -2328,6 +2328,22 @@ AccountingConfig parse_accounting(const YAML::Node& root)
                        [](unsigned char c) {
                            return static_cast<char>(std::tolower(c));
                        });
+        // Validate like pair asset ids (review round 10): a typo would
+        // silently prevent every opening/fingerprint/cache match,
+        // disabling the accounting feature while it reports enabled.
+        if (cfg.bridge_asset_id.size() != 64) {
+            throw ConfigError(
+                "accounting.bridge_asset_id must be a 64-character hex "
+                "string; got length "
+                + std::to_string(cfg.bridge_asset_id.size()));
+        }
+        for (char c : cfg.bridge_asset_id) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                throw ConfigError(
+                    std::string("accounting.bridge_asset_id contains "
+                                "invalid hex character '") + c + "'");
+            }
+        }
     }
     if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
         && !node["reward_asset_id"].IsNull()) {
