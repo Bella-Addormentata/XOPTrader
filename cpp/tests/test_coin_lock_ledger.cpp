@@ -232,6 +232,53 @@ TEST(CoinLockLedgerTest, InactiveLedgerAdmitsEverything) {
 }
 
 // ---------------------------------------------------------------------------
+// Ladder-preflight decision table (review round 9: these branches decide
+// whether an entire ladder disappears).
+// ---------------------------------------------------------------------------
+
+TEST(PreflightDropsTest, DoomedSpendSideKeepsABuyXchSurvivor) {
+    const auto d = OfferManager::preflight_side_drops(
+        /*any_bid=*/true, /*admit_bid=*/3, /*any_ask=*/true, /*admit_ask=*/0,
+        /*bids_buy_xch=*/true, /*asks_buy_xch=*/false);
+    EXPECT_TRUE(d.drop_asks);
+    EXPECT_FALSE(d.drop_bids);   // survivor buys XCH: deliberate one-sided
+}
+
+TEST(PreflightDropsTest, BothSidesDropWhenTheSurvivorDoesNotBuyXch) {
+    // CAT/CAT pair: neither side buys XCH, so a doomed ask side takes the
+    // bid side down with it rather than stranding a one-sided book.
+    const auto d = OfferManager::preflight_side_drops(
+        true, 3, true, 0, /*bids_buy_xch=*/false, /*asks_buy_xch=*/false);
+    EXPECT_TRUE(d.drop_asks);
+    EXPECT_TRUE(d.drop_bids);
+}
+
+TEST(PreflightDropsTest, PartialAdmissionDoomsNothing) {
+    const auto d = OfferManager::preflight_side_drops(
+        true, 3, true, 1, false, false);
+    EXPECT_FALSE(d.drop_asks);
+    EXPECT_FALSE(d.drop_bids);
+}
+
+TEST(PreflightDropsTest, BothSidesFullyRefusedDropsNeitherHere) {
+    // Neither side survives, so there is no asymmetry to guard -- the
+    // per-tier admission refusals handle it (and nothing posts anyway).
+    const auto d = OfferManager::preflight_side_drops(
+        true, 0, true, 0, false, false);
+    EXPECT_FALSE(d.drop_asks);
+    EXPECT_FALSE(d.drop_bids);
+}
+
+TEST(PreflightDropsTest, OneSidedLaddersAreLeftAlone) {
+    // A bids-only ladder (e.g. the wmilliETH.b revive experiment) has no
+    // asymmetry to create: nothing is dropped even when refused.
+    const auto d = OfferManager::preflight_side_drops(
+        true, 0, /*any_ask=*/false, 0, true, false);
+    EXPECT_FALSE(d.drop_bids);
+    EXPECT_FALSE(d.drop_asks);
+}
+
+// ---------------------------------------------------------------------------
 // Wiring helpers (review: the extraction the incident protection rides on
 // had zero coverage; a silent regression would degrade the ledger to
 // fee-only accounting with every test green).

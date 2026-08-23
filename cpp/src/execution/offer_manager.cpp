@@ -250,10 +250,13 @@ asio::awaitable<int> OfferManager::post_quotes(
         // Exception: when XCH reserve is breached and the posted side buys
         // XCH, the other side was *intentionally* suppressed.  Do not
         // cancel in that case -- the one-sided book is by design.
-        // A ledger refusal suppresses only the XCH-spending side (buy-XCH
-        // offers bypass the ledger), so like a reserve breach it produces a
-        // DELIBERATE one-sided book; cancelling the surviving side would
-        // burn create+cancel fees every cycle in a livelock (review).
+        // A ledger suppression is DELIBERATE like a reserve breach, so the
+        // exemption below spares the surviving side from cancellation --
+        // but only when that survivor buys XCH (buy-XCH offers are
+        // cap-exempt yet floor-checked, so they too can be refused and set
+        // this flag; a surviving spend side is never exempted).  Without
+        // the exemption, cancelling the survivor would burn create+cancel
+        // fees every cycle in a livelock (review).
         const bool bid_side_exempt =
             (reserve_breached || xch_ledger_suppressed_) && bids_buy_xch;
         const bool ask_side_exempt =
@@ -371,28 +374,18 @@ asio::awaitable<int> OfferManager::post_quotes(
                 if (ok) ++admit_ask;
             }
         }
-        const bool asks_doomed = any_ask && admit_ask == 0 && admit_bid > 0;
-        const bool bids_doomed = any_bid && admit_bid == 0 && admit_ask > 0;
-        if (asks_doomed) {
-            ask_funds_exhausted = true;
+        const PreflightDrops drops = preflight_side_drops(
+            any_bid, admit_bid, any_ask, admit_ask,
+            bids_buy_xch, asks_buy_xch);
+        if (drops.drop_asks || drops.drop_bids) {
+            ask_funds_exhausted = ask_funds_exhausted || drops.drop_asks;
+            bid_funds_exhausted = bid_funds_exhausted || drops.drop_bids;
             xch_ledger_suppressed_ = true;
-            if (!bids_buy_xch) {
-                bid_funds_exhausted = true;
-            }
-            logger_->warn("XCH lock ledger preflight: {} ask side would be "
-                          "fully refused -- dropping asks{} up front",
+            logger_->warn("XCH lock ledger preflight: {} dropping{}{} up "
+                          "front (one-sided guard)",
                           pair.name,
-                          bids_buy_xch ? "" : " and bids (one-sided guard)");
-        } else if (bids_doomed) {
-            bid_funds_exhausted = true;
-            xch_ledger_suppressed_ = true;
-            if (!asks_buy_xch) {
-                ask_funds_exhausted = true;
-            }
-            logger_->warn("XCH lock ledger preflight: {} bid side would be "
-                          "fully refused -- dropping bids{} up front",
-                          pair.name,
-                          asks_buy_xch ? "" : " and asks (one-sided guard)");
+                          drops.drop_bids ? " bids" : "",
+                          drops.drop_asks ? " asks" : "");
         }
     }
 
@@ -2776,6 +2769,27 @@ std::vector<Mojo> OfferManager::spendable_amounts_from_coin_records(
         }
     }
     return amounts;
+}
+
+OfferManager::PreflightDrops OfferManager::preflight_side_drops(
+    bool any_bid, int admit_bid, bool any_ask, int admit_ask,
+    bool bids_buy_xch, bool asks_buy_xch)
+{
+    PreflightDrops drops;
+    const bool asks_doomed = any_ask && admit_ask == 0 && admit_bid > 0;
+    const bool bids_doomed = any_bid && admit_bid == 0 && admit_ask > 0;
+    if (asks_doomed) {
+        drops.drop_asks = true;
+        if (!bids_buy_xch) {
+            drops.drop_bids = true;
+        }
+    } else if (bids_doomed) {
+        drops.drop_bids = true;
+        if (!asks_buy_xch) {
+            drops.drop_asks = true;
+        }
+    }
+    return drops;
 }
 
 bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,

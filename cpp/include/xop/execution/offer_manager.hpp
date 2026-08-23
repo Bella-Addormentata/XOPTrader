@@ -679,6 +679,20 @@ public:
 
 private:
 
+    /// Pure decision table for the ladder preflight (public + static so
+    /// the branches that can make an entire ladder disappear are unit
+    /// tested): a side whose every tier would be refused is dropped, and
+    /// the surviving side is dropped too unless it buys XCH -- the T5-08
+    /// exemption rule.  Partial admission dooms nothing.
+    struct PreflightDrops {
+        bool drop_bids{false};
+        bool drop_asks{false};
+    };
+    [[nodiscard]] static PreflightDrops preflight_side_drops(
+        bool any_bid, int admit_bid, bool any_ask, int admit_ask,
+        bool bids_buy_xch, bool asks_buy_xch);
+
+private:
     /// Probe-only admission mirror of xch_ledger_admits, run against a
     /// COPY of the cycle ledger by the ladder preflight: same charges,
     /// no logging, no flag side effects.
@@ -701,10 +715,11 @@ private:
     CoinLockLedger xch_cycle_ledger_;
     bool           xch_ledger_refusal_logged_{false};
     /// True when the ledger refused a side during the current post_quotes
-    /// call.  The T5-08 asymmetric guard treats it like reserve_breached:
-    /// the surviving side is buy-XCH by construction (buy-XCH offers bypass
-    /// the ledger), so the one-sided book is deliberate, and cancelling it
-    /// would burn fees in a livelock (review).
+    /// call.  The T5-08 asymmetric guard treats it like reserve_breached,
+    /// exempting the surviving side from cancellation -- but only when
+    /// that survivor buys XCH.  Buy-XCH offers are cap-exempt yet
+    /// floor-checked, so they can also be refused and set this flag; a
+    /// surviving spend side is never exempted (review rounds 3 and 9).
     bool           xch_ledger_suppressed_{false};
 
     // -- Internal helpers ---------------------------------------------------
