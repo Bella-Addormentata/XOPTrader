@@ -230,6 +230,10 @@ TEST(BridgeNoteTest, ForeignNotesParseToZero) {
         "dexie liquidity reward; fmv_usd=0.0137520000; px_usd_per_unit="
         "0.0137520000; wallet_tx=abc"), 0.0);   // reward note: no flow_usd
     EXPECT_EQ(parse_bridge_flow_usd("flow_usd=garbage"), 0.0);
+    // (round 15) Same magnitude bound as the live accumulator: a row
+    // add_net_deposit_usd rejects must not reappear on rehydration.
+    EXPECT_EQ(parse_bridge_flow_usd("flow_usd=2000000000000.0"), 0.0);
+    EXPECT_EQ(parse_bridge_flow_usd("flow_usd=-2000000000000.0"), 0.0);
 }
 
 // ============================================================================

@@ -255,7 +255,10 @@ struct BridgeValuation {
     if (pos == std::string::npos) return 0.0;
     const double v = std::strtod(note.c_str() + pos + sizeof(kKey) - 1,
                                  nullptr);
-    if (!std::isfinite(v) || !(std::fabs(v) < 1e15)) return 0.0;
+    // Same magnitude bound as PnLTracker::add_net_deposit_usd (review
+    // round 15): a row the live accumulator rejects must not reappear on
+    // rehydration, or restart invariance breaks.
+    if (!std::isfinite(v) || !(std::fabs(v) < 1e12)) return 0.0;
     return v;
 }
 
