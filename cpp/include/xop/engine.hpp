@@ -854,6 +854,14 @@ private:
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
 
+    /// [S19 review round 18] Ledger event ids already booked (or found
+    /// already-booked) by the bridge scan.  Historical jobs stay in the
+    /// scan forever, and without this every one of them executed a
+    /// write transaction (BEGIN IMMEDIATE / INSERT OR IGNORE / COMMIT)
+    /// per heartbeat for the lifetime of the database.  One no-op pass
+    /// per restart warms the cache.
+    std::set<std::string> bridge_booked_event_ids_;
+
     /// [S19 review round 17] Booked bridge flows (signed CAT mojos)
     /// whose quantity has not yet been folded into InventoryTracker by
     /// the wallet-truth reconcile.  The peak rescale is attributed from
