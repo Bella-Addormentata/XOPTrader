@@ -350,6 +350,49 @@ if __name__ == "__main__":
 # Unwrap controls
 # ---------------------------------------------------------------------------
 
+def test_wrap_and_unwrap_controls_live_in_separate_sections(qapp):
+    """Each bridge direction gets its own group box (regression pin).
+
+    The original layout put every control under one "Bridging" header and an
+    ordering accident rendered the unwrap burn inputs ABOVE the Bridge now
+    button, where they read as bridge parameters.  Pin the fix behaviorally:
+    the wrap controls and the unwrap controls each descend from a QGroupBox
+    titled for their direction, and never from the other direction's box.
+    """
+    from PySide6.QtWidgets import QGroupBox
+
+    w = WarpWidget()
+    boxes = {}
+    for b in w.findChildren(QGroupBox):
+        title = b.title().strip().lower()
+        # startswith, not exact punctuation: the em dash in the title is
+        # copy, and "unwrap".startswith("wrap") is False so this stays
+        # unambiguous.
+        if title.startswith("unwrap"):
+            boxes["unwrap"] = b
+        elif title.startswith("wrap"):
+            boxes["wrap"] = b
+    assert "wrap" in boxes and "unwrap" in boxes, sorted(boxes)
+
+    def owning_box(widget):
+        p = widget.parent()
+        while p is not None and not isinstance(p, QGroupBox):
+            p = p.parent()
+        return p
+
+    assert owning_box(w._bridge_btn) is boxes["wrap"]
+    assert owning_box(w._dest_field) is boxes["wrap"]
+    for burn_side in (w._unwrap_btn, w._unwrap_amount, w._unwrap_dest,
+                      w._unwrap_external):
+        assert owning_box(burn_side) is boxes["unwrap"]
+
+    # The portal/docs links are the shared resources row: boxed to NEITHER
+    # direction (the portal is the out-of-band recovery path -- hiding it
+    # under one direction's header recreates half the original confusion).
+    assert owning_box(w._portal_btn) is None
+    assert owning_box(w._docs_btn) is None
+
+
 def test_unwrap_click_emits_mojos_destination_and_relay_mode(qapp):
     w = _make(qapp, {"enabled": True})
     got = []

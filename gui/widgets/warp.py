@@ -218,9 +218,12 @@ class WarpWidget(QWidget):
     * a status banner (disabled / blocked reason / dry run / active);
     * the Base hot-wallet deposit address + copy, and its USDC / ETH balances
       with a low-gas warning;
-    * the bridge configuration (destination XCH address, auto-bridge state,
-      min/max caps, wUSDC.b asset id) and a "Bridge now" button, plus warp.green
-      portal and developer-docs links;
+    * a **Wrap** section (USDC on Base -> wUSDC.b): destination XCH address,
+      auto-bridge state, min/max caps, wUSDC.b asset id, and the "Bridge now"
+      button;
+    * an **Unwrap** section (wUSDC.b -> native USDC on Base): amount, Base
+      destination, the burn button, and the external-relay option;
+    * a shared links row (warp.green portal, developer docs);
     * a jobs table with per-job BaseScan / SpaceScan links, error tooltips, and a
       Retry / Sweep / Cancel context menu.
 
@@ -307,11 +310,11 @@ class WarpWidget(QWidget):
         layout.addWidget(title)
 
         subtitle = _body_label(
-            "XOPTrader bridges <b>USDC on Base</b> to <b>wUSDC.b</b> on Chia "
-            "automatically via the warp.green trustless bridge. Send USDC on the "
-            "Base network to the hot-wallet address below and the bot performs "
-            "the entire bridge in the background — no step-by-step actions "
-            "required. wUSDC.b is the primary quote currency traded on XOPTrader."
+            "XOPTrader moves USDC across the warp.green trustless bridge in "
+            "both directions. <b>Wrap</b> brings USDC on Base into the bot as "
+            "wUSDC.b — its primary quote currency — and <b>Unwrap</b> sends "
+            "wUSDC.b back out as native USDC on Base. Each direction has its "
+            "own section below; both share the hot wallet and the jobs table."
         )
         subtitle.setTextFormat(Qt.TextFormat.RichText)
         layout.addWidget(subtitle)
@@ -365,8 +368,19 @@ class WarpWidget(QWidget):
 
         layout.addWidget(_separator())
 
-        # -- Bridge configuration + controls ---------------------------
-        layout.addWidget(_section_label("Bridging USDC (Base) → wUSDC.b (Chia)"))
+        # -- Wrap: USDC (Base) -> wUSDC.b (Chia) -----------------------
+        wrap_group = QGroupBox("Wrap — USDC (Base) → wUSDC.b (Chia)")
+        wrap_layout = QVBoxLayout(wrap_group)
+        wrap_layout.setSpacing(10)
+
+        wrap_intro = _body_label(
+            "Brings quote capital <b>into</b> the bot. Once USDC lands at the "
+            "hot-wallet address above, <b>Bridge now</b> starts a job that "
+            "approves, bridges, collects validator signatures, and claims the "
+            "wUSDC.b into the bot's Chia wallet automatically."
+        )
+        wrap_intro.setTextFormat(Qt.TextFormat.RichText)
+        wrap_layout.addWidget(wrap_intro)
 
         dest_row = QHBoxLayout()
         dest_lead = QLabel("Destination (Chia):")
@@ -376,35 +390,39 @@ class WarpWidget(QWidget):
             "Defaults to the bot's Chia wallet address"
         )
         dest_row.addWidget(self._dest_field, 1)
-        layout.addLayout(dest_row)
+        wrap_layout.addLayout(dest_row)
 
         self._auto_lbl = _body_label("")
-        layout.addWidget(self._auto_lbl)
+        wrap_layout.addWidget(self._auto_lbl)
 
         self._asset_lbl = QLabel()
         self._asset_lbl.setStyleSheet(f"color: {TEXT_SECONDARY}; font-size: 11px;")
         self._asset_lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-        layout.addWidget(self._asset_lbl)
+        wrap_layout.addWidget(self._asset_lbl)
 
-        ctrl_row = QHBoxLayout()
+        bridge_row = QHBoxLayout()
         self._bridge_btn = self._primary_button("\U0001F309  Bridge now")
         self._bridge_btn.clicked.connect(self._on_bridge_now)
-        ctrl_row.addWidget(self._bridge_btn)
-        ctrl_row.addStretch(1)
+        bridge_row.addWidget(self._bridge_btn)
+        bridge_row.addStretch(1)
+        wrap_layout.addLayout(bridge_row)
 
-        # Deliberately always enabled, independent of `built`/`enabled`: the
-        # portal is the documented out-of-band recovery path for a message this
-        # app cannot claim, so a *blocked* operator is exactly who needs it.
-        self._portal_btn = self._link_button("Open warp.green portal")
-        self._portal_btn.setToolTip(
-            f"{_WARP_PORTAL_URL}\n\nThe official bridge UI. Also the recovery path: "
-            "an attested message stays claimable there forever, paid to the same "
-            "attested Chia receiver.\n\nVerify the URL before connecting any wallet."
+        layout.addWidget(wrap_group)
+
+        # -- Unwrap: wUSDC.b (Chia) -> USDC (Base) ---------------------
+        unwrap_group = QGroupBox("Unwrap — wUSDC.b (Chia) → USDC (Base)")
+        unwrap_layout = QVBoxLayout(unwrap_group)
+        unwrap_layout.setSpacing(10)
+
+        unwrap_intro = _body_label(
+            "The reverse direction: takes capital <b>out</b> of the bot by "
+            "burning wUSDC.b on Chia and releasing native USDC on Base. "
+            "Irreversible once the burn is sent; the warp tip and the Chia "
+            "toll apply (current figures on the Unwrap button)."
         )
-        self._portal_btn.clicked.connect(lambda: _open_url(_WARP_PORTAL_URL))
-        ctrl_row.addWidget(self._portal_btn)
+        unwrap_intro.setTextFormat(Qt.TextFormat.RichText)
+        unwrap_layout.addWidget(unwrap_intro)
 
-        # -- Unwrap (Chia -> Base): burn wUSDC.b, release native USDC ------
         unwrap_row = QHBoxLayout()
         self._unwrap_amount = QLineEdit()
         self._unwrap_amount.setPlaceholderText("USDC amount (min 0.001)")
@@ -424,7 +442,7 @@ class WarpWidget(QWidget):
         )
         self._unwrap_btn.clicked.connect(self._on_unwrap_clicked)
         unwrap_row.addWidget(self._unwrap_btn)
-        layout.addLayout(unwrap_row)
+        unwrap_layout.addLayout(unwrap_row)
 
         # Chia-only mode + the liveness evidence that makes it worth choosing.
         self._unwrap_external = QCheckBox(
@@ -439,19 +457,36 @@ class WarpWidget(QWidget):
             "for your attention — the message itself stays deliverable "
             "forever, including via the warp.green portal."
         )
-        layout.addWidget(self._unwrap_external)
+        unwrap_layout.addWidget(self._unwrap_external)
 
         self._relay_activity_lbl = QLabel()
         self._relay_activity_lbl.setWordWrap(True)
         self._relay_activity_lbl.setTextFormat(Qt.TextFormat.RichText)
         self._relay_activity_lbl.setVisible(False)
-        layout.addWidget(self._relay_activity_lbl)
+        unwrap_layout.addWidget(self._relay_activity_lbl)
+
+        layout.addWidget(unwrap_group)
+
+        # -- Shared resources ------------------------------------------
+        links_row = QHBoxLayout()
+        # Deliberately always enabled, independent of `built`/`enabled`: the
+        # portal is the documented out-of-band recovery path for a message this
+        # app cannot claim, so a *blocked* operator is exactly who needs it.
+        self._portal_btn = self._link_button("Open warp.green portal")
+        self._portal_btn.setToolTip(
+            f"{_WARP_PORTAL_URL}\n\nThe official bridge UI. Also the recovery path: "
+            "an attested message stays claimable there forever, paid to the same "
+            "attested Chia receiver.\n\nVerify the URL before connecting any wallet."
+        )
+        self._portal_btn.clicked.connect(lambda: _open_url(_WARP_PORTAL_URL))
+        links_row.addWidget(self._portal_btn)
 
         self._docs_btn = self._link_button("Developer docs")
         self._docs_btn.setToolTip(_WARP_DOCS_URL)
         self._docs_btn.clicked.connect(lambda: _open_url(_WARP_DOCS_URL))
-        ctrl_row.addWidget(self._docs_btn)
-        layout.addLayout(ctrl_row)
+        links_row.addWidget(self._docs_btn)
+        links_row.addStretch(1)
+        layout.addLayout(links_row)
 
         layout.addWidget(_separator())
 
