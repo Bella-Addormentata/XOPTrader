@@ -341,6 +341,61 @@ asio::awaitable<int> OfferManager::post_quotes(
     bool bid_funds_exhausted = false;
     bool ask_funds_exhausted = false;
 
+    // [XCH-LOCK-LEDGER] Ladder preflight (review round 8): ladders order
+    // all bids before all asks, so in this non-batch path a mid-ladder
+    // cap exhaustion could admit every bid and then refuse every ask,
+    // leaving a one-sided book with no T5-08 cleanup (the guard exists
+    // only in the batch branch).  Run the whole ladder against a COPY of
+    // the cycle ledger first; a side whose every tier would be refused is
+    // dropped up front, and if the surviving side does not buy XCH it is
+    // dropped too -- the same exemption rule the batch guard applies.
+    if (xch_cycle_ledger_.active()) {
+        // Local: the batch branch's equivalents are scoped inside it.
+        const bool bids_buy_xch = (pair.base_asset_id == "xch");
+        const bool asks_buy_xch = (pair.quote_asset_id == "xch");
+        CoinLockLedger probe = xch_cycle_ledger_;
+        int  admit_bid = 0, admit_ask = 0;
+        bool any_bid = false, any_ask = false;
+        for (const auto& tier : quotes) {
+            json probe_dict = build_offer_dict(pair, tier);
+            if (probe_dict.empty()) {
+                continue;
+            }
+            const bool ok =
+                xch_ledger_probe_admits(probe, probe_dict, pair, tier.side);
+            if (tier.side == Side::Bid) {
+                any_bid = true;
+                if (ok) ++admit_bid;
+            } else {
+                any_ask = true;
+                if (ok) ++admit_ask;
+            }
+        }
+        const bool asks_doomed = any_ask && admit_ask == 0 && admit_bid > 0;
+        const bool bids_doomed = any_bid && admit_bid == 0 && admit_ask > 0;
+        if (asks_doomed) {
+            ask_funds_exhausted = true;
+            xch_ledger_suppressed_ = true;
+            if (!bids_buy_xch) {
+                bid_funds_exhausted = true;
+            }
+            logger_->warn("XCH lock ledger preflight: {} ask side would be "
+                          "fully refused -- dropping asks{} up front",
+                          pair.name,
+                          bids_buy_xch ? "" : " and bids (one-sided guard)");
+        } else if (bids_doomed) {
+            bid_funds_exhausted = true;
+            xch_ledger_suppressed_ = true;
+            if (!asks_buy_xch) {
+                ask_funds_exhausted = true;
+            }
+            logger_->warn("XCH lock ledger preflight: {} bid side would be "
+                          "fully refused -- dropping bids{} up front",
+                          pair.name,
+                          asks_buy_xch ? "" : " and asks (one-sided guard)");
+        }
+    }
+
     for (const auto& tier : quotes) {
         // Skip further tiers on the side that already reported
         // insufficient funds; the other side may still succeed.
@@ -2721,6 +2776,24 @@ std::vector<Mojo> OfferManager::spendable_amounts_from_coin_records(
         }
     }
     return amounts;
+}
+
+bool OfferManager::xch_ledger_probe_admits(CoinLockLedger&   probe,
+                                           const json&       offer_dict,
+                                           const PairConfig& pair,
+                                           Side              side) const
+{
+    if (!probe.active()) {
+        return true;
+    }
+    const bool buys_xch =
+        (side == Side::Bid && pair.base_asset_id == "xch")
+        || (side == Side::Ask && pair.quote_asset_id == "xch");
+    if (buys_xch) {
+        return probe.try_lock_floor_only(0, current_fee_mojos_);
+    }
+    return probe.try_lock(xch_principal_from_offer_dict(offer_dict),
+                          current_fee_mojos_);
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,

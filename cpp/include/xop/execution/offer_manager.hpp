@@ -679,6 +679,14 @@ public:
 
 private:
 
+    /// Probe-only admission mirror of xch_ledger_admits, run against a
+    /// COPY of the cycle ledger by the ladder preflight: same charges,
+    /// no logging, no flag side effects.
+    [[nodiscard]] bool xch_ledger_probe_admits(CoinLockLedger&   probe,
+                                               const json&       offer_dict,
+                                               const PairConfig& pair,
+                                               Side              side) const;
+
     /// Cancel forwarders that charge the cycle ledger for the fee coin a
     /// cancellation locks (review: cancels run after the cycle snapshot,
     /// so without this the ledger overstates the free pool).  Charged

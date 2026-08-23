@@ -102,6 +102,32 @@ TEST(CoinLockLedgerTest, KnapsackOfSmallerCoinsIsChargedWhenWalletPrefersIt) {
     EXPECT_EQ(ledger.remaining(), kXch * 11 / 10);
 }
 
+TEST(CoinLockLedgerTest, ExactSingleCoinMatchWinsOverKnapsack) {
+    // (review round 8) The wallet takes an EXACT one-coin match before any
+    // smaller-coin knapsacking: {0.6, 0.6, 1.0} with need 1.0 removes the
+    // 1.0 coin, never the 0.6s.
+    std::vector<Mojo> coins = {kXch * 6 / 10, kXch * 6 / 10, kXch};
+    CoinLockLedger ledger(coins, 0, 1.0);
+
+    ASSERT_TRUE(ledger.try_lock(kXch, 0));
+    EXPECT_EQ(ledger.committed(), kXch);
+    EXPECT_EQ(ledger.remaining(), 2 * (kXch * 6 / 10));
+}
+
+TEST(CoinLockLedgerTest, SmallerCoinMatchRequiresStrictlyUnder500Coins) {
+    // (review round 8) chia's exact-all-smaller branch requires
+    // len(smaller_coins) < 500; AT 500 the wallet falls back to a covering
+    // coin, so the model must too -- 500 one-mojo coins summing exactly to
+    // the need still select the 1000-mojo covering coin.
+    std::vector<Mojo> coins(500, 1);
+    coins.push_back(1'000);
+    CoinLockLedger ledger(coins, 0, 1.0);
+
+    ASSERT_TRUE(ledger.try_lock(500, 0));
+    EXPECT_EQ(ledger.committed(), 1'000);   // the covering coin, not the dust
+    EXPECT_EQ(ledger.remaining(), 500);
+}
+
 TEST(CoinLockLedgerTest, KnapsackIdentityIsPreservedAcrossLocks) {
     // (review round 5) {4,4,9} with needs 8 then 4: the wallet knapsacks
     // {4,4} for the first need and must lock 9 for the second, ending at

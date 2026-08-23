@@ -213,6 +213,12 @@ private:
             single_sel.single     = true;
             single_sel.single_idx =
                 static_cast<std::size_t>(it - coins_.begin());
+            // The wallet checks for an EXACT one-coin match before any
+            // smaller-coin knapsacking (review round 8: {1.0, 0.6, 0.6}
+            // need 1.0 removes the 1.0 coin, never the 0.6s).
+            if (*it == need) {
+                return single_sel;
+            }
         }
 
         // Knapsack model, applicable when the sub-need coins alone can
@@ -239,12 +245,12 @@ private:
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
-            // The wallet only accepts a smaller-coin match under its
-            // per-spend coin-count limit; past that it falls back to a
-            // covering coin (review round 7: 501 dust coins summing past
-            // the need would never be knapsacked by the real wallet).
+            // The wallet only accepts a smaller-coin match STRICTLY under
+            // its per-spend coin-count limit (chia's exact-all-smaller
+            // branch requires len(smaller_coins) < 500); at or past it,
+            // it falls back to a covering coin (review rounds 7-8).
             constexpr std::size_t kMaxSelectionCoins = 500;
-            if (covered >= need && count <= kMaxSelectionCoins) {
+            if (covered >= need && count < kMaxSelectionCoins) {
                 tail_sel.covered      = true;
                 tail_sel.locked       = covered;
                 tail_sel.prefix_count = count;   // largest sub-need coins
