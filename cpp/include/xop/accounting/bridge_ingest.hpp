@@ -286,7 +286,18 @@ struct BridgeValuation {
                 break;
         }
     }
-    return true;
+    // Semantic field ranges (review round 13): "2026-99-99T99:99:99"
+    // passes the shape check yet sorts after any real timestamp, and
+    // this predicate is the fail-closed guard for double-booking and
+    // peak shifts.  Both writers are machine-generated, so a violation
+    // means corruption -- reject it.
+    const auto two = [&s](std::size_t i) {
+        return (s[i] - '0') * 10 + (s[i + 1] - '0');
+    };
+    const int month = two(5), day = two(8);
+    const int hour = two(11), minute = two(14), second = two(17);
+    return month >= 1 && month <= 12 && day >= 1 && day <= 31
+        && hour <= 23 && minute <= 59 && second <= 59;
 }
 
 /// Whether ISO-8601 UTC timestamp `a` is STRICTLY after `b`, comparing the

@@ -1060,6 +1060,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         && confirmed >= 0) {
                         genesis_balances[AssetId{aid}] = confirmed;
                     }
+                    // Record the successful balance observation BEFORE
+                    // the zero-seed continue (review round 13): a zero
+                    // bridge balance skips seeding, but its zero-valued
+                    // opening still needs the observation time or the
+                    // chronology filter falls back to the later write
+                    // time and can misclassify the first mint.
+                    genesis_observed_at[AssetId{aid}] =
+                        PnLTracker::timestamp_to_iso(
+                            std::chrono::system_clock::now());
                     const Mojo seed_qty = (confirmed > 0) ? confirmed : spendable;
                     if (seed_qty <= 0) continue;
 
@@ -1069,9 +1078,6 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     if (confirmed > 0) {
                         genesis_balances[AssetId{aid}] = confirmed;
                     }
-                    genesis_observed_at[AssetId{aid}] =
-                        PnLTracker::timestamp_to_iso(
-                            std::chrono::system_clock::now());
 
                     // Use 1 as synthetic cost basis -- the actual value
                     // doesn't affect inventory_ratio because that method

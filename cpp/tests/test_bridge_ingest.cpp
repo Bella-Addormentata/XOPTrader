@@ -269,6 +269,12 @@ TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
         "zzzzzzzzzzzzzzzzzzz", "2026-08-23T19:08:00Z"));
     EXPECT_FALSE(completed_during_process(
         "2026-08-23X19:31:12Z", "2026-08-23T19:08:00Z"));  // bad separator
+    // (round 13) Shape-valid but semantically impossible fields must
+    // fail closed too -- "month 99" sorts after any real timestamp.
+    EXPECT_FALSE(completed_during_process(
+        "2026-99-99T99:99:99Z", "2026-08-23T19:08:00Z"));
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-13-01T00:00:00Z", "2026-08-01T00:00:00Z"));
     EXPECT_FALSE(iso_strictly_after(
         "zzzzzzzzzzzzzzzzzzz", "2026-08-01T00:00:00Z"));
 }
