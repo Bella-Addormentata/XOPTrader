@@ -842,6 +842,15 @@ private:
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
 
+    /// [S19 review round 11] Whether the bridge scan can currently act
+    /// as the bridge asset's inventory maintainer.  The Step 8 recovery
+    /// seed and Step 11 one-shot reconcile exclude the asset ONLY while
+    /// this holds -- if the scan stands down (ledger off, genesis not
+    /// done, incomplete ledger, empty path, asset not opened), the
+    /// recovery paths resume maintaining it instead of both sides
+    /// standing down forever.
+    [[nodiscard]] bool bridge_accounting_operational() const;
+
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)
     /// has already been warned about -- such jobs stay in the scan
@@ -857,10 +866,13 @@ private:
     /// re-anchors the peak from live equity anyway.
     double pending_peak_flow_usd_{0.0};
 
-    /// [S19 2026-08-23] Process start time, ISO-8601 UTC.  Bridge flows
-    /// completing at or after this instant shift the drawdown peak; older
-    /// flows are already inside the startup peak anchor (which re-seeds
-    /// from live equity) and shifting again would double-count them.
+    /// [S19 2026-08-23, rebased round 11] The live-flow baseline,
+    /// ISO-8601 UTC, stamped lazily at the FIRST bridge scan (not at
+    /// construction: a flow completing before startup seeding is already
+    /// inside the startup baseline).  Bridge flows completing strictly
+    /// after this instant rescale the drawdown peak; older flows are
+    /// covered by the peak's own seeding and rescaling again would
+    /// double-count them.
     std::string engine_start_iso_;
 
     /// Timestamp of the last wallet recovery probe (to throttle retries).

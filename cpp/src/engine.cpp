@@ -199,10 +199,6 @@ Engine::Engine(const AppConfig& config, bool dry_run)
                  execution::kReconcileStopAfterOldPages,
                  execution::kReconcileScanSlackSecs / 3600);
 
-    // [S19] Anchor for the bridge-flow drawdown-peak guard.
-    engine_start_iso_ = PnLTracker::timestamp_to_iso(
-        std::chrono::system_clock::now());
-
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
 
@@ -7333,12 +7329,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // the bridge scan's wallet-truth reconcile
                         // (single writer); seeding here would absorb a
                         // mint the scan is about to book.  Same exclusion
-                        // as Step 11's one-shot reconcile.
+                        // as Step 11's one-shot reconcile.  Only while
+                        // the scan is OPERATIONAL (round 11) -- when it
+                        // stands down, this recovery seed resumes.
                         const bool bridge_owned =
-                            config_.accounting.ledger_enabled
-                            && config_.accounting.bridge_ingest_enabled
-                            && sb.label
-                                   == config_.accounting.bridge_asset_id;
+                            sb.label == config_.accounting.bridge_asset_id
+                            && bridge_accounting_operational();
                         if (!bridge_owned && confirmed > 0 && inventory_
                             && inventory_->net_inventory(tracked_asset) == 0)
                         {
@@ -11536,6 +11532,20 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     co_return;
 }
 
+// [S19 review round 11] The single-writer contract holds only while the
+// scan can actually run; Step 8/Step 11 consult this before excluding
+// the bridge asset from their recovery paths.
+bool Engine::bridge_accounting_operational() const
+{
+    const auto& acc = config_.accounting;
+    return acc.ledger_enabled && acc.bridge_ingest_enabled
+        && db_ && inventory_ && pnl_
+        && !acc.bridge_asset_id.empty()
+        && !acc.bridge_jobs_db_path.empty()
+        && ledger_genesis_done_ && !ledger_incomplete_
+        && ledger_opened_assets_.count(AssetId{acc.bridge_asset_id}) > 0;
+}
+
 // [S19 2026-08-23] Book completed warp bridge flows as first-class ledger
 // events.  See accounting/bridge_ingest.hpp for the design rationale and
 // engine.hpp for the contract.  Synchronous on purpose: one read-only
@@ -11554,6 +11564,19 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
 
     const AssetId asset{acc.bridge_asset_id};
     if (!ledger_opened_assets_.count(asset)) return;
+
+    // The live-flow baseline is the FIRST scan, not process construction
+    // (review round 11): a flow completing between the constructor and
+    // startup seeding is already inside the startup inventory/equity
+    // baseline, and queuing it for a peak rescale would double-count.
+    // Everything completed before this instant is pre-baseline by
+    // construction; the peak's own max() seeding covers it.
+    if (engine_start_iso_.empty()) {
+        engine_start_iso_ = PnLTracker::timestamp_to_iso(
+            std::chrono::system_clock::now());
+        spdlog::info("[Engine] Bridge ingest: live-flow baseline stamped "
+                     "at {}", engine_start_iso_);
+    }
 
     // The GUI owns warp_jobs.db; the engine only ever reads it.
     // SQLITE_OPEN_READONLY refuses to create the file and makes writes
@@ -12359,13 +12382,13 @@ void Engine::step_update_pnl(BlockHeight block_height)
                 // nothing corrects.  Residual NON-bridge transfers of the
                 // asset fall to the ledger divergence control, exactly the
                 // pre-S19 behaviour for every asset.
-                if (config_.accounting.ledger_enabled
-                    && config_.accounting.bridge_ingest_enabled
-                    && aid == config_.accounting.bridge_asset_id) {
-                    // With ledger_enabled: false the bridge scan is a
-                    // no-op (no writer), so the exclusion must not apply
-                    // or the asset would have NO quantity maintainer
-                    // (review round 5).
+                if (aid == config_.accounting.bridge_asset_id
+                    && bridge_accounting_operational()) {
+                    // Excluded only while the bridge scan is OPERATIONAL
+                    // (rounds 5 + 11): whenever the scan stands down --
+                    // ledger off, genesis not done, incomplete ledger,
+                    // asset not opened -- this one-shot reconcile resumes
+                    // as the asset's maintainer.
                     continue;
                 }
                 if (bal.pending_change != 0) continue;  // coins in flight
