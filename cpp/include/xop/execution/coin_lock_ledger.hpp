@@ -245,15 +245,18 @@ private:
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
-            // Coin-count limits mirror chia's two branches (review rounds
-            // 7-10): the exact-all-smaller branch requires STRICTLY fewer
-            // than 500 coins, while the knapsack/largest-first fallback
-            // accepts an overshooting result of up to 500 coins and only
-            // rejects above that.
-            constexpr std::size_t kMaxSelectionCoins = 500;
+            // Coin-count limits mirror chia 2.7.3's two branches (review
+            // rounds 7-11): the exact-all-smaller branch requires STRICTLY
+            // fewer than 500 coins, while knapsack_coin_algorithm checks
+            // len > 500 BEFORE adding the next coin, so it can return a
+            // 501-coin set that select_coins does not revalidate.  These
+            // bounds are version-specific heuristics; divergence on other
+            // versions is covered by the approximation contract above.
+            constexpr std::size_t kExactMatchMaxCoins = 500;  // strict <
+            constexpr std::size_t kKnapsackMaxCoins   = 501;  // inclusive
             const bool count_ok =
-                covered == need ? count < kMaxSelectionCoins
-                                : count <= kMaxSelectionCoins;
+                covered == need ? count < kExactMatchMaxCoins
+                                : count <= kKnapsackMaxCoins;
             if (covered >= need && count_ok) {
                 tail_sel.covered      = true;
                 tail_sel.locked       = covered;

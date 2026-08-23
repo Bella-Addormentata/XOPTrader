@@ -102,6 +102,20 @@ TEST(CoinLockLedgerTest, KnapsackOfSmallerCoinsIsChargedWhenWalletPrefersIt) {
     EXPECT_EQ(ledger.remaining(), kXch * 11 / 10);
 }
 
+TEST(CoinLockLedgerTest, KnapsackAccepts501CoinOvershoot) {
+    // (review round 11) chia 2.7.3's knapsack checks len > 500 BEFORE
+    // adding the next coin, so a 501-coin overshooting set is reachable
+    // and select_coins does not revalidate it: 501 two-mojo dust coins
+    // vs need 1001 are selected over the 1002-mojo covering coin.
+    std::vector<Mojo> coins(501, 2);
+    coins.push_back(1'002);
+    CoinLockLedger ledger(coins, 0, 1.0);
+
+    ASSERT_TRUE(ledger.try_lock(1'001, 0));
+    EXPECT_EQ(ledger.committed(), 1'002);    // the dust total (501 x 2)
+    EXPECT_EQ(ledger.remaining(), 1'002);    // the big coin survives
+}
+
 TEST(CoinLockLedgerTest, OvershootingKnapsackAccepts500Coins) {
     // (review round 10) The strict <500 rule applies only to the
     // exact-total branch; chia's knapsack fallback accepts an OVERSHOOTING
