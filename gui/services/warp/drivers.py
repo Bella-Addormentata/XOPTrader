@@ -1096,7 +1096,14 @@ def build_claim_bundle(req: ClaimRequest) -> ClaimBundle:
         message_coin_puzzle,
         get_message_coin_solution(
             minter_coin,
-            req.portal_parent_parent_info,
+            # The message coin's parent is the CURRENT portal coin, so this
+            # pair must rebuild THAT coin's id: its parent id and its own
+            # inner puzzle hash.  req.portal_parent_parent_info is the
+            # portal's GRANDPARENT -- it belongs only in the portal spend's
+            # lineage proof above; here it asserted a parent that never
+            # existed (deterministic ASSERT_MY_PARENT_ID_FAILED, first
+            # observed on the first live claim, 2026-08-23).
+            req.portal_coin.parent_coin_info,
             portal_inner_hash,
             message_coin.name(),
         ),
