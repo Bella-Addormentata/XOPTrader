@@ -1044,6 +1044,17 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     Mojo confirmed = bal_json.value("confirmed_wallet_balance",
                                                     static_cast<Mojo>(0));
+                    // [S19 review round 6] The bridge asset records
+                    // its opening even at ZERO balance: the zero-opening
+                    // exception in post_ledger_genesis is unreachable
+                    // unless the queried zero survives this collection,
+                    // and without an opening the first deposit into an
+                    // empty asset could never book as external capital.
+                    if (config_.accounting.bridge_ingest_enabled
+                        && aid == config_.accounting.bridge_asset_id
+                        && confirmed >= 0) {
+                        genesis_balances[AssetId{aid}] = confirmed;
+                    }
                     const Mojo seed_qty = (confirmed > 0) ? confirmed : spendable;
                     if (seed_qty <= 0) continue;
 
@@ -7317,7 +7328,18 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         cached_wallet_balances_[sb.label] =
                             {spendable, confirmed, pending, block_height};
                         const AssetId tracked_asset{sb.label};
-                        if (confirmed > 0 && inventory_
+                        // [S19 review round 6] The bridge asset's
+                        // inventory and State position are maintained by
+                        // the bridge scan's wallet-truth reconcile
+                        // (single writer); seeding here would absorb a
+                        // mint the scan is about to book.  Same exclusion
+                        // as Step 11's one-shot reconcile.
+                        const bool bridge_owned =
+                            config_.accounting.ledger_enabled
+                            && config_.accounting.bridge_ingest_enabled
+                            && sb.label
+                                   == config_.accounting.bridge_asset_id;
+                        if (!bridge_owned && confirmed > 0 && inventory_
                             && inventory_->net_inventory(tracked_asset) == 0)
                         {
                             inventory_->seed_position(tracked_asset, confirmed,
@@ -7331,7 +7353,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // persist so a crash in between round-trips.
                             persist_inventory_state();
                         }
-                        if (confirmed > 0 && state_
+                        if (!bridge_owned && confirmed > 0 && state_
                             && state_->get_position(tracked_asset).balance == 0)
                         {
                             state_->record_buy(tracked_asset, confirmed, Mojo{1});
@@ -11568,12 +11590,12 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     // for Base-side delivery -- minutes normally, UNBOUNDED for
     // AWAITING_EXTERNAL_RELAY -- during which the invariant would absorb
     // the burn as blind adjust churn, exactly what this step exists to
-    // prevent (review round 1).  The three extra statuses are
-    // outbound-only vocabulary, so no direction ambiguity enters.
-    // FAILED/CANCELLED recovered or never sent funds, DRY_RUN_OK
-    // deliberately broadcast nothing; a post-burn FAILED job stays
-    // unbooked until the operator resolves it (the slot is held and the
-    // divergence control covers the gap meanwhile -- documented choice).
+    // prevent (review round 1).  Selection is by EXISTENCE of the
+    // historical booking-point event, not the job's CURRENT status
+    // (review round 6): a post-burn job can later move to FAILED or be
+    // operator-closed, and neither un-burns the CAT -- the flow already
+    // happened.  Jobs that never reached a booking point (pre-burn
+    // FAILED/CANCELLED, DRY_RUN_OK) have no such event and never match.
     // The flow timestamp is the FIRST warp_events entry in a
     // booking-eligible status: immutable, unlike warp_jobs.updated_at
     // which rewrites on every poll (review round 3).
@@ -11590,8 +11612,12 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
                COALESCE(j.state, '{}'),
                COALESCE(j.created_at, '')
         FROM warp_jobs j
-        WHERE j.status IN ('COMPLETED', 'COLLECTING_EVM_SIGS', 'RELAYING',
-                           'AWAITING_EXTERNAL_RELAY')
+        WHERE EXISTS (SELECT 1 FROM warp_events e
+                      WHERE e.job_id = j.id
+                        AND e.status IN ('COMPLETED',
+                                         'COLLECTING_EVM_SIGS',
+                                         'RELAYING',
+                                         'AWAITING_EXTERNAL_RELAY'))
         ORDER BY j.id;
     )SQL";
 
@@ -11745,21 +11771,11 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         }
         if (*inserted == 0) continue;    // already booked (restart/re-scan)
 
-        // 2. Cost basis: a mint folds in at the numeraire price; a burn
-        // draws down at weighted-average basis (enforce_no_loss=false --
-        // the burn is already on-chain, this records it).
-        if (flow.inbound) {
-            inventory_->record_buy(asset, flow.delta_mojos,
-                                   val.fmv_pseudo_price, block_height, now);
-        } else if (!inventory_->record_sell(asset, -flow.delta_mojos,
-                                            val.fmv_pseudo_price,
-                                            block_height, now,
-                                            /*enforce_no_loss=*/false)) {
-            spdlog::warn("[Engine] Bridge ingest: cost basis not reduced "
-                         "for job {} burn of {} mojos (holdings below "
-                         "quantity?) -- ledger entry stands",
-                         row.id, -flow.delta_mojos);
-        }
+        // 2. Inventory is NOT mutated per flow.  Add-based mutations
+        // raced every recovery path that also writes this asset (Step 8
+        // zero-seed, Step 11 reconcile -- review rounds 4-6); the
+        // end-of-scan wallet-truth reconcile below covers the flow
+        // idempotently instead.
 
         // 3. External capital, kept out of trading P&L (GIPS/TWR).
         pnl_->add_net_deposit_usd(val.flow_usd);
@@ -11810,10 +11826,60 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     }
 
     if (booked > 0) {
-        persist_inventory_state();
         spdlog::info("[Engine] Bridge ingest: booked {} flow(s), net "
                      "${:+.6f} external capital at block {}",
                      booked, booked_usd, block_height);
+    }
+
+    // Single-writer inventory maintenance (review rounds 4-6): the scan
+    // reconciles the bridge asset's tracked quantity and State position
+    // to the CONFIRMED wallet balance -- idempotent wallet truth
+    // covering the cold-start baseline, every booked flow, and any
+    // drift, at the numeraire price (identical basis math to a $1
+    // record_buy for increases; proportional draw-down for decreases).
+    // Step 8's recovery seed and Step 11's one-shot reconcile both skip
+    // this asset, so exactly one writer remains and no seed can absorb
+    // a mint this scan is about to book.  Freshness-gated like Step 11:
+    // a stale snapshot must not undo a fill or a just-landed flow.
+    const Mojo numeraire_pseudo =
+        static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
+    bool inv_changed = false;
+    if (auto bit = cached_wallet_balances_.find(asset);
+        bit != cached_wallet_balances_.end()) {
+        const auto& bal = bit->second;
+        constexpr BlockHeight kBalanceMaxAgeBlocks = 10;
+        const bool fresh = bal.as_of_block != 0
+            && block_height >= bal.as_of_block
+            && block_height - bal.as_of_block <= kBalanceMaxAgeBlocks
+            && bal.pending_change == 0;
+        if (fresh && bal.confirmed >= 0) {
+            const Mojo tracked = inventory_->net_inventory(asset);
+            if (tracked != bal.confirmed) {
+                inventory_->adjust_quantity(asset, bal.confirmed,
+                                            numeraire_pseudo);
+                inv_changed = true;
+                spdlog::info("[Engine] Bridge ingest: reconciled {} "
+                             "inventory {} -> {} mojos to wallet truth",
+                             asset.substr(0, 12), tracked, bal.confirmed);
+            }
+            if (state_) {
+                const Mojo pos = state_->get_position(asset).balance;
+                if (bal.confirmed > pos) {
+                    state_->record_buy(asset, bal.confirmed - pos,
+                                       numeraire_pseudo);
+                } else if (bal.confirmed < pos
+                           && !state_->record_sell(
+                                  asset, pos - bal.confirmed)) {
+                    spdlog::warn("[Engine] Bridge ingest: state position "
+                                 "for {} could not be reduced {} -> {}",
+                                 asset.substr(0, 12), pos, bal.confirmed);
+                }
+            }
+        }
+    }
+
+    if (booked > 0 || inv_changed) {
+        persist_inventory_state();
     }
 }
 
