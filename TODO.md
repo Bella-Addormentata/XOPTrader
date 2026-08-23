@@ -220,9 +220,14 @@
   `cpp/src/engine.cpp` (step_ingest_bridge_flows), `cpp/src/monitoring/pnl.cpp`,
   `gui/services/database_service.py`, `gui/widgets/dashboard.py`
 - **Status:** `[x]` BUILT 2026-08-23 -- engine reads warp_jobs.db read-only
-  each heartbeat and books COMPLETED jobs as bridge_deposit (+post_tip
-  mojos) / bridge_withdrawal (-burned mojos) BEFORE the divergence control,
-  idempotent via ledger event_id "bridge:job:<id>".  GIPS/TWR treatment:
+  each heartbeat and books bridge_deposit (+post_tip mojos, inbound at
+  COMPLETED) / bridge_withdrawal (-burned mojos, outbound at the FIRST
+  burn-confirmed status: COLLECTING_EVM_SIGS/RELAYING/
+  AWAITING_EXTERNAL_RELAY, since COMPLETED can lag unboundedly behind the
+  wallet-affecting burn) BEFORE the divergence control, idempotent via
+  ledger event_id "bridge:job:<id>:<created_at>"; chronology (opening
+  filter + peak guard) uses the job's first booking-eligible warp_events
+  timestamp, immutable unlike updated_at.  GIPS/TWR treatment:
   signed USD accumulates as a net-deposits figure outside trading P&L
   (PnLSummary::net_deposits_usd, Prometheus component="net_deposits",
   dashboard "Net Deposits" card), and the drawdown peak shifts with each

@@ -65,11 +65,21 @@ namespace xop::accounting {
 // ---------------------------------------------------------------------------
 
 struct BridgeJobRow {
-    std::int64_t id{0};             ///< warp_jobs.id (the idempotency key).
+    std::int64_t id{0};             ///< warp_jobs.id (AUTOINCREMENT -- only
+                                    ///< unique within one DB file).
     Mojo         amount_mojos{0};   ///< Outbound: CAT mojos burned.
     Mojo         post_tip_mojos{0}; ///< Inbound: CAT mojos minted after tip.
-    std::string  updated_at;        ///< ISO-8601 UTC of the last transition.
+    /// ISO-8601 UTC of the job's FIRST entry into a booking-eligible
+    /// status, taken from warp_events (immutable).  NOT
+    /// warp_jobs.updated_at, which rewrites on every poll and would let
+    /// a pre-opening burn drift past the opening filter (review round 3).
+    std::string  flow_at;
     std::string  state_json;        ///< Evolving payload; carries direction.
+    /// ISO-8601 UTC creation stamp (immutable, never rewritten).  Part of
+    /// the ledger identity: a recreated jobs DB restarts AUTOINCREMENT,
+    /// and "bridge:job:1" alone would collide with a genuinely new flow,
+    /// which INSERT OR IGNORE would then silently drop (review round 3).
+    std::string  created_at;
 };
 
 // ---------------------------------------------------------------------------
@@ -132,7 +142,8 @@ struct BridgeFlow {
         f.delta_mojos = row.post_tip_mojos;
         f.event_type  = "bridge_deposit";
     }
-    f.event_id = "bridge:job:" + std::to_string(row.id);
+    f.event_id = "bridge:job:" + std::to_string(row.id) + ":"
+               + row.created_at;
     f.valid    = true;
     return f;
 }
@@ -290,24 +301,19 @@ struct BridgeValuation {
 // Drawdown-anchor guard.
 // ---------------------------------------------------------------------------
 
-/// Whether a job completed while THIS engine process was alive.  The
-/// drawdown peak only shifts for such flows: after a restart the startup
-/// grace re-anchors the peak to an equity that already contains the flow,
-/// and shifting again would double-count it.  Both timestamps are ISO-8601
-/// UTC, so comparing the first 19 chars ("YYYY-MM-DDTHH:MM:SS") is a
-/// correct chronological compare regardless of the suffix ("Z" vs
-/// "+00:00").  Malformed or missing timestamps fail closed (no shift).
+/// Whether a job's flow happened while THIS engine process was alive.
+/// The drawdown peak only rescales for such flows: after a restart the
+/// startup grace re-anchors the peak to an equity that already contains
+/// the flow, and rescaling again would double-count it.  STRICTLY after
+/// (review round 3): the GUI stamps whole seconds while the engine start
+/// carries sub-second precision the prefix compare discards, so an
+/// equal-second flow is ambiguous and must fail closed -- the same
+/// doctrine as the opening filter, and literally the same ordering.
 [[nodiscard]] inline bool completed_during_process(
-    const std::string& updated_at_iso,
+    const std::string& flow_at_iso,
     const std::string& process_start_iso) noexcept
 {
-    constexpr std::size_t kPrefix = 19;
-    if (!looks_like_iso_prefix(updated_at_iso)
-        || !looks_like_iso_prefix(process_start_iso)) {
-        return false;
-    }
-    return updated_at_iso.compare(0, kPrefix,
-                                  process_start_iso, 0, kPrefix) >= 0;
+    return iso_strictly_after(flow_at_iso, process_start_iso);
 }
 
 }  // namespace xop::accounting

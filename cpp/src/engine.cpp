@@ -11562,16 +11562,25 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     // deliberately broadcast nothing; a post-burn FAILED job stays
     // unbooked until the operator resolves it (the slot is held and the
     // divergence control covers the gap meanwhile -- documented choice).
+    // The flow timestamp is the FIRST warp_events entry in a
+    // booking-eligible status: immutable, unlike warp_jobs.updated_at
+    // which rewrites on every poll (review round 3).
     static constexpr const char* kJobsSql = R"SQL(
-        SELECT id,
-               COALESCE(amount_mojos, 0),
-               COALESCE(post_tip_mojos, 0),
-               COALESCE(updated_at, ''),
-               COALESCE(state, '{}')
-        FROM warp_jobs
-        WHERE status IN ('COMPLETED', 'COLLECTING_EVM_SIGS', 'RELAYING',
-                         'AWAITING_EXTERNAL_RELAY')
-        ORDER BY id;
+        SELECT j.id,
+               COALESCE(j.amount_mojos, 0),
+               COALESCE(j.post_tip_mojos, 0),
+               COALESCE((SELECT MIN(e.ts) FROM warp_events e
+                         WHERE e.job_id = j.id
+                           AND e.status IN ('COMPLETED',
+                                            'COLLECTING_EVM_SIGS',
+                                            'RELAYING',
+                                            'AWAITING_EXTERNAL_RELAY')), ''),
+               COALESCE(j.state, '{}'),
+               COALESCE(j.created_at, '')
+        FROM warp_jobs j
+        WHERE j.status IN ('COMPLETED', 'COLLECTING_EVM_SIGS', 'RELAYING',
+                           'AWAITING_EXTERNAL_RELAY')
+        ORDER BY j.id;
     )SQL";
 
     sqlite3_stmt* stmt = nullptr;
@@ -11591,12 +11600,15 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         r.id             = sqlite3_column_int64(stmt, 0);
         r.amount_mojos   = sqlite3_column_int64(stmt, 1);
         r.post_tip_mojos = sqlite3_column_int64(stmt, 2);
-        const char* ua = reinterpret_cast<const char*>(
+        const char* fa = reinterpret_cast<const char*>(
             sqlite3_column_text(stmt, 3));
         const char* sj = reinterpret_cast<const char*>(
             sqlite3_column_text(stmt, 4));
-        r.updated_at = ua ? ua : "";
+        const char* ca = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 5));
+        r.flow_at    = fa ? fa : "";
         r.state_json = sj ? sj : "{}";
+        r.created_at = ca ? ca : "";
         jobs.push_back(std::move(r));
     }
     // Handles released by the RAII guards at scope exit; the booking
@@ -11650,8 +11662,16 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             continue;
         }
 
-        if (!accounting::iso_strictly_after(row.updated_at, opening_time)) {
-            spdlog::debug("[Engine] Bridge ingest: job {} completed at or "
+        if (row.flow_at.empty()) {
+            spdlog::warn("[Engine] Bridge ingest: job {} has no recorded "
+                         "transition event -- chronology unknowable, not "
+                         "booked (left for the divergence control)",
+                         row.id);
+            continue;
+        }
+
+        if (!accounting::iso_strictly_after(row.flow_at, opening_time)) {
+            spdlog::debug("[Engine] Bridge ingest: job {} flowed at or "
                           "before the {} ledger opening ({}) -- already "
                           "inside the opening balance, not booked",
                           row.id, asset.substr(0, 12), opening_time);
@@ -11724,7 +11744,7 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // from an equity that already contains the flow.  Skipped (with
         // a log) while equity is not yet valued -- the startup grace
         // covers those cycles.
-        if (accounting::completed_during_process(row.updated_at,
+        if (accounting::completed_during_process(row.flow_at,
                                                  engine_start_iso_)) {
             const double equity_now    = compute_portfolio_equity_usd();
             const double equity_before = equity_now - val.flow_usd;

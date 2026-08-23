@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/accounting/bridge_ingest.hpp>
 #include <xop/accounting/reward_ingest.hpp>
 #include <xop/database.hpp>
 #include <xop/monitoring/pnl.hpp>
@@ -487,6 +488,84 @@ TEST_F(PnLTrackerTest, RewardIncomeRebuildsFromLedgerAcrossRestart) {
     t.add_reward_income_usd(-5.0);
     t.add_reward_income_usd(std::numeric_limits<double>::quiet_NaN());
     EXPECT_NEAR(t.get_reward_income_usd(), expected + 0.0100, 1e-9);
+}
+
+TEST_F(PnLTrackerTest, NetDepositsRebuildFromLedgerAcrossRestart) {
+    // [S19 2026-08-23] Bridge flows rebuild the SIGNED net-deposits total
+    // from the ledger notes on restart, without touching reward income or
+    // any trading figure.
+    const std::string wusdc =
+        "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d";
+
+    {
+        xop::Database db(db_path_);
+        auto mk = [&](const char* type, xop::Mojo delta, double usd,
+                      std::int64_t job) {
+            xop::DbLedgerEntry e;
+            e.entry_time   = "2026-08-23T19:28:03.000Z";
+            e.event_type   = type;
+            e.event_id     = std::string("bridge:job:")
+                           + std::to_string(job) + ":2026-08-23T11:59:38Z";
+            e.leg          = "bridge";
+            e.asset_id     = wusdc;
+            e.delta_mojos  = delta;
+            e.block_height = 9'189'949;
+            e.note = xop::accounting::bridge_note(usd, 1.0, job);
+            return e;
+        };
+        ASSERT_EQ(db.append_ledger_entries({
+            // The live job 2 mint and a hypothetical later unwrap.
+            mk("bridge_deposit", 4'985, 4.985, 2),
+            mk("bridge_withdrawal", -20'000, -20.0, 3),
+            // Neither an adjust nor a reward row may leak into the total.
+            [&] {
+                xop::DbLedgerEntry e;
+                e.entry_time  = "2026-08-23T19:30:00.000Z";
+                e.event_type  = "adjust";
+                e.event_id    = "adjust:" + wusdc + ":9189950";
+                e.leg         = "adjust";
+                e.asset_id    = wusdc;
+                e.delta_mojos = 500;
+                e.note = "unexplained divergence reconciled to wallet";
+                return e;
+            }(),
+            [&] {
+                xop::DbLedgerEntry e;
+                e.entry_time  = "2026-08-23T19:31:00.000Z";
+                e.event_type  = "reward";
+                e.event_id    = "reward:0xccc3";
+                e.leg         = "reward";
+                e.asset_id    = wusdc;
+                e.delta_mojos = 10;
+                e.note = xop::accounting::reward_note(0.01, 1.0, "0xccc3");
+                return e;
+            }(),
+        }).value_or(0), 4u);
+    }
+
+    // "Restart": a fresh tracker rebuilds the signed total from the
+    // ledger.  Must FAIL if the event filter or note parse regresses.
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    EXPECT_NEAR(t.get_net_deposits_usd(), 4.985 - 20.0, 1e-9);
+    EXPECT_NEAR(t.get_reward_income_usd(), 0.01, 1e-9);  // untouched
+
+    // Live accumulation stacks, and negatives are VALID here (unlike
+    // reward income): a withdrawal is a negative external flow.
+    t.add_net_deposit_usd(400.0);
+    t.add_net_deposit_usd(-5.0);
+    EXPECT_NEAR(t.get_net_deposits_usd(), 4.985 - 20.0 + 395.0, 1e-9);
+
+    // Surfaced beside the trading figures but part of NONE of them.
+    const auto s = t.get_total_pnl();
+    EXPECT_NEAR(s.net_deposits_usd, 4.985 - 20.0 + 395.0, 1e-9);
+    EXPECT_DOUBLE_EQ(s.total_pnl_usd, 0.0);
+    EXPECT_NEAR(s.reward_income_usd, 0.01, 1e-9);
+
+    // Garbage guards: NaN and absurd magnitudes are ignored.
+    t.add_net_deposit_usd(std::numeric_limits<double>::quiet_NaN());
+    t.add_net_deposit_usd(2e12);
+    EXPECT_NEAR(t.get_net_deposits_usd(), 4.985 - 20.0 + 395.0, 1e-9);
 }
 
 // ---------------------------------------------------------------------------

@@ -32,7 +32,8 @@ BridgeJobRow inbound_job() {
     r.id             = 2;
     r.amount_mojos   = kJob2Gross;
     r.post_tip_mojos = kJob2Minted;
-    r.updated_at     = "2026-08-23T18:31:12+00:00";
+    r.flow_at        = "2026-08-23T19:28:03+00:00";  // first COMPLETED event
+    r.created_at     = "2026-08-23T11:59:38+00:00";  // immutable, live job 2
     // Inbound jobs carry no "direction" key; that absence IS the marker.
     // The fingerprint is the live job 2 shape (v1:<erc20>:<dec>:<dec>:<id>).
     r.state_json     = R"({"phase": "done", "claim_block": 9189949,
@@ -45,7 +46,8 @@ BridgeJobRow outbound_job() {
     r.id             = 3;
     r.amount_mojos   = 20'000;             // burned CAT mojos
     r.post_tip_mojos = 0;
-    r.updated_at     = "2026-08-24T02:00:00+00:00";
+    r.flow_at        = "2026-08-24T02:00:00+00:00";
+    r.created_at     = "2026-08-24T01:30:00+00:00";
     r.state_json     = R"({"direction": "out", "receiver_evm": "3b04",
         "asset_fingerprint": "v1:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"})";
     return r;
@@ -61,7 +63,9 @@ TEST(BridgeClassifyTest, FirstLiveBridgeBooksAsDeposit) {
     EXPECT_TRUE(f.inbound);
     EXPECT_EQ(f.delta_mojos, kJob2Minted);      // post-tip, not gross
     EXPECT_EQ(f.event_type, "bridge_deposit");
-    EXPECT_EQ(f.event_id, "bridge:job:2");
+    // The immutable created_at is part of the identity: a recreated
+    // jobs DB reusing AUTOINCREMENT id 2 cannot collide (round 3).
+    EXPECT_EQ(f.event_id, "bridge:job:2:2026-08-23T11:59:38+00:00");
 }
 
 TEST(BridgeClassifyTest, UnwrapBooksAsWithdrawal) {
@@ -70,7 +74,7 @@ TEST(BridgeClassifyTest, UnwrapBooksAsWithdrawal) {
     EXPECT_FALSE(f.inbound);
     EXPECT_EQ(f.delta_mojos, -20'000);          // burn: negative delta
     EXPECT_EQ(f.event_type, "bridge_withdrawal");
-    EXPECT_EQ(f.event_id, "bridge:job:3");
+    EXPECT_EQ(f.event_id, "bridge:job:3:2026-08-24T01:30:00+00:00");
 }
 
 TEST(BridgeClassifyTest, UnparseableStateIsSkippedNotGuessed) {
@@ -228,12 +232,17 @@ TEST(BridgeNoteTest, ForeignNotesParseToZero) {
 // ============================================================================
 
 TEST(BridgePeakGuardTest, LiveFlowShiftsThePeak) {
-    // Job completed after this process started: the peak shifts.
-    // Completed before: the startup anchor already contains it.
+    // Flow after this process started: the peak rescales.
+    // Flow before: the startup anchor already contains it.
     EXPECT_FALSE(completed_during_process(
         "2026-08-23T18:31:12+00:00", "2026-08-23T19:08:00+00:00"));
     EXPECT_TRUE(completed_during_process(
         "2026-08-23T19:31:12+00:00", "2026-08-23T19:08:00+00:00"));
+    // (round 3) Equal second fails CLOSED: the GUI stamps whole seconds,
+    // the engine start carries sub-second precision the compare discards,
+    // so a same-second flow may already be inside the startup anchor.
+    EXPECT_FALSE(completed_during_process(
+        "2026-08-23T19:08:00+00:00", "2026-08-23T19:08:00.412Z"));
 }
 
 TEST(BridgePeakGuardTest, SuffixStylesCompareCorrectly) {
