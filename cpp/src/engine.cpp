@@ -26,6 +26,11 @@
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
+
+// [S19] Real SQLite API for the read-only warp_jobs.db scan.  database.hpp
+// deliberately forward-declares only the opaque handles; a .cpp that calls
+// the API includes the header itself (same pattern as monitoring/pnl.cpp).
+#include <sqlite3.h>
 #include "xop/execution/wallet_poll_throttle.hpp"
 #include "xop/risk/drawdown_breaker.hpp"
 #include "xop/strategy/avellaneda.hpp"
