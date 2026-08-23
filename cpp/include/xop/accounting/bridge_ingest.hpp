@@ -196,7 +196,13 @@ struct BridgeValuation {
 {
     BridgeValuation v{};
     if (delta_mojos == 0) return v;
-    if (!(mojos_per_unit > 0.0) || !(usd_per_unit > 0.0)) return v;  // NaN-safe
+    // Reject non-finite rates outright (review round 7: +Inf
+    // mojos_per_unit passed the positivity check and produced a nonzero
+    // pseudo-price with a zero USD flow, violating the contract).
+    if (!std::isfinite(mojos_per_unit) || !std::isfinite(usd_per_unit)) {
+        return v;
+    }
+    if (!(mojos_per_unit > 0.0) || !(usd_per_unit > 0.0)) return v;
     // The 1e12 pseudo-price scale overflows Mojo above ~$9.2M/unit, and
     // converting an out-of-range double to int64 is UB -- bound the SCALED
     // value against Mojo max before the cast (review round 1).  Also

@@ -184,6 +184,11 @@ TEST(BridgeValueTest, DegenerateInputsZeroOut) {
     EXPECT_EQ(value_bridge_flow(1'000, std::nan(""),
                                 1.0).fmv_pseudo_price, 0);
     EXPECT_EQ(value_bridge_flow(1'000, 1e3, 1e13).fmv_pseudo_price, 0);
+    // (review round 7) +Inf rates must zero out entirely -- an infinite
+    // mojos_per_unit used to yield a nonzero pseudo-price with a zero
+    // USD flow.
+    EXPECT_EQ(value_bridge_flow(1'000, HUGE_VAL, 1.0).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3, HUGE_VAL).fmv_pseudo_price, 0);
 }
 
 TEST(BridgeValueTest, PseudoPriceScaleCannotOverflowMojo) {

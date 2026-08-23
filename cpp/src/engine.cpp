@@ -11687,6 +11687,7 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
+    double      live_flow_usd = 0.0;   // in-process flows this scan (GIPS)
 
     for (const auto& row : jobs) {
         const auto flow = accounting::classify_bridge_job(row);
@@ -11780,41 +11781,16 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // 3. External capital, kept out of trading P&L (GIPS/TWR).
         pnl_->add_net_deposit_usd(val.flow_usd);
 
-        // 4. GIPS anchor shift: the drawdown peak moves WITH the flow so
-        // a deposit cannot mask losses (nor a withdrawal fake them).
-        // PROPORTIONAL, not additive (review round 1): the breaker tests
-        // the FRACTION (peak - equity) / peak, and an additive shift
-        // preserves the dollar gap while inflating that fraction on
-        // withdrawals (peak $158, equity $150, unwrap $100: 5.1% dd
-        // becomes $8/$58 = 13.8% -- a false trip) and diluting it on
-        // deposits.  Scaling by equity_after / equity_before preserves
-        // the fraction exactly.  Equity already contains the flow by
-        // booking time (mint claimed / burn confirmed), so
-        // equity_before = equity_now - flow.  Only for flows completing
-        // while this process is alive: after a restart the peak re-seeds
-        // from an equity that already contains the flow.  Skipped (with
-        // a log) while equity is not yet valued -- the startup grace
-        // covers those cycles.
+        // 4. GIPS anchor shift: accumulate the live flows and rescale
+        // the peak ONCE after the scan (review round 7: a per-flow
+        // rescale against the same final equity compounds -- two $10
+        // deposits at final equity $120 would multiply by (120/110)^2
+        // instead of 120/100).  Only flows completing while this process
+        // is alive count: after a restart the peak re-seeds from an
+        // equity that already contains the flow.
         if (accounting::completed_during_process(row.flow_at,
                                                  engine_start_iso_)) {
-            const double equity_now    = compute_portfolio_equity_usd();
-            const double equity_before = equity_now - val.flow_usd;
-            if (equity_now > 0.0 && equity_before > 0.0
-                && peak_equity_hwm_usd_ > 0.0) {
-                const double rescaled =
-                    peak_equity_hwm_usd_ * (equity_now / equity_before);
-                spdlog::info("[Engine] Bridge ingest: drawdown peak "
-                             "rescaled {:.2f} -> {:.2f} for job {} flow "
-                             "${:+.6f} (fraction-preserving GIPS "
-                             "adjustment)",
-                             peak_equity_hwm_usd_, rescaled, row.id,
-                             val.flow_usd);
-                peak_equity_hwm_usd_ = rescaled;
-            } else {
-                spdlog::info("[Engine] Bridge ingest: peak rescale "
-                             "skipped for job {} (equity not yet valued "
-                             "this early in the run)", row.id);
-            }
+            live_flow_usd += val.flow_usd;
         }
 
         ++booked;
@@ -11875,6 +11851,35 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
                                  asset.substr(0, 12), pos, bal.confirmed);
                 }
             }
+        }
+    }
+
+    // Single fraction-preserving peak rescale for this scan's live
+    // flows, AFTER the reconcile above -- equity is computed from
+    // InventoryTracker records, so the flows must be folded in first.
+    // The breaker tests (peak - equity) / peak; scaling by
+    // equity_after / equity_before preserves that fraction exactly,
+    // where equity_before = equity_now - sum(live flows).  An additive
+    // shift preserved only the dollar gap and could false-trip on a
+    // withdrawal (peak $158, equity $150, unwrap $100: 5.1% -> 13.8%).
+    // Skipped with a log while equity is not yet valued -- the startup
+    // grace covers those cycles.
+    if (live_flow_usd != 0.0) {
+        const double equity_now    = compute_portfolio_equity_usd();
+        const double equity_before = equity_now - live_flow_usd;
+        if (equity_now > 0.0 && equity_before > 0.0
+            && peak_equity_hwm_usd_ > 0.0) {
+            const double rescaled =
+                peak_equity_hwm_usd_ * (equity_now / equity_before);
+            spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
+                         "{:.2f} -> {:.2f} for ${:+.6f} of live bridge "
+                         "flow (fraction-preserving GIPS adjustment)",
+                         peak_equity_hwm_usd_, rescaled, live_flow_usd);
+            peak_equity_hwm_usd_ = rescaled;
+        } else {
+            spdlog::info("[Engine] Bridge ingest: peak rescale skipped "
+                         "for ${:+.6f} of live flow (equity not yet "
+                         "valued this early in the run)", live_flow_usd);
         }
     }
 
