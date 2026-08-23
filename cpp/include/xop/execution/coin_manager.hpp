@@ -213,6 +213,31 @@ public:
      * @return true if the resulting outputs contain more pool-ready coins than
      *         the original source coin.
      */
+    /// One coin's viable split, chosen by plan_split_for_coin().
+    /// batch == 0 means the coin has no improving split.
+    struct SplitPlan {
+        Mojo split_amount{0};  ///< denomination of each created coin
+        int  batch{0};         ///< number of coins to create (0 = no plan)
+    };
+
+    /// Decide how (whether) to split one free coin to improve the pool.
+    ///
+    /// Preferred plan: `batch` coins of the pool target denomination, largest
+    /// improving batch first (the historical behaviour).  Fallback
+    /// [COIN-POOL-DEADLOCK 2026-08-23]: a coin in [target+fee, 1.5*target)
+    /// can fund only a batch-1 target split whose change falls below the
+    /// pool-ready band -- "no improvement", so such coins were refused
+    /// forever.  On the live wallet every free XCH coin was ~2.0 XCH against
+    /// the 1.5 target, so ensure_split failed 76 times while offer
+    /// whole-coin locking starved spendable XCH to zero.  For that window
+    /// the planner splits the coin into two in-band halves instead (batch=1
+    /// of (amount-fee)/2 -- the wallet's change output IS the other half, so
+    /// no dust is created and the ready count goes 1 -> 2).
+    static SplitPlan plan_split_for_coin(Mojo amount_mojos,
+                                         int  needed,
+                                         Mojo target_amount_mojos,
+                                         Mojo fee);
+
     static bool split_improves_pool_ready_count(Mojo source_amount_mojos,
                                                 int  batch,
                                                 Mojo target_amount_mojos,
