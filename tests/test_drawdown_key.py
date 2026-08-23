@@ -57,6 +57,29 @@ def cfg_path(tmp_path):
     return dest
 
 
+def test_collect_preserves_strategy_keys_the_ui_does_not_own(panel, cfg_path):
+    """The comment-preserving writer deletes keys absent from the collected
+    dict, so any strategy key without a Settings widget used to die on the
+    first save -- including an operator's emergency
+    xch_cycle_commit_frac: 0.0 reverting to the engine default (review on
+    the coin-lock-ledger PR).  The collector now passes through every
+    loaded strategy key it does not own."""
+    import yaml as _yaml
+
+    raw = _yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    raw.setdefault("strategy", {})["xch_cycle_commit_frac"] = 0.0
+    raw["strategy"]["some_future_knob"] = "kept"
+    cfg_path.write_text(_yaml.safe_dump(raw), encoding="utf-8")
+
+    panel.load_config(str(cfg_path))
+    strategy = panel._collect_config_dict()["strategy"]
+
+    assert strategy["xch_cycle_commit_frac"] == 0.0
+    assert strategy["some_future_knob"] == "kept"
+    # Widget-owned keys still come from the widgets, not the snapshot.
+    assert "gamma" in strategy
+
+
 def test_collect_writes_the_new_key_and_never_the_fatal_one(panel, cfg_path):
     panel.load_config(str(cfg_path))
     risk = panel._collect_config_dict()["risk"]

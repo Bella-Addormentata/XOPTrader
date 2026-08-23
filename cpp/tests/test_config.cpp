@@ -751,13 +751,11 @@ TEST(ConfigParserTest, FeeReserveXch_RejectsNonFiniteAndOverflow) {
     // silently disabling the protection the value configures.
     const auto with_reserve = [](const std::string& value) {
         std::string yaml(kMinimalValidYaml);
-        const std::string anchor = "strategy:
-";
+        const std::string anchor = "strategy:\n";
         const auto at = yaml.find(anchor);
         EXPECT_NE(at, std::string::npos);
         yaml.insert(at + anchor.size(),
-                    "  fee_reserve_xch: " + value + "
-");
+                    "  fee_reserve_xch: " + value + "\n");
         return yaml;
     };
 
