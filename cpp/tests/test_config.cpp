@@ -202,6 +202,33 @@ accounting:
               "aabbccddeeff00112233445566778899");
 }
 
+TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {
+    // [S19 review round 14] Bridge ingestion needs the asset tracked by
+    // an enabled pair (openings + balance snapshots come from pairs).
+    // An untracked asset LOUDLY auto-disables the feature rather than
+    // throwing: the flag defaults to true, so a throw would brick every
+    // config that simply does not trade the bridge asset.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_ingest_enabled: true
+  bridge_asset_id: 00000000000000000000000000000000000000000000000000000000000000ff
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
+}
+
+TEST(ConfigParserTest, BridgeIngestDisabledSkipsPairCheck) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_ingest_enabled: false
+  bridge_asset_id: 00000000000000000000000000000000000000000000000000000000000000ff
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
+}
+
 TEST(ConfigParserTest, AccountingPauseBelowAlert_Throws) {
     // A pause threshold tighter than the alert threshold would pause before
     // ever alerting -- reject it rather than silently mis-escalate.

@@ -3363,6 +3363,39 @@ AppConfig load_config(const std::string& path,
     // without exposing secrets in log files.
     log_config_summary(cfg);
 
+    // [S19 review round 14] Bridge ingestion depends on the bridge asset
+    // being tracked: startup builds ledger openings and Step 8 refreshes
+    // balances exclusively from ENABLED pairs, so a bridge asset no
+    // enabled pair uses would silently never book anything while the
+    // feature reports enabled.  Fail loudly instead.
+    if (cfg.accounting.ledger_enabled
+        && cfg.accounting.bridge_ingest_enabled) {
+        bool tracked = false;
+        for (const auto& pr : cfg.pairs) {
+            if (!pr.enabled) continue;
+            if (pr.base_asset_id == cfg.accounting.bridge_asset_id
+                || pr.quote_asset_id == cfg.accounting.bridge_asset_id) {
+                tracked = true;
+                break;
+            }
+        }
+        if (!tracked) {
+            // Loud auto-disable, not a throw: bridge_ingest_enabled
+            // defaults to TRUE, so a hard failure would brick every
+            // config that simply does not trade the bridge asset.  The
+            // point is that the state is EXPLICIT, not silent.
+            cfg.accounting.bridge_ingest_enabled = false;
+            spdlog::warn(
+                "accounting.bridge_ingest_enabled disabled: no ENABLED "
+                "pair uses accounting.bridge_asset_id ({}...) as base or "
+                "quote, so the asset would have no ledger opening and no "
+                "balance snapshots and bridge flows could never book. "
+                "Enable a pair that trades the asset to activate bridge "
+                "accounting.",
+                cfg.accounting.bridge_asset_id.substr(0, 12));
+        }
+    }
+
     return cfg;
 }
 
