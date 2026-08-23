@@ -245,6 +245,17 @@ private:
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
+            // DELIBERATE LIMIT (review round 13, declined): chia 2.7.3's
+            // select_coins runs knapsack_coin_algorithm before the
+            // largest-first fallback, and with a constant default seed its
+            // output is technically reproducible -- but mirroring it would
+            // require replicating Python's Mersenne-Twister semantics and
+            // per-version iteration parameters byte-for-byte in C++, which
+            // silently breaks on any chia upgrade.  The largest-first
+            // accumulation stands in for the knapsack phase; residual
+            // identity drift is single-coin-granularity, bounded by the
+            // per-cycle reseed, the floor, and the wallet-requery
+            // backstops (see the approximation contract above).
             // Coin-count limits mirror chia 2.7.3's two branches (review
             // rounds 7-11): the exact-all-smaller branch requires STRICTLY
             // fewer than 500 coins, while knapsack_coin_algorithm checks
