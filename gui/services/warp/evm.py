@@ -88,6 +88,10 @@ MESSAGE_SENT_TOPIC0 = "ca4cf462dc4787a3aa57636ad2349b8fb4e4f2d2c0ef4ac57f85955f7
 # always estimates live and applies headroom.
 _APPROVE_GAS_DEFAULT = 80_000
 _BRIDGE_GAS_DEFAULT = 300_000
+#: Public alias: the dry-run BRIDGING fallback signs at this limit when the
+#: estimate cannot exist (see is_allowance_revert).  The signed transaction is
+#: never broadcast in a rehearsal, so the figure only has to be plausible.
+BRIDGE_GAS_DEFAULT = _BRIDGE_GAS_DEFAULT
 # A real relay measured 145,195; 250k default only when estimation is down.
 _RELAY_GAS_DEFAULT = 250_000
 
@@ -566,6 +570,33 @@ def _is_execution_revert(exc: BaseException) -> bool:
         return True
     data = getattr(exc, "data", None)
     return isinstance(data, str) and data.startswith("0x08c379a0")  # Error(string)
+
+
+def is_allowance_revert(exc: BaseException) -> bool:
+    """Whether an RPC failure is an execution revert at the token's
+    allowance guard.
+
+    The dry-run bridge preflight hits this by DESIGN: the approve is signed
+    but never broadcast in a rehearsal, so the chain's allowance is still
+    zero when ``bridgeToChia`` is estimated.  That specific revert proves
+    the RPC round-tripped, the calldata decoded, and the bridge contract
+    executed to the token ``transferFrom`` guard -- it is the rehearsal's
+    success signal, not a failure.  Substring-matching the reason keeps
+    every token wording covered (OpenZeppelin "transfer amount exceeds
+    allowance" / "insufficient allowance", Circle's FiatToken) while any
+    other revert -- toll, pause, receiver -- stays fatal.
+
+    The reason is read through :func:`decode_revert_reason`, not ``str``:
+    nodes differ on where they put it (message vs the ABI ``Error(string)``
+    blob in ``data``), and matching the message alone silently re-breaks
+    the dry run on reason-in-data providers.  Known residual limit: a token
+    using OZ v5 *custom errors* (``ERC20InsufficientAllowance`` selector)
+    carries no reason string at all and cannot be recognised here -- fine
+    for USDC's FiatToken (require strings), worth revisiting if a
+    custom-error token is ever bridged.
+    """
+    return (_is_execution_revert(exc)
+            and "allowance" in decode_revert_reason(exc).lower())
 
 
 def receipt_status(receipt: dict) -> Optional[int]:
