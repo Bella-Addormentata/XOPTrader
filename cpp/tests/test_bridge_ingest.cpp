@@ -237,45 +237,45 @@ TEST(BridgeNoteTest, ForeignNotesParseToZero) {
 }
 
 // ============================================================================
-// Drawdown-anchor guard
+// Strict ISO ordering (used by the opening filter; the drawdown peak is
+// adjusted by MEASURED equity across the reconcile since round 16, so no
+// flow-time classification remains)
 // ============================================================================
 
-TEST(BridgePeakGuardTest, LiveFlowShiftsThePeak) {
-    // Flow after this process started: the peak rescales.
-    // Flow before: the startup anchor already contains it.
-    EXPECT_FALSE(completed_during_process(
+TEST(BridgePeakGuardTest, StrictOrderingBasics) {
+    EXPECT_FALSE(iso_strictly_after(
         "2026-08-23T18:31:12+00:00", "2026-08-23T19:08:00+00:00"));
-    EXPECT_TRUE(completed_during_process(
+    EXPECT_TRUE(iso_strictly_after(
         "2026-08-23T19:31:12+00:00", "2026-08-23T19:08:00+00:00"));
     // (round 3) Equal second fails CLOSED: the GUI stamps whole seconds,
     // the engine start carries sub-second precision the compare discards,
     // so a same-second flow may already be inside the startup anchor.
-    EXPECT_FALSE(completed_during_process(
+    EXPECT_FALSE(iso_strictly_after(
         "2026-08-23T19:08:00+00:00", "2026-08-23T19:08:00.412Z"));
 }
 
 TEST(BridgePeakGuardTest, SuffixStylesCompareCorrectly) {
     // GUI writes "+00:00" offsets; the engine writes "Z".  The 19-char
     // prefix compare must be indifferent to the suffix style.
-    EXPECT_TRUE(completed_during_process(
+    EXPECT_TRUE(iso_strictly_after(
         "2026-08-23T19:31:12+00:00", "2026-08-23T19:08:00Z"));
-    EXPECT_FALSE(completed_during_process(
+    EXPECT_FALSE(iso_strictly_after(
         "2026-08-23T18:31:12Z", "2026-08-23T19:08:00+00:00"));
 }
 
 TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
-    EXPECT_FALSE(completed_during_process("", "2026-08-23T19:08:00Z"));
-    EXPECT_FALSE(completed_during_process("2026-08-23T19:31:12Z", ""));
-    EXPECT_FALSE(completed_during_process("yesterday", "today"));
+    EXPECT_FALSE(iso_strictly_after("", "2026-08-23T19:08:00Z"));
+    EXPECT_FALSE(iso_strictly_after("2026-08-23T19:31:12Z", ""));
+    EXPECT_FALSE(iso_strictly_after("yesterday", "today"));
     // (review round 2) Length alone is not fail-closed: 19 chars of
     // garbage that sorts after any digit prefix must NOT shift the peak.
-    EXPECT_FALSE(completed_during_process(
+    EXPECT_FALSE(iso_strictly_after(
         "zzzzzzzzzzzzzzzzzzz", "2026-08-23T19:08:00Z"));
-    EXPECT_FALSE(completed_during_process(
+    EXPECT_FALSE(iso_strictly_after(
         "2026-08-23X19:31:12Z", "2026-08-23T19:08:00Z"));  // bad separator
     // (round 13) Shape-valid but semantically impossible fields must
     // fail closed too -- "month 99" sorts after any real timestamp.
-    EXPECT_FALSE(completed_during_process(
+    EXPECT_FALSE(iso_strictly_after(
         "2026-99-99T99:99:99Z", "2026-08-23T19:08:00Z"));
     EXPECT_FALSE(iso_strictly_after(
         "2026-13-01T00:00:00Z", "2026-08-01T00:00:00Z"));

@@ -323,25 +323,6 @@ struct BridgeValuation {
     return a.compare(0, kPrefix, b, 0, kPrefix) > 0;
 }
 
-// ---------------------------------------------------------------------------
-// Drawdown-anchor guard.
-// ---------------------------------------------------------------------------
-
-/// Whether a job's flow happened while THIS engine process was alive.
-/// The drawdown peak only rescales for such flows: after a restart the
-/// startup grace re-anchors the peak to an equity that already contains
-/// the flow, and rescaling again would double-count it.  STRICTLY after
-/// (review round 3): the GUI stamps whole seconds while the engine start
-/// carries sub-second precision the prefix compare discards, so an
-/// equal-second flow is ambiguous and must fail closed -- the same
-/// doctrine as the opening filter, and literally the same ordering.
-[[nodiscard]] inline bool completed_during_process(
-    const std::string& flow_at_iso,
-    const std::string& process_start_iso) noexcept
-{
-    return iso_strictly_after(flow_at_iso, process_start_iso);
-}
-
 }  // namespace xop::accounting
 
 #endif  // XOP_ACCOUNTING_BRIDGE_INGEST_HPP

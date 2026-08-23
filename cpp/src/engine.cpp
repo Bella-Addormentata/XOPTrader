@@ -11591,19 +11591,6 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const AssetId asset{acc.bridge_asset_id};
     if (!ledger_opened_assets_.count(asset)) return;
 
-    // The live-flow baseline is the FIRST scan, not process construction
-    // (review round 11): a flow completing between the constructor and
-    // startup seeding is already inside the startup inventory/equity
-    // baseline, and queuing it for a peak rescale would double-count.
-    // Everything completed before this instant is pre-baseline by
-    // construction; the peak's own max() seeding covers it.
-    if (engine_start_iso_.empty()) {
-        engine_start_iso_ = PnLTracker::timestamp_to_iso(
-            std::chrono::system_clock::now());
-        spdlog::info("[Engine] Bridge ingest: live-flow baseline stamped "
-                     "at {}", engine_start_iso_);
-    }
-
     // The GUI owns warp_jobs.db; the engine only ever reads it.
     // SQLITE_OPEN_READONLY refuses to create the file and makes writes
     // impossible at the API level.  A missing file (warp never used on
@@ -11763,7 +11750,6 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
-    double      live_flow_usd = 0.0;   // in-process flows this scan (GIPS)
 
     for (const auto& row : jobs) {
         // Skip warnings fire ONCE per job (review round 10): skipped
@@ -11871,17 +11857,9 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // 3. External capital, kept out of trading P&L (GIPS/TWR).
         pnl_->add_net_deposit_usd(val.flow_usd);
 
-        // 4. GIPS anchor shift: accumulate the live flows and rescale
-        // the peak ONCE after the scan (review round 7: a per-flow
-        // rescale against the same final equity compounds -- two $10
-        // deposits at final equity $120 would multiply by (120/110)^2
-        // instead of 120/100).  Only flows completing while this process
-        // is alive count: after a restart the peak re-seeds from an
-        // equity that already contains the flow.
-        if (accounting::completed_during_process(row.flow_at,
-                                                 engine_start_iso_)) {
-            live_flow_usd += val.flow_usd;
-        }
+        // 4. The GIPS peak adjustment happens at the wallet-truth
+        // reconcile below, measured directly across the inventory
+        // mutation -- no per-flow bookkeeping needed (review round 16).
 
         ++booked;
         booked_usd += val.flow_usd;
@@ -11910,7 +11888,6 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
     const Mojo numeraire_pseudo =
         static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
     bool inv_changed = false;
-    bool reconciled  = false;
     if (auto bit = cached_wallet_balances_.find(asset);
         bit != cached_wallet_balances_.end()) {
         const auto& bal = bit->second;
@@ -11934,11 +11911,41 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
             && bal.as_of_block == block_height
             && bal.pending_change == 0;
         if (fresh && bal.confirmed >= 0) {
-            reconciled = true;
             const Mojo tracked = inventory_->net_inventory(asset);
             if (tracked != bal.confirmed) {
+                // GIPS anchor adjustment, MEASURED (review round 16):
+                // equity is sampled immediately before and after the
+                // mutation, so the peak scales by exactly the equity
+                // change this external-capital reconcile causes -- same
+                // prices on both sides of the measurement.  The drawdown
+                // fraction the breaker tests is preserved by
+                // construction, with no flow classification, baseline
+                // timestamp, pending accumulator, or double-count: an
+                // inventory that already matches produces factor 1.0.
+                // (The earlier inferred-equity design distorted under
+                // delayed reconciliation, double-fold races, startup
+                // races, and restart catch-up -- the five round-16
+                // threads.)
+                const double e_before = compute_portfolio_equity_usd();
                 inventory_->adjust_quantity(asset, bal.confirmed,
                                             numeraire_pseudo);
+                const double e_after = compute_portfolio_equity_usd();
+                if (e_before > 0.0 && e_after > 0.0
+                    && peak_equity_hwm_usd_ > 0.0) {
+                    const double rescaled =
+                        peak_equity_hwm_usd_ * (e_after / e_before);
+                    spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                                 "rescaled {:.2f} -> {:.2f} (measured "
+                                 "equity {:.2f} -> {:.2f} across the "
+                                 "external-capital reconcile)",
+                                 peak_equity_hwm_usd_, rescaled,
+                                 e_before, e_after);
+                    peak_equity_hwm_usd_ = rescaled;
+                } else {
+                    spdlog::info("[Engine] Bridge ingest: peak rescale "
+                                 "skipped (equity not yet valued this "
+                                 "early in the run)");
+                }
                 inv_changed = true;
                 spdlog::info("[Engine] Bridge ingest: reconciled {} "
                              "inventory {} -> {} mojos to wallet truth",
@@ -11962,41 +11969,6 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
                 }
             }
         }
-    }
-
-    // Single fraction-preserving peak rescale, consumed only once
-    // wallet truth has ACTUALLY folded this scan's flows into inventory
-    // (review round 8): equity is computed from InventoryTracker, so
-    // rescaling while the reconcile deferred would subtract the flow
-    // from an equity that does not contain it yet -- and the ledger
-    // dedupe means the flow would never re-enter the accumulator.  The
-    // pending sum is a member, carried across heartbeats until a
-    // reconcile lands.  The breaker tests (peak - equity) / peak;
-    // scaling by equity_after / equity_before preserves that fraction
-    // exactly.  An additive shift preserved only the dollar gap and
-    // could false-trip on a withdrawal (peak $158, equity $150, unwrap
-    // $100: 5.1% -> 13.8%).
-    pending_peak_flow_usd_ += live_flow_usd;
-    if (reconciled && pending_peak_flow_usd_ != 0.0) {
-        const double equity_now    = compute_portfolio_equity_usd();
-        const double equity_before = equity_now - pending_peak_flow_usd_;
-        if (equity_now > 0.0 && equity_before > 0.0
-            && peak_equity_hwm_usd_ > 0.0) {
-            const double rescaled =
-                peak_equity_hwm_usd_ * (equity_now / equity_before);
-            spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
-                         "{:.2f} -> {:.2f} for ${:+.6f} of live bridge "
-                         "flow (fraction-preserving GIPS adjustment)",
-                         peak_equity_hwm_usd_, rescaled,
-                         pending_peak_flow_usd_);
-            peak_equity_hwm_usd_ = rescaled;
-        } else {
-            spdlog::info("[Engine] Bridge ingest: peak rescale dropped "
-                         "for ${:+.6f} of live flow (equity not yet "
-                         "valued; the startup grace re-anchors instead)",
-                         pending_peak_flow_usd_);
-        }
-        pending_peak_flow_usd_ = 0.0;
     }
 
     if (booked > 0 || inv_changed) {
@@ -12035,7 +12007,12 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             || block_height - cached.as_of_block > acc.max_balance_age_blocks) {
             continue;                                   // stale snapshot
         }
-        if (cached.confirmed <= 0) continue;
+        // Zero is a USABLE balance (review round 16): an outbound
+        // bridge can legitimately drain the CAT wallet to zero, and
+        // skipping it left an already-absorbed withdrawal's promised
+        // counter-adjust unreachable (books stuck at -X forever).  Only
+        // an invalid negative snapshot is rejected.
+        if (cached.confirmed < 0) continue;
 
         // Coins in flight widen UNCERTAINTY; they do not move the target.
         //

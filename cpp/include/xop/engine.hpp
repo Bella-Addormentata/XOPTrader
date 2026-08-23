@@ -860,23 +860,6 @@ private:
     /// heartbeat for the lifetime of the database.
     std::set<std::int64_t> bridge_warned_jobs_;
 
-    /// [S19 review round 8] Live bridge flows (signed USD) whose
-    /// fraction-preserving peak rescale has not yet been applied --
-    /// carried across heartbeats until the wallet-truth reconcile
-    /// actually folds them into inventory (equity's source), then
-    /// consumed in one aggregate rescale.  In-memory only: a restart
-    /// re-anchors the peak from live equity anyway.
-    double pending_peak_flow_usd_{0.0};
-
-    /// [S19 2026-08-23, rebased round 11] The live-flow baseline,
-    /// ISO-8601 UTC, stamped lazily at the FIRST bridge scan (not at
-    /// construction: a flow completing before startup seeding is already
-    /// inside the startup baseline).  Bridge flows completing strictly
-    /// after this instant rescale the drawdown peak; older flows are
-    /// covered by the peak's own seeding and rescaling again would
-    /// double-count them.
-    std::string engine_start_iso_;
-
     /// Timestamp of the last wallet recovery probe (to throttle retries).
     std::chrono::steady_clock::time_point wallet_last_probe_{};
 
