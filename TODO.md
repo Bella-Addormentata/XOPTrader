@@ -178,3 +178,39 @@
 - **T8-26 PnLTracker database tests** — DONE: `test_pnl_tracker.cpp` (11 tests, commit e4405a9) covers DB rehydration, trade_id idempotency, USD conversion, CSV export; snapshot insert/query covered in test_database.cpp:520-562; equity-curve API removed by the P&L overhaul (drawdown breaker now on portfolio equity, 692c1fd).
 - **S1 Phantom offer removal** — DONE: cae2bfd (see New findings S1 above); the MEMORY.md "proven, unfixed" index line is stale.
 - **S2 CI red since 2026-04-08** — DONE: PR #70 / 206d55c (see New findings S2 above); recent runs green as of 2026-08-18.
+
+### S16: Taker paths lack floor-aware XCH pre-checks
+- **Files:** `cpp/src/engine.cpp` (Step 9c ~9203, 9e ~9796, 9f ~10322)
+- **Status:** `[ ]` -- Found 2026-08-23 by the coin-lock-ledger adversarial
+  review (minor): Step 9c's crossed-book taker lifts asks with NO balance
+  check at all (on a quote=XCH pair it spends XCH principal + fee straight
+  from the pool; bounded per cycle by max_take_xch, so not incident-class).
+  9e and the 9f drift corrector check spendable >= cost but omit the fee
+  and do not require the fee-reserve floor to survive. Takers are instant
+  spends, not standing locks, so they stay outside the cycle ledger by
+  design -- but each should get a floor-aware pre-check:
+  spendable - cost - fee >= fee_reserve_xch.
+
+### S17: Depeg bail-out re-alerts at ERROR every block (no rate limit)
+- **Files:** `cpp/src/engine.cpp` (Step 3 depeg bail-out alert)
+- **Status:** `[ ]` -- Observed live 2026-08-23 10:25-10:30+: "DEPEG
+  BAIL-OUT BYC/wUSDC.b price=0.750000 -- pulling all quotes!" repeated at
+  ERROR level every ~30-60s for the duration of the bail-out, unlike the
+  Step 13 drawdown breaker which gates re-alerts to 30 min. Alert once on
+  the transition (and on recovery), debug thereafter. Bonus observation
+  from the same incident: the bail price was a single stale order on an
+  emptied dexie book (TibetSwap AMM simultaneously priced BYC at $0.92,
+  not $0.75) -- consider requiring depeg confirmation from a second source
+  (TibetSwap reserves) before bail-out, mirroring the S12 flash-crash
+  junk-print lesson.
+
+### S18: Max-drawdown re-alert gate not holding while breaker-latched
+- **Files:** `cpp/src/engine.cpp` (Step 13 drawdown breaker alerting)
+- **Status:** `[ ]` -- Observed live 2026-08-23 10:43:51 / 10:44:12 /
+  10:44:53: three ALERT:CRITICAL max-drawdown alerts in 62 seconds while
+  breaker_pause_active_ was already latched, despite the configured
+  realert=30min gate (which held correctly on 2026-08-22 during the
+  v0.9.10 incident, ~15-30 min cadence). Suspect the re-alert timestamp
+  resets on some per-evaluation path when the state is already Paused, or
+  the gate only covers the un-latched trip path. Alert once per 30 min as
+  documented, regardless of latch state.

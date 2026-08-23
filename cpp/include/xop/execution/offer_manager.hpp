@@ -49,6 +49,8 @@
 #include <boost/asio/awaitable.hpp>
 #include <boost/asio/io_context.hpp>
 #include <nlohmann/json.hpp>
+
+#include "xop/execution/coin_lock_ledger.hpp"
 #include <spdlog/spdlog.h>
 
 #include <chrono>
@@ -641,7 +643,86 @@ public:
         Side                  side,
         const PairConfig&     pair);
 
+    /// [XCH-LOCK-LEDGER 2026-08-23] Seed the per-cycle XCH coin-lock
+    /// budget from the wallet's actual free-coin list.  Called by the
+    /// engine at the start of every Step 8 cycle.  Best-effort: on RPC
+    /// failure the ledger stays inactive (admits everything) and the
+    /// pre-existing wallet-requery guards remain the backstop.
+    asio::awaitable<void> begin_xch_lock_cycle();
+
 private:
+    /// Admit-or-refuse one offer against the cycle's XCH coin-lock ledger.
+    /// The XCH principal is read straight from the offer_dict the wallet
+    /// will receive (negative amount on wallet id 1), so every creation
+    /// path -- per-tier, merged batch, batch fallback -- shares one
+    /// accounting, and CAT-principal offers still charge their fee-coin
+    /// lock.  Refusals lock nothing and are logged once per cycle at warn.
+    bool xch_ledger_admits(const json&       offer_dict,
+                           const PairConfig& pair,
+                           Side              side,
+                           const char*       context);
+
+public:
+    /// The XCH this offer_dict spends: the negative amount on wallet id 1,
+    /// 0 otherwise.  Static and public so the extraction that the whole
+    /// incident protection rides on is unit-testable in isolation
+    /// (review: a silent regression here degrades the ledger to fee-only
+    /// accounting while every existing test stays green).
+    [[nodiscard]] static Mojo xch_principal_from_offer_dict(
+        const json& offer_dict);
+
+    /// Coin amounts from a get_spendable_coins response, tolerating both
+    /// the {"coin": {...}} wrapper and bare coin objects; entries without
+    /// an amount are skipped.  Static/public for the same reason.
+    [[nodiscard]] static std::vector<Mojo> spendable_amounts_from_coin_records(
+        const std::vector<json>& records);
+
+private:
+
+public:
+    /// Pure decision table for the ladder preflight (public + static so
+    /// the branches that can make an entire ladder disappear are unit
+    /// tested): a side whose every tier would be refused is dropped, and
+    /// the surviving side is dropped too unless it buys XCH -- the T5-08
+    /// exemption rule.  Partial admission dooms nothing.
+    struct PreflightDrops {
+        bool drop_bids{false};
+        bool drop_asks{false};
+    };
+    [[nodiscard]] static PreflightDrops preflight_side_drops(
+        bool any_bid, int admit_bid, bool any_ask, int admit_ask,
+        bool bids_buy_xch, bool asks_buy_xch);
+
+private:
+    /// Probe-only admission mirror of xch_ledger_admits, run against a
+    /// COPY of the cycle ledger by the ladder preflight: same charges,
+    /// no logging, no flag side effects.
+    [[nodiscard]] bool xch_ledger_probe_admits(CoinLockLedger&   probe,
+                                               const json&       offer_dict,
+                                               const PairConfig& pair,
+                                               Side              side) const;
+
+    /// Cancel forwarders that charge the cycle ledger for the fee coin a
+    /// cancellation locks (review: cancels run after the cycle snapshot,
+    /// so without this the ledger overstates the free pool).  Charged
+    /// before the RPC: a failed cancel over-counts, which is the
+    /// conservative direction.
+    asio::awaitable<json> cancel_offer_charged(const std::string& trade_id,
+                                               std::uint64_t      fee,
+                                               bool               secure);
+    asio::awaitable<json> cancel_offers_charged(std::uint64_t fee,
+                                                bool          secure);
+
+    CoinLockLedger xch_cycle_ledger_;
+    bool           xch_ledger_refusal_logged_{false};
+    /// True when the ledger refused a side during the current post_quotes
+    /// call.  The T5-08 asymmetric guard treats it like reserve_breached,
+    /// exempting the surviving side from cancellation -- but only when
+    /// that survivor buys XCH.  Buy-XCH offers are cap-exempt yet
+    /// floor-checked, so they can also be refused and set this flag; a
+    /// surviving spend side is never exempted (review rounds 3 and 9).
+    bool           xch_ledger_suppressed_{false};
+
     // -- Internal helpers ---------------------------------------------------
 
     /**

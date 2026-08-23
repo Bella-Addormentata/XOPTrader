@@ -745,6 +745,91 @@ TEST(ConfigParserTest, ReviveMarketWithDisabledFreshnessThreshold_Throws) {
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
 
+TEST(ConfigParserTest, FeeReserveXch_RejectsNonFiniteAndOverflow) {
+    // (review) .nan passed the bare < 0 check into llround -- a domain
+    // error that on common implementations zeroes the reserve floor,
+    // silently disabling the protection the value configures.
+    const auto with_reserve = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "strategy:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  fee_reserve_xch: " + value + "\n");
+        return yaml;
+    };
+
+    {
+        TempYaml tmp(with_reserve("0.5"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.fee_reserve_xch, 0.5);
+    }
+    {
+        TempYaml tmp(with_reserve(".nan"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_reserve(".inf"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_reserve("10000000"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, XchCycleCommitFrac_ParsesDefaultsAndRejects) {
+    // Injected into the existing strategy: section (duplicate root keys
+    // resolve to whichever yaml-cpp meets first -- same hazard the
+    // FlashCrashWindow test documents).
+    const auto with_frac = [](const std::string& value) {
+        std::string yaml(kMinimalValidYaml);
+        const std::string anchor = "strategy:\n";
+        const auto at = yaml.find(anchor);
+        EXPECT_NE(at, std::string::npos);
+        yaml.insert(at + anchor.size(),
+                    "  xch_cycle_commit_frac: " + value + "\n");
+        return yaml;
+    };
+
+    {
+        TempYaml tmp(with_frac("0.25"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.25);
+    }
+    {
+        // Omitted: the documented default.
+        TempYaml tmp(kMinimalValidYaml);
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.5);
+    }
+    {
+        // The documented bounds are inclusive; an operator sets exactly
+        // these during an incident (0.0 = no SPEND-SIDE posting -- buy-XCH
+        // offers stay cap-exempt -- and 1.0 = floor-only).
+        TempYaml tmp(with_frac("0.0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.0);
+    }
+    {
+        TempYaml tmp(with_frac("1.0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 1.0);
+    }
+    {
+        TempYaml tmp(with_frac("1.5"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_frac(".nan"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        TempYaml tmp(with_frac("-0.1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
 TEST(ConfigParserTest, FlashCrashWindow_ParsesDefaultsAndRejects) {
     // kMinimalValidYaml already carries a risk: section, so the knob is
     // INJECTED into it rather than appended as a duplicate root key --

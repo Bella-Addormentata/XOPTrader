@@ -2351,6 +2351,17 @@ class SettingsWidget(QWidget):
             "auto_rebalance_enabled": self._auto_rebalance.isChecked(),
             "ratio_target_by_pair": ratio_target_by_pair,
         }
+        # Pass through strategy keys the Settings UI does not own
+        # (xch_cycle_commit_frac, min_spendable_reserve_pct, ...): the
+        # comment-preserving writer deletes keys absent from the collected
+        # dict, so a save would otherwise silently revert operator-set
+        # values -- including the documented emergency
+        # xch_cycle_commit_frac: 0.0 -- back to engine defaults.
+        snapshot_strategy = (
+            getattr(self, "_clean_snapshot", None) or {}
+        ).get("strategy") or {}
+        for _key, _value in snapshot_strategy.items():
+            cfg["strategy"].setdefault(_key, _value)
 
         # -- risk --
         cfg["risk"] = {
