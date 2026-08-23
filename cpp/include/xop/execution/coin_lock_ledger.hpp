@@ -239,7 +239,12 @@ private:
                     covered, coins_[sub_need_end - 1 - count]);
                 ++count;
             }
-            if (covered >= need) {
+            // The wallet only accepts a smaller-coin match under its
+            // per-spend coin-count limit; past that it falls back to a
+            // covering coin (review round 7: 501 dust coins summing past
+            // the need would never be knapsacked by the real wallet).
+            constexpr std::size_t kMaxSelectionCoins = 500;
+            if (covered >= need && count <= kMaxSelectionCoins) {
                 tail_sel.covered      = true;
                 tail_sel.locked       = covered;
                 tail_sel.prefix_count = count;   // largest sub-need coins

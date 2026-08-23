@@ -671,10 +671,14 @@ struct StrategyConfig {
 
     /// [XCH-LOCK-LEDGER 2026-08-23] Fraction of the cycle's free XCH
     /// (above the fee reserve) that one posting cycle may lock into
-    /// offers, measured in WHOLE-COIN terms by the coin-lock ledger.
-    /// Range [0, 1].  Default 0.5: one cycle can never commit more than
-    /// half the free coin value, so no single requote burst can walk
-    /// spendable XCH to zero the way the 2026-08-23 incident did.
+    /// SPEND-SIDE offers, measured in WHOLE-COIN terms by the coin-lock
+    /// ledger.  Buy-XCH offers are deliberately cap-EXEMPT (they
+    /// net-increase XCH when filled; only the fee-reserve floor applies
+    /// to them), so 0.0 stops spend-side posting but is NOT a full
+    /// shutdown.  Range [0, 1].  Default 0.5: one cycle can never commit
+    /// more than half the free coin value to the spend side, so no single
+    /// requote burst can walk spendable XCH to zero the way the
+    /// 2026-08-23 incident did.
     double   xch_cycle_commit_frac{0.5};
 
     /// Extra blocks beyond offer_ttl_blocks before an offer is considered

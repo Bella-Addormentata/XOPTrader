@@ -805,7 +805,8 @@ TEST(ConfigParserTest, XchCycleCommitFrac_ParsesDefaultsAndRejects) {
     }
     {
         // The documented bounds are inclusive; an operator sets exactly
-        // these during an incident (0.0 = post nothing, 1.0 = floor-only).
+        // these during an incident (0.0 = no SPEND-SIDE posting -- buy-XCH
+        // offers stay cap-exempt -- and 1.0 = floor-only).
         TempYaml tmp(with_frac("0.0"));
         auto cfg = xop::load_config(tmp.path());
         EXPECT_DOUBLE_EQ(cfg.strategy.xch_cycle_commit_frac, 0.0);

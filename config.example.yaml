@@ -210,9 +210,11 @@ strategy:
   min_spendable_reserve_pct: 0.10      # [OPTIONAL, default: 0.25] Suppress side when spendable/confirmed < this
                                        #   Lower if most inventory is locked in offers (e.g. depleted CATs).
   xch_cycle_commit_frac: 0.5           # [OPTIONAL, default: 0.5] Max fraction of free XCH (whole-coin terms,
-                                       # above the fee reserve) one posting cycle may lock into offers.
-                                       # The coin-lock ledger counts actual UTXO + fee-coin locks, so a
-                                       # requote burst can no longer walk spendable XCH to zero.
+                                       # above the fee reserve) one posting cycle may lock into SPEND-SIDE
+                                       # offers. Buy-XCH offers are cap-exempt (floor-checked only), so 0.0
+                                       # stops spend-side posting but is not a full shutdown. The ledger
+                                       # counts actual UTXO + fee-coin locks, so a requote burst can no
+                                       # longer walk spendable XCH to zero.
   arb_reserve_coins: 2                 # [OPTIONAL, default: 2]   Coins kept unallocated for arb takes
   min_reserve_units: 1.0               # [OPTIONAL, default: 1.0]  Absolute floor per coin (units)
   min_offer_size_units: 1.0            # [OPTIONAL, default: 1.0]  Min offer size in base-asset units; tiers below this are dropped
