@@ -1,0 +1,204 @@
+// test_bridge_ingest.cpp -- Unit tests for warp bridge-flow accounting
+// ([S19 2026-08-23]).
+//
+// The constants below are the MEASURED production numbers from the first
+// live bridge (2026-08-23, warp_jobs.db job 2):
+//   - inbound mint: 4,985 CAT mojos of wUSDC.b (post_tip_mojos, after the
+//     warp.green 0.3% tip on a 5,000-mojo deposit) at block 9189949
+//   - wUSDC.b is valued at exactly $1.00 (the numeraire doctrine), so the
+//     flow is $4.985 and the pseudo price is 1e12
+//
+// ISO/IEC 27001:2022 -- no secrets; pure numerical verification.
+// ISO/IEC 5055       -- deterministic tests; no undefined behaviour.
+
+#include <gtest/gtest.h>
+
+#include <xop/accounting/bridge_ingest.hpp>
+#include <xop/config.hpp>
+
+#include <cmath>
+#include <string>
+
+namespace {
+
+using namespace xop::accounting;
+
+// Production-shaped constants (job 2, first live bridge).
+constexpr xop::Mojo kJob2Minted = 4'985;   // post_tip_mojos
+constexpr xop::Mojo kJob2Gross  = 5'000;   // amount_mojos (pre-tip)
+
+BridgeJobRow inbound_job() {
+    BridgeJobRow r;
+    r.id             = 2;
+    r.amount_mojos   = kJob2Gross;
+    r.post_tip_mojos = kJob2Minted;
+    r.updated_at     = "2026-08-23T18:31:12+00:00";
+    // Inbound jobs carry no "direction" key; that absence IS the marker.
+    r.state_json     = R"({"phase": "done", "claim_block": 9189949})";
+    return r;
+}
+
+BridgeJobRow outbound_job() {
+    BridgeJobRow r;
+    r.id             = 3;
+    r.amount_mojos   = 20'000;             // burned CAT mojos
+    r.post_tip_mojos = 0;
+    r.updated_at     = "2026-08-24T02:00:00+00:00";
+    r.state_json     = R"({"direction": "out", "receiver_evm": "3b04"})";
+    return r;
+}
+
+// ============================================================================
+// Classification
+// ============================================================================
+
+TEST(BridgeClassifyTest, FirstLiveBridgeBooksAsDeposit) {
+    const auto f = classify_bridge_job(inbound_job());
+    ASSERT_TRUE(f.valid);
+    EXPECT_TRUE(f.inbound);
+    EXPECT_EQ(f.delta_mojos, kJob2Minted);      // post-tip, not gross
+    EXPECT_EQ(f.event_type, "bridge_deposit");
+    EXPECT_EQ(f.event_id, "bridge:job:2");
+}
+
+TEST(BridgeClassifyTest, UnwrapBooksAsWithdrawal) {
+    const auto f = classify_bridge_job(outbound_job());
+    ASSERT_TRUE(f.valid);
+    EXPECT_FALSE(f.inbound);
+    EXPECT_EQ(f.delta_mojos, -20'000);          // burn: negative delta
+    EXPECT_EQ(f.event_type, "bridge_withdrawal");
+    EXPECT_EQ(f.event_id, "bridge:job:3");
+}
+
+TEST(BridgeClassifyTest, UnparseableStateIsSkippedNotGuessed) {
+    // A corrupt state payload must not default to a direction: booking a
+    // burn as a mint (or vice versa) is a signed error twice the flow.
+    auto r = inbound_job();
+    r.state_json = "{not json";
+    EXPECT_FALSE(classify_bridge_job(r).valid);
+}
+
+TEST(BridgeClassifyTest, NonPositiveQuantitiesAreRefused) {
+    auto in = inbound_job();
+    in.post_tip_mojos = 0;                      // COMPLETED but no mint??
+    EXPECT_FALSE(classify_bridge_job(in).valid);
+
+    auto out = outbound_job();
+    out.amount_mojos = 0;
+    EXPECT_FALSE(classify_bridge_job(out).valid);
+
+    auto bad_id = inbound_job();
+    bad_id.id = 0;
+    EXPECT_FALSE(classify_bridge_job(bad_id).valid);
+}
+
+TEST(BridgeClassifyTest, InboundIgnoresGrossAmount) {
+    // The gross deposit is 5,000 but only 4,985 arrived on-chain; booking
+    // the gross would manufacture 15 mojos of phantom divergence.
+    const auto f = classify_bridge_job(inbound_job());
+    ASSERT_TRUE(f.valid);
+    EXPECT_NE(f.delta_mojos, kJob2Gross);
+}
+
+// ============================================================================
+// Valuation (the $1.00 numeraire)
+// ============================================================================
+
+TEST(BridgeValueTest, Job2ValuesAtFourNinetyEightFive) {
+    const auto v = value_bridge_flow(kJob2Minted, 1e3, 1.0);
+    EXPECT_EQ(v.fmv_pseudo_price, 1'000'000'000'000LL);   // $1.00 in 1e12
+    EXPECT_NEAR(v.flow_usd, 4.985, 1e-9);
+}
+
+TEST(BridgeValueTest, WithdrawalValuesNegative) {
+    const auto v = value_bridge_flow(-20'000, 1e3, 1.0);
+    EXPECT_EQ(v.fmv_pseudo_price, 1'000'000'000'000LL);
+    EXPECT_NEAR(v.flow_usd, -20.0, 1e-9);
+}
+
+TEST(BridgeValueTest, DegenerateInputsZeroOut) {
+    EXPECT_EQ(value_bridge_flow(0, 1e3, 1.0).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 0.0, 1.0).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3, 0.0).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3,
+                                std::nan("")).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, std::nan(""),
+                                1.0).fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(1'000, 1e3, 1e13).fmv_pseudo_price, 0);
+}
+
+// ============================================================================
+// Note round-trip (writer and parser side by side, so the format
+// cannot drift -- same contract as reward_note/parse_reward_fmv_usd)
+// ============================================================================
+
+TEST(BridgeNoteTest, DepositRoundTrips) {
+    const auto note = bridge_note(4.985, 1.0, 2);
+    EXPECT_NE(note.find("deposit"), std::string::npos);
+    EXPECT_NE(note.find("job=2"), std::string::npos);
+    EXPECT_NEAR(parse_bridge_flow_usd(note), 4.985, 1e-9);
+}
+
+TEST(BridgeNoteTest, WithdrawalRoundTripsSigned) {
+    // Withdrawals must survive the round trip NEGATIVE -- an unsigned
+    // parse (the reward parser's contract) would flip a withdrawal into
+    // a deposit on rehydration and double the error.
+    const auto note = bridge_note(-20.0, 1.0, 3);
+    EXPECT_NE(note.find("withdrawal"), std::string::npos);
+    EXPECT_NEAR(parse_bridge_flow_usd(note), -20.0, 1e-9);
+}
+
+TEST(BridgeNoteTest, ForeignNotesParseToZero) {
+    EXPECT_EQ(parse_bridge_flow_usd(""), 0.0);
+    EXPECT_EQ(parse_bridge_flow_usd(
+        "unexplained divergence reconciled to wallet"), 0.0);
+    EXPECT_EQ(parse_bridge_flow_usd(
+        "dexie liquidity reward; fmv_usd=0.0137520000; px_usd_per_unit="
+        "0.0137520000; wallet_tx=abc"), 0.0);   // reward note: no flow_usd
+    EXPECT_EQ(parse_bridge_flow_usd("flow_usd=garbage"), 0.0);
+}
+
+// ============================================================================
+// Drawdown-anchor guard
+// ============================================================================
+
+TEST(BridgePeakGuardTest, LiveFlowShiftsThePeak) {
+    // Job completed after this process started: the peak shifts.
+    // Completed before: the startup anchor already contains it.
+    EXPECT_FALSE(completed_during_process(
+        "2026-08-23T18:31:12+00:00", "2026-08-23T19:08:00+00:00"));
+    EXPECT_TRUE(completed_during_process(
+        "2026-08-23T19:31:12+00:00", "2026-08-23T19:08:00+00:00"));
+}
+
+TEST(BridgePeakGuardTest, SuffixStylesCompareCorrectly) {
+    // GUI writes "+00:00" offsets; the engine writes "Z".  The 19-char
+    // prefix compare must be indifferent to the suffix style.
+    EXPECT_TRUE(completed_during_process(
+        "2026-08-23T19:31:12+00:00", "2026-08-23T19:08:00Z"));
+    EXPECT_FALSE(completed_during_process(
+        "2026-08-23T18:31:12Z", "2026-08-23T19:08:00+00:00"));
+}
+
+TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
+    EXPECT_FALSE(completed_during_process("", "2026-08-23T19:08:00Z"));
+    EXPECT_FALSE(completed_during_process("2026-08-23T19:31:12Z", ""));
+    EXPECT_FALSE(completed_during_process("yesterday", "today"));
+}
+
+// ============================================================================
+// Config wiring
+// ============================================================================
+
+TEST(BridgeConfigTest, DefaultsMatchTheLiveDeployment) {
+    const xop::AccountingConfig acc{};
+    EXPECT_TRUE(acc.bridge_ingest_enabled);
+    EXPECT_EQ(acc.bridge_jobs_db_path, "data/warp_jobs.db");
+    // wUSDC.b mainnet CAT id -- must match config.yaml's quote_asset_id
+    // for the wUSDC.b pairs.
+    EXPECT_EQ(acc.bridge_asset_id,
+              "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901b"
+              "aa6b7a99d");
+}
+
+}  // namespace

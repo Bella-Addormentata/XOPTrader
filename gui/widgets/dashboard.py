@@ -465,9 +465,14 @@ class DashboardWidget(QWidget):
         # were removed: Spread and Inventory literally duplicated
         # Realized/Unrealized, and Realized is now the headline.
         self._metric_cards: dict[str, MetricCard] = {}
+        # [S19 2026-08-23] "Net Deposits" is external bridge capital --
+        # shown beside the P&L cards precisely so it is never read AS
+        # P&L.  The title deliberately carries no P&L token: capital is
+        # neither a gain nor a loss, so it must not be sign-coloured.
         metric_defs: list[str] = [
             "Total P&L",
             "24h P&L",
+            "Net Deposits",
             "Unrealized PnL",
             "24h Fill Count",
             "Fees Paid 24h",

@@ -556,6 +556,17 @@ private:
     asio::awaitable<void> step_ingest_reward_inflows(
         BlockHeight block_height);
 
+    /// [S19 2026-08-23] Book completed warp bridge flows as first-class
+    /// ledger events (bridge_deposit / bridge_withdrawal) so external
+    /// capital is explained flow by the time the books are tied to the
+    /// wallet, not "unexplained divergence" for the adjusting entries to
+    /// absorb.  Reads the GUI-owned warp_jobs.db READ-ONLY; idempotent
+    /// per job (ledger event_id uniqueness), so re-scans and restarts
+    /// never double-book.  GIPS/TWR: the USD accumulates as net deposits
+    /// outside trading P&L, and the drawdown peak shifts with each flow
+    /// completed while this process is alive.
+    void step_ingest_bridge_flows(BlockHeight block_height);
+
     /// Tie the ledger's implied balances to the wallet's confirmed balances
     /// and escalate on sustained, unexplained divergence.  Alert-only unless
     /// accounting.pause_enabled is set.
@@ -829,6 +840,12 @@ private:
     /// debug -- re-warning every block for an indefinite pause is the same
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
+
+    /// [S19 2026-08-23] Process start time, ISO-8601 UTC.  Bridge flows
+    /// completing at or after this instant shift the drawdown peak; older
+    /// flows are already inside the startup peak anchor (which re-seeds
+    /// from live equity) and shifting again would double-count them.
+    std::string engine_start_iso_;
 
     /// Timestamp of the last wallet recovery probe (to throttle retries).
     std::chrono::steady_clock::time_point wallet_last_probe_{};

@@ -216,9 +216,19 @@
   documented, regardless of latch state.
 
 ### S19: Bridge transfers need first-class ledger accounting (deposits, not P&L)
-- **Files:** `cpp/src/engine.cpp` (ledger tie ~11600), `gui/services/warp/jobs.py`,
-  P&L tracker + GUI P&L display
-- **Status:** `[ ]` -- Raised by the operator after the first live bridge
+- **Files:** `cpp/include/xop/accounting/bridge_ingest.hpp` (new),
+  `cpp/src/engine.cpp` (step_ingest_bridge_flows), `cpp/src/monitoring/pnl.cpp`,
+  `gui/services/database_service.py`, `gui/widgets/dashboard.py`
+- **Status:** `[x]` BUILT 2026-08-23 -- engine reads warp_jobs.db read-only
+  each heartbeat and books COMPLETED jobs as bridge_deposit (+post_tip
+  mojos) / bridge_withdrawal (-burned mojos) BEFORE the divergence control,
+  idempotent via ledger event_id "bridge:job:<id>".  GIPS/TWR treatment:
+  signed USD accumulates as a net-deposits figure outside trading P&L
+  (PnLSummary::net_deposits_usd, Prometheus component="net_deposits",
+  dashboard "Net Deposits" card), and the drawdown peak shifts with each
+  flow completed while the process is alive so a deposit cannot mask
+  losses.  wUSDC.b valued at the $1.00 numeraire (peg monitored, not
+  priced in).  Originally raised by the operator after the first live bridge
   (2026-08-23, job 2: +4.985 wUSDC.b). The ledger has no deposit/transfer
   event type, so a completed bridge inflow is absorbed by the divergence
   control as an "adjust" entry ("unexplained divergence reconciled to
@@ -234,3 +244,25 @@
   line. Until then: SELECT SUM(delta_mojos) FROM ledger_entries WHERE
   event_type='adjust' is the manual correction, and each bridge lands as
   one adjust entry ~= its post-tip amount.
+
+### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
+- **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13
+  rolling-window breaker), valuation price sources
+- **Status:** `[ ]` -- Observed live 2026-08-23 14:45:34, the THIRD breaker
+  event of the day from one root cause. The freshly installed v0.9.19
+  process anchored its equity peak at $253.67 during startup warm-up (BYC
+  valued high before the dexie feed delivered the book), then the stale
+  0.75 BYC/wUSDC.b print re-asserted and ~104 BYC marked down ~$21;
+  equity "fell" to ~$232.6, the rolling window read -$18.42/36 blocks
+  against its 250 bps ($5.81) limit, and the engine PAUSED (latched).
+  trade_log shows ZERO fills all afternoon -- the entire loss was
+  mark-to-market flapping on a single stale order in an emptied dexie
+  book (TibetSwap AMM simultaneously ~0.92; the Step 7 uncertainty
+  centre blended 0.75 -> 0.877 with w_ext=0.99 at the same moment).
+  Directions to evaluate: (a) value stablecoin-pair inventory for EQUITY
+  at the blended/uncertainty centre or a second source instead of the
+  raw book mid; (b) a startup valuation-grace window before the rolling
+  window arms (the drawdown breaker already has one); (c) the S17
+  second-source depeg confirmation, which is the same lesson. Related:
+  the morning's depeg bail-out (S17) and drawdown-latch alerts (S18)
+  came from the same stale print.

@@ -72,6 +72,7 @@ add_executable(xop_tests
     test_coin_lock_ledger.cpp
     test_exposure_gate.cpp
     test_reservation_offset.cpp
+    test_bridge_ingest.cpp
     test_reward_ingest.cpp
     test_drawdown_breaker.cpp
     test_settled_fill.cpp

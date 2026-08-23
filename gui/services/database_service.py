@@ -563,11 +563,34 @@ class _DatabaseWorker(QObject):
         pnl_24h_usd = float(rows[0]["pnl_24h_usd"] or 0.0) if rows else 0.0
         fills_24h = int(rows[0]["fills_24h"] or 0) if rows else 0
 
+        # [S19 2026-08-23] Net external capital via the warp bridge, so a
+        # deposit is never mistaken for profit.  The engine books completed
+        # bridge jobs as bridge_deposit / bridge_withdrawal ledger rows;
+        # wUSDC.b is the $1.00 numeraire, so mojos / 1e3 IS the dollar
+        # figure.  NOT filtered by the display baseline: capital is a
+        # balance-sheet fact, not a performance figure a reset should hide.
+        # The table may not exist on a fresh DB -- that is "no flows yet",
+        # not a reason to drop the whole P&L payload.
+        bridge_sql = """
+            SELECT COALESCE(SUM(delta_mojos), 0) AS net_mojos,
+                   COUNT(*)                      AS flow_count
+            FROM ledger_entries
+            WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal')
+        """
+        net_deposits_usd = 0.0
+        bridge_flows = 0
+        rows = self._execute_query(bridge_sql, [])
+        if rows:
+            net_deposits_usd = float(rows[0]["net_mojos"] or 0) / 1e3
+            bridge_flows = int(rows[0]["flow_count"] or 0)
+
         self.pnl_display_ready.emit({
             "lifetime_usd": lifetime_usd,
             "lifetime_trades": lifetime_trades,
             "pnl_24h_usd": pnl_24h_usd,
             "fills_24h": fills_24h,
+            "net_deposits_usd": net_deposits_usd,
+            "bridge_flows": bridge_flows,
             "baseline_iso": "" if baseline == _EPOCH_ISO else baseline,
         })
 

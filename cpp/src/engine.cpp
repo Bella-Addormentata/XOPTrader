@@ -24,6 +24,7 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
+#include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
 #include "xop/execution/wallet_poll_throttle.hpp"
 #include "xop/risk/drawdown_breaker.hpp"
@@ -191,6 +192,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
                  config_.strategy.detect_fills_backoff_interval,
                  execution::kReconcileStopAfterOldPages,
                  execution::kReconcileScanSlackSecs / 3600);
+
+    // [S19] Anchor for the bridge-flow drawdown-peak guard.
+    engine_start_iso_ = PnLTracker::timestamp_to_iso(
+        std::chrono::system_clock::now());
 
     // -- Database (must be first: other subsystems may query on construction) --
     db_ = std::make_unique<Database>(config_.database.path);
@@ -1806,6 +1811,16 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     try { co_await step_ingest_reward_inflows(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Reward ingestion failed: {}", e.what());
+    }
+
+    // [S19 2026-08-23] Book completed warp bridge flows BEFORE the
+    // invariant below, for the same reason as the reward step: a bridge
+    // mint must be explained flow (a 'bridge_deposit' entry) by the time
+    // the books are tied to the wallet, not divergence for a blind
+    // adjusting entry to absorb.
+    try { step_ingest_bridge_flows(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Bridge ingestion failed: {}", e.what());
     }
 
     // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
@@ -11481,6 +11496,184 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     co_return;
 }
 
+// [S19 2026-08-23] Book completed warp bridge flows as first-class ledger
+// events.  See accounting/bridge_ingest.hpp for the design rationale and
+// engine.hpp for the contract.  Synchronous on purpose: one read-only
+// SQLite open of a small GUI-owned database per heartbeat, no RPC.
+void Engine::step_ingest_bridge_flows(BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) return;
+    if (!db_ || !inventory_ || !pnl_) return;
+    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) return;
+
+    // Same stand-down conditions as the invariant control: without a
+    // genesis baseline (or with known-incomplete books) posting bridge
+    // legs would only deepen the inconsistency.
+    if (!ledger_genesis_done_ || ledger_incomplete_) return;
+
+    const AssetId asset{acc.bridge_asset_id};
+    if (!ledger_opened_assets_.count(asset)) return;
+
+    // The GUI owns warp_jobs.db; the engine only ever reads it.
+    // SQLITE_OPEN_READONLY refuses to create the file and makes writes
+    // impossible at the API level.  A missing file (warp never used on
+    // this host) or a transiently locked one is a clean no-op: unbooked
+    // flows simply remain wallet-vs-books divergence for the invariant to
+    // absorb -- the pre-S19 behaviour, not a new failure mode.
+    sqlite3* wdb = nullptr;
+    int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &wdb,
+                             SQLITE_OPEN_READONLY, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::debug("[Engine] Bridge ingest: cannot open {} read-only "
+                      "({}) -- skipping this heartbeat",
+                      acc.bridge_jobs_db_path,
+                      wdb ? sqlite3_errmsg(wdb) : "out of memory");
+        if (wdb) sqlite3_close(wdb);
+        return;
+    }
+    // The GUI holds WAL writers; brief waits are expected and cheap.
+    sqlite3_busy_timeout(wdb, 2000);
+
+    // Only COMPLETED moves value cross-chain: FAILED/CANCELLED recovered
+    // or never sent funds, and DRY_RUN_OK deliberately broadcast nothing.
+    static constexpr const char* kJobsSql = R"SQL(
+        SELECT id,
+               COALESCE(amount_mojos, 0),
+               COALESCE(post_tip_mojos, 0),
+               COALESCE(updated_at, ''),
+               COALESCE(state, '{}')
+        FROM warp_jobs
+        WHERE status = 'COMPLETED'
+        ORDER BY id;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+    rc = sqlite3_prepare_v2(wdb, kJobsSql, -1, &stmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::warn("[Engine] Bridge ingest: prepare failed on {} ({}) -- "
+                     "skipping this heartbeat",
+                     acc.bridge_jobs_db_path, sqlite3_errmsg(wdb));
+        sqlite3_close(wdb);
+        return;
+    }
+
+    std::vector<accounting::BridgeJobRow> jobs;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        accounting::BridgeJobRow r;
+        r.id             = sqlite3_column_int64(stmt, 0);
+        r.amount_mojos   = sqlite3_column_int64(stmt, 1);
+        r.post_tip_mojos = sqlite3_column_int64(stmt, 2);
+        const char* ua = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 3));
+        const char* sj = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 4));
+        r.updated_at = ua ? ua : "";
+        r.state_json = sj ? sj : "{}";
+        jobs.push_back(std::move(r));
+    }
+    sqlite3_finalize(stmt);
+    sqlite3_close(wdb);
+
+    // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
+    // AccountingConfig peg-monitor doctrine), so no price feed is needed
+    // and a flow can never be deferred for want of an FMV.
+    const double usd_per_unit   = 1.0;
+    const double mojos_per_unit = (asset == "xch") ? 1e12 : 1e3;
+
+    const auto  now = std::chrono::system_clock::now();
+    std::size_t booked     = 0;
+    double      booked_usd = 0.0;
+
+    for (const auto& row : jobs) {
+        const auto flow = accounting::classify_bridge_job(row);
+        if (!flow.valid) {
+            spdlog::warn("[Engine] Bridge ingest: COMPLETED job {} is "
+                         "unclassifiable (bad state or non-positive "
+                         "quantity) -- left for the divergence control",
+                         row.id);
+            continue;
+        }
+
+        const auto val = accounting::value_bridge_flow(
+            flow.delta_mojos, mojos_per_unit, usd_per_unit);
+        if (val.fmv_pseudo_price <= 0) continue;
+
+        // 1. Journal first (crash-consistent, and the idempotency gate).
+        DbLedgerEntry e;
+        e.entry_time   = PnLTracker::timestamp_to_iso(now);
+        e.event_type   = flow.event_type;
+        e.event_id     = flow.event_id;
+        e.leg          = "bridge";
+        e.asset_id     = asset;
+        e.delta_mojos  = flow.delta_mojos;
+        // The claim/burn block is not recorded in warp_jobs; the booking
+        // block is an honest, queryable stand-in.
+        e.block_height = block_height;
+        e.note         = accounting::bridge_note(val.flow_usd, usd_per_unit,
+                                                 row.id);
+
+        const auto inserted = db_->append_ledger_entries({e});
+        if (!inserted) {
+            // Mirror the fill path: a dropped leg leaves the books
+            // permanently short, so stand the control down honestly.
+            ledger_incomplete_ = true;
+            spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
+                          "job {} -- invariant control disabled until "
+                          "restart", row.id);
+            return;
+        }
+        if (*inserted == 0) continue;    // already booked (restart/re-scan)
+
+        // 2. Cost basis: a mint folds in at the numeraire price; a burn
+        // draws down at weighted-average basis (enforce_no_loss=false --
+        // the burn is already on-chain, this records it).
+        if (flow.inbound) {
+            inventory_->record_buy(asset, flow.delta_mojos,
+                                   val.fmv_pseudo_price, block_height, now);
+        } else if (!inventory_->record_sell(asset, -flow.delta_mojos,
+                                            val.fmv_pseudo_price,
+                                            block_height, now,
+                                            /*enforce_no_loss=*/false)) {
+            spdlog::warn("[Engine] Bridge ingest: cost basis not reduced "
+                         "for job {} burn of {} mojos (holdings below "
+                         "quantity?) -- ledger entry stands",
+                         row.id, -flow.delta_mojos);
+        }
+
+        // 3. External capital, kept out of trading P&L (GIPS/TWR).
+        pnl_->add_net_deposit_usd(val.flow_usd);
+
+        // 4. GIPS anchor shift: the drawdown peak moves WITH the flow so
+        // a deposit cannot mask losses (nor a withdrawal fake them).
+        // Only for flows completing while this process is alive: after a
+        // restart the peak re-seeds from an equity that already contains
+        // the flow, and shifting again would double-count it.
+        if (accounting::completed_during_process(row.updated_at,
+                                                 engine_start_iso_)) {
+            peak_equity_hwm_usd_ =
+                std::max(0.0, peak_equity_hwm_usd_ + val.flow_usd);
+            spdlog::info("[Engine] Bridge ingest: drawdown peak shifted "
+                         "{:+.6f} USD for job {} (GIPS flow adjustment)",
+                         val.flow_usd, row.id);
+        }
+
+        ++booked;
+        booked_usd += val.flow_usd;
+        spdlog::info("[Engine] Bridge flow: {} {:+} mojos of {} "
+                     "(job {}, ${:+.6f}) booked at block {}",
+                     flow.event_type, flow.delta_mojos, asset.substr(0, 12),
+                     row.id, val.flow_usd, block_height);
+    }
+
+    if (booked > 0) {
+        persist_inventory_state();
+        spdlog::info("[Engine] Bridge ingest: booked {} flow(s), net "
+                     "${:+.6f} external capital at block {}",
+                     booked, booked_usd, block_height);
+    }
+}
+
 void Engine::step_check_ledger_invariant(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
@@ -12093,6 +12286,9 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // [REWARD-INCOME 2026-08-01] Other income beside the trading figures;
     // not part of ps.usd.
     ps.usd_reward_income = total.reward_income_usd;
+    // [S19 2026-08-23] External capital beside the trading figures; part
+    // of neither ps.usd nor ps.usd_reward_income.
+    ps.usd_net_deposits  = total.net_deposits_usd;
     metrics_->update_pnl(ps);
 
     // Dashboard 2: Inventory

@@ -760,6 +760,7 @@ class MainWindow(QMainWindow):
             card_data = {
                 "Total P&L": self._total_pnl_payload(),
                 "24h P&L": self._pnl_24h_payload(),
+                "Net Deposits": self._net_deposits_payload(),
                 "Unrealized PnL": _metric_payload(pnl.get("usd_unrealized")),
                 "24h Fill Count": {
                     "value": fill_count_24h,
@@ -1150,6 +1151,34 @@ class MainWindow(QMainWindow):
             "secondary_text": f"realized · {fills:,} fills in 24h",
         }
 
+    def _net_deposits_payload(self) -> dict[str, Any]:
+        """Build the "Net Deposits" card payload ([S19 2026-08-23]).
+
+        External bridge capital, shown beside the P&L cards precisely so
+        it is never read AS P&L: a $415 deposit must not look like a $415
+        profit.  Deliberately not sign-coloured (the title carries no
+        P&L token), because a deposit is neither a gain nor a loss.
+        """
+        display = self._pnl_display
+        if not display:
+            return {
+                "value": 0.0,
+                "spark": 0.0,
+                "display_text": "—",
+                "secondary_text": "loading from ledger…",
+            }
+        usd = float(display.get("net_deposits_usd", 0.0))
+        flows = int(display.get("bridge_flows", 0))
+        return {
+            "value": usd,
+            "spark": usd,
+            "display_text": _fmt_usd(usd),
+            "secondary_text": (
+                f"external capital · {flows:,} bridge flow(s)"
+                if flows else "no bridge flows yet"
+            ),
+        }
+
     def _refresh_pnl_cards(self) -> None:
         """Push the latest DB-derived P&L figures to the dashboard cards.
 
@@ -1163,6 +1192,7 @@ class MainWindow(QMainWindow):
         dashboard.update_metrics({
             "Total P&L": self._total_pnl_payload(),
             "24h P&L": self._pnl_24h_payload(),
+            "Net Deposits": self._net_deposits_payload(),
         })
 
     def _on_pair_summary(self, summary: dict) -> None:

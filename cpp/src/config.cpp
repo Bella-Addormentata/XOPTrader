@@ -2310,6 +2310,15 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     // [REWARD-INCOME 2026-08-01] Dexie reward ingestion; defaults are the
     // operative values (see config.hpp for the measured calibration).
     read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
+    read_bool("bridge_ingest_enabled",  cfg.bridge_ingest_enabled);
+    if (node["bridge_jobs_db_path"] && node["bridge_jobs_db_path"].IsDefined()
+        && !node["bridge_jobs_db_path"].IsNull()) {
+        cfg.bridge_jobs_db_path = node["bridge_jobs_db_path"].as<std::string>();
+    }
+    if (node["bridge_asset_id"] && node["bridge_asset_id"].IsDefined()
+        && !node["bridge_asset_id"].IsNull()) {
+        cfg.bridge_asset_id = node["bridge_asset_id"].as<std::string>();
+    }
     if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
         && !node["reward_asset_id"].IsNull()) {
         cfg.reward_asset_id = node["reward_asset_id"].as<std::string>();
