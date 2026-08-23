@@ -249,6 +249,14 @@ TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
     EXPECT_FALSE(completed_during_process("", "2026-08-23T19:08:00Z"));
     EXPECT_FALSE(completed_during_process("2026-08-23T19:31:12Z", ""));
     EXPECT_FALSE(completed_during_process("yesterday", "today"));
+    // (review round 2) Length alone is not fail-closed: 19 chars of
+    // garbage that sorts after any digit prefix must NOT shift the peak.
+    EXPECT_FALSE(completed_during_process(
+        "zzzzzzzzzzzzzzzzzzz", "2026-08-23T19:08:00Z"));
+    EXPECT_FALSE(completed_during_process(
+        "2026-08-23X19:31:12Z", "2026-08-23T19:08:00Z"));  // bad separator
+    EXPECT_FALSE(iso_strictly_after(
+        "zzzzzzzzzzzzzzzzzzz", "2026-08-01T00:00:00Z"));
 }
 
 // ============================================================================

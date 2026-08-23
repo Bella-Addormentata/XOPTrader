@@ -241,9 +241,7 @@
   BEFORE the divergence control runs, so the movement is explained
   rather than adjusted. P&L tracker gains a net-deposits component
   excluded from performance; GUI P&L display gains a "Net deposits"
-  line. Until then: SELECT SUM(delta_mojos) FROM ledger_entries WHERE
-  event_type='adjust' is the manual correction, and each bridge lands as
-  one adjust entry ~= its post-tip amount.
+  line. (All of the above is now implemented -- see the Status line.)
 
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
 - **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13

@@ -236,6 +236,36 @@ struct BridgeValuation {
     return v;
 }
 
+/// Shape-check the 19-char "YYYY-MM-DDTHH:MM:SS" prefix: digits in the
+/// digit positions, the exact separators between them.  Length alone is
+/// not fail-closed -- 19 chars of garbage that happens to sort high would
+/// otherwise pass a lexicographic compare and shift the drawdown peak
+/// (review round 2).
+[[nodiscard]] inline bool looks_like_iso_prefix(
+    const std::string& s) noexcept
+{
+    constexpr std::size_t kPrefix = 19;
+    if (s.size() < kPrefix) return false;
+    for (std::size_t i = 0; i < kPrefix; ++i) {
+        const char c = s[i];
+        switch (i) {
+            case 4: case 7:
+                if (c != '-') return false;
+                break;
+            case 10:
+                if (c != 'T') return false;
+                break;
+            case 13: case 16:
+                if (c != ':') return false;
+                break;
+            default:
+                if (c < '0' || c > '9') return false;
+                break;
+        }
+    }
+    return true;
+}
+
 /// Whether ISO-8601 UTC timestamp `a` is STRICTLY after `b`, comparing the
 /// 19-char "YYYY-MM-DDTHH:MM:SS" prefix (suffix-style-indifferent, same as
 /// completed_during_process below).  Malformed or missing timestamps fail
@@ -250,7 +280,9 @@ struct BridgeValuation {
     const std::string& a, const std::string& b) noexcept
 {
     constexpr std::size_t kPrefix = 19;
-    if (a.size() < kPrefix || b.size() < kPrefix) return false;
+    if (!looks_like_iso_prefix(a) || !looks_like_iso_prefix(b)) {
+        return false;
+    }
     return a.compare(0, kPrefix, b, 0, kPrefix) > 0;
 }
 
@@ -270,8 +302,8 @@ struct BridgeValuation {
     const std::string& process_start_iso) noexcept
 {
     constexpr std::size_t kPrefix = 19;
-    if (updated_at_iso.size() < kPrefix
-        || process_start_iso.size() < kPrefix) {
+    if (!looks_like_iso_prefix(updated_at_iso)
+        || !looks_like_iso_prefix(process_start_iso)) {
         return false;
     }
     return updated_at_iso.compare(0, kPrefix,
