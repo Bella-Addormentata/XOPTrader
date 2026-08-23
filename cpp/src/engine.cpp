@@ -11830,7 +11830,18 @@ void Engine::step_ingest_bridge_flows(BlockHeight block_height)
         // older snapshot -- Step 8 skipped during pauses -- could
         // predate a fill and overwrite it; in that case the reconcile
         // simply defers to the next heartbeat Step 8 runs.
-        const bool fresh = bal.as_of_block == block_height
+        //
+        // ALSO defer on any pass that BOOKED a flow (review round 9):
+        // the GUI can record a booking-eligible transition between
+        // Step 8's wallet query and this scan, in which case even the
+        // current-heartbeat snapshot predates the flow and reconciling
+        // would set inventory below truth.  Next heartbeat Step 8
+        // re-queries after the flow's on-chain effect, and the
+        // still-pending peak rescale is consumed then.  (The invariant
+        // sees at most one transient divergence observation this
+        // heartbeat -- below its 2-observation action gate.)
+        const bool fresh = booked == 0
+            && bal.as_of_block == block_height
             && bal.pending_change == 0;
         if (fresh && bal.confirmed >= 0) {
             reconciled = true;

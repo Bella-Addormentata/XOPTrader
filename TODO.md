@@ -239,14 +239,16 @@
   control as an "adjust" entry ("unexplained divergence reconciled to
   wallet") -- books tie, but attribution is blind: the equity jump can
   mask real trading losses in the rolling window, and nothing separates
-  capital movements from performance. Design: the engine reads
+  capital movements from performance. Design (as implemented; see the
+  Status line for the review-hardened details): the engine reads
   data/warp_jobs.db (read-only; the GUI owns writes) during the ledger
-  tie and posts event_type "bridge_deposit" (+post_tip_mojos, inbound) /
-  "bridge_withdrawal" (unwraps) for COMPLETED jobs not yet booked --
-  BEFORE the divergence control runs, so the movement is explained
-  rather than adjusted. P&L tracker gains a net-deposits component
-  excluded from performance; GUI P&L display gains a "Net deposits"
-  line. (All of the above is now implemented -- see the Status line.)
+  tie and posts event_type "bridge_deposit" (+post_tip_mojos, inbound
+  at COMPLETED) / "bridge_withdrawal" (unwraps, at the FIRST
+  burn-confirmed event -- COMPLETED can lag unboundedly behind the
+  wallet-affecting burn) for jobs not yet booked -- BEFORE the
+  divergence control runs, so the movement is explained rather than
+  adjusted. P&L tracker gains a net-deposits component excluded from
+  performance; GUI P&L display gains a "Net deposits" line.
 
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
 - **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13

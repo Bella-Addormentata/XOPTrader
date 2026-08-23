@@ -2318,6 +2318,16 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     if (node["bridge_asset_id"] && node["bridge_asset_id"].IsDefined()
         && !node["bridge_asset_id"].IsNull()) {
         cfg.bridge_asset_id = node["bridge_asset_id"].as<std::string>();
+        // T3-29 pattern (review round 9): normalize to lowercase at the
+        // boundary like pair asset ids -- downstream code compares this
+        // exactly against lowercased pair/cache/opening keys, and an
+        // uppercase override would silently never book anything.
+        std::transform(cfg.bridge_asset_id.begin(),
+                       cfg.bridge_asset_id.end(),
+                       cfg.bridge_asset_id.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
     }
     if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
         && !node["reward_asset_id"].IsNull()) {
