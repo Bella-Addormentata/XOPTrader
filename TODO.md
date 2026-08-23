@@ -190,3 +190,16 @@
   spends, not standing locks, so they stay outside the cycle ledger by
   design -- but each should get a floor-aware pre-check:
   spendable - cost - fee >= fee_reserve_xch.
+
+### S17: Depeg bail-out re-alerts at ERROR every block (no rate limit)
+- **Files:** `cpp/src/engine.cpp` (Step 3 depeg bail-out alert)
+- **Status:** `[ ]` -- Observed live 2026-08-23 10:25-10:30+: "DEPEG
+  BAIL-OUT BYC/wUSDC.b price=0.750000 -- pulling all quotes!" repeated at
+  ERROR level every ~30-60s for the duration of the bail-out, unlike the
+  Step 13 drawdown breaker which gates re-alerts to 30 min. Alert once on
+  the transition (and on recovery), debug thereafter. Bonus observation
+  from the same incident: the bail price was a single stale order on an
+  emptied dexie book (TibetSwap AMM simultaneously priced BYC at $0.92,
+  not $0.75) -- consider requiring depeg confirmation from a second source
+  (TibetSwap reserves) before bail-out, mirroring the S12 flash-crash
+  junk-print lesson.
