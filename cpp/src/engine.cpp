@@ -12347,12 +12347,14 @@ void Engine::step_check_alerts(BlockHeight block_height)
             // immediately -- but only after a STREAK of lifted
             // evaluations.  [S18 2026-08-23] A single transient false
             // read of the breach condition (flaky wallet RPC corrupting
-            // one equity computation) re-armed the gate mid-episode, and
-            // 50+ CRITICAL alerts fired minutes apart against the 30-min
-            // interval while 1,088 correctly-suppressed evaluations sat
-            // between them.  ~10 consecutive lifted reads (~2-3 min of
-            // heartbeats) is long enough to outlive any RPC blip and
-            // short enough that a genuine recovery re-arms promptly.
+            // one equity computation) re-armed the gate mid-episode:
+            // three CRITICAL re-alerts fired within 62 seconds against
+            // the 30-minute interval, while 1,088 correctly-suppressed
+            // evaluations interleaved with the premature re-alerts and
+            // equity never actually rose above the threshold.  ~10
+            // consecutive lifted reads (~2-3 min of heartbeats) is long
+            // enough to outlive any RPC blip and short enough that a
+            // genuine recovery re-arms promptly.
             constexpr int kRealertRearmStreak = 10;
             if (breaker_lift_streak_ < kRealertRearmStreak) {
                 ++breaker_lift_streak_;
