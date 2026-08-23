@@ -2,6 +2,8 @@
 
 #include <xop/execution/coin_manager.hpp>
 
+#include <limits>
+
 namespace {
 
 using xop::Mojo;
@@ -61,6 +63,21 @@ TEST(CoinManagerTest, PlanSplitFallsBackToHalvesInsideTheDeadlockWindow) {
     EXPECT_TRUE(CoinManager::is_pool_ready_coin(plan.split_amount, target));
     EXPECT_TRUE(
         CoinManager::is_pool_ready_coin(amount - plan.split_amount, target));
+}
+
+TEST(CoinManagerTest, PlanSplitSurvivesExtremeArguments) {
+    // Near-limit arguments must refuse cleanly, not overflow (the funding
+    // gate now subtracts), and a tiny target against a huge coin must cap
+    // the batch at the 500-coin split limit rather than narrowing an
+    // out-of-range quotient to int.
+    const Mojo huge = std::numeric_limits<Mojo>::max();
+
+    EXPECT_EQ(CoinManager::plan_split_for_coin(huge - 1, 1, huge, 2).batch, 0);
+
+    const auto plan = CoinManager::plan_split_for_coin(
+        huge, 1000, /*target=*/1'000LL, 0);
+    EXPECT_EQ(plan.split_amount, 1'000LL);
+    EXPECT_EQ(plan.batch, 500);  // the Chia per-tx split limit
 }
 
 TEST(CoinManagerTest, PlanSplitPrefersTargetDenominationWhenItImproves) {
