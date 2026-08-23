@@ -72,6 +72,43 @@ public:
     [[nodiscard]] Mojo remaining() const noexcept { return remaining_; }
     [[nodiscard]] Mojo committed() const noexcept { return committed_; }
 
+    /// Charge a lock that will happen REGARDLESS of budget -- cancel
+    /// fees.  Same wallet-shaped selection as try_lock, but never refuses:
+    /// the pool simply reflects reality, so posting later in the cycle is
+    /// gated against what cancellations actually consumed (review: the
+    /// cycle snapshot is taken before Step 8's cancellation passes, and a
+    /// secure cancel locks an XCH fee coin the snapshot still counts as
+    /// free).  A need the pool cannot cover drains the pool entirely.
+    void note_lock(Mojo principal_mojos, Mojo fee_mojos)
+    {
+        if (!active_) {
+            return;
+        }
+        if (principal_mojos < 0) principal_mojos = 0;
+        if (fee_mojos < 0) fee_mojos = 0;
+        const Mojo need = saturating_add(principal_mojos, fee_mojos);
+        if (need == 0) {
+            return;
+        }
+
+        const auto it = std::lower_bound(coins_.begin(), coins_.end(), need);
+        if (it != coins_.end()) {
+            const Mojo locked = *it;
+            coins_.erase(it);
+            remaining_ -= locked;
+            committed_ = saturating_add(committed_, locked);
+            return;
+        }
+        Mojo covered = 0;
+        while (!coins_.empty() && covered < need) {
+            const Mojo c = coins_.back();
+            covered = saturating_add(covered, c);
+            coins_.pop_back();
+            remaining_ -= c;
+            committed_ = saturating_add(committed_, c);
+        }
+    }
+
     /// Admit-or-refuse one offer's XCH lock.  On admit, the selected coins
     /// leave the pool and count against the cycle cap.  Refusal locks
     /// nothing.  Over-counting is the deliberate failure direction: a

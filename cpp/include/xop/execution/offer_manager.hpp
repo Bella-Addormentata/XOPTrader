@@ -661,6 +661,17 @@ private:
                            const PairConfig& pair,
                            const char*       context);
 
+    /// Cancel forwarders that charge the cycle ledger for the fee coin a
+    /// cancellation locks (review: cancels run after the cycle snapshot,
+    /// so without this the ledger overstates the free pool).  Charged
+    /// before the RPC: a failed cancel over-counts, which is the
+    /// conservative direction.
+    asio::awaitable<json> cancel_offer_charged(const std::string& trade_id,
+                                               std::uint64_t      fee,
+                                               bool               secure);
+    asio::awaitable<json> cancel_offers_charged(std::uint64_t fee,
+                                                bool          secure);
+
     CoinLockLedger xch_cycle_ledger_;
     bool           xch_ledger_refusal_logged_{false};
 

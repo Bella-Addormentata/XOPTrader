@@ -265,7 +265,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
-                        co_await wallet_->cancel_offer(
+                        co_await cancel_offer_charged(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
@@ -300,7 +300,7 @@ asio::awaitable<int> OfferManager::post_quotes(
                     bool cancel_ok = false;
                     bool needs_emergency = false;
                     try {
-                        co_await wallet_->cancel_offer(
+                        co_await cancel_offer_charged(
                             po.offer_id, current_fee_mojos_, /*secure=*/true);
                         cancel_ok = true;
                     } catch (const rpc::ChiaRPCError& e) {
@@ -909,7 +909,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_stale(
         bool cancel_ok = false;
         bool needs_emergency = false;
         try {
-            co_await wallet_->cancel_offer(
+            co_await cancel_offer_charged(
                 po.offer_id, current_fee_mojos_, /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
@@ -969,7 +969,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
     bool bulk_ok = false;
     std::string bulk_err;
     try {
-        co_await wallet_->cancel_offers(current_fee_mojos_, /*secure=*/true);
+        co_await cancel_offers_charged(current_fee_mojos_, /*secure=*/true);
         logger_->info("cancel_all: bulk cancel_offers succeeded");
         bulk_ok = true;
     } catch (const rpc::ChiaRPCError& e) {
@@ -991,7 +991,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::cancel_all()
             bool cancel_ok = false;
             bool needs_emergency = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     po.offer_id, current_fee_mojos_, /*secure=*/true);
                 logger_->debug("Cancelled offer {}", po.offer_id.substr(0, 12));
                 cancel_ok = true;
@@ -1590,7 +1590,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::selective_cancel(
         bool cancel_ok = false;
         bool needs_emergency = false;
         try {
-            co_await wallet_->cancel_offer(
+            co_await cancel_offer_charged(
                 offer_id, current_fee_mojos_, /*secure=*/true);
             cancel_ok = true;
         } catch (const rpc::ChiaRPCError& e) {
@@ -2408,7 +2408,7 @@ asio::awaitable<std::vector<std::string>> OfferManager::startup_reconcile(
                 } else {
                 bool needs_emergency = false;
                 try {
-                    co_await wallet_->cancel_offer(wo->trade_id,
+                    co_await cancel_offer_charged(wo->trade_id,
                                                    current_fee_mojos_,
                                                    /*secure=*/true);
                     cancel_ok = true;
@@ -2681,6 +2681,20 @@ asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
         logger_->warn("XCH lock ledger snapshot failed ({}) -- this cycle "
                       "runs on the wallet-requery guards only", e.what());
     }
+}
+
+asio::awaitable<json> OfferManager::cancel_offer_charged(
+    const std::string& trade_id, std::uint64_t fee, bool secure)
+{
+    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    co_return co_await wallet_->cancel_offer(trade_id, fee, secure);
+}
+
+asio::awaitable<json> OfferManager::cancel_offers_charged(std::uint64_t fee,
+                                                          bool          secure)
+{
+    xch_cycle_ledger_.note_lock(0, static_cast<Mojo>(fee));
+    co_return co_await wallet_->cancel_offers(fee, secure);
 }
 
 bool OfferManager::xch_ledger_admits(const json&       offer_dict,
@@ -3290,7 +3304,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                           context, offer_id.substr(0, 12));
             bool zero_ok = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     offer_id, 0, /*secure=*/true);
                 zero_ok = true;
             } catch (const std::exception& e) {
@@ -3329,7 +3343,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                 bool rpc_failed = false;
                 bool insufficient = false;
                 try {
-                    co_await wallet_->cancel_offer(
+                    co_await cancel_offer_charged(
                         offer_id,
                         static_cast<std::uint64_t>(attempt_fee),
                         /*secure=*/true);
@@ -3368,7 +3382,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
                           context, offer_id.substr(0, 12));
             bool secure_zero_ok = false;
             try {
-                co_await wallet_->cancel_offer(
+                co_await cancel_offer_charged(
                     offer_id, 0, /*secure=*/true);
                 secure_zero_ok = true;
             } catch (const rpc::ChiaRPCError& e) {
@@ -3390,7 +3404,7 @@ asio::awaitable<bool> OfferManager::emergency_cancel(
         // offer on-chain.  Better than leaving funds locked forever.
         logger_->warn("{}: zero XCH spendable -- local-only (insecure) "
                       "cancel for {}", context, offer_id.substr(0, 12));
-        co_await wallet_->cancel_offer(
+        co_await cancel_offer_charged(
             offer_id, 0, /*secure=*/false);
         logger_->warn("{}: local-only cancelled {} "
                       "(INSECURE -- offer may still be taken on-chain)",

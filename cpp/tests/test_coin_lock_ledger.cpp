@@ -89,6 +89,26 @@ TEST(CoinLockLedgerTest, FeeOnlyLocksModelWholeCoins) {
     EXPECT_FALSE(ledger.try_lock(0, kFee));  // second lock crosses the cap
 }
 
+TEST(CoinLockLedgerTest, NoteLockChargesUnconditionally) {
+    // Cancel fees are charged with note_lock: they happen regardless of
+    // budget, so the pool must reflect them even past the floor -- and a
+    // later try_lock is then correctly refused.
+    std::vector<Mojo> coins = {2 * kXch, 2 * kXch};
+    CoinLockLedger ledger(coins, kXch / 2, 1.0);
+
+    ledger.note_lock(0, kFee);               // cancel fee locks a whole coin
+    EXPECT_EQ(ledger.committed(), 2 * kXch);
+    ledger.note_lock(0, kFee);               // second cancel: past the cap,
+    EXPECT_EQ(ledger.remaining(), 0);        // charged anyway
+    EXPECT_FALSE(ledger.try_lock(0, kFee));  // posting is now refused
+}
+
+TEST(CoinLockLedgerTest, NoteLockOnInactiveLedgerIsANoOp) {
+    CoinLockLedger ledger;
+    ledger.note_lock(kXch, kFee);
+    EXPECT_EQ(ledger.committed(), 0);
+}
+
 TEST(CoinLockLedgerTest, InactiveLedgerAdmitsEverything) {
     CoinLockLedger ledger;
     EXPECT_FALSE(ledger.active());
