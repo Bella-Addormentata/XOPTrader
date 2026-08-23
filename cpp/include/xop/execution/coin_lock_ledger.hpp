@@ -122,6 +122,34 @@ public:
         return true;
     }
 
+    /// Floor-aware, CAP-EXEMPT admission for buy-XCH offers (review
+    /// round 3): recovery exemptions may skip the per-cycle offer cap --
+    /// buy-XCH offers net-increase XCH when filled -- but must never skip
+    /// the fee-reserve floor, or the exemption itself can walk the pool to
+    /// zero (the incident's five CAT-principal bids would have done
+    /// exactly that through an unconditional bypass).  The charge does not
+    /// count against committed(): the cap remains a spend-side budget.
+    [[nodiscard]] bool try_lock_floor_only(Mojo principal_mojos,
+                                           Mojo fee_mojos)
+    {
+        if (!active_) {
+            return true;
+        }
+        const Mojo need = clamp_need(principal_mojos, fee_mojos);
+        if (need == 0) {
+            return true;
+        }
+        const Selection sel = select_for(need);
+        if (!sel.covered) {
+            return false;
+        }
+        if (remaining_ - sel.locked < floor_) {
+            return false;
+        }
+        apply(sel);
+        return true;
+    }
+
     /// Unconditional pool drain for spends that happen REGARDLESS of
     /// budget -- cancel fees (review: cancels run after the cycle snapshot,
     /// and a secure cancel locks a whole XCH fee coin the snapshot still

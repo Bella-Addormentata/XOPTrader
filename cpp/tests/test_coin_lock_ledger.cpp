@@ -32,16 +32,21 @@ TEST(CoinLockLedgerTest, ReplaysTheIncidentBatchExactly) {
     CoinLockLedger ledger(coins, /*floor=*/kXch / 2, /*commit_frac=*/1.0);
 
     int admitted = 0;
-    for (int i = 0; i < 5; ++i) {          // 1-XCH asks
+    for (int i = 0; i < 5; ++i) {          // 1-XCH asks: spend side, capped
         if (ledger.try_lock(kXch, kFee)) ++admitted;
     }
-    for (int i = 0; i < 5; ++i) {          // CAT bids: fee-coin lock only
-        if (ledger.try_lock(0, kFee)) ++admitted;
+    for (int i = 0; i < 5; ++i) {          // buy-XCH bids: fee-coin locks,
+        if (ledger.try_lock_floor_only(0, kFee)) ++admitted;   // cap-exempt
     }
 
+    // 5 asks lock a 2-XCH coin each (committed 10); bid 1 locks the 0.59
+    // tail, bid 2 a 2-XCH coin -- neither counts against the cap -- and
+    // bid 3 would leave the pool below the 0.5 floor: refused THERE, not
+    // at the cap.  7 admitted, exactly 2 XCH remaining; production
+    // admitted all 10 and hit zero.
     EXPECT_EQ(admitted, 7);
     EXPECT_EQ(ledger.remaining(), 2 * kXch);
-    EXPECT_EQ(ledger.committed(), 10 * kXch + tail + 2 * kXch);
+    EXPECT_EQ(ledger.committed(), 10 * kXch);
 }
 
 TEST(CoinLockLedgerTest, CycleCapLimitsCommitmentFraction) {
@@ -148,6 +153,21 @@ TEST(CoinLockLedgerTest, RefusalThenSmallerLockIsAdmitted) {
     EXPECT_EQ(ledger.remaining(), 3 * kXch);       // refusal locked nothing
     EXPECT_TRUE(ledger.try_lock(kXch, 0));         // the 1-XCH coin fits
     EXPECT_EQ(ledger.committed(), kXch);
+}
+
+TEST(CoinLockLedgerTest, FloorOnlyLockIsCapExemptButNeverFloorExempt) {
+    // (review round 3) Buy-XCH offers skip the spend cap -- the recovery
+    // escapes must not starve -- but an unconditional bypass would let
+    // fee-coin locks alone drain the pool to zero, re-opening the incident
+    // from the other side.  The floor is the line neither path may cross.
+    std::vector<Mojo> coins = {2 * kXch, 2 * kXch};
+    CoinLockLedger ledger(coins, kXch / 2, 0.0);   // cap = 0: spend side dead
+
+    EXPECT_FALSE(ledger.try_lock(kXch, kFee));            // cap refuses spend
+    EXPECT_TRUE(ledger.try_lock_floor_only(0, kFee));     // buy-XCH admitted
+    EXPECT_EQ(ledger.committed(), 0);                     // cap untouched
+    EXPECT_FALSE(ledger.try_lock_floor_only(0, kFee));    // floor refuses:
+    EXPECT_EQ(ledger.remaining(), 2 * kXch);              // last coin stays
 }
 
 TEST(CoinLockLedgerTest, NoteLockOverdrainClearsThePool) {

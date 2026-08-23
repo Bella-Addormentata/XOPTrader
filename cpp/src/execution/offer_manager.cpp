@@ -2668,14 +2668,9 @@ asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
     xch_ledger_refusal_logged_ = false;
     try {
         auto coins = co_await wallet_->get_spendable_coins(1);
-        std::vector<Mojo> amounts;
-        amounts.reserve(coins.size());
-        for (const auto& cr : coins) {
-            const auto& coin = cr.contains("coin") ? cr["coin"] : cr;
-            if (coin.contains("amount")) {
-                amounts.push_back(coin["amount"].get<Mojo>());
-            }
-        }
+        // Parsed by the same helper the unit tests exercise, so schema
+        // handling cannot silently diverge from the tested path (review).
+        std::vector<Mojo> amounts = spendable_amounts_from_coin_records(coins);
         const auto floor = static_cast<Mojo>(std::llround(
             strategy_cfg_.fee_reserve_xch
             * static_cast<double>(kMojosPerXch)));
@@ -2736,17 +2731,32 @@ bool OfferManager::xch_ledger_admits(const json&       offer_dict,
     if (!xch_cycle_ledger_.active()) {
         return true;
     }
-    // Buy-XCH offers bypass the cap and floor entirely, mirroring the
-    // pre-existing recovery-zone and xch_buy_only_mode exemptions: they
-    // net-INCREASE XCH when filled, and vetoing them re-created the
-    // low-XCH permanent-starvation deadlock those paths exist to prevent
-    // (review, critical).  Their fee coin still drains the modeled pool.
+    // Buy-XCH offers are CAP-exempt but never FLOOR-exempt (review round
+    // 3).  Cap-exempt mirrors the pre-existing recovery-zone and
+    // xch_buy_only_mode escapes: buy-XCH offers net-increase XCH when
+    // filled, and vetoing them on the spend budget re-created the low-XCH
+    // starvation deadlock those paths exist to prevent.  Floor-checked
+    // because an unconditional bypass re-opened the incident from the
+    // other side: fee-coin locks alone could drain the pool to zero.
+    // Below the floor, the remaining escapes are the ones that spend no
+    // XCH at all: resting-offer fills, TTL expiries, and the xch_recovery
+    // taker (which pays wUSDC.b).
     const bool buys_xch =
         (side == Side::Bid && pair.base_asset_id == "xch")
         || (side == Side::Ask && pair.quote_asset_id == "xch");
     if (buys_xch) {
-        xch_cycle_ledger_.note_lock(0, current_fee_mojos_);
-        return true;
+        if (xch_cycle_ledger_.try_lock_floor_only(0, current_fee_mojos_)) {
+            return true;
+        }
+        xch_ledger_suppressed_ = true;
+        if (!xch_ledger_refusal_logged_) {
+            logger_->warn("XCH lock ledger: refusing buy-XCH {} for {} -- "
+                          "even a fee-coin lock would breach the reserve "
+                          "floor (remaining={})",
+                          context, pair.name, xch_cycle_ledger_.remaining());
+            xch_ledger_refusal_logged_ = true;
+        }
+        return false;
     }
     const Mojo principal = xch_principal_from_offer_dict(offer_dict);
     if (xch_cycle_ledger_.try_lock(principal, current_fee_mojos_)) {
@@ -2828,10 +2838,19 @@ asio::awaitable<int> OfferManager::post_merged_side(
         for (const auto& tier : tiers) {
             json single_dict = build_offer_dict(pair, tier);
             if (single_dict.empty()) continue;
-            // [XCH-LOCK-LEDGER] Deliberately NOT re-charged: the merged
-            // charge above already counted this side's XCH in full, and a
-            // second per-tier charge turned one transient batch-RPC failure
-            // into a whole side posting nothing for the cycle (review).
+            // [XCH-LOCK-LEDGER] Re-charged per tier (review round 3):
+            // the merged attempt charged ONE combined selection, but each
+            // fallback tier is a separate wallet offer with its own
+            // whole-coin principal + fee-coin selection, so skipping the
+            // charge under-counts real locks and can breach both cap and
+            // floor.  Over-counting after the failed merged create is the
+            // contract's deliberate conservative direction; the cost is a
+            // quieter cycle after a transient batch failure, healed at the
+            // next reseed.
+            if (!xch_ledger_admits(single_dict, pair, tier.side,
+                                   "batch fallback")) {
+                continue;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
