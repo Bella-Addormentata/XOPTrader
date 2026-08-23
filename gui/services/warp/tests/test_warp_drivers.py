@@ -253,6 +253,52 @@ def test_build_claim_bundle_shape_and_id_chain():
     assert result.final_cat_coin_id == cu.coin_name(result.eve_cat_coin_id, final_ph, _TOKEN_AMOUNT)
 
 
+def test_message_coin_solution_rebuilds_the_portal_coin_id():
+    """The message coin's puzzle ASSERT_MY_PARENT_IDs the coin rebuilt from
+    the solution's (parent_parent_info . parent_inner_puzzle_hash) pair --
+    and its actual parent is the CURRENT portal coin.  The pair must
+    therefore be (portal.parent_coin_info, portal's own inner hash); the
+    original code passed the portal's GRANDPARENT id (the field that
+    belongs in the portal spend's own lineage proof), asserting a parent
+    that never existed.  Every live claim failed deterministically with
+    ASSERT_MY_PARENT_ID_FAILED (first seen 2026-08-23, the stuck $5 job:
+    the shape tests never related this solution to the portal's parentage,
+    and the fixture's 0x44... grandparent made the slip invisible).
+    Mirrors the puzzle's own reconstruction end-to-end."""
+    req = _make_request()
+    result = d.build_claim_bundle(req)
+    js = result.bundle.to_json()
+
+    # Find the message-coin spend by its parentage (order-independent).
+    message_spends = [
+        cs for cs in js["coin_spends"]
+        if bytes.fromhex(cs["coin"]["parent_coin_info"][2:]) == req.portal_coin.name()
+    ]
+    assert len(message_spends) == 1
+    solution = cu.program_from_hex(message_spends[0]["solution"][2:])
+    _receiver_pair, parent_pair, _msg_id = list(solution.as_iter())
+    pp = parent_pair.first().as_atom()
+    pih = parent_pair.rest().as_atom()
+
+    # The pair describes the portal coin itself, not its grandparent.
+    assert pp == req.portal_coin.parent_coin_info
+    launcher_id = bytes.fromhex(NET.portal_launcher_id)
+    update_ph = d.get_portal_update_puzzle_hash(NET)
+    inner = d.get_portal_receiver_inner_puzzle(
+        launcher_id,
+        NET.signature_threshold,
+        NET.validator_bls_keys,
+        update_ph,
+        (),
+    )
+    assert pih == cu.sha256tree(inner)
+
+    # End-to-end: the puzzle's reconstruction lands on the actual parent.
+    outer_ph = cu.sha256tree(d.puzzle_for_singleton(launcher_id, inner))
+    assert outer_ph == req.portal_coin.puzzle_hash
+    assert cu.coin_name(pp, outer_ph, 1) == req.portal_coin.name()
+
+
 def test_claim_bundle_aggregated_signature_signs_security_coin():
     # With no validator sigs, the aggregate is exactly the security-coin sig.
     req = _make_request()
