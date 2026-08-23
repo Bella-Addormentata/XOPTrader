@@ -14,6 +14,13 @@ requests>=2.31.0,<3
 packaging>=23.0
 # warp.green bridge (gui/services/warp) — imported lazily; GUI boots without them.
 web3>=7,<8
+# eth-account 0.14.0 (2026-08-22) pulls py_ecc and reads its package
+# metadata at runtime; PyInstaller ships no dist-info it is not told to
+# copy, so the frozen warp engine died with "No package metadata was
+# found for py_ecc" (v0.9.16). The unpinned range let two same-day
+# builds resolve different stacks. Cap until the bundle copies the
+# metadata (--copy-metadata py_ecc) or the stack is lock-pinned.
+eth-account>=0.13,<0.14
 clvm>=0.9.10,<1
 chia_rs>=0.47,<1
 websocket-client>=1.7,<2

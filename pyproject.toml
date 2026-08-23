@@ -31,6 +31,11 @@ gui = [
     # disabled. clvm = pure-python SExp/serialize; chia_rs = BLS + coin oracle;
     # web3 = Base EVM client; websocket-client = Nostr signature collection.
     "web3>=7,<8",
+    # eth-account 0.14.0 pulls py_ecc + reads its dist metadata at
+    # runtime, which a PyInstaller bundle lacks -- froze the warp engine
+    # in v0.9.16 ("No package metadata was found for py_ecc"). Cap to the
+    # proven line until the bundle copies the metadata or deps are locked.
+    "eth-account>=0.13,<0.14",
     "clvm>=0.9.10,<1",
     "chia_rs>=0.47,<1",
     "websocket-client>=1.7,<2",
