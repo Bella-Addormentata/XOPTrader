@@ -214,3 +214,23 @@
   resets on some per-evaluation path when the state is already Paused, or
   the gate only covers the un-latched trip path. Alert once per 30 min as
   documented, regardless of latch state.
+
+### S19: Bridge transfers need first-class ledger accounting (deposits, not P&L)
+- **Files:** `cpp/src/engine.cpp` (ledger tie ~11600), `gui/services/warp/jobs.py`,
+  P&L tracker + GUI P&L display
+- **Status:** `[ ]` -- Raised by the operator after the first live bridge
+  (2026-08-23, job 2: +4.985 wUSDC.b). The ledger has no deposit/transfer
+  event type, so a completed bridge inflow is absorbed by the divergence
+  control as an "adjust" entry ("unexplained divergence reconciled to
+  wallet") -- books tie, but attribution is blind: the equity jump can
+  mask real trading losses in the rolling window, and nothing separates
+  capital movements from performance. Design: the engine reads
+  data/warp_jobs.db (read-only; the GUI owns writes) during the ledger
+  tie and posts event_type "bridge_deposit" (+post_tip_mojos, inbound) /
+  "bridge_withdrawal" (unwraps) for COMPLETED jobs not yet booked --
+  BEFORE the divergence control runs, so the movement is explained
+  rather than adjusted. P&L tracker gains a net-deposits component
+  excluded from performance; GUI P&L display gains a "Net deposits"
+  line. Until then: SELECT SUM(delta_mojos) FROM ledger_entries WHERE
+  event_type='adjust' is the manual correction, and each bridge lands as
+  one adjust entry ~= its post-tip amount.
