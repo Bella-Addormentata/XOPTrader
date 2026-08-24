@@ -12038,8 +12038,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             // amounts simply leave the peak standing (conservative
             // false-trip direction) until the bounded expiry or a
             // restart re-anchor.
-            bridge_pending_withdrawal_mojos_ += -flow.delta_mojos;
-            bridge_pending_withdrawal_block_ = block_height;
+            bridge_pending_withdrawals_.emplace_back(
+                -flow.delta_mojos, block_height);
         } else {
             spdlog::info("[Engine] Bridge ingest: withdrawal of {} "
                          "mojos completed before this process started "
@@ -12159,17 +12159,16 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         };
         expire(bridge_pos_fold_provs_, "positive");
         expire(bridge_neg_fold_provs_, "negative");
-        if (bridge_pending_withdrawal_mojos_ > 0
-            && bridge_pending_withdrawal_block_ != 0
-            && block_height > bridge_pending_withdrawal_block_
-                                  + kFoldProvenanceExpiryBlocks) {
+        while (!bridge_pending_withdrawals_.empty()
+               && block_height > bridge_pending_withdrawals_.front().second
+                                     + kFoldProvenanceExpiryBlocks) {
             spdlog::info("[Engine] Bridge ingest: {} mojos of booked "
-                         "withdrawal never matched an observed fold -- "
-                         "peak left standing (conservative; restart "
-                         "re-anchor heals it)",
-                         bridge_pending_withdrawal_mojos_);
-            bridge_pending_withdrawal_mojos_ = 0;
-            bridge_pending_withdrawal_block_ = 0;
+                         "withdrawal (block {}) never matched an "
+                         "observed fold -- peak left standing "
+                         "(conservative; restart re-anchor heals it)",
+                         bridge_pending_withdrawals_.front().first,
+                         bridge_pending_withdrawals_.front().second);
+            bridge_pending_withdrawals_.pop_front();
         }
 
         // WITHDRAWAL SHRINK, leg 1 (round 37): booked withdrawals
@@ -12182,8 +12181,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // The aggregate factor (e - SUM w)/e shrinks LESS than the
         // per-event product -- the conservative form for this
         // direction.
-        Mojo matched = std::min(bridge_pending_withdrawal_mojos_,
-                                bridge_neg_fold_now);
+        Mojo pending_total = 0;
+        for (const auto& pw : bridge_pending_withdrawals_) {
+            pending_total += pw.first;
+        }
+        Mojo matched = std::min(pending_total, bridge_neg_fold_now);
         if (matched > 0) {
             const double w_usd =
                 (static_cast<double>(matched) / mojos_per_unit)
@@ -12201,8 +12203,17 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                              peak_equity_hwm_usd_ * factor, -w_usd,
                              bridge_pre_fold_equity_usd);
                 peak_equity_hwm_usd_ *= factor;
-                bridge_pending_withdrawal_mojos_ -= matched;
                 bridge_neg_fold_now -= matched;
+                Mojo consume = matched;
+                while (consume > 0) {
+                    auto& pw = bridge_pending_withdrawals_.front();
+                    const Mojo c = std::min(consume, pw.first);
+                    pw.first -= c;
+                    consume  -= c;
+                    if (pw.first == 0) {
+                        bridge_pending_withdrawals_.pop_front();
+                    }
+                }
             } else {
                 spdlog::info("[Engine] Bridge ingest: withdrawal of "
                              "${:+.6f} not shrunk (peak or equity "
@@ -12215,12 +12226,20 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // aggregate factor PER RECORD (round 38: flows sharing a
         // snapshot are simultaneous); (e_rec - w)/e_rec applied to
         // the current peak is exact under multiplicative composition.
-        while (bridge_pending_withdrawal_mojos_ > 0
+        while (!bridge_pending_withdrawals_.empty()
                && !bridge_neg_fold_provs_.empty()
                && peak_equity_hwm_usd_ > 0.0) {
             auto& prov = bridge_neg_fold_provs_.front();
-            const Mojo m = std::min(bridge_pending_withdrawal_mojos_,
-                                    prov.mojos);
+            // Provenance recorded THIS block is for future bookings;
+            // this pass's fold already matched through leg 1
+            // (round 40 ordering guard, mirrored in the deposit
+            // tail).
+            if (prov.at_block == block_height) break;
+            Mojo avail = 0;
+            for (const auto& pw : bridge_pending_withdrawals_) {
+                avail += pw.first;
+            }
+            const Mojo m = std::min(avail, prov.mojos);
             const double w_usd =
                 (static_cast<double>(m) / mojos_per_unit)
                 * usd_per_unit;
@@ -12243,7 +12262,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                          peak_equity_hwm_usd_ * factor, -w_usd,
                          prov.equity_usd, prov.at_block);
             peak_equity_hwm_usd_ *= factor;
-            bridge_pending_withdrawal_mojos_ -= m;
+            Mojo consume = m;
+            while (consume > 0) {
+                auto& pw = bridge_pending_withdrawals_.front();
+                const Mojo c = std::min(consume, pw.first);
+                pw.first -= c;
+                consume  -= c;
+                if (pw.first == 0) bridge_pending_withdrawals_.pop_front();
+            }
             prov.mojos -= m;
             if (prov.mojos == 0) bridge_neg_fold_provs_.pop_front();
         }
@@ -12385,6 +12411,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             Mojo prior_covered = 0;
             while (remaining > 0 && !bridge_pos_fold_provs_.empty()) {
                 auto& prov = bridge_pos_fold_provs_.front();
+                // Provenance recorded THIS block describes THIS
+                // pass's fold, which the e_pre factor below already
+                // handles (round 40): consuming it here would split
+                // one deposit into (E+S)/E * (E+F-S)/E instead of
+                // the single correct (E+F)/E and inflate the peak.
+                // FIFO is block-ordered, so the first same-block
+                // record means all remaining are same-block.
+                if (prov.at_block == block_height) break;
                 const Mojo c = std::min(remaining, prov.mojos);
                 const double c_usd =
                     (static_cast<double>(c) / mojos_per_unit)

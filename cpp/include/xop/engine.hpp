@@ -911,16 +911,19 @@ private:
     /// consumed oldest-first; each record expires independently.
     std::deque<BridgeFoldProvenance> bridge_pos_fold_provs_;
     std::deque<BridgeFoldProvenance> bridge_neg_fold_provs_;
-    /// [S19 round 37] Booked in-process withdrawals whose peak shrink
-    /// is still waiting for its observed wallet fold.  A shrink
-    /// executes only when the BOOKED event and the OBSERVED fold have
-    /// both happened -- authorization plus observation -- using the
+    /// [S19 rounds 37+40] Booked in-process withdrawals whose peak
+    /// shrink is still waiting for its observed wallet fold, kept as
+    /// a FIFO of (mojos, booked-at-block) records: a single aggregate
+    /// whose age reset on every booking never expired while
+    /// withdrawals kept arriving, so stale unmatched amounts could
+    /// later match an unrelated negative fold and shrink the peak
+    /// wrongly (round 40).  A shrink executes only when the BOOKED
+    /// event and the OBSERVED fold have both happened -- using the
     /// fold-time measured pre-fold equity, which is what the retired
-    /// rounds-19-25 budget could never prove.  Expires like the
-    /// provenance records (no shrink, conservative false-trip
-    /// direction; a restart re-anchor heals it).
-    Mojo bridge_pending_withdrawal_mojos_{0};
-    BlockHeight bridge_pending_withdrawal_block_{0};
+    /// rounds-19-25 budget could never prove.  Records expire
+    /// individually (no shrink, conservative false-trip direction; a
+    /// restart re-anchor heals it).
+    std::deque<std::pair<Mojo, BlockHeight>> bridge_pending_withdrawals_;
 
     /// [S19 rounds 17-38] Booked bridge DEPOSITS awaiting their
     /// one-time peak credit.  Withdrawals shrink the peak only when
