@@ -11623,6 +11623,13 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // DB must not leave its inventory without any maintainer.
     std::vector<accounting::BridgeJobRow> jobs;
 
+    {
+    // Nested scope (round 45): both SQLite guards must destruct at the
+    // closing brace below -- BEFORE the wallet co_await, the ledger
+    // writes, and inventory persistence -- so the read-only warp
+    // handle is never held across a suspension or a write.  The
+    // function-scoped form kept it open for the whole pass, which the
+    // old scope-exit comment mis-stated.
     sqlite3* raw_db = nullptr;
     int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &raw_db,
                              SQLITE_OPEN_READONLY, nullptr);
@@ -11738,9 +11745,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     }
     }  // prepare ok
     }  // open ok
-    // Handles released by the RAII guards at scope exit; the booking
-    // below deliberately runs after the scan so the read-only handle is
-    // not held across ledger writes.
+    }  // scan scope: wdb_guard and stmt_guard destruct HERE (round 45),
+       // before the coroutine can suspend or the ledger is written.
 
     // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
     // AccountingConfig peg-monitor doctrine), so no price feed is needed
