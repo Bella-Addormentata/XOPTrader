@@ -1066,6 +1066,11 @@ void PnLTracker::mark_to_market(
     // P&L; the others report 0 so per-pair figures still add up to the total.
     std::unordered_map<std::string, bool> asset_marked;
 
+    // [S20 2026-08-24] base_asset -> the first pair holding a position in
+    // it that could not be priced this cycle.  Resolved after the loop, so
+    // a carry never pre-empts a pair that can actually mark the asset.
+    std::unordered_map<std::string, std::string> carry_candidates;
+
     for (auto& [pair_name, ppnl] : pair_pnl_) {
         // [PNL-KEYING-FIX 2026-07-30] Resolve the CANONICAL base asset id
         // ("xch" / 64-hex CAT id) from the registered pair conversion.  The
@@ -1146,12 +1151,16 @@ void PnLTracker::mark_to_market(
         // reasons -- no basis, no balance, another pair already marked
         // this asset -- still zero, because those genuinely mean "no
         // unrealized P&L here".
+        //
+        // The carry is DEFERRED to a second pass rather than applied here.
+        // pair_pnl_ is an unordered_map and one base asset spans several
+        // pairs (XCH is the base of three), so claiming the asset on the
+        // first unpriced pair visited would lock out a later pair that has
+        // a perfectly good price -- freezing the mark on iteration order.
+        // A carry is the LAST resort, valid only once every pair for the
+        // asset has failed to supply one.
         if (!already_marked && basis > 0 && balance > 0 && smoothed_price <= 0) {
-            spdlog::debug("PnLTracker::mark_to_market: {} has no usable "
-                          "price this cycle -- carrying previous mark {}",
-                          pair_name, ppnl.inventory_pnl);
-            total_pnl_.inventory_pnl += ppnl.inventory_pnl;
-            asset_marked[base_asset] = true;
+            carry_candidates.emplace(base_asset, pair_name);
             continue;
         }
 
@@ -1183,6 +1192,25 @@ void PnLTracker::mark_to_market(
         }
 
         total_pnl_.inventory_pnl += ppnl.inventory_pnl;
+    }
+
+    // [S20 2026-08-24] Second pass: apply carries only where NO pair could
+    // price the asset.  ppnl.inventory_pnl is deliberately left untouched
+    // (that IS the carried value); an asset another pair priced keeps the
+    // fresh mark and the unpriced pair reports 0, preserving the existing
+    // dedup rule that per-pair figures sum to the total.
+    for (const auto& [base_asset, pair_name] : carry_candidates) {
+        auto it = pair_pnl_.find(pair_name);
+        if (it == pair_pnl_.end()) continue;
+        if (asset_marked[base_asset]) {
+            it->second.inventory_pnl = 0;
+            continue;
+        }
+        spdlog::debug("PnLTracker::mark_to_market: no pair could price {} "
+                      "this cycle -- carrying {}'s previous mark {}",
+                      base_asset, pair_name, it->second.inventory_pnl);
+        total_pnl_.inventory_pnl += it->second.inventory_pnl;
+        asset_marked[base_asset] = true;
     }
 
     // Record a PnL snapshot for Sharpe/drawdown analytics.

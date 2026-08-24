@@ -604,3 +604,87 @@ TEST(SharpeAnnualizationTest, UsesMeasuredCadenceNotBlockConstant) {
 }
 
 }  // namespace
+
+// ---------------------------------------------------------------------------
+// 4c. [S20 2026-08-24] Price-only failures CARRY, and a carry must never
+//     pre-empt a pair that can actually price the asset.
+//
+//     pair_pnl_ is an unordered_map and XCH is the base of three pairs, so
+//     an earlier cut that claimed the asset on the first unpriced pair
+//     visited made the mark depend on iteration order: an ungraded pair
+//     could lock out a graded one and freeze unrealized P&L despite usable
+//     data.  Here exactly one of the three XCH pairs has a price; the mark
+//     must be the priced one's, whatever order the map yields.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CarryNeverPreemptsAPairThatCanPrice) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    for (const char* pair : {"XCH/wUSDC.b", "XCH/BYC", "XCH/DBX"}) {
+        t.set_pair_conversion(pair, "xch", kBaseXchD, kCatDenomD, 1.0);
+        xop::Fill f = make_fill(std::string("trade-") + pair, xop::Side::Ask,
+                                static_cast<xop::Mojo>(2.5e12),
+                                static_cast<xop::Mojo>(1e12));
+        f.pair_name = pair;
+        ASSERT_TRUE(t.record_fill(f, 0, static_cast<xop::Mojo>(2.0e12), 0));
+    }
+
+    // Only XCH/BYC has a usable price; the other two are withheld exactly
+    // as the engine withholds an ungraded mid.
+    t.mark_to_market(
+        [](const std::string& pair, const std::string&) -> xop::Mojo {
+            return pair == "XCH/BYC" ? static_cast<xop::Mojo>(2.5e12) : 0;
+        },
+        [](const std::string&) -> xop::Mojo { return static_cast<xop::Mojo>(1e12); },
+        [](const std::string&) -> xop::Mojo { return static_cast<xop::Mojo>(2.0e12); },
+        2.5,
+        [](const std::string&) -> double { return kCatDenomD / kBaseXchD; });
+
+    // ($2.50 - $2.00) * 1 XCH = 500 quote mojos, booked to the priced pair.
+    EXPECT_EQ(t.get_pair_pnl("XCH/BYC").inventory_pnl, 500)
+        << "the pair that CAN price the asset must own the mark";
+    EXPECT_EQ(t.get_total_pnl().inventory_pnl, 500)
+        << "asset marked exactly once, by the priced pair";
+}
+
+// A price-only failure across EVERY pair for the asset carries the previous
+// mark rather than zeroing it -- zeroing injected a spurious step into the
+// rolling-window loss series the engine's breaker watches.
+TEST_F(PnLTrackerTest, PriceOnlyFailureCarriesPreviousMark) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    register_pair(t);
+
+    ASSERT_TRUE(t.record_fill(
+        make_fill("trade-carry", xop::Side::Ask,
+                  static_cast<xop::Mojo>(2.5e12),
+                  static_cast<xop::Mojo>(1e12)),
+        0, static_cast<xop::Mojo>(2.0e12), 0));
+
+    auto balance = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(1e12);
+    };
+    auto basis = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.0e12);
+    };
+    auto unit = [](const std::string&) -> double {
+        return kCatDenomD / kBaseXchD;
+    };
+
+    // Cycle 1: priced.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(2.5e12);
+        }, balance, basis, 2.5, unit);
+    const auto marked = t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl;
+    ASSERT_EQ(marked, 500);
+
+    // Cycle 2: no usable price anywhere -- carry, do not zero.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo { return 0; },
+        balance, basis, 2.5, unit);
+
+    EXPECT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, marked)
+        << "an unpriced cycle must not erase the position's mark";
+    EXPECT_EQ(t.get_total_pnl().inventory_pnl, marked);
+}

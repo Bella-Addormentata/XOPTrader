@@ -163,13 +163,16 @@ struct GateInputs {
 
 [[nodiscard]] inline GateVerdict gate_mid(const GateInputs& in) noexcept
 {
-    if (in.candidate_mid <= 0.0) {
-        return GateVerdict::Accept;   // nothing to gate; no-mid is upstream's verdict
-    }
-    // A non-finite candidate must never publish: every comparison below
-    // would be false for NaN, so it would sail through as "in band".
+    // Finiteness FIRST.  Ordering matters: -infinity satisfies `<= 0.0`,
+    // so a no-mid test placed ahead of this would Accept it and hand a
+    // non-finite value to the snapshot conversion downstream.  NaN
+    // likewise fails every comparison and would otherwise sail through the
+    // band test as "in band".
     if (!std::isfinite(in.candidate_mid)) {
         return GateVerdict::RejectAnchor;
+    }
+    if (in.candidate_mid <= 0.0) {
+        return GateVerdict::Accept;   // nothing to gate; no-mid is upstream's verdict
     }
     // A non-finite ANCHOR is not a reference; ignore it and fall through
     // to the step bound rather than letting it silently disable the test

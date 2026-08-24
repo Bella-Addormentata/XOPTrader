@@ -1601,9 +1601,11 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
     }
 
-    // [S20 2026-08-24] valuation_carry_ttl_blocks: blocks an asset's carried
-    // USD price stays authoritative for peak/breaker purposes without a
-    // fresh valuation-grade print.  0 disables the expiry.
+    // [S20 2026-08-24] valuation_carry_ttl_blocks: heartbeats an asset's
+    // carried USD price keeps PEAK-UPDATE authority without a fresh
+    // valuation-grade print.  Expiry freezes the drawdown peak; it does
+    // NOT disarm either breaker (they stay armed against the frozen peak).
+    // 0 disables the expiry.
     if (node["valuation_carry_ttl_blocks"]
             && node["valuation_carry_ttl_blocks"].IsDefined()
             && !node["valuation_carry_ttl_blocks"].IsNull()) {

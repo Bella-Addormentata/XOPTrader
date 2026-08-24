@@ -471,6 +471,14 @@ private:
     /// the two cases apart -- a par constant needs no provenance.
     [[nodiscard]] bool quote_usd_factor_is_par(const PairConfig& pc) const;
 
+    /// [S20] Name of the pair whose published snapshot quote_usd_factor()
+    /// reads to answer `pc` -- usually `pc` itself, but a BYC quote is
+    /// answered from the separate BYC/<stable> cross.  Empty when the
+    /// factor is a par constant or no source pair is enabled.  Callers
+    /// checking valuation grade must test THIS snapshot, not `pc`'s.
+    [[nodiscard]] std::string quote_usd_factor_source_pair(
+        const PairConfig& pc) const;
+
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
     /// Returns 0 when the quote's USD value is unknown.
     [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
@@ -1001,7 +1009,8 @@ private:
     // asset's carry outlives risk.valuation_carry_ttl_blocks, the equity
     // figure is declared degraded for the cycle: the value itself keeps
     // being used (a data gap must not read as a crash) but it loses the
-    // authority to move the drawdown peak or trip a breaker.
+    // authority to move the drawdown PEAK.  Breakers stay armed against
+    // the frozen peak -- disarming them would fail open.
     std::unordered_map<AssetId, BlockHeight> last_asset_live_block_;
 
     /// [S20] Set by compute_portfolio_equity_usd when any held asset's

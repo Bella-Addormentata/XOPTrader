@@ -458,3 +458,17 @@ TEST(MidGateIngestTest, OfferBoundAlwaysExceedsTheGateBand) {
             << "offer filter would strip the confirming book at band " << band;
     }
 }
+
+// -infinity satisfies `<= 0.0`, so a no-mid test placed ahead of the
+// finiteness test would Accept it and hand a non-finite value to the
+// snapshot conversion.  Ordering pin.
+TEST(MidGateTest, NegativeInfinityIsRejectedNotTreatedAsNoMid) {
+    auto in = base_inputs();
+    in.anchor        = {1.0, AnchorSource::Peg};
+    in.candidate_mid = -std::numeric_limits<double>::infinity();
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
+
+    // A genuine no-mid is still not gated.
+    in.candidate_mid = 0.0;
+    EXPECT_EQ(gate_mid(in), GateVerdict::Accept);
+}

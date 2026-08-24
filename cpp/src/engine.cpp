@@ -2013,6 +2013,32 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
     }
 
+    // [S20 2026-08-24] Inject the external references the plausibility gate
+    // and the per-offer filter anchor on, BEFORE any ingestion this cycle.
+    //
+    // Ordering is load-bearing and was wrong in the first cut, which
+    // injected these after the ingest loop below.  Both offer filters run
+    // INSIDE that loop, so on a process's first cycle a brand-new pair had
+    // no anchor while its offers were being filtered -- the unanchored
+    // path let a coherent two-sided 187x book through, which then
+    // satisfied the gate's book-confirmation escape.  That is precisely
+    // the restart-poisoning sequence this change exists to prevent, and it
+    // survived because the ingestion tests injected the anchor first and
+    // so never reproduced production ordering.
+    //
+    // The implied cross is computed from the PREVIOUS cycle's published
+    // sibling mids (already gated), and peg_target is static config, so
+    // nothing here depends on this cycle's fetches.
+    if (config_.market_data.mid_gate_enabled) {
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            market_data_->ingest_reference_anchor(
+                pair.name,
+                compute_implied_cross_anchor(pair),
+                pair.is_stablecoin ? pair.peg_target : 0.0);
+        }
+    }
+
     // For each enabled pair, fetch the latest dexie ticker data.
     // [T3-24] Track per-pair success for dependency-aware gating.
     for (const auto& pair : config_.pairs) {
@@ -2326,22 +2352,8 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
     }
 
-    // [S20 2026-08-24] Inject the external references the feed's
-    // plausibility gate anchors on: the triangulated implied cross
-    // (computed from SIBLING pairs' previous-cycle published mids -- the
-    // engine owns the pair graph, the feed only consumes the result) and
-    // the peg target for stablecoin pairs.  Runs BEFORE refresh() so this
-    // heartbeat's gate sees them; the one-cycle lag on the legs is
-    // harmless against a 3x band.
-    if (config_.market_data.mid_gate_enabled) {
-        for (const auto& pair : config_.pairs) {
-            if (!pair.enabled) continue;
-            market_data_->ingest_reference_anchor(
-                pair.name,
-                compute_implied_cross_anchor(pair),
-                pair.is_stablecoin ? pair.peg_target : 0.0);
-        }
-    }
+    // Anchors for this heartbeat were injected at the TOP of Step 1, before
+    // any ingestion -- see the note there for why the ordering matters.
 
     // Compute aggregated mid-prices, spreads, arbitrage signals.
     market_data_->refresh(enabled);
@@ -10985,6 +10997,36 @@ double Engine::usd_per_xch() const
 // valued at $1 par, and BYC falls back to par whenever its cross is not
 // tight enough to trust -- neither carries the provenance risk that makes
 // valuation grade necessary.  Everything else is derived from a live mid.
+// [S20 2026-08-24] Which pair's published snapshot quote_usd_factor()
+// actually reads to answer `pc`.  Usually pc itself (the DBX cross), but
+// for a BYC quote it is the separate BYC/<stable> cross.  Empty when the
+// factor needs no snapshot (par) or none is available.
+std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
+{
+    const auto slash = pc.name.find('/');
+    const std::string quote = (slash == std::string::npos)
+        ? std::string{}
+        : pc.name.substr(slash + 1);
+
+    if (quote == "BYC") {
+        for (const auto& other : config_.pairs) {
+            if (!other.enabled) continue;
+            if (other.base_asset_id != pc.quote_asset_id) continue;
+            const auto oslash = other.name.find('/');
+            if (oslash == std::string::npos) continue;
+            const std::string oquote = other.name.substr(oslash + 1);
+            if (oquote == "wUSDC.b" || oquote == "wUSDC" || oquote == "USDS") {
+                return other.name;
+            }
+        }
+        return {};
+    }
+    if (pc.base_asset_id == "xch") {
+        return pc.name;   // DBX-style: derived from this pair's own mid
+    }
+    return {};
+}
+
 bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 {
     const auto slash = pc.name.find('/');
@@ -11241,9 +11283,19 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
     // Require grade exactly in the derived case.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.quote_asset_id != asset_id) continue;
-        if (!quote_usd_factor_is_par(pair)
-            && !state_->get_market(pair.name).mid_valuation_grade) {
-            continue;
+        // Grade must be read from the snapshot that actually SUPPLIES the
+        // factor, which is not always this pair.  For a BYC quote the
+        // factor comes from the BYC/wUSDC.b cross, so testing XCH/BYC's
+        // grade here would let a frozen BYC book keep refreshing BYC's
+        // live-price timestamp behind a graded XCH/BYC snapshot -- and the
+        // carry TTL would never fire for the very asset it was written
+        // for.  quote_usd_factor_source_pair() names the right one.
+        if (!quote_usd_factor_is_par(pair)) {
+            const std::string src = quote_usd_factor_source_pair(pair);
+            if (src.empty()
+                || !state_->get_market(src).mid_valuation_grade) {
+                continue;
+            }
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
@@ -11272,7 +11324,8 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     // When a held asset's carry outlives risk.valuation_carry_ttl_blocks,
     // the figure this function returns is still the best available number
     // (the value keeps being carried), but it loses the authority to move
-    // the drawdown peak or trip a breaker; Step 13 reads the flag.
+    // the drawdown PEAK.  Both breakers stay armed and keep comparing
+    // against the frozen peak -- see Step 13.
     // current_block == 0 (callers outside the heartbeat) skips the verdict.
     const uint32_t ttl = config_.risk.valuation_carry_ttl_blocks;
     bool degraded = false;
@@ -13184,10 +13237,10 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // [S20 2026-08-24] Degradation bookkeeping.  A degraded equity figure
     // (a held asset riding an expired carry) keeps being REPORTED -- the
     // GUI and alert rules see the honest best-available number -- but it
-    // loses authority over the peak and the breakers below.  Recovery
-    // re-arms only after kValuationRearmCleanCycles consecutive clean
-    // cycles (the S18 lift-streak idiom), so alternating junk/honest
-    // cycles cannot ratchet the peak.
+    // loses authority over the PEAK below -- the breakers stay armed.
+    // Peak updates resume only after kValuationRearmCleanCycles
+    // consecutive clean cycles (the S18 lift-streak idiom), so
+    // alternating junk/honest cycles cannot ratchet the peak.
     if (valuation_degraded_) {
         valuation_clean_streak_ = 0;
         if (!valuation_degraded_warned_) {
