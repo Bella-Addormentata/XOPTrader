@@ -11602,6 +11602,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     const AssetId asset{acc.bridge_asset_id};
     if (!ledger_opened_assets_.count(asset)) co_return;
 
+    // Captured ONCE, before the first anchor can seed (round 35): the
+    // peak-credit gate below compares job completion stamps against
+    // this.
+    if (bridge_process_start_iso_.empty()) {
+        bridge_process_start_iso_ = PnLTracker::timestamp_to_iso(
+            std::chrono::system_clock::now());
+    }
+
     // The GUI owns warp_jobs.db; the engine only ever reads it.
     // SQLITE_OPEN_READONLY refuses to create the file and makes writes
     // impossible at the API level.  A missing file (warp never used on
@@ -11998,7 +12006,27 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // drawdown reads conservatively high until the next restart
         // re-anchors from live equity.
         if (flow.delta_mojos > 0) {
-            bridge_unapplied_deposit_flows_.push_back(flow.delta_mojos);
+            // Round 35: a deposit completed BEFORE this process started
+            // is already inside the startup equity anchor (the wallet
+            // held the mint when the HWM first seeded), so crediting it
+            // again would inflate the peak -- a false drawdown that can
+            // trip and latch the breaker on every restart made while
+            // the jobs DB was unreadable.  It books into the ledger and
+            // Net Deposits exactly like any flow; only the peak credit
+            // is withheld.  Ties and unparseable stamps fail toward
+            // historical, matching the opening filter's tie-skip
+            // precedent.
+            if (accounting::iso_strictly_after(
+                    row.flow_at, bridge_process_start_iso_)) {
+                bridge_unapplied_deposit_flows_.push_back(flow.delta_mojos);
+            } else {
+                spdlog::info("[Engine] Bridge ingest: job {} completed "
+                             "at {} -- before this process started ({}),"
+                             " booked without a peak credit (already "
+                             "inside the startup anchor)",
+                             row.id, row.flow_at,
+                             bridge_process_start_iso_);
+            }
         } else {
             spdlog::info("[Engine] Bridge ingest: withdrawal of {} "
                          "mojos booked; drawdown peak intentionally "

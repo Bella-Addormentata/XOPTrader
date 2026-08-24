@@ -874,6 +874,14 @@ private:
     /// unbooked-candidate check true forever and force an extra wallet
     /// RPC every heartbeat.  In-memory: restarts re-derive it.
     std::set<std::string> bridge_terminal_skip_ids_;
+    /// [S19 round 35] Wall-clock ISO stamp captured on the scan's first
+    /// invocation.  A deposit whose completion (flow_at) predates it is
+    /// already inside the startup equity anchor -- the wallet held the
+    /// mint when the HWM first seeded -- so it books into the ledger
+    /// and Net Deposits WITHOUT a peak credit; crediting it again
+    /// would inflate the peak and could false-trip and latch the
+    /// breaker on every restart made while the jobs DB was unreadable.
+    std::string bridge_process_start_iso_;
 
     /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
     /// their one-time peak credit, kept PER EVENT (withdrawals never
