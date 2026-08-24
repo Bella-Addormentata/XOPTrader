@@ -43,6 +43,20 @@
 // that ever changes, the booking must compare the job's receiver_ph
 // against the engine wallet's puzzle hashes before booking.
 //
+// KNOWN LIMITATION (review round 43, deferred).  Inbound flows book at
+// COMPLETED, but the warp service holds a claimed mint in CLAIMING for
+// the chia_confirmation_min_height wait AFTER the CAT coin is already
+// on-chain -- during that window the wallet balance contains the mint
+// with no bridge leg, so the invariant absorbs it as an adjust and the
+// booking at COMPLETED then converges through the documented
+// three-entry catch-up (adjust + bridge leg + counter-adjust net to
+// zero; one expected LedgerDivergence alert).  Booking mid-CLAIMING was
+// rejected in round 30: CLAIMING precedes the wallet effect and the
+// handler can regress to signature collection, so an early booking
+// could book a mint that never landed.  The clean fix is the same
+// cross-component work as the round-30 item below (the GUI persists
+// the wallet-effect event; TODO.md S21).
+//
 // KNOWN LIMITATION (review round 30, deferred).  The chronology lower
 // bound (MIN ts of CLAIMING / BURN_SENT) is a STATUS time, not the
 // wallet-effect time: the warp service enters CLAIMING before a later

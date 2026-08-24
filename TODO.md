@@ -268,7 +268,11 @@ requires the GUI warp service to persist the wallet-affecting claim/burn
 chain height per job (new column + event write at push time), with the
 engine comparing THAT against the opening.  Cross-component; deliberately
 not smuggled into PR #109 at round 30.  Window is minutes wide and only
-matters when ledger genesis lands inside it.
+matters when ledger genesis lands inside it.  Round 43 adds the inbound
+twin: a claimed mint sits in CLAIMING for the confirmation-depth wait
+after the CAT is on-chain, so the invariant briefly absorbs it as an
+adjust before the COMPLETED booking converges through the three-entry
+catch-up -- the same persisted wallet-effect event closes both windows.
 
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
 - **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13

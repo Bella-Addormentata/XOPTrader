@@ -11646,7 +11646,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
 
     // Inbound books at COMPLETED (the mint lands with completion).
     // Outbound books as soon as the Chia burn is IRREVERSIBLY on-chain:
-    // COLLECTING_EVM_SIGS is entered only after the burn confirms
+    // BURNING is entered when the burn CAT is observed on-chain and the
+    // service declares the unwrap forward-only (round 43 -- the job can
+    // then sit in BURNING for the whole confirmation-depth wait while
+    // the wallet balance has already dropped), and COLLECTING_EVM_SIGS
+    // only after the burn confirms at depth
     // (gui/services/warp/service.py _h_burning), while COMPLETED waits
     // for Base-side delivery -- minutes normally, UNBOUNDED for
     // AWAITING_EXTERNAL_RELAY -- during which the invariant would absorb
@@ -11667,6 +11671,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                COALESCE((SELECT MIN(e.ts) FROM warp_events e
                          WHERE e.job_id = j.id
                            AND e.status IN ('COMPLETED',
+                                            'BURNING',
                                             'COLLECTING_EVM_SIGS',
                                             'RELAYING',
                                             'AWAITING_EXTERNAL_RELAY')), ''),
@@ -11679,6 +11684,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         WHERE EXISTS (SELECT 1 FROM warp_events e
                       WHERE e.job_id = j.id
                         AND e.status IN ('COMPLETED',
+                                         'BURNING',
                                          'COLLECTING_EVM_SIGS',
                                          'RELAYING',
                                          'AWAITING_EXTERNAL_RELAY'))
