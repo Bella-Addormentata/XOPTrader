@@ -1850,13 +1850,28 @@ void MarketDataFeed::ingest_competing_offers(
         auto it = pairs_.find(pair_name);
         if (it != pairs_.end()) {
             const PairState& ps = it->second;
-            legacy_ref = ps.cex_mid > 0.0 ? ps.cex_mid : ps.mid_price;
-            ref_price  = cfg.mid_gate_enabled
-                ? midgate::select_anchor(
-                      anchor_candidates(ps, cfg,
-                                        std::chrono::system_clock::now()))
-                      .value
-                : 0.0;
+            if (cfg.mid_gate_enabled) {
+                ref_price = midgate::select_anchor(
+                    anchor_candidates(ps, cfg,
+                                      std::chrono::system_clock::now()))
+                    .value;
+                // Anchorless fallback: this pair's own last ACCEPTED mid,
+                // never a raw cex_mid.
+                //
+                // anchor_candidates deliberately drops an EXPIRED CEX
+                // sample, so reintroducing that same stale value here as
+                // the tight 20% near reference would undo the freshness
+                // check by the back door -- and worse, permanently: after
+                // a genuine move of more than 20% every honest offer is
+                // discarded against the obsolete price, so the filtered
+                // book can never rebuild and valuation grade can never
+                // return.  last_accepted_mid at least tracks prices this
+                // gate has already vetted, and it moves with the market.
+                legacy_ref = ps.last_accepted_mid;
+            } else {
+                // Pre-S20 behaviour, unchanged.
+                legacy_ref = ps.cex_mid > 0.0 ? ps.cex_mid : ps.mid_price;
+            }
         }
     }
 

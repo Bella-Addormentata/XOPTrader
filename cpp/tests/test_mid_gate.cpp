@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <thread>
 #include <vector>
 
 using namespace xop::midgate;
@@ -796,4 +797,39 @@ TEST(MidGateIngestTest, UnavailableFairValueDoesNotAnchorTheGate) {
     EXPECT_NEAR(feed.get_mid_price(pair), 1.66, 0.05)
         << "an Unavailable-by-sigma estimate anchored the gate and refused "
            "an honest mid";
+}
+
+// [S20 2026-08-24] A stale CEX sample must not lock the book out of
+// recovering after a real move.
+//
+// anchor_candidates drops an EXPIRED CEX sample, but the anchorless
+// fallback used to reintroduce that same stale value as the tight 20%
+// near reference -- undoing the freshness check, and permanently: after a
+// genuine move beyond 20% every honest offer is discarded against the
+// obsolete price, so the filtered book can never rebuild and valuation
+// grade can never return.
+TEST(MidGateIngestTest, StaleCexDoesNotLockOutBookRecovery) {
+    auto cfg = gate_cfg();
+    cfg.cex_freshness_threshold_sec = 0.001;   // any sample is instantly stale
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "XCH/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    feed.ingest_cex_reference(pair, 1.40);     // will expire immediately
+    std::this_thread::sleep_for(std::chrono::milliseconds(5));
+
+    // The market has genuinely moved ~40% -- far outside the tight 20%
+    // near-reference test that the stale 1.40 would have imposed.
+    const std::vector<CompetingOffer> moved{
+        mk_offer("b1", Side::Bid, 1.96, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 2.00, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, moved, {}, kMojosPerXch, 1'000);
+
+    const auto bbo = feed.get_dex_bbo(pair);
+    EXPECT_GT(bbo.first, 0.0)
+        << "honest bid discarded against an expired CEX price";
+    EXPECT_GT(bbo.second, 0.0)
+        << "honest ask discarded against an expired CEX price";
 }
