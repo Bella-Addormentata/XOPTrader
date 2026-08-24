@@ -11753,9 +11753,26 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // every job already visible in this scan's list, so booking and
     // reconciling in the same pass is safe and the old booked==0
     // deferral is gone.
+    // A same-block Step 8 snapshot can still PREDATE this scan's jobs
+    // read (round 31): Step 8 runs earlier in the heartbeat, so a mint
+    // landing between its RPC and the scan would book against a
+    // pre-flow balance -- the peak credit then lands while equity has
+    // not yet received the flow, an immediate and latching false trip.
+    // Whenever the scan holds a candidate not yet known booked, force
+    // the on-demand fetch below so the snapshot postdates every job
+    // visible in this scan (the original round-17 guarantee).
+    bool unbooked_candidate = false;
+    for (const auto& row : jobs) {
+        if (bridge_booked_event_ids_.find(
+                accounting::bridge_event_id(row.id, row.created_at))
+            == bridge_booked_event_ids_.end()) {
+            unbooked_candidate = true;
+            break;
+        }
+    }
     bool snapshot_current = false;
     if (auto sit = cached_wallet_balances_.find(asset);
-        sit != cached_wallet_balances_.end()) {
+        !unbooked_candidate && sit != cached_wallet_balances_.end()) {
         // Field-validated entries only (round 28): Step 8's writers
         // default missing RPC fields to zero, so a same-block entry
         // is not necessarily settled wallet truth.  An unvalidated

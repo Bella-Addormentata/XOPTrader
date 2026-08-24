@@ -145,6 +145,34 @@ TEST(BridgeFingerprintTest, AbsentOrMalformedFingerprintNeverMatches) {
                                            acc.bridge_asset_id));
 }
 
+TEST(BridgeFingerprintTest, WrongShapeOrPrecisionFailsClosed) {
+    // Review round 31: the ingester hard-codes 1e3 mojos per unit, so a
+    // fingerprint stamped with any other CAT precision (or an unknown
+    // version, or a field-count mismatch) must never book.
+    const xop::AccountingConfig acc{};
+    const std::string id = acc.bridge_asset_id;
+    // Wrong CAT-decimals field (would misvalue by 1000x).
+    EXPECT_FALSE(fingerprint_matches_asset(
+        "v1:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:6:" + id, id));
+    // Unknown version prefix.
+    EXPECT_FALSE(fingerprint_matches_asset(
+        "v2:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:" + id, id));
+    // Field-count mismatches around an otherwise-matching tail.
+    EXPECT_FALSE(fingerprint_matches_asset("v1:6:3:" + id, id));
+    EXPECT_FALSE(fingerprint_matches_asset(
+        "v1:x:y:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:" + id, id));
+    // The live shape still matches.
+    EXPECT_TRUE(fingerprint_matches_asset(
+        "v1:833589fcd6edb6e08f4c7c32d4f71b54bda02913:6:3:" + id, id));
+}
+
+TEST(BridgeEventIdTest, SharedBuilderMatchesClassifierOutput) {
+    // The engine's pre-fetch booked-candidate check must produce the
+    // exact id the classifier books under (round 31).
+    EXPECT_EQ(bridge_event_id(2, "2026-08-23 19:10:05"),
+              "bridge:job:2:2026-08-23 19:10:05");
+}
+
 TEST(BridgeFingerprintTest, MatchIsCaseInsensitive) {
     EXPECT_TRUE(fingerprint_matches_asset("v1:x:6:3:ABCDEF12", "abcdef12"));
     EXPECT_TRUE(fingerprint_matches_asset("v1:x:6:3:abcdef12", "ABCDEF12"));

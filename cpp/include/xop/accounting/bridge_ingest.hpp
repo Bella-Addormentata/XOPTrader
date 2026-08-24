@@ -141,6 +141,15 @@ struct BridgeFlow {
 /// the indicated direction.  Jobs that never reached a booking point
 /// (pre-burn FAILED / CANCELLED, DRY_RUN_OK) have no such event and must
 /// be excluded by the caller's selection before this runs.
+/// The ledger identity of a job's flow.  Shared between classification
+/// and the engine's pre-fetch booked-candidate check (round 31) so the
+/// two can never drift apart.
+[[nodiscard]] inline std::string bridge_event_id(
+    std::int64_t id, const std::string& created_at)
+{
+    return "bridge:job:" + std::to_string(id) + ":" + created_at;
+}
+
 [[nodiscard]] inline BridgeFlow classify_bridge_job(const BridgeJobRow& row)
 {
     BridgeFlow f{};
@@ -175,8 +184,7 @@ struct BridgeFlow {
         f.delta_mojos = row.post_tip_mojos;
         f.event_type  = "bridge_deposit";
     }
-    f.event_id = "bridge:job:" + std::to_string(row.id) + ":"
-               + row.created_at;
+    f.event_id = bridge_event_id(row.id, row.created_at);
     f.valid    = true;
     return f;
 }
@@ -192,11 +200,31 @@ struct BridgeFlow {
     const std::string& fingerprint, const std::string& asset_id) noexcept
 {
     if (fingerprint.empty() || asset_id.empty()) return false;
-    const auto pos = fingerprint.rfind(':');
-    if (pos == std::string::npos || pos + 1 >= fingerprint.size()) {
-        return false;
+    // Strict shape validation (review round 31): the live format is
+    // v1:<erc20>:<erc20-decimals>:<cat-decimals>:<asset-id>, and the
+    // ingester hard-codes mojos_per_unit = 1e3, so a fingerprint whose
+    // CAT-decimals field is not 3 (or whose version is unknown) must
+    // fail closed -- a tail-only match would book such a row at the
+    // wrong unit value by orders of magnitude.
+    std::size_t field_starts[5];
+    std::size_t nfields = 0, start = 0;
+    for (std::size_t i = 0; i <= fingerprint.size(); ++i) {
+        if (i == fingerprint.size() || fingerprint[i] == ':') {
+            if (nfields == 5) return false;      // too many fields
+            field_starts[nfields++] = start;
+            start = i + 1;
+        }
     }
-    const std::string tail = fingerprint.substr(pos + 1);
+    if (nfields != 5) return false;              // too few fields
+    const auto field = [&](std::size_t n) {
+        const std::size_t b = field_starts[n];
+        const std::size_t e = (n + 1 < 5) ? field_starts[n + 1] - 1
+                                          : fingerprint.size();
+        return fingerprint.substr(b, e - b);
+    };
+    if (field(0) != "v1") return false;          // unknown version
+    if (field(3) != "3")  return false;          // wrong CAT precision
+    const std::string tail = field(4);
     if (tail.size() != asset_id.size()) return false;
     for (std::size_t i = 0; i < tail.size(); ++i) {
         const auto lower = [](char c) {
