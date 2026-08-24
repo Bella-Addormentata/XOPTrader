@@ -357,8 +357,16 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   block regression.  699/699 tests incl. 3 ingestion-path tests that
   drive the real feed (the pure-gate tests could not catch a
   gate-vs-ingestion contradiction).
-  Residual (documented, accepted): a coordinated two-sided wash book
-  inside the 3x band can still mark equity wrong at real capital cost;
+  Residual (documented, accepted): the wash-book exposure extends to the
+  OFFER-ABSURDITY bound, not the 3x gate band.  Offers are screened at
+  max(10x, 2*band) -- deliberately wider than the gate, or a real collapse
+  could never assemble the two-sided book its confirmation escape needs
+  (RealCollapseSurvivesTheOfferFilterAndPublishes exercises exactly that
+  at 0.2x).  So a coordinated fresh two-sided book anywhere in roughly
+  0.1x-10x of the anchor can override the band and mark equity, at real
+  capital cost to whoever posts it.  Tightening the confirmation policy
+  would trade this away for the inability to price a genuine collapse --
+  the opposite failure, and the one that actually happened;
   pre-S20 junk persisted to DB (cost basis, AS warm-start snapshots) is
   NOT repaired by this change -- separate sanitation task if it bites;
   valuation_carry_ttl_blocks is calibrated at 52 s/block while the
