@@ -565,12 +565,11 @@ private:
     /// wallet, not "unexplained divergence" for the adjusting entries to
     /// absorb.  Reads the GUI-owned warp_jobs.db READ-ONLY; idempotent
     /// per job (ledger event_id uniqueness), so re-scans and restarts
-    /// never double-book.  GIPS/TWR: the USD accumulates as net
-    /// deposits outside trading P&L; in-process deposits credit the
-    /// drawdown peak, in-process withdrawals shrink it only when
-    /// matched to an observed wallet fold (unmatched: the peak stands,
-    /// conservatively, until the bounded expiry or the next restart
-    /// re-anchor).
+    /// never double-book.  GIPS: the USD accumulates as net deposits
+    /// outside trading P&L; booking an in-process flow re-anchors the
+    /// drawdown peak from the next equity valuation (restart
+    /// semantics -- in-place peak adjustment was retired after review
+    /// rounds 24-41; see bridge_ingest.hpp).
     asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
@@ -875,69 +874,13 @@ private:
     /// unbooked-candidate check true forever and force an extra wallet
     /// RPC every heartbeat.  In-memory: restarts re-derive it.
     std::set<std::string> bridge_terminal_skip_ids_;
-    /// [S19 round 35] Wall-clock ISO stamp captured on the scan's first
-    /// invocation.  A deposit whose completion (flow_at) predates it is
-    /// already inside the startup equity anchor -- the wallet held the
-    /// mint when the HWM first seeded -- so it books into the ledger
-    /// and Net Deposits WITHOUT a peak credit; crediting it again
-    /// would inflate the peak and could false-trip and latch the
-    /// breaker on every restart made while the jobs DB was unreadable.
+    /// [S19 rounds 35+42] Wall-clock ISO stamp captured on the
+    /// scan's first invocation.  A flow whose completion (flow_at)
+    /// predates it is already inside the current equity anchor, so
+    /// booking it must NOT trigger the flow re-anchor -- erasing live
+    /// drawdown state for capital that moved before this process
+    /// existed.  Ties and unparseable stamps count as pre-process.
     std::string bridge_process_start_iso_;
-    /// [S19 rounds 36+37] Fold provenance: the peak, pre-fold
-    /// equity, and UNMATCHED MAGNITUDE recorded when the wallet-truth
-    /// reconcile folds a bridge-asset delta beyond what the pass's
-    /// booked flows explain (a mint or burn absorbed while the jobs
-    /// DB was unreadable, or before the job row completed).  A later
-    /// booking consumes provenance only up to the recorded magnitude
-    /// (round 37) -- without the cap, an unrelated quote-fill's
-    /// record could rescale an entire deposit from a stale base.
-    /// Deposits rescale peak_rec * (e_rec + f)/e_rec floored by max()
-    /// against the current peak (Step 13's natural max() may already
-    /// have carried part of the credit -- rounds 34+36).  Withdrawals
-    /// apply (e_rec - w)/e_rec multiplicatively to the CURRENT peak:
-    /// Step 13 never absorbs any part of a shrink, so the factor
-    /// composes exactly with later performance.  Bounded expiry;
-    /// in-memory only.
-    struct BridgeFoldProvenance {
-        double peak_usd{-1.0};
-        double equity_usd{-1.0};
-        Mojo   mojos{0};
-        BlockHeight at_block{0};
-    };
-    /// FIFO per direction (round 38): a single slot silently dropped
-    /// every later unmatched fold until expiry, so a second deposit
-    /// absorbed during the same jobs-DB outage could book with no
-    /// covering provenance and mask an existing drawdown.  Bounded;
-    /// consumed oldest-first; each record expires independently.
-    std::deque<BridgeFoldProvenance> bridge_pos_fold_provs_;
-    std::deque<BridgeFoldProvenance> bridge_neg_fold_provs_;
-    /// [S19 rounds 37+40] Booked in-process withdrawals whose peak
-    /// shrink is still waiting for its observed wallet fold, kept as
-    /// a FIFO of (mojos, booked-at-block) records: a single aggregate
-    /// whose age reset on every booking never expired while
-    /// withdrawals kept arriving, so stale unmatched amounts could
-    /// later match an unrelated negative fold and shrink the peak
-    /// wrongly (round 40).  A shrink executes only when the BOOKED
-    /// event and the OBSERVED fold have both happened -- using the
-    /// fold-time measured pre-fold equity, which is what the retired
-    /// rounds-19-25 budget could never prove.  Records expire
-    /// individually (no shrink, conservative false-trip direction; a
-    /// restart re-anchor heals it).
-    std::deque<std::pair<Mojo, BlockHeight>> bridge_pending_withdrawals_;
-
-    /// [S19 rounds 17-38] Booked bridge DEPOSITS awaiting their
-    /// one-time peak credit.  Withdrawals shrink the peak only when
-    /// matched to an observed wallet fold (round 37; see
-    /// bridge_pending_withdrawal_mojos_).  Flows sharing one measured
-    /// pre-fold snapshot take ONE aggregate factor (e + SUM)/e --
-    /// per-event products against a shared base fabricate drawdown
-    /// (round 38) -- while flows folded at different times use their
-    /// own recorded bases via the provenance FIFO, which is the true
-    /// per-event TWR structure.  Consumed or cleared by the same pass
-    /// that fills it.  In-memory only: a restart re-anchors the peak
-    /// from live equity anyway.
-    std::vector<Mojo> bridge_unapplied_deposit_flows_;  // each > 0
-
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)
     /// has already been warned about -- such jobs stay in the scan

@@ -14,16 +14,16 @@
 // ledger event (bridge_deposit inbound / bridge_withdrawal outbound) BEFORE
 // the divergence control runs, so the movement is explained flow rather
 // than a blind adjustment.  The USD amount accumulates in a NET DEPOSITS
-// figure kept out of trading P&L.  Drawdown-peak policy (engine.cpp):
-// DEPOSITS credit the peak so they cannot mask losses; WITHDRAWALS
-// shrink it only when the booked event is matched to a wallet fold this
-// process OBSERVED (this pass's reconcile delta, or amount-capped fold
-// provenance recorded when the fold arrived before the job row) --
-// authorization plus observation, the attribution a blind budget could
-// never prove.  Unmatched withdrawals leave the peak standing, so
-// drawdown reads conservatively high until the bounded expiry or the
-// next restart re-anchors the peak from live equity.  Flows completed
-// before the process started live only in the startup anchor.
+// figure kept out of trading P&L.  Drawdown-peak policy (engine.cpp,
+// owner decision after review rounds 24-41): the peak is NOT adjusted
+// in place for flows -- fills are tracked base-side only, so no wallet
+// movement can be attributed to a specific flow, and every in-place
+// factor scheme was refuted.  Instead, booking an IN-PROCESS flow
+// resets the peak to its unseeded state and the next equity valuation
+// re-anchors it, exactly the accepted restart semantics: drawdown
+// measurement restarts at the capital event.  Flows completed before
+// the process started are already inside the current anchor and leave
+// it untouched.
 //
 // DATA SOURCE.  The GUI owns data/warp_jobs.db (WAL); the engine reads it
 // READ-ONLY during the ledger tie.  A job row's direction rides in its JSON
