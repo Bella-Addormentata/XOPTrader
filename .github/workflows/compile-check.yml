@@ -178,7 +178,7 @@ jobs:
         run: |
           pip install --upgrade pip
           pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
-          pip install pytest pytest-asyncio
+          pip install -r gui/requirements-tools.lock.txt
 
       # Every warp test module opens with pytest.importorskip("clvm") /
       # ("chia_rs").  If those wheels are absent the suite drops from 244 tests
