@@ -11784,7 +11784,15 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             && sit->second.pending_change == 0
             && sit->second.fields_validated;
     }
-    if (!snapshot_current && offer_mgr_ && wallet_ && wallet_->is_open()) {
+    // Respect the wallet circuit breaker (round 34): while the
+    // circuit is open the poll loop probes only at
+    // kWalletProbeInterval, and an every-heartbeat RPC from here would
+    // recreate exactly the timeout cascade the breaker exists to stop.
+    // Booking simply defers until the scheduled probe closes the
+    // circuit -- the awaitable-scan design already books through
+    // arbitrarily long deferrals.
+    if (!snapshot_current && !wallet_circuit_open_
+        && offer_mgr_ && wallet_ && wallet_->is_open()) {
         const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
         if (wid > 0) {
             try {
@@ -12109,30 +12117,45 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                          "anchored -- the upcoming equity anchor "
                          "includes it, no separate credit", flow_usd);
         } else if (bridge_pre_fold_equity_usd > 0.0) {
-            // PER-EVENT factors (round 27), all against the same
-            // measured pre-fold base: the aggregate 1 + SUM(f)/e is
-            // strictly smaller than the product of 1 + f_i/e, so
-            // collapsing deposits discovered in one scan (e.g. after
-            // the jobs DB was unreadable for a while) would
-            // under-credit and mask part of a loss that landed
-            // between their true completion times.  The per-event
-            // product over-credits at worst -- the false-trip-safe
-            // direction the whole policy is built on.
-            double factor = 1.0;
+            // Whether the measured base already CONTAINS these flows
+            // is unknowable (round 23): a failed/partial scan books
+            // nothing while its wallet reconcile still absorbs the
+            // mint, so a later heartbeat books the job against
+            // POST-flow equity.  Rounds 27+34: compute the factor
+            // under BOTH hypotheses and take the larger -- whichever
+            // hypothesis is false, the error is an over-credit
+            // (higher peak, false-trip-safe), never an under-credit.
+            //   NOT yet folded: per-event product of (e + f_i)/e
+            //     (the aggregate 1 + SUM(f)/e under-credits when
+            //     performance landed between completions, round 27).
+            //   Already folded: e/(e - SUM(f)) -- the measured base
+            //     is post-flow, so the true pre-flow base is smaller
+            //     and the required factor larger (peak 120/equity
+            //     100 + 20 folded deposit must become 144, not 140).
+            const double e_m = bridge_pre_fold_equity_usd;
+            double factor_unfolded = 1.0;
             for (const Mojo f : flows) {
                 const double f_usd =
                     (static_cast<double>(f) / mojos_per_unit)
                     * usd_per_unit;
-                factor *= (bridge_pre_fold_equity_usd + f_usd)
-                          / bridge_pre_fold_equity_usd;
+                factor_unfolded *= (e_m + f_usd) / e_m;
+            }
+            double factor = factor_unfolded;
+            const char* hypothesis = "not-yet-folded";
+            if (e_m - flow_usd > 0.0) {
+                const double factor_folded = e_m / (e_m - flow_usd);
+                if (factor_folded > factor) {
+                    factor = factor_folded;
+                    hypothesis = "already-folded";
+                }
             }
             const double rescaled = peak_equity_hwm_usd_ * factor;
             spdlog::info("[Engine] Bridge ingest: drawdown peak "
                          "rescaled {:.2f} -> {:.2f} for {} deposit "
-                         "event(s) totalling ${:+.6f} (pre-fold "
-                         "equity {:.2f})",
+                         "event(s) totalling ${:+.6f} (measured "
+                         "equity {:.2f}, {} hypothesis)",
                          peak_equity_hwm_usd_, rescaled, flows.size(),
-                         flow_usd, bridge_pre_fold_equity_usd);
+                         flow_usd, e_m, hypothesis);
             peak_equity_hwm_usd_ = rescaled;
         } else {
             // Deposit while equity was not yet valued (warm-up):
