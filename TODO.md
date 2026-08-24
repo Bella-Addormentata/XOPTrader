@@ -193,7 +193,11 @@
 
 ### S17: Depeg bail-out re-alerts at ERROR every block (no rate limit)
 - **Files:** `cpp/src/engine.cpp` (Step 3 depeg bail-out alert)
-- **Status:** `[ ]` -- Observed live 2026-08-23 10:25-10:30+: "DEPEG
+- **Status:** `[x]` FIXED 2026-08-23 -- Step 3 logs depeg state
+  TRANSITIONS at full severity (with an info recovery line) and ongoing
+  states at debug; the Step 4 per-cycle suppression note dropped to
+  debug. The second-source-confirmation idea (below) remains open as a
+  separate hardening. Originally observed live 2026-08-23 10:25-10:30+: "DEPEG
   BAIL-OUT BYC/wUSDC.b price=0.750000 -- pulling all quotes!" repeated at
   ERROR level every ~30-60s for the duration of the bail-out, unlike the
   Step 13 drawdown breaker which gates re-alerts to 30 min. Alert once on
@@ -206,7 +210,15 @@
 
 ### S18: Max-drawdown re-alert gate not holding while breaker-latched
 - **Files:** `cpp/src/engine.cpp` (Step 13 drawdown breaker alerting)
-- **Status:** `[ ]` -- Observed live 2026-08-23 10:43:51 / 10:44:12 /
+- **Status:** `[x]` FIXED 2026-08-23 -- root cause: the gate re-armed on
+  ANY single lifted evaluation of the breach condition, so one transient
+  false read (flaky wallet RPC corrupting an equity computation) cleared
+  it mid-episode; the log shows 1,088 correctly-suppressed evaluations
+  interleaved with the premature re-alerts, and equity never actually
+  recovered above the threshold. Fix: re-arm only after 10 consecutive
+  lifted evaluations (~2-3 min), so an RPC blip cannot reset the 30-min
+  interval but a genuine recovery still re-arms promptly. Originally
+  observed live 2026-08-23 10:43:51 / 10:44:12 /
   10:44:53: three ALERT:CRITICAL max-drawdown alerts in 62 seconds while
   breaker_pause_active_ was already latched, despite the configured
   realert=30min gate (which held correctly on 2026-08-22 during the
