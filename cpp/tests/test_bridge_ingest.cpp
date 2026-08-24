@@ -217,6 +217,13 @@ TEST(BridgeValueTest, DegenerateInputsZeroOut) {
     // USD flow.
     EXPECT_EQ(value_bridge_flow(1'000, HUGE_VAL, 1.0).fmv_pseudo_price, 0);
     EXPECT_EQ(value_bridge_flow(1'000, 1e3, HUGE_VAL).fmv_pseudo_price, 0);
+    // Round 32: a quantity valuing at >= $1e12 must fail closed -- the
+    // accumulator ignores it and the restart parser rehydrates zero, so
+    // booking it would desynchronize the ledger from the PnL figure.
+    EXPECT_EQ(value_bridge_flow(9'000'000'000'000'000'000LL, 1e3, 1.0)
+                  .fmv_pseudo_price, 0);
+    EXPECT_EQ(value_bridge_flow(-9'000'000'000'000'000'000LL, 1e3, 1.0)
+                  .fmv_pseudo_price, 0);
 }
 
 TEST(BridgeValueTest, PseudoPriceScaleCannotOverflowMojo) {

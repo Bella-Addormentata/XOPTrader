@@ -277,6 +277,17 @@ struct BridgeValuation {
     v.fmv_pseudo_price = static_cast<Mojo>(scaled);
     v.flow_usd = (static_cast<double>(delta_mojos) / mojos_per_unit)
                * usd_per_unit;
+    // Reject what the live accumulator and the restart parser will
+    // reject (review round 32): add_net_deposit_usd ignores
+    // |usd| >= 1e12 and parse_bridge_flow_usd rehydrates it as zero,
+    // so journaling such a row would leave the ledger/GUI and the PnL
+    // accumulator permanently inconsistent.  An int64 mojo quantity
+    // can reach ~9.2e15 USD at the $1 numeraire, so the bound is
+    // reachable, not theoretical.
+    if (!std::isfinite(v.flow_usd)
+        || !(std::fabs(v.flow_usd) < 1e12)) {
+        return BridgeValuation{};
+    }
     return v;
 }
 
