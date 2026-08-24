@@ -904,8 +904,13 @@ private:
         Mojo   mojos{0};
         BlockHeight at_block{0};
     };
-    BridgeFoldProvenance bridge_pos_fold_prov_;
-    BridgeFoldProvenance bridge_neg_fold_prov_;
+    /// FIFO per direction (round 38): a single slot silently dropped
+    /// every later unmatched fold until expiry, so a second deposit
+    /// absorbed during the same jobs-DB outage could book with no
+    /// covering provenance and mask an existing drawdown.  Bounded;
+    /// consumed oldest-first; each record expires independently.
+    std::deque<BridgeFoldProvenance> bridge_pos_fold_provs_;
+    std::deque<BridgeFoldProvenance> bridge_neg_fold_provs_;
     /// [S19 round 37] Booked in-process withdrawals whose peak shrink
     /// is still waiting for its observed wallet fold.  A shrink
     /// executes only when the BOOKED event and the OBSERVED fold have
@@ -917,17 +922,17 @@ private:
     Mojo bridge_pending_withdrawal_mojos_{0};
     BlockHeight bridge_pending_withdrawal_block_{0};
 
-    /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
-    /// their one-time peak credit, kept PER EVENT (withdrawals never
-    /// adjust the peak in-process -- attributing wallet movement to a
-    /// specific flow is unsound, so the peak stands and drawdown reads
-    /// conservatively high until the next restart re-anchor).  Each
-    /// deposit gets its own factor against the same measured pre-fold
-    /// equity: the aggregate factor 1 + SUM(f)/e is smaller than the
-    /// per-event product and could under-credit -- masking part of a
-    /// loss that landed between the flows' true completion times.
-    /// Consumed or cleared by the same pass that fills it.  In-memory
-    /// only: a restart re-anchors the peak from live equity anyway.
+    /// [S19 rounds 17-38] Booked bridge DEPOSITS awaiting their
+    /// one-time peak credit.  Withdrawals shrink the peak only when
+    /// matched to an observed wallet fold (round 37; see
+    /// bridge_pending_withdrawal_mojos_).  Flows sharing one measured
+    /// pre-fold snapshot take ONE aggregate factor (e + SUM)/e --
+    /// per-event products against a shared base fabricate drawdown
+    /// (round 38) -- while flows folded at different times use their
+    /// own recorded bases via the provenance FIFO, which is the true
+    /// per-event TWR structure.  Consumed or cleared by the same pass
+    /// that fills it.  In-memory only: a restart re-anchors the peak
+    /// from live equity anyway.
     std::vector<Mojo> bridge_unapplied_deposit_flows_;  // each > 0
 
     /// [S19 review round 10] Job ids whose skip condition
