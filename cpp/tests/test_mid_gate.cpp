@@ -260,10 +260,22 @@ TEST(MidGateTest, DeepCollapseWithLiveBookPassesViaConfirmation)
     in.anchor          = {1.0, AnchorSource::Peg};
     in.book_two_sided  = true;
     in.book_fresh      = true;
+    in.book_fresh_independent = true;        // screened against the peg
     in.book_spread_bps = 800.0;
     EXPECT_EQ(gate_mid(in), GateVerdict::Accept);
 
-    // Same move on a stale book: no confirmation, rejected.
+    // Screened only against this pair's OWN history: not evidence against
+    // an anchor.  An anchor can arrive after the offers were filtered
+    // within one heartbeat, so without this distinction a self-screened
+    // book would confirm an anchor-band breach on the recovery cycle.
+    in.book_fresh_independent = false;
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
+    in.book_fresh_independent = true;
+
+    // Same move on a stale book: no confirmation, rejected.  Independent
+    // screening is a stricter form of freshness, never a substitute --
+    // book_confirms requires book_fresh in both modes, so an incoherent
+    // pair of flags cannot widen the escape.
     in.book_fresh = false;
     EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
 
@@ -287,9 +299,12 @@ TEST(MidGateTest, AnchorlessMaxStepFallback)
     in.candidate_mid = 28.4;           // 10x in one heartbeat
     EXPECT_EQ(gate_mid(in), GateVerdict::RejectStep);
 
-    // ...unless a fresh two-sided book confirms the move.
+    // ...unless a fresh two-sided book confirms the move.  The STEP
+    // escape accepts self-history screening -- an anchorless pair has
+    // nothing better, and refusing would latch it silent forever.
     in.book_two_sided  = true;
     in.book_fresh      = true;
+    in.book_fresh_independent = false;
     in.book_spread_bps = 400.0;
     EXPECT_EQ(gate_mid(in), GateVerdict::Accept);
 }

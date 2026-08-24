@@ -146,9 +146,26 @@ struct GateInputs {
     double anchor_band_ratio{3.0};
 
     // Book-confirmation escape: a fresh two-sided dust-filtered third-party
-    // book with spread in (0, confirm_max] overrides a band breach.
+    // book with spread in (0, confirm_max] overrides a rejection.
+    //
+    // Two freshness flags, because the two escapes demand different
+    // evidence.  book_fresh means the book was screened against SOME
+    // reference, possibly this pair's own last accepted mid; that is
+    // enough to confirm a step rejection, where by definition no anchor
+    // exists and the alternative is a permanent no-mid lockout.  The
+    // anchor-band escape requires book_fresh_independent -- screened
+    // against a genuinely external reference.
+    //
+    // Keeping them apart matters because an anchor can arrive AFTER the
+    // offers were filtered, inside the same heartbeat (CoinGecko and AMM
+    // legs are ingested later in the loop).  A book screened only against
+    // self-history would otherwise be admitted as confirmation of an
+    // anchor-band breach on the very cycle the anchor appears -- letting
+    // a price accepted during an upstream outage poison the peak on the
+    // recovery cycle.
     bool   book_two_sided{false};
     bool   book_fresh{false};
+    bool   book_fresh_independent{false};
     double book_spread_bps{0.0};
     double book_confirm_max_spread_bps{5000.0};
 
@@ -158,9 +175,17 @@ struct GateInputs {
     double max_step_frac{0.5};
 };
 
-[[nodiscard]] inline bool book_confirms(const GateInputs& in) noexcept
+[[nodiscard]] inline bool book_confirms(const GateInputs& in,
+                                        bool require_independent) noexcept
 {
-    return in.book_two_sided && in.book_fresh
+    // book_fresh is the base requirement in BOTH modes: independent
+    // screening is a STRICTER form of screening, never a substitute for
+    // it.  Enforcing that here rather than assuming callers keep the two
+    // flags coherent means an incoherent pair cannot silently widen the
+    // escape.
+    const bool fresh = in.book_fresh
+                    && (!require_independent || in.book_fresh_independent);
+    return in.book_two_sided && fresh
         && in.book_spread_bps > 0.0
         && in.book_spread_bps <= in.book_confirm_max_spread_bps;
 }
@@ -186,8 +211,9 @@ struct GateInputs {
         const double ratio = in.candidate_mid / in.anchor.value;
         if (ratio > in.anchor_band_ratio
             || ratio < 1.0 / in.anchor_band_ratio) {
-            return book_confirms(in) ? GateVerdict::Accept
-                                     : GateVerdict::RejectAnchor;
+            return book_confirms(in, /*require_independent=*/true)
+                ? GateVerdict::Accept
+                : GateVerdict::RejectAnchor;
         }
         return GateVerdict::Accept;
     }
@@ -195,8 +221,9 @@ struct GateInputs {
         const double step =
             std::abs(in.candidate_mid / in.last_accepted_mid - 1.0);
         if (step > in.max_step_frac) {
-            return book_confirms(in) ? GateVerdict::Accept
-                                     : GateVerdict::RejectStep;
+            return book_confirms(in, /*require_independent=*/false)
+                ? GateVerdict::Accept
+                : GateVerdict::RejectStep;
         }
     }
     return GateVerdict::Accept;

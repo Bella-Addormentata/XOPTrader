@@ -1525,6 +1525,7 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
         in.anchor_band_ratio           = cfg.mid_anchor_band_ratio;
         in.book_two_sided              = book_two_sided;
         in.book_fresh                  = dex_fresh;
+        in.book_fresh_independent      = dex_fresh_grade;
         in.book_spread_bps             = book_spread_bps;
         in.book_confirm_max_spread_bps = cfg.mid_gate_book_confirm_max_spread_bps;
         in.last_accepted_mid           = ps.last_accepted_mid;
