@@ -833,3 +833,49 @@ TEST(MidGateIngestTest, StaleCexDoesNotLockOutBookRecovery) {
     EXPECT_GT(bbo.second, 0.0)
         << "honest ask discarded against an expired CEX price";
 }
+
+// [S20 2026-08-24] A truly anchorless pair must be able to RECOVER from a
+// genuine large move.
+//
+// gate_mid promises that a fresh two-sided book can confirm a RejectStep,
+// but two earlier fixes combined to make that unreachable: the anchorless
+// offer filter used the tight 20% near test against last_accepted_mid --
+// necessarily stripping every offer after a move past the 50% step limit
+// -- and the screening flag required an independent ANCHOR, which an
+// anchorless pair by definition lacks.  The pair stayed no-mid forever.
+TEST(MidGateIngestTest, AnchorlessPairRecoversFromALargeGenuineMove) {
+    auto cfg = gate_cfg();
+    cfg.orderbook_mid_enabled = true;
+    State state;
+    MarketDataFeed feed(cfg, state);
+    // No peg, no CEX, no AMM, no fair value, no sibling triangle.
+    const std::string pair = "XCH/DBX";
+
+    feed.ingest_block_height(100);
+
+    // Establish an accepted mid near 100.
+    const std::vector<CompetingOffer> before{
+        mk_offer("b1", Side::Bid, 99.0, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 101.0, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, before, {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    ASSERT_NEAR(feed.get_mid_price(pair), 100.0, 2.0);
+
+    // The market genuinely repriced ~120% -- past the 50% step limit --
+    // and says so with a coherent two-sided book.
+    const std::vector<CompetingOffer> after{
+        mk_offer("b2", Side::Bid, 219.0, 5'000'000'000'000LL),
+        mk_offer("a2", Side::Ask, 221.0, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, after, {}, kMojosPerXch, 1'000);
+
+    const auto bbo = feed.get_dex_bbo(pair);
+    EXPECT_GT(bbo.first, 0.0)  << "honest bid stripped by the near filter";
+    EXPECT_GT(bbo.second, 0.0) << "honest ask stripped by the near filter";
+
+    feed.refresh({pair});
+    EXPECT_NEAR(feed.get_mid_price(pair), 220.0, 5.0)
+        << "anchorless pair could not recover from a real move -- the "
+           "book-confirmation escape gate_mid advertises is unreachable";
+}

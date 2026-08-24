@@ -1875,6 +1875,10 @@ void MarketDataFeed::ingest_competing_offers(
         }
     }
 
+    // Which reference actually screened this book (0 = none available, so
+    // nothing was screened at all).
+    const double offer_ref_used = ref_price > 0.0 ? ref_price : legacy_ref;
+
     // Filter out own offers and offers below minimum size threshold.
     std::vector<CompetingOffer> filtered;
     filtered.reserve(competing_offers.size());
@@ -1942,13 +1946,23 @@ void MarketDataFeed::ingest_competing_offers(
         // behaviour.  Self-reference is acceptable for removing absurd
         // individual offers; it is only unacceptable as the authority on
         // the published mid, which is what the gate now handles.
-        const double offer_ref = ref_price > 0.0 ? ref_price : legacy_ref;
-        const bool   ref_is_anchor = ref_price > 0.0;
+        const double offer_ref = offer_ref_used;
         if (offer_ref > 0.0) {
             const double offer_price = static_cast<double>(offer.price)
                                        / static_cast<double>(kMojosPerXch);
             bool outlier;
-            if (ref_is_anchor && cfg.mid_gate_enabled) {
+            if (cfg.mid_gate_enabled) {
+                // Wide bound on BOTH gated paths, anchored or not.
+                //
+                // The anchorless path used the tight 20% near test against
+                // last_accepted_mid, which made the gate's own step escape
+                // unreachable: a genuine move past mid_gate_max_step_frac
+                // (50%) is by definition past 20%, so every honest offer
+                // was stripped before a book could form -- and gate_mid
+                // then had no two-sided book to confirm the move it had
+                // just rejected.  The pair stayed no-mid permanently while
+                // the header promised exactly the opposite.  The bound
+                // must therefore exceed the step limit, not sit under it.
                 const double bound = midgate::offer_absurdity_ratio(
                     cfg.mid_anchor_band_ratio);
                 const double ratio = offer_price / offer_ref;
@@ -1962,7 +1976,8 @@ void MarketDataFeed::ingest_competing_offers(
                 spdlog::debug("[MarketData] {} outlier offer {}: "
                               "price={:.6f} vs ref={:.6f} ({}) -- skipping",
                               pair_name, offer.offer_id, offer_price,
-                              offer_ref, ref_is_anchor ? "anchor" : "near");
+                              offer_ref,
+                              ref_price > 0.0 ? "anchor" : "last-accepted");
                 continue;
             }
         }
@@ -2076,8 +2091,16 @@ void MarketDataFeed::ingest_competing_offers(
             // against.  With the gate off the legacy near-reference filter
             // is what is configured, so that counts as screened.
             ps.bbo_from_filtered_book = true;
+            // Screened against SOME reference -- an independent anchor
+            // when one exists, otherwise this pair's own last accepted
+            // mid.  Both count, and that does not weaken the anchored
+            // path: gate_mid reaches the step escape only when no anchor
+            // exists, and the anchor-band escape only when one does, so
+            // the two are mutually exclusive by construction.  Requiring
+            // an ANCHOR here left the step escape permanently unreachable
+            // for genuinely anchorless pairs.
             ps.bbo_filter_had_anchor  =
-                !cfg.mid_gate_enabled || ref_price > 0.0;
+                !cfg.mid_gate_enabled || offer_ref_used > 0.0;
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and
