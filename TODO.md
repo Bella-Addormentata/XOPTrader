@@ -230,12 +230,13 @@
   timestamp, immutable unlike updated_at.  GIPS/TWR treatment:
   signed USD accumulates as a net-deposits figure outside trading P&L
   (PnLSummary::net_deposits_usd, Prometheus component="net_deposits",
-  dashboard "Net Deposits" card); deposits completed while the process
-  is alive credit the drawdown peak so they cannot mask losses, while
-  withdrawals leave the peak standing -- drawdown reads conservatively
-  high until the next restart re-anchor (attributing wallet movement to
-  a specific flow is unsound, so a withdrawal shrink can never be
-  proven legitimate).  wUSDC.b valued at the $1.00 numeraire (peg monitored, not
+  dashboard "Net Deposits" card); in-process deposits credit the
+  drawdown peak so they cannot mask losses; in-process withdrawals
+  shrink it only when the booked event is matched to a wallet fold the
+  process observed (this pass's reconcile delta or amount-capped fold
+  provenance) -- unmatched withdrawals leave the peak standing until a
+  bounded expiry or restart re-anchor, and pre-process flows live only
+  in the startup anchor.  wUSDC.b valued at the $1.00 numeraire (peg monitored, not
   priced in).  Originally raised by the operator after the first live bridge
   (2026-08-23, job 2: +4.985 wUSDC.b). The ledger has no deposit/transfer
   event type, so a completed bridge inflow is absorbed by the divergence

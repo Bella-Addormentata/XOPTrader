@@ -566,10 +566,11 @@ private:
     /// absorb.  Reads the GUI-owned warp_jobs.db READ-ONLY; idempotent
     /// per job (ledger event_id uniqueness), so re-scans and restarts
     /// never double-book.  GIPS/TWR: the USD accumulates as net
-    /// deposits outside trading P&L; deposits completed while this
-    /// process is alive credit the drawdown peak, withdrawals leave it
-    /// standing (drawdown reads conservatively high until the next
-    /// restart re-anchor).
+    /// deposits outside trading P&L; in-process deposits credit the
+    /// drawdown peak, in-process withdrawals shrink it only when
+    /// matched to an observed wallet fold (unmatched: the peak stands,
+    /// conservatively, until the bounded expiry or the next restart
+    /// re-anchor).
     asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
@@ -882,22 +883,39 @@ private:
     /// would inflate the peak and could false-trip and latch the
     /// breaker on every restart made while the jobs DB was unreadable.
     std::string bridge_process_start_iso_;
-    /// [S19 round 36] Fold provenance: peak and pre-fold equity
-    /// recorded the FIRST time the wallet-truth reconcile folds a
-    /// positive bridge-asset delta that exceeds the pass's queued
-    /// deposits (a mint absorbed while the jobs DB was unreadable, or
-    /// before the job row completed).  A later booking covered by a
-    /// prior fold rescales from THIS base -- peak_rec * (e_rec + f) /
-    /// e_rec -- floored by max() against the current peak, which Step
-    /// 13's natural max() may have already raised.  Using the current
-    /// (post-fold) state instead either under-credits (round 34,
-    /// masking) or over-credits (round 36, fabricated drawdown that
-    /// can latch the breaker).  Expires after a bounded window so a
-    /// quote fill's unmatched delta cannot linger forever; in-memory
-    /// only, like every other piece of the peak machinery.
-    double bridge_fold_peak_usd_{-1.0};
-    double bridge_fold_equity_usd_{-1.0};
-    BlockHeight bridge_fold_block_{0};
+    /// [S19 rounds 36+37] Fold provenance: the peak, pre-fold
+    /// equity, and UNMATCHED MAGNITUDE recorded when the wallet-truth
+    /// reconcile folds a bridge-asset delta beyond what the pass's
+    /// booked flows explain (a mint or burn absorbed while the jobs
+    /// DB was unreadable, or before the job row completed).  A later
+    /// booking consumes provenance only up to the recorded magnitude
+    /// (round 37) -- without the cap, an unrelated quote-fill's
+    /// record could rescale an entire deposit from a stale base.
+    /// Deposits rescale peak_rec * (e_rec + f)/e_rec floored by max()
+    /// against the current peak (Step 13's natural max() may already
+    /// have carried part of the credit -- rounds 34+36).  Withdrawals
+    /// apply (e_rec - w)/e_rec multiplicatively to the CURRENT peak:
+    /// Step 13 never absorbs any part of a shrink, so the factor
+    /// composes exactly with later performance.  Bounded expiry;
+    /// in-memory only.
+    struct BridgeFoldProvenance {
+        double peak_usd{-1.0};
+        double equity_usd{-1.0};
+        Mojo   mojos{0};
+        BlockHeight at_block{0};
+    };
+    BridgeFoldProvenance bridge_pos_fold_prov_;
+    BridgeFoldProvenance bridge_neg_fold_prov_;
+    /// [S19 round 37] Booked in-process withdrawals whose peak shrink
+    /// is still waiting for its observed wallet fold.  A shrink
+    /// executes only when the BOOKED event and the OBSERVED fold have
+    /// both happened -- authorization plus observation -- using the
+    /// fold-time measured pre-fold equity, which is what the retired
+    /// rounds-19-25 budget could never prove.  Expires like the
+    /// provenance records (no shrink, conservative false-trip
+    /// direction; a restart re-anchor heals it).
+    Mojo bridge_pending_withdrawal_mojos_{0};
+    BlockHeight bridge_pending_withdrawal_block_{0};
 
     /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
     /// their one-time peak credit, kept PER EVENT (withdrawals never

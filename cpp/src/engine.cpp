@@ -12027,11 +12027,25 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                              row.id, row.flow_at,
                              bridge_process_start_iso_);
             }
+        } else if (accounting::iso_strictly_after(
+                       row.flow_at, bridge_process_start_iso_)) {
+            // Round 37: an in-process withdrawal queues for a peak
+            // shrink that executes only once its wallet fold is
+            // OBSERVED (this pass's reconcile below, or recorded
+            // negative provenance from an earlier pass).  Booked event
+            // plus observed fold is the attribution the retired
+            // rounds-19-25 budget could never prove; unmatched
+            // amounts simply leave the peak standing (conservative
+            // false-trip direction) until the bounded expiry or a
+            // restart re-anchor.
+            bridge_pending_withdrawal_mojos_ += -flow.delta_mojos;
+            bridge_pending_withdrawal_block_ = block_height;
         } else {
             spdlog::info("[Engine] Bridge ingest: withdrawal of {} "
-                         "mojos booked; drawdown peak intentionally "
-                         "unchanged (conservative until restart "
-                         "re-anchor)", flow.delta_mojos);
+                         "mojos completed before this process started "
+                         "-- booked without a peak shrink (already "
+                         "outside the startup anchor)",
+                         flow.delta_mojos);
         }
 
         ++booked;
@@ -12076,6 +12090,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
     bool inv_changed = false;
     Mojo bridge_pos_fold_now = 0;
+    Mojo bridge_neg_fold_now = 0;   // magnitude of a negative fold
     if (snapshot_current) {
         if (auto bit = cached_wallet_balances_.find(asset);
             bit != cached_wallet_balances_.end()) {
@@ -12087,6 +12102,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                 if (tracked != bal.confirmed) {
                     if (bal.confirmed > tracked) {
                         bridge_pos_fold_now = bal.confirmed - tracked;
+                    } else {
+                        bridge_neg_fold_now = tracked - bal.confirmed;
                     }
                     inventory_->adjust_quantity(asset, bal.confirmed,
                                                 numeraire_pseudo);
@@ -12117,62 +12134,162 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         }
     }
 
-    // Fold provenance maintenance (round 36).  A positive fold beyond
-    // what this pass's queued deposits explain was absorbed WITHOUT a
-    // booking -- the jobs DB was unreadable, or the mint landed before
-    // its job row completed.  Record the pre-fold state ONCE so the
-    // eventual booking can rescale from the correct base; expire the
-    // record after a bounded window so an unmatched quote-fill delta
-    // cannot linger as stale provenance forever.
+    // Fold provenance and pending-withdrawal maintenance (rounds
+    // 36+37).  A fold beyond what this pass's booked flows explain was
+    // absorbed WITHOUT a booking -- the jobs DB was unreadable, or the
+    // flow landed before its job row completed.  Record the pre-fold
+    // state and the unmatched MAGNITUDE (round 37: consumption is
+    // capped by it, so an unrelated quote-fill's record can never
+    // rescale a whole later flow from a stale base); expire records so
+    // unmatched fill deltas cannot linger as provenance forever.
     {
+        constexpr BlockHeight kFoldProvenanceExpiryBlocks = 240;
+        const auto expire = [&](BridgeFoldProvenance& prov,
+                                const char* which) {
+            if (prov.at_block != 0
+                && block_height
+                       > prov.at_block + kFoldProvenanceExpiryBlocks) {
+                spdlog::info("[Engine] Bridge ingest: {} fold "
+                             "provenance ({} mojos from block {}) "
+                             "expired unused",
+                             which, prov.mojos, prov.at_block);
+                prov = BridgeFoldProvenance{};
+            }
+        };
+        expire(bridge_pos_fold_prov_, "positive");
+        expire(bridge_neg_fold_prov_, "negative");
+        if (bridge_pending_withdrawal_mojos_ > 0
+            && bridge_pending_withdrawal_block_ != 0
+            && block_height > bridge_pending_withdrawal_block_
+                                  + kFoldProvenanceExpiryBlocks) {
+            spdlog::info("[Engine] Bridge ingest: {} mojos of booked "
+                         "withdrawal never matched an observed fold -- "
+                         "peak left standing (conservative; restart "
+                         "re-anchor heals it)",
+                         bridge_pending_withdrawal_mojos_);
+            bridge_pending_withdrawal_mojos_ = 0;
+            bridge_pending_withdrawal_block_ = 0;
+        }
+
+        // WITHDRAWAL SHRINK, leg 1 (round 37): booked withdrawals
+        // matched by THIS pass's observed negative fold shrink the
+        // peak NOW, from this pass's measured pre-fold equity --
+        // authorization (booked, journaled event) plus observation
+        // (the wallet actually moved under this process's watch).
+        // Factors compose multiplicatively with later performance
+        // because Step 13's max() never absorbs any part of a shrink.
+        // The aggregate factor (e - SUM w)/e shrinks LESS than the
+        // per-event product -- the conservative form for this
+        // direction.
+        Mojo matched = std::min(bridge_pending_withdrawal_mojos_,
+                                bridge_neg_fold_now);
+        if (matched > 0) {
+            const double w_usd =
+                (static_cast<double>(matched) / mojos_per_unit)
+                * usd_per_unit;
+            if (peak_equity_hwm_usd_ > 0.0
+                && bridge_pre_fold_equity_usd > w_usd) {
+                const double factor =
+                    (bridge_pre_fold_equity_usd - w_usd)
+                    / bridge_pre_fold_equity_usd;
+                spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                             "shrunk {:.2f} -> {:.2f} for ${:+.6f} of "
+                             "withdrawal matched to this pass's fold "
+                             "(pre-fold equity {:.2f})",
+                             peak_equity_hwm_usd_,
+                             peak_equity_hwm_usd_ * factor, -w_usd,
+                             bridge_pre_fold_equity_usd);
+                peak_equity_hwm_usd_ *= factor;
+                bridge_pending_withdrawal_mojos_ -= matched;
+                bridge_neg_fold_now -= matched;
+            } else {
+                spdlog::info("[Engine] Bridge ingest: withdrawal of "
+                             "${:+.6f} not shrunk (peak or equity "
+                             "unusable this pass) -- left pending",
+                             -w_usd);
+            }
+        }
+        // Leg 2: fold observed EARLIER (negative provenance) matched
+        // by withdrawals booked now.  (e_rec - w)/e_rec applied to
+        // the current peak is exact under multiplicative composition.
+        matched = std::min(bridge_pending_withdrawal_mojos_,
+                           bridge_neg_fold_prov_.mojos);
+        if (matched > 0 && peak_equity_hwm_usd_ > 0.0
+            && bridge_neg_fold_prov_.equity_usd > 0.0) {
+            const double w_usd =
+                (static_cast<double>(matched) / mojos_per_unit)
+                * usd_per_unit;
+            if (bridge_neg_fold_prov_.equity_usd > w_usd) {
+                const double factor =
+                    (bridge_neg_fold_prov_.equity_usd - w_usd)
+                    / bridge_neg_fold_prov_.equity_usd;
+                spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                             "shrunk {:.2f} -> {:.2f} for ${:+.6f} of "
+                             "withdrawal matched to recorded fold "
+                             "provenance (equity {:.2f} at block {})",
+                             peak_equity_hwm_usd_,
+                             peak_equity_hwm_usd_ * factor, -w_usd,
+                             bridge_neg_fold_prov_.equity_usd,
+                             bridge_neg_fold_prov_.at_block);
+                peak_equity_hwm_usd_ *= factor;
+                bridge_pending_withdrawal_mojos_ -= matched;
+                bridge_neg_fold_prov_.mojos -= matched;
+                if (bridge_neg_fold_prov_.mojos == 0) {
+                    bridge_neg_fold_prov_ = BridgeFoldProvenance{};
+                }
+            }
+        }
+
+        // Record NEW provenance from this pass's unmatched excess.
         Mojo queued_total = 0;
         for (const Mojo f : bridge_unapplied_deposit_flows_) {
             queued_total += f;
         }
-        constexpr BlockHeight kFoldProvenanceExpiryBlocks = 240;
-        if (bridge_fold_block_ != 0
-            && block_height
-                   > bridge_fold_block_ + kFoldProvenanceExpiryBlocks) {
-            spdlog::info("[Engine] Bridge ingest: fold provenance "
-                         "(peak {:.2f}, equity {:.2f}, block {}) "
-                         "expired unused",
-                         bridge_fold_peak_usd_, bridge_fold_equity_usd_,
-                         bridge_fold_block_, block_height);
-            bridge_fold_peak_usd_   = -1.0;
-            bridge_fold_equity_usd_ = -1.0;
-            bridge_fold_block_      = 0;
-        }
         if (bridge_pos_fold_now > queued_total
-            && bridge_fold_block_ == 0
+            && bridge_pos_fold_prov_.at_block == 0
             && peak_equity_hwm_usd_ > 0.0
             && bridge_pre_fold_equity_usd > 0.0) {
-            bridge_fold_peak_usd_   = peak_equity_hwm_usd_;
-            bridge_fold_equity_usd_ = bridge_pre_fold_equity_usd;
-            bridge_fold_block_      = block_height;
+            bridge_pos_fold_prov_.peak_usd   = peak_equity_hwm_usd_;
+            bridge_pos_fold_prov_.equity_usd = bridge_pre_fold_equity_usd;
+            bridge_pos_fold_prov_.mojos = bridge_pos_fold_now
+                                          - queued_total;
+            bridge_pos_fold_prov_.at_block = block_height;
             spdlog::info("[Engine] Bridge ingest: unmatched positive "
                          "fold of {} mojos -- provenance recorded "
                          "(peak {:.2f}, pre-fold equity {:.2f})",
-                         bridge_pos_fold_now - queued_total,
-                         bridge_fold_peak_usd_,
-                         bridge_fold_equity_usd_);
+                         bridge_pos_fold_prov_.mojos,
+                         bridge_pos_fold_prov_.peak_usd,
+                         bridge_pos_fold_prov_.equity_usd);
+        }
+        if (bridge_neg_fold_now > 0
+            && bridge_neg_fold_prov_.at_block == 0
+            && peak_equity_hwm_usd_ > 0.0
+            && bridge_pre_fold_equity_usd > 0.0) {
+            bridge_neg_fold_prov_.peak_usd   = peak_equity_hwm_usd_;
+            bridge_neg_fold_prov_.equity_usd = bridge_pre_fold_equity_usd;
+            bridge_neg_fold_prov_.mojos      = bridge_neg_fold_now;
+            bridge_neg_fold_prov_.at_block   = block_height;
+            spdlog::info("[Engine] Bridge ingest: unmatched negative "
+                         "fold of {} mojos -- provenance recorded "
+                         "(pre-fold equity {:.2f})",
+                         bridge_neg_fold_prov_.mojos,
+                         bridge_neg_fold_prov_.equity_usd);
         }
     }
 
-    // DEPOSIT-only peak maintenance (round 26).  Whether a flow was
-    // already folded into equity is unknowable (round 23) -- a deposit
-    // and an exactly opposing quote fill leave every quantity
-    // unchanged -- so each direction gets its provably safe policy:
-    //   DEPOSITS credit the peak once, factor (e_pre + f)/e_pre
-    //   against equity measured before the reconcile fold.  If the
-    //   flow was already inside equity this over-credits: a HIGHER
-    //   peak, which can false-trip the breaker but can never mask
-    //   losses.
-    //   WITHDRAWALS never shrink the peak in-process.  The retired
-    //   negative-fold budget (rounds 19-25) counted every negative
-    //   bridge-asset reconcile delta, quote fills included, so a
-    //   value-neutral fill could "authorize" a shrink for a
-    //   pre-restart burn the seeded anchor already contained --
-    //   erasing a real drawdown.
+    // Deposit peak-credit tail (rounds 26-37).  Whether a flow was
+    // already folded into equity cannot be guessed (round 23), so the
+    // split is MEASURED: this pass's observed fold covers flows folded
+    // now (exact factor against pre-fold equity), amount-capped
+    // provenance covers flows folded earlier (rescale from the
+    // recorded base, floored by max() against the current peak), and
+    // anything uncovered gets no credit (the anchor or Step 13's
+    // natural max already carried it).  Withdrawals are handled in
+    // the maintenance block above: a shrink executes only when the
+    // booked event and an observed fold have BOTH happened (round
+    // 37), which is the attribution the retired rounds-19-25 budget
+    // could never prove; unmatched withdrawals leave the peak
+    // standing until expiry or restart.
     if (!bridge_unapplied_deposit_flows_.empty()) {
         std::vector<Mojo> flows;
         flows.swap(bridge_unapplied_deposit_flows_);
@@ -12241,29 +12358,41 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                         * usd_per_unit;
                     factor_now *= (e_m + m_usd) / e_m;
                 }
-                const Mojo u = f - m;
-                if (u > 0 && bridge_fold_equity_usd_ > 0.0) {
+                // Provenance consumption is CAPPED by its recorded
+                // magnitude (round 37): beyond it there is no proof
+                // the record describes these flows, and rescaling
+                // from a stale base can err in either direction.
+                Mojo u = f - m;
+                const Mojo covered =
+                    std::min(u, bridge_pos_fold_prov_.mojos);
+                if (covered > 0
+                    && bridge_pos_fold_prov_.equity_usd > 0.0) {
                     const double u_usd =
-                        (static_cast<double>(u) / mojos_per_unit)
+                        (static_cast<double>(covered) / mojos_per_unit)
                         * usd_per_unit;
-                    factor_rec *= (bridge_fold_equity_usd_ + u_usd)
-                                  / bridge_fold_equity_usd_;
+                    factor_rec *=
+                        (bridge_pos_fold_prov_.equity_usd + u_usd)
+                        / bridge_pos_fold_prov_.equity_usd;
+                    bridge_pos_fold_prov_.mojos -= covered;
+                    prior_mojos += covered;
+                    u -= covered;
                 }
-                prior_mojos += u;
+                if (u > 0) {
+                    spdlog::info("[Engine] Bridge ingest: {} mojos of "
+                                 "booked deposit folded earlier with "
+                                 "no covering provenance -- no extra "
+                                 "peak credit (the anchor or natural "
+                                 "max already carried it)", u);
+                }
             }
             double rescaled = peak_equity_hwm_usd_;
-            if (prior_mojos > 0 && bridge_fold_equity_usd_ > 0.0) {
+            if (prior_mojos > 0) {
                 rescaled = std::max(rescaled,
-                                    bridge_fold_peak_usd_ * factor_rec);
-                bridge_fold_peak_usd_   = -1.0;   // consumed
-                bridge_fold_equity_usd_ = -1.0;
-                bridge_fold_block_      = 0;
-            } else if (prior_mojos > 0) {
-                spdlog::info("[Engine] Bridge ingest: {} mojos of "
-                             "booked deposit folded by a prior pass "
-                             "without provenance -- no extra peak "
-                             "credit (the anchor or natural max "
-                             "already carried it)", prior_mojos);
+                                    bridge_pos_fold_prov_.peak_usd
+                                        * factor_rec);
+                if (bridge_pos_fold_prov_.mojos == 0) {
+                    bridge_pos_fold_prov_ = BridgeFoldProvenance{};
+                }
             }
             rescaled *= factor_now;
             if (rescaled != peak_equity_hwm_usd_) {

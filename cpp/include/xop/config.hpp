@@ -1709,10 +1709,11 @@ struct AccountingConfig {
     // as first-class bridge_deposit / bridge_withdrawal ledger events
     // BEFORE the divergence control runs, so external capital is explained
     // flow rather than a blind adjusting entry.  GIPS/TWR treatment: the
-    // USD accumulates as NET DEPOSITS outside trading P&L; deposits
-    // completed while the process is alive credit the drawdown peak,
-    // withdrawals leave it standing (conservative until the next restart
-    // re-anchor).  Detection and valuation: accounting/bridge_ingest.hpp.
+    // USD accumulates as NET DEPOSITS outside trading P&L; in-process
+    // deposits credit the drawdown peak, in-process withdrawals shrink it
+    // only when matched to a wallet fold this process observed (unmatched:
+    // conservative, peak stands until expiry or restart re-anchor).
+    // Detection and valuation: accounting/bridge_ingest.hpp.
     bool bridge_ingest_enabled{true};
 
     /// The GUI-owned warp jobs database, opened READ-ONLY each heartbeat.
