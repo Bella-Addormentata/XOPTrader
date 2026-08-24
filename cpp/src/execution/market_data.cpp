@@ -162,10 +162,19 @@ midgate::AnchorCandidates anchor_candidates(const PairState&        ps,
                    < cfg.amm_freshness_threshold_sec)) {
         c.amm_mid = ps.amm_mid;
     }
+    // Mirror get_fair_value_estimate exactly: require a stamp, treat
+    // max_age <= 0 as "expiry disabled" (documented and pinned by
+    // FairValueTest.ZeroMaxAgeDisablesExpiry), and make the boundary
+    // inclusive.  Writing this as a bare `age < max_age` rejected EVERY
+    // fair-value anchor under the valid zero-means-disabled setting, since
+    // no age is below zero -- silently dropping the source from the chain.
     if (ps.fair_value_estimate > 0.0
-        && age_seconds(ps.fair_value_updated_at, now)
-               < cfg.fair_value_max_age_sec) {
-        c.fair_value_estimate = ps.fair_value_estimate;
+        && ps.fair_value_updated_at != Timestamp{}) {
+        const double age = age_seconds(ps.fair_value_updated_at, now);
+        if (cfg.fair_value_max_age_sec <= 0.0
+            || age <= cfg.fair_value_max_age_sec) {
+            c.fair_value_estimate = ps.fair_value_estimate;
+        }
     }
     c.peg_target = ps.peg_target;
     return c;

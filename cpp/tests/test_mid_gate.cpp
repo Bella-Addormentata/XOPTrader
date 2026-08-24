@@ -505,3 +505,28 @@ TEST(MidGateTest, NegativeInfinityIsRejectedNotTreatedAsNoMid) {
     in.candidate_mid = 0.0;
     EXPECT_EQ(gate_mid(in), GateVerdict::Accept);
 }
+
+// A zero fair_value_max_age_sec means "expiry disabled" everywhere else in
+// this feed (FairValueTest.ZeroMaxAgeDisablesExpiry).  Written as a bare
+// `age < max_age`, the anchor chain rejected EVERY fair-value anchor under
+// that valid setting -- no age is below zero -- silently dropping the
+// source.  Here the fair value is the only anchor available, so the gate
+// can only reject the junk mid if the anchor actually survived.
+TEST(MidGateIngestTest, ZeroFairValueMaxAgeDoesNotDisableTheAnchor) {
+    auto cfg = gate_cfg();
+    cfg.fair_value_max_age_sec = 0.0;   // documented as "no expiry"
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "wmilliETH.b/XCH";   // no peg, no CEX leg
+
+    feed.ingest_block_height(100);
+    feed.ingest_fair_value(pair, 1.66, FairValueTier::Triangulated);
+
+    // A junk last-trade print far outside the 3x band around 1.66.
+    feed.ingest_dexie(pair, /*bid=*/0.0, /*ask=*/0.0,
+                      /*last_trade=*/187.46, /*vol=*/0.0);
+    feed.refresh({pair});
+
+    EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
+        << "fair-value anchor was dropped, so the junk print published";
+}
