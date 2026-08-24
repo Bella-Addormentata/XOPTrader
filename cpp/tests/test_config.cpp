@@ -1314,3 +1314,107 @@ TEST(ConfigParserTest, ReviveMarketUnmappableLeg_Throws) {
 }
 
 }  // namespace
+
+// ============================================================================
+// [S20 2026-08-24] Gate-knob validation through the REAL YAML parser.
+//
+// The gate tests construct MarketDataConfig / RiskConfig structs directly,
+// so nothing exercised these validators.  That matters more than usual
+// here: yaml-cpp accepts `.nan` and `.inf`, and a non-finite value slips
+// through ordinary range comparisons -- `NaN > 1.0` is false, so a
+// `.nan` band would silently skip the anchor test while the config still
+// read as though the gate were armed.
+// ============================================================================
+
+namespace {
+
+std::string with_market_data(const std::string& body) {
+    return std::string(kMinimalValidYaml) + "\nmarket_data:\n" + body;
+}
+
+std::string with_risk_extra(const std::string& line) {
+    // Append into the existing risk: block by re-declaring the key under a
+    // fresh document is not possible, so build the section inline.
+    std::string s(kMinimalValidYaml);
+    const std::string anchor = "risk:\n";
+    const auto pos = s.find(anchor);
+    s.insert(pos + anchor.size(), "  " + line + "\n");
+    return s;
+}
+
+}  // namespace
+
+TEST(ConfigParserTest, S20GateKnobs_NonFiniteRejected) {
+    for (const char* bad : {".nan", ".inf", "-.inf"}) {
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  mid_anchor_band_ratio: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "mid_anchor_band_ratio accepted " << bad;
+        }
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  mid_gate_book_confirm_max_spread_bps: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "mid_gate_book_confirm_max_spread_bps accepted " << bad;
+        }
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  mid_gate_max_step_frac: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "mid_gate_max_step_frac accepted " << bad;
+        }
+        {
+            TempYaml tmp(with_market_data(
+                std::string("  implied_cross_max_leg_spread_bps: ") + bad));
+            EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+                << "implied_cross_max_leg_spread_bps accepted " << bad;
+        }
+    }
+}
+
+TEST(ConfigParserTest, S20GateKnobs_LegalDisabledValuesAccepted) {
+    // 0 / <=1 are documented as "disabled" for the band and step gates and
+    // must keep parsing -- a validator that rejected them would make the
+    // documented escape hatch unusable.
+    TempYaml tmp(with_market_data(
+        "  mid_gate_enabled: false\n"
+        "  mid_anchor_band_ratio: 0.0\n"
+        "  mid_gate_max_step_frac: 0.0\n"
+        "  mid_gate_book_confirm_max_spread_bps: 0.0\n"
+        "  implied_cross_max_leg_spread_bps: 1500.0\n"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.market_data.mid_gate_enabled);
+    EXPECT_DOUBLE_EQ(cfg.market_data.mid_anchor_band_ratio, 0.0);
+    EXPECT_DOUBLE_EQ(cfg.market_data.mid_gate_max_step_frac, 0.0);
+}
+
+TEST(ConfigParserTest, S20GateKnobs_NegativeAndZeroLegCapRejected) {
+    {
+        TempYaml tmp(with_market_data("  mid_anchor_band_ratio: -1.0\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+    {
+        // The leg cap is a strict positive: at 0 no triangle can ever form.
+        TempYaml tmp(with_market_data("  implied_cross_max_leg_spread_bps: 0.0\n"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}
+
+TEST(ConfigParserTest, S20CarryTtl_ParsesAndRejectsNegative) {
+    {
+        TempYaml tmp(with_risk_extra("valuation_carry_ttl_blocks: 720"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.valuation_carry_ttl_blocks, 720u);
+    }
+    {
+        // 0 is the documented "expiry disabled" value and must parse.
+        TempYaml tmp(with_risk_extra("valuation_carry_ttl_blocks: 0"));
+        auto cfg = xop::load_config(tmp.path());
+        EXPECT_EQ(cfg.risk.valuation_carry_ttl_blocks, 0u);
+    }
+    {
+        TempYaml tmp(with_risk_extra("valuation_carry_ttl_blocks: -1"));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+    }
+}

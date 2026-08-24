@@ -530,3 +530,48 @@ TEST(MidGateIngestTest, ZeroFairValueMaxAgeDoesNotDisableTheAnchor) {
     EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
         << "fair-value anchor was dropped, so the junk print published";
 }
+
+// The byte-identical-freeze defence, exercised END TO END.
+//
+// The pure freeze test hands the gate `book_fresh = false` directly, and
+// the other ingestion tests perform at most two ingests -- so nothing
+// actually drove dex_print_age past kMaxConfirmingPrintAge, and the
+// movement check could have been disconnected without failing the suite.
+// This repeatedly re-ingests an UNCHANGED two-sided filtered book and
+// asserts the expiry boundary from both sides.
+TEST(MidGateIngestTest, UnchangedBookExpiresAsConfirmingEvidence) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "BYC/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, 0.0, /*peg_target=*/1.0);
+
+    const std::vector<CompetingOffer> frozen{
+        mk_offer("b1", Side::Bid, 0.995, 5'000'000),
+        mk_offer("a1", Side::Ask, 1.005, 5'000'000),
+    };
+
+    // First ingest establishes the print (age 0); each identical ingest
+    // thereafter ages it by one.  61 ingests -> age 60, the last value
+    // still accepted.
+    for (int i = 0; i < 61; ++i) {
+        feed.ingest_competing_offers(pair, frozen, {}, 1'000, 1'000);
+    }
+    ASSERT_EQ(feed.dex_print_age(pair), 60);
+    EXPECT_TRUE(feed.book_evidence_fresh(pair))
+        << "a book at exactly the age limit must still count";
+
+    feed.refresh({pair});
+    EXPECT_TRUE(feed.mid_valuation_grade(pair));
+
+    // One more identical ingest crosses the boundary.
+    feed.ingest_competing_offers(pair, frozen, {}, 1'000, 1'000);
+    ASSERT_EQ(feed.dex_print_age(pair), 61);
+    EXPECT_FALSE(feed.book_evidence_fresh(pair))
+        << "a frozen book must stop counting as confirming evidence";
+
+    feed.refresh({pair});
+    EXPECT_FALSE(feed.mid_valuation_grade(pair))
+        << "a frozen book must not keep marking equity";
+}
