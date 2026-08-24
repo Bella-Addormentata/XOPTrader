@@ -162,18 +162,28 @@ midgate::AnchorCandidates anchor_candidates(const PairState&        ps,
                    < cfg.amm_freshness_threshold_sec)) {
         c.amm_mid = ps.amm_mid;
     }
-    // Mirror get_fair_value_estimate exactly: require a stamp, treat
+    // Anchor on fair_value, NOT fair_value_estimate.
+    //
+    // ingest_fair_value keeps the raw estimate alive through an
+    // Unavailable-by-sigma solve because "1.36 +- 467 bps" is still a
+    // useful WIDTH instruction for quoting -- while zeroing fair_value so
+    // that, in that method's own words, no caller can read a number we
+    // have just declared untrustworthy.  A gate anchor is exactly such a
+    // reader: it decides whether an honest published mid is refused and
+    // which offers survive filtering, so it must use the value the solve
+    // says is safe to clamp against, not the one it says is too shaky.
+    //
+    // Freshness mirrors get_fair_value_estimate: require a stamp, treat
     // max_age <= 0 as "expiry disabled" (documented and pinned by
-    // FairValueTest.ZeroMaxAgeDisablesExpiry), and make the boundary
-    // inclusive.  Writing this as a bare `age < max_age` rejected EVERY
-    // fair-value anchor under the valid zero-means-disabled setting, since
-    // no age is below zero -- silently dropping the source from the chain.
-    if (ps.fair_value_estimate > 0.0
+    // FairValueTest.ZeroMaxAgeDisablesExpiry), inclusive boundary.  A bare
+    // `age < max_age` rejected EVERY fair-value anchor under the valid
+    // zero-means-disabled setting, since no age is below zero.
+    if (ps.fair_value > 0.0
         && ps.fair_value_updated_at != Timestamp{}) {
         const double age = age_seconds(ps.fair_value_updated_at, now);
         if (cfg.fair_value_max_age_sec <= 0.0
             || age <= cfg.fair_value_max_age_sec) {
-            c.fair_value_estimate = ps.fair_value_estimate;
+            c.fair_value_estimate = ps.fair_value;
         }
     }
     c.peg_target = ps.peg_target;

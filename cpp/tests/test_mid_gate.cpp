@@ -757,3 +757,43 @@ TEST(MidGateIngestTest, OffersFilteredWithoutAnAnchorCannotConfirm) {
         << "unscreened junk book confirmed its own band breach";
     EXPECT_FALSE(feed.mid_valuation_grade(pair));
 }
+
+// [S20 2026-08-24] An Unavailable-by-sigma fair value must not anchor the
+// gate.
+//
+// ingest_fair_value deliberately keeps the raw ESTIMATE alive through such
+// a solve -- "1.36 +- 467 bps" is a useful width instruction for quoting --
+// while zeroing fair_value so that no caller reads a number the solve has
+// just declared untrustworthy.  A gate anchor is exactly such a reader: it
+// decides whether an honest mid is refused and which offers survive
+// filtering.  Anchoring on the estimate would let a value the solver
+// distrusts reject a perfectly good published mid.
+TEST(MidGateIngestTest, UnavailableFairValueDoesNotAnchorTheGate) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "wmilliETH.b/XCH";   // no peg, no CEX leg
+
+    feed.ingest_block_height(100);
+
+    // A solve that is anchored but far too uncertain to clamp against, and
+    // whose price sits far from the market -- if it anchored the gate, the
+    // honest mid below would be refused.
+    FairValue fv;
+    fv.price      = 20.0;
+    fv.tier       = FairValueTier::Unavailable;
+    fv.sigma_bps  = 4670.0;
+    fv.observations = 3;
+    feed.ingest_fair_value(pair, fv);
+
+    // An honest two-sided book near 1.66.
+    const std::vector<CompetingOffer> honest{
+        mk_offer("b1", Side::Bid, 1.64, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 1.68, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, honest, {}, 1'000, kMojosPerXch);
+    feed.refresh({pair});
+
+    EXPECT_NEAR(feed.get_mid_price(pair), 1.66, 0.05)
+        << "an Unavailable-by-sigma estimate anchored the gate and refused "
+           "an honest mid";
+}
