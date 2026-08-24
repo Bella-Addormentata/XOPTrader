@@ -11763,9 +11763,12 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // visible in this scan (the original round-17 guarantee).
     bool unbooked_candidate = false;
     for (const auto& row : jobs) {
-        if (bridge_booked_event_ids_.find(
-                accounting::bridge_event_id(row.id, row.created_at))
-            == bridge_booked_event_ids_.end()) {
+        const std::string eid =
+            accounting::bridge_event_id(row.id, row.created_at);
+        // Terminally-skipped rows (round 33) can never book, so they
+        // must not force the fresh fetch every heartbeat forever.
+        if (bridge_booked_event_ids_.count(eid) == 0
+            && bridge_terminal_skip_ids_.count(eid) == 0) {
             unbooked_candidate = true;
             break;
         }
@@ -11848,6 +11851,10 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
 
         const auto flow = accounting::classify_bridge_job(row);
         if (!flow.valid) {
+            // Terminal (round 33): a completed job's state payload and
+            // quantities are immutable, so this row can never book.
+            bridge_terminal_skip_ids_.insert(
+                accounting::bridge_event_id(row.id, row.created_at));
             skip_notice("is unclassifiable (bad state, unknown direction, "
                         "or non-positive quantity)", "");
             continue;
@@ -11859,6 +11866,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // (review round 1).  Strict: no fingerprint, no booking.
         if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
                                                    acc.bridge_asset_id)) {
+            bridge_terminal_skip_ids_.insert(flow.event_id);  // terminal
             skip_notice("has an asset fingerprint that does not resolve "
                         "to the configured bridge asset: ",
                         flow.asset_fingerprint);
@@ -11866,6 +11874,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         }
 
         if (row.flow_at.empty()) {
+            // NOT terminal (round 33): the scan selects jobs by the
+            // existence of a booking-point event, so an empty flow_at
+            // is a data anomaly that may heal -- keep forcing the
+            // fresh fetch rather than cache a decision that could
+            // flip.
             skip_notice("has no recorded transition event (chronology "
                         "unknowable)", "");
             continue;
@@ -11893,6 +11906,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         const std::string& flow_floor =
             row.flow_lb.empty() ? row.flow_at : row.flow_lb;
         if (!accounting::iso_strictly_after(flow_floor, opening_time)) {
+            // Terminal (round 33): the broadcast lower bound can only
+            // move EARLIER (MIN over append-only events) and the
+            // opening is fixed for this ledger generation, so a
+            // pre-opening verdict never flips.
+            bridge_terminal_skip_ids_.insert(flow.event_id);
             spdlog::debug("[Engine] Bridge ingest: job {} may predate the "
                           "{} ledger opening ({}) -- treated as inside "
                           "the opening balance, not booked",
@@ -11902,7 +11920,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
 
         const auto val = accounting::value_bridge_flow(
             flow.delta_mojos, mojos_per_unit, usd_per_unit);
-        if (val.fmv_pseudo_price <= 0) continue;
+        if (val.fmv_pseudo_price <= 0) {
+            // Terminal (round 33): quantity and rates are fixed, so a
+            // rejected valuation never becomes acceptable.
+            bridge_terminal_skip_ids_.insert(flow.event_id);
+            skip_notice("has a quantity the valuation guard rejects "
+                        "(unbookable magnitude)", "");
+            continue;
+        }
 
         // 1. Journal first (crash-consistent, and the idempotency gate).
         DbLedgerEntry e;

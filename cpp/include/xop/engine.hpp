@@ -864,6 +864,16 @@ private:
     /// per heartbeat for the lifetime of the database.  One no-op pass
     /// per restart warms the cache.
     std::set<std::string> bridge_booked_event_ids_;
+    /// [S19 round 33] Event ids whose booking decision is TERMINAL for
+    /// this process: unclassifiable rows, foreign-asset fingerprints,
+    /// pre-opening chronology, and rejected valuations are immutable
+    /// functions of the row content, the config, and the ledger
+    /// opening, so such a job can never become bookable later.  Without
+    /// this cache every permanently-skipped job (the expected
+    /// pre-opening job 2 included) would keep the round-31
+    /// unbooked-candidate check true forever and force an extra wallet
+    /// RPC every heartbeat.  In-memory: restarts re-derive it.
+    std::set<std::string> bridge_terminal_skip_ids_;
 
     /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
     /// their one-time peak credit, kept PER EVENT (withdrawals never
