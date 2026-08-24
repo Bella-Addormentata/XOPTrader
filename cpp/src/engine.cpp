@@ -12151,15 +12151,20 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
         // 16 + 22): an outbound bridge can legitimately drain that CAT
         // wallet to zero, and skipping it left an already-absorbed
         // withdrawal's counter-adjust unreachable.  For every other
-        // asset the historical <= 0 skip stands -- Step 8's cache writer
-        // defaults missing RPC fields to zero, and treating such a
-        // malformed snapshot as settled-zero would let the invariant
-        // adjust a real balance away.  (The bridge asset's on-demand
-        // writer validates field presence before caching.)
+        // asset the historical <= 0 skip stands -- Step 8's cache
+        // writers default missing RPC fields to zero, and treating such
+        // a malformed snapshot as settled-zero would let the invariant
+        // adjust a real balance away.  The bridge asset is no
+        // exception (round 29): it is also a pair asset, so Step 8's
+        // pair-gate writer caches it too, and only an entry whose
+        // writer proved field presence (fields_validated) may put a
+        // zero into the invariant.  A nonzero confirmed needs no bit:
+        // defaults are zero, so nonzero implies the field was present.
         if (cached.confirmed < 0) continue;
         if (cached.confirmed == 0
             && !(acc.bridge_ingest_enabled
-                 && asset == acc.bridge_asset_id)) {
+                 && asset == acc.bridge_asset_id
+                 && cached.fields_validated)) {
             continue;
         }
 
