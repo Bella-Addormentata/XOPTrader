@@ -1,5 +1,9 @@
 # GUI dependencies — canonical source is pyproject.toml [project.optional-dependencies] gui
 # Install via: pip install -e ".[gui]"
+#
+# NOTE: CI and release builds install gui/requirements.lock.txt (the fully
+# pinned transitive freeze), NOT this file. This file records INTENT; after
+# editing it, regenerate the lock (instructions in its header).
 PySide6>=6.6.0,<7
 pyqtgraph>=0.13.0,<1
 PyYAML>=6.0,<7

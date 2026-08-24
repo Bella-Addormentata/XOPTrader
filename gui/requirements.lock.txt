@@ -1,0 +1,76 @@
+# gui/requirements.lock.txt -- FULLY PINNED transitive dependency set.
+#
+# WHY THIS EXISTS: eth-account 0.14.0 released 2026-08-22 and the ranged
+# requirements let two same-day builds resolve different stacks; the frozen
+# v0.9.16 warp engine died at runtime ("No package metadata was found for
+# py_ecc").  Every CI and release build now installs THIS file, so a build is
+# reproducible regardless of what upstream published that morning.
+#
+# MAINTENANCE:
+#   - gui/requirements.txt stays the human-maintained INTENT (ranges + why).
+#   - Regenerate this lock after editing requirements.txt:
+#       python -m venv /tmp/lockenv
+#       /tmp/lockenv/Scripts/pip install -r gui/requirements.txt
+#       /tmp/lockenv/Scripts/pip freeze --exclude-editable
+#     then re-apply the platform markers below (pip freeze drops them).
+#   - Generated on Windows / CPython 3.13; CI runs 3.11 on Ubuntu AND
+#     Windows -- both install paths exercise the lock, so a pin that cannot
+#     satisfy either platform fails loudly in CI, not at runtime.
+#
+aiohappyeyeballs==2.7.1
+aiohttp==3.14.3
+aiosignal==1.4.0
+annotated-types==0.8.0
+attrs==26.1.0
+bitarray==3.10.1
+certifi==2026.7.22
+charset-normalizer==3.5.1
+chia_rs==0.47.0
+ckzg==2.1.8
+clvm==0.9.15
+colorama==0.4.6; sys_platform == "win32"
+cytoolz==1.1.0
+eth-account==0.13.7
+eth-hash==0.8.0
+eth-keyfile==0.8.1
+eth-keys==0.8.0
+eth-rlp==3.0.0
+eth-typing==6.0.0
+eth-utils==6.0.0
+eth_abi==6.0.0
+frozenlist==1.8.0
+hexbytes==2.0.0
+idna==3.19
+importlib_metadata==8.9.0
+multidict==6.7.1
+numpy==2.5.2
+packaging==26.3
+parsimonious==0.10.0
+propcache==0.5.2
+pycryptodome==3.23.0
+pydantic==2.13.4
+pydantic_core==2.46.4
+pyqtgraph==0.14.0
+PySide6==6.11.2
+PySide6_Addons==6.11.2
+PySide6_Essentials==6.11.2
+pyunormalize==17.0.0
+pywin32==312; sys_platform == "win32"
+PyYAML==6.0.3
+regex==2026.7.19
+requests==2.34.2
+rlp==5.0.0
+ruamel.yaml==0.18.17
+ruamel.yaml.clib==0.2.15
+segno==1.6.6
+shiboken6==6.11.2
+toolz==1.1.0
+types-requests==2.33.0.20260712
+typing-inspection==0.4.4
+typing_extensions==4.16.0
+urllib3==2.7.0
+web3==7.16.0
+websocket-client==1.9.0
+websockets==15.0.1
+yarl==1.24.5
+zipp==4.1.0

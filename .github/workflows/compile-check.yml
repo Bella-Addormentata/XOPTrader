@@ -177,7 +177,7 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.txt
+          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
           pip install pytest pytest-asyncio
 
       # Every warp test module opens with pytest.importorskip("clvm") /
