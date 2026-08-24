@@ -865,6 +865,13 @@ private:
     /// max() anchors 180; the correct peak is 100 * 180/80 = 225).
     Mojo   bridge_inproc_pos_fold_mojos_{0};
     double bridge_pos_fold_peak_usd_{0.0};
+    /// Block at which the positive budget's FIRST entry (and its peak
+    /// snapshot) was recorded.  The budget expires after a bounded
+    /// window (review round 21): the snapshot can be captured by an
+    /// ordinary fill's residual, and without expiry a bridge job
+    /// discovered much later would be reconstructed against an
+    /// arbitrarily stale peak, masking the intervening drawdown.
+    BlockHeight bridge_pos_fold_block_{0};
 
     /// [S19 review round 19] Negative unattributed inventory movement
     /// observed by THIS process's reconciles (always <= 0).  The budget

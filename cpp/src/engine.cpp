@@ -11958,6 +11958,28 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // pre-folded WITHDRAWAL still shrinks the peak: max() never lowers
     // it, so no prior downward adjustment can have happened and the
     // single shrink is exact.
+    // The positive budget EXPIRES after a bounded window (round 21):
+    // its anchor can be captured by an ordinary fill's residual, and a
+    // deposit discovered much later must not be reconstructed against an
+    // arbitrarily stale peak (masking the intervening drawdown).  The
+    // window generously covers the GUI's job-visibility lag plus a
+    // jobs-DB outage; expired late bookings fall back to the round-18
+    // conservative skip (max() anchor -- can false-trip, never masks).
+    constexpr BlockHeight kPosFoldExpiryBlocks = 240;   // ~2 hours
+    if (bridge_inproc_pos_fold_mojos_ > 0
+        && bridge_pos_fold_block_ != 0
+        && block_height > bridge_pos_fold_block_ + kPosFoldExpiryBlocks) {
+        spdlog::info("[Engine] Bridge ingest: positive fold budget of {} "
+                     "mojos expired (recorded at block {}, now {}) -- "
+                     "late deposit bookings fall back to the conservative "
+                     "max() anchor",
+                     bridge_inproc_pos_fold_mojos_,
+                     bridge_pos_fold_block_, block_height);
+        bridge_inproc_pos_fold_mojos_ = 0;
+        bridge_pos_fold_peak_usd_ = 0.0;
+        bridge_pos_fold_block_ = 0;
+    }
+
     if (prefolded_pos_mojos > 0) {
         // Rebuild the pre-flow anchor from the snapshot (round 20):
         // multiplying the CURRENT peak would overshoot (max() already
@@ -12000,6 +12022,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         }
         if (bridge_inproc_pos_fold_mojos_ == 0) {
             bridge_pos_fold_peak_usd_ = 0.0;
+            bridge_pos_fold_block_ = 0;
         }
     }
     if (prefolded_neg_mojos < 0 && peak_equity_hwm_usd_ > 0.0) {
@@ -12094,6 +12117,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     // anchor (round 20).
                     if (bridge_inproc_pos_fold_mojos_ == 0) {
                         bridge_pos_fold_peak_usd_ = peak_equity_hwm_usd_;
+                        bridge_pos_fold_block_   = block_height;
                     }
                     bridge_inproc_pos_fold_mojos_ += residual;
                 }
