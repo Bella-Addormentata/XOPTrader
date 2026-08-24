@@ -546,6 +546,7 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // when) it successfully rebuilds the BBO from filtered offers.
     ps.bbo_from_filtered_book = false;
     ps.bbo_filter_had_anchor  = false;
+    ps.bbo_filter_had_independent_anchor = false;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
@@ -1013,7 +1014,7 @@ bool MarketDataFeed::book_evidence_fresh(const std::string& pair_name) const {
     }
     const PairState& ps = it->second;
     return ps.bbo_from_filtered_book
-        && ps.bbo_filter_had_anchor
+        && ps.bbo_filter_had_independent_anchor
         && ps.ob_updated_at != Timestamp{}
         && std::chrono::system_clock::now() - ps.ob_updated_at
                <= cfg.stale_threshold
@@ -1500,11 +1501,15 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     //     this and never wired to a consumer until now.
     const bool book_moving =
         ps.dex_print_age <= kMaxConfirmingPrintAge;
-    const bool dex_fresh = ps.bbo_from_filtered_book
-        && ps.bbo_filter_had_anchor
+    const bool book_live = ps.bbo_from_filtered_book
         && ps.ob_updated_at != Timestamp{}
         && now - ps.ob_updated_at <= cfg.stale_threshold
         && book_moving;
+    // Confirming a gate rejection accepts either screening; marking
+    // equity requires the independent one (see the PairState note).
+    const bool dex_fresh       = book_live && ps.bbo_filter_had_anchor;
+    const bool dex_fresh_grade = book_live
+                              && ps.bbo_filter_had_independent_anchor;
     const bool book_two_sided =
         ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0;
     const double book_spread_bps =
@@ -1576,7 +1581,7 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
             || age_seconds(ps.cex_updated_at, now)
                    < cfg.cex_freshness_threshold_sec);
     ps.mid_valuation_grade = ps.mid_price > 0.0
-        && ((book_two_sided && dex_fresh) || cex_fresh);
+        && ((book_two_sided && dex_fresh_grade) || cex_fresh);
 }
 
 void MarketDataFeed::ingest_reference_anchor(const std::string& pair_name,
@@ -1964,7 +1969,7 @@ void MarketDataFeed::ingest_competing_offers(
                 // the header promised exactly the opposite.  The bound
                 // must therefore exceed the step limit, not sit under it.
                 const double bound = midgate::offer_absurdity_ratio(
-                    cfg.mid_anchor_band_ratio);
+                    cfg.mid_anchor_band_ratio, cfg.mid_gate_max_step_frac);
                 const double ratio = offer_price / offer_ref;
                 outlier = ratio > bound || ratio < 1.0 / bound;
             } else {
@@ -2101,6 +2106,12 @@ void MarketDataFeed::ingest_competing_offers(
             // for genuinely anchorless pairs.
             ps.bbo_filter_had_anchor  =
                 !cfg.mid_gate_enabled || offer_ref_used > 0.0;
+            // Only an INDEPENDENT anchor earns valuation grade and
+            // triangle-leg eligibility; our own last accepted mid does
+            // not, or a junk cycle-1 publication would launder itself
+            // into evidence on cycle 2.
+            ps.bbo_filter_had_independent_anchor =
+                !cfg.mid_gate_enabled || ref_price > 0.0;
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and

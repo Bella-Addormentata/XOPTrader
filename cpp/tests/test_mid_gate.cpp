@@ -536,6 +536,23 @@ TEST(MidGateIngestTest, OfferBoundAlwaysExceedsTheGateBand) {
     }
 }
 
+// The bound must also clear the STEP limit, which is configured
+// independently.  With max_step_frac 0.95 the gate permits a move to
+// 0.05x, so a fixed 10x bound (rejecting below 0.1x) would strip the very
+// book that move needs -- the two halves of one feature contradicting
+// each other in a configuration the parser accepts.
+TEST(MidGateIngestTest, OfferBoundAlsoClearsTheStepLimit) {
+    for (double step : {0.5, 0.8, 0.95, 0.99}) {
+        const double bound = offer_absurdity_ratio(3.0, step);
+        const double gate_allows_down_to = 1.0 - step;
+        EXPECT_LT(1.0 / bound, gate_allows_down_to)
+            << "offers stripped inside the permitted step at max_step_frac "
+            << step;
+    }
+    // Defaults are unchanged by the new term.
+    EXPECT_DOUBLE_EQ(offer_absurdity_ratio(3.0, 0.5), 10.0);
+}
+
 // End-to-end version of the same invariant: at a RAISED band, an honest
 // offer sitting between the gate band and the derived offer bound must
 // survive the filter and still form a book.  A fixed 10x bound passed the
@@ -878,4 +895,42 @@ TEST(MidGateIngestTest, AnchorlessPairRecoversFromALargeGenuineMove) {
     EXPECT_NEAR(feed.get_mid_price(pair), 220.0, 5.0)
         << "anchorless pair could not recover from a real move -- the "
            "book-confirmation escape gate_mid advertises is unreachable";
+}
+
+// [S20 2026-08-24] A junk cycle-1 publication must not launder itself into
+// valuation evidence on cycle 2.
+//
+// On an anchorless pair, cycle 1 has no reference at all, so a coherent
+// junk book publishes and becomes last_accepted_mid.  If the screening
+// flag were collapsed into one, cycle 2 would find that junk value
+// screening the unchanged book, promote it to valuation grade, and let it
+// mark equity -- the self-referential lock-in this whole change exists to
+// break, re-entering through the back door.  Confirming a step rejection
+// may lean on our own history; marking equity may not.
+TEST(MidGateIngestTest, SelfReferenceNeverBecomesValuationGrade) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "XCH/DBX";   // anchorless by construction
+
+    feed.ingest_block_height(100);
+
+    const std::vector<CompetingOffer> junk{
+        mk_offer("b1", Side::Bid, 187.0, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 188.0, 5'000'000'000'000LL),
+    };
+
+    // Cycle 1: nothing to screen against.
+    feed.ingest_competing_offers(pair, junk, {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    EXPECT_FALSE(feed.mid_valuation_grade(pair))
+        << "unscreened cycle-1 book marked equity";
+
+    // Cycle 2: the same book, now 'screened' against cycle 1's own value.
+    feed.ingest_competing_offers(pair, junk, {}, kMojosPerXch, 1'000);
+    feed.refresh({pair});
+    EXPECT_FALSE(feed.mid_valuation_grade(pair))
+        << "a pair's own prior publication was laundered into valuation "
+           "grade -- self-referential lock-in reintroduced";
+    EXPECT_FALSE(feed.book_evidence_fresh(pair))
+        << "self-screened book must not qualify as a triangle leg either";
 }

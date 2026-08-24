@@ -283,10 +283,34 @@ struct LegOrientation {
 inline constexpr double kOfferAbsurdityFloor    = 10.0;
 inline constexpr double kOfferAbsurdityBandMult = 2.0;
 
-[[nodiscard]] inline double offer_absurdity_ratio(double anchor_band_ratio) noexcept
+// Both escapes the bound has to feed are accounted for, because the gate
+// has TWO of them and they are configured independently:
+//
+//   * the anchor band, needing 2x the band;
+//   * the step limit, needing room at its lower extreme.  A move to
+//     (1 - max_step_frac) is inside what the gate permits, so the filter
+//     must not strip a book at that level -- with max_step_frac 0.95 the
+//     gate allows 0.05x while a fixed 10x bound removes anything below
+//     0.1x, and the two halves of the same feature contradict each other.
+//
+// Sizing the bound from only one of them is how such a contradiction gets
+// shipped, so it is derived from both.  The divisor is floored so a
+// max_step_frac approaching 1.0 cannot send the bound to infinity.
+[[nodiscard]] inline double offer_absurdity_ratio(double anchor_band_ratio,
+                                                  double max_step_frac = 0.0) noexcept
 {
-    return std::max(kOfferAbsurdityFloor,
-                    anchor_band_ratio * kOfferAbsurdityBandMult);
+    const double from_band = anchor_band_ratio * kOfferAbsurdityBandMult;
+    double from_step = 0.0;
+    if (max_step_frac > 0.0 && std::isfinite(max_step_frac)) {
+        // Floor only guards division, and must sit BELOW the smallest
+        // step the parser accepts -- a 0.05 floor still stripped offers
+        // inside the permitted range at max_step_frac 0.99.  A very
+        // permissive step therefore yields a very wide bound, which is
+        // the honest consequence of asking for it.
+        const double lower = std::max(0.01, 1.0 - max_step_frac);
+        from_step = kOfferAbsurdityBandMult / lower;
+    }
+    return std::max({kOfferAbsurdityFloor, from_band, from_step});
 }
 
 [[nodiscard]] inline const char* anchor_source_name(AnchorSource s) noexcept

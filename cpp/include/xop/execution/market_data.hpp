@@ -536,6 +536,20 @@ struct PairState {
     // move the peak.  A book nothing screened is not evidence.
     bool        bbo_filter_had_anchor{false};
 
+    // [S20 2026-08-24] ...and whether that reference was an INDEPENDENT
+    // anchor rather than this pair's own last accepted mid.
+    //
+    // The two must stay separate.  Screening against our own history is
+    // enough to let a fresh book confirm a step rejection -- an anchorless
+    // pair has nothing better, and the alternative is a permanent no-mid
+    // lockout.  It is NOT enough to mark equity: on cycle 1 an anchorless
+    // pair has no reference at all, so a coherent junk book publishes and
+    // becomes last_accepted_mid; on cycle 2 that junk value would screen
+    // the unchanged book, and collapsing the two flags would then promote
+    // it to valuation grade.  That is the self-referential lock-in this
+    // whole change exists to break, re-entering through the back door.
+    bool        bbo_filter_had_independent_anchor{false};
+
     // --- [S20] Orderbook-mid provenance ---
     // orderbook_mid is written ONLY by ingest_competing_offers.  When the
     // offers fetch throws, that method never runs and the field froze with
