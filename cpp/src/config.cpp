@@ -567,9 +567,16 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         if (item["peg_target"] && item["peg_target"].IsDefined()
             && !item["peg_target"].IsNull()) {
             double v = item["peg_target"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".peg_target must be > 0; got "
-                                  + std::to_string(v));
+            // [S20 2026-08-24] Finiteness matters here specifically: the
+            // peg is the FIRST-CYCLE anchor for a stablecoin pair, the one
+            // thing standing between a freshly restarted process and the
+            // junk-book poisoning this release exists to stop.  `!(v > 0)`
+            // catches NaN but passes +inf, which select_anchor then
+            // discards as unusable -- leaving the pair silently anchorless
+            // on exactly that path.  Fail startup instead.
+            if (!(v > 0.0) || !std::isfinite(v)) {
+                throw ConfigError(idx + ".peg_target must be a finite value "
+                                        "> 0; got " + std::to_string(v));
             }
             p.peg_target = v;
         }

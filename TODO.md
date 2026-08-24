@@ -316,9 +316,11 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   cross through healthy sibling books (generalised for EVERY triangle,
   per operator direction) > AMM > fair value > peg -- with a wide 3x
   band and a book-confirmation escape so real repricing passes; a breach
-  publishes NO mid.  MarketSnapshot gained mid_valuation_grade (equity,
-  P&L marks, and the depeg counter only consume grade prices; a
-  last-trade-only 0.75-class print publishes but cannot mark), the
+  publishes NO mid.  MarketSnapshot gained mid_valuation_grade (equity
+  valuation and P&L marks consume only grade prices; a last-trade-only
+  0.75-class print publishes but cannot mark).  The depeg detector is
+  deliberately NOT grade-gated -- liquidity leaves before a peg breaks,
+  so gating would mute it in the mode it exists for -- and the
   carry cache gained a TTL (risk.valuation_carry_ttl_blocks, degraded
   equity freezes the PEAK ONLY -- both breakers stay armed against the
   frozen peak, S18-style 10-clean-cycle re-arm for peak updates), and the

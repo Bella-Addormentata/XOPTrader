@@ -1418,3 +1418,35 @@ TEST(ConfigParserTest, S20CarryTtl_ParsesAndRejectsNegative) {
         EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
     }
 }
+
+// [S20 2026-08-24] A non-finite peg_target must fail startup.
+//
+// The peg is the FIRST-CYCLE anchor for a stablecoin pair -- the one thing
+// between a freshly restarted process and the junk-book poisoning this
+// release exists to stop.  The historical `!(v > 0)` test catches NaN but
+// passes +inf, and select_anchor then discards the infinity as unusable,
+// leaving the pair silently anchorless on exactly that path.
+TEST(ConfigParserTest, S20NonFinitePegTargetRejected) {
+    auto with_peg = [](const char* v) {
+        std::string s(kMinimalValidYaml);
+        const std::string anchor = "    name: \"XCH/TEST\"\n";
+        const auto pos = s.find(anchor);
+        EXPECT_NE(pos, std::string::npos);
+        s.insert(pos + anchor.size(),
+                 std::string("    is_stablecoin: true\n    peg_target: ")
+                 + v + "\n");
+        return s;
+    };
+
+    for (const char* bad : {".inf", "-.inf", ".nan", "0", "-1.0"}) {
+        TempYaml tmp(with_peg(bad));
+        EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError)
+            << "peg_target accepted " << bad;
+    }
+
+    TempYaml ok(with_peg("1.0"));
+    EXPECT_NO_THROW({
+        auto cfg = xop::load_config(ok.path());
+        EXPECT_DOUBLE_EQ(cfg.pairs[0].peg_target, 1.0);
+    });
+}

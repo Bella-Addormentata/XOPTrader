@@ -1570,10 +1570,21 @@ void MarketDataFeed::ingest_reference_anchor(const std::string& pair_name,
                                              double             implied_cross,
                                              double             peg_target)
 {
+    // [S20] Defence in depth against a non-finite anchor: the config
+    // parser rejects these at startup, but an infinity stored here would
+    // be silently dropped by select_anchor and leave the pair anchorless
+    // -- the failure mode is invisible, so refuse it at both ends.
+    const bool implied_ok = implied_cross > 0.0 && std::isfinite(implied_cross);
+    const bool peg_ok     = peg_target    > 0.0 && std::isfinite(peg_target);
+    if (peg_target > 0.0 && !peg_ok) {
+        spdlog::warn("[MarketData] [S20] {}: ignoring non-finite peg_target",
+                     pair_name);
+    }
+
     std::unique_lock lock(mtx_pairs_);
     PairState& ps = get_or_create_pair(pair_name);
-    ps.implied_cross     = implied_cross > 0.0 ? implied_cross : 0.0;
-    ps.peg_target        = peg_target > 0.0 ? peg_target : 0.0;
+    ps.implied_cross     = implied_ok ? implied_cross : 0.0;
+    ps.peg_target        = peg_ok ? peg_target : 0.0;
     ps.anchor_updated_at = std::chrono::system_clock::now();
 }
 
