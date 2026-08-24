@@ -12357,71 +12357,70 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             //     natural max() already carried it, and crediting
             //     again is exactly the round-36 fabrication.
             const double e_m = bridge_pre_fold_equity_usd;
-            // If the reconcile did not run this pass (stale snapshot,
-            // deferred fetch), the flows are not folded at all yet --
-            // e_pre excludes every one of them.
-            Mojo fold_budget = snapshot_current
-                ? bridge_pos_fold_now
-                : std::numeric_limits<Mojo>::max();
-            // ONE aggregate factor per shared snapshot (round 38):
-            // flows covered by the same measured base are
-            // simultaneous, and per-event products against it
-            // fabricate drawdown -- two $20 deposits folding into
-            // $100 equity must credit (100+40)/100 = 1.4 (peak 140,
-            // equity 140), not 1.2*1.2 = 1.44.  Flows folded at
-            // DIFFERENT times use their own recorded bases below,
-            // which is the true per-event TWR structure.
-            Mojo matched_now = 0;
-            Mojo uncovered   = 0;
-            for (const Mojo f : flows) {
-                const Mojo m = std::min(f, fold_budget);
-                fold_budget -= m;
-                matched_now += m;
-                uncovered   += f - m;
-            }
+            // Consumption order (round 39): PRIOR-fold provenance
+            // first (folds this process observed before these jobs
+            // became readable), then everything remaining takes ONE
+            // aggregate factor against this pass's measured pre-fold
+            // equity.  The remainder needs no net-delta cap: the
+            // round-31 fresh-fetch guarantee means the reconcile
+            // snapshot postdates every job visible in this scan, so
+            // an unprovenanced booked deposit either folded THIS pass
+            // (e_pre excludes it) or has not folded yet (e_pre also
+            // excludes it) -- e_pre is the correct base either way.
+            // Capping by the NET positive delta (round 38's form)
+            // under-credited when a concurrent quote-side outflow
+            // offset part of the deposit (a 100 deposit plus a 40
+            // sale nets +60 and left 40 uncredited -- the masking
+            // direction); concurrent fills are value-neutral, so the
+            // full booked amount belongs in the factor.  The only
+            // uncovered corner is a fold whose provenance EXPIRED
+            // before its job became readable (>240 blocks): the
+            // e_pre factor then over-credits a flow already inside
+            // equity -- the documented false-trip-safe direction,
+            // bounded by the expiry making it rare.  ONE aggregate
+            // factor per shared base (round 38): flows against the
+            // same snapshot are simultaneous; per-event products
+            // fabricate drawdown.
             double rescaled = peak_equity_hwm_usd_;
-            // Prior folds: consume the provenance FIFO oldest-first,
-            // one aggregate factor per record, each rescaling from
-            // its own recorded base and flooring the running peak by
-            // max() (Step 13's natural max may already have carried
-            // part of the credit -- rounds 34+36).
-            while (uncovered > 0 && !bridge_pos_fold_provs_.empty()) {
+            Mojo remaining = consumed;
+            Mojo prior_covered = 0;
+            while (remaining > 0 && !bridge_pos_fold_provs_.empty()) {
                 auto& prov = bridge_pos_fold_provs_.front();
-                const Mojo c = std::min(uncovered, prov.mojos);
+                const Mojo c = std::min(remaining, prov.mojos);
                 const double c_usd =
                     (static_cast<double>(c) / mojos_per_unit)
                     * usd_per_unit;
                 if (prov.equity_usd > 0.0) {
+                    // Rescale from the recorded base, floored by
+                    // max() against the running peak (Step 13's
+                    // natural max may already have carried part of
+                    // the credit -- rounds 34+36).
                     rescaled = std::max(
                         rescaled,
                         prov.peak_usd
                             * ((prov.equity_usd + c_usd)
                                / prov.equity_usd));
                 }
-                uncovered  -= c;
-                prov.mojos -= c;
+                remaining     -= c;
+                prior_covered += c;
+                prov.mojos    -= c;
                 if (prov.mojos == 0) bridge_pos_fold_provs_.pop_front();
             }
-            if (uncovered > 0) {
-                spdlog::info("[Engine] Bridge ingest: {} mojos of "
-                             "booked deposit folded earlier with no "
-                             "covering provenance -- no extra peak "
-                             "credit (the anchor or natural max "
-                             "already carried it)", uncovered);
-            }
-            if (matched_now > 0) {
-                const double m_usd =
-                    (static_cast<double>(matched_now) / mojos_per_unit)
+            if (remaining > 0) {
+                const double r_usd =
+                    (static_cast<double>(remaining) / mojos_per_unit)
                     * usd_per_unit;
-                rescaled *= (e_m + m_usd) / e_m;
+                rescaled *= (e_m + r_usd) / e_m;
             }
             if (rescaled != peak_equity_hwm_usd_) {
                 spdlog::info("[Engine] Bridge ingest: drawdown peak "
                              "rescaled {:.2f} -> {:.2f} for {} deposit "
                              "event(s) totalling ${:+.6f} (pre-fold "
-                             "equity {:.2f}, {} mojos prior-folded)",
+                             "equity {:.2f}, {} mojos via recorded "
+                             "provenance)",
                              peak_equity_hwm_usd_, rescaled,
-                             flows.size(), flow_usd, e_m, prior_mojos);
+                             flows.size(), flow_usd, e_m,
+                             prior_covered);
                 peak_equity_hwm_usd_ = rescaled;
             }
         } else {
