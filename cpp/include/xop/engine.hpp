@@ -1201,6 +1201,15 @@ private:
         // consumer must check freshness or it may reconcile against a
         // pre-fill balance and undo the fill (PNL-BASIS-PERSIST 2026-07-30).
         BlockHeight as_of_block{0};
+        // [S19 review round 28] True only when the RPC response actually
+        // carried confirmed_wallet_balance AND pending_change.  Writers
+        // default missing fields to zero for the spendable-gating
+        // consumers, but a defaulted zero must never read as settled
+        // wallet truth: the bridge scan requires this bit before
+        // reconciling inventory/State, or a malformed response would
+        // fold a real balance to nothing and let the invariant adjust
+        // the recorded ledger balance away.
+        bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
 

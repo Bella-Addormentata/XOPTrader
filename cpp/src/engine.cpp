@@ -7010,7 +7010,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         pending =
                             bal_json["pending_change"].get<Mojo>();
                     cached_wallet_balances_[asset] =
-                        {spendable, confirmed, pending, block_height};
+                        {spendable, confirmed, pending, block_height,
+                         bal_json.contains("confirmed_wallet_balance")
+                             && bal_json.contains("pending_change")};
                     // Log only transitions worth an operator's eye: a
                     // balance appearing where the cache had none/zero.
                     if (confirmed > 0
@@ -7347,7 +7349,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // skipped in several engine modes while Step 2 keeps
                         // mutating inventory).
                         cached_wallet_balances_[sb.label] =
-                            {spendable, confirmed, pending, block_height};
+                            {spendable, confirmed, pending, block_height,
+                             bal_json.contains("confirmed_wallet_balance")
+                                 && bal_json.contains("pending_change")};
                         const AssetId tracked_asset{sb.label};
                         // [S19 review round 6] The bridge asset's
                         // inventory and State position are maintained by
@@ -11752,8 +11756,13 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     bool snapshot_current = false;
     if (auto sit = cached_wallet_balances_.find(asset);
         sit != cached_wallet_balances_.end()) {
+        // Field-validated entries only (round 28): Step 8's writers
+        // default missing RPC fields to zero, so a same-block entry
+        // is not necessarily settled wallet truth.  An unvalidated
+        // entry falls through to the validated on-demand fetch below.
         snapshot_current = sit->second.as_of_block == block_height
-            && sit->second.pending_change == 0;
+            && sit->second.pending_change == 0
+            && sit->second.fields_validated;
     }
     if (!snapshot_current && offer_mgr_ && wallet_ && wallet_->is_open()) {
         const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
@@ -11779,6 +11788,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                     e.pending_change = bal_json.value("pending_change",
                                                       static_cast<Mojo>(0));
                     e.as_of_block = block_height;
+                    e.fields_validated = true;  // presence checked above
                     cached_wallet_balances_[asset] = e;
                     snapshot_current = e.pending_change == 0;
                 }
@@ -11989,7 +11999,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             bit != cached_wallet_balances_.end()) {
             const auto& bal = bit->second;
             if (bal.as_of_block == block_height
-                && bal.pending_change == 0 && bal.confirmed >= 0) {
+                && bal.pending_change == 0 && bal.confirmed >= 0
+                && bal.fields_validated) {
                 const Mojo tracked = inventory_->net_inventory(asset);
                 if (tracked != bal.confirmed) {
                     inventory_->adjust_quantity(asset, bal.confirmed,
