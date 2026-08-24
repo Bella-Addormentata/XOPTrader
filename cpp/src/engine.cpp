@@ -11044,6 +11044,33 @@ std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
     return {};
 }
 
+// [S20 2026-08-24] Whether quote_usd_factor(pc) may be trusted to convert
+// a valuation WITHOUT checking a source snapshot's grade.
+//
+// Three ways that can be true:
+//   * a $1 par constant (fiat wrapper, or BYC falling back) -- no market
+//     observation at all;
+//   * an XCH-quoted pair, whose factor is usd_per_xch().  That path is
+//     DELIBERATELY ungated (see the note there): XCH/wUSDC.b's filtered
+//     book is one-sided on most live cycles, so requiring grade would
+//     reduce it to "is CoinGecko up?" and zero every USD figure in the
+//     bot on a single feed blip.  Classifying it untrusted here would
+//     re-introduce exactly that gating by the back door -- and did: a
+//     freshly restarted process had no carried factor for <CAT>/XCH
+//     pairs, so wmilliETH.b/XCH registered usd_per_quote_unit = 0, its
+//     basis was discarded, and its unrealized P&L could never be marked
+//     even with perfectly good mids;
+//   * otherwise the factor IS a market observation, and the snapshot that
+//     supplies it must be valuation grade.
+bool Engine::quote_usd_factor_trusted(const PairConfig& pc) const
+{
+    if (quote_usd_factor_is_par(pc)) return true;
+    if (pc.quote_asset_id == "xch")  return true;
+
+    const std::string src = quote_usd_factor_source_pair(pc);
+    return !src.empty() && state_->get_market(src).mid_valuation_grade;
+}
+
 bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 {
     const auto slash = pc.name.find('/');
@@ -11267,12 +11294,8 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         // (raw ticker, or frozen) while XCH/BYC itself grades fine -- and
         // the composite would then mark equity and refresh the carry TTL
         // on an untrusted cross.  Par factors need no such check.
-        if (!quote_usd_factor_is_par(pair)) {
-            const std::string src = quote_usd_factor_source_pair(pair);
-            if (!src.empty() && src != pair.name
-                && !state_->get_market(src).mid_valuation_grade) {
-                continue;
-            }
+        if (!quote_usd_factor_trusted(pair)) {
+            continue;
         }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
@@ -11298,12 +11321,8 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         // live-price timestamp behind a graded XCH/BYC snapshot -- and the
         // carry TTL would never fire for the very asset it was written
         // for.  quote_usd_factor_source_pair() names the right one.
-        if (!quote_usd_factor_is_par(pair)) {
-            const std::string src = quote_usd_factor_source_pair(pair);
-            if (src.empty()
-                || !state_->get_market(src).mid_valuation_grade) {
-                continue;
-            }
+        if (!quote_usd_factor_trusted(pair)) {
+            continue;
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
@@ -12858,13 +12877,8 @@ void Engine::step_update_pnl(BlockHeight block_height)
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
 
-        double factor = quote_usd_factor(pair);
-        bool   trusted = quote_usd_factor_is_par(pair);
-        if (!trusted) {
-            const std::string src = quote_usd_factor_source_pair(pair);
-            trusted = !src.empty()
-                   && state_->get_market(src).mid_valuation_grade;
-        }
+        double     factor  = quote_usd_factor(pair);
+        const bool trusted = quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;

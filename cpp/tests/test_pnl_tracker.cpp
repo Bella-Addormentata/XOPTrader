@@ -799,3 +799,46 @@ TEST_F(PnLTrackerTest, NonPositiveConversionFactorErasesTheMark) {
         << "a non-positive factor must be recognised as mark-erasing -- "
            "this is why the engine carries the last TRUSTED factor";
 }
+
+// ---------------------------------------------------------------------------
+// 4f. [S20 2026-08-24] A <CAT>/XCH pair must be markable on a FRESH process.
+//
+//     Regression pin for the trust classifier: an XCH-quoted pair's factor
+//     is usd_per_xch(), which S20 deliberately leaves ungated.  Classifying
+//     it as needing a source grade meant a freshly restarted process had no
+//     carried factor, registered usd_per_quote_unit = 0, and PnLTracker
+//     then discarded the basis -- so wmilliETH.b/XCH could never be marked
+//     even with perfectly good mids.  This asserts the tracker side of that
+//     contract: a positive factor on the first registration marks normally.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CatQuotedByXchIsMarkableOnFirstRegistration) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    // wmilliETH.b/XCH: base is the CAT, quote is XCH (1e12 mojos/unit).
+    t.set_pair_conversion("wmilliETH.b/XCH", "wmilliETH.b",
+                          kCatDenomD, kBaseXchD, /*usd_per_quote_unit=*/1.39);
+
+    xop::Fill f = make_fill("trade-meth", xop::Side::Ask,
+                            static_cast<xop::Mojo>(1.66e12),
+                            static_cast<xop::Mojo>(1e3));
+    f.pair_name = "wmilliETH.b/XCH";
+    ASSERT_TRUE(t.record_fill(f, 0, static_cast<xop::Mojo>(1.50e12), 0));
+
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(1.66e12);      // quote-pseudo mid
+        },
+        [](const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(1e3);          // 1 milliETH held
+        },
+        [](const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(1.50e12 * 1.39);  // USD-pseudo basis
+        },
+        1.39,
+        [](const std::string&) -> double { return kBaseXchD / kCatDenomD; });
+
+    EXPECT_NE(t.get_pair_pnl("wmilliETH.b/XCH").inventory_pnl, 0)
+        << "an XCH-quoted pair must be markable on a fresh process -- a "
+           "zero conversion factor discards the basis entirely";
+}

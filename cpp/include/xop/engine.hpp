@@ -488,6 +488,15 @@ private:
     [[nodiscard]] std::string byc_cross_source_pair(
         const PairConfig& pc) const;
 
+    /// [S20] Whether quote_usd_factor(pc) may convert a valuation without
+    /// a source-snapshot grade check: true for a par constant, true for an
+    /// XCH-quoted pair (whose factor is the deliberately ungated
+    /// usd_per_xch -- gating it would zero every USD figure on a CoinGecko
+    /// blip), otherwise it requires the supplying snapshot to be grade.
+    /// Single classifier for all three consumers: both branches of
+    /// asset_usd_pseudo_price and the P&L conversion refresh.
+    [[nodiscard]] bool quote_usd_factor_trusted(const PairConfig& pc) const;
+
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
     /// Returns 0 when the quote's USD value is unknown.
     [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
