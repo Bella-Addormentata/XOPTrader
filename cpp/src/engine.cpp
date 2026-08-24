@@ -1055,8 +1055,14 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // unless the queried zero survives this collection,
                     // and without an opening the first deposit into an
                     // empty asset could never book as external capital.
+                    // Only when the RPC actually carried the field
+                    // (round 24): a missing confirmed_wallet_balance
+                    // defaults to 0 above, and recording that as a
+                    // genuine zero opening would permanently misdate
+                    // every historical bridge flow.
                     if (config_.accounting.bridge_ingest_enabled
                         && aid == config_.accounting.bridge_asset_id
+                        && bal_json.contains("confirmed_wallet_balance")
                         && confirmed >= 0) {
                         genesis_balances[AssetId{aid}] = confirmed;
                     }
@@ -12066,26 +12072,38 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
             const double flow_usd =
                 (static_cast<double>(consumed) / mojos_per_unit)
                 * usd_per_unit;
-            const double e_now = compute_portfolio_equity_usd();
-            if (e_now > 0.0 && e_now + flow_usd >= 0.0) {
-                const double rescaled = peak_equity_hwm_usd_
-                    * ((e_now + flow_usd) / e_now);
+            // POST-flow baseline (round 24): the reconcile above has
+            // already folded the flow, so e_now is post-flow equity and
+            // the TWR factor is e / (e - f) -- peak 100, pre-flow 80,
+            // +100 deposit: 180/80 rebuilds 225, preserving the 20%
+            // drawdown (the pre-flow form computed 155.6 and max() then
+            // erased the drawdown entirely).  The denominator guard also
+            // resolves the round-23 cancellation case for free: a
+            // deposit that never entered equity (e - f <= 0 with f > 0)
+            // needs NO adjustment, because equity never moved.
+            const double e_now  = compute_portfolio_equity_usd();
+            const double e_pre  = e_now - flow_usd;
+            if (e_now > 0.0 && e_pre > 0.0) {
+                const double rescaled =
+                    peak_equity_hwm_usd_ * (e_now / e_pre);
                 spdlog::info("[Engine] Bridge ingest: drawdown peak "
                              "rescaled {:.2f} -> {:.2f} for ${:+.6f} of "
-                             "booked flow (safe-direction policy)",
+                             "booked flow (post-flow TWR factor)",
                              peak_equity_hwm_usd_, rescaled, flow_usd);
                 peak_equity_hwm_usd_ = rescaled;
-            } else if (e_now <= 0.0 && flow_usd > 0.0) {
-                const double e_check = compute_portfolio_equity_usd();
-                spdlog::info("[Engine] Bridge ingest: peak re-anchored "
-                             "to {:.2f} (deposit into zero equity)",
-                             e_check);
-                peak_equity_hwm_usd_ = e_check;
+            } else if (flow_usd > 0.0) {
+                spdlog::info("[Engine] Bridge ingest: ${:+.6f} of "
+                             "deposit not reflected in equity -- no "
+                             "peak adjustment needed", flow_usd);
+            } else if (e_now <= 0.0) {
+                spdlog::info("[Engine] Bridge ingest: full withdrawal "
+                             "scaled the peak to zero (equity {:.2f})",
+                             e_now);
+                peak_equity_hwm_usd_ = 0.0;
             } else {
                 spdlog::info("[Engine] Bridge ingest: peak rescale "
-                             "skipped for ${:+.6f} (equity not yet "
-                             "valued this early in the run)",
-                             flow_usd);
+                             "skipped for ${:+.6f} (degenerate "
+                             "denominator)", flow_usd);
             }
         }
     }
