@@ -567,9 +567,16 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         if (item["peg_target"] && item["peg_target"].IsDefined()
             && !item["peg_target"].IsNull()) {
             double v = item["peg_target"].as<double>();
-            if (!(v > 0.0)) {
-                throw ConfigError(idx + ".peg_target must be > 0; got "
-                                  + std::to_string(v));
+            // [S20 2026-08-24] Finiteness matters here specifically: the
+            // peg is the FIRST-CYCLE anchor for a stablecoin pair, the one
+            // thing standing between a freshly restarted process and the
+            // junk-book poisoning this release exists to stop.  `!(v > 0)`
+            // catches NaN but passes +inf, which select_anchor then
+            // discards as unusable -- leaving the pair silently anchorless
+            // on exactly that path.  Fail startup instead.
+            if (!(v > 0.0) || !std::isfinite(v)) {
+                throw ConfigError(idx + ".peg_target must be a finite value "
+                                        "> 0; got " + std::to_string(v));
             }
             p.peg_target = v;
         }
@@ -1599,6 +1606,22 @@ RiskConfig parse_risk(const YAML::Node& root)
                               "[1, 1440]; got " + std::to_string(v));
         }
         cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
+    }
+
+    // [S20 2026-08-24] valuation_carry_ttl_blocks: heartbeats an asset's
+    // carried USD price keeps PEAK-UPDATE authority without a fresh
+    // valuation-grade print.  Expiry freezes the drawdown peak; it does
+    // NOT disarm either breaker (they stay armed against the frozen peak).
+    // 0 disables the expiry.
+    if (node["valuation_carry_ttl_blocks"]
+            && node["valuation_carry_ttl_blocks"].IsDefined()
+            && !node["valuation_carry_ttl_blocks"].IsNull()) {
+        int64_t v = node["valuation_carry_ttl_blocks"].as<int64_t>();
+        if (v < 0 || v > static_cast<int64_t>(std::numeric_limits<uint32_t>::max())) {
+            throw ConfigError(sec + ".valuation_carry_ttl_blocks must be >= 0; got "
+                              + std::to_string(v));
+        }
+        cfg.valuation_carry_ttl_blocks = static_cast<uint32_t>(v);
     }
 
     // drawdown_grace_blocks: blocks to skip drawdown check at startup [0, UINT32_MAX].
@@ -2787,6 +2810,15 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     read_bool("orderbook_mid_enabled",         cfg.orderbook_mid_enabled);
     read_u32 ("orderbook_mid_depth",           cfg.orderbook_mid_depth);
 
+    // [S20 2026-08-24] Published-mid plausibility gate.
+    read_bool("mid_gate_enabled",              cfg.mid_gate_enabled);
+    read_dbl ("mid_anchor_band_ratio",         cfg.mid_anchor_band_ratio);
+    read_dbl ("mid_gate_book_confirm_max_spread_bps",
+              cfg.mid_gate_book_confirm_max_spread_bps);
+    read_dbl ("mid_gate_max_step_frac",        cfg.mid_gate_max_step_frac);
+    read_dbl ("implied_cross_max_leg_spread_bps",
+              cfg.implied_cross_max_leg_spread_bps);
+
     // Validate ranges.
     if (cfg.whale_volume_fraction < 0.0 || cfg.whale_volume_fraction > 1.0) {
         throw ConfigError(sec + ".whale_volume_fraction must be in [0, 1]");
@@ -2802,6 +2834,37 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     }
     if (cfg.orderbook_mid_depth == 0) {
         throw ConfigError(sec + ".orderbook_mid_depth must be > 0");
+    }
+    // [S20] A band at or below 1.0 means "disabled", which is legal; a
+    // NEGATIVE band is a sign error.  The leg-spread cap must be positive
+    // or the implied cross can never form.
+    //
+    // Every bound below rejects non-finite values EXPLICITLY, because
+    // yaml-cpp accepts `.nan` and `.inf` and both slip through ordinary
+    // range comparisons -- silently defeating the very guards this section
+    // configures.  NaN fails every comparison, so `NaN > 1.0` is false and
+    // the anchor test would be skipped; `.inf` on a cap admits everything
+    // it was meant to exclude.  Same treatment as
+    // strategy.xch_cycle_commit_frac.
+    if (!std::isfinite(cfg.mid_anchor_band_ratio)
+        || cfg.mid_anchor_band_ratio < 0.0) {
+        throw ConfigError(sec + ".mid_anchor_band_ratio must be a finite "
+                                "value >= 0");
+    }
+    if (!std::isfinite(cfg.mid_gate_book_confirm_max_spread_bps)
+        || cfg.mid_gate_book_confirm_max_spread_bps < 0.0) {
+        throw ConfigError(sec + ".mid_gate_book_confirm_max_spread_bps must "
+                                "be a finite value >= 0");
+    }
+    if (!std::isfinite(cfg.mid_gate_max_step_frac)
+        || cfg.mid_gate_max_step_frac < 0.0) {
+        throw ConfigError(sec + ".mid_gate_max_step_frac must be a finite "
+                                "value >= 0");
+    }
+    if (!std::isfinite(cfg.implied_cross_max_leg_spread_bps)
+        || cfg.implied_cross_max_leg_spread_bps <= 0.0) {
+        throw ConfigError(sec + ".implied_cross_max_leg_spread_bps must be "
+                                "a finite value > 0");
     }
 
     return cfg;

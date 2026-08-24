@@ -1262,6 +1262,23 @@ struct RiskConfig {
     double   max_window_loss_bps{500.0};    ///< Max window P&L loss (bps of equity; 0=disabled).
     uint32_t breaker_realert_minutes{30};   ///< Min minutes between repeat breaker alerts while paused.
 
+    /// [S20 2026-08-24] Heartbeats an asset's last-known USD price may be
+    /// carried without a fresh valuation-grade print before the equity
+    /// figure is declared DEGRADED.
+    ///
+    /// Degradation freezes the drawdown PEAK only.  Both breakers stay
+    /// ARMED and keep comparing against that frozen peak -- disarming them
+    /// would make a risk control fail open for a condition that can
+    /// persist for hours, while the engine goes on quoting.  The carry
+    /// VALUE also keeps being used either way, because a data gap must not
+    /// read as a crash; what expires is only its authority to ratchet the
+    /// high-water mark.
+    ///
+    /// Duration: the counter advances once per heartbeat, and the observed
+    /// cadence is ~17-21 s (NOT the nominal 52 s block time), so 720 is
+    /// roughly 3.5-4.2 hours.  0 disables the expiry.
+    uint32_t valuation_carry_ttl_blocks{720};
+
     // -- Flash crash detection (T7-07, T7-08) --------------------------------
     double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
     /// Blocks of history the crash detector scans (one entry per block).
@@ -1889,6 +1906,51 @@ struct MarketDataSettings {
     /// Number of order book levels per side to include in the VWAP
     /// micro-price computation.  Default: 5.
     uint32_t orderbook_mid_depth{5};
+
+    // -- [S20 2026-08-24] Published-mid plausibility gate --------------------
+    // One junk print on BYC/wUSDC.b (187.461980 vs a ~1.0 peg) valued the
+    // whole BYC position at $187/unit, seeded a $15,180 phantom drawdown
+    // peak on a fresh process within 40 minutes, and latched the breaker.
+    // The gate compares every candidate mid against an independent anchor
+    // (CEX > triangulated implied cross > AMM > fair value > peg) and
+    // refuses to publish on a breach; the pair goes no-mid, which every
+    // consumer already treats as "do not quote, do not value".
+
+    /// Master switch for the anchor gate and the anchored offer filter.
+    bool mid_gate_enabled{true};
+
+    /// Multiplicative anchor band: candidate/anchor confined to
+    /// [1/ratio, ratio].  Wide by design -- refuse 187x absurdity, pass
+    /// real repricing.  <= 1.0 disables the anchor test.
+    double mid_anchor_band_ratio{3.0};
+
+    /// Book-confirmation escape: a fresh two-sided dust-filtered book with
+    /// spread in (0, this] bps overrides a band breach ("the whole market
+    /// repriced" evidence that a lone absurd offer cannot produce).
+    double mid_gate_book_confirm_max_spread_bps{5000.0};
+
+    /// Anchorless fallback: max fractional mid move vs the last accepted
+    /// mid in one heartbeat (~52 s).  <= 0 disables.
+    double mid_gate_max_step_frac{0.5};
+
+    /// Max spread (bps) for a sibling pair's book to serve as a leg of the
+    /// triangulated implied cross.
+    ///
+    /// This is NOT the S17 300 bps test, and copying that number here was
+    /// a mistake in the first cut: it sits below the measured spread of
+    /// most books this bot trades (XCH/BYC alone was 328 bps during the
+    /// 2026-08-24 episode, wmilliETH.b/XCH 558), so the triangulated
+    /// anchor could essentially never form.  The two tests answer
+    /// different questions.  S17 asks whether a book's midpoint is precise
+    /// enough to VALUE inventory, where a 300 bps spread is already a
+    /// ~150 bps location error on the number itself.  This asks whether
+    /// two legs are jointly good enough to bound a PLAUSIBILITY check
+    /// whose band is 3x (20 000 bps) wide.  Implied-cross error is about
+    /// half-spread(leg1) + half-spread(leg2), so a 1500 bps cap yields at
+    /// most ~1500 bps (15%) of anchor error against a 200% band -- an
+    /// order of magnitude of margin, while still excluding books so wide
+    /// that their midpoint means nothing.
+    double implied_cross_max_leg_spread_bps{1500.0};
 };
 
 // ---------------------------------------------------------------------------

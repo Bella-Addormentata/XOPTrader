@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -464,6 +465,39 @@ private:
     /// Returns 0.0 when unknown (pair excluded from USD accounting).
     [[nodiscard]] double quote_usd_factor(const PairConfig& pc) const;
 
+    /// [S20 2026-08-24] True when quote_usd_factor() answers this pair
+    /// from a par constant (fiat-collateralised wrapper, or BYC falling
+    /// back to $1) rather than from a live mid.  Callers that must not
+    /// value inventory on an ungraded market observation use this to tell
+    /// the two cases apart -- a par constant needs no provenance.
+    [[nodiscard]] bool quote_usd_factor_is_par(const PairConfig& pc) const;
+
+    /// [S20] Name of the pair whose published snapshot quote_usd_factor()
+    /// reads to answer `pc` -- usually `pc` itself, but a BYC quote is
+    /// answered from the separate BYC/<stable> cross.  Empty when the
+    /// factor is a par constant or no source pair is enabled.  Callers
+    /// checking valuation grade must test THIS snapshot, not `pc`'s.
+    [[nodiscard]] std::string quote_usd_factor_source_pair(
+        const PairConfig& pc) const;
+
+    /// [S20] The BYC/<stable> cross quote_usd_factor() would actually
+    /// select for `pc` (positive mid, spread inside the S17 300 bps trust
+    /// window), or empty when it would fall back to $1 par.  Single source
+    /// of truth for both quote_usd_factor_is_par and
+    /// quote_usd_factor_source_pair, so they cannot disagree about which
+    /// snapshot supplies the factor.
+    [[nodiscard]] std::string byc_cross_source_pair(
+        const PairConfig& pc) const;
+
+    /// [S20] Whether quote_usd_factor(pc) may convert a valuation without
+    /// a source-snapshot grade check: true for a par constant, true for an
+    /// XCH-quoted pair (whose factor is the deliberately ungated
+    /// usd_per_xch -- gating it would zero every USD figure on a CoinGecko
+    /// blip), otherwise it requires the supplying snapshot to be grade.
+    /// Single classifier for all three consumers: both branches of
+    /// asset_usd_pseudo_price and the P&L conversion refresh.
+    [[nodiscard]] bool quote_usd_factor_trusted(const PairConfig& pc) const;
+
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
     /// Returns 0 when the quote's USD value is unknown.
     [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
@@ -477,7 +511,14 @@ private:
     /// USD-normalized pseudo-price for one display unit of an asset,
     /// resolved from any enabled pair that trades it (base: mid * factor;
     /// quote: factor * kMojosPerXch).  0 when no market data yet.
+    /// [S20] The base-of-pair branch only accepts valuation-grade mids.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// [S20 2026-08-24] Median implied price of `pc` triangulated through
+    /// every healthy pair of enabled sibling books (see the definition for
+    /// leg-health rules).  0 when no healthy triangle exists.  Feeds
+    /// MarketDataFeed::ingest_reference_anchor each heartbeat.
+    [[nodiscard]] double compute_implied_cross_anchor(const PairConfig& pc) const;
 
     /// [DRAWDOWN-EQUITY 2026-08-04] Total portfolio equity in USD: the sum
     /// over all tracked inventory records of holdings x USD price, using
@@ -488,7 +529,10 @@ private:
     /// data gap cannot masquerade as a crash.  Non-const: refreshes that
     /// cache.  This is the denominator of the max-drawdown breaker and the
     /// anchor of the rolling-window loss threshold.
-    [[nodiscard]] double compute_portfolio_equity_usd();
+    /// [S20] Pass the heartbeat's block height to arm the carry-TTL
+    /// degradation verdict (valuation_degraded_); 0 skips it, for callers
+    /// outside the heartbeat that only want the number.
+    [[nodiscard]] double compute_portfolio_equity_usd(BlockHeight current_block = 0);
 
     /// Snapshot all InventoryTracker records into the inventory_state table
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
@@ -978,6 +1022,39 @@ private:
     // entire value from equity and read as an instantaneous crash --
     // firing the breaker on a DATA GAP rather than a market move.
     std::unordered_map<AssetId, double> last_asset_usd_price_;
+
+    // [S20 2026-08-24] Block at which each asset last had a LIVE
+    // valuation-grade price (as opposed to a carried one).  When a held
+    // asset's carry outlives risk.valuation_carry_ttl_blocks, the equity
+    // figure is declared degraded for the cycle: the value itself keeps
+    // being used (a data gap must not read as a crash) but it loses the
+    // authority to move the drawdown PEAK.  Breakers stay armed against
+    // the frozen peak -- disarming them would fail open.
+    std::unordered_map<AssetId, BlockHeight> last_asset_live_block_;
+
+    /// [S20 2026-08-24] Last quote_usd_factor per pair whose SOURCE
+    /// snapshot was valuation grade (or a par constant).  The stored P&L
+    /// conversion is refreshed only from these: an ungraded cross must not
+    /// convert a graded mid into USD unrealized P&L and feed the
+    /// rolling-window breaker.  Carried rather than zeroed, because
+    /// PnLTracker reads a non-positive factor as "basis unknown" and
+    /// zeroes the mark.
+    std::unordered_map<std::string, double> last_trusted_quote_usd_factor_;
+
+    /// [S20] Set by compute_portfolio_equity_usd when any held asset's
+    /// carry has outlived its TTL this cycle.  Consumed by Step 13, where
+    /// it removes PEAK-UPDATE authority ONLY: a suspect number must not
+    /// ratchet the high-water mark, but both breakers stay armed and keep
+    /// comparing against the frozen peak.  Disarming them would make a
+    /// risk control fail open for a condition that can persist hours.
+    bool valuation_degraded_{false};
+
+    /// [S20] Peak-update authority: the clean-streak debounce and the
+    /// transition signals that drive the warn-once logging.  Pure logic in
+    /// risk/valuation_authority.hpp so the semantics are test-pinned
+    /// (cpp/tests/test_valuation_authority.cpp) rather than living only
+    /// inside Step 13.
+    risk::ValuationAuthorityGate valuation_authority_;
 
     // [DRAWDOWN-EQUITY 2026-08-04] Re-alert suppression for the breakers:
     // while the engine stays Paused on a persisting condition, the

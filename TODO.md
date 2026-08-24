@@ -27,6 +27,13 @@
 - **Status:** `[ ]` — Audit 2026-08-18: no `test_backtest_integration.cpp`; CI itself was red until PR #70, so no test tier had run in CI at all.
 
 ### T4-07: Add engine startup/shutdown and fill processing tests
+- **[S20 2026-08-24] Now also blocks an ordering regression test.** PR #112
+  round 4 found anchors being injected AFTER the Step 1 ingest loop, so a
+  first-cycle pair had no anchor while its offers were filtered -- the
+  restart-poisoning path the PR exists to close. Feed-level tests cannot
+  catch a reordering inside the heartbeat; a runtime warn-once in
+  ingest_competing_offers covers it for now, but a real regression test
+  needs the harness this item tracks.
 - **Files:** `cpp/tests/` (new), `cpp/src/engine.cpp`
 - **Issue:** Engine lifecycle (`Running` → `ShuttingDown` → `Stopped`), shutdown idempotency, and `detect_fills()`/`record_buy`/`record_sell` remain untested; no mock `ChiaFullNodeRPC`/`ChiaWalletRPC`/`DexieClient`/`CoinGeckoClient` and no DI seams exist anywhere in `cpp/tests/`.
 - **Status:** `[ ]` — Audit 2026-08-18: gap confirmed (zero `mock` hits in cpp/tests/); made more acute by the phantom-offer-removal bug that lived in exactly this path (fixed cae2bfd, still uncovered by tests).
@@ -287,23 +294,82 @@ adjust before the COMPLETED booking converges through the three-entry
 catch-up -- the same persisted wallet-effect event closes both windows.
 
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
-- **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13
-  rolling-window breaker), valuation price sources
-- **Status:** `[ ]` -- Observed live 2026-08-23 14:45:34, the THIRD breaker
-  event of the day from one root cause. The freshly installed v0.9.19
-  process anchored its equity peak at $253.67 during startup warm-up (BYC
-  valued high before the dexie feed delivered the book), then the stale
-  0.75 BYC/wUSDC.b print re-asserted and ~104 BYC marked down ~$21;
-  equity "fell" to ~$232.6, the rolling window read -$18.42/36 blocks
-  against its 250 bps ($5.81) limit, and the engine PAUSED (latched).
-  trade_log shows ZERO fills all afternoon -- the entire loss was
-  mark-to-market flapping on a single stale order in an emptied dexie
-  book (TibetSwap AMM simultaneously ~0.92; the Step 7 uncertainty
-  centre blended 0.75 -> 0.877 with w_ext=0.99 at the same moment).
-  Directions to evaluate: (a) value stablecoin-pair inventory for EQUITY
-  at the blended/uncertainty centre or a second source instead of the
-  raw book mid; (b) a startup valuation-grace window before the rolling
-  window arms (the drawdown breaker already has one); (c) the S17
-  second-source depeg confirmation, which is the same lesson. Related:
-  the morning's depeg bail-out (S17) and drawdown-latch alerts (S18)
-  came from the same stale print.
+- **Files:** `cpp/include/xop/execution/mid_gate.hpp` (new pure header),
+  `cpp/src/execution/market_data.cpp` (gate wiring, anchored offer filter,
+  ob_updated_at), `cpp/src/engine.cpp` (implied-cross anchor injection,
+  valuation-grade gates, carry TTL, Step 13 authority gating),
+  `cpp/tests/test_mid_gate.cpp`
+- **Status:** `[x]` -- Built 2026-08-24 (branch feat/s20-valuation-guards)
+  after the definitive exhibit: the junk 187.461980 BYC/wUSDC.b print
+  (byte-identical 12+ h) re-poisoned a FRESHLY RESTARTED v0.9.20 in ~40
+  minutes (peak seeded $15,180.38, honest equity $258.94 read as a 98.29%
+  drawdown, breaker latched 09:25).  Root causes found by the review of
+  the feed: (1) the per-offer outlier filter anchored on the pair's OWN
+  previous mid -- self-referential lock-in that rejected honest ~1.0
+  offers as outliers while junk passed, and was skipped entirely on the
+  first cycle (the fresh-restart re-poisoning path); (2) ps.orderbook_mid
+  had no age of its own, so a throwing offers fetch froze it while
+  dex_updated_at kept re-stamping; (3) no plausibility bound existed on
+  the published mid at all.  Fix (design B "guard at the source" +
+  grafts, judged 2-0 by independent panels): every candidate mid is
+  gated against an independent anchor -- CEX > triangulated implied
+  cross through healthy sibling books (generalised for EVERY triangle,
+  per operator direction) > AMM > fair value > peg -- with a wide 3x
+  band and a book-confirmation escape so real repricing passes; a breach
+  publishes NO mid.  MarketSnapshot gained mid_valuation_grade (equity
+  valuation and P&L marks consume only grade prices; a last-trade-only
+  0.75-class print publishes but cannot mark).  The depeg detector is
+  deliberately NOT grade-gated -- liquidity leaves before a peg breaks,
+  so gating would mute it in the mode it exists for -- and the
+  carry cache gained a TTL (risk.valuation_carry_ttl_blocks, degraded
+  equity freezes the PEAK ONLY -- both breakers stay armed against the
+  frozen peak, S18-style 10-clean-cycle re-arm for peak updates), and the
+  raw-BBO 10x guard now falls back to the anchor
+  chain on CEX-less pairs.  692/692 tests incl. 12 incident-replay pins.
+  SCOPE CORRECTED after review (45-agent panel + Copilot rounds 1-2
+  found 25 confirmed issues, 5 critical): the first cut over-reached and
+  several gates created NEW failure modes, now reverted --
+  (a) the PnL get_price grade gate ZEROED unrealized P&L rather than
+  carrying it (pnl.cpp assigns inventory_pnl = 0 on price<=0), injecting
+  a false step into the very rolling-window series it claimed to protect;
+  (b) grade-gating usd_per_xch/quote_usd_factor collapsed ALL USD figures
+  to zero whenever CoinGecko blipped, because XCH/wUSDC.b's filtered book
+  is one-sided most cycles so grade reduced to "is CoinGecko up?";
+  (c) grade-gating the depeg detector muted it during a liquidity-crisis
+  depeg -- the mode it exists for -- and silently rescaled
+  depeg_sustained_blocks from blocks to invocations;
+  (d) disarming BOTH breakers on degraded valuation was fail-OPEN (engine
+  kept quoting with no drawdown protection); degradation now freezes the
+  PEAK only, and the comparison still runs.
+  Grade is now scoped to asset_usd_pseudo_price (the actual incident
+  hole) + peak authority.  ADDED from the panel: bbo_from_filtered_book
+  provenance flag (set by the filtered ingest, CLEARED by the raw ticker)
+  -- without it the bot could read its OWN resting offers back as
+  third-party confirmation of a band breach after a failed offers fetch;
+  dex_print_age wired to a consumer at last (frozen book cannot confirm);
+  per-offer absurdity band widened to 10x and SEPARATED from the 3x gate
+  band, because filtering at the gate's own band made the
+  book-confirmation escape unreachable for the real move it exists for;
+  anchorless pairs keep the legacy near-reference filter (dropping it was
+  a strict weakening); implied_cross_max_leg_spread_bps 300 -> 1500 (300
+  was below the measured spread of most books, so the triangulated anchor
+  could never form); non-finite config/gate guards; unsigned underflow on
+  block regression.  699/699 tests incl. 3 ingestion-path tests that
+  drive the real feed (the pure-gate tests could not catch a
+  gate-vs-ingestion contradiction).
+  Residual (documented, accepted): the wash-book exposure extends to the
+  OFFER-ABSURDITY bound, not the 3x gate band.  Offers are screened at
+  max(10x, 2*band) -- deliberately wider than the gate, or a real collapse
+  could never assemble the two-sided book its confirmation escape needs
+  (RealCollapseSurvivesTheOfferFilterAndPublishes exercises exactly that
+  at 0.2x).  So a coordinated fresh two-sided book anywhere in roughly
+  0.1x-10x of the anchor can override the band and mark equity, at real
+  capital cost to whoever posts it.  Tightening the confirmation policy
+  would trade this away for the inability to price a genuine collapse --
+  the opposite failure, and the one that actually happened;
+  pre-S20 junk persisted to DB (cost basis, AS warm-start snapshots) is
+  NOT repaired by this change -- separate sanitation task if it bites;
+  valuation_carry_ttl_blocks is calibrated at 52 s/block while the
+  deployment runs ~17-21 s/block, so the real TTL is ~3.5-4 h not 10.4 h;
+  the carry TTL cannot fire for BYC itself because quote_usd_factor's par
+  fallback always reports a live price.
