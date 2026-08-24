@@ -818,6 +818,12 @@ public:
     /// two-sided third-party book or fresh CEX leg).  False for unknown
     /// pairs, no-mid pairs, and last-trade-only or stale-book mids.  See
     /// MarketSnapshot::mid_valuation_grade.
+    ///
+    /// Acquires mtx_pairs_ (shared), so like get_mid_price it must NOT be
+    /// called from an ArbitrageCallback: check_arbitrage invokes that
+    /// callback while refresh() still holds mtx_pairs_ exclusively, and a
+    /// shared re-acquisition on the same thread self-deadlocks.  Read the
+    /// State snapshot's mid_valuation_grade field from a callback instead.
     bool mid_valuation_grade(const std::string& pair_name) const;
 
     /// Self-filtered dexie top-of-book as {best_bid, best_ask}.

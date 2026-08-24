@@ -339,6 +339,16 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
     const auto now = std::chrono::system_clock::now();
     const BlockHeight current_block = block_height_.load(std::memory_order_acquire);
 
+    // [S20 2026-08-24] ONE config snapshot for the whole sweep, taken here
+    // rather than per pair inside the loop: the struct copy is not free,
+    // and every pair in a heartbeat should be judged against the same
+    // configuration.  (The other snapshot sites in this file predate S20
+    // and are left alone; see the lock-order note in the header.)
+    const auto sweep_cfg = [&] {
+        std::shared_lock lk(mtx_config_);
+        return config_;
+    }();
+
     for (const auto& pair_name : enabled_pairs) {
         PairState& ps = get_or_create_pair(pair_name);
 
@@ -354,13 +364,7 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         // rejected mid reaches none of them -- a refused publish is how
         // 187.461980 stays out of equity, the flash-crash window, and the
         // triangular-arb scan all at once.
-        {
-            const auto cfg = [&] {
-                std::shared_lock lk(mtx_config_);
-                return config_;
-            }();
-            apply_mid_gate(ps, cfg);
-        }
+        apply_mid_gate(ps, sweep_cfg);
 
         // Step 5: Compute spread.
         ps.spread_bps = compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
