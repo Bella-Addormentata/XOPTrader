@@ -305,19 +305,24 @@ TEST(MidGateTest, NonFiniteAnchorDoesNotDisableTheGate)
 
 TEST(ImpliedCrossTest, EvenCandidateCountAveragesTheMiddlePair)
 {
-    // Mirrors Engine::compute_implied_cross_anchor's selection: with an
-    // even count the upper-middle observation would let one high outlier
-    // become the entire anchor.  n == 2 is the common case (two triangles
-    // through different common assets), so this is not a corner.
-    auto median = [](std::vector<double> v) {
-        std::sort(v.begin(), v.end());
-        const std::size_t n = v.size();
-        return (n % 2 == 0) ? (v[n / 2 - 1] + v[n / 2]) / 2.0 : v[n / 2];
-    };
+    // Calls the SAME median_of that Engine::compute_implied_cross_anchor
+    // uses -- an earlier version of this test reimplemented the formula in
+    // a lambda and so would have stayed green through a production
+    // regression.  With an even count the upper-middle observation would
+    // let one high outlier become the entire anchor, and n == 2 (two
+    // triangles through different common assets) is the common case here,
+    // not a corner.
+    std::vector<double> two{1.40, 1.00};
+    EXPECT_NEAR(median_of(two), 1.20, 1e-12);
 
-    EXPECT_NEAR(median({1.00, 1.40}), 1.20, 1e-12);
-    EXPECT_NEAR(median({1.01}), 1.01, 1e-12);
-    EXPECT_NEAR(median({0.98, 1.00, 1.40}), 1.00, 1e-12);
+    std::vector<double> one{1.01};
+    EXPECT_NEAR(median_of(one), 1.01, 1e-12);
+
+    std::vector<double> three{1.40, 0.98, 1.00};
+    EXPECT_NEAR(median_of(three), 1.00, 1e-12);
+
+    std::vector<double> none;
+    EXPECT_DOUBLE_EQ(median_of(none), 0.0);
 }
 
 // ===========================================================================
@@ -449,14 +454,42 @@ TEST(AnchorChainTest, NonFiniteCandidateSkippedNotSelected) {
 // configurable band, or the book-confirmation escape becomes unreachable
 // again at some setting (a fixed 10x bound breaks at band >= 10).
 TEST(MidGateIngestTest, OfferBoundAlwaysExceedsTheGateBand) {
-    // Mirrors market_data.cpp's offer_absurdity_ratio.
-    auto bound = [](double band) {
-        return std::max(10.0, band * 2.0);
-    };
+    // Calls the production helper, not a copy of it, so this catches the
+    // bound being changed or disconnected from configuration.
     for (double band : {1.5, 3.0, 5.0, 9.9, 10.0, 25.0, 100.0}) {
-        EXPECT_GT(bound(band), band)
+        EXPECT_GT(offer_absurdity_ratio(band), band)
             << "offer filter would strip the confirming book at band " << band;
     }
+}
+
+// End-to-end version of the same invariant: at a RAISED band, an honest
+// offer sitting between the gate band and the derived offer bound must
+// survive the filter and still form a book.  A fixed 10x bound passed the
+// arithmetic test above but failed this one for band >= 10.
+TEST(MidGateIngestTest, OffersBetweenBandAndBoundSurviveTheFilter) {
+    auto cfg = gate_cfg();
+    cfg.mid_anchor_band_ratio = 12.0;   // deliberately above the old 10x floor
+    State state;
+    MarketDataFeed feed(cfg, state);
+    const std::string pair = "BYC/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, 0.0, /*peg_target=*/1.0);
+
+    // 15x the peg: outside the 12x gate band, inside the derived 24x offer
+    // bound.  These must reach the book so the confirmation escape can see
+    // them; with a fixed 10x bound they were stripped here.
+    std::vector<CompetingOffer> offers{
+        mk_offer("b1", Side::Bid, 14.9, 5'000'000),
+        mk_offer("a1", Side::Ask, 15.1, 5'000'000),
+    };
+    feed.ingest_competing_offers(pair, offers, {}, 1'000, 1'000);
+
+    const auto bbo = feed.get_dex_bbo(pair);
+    EXPECT_GT(bbo.first, 0.0)
+        << "bid between the gate band and the offer bound was filtered out";
+    EXPECT_GT(bbo.second, 0.0)
+        << "ask between the gate band and the offer bound was filtered out";
 }
 
 // -infinity satisfies `<= 0.0`, so a no-mid test placed ahead of the

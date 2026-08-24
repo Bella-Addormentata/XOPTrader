@@ -11241,16 +11241,9 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
         }
     }
 
-    if (candidates.empty()) return 0.0;
-    std::sort(candidates.begin(), candidates.end());
-    const std::size_t n = candidates.size();
-    // True median: with an even count, taking the upper-middle observation
-    // would let a single high outlier BE the anchor (n == 2 is the common
-    // case here) and bias the whole chain upward.
-    if (n % 2 == 0) {
-        return (candidates[n / 2 - 1] + candidates[n / 2]) / 2.0;
-    }
-    return candidates[n / 2];
+    // midgate::median_of is shared with the tests so the even-count rule is
+    // pinned against the real implementation, not a copy of it.
+    return midgate::median_of(candidates);
 }
 
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
@@ -11266,6 +11259,20 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != asset_id) continue;
         auto snap = state_->get_market(pair.name);
+        // This valuation is a PRODUCT of two market observations, so both
+        // need provenance.  Grading only snap leaves the factor
+        // unchecked: for an XCH/BYC snapshot the factor comes from the
+        // separate BYC/<stable> cross, which can be tight-but-ungraded
+        // (raw ticker, or frozen) while XCH/BYC itself grades fine -- and
+        // the composite would then mark equity and refresh the carry TTL
+        // on an untrusted cross.  Par factors need no such check.
+        if (!quote_usd_factor_is_par(pair)) {
+            const std::string src = quote_usd_factor_source_pair(pair);
+            if (!src.empty() && src != pair.name
+                && !state_->get_market(src).mid_valuation_grade) {
+                continue;
+            }
+        }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
             return static_cast<Mojo>(std::llround(

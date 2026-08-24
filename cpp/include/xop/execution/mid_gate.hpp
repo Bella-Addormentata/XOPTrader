@@ -43,6 +43,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstddef>
+#include <vector>
 
 namespace xop::midgate {
 
@@ -196,6 +198,44 @@ struct GateInputs {
         }
     }
     return GateVerdict::Accept;
+}
+
+// True median of a candidate set, SORTING IN PLACE.  Lives here rather
+// than inline at the call site so production and tests exercise the same
+// code: an even count must average the two middle observations, or a
+// single high outlier becomes the whole anchor (n == 2 is the common case
+// when two triangles exist).  Returns 0 for an empty set.
+[[nodiscard]] inline double median_of(std::vector<double>& v)
+{
+    if (v.empty()) return 0.0;
+    std::sort(v.begin(), v.end());
+    const std::size_t n = v.size();
+    if (n % 2 == 0) {
+        return (v[n / 2 - 1] + v[n / 2]) / 2.0;
+    }
+    return v[n / 2];
+}
+
+// Absurdity bound for individual competing offers, DERIVED from the gate's
+// anchor band so the two can never be configured into conflict.
+//
+// The per-offer filter and the published-mid gate do different jobs: the
+// filter removes offers no honest market could produce, while the gate
+// adjudicates whether the resulting mid is plausible.  Filtering at the
+// gate's own band would make the gate's book-confirmation escape
+// unreachable -- a genuine beyond-band repricing would lose every honest
+// offer near the new market before the book was assembled, so a real
+// collapse could never publish.  A hard 10x floor covers the default 3x
+// band; beyond that the bound tracks the band at 2x, so the invariant
+// "offer bound strictly wider than gate band" holds for every setting the
+// parser accepts (a fixed 10x silently broke it at band >= 10).
+inline constexpr double kOfferAbsurdityFloor    = 10.0;
+inline constexpr double kOfferAbsurdityBandMult = 2.0;
+
+[[nodiscard]] inline double offer_absurdity_ratio(double anchor_band_ratio) noexcept
+{
+    return std::max(kOfferAbsurdityFloor,
+                    anchor_band_ratio * kOfferAbsurdityBandMult);
 }
 
 [[nodiscard]] inline const char* anchor_source_name(AnchorSource s) noexcept

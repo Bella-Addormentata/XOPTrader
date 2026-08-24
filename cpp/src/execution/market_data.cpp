@@ -104,30 +104,11 @@ bool last_trade_is_fresh(const PairState& ps,
 // (e.g. $22.38 bid when market is $2.24 = ~8900 bps off).
 constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
 
-// [S20 2026-08-24] Absurdity bound for individual competing offers when the
-// anchor gate is on, expressed as a ratio like the raw-BBO guard's 10x.
-//
-// This MUST stay wider than mid_anchor_band_ratio.  The per-offer filter
-// and the published-mid gate do different jobs: the filter removes offers
-// no honest market could produce, while the gate adjudicates whether the
-// resulting mid is plausible.  Filtering at the gate's own band would make
-// the gate's book-confirmation escape unreachable -- during a genuine
-// beyond-band repricing every honest offer near the new market would be
-// stripped here, leaving no two-sided book to confirm the move, so a real
-// collapse could never publish.
-//
-// It is DERIVED from the configured band rather than fixed, so the
-// relationship cannot be broken by configuration: a hard 10x floor for the
-// default 3x band, widening to twice the band if an operator raises it.
-// (A fixed 10x would silently recreate the unreachable-escape bug for any
-// mid_anchor_band_ratio >= 10.)
-constexpr double kOfferAbsurdityFloor    = 10.0;
-constexpr double kOfferAbsurdityBandMult = 2.0;
-
-double offer_absurdity_ratio(double anchor_band_ratio) noexcept {
-    return std::max(kOfferAbsurdityFloor,
-                    anchor_band_ratio * kOfferAbsurdityBandMult);
-}
+// [S20 2026-08-24] The per-offer absurdity bound lives in mid_gate.hpp as
+// midgate::offer_absurdity_ratio(), shared with the tests so the invariant
+// "offer bound strictly wider than the gate band" is pinned against the
+// real function rather than a copy of it.  See the header for why the two
+// thresholds must differ.
 
 // [S20] Maximum dex_print_age (heartbeats since the filtered book mid last
 // moved by more than 1 bp) for a book to count as CONFIRMING evidence.  A
@@ -1885,8 +1866,8 @@ void MarketDataFeed::ingest_competing_offers(
                                        / static_cast<double>(kMojosPerXch);
             bool outlier;
             if (ref_is_anchor && cfg.mid_gate_enabled) {
-                const double bound =
-                    offer_absurdity_ratio(cfg.mid_anchor_band_ratio);
+                const double bound = midgate::offer_absurdity_ratio(
+                    cfg.mid_anchor_band_ratio);
                 const double ratio = offer_price / offer_ref;
                 outlier = ratio > bound || ratio < 1.0 / bound;
             } else {

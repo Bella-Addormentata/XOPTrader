@@ -313,8 +313,9 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   P&L marks, and the depeg counter only consume grade prices; a
   last-trade-only 0.75-class print publishes but cannot mark), the
   carry cache gained a TTL (risk.valuation_carry_ttl_blocks, degraded
-  equity freezes the peak and suspends breaker trips, S18-style 10-clean-
-  cycle re-arm), and the raw-BBO 10x guard now falls back to the anchor
+  equity freezes the PEAK ONLY -- both breakers stay armed against the
+  frozen peak, S18-style 10-clean-cycle re-arm for peak updates), and the
+  raw-BBO 10x guard now falls back to the anchor
   chain on CEX-less pairs.  692/692 tests incl. 12 incident-replay pins.
   SCOPE CORRECTED after review (45-agent panel + Copilot rounds 1-2
   found 25 confirmed issues, 5 critical): the first cut over-reached and
