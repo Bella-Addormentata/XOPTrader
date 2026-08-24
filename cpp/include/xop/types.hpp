@@ -303,13 +303,19 @@ struct MarketSnapshot {
     BlockHeight  last_block;   // block height at which this snapshot was taken
     Timestamp    updated_at;   // wall-clock time
 
-    // [S20 2026-08-24] Valuation trust.  True only when the published mid is
-    // backed by live evidence: it passed the plausibility gate AND rests on
-    // a fresh two-sided third-party book or a fresh CEX leg.  A last-trade
-    // print or a stale/one-sided book publishes (quoting logic may still
-    // want it) but is NOT valuation grade: equity falls back to its
-    // last-known-price carry and P&L marks skip the cycle, so a lone stale
-    // print can never move the drawdown peak or the rolling-window flow.
+    // [S20 2026-08-24] Valuation trust.  True only when the published mid
+    // is backed by live evidence: it passed the plausibility gate AND rests
+    // on a fresh, moving, dust-filtered two-sided book or a fresh CEX leg.
+    // A last-trade print or a stale/one-sided book still PUBLISHES (quoting
+    // logic may want it) but is not valuation grade.
+    //
+    // Consumers, precisely: asset_usd_pseudo_price requires grade when it
+    // prices an asset from a live mid, so an ungraded pair falls back to the
+    // equity carry; the P&L mark-to-market callback withholds an ungraded
+    // mid, and PnLTracker then CARRIES the previous mark rather than zeroing
+    // it.  Not every USD path is gated -- usd_per_xch and the par quote
+    // conversions deliberately are not, since requiring grade there would
+    // zero every USD figure whenever a filtered book went one-sided.
     // Defaults TRUE so hand-built snapshots (tests, tools) keep their
     // pre-S20 behaviour; MarketDataFeed::publish_snapshot always sets it.
     bool         mid_valuation_grade{true};

@@ -10980,6 +10980,46 @@ double Engine::usd_per_xch() const
     return 0.0;
 }
 
+// [S20 2026-08-24] Whether quote_usd_factor() answers this pair from a
+// constant rather than from market data.  A fiat-collateralised wrapper is
+// valued at $1 par, and BYC falls back to par whenever its cross is not
+// tight enough to trust -- neither carries the provenance risk that makes
+// valuation grade necessary.  Everything else is derived from a live mid.
+bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
+{
+    const auto slash = pc.name.find('/');
+    const std::string quote = (slash == std::string::npos)
+        ? std::string{}
+        : pc.name.substr(slash + 1);
+
+    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+        return true;
+    }
+    if (quote == "BYC") {
+        // Par unless the tight-cross branch actually supplies a mid; ask
+        // the same question that branch asks, without duplicating it.
+        constexpr double kMaxCrossSpreadBps = 300.0;
+        for (const auto& other : config_.pairs) {
+            if (!other.enabled) continue;
+            if (other.base_asset_id != pc.quote_asset_id) continue;
+            const auto oslash = other.name.find('/');
+            if (oslash == std::string::npos) continue;
+            const std::string oquote = other.name.substr(oslash + 1);
+            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
+                continue;
+            }
+            auto snap = state_->get_market(other.name);
+            if (snap.mid_price > 0
+                && snap.spread_bps > 0.0
+                && snap.spread_bps <= kMaxCrossSpreadBps) {
+                return false;   // live cross wins; it is market-derived
+            }
+        }
+        return true;
+    }
+    return false;
+}
+
 double Engine::quote_usd_factor(const PairConfig& pc) const
 {
     const auto slash = pc.name.find('/');
@@ -11191,8 +11231,20 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
     }
     // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
+    //
+    // [S20] The factor is only sometimes a market observation.  For a
+    // fiat-collateralised wrapper it is the $1 par constant, which carries
+    // no market risk and needs no provenance; for a non-pegged quote (DBX)
+    // it is DERIVED from this pair's own published mid, and accepting that
+    // ungraded would let a last-trade-only print mark equity and keep
+    // refreshing last_asset_live_block_ so the carry TTL never notices.
+    // Require grade exactly in the derived case.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.quote_asset_id != asset_id) continue;
+        if (!quote_usd_factor_is_par(pair)
+            && !state_->get_market(pair.name).mid_valuation_grade) {
+            continue;
+        }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
             return static_cast<Mojo>(std::llround(
@@ -12836,20 +12888,24 @@ void Engine::step_update_pnl(BlockHeight block_height)
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
         //
-        // [S20 2026-08-24] NOT gated on mid_valuation_grade, deliberately.
-        // An earlier cut of this branch returned 0 for non-grade mids on
-        // the premise that PnLTracker would then carry the previous mark.
-        // That premise is FALSE: mark_to_market's price<=0 path assigns
-        // ppnl.inventory_pnl = 0 (monitoring/pnl.cpp, the else of the
-        // `smoothed_price > 0` guard), so gating here would ZERO unrealized
-        // P&L for the cycle and push that step straight into the
-        // rolling-window flow series -- manufacturing exactly the kind of
-        // mark-to-market discontinuity that tripped the window breaker on
-        // 2026-08-23.  Junk prices are already excluded upstream: the
-        // published mid is gated before it ever reaches State.
+        // [S20 2026-08-24] Withhold a mid we do not trust for VALUATION.
+        //
+        // The published-mid gate stops absurdity, but it deliberately
+        // accepts an in-band print like the 0.75 that tripped the window
+        // breaker on 2026-08-23 (zero fills all afternoon) -- because
+        // 0.75 against a 1.0 peg is a plausible depeg, not junk.  What
+        // made that print unusable was not its LEVEL but its PROVENANCE:
+        // a last-trade-only print on an emptied book, which is exactly
+        // what mid_valuation_grade reports.
+        //
+        // Returning 0 here is only safe because PnLTracker now CARRIES
+        // the previous mark on a price-only failure instead of zeroing it
+        // (see the S20 note in mark_to_market).  An earlier cut of this
+        // branch gated without that change and would have injected the
+        // very discontinuity it was meant to prevent.
         [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
             auto snap = state_->get_market(pair);
-            return snap.mid_price;
+            return snap.mid_valuation_grade ? snap.mid_price : 0;
         },
         // get_balance callback: return balance in mojos for an asset.
         [this](const std::string& asset) -> Mojo {
@@ -13137,8 +13193,9 @@ void Engine::step_check_alerts(BlockHeight block_height)
         if (!valuation_degraded_warned_) {
             spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
                          "(carry TTL exceeded on a held asset) -- peak "
-                         "frozen at ${:.2f}, breaker trips suspended until "
-                         "{} consecutive clean cycles",
+                         "frozen at ${:.2f} until {} consecutive clean "
+                         "cycles.  Both breakers REMAIN ARMED and keep "
+                         "comparing against that frozen peak",
                          peak_equity_hwm_usd_, kValuationRearmCleanCycles);
             valuation_degraded_warned_ = true;
         }
@@ -13146,8 +13203,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
         ++valuation_clean_streak_;
         if (valuation_clean_streak_ == kValuationRearmCleanCycles) {
             spdlog::info("[Engine] Step 13: [S20] equity valuation clean "
-                         "for {} cycles -- peak updates and breakers "
-                         "re-armed", kValuationRearmCleanCycles);
+                         "for {} cycles -- peak updates re-enabled",
+                         kValuationRearmCleanCycles);
             valuation_degraded_warned_ = false;
         }
     }

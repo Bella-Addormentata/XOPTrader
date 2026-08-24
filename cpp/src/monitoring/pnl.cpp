@@ -1128,8 +1128,33 @@ void PnLTracker::mark_to_market(
         // [PNL-MTM-DEDUP] Skip if another pair already marked this asset.
         const bool already_marked = asset_marked[base_asset];
 
-        // smoothed_price > 0 guard: a missing market snapshot (mid = 0)
-        // must not mark the whole position as a total loss.
+        // [S20 2026-08-24] CARRY, don't zero, when the only thing missing
+        // is a usable price.
+        //
+        // The `smoothed_price > 0` guard below was written so a missing
+        // snapshot could not mark a position as a total loss -- but the
+        // else-branch assigned 0, which does exactly that to the
+        // UNREALIZED component: the position's mark vanishes for the
+        // cycle and reappears the next, injecting a spurious step into
+        // total_pnl_usd and therefore into the engine's rolling-window
+        // loss series.  That series is a trading-loss detector; a data gap
+        // must not look like a loss and then a gain.
+        //
+        // So a price-only failure now carries the previous mark, and the
+        // caller can safely withhold a price it does not trust (an
+        // ungraded mid) instead of being forced to pass one.  Position
+        // reasons -- no basis, no balance, another pair already marked
+        // this asset -- still zero, because those genuinely mean "no
+        // unrealized P&L here".
+        if (!already_marked && basis > 0 && balance > 0 && smoothed_price <= 0) {
+            spdlog::debug("PnLTracker::mark_to_market: {} has no usable "
+                          "price this cycle -- carrying previous mark {}",
+                          pair_name, ppnl.inventory_pnl);
+            total_pnl_.inventory_pnl += ppnl.inventory_pnl;
+            asset_marked[base_asset] = true;
+            continue;
+        }
+
         if (!already_marked && basis > 0 && balance > 0 && smoothed_price > 0) {
             // [PNL-UNIT-FIX] Inventory PnL in quote-asset mojos.
             // Uses the canonical xop::quote_mojos_for helper from types.hpp

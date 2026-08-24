@@ -73,11 +73,21 @@ struct AnchorCandidates {
 
 [[nodiscard]] inline Anchor select_anchor(const AnchorCandidates& c) noexcept
 {
-    if (c.cex_mid > 0.0)             return {c.cex_mid, AnchorSource::Cex};
-    if (c.implied_cross > 0.0)       return {c.implied_cross, AnchorSource::ImpliedCross};
-    if (c.amm_mid > 0.0)             return {c.amm_mid, AnchorSource::Amm};
-    if (c.fair_value_estimate > 0.0) return {c.fair_value_estimate, AnchorSource::FairValue};
-    if (c.peg_target > 0.0)          return {c.peg_target, AnchorSource::Peg};
+    // Non-finite candidates are skipped rather than selected-then-rejected:
+    // +inf passes a bare `> 0` test and would WIN the priority chain, and
+    // gate_mid would then discard it as invalid instead of falling through
+    // to a perfectly good lower-priority anchor -- on a first cycle, with
+    // no accepted history to fall back on, that silently disables the
+    // plausibility check entirely.  The ingesters accept infinities today,
+    // so this is reachable from feed data, not just from tests.
+    auto usable = [](double v) noexcept {
+        return v > 0.0 && std::isfinite(v);
+    };
+    if (usable(c.cex_mid))             return {c.cex_mid, AnchorSource::Cex};
+    if (usable(c.implied_cross))       return {c.implied_cross, AnchorSource::ImpliedCross};
+    if (usable(c.amm_mid))             return {c.amm_mid, AnchorSource::Amm};
+    if (usable(c.fair_value_estimate)) return {c.fair_value_estimate, AnchorSource::FairValue};
+    if (usable(c.peg_target))          return {c.peg_target, AnchorSource::Peg};
     return {};
 }
 

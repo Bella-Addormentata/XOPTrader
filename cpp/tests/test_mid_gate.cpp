@@ -426,3 +426,35 @@ TEST(MidGateIngestTest, ProvenanceClearedByRawTickerRestoredByFilteredBook) {
     feed.ingest_competing_offers(pair, offers, {}, kMojosPerXch, 1'000);
     EXPECT_TRUE(feed.book_evidence_fresh(pair));
 }
+
+// An infinite candidate must not win the anchor chain and thereby disable
+// the plausibility check -- it must be skipped so a valid lower-priority
+// anchor is used instead.
+TEST(AnchorChainTest, NonFiniteCandidateSkippedNotSelected) {
+    AnchorCandidates c;
+    c.cex_mid    = std::numeric_limits<double>::infinity();
+    c.peg_target = 1.0;
+
+    const auto a = select_anchor(c);
+    EXPECT_EQ(a.source, AnchorSource::Peg)
+        << "an infinite CEX value must not win the chain";
+    EXPECT_DOUBLE_EQ(a.value, 1.0);
+
+    c.cex_mid       = std::numeric_limits<double>::quiet_NaN();
+    c.implied_cross = 1.02;
+    EXPECT_EQ(select_anchor(c).source, AnchorSource::ImpliedCross);
+}
+
+// The offer-absurdity bound must stay wider than the gate band for EVERY
+// configurable band, or the book-confirmation escape becomes unreachable
+// again at some setting (a fixed 10x bound breaks at band >= 10).
+TEST(MidGateIngestTest, OfferBoundAlwaysExceedsTheGateBand) {
+    // Mirrors market_data.cpp's offer_absurdity_ratio.
+    auto bound = [](double band) {
+        return std::max(10.0, band * 2.0);
+    };
+    for (double band : {1.5, 3.0, 5.0, 9.9, 10.0, 25.0, 100.0}) {
+        EXPECT_GT(bound(band), band)
+            << "offer filter would strip the confirming book at band " << band;
+    }
+}

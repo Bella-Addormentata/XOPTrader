@@ -464,6 +464,13 @@ private:
     /// Returns 0.0 when unknown (pair excluded from USD accounting).
     [[nodiscard]] double quote_usd_factor(const PairConfig& pc) const;
 
+    /// [S20 2026-08-24] True when quote_usd_factor() answers this pair
+    /// from a par constant (fiat-collateralised wrapper, or BYC falling
+    /// back to $1) rather than from a live mid.  Callers that must not
+    /// value inventory on an ungraded market observation use this to tell
+    /// the two cases apart -- a par constant needs no provenance.
+    [[nodiscard]] bool quote_usd_factor_is_par(const PairConfig& pc) const;
+
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
     /// Returns 0 when the quote's USD value is unknown.
     [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,
@@ -998,7 +1005,11 @@ private:
     std::unordered_map<AssetId, BlockHeight> last_asset_live_block_;
 
     /// [S20] Set by compute_portfolio_equity_usd when any held asset's
-    /// carry has outlived its TTL this cycle.  Consumed by Step 13.
+    /// carry has outlived its TTL this cycle.  Consumed by Step 13, where
+    /// it removes PEAK-UPDATE authority ONLY: a suspect number must not
+    /// ratchet the high-water mark, but both breakers stay armed and keep
+    /// comparing against the frozen peak.  Disarming them would make a
+    /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
 
     /// [S20] Debounce streak for re-arming the peak after degradation.

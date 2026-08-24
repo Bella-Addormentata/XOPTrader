@@ -330,12 +330,16 @@ risk:
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
   max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 
-  # [S20 2026-08-24] Blocks an asset's last-known USD price may be carried
-  # without a fresh valuation-grade print before equity is declared
-  # DEGRADED, which freezes the drawdown peak and suspends breaker trips
-  # until live prices return (10 consecutive clean cycles).  The carried
-  # VALUE keeps being used either way -- a data gap must not read as a
-  # crash.  ~10.4 h at 52 s/block.  0 disables the expiry.
+  # [S20 2026-08-24] Heartbeats an asset's last-known USD price may be
+  # carried without a fresh valuation-grade print before equity is declared
+  # DEGRADED.  Degradation freezes the drawdown PEAK; it does NOT disarm
+  # either breaker -- both stay armed and keep comparing against the frozen
+  # peak, because a risk control that switches itself off while the engine
+  # keeps trading is worse than one measuring from an imperfect anchor.
+  # Peak updates resume after 10 consecutive clean cycles.  The carried
+  # VALUE keeps being used throughout -- a data gap must not read as a
+  # crash.  At the observed ~17-21 s heartbeat cadence 720 is about
+  # 3.5-4.2 hours.  0 disables the expiry.
   valuation_carry_ttl_blocks: 720  # [OPTIONAL, default: 720]
 
   # Flash-crash detector: how many blocks of price history the drawdown

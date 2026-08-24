@@ -1262,13 +1262,21 @@ struct RiskConfig {
     double   max_window_loss_bps{500.0};    ///< Max window P&L loss (bps of equity; 0=disabled).
     uint32_t breaker_realert_minutes{30};   ///< Min minutes between repeat breaker alerts while paused.
 
-    /// [S20 2026-08-24] Blocks an asset's last-known USD price may be
+    /// [S20 2026-08-24] Heartbeats an asset's last-known USD price may be
     /// carried without a fresh valuation-grade print before the equity
-    /// figure is declared DEGRADED -- which freezes the drawdown peak and
-    /// suppresses breaker trips until live prices return.  The carry VALUE
-    /// keeps being used either way (a data gap must not read as a crash);
-    /// only its authority to move the peak or trip a breaker expires.
-    /// Default ~10.4 h at 52 s/block.  0 disables the expiry.
+    /// figure is declared DEGRADED.
+    ///
+    /// Degradation freezes the drawdown PEAK only.  Both breakers stay
+    /// ARMED and keep comparing against that frozen peak -- disarming them
+    /// would make a risk control fail open for a condition that can
+    /// persist for hours, while the engine goes on quoting.  The carry
+    /// VALUE also keeps being used either way, because a data gap must not
+    /// read as a crash; what expires is only its authority to ratchet the
+    /// high-water mark.
+    ///
+    /// Duration: the counter advances once per heartbeat, and the observed
+    /// cadence is ~17-21 s (NOT the nominal 52 s block time), so 720 is
+    /// roughly 3.5-4.2 hours.  0 disables the expiry.
     uint32_t valuation_carry_ttl_blocks{720};
 
     // -- Flash crash detection (T7-07, T7-08) --------------------------------

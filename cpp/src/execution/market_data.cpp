@@ -107,25 +107,42 @@ constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
 // [S20 2026-08-24] Absurdity bound for individual competing offers when the
 // anchor gate is on, expressed as a ratio like the raw-BBO guard's 10x.
 //
-// This MUST be wider than mid_anchor_band_ratio.  The per-offer filter and
-// the published-mid gate do different jobs: the filter removes offers no
-// honest market could produce, while the gate adjudicates whether the
+// This MUST stay wider than mid_anchor_band_ratio.  The per-offer filter
+// and the published-mid gate do different jobs: the filter removes offers
+// no honest market could produce, while the gate adjudicates whether the
 // resulting mid is plausible.  Filtering at the gate's own band would make
 // the gate's book-confirmation escape unreachable -- during a genuine
 // beyond-band repricing every honest offer near the new market would be
 // stripped here, leaving no two-sided book to confirm the move, so a real
-// collapse could never publish.  At 10x the escape stays reachable across
-// the whole 3x-10x range while 187x-class junk is still refused.
-constexpr double kOfferAbsurdityRatio = 10.0;
+// collapse could never publish.
+//
+// It is DERIVED from the configured band rather than fixed, so the
+// relationship cannot be broken by configuration: a hard 10x floor for the
+// default 3x band, widening to twice the band if an operator raises it.
+// (A fixed 10x would silently recreate the unreachable-escape bug for any
+// mid_anchor_band_ratio >= 10.)
+constexpr double kOfferAbsurdityFloor    = 10.0;
+constexpr double kOfferAbsurdityBandMult = 2.0;
+
+double offer_absurdity_ratio(double anchor_band_ratio) noexcept {
+    return std::max(kOfferAbsurdityFloor,
+                    anchor_band_ratio * kOfferAbsurdityBandMult);
+}
 
 // [S20] Maximum dex_print_age (heartbeats since the filtered book mid last
 // moved by more than 1 bp) for a book to count as CONFIRMING evidence.  A
 // frozen book is not a live market: BYC/wUSDC.b once held exactly 1.1030
 // for 26+ consecutive snapshots (longest freeze 30.4 h) while reporting an
-// age of zero seconds.  Twenty heartbeats is ~17 min at the observed block
-// cadence -- long enough that a genuinely quiet book is not disqualified,
-// short enough that a wedged one cannot vouch for a band breach.
-constexpr std::int32_t kMaxConfirmingPrintAge = 20;
+// age of zero seconds.
+//
+// Sizing, at the OBSERVED heartbeat cadence of ~17-21 s (not the nominal
+// 52 s block time -- the engine polls faster than one heartbeat per
+// block): 60 heartbeats is ~17-21 minutes.  This cutoff is load-bearing
+// for three things at once -- book confirmation, valuation grade, and
+// triangle-leg eligibility -- so erring short would disqualify genuinely
+// quiet books from all three.  A wedged book is still caught long before
+// the multi-hour freezes actually observed.
+constexpr std::int32_t kMaxConfirmingPrintAge = 60;
 
 // [S20 2026-08-24] Age in seconds; a huge value for the never-set epoch so
 // every threshold comparison fails closed.
@@ -1868,9 +1885,10 @@ void MarketDataFeed::ingest_competing_offers(
                                        / static_cast<double>(kMojosPerXch);
             bool outlier;
             if (ref_is_anchor && cfg.mid_gate_enabled) {
+                const double bound =
+                    offer_absurdity_ratio(cfg.mid_anchor_band_ratio);
                 const double ratio = offer_price / offer_ref;
-                outlier = ratio > kOfferAbsurdityRatio
-                       || ratio < 1.0 / kOfferAbsurdityRatio;
+                outlier = ratio > bound || ratio < 1.0 / bound;
             } else {
                 const double dev_bps = std::abs(offer_price - offer_ref)
                                        / offer_ref * 10000.0;
