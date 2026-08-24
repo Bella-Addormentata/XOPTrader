@@ -156,7 +156,16 @@ struct GateInputs {
     if (in.candidate_mid <= 0.0) {
         return GateVerdict::Accept;   // nothing to gate; no-mid is upstream's verdict
     }
-    if (in.anchor.value > 0.0 && in.anchor_band_ratio > 1.0) {
+    // A non-finite candidate must never publish: every comparison below
+    // would be false for NaN, so it would sail through as "in band".
+    if (!std::isfinite(in.candidate_mid)) {
+        return GateVerdict::RejectAnchor;
+    }
+    // A non-finite ANCHOR is not a reference; ignore it and fall through
+    // to the step bound rather than letting it silently disable the test
+    // (the config parser rejects these, but the struct is public API).
+    if (std::isfinite(in.anchor.value)
+        && in.anchor.value > 0.0 && in.anchor_band_ratio > 1.0) {
         const double ratio = in.candidate_mid / in.anchor.value;
         if (ratio > in.anchor_band_ratio
             || ratio < 1.0 / in.anchor_band_ratio) {

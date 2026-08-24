@@ -316,7 +316,42 @@ catch-up -- the same persisted wallet-effect event closes both windows.
   equity freezes the peak and suspends breaker trips, S18-style 10-clean-
   cycle re-arm), and the raw-BBO 10x guard now falls back to the anchor
   chain on CEX-less pairs.  692/692 tests incl. 12 incident-replay pins.
+  SCOPE CORRECTED after review (45-agent panel + Copilot rounds 1-2
+  found 25 confirmed issues, 5 critical): the first cut over-reached and
+  several gates created NEW failure modes, now reverted --
+  (a) the PnL get_price grade gate ZEROED unrealized P&L rather than
+  carrying it (pnl.cpp assigns inventory_pnl = 0 on price<=0), injecting
+  a false step into the very rolling-window series it claimed to protect;
+  (b) grade-gating usd_per_xch/quote_usd_factor collapsed ALL USD figures
+  to zero whenever CoinGecko blipped, because XCH/wUSDC.b's filtered book
+  is one-sided most cycles so grade reduced to "is CoinGecko up?";
+  (c) grade-gating the depeg detector muted it during a liquidity-crisis
+  depeg -- the mode it exists for -- and silently rescaled
+  depeg_sustained_blocks from blocks to invocations;
+  (d) disarming BOTH breakers on degraded valuation was fail-OPEN (engine
+  kept quoting with no drawdown protection); degradation now freezes the
+  PEAK only, and the comparison still runs.
+  Grade is now scoped to asset_usd_pseudo_price (the actual incident
+  hole) + peak authority.  ADDED from the panel: bbo_from_filtered_book
+  provenance flag (set by the filtered ingest, CLEARED by the raw ticker)
+  -- without it the bot could read its OWN resting offers back as
+  third-party confirmation of a band breach after a failed offers fetch;
+  dex_print_age wired to a consumer at last (frozen book cannot confirm);
+  per-offer absurdity band widened to 10x and SEPARATED from the 3x gate
+  band, because filtering at the gate's own band made the
+  book-confirmation escape unreachable for the real move it exists for;
+  anchorless pairs keep the legacy near-reference filter (dropping it was
+  a strict weakening); implied_cross_max_leg_spread_bps 300 -> 1500 (300
+  was below the measured spread of most books, so the triangulated anchor
+  could never form); non-finite config/gate guards; unsigned underflow on
+  block regression.  699/699 tests incl. 3 ingestion-path tests that
+  drive the real feed (the pure-gate tests could not catch a
+  gate-vs-ingestion contradiction).
   Residual (documented, accepted): a coordinated two-sided wash book
   inside the 3x band can still mark equity wrong at real capital cost;
   pre-S20 junk persisted to DB (cost basis, AS warm-start snapshots) is
-  NOT repaired by this change -- separate sanitation task if it bites.
+  NOT repaired by this change -- separate sanitation task if it bites;
+  valuation_carry_ttl_blocks is calibrated at 52 s/block while the
+  deployment runs ~17-21 s/block, so the real TTL is ~3.5-4 h not 10.4 h;
+  the carry TTL cannot fire for BYC itself because quote_usd_factor's par
+  fallback always reports a live price.

@@ -2829,16 +2829,33 @@ MarketDataSettings parse_market_data(const YAML::Node& root)
     // [S20] A band at or below 1.0 means "disabled", which is legal; a
     // NEGATIVE band is a sign error.  The leg-spread cap must be positive
     // or the implied cross can never form.
-    if (cfg.mid_anchor_band_ratio < 0.0) {
-        throw ConfigError(sec + ".mid_anchor_band_ratio must be >= 0");
+    //
+    // Every bound below rejects non-finite values EXPLICITLY, because
+    // yaml-cpp accepts `.nan` and `.inf` and both slip through ordinary
+    // range comparisons -- silently defeating the very guards this section
+    // configures.  NaN fails every comparison, so `NaN > 1.0` is false and
+    // the anchor test would be skipped; `.inf` on a cap admits everything
+    // it was meant to exclude.  Same treatment as
+    // strategy.xch_cycle_commit_frac.
+    if (!std::isfinite(cfg.mid_anchor_band_ratio)
+        || cfg.mid_anchor_band_ratio < 0.0) {
+        throw ConfigError(sec + ".mid_anchor_band_ratio must be a finite "
+                                "value >= 0");
     }
-    if (cfg.mid_gate_book_confirm_max_spread_bps < 0.0) {
-        throw ConfigError(sec
-            + ".mid_gate_book_confirm_max_spread_bps must be >= 0");
+    if (!std::isfinite(cfg.mid_gate_book_confirm_max_spread_bps)
+        || cfg.mid_gate_book_confirm_max_spread_bps < 0.0) {
+        throw ConfigError(sec + ".mid_gate_book_confirm_max_spread_bps must "
+                                "be a finite value >= 0");
     }
-    if (cfg.implied_cross_max_leg_spread_bps <= 0.0) {
-        throw ConfigError(sec
-            + ".implied_cross_max_leg_spread_bps must be > 0");
+    if (!std::isfinite(cfg.mid_gate_max_step_frac)
+        || cfg.mid_gate_max_step_frac < 0.0) {
+        throw ConfigError(sec + ".mid_gate_max_step_frac must be a finite "
+                                "value >= 0");
+    }
+    if (!std::isfinite(cfg.implied_cross_max_leg_spread_bps)
+        || cfg.implied_cross_max_leg_spread_bps <= 0.0) {
+        throw ConfigError(sec + ".implied_cross_max_leg_spread_bps must be "
+                                "a finite value > 0");
     }
 
     return cfg;

@@ -11,7 +11,11 @@
 
 #include <gtest/gtest.h>
 
+#include <xop/execution/market_data.hpp>
+#include <xop/state.hpp>
+
 #include <algorithm>
+#include <limits>
 #include <vector>
 
 using namespace xop::midgate;
@@ -270,6 +274,31 @@ TEST(MidGateTest, StaleBookCannotConfirmAnAbsurdMid)
     EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
 }
 
+TEST(MidGateTest, NonFiniteCandidateNeverPublishes)
+{
+    // NaN fails every comparison, so an unguarded gate would wave it
+    // through as "in band" and it would become the published mid.
+    auto in = base_inputs();
+    in.anchor = {1.0, AnchorSource::Peg};
+
+    in.candidate_mid = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
+
+    in.candidate_mid = std::numeric_limits<double>::infinity();
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
+}
+
+TEST(MidGateTest, NonFiniteAnchorDoesNotDisableTheGate)
+{
+    // A NaN anchor must not silently switch the anchor test off; the step
+    // bound still applies.
+    auto in = base_inputs();
+    in.anchor = {std::numeric_limits<double>::quiet_NaN(), AnchorSource::Cex};
+    in.last_accepted_mid = 1.00;
+    in.candidate_mid     = 187.461980;
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectStep);
+}
+
 // ---------------------------------------------------------------------------
 // Median selection (engine-side triangulation combines candidates this way)
 // ---------------------------------------------------------------------------
@@ -289,4 +318,111 @@ TEST(ImpliedCrossTest, EvenCandidateCountAveragesTheMiddlePair)
     EXPECT_NEAR(median({1.00, 1.40}), 1.20, 1e-12);
     EXPECT_NEAR(median({1.01}), 1.01, 1e-12);
     EXPECT_NEAR(median({0.98, 1.00, 1.40}), 1.00, 1e-12);
+}
+
+// ===========================================================================
+// Ingestion-path tests.
+//
+// The pure-gate tests above exercise gate_mid() directly, which -- as PR
+// review correctly pointed out -- cannot catch a contradiction between the
+// gate and the ingestion that FEEDS it.  These drive the real feed.
+// ===========================================================================
+
+namespace {
+
+using namespace xop;
+
+MarketDataConfig gate_cfg() {
+    MarketDataConfig cfg;
+    cfg.cex_freshness_threshold_sec = 0.0;   // no decay; exact blends
+    cfg.amm_blend_weight            = 0.0;
+    cfg.mid_gate_enabled            = true;
+    return cfg;
+}
+
+CompetingOffer mk_offer(const std::string& id, Side side, double price,
+                        Mojo size) {
+    CompetingOffer o;
+    o.offer_id = id;
+    o.side     = side;
+    o.price    = static_cast<Mojo>(std::llround(price * static_cast<double>(kMojosPerXch)));
+    o.size     = size;
+    return o;
+}
+
+}  // namespace
+
+// A genuine beyond-band collapse, delivered as a real two-sided filtered
+// book.  The offer filter must NOT strip the honest offers near the new
+// market -- if it did, no book could ever confirm the move and a real
+// depeg would be refused forever (the escape would be decorative).
+TEST(MidGateIngestTest, RealCollapseSurvivesTheOfferFilterAndPublishes) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "BYC/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, /*implied_cross=*/0.0,
+                                 /*peg_target=*/1.0);
+
+    // The whole market has repriced to ~0.20 (5x below peg, outside the
+    // 3x gate band) and says so with a coherent two-sided book.
+    std::vector<CompetingOffer> offers{
+        mk_offer("b1", Side::Bid, 0.198, 5'000'000),
+        mk_offer("a1", Side::Ask, 0.202, 5'000'000),
+    };
+    feed.ingest_competing_offers(pair, offers, {}, 1'000, 1'000);
+    feed.refresh({pair});
+
+    EXPECT_GT(feed.get_mid_price(pair), 0.0)
+        << "a real collapse with executable two-sided evidence must publish";
+    EXPECT_NEAR(feed.get_mid_price(pair), 0.20, 0.01);
+}
+
+// The same absurd print the incident produced, with NO third-party book
+// behind it, must not publish -- and must not be rescued by the raw
+// ticker BBO that ingest_dexie writes every heartbeat.
+TEST(MidGateIngestTest, JunkTickerCannotConfirmItself) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "BYC/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    feed.ingest_reference_anchor(pair, 0.0, /*peg_target=*/1.0);
+
+    // Raw ticker reports a two-sided book around the junk level.  These
+    // values are self-inclusive (they may be our own resting offers) and
+    // no filtered ingest has run, so they must not count as evidence.
+    feed.ingest_dexie(pair, /*bid=*/4.00, /*ask=*/4.40,
+                      /*last_trade=*/0.0, /*vol=*/0.0);
+    feed.refresh({pair});
+
+    EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
+        << "raw ticker BBO must not confirm its own band breach";
+    EXPECT_FALSE(feed.mid_valuation_grade(pair));
+    EXPECT_FALSE(feed.book_evidence_fresh(pair));
+}
+
+// Provenance flips back and forth with the two writers.
+TEST(MidGateIngestTest, ProvenanceClearedByRawTickerRestoredByFilteredBook) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "XCH/wUSDC.b";
+
+    feed.ingest_block_height(100);
+    std::vector<CompetingOffer> offers{
+        mk_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 1.44, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, offers, {}, kMojosPerXch, 1'000);
+    EXPECT_TRUE(feed.book_evidence_fresh(pair));
+
+    // A raw ticker poll lands: the BBO in the state is now self-inclusive.
+    feed.ingest_dexie(pair, 1.30, 1.55, 0.0, 0.0);
+    EXPECT_FALSE(feed.book_evidence_fresh(pair))
+        << "raw ticker must invalidate book provenance until the filtered "
+           "ingest runs again";
+
+    feed.ingest_competing_offers(pair, offers, {}, kMojosPerXch, 1'000);
+    EXPECT_TRUE(feed.book_evidence_fresh(pair));
 }

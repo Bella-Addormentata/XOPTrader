@@ -509,6 +509,20 @@ struct PairState {
     double      peg_target{0.0};           // 0 = not a stablecoin pair
     Timestamp   anchor_updated_at{};       // when the engine last injected
 
+    // --- [S20] BBO provenance ---
+    // dex_best_bid/ask have TWO writers: ingest_dexie (the raw dexie
+    // ticker, which includes OUR OWN resting offers) and
+    // ingest_competing_offers (dust-filtered, third-party only,
+    // authoritative).  A timestamp cannot distinguish them, because
+    // ingest_dexie runs every heartbeat and overwrites both fields before
+    // the offers fetch is even attempted.  This flag records which writer
+    // produced the values currently sitting there: set by the filtered
+    // ingest, CLEARED by the raw one.  Without it, a throwing offers fetch
+    // lets the bot read its own quotes back as third-party evidence --
+    // confirming the very band breach it should refuse, and marking equity
+    // on it.
+    bool        bbo_from_filtered_book{false};
+
     // --- [S20] Orderbook-mid provenance ---
     // orderbook_mid is written ONLY by ingest_competing_offers.  When the
     // offers fetch throws, that method never runs and the field froze with
@@ -825,6 +839,17 @@ public:
     /// shared re-acquisition on the same thread self-deadlocks.  Read the
     /// State snapshot's mid_valuation_grade field from a callback instead.
     bool mid_valuation_grade(const std::string& pair_name) const;
+
+    /// [S20] Whether this pair's CURRENT best bid/ask came from the
+    /// dust-filtered third-party ingest (not the raw self-inclusive dexie
+    /// ticker), that ingest ran within the stale threshold, and the book
+    /// mid is not frozen.  This is the "independent book evidence" test:
+    /// callers that need to trust a book -- the plausibility gate's
+    /// confirmation escape, and triangulated cross legs -- must use this
+    /// rather than is_stale(), which is rescued by a fresh CEX sample and
+    /// is derived from a poll timestamp that cannot see a frozen book.
+    /// Same locking caveat as mid_valuation_grade.
+    bool book_evidence_fresh(const std::string& pair_name) const;
 
     /// Self-filtered dexie top-of-book as {best_bid, best_ask}.
     /// Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer exists there, so

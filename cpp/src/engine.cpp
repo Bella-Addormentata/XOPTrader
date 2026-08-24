@@ -3021,16 +3021,19 @@ void Engine::step_update_analytics(BlockHeight block_height)
         // flagged as a stablecoin.  The detector tracks sustained deviations
         // and transitions through Normal -> Warning -> Bailed states.
         //
-        // [S20 2026-08-24] ...but only valuation-grade mids advance it.  A
-        // last-trade-only or stale-book print (the 187.46 class) latched
-        // Bailed for hours on evidence no one could trade against.  The
-        // gate is price-BLIND -- it asks how the mid was formed, never how
-        // far it moved -- so a genuine depeg on a live book still warns
-        // instantly and bails after depeg_sustained_blocks.  The detector's
-        // counters mutate only inside update(), so a skipped cycle pauses
-        // the count rather than resetting it.
-        if (pair.is_stablecoin && depeg_detector_
-            && market_data_->mid_valuation_grade(pair.name)) {
+        // [S20 2026-08-24] Deliberately NOT gated on mid_valuation_grade.
+        // An earlier cut of this branch skipped update() for non-grade
+        // mids, which reads well until you ask what a real depeg looks
+        // like: liquidity leaves first, so the book goes one-sided or
+        // empty exactly when the peg is breaking.  Grade-gating would
+        // therefore mute the detector in the mode it exists for, and --
+        // because depeg_sustained_blocks counts INVOCATIONS, not blocks --
+        // would silently rescale the bail threshold on every skipped
+        // cycle.  Junk mids are stopped upstream instead: the S20
+        // plausibility gate refuses to publish them, so a rejected print
+        // reaches this call as no-mid and is skipped by the `mid <= 0`
+        // guard above, without disturbing the counters.
+        if (pair.is_stablecoin && depeg_detector_) {
             auto depeg_status = depeg_detector_->update(
                 pair.name, mid, block_height);
 
@@ -10949,11 +10952,17 @@ double Engine::usd_per_xch() const
         const std::string quote = pair.name.substr(slash + 1);
         if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
             auto snap = state_->get_market(pair.name);
-            // [S20] Valuation-grade mids only: this rate multiplies into
-            // every USD figure in the bot, so a last-trade-only or
-            // stale-book print must fall through to "unknown" (0), not
-            // become the exchange rate.
-            if (snap.mid_price > 0 && snap.mid_valuation_grade) {
+            // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
+            // requires a fresh two-sided FILTERED book or a fresh CEX leg,
+            // and XCH/wUSDC.b's dust-filtered book is one-sided on most
+            // live cycles -- so grade here would collapse to "is CoinGecko
+            // up?".  A CoinGecko timeout (observed 2026-08-24 09:28) would
+            // then drive this rate to 0, which zeroes every USD figure in
+            // the bot: realized P&L, unrealized P&L, and the window
+            // breaker's own anchor.  The published mid is already gated
+            // against an independent anchor before it reaches State, which
+            // is where junk is meant to be stopped.
+            if (snap.mid_price > 0) {
                 return static_cast<double>(snap.mid_price)
                      / static_cast<double>(kMojosPerXch);
             }
@@ -11013,8 +11022,11 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
                 continue;
             }
             auto snap = state_->get_market(other.name);
+            // [S20] The S17 tight-spread test already establishes a live
+            // two-sided book here, which is the same evidence grade would
+            // ask for; adding grade would only fold in the CEX-availability
+            // dependency described at usd_per_xch.
             if (snap.mid_price > 0
-                && snap.mid_valuation_grade   // [S20]
                 && snap.spread_bps > 0.0
                 && snap.spread_bps <= kMaxCrossSpreadBps) {
                 return static_cast<double>(snap.mid_price)
@@ -11030,11 +11042,13 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
 
     // Non-pegged quote (DBX): derive via this pair's own cross rate when the
     // base is XCH:  usd_per_quote = usd_per_xch / quote_per_xch.
-    // [S20] Valuation-grade only -- this divides one mid by another, so a
-    // junk print here scales every DBX figure by its error.
+    // [S20] Ungated for the same reason as usd_per_xch: the mid reaching
+    // State has already passed the plausibility gate, and requiring grade
+    // would zero every DBX-denominated figure whenever that pair's
+    // filtered book happens to be one-sided.
     if (pc.base_asset_id == "xch") {
         auto snap = state_->get_market(pc.name);
-        if (snap.mid_price > 0 && snap.mid_valuation_grade) {
+        if (snap.mid_price > 0) {
             const double quote_per_xch =
                 static_cast<double>(snap.mid_price)
                 / static_cast<double>(kMojosPerXch);
@@ -11089,7 +11103,18 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
         midgate::CrossLeg leg;
         leg.mid        = market_data_->get_mid_price(sib.name);
         leg.spread_bps = market_data_->get_spread_bps(sib.name);
-        leg.fresh      = !market_data_->is_stale(sib.name);
+        // Provenance, not poll age.  is_stale() would be the wrong test
+        // twice over: it is rescued by a fresh CEX sample even when the
+        // book is dead, and it reads dex_updated_at, which this feed
+        // documents as unable to see a frozen book.  Worse, spread_bps is
+        // computed from whatever currently sits in dex_best_bid/ask -- so
+        // after a failed offers fetch the raw self-inclusive ticker could
+        // supply a "fresh, tight" leg, and because the implied cross
+        // outranks AMM/fair-value/peg that poisons OTHER pairs' anchors.
+        // book_evidence_fresh requires the filtered ingest, recency, and a
+        // moving book, which also makes spread_bps trustworthy: when it
+        // holds, dex_best_bid/ask ARE the filtered values.
+        leg.fresh      = market_data_->book_evidence_fresh(sib.name);
         leg.invert     = invert;
         return leg;
     };
@@ -11225,10 +11250,16 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
             in.last_usd_per_unit = it->second;
 
             // [S20] Expired carry on a HELD asset degrades the cycle.
+            // The subtraction is guarded because BlockHeight is unsigned:
+            // a peer serving a lower height (reorg, node swap) would
+            // otherwise underflow to a huge age and instantly declare
+            // every asset degraded.  A regressed height means "no elapsed
+            // time", not "infinite elapsed time".
             if (pseudo <= 0 && current_block > 0 && ttl > 0) {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
-                    || current_block - lb->second > ttl) {
+                    || (current_block > lb->second
+                        && current_block - lb->second > ttl)) {
                     degraded = true;
                     spdlog::debug("[Engine] [S20] carry for {} exceeds "
                                   "{} blocks without a live print -- "
@@ -12804,17 +12835,20 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // Mark-to-market all positions.
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
-        // [S20 2026-08-24] Valuation-grade mids only: unrealized P&L feeds
-        // the rolling-window flow series, and the 2026-08-23 window trip
-        // (-$18.42/36 blocks, zero fills) was pure mark-to-market flap on
-        // one stale in-band print.  The P&L layer already skips marks at
-        // price <= 0, so a non-grade cycle simply carries the previous
-        // mark -- same semantics as a missing price.
+        //
+        // [S20 2026-08-24] NOT gated on mid_valuation_grade, deliberately.
+        // An earlier cut of this branch returned 0 for non-grade mids on
+        // the premise that PnLTracker would then carry the previous mark.
+        // That premise is FALSE: mark_to_market's price<=0 path assigns
+        // ppnl.inventory_pnl = 0 (monitoring/pnl.cpp, the else of the
+        // `smoothed_price > 0` guard), so gating here would ZERO unrealized
+        // P&L for the cycle and push that step straight into the
+        // rolling-window flow series -- manufacturing exactly the kind of
+        // mark-to-market discontinuity that tripped the window breaker on
+        // 2026-08-23.  Junk prices are already excluded upstream: the
+        // published mid is gated before it ever reaches State.
         [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
             auto snap = state_->get_market(pair);
-            if (!snap.mid_valuation_grade) {
-                return 0;
-            }
             return snap.mid_price;
         },
         // get_balance callback: return balance in mojos for an asset.
@@ -13162,14 +13196,16 @@ void Engine::step_check_alerts(BlockHeight block_height)
         --drawdown_grace_remaining_;
     }
 
-    // [S20] ...and only an authoritative valuation may TRIP the breaker:
-    // comparing a degraded (expired-carry) equity against the peak is
-    // comparing two numbers from different regimes.  The skip is visible
-    // through the degradation warn above, and quoting is separately halted
-    // by the pairs' own no-mid state, so this cannot mask a real loss that
-    // live prices would show.
-    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0
-        && valuation_authoritative) {
+    // [S20 2026-08-24] The breaker COMPARISON is deliberately NOT gated on
+    // valuation authority.  Degradation freezes the PEAK (above) because a
+    // suspect number must not ratchet the high-water mark upward -- but
+    // disarming the trip as well would turn a risk control fail-OPEN: the
+    // engine keeps quoting on the very prices whose valuation we distrust,
+    // with no drawdown protection at all, and the condition that disarms it
+    // is one that can persist for hours.  A frozen peak compared against a
+    // degraded equity still detects a real loss; it merely cannot invent a
+    // new peak to measure it from.
+    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
         const double drawdown_frac = risk::equity_drawdown_frac(
             peak_equity_hwm_usd_, equity_usd);
 
@@ -13330,14 +13366,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 config_.risk.max_window_loss_bps);
 
             // 4. Fire if window_loss exceeds the threshold.
-            // [S20] The deque above is fed unconditionally (a gap in the
-            // series was the pre-S19 resume bug), but the TRIP requires an
-            // authoritative valuation: the threshold is anchored to equity
-            // and the flow series is marked at the same prices, so a
-            // degraded cycle can neither size the limit honestly nor
-            // measure the loss it claims.
+            // [S20] Also ungated, for the same fail-open reason as the
+            // drawdown comparison above: a loss detector that switches
+            // itself off while the engine keeps trading is worse than one
+            // measuring against an imperfect anchor.
             if (window_loss_usd > 0.0 && threshold_usd > 0.0
-                    && valuation_authoritative
                     && window_loss_usd > threshold_usd) {
 
                 const BlockHeight window_actual =

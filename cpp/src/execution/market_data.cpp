@@ -104,6 +104,29 @@ bool last_trade_is_fresh(const PairState& ps,
 // (e.g. $22.38 bid when market is $2.24 = ~8900 bps off).
 constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
 
+// [S20 2026-08-24] Absurdity bound for individual competing offers when the
+// anchor gate is on, expressed as a ratio like the raw-BBO guard's 10x.
+//
+// This MUST be wider than mid_anchor_band_ratio.  The per-offer filter and
+// the published-mid gate do different jobs: the filter removes offers no
+// honest market could produce, while the gate adjudicates whether the
+// resulting mid is plausible.  Filtering at the gate's own band would make
+// the gate's book-confirmation escape unreachable -- during a genuine
+// beyond-band repricing every honest offer near the new market would be
+// stripped here, leaving no two-sided book to confirm the move, so a real
+// collapse could never publish.  At 10x the escape stays reachable across
+// the whole 3x-10x range while 187x-class junk is still refused.
+constexpr double kOfferAbsurdityRatio = 10.0;
+
+// [S20] Maximum dex_print_age (heartbeats since the filtered book mid last
+// moved by more than 1 bp) for a book to count as CONFIRMING evidence.  A
+// frozen book is not a live market: BYC/wUSDC.b once held exactly 1.1030
+// for 26+ consecutive snapshots (longest freeze 30.4 h) while reporting an
+// age of zero seconds.  Twenty heartbeats is ~17 min at the observed block
+// cadence -- long enough that a genuinely quiet book is not disqualified,
+// short enough that a wedged one cannot vouch for a band breach.
+constexpr std::int32_t kMaxConfirmingPrintAge = 20;
+
 // [S20 2026-08-24] Age in seconds; a huge value for the never-set epoch so
 // every threshold comparison fails closed.
 double age_seconds(Timestamp ts, Timestamp now) {
@@ -499,6 +522,12 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
 
     ps.dex_best_bid  = best_bid;
     ps.dex_best_ask  = best_ask;
+    // [S20 2026-08-24] These are RAW ticker values: they include our own
+    // resting offers and have had no dust or outlier filtering.  Clear the
+    // provenance flag so nothing downstream mistakes them for third-party
+    // book evidence.  ingest_competing_offers re-sets it when (and only
+    // when) it successfully rebuilds the BBO from filtered offers.
+    ps.bbo_from_filtered_book = false;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
@@ -950,6 +979,22 @@ bool MarketDataFeed::mid_valuation_grade(const std::string& pair_name) const {
         return false;
     }
     return it->second.mid_valuation_grade;
+}
+
+bool MarketDataFeed::book_evidence_fresh(const std::string& pair_name) const {
+    const auto cfg = [&] { std::shared_lock lk(mtx_config_); return config_; }();
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return false;
+    }
+    const PairState& ps = it->second;
+    return ps.bbo_from_filtered_book
+        && ps.ob_updated_at != Timestamp{}
+        && std::chrono::system_clock::now() - ps.ob_updated_at
+               <= cfg.stale_threshold
+        && ps.dex_print_age <= kMaxConfirmingPrintAge;
 }
 
 // =========================================================================
@@ -1419,8 +1464,23 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     // pair ever earns book-based evidence and valuation grade rests
     // entirely on a fresh CEX leg.  That is the honest reading -- without
     // the filtered book there is no third-party book to speak of.
-    const bool dex_fresh = ps.ob_updated_at != Timestamp{}
-        && now - ps.ob_updated_at <= cfg.stale_threshold;
+    // Three independent conditions, all required:
+    //   * PROVENANCE -- the values in dex_best_bid/ask were written by the
+    //     filtered third-party ingest, not by the raw self-inclusive
+    //     ticker (bbo_from_filtered_book).  A timestamp cannot answer
+    //     this: ingest_dexie overwrites the BBO every heartbeat.
+    //   * RECENCY -- that ingest ran recently (ob_updated_at).
+    //   * MOVEMENT -- the book is not frozen.  dex_updated_at records when
+    //     we last LOOKED, so a book that has not moved in hours still
+    //     reports zero age; dex_print_age counts heartbeats since the mid
+    //     actually changed, which is the signal that was added for exactly
+    //     this and never wired to a consumer until now.
+    const bool book_moving =
+        ps.dex_print_age <= kMaxConfirmingPrintAge;
+    const bool dex_fresh = ps.bbo_from_filtered_book
+        && ps.ob_updated_at != Timestamp{}
+        && now - ps.ob_updated_at <= cfg.stale_threshold
+        && book_moving;
     const bool book_two_sided =
         ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0;
     const double book_spread_bps =
@@ -1714,20 +1774,25 @@ void MarketDataFeed::ingest_competing_offers(
     // is how a fresh restart re-poisoned within 40 minutes.  On stablecoin
     // pairs the peg anchor exists from cycle 1, so neither failure mode
     // survives.  With the gate disabled the legacy chain applies.
-    const double ref_price = [&] {
+    // ref_price is the ANCHOR (0 when none exists this cycle); legacy_ref
+    // is the near reference the pre-S20 filter used, kept as the fallback
+    // for anchorless pairs so they are never left unfiltered.
+    double ref_price   = 0.0;
+    double legacy_ref  = 0.0;
+    {
         std::shared_lock plk(mtx_pairs_);
         auto it = pairs_.find(pair_name);
-        if (it == pairs_.end()) return 0.0;
-        const PairState& ps = it->second;
-        if (cfg.mid_gate_enabled) {
-            return midgate::select_anchor(
-                anchor_candidates(ps, cfg,
-                                  std::chrono::system_clock::now()))
-                .value;
+        if (it != pairs_.end()) {
+            const PairState& ps = it->second;
+            legacy_ref = ps.cex_mid > 0.0 ? ps.cex_mid : ps.mid_price;
+            ref_price  = cfg.mid_gate_enabled
+                ? midgate::select_anchor(
+                      anchor_candidates(ps, cfg,
+                                        std::chrono::system_clock::now()))
+                      .value
+                : 0.0;
         }
-        if (ps.cex_mid > 0.0) return ps.cex_mid;
-        return ps.mid_price;
-    }();
+    }
 
     // Filter out own offers and offers below minimum size threshold.
     std::vector<CompetingOffer> filtered;
@@ -1773,33 +1838,49 @@ void MarketDataFeed::ingest_competing_offers(
         // bid when market is $2.24) from corrupting ob_mid or the
         // competitive anchor.
         //
-        // [S20 2026-08-24] Two regimes, matching where ref_price came from.
-        // With the gate enabled the reference is the far anchor chain
-        // (peg/implied/CEX), which asserts PLAUSIBILITY, not location: a
-        // genuine 25% depeg has honest offers 2500 bps off the peg, and
-        // filtering those would blind the depeg detector to exactly the
-        // moves it exists to catch.  So the anchored regime uses the same
-        // wide multiplicative band as the published-mid gate (3x default)
-        // and refuses only absurdity.  The legacy regime keeps the tight
-        // 2000 bps test against the near reference (CEX or own mid).
-        if (ref_price > 0.0) {
+        // [S20 2026-08-24] Two regimes, matching where the reference came
+        // from -- and note they use DIFFERENT widths on purpose.
+        //
+        // Anchored regime (gate on, independent anchor available): the
+        // reference is a far anchor (peg/implied-cross/CEX) that asserts
+        // PLAUSIBILITY, not location.  Two things follow.  A genuine 25%
+        // depeg puts honest offers 2500 bps off the peg, so a tight test
+        // would strip exactly the evidence the depeg detector needs.  And
+        // filtering at the GATE's own band (3x) would make the gate's
+        // book-confirmation escape unreachable: a real beyond-band move
+        // would lose every offer near the new market before the book was
+        // assembled, so no two-sided book could ever confirm it.  Hence
+        // the wider absurdity bound.
+        //
+        // Near regime (gate off, or no anchor this cycle): the reference
+        // is the pair's own previous mid or a CEX mid, which DOES assert
+        // location, so the historical tight 2000 bps test applies.  Note
+        // the fallback to the pair's own mid is retained here even under
+        // the gate -- dropping it would leave anchorless pairs with no
+        // offer filter at all, a strict weakening versus the pre-S20
+        // behaviour.  Self-reference is acceptable for removing absurd
+        // individual offers; it is only unacceptable as the authority on
+        // the published mid, which is what the gate now handles.
+        const double offer_ref = ref_price > 0.0 ? ref_price : legacy_ref;
+        const bool   ref_is_anchor = ref_price > 0.0;
+        if (offer_ref > 0.0) {
             const double offer_price = static_cast<double>(offer.price)
                                        / static_cast<double>(kMojosPerXch);
             bool outlier;
-            if (cfg.mid_gate_enabled && cfg.mid_anchor_band_ratio > 1.0) {
-                const double ratio = offer_price / ref_price;
-                outlier = ratio > cfg.mid_anchor_band_ratio
-                       || ratio < 1.0 / cfg.mid_anchor_band_ratio;
+            if (ref_is_anchor && cfg.mid_gate_enabled) {
+                const double ratio = offer_price / offer_ref;
+                outlier = ratio > kOfferAbsurdityRatio
+                       || ratio < 1.0 / kOfferAbsurdityRatio;
             } else {
-                const double dev_bps = std::abs(offer_price - ref_price)
-                                       / ref_price * 10000.0;
+                const double dev_bps = std::abs(offer_price - offer_ref)
+                                       / offer_ref * 10000.0;
                 outlier = dev_bps > kOutlierPriceThresholdBps;
             }
             if (outlier) {
                 spdlog::debug("[MarketData] {} outlier offer {}: "
-                              "price={:.6f} vs ref={:.6f} -- skipping",
-                              pair_name, offer.offer_id,
-                              offer_price, ref_price);
+                              "price={:.6f} vs ref={:.6f} ({}) -- skipping",
+                              pair_name, offer.offer_id, offer_price,
+                              offer_ref, ref_is_anchor ? "anchor" : "near");
                 continue;
             }
         }
@@ -1906,6 +1987,10 @@ void MarketDataFeed::ingest_competing_offers(
             }
             ps.dex_best_bid = filtered_best_bid > 0.0 ? filtered_best_bid : 0.0;
             ps.dex_best_ask = filtered_best_ask > 0.0 ? filtered_best_ask : 0.0;
+            // [S20] These ARE third-party filtered values (including the
+            // authoritative zeroes above), so the BBO may now serve as
+            // independent book evidence until ingest_dexie overwrites it.
+            ps.bbo_from_filtered_book = true;
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and

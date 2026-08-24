@@ -1926,9 +1926,23 @@ struct MarketDataSettings {
     double mid_gate_max_step_frac{0.5};
 
     /// Max spread (bps) for a sibling pair's book to serve as a leg of the
-    /// triangulated implied cross.  Matches the S17 lesson: a leg is
-    /// trustworthy exactly when its own book is tight.
-    double implied_cross_max_leg_spread_bps{300.0};
+    /// triangulated implied cross.
+    ///
+    /// This is NOT the S17 300 bps test, and copying that number here was
+    /// a mistake in the first cut: it sits below the measured spread of
+    /// most books this bot trades (XCH/BYC alone was 328 bps during the
+    /// 2026-08-24 episode, wmilliETH.b/XCH 558), so the triangulated
+    /// anchor could essentially never form.  The two tests answer
+    /// different questions.  S17 asks whether a book's midpoint is precise
+    /// enough to VALUE inventory, where a 300 bps spread is already a
+    /// ~150 bps location error on the number itself.  This asks whether
+    /// two legs are jointly good enough to bound a PLAUSIBILITY check
+    /// whose band is 3x (20 000 bps) wide.  Implied-cross error is about
+    /// half-spread(leg1) + half-spread(leg2), so a 1500 bps cap yields at
+    /// most ~1500 bps (15%) of anchor error against a 200% band -- an
+    /// order of magnitude of margin, while still excluding books so wide
+    /// that their midpoint means nothing.
+    double implied_cross_max_leg_spread_bps{1500.0};
 };
 
 // ---------------------------------------------------------------------------
