@@ -12295,19 +12295,18 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         }
     }
 
-    // Deposit peak-credit tail (rounds 26-37).  Whether a flow was
-    // already folded into equity cannot be guessed (round 23), so the
-    // split is MEASURED: this pass's observed fold covers flows folded
-    // now (exact factor against pre-fold equity), amount-capped
-    // provenance covers flows folded earlier (rescale from the
-    // recorded base, floored by max() against the current peak), and
-    // anything uncovered gets no credit (the anchor or Step 13's
-    // natural max already carried it).  Withdrawals are handled in
-    // the maintenance block above: a shrink executes only when the
-    // booked event and an observed fold have BOTH happened (round
-    // 37), which is the attribution the retired rounds-19-25 budget
-    // could never prove; unmatched withdrawals leave the peak
-    // standing until expiry or restart.
+    // Deposit peak-credit tail (rounds 26-39).  Amount-capped
+    // provenance covers flows whose fold this process observed in an
+    // EARLIER pass (rescale from the recorded base, floored by max()
+    // against the current peak); everything remaining takes one
+    // aggregate factor against this pass's measured pre-fold equity,
+    // which the round-31 fresh-fetch guarantee makes correct whether
+    // the flow folded this pass or has not folded yet.  Withdrawals
+    // are handled in the maintenance block above: a shrink executes
+    // only when the booked event and an observed fold have BOTH
+    // happened (round 37), which is the attribution the retired
+    // rounds-19-25 budget could never prove; unmatched withdrawals
+    // leave the peak standing until expiry or restart.
     if (!bridge_unapplied_deposit_flows_.empty()) {
         std::vector<Mojo> flows;
         flows.swap(bridge_unapplied_deposit_flows_);
