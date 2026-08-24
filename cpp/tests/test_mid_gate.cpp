@@ -575,3 +575,27 @@ TEST(MidGateIngestTest, UnchangedBookExpiresAsConfirmingEvidence) {
     EXPECT_FALSE(feed.mid_valuation_grade(pair))
         << "a frozen book must not keep marking equity";
 }
+
+// A non-finite CEX sample must never grant valuation grade.  The grade
+// predicate is independent of select_anchor (which already skips
+// non-finite values), so a bare `cex_mid > 0.0` there let +inf bless an
+// otherwise-ungraded DEX candidate straight into equity and P&L.
+TEST(MidGateIngestTest, NonFiniteCexCannotGrantValuationGrade) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "XCH/wUSDC.b";
+
+    feed.ingest_block_height(100);
+
+    // Rejected at the ingester, so it never reaches the grade predicate.
+    feed.ingest_cex_reference(pair, std::numeric_limits<double>::infinity());
+    feed.ingest_cex_reference(pair, std::numeric_limits<double>::quiet_NaN());
+
+    // Only a last-trade print on an empty book -- not book evidence.
+    feed.ingest_dexie(pair, /*bid=*/0.0, /*ask=*/0.0,
+                      /*last_trade=*/1.42, /*vol=*/0.0);
+    feed.refresh({pair});
+
+    EXPECT_FALSE(feed.mid_valuation_grade(pair))
+        << "an invalid CEX leg blessed a last-trade-only mid into equity";
+}
