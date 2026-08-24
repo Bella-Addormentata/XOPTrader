@@ -376,6 +376,12 @@ accounting:
   # deposits/withdrawals have no ledger event yet, so auto-pausing would halt
   # trading on legitimate activity.  Alerts still fire either way.
   pause_enabled: false
+  # [S19 2026-08-23] Book completed warp bridge jobs as first-class
+  # bridge_deposit/bridge_withdrawal ledger events (GIPS: external capital,
+  # not P&L).  The engine reads the GUI-owned jobs DB READ-ONLY.
+  bridge_ingest_enabled: true
+  bridge_jobs_db_path: data/warp_jobs.db
+  bridge_asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   floor_xch_mojos: 1000000000   # 0.001 XCH -- covers fee dust
   floor_cat_mojos: 100          # 0.1 unit  -- 100x the per-leg rounding error
   fee_slack_mojos: 200000       # ~40 offer events at 5,000 mojos

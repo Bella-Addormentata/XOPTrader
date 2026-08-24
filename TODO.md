@@ -228,21 +228,82 @@
   documented, regardless of latch state.
 
 ### S19: Bridge transfers need first-class ledger accounting (deposits, not P&L)
-- **Files:** `cpp/src/engine.cpp` (ledger tie ~11600), `gui/services/warp/jobs.py`,
-  P&L tracker + GUI P&L display
-- **Status:** `[ ]` -- Raised by the operator after the first live bridge
+- **Files:** `cpp/include/xop/accounting/bridge_ingest.hpp` (new),
+  `cpp/src/engine.cpp` (step_ingest_bridge_flows), `cpp/src/monitoring/pnl.cpp`,
+  `gui/services/database_service.py`, `gui/widgets/dashboard.py`
+- **Status:** `[x]` BUILT 2026-08-23 -- engine reads warp_jobs.db read-only
+  each heartbeat and books bridge_deposit (+post_tip mojos, inbound at
+  COMPLETED) / bridge_withdrawal (-burned mojos, outbound at the FIRST
+  burn-confirmed status: COLLECTING_EVM_SIGS/RELAYING/
+  AWAITING_EXTERNAL_RELAY, since COMPLETED can lag unboundedly behind the
+  wallet-affecting burn) BEFORE the divergence control, idempotent via
+  ledger event_id "bridge:job:<id>:<created_at>"; chronology (opening
+  filter + peak guard) uses the job's first booking-eligible warp_events
+  timestamp, immutable unlike updated_at.  GIPS/TWR treatment:
+  signed USD accumulates as a net-deposits figure outside trading P&L
+  (PnLSummary::net_deposits_usd, Prometheus component="net_deposits",
+  dashboard "Net Deposits" card); the drawdown peak is NOT adjusted
+  in place for flows (owner decision after review rounds 24-41 refuted
+  every in-place scheme -- fills are tracked base-side only, so wallet
+  movement cannot be attributed to a specific flow): booking an
+  in-process flow resets the peak and the next equity valuation
+  re-anchors it, identical to the accepted restart semantics.
+  Pre-process flows are already inside the current anchor and leave it
+  untouched.  wUSDC.b valued at the $1.00 numeraire (peg monitored, not
+  priced in).  Originally raised by the operator after the first live bridge
   (2026-08-23, job 2: +4.985 wUSDC.b). The ledger has no deposit/transfer
   event type, so a completed bridge inflow is absorbed by the divergence
   control as an "adjust" entry ("unexplained divergence reconciled to
   wallet") -- books tie, but attribution is blind: the equity jump can
   mask real trading losses in the rolling window, and nothing separates
-  capital movements from performance. Design: the engine reads
+  capital movements from performance. Design (as implemented; see the
+  Status line for the review-hardened details): the engine reads
   data/warp_jobs.db (read-only; the GUI owns writes) during the ledger
-  tie and posts event_type "bridge_deposit" (+post_tip_mojos, inbound) /
-  "bridge_withdrawal" (unwraps) for COMPLETED jobs not yet booked --
-  BEFORE the divergence control runs, so the movement is explained
-  rather than adjusted. P&L tracker gains a net-deposits component
-  excluded from performance; GUI P&L display gains a "Net deposits"
-  line. Until then: SELECT SUM(delta_mojos) FROM ledger_entries WHERE
-  event_type='adjust' is the manual correction, and each bridge lands as
-  one adjust entry ~= its post-tip amount.
+  tie and posts event_type "bridge_deposit" (+post_tip_mojos, inbound
+  at COMPLETED) / "bridge_withdrawal" (unwraps, at the FIRST
+  burn-confirmed event -- COMPLETED can lag unboundedly behind the
+  wallet-affecting burn) for jobs not yet booked -- BEFORE the
+  divergence control runs, so the movement is explained rather than
+  adjusted. P&L tracker gains a net-deposits component excluded from
+  performance; GUI P&L display gains a "Net deposits" line.
+
+### S21: Bridge chronology uses status time, not wallet-effect time (bounded, deferred)
+
+Copilot round 30 (suppressed comment, acknowledged): the S19 opening filter's
+lower bound is MIN ts of CLAIMING / BURN_SENT, but the warp service enters
+CLAIMING before a later handler invocation pushes the actual claim spend --
+so a ledger genesis captured in that window produces an opening WITHOUT the
+mint while `flow_lb <= opening_time` skips the booking permanently.  The
+flow then books as an adjustment (pre-S19 behaviour): equity and the
+invariant stay correct, only Net Deposits attribution misses it.  Fix
+requires the GUI warp service to persist the wallet-affecting claim/burn
+chain height per job (new column + event write at push time), with the
+engine comparing THAT against the opening.  Cross-component; deliberately
+not smuggled into PR #109 at round 30.  Window is minutes wide and only
+matters when ledger genesis lands inside it.  Round 43 adds the inbound
+twin: a claimed mint sits in CLAIMING for the confirmation-depth wait
+after the CAT is on-chain, so the invariant briefly absorbs it as an
+adjust before the COMPLETED booking converges through the three-entry
+catch-up -- the same persisted wallet-effect event closes both windows.
+
+### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
+- **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13
+  rolling-window breaker), valuation price sources
+- **Status:** `[ ]` -- Observed live 2026-08-23 14:45:34, the THIRD breaker
+  event of the day from one root cause. The freshly installed v0.9.19
+  process anchored its equity peak at $253.67 during startup warm-up (BYC
+  valued high before the dexie feed delivered the book), then the stale
+  0.75 BYC/wUSDC.b print re-asserted and ~104 BYC marked down ~$21;
+  equity "fell" to ~$232.6, the rolling window read -$18.42/36 blocks
+  against its 250 bps ($5.81) limit, and the engine PAUSED (latched).
+  trade_log shows ZERO fills all afternoon -- the entire loss was
+  mark-to-market flapping on a single stale order in an emptied dexie
+  book (TibetSwap AMM simultaneously ~0.92; the Step 7 uncertainty
+  centre blended 0.75 -> 0.877 with w_ext=0.99 at the same moment).
+  Directions to evaluate: (a) value stablecoin-pair inventory for EQUITY
+  at the blended/uncertainty centre or a second source instead of the
+  raw book mid; (b) a startup valuation-grace window before the rolling
+  window arms (the drawdown breaker already has one); (c) the S17
+  second-source depeg confirmation, which is the same lesson. Related:
+  the morning's depeg bail-out (S17) and drawdown-latch alerts (S18)
+  came from the same stale print.

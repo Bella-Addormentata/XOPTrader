@@ -74,6 +74,10 @@ struct MetricsPnlSnapshot {
     // [REWARD-INCOME 2026-08-01] Dexie DBX rewards at receipt FMV.  OTHER
     // INCOME: exported beside the trading components but NOT part of `usd`.
     double usd_reward_income{0.0};
+    // [S19 2026-08-23] Net external bridge capital (signed).  CAPITAL,
+    // exported beside the trading components but part of neither `usd`
+    // nor `usd_reward_income`.
+    double usd_net_deposits{0.0};
 };
 
 // ---------------------------------------------------------------------------
@@ -317,6 +321,7 @@ private:
     prometheus::Gauge* pnl_usd_unrealized_{nullptr};
     prometheus::Gauge* pnl_usd_fees_{nullptr};
     prometheus::Gauge* pnl_usd_reward_income_{nullptr};
+    prometheus::Gauge* pnl_usd_net_deposits_{nullptr};
 
     // -- Dashboard 2: Inventory gauges (label-keyed) -------------------------
 

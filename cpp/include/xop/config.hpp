@@ -1703,6 +1703,29 @@ struct AccountingConfig {
     /// observed reward coin while staying 50x below the smallest trade.
     std::int64_t reward_max_mojos_per_coin{2'000LL};
 
+    // -- Warp bridge flow ingestion ([S19 2026-08-23]) ---------------------
+    //
+    // Completed warp.green bridge jobs (the GUI's data/warp_jobs.db) book
+    // as first-class bridge_deposit / bridge_withdrawal ledger events
+    // BEFORE the divergence control runs, so external capital is explained
+    // flow rather than a blind adjusting entry.  GIPS treatment: the USD
+    // accumulates as NET DEPOSITS outside trading P&L.  Booking an
+    // in-process flow re-anchors the drawdown peak from the next equity
+    // valuation (restart semantics; in-place peak adjustment was retired
+    // -- see bridge_ingest.hpp).  Detection and valuation:
+    // accounting/bridge_ingest.hpp.
+    bool bridge_ingest_enabled{true};
+
+    /// The GUI-owned warp jobs database, opened READ-ONLY each heartbeat.
+    /// A missing file is a clean no-op (warp never used on this host).
+    std::string bridge_jobs_db_path{"data/warp_jobs.db"};
+
+    /// Asset the bridge mints/burns on the Chia side: wUSDC.b mainnet CAT
+    /// id.  Valued at exactly $1.00 -- the numeraire doctrine of the peg
+    /// monitor above (the peg is MONITORED, not priced in).
+    std::string bridge_asset_id{
+        "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"};
+
     // -- Stablecoin peg monitor (2026-07-30) -------------------------------
     //
     // Accounting values wUSDC.b / wUSDC / USDS at exactly $1.00 -- they are

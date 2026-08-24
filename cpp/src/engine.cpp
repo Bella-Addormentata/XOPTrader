@@ -24,7 +24,13 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 
+#include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
+
+// [S19] Real SQLite API for the read-only warp_jobs.db scan.  database.hpp
+// deliberately forward-declares only the opaque handles; a .cpp that calls
+// the API includes the header itself (same pattern as monitoring/pnl.cpp).
+#include <sqlite3.h>
 #include "xop/execution/wallet_poll_throttle.hpp"
 #include "xop/risk/drawdown_breaker.hpp"
 #include "xop/strategy/avellaneda.hpp"
@@ -50,6 +56,7 @@
 #include <cstdlib>
 #include <functional>
 #include <limits>
+#include <memory>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -1023,6 +1030,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Collect confirmed balances so opening entries can be
             // posted once, from wallet truth, at ledger genesis.
             std::unordered_map<AssetId, Mojo> genesis_balances;
+            // [S19 review round 12] Per-asset balance OBSERVATION times:
+            // the opening's entry_time must reflect when the balance was
+            // read, not when post_ledger_genesis later writes the row --
+            // a flow completing between the two was absent from the
+            // balance yet predated the row's stamp, permanently failing
+            // the bridge chronology test.  Captured AFTER the RPC
+            // returns, biasing the irreducible in-flight race toward
+            // skip (degrades to an adjust) over double-book.
+            std::unordered_map<AssetId, std::string> genesis_observed_at;
             for (const auto& aid : seed_asset_ids) {
                 auto wid = offer_mgr_->resolve_wallet_id(aid);
                 if (wid <= 0) continue;
@@ -1033,6 +1049,32 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                                     static_cast<Mojo>(0));
                     Mojo confirmed = bal_json.value("confirmed_wallet_balance",
                                                     static_cast<Mojo>(0));
+                    // [S19 review round 6] The bridge asset records
+                    // its opening even at ZERO balance: the zero-opening
+                    // exception in post_ledger_genesis is unreachable
+                    // unless the queried zero survives this collection,
+                    // and without an opening the first deposit into an
+                    // empty asset could never book as external capital.
+                    // Only when the RPC actually carried the field
+                    // (round 24): a missing confirmed_wallet_balance
+                    // defaults to 0 above, and recording that as a
+                    // genuine zero opening would permanently misdate
+                    // every historical bridge flow.
+                    if (config_.accounting.bridge_ingest_enabled
+                        && aid == config_.accounting.bridge_asset_id
+                        && bal_json.contains("confirmed_wallet_balance")
+                        && confirmed >= 0) {
+                        genesis_balances[AssetId{aid}] = confirmed;
+                    }
+                    // Record the successful balance observation BEFORE
+                    // the zero-seed continue (review round 13): a zero
+                    // bridge balance skips seeding, but its zero-valued
+                    // opening still needs the observation time or the
+                    // chronology filter falls back to the later write
+                    // time and can misclassify the first mint.
+                    genesis_observed_at[AssetId{aid}] =
+                        PnLTracker::timestamp_to_iso(
+                            std::chrono::system_clock::now());
                     const Mojo seed_qty = (confirmed > 0) ? confirmed : spendable;
                     if (seed_qty <= 0) continue;
 
@@ -1078,7 +1120,8 @@ asio::awaitable<void> Engine::poll_loop_coro()
             // [LEDGER] Establish opening balances (no-op after the first
             // run -- the 'opening' legs already exist).  Anchored to the
             // startup block so downtime fills are not counted twice.
-            post_ledger_genesis(genesis_balances, startup_block_);
+            post_ledger_genesis(genesis_balances, startup_block_,
+                                genesis_observed_at);
         } catch (const std::exception& ex) {
             spdlog::warn("[Engine] Startup inventory seeding failed: {}; "
                          "continuing with zero inventory", ex.what());
@@ -1806,6 +1849,16 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     try { co_await step_ingest_reward_inflows(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Reward ingestion failed: {}", e.what());
+    }
+
+    // [S19 2026-08-23] Book completed warp bridge flows BEFORE the
+    // invariant below, for the same reason as the reward step: a bridge
+    // mint must be explained flow (a 'bridge_deposit' entry) by the time
+    // the books are tied to the wallet, not divergence for a blind
+    // adjusting entry to absorb.
+    try { co_await step_ingest_bridge_flows(block_height); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] Bridge ingestion failed: {}", e.what());
     }
 
     // [LEDGER 2026-07-30] Tie the books to the wallet.  Runs after Step 2
@@ -6988,7 +7041,9 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         pending =
                             bal_json["pending_change"].get<Mojo>();
                     cached_wallet_balances_[asset] =
-                        {spendable, confirmed, pending, block_height};
+                        {spendable, confirmed, pending, block_height,
+                         bal_json.contains("confirmed_wallet_balance")
+                             && bal_json.contains("pending_change")};
                     // Log only transitions worth an operator's eye: a
                     // balance appearing where the cache had none/zero.
                     if (confirmed > 0
@@ -7325,9 +7380,22 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                         // skipped in several engine modes while Step 2 keeps
                         // mutating inventory).
                         cached_wallet_balances_[sb.label] =
-                            {spendable, confirmed, pending, block_height};
+                            {spendable, confirmed, pending, block_height,
+                             bal_json.contains("confirmed_wallet_balance")
+                                 && bal_json.contains("pending_change")};
                         const AssetId tracked_asset{sb.label};
-                        if (confirmed > 0 && inventory_
+                        // [S19 review round 6] The bridge asset's
+                        // inventory and State position are maintained by
+                        // the bridge scan's wallet-truth reconcile
+                        // (single writer); seeding here would absorb a
+                        // mint the scan is about to book.  Same exclusion
+                        // as Step 11's one-shot reconcile.  Only while
+                        // the scan is OPERATIONAL (round 11) -- when it
+                        // stands down, this recovery seed resumes.
+                        const bool bridge_owned =
+                            sb.label == config_.accounting.bridge_asset_id
+                            && bridge_accounting_operational();
+                        if (!bridge_owned && confirmed > 0 && inventory_
                             && inventory_->net_inventory(tracked_asset) == 0)
                         {
                             inventory_->seed_position(tracked_asset, confirmed,
@@ -7341,7 +7409,7 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
                             // persist so a crash in between round-trips.
                             persist_inventory_state();
                         }
-                        if (confirmed > 0 && state_
+                        if (!bridge_owned && confirmed > 0 && state_
                             && state_->get_position(tracked_asset).balance == 0)
                         {
                             state_->record_buy(tracked_asset, confirmed, Mojo{1});
@@ -11062,7 +11130,8 @@ void Engine::persist_inventory_state() noexcept
 
 void Engine::post_ledger_genesis(
     const std::unordered_map<AssetId, Mojo>& balances,
-    BlockHeight at_block)
+    BlockHeight at_block,
+    const std::unordered_map<AssetId, std::string>& observed_at)
 {
     if (!config_.accounting.ledger_enabled || !db_) return;
 
@@ -11075,11 +11144,29 @@ void Engine::post_ledger_genesis(
         // step_check_ledger_invariant), so skipping a zero balance here is
         // safe -- but it must still be anchored when it IS opened later,
         // which the at_block stamp below provides.
-        if (balance <= 0) continue;
+        //
+        // EXCEPTION ([S19] review round 5): the bridge asset gets a
+        // zero-valued opening.  Without one, the FIRST deposit into an
+        // empty asset could never book: the scan requires an opening, and
+        // by the restart that creates one the (now-positive) balance --
+        // mint included -- IS the opening, so the chronology filter then
+        // rightly drops the historical job.  A 0-mojo opening anchors the
+        // timeline BEFORE the flow, so the deposit books as external
+        // capital.
+        const bool is_bridge_asset =
+            config_.accounting.bridge_ingest_enabled
+            && asset == AssetId{config_.accounting.bridge_asset_id};
+        if (balance < 0 || (balance == 0 && !is_bridge_asset)) continue;
         if (db_->has_ledger_opening(asset)) continue;   // once, ever
 
         DbLedgerEntry e;
-        e.entry_time   = now_iso;
+        // The opening's entry_time is the balance OBSERVATION time when
+        // known (review round 12): the bridge chronology test compares
+        // flow times against it, and the later write time would wrongly
+        // classify an in-between flow as already inside the opening.
+        const auto oit = observed_at.find(asset);
+        e.entry_time   = (oit != observed_at.end() && !oit->second.empty())
+                           ? oit->second : now_iso;
         e.event_type   = "opening";
         e.event_id     = "genesis:" + asset;
         e.leg          = "opening";
@@ -11512,6 +11599,558 @@ asio::awaitable<void> Engine::step_ingest_reward_inflows(
     co_return;
 }
 
+// [S19 review round 11] The single-writer contract holds only while the
+// scan can actually run; Step 8/Step 11 consult this before excluding
+// the bridge asset from their recovery paths.
+bool Engine::bridge_accounting_operational() const
+{
+    const auto& acc = config_.accounting;
+    return acc.ledger_enabled && acc.bridge_ingest_enabled
+        && db_ && inventory_ && pnl_
+        && !acc.bridge_asset_id.empty()
+        && !acc.bridge_jobs_db_path.empty()
+        && ledger_genesis_done_ && !ledger_incomplete_
+        && ledger_opened_assets_.count(AssetId{acc.bridge_asset_id}) > 0;
+}
+
+// [S19 2026-08-23] Book completed warp bridge flows as first-class ledger
+// events.  See accounting/bridge_ingest.hpp for the design rationale and
+// engine.hpp for the contract.  Synchronous on purpose: one read-only
+// SQLite open of a small GUI-owned database per heartbeat, no RPC.
+asio::awaitable<void> Engine::step_ingest_bridge_flows(
+    BlockHeight block_height)
+{
+    const auto& acc = config_.accounting;
+    if (!acc.ledger_enabled || !acc.bridge_ingest_enabled) co_return;
+    if (!db_ || !inventory_ || !pnl_) co_return;
+    if (acc.bridge_asset_id.empty() || acc.bridge_jobs_db_path.empty()) co_return;
+
+    // Same stand-down conditions as the invariant control: without a
+    // genesis baseline (or with known-incomplete books) posting bridge
+    // legs would only deepen the inconsistency.
+    if (!ledger_genesis_done_ || ledger_incomplete_) co_return;
+
+    const AssetId asset{acc.bridge_asset_id};
+    if (!ledger_opened_assets_.count(asset)) co_return;
+
+    // Captured ONCE, before the first anchor can seed (round 35): the
+    // peak-credit gate below compares job completion stamps against
+    // this.
+    if (bridge_process_start_iso_.empty()) {
+        bridge_process_start_iso_ = PnLTracker::timestamp_to_iso(
+            std::chrono::system_clock::now());
+    }
+
+    // The GUI owns warp_jobs.db; the engine only ever reads it.
+    // SQLITE_OPEN_READONLY refuses to create the file and makes writes
+    // impossible at the API level.  A missing file (warp never used on
+    // this host) or a transiently locked one is a clean no-op: unbooked
+    // flows simply remain wallet-vs-books divergence for the invariant to
+    // absorb -- the pre-S19 behaviour, not a new failure mode.
+    // The scan portion below may fail (missing/locked DB, truncated
+    // read); those paths skip BOOKING only.  The wallet-truth reconcile
+    // at the tail still runs (review round 10) -- with Step 8 and
+    // Step 11 both excluding this asset, a permanently unreadable jobs
+    // DB must not leave its inventory without any maintainer.
+    std::vector<accounting::BridgeJobRow> jobs;
+
+    {
+    // Nested scope (round 45): both SQLite guards must destruct at the
+    // closing brace below -- BEFORE the wallet co_await, the ledger
+    // writes, and inventory persistence -- so the read-only warp
+    // handle is never held across a suspension or a write.  The
+    // function-scoped form kept it open for the whole pass, which the
+    // old scope-exit comment mis-stated.
+    sqlite3* raw_db = nullptr;
+    int rc = sqlite3_open_v2(acc.bridge_jobs_db_path.c_str(), &raw_db,
+                             SQLITE_OPEN_READONLY, nullptr);
+    // RAII: sqlite3_open_v2 hands back a handle even on failure, and an
+    // exception between prepare and finalize must not leak either handle
+    // (review round 1).
+    const std::unique_ptr<sqlite3, int (*)(sqlite3*)> wdb_guard(
+        raw_db, &sqlite3_close);
+    sqlite3* const wdb = raw_db;
+    if (rc != SQLITE_OK) {
+        spdlog::debug("[Engine] Bridge ingest: cannot open {} read-only "
+                      "({}) -- booking skipped this heartbeat",
+                      acc.bridge_jobs_db_path,
+                      wdb ? sqlite3_errmsg(wdb) : "out of memory");
+    } else {
+    // This runs on the engine's io_context thread: a locked database
+    // this heartbeat is a clean skip, not worth blocking the event loop
+    // for (review round 1).  The GUI's WAL writers hold locks only
+    // briefly.
+    sqlite3_busy_timeout(wdb, 250);
+
+    // Inbound books at COMPLETED.  NOTE: the mint's wallet effect
+    // PRECEDES completion -- the CAT is on-chain while the job waits
+    // out the confirmation depth in CLAIMING (the documented S21
+    // window, absorbed as an adjust and converged by the three-entry
+    // catch-up); COMPLETED is simply the earliest booking point that
+    // cannot regress.
+    // Outbound books as soon as the Chia burn is IRREVERSIBLY on-chain:
+    // BURNING is entered when the burn CAT is observed on-chain and the
+    // service declares the unwrap forward-only (round 43 -- the job can
+    // then sit in BURNING for the whole confirmation-depth wait while
+    // the wallet balance has already dropped), and COLLECTING_EVM_SIGS
+    // only after the burn confirms at depth
+    // (gui/services/warp/service.py _h_burning), while COMPLETED waits
+    // for Base-side delivery -- minutes normally, UNBOUNDED for
+    // AWAITING_EXTERNAL_RELAY -- during which the invariant would absorb
+    // the burn as blind adjust churn, exactly what this step exists to
+    // prevent (review round 1).  Selection is by EXISTENCE of the
+    // historical booking-point event, not the job's CURRENT status
+    // (review round 6): a post-burn job can later move to FAILED or be
+    // operator-closed, and neither un-burns the CAT -- the flow already
+    // happened.  Jobs that never reached a booking point (pre-burn
+    // FAILED/CANCELLED, DRY_RUN_OK) have no such event and never match.
+    // The flow timestamp is the FIRST warp_events entry in a
+    // booking-eligible status: immutable, unlike warp_jobs.updated_at
+    // which rewrites on every poll (review round 3).
+    static constexpr const char* kJobsSql = R"SQL(
+        SELECT j.id,
+               COALESCE(j.amount_mojos, 0),
+               COALESCE(j.post_tip_mojos, 0),
+               COALESCE((SELECT MIN(e.ts) FROM warp_events e
+                         WHERE e.job_id = j.id
+                           AND e.status IN ('COMPLETED',
+                                            'BURNING',
+                                            'COLLECTING_EVM_SIGS',
+                                            'RELAYING',
+                                            'AWAITING_EXTERNAL_RELAY')), ''),
+               COALESCE(j.state, '{}'),
+               COALESCE(j.created_at, ''),
+               COALESCE((SELECT MIN(e.ts) FROM warp_events e
+                         WHERE e.job_id = j.id
+                           AND e.status IN ('CLAIMING', 'BURN_SENT')), '')
+        FROM warp_jobs j
+        WHERE EXISTS (SELECT 1 FROM warp_events e
+                      WHERE e.job_id = j.id
+                        AND e.status IN ('COMPLETED',
+                                         'BURNING',
+                                         'COLLECTING_EVM_SIGS',
+                                         'RELAYING',
+                                         'AWAITING_EXTERNAL_RELAY'))
+        ORDER BY j.id;
+    )SQL";
+
+    sqlite3_stmt* stmt = nullptr;
+    rc = sqlite3_prepare_v2(wdb, kJobsSql, -1, &stmt, nullptr);
+    const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> stmt_guard(
+        stmt, &sqlite3_finalize);
+    if (rc != SQLITE_OK) {
+        spdlog::warn("[Engine] Bridge ingest: prepare failed on {} ({}) -- "
+                     "booking skipped this heartbeat",
+                     acc.bridge_jobs_db_path, sqlite3_errmsg(wdb));
+    } else {
+
+    int step_rc = SQLITE_OK;
+    while ((step_rc = sqlite3_step(stmt)) == SQLITE_ROW) {
+        accounting::BridgeJobRow r;
+        r.id             = sqlite3_column_int64(stmt, 0);
+        r.amount_mojos   = sqlite3_column_int64(stmt, 1);
+        r.post_tip_mojos = sqlite3_column_int64(stmt, 2);
+        const char* fa = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 3));
+        const char* sj = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 4));
+        const char* ca = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 5));
+        const char* lb = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 6));
+        r.flow_at    = fa ? fa : "";
+        r.state_json = sj ? sj : "{}";
+        r.created_at = ca ? ca : "";
+        r.flow_lb    = lb ? lb : "";
+        jobs.push_back(std::move(r));
+    }
+    // A truncated scan must not be processed as a complete snapshot:
+    // SQLITE_BUSY mid-scan (the GUI's WAL writers are expected) would
+    // otherwise silently drop the tail and let the invariant absorb the
+    // omitted flows as adjustments (review round 4).
+    if (step_rc != SQLITE_DONE) {
+        spdlog::warn("[Engine] Bridge ingest: scan of {} ended with rc={} "
+                     "-- partial snapshot discarded, booking skipped "
+                     "this heartbeat", acc.bridge_jobs_db_path, step_rc);
+        jobs.clear();
+    }
+    }  // prepare ok
+    }  // open ok
+    }  // scan scope: wdb_guard and stmt_guard destruct HERE (round 45),
+       // before the coroutine can suspend or the ledger is written.
+
+    // wUSDC.b is the $1.00 numeraire (peg MONITORED, not priced in -- the
+    // AccountingConfig peg-monitor doctrine), so no price feed is needed
+    // and a flow can never be deferred for want of an FMV.
+    const double usd_per_unit   = 1.0;
+    const double mojos_per_unit = (asset == "xch") ? 1e12 : 1e3;
+
+    // Jobs completed at or before the asset's opening are already inside
+    // the opening balance (the opening records the live wallet, mint
+    // included); booking them again would double-count on a fresh or
+    // reset ledger (review round 1).  Ties skip: under-booking degrades
+    // to the pre-S19 adjust behaviour, double-booking permanently
+    // overstates net deposits.
+    const std::string opening_time = db_->ledger_opening_time(asset);
+    if (opening_time.empty()) {
+        spdlog::warn("[Engine] Bridge ingest: no opening timestamp for {} "
+                     "despite ledger_opened_assets_ -- booking skipped "
+                     "this heartbeat", asset.substr(0, 12));
+        jobs.clear();
+    }
+
+    // Fresh wallet truth ON DEMAND (review round 17): Step 8's cache
+    // writers live inside step_manage_offers, which is skipped during
+    // GUI/breaker/flash-crash pauses -- the previous same-block gate
+    // therefore made booking impossible for the ENTIRE paused period,
+    // leaving the ledger and Net Deposits stale exactly when the
+    // operator inspects them.  Fetching the balance here also closes
+    // the earlier ordering races outright: the snapshot now postdates
+    // every job already visible in this scan's list, so booking and
+    // reconciling in the same pass is safe and the old booked==0
+    // deferral is gone.
+    // A same-block Step 8 snapshot can still PREDATE this scan's jobs
+    // read (round 31): Step 8 runs earlier in the heartbeat, so a mint
+    // landing between its RPC and the scan would book against a
+    // pre-flow balance -- the peak credit then lands while equity has
+    // not yet received the flow, an immediate and latching false trip.
+    // Whenever the scan holds a candidate not yet known booked, force
+    // the on-demand fetch below so the snapshot postdates every job
+    // visible in this scan (the original round-17 guarantee).
+    bool unbooked_candidate = false;
+    for (const auto& row : jobs) {
+        const std::string eid =
+            accounting::bridge_event_id(row.id, row.created_at);
+        // Terminally-skipped rows (round 33) can never book, so they
+        // must not force the fresh fetch every heartbeat forever.
+        if (bridge_booked_event_ids_.count(eid) == 0
+            && bridge_terminal_skip_ids_.count(eid) == 0) {
+            unbooked_candidate = true;
+            break;
+        }
+    }
+    bool snapshot_current = false;
+    if (auto sit = cached_wallet_balances_.find(asset);
+        !unbooked_candidate && sit != cached_wallet_balances_.end()) {
+        // Field-validated entries only (round 28): Step 8's writers
+        // default missing RPC fields to zero, so a same-block entry
+        // is not necessarily settled wallet truth.  An unvalidated
+        // entry falls through to the validated on-demand fetch below.
+        snapshot_current = sit->second.as_of_block == block_height
+            && sit->second.pending_change == 0
+            && sit->second.fields_validated;
+    }
+    // Respect the wallet circuit breaker (round 34): while the
+    // circuit is open the poll loop probes only at
+    // kWalletProbeInterval, and an every-heartbeat RPC from here would
+    // recreate exactly the timeout cascade the breaker exists to stop.
+    // Booking simply defers until the scheduled probe closes the
+    // circuit -- the awaitable-scan design already books through
+    // arbitrarily long deferrals.
+    if (!snapshot_current && !wallet_circuit_open_
+        && offer_mgr_ && wallet_ && wallet_->is_open()) {
+        const std::int64_t wid = offer_mgr_->resolve_wallet_id(asset);
+        if (wid > 0) {
+            try {
+                auto bal_json = co_await wallet_->get_wallet_balance(wid);
+                // A missing balance field must not read as a settled
+                // ZERO (review round 22): zero is a valid target now,
+                // and defaulting a malformed response would reconcile
+                // inventory to nothing and let the invariant adjust the
+                // recorded balance away.
+                if (!bal_json.contains("confirmed_wallet_balance")
+                    || !bal_json.contains("pending_change")) {
+                    spdlog::warn("[Engine] Bridge ingest: balance "
+                                 "response missing required fields -- "
+                                 "deferring this heartbeat");
+                } else {
+                    WalletBalanceEntry e{};
+                    e.spendable = bal_json.value("spendable_balance",
+                                                 static_cast<Mojo>(0));
+                    e.confirmed = bal_json.value("confirmed_wallet_balance",
+                                                 static_cast<Mojo>(0));
+                    e.pending_change = bal_json.value("pending_change",
+                                                      static_cast<Mojo>(0));
+                    e.as_of_block = block_height;
+                    e.fields_validated = true;  // presence checked above
+                    cached_wallet_balances_[asset] = e;
+                    snapshot_current = e.pending_change == 0;
+                }
+            } catch (const std::exception& ex) {
+                spdlog::debug("[Engine] Bridge ingest: on-demand balance "
+                              "fetch failed ({}) -- deferring this "
+                              "heartbeat", ex.what());
+            }
+        }
+    }
+    if (!snapshot_current && !jobs.empty()) {
+        spdlog::debug("[Engine] Bridge ingest: no usable wallet snapshot "
+                      "-- booking deferred this heartbeat");
+        jobs.clear();
+    }
+
+    const auto  now = std::chrono::system_clock::now();
+    std::size_t booked     = 0;
+    double      booked_usd = 0.0;
+    bool        inproc_booked = false;
+
+    for (const auto& row : jobs) {
+        // Skip warnings fire ONCE per job (review round 10): skipped
+        // jobs stay in the scan forever, and a single legitimate
+        // foreign-asset job must not warn every heartbeat for the
+        // lifetime of the database.
+        const bool first_skip_notice =
+            bridge_warned_jobs_.count(row.id) == 0;
+        const auto skip_notice =
+            [&](const char* what, const std::string& detail) {
+                if (first_skip_notice) {
+                    bridge_warned_jobs_.insert(row.id);
+                    spdlog::warn("[Engine] Bridge ingest: job {} {}{} -- "
+                                 "skipped (left for the divergence "
+                                 "control)", row.id, what, detail);
+                } else {
+                    spdlog::debug("[Engine] Bridge ingest: job {} still "
+                                  "skipped ({})", row.id, what);
+                }
+            };
+
+        const auto flow = accounting::classify_bridge_job(row);
+        if (!flow.valid) {
+            // Terminal (round 33): a completed job's state payload and
+            // quantities are immutable, so this row can never book.
+            bridge_terminal_skip_ids_.insert(
+                accounting::bridge_event_id(row.id, row.created_at));
+            skip_notice("is unclassifiable (bad state, unknown direction, "
+                        "or non-positive quantity)", "");
+            continue;
+        }
+
+        // The warp GUI can bridge more than one asset; only jobs whose
+        // fingerprint resolves to the configured bridge asset book here.
+        // A milliETH job valued at the $1 numeraire would be badly wrong
+        // (review round 1).  Strict: no fingerprint, no booking.
+        if (!accounting::fingerprint_matches_asset(flow.asset_fingerprint,
+                                                   acc.bridge_asset_id)) {
+            bridge_terminal_skip_ids_.insert(flow.event_id);  // terminal
+            skip_notice("has an asset fingerprint that does not resolve "
+                        "to the configured bridge asset: ",
+                        flow.asset_fingerprint);
+            continue;
+        }
+
+        if (row.flow_at.empty()) {
+            // NOT terminal (round 33): the scan selects jobs by the
+            // existence of a booking-point event, so an empty flow_at
+            // is a data anomaly that may heal -- keep forcing the
+            // fresh fetch rather than cache a decision that could
+            // flip.
+            skip_notice("has no recorded transition event (chronology "
+                        "unknowable)", "");
+            continue;
+        }
+
+        // A HISTORICAL flow the divergence control already absorbed as
+        // a blind adjust converges rather than corrupts (review round 4):
+        // booking the bridge leg makes the books overshoot the wallet by
+        // the flow, and the invariant's next cycle posts the opposite
+        // adjust.  End state: old adjust + bridge leg + counter-adjust
+        // net to zero, the flow is explained by its proper event type,
+        // net deposits is correct, and the adjust SUM returns to ~0 for
+        // that flow -- at the cost of one expected LedgerDivergence
+        // alert during catch-up.  Reclassification machinery to rewrite
+        // the old adjust in place was considered and declined: it would
+        // edit journaled history, and the three-entry form is exactly
+        // how a correcting entry is supposed to look.
+        // Compare the BROADCAST lower bound against the opening
+        // (review round 17): warp_events.ts is GUI-persist time, and
+        // the wallet changes at broadcast confirmation, up to minutes
+        // earlier.  A genesis inside that lag window would otherwise
+        // read the flow as post-opening and double-book net deposits
+        // permanently.  Skipping degrades to an adjust -- the
+        // established safe direction.
+        const std::string& flow_floor =
+            row.flow_lb.empty() ? row.flow_at : row.flow_lb;
+        if (!accounting::iso_strictly_after(flow_floor, opening_time)) {
+            // Terminal (round 33): the broadcast lower bound can only
+            // move EARLIER (MIN over append-only events) and the
+            // opening is fixed for this ledger generation, so a
+            // pre-opening verdict never flips.
+            bridge_terminal_skip_ids_.insert(flow.event_id);
+            spdlog::debug("[Engine] Bridge ingest: job {} may predate the "
+                          "{} ledger opening ({}) -- treated as inside "
+                          "the opening balance, not booked",
+                          row.id, asset.substr(0, 12), opening_time);
+            continue;
+        }
+
+        const auto val = accounting::value_bridge_flow(
+            flow.delta_mojos, mojos_per_unit, usd_per_unit);
+        if (val.fmv_pseudo_price <= 0) {
+            // Terminal (round 33): quantity and rates are fixed, so a
+            // rejected valuation never becomes acceptable.
+            bridge_terminal_skip_ids_.insert(flow.event_id);
+            skip_notice("has a quantity the valuation guard rejects "
+                        "(unbookable magnitude)", "");
+            continue;
+        }
+
+        // 1. Journal first (crash-consistent, and the idempotency gate).
+        DbLedgerEntry e;
+        e.entry_time   = PnLTracker::timestamp_to_iso(now);
+        e.event_type   = flow.event_type;
+        e.event_id     = flow.event_id;
+        e.leg          = "bridge";
+        e.asset_id     = asset;
+        e.delta_mojos  = flow.delta_mojos;
+        // The claim/burn block is not recorded in warp_jobs; the booking
+        // block is an honest, queryable stand-in.
+        e.block_height = block_height;
+        e.note         = accounting::bridge_note(val.flow_usd, usd_per_unit,
+                                                 row.id);
+
+        if (bridge_booked_event_ids_.count(flow.event_id)) {
+            continue;   // known-booked: no write transaction (round 18)
+        }
+
+        const auto inserted = db_->append_ledger_entries({e});
+        if (!inserted) {
+            // Unlike the fill path (which latches ledger_incomplete_
+            // because a wallet-side effect already happened and the leg
+            // is lost), nothing here is half-applied: the scan re-derives
+            // every candidate from warp_jobs.db each heartbeat and the
+            // event_id dedupe makes re-booking safe, so a transient
+            // write failure just retries next heartbeat (review round 1).
+            // BREAK, not return (round 18): rows inserted earlier in
+            // this pass still reconcile and persist below, and a
+            // persistent failure must not leave the single-writer asset
+            // without its maintainer.
+            spdlog::error("[Engine] Bridge ingest: ledger write FAILED for "
+                          "job {} -- remaining rows retry next heartbeat",
+                          row.id);
+            break;
+        }
+        if (*inserted == 0) {
+            // Already booked before this process (restart/re-scan): warm
+            // the cache so the no-op write transaction happens once.
+            bridge_booked_event_ids_.insert(flow.event_id);
+            continue;
+        }
+        bridge_booked_event_ids_.insert(flow.event_id);
+
+        // 2. Inventory is NOT mutated per flow.  Add-based mutations
+        // raced every recovery path that also writes this asset (Step 8
+        // zero-seed, Step 11 reconcile -- review rounds 4-6); the
+        // end-of-scan wallet-truth reconcile below covers the flow
+        // idempotently instead.
+
+        // 3. External capital, kept out of trading P&L (GIPS/TWR).
+        pnl_->add_net_deposit_usd(val.flow_usd);
+
+        // 4. Peak policy (round 42, owner decision): booking an
+        // IN-PROCESS flow triggers the restart-style peak re-anchor
+        // after the reconcile below.  Flows that completed before
+        // this process started are already inside the current anchor
+        // (round 35) and must not erase live drawdown state.  Ties
+        // and unparseable stamps count as pre-process, matching the
+        // opening filter's tie-skip precedent.
+        if (accounting::iso_strictly_after(row.flow_at,
+                                           bridge_process_start_iso_)) {
+            inproc_booked = true;
+        }
+
+        ++booked;
+        booked_usd += val.flow_usd;
+        spdlog::info("[Engine] Bridge flow: {} {:+} mojos of {} "
+                     "(job {}, ${:+.6f}) booked at block {}",
+                     flow.event_type, flow.delta_mojos, asset.substr(0, 12),
+                     row.id, val.flow_usd, block_height);
+    }
+
+    if (booked > 0) {
+        spdlog::info("[Engine] Bridge ingest: booked {} flow(s), net "
+                     "${:+.6f} external capital at block {}",
+                     booked, booked_usd, block_height);
+    }
+
+    // Single-writer inventory maintenance (rounds 4-6): the scan
+    // reconciles the bridge asset's tracked quantity and State position
+    // to the CONFIRMED wallet balance -- idempotent wallet truth
+    // covering the cold-start baseline, every booked flow, and drift,
+    // at the numeraire price.  Step 8's recovery seed and Step 11's
+    // one-shot reconcile both skip this asset while the scan is
+    // operational, so exactly one writer remains.
+    const Mojo numeraire_pseudo =
+        static_cast<Mojo>(usd_per_unit * 1e12 + 0.5);
+    bool inv_changed = false;
+    if (snapshot_current) {
+        if (auto bit = cached_wallet_balances_.find(asset);
+            bit != cached_wallet_balances_.end()) {
+            const auto& bal = bit->second;
+            if (bal.as_of_block == block_height
+                && bal.pending_change == 0 && bal.confirmed >= 0
+                && bal.fields_validated) {
+                const Mojo tracked = inventory_->net_inventory(asset);
+                if (tracked != bal.confirmed) {
+                    inventory_->adjust_quantity(asset, bal.confirmed,
+                                                numeraire_pseudo);
+                    inv_changed = true;
+                    spdlog::info("[Engine] Bridge ingest: reconciled {} "
+                                 "inventory {} -> {} mojos to wallet "
+                                 "truth", asset.substr(0, 12), tracked,
+                                 bal.confirmed);
+                }
+                if (state_) {
+                    const Mojo pos = state_->get_position(asset).balance;
+                    if (bal.confirmed > pos) {
+                        // Unit-mojo basis (Mojo{1}), the State
+                        // convention for quote assets (round 8).
+                        state_->record_buy(asset, bal.confirmed - pos,
+                                           Mojo{1});
+                    } else if (bal.confirmed < pos
+                               && !state_->record_sell(
+                                      asset, pos - bal.confirmed)) {
+                        spdlog::warn("[Engine] Bridge ingest: state "
+                                     "position for {} could not be "
+                                     "reduced {} -> {}",
+                                     asset.substr(0, 12), pos,
+                                     bal.confirmed);
+                    }
+                }
+            }
+        }
+    }
+
+    // FLOW-TRIGGERED RE-ANCHOR (round 42, owner decision).  Rounds
+    // 24-41 tried to adjust the drawdown peak in place for external
+    // flows, and every variant was refuted: fills are tracked
+    // base-side only (round 17), so neither the wallet delta, the
+    // mid-heartbeat equity snapshot, nor amount-matched provenance
+    // can attribute a wallet movement to a specific flow -- rounds 39
+    // and 41 ended by demanding OPPOSITE policies for the same
+    // unknowable case.  That machinery is gone.  POLICY: booking an
+    // in-process flow resets the peak to its unseeded state, exactly
+    // what a restart does; Step 13 then re-seeds it from the next
+    // live equity valuation, which already contains the flow.
+    // Drawdown measurement restarts at the capital event -- external
+    // flows are deliberate operator actions, like restarts, and
+    // restart re-anchoring is the accepted ground truth everywhere
+    // else in this engine.  Ledger, Net Deposits, and the inventory
+    // reconcile above are untouched by this policy: P&L attribution
+    // never depended on the peak.
+    if (inproc_booked && peak_equity_hwm_usd_ > 0.0) {
+        spdlog::info("[Engine] Bridge ingest: external flow booked -- "
+                     "drawdown peak {:.2f} discarded; the next equity "
+                     "valuation re-anchors it (restart semantics)",
+                     peak_equity_hwm_usd_);
+        peak_equity_hwm_usd_ = 0.0;
+    }
+
+    if (booked > 0 || inv_changed) {
+        persist_inventory_state();
+    }
+    co_return;
+}
+
 void Engine::step_check_ledger_invariant(BlockHeight block_height)
 {
     const auto& acc = config_.accounting;
@@ -11543,7 +12182,26 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             || block_height - cached.as_of_block > acc.max_balance_age_blocks) {
             continue;                                   // stale snapshot
         }
-        if (cached.confirmed <= 0) continue;
+        // Zero is a USABLE balance for the BRIDGE asset only (rounds
+        // 16 + 22): an outbound bridge can legitimately drain that CAT
+        // wallet to zero, and skipping it left an already-absorbed
+        // withdrawal's counter-adjust unreachable.  For every other
+        // asset the historical <= 0 skip stands -- Step 8's cache
+        // writers default missing RPC fields to zero, and treating such
+        // a malformed snapshot as settled-zero would let the invariant
+        // adjust a real balance away.  The bridge asset is no
+        // exception (round 29): it is also a pair asset, so Step 8's
+        // pair-gate writer caches it too, and only an entry whose
+        // writer proved field presence (fields_validated) may put a
+        // zero into the invariant.  A nonzero confirmed needs no bit:
+        // defaults are zero, so nonzero implies the field was present.
+        if (cached.confirmed < 0) continue;
+        if (cached.confirmed == 0
+            && !(acc.bridge_ingest_enabled
+                 && asset == acc.bridge_asset_id
+                 && cached.fields_validated)) {
+            continue;
+        }
 
         // Coins in flight widen UNCERTAINTY; they do not move the target.
         //
@@ -11928,6 +12586,24 @@ void Engine::step_update_pnl(BlockHeight block_height)
             for (const auto& [aid, bal] : cached_wallet_balances_) {
                 if (inventory_reconciled_assets_.count(aid)) continue;
                 if (tracked_assets.find(aid) == tracked_assets.end()) continue;
+                // [S19 review round 4] The bridge asset has a dedicated
+                // external-flow mechanism now (step_ingest_bridge_flows
+                // books mints/burns into inventory itself).  Reconciling
+                // it here raced that scan: set-to-wallet absorbs a mint,
+                // then a delayed scan (jobs DB briefly locked) record_buys
+                // the same mint again -- a permanent double-apply that
+                // nothing corrects.  Residual NON-bridge transfers of the
+                // asset fall to the ledger divergence control, exactly the
+                // pre-S19 behaviour for every asset.
+                if (aid == config_.accounting.bridge_asset_id
+                    && bridge_accounting_operational()) {
+                    // Excluded only while the bridge scan is OPERATIONAL
+                    // (rounds 5 + 11): whenever the scan stands down --
+                    // ledger off, genesis not done, incomplete ledger,
+                    // asset not opened -- this one-shot reconcile resumes
+                    // as the asset's maintainer.
+                    continue;
+                }
                 if (bal.pending_change != 0) continue;  // coins in flight
                 // Stale snapshot: skip WITHOUT consuming the one-shot so it
                 // is retried once Step 8 refreshes the balance.
@@ -12124,6 +12800,9 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // [REWARD-INCOME 2026-08-01] Other income beside the trading figures;
     // not part of ps.usd.
     ps.usd_reward_income = total.reward_income_usd;
+    // [S19 2026-08-23] External capital beside the trading figures; part
+    // of neither ps.usd nor ps.usd_reward_income.
+    ps.usd_net_deposits  = total.net_deposits_usd;
     metrics_->update_pnl(ps);
 
     // Dashboard 2: Inventory

@@ -464,6 +464,13 @@ public:
     /// balances are established exactly once in the ledger's lifetime.
     [[nodiscard]] bool has_ledger_opening(const AssetId& asset_id) const;
 
+    /// The entry_time of this asset's 'opening' leg (ISO-8601 UTC), or ""
+    /// when none exists / the query fails.  [S19] The bridge ingester
+    /// skips jobs completed at or before this instant: their flow is
+    /// already inside the opening balance.
+    [[nodiscard]] std::string ledger_opening_time(
+        const AssetId& asset_id) const;
+
     /// Total number of legs (diagnostics / first-run detection).
     [[nodiscard]] std::int64_t ledger_entry_count() const;
 

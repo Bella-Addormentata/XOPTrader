@@ -176,6 +176,9 @@ accounting:
   floor_cat_mojos: 250
   fee_slack_mojos: 300000
   max_balance_age_blocks: 20
+  bridge_ingest_enabled: false
+  bridge_jobs_db_path: elsewhere/warp.db
+  bridge_asset_id: aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899
 )";
     TempYaml tmp(yaml.c_str());
     auto cfg = xop::load_config(tmp.path());
@@ -190,6 +193,40 @@ accounting:
     EXPECT_EQ(cfg.accounting.floor_cat_mojos, 250LL);
     EXPECT_EQ(cfg.accounting.fee_slack_mojos, 300'000LL);
     EXPECT_EQ(cfg.accounting.max_balance_age_blocks, 20u);
+    // [S19] Bridge-ingest keys (review round 5: non-default values so a
+    // key rename or conversion regression is caught here, not live).
+    EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
+    EXPECT_EQ(cfg.accounting.bridge_jobs_db_path, "elsewhere/warp.db");
+    EXPECT_EQ(cfg.accounting.bridge_asset_id,
+              "aabbccddeeff00112233445566778899"
+              "aabbccddeeff00112233445566778899");
+}
+
+TEST(ConfigParserTest, BridgeAssetWithoutEnabledPair_AutoDisables) {
+    // [S19 review round 14] Bridge ingestion needs the asset tracked by
+    // an enabled pair (openings + balance snapshots come from pairs).
+    // An untracked asset LOUDLY auto-disables the feature rather than
+    // throwing: the flag defaults to true, so a throw would brick every
+    // config that simply does not trade the bridge asset.
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_ingest_enabled: true
+  bridge_asset_id: 00000000000000000000000000000000000000000000000000000000000000ff
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
+}
+
+TEST(ConfigParserTest, BridgeIngestDisabledSkipsPairCheck) {
+    std::string yaml = std::string(kMinimalValidYaml) + R"(
+accounting:
+  bridge_ingest_enabled: false
+  bridge_asset_id: 00000000000000000000000000000000000000000000000000000000000000ff
+)";
+    TempYaml tmp(yaml.c_str());
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_FALSE(cfg.accounting.bridge_ingest_enabled);
 }
 
 TEST(ConfigParserTest, AccountingPauseBelowAlert_Throws) {

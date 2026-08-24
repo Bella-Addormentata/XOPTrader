@@ -1287,6 +1287,30 @@ bool Database::has_ledger_opening(const AssetId& asset_id) const
     return found;
 }
 
+std::string Database::ledger_opening_time(const AssetId& asset_id) const
+{
+    static constexpr const char* kSelect = R"SQL(
+        SELECT entry_time FROM ledger_entries
+        WHERE asset_id = ?1 AND leg = 'opening'
+        ORDER BY id LIMIT 1;
+    )SQL";
+
+    std::lock_guard<std::mutex> lock(mtx_);
+    sqlite3_stmt* stmt = nullptr;
+    if (sqlite3_prepare_v2(db_, kSelect, -1, &stmt, nullptr) != SQLITE_OK) {
+        return {};
+    }
+    sqlite3_bind_text(stmt, 1, asset_id.c_str(), -1, SQLITE_TRANSIENT);
+    std::string out;
+    if (sqlite3_step(stmt) == SQLITE_ROW) {
+        const char* text = reinterpret_cast<const char*>(
+            sqlite3_column_text(stmt, 0));
+        if (text) out = text;
+    }
+    sqlite3_finalize(stmt);
+    return out;
+}
+
 std::int64_t Database::ledger_entry_count() const
 {
     std::lock_guard<std::mutex> lock(mtx_);

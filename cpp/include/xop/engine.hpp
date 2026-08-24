@@ -103,6 +103,7 @@
 #include <map>
 #include <memory>
 #include <string>
+#include <set>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -504,8 +505,10 @@ private:
     ///                  opening balance (offers restored from a prior run can
     ///                  settle during downtime and are detected afterwards),
     ///                  so their legs must be suppressed or they double-count.
-    void post_ledger_genesis(const std::unordered_map<AssetId, Mojo>& balances,
-                             BlockHeight at_block);
+    void post_ledger_genesis(
+        const std::unordered_map<AssetId, Mojo>& balances,
+        BlockHeight at_block,
+        const std::unordered_map<AssetId, std::string>& observed_at);
 
     /// Post the balanced legs of a settled fill (base, quote and fee).
     /// Idempotent on the fill's trade id.
@@ -554,6 +557,20 @@ private:
     /// absorb.  Idempotent per wallet transaction (ledger event_id
     /// uniqueness), so re-scans and restarts never double-book.
     asio::awaitable<void> step_ingest_reward_inflows(
+        BlockHeight block_height);
+
+    /// [S19 2026-08-23] Book completed warp bridge flows as first-class
+    /// ledger events (bridge_deposit / bridge_withdrawal) so external
+    /// capital is explained flow by the time the books are tied to the
+    /// wallet, not "unexplained divergence" for the adjusting entries to
+    /// absorb.  Reads the GUI-owned warp_jobs.db READ-ONLY; idempotent
+    /// per job (ledger event_id uniqueness), so re-scans and restarts
+    /// never double-book.  GIPS: the USD accumulates as net deposits
+    /// outside trading P&L; booking an in-process flow re-anchors the
+    /// drawdown peak from the next equity valuation (restart
+    /// semantics -- in-place peak adjustment was retired after review
+    /// rounds 24-41; see bridge_ingest.hpp).
+    asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
     /// Tie the ledger's implied balances to the wallet's confirmed balances
@@ -829,6 +846,47 @@ private:
     /// debug -- re-warning every block for an indefinite pause is the same
     /// log spam Step 13 rate-limits.
     bool breaker_skip_warned_{false};
+
+    /// [S19 review round 11] Whether the bridge scan can currently act
+    /// as the bridge asset's inventory maintainer.  The Step 8 recovery
+    /// seed and Step 11 one-shot reconcile exclude the asset ONLY while
+    /// this holds -- if the scan stands down (ledger off, genesis not
+    /// done, incomplete ledger, empty path, asset not opened), the
+    /// recovery paths resume maintaining it instead of both sides
+    /// standing down forever.
+    [[nodiscard]] bool bridge_accounting_operational() const;
+
+
+    /// [S19 review round 18] Ledger event ids already booked (or found
+    /// already-booked) by the bridge scan.  Historical jobs stay in the
+    /// scan forever, and without this every one of them executed a
+    /// write transaction (BEGIN IMMEDIATE / INSERT OR IGNORE / COMMIT)
+    /// per heartbeat for the lifetime of the database.  One no-op pass
+    /// per restart warms the cache.
+    std::set<std::string> bridge_booked_event_ids_;
+    /// [S19 round 33] Event ids whose booking decision is TERMINAL for
+    /// this process: unclassifiable rows, foreign-asset fingerprints,
+    /// pre-opening chronology, and rejected valuations are immutable
+    /// functions of the row content, the config, and the ledger
+    /// opening, so such a job can never become bookable later.  Without
+    /// this cache every permanently-skipped job (the expected
+    /// pre-opening job 2 included) would keep the round-31
+    /// unbooked-candidate check true forever and force an extra wallet
+    /// RPC every heartbeat.  In-memory: restarts re-derive it.
+    std::set<std::string> bridge_terminal_skip_ids_;
+    /// [S19 rounds 35+42] Wall-clock ISO stamp captured on the
+    /// scan's first invocation.  A flow whose completion (flow_at)
+    /// predates it is already inside the current equity anchor, so
+    /// booking it must NOT trigger the flow re-anchor -- erasing live
+    /// drawdown state for capital that moved before this process
+    /// existed.  Ties and unparseable stamps count as pre-process.
+    std::string bridge_process_start_iso_;
+    /// [S19 review round 10] Job ids whose skip condition
+    /// (unclassifiable / foreign fingerprint / missing transition event)
+    /// has already been warned about -- such jobs stay in the scan
+    /// forever, and one legitimate milliETH job must not warn on every
+    /// heartbeat for the lifetime of the database.
+    std::set<std::int64_t> bridge_warned_jobs_;
 
     /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
     /// condition; the re-alert gate only re-arms once this reaches the
@@ -1156,6 +1214,15 @@ private:
         // consumer must check freshness or it may reconcile against a
         // pre-fill balance and undo the fill (PNL-BASIS-PERSIST 2026-07-30).
         BlockHeight as_of_block{0};
+        // [S19 review round 28] True only when the RPC response actually
+        // carried confirmed_wallet_balance AND pending_change.  Writers
+        // default missing fields to zero for the spendable-gating
+        // consumers, but a defaulted zero must never read as settled
+        // wallet truth: the bridge scan requires this bit before
+        // reconciling inventory/State, or a malformed response would
+        // fold a real balance to nothing and let the invariant adjust
+        // the recorded ledger balance away.
+        bool fields_validated{false};
     };
     std::unordered_map<std::string, WalletBalanceEntry> cached_wallet_balances_;
 

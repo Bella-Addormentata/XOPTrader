@@ -2310,6 +2310,46 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     // [REWARD-INCOME 2026-08-01] Dexie reward ingestion; defaults are the
     // operative values (see config.hpp for the measured calibration).
     read_bool("reward_ingest_enabled",  cfg.reward_ingest_enabled);
+    read_bool("bridge_ingest_enabled",  cfg.bridge_ingest_enabled);
+    if (node["bridge_jobs_db_path"] && node["bridge_jobs_db_path"].IsDefined()
+        && !node["bridge_jobs_db_path"].IsNull()) {
+        // Same treatment as database.path (review round 26): ${VAR}
+        // references expand and a leading ~ resolves, so a valid
+        // configured path cannot silently become an unreadable
+        // database that disables ingestion while it reports enabled.
+        cfg.bridge_jobs_db_path = expand_tilde(
+            read_string(node, "bridge_jobs_db_path", "accounting"));
+    }
+    if (node["bridge_asset_id"] && node["bridge_asset_id"].IsDefined()
+        && !node["bridge_asset_id"].IsNull()) {
+        cfg.bridge_asset_id = node["bridge_asset_id"].as<std::string>();
+        // T3-29 pattern (review round 9): normalize to lowercase at the
+        // boundary like pair asset ids -- downstream code compares this
+        // exactly against lowercased pair/cache/opening keys, and an
+        // uppercase override would silently never book anything.
+        std::transform(cfg.bridge_asset_id.begin(),
+                       cfg.bridge_asset_id.end(),
+                       cfg.bridge_asset_id.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        // Validate like pair asset ids (review round 10): a typo would
+        // silently prevent every opening/fingerprint/cache match,
+        // disabling the accounting feature while it reports enabled.
+        if (cfg.bridge_asset_id.size() != 64) {
+            throw ConfigError(
+                "accounting.bridge_asset_id must be a 64-character hex "
+                "string; got length "
+                + std::to_string(cfg.bridge_asset_id.size()));
+        }
+        for (char c : cfg.bridge_asset_id) {
+            if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'))) {
+                throw ConfigError(
+                    std::string("accounting.bridge_asset_id contains "
+                                "invalid hex character '") + c + "'");
+            }
+        }
+    }
     if (node["reward_asset_id"] && node["reward_asset_id"].IsDefined()
         && !node["reward_asset_id"].IsNull()) {
         cfg.reward_asset_id = node["reward_asset_id"].as<std::string>();
@@ -3327,6 +3367,39 @@ AppConfig load_config(const std::string& path,
     // Emit a redacted summary so operators can verify the loaded parameters
     // without exposing secrets in log files.
     log_config_summary(cfg);
+
+    // [S19 review round 14] Bridge ingestion depends on the bridge asset
+    // being tracked: startup builds ledger openings and Step 8 refreshes
+    // balances exclusively from ENABLED pairs, so a bridge asset no
+    // enabled pair uses would silently never book anything while the
+    // feature reports enabled.  Fail loudly instead.
+    if (cfg.accounting.ledger_enabled
+        && cfg.accounting.bridge_ingest_enabled) {
+        bool tracked = false;
+        for (const auto& pr : cfg.pairs) {
+            if (!pr.enabled) continue;
+            if (pr.base_asset_id == cfg.accounting.bridge_asset_id
+                || pr.quote_asset_id == cfg.accounting.bridge_asset_id) {
+                tracked = true;
+                break;
+            }
+        }
+        if (!tracked) {
+            // Loud auto-disable, not a throw: bridge_ingest_enabled
+            // defaults to TRUE, so a hard failure would brick every
+            // config that simply does not trade the bridge asset.  The
+            // point is that the state is EXPLICIT, not silent.
+            cfg.accounting.bridge_ingest_enabled = false;
+            spdlog::warn(
+                "accounting.bridge_ingest_enabled disabled: no ENABLED "
+                "pair uses accounting.bridge_asset_id ({}...) as base or "
+                "quote, so the asset would have no ledger opening and no "
+                "balance snapshots and bridge flows could never book. "
+                "Enable a pair that trades the asset to activate bridge "
+                "accounting.",
+                cfg.accounting.bridge_asset_id.substr(0, 12));
+        }
+    }
 
     return cfg;
 }

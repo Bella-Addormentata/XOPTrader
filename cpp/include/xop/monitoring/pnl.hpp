@@ -98,6 +98,12 @@ struct PnLSummary {
     // P&L stays a measure of trading.  Populated on the cross-pair total
     // only (rewards are per-account, not per-pair).
     double reward_income_usd{0.0};
+    // [S19 2026-08-23] Net external capital via the warp bridge (deposits
+    // positive, withdrawals negative) at the $1.00 wUSDC.b numeraire.
+    // CAPITAL, not income: excluded from total_pnl_usd AND from
+    // reward_income_usd -- GIPS/TWR keeps external flows out of
+    // performance entirely.  Populated on the cross-pair total only.
+    double net_deposits_usd{0.0};
     double sharpe_ratio;            ///< Annualised Sharpe ratio.
     double max_drawdown;            ///< Maximum peak-to-trough decline [0,1].
     double profit_factor;           ///< gross_profit / gross_loss (>1 good).
@@ -258,6 +264,20 @@ public:
 
     /// Cumulative reward income in USD (live accumulation + rehydrated).
     [[nodiscard]] double get_reward_income_usd() const;
+
+    // -- Net bridge deposits ([S19 2026-08-23]) ----------------------------
+
+    /// Accumulate one external bridge flow in USD, SIGNED: deposits
+    /// positive, withdrawals negative.  Kept out of every P&L figure --
+    /// external capital is not performance.  The caller journals the flow
+    /// to the ledger first (event_type 'bridge_deposit' /
+    /// 'bridge_withdrawal', signed USD in the note);
+    /// rehydrate_from_db rebuilds this accumulator from those rows, so
+    /// restarts are invariant.
+    void add_net_deposit_usd(double usd);
+
+    /// Cumulative net external deposits in USD (live + rehydrated).
+    [[nodiscard]] double get_net_deposits_usd() const;
 
     // -- Mark-to-market ---------------------------------------------------
 
@@ -500,6 +520,11 @@ private:
     /// FMV, USD.  Separate from every trading accumulator; rebuilt from the
     /// ledger's 'reward' rows on init (rehydrate_from_db).
     double reward_income_usd_ = 0.0;
+
+    /// [S19 2026-08-23] Net external bridge capital, USD, SIGNED (deposits
+    /// +, withdrawals -).  Separate from every P&L accumulator; rebuilt
+    /// from the ledger's bridge rows on init (rehydrate_from_db).
+    double net_deposits_usd_ = 0.0;
 
     // -- Per-pair unit conversions (PNL-UNITS 2026-07-30) ------------------
 

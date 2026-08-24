@@ -165,6 +165,10 @@ void MetricsExporter::register_metrics()
     // components; deliberately not folded into component="total".
     pnl_usd_reward_income_ =
         &pnl_usd_family_->Add({{"component", "reward_income"}});
+    // [S19 2026-08-23] External capital, beside the trading components;
+    // deliberately not folded into component="total".
+    pnl_usd_net_deposits_ =
+        &pnl_usd_family_->Add({{"component", "net_deposits"}});
 
     // ---------------------------------------------------------------
     //  Dashboard 2: Inventory
@@ -390,6 +394,9 @@ void MetricsExporter::update_pnl(const MetricsPnlSnapshot& summary)
     if (pnl_usd_fees_)       pnl_usd_fees_->Set(summary.usd_fees);
     if (pnl_usd_reward_income_) {
         pnl_usd_reward_income_->Set(summary.usd_reward_income);
+    }
+    if (pnl_usd_net_deposits_) {
+        pnl_usd_net_deposits_->Set(summary.usd_net_deposits);
     }
 }
 

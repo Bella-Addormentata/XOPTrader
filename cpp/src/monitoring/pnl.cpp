@@ -20,6 +20,7 @@
 
 #include "xop/monitoring/pnl.hpp"
 
+#include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
 
 #include <sqlite3.h>
@@ -480,6 +481,46 @@ void PnLTracker::rehydrate_from_db()
                      "ledger ({} mojos, ${:.6f} income at receipt FMV)",
                      reward_rows, reward_mojos, reward_usd);
     }
+
+    // -- [S19 2026-08-23] Rebuild net bridge deposits from the ledger ------
+    // Bridge flows are journaled as bridge_deposit / bridge_withdrawal
+    // rows with the SIGNED USD embedded in the note by
+    // accounting::bridge_note.  Same restart-invariance treatment as the
+    // reward block above (and the same table, so the prepare cannot fail
+    // here after the reward prepare succeeded -- but check anyway).
+    static constexpr const char* kBridgeSql = R"SQL(
+        SELECT COALESCE(note, ''), delta_mojos
+        FROM ledger_entries
+        WHERE event_type IN ('bridge_deposit', 'bridge_withdrawal');
+    )SQL";
+
+    sqlite3_stmt* bstmt = nullptr;
+    rc = sqlite3_prepare_v2(db_, kBridgeSql, -1, &bstmt, nullptr);
+    if (rc != SQLITE_OK) {
+        spdlog::debug("PnLTracker: bridge rehydration prepare failed ({}) "
+                      "-- net deposits start at 0", sqlite3_errmsg(db_));
+        return;
+    }
+
+    double      bridge_usd  = 0.0;
+    std::size_t bridge_rows = 0;
+    Mojo        bridge_mojos = 0;
+    while (sqlite3_step(bstmt) == SQLITE_ROW) {
+        const char* note_text = reinterpret_cast<const char*>(
+            sqlite3_column_text(bstmt, 0));
+        bridge_usd += accounting::parse_bridge_flow_usd(
+            note_text ? note_text : "");
+        bridge_mojos += sqlite3_column_int64(bstmt, 1);
+        ++bridge_rows;
+    }
+    net_deposits_usd_ = bridge_usd;
+    sqlite3_finalize(bstmt);
+
+    if (bridge_rows > 0) {
+        spdlog::info("PnLTracker: rehydrated {} bridge flow(s) from the "
+                     "ledger ({} mojos, ${:+.6f} net deposits)",
+                     bridge_rows, bridge_mojos, bridge_usd);
+    }
 }
 
 // =========================================================================
@@ -494,6 +535,22 @@ void PnLTracker::add_reward_income_usd(double usd)
     }
     std::lock_guard<std::mutex> lock(mtx_);
     reward_income_usd_ += usd;
+}
+
+void PnLTracker::add_net_deposit_usd(double usd)
+{
+    // Signed by design (withdrawals negative); NaN/huge-safe.
+    if (!std::isfinite(usd) || !(std::fabs(usd) < 1e12) || usd == 0.0) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(mtx_);
+    net_deposits_usd_ += usd;
+}
+
+double PnLTracker::get_net_deposits_usd() const
+{
+    std::lock_guard<std::mutex> lock(mtx_);
+    return net_deposits_usd_;
 }
 
 double PnLTracker::get_reward_income_usd() const
@@ -1395,6 +1452,7 @@ PnLSummary PnLTracker::get_total_pnl() const
     // other income (recognized at receipt FMV), deliberately kept out of
     // total_pnl_usd so the trading P&L stays a measure of trading.
     s.reward_income_usd = reward_income_usd_;
+    s.net_deposits_usd  = net_deposits_usd_;
 
     // [PNL-USD-TOTALS 2026-08-01] Rebuild the cross-pair profit factor from
     // USD-normalized grosses.  build_summary's ratio over total_pnl_'s raw
