@@ -11230,40 +11230,25 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
         return leg;
     };
 
+    // Orientation lives in midgate::orient_triangle so the four
+    // base/quote combinations are pinned against the real branches rather
+    // than against hand-supplied flags.
     std::vector<double> candidates;
     for (const auto& p1 : config_.pairs) {
         if (!p1.enabled || p1.name == pc.name) continue;
-        // p1 must touch the target's BASE; the other side is the common
-        // asset C.  Orientation: a pair's mid is quote-per-base, so
-        // rate(A->C) is the mid when p1 is A/C and 1/mid when p1 is C/A.
-        std::string common;
-        bool invert1 = false;
-        if (p1.base_asset_id == pc.base_asset_id) {
-            common = p1.quote_asset_id;
-        } else if (p1.quote_asset_id == pc.base_asset_id) {
-            common  = p1.base_asset_id;
-            invert1 = true;
-        } else {
-            continue;
-        }
-        if (common == pc.quote_asset_id) continue;  // the target itself
-
         for (const auto& p2 : config_.pairs) {
             if (!p2.enabled || p2.name == pc.name || p2.name == p1.name) {
                 continue;
             }
-            bool invert2 = false;
-            if (p2.base_asset_id == common
-                && p2.quote_asset_id == pc.quote_asset_id) {
-                // C/B: mid is already B per C.
-            } else if (p2.base_asset_id == pc.quote_asset_id
-                       && p2.quote_asset_id == common) {
-                invert2 = true;  // B/C: invert to get B per C.
-            } else {
-                continue;
-            }
+            const auto orient = midgate::orient_triangle(
+                pc.base_asset_id, pc.quote_asset_id,
+                p1.base_asset_id, p1.quote_asset_id,
+                p2.base_asset_id, p2.quote_asset_id);
+            if (!orient) continue;
+
             const double implied = midgate::implied_cross(
-                make_leg(p1, invert1), make_leg(p2, invert2), leg_cap);
+                make_leg(p1, orient->invert_first),
+                make_leg(p2, orient->invert_second), leg_cap);
             if (implied > 0.0) {
                 candidates.push_back(implied);
             }

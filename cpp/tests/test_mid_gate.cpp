@@ -68,15 +68,84 @@ TEST(AnchorChainTest, PriorityOrder)
 TEST(ImpliedCrossTest, BycUsdcViaXchLegs)
 {
     // The motivating triangle: BYC/wUSDC.b implied through the two XCH
-    // legs.  XCH/BYC mid = BYC per XCH; XCH/wUSDC.b mid = USDC per XCH.
-    // implied(BYC/wUSDC.b) = (1 / (BYC per XCH)) * (USDC per XCH).
-    // With XCH at $1.42 and BYC honest at ~$1.01: XCH/BYC ~ 1.4059,
-    // XCH/wUSDC.b ~ 1.42 -> implied ~ 1.0100.
-    CrossLeg xch_byc{1.4059, 120.0, /*fresh=*/true, /*invert=*/true};
-    CrossLeg xch_usdc{1.42, 80.0, /*fresh=*/true, /*invert=*/false};
+    // legs.  Orientation comes from the PRODUCTION helper rather than
+    // hand-supplied flags -- an earlier version of this test set both
+    // inverts itself, so it exercised only the multiplication and a
+    // reversal in any orientation branch would have left it green.
+    const auto o = orient_triangle(/*target*/ "byc", "usdc",
+                                   /*p1*/     "xch", "byc",
+                                   /*p2*/     "xch", "usdc");
+    ASSERT_TRUE(o.has_value());
+    EXPECT_TRUE(o->invert_first)   << "XCH/BYC is C/A -- must invert";
+    EXPECT_FALSE(o->invert_second) << "XCH/wUSDC.b is C/B -- used as-is";
 
-    const double implied = implied_cross(xch_byc, xch_usdc, 300.0);
-    EXPECT_NEAR(implied, 1.0100, 0.0005);
+    // XCH at $1.42, BYC honest at ~$1.01: XCH/BYC ~ 1.4059 -> implied
+    // (1/1.4059) * 1.42 ~ 1.0100.
+    CrossLeg xch_byc{1.4059, 120.0, true, o->invert_first};
+    CrossLeg xch_usdc{1.42, 80.0, true, o->invert_second};
+    EXPECT_NEAR(implied_cross(xch_byc, xch_usdc, 300.0), 1.0100, 0.0005);
+}
+
+TEST(ImpliedCrossTest, OrientationCoversAllFourCombinations)
+{
+    // Target A/B through common asset C, in every configured direction.
+    // Getting any one backwards yields a silently reciprocal anchor, so
+    // each branch is asserted individually.
+    {   // A/C and C/B -- neither inverted
+        const auto o = orient_triangle("a", "b", "a", "c", "c", "b");
+        ASSERT_TRUE(o.has_value());
+        EXPECT_FALSE(o->invert_first);
+        EXPECT_FALSE(o->invert_second);
+    }
+    {   // C/A and C/B -- first inverted
+        const auto o = orient_triangle("a", "b", "c", "a", "c", "b");
+        ASSERT_TRUE(o.has_value());
+        EXPECT_TRUE(o->invert_first);
+        EXPECT_FALSE(o->invert_second);
+    }
+    {   // A/C and B/C -- second inverted
+        const auto o = orient_triangle("a", "b", "a", "c", "b", "c");
+        ASSERT_TRUE(o.has_value());
+        EXPECT_FALSE(o->invert_first);
+        EXPECT_TRUE(o->invert_second);
+    }
+    {   // C/A and B/C -- both inverted
+        const auto o = orient_triangle("a", "b", "c", "a", "b", "c");
+        ASSERT_TRUE(o.has_value());
+        EXPECT_TRUE(o->invert_first);
+        EXPECT_TRUE(o->invert_second);
+    }
+}
+
+TEST(ImpliedCrossTest, OrientationRejectsNonTriangles)
+{
+    // Leg 1 does not touch the target's base.
+    EXPECT_FALSE(orient_triangle("a", "b", "x", "y", "c", "b").has_value());
+    // Leg 2 does not reach the target's quote.
+    EXPECT_FALSE(orient_triangle("a", "b", "a", "c", "c", "z").has_value());
+    // The "triangle" through the target's own quote is the target itself.
+    EXPECT_FALSE(orient_triangle("a", "b", "a", "b", "b", "b").has_value());
+}
+
+TEST(ImpliedCrossTest, OrientationRoundTripsAReciprocalPair)
+{
+    // Same economic triangle expressed both ways must imply the SAME
+    // price -- the sharpest check that no branch is reciprocal.
+    const auto fwd = orient_triangle("a", "b", "a", "c", "c", "b");
+    const auto rev = orient_triangle("a", "b", "c", "a", "b", "c");
+    ASSERT_TRUE(fwd.has_value());
+    ASSERT_TRUE(rev.has_value());
+
+    // rate(A->C) = 2.0, rate(C->B) = 3.0  =>  implied(A/B) = 6.0
+    const double f = implied_cross({2.0, 50.0, true, fwd->invert_first},
+                                   {3.0, 50.0, true, fwd->invert_second},
+                                   300.0);
+    // Same rates, pairs configured the other way round: C/A = 0.5, B/C = 1/3.
+    const double r = implied_cross({0.5, 50.0, true, rev->invert_first},
+                                   {1.0 / 3.0, 50.0, true, rev->invert_second},
+                                   300.0);
+    EXPECT_NEAR(f, 6.0, 1e-9);
+    EXPECT_NEAR(r, 6.0, 1e-9);
 }
 
 TEST(ImpliedCrossTest, UnhealthyLegRefusesAnchor)
@@ -598,4 +667,47 @@ TEST(MidGateIngestTest, NonFiniteCexCannotGrantValuationGrade) {
 
     EXPECT_FALSE(feed.mid_valuation_grade(pair))
         << "an invalid CEX leg blessed a last-trade-only mid into equity";
+}
+
+// The ordering hazard itself, reproduced at the feed level.
+//
+// Round 4 of review found that anchors were injected AFTER the ingest loop,
+// so a first-cycle pair had none while its offers were filtered.  This pins
+// the CONSEQUENCE from both sides: with no anchor a coherent two-sided junk
+// book survives and publishes, and with the anchor injected first the same
+// book is refused.  (Catching a reordering inside the engine heartbeat
+// itself needs the engine test harness tracked as T4-07/T8-25; the runtime
+// warn-once in ingest_competing_offers covers it in the meantime.)
+TEST(MidGateIngestTest, OffersIngestedBeforeAnyAnchorAreUnfiltered) {
+    const std::vector<CompetingOffer> junk{
+        mk_offer("b1", Side::Bid, 187.0, 5'000'000),
+        mk_offer("a1", Side::Ask, 188.0, 5'000'000),
+    };
+
+    // WRONG order: offers first, anchor never injected for this cycle.
+    {
+        State state;
+        MarketDataFeed feed(gate_cfg(), state);
+        const std::string pair = "BYC/wUSDC.b";
+        feed.ingest_block_height(100);
+        feed.ingest_competing_offers(pair, junk, {}, 1'000, 1'000);
+        feed.refresh({pair});
+        EXPECT_GT(feed.get_mid_price(pair), 100.0)
+            << "expected the unanchored path to admit junk -- if this now "
+               "fails the hazard is closed elsewhere and this test should "
+               "be revisited, not deleted";
+    }
+
+    // RIGHT order: anchor first, then the identical book.
+    {
+        State state;
+        MarketDataFeed feed(gate_cfg(), state);
+        const std::string pair = "BYC/wUSDC.b";
+        feed.ingest_block_height(100);
+        feed.ingest_reference_anchor(pair, 0.0, /*peg_target=*/1.0);
+        feed.ingest_competing_offers(pair, junk, {}, 1'000, 1'000);
+        feed.refresh({pair});
+        EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
+            << "anchor injected before ingest must refuse the junk book";
+    }
 }

@@ -1779,6 +1779,31 @@ void MarketDataFeed::ingest_competing_offers(
         return;  // Feature disabled; no-op.
     }
 
+    // [S20 2026-08-24] Ordering guard.  The per-offer filter below can only
+    // reject absurd offers if an anchor already exists, so the engine must
+    // inject anchors BEFORE ingesting a cycle's offers.  Getting that
+    // backwards is invisible in normal operation and catastrophic exactly
+    // once -- on a process's first cycle, where it lets a coherent
+    // two-sided junk book through and straight into the gate's
+    // book-confirmation escape.  That defect shipped in this change's own
+    // first cut and survived three review rounds, so it gets a runtime
+    // alarm rather than only a test.
+    if (cfg.mid_gate_enabled) {
+        std::unique_lock plk(mtx_pairs_);
+        PairState& ps0 = get_or_create_pair(pair_name);
+        if (ps0.anchor_updated_at == Timestamp{}
+            && !ps0.anchor_order_warned) {
+            ps0.anchor_order_warned = true;
+            spdlog::warn("[MarketData] [S20] {}: ingesting offers before any "
+                         "reference anchor was injected -- the outlier "
+                         "filter has nothing to anchor on this cycle.  The "
+                         "engine must call ingest_reference_anchor() before "
+                         "the ingest loop; if this repeats, the heartbeat "
+                         "ordering has regressed",
+                         pair_name);
+        }
+    }
+
     // Snapshot the current reference price for outlier detection.
     //
     // [S20 2026-08-24] With the gate enabled, the reference is the

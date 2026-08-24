@@ -44,6 +44,8 @@
 #include <algorithm>
 #include <cmath>
 #include <cstddef>
+#include <optional>
+#include <string>
 #include <vector>
 
 namespace xop::midgate {
@@ -198,6 +200,55 @@ struct GateInputs {
         }
     }
     return GateVerdict::Accept;
+}
+
+// How the two legs of a candidate triangle must be oriented, or nullopt
+// when the two pairs do not form one with the target.
+//
+// A pair's mid is QUOTE per BASE, so building implied(A/B) = rate(A->C) *
+// rate(C->B) needs each leg inverted or not depending on which way round
+// it is configured -- four combinations, and getting any one backwards
+// yields a plausible-looking number that is silently reciprocal.  The
+// decision lives here, next to implied_cross, so the tests can drive the
+// real branches rather than hand-supplying the flags they are meant to
+// verify.
+struct LegOrientation {
+    bool invert_first{false};   // rate(A->C) from pair 1
+    bool invert_second{false};  // rate(C->B) from pair 2
+};
+
+[[nodiscard]] inline std::optional<LegOrientation> orient_triangle(
+    const std::string& target_base,  const std::string& target_quote,
+    const std::string& p1_base,      const std::string& p1_quote,
+    const std::string& p2_base,      const std::string& p2_quote)
+{
+    // Leg 1 must touch the target's BASE; the other side is the common
+    // asset C.  A/C is used as-is (its mid is already C per A); C/A is
+    // inverted.
+    std::string common;
+    LegOrientation o;
+    if (p1_base == target_base) {
+        common = p1_quote;
+    } else if (p1_quote == target_base) {
+        common          = p1_base;
+        o.invert_first  = true;
+    } else {
+        return std::nullopt;
+    }
+
+    // The "triangle" through the target's own quote is the target itself.
+    if (common == target_quote) return std::nullopt;
+
+    // Leg 2 must carry C to the target's QUOTE.  C/B is used as-is; B/C is
+    // inverted.
+    if (p2_base == common && p2_quote == target_quote) {
+        o.invert_second = false;
+    } else if (p2_base == target_quote && p2_quote == common) {
+        o.invert_second = true;
+    } else {
+        return std::nullopt;
+    }
+    return o;
 }
 
 // True median of a candidate set, SORTING IN PLACE.  Lives here rather

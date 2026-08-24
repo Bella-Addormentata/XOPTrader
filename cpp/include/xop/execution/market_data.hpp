@@ -508,6 +508,8 @@ struct PairState {
     double      implied_cross{0.0};        // 0 = no healthy triangle this cycle
     double      peg_target{0.0};           // 0 = not a stablecoin pair
     Timestamp   anchor_updated_at{};       // when the engine last injected
+    bool        anchor_order_warned{false};// warn-once: offers ingested
+                                           // before any anchor existed
 
     // --- [S20] BBO provenance ---
     // dex_best_bid/ask have TWO writers: ingest_dexie (the raw dexie

@@ -27,6 +27,13 @@
 - **Status:** `[ ]` — Audit 2026-08-18: no `test_backtest_integration.cpp`; CI itself was red until PR #70, so no test tier had run in CI at all.
 
 ### T4-07: Add engine startup/shutdown and fill processing tests
+- **[S20 2026-08-24] Now also blocks an ordering regression test.** PR #112
+  round 4 found anchors being injected AFTER the Step 1 ingest loop, so a
+  first-cycle pair had no anchor while its offers were filtered -- the
+  restart-poisoning path the PR exists to close. Feed-level tests cannot
+  catch a reordering inside the heartbeat; a runtime warn-once in
+  ingest_competing_offers covers it for now, but a real regression test
+  needs the harness this item tracks.
 - **Files:** `cpp/tests/` (new), `cpp/src/engine.cpp`
 - **Issue:** Engine lifecycle (`Running` → `ShuttingDown` → `Stopped`), shutdown idempotency, and `detect_fills()`/`record_buy`/`record_sell` remain untested; no mock `ChiaFullNodeRPC`/`ChiaWalletRPC`/`DexieClient`/`CoinGeckoClient` and no DI seams exist anywhere in `cpp/tests/`.
 - **Status:** `[ ]` — Audit 2026-08-18: gap confirmed (zero `mock` hits in cpp/tests/); made more acute by the phantom-offer-removal bug that lived in exactly this path (fixed cae2bfd, still uncovered by tests).
