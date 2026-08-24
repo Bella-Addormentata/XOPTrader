@@ -1,5 +1,14 @@
 # GUI dependencies — canonical source is pyproject.toml [project.optional-dependencies] gui
 # Install via: pip install -e ".[gui]"
+#
+# OWNERSHIP: pyproject.toml [project.optional-dependencies].gui is the single
+# canonical source; this file MIRRORS it so plain `pip install -r` works
+# without an editable install.  CI and release builds install
+# gui/requirements.lock.txt -- the fully pinned transitive freeze generated
+# FROM this mirror (instructions in its header).  When editing the pyproject
+# extras: update this mirror to match, then regenerate the lock.  Keeping the
+# three in sync is manual today; an automated drift check is a welcome
+# follow-up.
 PySide6>=6.6.0,<7
 pyqtgraph>=0.13.0,<1
 PyYAML>=6.0,<7

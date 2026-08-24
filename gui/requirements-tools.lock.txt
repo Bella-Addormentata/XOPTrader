@@ -1,0 +1,30 @@
+# gui/requirements-tools.lock.txt -- pinned BUILD and TEST tooling.
+#
+# Review of PR #110 pointed out that pinning the runtime stack alone does
+# not make builds reproducible: the release jobs installed an unpinned
+# `pyinstaller` (whose hooks-contrib releases can change what lands in the
+# bundle) and compile-check installed unpinned pytest packages.  Every
+# tool that shapes the bundle or the CI verdict is pinned here.
+#
+# Regenerate alongside gui/requirements.lock.txt (same clean-venv recipe
+# ON PYTHON 3.11 -- the interpreter every CI and release leg runs -- then
+# `pip install pyinstaller pytest pytest-asyncio` and freeze the tool
+# entries; re-apply the platform markers for the win32 AND darwin legs).
+#
+# -- PyInstaller stack (release bundle) --------------------------------------
+pyinstaller==6.22.2
+pyinstaller-hooks-contrib==2026.6
+altgraph==0.17.5
+pefile==2024.8.26; sys_platform == "win32"
+pywin32-ctypes==0.2.3; sys_platform == "win32"
+macholib==1.16.4; sys_platform == "darwin"
+setuptools==84.0.0
+# -- Test tooling (compile-check Python tests) -------------------------------
+# Pinned INSIDE pyproject.toml's declared dev ranges (pytest>=8,<9,
+# pytest-asyncio>=0.23,<1) so CI tests the same major versions that
+# `pip install -e ".[dev]"` resolves for developers.
+pytest==8.4.2
+pytest-asyncio==0.26.0
+pluggy==1.6.0
+iniconfig==2.3.0
+pygments==2.21.0

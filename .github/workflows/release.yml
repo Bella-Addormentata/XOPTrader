@@ -263,8 +263,8 @@ jobs:
         working-directory: gui
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install -r requirements.lock.txt
+          pip install -r requirements-tools.lock.txt
 
       # ---- Copy pre-built application icon --------------------------------
       - name: Copy application icon
@@ -388,8 +388,8 @@ jobs:
         working-directory: gui
         run: |
           pip install --upgrade pip
-          pip install -r requirements.txt
-          pip install pyinstaller
+          pip install -r requirements.lock.txt
+          pip install -r requirements-tools.lock.txt
 
       - name: Download Windows runtime bundle
         uses: actions/download-artifact@v4

@@ -177,8 +177,8 @@ jobs:
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip
-          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.txt
-          pip install pytest pytest-asyncio
+          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
+          pip install -r gui/requirements-tools.lock.txt
 
       # Every warp test module opens with pytest.importorskip("clvm") /
       # ("chia_rs").  If those wheels are absent the suite drops from 244 tests
@@ -201,3 +201,47 @@ jobs:
         env:
           QT_QPA_PLATFORM: offscreen
         run: python -m pytest -q
+
+  # ---------------------------------------------------------------------------
+  # Job 4 -- GUI lock installability (three-OS matrix)
+  #
+  # Review of the dependency-lock PR caught that pull-request CI installed the
+  # locks only on Ubuntu, while the Windows and macOS release legs first
+  # exercised their platform-marked pins (pywin32, pefile, macholib, ...) at
+  # release time -- a bad pin could merge and only fail during a release.
+  # This job installs BOTH locks on every platform a release leg targets,
+  # under the same Python the release legs run, then has pip audit the result.
+  # Install-only by design: the test suite already runs in Job 3.
+  # ---------------------------------------------------------------------------
+  gui-lock-install:
+    name: GUI lock install (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, windows-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # Same --only-binary scoping rationale as Job 3.  --no-deps makes
+      # the install hermetic: the locks claim the full transitive
+      # closure, so pip must not quietly fetch anything they omit --
+      # the pip check below then RED-flags any missing platform
+      # dependency instead of the resolver papering over it (review
+      # round 4 caught exactly that: an unpinned colorama slipped in
+      # for pyqtgraph and the job still passed).
+      - name: Install both dependency locks
+        run: |
+          pip install --upgrade pip
+          pip install --no-deps --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
+          pip install --no-deps -r gui/requirements-tools.lock.txt
+
+      - name: Audit the installed set
+        run: pip check
