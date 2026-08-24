@@ -279,6 +279,16 @@ TEST(BridgePeakGuardTest, MalformedTimestampsFailClosed) {
         "2026-99-99T99:99:99Z", "2026-08-23T19:08:00Z"));
     EXPECT_FALSE(iso_strictly_after(
         "2026-13-01T00:00:00Z", "2026-08-01T00:00:00Z"));
+    // (round 22) Calendar-exact: Feb 31 / Apr 31 are impossible even
+    // though <= 31; leap-year Feb 29 is valid.
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-02-31T00:00:00Z", "2026-01-01T00:00:00Z"));
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-04-31T00:00:00Z", "2026-01-01T00:00:00Z"));
+    EXPECT_TRUE(iso_strictly_after(
+        "2028-02-29T00:00:00Z", "2026-01-01T00:00:00Z"));
+    EXPECT_FALSE(iso_strictly_after(
+        "2026-02-29T00:00:00Z", "2026-01-01T00:00:00Z"));
     EXPECT_FALSE(iso_strictly_after(
         "zzzzzzzzzzzzzzzzzzz", "2026-08-01T00:00:00Z"));
 }

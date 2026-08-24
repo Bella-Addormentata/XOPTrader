@@ -11754,16 +11754,28 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         if (wid > 0) {
             try {
                 auto bal_json = co_await wallet_->get_wallet_balance(wid);
-                WalletBalanceEntry e{};
-                e.spendable = bal_json.value("spendable_balance",
-                                             static_cast<Mojo>(0));
-                e.confirmed = bal_json.value("confirmed_wallet_balance",
-                                             static_cast<Mojo>(0));
-                e.pending_change = bal_json.value("pending_change",
-                                                  static_cast<Mojo>(0));
-                e.as_of_block = block_height;
-                cached_wallet_balances_[asset] = e;
-                snapshot_current = e.pending_change == 0;
+                // A missing balance field must not read as a settled
+                // ZERO (review round 22): zero is a valid target now,
+                // and defaulting a malformed response would reconcile
+                // inventory to nothing and let the invariant adjust the
+                // recorded balance away.
+                if (!bal_json.contains("confirmed_wallet_balance")
+                    || !bal_json.contains("pending_change")) {
+                    spdlog::warn("[Engine] Bridge ingest: balance "
+                                 "response missing required fields -- "
+                                 "deferring this heartbeat");
+                } else {
+                    WalletBalanceEntry e{};
+                    e.spendable = bal_json.value("spendable_balance",
+                                                 static_cast<Mojo>(0));
+                    e.confirmed = bal_json.value("confirmed_wallet_balance",
+                                                 static_cast<Mojo>(0));
+                    e.pending_change = bal_json.value("pending_change",
+                                                      static_cast<Mojo>(0));
+                    e.as_of_block = block_height;
+                    cached_wallet_balances_[asset] = e;
+                    snapshot_current = e.pending_change == 0;
+                }
             } catch (const std::exception& ex) {
                 spdlog::debug("[Engine] Bridge ingest: on-demand balance "
                               "fetch failed ({}) -- deferring this "
@@ -12221,12 +12233,21 @@ void Engine::step_check_ledger_invariant(BlockHeight block_height)
             || block_height - cached.as_of_block > acc.max_balance_age_blocks) {
             continue;                                   // stale snapshot
         }
-        // Zero is a USABLE balance (review round 16): an outbound
-        // bridge can legitimately drain the CAT wallet to zero, and
-        // skipping it left an already-absorbed withdrawal's promised
-        // counter-adjust unreachable (books stuck at -X forever).  Only
-        // an invalid negative snapshot is rejected.
+        // Zero is a USABLE balance for the BRIDGE asset only (rounds
+        // 16 + 22): an outbound bridge can legitimately drain that CAT
+        // wallet to zero, and skipping it left an already-absorbed
+        // withdrawal's counter-adjust unreachable.  For every other
+        // asset the historical <= 0 skip stands -- Step 8's cache writer
+        // defaults missing RPC fields to zero, and treating such a
+        // malformed snapshot as settled-zero would let the invariant
+        // adjust a real balance away.  (The bridge asset's on-demand
+        // writer validates field presence before caching.)
         if (cached.confirmed < 0) continue;
+        if (cached.confirmed == 0
+            && !(acc.bridge_ingest_enabled
+                 && asset == acc.bridge_asset_id)) {
+            continue;
+        }
 
         // Coins in flight widen UNCERTAINTY; they do not move the target.
         //

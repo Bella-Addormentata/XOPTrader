@@ -309,8 +309,18 @@ struct BridgeValuation {
     };
     const int month = two(5), day = two(8);
     const int hour = two(11), minute = two(14), second = two(17);
-    return month >= 1 && month <= 12 && day >= 1 && day <= 31
-        && hour <= 23 && minute <= 59 && second <= 59;
+    if (month < 1 || month > 12 || day < 1
+        || hour > 23 || minute > 59 || second > 59) {
+        return false;
+    }
+    // Calendar-exact day bound (review round 22): "2026-02-31" passed a
+    // flat <=31 check yet sorts after real February timestamps.
+    const int year = two(0) * 100 + two(2);
+    const bool leap = (year % 4 == 0 && year % 100 != 0) || year % 400 == 0;
+    static constexpr int kDays[12] = {31, 28, 31, 30, 31, 30,
+                                      31, 31, 30, 31, 30, 31};
+    const int max_day = (month == 2 && leap) ? 29 : kDays[month - 1];
+    return day <= max_day;
 }
 
 /// Whether ISO-8601 UTC timestamp `a` is STRICTLY after `b`, comparing the
