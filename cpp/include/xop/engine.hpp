@@ -888,6 +888,16 @@ private:
     /// heartbeat for the lifetime of the database.
     std::set<std::int64_t> bridge_warned_jobs_;
 
+    /// [S18 2026-08-23] Consecutive lifted evaluations of the max-drawdown
+    /// condition; the re-alert gate only re-arms once this reaches the
+    /// debounce streak, so one transient false read (a flaky wallet RPC
+    /// corrupting an equity computation) cannot re-arm it mid-episode.
+    int breaker_lift_streak_{0};
+
+    /// [S17 2026-08-23] Last depeg status logged per pair, so Step 3 logs
+    /// transitions at full severity and ongoing states at debug.
+    std::unordered_map<std::string, DepegStatus> depeg_logged_status_;
+
     /// Timestamp of the last wallet recovery probe (to throttle retries).
     std::chrono::steady_clock::time_point wallet_last_probe_{};
 

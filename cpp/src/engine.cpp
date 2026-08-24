@@ -2999,20 +2999,49 @@ void Engine::step_update_analytics(BlockHeight block_height)
             auto depeg_status = depeg_detector_->update(
                 pair.name, mid, block_height);
 
+            // [S17 2026-08-23] Log state TRANSITIONS at full severity and
+            // ongoing states at debug: the bail-out previously logged at
+            // ERROR every evaluation, ~2 lines per block for the entire
+            // episode (hours), unlike the Step 13 breaker's rate-limited
+            // re-alerts.  Recovery back to Normal logs once at info.
+            auto& last = depeg_logged_status_[pair.name];
+            const bool changed = (depeg_status != last);
             if (depeg_status == DepegStatus::Warning) {
-                spdlog::warn("[Engine] Step 3: DEPEG WARNING {} price={:.6f} "
-                             "peg={:.4f} -- deviation above warn threshold",
-                             pair.name, mid, pair.peg_target);
+                if (changed) {
+                    spdlog::warn("[Engine] Step 3: DEPEG WARNING {} "
+                                 "price={:.6f} peg={:.4f} -- deviation "
+                                 "above warn threshold",
+                                 pair.name, mid, pair.peg_target);
+                } else {
+                    spdlog::debug("[Engine] Step 3: depeg warning persists "
+                                  "for {} (price={:.6f})", pair.name, mid);
+                }
             } else if (depeg_status == DepegStatus::Bailed) {
-                spdlog::error("[Engine] Step 3: DEPEG BAIL-OUT {} price={:.6f} "
-                              "peg={:.4f} -- pulling all quotes! Suspected "
-                              "peg failure (like Stably).",
-                              pair.name, mid, pair.peg_target);
+                if (changed) {
+                    spdlog::error("[Engine] Step 3: DEPEG BAIL-OUT {} "
+                                  "price={:.6f} peg={:.4f} -- pulling all "
+                                  "quotes! Suspected peg failure (like "
+                                  "Stably).",
+                                  pair.name, mid, pair.peg_target);
+                } else {
+                    spdlog::debug("[Engine] Step 3: depeg bail-out persists "
+                                  "for {} (price={:.6f})", pair.name, mid);
+                }
             } else if (depeg_status == DepegStatus::SuspectedFailure) {
-                spdlog::error("[Engine] Step 3: {} FLAGGED as suspected "
-                              "failure -- all quotes suppressed",
-                              pair.name);
+                if (changed) {
+                    spdlog::error("[Engine] Step 3: {} FLAGGED as suspected "
+                                  "failure -- all quotes suppressed",
+                                  pair.name);
+                } else {
+                    spdlog::debug("[Engine] Step 3: suspected-failure flag "
+                                  "persists for {} -- quotes remain "
+                                  "suppressed", pair.name);
+                }
+            } else if (changed) {
+                spdlog::info("[Engine] Step 3: {} depeg state recovered to "
+                             "normal", pair.name);
             }
+            last = depeg_status;
         }
     }
 }
@@ -3038,7 +3067,9 @@ void Engine::step_compute_quotes(BlockHeight block_height)
         // This prevents us from market-making a coin that has lost its peg
         // (e.g. Stably) and accumulating worthless inventory.
         if (depeg_detector_ && depeg_detector_->should_bail(pair_name)) {
-            spdlog::error("[Engine] Step 4: {} depeg bail-out active -- "
+            // [S17] The Step 3 transition log is the alert; this per-cycle
+            // suppression note stays at debug.
+            spdlog::debug("[Engine] Step 4: {} depeg bail-out active -- "
                           "suppressing all quotes", pair_name);
             pcs.quote_valid = false;
             continue;
@@ -12970,6 +13001,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 state_->set_status(BotStatus::Paused);
             }
 
+            breaker_lift_streak_ = 0;  // condition holds: reset the
+                                       // re-arm debounce (S18)
             if (breaker_realert_gate_.should_alert(
                     std::chrono::steady_clock::now(),
                     std::chrono::minutes(
@@ -12994,8 +13027,24 @@ void Engine::step_check_alerts(BlockHeight block_height)
             }
         } else {
             // Condition lifted: re-arm so the next episode alerts
-            // immediately.
-            breaker_realert_gate_.clear();
+            // immediately -- but only after a STREAK of lifted
+            // evaluations.  [S18 2026-08-23] A single transient false
+            // read of the breach condition (flaky wallet RPC corrupting
+            // one equity computation) re-armed the gate mid-episode:
+            // three CRITICAL re-alerts fired within 62 seconds against
+            // the 30-minute interval, while 1,088 correctly-suppressed
+            // evaluations interleaved with the premature re-alerts and
+            // equity never actually rose above the threshold.  ~10
+            // consecutive lifted reads (~2-3 min of heartbeats) is long
+            // enough to outlive any RPC blip and short enough that a
+            // genuine recovery re-arms promptly.
+            constexpr int kRealertRearmStreak = 10;
+            if (breaker_lift_streak_ < kRealertRearmStreak) {
+                ++breaker_lift_streak_;
+            }
+            if (breaker_lift_streak_ >= kRealertRearmStreak) {
+                breaker_realert_gate_.clear();
+            }
         }
     }
 
