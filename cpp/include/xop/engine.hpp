@@ -565,9 +565,11 @@ private:
     /// wallet, not "unexplained divergence" for the adjusting entries to
     /// absorb.  Reads the GUI-owned warp_jobs.db READ-ONLY; idempotent
     /// per job (ledger event_id uniqueness), so re-scans and restarts
-    /// never double-book.  GIPS/TWR: the USD accumulates as net deposits
-    /// outside trading P&L, and the drawdown peak shifts with each flow
-    /// completed while this process is alive.
+    /// never double-book.  GIPS/TWR: the USD accumulates as net
+    /// deposits outside trading P&L; deposits completed while this
+    /// process is alive credit the drawdown peak, withdrawals leave it
+    /// standing (drawdown reads conservatively high until the next
+    /// restart re-anchor).
     asio::awaitable<void> step_ingest_bridge_flows(
         BlockHeight block_height);
 
@@ -863,14 +865,18 @@ private:
     /// per restart warms the cache.
     std::set<std::string> bridge_booked_event_ids_;
 
-    /// [S19 rounds 17+25+26] Booked bridge DEPOSITS awaiting their
-    /// one-time peak credit (withdrawals never adjust the peak
-    /// in-process -- attributing wallet movement to a specific flow is
-    /// unsound, so the peak stands and drawdown reads conservatively
-    /// high until the next restart re-anchor).  Consumed or cleared by
-    /// the same pass that fills it.  In-memory only: a restart
-    /// re-anchors the peak from live equity anyway.
-    Mojo bridge_unapplied_deposit_mojos_{0};     // always >= 0
+    /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
+    /// their one-time peak credit, kept PER EVENT (withdrawals never
+    /// adjust the peak in-process -- attributing wallet movement to a
+    /// specific flow is unsound, so the peak stands and drawdown reads
+    /// conservatively high until the next restart re-anchor).  Each
+    /// deposit gets its own factor against the same measured pre-fold
+    /// equity: the aggregate factor 1 + SUM(f)/e is smaller than the
+    /// per-event product and could under-credit -- masking part of a
+    /// loss that landed between the flows' true completion times.
+    /// Consumed or cleared by the same pass that fills it.  In-memory
+    /// only: a restart re-anchors the peak from live equity anyway.
+    std::vector<Mojo> bridge_unapplied_deposit_flows_;  // each > 0
 
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)

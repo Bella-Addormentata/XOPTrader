@@ -11938,7 +11938,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // drawdown reads conservatively high until the next restart
         // re-anchors from live equity.
         if (flow.delta_mojos > 0) {
-            bridge_unapplied_deposit_mojos_ += flow.delta_mojos;
+            bridge_unapplied_deposit_flows_.push_back(flow.delta_mojos);
         } else {
             spdlog::info("[Engine] Bridge ingest: withdrawal of {} "
                          "mojos booked; drawdown peak intentionally "
@@ -11969,7 +11969,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // equity already contains all trading up to this instant and
     // cannot go negative, so the factor (e_pre + f)/e_pre stays clean.
     double bridge_pre_fold_equity_usd = -1.0;
-    if (bridge_unapplied_deposit_mojos_ > 0
+    if (!bridge_unapplied_deposit_flows_.empty()
         && peak_equity_hwm_usd_ > 0.0) {
         bridge_pre_fold_equity_usd = compute_portfolio_equity_usd();
     }
@@ -12036,9 +12036,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     //   value-neutral fill could "authorize" a shrink for a
     //   pre-restart burn the seeded anchor already contained --
     //   erasing a real drawdown.
-    if (bridge_unapplied_deposit_mojos_ > 0) {
-        const Mojo consumed = bridge_unapplied_deposit_mojos_;
-        bridge_unapplied_deposit_mojos_ = 0;
+    if (!bridge_unapplied_deposit_flows_.empty()) {
+        std::vector<Mojo> flows;
+        flows.swap(bridge_unapplied_deposit_flows_);
+        Mojo consumed = 0;
+        for (const Mojo f : flows) consumed += f;
         const double flow_usd =
             (static_cast<double>(consumed) / mojos_per_unit)
             * usd_per_unit;
@@ -12054,14 +12056,30 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                          "anchored -- the upcoming equity anchor "
                          "includes it, no separate credit", flow_usd);
         } else if (bridge_pre_fold_equity_usd > 0.0) {
-            const double rescaled = peak_equity_hwm_usd_
-                * ((bridge_pre_fold_equity_usd + flow_usd)
-                   / bridge_pre_fold_equity_usd);
+            // PER-EVENT factors (round 27), all against the same
+            // measured pre-fold base: the aggregate 1 + SUM(f)/e is
+            // strictly smaller than the product of 1 + f_i/e, so
+            // collapsing deposits discovered in one scan (e.g. after
+            // the jobs DB was unreadable for a while) would
+            // under-credit and mask part of a loss that landed
+            // between their true completion times.  The per-event
+            // product over-credits at worst -- the false-trip-safe
+            // direction the whole policy is built on.
+            double factor = 1.0;
+            for (const Mojo f : flows) {
+                const double f_usd =
+                    (static_cast<double>(f) / mojos_per_unit)
+                    * usd_per_unit;
+                factor *= (bridge_pre_fold_equity_usd + f_usd)
+                          / bridge_pre_fold_equity_usd;
+            }
+            const double rescaled = peak_equity_hwm_usd_ * factor;
             spdlog::info("[Engine] Bridge ingest: drawdown peak "
-                         "rescaled {:.2f} -> {:.2f} for ${:+.6f} of "
-                         "booked deposit (pre-fold equity {:.2f})",
-                         peak_equity_hwm_usd_, rescaled, flow_usd,
-                         bridge_pre_fold_equity_usd);
+                         "rescaled {:.2f} -> {:.2f} for {} deposit "
+                         "event(s) totalling ${:+.6f} (pre-fold "
+                         "equity {:.2f})",
+                         peak_equity_hwm_usd_, rescaled, flows.size(),
+                         flow_usd, bridge_pre_fold_equity_usd);
             peak_equity_hwm_usd_ = rescaled;
         } else {
             // Deposit while equity was not yet valued (warm-up):
