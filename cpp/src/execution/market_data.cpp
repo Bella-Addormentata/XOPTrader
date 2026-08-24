@@ -448,12 +448,21 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
         auto it = pairs_.find(pair_name);
         const double ref = [&]() -> double {
             if (it == pairs_.end()) return 0.0;
-            if (it->second.cex_mid > 0.0) return it->second.cex_mid;
-            if (!cfg.mid_gate_enabled) return 0.0;
-            return midgate::select_anchor(
-                anchor_candidates(it->second, cfg,
-                                  std::chrono::system_clock::now()))
-                .value;
+            // Gate ON: the whole chain, freshness included.  Taking
+            // cex_mid directly here would accept a STALE CEX sample --
+            // which anchor_candidates deliberately excludes -- and a stale
+            // reference would then block the fallback to a fresh
+            // implied-cross/AMM/peg anchor and could reject an honest BBO
+            // against an obsolete price.  The chain already prefers CEX
+            // when it IS fresh, so nothing is lost.
+            if (cfg.mid_gate_enabled) {
+                return midgate::select_anchor(
+                    anchor_candidates(it->second, cfg,
+                                      std::chrono::system_clock::now()))
+                    .value;
+            }
+            // Gate OFF: legacy behaviour, unfiltered CEX only.
+            return it->second.cex_mid > 0.0 ? it->second.cex_mid : 0.0;
         }();
         if (ref > 0.0) {
             constexpr double kMaxRatio = 10.0;
@@ -1392,8 +1401,26 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     const auto now = std::chrono::system_clock::now();
 
     // Book evidence, needed by both the gate escape and the grade verdict.
-    const bool dex_fresh = ps.dex_updated_at != Timestamp{}
-        && now - ps.dex_updated_at <= cfg.stale_threshold;
+    //
+    // Freshness is measured on ob_updated_at, NOT dex_updated_at.  Both
+    // ingest_dexie (raw ticker BBO, which includes our OWN resting offers)
+    // and ingest_competing_offers (dust-filtered, third-party-only, and
+    // authoritative) write dex_best_bid/ask, but only the latter stamps
+    // ob_updated_at.  When the full-offer fetch throws -- the exact
+    // failure this change targets -- the raw ticker values survive with a
+    // freshly re-stamped dex_updated_at, and trusting that would let
+    // self-inclusive quotes satisfy the book-confirmation escape and mark
+    // the mid valuation grade: the bot reading its own offers back as
+    // proof the market agrees with it.  Epoch (never stamped) therefore
+    // fails CLOSED here, unlike compute_mid's Case 0 where a positive
+    // orderbook_mid already implies the ingest ran.
+    //
+    // Consequence worth stating: with enable_competitor_tracking off, no
+    // pair ever earns book-based evidence and valuation grade rests
+    // entirely on a fresh CEX leg.  That is the honest reading -- without
+    // the filtered book there is no third-party book to speak of.
+    const bool dex_fresh = ps.ob_updated_at != Timestamp{}
+        && now - ps.ob_updated_at <= cfg.stale_threshold;
     const bool book_two_sided =
         ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0;
     const double book_spread_bps =

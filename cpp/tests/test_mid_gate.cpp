@@ -11,6 +11,9 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
+#include <vector>
+
 using namespace xop::midgate;
 
 namespace {
@@ -246,4 +249,44 @@ TEST(MidGateTest, NoMidIsNotGated)
     in.candidate_mid = 0.0;
     in.anchor        = {1.0, AnchorSource::Peg};
     EXPECT_EQ(gate_mid(in), GateVerdict::Accept);
+}
+
+TEST(MidGateTest, StaleBookCannotConfirmAnAbsurdMid)
+{
+    // Review finding: the raw dexie ticker BBO (which includes our OWN
+    // resting offers) survives a throwing full-offer fetch with a freshly
+    // re-stamped poll time.  If that counted as book confirmation, the bot
+    // would read its own quotes back as proof the market agrees -- and the
+    // junk mid would publish anyway.  apply_mid_gate now measures
+    // freshness on ob_updated_at (stamped only by the FILTERED ingest);
+    // here the pure gate pins the consequence: without book_fresh, no
+    // escape.
+    auto in = base_inputs();
+    in.candidate_mid   = 187.461980;
+    in.anchor          = {1.0, AnchorSource::Peg};
+    in.book_two_sided  = true;
+    in.book_spread_bps = 300.0;   // looks coherent...
+    in.book_fresh      = false;   // ...but is not third-party-fresh
+    EXPECT_EQ(gate_mid(in), GateVerdict::RejectAnchor);
+}
+
+// ---------------------------------------------------------------------------
+// Median selection (engine-side triangulation combines candidates this way)
+// ---------------------------------------------------------------------------
+
+TEST(ImpliedCrossTest, EvenCandidateCountAveragesTheMiddlePair)
+{
+    // Mirrors Engine::compute_implied_cross_anchor's selection: with an
+    // even count the upper-middle observation would let one high outlier
+    // become the entire anchor.  n == 2 is the common case (two triangles
+    // through different common assets), so this is not a corner.
+    auto median = [](std::vector<double> v) {
+        std::sort(v.begin(), v.end());
+        const std::size_t n = v.size();
+        return (n % 2 == 0) ? (v[n / 2 - 1] + v[n / 2]) / 2.0 : v[n / 2];
+    };
+
+    EXPECT_NEAR(median({1.00, 1.40}), 1.20, 1e-12);
+    EXPECT_NEAR(median({1.01}), 1.01, 1e-12);
+    EXPECT_NEAR(median({0.98, 1.00, 1.40}), 1.00, 1e-12);
 }

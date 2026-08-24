@@ -11136,7 +11136,14 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
 
     if (candidates.empty()) return 0.0;
     std::sort(candidates.begin(), candidates.end());
-    return candidates[candidates.size() / 2];
+    const std::size_t n = candidates.size();
+    // True median: with an even count, taking the upper-middle observation
+    // would let a single high outlier BE the anchor (n == 2 is the common
+    // case here) and bias the whole chain upward.
+    if (n % 2 == 0) {
+        return (candidates[n / 2 - 1] + candidates[n / 2]) / 2.0;
+    }
+    return candidates[n / 2];
 }
 
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
