@@ -854,6 +854,14 @@ private:
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
 
+    /// [S19 review round 19] Negative unattributed inventory movement
+    /// observed by THIS process's reconciles (always <= 0).  The budget
+    /// a pre-folded withdrawal may shrink the peak against: a fold that
+    /// happened before a restart contributes nothing here, and its late
+    /// booking must not shrink the re-seeded HWM a second time (that
+    /// would mask future losses).
+    Mojo bridge_inproc_neg_fold_mojos_{0};
+
     /// [S19 review round 18] Ledger event ids already booked (or found
     /// already-booked) by the bridge scan.  Historical jobs stay in the
     /// scan forever, and without this every one of them executed a

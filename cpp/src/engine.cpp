@@ -11780,7 +11780,8 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
-    double      prefolded_flow_usd = 0.0;   // flows already inside inventory
+    double      prefolded_flow_usd = 0.0;   // pre-folded DEPOSITS (USD)
+    Mojo        prefolded_neg_mojos = 0;    // pre-folded WITHDRAWALS (mojos)
 
     for (const auto& row : jobs) {
         // Skip warnings fire ONCE per job (review round 10): skipped
@@ -11924,7 +11925,11 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // heartbeat's.
         if (inventory_->net_inventory(asset)
                 == cached_wallet_balances_[asset].confirmed) {
-            prefolded_flow_usd += val.flow_usd;
+            if (flow.inbound) {
+                prefolded_flow_usd += val.flow_usd;
+            } else {
+                prefolded_neg_mojos += flow.delta_mojos;
+            }
         } else {
             bridge_unapplied_flow_mojos_ += flow.delta_mojos;
         }
@@ -11958,17 +11963,38 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                      "deposit left to the peak's own max() anchor (no "
                      "rescale -- conservative direction)",
                      prefolded_flow_usd);
-    } else if (prefolded_flow_usd < 0.0 && peak_equity_hwm_usd_ > 0.0) {
-        const double e_now = compute_portfolio_equity_usd();
-        const double e_pre = e_now - prefolded_flow_usd;
-        if (e_now > 0.0 && e_pre > 0.0) {
-            const double rescaled =
-                peak_equity_hwm_usd_ * (e_now / e_pre);
-            spdlog::info("[Engine] Bridge ingest: drawdown peak rescaled "
-                         "{:.2f} -> {:.2f} for ${:+.6f} of pre-folded "
-                         "withdrawal", peak_equity_hwm_usd_, rescaled,
-                         prefolded_flow_usd);
-            peak_equity_hwm_usd_ = rescaled;
+    }
+    if (prefolded_neg_mojos < 0 && peak_equity_hwm_usd_ > 0.0) {
+        // Shrink only against the IN-PROCESS fold budget (round 19): a
+        // withdrawal folded before a restart is already inside the
+        // re-seeded HWM, and shrinking again would lower the anchor
+        // below truth and mask future losses.  Both quantities are
+        // <= 0; max() takes the smaller magnitude.
+        const Mojo shrink_mojos =
+            std::max(prefolded_neg_mojos, bridge_inproc_neg_fold_mojos_);
+        bridge_inproc_neg_fold_mojos_ -= shrink_mojos;
+        if (shrink_mojos < 0) {
+            const double shrink_usd =
+                (static_cast<double>(shrink_mojos) / mojos_per_unit)
+                * usd_per_unit;
+            const double e_now = compute_portfolio_equity_usd();
+            const double e_pre = e_now - shrink_usd;
+            if (e_now > 0.0 && e_pre > 0.0) {
+                const double rescaled =
+                    peak_equity_hwm_usd_ * (e_now / e_pre);
+                spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                             "rescaled {:.2f} -> {:.2f} for ${:+.6f} of "
+                             "in-process pre-folded withdrawal",
+                             peak_equity_hwm_usd_, rescaled, shrink_usd);
+                peak_equity_hwm_usd_ = rescaled;
+            }
+        }
+        if (shrink_mojos > prefolded_neg_mojos) {
+            spdlog::info("[Engine] Bridge ingest: {} mojos of pre-folded "
+                         "withdrawal left unshrunk (folded before this "
+                         "process; the restart re-anchor already "
+                         "accounted for it)",
+                         prefolded_neg_mojos - shrink_mojos);
         }
     }
 
@@ -12018,6 +12044,13 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                 const Mojo raw_delta = bal.confirmed - tracked;
                 const Mojo flow_part = bridge_unapplied_flow_mojos_;
                 bridge_unapplied_flow_mojos_ = 0;
+                // Track negative movement NOT explained by booked flows:
+                // the in-process budget pre-folded withdrawals may later
+                // shrink the peak against (round 19).
+                const Mojo residual = raw_delta - flow_part;
+                if (residual < 0) {
+                    bridge_inproc_neg_fold_mojos_ += residual;
+                }
                 const double flow_part_usd =
                     (static_cast<double>(flow_part) / mojos_per_unit)
                     * usd_per_unit;
