@@ -11939,12 +11939,16 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         // inference-based rescale after the loop -- provably safe there
         // because inventory equals wallet truth and prices are this
         // heartbeat's.
-        // UNIFORM accumulation (round 23): equality with the wallet
-        // proves nothing about whether a flow was folded -- a deposit
-        // and an exactly opposing quote fill leave both quantities
-        // unchanged.  Every booked flow goes through one path; the tail
-        // consumes it with the safe-direction policy documented there.
-        bridge_unapplied_flow_mojos_ += flow.delta_mojos;
+        // UNIFORM accumulation (round 23), DIRECTIONAL gross (round
+        // 25): every booked flow is consumed once by the tail through
+        // its direction's policy; deposits and withdrawals are never
+        // netted against each other, or a shrink could cancel against a
+        // credit and mask performance between the flows.
+        if (flow.delta_mojos > 0) {
+            bridge_unapplied_deposit_mojos_ += flow.delta_mojos;
+        } else {
+            bridge_unapplied_withdrawal_mojos_ += flow.delta_mojos;
+        }
 
         ++booked;
         booked_usd += val.flow_usd;
@@ -12046,28 +12050,35 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     //   WITHDRAWALS shrink only against the in-process negative fold
     //   budget (round 19): a pre-restart burn is already inside the
     //   re-seeded anchor, and shrinking again would mask future losses.
-    if (bridge_unapplied_flow_mojos_ != 0
-        && peak_equity_hwm_usd_ > 0.0) {
+    // Each direction consumes through its OWN policy (round 25) --
+    // gross, never netted.  Both factors measure against the same
+    // heartbeat's equity; sequential application of the two factors is
+    // the TWR-consistent form for flows landing in one pass.
+    for (int direction = 0; direction < 2; ++direction) {
+        if (peak_equity_hwm_usd_ <= 0.0) break;
         Mojo consumed = 0;
-        if (bridge_unapplied_flow_mojos_ > 0) {
-            consumed = bridge_unapplied_flow_mojos_;
+        if (direction == 0) {
+            consumed = bridge_unapplied_deposit_mojos_;
+            bridge_unapplied_deposit_mojos_ = 0;
         } else {
+            if (bridge_unapplied_withdrawal_mojos_ == 0) continue;
             // Both <= 0; max() takes the smaller magnitude.
-            consumed = std::max(bridge_unapplied_flow_mojos_,
+            consumed = std::max(bridge_unapplied_withdrawal_mojos_,
                                 bridge_inproc_neg_fold_mojos_);
             bridge_inproc_neg_fold_mojos_ -= consumed;
             if (bridge_inproc_neg_fold_mojos_ == 0) {
                 bridge_neg_fold_block_ = 0;
             }
-            if (consumed > bridge_unapplied_flow_mojos_) {
+            if (consumed > bridge_unapplied_withdrawal_mojos_) {
                 spdlog::info("[Engine] Bridge ingest: {} mojos of "
                              "withdrawal left unshrunk (no in-process "
                              "fold observed; the restart re-anchor "
                              "already accounted for it)",
-                             bridge_unapplied_flow_mojos_ - consumed);
+                             bridge_unapplied_withdrawal_mojos_
+                                 - consumed);
             }
+            bridge_unapplied_withdrawal_mojos_ = 0;
         }
-        bridge_unapplied_flow_mojos_ = 0;
         if (consumed != 0) {
             const double flow_usd =
                 (static_cast<double>(consumed) / mojos_per_unit)

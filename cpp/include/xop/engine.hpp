@@ -875,15 +875,16 @@ private:
     /// per restart warms the cache.
     std::set<std::string> bridge_booked_event_ids_;
 
-    /// [S19 review round 17] Booked bridge flows (signed CAT mojos)
-    /// whose quantity has not yet been folded into InventoryTracker by
-    /// the wallet-truth reconcile.  The peak rescale is attributed from
-    /// THIS, clamped onto the actual reconcile delta: fills also move
-    /// the bridge asset's wallet balance (fill processing tracks only
-    /// the base side), and crediting the peak for the full delta would
-    /// launder trading results into the GIPS anchor.  In-memory only: a
-    /// restart re-anchors the peak from live equity anyway.
-    Mojo bridge_unapplied_flow_mojos_{0};
+    /// [S19 rounds 17+25] Booked bridge flows awaiting their one-time
+    /// peak adjustment, kept as DIRECTIONAL GROSS totals: netting a
+    /// deposit against a withdrawal discovered in the same pass could
+    /// cancel a shrink against a credit and mask performance between
+    /// the flows (TWR treats each external flow separately).  Deposits
+    /// consume through the credit policy, withdrawals through the
+    /// budget-gated shrink.  In-memory only: a restart re-anchors the
+    /// peak from live equity anyway.
+    Mojo bridge_unapplied_deposit_mojos_{0};     // always >= 0
+    Mojo bridge_unapplied_withdrawal_mojos_{0};  // always <= 0
 
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)
