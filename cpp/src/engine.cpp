@@ -11644,7 +11644,12 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // briefly.
     sqlite3_busy_timeout(wdb, 250);
 
-    // Inbound books at COMPLETED (the mint lands with completion).
+    // Inbound books at COMPLETED.  NOTE: the mint's wallet effect
+    // PRECEDES completion -- the CAT is on-chain while the job waits
+    // out the confirmation depth in CLAIMING (the documented S21
+    // window, absorbed as an adjust and converged by the three-entry
+    // catch-up); COMPLETED is simply the earliest booking point that
+    // cannot regress.
     // Outbound books as soon as the Chia burn is IRREVERSIBLY on-chain:
     // BURNING is entered when the burn CAT is observed on-chain and the
     // service declares the unwrap forward-only (round 43 -- the job can

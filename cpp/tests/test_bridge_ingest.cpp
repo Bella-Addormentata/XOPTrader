@@ -272,9 +272,10 @@ TEST(BridgeNoteTest, ForeignNotesParseToZero) {
 }
 
 // ============================================================================
-// Strict ISO ordering (used by the opening filter; the drawdown peak is
-// adjusted by MEASURED equity across the reconcile since round 16, so no
-// flow-time classification remains)
+// Strict ISO ordering: used by the opening filter (pre-opening flows
+// stay inside the opening balance) and by the process-start gate that
+// decides whether a booked flow triggers the restart-style peak
+// re-anchor (rounds 35+42) -- ties fail closed in both uses.
 // ============================================================================
 
 TEST(BridgePeakGuardTest, StrictOrderingBasics) {
