@@ -38,6 +38,20 @@
 // that ever changes, the booking must compare the job's receiver_ph
 // against the engine wallet's puzzle hashes before booking.
 //
+// KNOWN LIMITATION (review round 30, deferred).  The chronology lower
+// bound (MIN ts of CLAIMING / BURN_SENT) is a STATUS time, not the
+// wallet-effect time: the warp service enters CLAIMING before a later
+// handler invocation actually builds and pushes the claim (and can
+// bounce back to signature collection first).  A ledger genesis
+// captured after the first CLAIMING event but before the mint lands
+// produces an opening WITHOUT the mint while flow_lb <= opening_time
+// skips the booking permanently -- the flow is then absorbed as an
+// adjustment (the pre-S19 behaviour: equity and the invariant stay
+// correct, only the Net Deposits attribution misses it).  Closing this
+// needs the GUI's warp service to persist the wallet-affecting claim /
+// burn chain height per job so the engine can compare effect time, not
+// status time, against the opening (TODO.md S21).
+//
 // VALUATION.  wUSDC.b is the $1.00 numeraire: the peg is MONITORED, not
 // priced in (AccountingConfig peg-monitor doctrine), so usd_per_unit is
 // exactly 1.0 and the flow's USD is embedded in the ledger note for

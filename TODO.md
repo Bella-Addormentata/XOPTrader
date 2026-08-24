@@ -253,6 +253,21 @@
   adjusted. P&L tracker gains a net-deposits component excluded from
   performance; GUI P&L display gains a "Net deposits" line.
 
+### S21: Bridge chronology uses status time, not wallet-effect time (bounded, deferred)
+
+Copilot round 30 (suppressed comment, acknowledged): the S19 opening filter's
+lower bound is MIN ts of CLAIMING / BURN_SENT, but the warp service enters
+CLAIMING before a later handler invocation pushes the actual claim spend --
+so a ledger genesis captured in that window produces an opening WITHOUT the
+mint while `flow_lb <= opening_time` skips the booking permanently.  The
+flow then books as an adjustment (pre-S19 behaviour): equity and the
+invariant stay correct, only Net Deposits attribution misses it.  Fix
+requires the GUI warp service to persist the wallet-affecting claim/burn
+chain height per job (new column + event write at push time), with the
+engine comparing THAT against the opening.  Cross-component; deliberately
+not smuggled into PR #109 at round 30.  Window is minutes wide and only
+matters when ledger genesis lands inside it.
+
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
 - **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13
   rolling-window breaker), valuation price sources
