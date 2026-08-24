@@ -11780,7 +11780,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     const auto  now = std::chrono::system_clock::now();
     std::size_t booked     = 0;
     double      booked_usd = 0.0;
-    double      prefolded_flow_usd = 0.0;   // pre-folded DEPOSITS (USD)
+    Mojo        prefolded_pos_mojos = 0;    // pre-folded DEPOSITS (mojos)
     Mojo        prefolded_neg_mojos = 0;    // pre-folded WITHDRAWALS (mojos)
 
     for (const auto& row : jobs) {
@@ -11926,7 +11926,7 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
         if (inventory_->net_inventory(asset)
                 == cached_wallet_balances_[asset].confirmed) {
             if (flow.inbound) {
-                prefolded_flow_usd += val.flow_usd;
+                prefolded_pos_mojos += flow.delta_mojos;
             } else {
                 prefolded_neg_mojos += flow.delta_mojos;
             }
@@ -11958,11 +11958,49 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
     // pre-folded WITHDRAWAL still shrinks the peak: max() never lowers
     // it, so no prior downward adjustment can have happened and the
     // single shrink is exact.
-    if (prefolded_flow_usd > 0.0) {
-        spdlog::info("[Engine] Bridge ingest: ${:+.6f} of pre-folded "
-                     "deposit left to the peak's own max() anchor (no "
-                     "rescale -- conservative direction)",
-                     prefolded_flow_usd);
+    if (prefolded_pos_mojos > 0) {
+        // Rebuild the pre-flow anchor from the snapshot (round 20):
+        // multiplying the CURRENT peak would overshoot (max() already
+        // absorbed the flow-inclusive equity), and skipping masked an
+        // opposing fill's loss.  Only the in-process budget qualifies;
+        // pre-restart folds were anchored by the restart re-seed.
+        const Mojo matched = std::min(prefolded_pos_mojos,
+                                      bridge_inproc_pos_fold_mojos_);
+        bridge_inproc_pos_fold_mojos_ -= matched;
+        if (matched > 0 && bridge_pos_fold_peak_usd_ > 0.0) {
+            const double matched_usd =
+                (static_cast<double>(matched) / mojos_per_unit)
+                * usd_per_unit;
+            const double e_now = compute_portfolio_equity_usd();
+            const double e_pre = e_now - matched_usd;
+            if (e_now > 0.0 && e_pre > 0.0) {
+                const double target =
+                    bridge_pos_fold_peak_usd_ * (e_now / e_pre);
+                if (target > peak_equity_hwm_usd_) {
+                    spdlog::info("[Engine] Bridge ingest: drawdown peak "
+                                 "rebuilt {:.2f} -> {:.2f} for ${:+.6f} "
+                                 "of in-process pre-folded deposit "
+                                 "(pre-flow anchor {:.2f})",
+                                 peak_equity_hwm_usd_, target,
+                                 matched_usd, bridge_pos_fold_peak_usd_);
+                    peak_equity_hwm_usd_ = target;
+                } else {
+                    spdlog::info("[Engine] Bridge ingest: pre-folded "
+                                 "deposit anchor {:.2f} not above the "
+                                 "current peak {:.2f} -- no change",
+                                 target, peak_equity_hwm_usd_);
+                }
+            }
+        }
+        if (matched < prefolded_pos_mojos) {
+            spdlog::info("[Engine] Bridge ingest: {} mojos of pre-folded "
+                         "deposit anchored by the restart re-seed (folded "
+                         "before this process)",
+                         prefolded_pos_mojos - matched);
+        }
+        if (bridge_inproc_pos_fold_mojos_ == 0) {
+            bridge_pos_fold_peak_usd_ = 0.0;
+        }
     }
     if (prefolded_neg_mojos < 0 && peak_equity_hwm_usd_ > 0.0) {
         // Shrink only against the IN-PROCESS fold budget (round 19): a
@@ -12050,6 +12088,14 @@ asio::awaitable<void> Engine::step_ingest_bridge_flows(
                 const Mojo residual = raw_delta - flow_part;
                 if (residual < 0) {
                     bridge_inproc_neg_fold_mojos_ += residual;
+                } else if (residual > 0) {
+                    // Snapshot the pre-fold peak on the FIRST entry so a
+                    // later pre-folded deposit can rebuild the pre-flow
+                    // anchor (round 20).
+                    if (bridge_inproc_pos_fold_mojos_ == 0) {
+                        bridge_pos_fold_peak_usd_ = peak_equity_hwm_usd_;
+                    }
+                    bridge_inproc_pos_fold_mojos_ += residual;
                 }
                 const double flow_part_usd =
                     (static_cast<double>(flow_part) / mojos_per_unit)

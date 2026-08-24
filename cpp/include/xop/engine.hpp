@@ -854,6 +854,18 @@ private:
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
 
+    /// [S19 review round 20] Positive unattributed inventory movement
+    /// observed by THIS process's reconciles (always >= 0), plus the
+    /// peak as it stood BEFORE the first such fold.  When a pre-folded
+    /// deposit's job later appears, its factor applies once against
+    /// that pre-flow anchor -- Step 13's max() has since absorbed the
+    /// flow-inclusive equity, and multiplying the CURRENT peak would
+    /// overshoot while skipping entirely masked an opposing fill's
+    /// loss (equity/HWM 100, +100 deposit, -20 fill folded together:
+    /// max() anchors 180; the correct peak is 100 * 180/80 = 225).
+    Mojo   bridge_inproc_pos_fold_mojos_{0};
+    double bridge_pos_fold_peak_usd_{0.0};
+
     /// [S19 review round 19] Negative unattributed inventory movement
     /// observed by THIS process's reconciles (always <= 0).  The budget
     /// a pre-folded withdrawal may shrink the peak against: a fold that
