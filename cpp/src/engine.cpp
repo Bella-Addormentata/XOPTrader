@@ -12838,14 +12838,49 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // tracker can key mark-to-market lookups by canonical asset id and
     // normalize per-quote-currency P&L into USD.  Refreshing every
     // heartbeat keeps the DBX cross-rate current.
+    //
+    // [S20 2026-08-24] ...but only a TRUSTED factor may refresh it.
+    //
+    // This is the same secondary-source hole asset_usd_pseudo_price
+    // closes, on the other consumer: the stored factor is a market
+    // observation in its own right, and for an XCH/BYC pair it comes from
+    // the separate BYC/<stable> cross.  Refreshing unconditionally lets a
+    // tight-but-ungraded (raw ticker, or frozen) cross convert a perfectly
+    // graded XCH/BYC mid into USD unrealized P&L, which then feeds the
+    // rolling-window breaker.
+    //
+    // An untrusted factor CARRIES the last trusted one rather than
+    // dropping to 0: PnLTracker treats a non-positive usd_per_quote_unit
+    // as "basis unknown" and zeroes the mark, which would inject the very
+    // discontinuity this guard exists to avoid.  0 is used only before any
+    // trusted factor has ever been seen, where there is no mark to
+    // preserve.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
+
+        double factor = quote_usd_factor(pair);
+        bool   trusted = quote_usd_factor_is_par(pair);
+        if (!trusted) {
+            const std::string src = quote_usd_factor_source_pair(pair);
+            trusted = !src.empty()
+                   && state_->get_market(src).mid_valuation_grade;
+        }
+
+        if (trusted && factor > 0.0) {
+            last_trusted_quote_usd_factor_[pair.name] = factor;
+        } else {
+            auto it = last_trusted_quote_usd_factor_.find(pair.name);
+            factor = (it != last_trusted_quote_usd_factor_.end())
+                ? it->second
+                : 0.0;
+        }
+
         pnl_->set_pair_conversion(
             pair.name,
             pair.base_asset_id,
             static_cast<double>(pair.base_mojos_per_unit),
             static_cast<double>(pair.quote_mojos_per_unit),
-            quote_usd_factor(pair));
+            factor);
     }
 
     // [PNL-BASIS-USD] Upgrade any remaining sentinel bases to the current

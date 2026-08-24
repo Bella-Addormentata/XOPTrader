@@ -1022,6 +1022,15 @@ private:
     // the frozen peak -- disarming them would fail open.
     std::unordered_map<AssetId, BlockHeight> last_asset_live_block_;
 
+    /// [S20 2026-08-24] Last quote_usd_factor per pair whose SOURCE
+    /// snapshot was valuation grade (or a par constant).  The stored P&L
+    /// conversion is refreshed only from these: an ungraded cross must not
+    /// convert a graded mid into USD unrealized P&L and feed the
+    /// rolling-window breaker.  Carried rather than zeroed, because
+    /// PnLTracker reads a non-positive factor as "basis unknown" and
+    /// zeroes the mark.
+    std::unordered_map<std::string, double> last_trusted_quote_usd_factor_;
+
     /// [S20] Set by compute_portfolio_equity_usd when any held asset's
     /// carry has outlived its TTL this cycle.  Consumed by Step 13, where
     /// it removes PEAK-UPDATE authority ONLY: a suspect number must not

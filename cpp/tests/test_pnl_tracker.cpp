@@ -753,3 +753,49 @@ TEST_F(PnLTrackerTest, CarryComesFromThePairHoldingThePriorMark) {
     EXPECT_EQ(nonzero, 1) << "stale per-pair marks left on dedup losers";
     EXPECT_EQ(sum, total_after_cycle1);
 }
+
+// ---------------------------------------------------------------------------
+// 4e. [S20 2026-08-24] A non-positive conversion factor zeroes the mark.
+//
+//     PnLTracker reads usd_per_quote_unit <= 0 as "basis unknown", which
+//     drives basis to 0 and drops the pair out of the marking branch --
+//     so pushing 0 for an untrusted factor would erase the mark rather
+//     than preserve it.  This pins the semantics the engine relies on when
+//     it CARRIES the last trusted factor instead of zeroing it.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, NonPositiveConversionFactorErasesTheMark) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    t.set_pair_conversion("XCH/wUSDC.b", "xch", kBaseXchD, kCatDenomD, 1.0);
+
+    ASSERT_TRUE(t.record_fill(
+        make_fill("trade-conv", xop::Side::Ask,
+                  static_cast<xop::Mojo>(2.5e12),
+                  static_cast<xop::Mojo>(1e12)),
+        0, static_cast<xop::Mojo>(2.0e12), 0));
+
+    auto price = [](const std::string&, const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.5e12);
+    };
+    auto balance = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(1e12);
+    };
+    auto basis = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.0e12);
+    };
+    auto unit = [](const std::string&) -> double {
+        return kCatDenomD / kBaseXchD;
+    };
+
+    t.mark_to_market(price, balance, basis, 2.5, unit);
+    ASSERT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 500);
+
+    // Re-register with a non-positive factor, as an untrusted cross would
+    // if the engine pushed 0 instead of carrying the last trusted value.
+    t.set_pair_conversion("XCH/wUSDC.b", "xch", kBaseXchD, kCatDenomD, 0.0);
+    t.mark_to_market(price, balance, basis, 2.5, unit);
+
+    EXPECT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 0)
+        << "a non-positive factor must be recognised as mark-erasing -- "
+           "this is why the engine carries the last TRUSTED factor";
+}
