@@ -1067,17 +1067,30 @@ void PnLTracker::mark_to_market(
     // P&L; the others report 0 so per-pair figures still add up to the total.
     std::unordered_map<std::string, bool> asset_marked;
 
-    // [S20 2026-08-24] base_asset -> EVERY pair holding a position in it
-    // that could not be priced this cycle.  Resolved after the loop, so a
-    // carry never pre-empts a pair that can actually mark the asset.
+    // [S20 2026-08-24] Pairs that hold a position but had no usable price
+    // this cycle, deferred to a second pass.
     //
-    // All of them, not just the first: the prior cycle's mark is owned by
-    // one specific pair (dedup gives the others 0), and that owner is not
-    // necessarily the first one this unordered_map iteration reaches.
-    // Keeping only the first could carry a dedup loser's 0 and drop the
-    // asset's whole unrealized P&L to zero -- the exact discontinuity this
-    // carry exists to prevent.
-    std::unordered_map<std::string, std::vector<std::string>> carry_candidates;
+    // They carry the last trusted PRICE, not the last computed amount.
+    // Balances and cost basis keep moving while a mid is ungraded -- the
+    // engine goes on quoting -- so freezing the amount would retain the
+    // unrealized P&L of a position that no longer exists: after a partial
+    // fill the realized leg is booked while the stale unrealized leg
+    // survives beside it, which is a false step in exactly the
+    // rolling-window series this carry exists to keep smooth.  Recomputing
+    // from the carried price and the CURRENT balance/basis keeps the two
+    // legs consistent.
+    //
+    // Deferred rather than resolved inline so a carried price never
+    // pre-empts a pair that has a live one: the prior mark belongs to one
+    // specific pair (dedup zeroes the others) and pair_pnl_ is unordered.
+    struct DeferredMark {
+        std::string pair_name;
+        std::string base_asset;
+        Mojo        balance{0};
+        Mojo        basis{0};
+        double      unit_factor{1.0};
+    };
+    std::vector<DeferredMark> deferred;
 
     for (auto& [pair_name, ppnl] : pair_pnl_) {
         // [PNL-KEYING-FIX 2026-07-30] Resolve the CANONICAL base asset id
@@ -1167,25 +1180,31 @@ void PnLTracker::mark_to_market(
         // a perfectly good price -- freezing the mark on iteration order.
         // A carry is the LAST resort, valid only once every pair for the
         // asset has failed to supply one.
-        if (!already_marked && basis > 0 && balance > 0 && smoothed_price <= 0) {
-            carry_candidates[base_asset].push_back(pair_name);
+        // [PNL-UNIT-FIX] Inventory PnL in quote-asset mojos.
+        // Uses the canonical xop::quote_mojos_for helper from types.hpp
+        // so this stays in lock-step with offer_manager.cpp and engine.cpp.
+        // The unit_factor below is (quote_denom / base_denom) supplied
+        // by the caller via get_pair_unit_factor; when absent we fall
+        // back to 1.0 for legacy callers / tests.
+        double unit_factor = 1.0;
+        if (get_pair_unit_factor) {
+            const double f = get_pair_unit_factor(pair_name);
+            if (f > 0.0) {
+                unit_factor = f;
+            }
+        }
+
+        const bool has_position = (basis > 0 && balance > 0);
+
+        if (!already_marked && has_position && smoothed_price <= 0) {
+            // [S20] Defer: this pair may still be markable from its
+            // carried price, but only if no pair can price the asset live.
+            deferred.push_back({pair_name, base_asset, balance, basis,
+                                unit_factor});
             continue;
         }
 
-        if (!already_marked && basis > 0 && balance > 0 && smoothed_price > 0) {
-            // [PNL-UNIT-FIX] Inventory PnL in quote-asset mojos.
-            // Uses the canonical xop::quote_mojos_for helper from types.hpp
-            // so this stays in lock-step with offer_manager.cpp and engine.cpp.
-            // The unit_factor below is (quote_denom / base_denom) supplied
-            // by the caller via get_pair_unit_factor; when absent we fall
-            // back to 1.0 for legacy callers / tests.
-            double unit_factor = 1.0;
-            if (get_pair_unit_factor) {
-                const double f = get_pair_unit_factor(pair_name);
-                if (f > 0.0) {
-                    unit_factor = f;
-                }
-            }
+        if (!already_marked && has_position && smoothed_price > 0) {
             // Equivalent to quote_mojos_for(balance, smoothed_price - basis,
             //                               base_denom, quote_denom)
             // with quote_denom/base_denom collapsed into unit_factor.
@@ -1198,49 +1217,54 @@ void PnLTracker::mark_to_market(
         } else {
             ppnl.inventory_pnl = 0;
         }
-
-        total_pnl_.inventory_pnl += ppnl.inventory_pnl;
     }
 
-    // [S20 2026-08-24] Second pass: apply carries only where NO pair could
-    // price the asset.
+    // [S20 2026-08-24] Second pass: mark from the CARRIED PRICE, and only
+    // for assets no pair could price live.
     //
-    // Among the unpriced candidates exactly one may hold the previous
-    // cycle's mark (dedup zeroed the rest), so the carry must come from
-    // THAT pair -- picking any other would carry a 0 and erase the
-    // asset's unrealized P&L.  Every remaining candidate is then zeroed so
-    // per-pair figures still sum to the total.
-    for (const auto& [base_asset, pairs] : carry_candidates) {
-        const bool priced_elsewhere = asset_marked[base_asset];
+    // price_ema_ already holds the last trusted smoothed price per pair,
+    // so the mark is recomputed from it against this cycle's balance and
+    // basis.  That keeps the unrealized leg consistent with any fills
+    // booked into the realized leg while the mid was ungraded, which
+    // carrying the previous AMOUNT could not do.
+    for (const auto& d : deferred) {
+        auto it = pair_pnl_.find(d.pair_name);
+        if (it == pair_pnl_.end()) continue;
 
-        // The prior owner is the candidate with a non-zero mark; with none
-        // (first cycle, or a genuinely flat position) any choice carries 0.
-        std::string owner;
-        if (!priced_elsewhere) {
-            for (const auto& name : pairs) {
-                auto it = pair_pnl_.find(name);
-                if (it != pair_pnl_.end() && it->second.inventory_pnl != 0) {
-                    owner = name;
-                    break;
-                }
-            }
+        if (asset_marked[d.base_asset]) {
+            // Priced live by another pair, or already carried by one.
+            it->second.inventory_pnl = 0;
+            continue;
         }
 
-        for (const auto& name : pairs) {
-            auto it = pair_pnl_.find(name);
-            if (it == pair_pnl_.end()) continue;
-            if (name == owner) {
-                spdlog::debug("PnLTracker::mark_to_market: no pair could "
-                              "price {} this cycle -- carrying {}'s "
-                              "previous mark {}",
-                              base_asset, name, it->second.inventory_pnl);
-                total_pnl_.inventory_pnl += it->second.inventory_pnl;
-                asset_marked[base_asset] = true;
-            } else {
-                // Dedup loser, or the asset was priced by another pair.
-                it->second.inventory_pnl = 0;
-            }
+        auto ema_it = price_ema_.find(d.pair_name);
+        if (ema_it == price_ema_.end() || ema_it->second <= 0.0) {
+            // Never priced -- nothing to carry.
+            it->second.inventory_pnl = 0;
+            continue;
         }
+
+        const Mojo carried = static_cast<Mojo>(ema_it->second);
+        it->second.inventory_pnl = static_cast<Mojo>(std::llround(
+            static_cast<double>(carried - d.basis)
+            * static_cast<double>(d.balance)
+            * d.unit_factor
+            / static_cast<double>(kMojosPerXch)));
+        asset_marked[d.base_asset] = true;
+
+        spdlog::debug("PnLTracker::mark_to_market: no live price for {} -- "
+                      "marked {} from carried price {} against current "
+                      "balance {} (result {})",
+                      d.base_asset, d.pair_name, carried, d.balance,
+                      it->second.inventory_pnl);
+    }
+
+    // Total is summed from the per-pair figures AFTER both passes, so the
+    // two can never disagree (a deferred pair's contribution is not known
+    // until the second pass decides whether it marks or zeroes).
+    total_pnl_.inventory_pnl = 0;
+    for (const auto& [name, ppnl] : pair_pnl_) {
+        total_pnl_.inventory_pnl += ppnl.inventory_pnl;
     }
 
     // Record a PnL snapshot for Sharpe/drawdown analytics.

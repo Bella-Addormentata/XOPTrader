@@ -842,3 +842,57 @@ TEST_F(PnLTrackerTest, CatQuotedByXchIsMarkableOnFirstRegistration) {
         << "an XCH-quoted pair must be markable on a fresh process -- a "
            "zero conversion factor discards the basis entirely";
 }
+
+// ---------------------------------------------------------------------------
+// 4g. [S20 2026-08-24] A carry must track the POSITION, not freeze an amount.
+//
+//     Balances and basis keep moving while a mid is ungraded, because the
+//     engine goes on quoting.  An earlier cut carried the previously
+//     COMPUTED inventory_pnl, so after a partial fill the realized leg was
+//     booked while the stale unrealized leg for the old quantity survived
+//     beside it -- a false step in the rolling-window series the carry
+//     exists to keep smooth.  The carry now retains the last trusted PRICE
+//     and recomputes against the current balance.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CarryRecomputesFromCurrentBalanceAfterAFill) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+    register_pair(t);
+
+    ASSERT_TRUE(t.record_fill(
+        make_fill("trade-c1", xop::Side::Ask,
+                  static_cast<xop::Mojo>(2.5e12),
+                  static_cast<xop::Mojo>(1e12)),
+        0, static_cast<xop::Mojo>(2.0e12), 0));
+
+    // Balance is read fresh each cycle so the test can shrink it.
+    xop::Mojo held = static_cast<xop::Mojo>(2e12);   // 2 XCH
+    auto balance = [&held](const std::string&) -> xop::Mojo { return held; };
+    auto basis = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.0e12);       // $2.00 basis
+    };
+    auto unit = [](const std::string&) -> double {
+        return kCatDenomD / kBaseXchD;
+    };
+
+    // Cycle 1: priced at $2.50 with 2 XCH held -> ($0.50 * 2) = 1000.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(2.5e12);
+        }, balance, basis, 2.5, unit);
+    ASSERT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 1000);
+
+    // A fill sells half the position while the mid is about to go ungraded.
+    held = static_cast<xop::Mojo>(1e12);             // 1 XCH left
+
+    // Cycle 2: no usable price.  The mark must follow the SMALLER position
+    // (carried $2.50 against 1 XCH = 500), not stay frozen at 1000.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo { return 0; },
+        balance, basis, 2.5, unit);
+
+    EXPECT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 500)
+        << "carry froze the amount instead of recomputing from the current "
+           "balance -- stale unrealized P&L for a position that was sold";
+    EXPECT_EQ(t.get_total_pnl().inventory_pnl, 500);
+}
