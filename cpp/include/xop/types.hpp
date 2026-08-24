@@ -302,6 +302,25 @@ struct MarketSnapshot {
     Mojo         volume_24h;   // rolling 24-hour volume in mojos of base asset
     BlockHeight  last_block;   // block height at which this snapshot was taken
     Timestamp    updated_at;   // wall-clock time
+
+    // [S20 2026-08-24] Valuation trust.  True only when the published mid is
+    // backed by live evidence: it passed the plausibility gate AND rests on
+    // a fresh two-sided third-party book or a fresh CEX leg.  A last-trade
+    // print or a stale/one-sided book publishes (quoting logic may still
+    // want it) but is NOT valuation grade: equity falls back to its
+    // last-known-price carry and P&L marks skip the cycle, so a lone stale
+    // print can never move the drawdown peak or the rolling-window flow.
+    // Defaults TRUE so hand-built snapshots (tests, tools) keep their
+    // pre-S20 behaviour; MarketDataFeed::publish_snapshot always sets it.
+    bool         mid_valuation_grade{true};
+
+    // [S20] Heartbeats since the dust-filtered book mid last moved by more
+    // than 1 bp (PairState::dex_print_age).  0 also when never observed.
+    std::int32_t dex_print_age{0};
+
+    // [S20] Poll-age staleness verdict at publish time (PairState::is_stale;
+    // previously computed and then dropped on the floor).
+    bool         is_stale{false};
 };
 
 // ---------------------------------------------------------------------------

@@ -1262,6 +1262,15 @@ struct RiskConfig {
     double   max_window_loss_bps{500.0};    ///< Max window P&L loss (bps of equity; 0=disabled).
     uint32_t breaker_realert_minutes{30};   ///< Min minutes between repeat breaker alerts while paused.
 
+    /// [S20 2026-08-24] Blocks an asset's last-known USD price may be
+    /// carried without a fresh valuation-grade print before the equity
+    /// figure is declared DEGRADED -- which freezes the drawdown peak and
+    /// suppresses breaker trips until live prices return.  The carry VALUE
+    /// keeps being used either way (a data gap must not read as a crash);
+    /// only its authority to move the peak or trip a breaker expires.
+    /// Default ~10.4 h at 52 s/block.  0 disables the expiry.
+    uint32_t valuation_carry_ttl_blocks{720};
+
     // -- Flash crash detection (T7-07, T7-08) --------------------------------
     double   flash_crash_threshold_pct{0.20};      ///< Drop % to trigger crash (0,1].
     /// Blocks of history the crash detector scans (one entry per block).
@@ -1889,6 +1898,37 @@ struct MarketDataSettings {
     /// Number of order book levels per side to include in the VWAP
     /// micro-price computation.  Default: 5.
     uint32_t orderbook_mid_depth{5};
+
+    // -- [S20 2026-08-24] Published-mid plausibility gate --------------------
+    // One junk print on BYC/wUSDC.b (187.461980 vs a ~1.0 peg) valued the
+    // whole BYC position at $187/unit, seeded a $15,180 phantom drawdown
+    // peak on a fresh process within 40 minutes, and latched the breaker.
+    // The gate compares every candidate mid against an independent anchor
+    // (CEX > triangulated implied cross > AMM > fair value > peg) and
+    // refuses to publish on a breach; the pair goes no-mid, which every
+    // consumer already treats as "do not quote, do not value".
+
+    /// Master switch for the anchor gate and the anchored offer filter.
+    bool mid_gate_enabled{true};
+
+    /// Multiplicative anchor band: candidate/anchor confined to
+    /// [1/ratio, ratio].  Wide by design -- refuse 187x absurdity, pass
+    /// real repricing.  <= 1.0 disables the anchor test.
+    double mid_anchor_band_ratio{3.0};
+
+    /// Book-confirmation escape: a fresh two-sided dust-filtered book with
+    /// spread in (0, this] bps overrides a band breach ("the whole market
+    /// repriced" evidence that a lone absurd offer cannot produce).
+    double mid_gate_book_confirm_max_spread_bps{5000.0};
+
+    /// Anchorless fallback: max fractional mid move vs the last accepted
+    /// mid in one heartbeat (~52 s).  <= 0 disables.
+    double mid_gate_max_step_frac{0.5};
+
+    /// Max spread (bps) for a sibling pair's book to serve as a leg of the
+    /// triangulated implied cross.  Matches the S17 lesson: a leg is
+    /// trustworthy exactly when its own book is tight.
+    double implied_cross_max_leg_spread_bps{300.0};
 };
 
 // ---------------------------------------------------------------------------

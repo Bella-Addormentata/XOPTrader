@@ -330,6 +330,14 @@ risk:
   loss_window_blocks: 1152      # [OPTIONAL, default: 1152]
   max_window_loss_bps: 500      # [OPTIONAL, default: 500] 0 = disabled
 
+  # [S20 2026-08-24] Blocks an asset's last-known USD price may be carried
+  # without a fresh valuation-grade print before equity is declared
+  # DEGRADED, which freezes the drawdown peak and suspends breaker trips
+  # until live prices return (10 consecutive clean cycles).  The carried
+  # VALUE keeps being used either way -- a data gap must not read as a
+  # crash.  ~10.4 h at 52 s/block.  0 disables the expiry.
+  valuation_carry_ttl_blocks: 720  # [OPTIONAL, default: 720]
+
   # Flash-crash detector: how many blocks of price history the drawdown
   # scan considers (one entry per block; ~18.75 s each).  0 scans the whole
   # retained buffer (~1000 blocks) -- the pre-S12 behaviour, under which a
@@ -568,6 +576,24 @@ market_data:
   # over price determination by analyzing actual liquidity depth.
   orderbook_mid_enabled: true            # true = use depth-weighted orderbook mid
   orderbook_mid_depth: 5                 # Number of levels per side for VWAP
+
+  # [S20 2026-08-24] Published-mid plausibility gate.  One junk print on
+  # BYC/wUSDC.b (187.461980 vs a ~1.0 peg, frozen for 12+ hours) valued the
+  # whole BYC position at $187/unit, seeded a $15,180 phantom drawdown peak
+  # on a freshly restarted process within 40 minutes, and latched the
+  # breaker.  Every candidate mid is now checked against an independent
+  # anchor -- CEX price, the implied cross triangulated through healthy
+  # sibling books (e.g. BYC/wUSDC.b via XCH/wUSDC.b / XCH/BYC), AMM pool
+  # price, external fair value, or the peg -- and a breach publishes NO mid
+  # instead of a junk one.  A real market move still passes: the band is
+  # wide (3x), and a fresh two-sided book with a coherent spread overrides
+  # the anchor ("the whole market repriced" evidence a lone absurd resting
+  # offer cannot produce).
+  mid_gate_enabled: true                    # [OPTIONAL, default: true]
+  mid_anchor_band_ratio: 3.0                # [OPTIONAL, default: 3.0] <= 1 disables
+  mid_gate_book_confirm_max_spread_bps: 5000.0  # [OPTIONAL, default: 5000]
+  mid_gate_max_step_frac: 0.5               # [OPTIONAL, default: 0.5] <= 0 disables
+  implied_cross_max_leg_spread_bps: 300.0   # [OPTIONAL, default: 300]
 
 # --- adverse_selection: OPTIONAL (omit section to use defaults) ---------------
 # Bayesian PIN estimator parameters.  All fields are OPTIONAL.

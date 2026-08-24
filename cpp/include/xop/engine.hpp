@@ -477,7 +477,14 @@ private:
     /// USD-normalized pseudo-price for one display unit of an asset,
     /// resolved from any enabled pair that trades it (base: mid * factor;
     /// quote: factor * kMojosPerXch).  0 when no market data yet.
+    /// [S20] The base-of-pair branch only accepts valuation-grade mids.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
+
+    /// [S20 2026-08-24] Median implied price of `pc` triangulated through
+    /// every healthy pair of enabled sibling books (see the definition for
+    /// leg-health rules).  0 when no healthy triangle exists.  Feeds
+    /// MarketDataFeed::ingest_reference_anchor each heartbeat.
+    [[nodiscard]] double compute_implied_cross_anchor(const PairConfig& pc) const;
 
     /// [DRAWDOWN-EQUITY 2026-08-04] Total portfolio equity in USD: the sum
     /// over all tracked inventory records of holdings x USD price, using
@@ -488,7 +495,10 @@ private:
     /// data gap cannot masquerade as a crash.  Non-const: refreshes that
     /// cache.  This is the denominator of the max-drawdown breaker and the
     /// anchor of the rolling-window loss threshold.
-    [[nodiscard]] double compute_portfolio_equity_usd();
+    /// [S20] Pass the heartbeat's block height to arm the carry-TTL
+    /// degradation verdict (valuation_degraded_); 0 skips it, for callers
+    /// outside the heartbeat that only want the number.
+    [[nodiscard]] double compute_portfolio_equity_usd(BlockHeight current_block = 0);
 
     /// Snapshot all InventoryTracker records into the inventory_state table
     /// (PNL-BASIS-PERSIST).  Called after every mutation; never throws.
@@ -978,6 +988,32 @@ private:
     // entire value from equity and read as an instantaneous crash --
     // firing the breaker on a DATA GAP rather than a market move.
     std::unordered_map<AssetId, double> last_asset_usd_price_;
+
+    // [S20 2026-08-24] Block at which each asset last had a LIVE
+    // valuation-grade price (as opposed to a carried one).  When a held
+    // asset's carry outlives risk.valuation_carry_ttl_blocks, the equity
+    // figure is declared degraded for the cycle: the value itself keeps
+    // being used (a data gap must not read as a crash) but it loses the
+    // authority to move the drawdown peak or trip a breaker.
+    std::unordered_map<AssetId, BlockHeight> last_asset_live_block_;
+
+    /// [S20] Set by compute_portfolio_equity_usd when any held asset's
+    /// carry has outlived its TTL this cycle.  Consumed by Step 13.
+    bool valuation_degraded_{false};
+
+    /// [S20] Debounce streak for re-arming the peak after degradation.
+    static constexpr int kValuationRearmCleanCycles = 10;
+
+    /// [S20] Consecutive non-degraded equity computations.  After a
+    /// degraded episode the peak stays frozen until this reaches
+    /// kValuationRearmCleanCycles -- the S18 lift-streak idiom, so
+    /// alternating junk/honest cycles cannot flap the peak upward.
+    /// Starts AT the threshold: a process that has never degraded seeds
+    /// its peak from the first valued cycle, as before.
+    int valuation_clean_streak_{kValuationRearmCleanCycles};
+
+    /// [S20] Warn-once flag for the degraded episode (reset on recovery).
+    bool valuation_degraded_warned_{false};
 
     // [DRAWDOWN-EQUITY 2026-08-04] Re-alert suppression for the breakers:
     // while the engine stays Paused on a persisting condition, the

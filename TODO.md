@@ -287,23 +287,36 @@ adjust before the COMPLETED booking converges through the three-entry
 catch-up -- the same persisted wallet-effect event closes both windows.
 
 ### S20: Equity valuation rides warm-up/stale prices -- breaker false trips
-- **Files:** `cpp/src/engine.cpp` (compute_portfolio_equity_usd, Step 13
-  rolling-window breaker), valuation price sources
-- **Status:** `[ ]` -- Observed live 2026-08-23 14:45:34, the THIRD breaker
-  event of the day from one root cause. The freshly installed v0.9.19
-  process anchored its equity peak at $253.67 during startup warm-up (BYC
-  valued high before the dexie feed delivered the book), then the stale
-  0.75 BYC/wUSDC.b print re-asserted and ~104 BYC marked down ~$21;
-  equity "fell" to ~$232.6, the rolling window read -$18.42/36 blocks
-  against its 250 bps ($5.81) limit, and the engine PAUSED (latched).
-  trade_log shows ZERO fills all afternoon -- the entire loss was
-  mark-to-market flapping on a single stale order in an emptied dexie
-  book (TibetSwap AMM simultaneously ~0.92; the Step 7 uncertainty
-  centre blended 0.75 -> 0.877 with w_ext=0.99 at the same moment).
-  Directions to evaluate: (a) value stablecoin-pair inventory for EQUITY
-  at the blended/uncertainty centre or a second source instead of the
-  raw book mid; (b) a startup valuation-grace window before the rolling
-  window arms (the drawdown breaker already has one); (c) the S17
-  second-source depeg confirmation, which is the same lesson. Related:
-  the morning's depeg bail-out (S17) and drawdown-latch alerts (S18)
-  came from the same stale print.
+- **Files:** `cpp/include/xop/execution/mid_gate.hpp` (new pure header),
+  `cpp/src/execution/market_data.cpp` (gate wiring, anchored offer filter,
+  ob_updated_at), `cpp/src/engine.cpp` (implied-cross anchor injection,
+  valuation-grade gates, carry TTL, Step 13 authority gating),
+  `cpp/tests/test_mid_gate.cpp`
+- **Status:** `[x]` -- Built 2026-08-24 (branch feat/s20-valuation-guards)
+  after the definitive exhibit: the junk 187.461980 BYC/wUSDC.b print
+  (byte-identical 12+ h) re-poisoned a FRESHLY RESTARTED v0.9.20 in ~40
+  minutes (peak seeded $15,180.38, honest equity $258.94 read as a 98.29%
+  drawdown, breaker latched 09:25).  Root causes found by the review of
+  the feed: (1) the per-offer outlier filter anchored on the pair's OWN
+  previous mid -- self-referential lock-in that rejected honest ~1.0
+  offers as outliers while junk passed, and was skipped entirely on the
+  first cycle (the fresh-restart re-poisoning path); (2) ps.orderbook_mid
+  had no age of its own, so a throwing offers fetch froze it while
+  dex_updated_at kept re-stamping; (3) no plausibility bound existed on
+  the published mid at all.  Fix (design B "guard at the source" +
+  grafts, judged 2-0 by independent panels): every candidate mid is
+  gated against an independent anchor -- CEX > triangulated implied
+  cross through healthy sibling books (generalised for EVERY triangle,
+  per operator direction) > AMM > fair value > peg -- with a wide 3x
+  band and a book-confirmation escape so real repricing passes; a breach
+  publishes NO mid.  MarketSnapshot gained mid_valuation_grade (equity,
+  P&L marks, and the depeg counter only consume grade prices; a
+  last-trade-only 0.75-class print publishes but cannot mark), the
+  carry cache gained a TTL (risk.valuation_carry_ttl_blocks, degraded
+  equity freezes the peak and suspends breaker trips, S18-style 10-clean-
+  cycle re-arm), and the raw-BBO 10x guard now falls back to the anchor
+  chain on CEX-less pairs.  692/692 tests incl. 12 incident-replay pins.
+  Residual (documented, accepted): a coordinated two-sided wash book
+  inside the 3x band can still mark equity wrong at real capital cost;
+  pre-S20 junk persisted to DB (cost basis, AS warm-start snapshots) is
+  NOT repaired by this change -- separate sanitation task if it bites.

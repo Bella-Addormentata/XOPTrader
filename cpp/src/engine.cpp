@@ -23,6 +23,7 @@
 #include "xop/feed_listings.hpp"
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
+#include "xop/execution/mid_gate.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -285,6 +286,13 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         config_.strategy.published_mid_band_floor_bps;
     md_cfg.published_mid_band_spread_frac =
         config_.strategy.published_mid_band_spread_frac;
+    // [S20 2026-08-24] Published-mid plausibility gate.
+    md_cfg.mid_gate_enabled     = config_.market_data.mid_gate_enabled;
+    md_cfg.mid_anchor_band_ratio = config_.market_data.mid_anchor_band_ratio;
+    md_cfg.mid_gate_book_confirm_max_spread_bps =
+        config_.market_data.mid_gate_book_confirm_max_spread_bps;
+    md_cfg.mid_gate_max_step_frac =
+        config_.market_data.mid_gate_max_step_frac;
     market_data_ = std::make_unique<MarketDataFeed>(md_cfg, *state_);
 
     // -- Data / analytics (per-pair estimators) --------------------------------
@@ -2318,6 +2326,23 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
         }
     }
 
+    // [S20 2026-08-24] Inject the external references the feed's
+    // plausibility gate anchors on: the triangulated implied cross
+    // (computed from SIBLING pairs' previous-cycle published mids -- the
+    // engine owns the pair graph, the feed only consumes the result) and
+    // the peg target for stablecoin pairs.  Runs BEFORE refresh() so this
+    // heartbeat's gate sees them; the one-cycle lag on the legs is
+    // harmless against a 3x band.
+    if (config_.market_data.mid_gate_enabled) {
+        for (const auto& pair : config_.pairs) {
+            if (!pair.enabled) continue;
+            market_data_->ingest_reference_anchor(
+                pair.name,
+                compute_implied_cross_anchor(pair),
+                pair.is_stablecoin ? pair.peg_target : 0.0);
+        }
+    }
+
     // Compute aggregated mid-prices, spreads, arbitrage signals.
     market_data_->refresh(enabled);
 
@@ -2995,7 +3020,17 @@ void Engine::step_update_analytics(BlockHeight block_height)
         // Feed the current mid-price to the depeg detector for any pair
         // flagged as a stablecoin.  The detector tracks sustained deviations
         // and transitions through Normal -> Warning -> Bailed states.
-        if (pair.is_stablecoin && depeg_detector_) {
+        //
+        // [S20 2026-08-24] ...but only valuation-grade mids advance it.  A
+        // last-trade-only or stale-book print (the 187.46 class) latched
+        // Bailed for hours on evidence no one could trade against.  The
+        // gate is price-BLIND -- it asks how the mid was formed, never how
+        // far it moved -- so a genuine depeg on a live book still warns
+        // instantly and bails after depeg_sustained_blocks.  The detector's
+        // counters mutate only inside update(), so a skipped cycle pauses
+        // the count rather than resetting it.
+        if (pair.is_stablecoin && depeg_detector_
+            && market_data_->mid_valuation_grade(pair.name)) {
             auto depeg_status = depeg_detector_->update(
                 pair.name, mid, block_height);
 
@@ -10914,7 +10949,11 @@ double Engine::usd_per_xch() const
         const std::string quote = pair.name.substr(slash + 1);
         if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
             auto snap = state_->get_market(pair.name);
-            if (snap.mid_price > 0) {
+            // [S20] Valuation-grade mids only: this rate multiplies into
+            // every USD figure in the bot, so a last-trade-only or
+            // stale-book print must fall through to "unknown" (0), not
+            // become the exchange rate.
+            if (snap.mid_price > 0 && snap.mid_valuation_grade) {
                 return static_cast<double>(snap.mid_price)
                      / static_cast<double>(kMojosPerXch);
             }
@@ -10975,6 +11014,7 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
             }
             auto snap = state_->get_market(other.name);
             if (snap.mid_price > 0
+                && snap.mid_valuation_grade   // [S20]
                 && snap.spread_bps > 0.0
                 && snap.spread_bps <= kMaxCrossSpreadBps) {
                 return static_cast<double>(snap.mid_price)
@@ -10990,9 +11030,11 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
 
     // Non-pegged quote (DBX): derive via this pair's own cross rate when the
     // base is XCH:  usd_per_quote = usd_per_xch / quote_per_xch.
+    // [S20] Valuation-grade only -- this divides one mid by another, so a
+    // junk print here scales every DBX figure by its error.
     if (pc.base_asset_id == "xch") {
         auto snap = state_->get_market(pc.name);
-        if (snap.mid_price > 0) {
+        if (snap.mid_price > 0 && snap.mid_valuation_grade) {
             const double quote_per_xch =
                 static_cast<double>(snap.mid_price)
                 / static_cast<double>(kMojosPerXch);
@@ -11023,14 +11065,95 @@ Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
         static_cast<double>(usd_price) / f));
 }
 
+// [S20 2026-08-24] Triangulated implied cross for the published-mid gate.
+//
+// For a target pair A/B, every pair of enabled siblings (A,C) and (C,B)
+// forms a triangle through a common asset C; the implied price of A/B is
+// rate(A->C) * rate(C->B), with legs inverted as their orientation
+// requires.  Both legs must be two-sided, fresh, and tight
+// (implied_cross_max_leg_spread_bps -- the S17 "trust the book only when
+// it is tight" lesson), so the implied mid's error is bounded by the
+// healthy legs' spreads, not by the sick book it will anchor.  Reads the
+// PREVIOUS cycle's published (already gated) sibling mids: the one-block
+// lag is harmless against a 3x band, and using published values means a
+// rejected junk leg can never serve as an anchor.  With several common
+// assets the median implied wins.  Returns 0 when no healthy triangle
+// exists -- the anchor chain then falls through to AMM/fair-value/peg.
+double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
+{
+    if (!market_data_) return 0.0;
+    const double leg_cap =
+        config_.market_data.implied_cross_max_leg_spread_bps;
+
+    auto make_leg = [&](const PairConfig& sib, bool invert) {
+        midgate::CrossLeg leg;
+        leg.mid        = market_data_->get_mid_price(sib.name);
+        leg.spread_bps = market_data_->get_spread_bps(sib.name);
+        leg.fresh      = !market_data_->is_stale(sib.name);
+        leg.invert     = invert;
+        return leg;
+    };
+
+    std::vector<double> candidates;
+    for (const auto& p1 : config_.pairs) {
+        if (!p1.enabled || p1.name == pc.name) continue;
+        // p1 must touch the target's BASE; the other side is the common
+        // asset C.  Orientation: a pair's mid is quote-per-base, so
+        // rate(A->C) is the mid when p1 is A/C and 1/mid when p1 is C/A.
+        std::string common;
+        bool invert1 = false;
+        if (p1.base_asset_id == pc.base_asset_id) {
+            common = p1.quote_asset_id;
+        } else if (p1.quote_asset_id == pc.base_asset_id) {
+            common  = p1.base_asset_id;
+            invert1 = true;
+        } else {
+            continue;
+        }
+        if (common == pc.quote_asset_id) continue;  // the target itself
+
+        for (const auto& p2 : config_.pairs) {
+            if (!p2.enabled || p2.name == pc.name || p2.name == p1.name) {
+                continue;
+            }
+            bool invert2 = false;
+            if (p2.base_asset_id == common
+                && p2.quote_asset_id == pc.quote_asset_id) {
+                // C/B: mid is already B per C.
+            } else if (p2.base_asset_id == pc.quote_asset_id
+                       && p2.quote_asset_id == common) {
+                invert2 = true;  // B/C: invert to get B per C.
+            } else {
+                continue;
+            }
+            const double implied = midgate::implied_cross(
+                make_leg(p1, invert1), make_leg(p2, invert2), leg_cap);
+            if (implied > 0.0) {
+                candidates.push_back(implied);
+            }
+        }
+    }
+
+    if (candidates.empty()) return 0.0;
+    std::sort(candidates.begin(), candidates.end());
+    return candidates[candidates.size() / 2];
+}
+
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 {
     // Prefer pricing the asset as the BASE of an enabled pair (live mid).
+    //
+    // [S20 2026-08-24] Valuation-grade mids only.  This branch was the main
+    // hole of the incident: it accepted any positive published mid, so the
+    // junk 187.461980 BYC/wUSDC.b print valued ~104 BYC at $187 each --
+    // $15k of phantom equity and a $15,180 drawdown peak on a fresh
+    // process.  A non-grade mid now falls through to the carry cache in
+    // compute_portfolio_equity_usd, exactly like a missing price.
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != asset_id) continue;
         auto snap = state_->get_market(pair.name);
         const double f = quote_usd_factor(pair);
-        if (snap.mid_price > 0 && f > 0.0) {
+        if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
             return static_cast<Mojo>(std::llround(
                 static_cast<double>(snap.mid_price) * f));
         }
@@ -11054,9 +11177,21 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 // carried at their last-known price (see last_asset_usd_price_) -- a data
 // gap must not read as a crash.  Assets that have never been valued
 // contribute 0 (and never contributed to the equity peak either).
-double Engine::compute_portfolio_equity_usd()
+double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
 {
     if (!inventory_) return 0.0;
+
+    // [S20 2026-08-24] Degradation verdict for this cycle.  Live prices are
+    // already grade-gated inside asset_usd_pseudo_price, so a junk print
+    // reads as "no live price" here and the asset rides its carry -- but a
+    // carry is only a bridge over a data GAP, not a permanent valuation.
+    // When a held asset's carry outlives risk.valuation_carry_ttl_blocks,
+    // the figure this function returns is still the best available number
+    // (the value keeps being carried), but it loses the authority to move
+    // the drawdown peak or trip a breaker; Step 13 reads the flag.
+    // current_block == 0 (callers outside the heartbeat) skips the verdict.
+    const uint32_t ttl = config_.risk.valuation_carry_ttl_blocks;
+    bool degraded = false;
 
     std::vector<risk::AssetValuationInput> inputs;
     for (const auto& rec : inventory_->get_all_records()) {
@@ -11074,14 +11209,33 @@ double Engine::compute_portfolio_equity_usd()
             in.live_usd_per_unit = static_cast<double>(pseudo)
                                  / static_cast<double>(kMojosPerXch);
             last_asset_usd_price_[rec.asset_id] = in.live_usd_per_unit;
+            if (current_block > 0) {
+                last_asset_live_block_[rec.asset_id] = current_block;
+            }
         }
         if (auto it = last_asset_usd_price_.find(rec.asset_id);
             it != last_asset_usd_price_.end()) {
             in.last_usd_per_unit = it->second;
+
+            // [S20] Expired carry on a HELD asset degrades the cycle.
+            if (pseudo <= 0 && current_block > 0 && ttl > 0) {
+                auto lb = last_asset_live_block_.find(rec.asset_id);
+                if (lb == last_asset_live_block_.end()
+                    || current_block - lb->second > ttl) {
+                    degraded = true;
+                    spdlog::debug("[Engine] [S20] carry for {} exceeds "
+                                  "{} blocks without a live print -- "
+                                  "equity degraded this cycle",
+                                  rec.asset_id, ttl);
+                }
+            }
         }
         inputs.push_back(in);
     }
 
+    if (current_block > 0) {
+        valuation_degraded_ = degraded;
+    }
     return risk::portfolio_equity_usd(inputs);
 }
 
@@ -12643,8 +12797,17 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // Mark-to-market all positions.
     pnl_->mark_to_market(
         // get_price callback: return mid-price in mojos for a pair/asset.
+        // [S20 2026-08-24] Valuation-grade mids only: unrealized P&L feeds
+        // the rolling-window flow series, and the 2026-08-23 window trip
+        // (-$18.42/36 blocks, zero fills) was pure mark-to-market flap on
+        // one stale in-band print.  The P&L layer already skips marks at
+        // price <= 0, so a non-grade cycle simply carries the previous
+        // mark -- same semantics as a missing price.
         [this](const std::string& pair, [[maybe_unused]] const std::string& asset) -> Mojo {
             auto snap = state_->get_market(pair);
+            if (!snap.mid_valuation_grade) {
+                return 0;
+            }
             return snap.mid_price;
         },
         // get_balance callback: return balance in mojos for an asset.
@@ -12919,15 +13082,47 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // trading-loss detector); equity is the denominator/anchor for both
     // thresholds.
     auto total = pnl_->get_total_pnl();
-    const double equity_usd = compute_portfolio_equity_usd();
+    const double equity_usd = compute_portfolio_equity_usd(block_height);
+
+    // [S20 2026-08-24] Degradation bookkeeping.  A degraded equity figure
+    // (a held asset riding an expired carry) keeps being REPORTED -- the
+    // GUI and alert rules see the honest best-available number -- but it
+    // loses authority over the peak and the breakers below.  Recovery
+    // re-arms only after kValuationRearmCleanCycles consecutive clean
+    // cycles (the S18 lift-streak idiom), so alternating junk/honest
+    // cycles cannot ratchet the peak.
+    if (valuation_degraded_) {
+        valuation_clean_streak_ = 0;
+        if (!valuation_degraded_warned_) {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "(carry TTL exceeded on a held asset) -- peak "
+                         "frozen at ${:.2f}, breaker trips suspended until "
+                         "{} consecutive clean cycles",
+                         peak_equity_hwm_usd_, kValuationRearmCleanCycles);
+            valuation_degraded_warned_ = true;
+        }
+    } else if (valuation_clean_streak_ < kValuationRearmCleanCycles) {
+        ++valuation_clean_streak_;
+        if (valuation_clean_streak_ == kValuationRearmCleanCycles) {
+            spdlog::info("[Engine] Step 13: [S20] equity valuation clean "
+                         "for {} cycles -- peak updates and breakers "
+                         "re-armed", kValuationRearmCleanCycles);
+            valuation_degraded_warned_ = false;
+        }
+    }
+    const bool valuation_authoritative =
+        !valuation_degraded_
+        && valuation_clean_streak_ >= kValuationRearmCleanCycles;
 
     // [MEDIUM-7]/[H6] Equity high-water mark.  Equity is non-negative by
     // construction, so a plain monotonic max is a complete seed: the first
     // valued cycle sets the peak, and the startup grace window below
     // covers the cycles before valuations warm up.  In-memory only -- a
     // restart re-anchors the peak to current equity (documented at the
-    // member).
-    peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
+    // member).  [S20] Only an authoritative valuation may move it.
+    if (valuation_authoritative) {
+        peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
+    }
 
     bs.equity_usd      = equity_usd;
     bs.peak_equity_usd = peak_equity_hwm_usd_;
@@ -12960,7 +13155,14 @@ void Engine::step_check_alerts(BlockHeight block_height)
         --drawdown_grace_remaining_;
     }
 
-    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
+    // [S20] ...and only an authoritative valuation may TRIP the breaker:
+    // comparing a degraded (expired-carry) equity against the peak is
+    // comparing two numbers from different regimes.  The skip is visible
+    // through the degradation warn above, and quoting is separately halted
+    // by the pairs' own no-mid state, so this cannot mask a real loss that
+    // live prices would show.
+    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0
+        && valuation_authoritative) {
         const double drawdown_frac = risk::equity_drawdown_frac(
             peak_equity_hwm_usd_, equity_usd);
 
@@ -13121,7 +13323,14 @@ void Engine::step_check_alerts(BlockHeight block_height)
                 config_.risk.max_window_loss_bps);
 
             // 4. Fire if window_loss exceeds the threshold.
+            // [S20] The deque above is fed unconditionally (a gap in the
+            // series was the pre-S19 resume bug), but the TRIP requires an
+            // authoritative valuation: the threshold is anchored to equity
+            // and the flow series is marked at the same prices, so a
+            // degraded cycle can neither size the limit honestly nor
+            // measure the loss it claims.
             if (window_loss_usd > 0.0 && threshold_usd > 0.0
+                    && valuation_authoritative
                     && window_loss_usd > threshold_usd) {
 
                 const BlockHeight window_actual =

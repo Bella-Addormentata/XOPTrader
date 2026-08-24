@@ -398,6 +398,35 @@ struct MarketDataConfig {
 
     /// Band as a fraction of the book's own relative spread.
     double published_mid_band_spread_frac{0.25};
+
+    // -- [S20 2026-08-24] Published-mid plausibility gate --------------------
+    //
+    // The BBO band above bounds the mid only while a two-sided fresh book
+    // exists; the S20 incidents all travelled the OTHER paths (frozen
+    // orderbook_mid after failed offer fetches, last-trade-only mids on an
+    // emptied book).  The gate compares every candidate mid against an
+    // independent anchor (see mid_gate.hpp) and refuses to publish on a
+    // breach: the pair goes no-mid, which every consumer already treats as
+    // "do not quote, do not value" -- the repo's established failure mode.
+
+    /// Master switch for the anchor gate AND the anchored offer filter.
+    bool mid_gate_enabled{true};
+
+    /// Multiplicative anchor band; candidate/anchor confined to
+    /// [1/ratio, ratio].  Wide by design: refuse 187x absurdity, pass real
+    /// repricing.  <= 1.0 disables the anchor test.
+    double mid_anchor_band_ratio{3.0};
+
+    /// Book-confirmation escape: a fresh two-sided dust-filtered book with
+    /// spread in (0, this] bps overrides a band breach ("the whole market
+    /// repriced" evidence).  Chosen above BYC/wUSDC.b's measured p50 spread
+    /// of 1163 bps with headroom for stress, below absurdity.
+    double mid_gate_book_confirm_max_spread_bps{5000.0};
+
+    /// Anchorless fallback: max fractional move vs the last ACCEPTED mid in
+    /// one heartbeat.  Chia blocks at ~52 s; nothing honest moves 50% in
+    /// one, but a book-confirmed move still passes.  <= 0 disables.
+    double mid_gate_max_step_frac{0.5};
 };
 
 // ---------------------------------------------------------------------------
@@ -469,10 +498,37 @@ struct PairState {
     // --- Block height context ---
     BlockHeight last_block{0};      // Most recent block height observed
 
+    // --- [S20 2026-08-24] Engine-supplied external references ---
+    // The engine owns the pair graph, so it computes the triangulated
+    // implied cross (mid_gate.hpp) from SIBLING pairs' previous-cycle
+    // published mids and injects it here each heartbeat, together with the
+    // pair's peg target for stablecoin pairs.  Never derived from this
+    // pair's own book or history -- that self-reference was the lock-in
+    // mechanism behind the 187.461980 incident.
+    double      implied_cross{0.0};        // 0 = no healthy triangle this cycle
+    double      peg_target{0.0};           // 0 = not a stablecoin pair
+    Timestamp   anchor_updated_at{};       // when the engine last injected
+
+    // --- [S20] Orderbook-mid provenance ---
+    // orderbook_mid is written ONLY by ingest_competing_offers.  When the
+    // offers fetch throws, that method never runs and the field froze with
+    // no age of its own while dex_updated_at kept being re-stamped -- the
+    // mechanism that served one junk micro-price byte-identical for 12+
+    // hours.  compute_mid now refuses an orderbook_mid older than the
+    // stale threshold.  Default epoch = "never stamped this process":
+    // treated as fresh so hand-built states keep pre-S20 behaviour (a
+    // non-zero orderbook_mid without a stamp only occurs in tests).
+    Timestamp   ob_updated_at{};
+
     // --- Computed fields ---
     double      mid_price{0.0};     // Aggregated mid (dex + optional cex blend)
     double      spread_bps{0.0};    // Current spread in basis points
     bool        is_stale{true};     // True if data is older than stale_threshold
+
+    // --- [S20] Gate outcome for the CURRENT published values ---
+    double      last_accepted_mid{0.0};    // last mid that passed the gate
+    bool        mid_valuation_grade{false};// see MarketSnapshot for semantics
+    bool        gate_reject_logged{false}; // warn-once per rejection episode
 
     explicit PairState(const std::string& name = "") : pair_name(name) {}
 };
@@ -633,6 +689,17 @@ public:
                         double             pool_usd = 0.0,
                         Timestamp          observed_at = Timestamp::clock::now());
 
+    /// [S20 2026-08-24] Inject the engine-computed external references for
+    /// one pair: the triangulated implied cross (0 when no healthy triangle
+    /// exists this cycle) and the pair's peg target (0 for non-stablecoin
+    /// pairs).  The engine owns the pair graph, so the triangulation lives
+    /// there; the feed only consumes the result -- as the plausibility
+    /// anchor for the published mid and as the reference for the per-offer
+    /// outlier filter.  Values must never derive from this pair's own book.
+    void ingest_reference_anchor(const std::string& pair_name,
+                                 double             implied_cross,
+                                 double             peg_target);
+
     /// Ingest an INDEPENDENT fair value for a pair.
     ///
     /// The caller is responsible for the independence guarantee: the value
@@ -745,6 +812,13 @@ public:
     /// opposed to the age of the last poll that dex_updated_at records.
     /// Returns 0 if the pair is unknown or has never printed.
     std::int32_t dex_print_age(const std::string& pair_name) const;
+
+    /// [S20] Whether the pair's current published mid is valuation grade:
+    /// it passed the plausibility gate AND rests on live evidence (fresh
+    /// two-sided third-party book or fresh CEX leg).  False for unknown
+    /// pairs, no-mid pairs, and last-trade-only or stale-book mids.  See
+    /// MarketSnapshot::mid_valuation_grade.
+    bool mid_valuation_grade(const std::string& pair_name) const;
 
     /// Self-filtered dexie top-of-book as {best_bid, best_ask}.
     /// Post-5e1ceb4 a side is 0.0 when no THIRD-PARTY offer exists there, so
@@ -980,6 +1054,14 @@ private:
     /// Returns true if (now - ts) > stale_threshold, or if ts is epoch-zero
     /// (never updated).
     bool detect_stale(Timestamp ts) const;
+
+    /// [S20] Run the plausibility gate on the freshly computed mid and set
+    /// the gate outcome fields on ps (mid_price zeroed on rejection,
+    /// mid_valuation_grade, last_accepted_mid).  Called from refresh()
+    /// between compute_mid and append_price_history/publish_snapshot so
+    /// every downstream consumer -- price history, flash-crash window,
+    /// snapshot readers -- sees only gated values.  Caller holds mtx_pairs_.
+    void apply_mid_gate(PairState& ps, const MarketDataConfig& cfg);
 
     /// Check for arbitrage divergence and fire the callback if threshold
     /// is exceeded.  Updates the per-pair latest_arb_signal.

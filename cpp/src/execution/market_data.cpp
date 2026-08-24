@@ -35,6 +35,7 @@
 
 #include "xop/execution/market_data.hpp"
 
+#include "xop/execution/mid_gate.hpp"
 #include "xop/execution/orderbook_mid.hpp"
 
 #include <spdlog/spdlog.h>
@@ -102,6 +103,52 @@ bool last_trade_is_fresh(const PairState& ps,
 // the competitive anchor.  Catches fat-finger / erroneous 10x-priced offers
 // (e.g. $22.38 bid when market is $2.24 = ~8900 bps off).
 constexpr double kOutlierPriceThresholdBps = 2000.0;  // 20%
+
+// [S20 2026-08-24] Age in seconds; a huge value for the never-set epoch so
+// every threshold comparison fails closed.
+double age_seconds(Timestamp ts, Timestamp now) {
+    if (ts == Timestamp{}) {
+        return std::numeric_limits<double>::max();
+    }
+    return std::chrono::duration<double>(now - ts).count();
+}
+
+// [S20] Assemble the independent references available RIGHT NOW for one
+// pair.  Freshness rules mirror each source's existing gate: CEX and AMM by
+// their taper thresholds (<= 0 keeps the legacy always-fresh behaviour),
+// the fair-value estimate by fair_value_max_age_sec, the engine-injected
+// implied cross by the general stale threshold.  peg_target is static
+// config, not a feed, so it carries no age.  Nothing here may read the
+// pair's own book or published history -- independence is the whole point.
+midgate::AnchorCandidates anchor_candidates(const PairState&        ps,
+                                            const MarketDataConfig& cfg,
+                                            Timestamp               now) {
+    midgate::AnchorCandidates c;
+    if (ps.cex_mid > 0.0
+        && (cfg.cex_freshness_threshold_sec <= 0.0
+            || age_seconds(ps.cex_updated_at, now)
+                   < cfg.cex_freshness_threshold_sec)) {
+        c.cex_mid = ps.cex_mid;
+    }
+    if (ps.implied_cross > 0.0
+        && ps.anchor_updated_at != Timestamp{}
+        && now - ps.anchor_updated_at <= cfg.stale_threshold) {
+        c.implied_cross = ps.implied_cross;
+    }
+    if (ps.amm_mid > 0.0
+        && (cfg.amm_freshness_threshold_sec <= 0.0
+            || age_seconds(ps.amm_updated_at, now)
+                   < cfg.amm_freshness_threshold_sec)) {
+        c.amm_mid = ps.amm_mid;
+    }
+    if (ps.fair_value_estimate > 0.0
+        && age_seconds(ps.fair_value_updated_at, now)
+               < cfg.fair_value_max_age_sec) {
+        c.fair_value_estimate = ps.fair_value_estimate;
+    }
+    c.peg_target = ps.peg_target;
+    return c;
+}
 
 }  // anonymous namespace
 
@@ -302,6 +349,19 @@ void MarketDataFeed::refresh(const std::vector<std::string>& enabled_pairs) {
         // Step 4: Compute aggregated mid-price.
         ps.mid_price = compute_mid(ps);
 
+        // Step 4b: [S20 2026-08-24] Plausibility gate.  Runs BEFORE the
+        // arbitrage check, price history append, and snapshot publish so a
+        // rejected mid reaches none of them -- a refused publish is how
+        // 187.461980 stays out of equity, the flash-crash window, and the
+        // triangular-arb scan all at once.
+        {
+            const auto cfg = [&] {
+                std::shared_lock lk(mtx_config_);
+                return config_;
+            }();
+            apply_mid_gate(ps, cfg);
+        }
+
         // Step 5: Compute spread.
         ps.spread_bps = compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
 
@@ -362,30 +422,48 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
                                    double             best_ask,
                                    double             last_trade,
                                    double             vol_24h) {
-    // -- Outlier rejection against CEX reference --------------------------
+    // -- Outlier rejection against an external reference -------------------
     // Dexie is a peer-to-peer marketplace with no matching engine.  Garbage
     // asks/bids (e.g. 978 million for a $2.38 asset) can appear from
     // mis-priced offers.  If accepted, the inflated mid poisons the price
     // history and triggers the flash-crash circuit breaker when normal
     // prices return.  Reject any bid/ask that is more than 10x or less
-    // than 0.1x the CEX reference (when available).
+    // than 0.1x the reference.
+    //
+    // [S20 2026-08-24] The reference used to be CEX-only, which left the
+    // guard inert on exactly the pairs that needed it (BYC/wUSDC.b has no
+    // CEX listing).  It now falls back to the anchor chain (implied cross,
+    // AMM, fair value, peg), so a stablecoin pair is guarded from cycle 1.
     {
+        // [MEDIUM-1] Snapshot config under shared_lock (ISO/IEC 5055).
+        const auto cfg = [&] {
+            std::shared_lock lk(mtx_config_);
+            return config_;
+        }();
         std::shared_lock lock(mtx_pairs_);
         auto it = pairs_.find(pair_name);
-        if (it != pairs_.end() && it->second.cex_mid > 0.0) {
-            const double cex = it->second.cex_mid;
+        const double ref = [&]() -> double {
+            if (it == pairs_.end()) return 0.0;
+            if (it->second.cex_mid > 0.0) return it->second.cex_mid;
+            if (!cfg.mid_gate_enabled) return 0.0;
+            return midgate::select_anchor(
+                anchor_candidates(it->second, cfg,
+                                  std::chrono::system_clock::now()))
+                .value;
+        }();
+        if (ref > 0.0) {
             constexpr double kMaxRatio = 10.0;
             constexpr double kMinRatio = 0.1;
-            if (best_bid > 0.0 && (best_bid > cex * kMaxRatio || best_bid < cex * kMinRatio)) {
+            if (best_bid > 0.0 && (best_bid > ref * kMaxRatio || best_bid < ref * kMinRatio)) {
                 spdlog::warn("[MarketData] Outlier bid rejected for {}: "
-                             "bid={:.6f} vs cex_mid={:.6f} (ratio={:.1f}x)",
-                             pair_name, best_bid, cex, best_bid / cex);
+                             "bid={:.6f} vs ref={:.6f} (ratio={:.1f}x)",
+                             pair_name, best_bid, ref, best_bid / ref);
                 best_bid = 0.0;  // discard
             }
-            if (best_ask > 0.0 && (best_ask > cex * kMaxRatio || best_ask < cex * kMinRatio)) {
+            if (best_ask > 0.0 && (best_ask > ref * kMaxRatio || best_ask < ref * kMinRatio)) {
                 spdlog::warn("[MarketData] Outlier ask rejected for {}: "
-                             "ask={:.6f} vs cex_mid={:.6f} (ratio={:.1f}x)",
-                             pair_name, best_ask, cex, best_ask / cex);
+                             "ask={:.6f} vs ref={:.6f} (ratio={:.1f}x)",
+                             pair_name, best_ask, ref, best_ask / ref);
                 best_ask = 0.0;  // discard
             }
         }
@@ -851,6 +929,16 @@ BlockHeight MarketDataFeed::current_block_height() const {
     return block_height_.load(std::memory_order_acquire);
 }
 
+bool MarketDataFeed::mid_valuation_grade(const std::string& pair_name) const {
+    std::shared_lock lock(mtx_pairs_);
+
+    auto it = pairs_.find(pair_name);
+    if (it == pairs_.end()) {
+        return false;
+    }
+    return it->second.mid_valuation_grade;
+}
+
 // =========================================================================
 //  Price history access
 // =========================================================================
@@ -1051,7 +1139,20 @@ double MarketDataFeed::compute_mid(const PairState& ps) const {
     // Case 0: Prefer order-book-derived VWAP micro-price when available.
     // This is computed from the top N levels of dust-filtered competing
     // offers and weights by depth -- more robust than simple BBO midpoint.
-    if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0) {
+    //
+    // [S20 2026-08-24] ...and only while it is FRESH.  orderbook_mid is
+    // written solely by ingest_competing_offers; when the offers fetch
+    // throws, that method never runs and this field used to freeze with no
+    // age of its own while ingest_dexie kept re-stamping dex_updated_at --
+    // the mechanism that served one junk micro-price (187.461980)
+    // byte-identical for 12+ hours.  An epoch-zero stamp means "never
+    // stamped this process" and is treated as fresh so hand-built states
+    // keep their pre-S20 behaviour; a non-zero orderbook_mid without a
+    // stamp only occurs in tests.
+    const bool ob_fresh = ps.ob_updated_at == Timestamp{}
+        || (std::chrono::system_clock::now() - ps.ob_updated_at
+            <= cfg.stale_threshold);
+    if (cfg.orderbook_mid_enabled && ps.orderbook_mid > 0.0 && ob_fresh) {
         dex_mid = ps.orderbook_mid;
         spdlog::debug("[MarketData] {} using orderbook_mid={:.6f}",
                       ps.pair_name, dex_mid);
@@ -1279,6 +1380,96 @@ bool MarketDataFeed::detect_stale(Timestamp ts) const {
 }
 
 // -------------------------------------------------------------------------
+// [S20 2026-08-24] The published-mid gate.
+// -------------------------------------------------------------------------
+
+void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
+{
+    const auto now = std::chrono::system_clock::now();
+
+    // Book evidence, needed by both the gate escape and the grade verdict.
+    const bool dex_fresh = ps.dex_updated_at != Timestamp{}
+        && now - ps.dex_updated_at <= cfg.stale_threshold;
+    const bool book_two_sided =
+        ps.dex_best_bid > 0.0 && ps.dex_best_ask > 0.0;
+    const double book_spread_bps =
+        compute_spread_bps(ps.dex_best_bid, ps.dex_best_ask);
+
+    midgate::GateVerdict verdict = midgate::GateVerdict::Accept;
+    midgate::Anchor anchor;
+    if (cfg.mid_gate_enabled) {
+        anchor = midgate::select_anchor(anchor_candidates(ps, cfg, now));
+        midgate::GateInputs in;
+        in.candidate_mid               = ps.mid_price;
+        in.anchor                      = anchor;
+        in.anchor_band_ratio           = cfg.mid_anchor_band_ratio;
+        in.book_two_sided              = book_two_sided;
+        in.book_fresh                  = dex_fresh;
+        in.book_spread_bps             = book_spread_bps;
+        in.book_confirm_max_spread_bps = cfg.mid_gate_book_confirm_max_spread_bps;
+        in.last_accepted_mid           = ps.last_accepted_mid;
+        in.max_step_frac               = cfg.mid_gate_max_step_frac;
+        verdict = midgate::gate_mid(in);
+    }
+
+    if (verdict != midgate::GateVerdict::Accept) {
+        // Once per rejection episode at warning; the recovery below logs
+        // the episode's end.  A sustained rejection keeps the pair no-mid,
+        // which Step 4 already reports through quote_valid.
+        if (!ps.gate_reject_logged) {
+            spdlog::warn("[MarketData] [S20] {} published mid {:.6f} "
+                         "REJECTED ({}): anchor {:.6f} ({}) band {:.1f}x, "
+                         "book two_sided={} fresh={} spread={:.0f}bps -- "
+                         "publishing no mid until the book or the anchor "
+                         "agrees",
+                         ps.pair_name, ps.mid_price,
+                         verdict == midgate::GateVerdict::RejectAnchor
+                             ? "anchor-band" : "max-step",
+                         anchor.value,
+                         midgate::anchor_source_name(anchor.source),
+                         cfg.mid_anchor_band_ratio,
+                         book_two_sided, dex_fresh, book_spread_bps);
+            ps.gate_reject_logged = true;
+        }
+        ps.mid_price           = 0.0;
+        ps.mid_valuation_grade = false;
+        return;
+    }
+
+    if (ps.gate_reject_logged && ps.mid_price > 0.0) {
+        spdlog::info("[MarketData] [S20] {} mid {:.6f} accepted again -- "
+                     "rejection episode over",
+                     ps.pair_name, ps.mid_price);
+    }
+    ps.gate_reject_logged = false;
+
+    if (ps.mid_price > 0.0) {
+        ps.last_accepted_mid = ps.mid_price;
+    }
+
+    // Valuation grade: live evidence only.  A last-trade-only mid (empty or
+    // one-sided book, no CEX leg) publishes for quoting logic but must not
+    // mark equity or P&L -- that is the 0.75-print class of incident.
+    const bool cex_fresh = ps.cex_mid > 0.0
+        && (cfg.cex_freshness_threshold_sec <= 0.0
+            || age_seconds(ps.cex_updated_at, now)
+                   < cfg.cex_freshness_threshold_sec);
+    ps.mid_valuation_grade = ps.mid_price > 0.0
+        && ((book_two_sided && dex_fresh) || cex_fresh);
+}
+
+void MarketDataFeed::ingest_reference_anchor(const std::string& pair_name,
+                                             double             implied_cross,
+                                             double             peg_target)
+{
+    std::unique_lock lock(mtx_pairs_);
+    PairState& ps = get_or_create_pair(pair_name);
+    ps.implied_cross     = implied_cross > 0.0 ? implied_cross : 0.0;
+    ps.peg_target        = peg_target > 0.0 ? peg_target : 0.0;
+    ps.anchor_updated_at = std::chrono::system_clock::now();
+}
+
+// -------------------------------------------------------------------------
 // check_arbitrage -- detect CEX-DEX price divergence
 //
 // Divergence (bps) = abs(dex_mid - cex_mid) / cex_mid * 10000
@@ -1443,6 +1634,13 @@ void MarketDataFeed::publish_snapshot(const PairState& ps) {
     snap.last_block = ps.last_block;
     snap.updated_at = ps.dex_updated_at;
 
+    // [S20 2026-08-24] Valuation-trust flags.  Set on EVERY publish -- the
+    // struct default is true only so hand-built snapshots keep their
+    // pre-S20 behaviour.
+    snap.mid_valuation_grade = ps.mid_valuation_grade;
+    snap.dex_print_age       = ps.dex_print_age;
+    snap.is_stale            = ps.is_stale;
+
     // Write to shared State (thread-safe; State::update_market acquires
     // its own internal mutex).
     state_.update_market(snap);
@@ -1474,14 +1672,28 @@ void MarketDataFeed::ingest_competing_offers(
     }
 
     // Snapshot the current reference price for outlier detection.
-    // Prefer CEX mid (pure external reference, unaffected by DEX noise);
-    // fall back to aggregated mid_price when CEX is unavailable (BYC, DBX).
-    // Zero means no reference yet (first cycle) -- outlier filter is skipped.
+    //
+    // [S20 2026-08-24] With the gate enabled, the reference is the
+    // INDEPENDENT anchor chain (CEX > implied cross > AMM > fair value >
+    // peg), never this pair's own previous mid.  The old self-referential
+    // fallback was the lock-in mechanism of the 187.461980 incident: once
+    // the published mid was junk, honest ~1.0 offers deviated ~9900 bps
+    // from it and were rejected here while the junk offer passed -- and
+    // the filter was skipped entirely on the first cycle (ref == 0), which
+    // is how a fresh restart re-poisoned within 40 minutes.  On stablecoin
+    // pairs the peg anchor exists from cycle 1, so neither failure mode
+    // survives.  With the gate disabled the legacy chain applies.
     const double ref_price = [&] {
         std::shared_lock plk(mtx_pairs_);
         auto it = pairs_.find(pair_name);
         if (it == pairs_.end()) return 0.0;
         const PairState& ps = it->second;
+        if (cfg.mid_gate_enabled) {
+            return midgate::select_anchor(
+                anchor_candidates(ps, cfg,
+                                  std::chrono::system_clock::now()))
+                .value;
+        }
         if (ps.cex_mid > 0.0) return ps.cex_mid;
         return ps.mid_price;
     }();
@@ -1525,21 +1737,38 @@ void MarketDataFeed::ingest_competing_offers(
             continue;
         }
 
-        // Outlier price filter: reject offers whose price deviates more than
-        // kOutlierPriceThresholdBps from the reference mid.  Prevents
-        // fat-finger / erroneous high-priced offers (e.g. a $22.38 bid when
-        // market is $2.24) from corrupting ob_mid or the competitive anchor.
+        // Outlier price filter: reject offers implausibly far from the
+        // reference.  Prevents fat-finger / erroneous offers (e.g. a $22.38
+        // bid when market is $2.24) from corrupting ob_mid or the
+        // competitive anchor.
+        //
+        // [S20 2026-08-24] Two regimes, matching where ref_price came from.
+        // With the gate enabled the reference is the far anchor chain
+        // (peg/implied/CEX), which asserts PLAUSIBILITY, not location: a
+        // genuine 25% depeg has honest offers 2500 bps off the peg, and
+        // filtering those would blind the depeg detector to exactly the
+        // moves it exists to catch.  So the anchored regime uses the same
+        // wide multiplicative band as the published-mid gate (3x default)
+        // and refuses only absurdity.  The legacy regime keeps the tight
+        // 2000 bps test against the near reference (CEX or own mid).
         if (ref_price > 0.0) {
             const double offer_price = static_cast<double>(offer.price)
                                        / static_cast<double>(kMojosPerXch);
-            const double dev_bps = std::abs(offer_price - ref_price)
-                                   / ref_price * 10000.0;
-            if (dev_bps > kOutlierPriceThresholdBps) {
+            bool outlier;
+            if (cfg.mid_gate_enabled && cfg.mid_anchor_band_ratio > 1.0) {
+                const double ratio = offer_price / ref_price;
+                outlier = ratio > cfg.mid_anchor_band_ratio
+                       || ratio < 1.0 / cfg.mid_anchor_band_ratio;
+            } else {
+                const double dev_bps = std::abs(offer_price - ref_price)
+                                       / ref_price * 10000.0;
+                outlier = dev_bps > kOutlierPriceThresholdBps;
+            }
+            if (outlier) {
                 spdlog::debug("[MarketData] {} outlier offer {}: "
-                              "price={:.6f} deviates {:.0f}bps from "
-                              "ref={:.6f} -- skipping",
+                              "price={:.6f} vs ref={:.6f} -- skipping",
                               pair_name, offer.offer_id,
-                              offer_price, dev_bps, ref_price);
+                              offer_price, ref_price);
                 continue;
             }
         }
@@ -1657,6 +1886,11 @@ void MarketDataFeed::ingest_competing_offers(
             if (cfg.orderbook_mid_enabled) {
                 ps.orderbook_mid = ob_mid;
             }
+            // [S20] Stamp the orderbook mid's OWN age.  This method is the
+            // field's only writer, so compute_mid can now distinguish "the
+            // fetch keeps succeeding" from "the fetch has been throwing for
+            // 12 hours and this number is an artifact".
+            ps.ob_updated_at  = std::chrono::system_clock::now();
             ps.dex_updated_at = std::chrono::system_clock::now();
 
             // [PRINT-AGE 2026-07-31] dex_updated_at is rewritten here on every
