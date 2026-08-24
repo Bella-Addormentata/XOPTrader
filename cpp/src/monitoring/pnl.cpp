@@ -39,6 +39,7 @@
 #include <numeric>
 #include <sstream>
 #include <stdexcept>
+#include <vector>
 
 namespace xop {
 
@@ -1066,10 +1067,17 @@ void PnLTracker::mark_to_market(
     // P&L; the others report 0 so per-pair figures still add up to the total.
     std::unordered_map<std::string, bool> asset_marked;
 
-    // [S20 2026-08-24] base_asset -> the first pair holding a position in
-    // it that could not be priced this cycle.  Resolved after the loop, so
-    // a carry never pre-empts a pair that can actually mark the asset.
-    std::unordered_map<std::string, std::string> carry_candidates;
+    // [S20 2026-08-24] base_asset -> EVERY pair holding a position in it
+    // that could not be priced this cycle.  Resolved after the loop, so a
+    // carry never pre-empts a pair that can actually mark the asset.
+    //
+    // All of them, not just the first: the prior cycle's mark is owned by
+    // one specific pair (dedup gives the others 0), and that owner is not
+    // necessarily the first one this unordered_map iteration reaches.
+    // Keeping only the first could carry a dedup loser's 0 and drop the
+    // asset's whole unrealized P&L to zero -- the exact discontinuity this
+    // carry exists to prevent.
+    std::unordered_map<std::string, std::vector<std::string>> carry_candidates;
 
     for (auto& [pair_name, ppnl] : pair_pnl_) {
         // [PNL-KEYING-FIX 2026-07-30] Resolve the CANONICAL base asset id
@@ -1160,7 +1168,7 @@ void PnLTracker::mark_to_market(
         // A carry is the LAST resort, valid only once every pair for the
         // asset has failed to supply one.
         if (!already_marked && basis > 0 && balance > 0 && smoothed_price <= 0) {
-            carry_candidates.emplace(base_asset, pair_name);
+            carry_candidates[base_asset].push_back(pair_name);
             continue;
         }
 
@@ -1195,22 +1203,44 @@ void PnLTracker::mark_to_market(
     }
 
     // [S20 2026-08-24] Second pass: apply carries only where NO pair could
-    // price the asset.  ppnl.inventory_pnl is deliberately left untouched
-    // (that IS the carried value); an asset another pair priced keeps the
-    // fresh mark and the unpriced pair reports 0, preserving the existing
-    // dedup rule that per-pair figures sum to the total.
-    for (const auto& [base_asset, pair_name] : carry_candidates) {
-        auto it = pair_pnl_.find(pair_name);
-        if (it == pair_pnl_.end()) continue;
-        if (asset_marked[base_asset]) {
-            it->second.inventory_pnl = 0;
-            continue;
+    // price the asset.
+    //
+    // Among the unpriced candidates exactly one may hold the previous
+    // cycle's mark (dedup zeroed the rest), so the carry must come from
+    // THAT pair -- picking any other would carry a 0 and erase the
+    // asset's unrealized P&L.  Every remaining candidate is then zeroed so
+    // per-pair figures still sum to the total.
+    for (const auto& [base_asset, pairs] : carry_candidates) {
+        const bool priced_elsewhere = asset_marked[base_asset];
+
+        // The prior owner is the candidate with a non-zero mark; with none
+        // (first cycle, or a genuinely flat position) any choice carries 0.
+        std::string owner;
+        if (!priced_elsewhere) {
+            for (const auto& name : pairs) {
+                auto it = pair_pnl_.find(name);
+                if (it != pair_pnl_.end() && it->second.inventory_pnl != 0) {
+                    owner = name;
+                    break;
+                }
+            }
         }
-        spdlog::debug("PnLTracker::mark_to_market: no pair could price {} "
-                      "this cycle -- carrying {}'s previous mark {}",
-                      base_asset, pair_name, it->second.inventory_pnl);
-        total_pnl_.inventory_pnl += it->second.inventory_pnl;
-        asset_marked[base_asset] = true;
+
+        for (const auto& name : pairs) {
+            auto it = pair_pnl_.find(name);
+            if (it == pair_pnl_.end()) continue;
+            if (name == owner) {
+                spdlog::debug("PnLTracker::mark_to_market: no pair could "
+                              "price {} this cycle -- carrying {}'s "
+                              "previous mark {}",
+                              base_asset, name, it->second.inventory_pnl);
+                total_pnl_.inventory_pnl += it->second.inventory_pnl;
+                asset_marked[base_asset] = true;
+            } else {
+                // Dedup loser, or the asset was priced by another pair.
+                it->second.inventory_pnl = 0;
+            }
+        }
     }
 
     // Record a PnL snapshot for Sharpe/drawdown analytics.

@@ -479,6 +479,15 @@ private:
     [[nodiscard]] std::string quote_usd_factor_source_pair(
         const PairConfig& pc) const;
 
+    /// [S20] The BYC/<stable> cross quote_usd_factor() would actually
+    /// select for `pc` (positive mid, spread inside the S17 300 bps trust
+    /// window), or empty when it would fall back to $1 par.  Single source
+    /// of truth for both quote_usd_factor_is_par and
+    /// quote_usd_factor_source_pair, so they cannot disagree about which
+    /// snapshot supplies the factor.
+    [[nodiscard]] std::string byc_cross_source_pair(
+        const PairConfig& pc) const;
+
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
     /// Returns 0 when the quote's USD value is unknown.
     [[nodiscard]] Mojo to_usd_pseudo(Mojo pair_price,

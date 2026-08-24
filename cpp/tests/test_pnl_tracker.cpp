@@ -688,3 +688,68 @@ TEST_F(PnLTrackerTest, PriceOnlyFailureCarriesPreviousMark) {
         << "an unpriced cycle must not erase the position's mark";
     EXPECT_EQ(t.get_total_pnl().inventory_pnl, marked);
 }
+
+// ---------------------------------------------------------------------------
+// 4d. [S20 2026-08-24] The carry must come from the pair that actually OWNS
+//     the previous cycle's mark, not merely the first unpriced pair the
+//     unordered_map happens to yield.
+//
+//     Dedup gives exactly one pair the asset's mark and zeroes the others,
+//     so carrying a dedup LOSER carries its 0 -- dropping the asset's whole
+//     unrealized P&L to zero and injecting the very discontinuity the carry
+//     exists to prevent.  Here cycle 1 gives the mark to one XCH pair, then
+//     cycle 2 withholds every price; the total must survive intact whatever
+//     order the map iterates.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CarryComesFromThePairHoldingThePriorMark) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    for (const char* pair : {"XCH/wUSDC.b", "XCH/BYC", "XCH/DBX"}) {
+        t.set_pair_conversion(pair, "xch", kBaseXchD, kCatDenomD, 1.0);
+        xop::Fill f = make_fill(std::string("trade-") + pair, xop::Side::Ask,
+                                static_cast<xop::Mojo>(2.5e12),
+                                static_cast<xop::Mojo>(1e12));
+        f.pair_name = pair;
+        ASSERT_TRUE(t.record_fill(f, 0, static_cast<xop::Mojo>(2.0e12), 0));
+    }
+
+    auto balance = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(1e12);
+    };
+    auto basis = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.0e12);
+    };
+    auto unit = [](const std::string&) -> double {
+        return kCatDenomD / kBaseXchD;
+    };
+
+    // Cycle 1: every pair can price, so dedup awards the mark to exactly
+    // one of them and zeroes the other two.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo {
+            return static_cast<xop::Mojo>(2.5e12);
+        }, balance, basis, 2.5, unit);
+    const auto total_after_cycle1 = t.get_total_pnl().inventory_pnl;
+    ASSERT_EQ(total_after_cycle1, 500);
+
+    // Cycle 2: no pair can price the asset -- carry the OWNER's mark.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo { return 0; },
+        balance, basis, 2.5, unit);
+
+    EXPECT_EQ(t.get_total_pnl().inventory_pnl, total_after_cycle1)
+        << "carried a dedup loser's zero instead of the owner's mark";
+
+    // Per-pair figures must still sum to the total: exactly one pair holds
+    // the carried mark and the rest are zero.
+    int nonzero = 0;
+    xop::Mojo sum = 0;
+    for (const char* pair : {"XCH/wUSDC.b", "XCH/BYC", "XCH/DBX"}) {
+        const auto v = t.get_pair_pnl(pair).inventory_pnl;
+        if (v != 0) ++nonzero;
+        sum += v;
+    }
+    EXPECT_EQ(nonzero, 1) << "stale per-pair marks left on dedup losers";
+    EXPECT_EQ(sum, total_after_cycle1);
+}

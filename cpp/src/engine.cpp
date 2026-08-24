@@ -10992,11 +10992,38 @@ double Engine::usd_per_xch() const
     return 0.0;
 }
 
-// [S20 2026-08-24] Whether quote_usd_factor() answers this pair from a
-// constant rather than from market data.  A fiat-collateralised wrapper is
-// valued at $1 par, and BYC falls back to par whenever its cross is not
-// tight enough to trust -- neither carries the provenance risk that makes
-// valuation grade necessary.  Everything else is derived from a live mid.
+// [S20 2026-08-24] The BYC cross that quote_usd_factor() would ACTUALLY
+// select for `pc`, or empty when it would fall back to par.
+//
+// The eligibility test must match quote_usd_factor's BYC branch exactly
+// (first enabled BYC/<stable> pair whose snapshot has a positive mid and a
+// spread inside the S17 300 bps trust window).  Returning merely the first
+// enabled stable cross would, with several configured, let valuation check
+// one snapshot's grade while consuming another snapshot's price -- passing
+// an ungraded factor or rejecting a graded one.  Both callers below derive
+// from this single answer so they cannot drift apart.
+std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+{
+    constexpr double kMaxCrossSpreadBps = 300.0;
+    for (const auto& other : config_.pairs) {
+        if (!other.enabled) continue;
+        if (other.base_asset_id != pc.quote_asset_id) continue;
+        const auto oslash = other.name.find('/');
+        if (oslash == std::string::npos) continue;
+        const std::string oquote = other.name.substr(oslash + 1);
+        if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
+            continue;
+        }
+        auto snap = state_->get_market(other.name);
+        if (snap.mid_price > 0
+            && snap.spread_bps > 0.0
+            && snap.spread_bps <= kMaxCrossSpreadBps) {
+            return other.name;
+        }
+    }
+    return {};
+}
+
 // [S20 2026-08-24] Which pair's published snapshot quote_usd_factor()
 // actually reads to answer `pc`.  Usually pc itself (the DBX cross), but
 // for a BYC quote it is the separate BYC/<stable> cross.  Empty when the
@@ -11009,17 +11036,7 @@ std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
         : pc.name.substr(slash + 1);
 
     if (quote == "BYC") {
-        for (const auto& other : config_.pairs) {
-            if (!other.enabled) continue;
-            if (other.base_asset_id != pc.quote_asset_id) continue;
-            const auto oslash = other.name.find('/');
-            if (oslash == std::string::npos) continue;
-            const std::string oquote = other.name.substr(oslash + 1);
-            if (oquote == "wUSDC.b" || oquote == "wUSDC" || oquote == "USDS") {
-                return other.name;
-            }
-        }
-        return {};
+        return byc_cross_source_pair(pc);
     }
     if (pc.base_asset_id == "xch") {
         return pc.name;   // DBX-style: derived from this pair's own mid
@@ -11038,26 +11055,10 @@ bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
         return true;
     }
     if (quote == "BYC") {
-        // Par unless the tight-cross branch actually supplies a mid; ask
-        // the same question that branch asks, without duplicating it.
-        constexpr double kMaxCrossSpreadBps = 300.0;
-        for (const auto& other : config_.pairs) {
-            if (!other.enabled) continue;
-            if (other.base_asset_id != pc.quote_asset_id) continue;
-            const auto oslash = other.name.find('/');
-            if (oslash == std::string::npos) continue;
-            const std::string oquote = other.name.substr(oslash + 1);
-            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
-                continue;
-            }
-            auto snap = state_->get_market(other.name);
-            if (snap.mid_price > 0
-                && snap.spread_bps > 0.0
-                && snap.spread_bps <= kMaxCrossSpreadBps) {
-                return false;   // live cross wins; it is market-derived
-            }
-        }
-        return true;
+        // Par exactly when no eligible cross exists -- the same question
+        // byc_cross_source_pair answers, so the two cannot disagree about
+        // which snapshot (if any) supplies the factor.
+        return byc_cross_source_pair(pc).empty();
     }
     return false;
 }
