@@ -882,6 +882,22 @@ private:
     /// would inflate the peak and could false-trip and latch the
     /// breaker on every restart made while the jobs DB was unreadable.
     std::string bridge_process_start_iso_;
+    /// [S19 round 36] Fold provenance: peak and pre-fold equity
+    /// recorded the FIRST time the wallet-truth reconcile folds a
+    /// positive bridge-asset delta that exceeds the pass's queued
+    /// deposits (a mint absorbed while the jobs DB was unreadable, or
+    /// before the job row completed).  A later booking covered by a
+    /// prior fold rescales from THIS base -- peak_rec * (e_rec + f) /
+    /// e_rec -- floored by max() against the current peak, which Step
+    /// 13's natural max() may have already raised.  Using the current
+    /// (post-fold) state instead either under-credits (round 34,
+    /// masking) or over-credits (round 36, fabricated drawdown that
+    /// can latch the breaker).  Expires after a bounded window so a
+    /// quote fill's unmatched delta cannot linger forever; in-memory
+    /// only, like every other piece of the peak machinery.
+    double bridge_fold_peak_usd_{-1.0};
+    double bridge_fold_equity_usd_{-1.0};
+    BlockHeight bridge_fold_block_{0};
 
     /// [S19 rounds 17+25+26+27] Booked bridge DEPOSITS awaiting
     /// their one-time peak credit, kept PER EVENT (withdrawals never
