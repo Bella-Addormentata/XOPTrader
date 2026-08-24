@@ -33,7 +33,7 @@ charset-normalizer==3.5.1
 chia_rs==0.47.0
 ckzg==2.1.8
 clvm==0.9.15
-colorama==0.4.6; sys_platform == "win32"
+colorama==0.4.6  # pyqtgraph requires it on EVERY platform (and pytest on win32)
 cytoolz==1.1.0
 eth-account==0.13.7
 eth-hash==0.8.0

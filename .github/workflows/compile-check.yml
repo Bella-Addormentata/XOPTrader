@@ -230,12 +230,18 @@ jobs:
           python-version: "3.11"
           cache: "pip"
 
-      # Same --only-binary scoping rationale as Job 3.
+      # Same --only-binary scoping rationale as Job 3.  --no-deps makes
+      # the install hermetic: the locks claim the full transitive
+      # closure, so pip must not quietly fetch anything they omit --
+      # the pip check below then RED-flags any missing platform
+      # dependency instead of the resolver papering over it (review
+      # round 4 caught exactly that: an unpinned colorama slipped in
+      # for pyqtgraph and the job still passed).
       - name: Install both dependency locks
         run: |
           pip install --upgrade pip
-          pip install --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
-          pip install -r gui/requirements-tools.lock.txt
+          pip install --no-deps --only-binary=chia_rs,PySide6,pyqtgraph -r gui/requirements.lock.txt
+          pip install --no-deps -r gui/requirements-tools.lock.txt
 
       - name: Audit the installed set
         run: pip check
