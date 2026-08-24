@@ -24,6 +24,7 @@
 #include "xop/execution/exposure_gate.hpp"
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/mid_gate.hpp"
+#include "xop/risk/valuation_authority.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -11390,8 +11391,7 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
             if (pseudo <= 0 && current_block > 0 && ttl > 0) {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
-                    || (current_block > lb->second
-                        && current_block - lb->second > ttl)) {
+                    || risk::carry_expired(current_block, lb->second, ttl)) {
                     degraded = true;
                     spdlog::debug("[Engine] [S20] carry for {} exceeds "
                                   "{} blocks without a live print -- "
@@ -13298,29 +13298,22 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // Peak updates resume only after kValuationRearmCleanCycles
     // consecutive clean cycles (the S18 lift-streak idiom), so
     // alternating junk/honest cycles cannot ratchet the peak.
-    if (valuation_degraded_) {
-        valuation_clean_streak_ = 0;
-        if (!valuation_degraded_warned_) {
-            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
-                         "(carry TTL exceeded on a held asset) -- peak "
-                         "frozen at ${:.2f} until {} consecutive clean "
-                         "cycles.  Both breakers REMAIN ARMED and keep "
-                         "comparing against that frozen peak",
-                         peak_equity_hwm_usd_, kValuationRearmCleanCycles);
-            valuation_degraded_warned_ = true;
-        }
-    } else if (valuation_clean_streak_ < kValuationRearmCleanCycles) {
-        ++valuation_clean_streak_;
-        if (valuation_clean_streak_ == kValuationRearmCleanCycles) {
-            spdlog::info("[Engine] Step 13: [S20] equity valuation clean "
-                         "for {} cycles -- peak updates re-enabled",
-                         kValuationRearmCleanCycles);
-            valuation_degraded_warned_ = false;
-        }
+    const auto authority = valuation_authority_.step(valuation_degraded_);
+    if (authority.entered_degraded) {
+        spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                     "(carry TTL exceeded on a held asset) -- peak frozen "
+                     "at ${:.2f} until {} consecutive clean cycles.  Both "
+                     "breakers REMAIN ARMED and keep comparing against "
+                     "that frozen peak",
+                     peak_equity_hwm_usd_,
+                     risk::ValuationAuthorityGate::kRearmCleanCycles);
     }
-    const bool valuation_authoritative =
-        !valuation_degraded_
-        && valuation_clean_streak_ >= kValuationRearmCleanCycles;
+    if (authority.recovered) {
+        spdlog::info("[Engine] Step 13: [S20] equity valuation clean for "
+                     "{} cycles -- peak updates re-enabled",
+                     risk::ValuationAuthorityGate::kRearmCleanCycles);
+    }
+    const bool valuation_authoritative = authority.may_update_peak;
 
     // [MEDIUM-7]/[H6] Equity high-water mark.  Equity is non-negative by
     // construction, so a plain monotonic max is a complete seed: the first

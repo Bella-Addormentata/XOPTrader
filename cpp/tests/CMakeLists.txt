@@ -70,6 +70,7 @@ add_executable(xop_tests
     test_orderbook_mid.cpp
     test_published_mid.cpp
     test_mid_gate.cpp
+    test_valuation_authority.cpp
     test_coin_lock_ledger.cpp
     test_exposure_gate.cpp
     test_reservation_offset.cpp

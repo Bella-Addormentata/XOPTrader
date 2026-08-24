@@ -550,6 +550,16 @@ private:
     // engine heartbeat, ~19 min in production -> half-life ~33 min).
     std::unordered_map<std::string, double> price_ema_;
 
+    /// [S20 2026-08-24] base asset id -> the pair that most recently marked
+    /// it from a LIVE price.  Needed because price_ema_ alone cannot
+    /// identify the mark's owner: every pair with a positive price updates
+    /// its own EMA before deduplication runs, so several pairs on the same
+    /// asset hold EMAs of differing ages.  Picking whichever the map
+    /// happens to yield first would carry an older price -- and, worse,
+    /// one denominated in a DIFFERENT quote asset, since each pair's EMA
+    /// and basis conversion live in that pair's own quote units.
+    std::unordered_map<std::string, std::string> mark_owner_;
+
     /// Maximum number of PnL snapshots retained for analytics.
     /// 8640 snapshots at one per ~19-minute heartbeat covers ~114 days
     /// -- ample history for the annualised Sharpe estimate.  (An older

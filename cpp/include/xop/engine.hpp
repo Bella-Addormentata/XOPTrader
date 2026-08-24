@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -1048,19 +1049,12 @@ private:
     /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
 
-    /// [S20] Debounce streak for re-arming the peak after degradation.
-    static constexpr int kValuationRearmCleanCycles = 10;
-
-    /// [S20] Consecutive non-degraded equity computations.  After a
-    /// degraded episode the peak stays frozen until this reaches
-    /// kValuationRearmCleanCycles -- the S18 lift-streak idiom, so
-    /// alternating junk/honest cycles cannot flap the peak upward.
-    /// Starts AT the threshold: a process that has never degraded seeds
-    /// its peak from the first valued cycle, as before.
-    int valuation_clean_streak_{kValuationRearmCleanCycles};
-
-    /// [S20] Warn-once flag for the degraded episode (reset on recovery).
-    bool valuation_degraded_warned_{false};
+    /// [S20] Peak-update authority: the clean-streak debounce and the
+    /// transition signals that drive the warn-once logging.  Pure logic in
+    /// risk/valuation_authority.hpp so the semantics are test-pinned
+    /// (cpp/tests/test_valuation_authority.cpp) rather than living only
+    /// inside Step 13.
+    risk::ValuationAuthorityGate valuation_authority_;
 
     // [DRAWDOWN-EQUITY 2026-08-04] Re-alert suppression for the breakers:
     // while the engine stays Paused on a persisting condition, the

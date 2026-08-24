@@ -896,3 +896,64 @@ TEST_F(PnLTrackerTest, CarryRecomputesFromCurrentBalanceAfterAFill) {
            "balance -- stale unrealized P&L for a position that was sold";
     EXPECT_EQ(t.get_total_pnl().inventory_pnl, 500);
 }
+
+// ---------------------------------------------------------------------------
+// 4h. [S20 2026-08-24] The carry price must come from the pair that last
+//     marked the asset LIVE, not from whichever EMA the map yields first.
+//
+//     Every pair with a positive price updates its own EMA before dedup
+//     runs, so pairs on one asset hold EMAs of differing ages -- and, worse,
+//     denominated in different quote assets.  Carrying the wrong pair's EMA
+//     is therefore both a staleness bug and a unit error.  Here XCH/BYC is
+//     given a stale EMA first, XCH/wUSDC.b then becomes the live owner at a
+//     different price, and the carry must follow the owner.
+// ---------------------------------------------------------------------------
+TEST_F(PnLTrackerTest, CarryPriceFollowsTheOwningPairNotMapOrder) {
+    xop::PnLTracker t(db_path_);
+    t.init_database();
+
+    for (const char* pair : {"XCH/wUSDC.b", "XCH/BYC"}) {
+        t.set_pair_conversion(pair, "xch", kBaseXchD, kCatDenomD, 1.0);
+        xop::Fill f = make_fill(std::string("trade-") + pair, xop::Side::Ask,
+                                static_cast<xop::Mojo>(2.5e12),
+                                static_cast<xop::Mojo>(1e12));
+        f.pair_name = pair;
+        ASSERT_TRUE(t.record_fill(f, 0, static_cast<xop::Mojo>(2.0e12), 0));
+    }
+
+    auto balance = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(1e12);
+    };
+    auto basis = [](const std::string&) -> xop::Mojo {
+        return static_cast<xop::Mojo>(2.0e12);
+    };
+    auto unit = [](const std::string&) -> double {
+        return kCatDenomD / kBaseXchD;
+    };
+
+    // Cycle 1: only XCH/BYC prices, at $3.00 -> it owns the mark (1000).
+    t.mark_to_market(
+        [](const std::string& pair, const std::string&) -> xop::Mojo {
+            return pair == "XCH/BYC" ? static_cast<xop::Mojo>(3.0e12) : 0;
+        }, balance, basis, 2.5, unit);
+    ASSERT_EQ(t.get_total_pnl().inventory_pnl, 1000);
+
+    // Cycle 2: only XCH/wUSDC.b prices, at $2.50 -> ownership moves to it
+    // and the mark becomes 500.  XCH/BYC keeps its now-stale $3.00 EMA.
+    t.mark_to_market(
+        [](const std::string& pair, const std::string&) -> xop::Mojo {
+            return pair == "XCH/wUSDC.b" ? static_cast<xop::Mojo>(2.5e12) : 0;
+        }, balance, basis, 2.5, unit);
+    ASSERT_EQ(t.get_total_pnl().inventory_pnl, 500);
+
+    // Cycle 3: nothing prices.  The carry must use the OWNER's $2.50, not
+    // XCH/BYC's stale $3.00 -- whichever order the map happens to iterate.
+    t.mark_to_market(
+        [](const std::string&, const std::string&) -> xop::Mojo { return 0; },
+        balance, basis, 2.5, unit);
+
+    EXPECT_EQ(t.get_total_pnl().inventory_pnl, 500)
+        << "carried a non-owning pair's staler EMA";
+    EXPECT_EQ(t.get_pair_pnl("XCH/wUSDC.b").inventory_pnl, 500);
+    EXPECT_EQ(t.get_pair_pnl("XCH/BYC").inventory_pnl, 0);
+}

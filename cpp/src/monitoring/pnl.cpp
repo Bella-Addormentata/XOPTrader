@@ -1214,6 +1214,7 @@ void PnLTracker::mark_to_market(
                 * unit_factor
                 / static_cast<double>(kMojosPerXch)));
             asset_marked[base_asset] = true;
+            mark_owner_[base_asset] = pair_name;   // [S20] carry source
         } else {
             ppnl.inventory_pnl = 0;
         }
@@ -1227,6 +1228,23 @@ void PnLTracker::mark_to_market(
     // basis.  That keeps the unrealized leg consistent with any fills
     // booked into the realized leg while the mid was ungraded, which
     // carrying the previous AMOUNT could not do.
+    // Which deferred pair may carry an asset: the one that last marked it
+    // live.  price_ema_ existence is NOT that test -- every pair with a
+    // positive price updates its own EMA before dedup runs, so an asset's
+    // pairs hold EMAs of differing ages, and the first one an unordered
+    // map yields could be the stalest.  It would also be denominated in a
+    // different quote asset, since each pair's EMA and basis conversion
+    // live in that pair's own quote units, so borrowing another pair's EMA
+    // is a unit error as well as a staleness one.  With no recorded owner
+    // (nothing has ever marked this asset) any deferred pair may carry its
+    // own EMA -- they are all equally unproven.
+    std::unordered_map<std::string, bool> asset_has_owner;
+    for (const auto& d : deferred) {
+        auto own_it = mark_owner_.find(d.base_asset);
+        asset_has_owner[d.base_asset] =
+            (own_it != mark_owner_.end() && !own_it->second.empty());
+    }
+
     for (const auto& d : deferred) {
         auto it = pair_pnl_.find(d.pair_name);
         if (it == pair_pnl_.end()) continue;
@@ -1235,6 +1253,15 @@ void PnLTracker::mark_to_market(
             // Priced live by another pair, or already carried by one.
             it->second.inventory_pnl = 0;
             continue;
+        }
+
+        if (asset_has_owner[d.base_asset]) {
+            auto own_it = mark_owner_.find(d.base_asset);
+            if (own_it == mark_owner_.end() || own_it->second != d.pair_name) {
+                // Some other pair owns this asset's mark; it will carry.
+                it->second.inventory_pnl = 0;
+                continue;
+            }
         }
 
         auto ema_it = price_ema_.find(d.pair_name);
