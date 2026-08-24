@@ -535,6 +535,7 @@ void MarketDataFeed::ingest_dexie(const std::string& pair_name,
     // book evidence.  ingest_competing_offers re-sets it when (and only
     // when) it successfully rebuilds the BBO from filtered offers.
     ps.bbo_from_filtered_book = false;
+    ps.bbo_filter_had_anchor  = false;
     // Age the print by its VALUE, not by when we polled: dex_updated_at is
     // re-stamped every heartbeat, so it cannot answer "how old is this
     // trade?".  A first sighting deliberately leaves last_trade_changed_at
@@ -1002,6 +1003,7 @@ bool MarketDataFeed::book_evidence_fresh(const std::string& pair_name) const {
     }
     const PairState& ps = it->second;
     return ps.bbo_from_filtered_book
+        && ps.bbo_filter_had_anchor
         && ps.ob_updated_at != Timestamp{}
         && std::chrono::system_clock::now() - ps.ob_updated_at
                <= cfg.stale_threshold
@@ -1489,6 +1491,7 @@ void MarketDataFeed::apply_mid_gate(PairState& ps, const MarketDataConfig& cfg)
     const bool book_moving =
         ps.dex_print_age <= kMaxConfirmingPrintAge;
     const bool dex_fresh = ps.bbo_from_filtered_book
+        && ps.bbo_filter_had_anchor
         && ps.ob_updated_at != Timestamp{}
         && now - ps.ob_updated_at <= cfg.stale_threshold
         && book_moving;
@@ -2043,8 +2046,13 @@ void MarketDataFeed::ingest_competing_offers(
             ps.dex_best_ask = filtered_best_ask > 0.0 ? filtered_best_ask : 0.0;
             // [S20] These ARE third-party filtered values (including the
             // authoritative zeroes above), so the BBO may now serve as
-            // independent book evidence until ingest_dexie overwrites it.
+            // independent book evidence until ingest_dexie overwrites it
+            // -- provided the filter actually had something to screen
+            // against.  With the gate off the legacy near-reference filter
+            // is what is configured, so that counts as screened.
             ps.bbo_from_filtered_book = true;
+            ps.bbo_filter_had_anchor  =
+                !cfg.mid_gate_enabled || ref_price > 0.0;
             // Publish unconditionally, INCLUDING the "no usable mid" zero.
             // The old `if (ob_mid > 0.0)` made this field sticky: once a book
             // went one-sided or empty the last good mid stayed in place and

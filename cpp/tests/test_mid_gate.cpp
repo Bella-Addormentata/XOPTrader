@@ -484,6 +484,10 @@ TEST(MidGateIngestTest, ProvenanceClearedByRawTickerRestoredByFilteredBook) {
     const std::string pair = "XCH/wUSDC.b";
 
     feed.ingest_block_height(100);
+    // A CEX leg stands in for the anchor production injects before the
+    // ingest loop; without one the book is unscreened and cannot serve as
+    // evidence at all (see OffersFilteredWithoutAnAnchorCannotConfirm).
+    feed.ingest_cex_reference(pair, 1.42);
     std::vector<CompetingOffer> offers{
         mk_offer("b1", Side::Bid, 1.40, 5'000'000'000'000LL),
         mk_offer("a1", Side::Ask, 1.44, 5'000'000'000'000LL),
@@ -710,4 +714,46 @@ TEST(MidGateIngestTest, OffersIngestedBeforeAnyAnchorAreUnfiltered) {
         EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
             << "anchor injected before ingest must refuse the junk book";
     }
+}
+
+
+// [S20 2026-08-24] A book filtered with NO anchor cannot confirm a later
+// anchor breach.
+//
+// Round 4 moved the implied-cross and peg injection ahead of the ingest
+// loop, but CEX and AMM legs are still ingested afterwards -- so on a
+// process's first cycle a CEX- or AMM-anchored (non-stablecoin) pair has
+// no anchor while its offers are filtered.  The junk book that results is
+// genuinely third-party and genuinely fresh, so provenance alone would
+// let it satisfy the confirmation escape and override the anchor that
+// arrives moments later: one poisoned publication, one poisoned peak.
+//
+// Screening is therefore tracked as its own fact, which holds regardless
+// of heartbeat ordering.
+TEST(MidGateIngestTest, OffersFilteredWithoutAnAnchorCannotConfirm) {
+    State state;
+    MarketDataFeed feed(gate_cfg(), state);
+    const std::string pair = "XCH/wUSDC.b";   // non-stablecoin: no peg anchor
+
+    feed.ingest_block_height(100);
+
+    // First cycle: offers arrive before any anchor exists.  Coherent,
+    // two-sided, and absurd -- 100x the real level.
+    const std::vector<CompetingOffer> junk{
+        mk_offer("b1", Side::Bid, 140.0, 5'000'000'000'000LL),
+        mk_offer("a1", Side::Ask, 144.0, 5'000'000'000'000LL),
+    };
+    feed.ingest_competing_offers(pair, junk, {}, kMojosPerXch, 1'000);
+
+    EXPECT_FALSE(feed.book_evidence_fresh(pair))
+        << "an unscreened book must not count as independent evidence";
+
+    // The CEX anchor lands later in the same heartbeat, as it does in
+    // production.  The junk book must NOT be able to override it.
+    feed.ingest_cex_reference(pair, 1.42);
+    feed.refresh({pair});
+
+    EXPECT_DOUBLE_EQ(feed.get_mid_price(pair), 0.0)
+        << "unscreened junk book confirmed its own band breach";
+    EXPECT_FALSE(feed.mid_valuation_grade(pair));
 }

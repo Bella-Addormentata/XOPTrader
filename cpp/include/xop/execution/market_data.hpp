@@ -525,6 +525,17 @@ struct PairState {
     // on it.
     bool        bbo_from_filtered_book{false};
 
+    // [S20 2026-08-24] ...and whether that filtering ran against an
+    // independent ANCHOR.  Provenance alone is not enough: on a process's
+    // first cycle a pair anchored by CEX or AMM has no anchor yet at
+    // ingest time (those legs are ingested later in the heartbeat), so its
+    // offers pass through unscreened.  The resulting book is genuinely
+    // third-party and genuinely fresh, and would therefore satisfy the
+    // gate's confirmation escape -- letting one coherent junk book
+    // override the anchor that arrives moments later, publish once, and
+    // move the peak.  A book nothing screened is not evidence.
+    bool        bbo_filter_had_anchor{false};
+
     // --- [S20] Orderbook-mid provenance ---
     // orderbook_mid is written ONLY by ingest_competing_offers.  When the
     // offers fetch throws, that method never runs and the field froze with
