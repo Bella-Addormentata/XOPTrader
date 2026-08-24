@@ -570,7 +570,9 @@ class _DatabaseWorker(QObject):
         # figure.  NOT filtered by the display baseline: capital is a
         # balance-sheet fact, not a performance figure a reset should hide.
         # The table may not exist on a fresh DB -- that is "no flows yet",
-        # not a reason to drop the whole P&L payload.
+        # not a reason to drop the whole P&L payload, and (round 26) not a
+        # reason to emit query_error on every refresh either: probe
+        # sqlite_master first so the fallback stays silent.
         bridge_sql = """
             SELECT COALESCE(SUM(delta_mojos), 0) AS net_mojos,
                    COUNT(*)                      AS flow_count
@@ -579,7 +581,8 @@ class _DatabaseWorker(QObject):
         """
         net_deposits_usd = 0.0
         bridge_flows = 0
-        rows = self._execute_query(bridge_sql, [])
+        rows = (self._execute_query(bridge_sql, [])
+                if self._table_exists("ledger_entries") else None)
         if rows:
             net_deposits_usd = float(rows[0]["net_mojos"] or 0) / 1e3
             bridge_flows = int(rows[0]["flow_count"] or 0)

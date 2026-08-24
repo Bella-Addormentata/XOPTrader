@@ -2313,7 +2313,12 @@ AccountingConfig parse_accounting(const YAML::Node& root)
     read_bool("bridge_ingest_enabled",  cfg.bridge_ingest_enabled);
     if (node["bridge_jobs_db_path"] && node["bridge_jobs_db_path"].IsDefined()
         && !node["bridge_jobs_db_path"].IsNull()) {
-        cfg.bridge_jobs_db_path = node["bridge_jobs_db_path"].as<std::string>();
+        // Same treatment as database.path (review round 26): ${VAR}
+        // references expand and a leading ~ resolves, so a valid
+        // configured path cannot silently become an unreadable
+        // database that disables ingestion while it reports enabled.
+        cfg.bridge_jobs_db_path = expand_tilde(
+            read_string(node, "bridge_jobs_db_path", "accounting"));
     }
     if (node["bridge_asset_id"] && node["bridge_asset_id"].IsDefined()
         && !node["bridge_asset_id"].IsNull()) {

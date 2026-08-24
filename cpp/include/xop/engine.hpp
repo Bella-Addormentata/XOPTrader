@@ -854,18 +854,6 @@ private:
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
 
-    /// [S19 review round 19] Negative unattributed inventory movement
-    /// observed by THIS process's reconciles (always <= 0).  The budget
-    /// a pre-folded withdrawal may shrink the peak against: a fold that
-    /// happened before a restart contributes nothing here, and its late
-    /// booking must not shrink the re-seeded HWM a second time (that
-    /// would mask future losses).
-    Mojo bridge_inproc_neg_fold_mojos_{0};
-    /// Block of the negative budget's first entry; the budget expires
-    /// after a bounded window (rounds 21+23) so stale fill-caused
-    /// movement cannot authorize a withdrawal shrink long after the
-    /// fact.
-    BlockHeight bridge_neg_fold_block_{0};
 
     /// [S19 review round 18] Ledger event ids already booked (or found
     /// already-booked) by the bridge scan.  Historical jobs stay in the
@@ -875,16 +863,14 @@ private:
     /// per restart warms the cache.
     std::set<std::string> bridge_booked_event_ids_;
 
-    /// [S19 rounds 17+25] Booked bridge flows awaiting their one-time
-    /// peak adjustment, kept as DIRECTIONAL GROSS totals: netting a
-    /// deposit against a withdrawal discovered in the same pass could
-    /// cancel a shrink against a credit and mask performance between
-    /// the flows (TWR treats each external flow separately).  Deposits
-    /// consume through the credit policy, withdrawals through the
-    /// budget-gated shrink.  In-memory only: a restart re-anchors the
-    /// peak from live equity anyway.
+    /// [S19 rounds 17+25+26] Booked bridge DEPOSITS awaiting their
+    /// one-time peak credit (withdrawals never adjust the peak
+    /// in-process -- attributing wallet movement to a specific flow is
+    /// unsound, so the peak stands and drawdown reads conservatively
+    /// high until the next restart re-anchor).  Consumed or cleared by
+    /// the same pass that fills it.  In-memory only: a restart
+    /// re-anchors the peak from live equity anyway.
     Mojo bridge_unapplied_deposit_mojos_{0};     // always >= 0
-    Mojo bridge_unapplied_withdrawal_mojos_{0};  // always <= 0
 
     /// [S19 review round 10] Job ids whose skip condition
     /// (unclassifiable / foreign fingerprint / missing transition event)
