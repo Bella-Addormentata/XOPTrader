@@ -854,25 +854,6 @@ private:
     /// standing down forever.
     [[nodiscard]] bool bridge_accounting_operational() const;
 
-    /// [S19 review round 20] Positive unattributed inventory movement
-    /// observed by THIS process's reconciles (always >= 0), plus the
-    /// peak as it stood BEFORE the first such fold.  When a pre-folded
-    /// deposit's job later appears, its factor applies once against
-    /// that pre-flow anchor -- Step 13's max() has since absorbed the
-    /// flow-inclusive equity, and multiplying the CURRENT peak would
-    /// overshoot while skipping entirely masked an opposing fill's
-    /// loss (equity/HWM 100, +100 deposit, -20 fill folded together:
-    /// max() anchors 180; the correct peak is 100 * 180/80 = 225).
-    Mojo   bridge_inproc_pos_fold_mojos_{0};
-    double bridge_pos_fold_peak_usd_{0.0};
-    /// Block at which the positive budget's FIRST entry (and its peak
-    /// snapshot) was recorded.  The budget expires after a bounded
-    /// window (review round 21): the snapshot can be captured by an
-    /// ordinary fill's residual, and without expiry a bridge job
-    /// discovered much later would be reconstructed against an
-    /// arbitrarily stale peak, masking the intervening drawdown.
-    BlockHeight bridge_pos_fold_block_{0};
-
     /// [S19 review round 19] Negative unattributed inventory movement
     /// observed by THIS process's reconciles (always <= 0).  The budget
     /// a pre-folded withdrawal may shrink the peak against: a fold that
@@ -880,6 +861,11 @@ private:
     /// booking must not shrink the re-seeded HWM a second time (that
     /// would mask future losses).
     Mojo bridge_inproc_neg_fold_mojos_{0};
+    /// Block of the negative budget's first entry; the budget expires
+    /// after a bounded window (rounds 21+23) so stale fill-caused
+    /// movement cannot authorize a withdrawal shrink long after the
+    /// fact.
+    BlockHeight bridge_neg_fold_block_{0};
 
     /// [S19 review round 18] Ledger event ids already booked (or found
     /// already-booked) by the bridge scan.  Historical jobs stay in the
