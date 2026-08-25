@@ -1478,6 +1478,31 @@ asio::awaitable<void> Engine::run_startup_analysis()
     market_analyzer_->force_complete();
 
     auto summaries = market_analyzer_->get_summaries();
+
+    // [S23 2026-08-24] Re-export AFTER force-completion, or the flag never
+    // reaches telemetry.  update_analysis() is called inside the poll loop
+    // above, so the last export predates the completion just performed --
+    // an unpriced pair's Prometheus `complete` gauge would stay 0 and
+    // MetricsService.is_analysis_active() would keep the GUI on
+    // "Analyzing", exactly the symptom this was meant to cure.  Plumbing
+    // the parameter through is not enough if nothing publishes afterwards.
+    if (metrics_->is_running()) {
+        for (const auto& s : summaries) {
+            metrics_->update_analysis(
+                s.pair_name,
+                s.blocks_collected,
+                target,
+                s.complete,
+                s.volatility_annual,
+                s.mean_spread_bps,
+                s.spread_cv,
+                s.variance_ratio,
+                s.book_imbalance,
+                s.momentum,
+                static_cast<int>(s.regime),
+                static_cast<int>(s.aggressiveness));
+        }
+    }
     for (const auto& s : summaries) {
         spdlog::info("[Engine] Analysis complete for {}: "
                      "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "

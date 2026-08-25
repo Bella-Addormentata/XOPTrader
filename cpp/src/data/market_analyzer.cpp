@@ -282,8 +282,15 @@ AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
     // so leaving them in meant an unpriceable pair could veto an
     // Aggressive consensus and move the applied spread multiplier from
     // 0.8 to 1.0 -- a pair with NO data quietly setting policy for the
-    // pairs that have it.  Same predicate is_complete() uses, so the two
-    // cannot disagree about which pairs count.
+    // pairs that have it.
+    //
+    // Uses has_no_observations(), NOT the is_structurally_unpriced() that
+    // completion uses.  The two DELIBERATELY differ: completion adds a
+    // `complete` guard so force_complete() can end the phase, but folding
+    // that guard in here would hand a zero-observation pair its vote back
+    // the moment the timeout fired -- on precisely the path where nobody
+    // has good data.  Having no observations is a property of the data;
+    // being complete is a statement about the phase.
     auto most_conservative = AnalysisAggressiveness::Aggressive;
     bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
