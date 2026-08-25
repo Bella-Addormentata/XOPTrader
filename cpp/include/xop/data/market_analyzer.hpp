@@ -315,12 +315,15 @@ private:
     /// Compute the analysis summary for one pair from its accumulated state.
     [[nodiscard]] PairAnalysisSummary compute_summary(const PairState& ps) const;
 
-    /// [S23 2026-08-24] Whether this pair has been polled its full share
-    /// and produced nothing -- see is_complete() for why that happens and
-    /// why such a pair is excluded rather than waited on.  Shared by
-    /// is_complete() and overall_recommendation() so the two cannot
-    /// disagree about which pairs count: a pair excluded from deciding
-    /// completion must not still get a vote on the spread multiplier.
+    /// [S23 2026-08-24] Polled its full share, produced NOTHING.  A
+    /// property of the DATA, independent of whether anyone has declared
+    /// the phase over -- used by overall_recommendation(), where the vote
+    /// must stay withdrawn after force_complete() as well.
+    [[nodiscard]] bool has_no_observations(const PairState& ps) const noexcept;
+
+    /// has_no_observations() plus "not already completed".  Used by
+    /// is_complete(), which must still return true after force_complete()
+    /// even when every pair collected nothing.
     [[nodiscard]] bool is_structurally_unpriced(const PairState& ps) const noexcept;
 
     /// Compute the variance ratio VR(lag) from the price series.

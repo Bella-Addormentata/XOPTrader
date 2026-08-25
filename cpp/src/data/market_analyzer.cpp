@@ -152,14 +152,24 @@ void MarketAnalyzer::ingest(const std::string& pair_name,
 // plausibility gate a pair whose junk mid is refused publishes no mid at
 // all, so such a pair never accumulates an observation.
 //
-// Deliberately shared by is_complete() and overall_recommendation(): the
-// two must agree about which pairs count, or a pair excluded from deciding
-// completion would still get a vote on the spread multiplier.
+// Deliberately does NOT consider `complete`.  force_complete() sets that
+// flag on every state, so folding it in here would make this predicate
+// stop recognising zero-observation pairs the moment the analysis timeout
+// fires -- handing them back their vote on the spread multiplier on
+// exactly the path where nobody has good data.  Having no observations is
+// a property of the data, not of whether someone declared the phase over.
+bool MarketAnalyzer::has_no_observations(const PairState& ps) const noexcept
+{
+    return ps.blocks_collected == 0
+        && ps.total_poll_attempts >= cfg_.analysis_blocks;
+}
+
+// The completion test adds the `complete` guard on top: force_complete()
+// must satisfy is_complete() even when every pair collected nothing, so a
+// state someone has explicitly completed is no longer "still waiting".
 bool MarketAnalyzer::is_structurally_unpriced(const PairState& ps) const noexcept
 {
-    return !ps.complete
-        && ps.blocks_collected == 0
-        && ps.total_poll_attempts >= cfg_.analysis_blocks;
+    return !ps.complete && has_no_observations(ps);
 }
 
 bool MarketAnalyzer::is_complete() const noexcept {
@@ -277,7 +287,9 @@ AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
     auto most_conservative = AnalysisAggressiveness::Aggressive;
     bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
-        if (is_structurally_unpriced(ps)) continue;
+        // has_no_observations, NOT is_structurally_unpriced: the vote must
+        // stay withdrawn after force_complete() too.
+        if (has_no_observations(ps)) continue;
         any_priceable = true;
         const auto summary = compute_summary(ps);
         if (static_cast<uint8_t>(summary.aggressiveness) <

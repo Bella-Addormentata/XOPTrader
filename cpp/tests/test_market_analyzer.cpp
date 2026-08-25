@@ -565,36 +565,72 @@ TEST(MarketAnalyzerComplete, ForceCompleteHonouredForZeroObservationPairs) {
 }
 
 // [S23 2026-08-24] A structurally unpriced pair must not vote on the
-// aggregate recommendation.
+// aggregate recommendation -- and the fixture must actually reach the
+// Aggressive case, or the test passes whether or not the vote is removed.
 //
-// Its summary is computed from zero observations and defaults to Normal, so
-// leaving it in let a pair with NO data veto an Aggressive consensus and
-// move the applied spread multiplier from 0.8 to 1.0 -- setting policy for
-// the pairs that actually have data.
+// recommend() returns Aggressive only when vol_annual < high_vol_threshold/2
+// (0.20), mean_spread_bps >= wide_spread_bps_threshold (80) and the regime
+// is MeanReverting.  The variance-ratio lag is 5, so a handful of constant
+// points can never leave Random -- an earlier version of this test used
+// three, sat at Normal for both fixtures, and would have passed with the
+// bug present.
+namespace {
+
+// Alternating micro-moves: mean-reverting, very low realised vol, and a
+// wide quoted spread -- the "quote tighter" case.
+void feed_aggressive(xop::MarketAnalyzer& ma, const std::string& pair, int n) {
+    for (int i = 0; i < n; ++i) {
+        const double mid = (i % 2 == 0) ? 1.7000 : 1.7002;
+        ma.ingest(pair, mid, /*spread_bps=*/150.0, /*vol=*/100000.0,
+                  /*bid_depth=*/50.0, /*ask_depth=*/50.0);
+    }
+}
+
+}  // namespace
+
 TEST(MarketAnalyzerComplete, UnpricedPairDoesNotVetoAggressiveConsensus) {
     xop::MarketAnalyzerConfig cfg;
-    cfg.analysis_blocks = 3;
-    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+    cfg.analysis_blocks = 20;
 
-    // Unpriceable pair: polled its share, produced nothing.
-    for (int i = 0; i < 3; ++i) {
+    // Baseline: the healthy pair ALONE must genuinely reach Aggressive,
+    // otherwise this test proves nothing.
+    xop::MarketAnalyzer solo(cfg, {"XCH/BYC"});
+    feed_aggressive(solo, "XCH/BYC", 20);
+    ASSERT_EQ(solo.overall_recommendation(),
+              xop::AnalysisAggressiveness::Aggressive)
+        << "fixture does not reach Aggressive -- the test cannot detect the veto";
+    ASSERT_DOUBLE_EQ(solo.recommended_spread_multiplier(), 0.8);
+
+    // Same healthy pair, plus one that is polled its share and yields
+    // nothing.  Its empty summary defaults to Normal and would veto.
+    xop::MarketAnalyzer mixed(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+    feed_aggressive(mixed, "XCH/BYC", 20);
+    for (int i = 0; i < 20; ++i) {
+        mixed.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    EXPECT_EQ(mixed.overall_recommendation(),
+              xop::AnalysisAggressiveness::Aggressive)
+        << "an unpriceable pair vetoed the Aggressive consensus";
+    EXPECT_DOUBLE_EQ(mixed.recommended_spread_multiplier(), 0.8);
+}
+
+// The veto must stay withdrawn after force_complete(), which is the
+// timeout path -- exactly when nobody has good data and a zero-observation
+// pair would otherwise regain its vote.
+TEST(MarketAnalyzerComplete, UnpricedVoteStaysWithdrawnAfterForceComplete) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 20;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+    feed_aggressive(ma, "XCH/BYC", 20);
+    for (int i = 0; i < 20; ++i) {
         ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
     }
-    // Healthy pair: a calm, tight book -- the Aggressive case.
-    for (int i = 0; i < 3; ++i) {
-        ma.ingest("XCH/BYC", 1.70, 20.0, 100000.0, 50.0, 50.0);
-    }
+    ASSERT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 0.8);
 
-    const double mult = ma.recommended_spread_multiplier();
-    EXPECT_NE(mult, 0.0);
-    // Whatever the healthy pair concludes, the empty pair must not be the
-    // one deciding: its presence must not change the answer.
-    xop::MarketAnalyzer solo(cfg, {"XCH/BYC"});
-    for (int i = 0; i < 3; ++i) {
-        solo.ingest("XCH/BYC", 1.70, 20.0, 100000.0, 50.0, 50.0);
-    }
-    EXPECT_DOUBLE_EQ(mult, solo.recommended_spread_multiplier())
-        << "an unpriceable pair changed the applied spread multiplier";
+    ma.force_complete();
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 0.8)
+        << "force_complete() handed the zero-observation pair its vote back";
 }
 
 // With nothing priceable at all, fall back to Normal rather than inheriting
