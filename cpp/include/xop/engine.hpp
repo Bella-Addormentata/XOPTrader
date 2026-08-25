@@ -1226,6 +1226,21 @@ private:
     // reverse, protecting cost-basis integrity.
     std::vector<Fill> pending_unconfirmed_fills_;
 
+    /// [S25 2026-08-24] Offers the wallet reported terminal, awaiting the
+    /// same confirmation depth fills use before the outcome is written.
+    ///
+    /// The write is ONE-WAY: update_offer_status reopens a terminal row
+    /// only for a fill, so a reorg-revived offer could never return to
+    /// pending once "cancelled" landed.  Entries also survive a transient
+    /// persistence failure and are retried, because detect_fills clears
+    /// its own terminal list every call -- dropping one here would strand
+    /// the row as pending until a restart re-observed it.
+    struct PendingTerminal {
+        std::string offer_id;
+        BlockHeight observed_block{0};
+    };
+    std::vector<PendingTerminal> pending_unconfirmed_terminals_;
+
     // -- PID adaptive spread controller state (per-pair) ------------------
     // Tracks fill-rate EMA and PID accumulators for each trading pair.
     // Updated in Step 2 (fill counting) and Step 5 (PID update + apply).

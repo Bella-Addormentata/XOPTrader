@@ -681,3 +681,62 @@ TEST(DatabaseTest, TerminalStatusForUnknownOfferThrows)
         std::exception)
         << "the engine relies on this throwing to skip unknown offers";
 }
+
+// [S25 2026-08-24] A cancelled row is NOT reopened by a later non-fill
+// update.
+//
+// This is why the engine buffers terminal observations to confirmation
+// depth rather than writing them immediately.  An earlier revision wrote
+// straight away, reasoning that a reorg-revived offer would simply be
+// re-reported live and corrected -- but update_offer_status reopens a
+// terminal row only for a FILL, so the correction has nowhere to land and
+// the row stays cancelled for good.  This pins the one-way behaviour the
+// buffering exists to respect; if it ever becomes reopenable, the gating
+// can be revisited.
+TEST(DatabaseTest, CancelledOfferIsNotReopenedByALaterPendingUpdate)
+{
+    TempDbPath temp_db{"xop_s25_oneway"};
+    const std::string offer_id = "offer-oneway";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 100,
+                               "wallet reported terminal");
+        // A reorg revival would try to put it back to pending.
+        db.update_offer_status(offer_id, "pending", 101, "revived");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "cancelled")
+        << "if this now reads 'pending', terminal writes are reversible and "
+           "the confirmation-depth buffer in step_process_fills can be "
+           "reconsidered";
+    close_db();
+}
+
+// A fill DOES still override a cancelled row -- the one documented
+// exception, and the reason the buffer protects cost basis rather than
+// merely tidiness.
+TEST(DatabaseTest, FillStillOverridesACancelledOffer)
+{
+    TempDbPath temp_db{"xop_s25_fillwins"};
+    const std::string offer_id = "offer-fillwins";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 100, "wallet terminal");
+        db.update_offer_status(offer_id, "filled", 101, "");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "filled");
+    close_db();
+}

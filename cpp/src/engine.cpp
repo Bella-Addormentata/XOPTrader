@@ -2435,29 +2435,24 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     //
     // detect_fills discovers cancelled/failed offers -- it must, to stop
     // tracking them -- but until now only removed them from State, so the
-    // offer_log row stayed 'pending' forever.  Measured 2026-08-24: 48 rows
-    // stuck, the oldest 17 days, one of them re-detected as terminal on all
-    // twelve process starts since 08-18 and re-forgotten every time.  The
-    // GUI reads offer_log, so an offer cancelled on dexie kept showing as
-    // pending here.
+    // offer_log row stayed 'pending' forever.  48 rows had accumulated by
+    // 2026-08-24, the oldest 17 days, one re-detected on all twelve
+    // process starts since 08-18 and re-forgotten each time.  The GUI
+    // reads offer_log, so an offer cancelled on dexie kept showing here as
+    // pending.
     //
-    // Written immediately rather than through the confirmation-depth buffer
-    // below: that buffer exists so a reorg cannot make us book a FILL that
-    // later vanishes, which is a cost-basis risk.  A cancellation carries no
-    // such risk -- if a reorg revived the offer the wallet would report it
-    // live again and the next post/cancel cycle would correct the row --
-    // and delaying it is what let these accumulate for weeks.
+    // Buffered to confirmation depth, exactly like fills below.  An
+    // earlier revision of this change wrote immediately, reasoning that a
+    // cancellation carries no reorg risk because a revived offer would be
+    // re-reported live.  That was wrong: update_offer_status reopens a
+    // terminal row only for a FILL (the !is_terminal_status guard), so
+    // once "cancelled" is written a reorg-revived offer can never return
+    // to pending -- reconciliation's reinsert hits the unique offer_id,
+    // the row stays cancelled, and the next restart sees an unknown
+    // orphan.  The write is one-way, so it waits for the same depth a
+    // fill does.
     for (const auto& tid : offer_mgr_->last_terminal_offers()) {
-        try {
-            db_->update_offer_status(tid, "cancelled",
-                                     static_cast<BlockHeight>(block_height),
-                                     "wallet reported terminal");
-        } catch (const std::exception& ex) {
-            // A row may legitimately be absent (an offer this process never
-            // logged); never let bookkeeping abort the heartbeat.
-            spdlog::debug("[Engine] update_offer_status({}) skipped: {}",
-                          tid.substr(0, 12), ex.what());
-        }
+        pending_unconfirmed_terminals_.push_back({tid, block_height});
     }
 
     // [T4-02] Reorg protection: confirmation depth gating.
@@ -2494,6 +2489,48 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         spdlog::debug("[Engine] Step 2: {} fills awaiting confirmation "
                       "(depth requirement: {} blocks)",
                       pending_unconfirmed_fills_.size(), conf_depth);
+    }
+
+    // [S25] Same partition for terminal offers, then persist the confirmed
+    // ones.  A transient failure KEEPS the entry rather than dropping it:
+    // detect_fills has already removed the offer from State and clears its
+    // terminal list every call, so swallowing a SQLite busy or I/O error
+    // would strand the row as pending until some future restart happened
+    // to re-observe it -- the very accumulation this change exists to
+    // stop.  Only the explicit not-found case is discarded, because an
+    // offer this process never logged has no row to update and never will.
+    {
+        std::vector<PendingTerminal> terminal_still_pending;
+        terminal_still_pending.reserve(pending_unconfirmed_terminals_.size());
+        for (auto& t : pending_unconfirmed_terminals_) {
+            const bool confirmed =
+                conf_depth == 0
+                || (block_height >= t.observed_block
+                    && block_height - t.observed_block >= conf_depth);
+            if (!confirmed) {
+                terminal_still_pending.push_back(std::move(t));
+                continue;
+            }
+            try {
+                db_->update_offer_status(
+                    t.offer_id, "cancelled",
+                    static_cast<BlockHeight>(block_height),
+                    "wallet reported terminal");
+            } catch (const std::exception& ex) {
+                const std::string what = ex.what();
+                if (what.find("no offer found") != std::string::npos) {
+                    spdlog::debug("[Engine] Step 2: terminal offer {} has no "
+                                  "offer_log row -- not ours to resolve",
+                                  t.offer_id.substr(0, 12));
+                } else {
+                    spdlog::warn("[Engine] Step 2: could not persist terminal "
+                                 "status for {} ({}) -- retrying next cycle",
+                                 t.offer_id.substr(0, 12), what);
+                    terminal_still_pending.push_back(std::move(t));
+                }
+            }
+        }
+        pending_unconfirmed_terminals_ = std::move(terminal_still_pending);
     }
 
     // Process only confirmed fills.
