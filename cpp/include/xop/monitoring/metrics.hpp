@@ -245,6 +245,7 @@ public:
     void update_analysis(const std::string& pair_name,
                          uint32_t blocks_collected,
                          uint32_t blocks_target,
+                         bool     complete,
                          double   vol_annual,
                          double   mean_spread_bps,
                          double   spread_cv,

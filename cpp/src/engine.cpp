@@ -1413,6 +1413,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
                     pair.name,
                     summary.blocks_collected,
                     target,
+                    summary.complete,
                     summary.volatility_annual,
                     summary.mean_spread_bps,
                     summary.spread_cv,
@@ -1467,6 +1468,15 @@ asio::awaitable<void> Engine::run_startup_analysis()
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
 
     // Log the completed analysis summaries.
+    // [S23 2026-08-24] The phase is over however we reached here, so no
+    // pair may still be reported as analysing.  The loop can now exit while
+    // a structurally unpriced pair is still incomplete -- that is the point
+    // of the fix -- and leaving it that way kept the GUI on "Analyzing" for
+    // the life of a process that was already trading.  force_complete()
+    // only touches states that are not complete and logs each one, so this
+    // is idempotent after the timeout path already called it.
+    market_analyzer_->force_complete();
+
     auto summaries = market_analyzer_->get_summaries();
     for (const auto& s : summaries) {
         spdlog::info("[Engine] Analysis complete for {}: "

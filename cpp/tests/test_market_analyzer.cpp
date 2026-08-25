@@ -646,3 +646,39 @@ TEST(MarketAnalyzerComplete, AllUnpricedFallsBackToNormal) {
     EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 1.0)
         << "no data must not be read as licence to tighten spreads";
 }
+
+// [S23 2026-08-24] After the phase ends, telemetry must not still say
+// "analysing".
+//
+// The exported Prometheus `complete` flag used to be re-derived from
+// blocks_collected >= blocks_target.  A structurally unpriced pair
+// legitimately ends the phase with zero observations, so that derivation
+// pinned the flag at 0 forever and MetricsService.is_analysis_active() kept
+// the GUI on "Analyzing" while the engine was already trading.  The
+// analyzer's own `complete` is the authoritative signal; `window_filled`
+// stays available for callers that genuinely need "did it fill".
+TEST(MarketAnalyzerComplete, SummaryDistinguishesCompleteFromWindowFilled) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    ma.force_complete();   // what the engine now does at phase end
+
+    for (const auto& s : ma.get_summaries()) {
+        EXPECT_TRUE(s.complete)
+            << s.pair_name << " still reports incomplete after the phase "
+               "ended -- the GUI would stay on Analyzing";
+        if (s.pair_name == "BYC/wUSDC.b") {
+            EXPECT_EQ(s.blocks_collected, 0u)
+                << "blocks_collected must stay honest about having no data";
+            EXPECT_FALSE(s.window_filled)
+                << "an unpriced pair must not claim its window was filled";
+        } else {
+            EXPECT_TRUE(s.window_filled);
+        }
+    }
+}
