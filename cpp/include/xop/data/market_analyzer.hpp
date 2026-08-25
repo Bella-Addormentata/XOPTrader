@@ -129,10 +129,17 @@ struct PairAnalysisSummary {
 
     // -- Completeness -------------------------------------------------------
     uint32_t blocks_collected{0}; ///< Actual observations ingested.
-    bool     complete{false};     ///< True when analysis has ended (either
-                                  ///  the full window was observed OR the
-                                  ///  analysis was force-completed due to
-                                  ///  a timeout).
+    bool     complete{false};     ///< True when analysis has ended for this
+                                  ///  pair, by ANY of: the full window was
+                                  ///  observed; the phase was finalised on
+                                  ///  exit (see force_complete); or the
+                                  ///  poll timeout fired.  [S23] The exit
+                                  ///  case is new -- the phase can now end
+                                  ///  while a structurally unpriced pair
+                                  ///  has zero observations, so this says
+                                  ///  the phase is over, never that data
+                                  ///  was gathered.  window_filled is the
+                                  ///  flag for that.
     bool     window_filled{false};///< True only when the full observation
                                   ///  window was filled (blocks_collected
                                   ///  >= analysis_blocks).  False after
@@ -221,11 +228,37 @@ public:
 
     // -- Queries --------------------------------------------------------------
 
-    /// True when every enabled pair has collected analysis_blocks observations.
+    /// True when every pair that CAN be priced has collected
+    /// analysis_blocks observations.
+    ///
+    /// [S23 2026-08-24] This no longer means "every pair filled its
+    /// window".  A pair that has been polled its full share and produced
+    /// nothing is structurally unpriced -- since the S20 plausibility gate,
+    /// a pair whose junk mid is refused publishes no mid at all, so
+    /// ingest() rejects every observation and it can never complete.  Such
+    /// a pair is excluded rather than waited on, or one bad book would hold
+    /// startup open until the timeout on every restart.
+    ///
+    /// Callers must therefore NOT assume a non-zero blocks_collected for
+    /// every pair when this returns true; check per-pair summaries if that
+    /// matters.  Returns false when NO pair is priceable, so a total feed
+    /// failure is never reported as a completed analysis, and true after
+    /// force_complete() regardless.
     [[nodiscard]] bool is_complete() const noexcept;
 
     /// Number of blocks collected for the given pair (0 if unknown pair).
     [[nodiscard]] uint32_t blocks_collected(const std::string& pair_name) const noexcept;
+
+    /// [S23 2026-08-24] Total ingest calls for the pair, INCLUDING those
+    /// rejected for an invalid mid (0 if unknown pair).
+    ///
+    /// Exists so callers can tell "this pair has not been polled yet" from
+    /// "this pair has been polled repeatedly and produced nothing".  The
+    /// second case is now normal: a pair whose junk mid is refused by the
+    /// S20 plausibility gate publishes no mid at all, so it never ingests
+    /// a valid observation and its blocks_collected stays at 0 forever.
+    [[nodiscard]] uint32_t poll_attempts(const std::string& pair_name) const noexcept;
+
 
     /// Configured analysis window length (blocks).
     [[nodiscard]] uint32_t analysis_blocks() const noexcept;
@@ -249,15 +282,39 @@ public:
     /// if they have not collected enough blocks.  ``window_filled`` will
     /// remain false for pairs that did not reach ``analysis_blocks``,
     /// allowing callers to distinguish forced vs. fully-observed results.
-    /// Used by the engine when the analysis timeout expires (e.g. a pair
-    /// has no market data) to prevent the bot from hanging indefinitely
-    /// in the Analyzing state.
+    ///
+    /// Called by the engine on EVERY exit from the analysis phase, not
+    /// only the timeout:
+    ///
+    ///   * timeout -- a pair has no market data and the phase must not
+    ///     hang indefinitely in the Analyzing state;
+    ///   * [S23 2026-08-24] natural exit -- is_complete() now returns true
+    ///     while a structurally unpriced pair is still incomplete, so
+    ///     finalising the states is what makes the phase's end OBSERVABLE.
+    ///     Without it that pair keeps complete == false, the exported
+    ///     Prometheus flag stays 0, and the GUI reports the engine as
+    ///     analysing for the life of a process that is already trading.
+    ///
+    /// So `complete` after this call means "the phase ended", never "the
+    /// data was gathered" -- consult window_filled for the latter.
     void force_complete();
 
-    /// Overall aggressiveness recommendation across all pairs.
-    /// Returns the most conservative recommendation among all pairs
-    /// (i.e. if any pair recommends Conservative, the overall is
+    /// Overall aggressiveness recommendation across the pairs that have
+    /// DATA.  Returns the most conservative recommendation among them
+    /// (i.e. if any such pair recommends Conservative, the overall is
     /// Conservative).  Returns Normal if no pairs are tracked.
+    ///
+    /// [S23 2026-08-24] Two exceptions callers must know about:
+    ///
+    ///   * A pair polled its full share that produced NO observations is
+    ///     EXCLUDED.  Its summary is computed from nothing and defaults to
+    ///     Normal, so including it let a pair with no data veto an
+    ///     Aggressive consensus and widen the applied spread multiplier
+    ///     for the pairs that do have data.  The exclusion holds after
+    ///     force_complete() as well -- see has_no_observations().
+    ///   * If EVERY pair is excluded the result is Normal, not the
+    ///     Aggressive value the scan seeds from: no data is not licence to
+    ///     tighten spreads.
     [[nodiscard]] AnalysisAggressiveness overall_recommendation() const;
 
     /// Spread multiplier derived from the overall aggressiveness
@@ -288,6 +345,17 @@ private:
 
     /// Compute the analysis summary for one pair from its accumulated state.
     [[nodiscard]] PairAnalysisSummary compute_summary(const PairState& ps) const;
+
+    /// [S23 2026-08-24] Polled its full share, produced NOTHING.  A
+    /// property of the DATA, independent of whether anyone has declared
+    /// the phase over -- used by overall_recommendation(), where the vote
+    /// must stay withdrawn after force_complete() as well.
+    [[nodiscard]] bool has_no_observations(const PairState& ps) const noexcept;
+
+    /// has_no_observations() plus "not already completed".  Used by
+    /// is_complete(), which must still return true after force_complete()
+    /// even when every pair collected nothing.
+    [[nodiscard]] bool is_structurally_unpriced(const PairState& ps) const noexcept;
 
     /// Compute the variance ratio VR(lag) from the price series.
     /// Returns 1.0 if there are insufficient observations.

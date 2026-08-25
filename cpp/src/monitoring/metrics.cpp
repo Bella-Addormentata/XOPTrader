@@ -600,6 +600,7 @@ void MetricsExporter::update_analysis(
     const std::string& pair_name,
     uint32_t blocks_collected,
     uint32_t blocks_target,
+    bool     complete,
     double   vol_annual,
     double   mean_spread_bps,
     double   spread_cv,
@@ -626,9 +627,18 @@ void MetricsExporter::update_analysis(
         .Set(static_cast<double>(blocks_collected));
 
     // Per-pair: complete flag.
+    //
+    // [S23 2026-08-24] Reports the ANALYZER's completion state, not
+    // `blocks_collected >= blocks_target`.  Those differ now: a
+    // structurally unpriced pair legitimately ends the phase with zero
+    // observations, and re-deriving the flag from the count left it at 0
+    // forever -- so MetricsService.is_analysis_active() kept the GUI
+    // showing "Analyzing" for the life of a process that was already
+    // trading.  blocks_collected stays honest at 0; the window_filled
+    // distinction lives in the analyzer for callers that need it.
     analysis_pair_family_
         ->Add({{"pair_name", pair_name}, {"metric", "complete"}})
-        .Set(blocks_collected >= blocks_target ? 1.0 : 0.0);
+        .Set(complete ? 1.0 : 0.0);
 
     // Per-pair: volatility.
     analysis_pair_family_

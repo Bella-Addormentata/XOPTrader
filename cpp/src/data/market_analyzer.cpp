@@ -147,17 +147,81 @@ void MarketAnalyzer::ingest(const std::string& pair_name,
 // Queries
 // ===========================================================================
 
+// [S23 2026-08-24] A pair that has been polled its full share and produced
+// NOTHING.  ingest() rejects any non-positive mid, and since the S20
+// plausibility gate a pair whose junk mid is refused publishes no mid at
+// all, so such a pair never accumulates an observation.
+//
+// Deliberately does NOT consider `complete`.  force_complete() sets that
+// flag on every state, so folding it in here would make this predicate
+// stop recognising zero-observation pairs the moment the analysis timeout
+// fires -- handing them back their vote on the spread multiplier on
+// exactly the path where nobody has good data.  Having no observations is
+// a property of the data, not of whether someone declared the phase over.
+bool MarketAnalyzer::has_no_observations(const PairState& ps) const noexcept
+{
+    return ps.blocks_collected == 0
+        && ps.total_poll_attempts >= cfg_.analysis_blocks;
+}
+
+// The completion test adds the `complete` guard on top: force_complete()
+// must satisfy is_complete() even when every pair collected nothing, so a
+// state someone has explicitly completed is no longer "still waiting".
+bool MarketAnalyzer::is_structurally_unpriced(const PairState& ps) const noexcept
+{
+    return !ps.complete && has_no_observations(ps);
+}
+
 bool MarketAnalyzer::is_complete() const noexcept {
     if (states_.empty()) return true;  // No pairs to analyse.
+
+    // [S23 2026-08-24] A structurally unpriced pair cannot hold the phase
+    // open.
+    //
+    // ingest() rejects any observation with a non-positive mid, and since
+    // the S20 plausibility gate a pair whose junk mid is refused publishes
+    // no mid at all -- so blocks_collected never leaves 0, `complete`
+    // never becomes true, and this function would return false forever.
+    // The startup loop polls on that answer, so one such pair costs every
+    // restart the full timeout before the phase force-completes on partial
+    // data.  A pair that has been polled its full share and produced
+    // NOTHING has been given its chance; the healthy pairs decide.
+    //
+    // The distinction is between "not polled yet" (still counts, so early
+    // progress is never skipped) and "polled repeatedly, produced nothing".
+    // Only an INCOMPLETE state can be structurally unpriced.
+    // The `!ps.complete` term inside is_structurally_unpriced() is what
+    // makes force_complete() work.  That method sets `complete` without
+    // touching the counters, so WITHOUT that term a zero-observation pair
+    // would still match here; with every pair at zero observations --
+    // exactly what the analysis timeout produces -- all of them would be
+    // skipped, any_priceable would stay false, and this function would
+    // return false even after a forced completion, breaking that method's
+    // contract.  The guard is why that cannot happen.
+    bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
+        if (is_structurally_unpriced(ps)) {
+            continue;   // structurally unpriced
+        }
+        any_priceable = true;
         if (!ps.complete) return false;
     }
-    return true;
+
+    // Every pair unpriced: deliberately NOT complete.  Declaring success on
+    // zero observations would hand the trading loop an empty analysis and
+    // hide a total feed failure; the existing timeout owns that case and
+    // says so in the log.
+    return any_priceable;
 }
 
 uint32_t MarketAnalyzer::blocks_collected(const std::string& pair_name) const noexcept {
     auto it = states_.find(pair_name);
     return (it != states_.end()) ? it->second.blocks_collected : 0u;
+}
+
+uint32_t MarketAnalyzer::poll_attempts(const std::string& pair_name) const noexcept {
+    auto it = states_.find(pair_name);
+    return (it != states_.end()) ? it->second.total_poll_attempts : 0u;
 }
 
 uint32_t MarketAnalyzer::analysis_blocks() const noexcept {
@@ -215,14 +279,37 @@ AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
 
     // Return the most conservative recommendation across all pairs.
     // Conservative(0) < Normal(1) < Aggressive(2) — lower is more conservative.
+    //
+    // [S23 2026-08-24] Structurally unpriced pairs do not vote.  Their
+    // summary is computed from zero observations and defaults to Normal,
+    // so leaving them in meant an unpriceable pair could veto an
+    // Aggressive consensus and move the applied spread multiplier from
+    // 0.8 to 1.0 -- a pair with NO data quietly setting policy for the
+    // pairs that have it.
+    //
+    // Uses has_no_observations(), NOT the is_structurally_unpriced() that
+    // completion uses.  The two DELIBERATELY differ: completion adds a
+    // `complete` guard so force_complete() can end the phase, but folding
+    // that guard in here would hand a zero-observation pair its vote back
+    // the moment the timeout fired -- on precisely the path where nobody
+    // has good data.  Having no observations is a property of the data;
+    // being complete is a statement about the phase.
     auto most_conservative = AnalysisAggressiveness::Aggressive;
+    bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
+        // has_no_observations, NOT is_structurally_unpriced: the vote must
+        // stay withdrawn after force_complete() too.
+        if (has_no_observations(ps)) continue;
+        any_priceable = true;
         const auto summary = compute_summary(ps);
         if (static_cast<uint8_t>(summary.aggressiveness) <
             static_cast<uint8_t>(most_conservative)) {
             most_conservative = summary.aggressiveness;
         }
     }
+    // Nothing priceable at all: fall back to Normal rather than inheriting
+    // the Aggressive seed above.
+    if (!any_priceable) return AnalysisAggressiveness::Normal;
     return most_conservative;
 }
 

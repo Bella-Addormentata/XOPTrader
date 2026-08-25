@@ -1413,6 +1413,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
                     pair.name,
                     summary.blocks_collected,
                     target,
+                    summary.complete,
                     summary.volatility_annual,
                     summary.mean_spread_bps,
                     summary.spread_cv,
@@ -1425,13 +1426,41 @@ asio::awaitable<void> Engine::run_startup_analysis()
         }
 
         // Log progress.
+        //
+        // [S23 2026-08-24] A pair that cannot be priced must not hold the
+        // whole phase at zero.
+        //
+        // This is the minimum across enabled pairs, so one pair stuck at 0
+        // pins the reported progress there however much data the others
+        // gather -- and since S20, a pair whose junk mid is correctly
+        // refused publishes NO mid, so MarketAnalyzer::ingest rejects
+        // every observation and its count never leaves 0.  Observed live
+        // on v0.9.21: BYC/wUSDC.b (crossed book, bid 373.97 / ask 0.95)
+        // held progress at 0/5 until the poll timeout force-completed the
+        // phase with partial data -- four minutes of every restart spent
+        // waiting, and regime detection started from almost nothing.
+        //
+        // Before S20 the junk mid WAS ingested, so the counter advanced on
+        // garbage.  Neither is right: a pair given its full share of polls
+        // that has produced nothing is structurally unpriced, and the
+        // other pairs should not wait on it.  Pairs that simply have not
+        // been polled yet still count, so genuine early progress is not
+        // skipped -- and if EVERY pair is unpriced the answer is 0, which
+        // keeps the phase waiting rather than completing on no data at all.
         const uint32_t min_collected = [&]() -> uint32_t {
             uint32_t m = target;
+            bool any_priceable = false;
             for (const auto& pair : config_.pairs) {
                 if (!pair.enabled) continue;
-                m = std::min(m, market_analyzer_->blocks_collected(pair.name));
+                const uint32_t got = market_analyzer_->blocks_collected(pair.name);
+                if (got == 0
+                    && market_analyzer_->poll_attempts(pair.name) >= target) {
+                    continue;   // structurally unpriced -- do not wait on it
+                }
+                any_priceable = true;
+                m = std::min(m, got);
             }
-            return m;
+            return any_priceable ? m : 0u;
         }();
         spdlog::info("[Engine] Analysis progress: {}/{} blocks", min_collected, target);
     }
@@ -1439,7 +1468,41 @@ asio::awaitable<void> Engine::run_startup_analysis()
     if (stop_requested_.load(std::memory_order_relaxed)) co_return;
 
     // Log the completed analysis summaries.
+    // [S23 2026-08-24] The phase is over however we reached here, so no
+    // pair may still be reported as analysing.  The loop can now exit while
+    // a structurally unpriced pair is still incomplete -- that is the point
+    // of the fix -- and leaving it that way kept the GUI on "Analyzing" for
+    // the life of a process that was already trading.  force_complete()
+    // only touches states that are not complete and logs each one, so this
+    // is idempotent after the timeout path already called it.
+    market_analyzer_->force_complete();
+
     auto summaries = market_analyzer_->get_summaries();
+
+    // [S23 2026-08-24] Re-export AFTER force-completion, or the flag never
+    // reaches telemetry.  update_analysis() is called inside the poll loop
+    // above, so the last export predates the completion just performed --
+    // an unpriced pair's Prometheus `complete` gauge would stay 0 and
+    // MetricsService.is_analysis_active() would keep the GUI on
+    // "Analyzing", exactly the symptom this was meant to cure.  Plumbing
+    // the parameter through is not enough if nothing publishes afterwards.
+    if (metrics_->is_running()) {
+        for (const auto& s : summaries) {
+            metrics_->update_analysis(
+                s.pair_name,
+                s.blocks_collected,
+                target,
+                s.complete,
+                s.volatility_annual,
+                s.mean_spread_bps,
+                s.spread_cv,
+                s.variance_ratio,
+                s.book_imbalance,
+                s.momentum,
+                static_cast<int>(s.regime),
+                static_cast<int>(s.aggressiveness));
+        }
+    }
     for (const auto& s : summaries) {
         spdlog::info("[Engine] Analysis complete for {}: "
                      "vol_ann={:.2f}% spread={:.1f}bps cv={:.2f} "

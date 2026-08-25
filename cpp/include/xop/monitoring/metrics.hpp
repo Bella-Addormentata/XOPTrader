@@ -234,6 +234,16 @@ public:
     /// @param pair_name         Trading pair label (e.g. "XCH/wUSDC").
     /// @param blocks_collected  Number of blocks observed so far.
     /// @param blocks_target     Total blocks in the analysis window.
+    /// @param complete          Whether the analysis PHASE has ended for
+    ///                          this pair -- NOT whether the observation
+    ///                          window filled.  A structurally unpriced
+    ///                          pair legitimately ends the phase with
+    ///                          blocks_collected == 0 (see
+    ///                          MarketAnalyzer::is_complete), so this is
+    ///                          passed through rather than re-derived from
+    ///                          the counts; re-deriving it kept the GUI
+    ///                          reporting the engine as analysing while it
+    ///                          was already trading.
     /// @param vol_annual        Annualised volatility (0–1 fraction).
     /// @param mean_spread_bps   Mean observed spread in bps.
     /// @param spread_cv         Spread coefficient of variation (σ/μ).
@@ -245,6 +255,7 @@ public:
     void update_analysis(const std::string& pair_name,
                          uint32_t blocks_collected,
                          uint32_t blocks_target,
+                         bool     complete,
                          double   vol_annual,
                          double   mean_spread_bps,
                          double   spread_cv,

@@ -449,3 +449,236 @@ TEST(MarketAnalyzerTest, NormalMarketConditionsIsNormal) {
 }
 
 }  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// [S23 2026-08-24] poll_attempts distinguishes "not polled yet" from "polled
+// and produced nothing".
+//
+// The engine's startup-analysis progress is the MINIMUM blocks_collected
+// across enabled pairs, so a pair that can never be priced pins it at zero.
+// Since S20 that is a normal state: a pair whose junk mid is refused
+// publishes no mid, ingest() rejects every observation, and the count stays
+// at 0 forever.  The engine needs to tell that apart from a pair that has
+// simply not had its turn yet, and poll_attempts is how.
+// ---------------------------------------------------------------------------
+TEST(MarketAnalyzerPollAttempts, CountsRejectedObservationsSeparately) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 5;
+    xop::MarketAnalyzer ma(cfg, {"BYC/wUSDC.b", "XCH/BYC"});
+
+    // Unknown pair: both zero.
+    EXPECT_EQ(ma.blocks_collected("XCH/NONE"), 0u);
+    EXPECT_EQ(ma.poll_attempts("XCH/NONE"), 0u);
+
+    // A pair that publishes no mid: polled repeatedly, collects nothing.
+    for (int i = 0; i < 6; ++i) {
+        ma.ingest("BYC/wUSDC.b", /*mid=*/0.0, /*spread=*/0.0, /*vol=*/0.0,
+                  /*bid_depth=*/0.0, /*ask_depth=*/0.0);
+    }
+    EXPECT_EQ(ma.blocks_collected("BYC/wUSDC.b"), 0u)
+        << "an unpriced observation must not count as collected";
+    EXPECT_GE(ma.poll_attempts("BYC/wUSDC.b"), 6u)
+        << "attempts must be tracked even when the observation is rejected";
+
+    // A healthy pair accumulates both.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+    }
+    EXPECT_EQ(ma.blocks_collected("XCH/BYC"), 3u);
+    EXPECT_GE(ma.poll_attempts("XCH/BYC"), 3u);
+}
+
+// ---------------------------------------------------------------------------
+// [S23 2026-08-24] is_complete() is the LOOP EXIT condition, so the unpriced
+// exclusion has to live here -- not only in the progress log.
+//
+// The first cut of this fix filtered only the logged minimum, which would
+// have reported "5/5" while the phase kept polling to its timeout: a log
+// that lies about the thing it reports. These pin the real behaviour.
+// ---------------------------------------------------------------------------
+TEST(MarketAnalyzerComplete, UnpricedPairDoesNotBlockCompletion) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+
+    // The unpriced pair is polled its full share and yields nothing.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    // The healthy pair fills its window.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+    }
+
+    EXPECT_TRUE(ma.is_complete())
+        << "a structurally unpriced pair held the analysis phase open, so "
+           "startup would burn the full timeout";
+}
+
+TEST(MarketAnalyzerComplete, NotYetPolledPairStillBlocks) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "XCH/DBX"});
+
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70, 250.0, 1000.0, 2.0, 2.0);
+    }
+    // XCH/DBX has had no polls at all -- genuinely early, must still block.
+    EXPECT_FALSE(ma.is_complete())
+        << "a pair that simply has not been polled yet must still be waited on";
+}
+
+TEST(MarketAnalyzerComplete, AllPairsUnpricedIsNotCompletion) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    EXPECT_FALSE(ma.is_complete())
+        << "declaring completion on zero observations would hand the trading "
+           "loop an empty analysis and hide a total feed failure";
+}
+
+// force_complete() must make is_complete() true, even when every pair
+// collected nothing.  It sets `complete` without touching the counters, so
+// an unpriced-pair skip that ignores `complete` would swallow those states
+// and leave is_complete() false forever -- breaking the contract the
+// timeout path depends on.
+TEST(MarketAnalyzerComplete, ForceCompleteHonouredForZeroObservationPairs) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    ASSERT_FALSE(ma.is_complete());
+
+    ma.force_complete();
+    EXPECT_TRUE(ma.is_complete())
+        << "force_complete() must satisfy is_complete() even with zero "
+           "observations on every pair";
+}
+
+// [S23 2026-08-24] A structurally unpriced pair must not vote on the
+// aggregate recommendation -- and the fixture must actually reach the
+// Aggressive case, or the test passes whether or not the vote is removed.
+//
+// recommend() returns Aggressive only when vol_annual < high_vol_threshold/2
+// (0.20), mean_spread_bps >= wide_spread_bps_threshold (80) and the regime
+// is MeanReverting.  The variance-ratio lag is 5, so a handful of constant
+// points can never leave Random -- an earlier version of this test used
+// three, sat at Normal for both fixtures, and would have passed with the
+// bug present.
+namespace {
+
+// Alternating micro-moves: mean-reverting, very low realised vol, and a
+// wide quoted spread -- the "quote tighter" case.
+void feed_aggressive(xop::MarketAnalyzer& ma, const std::string& pair, int n) {
+    for (int i = 0; i < n; ++i) {
+        const double mid = (i % 2 == 0) ? 1.7000 : 1.7002;
+        ma.ingest(pair, mid, /*spread_bps=*/150.0, /*vol=*/100000.0,
+                  /*bid_depth=*/50.0, /*ask_depth=*/50.0);
+    }
+}
+
+}  // namespace
+
+TEST(MarketAnalyzerComplete, UnpricedPairDoesNotVetoAggressiveConsensus) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 20;
+
+    // Baseline: the healthy pair ALONE must genuinely reach Aggressive,
+    // otherwise this test proves nothing.
+    xop::MarketAnalyzer solo(cfg, {"XCH/BYC"});
+    feed_aggressive(solo, "XCH/BYC", 20);
+    ASSERT_EQ(solo.overall_recommendation(),
+              xop::AnalysisAggressiveness::Aggressive)
+        << "fixture does not reach Aggressive -- the test cannot detect the veto";
+    ASSERT_DOUBLE_EQ(solo.recommended_spread_multiplier(), 0.8);
+
+    // Same healthy pair, plus one that is polled its share and yields
+    // nothing.  Its empty summary defaults to Normal and would veto.
+    xop::MarketAnalyzer mixed(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+    feed_aggressive(mixed, "XCH/BYC", 20);
+    for (int i = 0; i < 20; ++i) {
+        mixed.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+
+    EXPECT_EQ(mixed.overall_recommendation(),
+              xop::AnalysisAggressiveness::Aggressive)
+        << "an unpriceable pair vetoed the Aggressive consensus";
+    EXPECT_DOUBLE_EQ(mixed.recommended_spread_multiplier(), 0.8);
+}
+
+// The veto must stay withdrawn after force_complete(), which is the
+// timeout path -- exactly when nobody has good data and a zero-observation
+// pair would otherwise regain its vote.
+TEST(MarketAnalyzerComplete, UnpricedVoteStaysWithdrawnAfterForceComplete) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 20;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+    feed_aggressive(ma, "XCH/BYC", 20);
+    for (int i = 0; i < 20; ++i) {
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    ASSERT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 0.8);
+
+    ma.force_complete();
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 0.8)
+        << "force_complete() handed the zero-observation pair its vote back";
+}
+
+// With nothing priceable at all, fall back to Normal rather than inheriting
+// the Aggressive seed the scan starts from.
+TEST(MarketAnalyzerComplete, AllUnpricedFallsBackToNormal) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 1.0)
+        << "no data must not be read as licence to tighten spreads";
+}
+
+// [S23 2026-08-24] After the phase ends, telemetry must not still say
+// "analysing".
+//
+// The exported Prometheus `complete` flag used to be re-derived from
+// blocks_collected >= blocks_target.  A structurally unpriced pair
+// legitimately ends the phase with zero observations, so that derivation
+// pinned the flag at 0 forever and MetricsService.is_analysis_active() kept
+// the GUI on "Analyzing" while the engine was already trading.  The
+// analyzer's own `complete` is the authoritative signal; `window_filled`
+// stays available for callers that genuinely need "did it fill".
+TEST(MarketAnalyzerComplete, SummaryDistinguishesCompleteFromWindowFilled) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    ma.force_complete();   // what the engine now does at phase end
+
+    for (const auto& s : ma.get_summaries()) {
+        EXPECT_TRUE(s.complete)
+            << s.pair_name << " still reports incomplete after the phase "
+               "ended -- the GUI would stay on Analyzing";
+        if (s.pair_name == "BYC/wUSDC.b") {
+            EXPECT_EQ(s.blocks_collected, 0u)
+                << "blocks_collected must stay honest about having no data";
+            EXPECT_FALSE(s.window_filled)
+                << "an unpriced pair must not claim its window was filled";
+        } else {
+            EXPECT_TRUE(s.window_filled);
+        }
+    }
+}
