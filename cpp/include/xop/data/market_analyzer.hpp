@@ -280,10 +280,22 @@ public:
     /// in the Analyzing state.
     void force_complete();
 
-    /// Overall aggressiveness recommendation across all pairs.
-    /// Returns the most conservative recommendation among all pairs
-    /// (i.e. if any pair recommends Conservative, the overall is
+    /// Overall aggressiveness recommendation across the pairs that have
+    /// DATA.  Returns the most conservative recommendation among them
+    /// (i.e. if any such pair recommends Conservative, the overall is
     /// Conservative).  Returns Normal if no pairs are tracked.
+    ///
+    /// [S23 2026-08-24] Two exceptions callers must know about:
+    ///
+    ///   * A pair polled its full share that produced NO observations is
+    ///     EXCLUDED.  Its summary is computed from nothing and defaults to
+    ///     Normal, so including it let a pair with no data veto an
+    ///     Aggressive consensus and widen the applied spread multiplier
+    ///     for the pairs that do have data.  The exclusion holds after
+    ///     force_complete() as well -- see has_no_observations().
+    ///   * If EVERY pair is excluded the result is Normal, not the
+    ///     Aggressive value the scan seeds from: no data is not licence to
+    ///     tighten spreads.
     [[nodiscard]] AnalysisAggressiveness overall_recommendation() const;
 
     /// Spread multiplier derived from the overall aggressiveness

@@ -190,11 +190,14 @@ bool MarketAnalyzer::is_complete() const noexcept {
     // The distinction is between "not polled yet" (still counts, so early
     // progress is never skipped) and "polled repeatedly, produced nothing".
     // Only an INCOMPLETE state can be structurally unpriced.
-    // force_complete() sets `complete` without touching the counters, so a
-    // zero-observation pair keeps matching the test below -- and if every
-    // pair were zero-observation, skipping them all would leave
-    // any_priceable false and this function returning false even after a
-    // forced completion, breaking that method's contract.
+    // The `!ps.complete` term inside is_structurally_unpriced() is what
+    // makes force_complete() work.  That method sets `complete` without
+    // touching the counters, so WITHOUT that term a zero-observation pair
+    // would still match here; with every pair at zero observations --
+    // exactly what the analysis timeout produces -- all of them would be
+    // skipped, any_priceable would stay false, and this function would
+    // return false even after a forced completion, breaking that method's
+    // contract.  The guard is why that cannot happen.
     bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
         if (is_structurally_unpriced(ps)) {
