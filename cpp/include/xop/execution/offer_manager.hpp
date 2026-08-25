@@ -193,6 +193,24 @@ struct RebalanceSnapshot {
  *   6. Cancel stale offers (block-based TTL) or all offers on shutdown.
  *   7. Evaluate rebalancing triggers and return them to the engine.
  */
+/// [S25 2026-08-24] Verdict from OfferManager::recheck_terminal().
+enum class TerminalRecheck {
+    /// Wallet still reports CANCELLED/FAILED -- the buffered cancellation
+    /// may be written.
+    StillTerminal,
+    /// Wallet reports the offer live/pending again -- discard the
+    /// buffered write; reconciliation re-adopts it.
+    Revived,
+    /// Wallet reports CONFIRMED -- the observation was reorged into a
+    /// FILL.  recheck_terminal has put the offer back into State so
+    /// detect_fills() can record it; the caller must NOT write a
+    /// cancellation.
+    Confirmed,
+    /// Wallet unreachable or unparseable.  NOT a verdict: the caller
+    /// must retry rather than assume any of the above.
+    NoVerdict,
+};
+
 class OfferManager {
 public:
     /**
@@ -311,13 +329,21 @@ public:
     /// which means waiting out a confirmation depth proves nothing on its
     /// own.  This asks the wallet again at maturity.
     ///
-    /// @return true if the wallet still reports CANCELLED/FAILED; false if
-    ///         the offer is live again (the observation did not survive);
-    ///         nullopt if the wallet could not be reached, which is NOT a
-    ///         verdict -- the caller must retry rather than assume either
-    ///         way.
-    asio::awaitable<std::optional<bool>>
-    recheck_terminal(const std::string& trade_id);
+    /// CONFIRMED is reported separately from any other non-terminal
+    /// status, and is NOT merely "don't write the cancellation".  The
+    /// offer has left State, reconcile_offers() adopts only untracked
+    /// PENDING_ACCEPT records, and detect_fills() only inspects offers
+    /// still in State -- so nothing downstream would ever emit the fill.
+    /// On CONFIRMED this re-adopts the offer into State (the same
+    /// treatment reconcile_offers gives a confirmed offer it finds) so
+    /// the next detect_fills() records it through the normal path, with
+    /// settled amounts and fee capture intact.
+    ///
+    /// @param trade_id       Wallet trade id to re-query.
+    /// @param current_block  Height used when re-adopting a CONFIRMED
+    ///                       offer into State.
+    asio::awaitable<TerminalRecheck>
+    recheck_terminal(const std::string& trade_id, BlockHeight current_block);
 
     // -- Cancellation -------------------------------------------------------
 

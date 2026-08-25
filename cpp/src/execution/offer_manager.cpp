@@ -956,8 +956,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 // ---------------------------------------------------------------------------
 // [S25 2026-08-24] recheck_terminal
 // ---------------------------------------------------------------------------
-asio::awaitable<std::optional<bool>>
-OfferManager::recheck_terminal(const std::string& trade_id)
+asio::awaitable<TerminalRecheck>
+OfferManager::recheck_terminal(const std::string& trade_id,
+                               BlockHeight        current_block)
 {
     json rec;
     try {
@@ -968,26 +969,59 @@ OfferManager::recheck_terminal(const std::string& trade_id)
         logger_->warn("[S25] recheck_terminal: get_offer failed for {} -- "
                       "no verdict, caller retries: {}",
                       trade_id.substr(0, 12), e.what());
-        co_return std::nullopt;
+        co_return TerminalRecheck::NoVerdict;
     }
 
     if (!rec.contains("status")) {
         logger_->warn("[S25] recheck_terminal: wallet record for {} carries "
                       "no status field -- no verdict",
                       trade_id.substr(0, 12));
-        co_return std::nullopt;
+        co_return TerminalRecheck::NoVerdict;
     }
 
     const int status = trade_status::parse(rec["status"]);
-    const bool terminal = (status == trade_status::kCancelled
-                           || status == trade_status::kFailed);
-    if (!terminal) {
-        logger_->warn("[S25] recheck_terminal: {} was observed terminal but "
-                      "the wallet now reports status={} -- the observation "
-                      "did NOT survive; no cancellation will be written",
-                      trade_id.substr(0, 12), status);
+
+    if (status == trade_status::kCancelled || status == trade_status::kFailed) {
+        co_return TerminalRecheck::StillTerminal;
     }
-    co_return terminal;
+
+    if (status == trade_status::kConfirmed) {
+        // The terminal observation was reorged into a FILL.  Dropping the
+        // buffered write is not enough: detect_fills() only inspects
+        // offers still in State and the terminal branch already removed
+        // this one, while reconcile_offers() adopts untracked records only
+        // when they are PENDING_ACCEPT.  Left alone, the fill would be
+        // recorded nowhere -- an accounting loss, not a reporting one.
+        // Put it back so the normal path records it.
+        auto parsed = try_parse_wallet_offer(rec, current_block);
+        if (parsed) {
+            state_->upsert_offer(*parsed);
+            logger_->warn("[S25] recheck_terminal: {} was observed terminal "
+                          "but the wallet now reports CONFIRMED -- re-adopted "
+                          "into State ({} {} on {}) so detect_fills records "
+                          "the fill",
+                          trade_id.substr(0, 12),
+                          (parsed->side == Side::Bid) ? "BID" : "ASK",
+                          parsed->size, parsed->pair_name);
+        } else {
+            // Cannot rebuild the offer, so cannot hand it to detect_fills.
+            // Loud, because this is an unrecorded fill and no later pass
+            // will find it.
+            logger_->error("[S25] recheck_terminal: {} is CONFIRMED but its "
+                           "wallet record could not be parsed into a pending "
+                           "offer -- the fill CANNOT be re-adopted and will "
+                           "not be recorded; reconcile inventory for this "
+                           "trade by hand",
+                           trade_id.substr(0, 12));
+        }
+        co_return TerminalRecheck::Confirmed;
+    }
+
+    logger_->warn("[S25] recheck_terminal: {} was observed terminal but the "
+                  "wallet now reports status={} -- the observation did NOT "
+                  "survive; no cancellation will be written",
+                  trade_id.substr(0, 12), status);
+    co_return TerminalRecheck::Revived;
 }
 
 // ---------------------------------------------------------------------------

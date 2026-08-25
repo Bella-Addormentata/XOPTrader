@@ -1205,6 +1205,16 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                     // [S25] Buffer instead of writing: the
                                     // write is one-way and this path had no
                                     // confirmation gate at all.
+                                    //
+                                    // last_block_ is the only height this
+                                    // scope has.  Should it still be 0 the
+                                    // depth test passes at once and the
+                                    // entry matures on the next cycle --
+                                    // acceptable, because maturity only
+                                    // buys the right to ASK the wallet
+                                    // again, and that re-query, not the
+                                    // waiting, is what authorises the
+                                    // write.
                                     for (const auto& oid : fixed) {
                                         buffer_terminal_offer(
                                             oid,
@@ -2433,10 +2443,22 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 void Engine::buffer_terminal_offer(const std::string& offer_id,
                                    BlockHeight        observed_block)
 {
-    for (const auto& t : pending_unconfirmed_terminals_) {
-        if (t.offer_id == offer_id) {
-            return;
+    for (auto& t : pending_unconfirmed_terminals_) {
+        if (t.offer_id != offer_id) {
+            continue;
         }
+        // Already buffered.  Two discovery paths reporting the same offer
+        // in one cycle carry the SAME height and must not restart
+        // anything.  A LATER height is a different event -- the offer was
+        // revived and re-adopted before the first observation matured, and
+        // has now gone terminal again -- so the window restarts from it.
+        // Keeping the stale height would let that second cancellation be
+        // written before it had survived the depth at all.
+        if (observed_block > t.observed_block) {
+            t.observed_block   = observed_block;
+            t.recheck_failures = 0;
+        }
+        return;
     }
     pending_unconfirmed_terminals_.push_back({offer_id, observed_block, 0});
 }
@@ -2539,14 +2561,15 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
 
             // Re-verify against the wallet before the one-way write.
-            const std::optional<bool> still_terminal =
-                co_await offer_mgr_->recheck_terminal(t.offer_id);
+            const execution::TerminalRecheck verdict =
+                co_await offer_mgr_->recheck_terminal(t.offer_id,
+                                                      block_height);
 
-            if (!still_terminal.has_value()) {
-                // No verdict -- the wallet was unreachable.  Retry, but
-                // not forever: on exhaustion drop the entry, which leaves
-                // the row pending exactly as it is today rather than
-                // guessing at a write that cannot be undone.
+            if (verdict == execution::TerminalRecheck::NoVerdict) {
+                // The wallet was unreachable.  Retry, but not forever: on
+                // exhaustion drop the entry, which leaves the row pending
+                // exactly as it is today rather than guessing at a write
+                // that cannot be undone.
                 if (++t.recheck_failures >= kMaxTerminalRechecks) {
                     spdlog::warn("[Engine] Step 2: gave up re-verifying "
                                  "terminal offer {} after {} attempts -- "
@@ -2560,9 +2583,17 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 continue;
             }
 
-            if (!*still_terminal) {
-                // The offer is alive again; recheck_terminal has logged
-                // it.  Nothing to persist -- reconciliation re-adopts it.
+            if (verdict == execution::TerminalRecheck::Revived) {
+                // Alive again; recheck_terminal has logged it.  Nothing to
+                // persist -- reconciliation re-adopts it.
+                continue;
+            }
+
+            if (verdict == execution::TerminalRecheck::Confirmed) {
+                // Reorged into a fill.  recheck_terminal put the offer back
+                // into State, so the next detect_fills() records it through
+                // the normal path.  Writing "cancelled" here would race
+                // that and lose the fill.
                 continue;
             }
 
@@ -2571,18 +2602,21 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                     t.offer_id, "cancelled",
                     static_cast<BlockHeight>(block_height),
                     "wallet reported terminal");
+            } catch (const OfferNotFound& nf) {
+                // Genuinely unknown offer: nothing to update, ever.  This
+                // is a TYPED exception rather than a message match --
+                // update_offer_status used to raise the same "no offer
+                // found" text for a busy or broken database, so matching
+                // on it discarded exactly the transient failures the
+                // buffer exists to retry.
+                spdlog::debug("[Engine] Step 2: terminal offer {} has no "
+                              "offer_log row -- not ours to resolve ({})",
+                              t.offer_id.substr(0, 12), nf.what());
             } catch (const std::exception& ex) {
-                const std::string what = ex.what();
-                if (what.find("no offer found") != std::string::npos) {
-                    spdlog::debug("[Engine] Step 2: terminal offer {} has no "
-                                  "offer_log row -- not ours to resolve",
-                                  t.offer_id.substr(0, 12));
-                } else {
-                    spdlog::warn("[Engine] Step 2: could not persist terminal "
-                                 "status for {} ({}) -- retrying next cycle",
-                                 t.offer_id.substr(0, 12), what);
-                    terminal_still_pending.push_back(std::move(t));
-                }
+                spdlog::warn("[Engine] Step 2: could not persist terminal "
+                             "status for {} ({}) -- retrying next cycle",
+                             t.offer_id.substr(0, 12), ex.what());
+                terminal_still_pending.push_back(std::move(t));
             }
         }
         pending_unconfirmed_terminals_ = std::move(terminal_still_pending);

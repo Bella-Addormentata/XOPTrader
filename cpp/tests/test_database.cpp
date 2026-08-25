@@ -672,14 +672,35 @@ TEST(DatabaseTest, RepeatedTerminalObservationIsIdempotent)
 // An offer this process never logged must not abort the heartbeat.  The
 // engine catches the throw; this pins that the throw is what happens, so a
 // future change to either side cannot silently drop the guard.
-TEST(DatabaseTest, TerminalStatusForUnknownOfferThrows)
+//
+// [S25 2026-08-24] It must throw the TYPED OfferNotFound, not a bare
+// runtime_error.  The engine discards a buffered terminal observation on
+// this exception and RETRIES on any other, so the two cases have to be
+// distinguishable by type.  They were not: the throw site raised the same
+// "no offer found" text for every sqlite3_step result other than
+// SQLITE_ROW, SQLITE_BUSY included, so a caller matching the message threw
+// away transient failures as though the offer were unknown.
+TEST(DatabaseTest, TerminalStatusForUnknownOfferThrowsOfferNotFound)
 {
     TempDbPath temp_db{"xop_s25_unknown"};
     xop::Database db(temp_db.path().string());
     EXPECT_THROW(
         db.update_offer_status("offer-never-logged", "cancelled", 1, "x"),
-        std::exception)
-        << "the engine relies on this throwing to skip unknown offers";
+        xop::OfferNotFound)
+        << "the engine relies on this specific type to tell an unknown "
+           "offer apart from a database that is merely busy";
+}
+
+// OfferNotFound must remain catchable as a std::exception: the heartbeat's
+// outer handlers catch by that base, and a type that escaped them would
+// abort the cycle instead of skipping one offer.
+TEST(DatabaseTest, OfferNotFoundIsAStdException)
+{
+    TempDbPath temp_db{"xop_s25_unknown_base"};
+    xop::Database db(temp_db.path().string());
+    EXPECT_THROW(
+        db.update_offer_status("offer-never-logged", "cancelled", 1, "x"),
+        std::exception);
 }
 
 // [S25 2026-08-24] A cancelled row is NOT reopened by a later non-fill

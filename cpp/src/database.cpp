@@ -660,10 +660,26 @@ void Database::update_offer_status(const std::string& offer_id,
 
     int rc = sqlite3_step(stmt_query_offer_status_);
     if (rc != SQLITE_ROW) {
+        // [S25 2026-08-24] SQLITE_DONE means the query ran and matched
+        // nothing -- the offer is genuinely unknown, and a caller may drop
+        // it.  Every OTHER code is a database fault (SQLITE_BUSY, I/O
+        // errors), which must be retried.  This site used to raise the
+        // same "no offer found" message for all of them, so a caller
+        // could not tell the permanent case from the transient one and
+        // would discard work on a busy database.
+        const int         step_rc = rc;
+        const std::string db_error =
+            db_ ? sqlite3_errmsg(db_) : "no database handle";
         sqlite3_reset(stmt_query_offer_status_);
         sqlite3_clear_bindings(stmt_query_offer_status_);
+        if (step_rc == SQLITE_DONE) {
+            throw OfferNotFound(
+                "[Database] update_offer_status: no offer found with id '"
+                + offer_id + "'");
+        }
         throw std::runtime_error(
-            "[Database] update_offer_status: no offer found with id '" + offer_id + "'");
+            "[Database] update_offer_status: step failed for id '" + offer_id
+            + "': rc=" + std::to_string(step_rc) + " (" + db_error + ")");
     }
 
     const char* pair_name_text = reinterpret_cast<const char*>(
