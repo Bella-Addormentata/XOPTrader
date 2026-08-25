@@ -193,6 +193,28 @@ struct RebalanceSnapshot {
  *   6. Cancel stale offers (block-based TTL) or all offers on shutdown.
  *   7. Evaluate rebalancing triggers and return them to the engine.
  */
+/// [S25 2026-08-24] Verdict from OfferManager::recheck_terminal().
+enum class TerminalRecheck {
+    /// Wallet still reports CANCELLED/FAILED -- the buffered cancellation
+    /// may be written.
+    StillTerminal,
+    /// Wallet reports a recognised PENDING state again.  The offer has
+    /// been re-adopted into State by recheck_terminal; discard the
+    /// buffered write.
+    Revived,
+    /// Wallet reports CONFIRMED -- the observation was reorged into a
+    /// FILL.  recheck_terminal has put the offer back into State so
+    /// detect_fills() can record it; the caller must NOT write a
+    /// cancellation.
+    Confirmed,
+    /// Wallet unreachable, or its status is one this build does not
+    /// recognise.  NOT a verdict: the caller must retry rather than
+    /// assume any of the above.  An unknown code is specifically NOT
+    /// treated as "live" -- that would discard a one-way cancellation on
+    /// no evidence.
+    NoVerdict,
+};
+
 class OfferManager {
 public:
     /**
@@ -283,6 +305,52 @@ public:
      */
     asio::awaitable<std::vector<Fill>> detect_fills(
         BlockHeight current_block = 0);
+
+    /// [S25 2026-08-24] Offers observed TERMINAL (cancelled or failed) by
+    /// the most recent detect_fills() call, in wallet trade-id form.
+    ///
+    /// detect_fills already discovers these -- it must, to stop tracking
+    /// them -- but it only RETURNS fills, so the discovery died in memory.
+    /// OfferManager has no database handle by design, and the engine is
+    /// what persists offer outcomes (it writes "filled" from the returned
+    /// fills), so the terminal set is surfaced the same way rather than
+    /// reaching for a db_ here.
+    ///
+    /// Cleared at the start of every detect_fills(), so it describes that
+    /// call only.  Without this the offer_log row stayed 'pending'
+    /// forever: 48 rows had accumulated by 2026-08-24, the oldest 17 days
+    /// old, each re-detected and re-discarded on every process start.
+    [[nodiscard]] const std::vector<std::string>& last_terminal_offers() const noexcept {
+        return last_terminal_offers_;
+    }
+
+    /// [S25 2026-08-24] Re-query the wallet about an offer previously
+    /// observed terminal, so a deferred "cancelled" write can be checked
+    /// rather than merely delayed.
+    ///
+    /// detect_fills() calls remove_offer() the moment it sees a terminal
+    /// status, so the offer leaves State and is never polled again --
+    /// which means waiting out a confirmation depth proves nothing on its
+    /// own.  This asks the wallet again at maturity.
+    ///
+    /// Every non-terminal answer re-adopts the offer into State, because
+    /// declining to write the cancellation is only half an answer: the
+    /// offer has left State, reconcile_offers() adopts untracked records
+    /// only when they are PENDING_ACCEPT, and it does not run at all when
+    /// reconciliation is disabled or Step 8 is gated.  Without re-adoption
+    /// a PENDING_CONFIRM or PENDING_CANCEL offer would go unmanaged and a
+    /// later fill would be missed.
+    ///
+    /// CONFIRMED is still reported separately, because there re-adoption
+    /// is what makes a FILL recordable at all -- detect_fills() only
+    /// inspects offers still in State -- and it goes through the normal
+    /// path with settled amounts and fee capture intact.
+    ///
+    /// @param trade_id       Wallet trade id to re-query.
+    /// @param current_block  Height used when re-adopting a CONFIRMED
+    ///                       offer into State.
+    asio::awaitable<TerminalRecheck>
+    recheck_terminal(const std::string& trade_id, BlockHeight current_block);
 
     // -- Cancellation -------------------------------------------------------
 
@@ -694,6 +762,10 @@ public:
         bool bids_buy_xch, bool asks_buy_xch);
 
 private:
+    /// [S25 2026-08-24] Trade ids observed terminal by the most recent
+    /// detect_fills().  See last_terminal_offers().
+    std::vector<std::string> last_terminal_offers_;
+
     /// Probe-only admission mirror of xch_ledger_admits, run against a
     /// COPY of the cycle ledger by the ladder preflight: same charges,
     /// no logging, no flag side effects.

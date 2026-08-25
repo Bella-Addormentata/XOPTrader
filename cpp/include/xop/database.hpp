@@ -42,6 +42,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <stdexcept>
 
 // Forward-declare the opaque sqlite3 handles to avoid pulling the full
 // SQLite amalgamation header into every translation unit.
@@ -293,6 +294,20 @@ struct DbTakerFill {
 //   All methods throw std::runtime_error on SQLite failures.  The caller
 //   (engine) decides whether to retry, log, or abort.
 // ---------------------------------------------------------------------------
+
+/// [S25 2026-08-24] Thrown by update_offer_status() when offer_log holds
+/// no row with the given id.
+///
+/// Distinct from a database *failure* on purpose.  The single throw site
+/// used to raise a plain runtime_error carrying "no offer found" for every
+/// sqlite3_step result other than SQLITE_ROW -- SQLITE_BUSY and I/O errors
+/// included -- so a caller string-matching that message would discard a
+/// transient fault as if the offer did not exist.  An unknown offer is
+/// permanent and can be dropped; a busy database must be retried.
+class OfferNotFound : public std::runtime_error {
+public:
+    using std::runtime_error::runtime_error;
+};
 
 class Database {
 public:

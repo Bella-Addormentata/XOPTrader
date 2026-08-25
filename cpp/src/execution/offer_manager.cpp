@@ -39,6 +39,12 @@ namespace xop::execution {
 // ---------------------------------------------------------------------------
 namespace trade_status {
     constexpr int kPendingAccept    = 0;
+    // [S25 2026-08-24] 1 and 2 had no names because nothing needed to
+    // distinguish them from "not terminal".  recheck_terminal does: a
+    // recognised pending state is evidence the offer is live, whereas an
+    // unrecognised code (parse returns -1) is no evidence at all.
+    constexpr int kPendingConfirm   = 1;
+    constexpr int kPendingCancel    = 2;
     constexpr int kCancelled        = 3;
     constexpr int kConfirmed        = 4;
     constexpr int kFailed           = 5;
@@ -631,6 +637,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 {
     std::vector<Fill> fills;
 
+    // [S25] Describes THIS call only; the engine drains it after we return.
+    last_terminal_offers_.clear();
+
     // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
     // invocation -- the backoff schedule below is phased on it.
     ++fill_poll_heartbeat_;
@@ -922,6 +931,19 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     logger_->info("Offer {} removed (status={})",
                                   trade_id.substr(0, 12), status);
                 }
+
+                // [S25 2026-08-24] Report it, so the outcome is PERSISTED.
+                //
+                // Removing from State ends the tracking but writes nothing
+                // down, and this class holds no database handle by design
+                // -- the engine persists offer outcomes.  Recording the id
+                // here lets it write "cancelled" exactly as it writes
+                // "filled" from the returned fills.  Reported even when the
+                // state entry was already gone: the DB row can still be
+                // stale from an earlier process that saw the same terminal
+                // status and dropped it, which is how 48 rows reached 17
+                // days old.
+                last_terminal_offers_.push_back(trade_id);
             }
             // Status PENDING_ACCEPT / PENDING_CONFIRM: still alive, no action.
     }
@@ -929,8 +951,146 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
     if (!fills.empty()) {
         logger_->info("detect_fills: {} new fills detected", fills.size());
     }
+    if (!last_terminal_offers_.empty()) {
+        logger_->info("detect_fills: {} offer(s) observed terminal",
+                      last_terminal_offers_.size());
+    }
 
     co_return fills;
+}
+
+// ---------------------------------------------------------------------------
+// [S25 2026-08-24] recheck_terminal
+// ---------------------------------------------------------------------------
+asio::awaitable<TerminalRecheck>
+OfferManager::recheck_terminal(const std::string& trade_id,
+                               BlockHeight        current_block)
+{
+    json rec;
+    try {
+        rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
+    } catch (const std::exception& e) {
+        // Unreachable wallet is not evidence either way.  Say so and let
+        // the caller keep the entry buffered.
+        logger_->warn("[S25] recheck_terminal: get_offer failed for {} -- "
+                      "no verdict, caller retries: {}",
+                      trade_id.substr(0, 12), e.what());
+        co_return TerminalRecheck::NoVerdict;
+    }
+
+    if (!rec.contains("status")) {
+        logger_->warn("[S25] recheck_terminal: wallet record for {} carries "
+                      "no status field -- no verdict",
+                      trade_id.substr(0, 12));
+        co_return TerminalRecheck::NoVerdict;
+    }
+
+    const int status = trade_status::parse(rec["status"]);
+
+    if (status == trade_status::kCancelled || status == trade_status::kFailed) {
+        co_return TerminalRecheck::StillTerminal;
+    }
+
+    // Anything below means the offer is NOT over, and the offer is no
+    // longer in State -- detect_fills() calls remove_offer() the moment it
+    // sees a terminal status.  Declining to write the cancellation is
+    // therefore only half an answer: nothing else puts the offer back.
+    // reconcile_offers() adopts untracked records only when they are
+    // PENDING_ACCEPT, and it does not run at all when reconciliation is
+    // disabled or Step 8 is gated, so PENDING_CONFIRM and PENDING_CANCEL
+    // would never be restored and a later fill would be missed.  Re-adopt
+    // here, for every live status.
+    const auto readopt = [&](const char* why) {
+        // Never overwrite a live entry.  Something else may have taken the
+        // offer back under management while this observation sat buffered
+        // -- reconciliation's reverse adoption, or a restart -- and that
+        // entry carries state this record does not: cancel_pending, tier,
+        // the original post price.  Clobbering it would make cancel_stale
+        // pay a second cancellation fee on an offer it has already
+        // cancelled.
+        if (!state_->get_offer(trade_id).offer_id.empty()) {
+            logger_->info("[S25] recheck_terminal: {} reports {} and is "
+                          "already tracked in State -- leaving the live "
+                          "entry alone",
+                          trade_id.substr(0, 12), why);
+            return true;
+        }
+        auto parsed = try_parse_wallet_offer(rec, current_block);
+        if (parsed) {
+            state_->upsert_offer(*parsed);
+            logger_->warn("[S25] recheck_terminal: {} was observed terminal "
+                          "but the wallet now reports {} -- re-adopted into "
+                          "State ({} {} on {})",
+                          trade_id.substr(0, 12), why,
+                          (parsed->side == Side::Bid) ? "BID" : "ASK",
+                          parsed->size, parsed->pair_name);
+            return true;
+        }
+        // Unparseable record.  Adopt with minimal metadata anyway, the
+        // same fallback reconcile_offers uses: an untracked live offer
+        // holds its coins locked invisibly, and cancel_stale or UTXO
+        // liberation can still free them once the id is tracked.
+        PendingOffer po;
+        po.offer_id         = trade_id;
+        po.pair_name        = "UNKNOWN";
+        po.side             = Side::Bid;
+        po.price            = 0;
+        po.size             = 0;
+        po.tier             = 0;
+        po.fee_mojos        = 0;
+        po.created_at_block = 0;
+        state_->upsert_offer(po);
+        logger_->warn("[S25] recheck_terminal: {} reports {} but its wallet "
+                      "record could not be parsed -- adopted with minimal "
+                      "metadata to prevent a coin-lock deadlock",
+                      trade_id.substr(0, 12), why);
+        return false;
+    };
+
+    if (status == trade_status::kConfirmed) {
+        // The terminal observation was reorged into a FILL.  Re-adoption
+        // is what makes the fill recordable: detect_fills() only inspects
+        // offers still in State, so without this the fill would be
+        // recorded nowhere -- an accounting loss, not a reporting one.
+        if (!readopt("CONFIRMED")) {
+            // Minimal metadata cannot carry a fill: pair, side, price and
+            // size are all unknown, so detect_fills has nothing to record
+            // against.  Loud, because no later pass will find it.
+            logger_->error("[S25] recheck_terminal: {} is CONFIRMED but "
+                           "unparseable -- the FILL cannot be reconstructed "
+                           "and will not be recorded; reconcile inventory "
+                           "for this trade by hand",
+                           trade_id.substr(0, 12));
+        }
+        co_return TerminalRecheck::Confirmed;
+    }
+
+    if (status == trade_status::kPendingAccept
+        || status == trade_status::kPendingConfirm
+        || status == trade_status::kPendingCancel) {
+        readopt("a pending status");
+        if (status == trade_status::kPendingCancel) {
+            // The wallet is already cancelling this offer.  A re-adopted
+            // entry defaults to cancel_pending=false, and Step 8 would
+            // read that as "cancellable" and submit a SECOND secure
+            // cancellation, paying a second fee for a cancellation
+            // already in flight.  Applied after readopt so it covers the
+            // parsed entry, the minimal-metadata fallback, and the
+            // already-tracked case alike -- mark_cancel_pending only sets
+            // the flag on whatever entry is in State.
+            state_->mark_cancel_pending(trade_id);
+        }
+        co_return TerminalRecheck::Revived;
+    }
+
+    // Unrecognised code (trade_status::parse yields -1 for anything it does
+    // not know).  This is NOT evidence the offer is live, and treating it
+    // as such would discard a one-way cancellation on the strength of a
+    // string nobody has seen before.  No verdict: keep it buffered.
+    logger_->warn("[S25] recheck_terminal: wallet reports unrecognised "
+                  "status {} for {} -- no verdict, caller retries",
+                  status, trade_id.substr(0, 12));
+    co_return TerminalRecheck::NoVerdict;
 }
 
 // ---------------------------------------------------------------------------

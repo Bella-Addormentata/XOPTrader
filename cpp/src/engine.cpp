@@ -1202,15 +1202,22 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                     spdlog::info("[Engine] Post-reconnect offer "
                                                  "reconciliation corrected {} "
                                                  "discrepancies", fixed.size());
+                                    // [S25] Buffer instead of writing: the
+                                    // write is one-way and this path had no
+                                    // confirmation gate at all.
+                                    //
+                                    // last_block_ is the only height this
+                                    // scope has, and it can still be 0 here.
+                                    // The drain anchors a zero to the first
+                                    // real height it sees rather than
+                                    // treating it as infinitely old, so the
+                                    // entry still serves a full
+                                    // confirmation window.
                                     for (const auto& oid : fixed) {
-                                        try {
-                                            db_->update_offer_status(oid, "cancelled", 0,
-                                                                    "reconnect_reconcile");
-                                        } catch (const std::exception& e) {
-                                            spdlog::debug("[Engine] reconnect update_offer_status "
-                                                         "failed for {}: {}",
-                                                         oid.substr(0, 12), e.what());
-                                        }
+                                        buffer_terminal_offer(
+                                            oid,
+                                            last_block_.load(
+                                                std::memory_order_relaxed));
                                     }
                                 }
                             } catch (const std::exception& re) {
@@ -2487,12 +2494,67 @@ asio::awaitable<void> Engine::step_update_market_state(BlockHeight block_height)
 // co_awaits detect_fills() directly instead of co_spawn(use_future).get().
 // [T2-17] Checks record_sell() return value for no-loss rejection.
 // [T3-08] Feeds NHE accumulators with fill data for Step 10.
+// [S25 2026-08-24] Single entry point for "the wallet says this offer is
+// over".  Both detect_fills() and reconcile_offers() discover terminal
+// offers, and the periodic and post-reconnect reconcile callers used to
+// stamp "cancelled" into offer_log the moment they did -- an immediate,
+// irreversible write on a path that bypassed every guard below.  A backed
+// -off offer reaches reconciliation before detect_fills polls it, so that
+// was not a rare corner.  Everything now funnels through this buffer.
+void Engine::buffer_terminal_offer(const std::string& offer_id,
+                                   BlockHeight        observed_block)
+{
+    for (auto& t : pending_unconfirmed_terminals_) {
+        if (t.offer_id != offer_id) {
+            continue;
+        }
+        // Already buffered.  Two discovery paths reporting the same offer
+        // in one cycle carry the SAME height and must not restart
+        // anything.  A LATER height is a different event -- the offer was
+        // revived and re-adopted before the first observation matured, and
+        // has now gone terminal again -- so the window restarts from it.
+        // Keeping the stale height would let that second cancellation be
+        // written before it had survived the depth at all.
+        if (observed_block > t.observed_block) {
+            t.observed_block   = observed_block;
+            t.recheck_failures = 0;
+            t.persist_failures = 0;
+        }
+        return;
+    }
+    pending_unconfirmed_terminals_.push_back({offer_id, observed_block, 0, 0});
+}
+
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
 {
     // [T1-03] co_await the fill-detection coroutine directly.
     // [WALLET-LOAD 2026-08-04] Passes the block height for the fill-poll
     // age gate (a just-posted offer cannot have settled).
     auto new_fills = co_await offer_mgr_->detect_fills(block_height);
+
+    // [S25 2026-08-24] Persist offers the wallet reports TERMINAL.
+    //
+    // detect_fills discovers cancelled/failed offers -- it must, to stop
+    // tracking them -- but until now only removed them from State, so the
+    // offer_log row stayed 'pending' forever.  48 rows had accumulated by
+    // 2026-08-24, the oldest 17 days, one re-detected on all twelve
+    // process starts since 08-18 and re-forgotten each time.  The GUI
+    // reads offer_log, so an offer cancelled on dexie kept showing here as
+    // pending.
+    //
+    // Buffered to confirmation depth, exactly like fills below.  An
+    // earlier revision of this change wrote immediately, reasoning that a
+    // cancellation carries no reorg risk because a revived offer would be
+    // re-reported live.  That was wrong: update_offer_status reopens a
+    // terminal row only for a FILL (the !is_terminal_status guard), so
+    // once "cancelled" is written a reorg-revived offer can never return
+    // to pending -- reconciliation's reinsert hits the unique offer_id,
+    // the row stays cancelled, and the next restart sees an unknown
+    // orphan.  The write is one-way, so it waits for the same depth a
+    // fill does.
+    for (const auto& tid : offer_mgr_->last_terminal_offers()) {
+        buffer_terminal_offer(tid, block_height);
+    }
 
     // [T4-02] Reorg protection: confirmation depth gating.
     // Newly detected fills are buffered in pending_unconfirmed_fills_ and
@@ -2528,6 +2590,204 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         spdlog::debug("[Engine] Step 2: {} fills awaiting confirmation "
                       "(depth requirement: {} blocks)",
                       pending_unconfirmed_fills_.size(), conf_depth);
+    }
+
+    // [S25] An offer that produced a FILL is not a cancellation, whatever
+    // was observed earlier.  Drop any buffered terminal entry for it before
+    // the drain below, because a stale entry is not merely useless here --
+    // it is actively dangerous.  At maturity recheck_terminal would find
+    // the wallet reporting CONFIRMED and re-adopt the offer into State, and
+    // the next detect_fills would emit a SECOND Fill for the same trade id.
+    // pnl_->record_fill rejects the duplicate journal entry, but the
+    // inventory mutation and persist_inventory_state() below run BEFORE the
+    // !fill_newly_recorded guard, so the position would be double-counted
+    // and durably written.  The window is real: reconciliation can re-adopt
+    // a buffered offer (it knows nothing of this buffer, which lives here in
+    // Engine) and the offer can then settle normally, all before the entry
+    // matures.
+    if (!pending_unconfirmed_terminals_.empty()) {
+        const auto is_a_fill = [&](const std::string& id) {
+            for (const auto& f : confirmed_fills) {
+                if (f.offer_id == id) return true;
+            }
+            for (const auto& f : pending_unconfirmed_fills_) {
+                if (f.offer_id == id) return true;
+            }
+            return false;
+        };
+        const std::size_t before = pending_unconfirmed_terminals_.size();
+        pending_unconfirmed_terminals_.erase(
+            std::remove_if(pending_unconfirmed_terminals_.begin(),
+                           pending_unconfirmed_terminals_.end(),
+                           [&](const PendingTerminal& t) {
+                               return is_a_fill(t.offer_id);
+                           }),
+            pending_unconfirmed_terminals_.end());
+        const std::size_t dropped =
+            before - pending_unconfirmed_terminals_.size();
+        if (dropped > 0) {
+            spdlog::info("[Engine] Step 2: dropped {} buffered terminal "
+                         "observation(s) that resolved as fills instead",
+                         dropped);
+        }
+    }
+
+    // [S25] Same partition for terminal offers -- but depth ALONE proves
+    // nothing, because detect_fills calls remove_offer() the instant it
+    // resolves an offer, terminal or filled alike.  Nothing re-polls
+    // either kind once buffered, so waiting is just a timer: when it
+    // expired we would write "cancelled" even if a reorg had put the offer
+    // back on the book.  Maturity here therefore triggers a fresh wallet
+    // query, and only an answer that is STILL terminal is written.
+    //
+    // (An earlier version of this comment claimed a buffered FILL is
+    // re-polled every cycle and so accumulates evidence while it waits.
+    // It is not -- the fill branch removes it from State too.  What the
+    // depth buys a fill is settling time before the write, not repeated
+    // confirmation, and the same is true here; the wallet re-query is what
+    // supplies the evidence.)
+    //
+    // A transient failure KEEPS the entry rather than dropping it:
+    // detect_fills has already removed the offer from State and clears its
+    // terminal list every call, so swallowing a SQLite busy or I/O error
+    // would strand the row as pending until some future restart happened
+    // to re-observe it -- the very accumulation this change exists to
+    // stop.  Only the explicit not-found case is discarded, because an
+    // offer this process never logged has no row to update and never will.
+    {
+        std::vector<PendingTerminal> terminal_still_pending;
+        terminal_still_pending.reserve(pending_unconfirmed_terminals_.size());
+        for (auto& t : pending_unconfirmed_terminals_) {
+            // A zero height means the observation came from the
+            // post-reconnect path before last_block_ had been set.  Treated
+            // as a real height it is infinitely old, so the entry would
+            // mature on its first heartbeat and skip the confirmation
+            // window outright.  An earlier revision of this change argued
+            // that was acceptable because the wallet re-query is the real
+            // gate -- but the depth is what lets the chain SETTLE before we
+            // ask, so re-querying immediately can still read a terminal
+            // state a reorg is about to undo.  Adopt the first real height
+            // instead and serve the full window from there.
+            if (t.observed_block == 0 && block_height > 0) {
+                t.observed_block = block_height;
+                spdlog::debug("[Engine] Step 2: terminal offer {} had no "
+                              "observation height -- anchoring its "
+                              "confirmation window at block {}",
+                              t.offer_id.substr(0, 12), block_height);
+            }
+
+            const bool matured =
+                conf_depth == 0
+                || (block_height >= t.observed_block
+                    && block_height - t.observed_block >= conf_depth);
+            if (!matured) {
+                terminal_still_pending.push_back(std::move(t));
+                continue;
+            }
+
+            // Tracked in State again means some other path (reconcile's
+            // reverse adoption, a restart's startup_reconcile) has taken
+            // the offer back under management.  There is nothing stale to
+            // resolve, and re-verifying could only clobber the live entry
+            // or resurrect a fill that is already being handled.
+            if (!state_->get_offer(t.offer_id).offer_id.empty()) {
+                spdlog::info("[Engine] Step 2: buffered terminal offer {} is "
+                             "tracked in State again -- dropping the buffered "
+                             "cancellation, it is under management",
+                             t.offer_id.substr(0, 12));
+                continue;
+            }
+
+            // Re-verify against the wallet before the one-way write.
+            const execution::TerminalRecheck verdict =
+                co_await offer_mgr_->recheck_terminal(t.offer_id,
+                                                      block_height);
+
+            if (verdict == execution::TerminalRecheck::NoVerdict) {
+                // The wallet was unreachable.  Retry, but not forever: on
+                // exhaustion drop the entry, which leaves the row pending
+                // exactly as it is today rather than guessing at a write
+                // that cannot be undone.
+                if (++t.recheck_failures >= kMaxTerminalRechecks) {
+                    spdlog::warn("[Engine] Step 2: gave up re-verifying "
+                                 "terminal offer {} after {} attempts -- "
+                                 "leaving its row pending for a later "
+                                 "process to resolve",
+                                 t.offer_id.substr(0, 12),
+                                 kMaxTerminalRechecks);
+                    continue;
+                }
+                terminal_still_pending.push_back(std::move(t));
+                continue;
+            }
+
+            if (verdict == execution::TerminalRecheck::Revived) {
+                // Alive again, and recheck_terminal has already put it back
+                // into State -- reconciliation could not be relied on to,
+                // since it adopts only PENDING_ACCEPT and may not run at
+                // all.  Nothing to persist.
+                continue;
+            }
+
+            // A real answer arrived, so the no-verdict streak is over.
+            // recheck_failures is documented and logged as CONSECUTIVE; if
+            // a StillTerminal answer whose write then fails left the count
+            // standing, intermittent wallet trouble would accumulate across
+            // successful responses and eventually discard an entry that had
+            // never failed ten times in a row.
+            t.recheck_failures = 0;
+
+            if (verdict == execution::TerminalRecheck::Confirmed) {
+                // Reorged into a fill.  recheck_terminal put the offer back
+                // into State, so the next detect_fills() records it through
+                // the normal path.  Writing "cancelled" here would race
+                // that and lose the fill.
+                continue;
+            }
+
+            try {
+                // resolved_block is the height at which the status
+                // CHANGED, and the GUI derives offer lifetime from it.
+                // Writing the maturity height instead would report every
+                // externally terminated offer as resolving conf_depth
+                // blocks later than it did, growing every such offer's
+                // apparent lifetime by the confirmation window.
+                db_->update_offer_status(
+                    t.offer_id, "cancelled",
+                    static_cast<BlockHeight>(t.observed_block),
+                    "wallet reported terminal");
+            } catch (const OfferNotFound& nf) {
+                // Genuinely unknown offer: nothing to update, ever.  This
+                // is a TYPED exception rather than a message match --
+                // update_offer_status used to raise the same "no offer
+                // found" text for a busy or broken database, so matching
+                // on it discarded exactly the transient failures the
+                // buffer exists to retry.
+                spdlog::debug("[Engine] Step 2: terminal offer {} has no "
+                              "offer_log row -- not ours to resolve ({})",
+                              t.offer_id.substr(0, 12), nf.what());
+            } catch (const std::exception& ex) {
+                // Retry, but bounded.  A transient fault clears in a cycle
+                // or two; a permanent one (disk full, corrupt file) would
+                // otherwise re-verify and re-fail every block forever, and
+                // each of those retries spends a wallet get_offer RPC on an
+                // entry that cannot be written.
+                if (++t.persist_failures >= kMaxTerminalPersistFailures) {
+                    spdlog::error("[Engine] Step 2: giving up on terminal "
+                                  "status for {} after {} write failures "
+                                  "({}) -- its row stays pending; the "
+                                  "DATABASE is the problem, not the offer",
+                                  t.offer_id.substr(0, 12),
+                                  kMaxTerminalPersistFailures, ex.what());
+                    continue;
+                }
+                spdlog::warn("[Engine] Step 2: could not persist terminal "
+                             "status for {} ({}) -- retrying next cycle",
+                             t.offer_id.substr(0, 12), ex.what());
+                terminal_still_pending.push_back(std::move(t));
+            }
+        }
+        pending_unconfirmed_terminals_ = std::move(terminal_still_pending);
     }
 
     // Process only confirmed fills.
@@ -9103,16 +9363,12 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
             if (!reconciled_ids.empty()) {
                 spdlog::info("[Engine] Step 8: offer reconciliation corrected "
                              "{} discrepancies", reconciled_ids.size());
-                // Persist reconciled cancellations to database.
+                // [S25] Buffer reconciled cancellations rather than
+                // writing them here.  Same one-way write, same reorg
+                // exposure, and the old catch dropped a busy database
+                // silently.
                 for (const auto& oid : reconciled_ids) {
-                    try {
-                        db_->update_offer_status(oid, "cancelled", block_height,
-                                                "periodic_reconcile");
-                    } catch (const std::exception& e) {
-                        spdlog::debug("[Engine] reconcile update_offer_status "
-                                     "failed for {}: {}",
-                                     oid.substr(0, 12), e.what());
-                    }
+                    buffer_terminal_offer(oid, block_height);
                 }
             }
 

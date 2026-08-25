@@ -1226,6 +1226,55 @@ private:
     // reverse, protecting cost-basis integrity.
     std::vector<Fill> pending_unconfirmed_fills_;
 
+    /// [S25 2026-08-24] Offers the wallet reported terminal, awaiting the
+    /// same confirmation depth fills use before the outcome is written.
+    ///
+    /// The write is ONE-WAY: update_offer_status reopens a terminal row
+    /// only for a fill, so a reorg-revived offer could never return to
+    /// pending once "cancelled" landed.  Entries also survive a transient
+    /// persistence failure and are retried, because detect_fills clears
+    /// its own terminal list every call -- dropping one here would strand
+    /// the row as pending until a restart re-observed it.
+    struct PendingTerminal {
+        std::string offer_id;
+        BlockHeight observed_block{0};
+        /// Consecutive maturity rechecks that reached no verdict because
+        /// the wallet was unreachable.  Bounds the buffer: see
+        /// kMaxTerminalRechecks.
+        std::uint32_t recheck_failures{0};
+        /// Consecutive failures to WRITE the confirmed status.  Counted
+        /// separately from recheck_failures: a wallet that will not answer
+        /// and a database that will not accept the row are different
+        /// faults, and only the second one is still costing a wallet RPC
+        /// on every retry.
+        std::uint32_t persist_failures{0};
+    };
+    std::vector<PendingTerminal> pending_unconfirmed_terminals_;
+
+    /// Give up re-verifying a matured terminal observation after this many
+    /// consecutive no-verdict rechecks.  On exhaustion the entry is DROPPED
+    /// rather than written: an unwritten row stays "pending" and is
+    /// re-observed on the next process start, which is merely the old
+    /// behaviour, whereas a blind write can mark a live offer cancelled
+    /// forever (the row is one-way for anything but a fill).
+    static constexpr std::uint32_t kMaxTerminalRechecks = 10;
+
+    /// Give up persisting a re-verified terminal status after this many
+    /// consecutive write failures.  A transient fault (SQLITE_BUSY) clears
+    /// long before this; a permanent one (disk full, corrupt file) would
+    /// otherwise retry every block forever, and each retry spends a wallet
+    /// get_offer RPC re-verifying an entry it cannot write -- reintroducing
+    /// exactly the wallet-daemon load that detect_fills' poll throttling
+    /// exists to avoid.
+    static constexpr std::uint32_t kMaxTerminalPersistFailures = 10;
+
+    /// Buffer an offer the wallet reported terminal so Step 2 can persist
+    /// it once the observation has matured and been re-verified.  Ignores
+    /// an id already buffered, since detect_fills() and reconcile_offers()
+    /// can both surface the same offer in one cycle.
+    void buffer_terminal_offer(const std::string& offer_id,
+                               BlockHeight        observed_block);
+
     // -- PID adaptive spread controller state (per-pair) ------------------
     // Tracks fill-rate EMA and PID accumulators for each trading pair.
     // Updated in Step 2 (fill counting) and Step 5 (PID update + apply).

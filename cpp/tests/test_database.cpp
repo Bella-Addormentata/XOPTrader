@@ -610,3 +610,201 @@ TEST(DatabaseTest, RewardedInflowIsExplainedFlowNotDivergence) {
     EXPECT_EQ(db.ledger_balances().at(dbx), wallet_confirmed);
 }
 
+
+// ---------------------------------------------------------------------------
+// [S25 2026-08-24] A wallet-reported terminal offer must leave 'pending'.
+//
+// detect_fills discovers externally cancelled/failed offers but previously
+// only dropped them from in-memory State, so the offer_log row stayed
+// 'pending' forever -- 48 rows had accumulated by 2026-08-24, the oldest 17
+// days, and the GUI (which reads offer_log) kept showing an offer that dexie
+// had long since cancelled.  These pin the write the engine now performs.
+// ---------------------------------------------------------------------------
+TEST(DatabaseTest, WalletTerminalStatusResolvesAPendingOffer)
+{
+    TempDbPath temp_db{"xop_s25_terminal"};
+    const std::string offer_id = "offer-terminal";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 9195823,
+                               "wallet reported terminal");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    const auto row = query_offer_row(raw_db, offer_id);
+    EXPECT_EQ(row.status, "cancelled")
+        << "an offer the wallet reports terminal must not stay pending";
+    EXPECT_EQ(row.resolved_block, 9195823);
+    close_db();
+}
+
+// Re-observing the same terminal offer on a later heartbeat -- or a later
+// process -- must be harmless.  The wallet keeps reporting a dead offer for
+// as long as it remembers it, and one such offer was re-detected on all
+// twelve process starts since 2026-08-18.
+TEST(DatabaseTest, RepeatedTerminalObservationIsIdempotent)
+{
+    TempDbPath temp_db{"xop_s25_repeat"};
+    const std::string offer_id = "offer-repeat";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        for (int i = 0; i < 5; ++i) {
+            db.update_offer_status(offer_id, "cancelled", 9195823 + i,
+                                   "wallet reported terminal");
+        }
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "cancelled");
+    close_db();
+}
+
+// An offer this process never logged must not abort the heartbeat.  The
+// engine catches the throw; this pins that the throw is what happens, so a
+// future change to either side cannot silently drop the guard.
+//
+// [S25 2026-08-24] It must throw the TYPED OfferNotFound, not a bare
+// runtime_error.  The engine discards a buffered terminal observation on
+// this exception and RETRIES on any other, so the two cases have to be
+// distinguishable by type.  They were not: the throw site raised the same
+// "no offer found" text for every sqlite3_step result other than
+// SQLITE_ROW, SQLITE_BUSY included, so a caller matching the message threw
+// away transient failures as though the offer were unknown.
+TEST(DatabaseTest, TerminalStatusForUnknownOfferThrowsOfferNotFound)
+{
+    TempDbPath temp_db{"xop_s25_unknown"};
+    xop::Database db(temp_db.path().string());
+    EXPECT_THROW(
+        db.update_offer_status("offer-never-logged", "cancelled", 1, "x"),
+        xop::OfferNotFound)
+        << "the engine relies on this specific type to tell an unknown "
+           "offer apart from a database that is merely busy";
+}
+
+// OfferNotFound must remain catchable as a std::exception: the heartbeat's
+// outer handlers catch by that base, and a type that escaped them would
+// abort the cycle instead of skipping one offer.
+TEST(DatabaseTest, OfferNotFoundIsAStdException)
+{
+    TempDbPath temp_db{"xop_s25_unknown_base"};
+    xop::Database db(temp_db.path().string());
+    EXPECT_THROW(
+        db.update_offer_status("offer-never-logged", "cancelled", 1, "x"),
+        std::exception);
+}
+
+// The OTHER arm of the same contract, and the one that costs real work if it
+// regresses.  The engine DISCARDS a buffered terminal observation on
+// OfferNotFound and RETRIES on anything else, so a genuine database fault
+// reported as OfferNotFound would permanently drop the write -- which is the
+// stuck-pending accumulation this whole change set exists to stop.
+//
+// A fault is injected rather than simulated: a second connection drops
+// offer_log out from under the live Database's prepared statement, so the
+// lookup step fails with a real SQLite error instead of SQLITE_DONE.  The
+// offer IS logged first, so "not found" cannot be the honest answer -- only
+// a mapping bug could produce it.
+TEST(DatabaseTest, DatabaseFaultDoesNotMasqueradeAsOfferNotFound)
+{
+    TempDbPath temp_db{"xop_s25_fault"};
+    const std::string offer_id = "offer-fault";
+
+    xop::Database db(temp_db.path().string());
+    db.insert_offer(make_offer(offer_id));
+
+    // Sanity: the row is there and resolvable by the normal path.
+    ASSERT_NO_THROW(
+        db.update_offer_status(offer_id, "pending", 1, "still open"));
+
+    sqlite3* saboteur = open_db(temp_db.path());
+    ASSERT_NE(saboteur, nullptr);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(saboteur, "DROP TABLE offer_log;",
+                                nullptr, nullptr, &err);
+    const std::string drop_err = err ? err : "";
+    if (err) { sqlite3_free(err); }
+    sqlite3_close(saboteur);
+    ASSERT_EQ(rc, SQLITE_OK) << "could not inject the fault: " << drop_err;
+
+    try {
+        db.update_offer_status(offer_id, "cancelled", 2, "wallet terminal");
+        FAIL() << "a broken database must not report success";
+    } catch (const xop::OfferNotFound& e) {
+        FAIL() << "a database FAULT was reported as a missing offer: "
+               << e.what()
+               << " -- the engine discards on this type, so the "
+                  "terminal write would be lost for good.";
+    } catch (const std::exception& e) {
+        SUCCEED() << "reported as a fault, so the engine retries: "
+                  << e.what();
+    }
+}
+
+// [S25 2026-08-24] A cancelled row is NOT reopened by a later non-fill
+// update.
+//
+// This is why the engine buffers terminal observations to confirmation
+// depth rather than writing them immediately.  An earlier revision wrote
+// straight away, reasoning that a reorg-revived offer would simply be
+// re-reported live and corrected -- but update_offer_status reopens a
+// terminal row only for a FILL, so the correction has nowhere to land and
+// the row stays cancelled for good.  This pins the one-way behaviour the
+// buffering exists to respect; if it ever becomes reopenable, the gating
+// can be revisited.
+TEST(DatabaseTest, CancelledOfferIsNotReopenedByALaterPendingUpdate)
+{
+    TempDbPath temp_db{"xop_s25_oneway"};
+    const std::string offer_id = "offer-oneway";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 100,
+                               "wallet reported terminal");
+        // A reorg revival would try to put it back to pending.
+        db.update_offer_status(offer_id, "pending", 101, "revived");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "cancelled")
+        << "if this now reads 'pending', terminal writes are reversible and "
+           "the confirmation-depth buffer in step_process_fills can be "
+           "reconsidered";
+    close_db();
+}
+
+// A fill DOES still override a cancelled row -- the one documented
+// exception, and the reason the buffer protects cost basis rather than
+// merely tidiness.
+TEST(DatabaseTest, FillStillOverridesACancelledOffer)
+{
+    TempDbPath temp_db{"xop_s25_fillwins"};
+    const std::string offer_id = "offer-fillwins";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 100, "wallet terminal");
+        db.update_offer_status(offer_id, "filled", 101, "");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "filled");
+    close_db();
+}

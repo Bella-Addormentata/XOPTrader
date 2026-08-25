@@ -27,6 +27,14 @@
 - **Status:** `[ ]` — Audit 2026-08-18: no `test_backtest_integration.cpp`; CI itself was red until PR #70, so no test tier had run in CI at all.
 
 ### T4-07: Add engine startup/shutdown and fill processing tests
+- **[S25 2026-08-24] Now also blocks the terminal-offer handoff test.** PR
+  #114 makes `detect_fills()` report externally-cancelled/failed offers so
+  the engine can close their `offer_log` rows, but `OfferManager` takes a
+  concrete `std::shared_ptr<rpc::ChiaWalletRPC>`, so there is no seam to
+  feed a CANCELLED wallet record through. The PR's tests pin the database
+  contract the fix relies on (a terminal row is not reopened except by a
+  fill); the handoff itself -- wallet record in, `offer_log` row closed out
+  -- is unpinned until the wallet interface and fake this item tracks exist.
 - **[S20 2026-08-24] Now also blocks an ordering regression test.** PR #112
   round 4 found anchors being injected AFTER the Step 1 ingest loop, so a
   first-cycle pair had no anchor while its offers were filtered -- the
