@@ -2584,8 +2584,10 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
 
             if (verdict == execution::TerminalRecheck::Revived) {
-                // Alive again; recheck_terminal has logged it.  Nothing to
-                // persist -- reconciliation re-adopts it.
+                // Alive again, and recheck_terminal has already put it back
+                // into State -- reconciliation could not be relied on to,
+                // since it adopts only PENDING_ACCEPT and may not run at
+                // all.  Nothing to persist.
                 continue;
             }
 

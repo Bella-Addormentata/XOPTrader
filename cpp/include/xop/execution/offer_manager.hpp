@@ -198,16 +198,20 @@ enum class TerminalRecheck {
     /// Wallet still reports CANCELLED/FAILED -- the buffered cancellation
     /// may be written.
     StillTerminal,
-    /// Wallet reports the offer live/pending again -- discard the
-    /// buffered write; reconciliation re-adopts it.
+    /// Wallet reports a recognised PENDING state again.  The offer has
+    /// been re-adopted into State by recheck_terminal; discard the
+    /// buffered write.
     Revived,
     /// Wallet reports CONFIRMED -- the observation was reorged into a
     /// FILL.  recheck_terminal has put the offer back into State so
     /// detect_fills() can record it; the caller must NOT write a
     /// cancellation.
     Confirmed,
-    /// Wallet unreachable or unparseable.  NOT a verdict: the caller
-    /// must retry rather than assume any of the above.
+    /// Wallet unreachable, or its status is one this build does not
+    /// recognise.  NOT a verdict: the caller must retry rather than
+    /// assume any of the above.  An unknown code is specifically NOT
+    /// treated as "live" -- that would discard a one-way cancellation on
+    /// no evidence.
     NoVerdict,
 };
 
@@ -329,15 +333,18 @@ public:
     /// which means waiting out a confirmation depth proves nothing on its
     /// own.  This asks the wallet again at maturity.
     ///
-    /// CONFIRMED is reported separately from any other non-terminal
-    /// status, and is NOT merely "don't write the cancellation".  The
-    /// offer has left State, reconcile_offers() adopts only untracked
-    /// PENDING_ACCEPT records, and detect_fills() only inspects offers
-    /// still in State -- so nothing downstream would ever emit the fill.
-    /// On CONFIRMED this re-adopts the offer into State (the same
-    /// treatment reconcile_offers gives a confirmed offer it finds) so
-    /// the next detect_fills() records it through the normal path, with
-    /// settled amounts and fee capture intact.
+    /// Every non-terminal answer re-adopts the offer into State, because
+    /// declining to write the cancellation is only half an answer: the
+    /// offer has left State, reconcile_offers() adopts untracked records
+    /// only when they are PENDING_ACCEPT, and it does not run at all when
+    /// reconciliation is disabled or Step 8 is gated.  Without re-adoption
+    /// a PENDING_CONFIRM or PENDING_CANCEL offer would go unmanaged and a
+    /// later fill would be missed.
+    ///
+    /// CONFIRMED is still reported separately, because there re-adoption
+    /// is what makes a FILL recordable at all -- detect_fills() only
+    /// inspects offers still in State -- and it goes through the normal
+    /// path with settled amounts and fee capture intact.
     ///
     /// @param trade_id       Wallet trade id to re-query.
     /// @param current_block  Height used when re-adopting a CONFIRMED

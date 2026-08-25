@@ -39,6 +39,12 @@ namespace xop::execution {
 // ---------------------------------------------------------------------------
 namespace trade_status {
     constexpr int kPendingAccept    = 0;
+    // [S25 2026-08-24] 1 and 2 had no names because nothing needed to
+    // distinguish them from "not terminal".  recheck_terminal does: a
+    // recognised pending state is evidence the offer is live, whereas an
+    // unrecognised code (parse returns -1) is no evidence at all.
+    constexpr int kPendingConfirm   = 1;
+    constexpr int kPendingCancel    = 2;
     constexpr int kCancelled        = 3;
     constexpr int kConfirmed        = 4;
     constexpr int kFailed           = 5;
@@ -985,43 +991,81 @@ OfferManager::recheck_terminal(const std::string& trade_id,
         co_return TerminalRecheck::StillTerminal;
     }
 
-    if (status == trade_status::kConfirmed) {
-        // The terminal observation was reorged into a FILL.  Dropping the
-        // buffered write is not enough: detect_fills() only inspects
-        // offers still in State and the terminal branch already removed
-        // this one, while reconcile_offers() adopts untracked records only
-        // when they are PENDING_ACCEPT.  Left alone, the fill would be
-        // recorded nowhere -- an accounting loss, not a reporting one.
-        // Put it back so the normal path records it.
+    // Anything below means the offer is NOT over, and the offer is no
+    // longer in State -- detect_fills() calls remove_offer() the moment it
+    // sees a terminal status.  Declining to write the cancellation is
+    // therefore only half an answer: nothing else puts the offer back.
+    // reconcile_offers() adopts untracked records only when they are
+    // PENDING_ACCEPT, and it does not run at all when reconciliation is
+    // disabled or Step 8 is gated, so PENDING_CONFIRM and PENDING_CANCEL
+    // would never be restored and a later fill would be missed.  Re-adopt
+    // here, for every live status.
+    const auto readopt = [&](const char* why) {
         auto parsed = try_parse_wallet_offer(rec, current_block);
         if (parsed) {
             state_->upsert_offer(*parsed);
             logger_->warn("[S25] recheck_terminal: {} was observed terminal "
-                          "but the wallet now reports CONFIRMED -- re-adopted "
-                          "into State ({} {} on {}) so detect_fills records "
-                          "the fill",
-                          trade_id.substr(0, 12),
+                          "but the wallet now reports {} -- re-adopted into "
+                          "State ({} {} on {})",
+                          trade_id.substr(0, 12), why,
                           (parsed->side == Side::Bid) ? "BID" : "ASK",
                           parsed->size, parsed->pair_name);
-        } else {
-            // Cannot rebuild the offer, so cannot hand it to detect_fills.
-            // Loud, because this is an unrecorded fill and no later pass
-            // will find it.
-            logger_->error("[S25] recheck_terminal: {} is CONFIRMED but its "
-                           "wallet record could not be parsed into a pending "
-                           "offer -- the fill CANNOT be re-adopted and will "
-                           "not be recorded; reconcile inventory for this "
-                           "trade by hand",
+            return true;
+        }
+        // Unparseable record.  Adopt with minimal metadata anyway, the
+        // same fallback reconcile_offers uses: an untracked live offer
+        // holds its coins locked invisibly, and cancel_stale or UTXO
+        // liberation can still free them once the id is tracked.
+        PendingOffer po;
+        po.offer_id         = trade_id;
+        po.pair_name        = "UNKNOWN";
+        po.side             = Side::Bid;
+        po.price            = 0;
+        po.size             = 0;
+        po.tier             = 0;
+        po.fee_mojos        = 0;
+        po.created_at_block = 0;
+        state_->upsert_offer(po);
+        logger_->warn("[S25] recheck_terminal: {} reports {} but its wallet "
+                      "record could not be parsed -- adopted with minimal "
+                      "metadata to prevent a coin-lock deadlock",
+                      trade_id.substr(0, 12), why);
+        return false;
+    };
+
+    if (status == trade_status::kConfirmed) {
+        // The terminal observation was reorged into a FILL.  Re-adoption
+        // is what makes the fill recordable: detect_fills() only inspects
+        // offers still in State, so without this the fill would be
+        // recorded nowhere -- an accounting loss, not a reporting one.
+        if (!readopt("CONFIRMED")) {
+            // Minimal metadata cannot carry a fill: pair, side, price and
+            // size are all unknown, so detect_fills has nothing to record
+            // against.  Loud, because no later pass will find it.
+            logger_->error("[S25] recheck_terminal: {} is CONFIRMED but "
+                           "unparseable -- the FILL cannot be reconstructed "
+                           "and will not be recorded; reconcile inventory "
+                           "for this trade by hand",
                            trade_id.substr(0, 12));
         }
         co_return TerminalRecheck::Confirmed;
     }
 
-    logger_->warn("[S25] recheck_terminal: {} was observed terminal but the "
-                  "wallet now reports status={} -- the observation did NOT "
-                  "survive; no cancellation will be written",
-                  trade_id.substr(0, 12), status);
-    co_return TerminalRecheck::Revived;
+    if (status == trade_status::kPendingAccept
+        || status == trade_status::kPendingConfirm
+        || status == trade_status::kPendingCancel) {
+        readopt("a pending status");
+        co_return TerminalRecheck::Revived;
+    }
+
+    // Unrecognised code (trade_status::parse yields -1 for anything it does
+    // not know).  This is NOT evidence the offer is live, and treating it
+    // as such would discard a one-way cancellation on the strength of a
+    // string nobody has seen before.  No verdict: keep it buffered.
+    logger_->warn("[S25] recheck_terminal: wallet reports unrecognised "
+                  "status {} for {} -- no verdict, caller retries",
+                  status, trade_id.substr(0, 12));
+    co_return TerminalRecheck::NoVerdict;
 }
 
 // ---------------------------------------------------------------------------
