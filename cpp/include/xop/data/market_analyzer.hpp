@@ -129,10 +129,17 @@ struct PairAnalysisSummary {
 
     // -- Completeness -------------------------------------------------------
     uint32_t blocks_collected{0}; ///< Actual observations ingested.
-    bool     complete{false};     ///< True when analysis has ended (either
-                                  ///  the full window was observed OR the
-                                  ///  analysis was force-completed due to
-                                  ///  a timeout).
+    bool     complete{false};     ///< True when analysis has ended for this
+                                  ///  pair, by ANY of: the full window was
+                                  ///  observed; the phase was finalised on
+                                  ///  exit (see force_complete); or the
+                                  ///  poll timeout fired.  [S23] The exit
+                                  ///  case is new -- the phase can now end
+                                  ///  while a structurally unpriced pair
+                                  ///  has zero observations, so this says
+                                  ///  the phase is over, never that data
+                                  ///  was gathered.  window_filled is the
+                                  ///  flag for that.
     bool     window_filled{false};///< True only when the full observation
                                   ///  window was filled (blocks_collected
                                   ///  >= analysis_blocks).  False after
@@ -275,9 +282,21 @@ public:
     /// if they have not collected enough blocks.  ``window_filled`` will
     /// remain false for pairs that did not reach ``analysis_blocks``,
     /// allowing callers to distinguish forced vs. fully-observed results.
-    /// Used by the engine when the analysis timeout expires (e.g. a pair
-    /// has no market data) to prevent the bot from hanging indefinitely
-    /// in the Analyzing state.
+    ///
+    /// Called by the engine on EVERY exit from the analysis phase, not
+    /// only the timeout:
+    ///
+    ///   * timeout -- a pair has no market data and the phase must not
+    ///     hang indefinitely in the Analyzing state;
+    ///   * [S23 2026-08-24] natural exit -- is_complete() now returns true
+    ///     while a structurally unpriced pair is still incomplete, so
+    ///     finalising the states is what makes the phase's end OBSERVABLE.
+    ///     Without it that pair keeps complete == false, the exported
+    ///     Prometheus flag stays 0, and the GUI reports the engine as
+    ///     analysing for the life of a process that is already trading.
+    ///
+    /// So `complete` after this call means "the phase ended", never "the
+    /// data was gathered" -- consult window_filled for the latter.
     void force_complete();
 
     /// Overall aggressiveness recommendation across the pairs that have
