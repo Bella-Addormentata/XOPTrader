@@ -631,6 +631,9 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 {
     std::vector<Fill> fills;
 
+    // [S25] Describes THIS call only; the engine drains it after we return.
+    last_terminal_offers_.clear();
+
     // [WALLET-LOAD 2026-08-04] Advance the poll heartbeat counter once per
     // invocation -- the backoff schedule below is phased on it.
     ++fill_poll_heartbeat_;
@@ -922,12 +925,29 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
                     logger_->info("Offer {} removed (status={})",
                                   trade_id.substr(0, 12), status);
                 }
+
+                // [S25 2026-08-24] Report it, so the outcome is PERSISTED.
+                //
+                // Removing from State ends the tracking but writes nothing
+                // down, and this class holds no database handle by design
+                // -- the engine persists offer outcomes.  Recording the id
+                // here lets it write "cancelled" exactly as it writes
+                // "filled" from the returned fills.  Reported even when the
+                // state entry was already gone: the DB row can still be
+                // stale from an earlier process that saw the same terminal
+                // status and dropped it, which is how 48 rows reached 17
+                // days old.
+                last_terminal_offers_.push_back(trade_id);
             }
             // Status PENDING_ACCEPT / PENDING_CONFIRM: still alive, no action.
     }
 
     if (!fills.empty()) {
         logger_->info("detect_fills: {} new fills detected", fills.size());
+    }
+    if (!last_terminal_offers_.empty()) {
+        logger_->info("detect_fills: {} offer(s) observed terminal",
+                      last_terminal_offers_.size());
     }
 
     co_return fills;

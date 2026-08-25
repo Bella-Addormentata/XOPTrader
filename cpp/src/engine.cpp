@@ -2431,6 +2431,35 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     // age gate (a just-posted offer cannot have settled).
     auto new_fills = co_await offer_mgr_->detect_fills(block_height);
 
+    // [S25 2026-08-24] Persist offers the wallet reports TERMINAL.
+    //
+    // detect_fills discovers cancelled/failed offers -- it must, to stop
+    // tracking them -- but until now only removed them from State, so the
+    // offer_log row stayed 'pending' forever.  Measured 2026-08-24: 48 rows
+    // stuck, the oldest 17 days, one of them re-detected as terminal on all
+    // twelve process starts since 08-18 and re-forgotten every time.  The
+    // GUI reads offer_log, so an offer cancelled on dexie kept showing as
+    // pending here.
+    //
+    // Written immediately rather than through the confirmation-depth buffer
+    // below: that buffer exists so a reorg cannot make us book a FILL that
+    // later vanishes, which is a cost-basis risk.  A cancellation carries no
+    // such risk -- if a reorg revived the offer the wallet would report it
+    // live again and the next post/cancel cycle would correct the row --
+    // and delaying it is what let these accumulate for weeks.
+    for (const auto& tid : offer_mgr_->last_terminal_offers()) {
+        try {
+            db_->update_offer_status(tid, "cancelled",
+                                     static_cast<BlockHeight>(block_height),
+                                     "wallet reported terminal");
+        } catch (const std::exception& ex) {
+            // A row may legitimately be absent (an offer this process never
+            // logged); never let bookkeeping abort the heartbeat.
+            spdlog::debug("[Engine] update_offer_status({}) skipped: {}",
+                          tid.substr(0, 12), ex.what());
+        }
+    }
+
     // [T4-02] Reorg protection: confirmation depth gating.
     // Newly detected fills are buffered in pending_unconfirmed_fills_ and
     // only promoted to actual processing once their chain depth exceeds

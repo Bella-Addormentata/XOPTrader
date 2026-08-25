@@ -610,3 +610,74 @@ TEST(DatabaseTest, RewardedInflowIsExplainedFlowNotDivergence) {
     EXPECT_EQ(db.ledger_balances().at(dbx), wallet_confirmed);
 }
 
+
+// ---------------------------------------------------------------------------
+// [S25 2026-08-24] A wallet-reported terminal offer must leave 'pending'.
+//
+// detect_fills discovers externally cancelled/failed offers but previously
+// only dropped them from in-memory State, so the offer_log row stayed
+// 'pending' forever -- 48 rows had accumulated by 2026-08-24, the oldest 17
+// days, and the GUI (which reads offer_log) kept showing an offer that dexie
+// had long since cancelled.  These pin the write the engine now performs.
+// ---------------------------------------------------------------------------
+TEST(DatabaseTest, WalletTerminalStatusResolvesAPendingOffer)
+{
+    TempDbPath temp_db{"xop_s25_terminal"};
+    const std::string offer_id = "offer-terminal";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        db.update_offer_status(offer_id, "cancelled", 9195823,
+                               "wallet reported terminal");
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    const auto row = query_offer_row(raw_db, offer_id);
+    EXPECT_EQ(row.status, "cancelled")
+        << "an offer the wallet reports terminal must not stay pending";
+    EXPECT_EQ(row.resolved_block, 9195823);
+    close_db();
+}
+
+// Re-observing the same terminal offer on a later heartbeat -- or a later
+// process -- must be harmless.  The wallet keeps reporting a dead offer for
+// as long as it remembers it, and one such offer was re-detected on all
+// twelve process starts since 2026-08-18.
+TEST(DatabaseTest, RepeatedTerminalObservationIsIdempotent)
+{
+    TempDbPath temp_db{"xop_s25_repeat"};
+    const std::string offer_id = "offer-repeat";
+
+    {
+        xop::Database db(temp_db.path().string());
+        db.insert_offer(make_offer(offer_id));
+        for (int i = 0; i < 5; ++i) {
+            db.update_offer_status(offer_id, "cancelled", 9195823 + i,
+                                   "wallet reported terminal");
+        }
+    }
+
+    sqlite3* raw_db = open_db(temp_db.path());
+    auto close_db = [&raw_db]() {
+        if (raw_db) { sqlite3_close(raw_db); raw_db = nullptr; }
+    };
+    EXPECT_EQ(query_offer_row(raw_db, offer_id).status, "cancelled");
+    close_db();
+}
+
+// An offer this process never logged must not abort the heartbeat.  The
+// engine catches the throw; this pins that the throw is what happens, so a
+// future change to either side cannot silently drop the guard.
+TEST(DatabaseTest, TerminalStatusForUnknownOfferThrows)
+{
+    TempDbPath temp_db{"xop_s25_unknown"};
+    xop::Database db(temp_db.path().string());
+    EXPECT_THROW(
+        db.update_offer_status("offer-never-logged", "cancelled", 1, "x"),
+        std::exception)
+        << "the engine relies on this throwing to skip unknown offers";
+}

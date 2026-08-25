@@ -284,6 +284,24 @@ public:
     asio::awaitable<std::vector<Fill>> detect_fills(
         BlockHeight current_block = 0);
 
+    /// [S25 2026-08-24] Offers observed TERMINAL (cancelled or failed) by
+    /// the most recent detect_fills() call, in wallet trade-id form.
+    ///
+    /// detect_fills already discovers these -- it must, to stop tracking
+    /// them -- but it only RETURNS fills, so the discovery died in memory.
+    /// OfferManager has no database handle by design, and the engine is
+    /// what persists offer outcomes (it writes "filled" from the returned
+    /// fills), so the terminal set is surfaced the same way rather than
+    /// reaching for a db_ here.
+    ///
+    /// Cleared at the start of every detect_fills(), so it describes that
+    /// call only.  Without this the offer_log row stayed 'pending'
+    /// forever: 48 rows had accumulated by 2026-08-24, the oldest 17 days
+    /// old, each re-detected and re-discarded on every process start.
+    [[nodiscard]] const std::vector<std::string>& last_terminal_offers() const noexcept {
+        return last_terminal_offers_;
+    }
+
     // -- Cancellation -------------------------------------------------------
 
     /**
@@ -694,6 +712,10 @@ public:
         bool bids_buy_xch, bool asks_buy_xch);
 
 private:
+    /// [S25 2026-08-24] Trade ids observed terminal by the most recent
+    /// detect_fills().  See last_terminal_offers().
+    std::vector<std::string> last_terminal_offers_;
+
     /// Probe-only admission mirror of xch_ledger_admits, run against a
     /// COPY of the cycle ledger by the ladder preflight: same charges,
     /// no logging, no flag side effects.
