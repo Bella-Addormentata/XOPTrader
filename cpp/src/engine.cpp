@@ -2570,14 +2570,19 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
     }
 
     // [S25] Same partition for terminal offers -- but depth ALONE proves
-    // nothing here, unlike for a fill.  A fill stays in State and is
-    // re-polled every cycle, so surviving the window is itself the
-    // evidence.  detect_fills calls remove_offer() the instant it sees a
-    // terminal status, so a buffered cancellation is never looked at
-    // again; waiting would just be a timer, and after it expired we would
-    // write "cancelled" even if a reorg had put the offer back on the
-    // book.  So maturity here triggers a fresh wallet query, and only an
-    // answer that is STILL terminal is written.
+    // nothing, because detect_fills calls remove_offer() the instant it
+    // resolves an offer, terminal or filled alike.  Nothing re-polls
+    // either kind once buffered, so waiting is just a timer: when it
+    // expired we would write "cancelled" even if a reorg had put the offer
+    // back on the book.  Maturity here therefore triggers a fresh wallet
+    // query, and only an answer that is STILL terminal is written.
+    //
+    // (An earlier version of this comment claimed a buffered FILL is
+    // re-polled every cycle and so accumulates evidence while it waits.
+    // It is not -- the fill branch removes it from State too.  What the
+    // depth buys a fill is settling time before the write, not repeated
+    // confirmation, and the same is true here; the wallet re-query is what
+    // supplies the evidence.)
     //
     // A transient failure KEEPS the entry rather than dropping it:
     // detect_fills has already removed the offer from State and clears its
@@ -2678,9 +2683,15 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
             }
 
             try {
+                // resolved_block is the height at which the status
+                // CHANGED, and the GUI derives offer lifetime from it.
+                // Writing the maturity height instead would report every
+                // externally terminated offer as resolving conf_depth
+                // blocks later than it did, growing every such offer's
+                // apparent lifetime by the confirmation window.
                 db_->update_offer_status(
                     t.offer_id, "cancelled",
-                    static_cast<BlockHeight>(block_height),
+                    static_cast<BlockHeight>(t.observed_block),
                     "wallet reported terminal");
             } catch (const OfferNotFound& nf) {
                 // Genuinely unknown offer: nothing to update, ever.  This

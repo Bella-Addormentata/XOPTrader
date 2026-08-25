@@ -1069,6 +1069,17 @@ OfferManager::recheck_terminal(const std::string& trade_id,
         || status == trade_status::kPendingConfirm
         || status == trade_status::kPendingCancel) {
         readopt("a pending status");
+        if (status == trade_status::kPendingCancel) {
+            // The wallet is already cancelling this offer.  A re-adopted
+            // entry defaults to cancel_pending=false, and Step 8 would
+            // read that as "cancellable" and submit a SECOND secure
+            // cancellation, paying a second fee for a cancellation
+            // already in flight.  Applied after readopt so it covers the
+            // parsed entry, the minimal-metadata fallback, and the
+            // already-tracked case alike -- mark_cancel_pending only sets
+            // the flag on whatever entry is in State.
+            state_->mark_cancel_pending(trade_id);
+        }
         co_return TerminalRecheck::Revived;
     }
 
