@@ -563,3 +563,50 @@ TEST(MarketAnalyzerComplete, ForceCompleteHonouredForZeroObservationPairs) {
         << "force_complete() must satisfy is_complete() even with zero "
            "observations on every pair";
 }
+
+// [S23 2026-08-24] A structurally unpriced pair must not vote on the
+// aggregate recommendation.
+//
+// Its summary is computed from zero observations and defaults to Normal, so
+// leaving it in let a pair with NO data veto an Aggressive consensus and
+// move the applied spread multiplier from 0.8 to 1.0 -- setting policy for
+// the pairs that actually have data.
+TEST(MarketAnalyzerComplete, UnpricedPairDoesNotVetoAggressiveConsensus) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+
+    // Unpriceable pair: polled its share, produced nothing.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    // Healthy pair: a calm, tight book -- the Aggressive case.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70, 20.0, 100000.0, 50.0, 50.0);
+    }
+
+    const double mult = ma.recommended_spread_multiplier();
+    EXPECT_NE(mult, 0.0);
+    // Whatever the healthy pair concludes, the empty pair must not be the
+    // one deciding: its presence must not change the answer.
+    xop::MarketAnalyzer solo(cfg, {"XCH/BYC"});
+    for (int i = 0; i < 3; ++i) {
+        solo.ingest("XCH/BYC", 1.70, 20.0, 100000.0, 50.0, 50.0);
+    }
+    EXPECT_DOUBLE_EQ(mult, solo.recommended_spread_multiplier())
+        << "an unpriceable pair changed the applied spread multiplier";
+}
+
+// With nothing priceable at all, fall back to Normal rather than inheriting
+// the Aggressive seed the scan starts from.
+TEST(MarketAnalyzerComplete, AllUnpricedFallsBackToNormal) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    EXPECT_DOUBLE_EQ(ma.recommended_spread_multiplier(), 1.0)
+        << "no data must not be read as licence to tighten spreads";
+}

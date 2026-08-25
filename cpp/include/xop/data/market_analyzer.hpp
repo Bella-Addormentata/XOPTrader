@@ -221,7 +221,22 @@ public:
 
     // -- Queries --------------------------------------------------------------
 
-    /// True when every enabled pair has collected analysis_blocks observations.
+    /// True when every pair that CAN be priced has collected
+    /// analysis_blocks observations.
+    ///
+    /// [S23 2026-08-24] This no longer means "every pair filled its
+    /// window".  A pair that has been polled its full share and produced
+    /// nothing is structurally unpriced -- since the S20 plausibility gate,
+    /// a pair whose junk mid is refused publishes no mid at all, so
+    /// ingest() rejects every observation and it can never complete.  Such
+    /// a pair is excluded rather than waited on, or one bad book would hold
+    /// startup open until the timeout on every restart.
+    ///
+    /// Callers must therefore NOT assume a non-zero blocks_collected for
+    /// every pair when this returns true; check per-pair summaries if that
+    /// matters.  Returns false when NO pair is priceable, so a total feed
+    /// failure is never reported as a completed analysis, and true after
+    /// force_complete() regardless.
     [[nodiscard]] bool is_complete() const noexcept;
 
     /// Number of blocks collected for the given pair (0 if unknown pair).
@@ -236,6 +251,7 @@ public:
     /// S20 plausibility gate publishes no mid at all, so it never ingests
     /// a valid observation and its blocks_collected stays at 0 forever.
     [[nodiscard]] uint32_t poll_attempts(const std::string& pair_name) const noexcept;
+
 
     /// Configured analysis window length (blocks).
     [[nodiscard]] uint32_t analysis_blocks() const noexcept;
@@ -298,6 +314,14 @@ private:
 
     /// Compute the analysis summary for one pair from its accumulated state.
     [[nodiscard]] PairAnalysisSummary compute_summary(const PairState& ps) const;
+
+    /// [S23 2026-08-24] Whether this pair has been polled its full share
+    /// and produced nothing -- see is_complete() for why that happens and
+    /// why such a pair is excluded rather than waited on.  Shared by
+    /// is_complete() and overall_recommendation() so the two cannot
+    /// disagree about which pairs count: a pair excluded from deciding
+    /// completion must not still get a vote on the spread multiplier.
+    [[nodiscard]] bool is_structurally_unpriced(const PairState& ps) const noexcept;
 
     /// Compute the variance ratio VR(lag) from the price series.
     /// Returns 1.0 if there are insufficient observations.

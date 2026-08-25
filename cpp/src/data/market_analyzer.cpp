@@ -147,6 +147,21 @@ void MarketAnalyzer::ingest(const std::string& pair_name,
 // Queries
 // ===========================================================================
 
+// [S23 2026-08-24] A pair that has been polled its full share and produced
+// NOTHING.  ingest() rejects any non-positive mid, and since the S20
+// plausibility gate a pair whose junk mid is refused publishes no mid at
+// all, so such a pair never accumulates an observation.
+//
+// Deliberately shared by is_complete() and overall_recommendation(): the
+// two must agree about which pairs count, or a pair excluded from deciding
+// completion would still get a vote on the spread multiplier.
+bool MarketAnalyzer::is_structurally_unpriced(const PairState& ps) const noexcept
+{
+    return !ps.complete
+        && ps.blocks_collected == 0
+        && ps.total_poll_attempts >= cfg_.analysis_blocks;
+}
+
 bool MarketAnalyzer::is_complete() const noexcept {
     if (states_.empty()) return true;  // No pairs to analyse.
 
@@ -172,9 +187,7 @@ bool MarketAnalyzer::is_complete() const noexcept {
     // forced completion, breaking that method's contract.
     bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
-        if (!ps.complete
-            && ps.blocks_collected == 0
-            && ps.total_poll_attempts >= cfg_.analysis_blocks) {
+        if (is_structurally_unpriced(ps)) {
             continue;   // structurally unpriced
         }
         any_priceable = true;
@@ -253,14 +266,28 @@ AnalysisAggressiveness MarketAnalyzer::overall_recommendation() const {
 
     // Return the most conservative recommendation across all pairs.
     // Conservative(0) < Normal(1) < Aggressive(2) — lower is more conservative.
+    //
+    // [S23 2026-08-24] Structurally unpriced pairs do not vote.  Their
+    // summary is computed from zero observations and defaults to Normal,
+    // so leaving them in meant an unpriceable pair could veto an
+    // Aggressive consensus and move the applied spread multiplier from
+    // 0.8 to 1.0 -- a pair with NO data quietly setting policy for the
+    // pairs that have it.  Same predicate is_complete() uses, so the two
+    // cannot disagree about which pairs count.
     auto most_conservative = AnalysisAggressiveness::Aggressive;
+    bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
+        if (is_structurally_unpriced(ps)) continue;
+        any_priceable = true;
         const auto summary = compute_summary(ps);
         if (static_cast<uint8_t>(summary.aggressiveness) <
             static_cast<uint8_t>(most_conservative)) {
             most_conservative = summary.aggressiveness;
         }
     }
+    // Nothing priceable at all: fall back to Normal rather than inheriting
+    // the Aggressive seed above.
+    if (!any_priceable) return AnalysisAggressiveness::Normal;
     return most_conservative;
 }
 
