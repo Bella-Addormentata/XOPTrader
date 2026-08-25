@@ -703,6 +703,53 @@ TEST(DatabaseTest, OfferNotFoundIsAStdException)
         std::exception);
 }
 
+// The OTHER arm of the same contract, and the one that costs real work if it
+// regresses.  The engine DISCARDS a buffered terminal observation on
+// OfferNotFound and RETRIES on anything else, so a genuine database fault
+// reported as OfferNotFound would permanently drop the write -- which is the
+// stuck-pending accumulation this whole change set exists to stop.
+//
+// A fault is injected rather than simulated: a second connection drops
+// offer_log out from under the live Database's prepared statement, so the
+// lookup step fails with a real SQLite error instead of SQLITE_DONE.  The
+// offer IS logged first, so "not found" cannot be the honest answer -- only
+// a mapping bug could produce it.
+TEST(DatabaseTest, DatabaseFaultDoesNotMasqueradeAsOfferNotFound)
+{
+    TempDbPath temp_db{"xop_s25_fault"};
+    const std::string offer_id = "offer-fault";
+
+    xop::Database db(temp_db.path().string());
+    db.insert_offer(make_offer(offer_id));
+
+    // Sanity: the row is there and resolvable by the normal path.
+    ASSERT_NO_THROW(
+        db.update_offer_status(offer_id, "pending", 1, "still open"));
+
+    sqlite3* saboteur = open_db(temp_db.path());
+    ASSERT_NE(saboteur, nullptr);
+    char* err = nullptr;
+    const int rc = sqlite3_exec(saboteur, "DROP TABLE offer_log;",
+                                nullptr, nullptr, &err);
+    const std::string drop_err = err ? err : "";
+    if (err) { sqlite3_free(err); }
+    sqlite3_close(saboteur);
+    ASSERT_EQ(rc, SQLITE_OK) << "could not inject the fault: " << drop_err;
+
+    try {
+        db.update_offer_status(offer_id, "cancelled", 2, "wallet terminal");
+        FAIL() << "a broken database must not report success";
+    } catch (const xop::OfferNotFound& e) {
+        FAIL() << "a database FAULT was reported as a missing offer: "
+               << e.what()
+               << " -- the engine discards on this type, so the "
+                  "terminal write would be lost for good.";
+    } catch (const std::exception& e) {
+        SUCCEED() << "reported as a fault, so the engine retries: "
+                  << e.what();
+    }
+}
+
 // [S25 2026-08-24] A cancelled row is NOT reopened by a later non-fill
 // update.
 //
