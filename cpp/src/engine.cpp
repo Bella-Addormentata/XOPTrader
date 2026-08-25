@@ -1207,14 +1207,12 @@ asio::awaitable<void> Engine::poll_loop_coro()
                                     // confirmation gate at all.
                                     //
                                     // last_block_ is the only height this
-                                    // scope has.  Should it still be 0 the
-                                    // depth test passes at once and the
-                                    // entry matures on the next cycle --
-                                    // acceptable, because maturity only
-                                    // buys the right to ASK the wallet
-                                    // again, and that re-query, not the
-                                    // waiting, is what authorises the
-                                    // write.
+                                    // scope has, and it can still be 0 here.
+                                    // The drain anchors a zero to the first
+                                    // real height it sees rather than
+                                    // treating it as infinitely old, so the
+                                    // entry still serves a full
+                                    // confirmation window.
                                     for (const auto& oid : fixed) {
                                         buffer_terminal_offer(
                                             oid,
@@ -2592,6 +2590,24 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
         std::vector<PendingTerminal> terminal_still_pending;
         terminal_still_pending.reserve(pending_unconfirmed_terminals_.size());
         for (auto& t : pending_unconfirmed_terminals_) {
+            // A zero height means the observation came from the
+            // post-reconnect path before last_block_ had been set.  Treated
+            // as a real height it is infinitely old, so the entry would
+            // mature on its first heartbeat and skip the confirmation
+            // window outright.  An earlier revision of this change argued
+            // that was acceptable because the wallet re-query is the real
+            // gate -- but the depth is what lets the chain SETTLE before we
+            // ask, so re-querying immediately can still read a terminal
+            // state a reorg is about to undo.  Adopt the first real height
+            // instead and serve the full window from there.
+            if (t.observed_block == 0 && block_height > 0) {
+                t.observed_block = block_height;
+                spdlog::debug("[Engine] Step 2: terminal offer {} had no "
+                              "observation height -- anchoring its "
+                              "confirmation window at block {}",
+                              t.offer_id.substr(0, 12), block_height);
+            }
+
             const bool matured =
                 conf_depth == 0
                 || (block_height >= t.observed_block
@@ -2644,6 +2660,14 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                 // all.  Nothing to persist.
                 continue;
             }
+
+            // A real answer arrived, so the no-verdict streak is over.
+            // recheck_failures is documented and logged as CONSECUTIVE; if
+            // a StillTerminal answer whose write then fails left the count
+            // standing, intermittent wallet trouble would accumulate across
+            // successful responses and eventually discard an entry that had
+            // never failed ten times in a row.
+            t.recheck_failures = 0;
 
             if (verdict == execution::TerminalRecheck::Confirmed) {
                 // Reorged into a fill.  recheck_terminal put the offer back
