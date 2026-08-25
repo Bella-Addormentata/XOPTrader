@@ -2457,10 +2457,11 @@ void Engine::buffer_terminal_offer(const std::string& offer_id,
         if (observed_block > t.observed_block) {
             t.observed_block   = observed_block;
             t.recheck_failures = 0;
+            t.persist_failures = 0;
         }
         return;
     }
-    pending_unconfirmed_terminals_.push_back({offer_id, observed_block, 0});
+    pending_unconfirmed_terminals_.push_back({offer_id, observed_block, 0, 0});
 }
 
 asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
@@ -2530,6 +2531,46 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                       pending_unconfirmed_fills_.size(), conf_depth);
     }
 
+    // [S25] An offer that produced a FILL is not a cancellation, whatever
+    // was observed earlier.  Drop any buffered terminal entry for it before
+    // the drain below, because a stale entry is not merely useless here --
+    // it is actively dangerous.  At maturity recheck_terminal would find
+    // the wallet reporting CONFIRMED and re-adopt the offer into State, and
+    // the next detect_fills would emit a SECOND Fill for the same trade id.
+    // pnl_->record_fill rejects the duplicate journal entry, but the
+    // inventory mutation and persist_inventory_state() below run BEFORE the
+    // !fill_newly_recorded guard, so the position would be double-counted
+    // and durably written.  The window is real: reconciliation can re-adopt
+    // a buffered offer (it knows nothing of this buffer, which lives here in
+    // Engine) and the offer can then settle normally, all before the entry
+    // matures.
+    if (!pending_unconfirmed_terminals_.empty()) {
+        const auto is_a_fill = [&](const std::string& id) {
+            for (const auto& f : confirmed_fills) {
+                if (f.offer_id == id) return true;
+            }
+            for (const auto& f : pending_unconfirmed_fills_) {
+                if (f.offer_id == id) return true;
+            }
+            return false;
+        };
+        const std::size_t before = pending_unconfirmed_terminals_.size();
+        pending_unconfirmed_terminals_.erase(
+            std::remove_if(pending_unconfirmed_terminals_.begin(),
+                           pending_unconfirmed_terminals_.end(),
+                           [&](const PendingTerminal& t) {
+                               return is_a_fill(t.offer_id);
+                           }),
+            pending_unconfirmed_terminals_.end());
+        const std::size_t dropped =
+            before - pending_unconfirmed_terminals_.size();
+        if (dropped > 0) {
+            spdlog::info("[Engine] Step 2: dropped {} buffered terminal "
+                         "observation(s) that resolved as fills instead",
+                         dropped);
+        }
+    }
+
     // [S25] Same partition for terminal offers -- but depth ALONE proves
     // nothing here, unlike for a fill.  A fill stays in State and is
     // re-polled every cycle, so surviving the window is itself the
@@ -2557,6 +2598,19 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                     && block_height - t.observed_block >= conf_depth);
             if (!matured) {
                 terminal_still_pending.push_back(std::move(t));
+                continue;
+            }
+
+            // Tracked in State again means some other path (reconcile's
+            // reverse adoption, a restart's startup_reconcile) has taken
+            // the offer back under management.  There is nothing stale to
+            // resolve, and re-verifying could only clobber the live entry
+            // or resurrect a fill that is already being handled.
+            if (!state_->get_offer(t.offer_id).offer_id.empty()) {
+                spdlog::info("[Engine] Step 2: buffered terminal offer {} is "
+                             "tracked in State again -- dropping the buffered "
+                             "cancellation, it is under management",
+                             t.offer_id.substr(0, 12));
                 continue;
             }
 
@@ -2615,6 +2669,20 @@ asio::awaitable<void> Engine::step_process_fills(BlockHeight block_height)
                               "offer_log row -- not ours to resolve ({})",
                               t.offer_id.substr(0, 12), nf.what());
             } catch (const std::exception& ex) {
+                // Retry, but bounded.  A transient fault clears in a cycle
+                // or two; a permanent one (disk full, corrupt file) would
+                // otherwise re-verify and re-fail every block forever, and
+                // each of those retries spends a wallet get_offer RPC on an
+                // entry that cannot be written.
+                if (++t.persist_failures >= kMaxTerminalPersistFailures) {
+                    spdlog::error("[Engine] Step 2: giving up on terminal "
+                                  "status for {} after {} write failures "
+                                  "({}) -- its row stays pending; the "
+                                  "DATABASE is the problem, not the offer",
+                                  t.offer_id.substr(0, 12),
+                                  kMaxTerminalPersistFailures, ex.what());
+                    continue;
+                }
                 spdlog::warn("[Engine] Step 2: could not persist terminal "
                              "status for {} ({}) -- retrying next cycle",
                              t.offer_id.substr(0, 12), ex.what());

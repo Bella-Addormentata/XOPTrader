@@ -1242,6 +1242,12 @@ private:
         /// the wallet was unreachable.  Bounds the buffer: see
         /// kMaxTerminalRechecks.
         std::uint32_t recheck_failures{0};
+        /// Consecutive failures to WRITE the confirmed status.  Counted
+        /// separately from recheck_failures: a wallet that will not answer
+        /// and a database that will not accept the row are different
+        /// faults, and only the second one is still costing a wallet RPC
+        /// on every retry.
+        std::uint32_t persist_failures{0};
     };
     std::vector<PendingTerminal> pending_unconfirmed_terminals_;
 
@@ -1252,6 +1258,15 @@ private:
     /// behaviour, whereas a blind write can mark a live offer cancelled
     /// forever (the row is one-way for anything but a fill).
     static constexpr std::uint32_t kMaxTerminalRechecks = 10;
+
+    /// Give up persisting a re-verified terminal status after this many
+    /// consecutive write failures.  A transient fault (SQLITE_BUSY) clears
+    /// long before this; a permanent one (disk full, corrupt file) would
+    /// otherwise retry every block forever, and each retry spends a wallet
+    /// get_offer RPC re-verifying an entry it cannot write -- reintroducing
+    /// exactly the wallet-daemon load that detect_fills' poll throttling
+    /// exists to avoid.
+    static constexpr std::uint32_t kMaxTerminalPersistFailures = 10;
 
     /// Buffer an offer the wallet reported terminal so Step 2 can persist
     /// it once the observation has matured and been re-verified.  Ignores

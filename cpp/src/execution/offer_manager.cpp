@@ -1001,6 +1001,20 @@ OfferManager::recheck_terminal(const std::string& trade_id,
     // would never be restored and a later fill would be missed.  Re-adopt
     // here, for every live status.
     const auto readopt = [&](const char* why) {
+        // Never overwrite a live entry.  Something else may have taken the
+        // offer back under management while this observation sat buffered
+        // -- reconciliation's reverse adoption, or a restart -- and that
+        // entry carries state this record does not: cancel_pending, tier,
+        // the original post price.  Clobbering it would make cancel_stale
+        // pay a second cancellation fee on an offer it has already
+        // cancelled.
+        if (!state_->get_offer(trade_id).offer_id.empty()) {
+            logger_->info("[S25] recheck_terminal: {} reports {} and is "
+                          "already tracked in State -- leaving the live "
+                          "entry alone",
+                          trade_id.substr(0, 12), why);
+            return true;
+        }
         auto parsed = try_parse_wallet_offer(rec, current_block);
         if (parsed) {
             state_->upsert_offer(*parsed);
