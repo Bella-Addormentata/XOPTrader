@@ -487,3 +487,57 @@ TEST(MarketAnalyzerPollAttempts, CountsRejectedObservationsSeparately) {
     EXPECT_EQ(ma.blocks_collected("XCH/BYC"), 3u);
     EXPECT_GE(ma.poll_attempts("XCH/BYC"), 3u);
 }
+
+// ---------------------------------------------------------------------------
+// [S23 2026-08-24] is_complete() is the LOOP EXIT condition, so the unpriced
+// exclusion has to live here -- not only in the progress log.
+//
+// The first cut of this fix filtered only the logged minimum, which would
+// have reported "5/5" while the phase kept polling to its timeout: a log
+// that lies about the thing it reports. These pin the real behaviour.
+// ---------------------------------------------------------------------------
+TEST(MarketAnalyzerComplete, UnpricedPairDoesNotBlockCompletion) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "BYC/wUSDC.b"});
+
+    // The unpriced pair is polled its full share and yields nothing.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("BYC/wUSDC.b", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    // The healthy pair fills its window.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+    }
+
+    EXPECT_TRUE(ma.is_complete())
+        << "a structurally unpriced pair held the analysis phase open, so "
+           "startup would burn the full timeout";
+}
+
+TEST(MarketAnalyzerComplete, NotYetPolledPairStillBlocks) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 3;
+    xop::MarketAnalyzer ma(cfg, {"XCH/BYC", "XCH/DBX"});
+
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70, 250.0, 1000.0, 2.0, 2.0);
+    }
+    // XCH/DBX has had no polls at all -- genuinely early, must still block.
+    EXPECT_FALSE(ma.is_complete())
+        << "a pair that simply has not been polled yet must still be waited on";
+}
+
+TEST(MarketAnalyzerComplete, AllPairsUnpricedIsNotCompletion) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    EXPECT_FALSE(ma.is_complete())
+        << "declaring completion on zero observations would hand the trading "
+           "loop an empty analysis and hide a total feed failure";
+}

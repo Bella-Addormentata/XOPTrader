@@ -149,10 +149,36 @@ void MarketAnalyzer::ingest(const std::string& pair_name,
 
 bool MarketAnalyzer::is_complete() const noexcept {
     if (states_.empty()) return true;  // No pairs to analyse.
+
+    // [S23 2026-08-24] A structurally unpriced pair cannot hold the phase
+    // open.
+    //
+    // ingest() rejects any observation with a non-positive mid, and since
+    // the S20 plausibility gate a pair whose junk mid is refused publishes
+    // no mid at all -- so blocks_collected never leaves 0, `complete`
+    // never becomes true, and this function would return false forever.
+    // The startup loop polls on that answer, so one such pair costs every
+    // restart the full timeout before the phase force-completes on partial
+    // data.  A pair that has been polled its full share and produced
+    // NOTHING has been given its chance; the healthy pairs decide.
+    //
+    // The distinction is between "not polled yet" (still counts, so early
+    // progress is never skipped) and "polled repeatedly, produced nothing".
+    bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
+        if (ps.blocks_collected == 0
+            && ps.total_poll_attempts >= cfg_.analysis_blocks) {
+            continue;   // structurally unpriced
+        }
+        any_priceable = true;
         if (!ps.complete) return false;
     }
-    return true;
+
+    // Every pair unpriced: deliberately NOT complete.  Declaring success on
+    // zero observations would hand the trading loop an empty analysis and
+    // hide a total feed failure; the existing timeout owns that case and
+    // says so in the log.
+    return any_priceable;
 }
 
 uint32_t MarketAnalyzer::blocks_collected(const std::string& pair_name) const noexcept {
