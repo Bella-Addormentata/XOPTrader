@@ -541,3 +541,25 @@ TEST(MarketAnalyzerComplete, AllPairsUnpricedIsNotCompletion) {
         << "declaring completion on zero observations would hand the trading "
            "loop an empty analysis and hide a total feed failure";
 }
+
+// force_complete() must make is_complete() true, even when every pair
+// collected nothing.  It sets `complete` without touching the counters, so
+// an unpriced-pair skip that ignores `complete` would swallow those states
+// and leave is_complete() false forever -- breaking the contract the
+// timeout path depends on.
+TEST(MarketAnalyzerComplete, ForceCompleteHonouredForZeroObservationPairs) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 2;
+    xop::MarketAnalyzer ma(cfg, {"A/B", "C/D"});
+
+    for (int i = 0; i < 4; ++i) {
+        ma.ingest("A/B", 0.0, 0.0, 0.0, 0.0, 0.0);
+        ma.ingest("C/D", 0.0, 0.0, 0.0, 0.0, 0.0);
+    }
+    ASSERT_FALSE(ma.is_complete());
+
+    ma.force_complete();
+    EXPECT_TRUE(ma.is_complete())
+        << "force_complete() must satisfy is_complete() even with zero "
+           "observations on every pair";
+}

@@ -164,9 +164,16 @@ bool MarketAnalyzer::is_complete() const noexcept {
     //
     // The distinction is between "not polled yet" (still counts, so early
     // progress is never skipped) and "polled repeatedly, produced nothing".
+    // Only an INCOMPLETE state can be structurally unpriced.
+    // force_complete() sets `complete` without touching the counters, so a
+    // zero-observation pair keeps matching the test below -- and if every
+    // pair were zero-observation, skipping them all would leave
+    // any_priceable false and this function returning false even after a
+    // forced completion, breaking that method's contract.
     bool any_priceable = false;
     for (const auto& [name, ps] : states_) {
-        if (ps.blocks_collected == 0
+        if (!ps.complete
+            && ps.blocks_collected == 0
             && ps.total_poll_attempts >= cfg_.analysis_blocks) {
             continue;   // structurally unpriced
         }
