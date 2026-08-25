@@ -160,6 +160,11 @@ uint32_t MarketAnalyzer::blocks_collected(const std::string& pair_name) const no
     return (it != states_.end()) ? it->second.blocks_collected : 0u;
 }
 
+uint32_t MarketAnalyzer::poll_attempts(const std::string& pair_name) const noexcept {
+    auto it = states_.find(pair_name);
+    return (it != states_.end()) ? it->second.total_poll_attempts : 0u;
+}
+
 uint32_t MarketAnalyzer::analysis_blocks() const noexcept {
     return cfg_.analysis_blocks;
 }

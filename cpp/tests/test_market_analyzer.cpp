@@ -449,3 +449,41 @@ TEST(MarketAnalyzerTest, NormalMarketConditionsIsNormal) {
 }
 
 }  // anonymous namespace
+
+// ---------------------------------------------------------------------------
+// [S23 2026-08-24] poll_attempts distinguishes "not polled yet" from "polled
+// and produced nothing".
+//
+// The engine's startup-analysis progress is the MINIMUM blocks_collected
+// across enabled pairs, so a pair that can never be priced pins it at zero.
+// Since S20 that is a normal state: a pair whose junk mid is refused
+// publishes no mid, ingest() rejects every observation, and the count stays
+// at 0 forever.  The engine needs to tell that apart from a pair that has
+// simply not had its turn yet, and poll_attempts is how.
+// ---------------------------------------------------------------------------
+TEST(MarketAnalyzerPollAttempts, CountsRejectedObservationsSeparately) {
+    xop::MarketAnalyzerConfig cfg;
+    cfg.analysis_blocks = 5;
+    xop::MarketAnalyzer ma(cfg, {"BYC/wUSDC.b", "XCH/BYC"});
+
+    // Unknown pair: both zero.
+    EXPECT_EQ(ma.blocks_collected("XCH/NONE"), 0u);
+    EXPECT_EQ(ma.poll_attempts("XCH/NONE"), 0u);
+
+    // A pair that publishes no mid: polled repeatedly, collects nothing.
+    for (int i = 0; i < 6; ++i) {
+        ma.ingest("BYC/wUSDC.b", /*mid=*/0.0, /*spread=*/0.0, /*vol=*/0.0,
+                  /*bid_depth=*/0.0, /*ask_depth=*/0.0);
+    }
+    EXPECT_EQ(ma.blocks_collected("BYC/wUSDC.b"), 0u)
+        << "an unpriced observation must not count as collected";
+    EXPECT_GE(ma.poll_attempts("BYC/wUSDC.b"), 6u)
+        << "attempts must be tracked even when the observation is rejected";
+
+    // A healthy pair accumulates both.
+    for (int i = 0; i < 3; ++i) {
+        ma.ingest("XCH/BYC", 1.70 + i * 0.01, 250.0, 1000.0, 2.0, 2.0);
+    }
+    EXPECT_EQ(ma.blocks_collected("XCH/BYC"), 3u);
+    EXPECT_GE(ma.poll_attempts("XCH/BYC"), 3u);
+}

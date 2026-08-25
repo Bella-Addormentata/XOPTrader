@@ -227,6 +227,16 @@ public:
     /// Number of blocks collected for the given pair (0 if unknown pair).
     [[nodiscard]] uint32_t blocks_collected(const std::string& pair_name) const noexcept;
 
+    /// [S23 2026-08-24] Total ingest calls for the pair, INCLUDING those
+    /// rejected for an invalid mid (0 if unknown pair).
+    ///
+    /// Exists so callers can tell "this pair has not been polled yet" from
+    /// "this pair has been polled repeatedly and produced nothing".  The
+    /// second case is now normal: a pair whose junk mid is refused by the
+    /// S20 plausibility gate publishes no mid at all, so it never ingests
+    /// a valid observation and its blocks_collected stays at 0 forever.
+    [[nodiscard]] uint32_t poll_attempts(const std::string& pair_name) const noexcept;
+
     /// Configured analysis window length (blocks).
     [[nodiscard]] uint32_t analysis_blocks() const noexcept;
 
