@@ -302,6 +302,23 @@ public:
         return last_terminal_offers_;
     }
 
+    /// [S25 2026-08-24] Re-query the wallet about an offer previously
+    /// observed terminal, so a deferred "cancelled" write can be checked
+    /// rather than merely delayed.
+    ///
+    /// detect_fills() calls remove_offer() the moment it sees a terminal
+    /// status, so the offer leaves State and is never polled again --
+    /// which means waiting out a confirmation depth proves nothing on its
+    /// own.  This asks the wallet again at maturity.
+    ///
+    /// @return true if the wallet still reports CANCELLED/FAILED; false if
+    ///         the offer is live again (the observation did not survive);
+    ///         nullopt if the wallet could not be reached, which is NOT a
+    ///         verdict -- the caller must retry rather than assume either
+    ///         way.
+    asio::awaitable<std::optional<bool>>
+    recheck_terminal(const std::string& trade_id);
+
     // -- Cancellation -------------------------------------------------------
 
     /**

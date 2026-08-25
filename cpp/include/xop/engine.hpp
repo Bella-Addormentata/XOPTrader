@@ -1238,8 +1238,27 @@ private:
     struct PendingTerminal {
         std::string offer_id;
         BlockHeight observed_block{0};
+        /// Consecutive maturity rechecks that reached no verdict because
+        /// the wallet was unreachable.  Bounds the buffer: see
+        /// kMaxTerminalRechecks.
+        std::uint32_t recheck_failures{0};
     };
     std::vector<PendingTerminal> pending_unconfirmed_terminals_;
+
+    /// Give up re-verifying a matured terminal observation after this many
+    /// consecutive no-verdict rechecks.  On exhaustion the entry is DROPPED
+    /// rather than written: an unwritten row stays "pending" and is
+    /// re-observed on the next process start, which is merely the old
+    /// behaviour, whereas a blind write can mark a live offer cancelled
+    /// forever (the row is one-way for anything but a fill).
+    static constexpr std::uint32_t kMaxTerminalRechecks = 10;
+
+    /// Buffer an offer the wallet reported terminal so Step 2 can persist
+    /// it once the observation has matured and been re-verified.  Ignores
+    /// an id already buffered, since detect_fills() and reconcile_offers()
+    /// can both surface the same offer in one cycle.
+    void buffer_terminal_offer(const std::string& offer_id,
+                               BlockHeight        observed_block);
 
     // -- PID adaptive spread controller state (per-pair) ------------------
     // Tracks fill-rate EMA and PID accumulators for each trading pair.

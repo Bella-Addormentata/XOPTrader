@@ -954,6 +954,43 @@ asio::awaitable<std::vector<Fill>> OfferManager::detect_fills(
 }
 
 // ---------------------------------------------------------------------------
+// [S25 2026-08-24] recheck_terminal
+// ---------------------------------------------------------------------------
+asio::awaitable<std::optional<bool>>
+OfferManager::recheck_terminal(const std::string& trade_id)
+{
+    json rec;
+    try {
+        rec = co_await wallet_->get_offer(trade_id, /*file_contents=*/false);
+    } catch (const std::exception& e) {
+        // Unreachable wallet is not evidence either way.  Say so and let
+        // the caller keep the entry buffered.
+        logger_->warn("[S25] recheck_terminal: get_offer failed for {} -- "
+                      "no verdict, caller retries: {}",
+                      trade_id.substr(0, 12), e.what());
+        co_return std::nullopt;
+    }
+
+    if (!rec.contains("status")) {
+        logger_->warn("[S25] recheck_terminal: wallet record for {} carries "
+                      "no status field -- no verdict",
+                      trade_id.substr(0, 12));
+        co_return std::nullopt;
+    }
+
+    const int status = trade_status::parse(rec["status"]);
+    const bool terminal = (status == trade_status::kCancelled
+                           || status == trade_status::kFailed);
+    if (!terminal) {
+        logger_->warn("[S25] recheck_terminal: {} was observed terminal but "
+                      "the wallet now reports status={} -- the observation "
+                      "did NOT survive; no cancellation will be written",
+                      trade_id.substr(0, 12), status);
+    }
+    co_return terminal;
+}
+
+// ---------------------------------------------------------------------------
 // cancel_stale -- cancel offers exceeding their block-based TTL
 // ---------------------------------------------------------------------------
 
