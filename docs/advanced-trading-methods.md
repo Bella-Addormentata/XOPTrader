@@ -4,6 +4,11 @@ Three scholarly-grounded methods layered on top of the existing whale detection
 system: **VPIN** (flow-toxicity estimation), **OFI** (order-flow imbalance), and
 **asymmetric spread widening** (skewed quoting toward the informed side).
 
+Section 4 is different in kind: **SVPerps** (statistical volatility
+perpetuals) are a venue type we do not yet trade, recorded here because the
+literature is thin and split across two fields, and because we have primary
+measurements from a live venue that the literature does not contain.
+
 ---
 
 ## 1  VPIN — Volume-Synchronized Probability of Informed Trading
@@ -188,6 +193,145 @@ double ask_spread = base_spread * am.ask_multiplier;
 
 ---
 
+## 4  SVPerps — Statistical Volatility Perpetuals
+
+### Reference
+
+**There is no peer-reviewed literature on "SVPerps" as a standardised
+product.** The term is crypto-native, used in DeFi whitepapers and
+quantitative trading circles rather than in journals. Anyone researching
+these has to bridge two literatures that do not usually cite each other:
+volatility derivatives from traditional quantitative finance, and perpetual
+contract design from crypto.
+
+Verified — found and confirmed to exist:
+
+1. Shiller, R.J. — originator of the perpetual-futures concept; BitMEX
+   introduced it to crypto in 2016.
+2. "Designing funding rates for perpetual futures in cryptocurrency
+   markets." arXiv:2506.08573.
+3. "Perpetual future contracts in centralized and decentralized exchanges:
+   Mechanism and traders' behavior." *Electronic Markets* 34(1), 2024.
+   doi:10.1007/s12525-024-00715-1.
+4. "Exploring the Impact: How Decentralized Exchange Designs Shape Traders'
+   Behavior on Perpetual Future Contracts." arXiv:2402.03953.
+5. Avellaneda, M. & Stoikov, S. (2008) — already in this document, and the
+   quoting model this section ultimately feeds.
+
+Cited to us but **NOT independently verified** — titles could not be
+confirmed against a source, and the citations supplied were bare domains
+rather than DOIs. Treat as leads, not authorities:
+
+- Cox et al., "The Valuation of Options for Alternative Stochastic
+  Processes" — foundations of modelling volatility as a process.
+- "Pricing Variance Swaps under Hybrid CEV and Stochastic Volatility" —
+  how a variance-swap leg computes and pays realized variance.
+- "Analytic Approximations for Pricing Perpetual American Strangle Options
+  under Stochastic Volatility", *J. Comput. Appl. Math.*
+- Chitra et al. (2026), "Perpetual Futures in Decentralised Finance:
+  Mechanics, Economic Risks, and Design", *DeFi Markets*. Searching found
+  adjacent real work but not this title.
+- "Probability-based portfolio in crypto-perpetual futures market"
+  (ProSP), *Physica A*-style, Aug 2026.
+
+For protocol blueprints rather than theory: Deri Protocol and Volatility
+Protocol documentation.
+
+### Concept
+
+An SVPerp gives perpetual exposure to a *statistical volatility* series
+rather than to a price. Two ingredients, from the two literatures:
+
+- **The payoff leg** is the variance-swap idea: settle against realized
+  (statistical) variance rather than against an asset price.
+- **The tether** is the crypto perpetual mechanism: no expiry, and a
+  continuous funding rate that pulls mark toward the oracle. This replaces
+  the expiry-and-settle machinery of a variance swap.
+
+The consequence that matters for market making: **there is no cash-and-carry
+arbitrage to anchor the contract.** A conventional perp is disciplined by
+arbitrageurs who can hold the underlying. Nobody can hold "QQQ 30-day
+realized vol". The oracle and the funding rate are the *only* things holding
+mark to fair value, so a maker on an SVPerp is quoting against a reference
+they cannot hedge in the underlying.
+
+### What we measured on a live SVPerp venue
+
+Primary data, Permuto Capital (`perps.permuto.capital`), 2026-08-26. This
+is the part not available in any of the literature above.
+
+**The oracle is session-shaped.** Mean intrabar range by hour (UTC),
+weekdays, from hourly candles:
+
+| hours (UTC) | mean intrabar range |
+| ----------- | ------------------- |
+| 00:00–12:00 | 0.0%                |
+| 13:00 (09:00 ET) | **488.8%**     |
+| 14:00–18:00 | 277% → 160%         |
+| 19:00       | 92%                 |
+| 20:00       | 11%                 |
+| 21:00–23:00 | ~0%                 |
+
+Weekends: 0.2–0.4% against 57–88% on weekdays. So the series is frozen for
+~13 hours a day and all weekend, then detonates at the equity open and
+decays monotonically through the session. **A vol oracle is not a
+round-the-clock process even when the perp trading on it is.**
+
+**Vol-of-vol is enormous and market-specific.** 200 samples at 2s:
+
+| oracle   | sd     | VR(2) | VR(5) | VR(10) |
+| -------- | ------ | ----- | ----- | ------ |
+| QQQ-VOL  | 12.5%  | 0.98  | 0.99  | 0.92   |
+| NVDA-VOL | 20.6%  | 0.97  | 0.75  | **0.54** |
+| TSLA-VOL | 25.8%  | 1.00  | 1.15  | **1.20** |
+
+Variance ratio < 1 is mean-reverting, ~1 a random walk, > 1 trending. All
+three are a random walk at 2s and **diverge with horizon**: NVDA reverts,
+TSLA trends, QQQ is neither.
+
+This is the practically important finding, and it cuts against the theory.
+Stochastic-volatility models (Heston and descendants) assume variance is
+mean-reverting — that is the defining property. **Only one of these three
+oracles behaves that way.** A maker who assumes reversion because the
+underlying is "volatility" will be right on NVDA and systematically run over
+on TSLA.
+
+### Implications for quoting
+
+1. **Reservation spread must cover vol-of-vol, not vol.** In
+   Avellaneda–Stoikov the inventory penalty scales with σ of the *quoted
+   instrument*. Here the quoted instrument is itself a volatility, so the
+   relevant σ is vol-of-vol — 12–26% here, far above what a price-based
+   calibration would produce.
+2. **Reversion is an empirical question per market, not a property of the
+   asset class.** Measure the variance ratio per oracle, per session
+   segment; do not assume it from the fact that the underlying is variance.
+3. **Session awareness is mandatory.** Thirteen dead hours a day is not
+   noise to be smoothed — it is a different regime, and any estimator
+   calibrated on a blended day will misprice both halves.
+4. **Funding is the only tether, so basis can persist.** With no
+   cash-and-carry, a mark/oracle gap is not self-correcting on any
+   particular timescale; it closes only as fast as funding makes it
+   expensive. Sizing a mean-reversion trade on basis needs the funding
+   cadence as an explicit input.
+5. **No hedge exists in the underlying.** Inventory acquired on an SVPerp
+   can only be flattened on the same venue, so inventory risk is closer to
+   a single-venue CAT than to a hedgeable perp.
+
+### Open questions
+
+- Is the 13:00Z spike a genuine open-effect or an artefact of the oracle
+  restarting after 13 idle hours? Not resolvable from venue history —
+  `/info/candles` accepts `tf` but **ignores it**, always returning hourly
+  bars.
+- Does a frozen oracle still count as "fresh" for liquidity-incentive
+  purposes? Decides whether overnight quoting is cheap credit or no credit.
+- How is the oracle actually computed? Permuto documents a BLS-signed
+  price certificate, but `/info/price_certificate` returns
+  `No price certificate available yet`, so no provenance is exposed.
+
+---
+
 ## Integration Guide
 
 ### Combining All Signals
@@ -291,3 +435,9 @@ do so in this global order; no method acquires locks in a conflicting order.
    Journal of Finance*.
 6. Easley, D., Kiefer, N.M., O'Hara, M. & Paperman, J.B. (1996). "Liquidity,
    Information, and Infrequently Traded Stocks."  *The Journal of Finance*.
+7. "Designing funding rates for perpetual futures in cryptocurrency
+   markets."  arXiv:2506.08573.
+8. "Perpetual future contracts in centralized and decentralized exchanges:
+   Mechanism and traders' behavior."  *Electronic Markets* 34(1), 2024.
+9. "Exploring the Impact: How Decentralized Exchange Designs Shape Traders'
+   Behavior on Perpetual Future Contracts."  arXiv:2402.03953.
