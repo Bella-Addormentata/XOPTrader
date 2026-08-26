@@ -9,17 +9,26 @@ live Chia bot.
 are recorded rather than quietly edited out, because the errors are
 instructive.**
 
-> ## ⛔ C-00 — ELIGIBILITY, unresolved and gating everything
+> ## C-00 — eligibility: the CONTEST is open to us, live trading is not
 >
-> From permuto.capital/product-svperps, verbatim:
+> The product page carries a geographic restriction, verbatim:
 >
 > > "Available to non-U.S. participants only. Permuto svPerps is currently
 > > only open to eligible participants outside of the United States."
 >
-> This operation runs from the United States. **Settle this before any
-> further work** — every task below is moot if we are not eligible to
-> participate, and the page offers a "Contact us" route for eligibility
-> questions. Not a technical question and not one this document can answer.
+> **Per the operator, that restriction applies to live trading, not to the
+> contest**, which runs on paper money — the $500k seed is a clearinghouse
+> grant with `withdrawals_enabled: false`, so nothing leaves the venue. US
+> participation in the competition is therefore in scope.
+>
+> Two things to keep straight:
+>
+> - **Do not carry contest work into live trading** without settling
+>   eligibility separately. The paper/live boundary is where the
+>   restriction bites.
+> - **XOPTrader is open source and used worldwide.** Any perps capability
+>   built here is usable by operators who *are* eligible to trade it live,
+>   whatever we do with our own account.
 
 ---
 
@@ -274,10 +283,29 @@ Two reasons for care:
 early on exactly one thing — a single qualifying fill to survive the
 untraded purge.
 
+## Why this is worth doing even if we never place a live perp order
+
+The contest is paper money, so the direct payoff is a prize. **The durable
+payoff is capability that flows back into the dexie bot** — and several
+things Permuto forces on us are gaps XOPTrader already has.
+
+| capability | why Permuto forces it | value back on dexie |
+| --- | --- | --- |
+| **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31** in `TODO.md` |
+| **Paper / observer mode** | history is hourly only, so a rule must be scored on live data before risking capital | XOPTrader has **no paper mode**; every strategy change ships straight to a live book |
+| **Jump-aware estimation** | the oracle is a jump process and continuous-path models are misspecified | Dexie CATs jump too — the 100× outlier at `price=0.013810` is the same shape. Feeds S20 |
+| **Estimator noise vs information** | the oracle is a 60s RV estimate, so much of its jitter is sampling error | The same question S20 asks: junk print, or real repricing? |
+| **Balanced two-sided depth** | `min(bid, ask)` — a lifted side earns zero | We do not track whether our dexie book is two-sided; one-sided quoting is invisible today |
+| **Batch quote maintenance** | `batch_upsert` restores a lifted side in one call | Step 8's cancel-and-repost is two operations with a window between |
+
+The perps-specific work — funding, margin, liquidation — does **not**
+transfer and must not leak into shared code.
+
 ## Sequenced work
 
-- [ ] **C-00** **ELIGIBILITY** — non-U.S. participants only. **Blocks
-      everything.** Operator decision.
+- [x] **C-00** Eligibility — the contest is open to US participants (paper
+      money); the non-U.S. restriction applies to **live trading**. Do not
+      cross that boundary without settling it separately.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth, but **decaying**.
 - [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
@@ -303,8 +331,11 @@ untraded purge.
 - Compete at all, given every MM with real depth is deeply negative.
 - Where the BLS signing key lives; fresh identity or existing.
 - Testnet vs mainnet — prizes may require mainnet; unconfirmed.
-- **Keep competition code behind an adapter boundary?** Strongly
-  recommended; the live bot is paused mid-incident.
+- **Keep competition code behind an adapter boundary?** Still recommended,
+  but for a sharper reason than "the live bot is fragile": the *strategy
+  and observation* layers are what we want flowing back to dexie, while
+  funding/margin/liquidation must not. The goal is a boundary that lets the
+  first cross and blocks the second — not a wall.
 
 ## Companion documents
 

@@ -319,6 +319,13 @@
 - **Issue:** warp.green (minter of every `.b` asset) reported compromised 2026-08-25 — wUSDC.b traded ~26% below par on the implied peg for hours while accounting valued it at $1.00. Then Circuit DAO reported its treasury drained and stated the protocol "will have to be sunset and relaunched", so BYC is being wound down rather than merely depegged. Four XCH→BYC asks filled 2–4 hours *after* that announcement, because BYC had no external feed and its only peg watch was on the pair we had already disabled.
 - **Status:** `[~]` — Contained: trading paused, all BYC/wUSDC.b-acquiring offers cancelled (0 takeable), XCH/wUSDC.b, BYC/wUSDC.b, wmilliETH.b/XCH and XCH/BYC all disabled, `recovery.pair_allowlist` emptied. **Open:** the ~58 BYC and ~79 wUSDC.b holdings, and whether to follow Circuit's relaunch. Both are operator calls. Blocks S27 — with every stablecoin pair disabled there is no USD anchor left, which is why the external-feed fix matters.
 
+### S31: no dead man's switch -- a wedged engine leaves live offers on the book
+- **Files:** `cpp/src/engine.cpp` (heartbeat), `cpp/src/execution/offer_manager.cpp`
+- **Issue:** On 2026-08-25 the engine spent ~4h unable to reach the full node while offers rested on dexie. When the node returned, six four-hour-old XCH/BYC bids filled in the same second and the rolling-window breaker tripped (-$12.71 over 3 blocks). Nothing cancels our book when the engine stops functioning -- the offers outlive the process that is supposed to be managing them. S28 compounds it: `pause.flag` is also unreadable in that state, so the operator cannot intervene either.
+- **Prior art:** Permuto exposes exactly this as a first-class endpoint (`POST /exchange/schedule_cancel`, Hyperliquid-style): arm a future cancel-all, extend it on every healthy loop, and the venue cancels for you if you stop. Policy there is `min_delay_ms` 5000, `max_triggers_per_day` 10 fresh arms, with rescheduling-while-armed unlimited -- so the pattern is *extend*, never disarm-and-rearm. See `docs/permuto-api-reference.md` §2.
+- **Design note:** dexie has no server-side equivalent, so ours must be local and must NOT depend on the heartbeat it is protecting against -- a watchdog inside the loop that wedges is worthless. Wallet RPC stayed healthy throughout the 2026-08-25 outage while the full node was unreachable, so a wallet-only cancel path is viable.
+- **Status:** `[ ]` — Identified 2026-08-26 while scoping Permuto; the capability is a straight transfer back to the dexie bot.
+
 ### S21: Bridge chronology uses status time, not wallet-effect time (bounded, deferred)
 
 Copilot round 30 (suppressed comment, acknowledged): the S19 opening filter's
