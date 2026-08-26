@@ -4,8 +4,26 @@ Working document for whether and how XOPTrader competes at
 <https://perps.permuto.capital>. Separate from `TODO.md`, which tracks the
 live Chia bot.
 
-**Status: scoped, nothing built.** Figures read from the live venue
-2026-08-26 unless noted. **This document has been wrong twice; corrections
+**Status: scoped, nothing built — and the contest starts in under 5 days.**
+Figures read from the live venue 2026-08-26 unless noted; contest terms from
+the official rules page.
+
+> ## ⏱ THE CLOCK
+>
+> | | |
+> | --- | --- |
+> | **Sign-up closes** | Mon **31 Aug 2026, 17:00 ET** (21:00 UTC) |
+> | **Contest runs** | Mon **31 Aug 09:30 ET** → Fri **4 Sep 16:00 ET** |
+> | Duration | 4.3 days, ~32 cash-session hours |
+> | As of 2026-08-26 23:06 UTC | **4.6 days to start, 4.9 to sign-up close** |
+>
+> **New participants cannot join after the first day of competition.** If we
+> are entering at all, registration is the only thing that has a hard
+> deadline, and it comes before any code needs to exist.
+>
+> **Prizes** (each category, paid in XCH): 1st **$15,000**, 2nd **$5,000**,
+> 3rd **$2,500**. Traders and Market Makers are separate categories and one
+> entrant may win in both — $45,000 total pool. **This document has been wrong twice; corrections
 are recorded rather than quietly edited out, because the errors are
 instructive.**
 
@@ -16,10 +34,16 @@ instructive.**
 > > "Available to non-U.S. participants only. Permuto svPerps is currently
 > > only open to eligible participants outside of the United States."
 >
-> **Per the operator, that restriction applies to live trading, not to the
-> contest**, which runs on paper money — the $500k seed is a clearinghouse
-> grant with `withdrawals_enabled: false`, so nothing leaves the venue. US
-> participation in the competition is therefore in scope.
+> **The official rules confirm this.** Entry is open to "legal residents of
+> the 50 US states, District of Columbia, and worldwide territories". The
+> non-U.S. restriction on the product page applies to **live trading**, not
+> to the contest, which runs on *simulated* dollars — explicitly "not real
+> funds or testnet/mainnet cryptocurrency", so the `/exchange/faucet`
+> testnet wUSDC.b is a separate thing from the contest seed.
+>
+> Excluded: Cuba, Crimea, Donetsk, Luhansk, Iran, North Korea, **Quebec**,
+> anyone under US sanctions or on Treasury blocked-persons lists, and
+> employees/contractors of the Sponsor and their families.
 >
 > Two things to keep straight:
 >
@@ -139,6 +163,22 @@ depth_seconds += Σ_markets balanced_depth_usdc × 10
 Skill states the gate as ≈$3,000 balanced depth for ~28 hours. **But it
 decays** (correction 2), so it must be *held*, not banked and abandoned.
 
+⚠ **The official rules and the agent skill do not obviously agree.** The
+rules say market makers are ranked by profit "**combined with** liquidity
+scoring", while the skill is explicit that the two metrics are "**not**
+added into one score" — depth is an eligibility gate, then rank is by net
+PnL alone. The skill is the more specific document and is what the API
+actually exposes (`prize_eligible` is a boolean, separate from `total_pnl`),
+but this is worth clarifying with the Sponsor before optimising for either
+reading. They imply different strategies.
+
+**The contest window changes the arithmetic.** Eligibility integrates
+`[CONTEST_START, CONTEST_END]` once set, so **depth banked before 31 Aug
+does not count**. 300,000,000 over ~32 cash-session hours is ~$2,600 of
+balanced depth held continuously — but only ~32 of the 103 wall-clock hours
+are cash session, and whether *carried* (out-of-hours) ticks credit is still
+unresolved. If they do not, the gate must be cleared inside those 32 hours.
+
 Rules: one-sided quotes earn **zero** for that market (`min(bid, ask)`);
 pauses/restarts/stale oracle advance the window and add nothing.
 
@@ -198,6 +238,22 @@ Still unresolved and decisive: **do carried ticks accrue depth at all?**
 Carried is evidently not the same as stale (stale placement returns HTTP
 503, carried placement is permitted at 8× IM), but whether the ~10s sampler
 credits carried ticks is undocumented.
+
+## Conduct rules that bind a two-sided quoter
+
+From the official rules, disqualifying conduct includes **wash trading,
+self-dealing, collusion**, operating **multiple accounts**, false
+information, and tampering with Exchange operations.
+
+⚠ **Self-trading is a live risk for us specifically.** A two-sided quoter
+with a bid and an ask on the same market *can* cross itself when the oracle
+moves through both — and the API skill references "opposite-side self-trade
+refresh" as a real scenario in the `batch_place` docs. That is exactly the
+shape of accidental self-dealing. Any quoting loop needs an explicit
+self-trade guard before it goes near this contest, not after.
+
+**One account only.** No hedging our own entry with a second identity, and
+no separate "test" account running alongside.
 
 ## THE TRAP: quote-only accounts get wiped
 
@@ -303,9 +359,17 @@ transfer and must not leak into shared code.
 
 ## Sequenced work
 
-- [x] **C-00** Eligibility — the contest is open to US participants (paper
-      money); the non-U.S. restriction applies to **live trading**. Do not
-      cross that boundary without settling it separately.
+- [x] **C-00** Eligibility — confirmed by the official rules: open to legal
+      residents of the 50 US states, DC and territories. The non-U.S.
+      restriction applies to **live trading**, not the contest. Do not cross
+      that boundary without settling it separately.
+- [ ] **C-0R** **REGISTER, or decide not to enter.** Sign-up closes Mon
+      **31 Aug 17:00 ET** and no one may join after day one. This is the
+      only hard deadline and it does not require any code. **Operator
+      decision, and the first one.**
+- [ ] **C-0S** Clarify with the Sponsor whether MM rank is *gate-then-PnL*
+      (agent skill) or *PnL combined with liquidity score* (official rules).
+      They imply different strategies. Cheap to ask, expensive to guess.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth, but **decaying**.
 - [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
@@ -322,7 +386,11 @@ transfer and must not leak into shared code.
       funding budget. Never let a position price at 0 in silence.
 - [ ] **C-07** Session scheduler — stand down at 13:00Z; quote per-market
       on measured statistics, not by rule.
-- [ ] **C-08** Secure the qualifying fill early.
+- [ ] **C-08** Secure the qualifying fill early (untraded purge).
+- [ ] **C-10** **Self-trade guard.** A two-sided quoter can cross its own
+      bid and ask when the oracle moves through both; wash trading and
+      self-dealing are disqualifying. Must exist before the first quote,
+      not after.
 - [ ] **C-09** Poll `CONTEST_START` / `untraded_purge_at` / `signup_closed`
       continuously; all three change the plan when they flip.
 
