@@ -9,6 +9,18 @@ live Chia bot.
 are recorded rather than quietly edited out, because the errors are
 instructive.**
 
+> ## ⛔ C-00 — ELIGIBILITY, unresolved and gating everything
+>
+> From permuto.capital/product-svperps, verbatim:
+>
+> > "Available to non-U.S. participants only. Permuto svPerps is currently
+> > only open to eligible participants outside of the United States."
+>
+> This operation runs from the United States. **Settle this before any
+> further work** — every task below is moot if we are not eligible to
+> participate, and the page offers a "Contact us" route for eligibility
+> questions. Not a technical question and not one this document can answer.
+
 ---
 
 ## Corrections to earlier versions of this file
@@ -44,7 +56,28 @@ impact notional 6000: `QQQ-VOL-PERP`, `NVDA-VOL-PERP`, `TSLA-VOL-PERP`.
 tradeable (`/info/l2/AAPL-PERP` → `market not found`, `/info/stats` empty).
 **Watch for activation.**
 
-## The oracle: market-linked, session-shaped, brutally volatile
+## The oracle: a 60-second realized-vol estimate, resampled every 5s
+
+The product page states what it is:
+
+> "a single number built from price movement over the **preceding 60
+> seconds** … **refreshed every five seconds** during U.S. market hours"
+
+**This reframes every volatility number below.** A realized-vol estimate
+built from sixty seconds of data carries a large standard error, so much of
+the dispersion we measured is **estimator noise, not market information**.
+And at a 5s refresh over a 60s window, consecutive prints share ~55/60 of
+their input — they are autocorrelated *by construction*, which means the
+VR(2) ≈ 1.0 "random walk" reading below is **confounded by overlapping
+windows** and is not evidence that the underlying quantity wanders.
+
+If the jitter is mostly sampling error around a slower true volatility,
+quoting around a **smoothed** oracle is sound and the noise is edge rather
+than toxicity. **That is now the central untested hypothesis of the whole
+exercise**, and C-03 exists to settle it. Full treatment in
+`docs/permuto-api-reference.md` §0.
+
+## Measured behaviour: market-linked, session-shaped, brutally volatile
 
 Mean intrabar range by hour, weekdays only, from hourly candles:
 
@@ -98,8 +131,13 @@ Skill states the gate as ≈$3,000 balanced depth for ~28 hours. **But it
 decays** (correction 2), so it must be *held*, not banked and abandoned.
 
 Rules: one-sided quotes earn **zero** for that market (`min(bid, ask)`);
-band is ±2% (`MM_UPTIME_PROXIMITY_PCT`) while `vol_oracle_band_pct` is 5;
 pauses/restarts/stale oracle advance the window and add nothing.
+
+**There are two bands and they do different jobs.** `vol_oracle_band_pct`
+(default 5) is the *legal placement* band — outside it, orders are rejected
+HTTP 400. `vol_aggressive_ring_pct` (default 2) is the inner *aggressive*
+ring; outside the ring only **passive** rests are allowed (bids ≤ oracle,
+asks ≥ oracle). The ±2% that governs depth credit is the ring, not the band.
 
 ### The live field
 
@@ -131,11 +169,26 @@ weekends, quote the session only where statistics support it.** That would
 also explain the leaderboard — accounts chasing `Σ_markets` depth during
 the session, in TSLA as hard as NVDA, getting run over.
 
-**This is a hypothesis, not a finding.** It needs: confirmation that
-overnight ticks actually credit; whether a frozen oracle counts as
-"fresh" (`Zero-depth ticks` covers *stale* oracle — the boundary is
-undefined and decisive); and per-market session statistics over several
-days.
+**This is a hypothesis, and it is now materially weaker than when first
+written.** Two venue rules found in the API skill on 2026-08-26 cut against
+it:
+
+- **Carried sessions cost 8× margin.** While the oracle is *carried* (the
+  venue's own term for the frozen out-of-hours state), risk-increasing
+  places require stressed initial margin (`VOL_CARRIED_STRESS_MULTIPLE`,
+  default 8). Reduce-only is exempt. Overnight depth may be low-risk but it
+  is **not low-capital**.
+- **Everything is cancelled at the open.** At carried→live, *all* resting
+  orders and pending triggers on that vol market are cancelled and must be
+  re-quoted. So overnight depth cannot roll into the session, and — usefully
+  — we cannot be caught holding stale quotes into the 488% hour even by
+  accident. The venue already protects makers from the thing C-07 was
+  written to avoid.
+
+Still unresolved and decisive: **do carried ticks accrue depth at all?**
+Carried is evidently not the same as stale (stale placement returns HTTP
+503, carried placement is permitted at 8× IM), but whether the ~10s sampler
+credits carried ticks is undocumented.
 
 ## THE TRAP: quote-only accounts get wiped
 
@@ -223,11 +276,16 @@ untraded purge.
 
 ## Sequenced work
 
+- [ ] **C-00** **ELIGIBILITY** — non-U.S. participants only. **Blocks
+      everything.** Operator decision.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth, but **decaying**.
 - [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
-- [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: does
-      overnight credit depth; is a frozen oracle "fresh"; per-market
-      session statistics; would-be PnL of a candidate rule. **Do first.**
+- [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
+      short-horizon jitter estimator noise or information** (the central
+      question, given the 60s/5s overlapping-window construction); do
+      carried ticks credit depth; per-market session statistics; would-be
+      PnL of a candidate rule. Endpoints listed in
+      `docs/permuto-api-reference.md` §7. **Do first, after C-00.**
 - [ ] **C-04** Perps position model — positions, margin, funding,
       liquidation distance.
 - [ ] **C-05** Execution adapter — `order`/`modify`/`cancel`/
@@ -247,6 +305,13 @@ untraded purge.
 - Testnet vs mainnet — prizes may require mainnet; unconfirmed.
 - **Keep competition code behind an adapter boundary?** Strongly
   recommended; the live bot is paused mid-incident.
+
+## Companion documents
+
+- `docs/permuto-api-reference.md` — all 59 API routes, what each does, how
+  we would use it, and the constraints that bind a market maker.
+- `docs/advanced-trading-methods.md` §4 — the SVPerp literature, what
+  transfers, and which published methods cannot run on this venue.
 
 ## Sources
 
