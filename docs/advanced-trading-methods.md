@@ -318,6 +318,100 @@ on TSLA.
    can only be flattened on the same venue, so inventory risk is closer to
    a single-venue CAT than to a hedgeable perp.
 
+### Market making an SVPerp — the two-literature blueprint
+
+No paper is titled "Market Making for SVPerps". The mathematical blueprint
+has to be assembled from two fields that do not cite each other: **optimal
+perpetual control** (how to quote given a funding cash flow) and **variance
+swap replication** (how to hedge the volatility leg).
+
+#### The perp leg — funding-aware quoting
+
+**Le, N.A. (2026). "Funding-Aware Optimal Market Making for Perpetual
+DEXs." arXiv:2605.06405, 7 May 2026.** *Verified.*
+
+Extends Avellaneda–Stoikov by making the **funding rate a state variable**.
+The insight is that inventory generates two distinct exposures, not one:
+mark-to-market, and a *state-dependent funding cash flow*. Classical A–S
+models only the first, so its optimal spread is wrong whenever funding is
+material. Formulated as a reduced inventory-funding control problem and
+solved with a monotone finite-difference HJB scheme; optimal spreads come
+out of discrete inventory value differences.
+
+Two details from the paper that matter to us more than the headline result:
+
+- Calibrated on **Hyperliquid** data, and the author reports that real
+  funding innovations have **heavy tails** beyond the Gaussian
+  Ornstein–Uhlenbeck baseline the model uses. Our oracles are heavier-tailed
+  still (20.8% two-second moves), so the Gaussian-OU calibration is a floor
+  on the risk, not an estimate of it.
+- Results were **mixed on SOL** — gains against unscaled baselines, no clear
+  advantage once risk-scaled. Funding-awareness is not a free improvement;
+  it pays where funding is large relative to spread.
+
+Practical takeaway: skew quotes by *which side of the funding you are on*,
+not only by inventory sign. Being long inventory while receiving funding is
+a materially different state from being long while paying it, and A–S
+cannot express the difference.
+
+**Reinforcement learning for automated market making in perpetual futures**
+(ScienceDirect, S240591882600022X). *Unverified — 403 on fetch.* Cited for
+adaptive quoting under volatility regimes: static rules do not survive, and
+quotes must widen on regime shifts to avoid being adversely filled during
+spikes. Consistent with our own measurements, but we could not read it.
+
+#### The volatility leg — replication, and why it does not apply here
+
+**Martin, I. (2011). "Simple Variance Swaps." NBER Working Paper 16884,
+March 2011. doi:10.3386/w16884.** *Verified.*
+
+⚠ **A correction to how this is usually cited.** The familiar results —
+the log-contract price and the **1/K² strike weighting** — belong to the
+*standard* variance swap (Demeterfi, Derman, Kamal & Zou, 1999). Martin's
+paper exists precisely because that replication **breaks when prices jump**;
+it was motivated by the 2008–09 jumps that dried up the single-name variance
+swap market entirely. The *simple* variance swap is a different contract
+chosen to stay robust and hedgeable under jumps.
+
+That distinction is not pedantry for us. These oracles jump violently — a
+488% mean intrabar range at the open, 20.8% moves in two seconds. **Any
+replication argument that assumes a continuous price path is invalid in
+exactly our regime.** If we ever reason about fair value from replication,
+it must be the jump-robust formulation.
+
+**"Variance Swap Replication: Discrete or Continuous?"** (MDPI,
+*JRFM* 11(1), 11). *Unverified — 403 on fetch.* Cited for discretisation
+error: real option chains have finitely many strikes, so replication carries
+tracking error that must be managed by surface interpolation.
+
+#### The blueprint's third step is unavailable to us
+
+The standard three-step cycle — (1) quote via funding-aware HJB, (2) filter
+by volatility regime, (3) hedge residual variance exposure with an options
+strip — **cannot be completed on Permuto.**
+
+Step 3 requires an options chain on the underlying to build the replicating
+portfolio. Permuto lists three vol perps and nothing else: no options, no
+spot vol instrument, and no venue on which the same exposure trades. There
+is also no cash-and-carry anchor, since nobody can hold realized variance.
+
+So a market maker there is **unhedged by construction**. Inventory can only
+be flattened by trading back on the same book, against the same flow that
+created it. Steps 1 and 2 are all that is available, and they control the
+*rate* of inventory accumulation without providing any way to offload it.
+
+This is the most important practical conclusion in this section, and it is
+consistent with the live evidence: on the venue leaderboard, every market
+maker that accumulated meaningful two-sided depth is deeply negative, three
+are at exactly zero equity, and the only non-negative MM has essentially no
+depth. That is the signature of unhedgeable inventory in a jumping series,
+not of bad execution.
+
+Implication for any SVPerp strategy we build: **inventory limits are the
+primary risk control**, not spread. Spread governs how fast inventory
+arrives; with no hedge, only a hard cap governs how much of it we can be
+holding when the 13:00Z hour arrives.
+
 ### Open questions
 
 - Is the 13:00Z spike a genuine open-effect or an artefact of the oracle
@@ -441,3 +535,11 @@ do so in this global order; no method acquires locks in a conflicting order.
    Mechanism and traders' behavior."  *Electronic Markets* 34(1), 2024.
 9. "Exploring the Impact: How Decentralized Exchange Designs Shape Traders'
    Behavior on Perpetual Future Contracts."  arXiv:2402.03953.
+10. Le, N.A. (2026). "Funding-Aware Optimal Market Making for Perpetual
+    DEXs."  arXiv:2605.06405.
+11. Martin, I. (2011). "Simple Variance Swaps."  NBER Working Paper 16884.
+    doi:10.3386/w16884.
+12. Demeterfi, K., Derman, E., Kamal, M. & Zou, J. (1999). "More Than You
+    Ever Wanted To Know About Volatility Swaps."  Goldman Sachs
+    Quantitative Strategies Research Notes.  (Source of the 1/K^2
+    replication weighting often misattributed to Martin.)
