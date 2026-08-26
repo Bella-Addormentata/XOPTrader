@@ -1,7 +1,8 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
+**Last audited: 2026-08-26 (v0.9.22)** -- S22/S24/S26-S30 added from the 2026-08-25/26 incident sessions: the warp.green and Circuit DAO compromises, the equity-blindness and dead-pause-flag defects found while responding to them, and the peg registry built in reply. S23 and S25 shipped in v0.9.22 (PRs #113, #114).
+**Previously audited: 2026-08-23 (v0.9.19)** -- statuses refreshed after the release train #96-#107: the spendable-XCH-zero incident fixes (coin-lock ledger PR #107, ensure_split half-split PR #106), the warp claim fix (PR #105, first live bridge completed 2026-08-23), the eth-account pin (PR #104), and the Warp tab split (PR #102).
 **Source:** Consolidated from all code reviews in `docs/CODE REVIEWS/` plus the 2026-08 live-operation sessions.
 
 **Status Key:** `[ ]` = Not started | `[~]` = In progress | `[x]` = Complete
@@ -281,6 +282,42 @@
   divergence control runs, so the movement is explained rather than
   adjusted. P&L tracker gains a net-deposits component excluded from
   performance; GUI P&L display gains a "Net deposits" line.
+
+### S22: pre-S20 junk persisted to the DB
+- **Files:** `data/xop_trader.db` (`inventory_state`, `snapshots`)
+- **Issue:** S20 stops junk prints reaching equity going forward, but rows written before it survive -- BYC/wUSDC.b `sigma_annual=143.30` from a warm-start, and cost basis stamped at junk prices.
+- **Status:** `[ ]` — Live DB, so any sweep needs an explicit operator go-ahead.
+
+### S24: run_full_reconciliation dominates the heartbeat
+- **Files:** `cpp/src/engine.cpp` (Step 8 reconciliation), `cpp/src/rpc/chia_rpc.cpp`
+- **Issue:** ~800s of every ~840s cycle spent in reconciliation, scanning blocks at ~12.5s each. Pre-existing but invisible while v0.9.20 was breaker-paused.
+- **Status:** `[ ]` — Suspected contributor to the 2026-08-25 full-node RPC wedge: sustained scan load against an I/O-strained node. Unproven, but the two facts sit close together.
+
+### S26: forced cancel does not clear stuck offers
+- **Files:** `cpp/src/engine.cpp:7435` (`cancel_stale` call site)
+- **Issue:** Two wmilliETH.b/XCH bids (`0xa49d5c9edd`, `0xca4eed3a27`) were reported stuck and "attempting forced cancel" every cycle for 6+ hours, age climbing 895 -> 1173 blocks (~3x the 400-block TTL), with no error logged after the attempt. Same signature later seen on XCH/DBX ("3 stuck offers ... attempting forced cancel").
+- **Status:** `[ ]` — Diagnose FIRST: either `cancel_stale` is not returning these ids, or the cancel is issued and does not take. Different fixes. NOTE: engine.cpp:7439 is a fourth immediate `update_offer_status("cancelled")` with the same silent catch S25 fixed elsewhere, but it must NOT be routed through the S25 re-verify buffer -- `cancel_stale` is self-initiated and the wallet reports PENDING_CANCEL for a while, which `recheck_terminal` would read as non-terminal and discard, breaking the working path.
+
+### S27: assets with no enabled pair price at $0 -- silently, and the S20 gate cannot see it
+- **Files:** `cpp/src/engine.cpp:11582` (`asset_usd_pseudo_price`), `:11277` (`usd_per_xch`), `cpp/include/xop/risk/drawdown_breaker.hpp`
+- **Issue:** `asset_usd_pseudo_price` prices an asset only through **enabled** pairs. Disabling the wUSDC.b pairs on 2026-08-25 therefore dropped XCH, DBX, wUSDC.b and wmilliETH.b to $0 each, leaving equity equal to the BYC balance alone (peak $63.82 == 63.818 BYC). Two compounding faults: (a) `usd_per_xch()` accepts **only** an enabled `XCH/⟨wUSDC.b|wUSDC|USDS⟩` pair as its anchor -- BYC never qualified -- so `snapshots.xch_usd_rate` went from 1.9165 (35% too high, priced through a depegged wrapper) to 0.0; (b) the S20 carry-expiry degradation check is nested **inside** the "carry entry found" branch, so an asset that was NEVER valued contributes $0 without setting `degraded`, the `ValuationAuthorityGate` never fires, and the peak re-anchors to a partial book.
+- **Consequence:** with only XCH/DBX enabled, equity is exactly $0. `equity_drawdown_frac` returns 0.0 when the peak is non-positive, so **both breakers go inert rather than trip** -- trading with no drawdown protection, and fills landing on `record_fill_unpriced`.
+- **Status:** `[ ]` — Fix has three parts: decouple price/peg **observation** from `pair.enabled` (a disabled pair should still be watched); make "never valued" set `degraded`; and let `usd_per_xch()` prefer the **external** CoinGecko XCH/USD already in `coingecko_prices_` (three call sites exist) with the DEX-derived mid as fallback. The last is the only anchor that survives both issuers being compromised.
+
+### S28: the GUI pause flag is unreachable during a node outage
+- **Files:** `cpp/src/engine.cpp:1597` (sole `check_pause_flag()` call site), `:1237`, `:13901-13929`
+- **Issue:** `check_pause_flag()` is called once, inside `on_new_block_coro`, reached only when `current_block > last_block_` -- which requires a successful `get_block_height()`. During the 2026-08-25 outage that call failed **529 consecutive times** over ~2.5h, so `pause.flag` was never *read*. Pause and Resume are dead controls in exactly the incident where an operator reaches for them. Separately, `wallet_only_mode_` is assigned only inside `open_connections()`, so the `mode: auto` fallback is one-shot at startup and the engine cannot switch to `wallet_->get_height_info()` mid-outage even though that path exists and the wallet RPC stayed healthy throughout.
+- **Status:** `[ ]` — Two small independent commits. Verified 2026-08-26.
+
+### S29: peg identity is a repeated string comparison, not a property of the asset
+- **Files:** `cpp/include/xop/peg_registry.hpp` (new), `cpp/src/engine.cpp` (5 sites), `cpp/src/monitoring/pnl.cpp:1512`, `cpp/src/strategy/arbitrage.cpp:916`, `cpp/src/strategy/market_allocator.cpp:188`, `cpp/include/xop/feed_listings.hpp:47`
+- **Issue:** 15 sites each ask a variant of `quote == "wUSDC.b" || ... == "USDS"` and independently conclude "worth exactly $1". Two failures followed: BYC's depeg watch existed only because a *pair* carried `is_stablecoin`, so disabling BYC/wUSDC.b removed monitoring from the asset that had just become the book's dollar anchor; and `quote_usd_factor`'s BYC branch falls through to `return 1.0`, so BYC kept marking the portfolio at par after Circuit DAO announced the protocol would be sunset.
+- **Status:** `[~]` — Registry built on `feat/peg-registry` (f86d9b9): asset-keyed, declares the peg **currency** (so EUR/JPY pegs are expressible and a missing FX rate yields *no valuation* rather than a silent 1:1), separates `Unobserved` from `Holding`, and has an `enforce` flag for "declared but no longer trusted to value anything". 16 tests, sabotage-verified. **No call sites converted yet** — that is the next commit and is what actually fixes the live bug.
+
+### S30: both issuers of our quote assets were compromised within a day
+- **Files:** `config.yaml` (pairs), `TODO-COMPETITION.md`, memory `warp-green-bridge-compromise`
+- **Issue:** warp.green (minter of every `.b` asset) reported compromised 2026-08-25 — wUSDC.b traded ~26% below par on the implied peg for hours while accounting valued it at $1.00. Then Circuit DAO reported its treasury drained and stated the protocol "will have to be sunset and relaunched", so BYC is being wound down rather than merely depegged. Four XCH→BYC asks filled 2–4 hours *after* that announcement, because BYC had no external feed and its only peg watch was on the pair we had already disabled.
+- **Status:** `[~]` — Contained: trading paused, all BYC/wUSDC.b-acquiring offers cancelled (0 takeable), XCH/wUSDC.b, BYC/wUSDC.b, wmilliETH.b/XCH and XCH/BYC all disabled, `recovery.pair_allowlist` emptied. **Open:** the ~58 BYC and ~79 wUSDC.b holdings, and whether to follow Circuit's relaunch. Both are operator calls. Blocks S27 — with every stablecoin pair disabled there is no USD anchor left, which is why the external-feed fix matters.
 
 ### S21: Bridge chronology uses status time, not wallet-effect time (bounded, deferred)
 
