@@ -412,14 +412,108 @@ primary risk control**, not spread. Spread governs how fast inventory
 arrives; with no hedge, only a hard cap governs how much of it we can be
 holding when the 13:00Z hour arrives.
 
+### Four advanced MM methods, and which can actually run on our venue
+
+A survey of methods proposed for SVPerp market making. **Citations for this
+set were supplied as bare domains (arxiv.org, medium.com, ssrn.com) with no
+paths or DOIs, so none could be verified.** Recorded as *ideas to evaluate*,
+not as literature. The value added here is the applicability check against
+Permuto, which is verified.
+
+#### 1. Jump-aware volatility filters — APPLICABLE, and the most relevant
+
+Classical A–S assumes continuous paths. Statistical volatility indices gap
+instead: they spike when liquidations cascade. The proposal is a jump-aware
+Realized GARCH with autoregressive jump intensity, widening the ask and
+leaning short-vol ahead of a predicted upward jump.
+
+Directly relevant. Our own measurements show a 488% mean intrabar range at
+the equity open and 20.8% two-second moves — this is a jump process, and
+any continuous-path model is misspecified in exactly our regime (see the
+Martin note above for the same point from the replication side).
+
+One caveat on the proposed *signal*: it assumes on-chain flow and liquidation
+observability. Permuto runs an off-chain sequencer with a CLOB, so there is
+no mempool to read. The usable inputs are `/info/l2` book deltas,
+`/info/trades`, and `/info/funding/predicted` — not chain flow.
+
+#### 2. RL for funding-rate farming — APPLICABLE BUT DANGEROUS HERE
+
+The proposal: a PPO/DDPG agent on
+`ΔPnL − λ₁·InventoryRisk + λ₂·FundingEarned`, learning to accumulate large
+directional inventory purely to farm funding paid by leveraged speculators.
+
+⚠ **On Permuto this is the strategy that has already bankrupted people.**
+Farming funding means holding large unhedged inventory, and per the section
+above there is no hedge available on this venue — no options, no second
+market, no cash-and-carry. Three MMs currently sit at exactly zero equity.
+The reward function above prices inventory risk with a tunable λ₁; the
+venue prices it with a liquidation. Any funding-farming term must sit behind
+a hard inventory cap, not a soft penalty.
+
+Note also the funding cadence: `markets[].funding_timing` is authoritative
+and VOL markets settle every **60s**, not the 3600s in the top-level
+fallback. Funding accrues 60× more often than the platform default implies.
+
+#### 3. Cross-market synthetic tenor surfaces — NOT APPLICABLE
+
+The method maps options IV, ATM straddles, and perp funding into a unified
+surface over synthetic tenors, then arbitrages the SVPerp against a
+replicating options strip.
+
+**Verified unavailable.** `/info/meta` lists exactly three markets —
+`QQQ-VOL`, `TSLA-VOL`, `NVDA-VOL` — with no option-like instrument and no
+second venue trading the same exposure. The method presumes a
+Deribit-plus-Hyperliquid world. This is the same wall as the replication
+leg: the arbitrage that would make the operation statistical rather than
+directional does not exist here.
+
+#### 4. vAMM pool provision — NOT APPLICABLE
+
+**Verified: Permuto is a CLOB, not a vAMM.** Neither published skill
+contains any pool, vault, LP-token or deposit-share concept (zero matches),
+while the API is unambiguously order-driven: `/info/l2` snapshots,
+`POST /exchange/order` with GTC/IOC/FOK/ALO, `batch_upsert` to modify
+resting orders. There is no "deposit and act as the house" path — capital
+is committed as limit orders and liquidity is provided actively.
+
+### Venue mechanics we had missed
+
+Found while checking the above, and material to any strategy:
+
+- **"Carried" is the venue's own term for the frozen oracle.** While the
+  equity cash session is closed the vol oracle is *carried*, confirming the
+  13 dead hours measured from candles.
+- **Overnight quoting costs 8× margin.** Risk-increasing places during a
+  carried session require stressed initial margin
+  (`VOL_CARRIED_STRESS_MULTIPLE`, default **8**). Reduce-only is exempt.
+  This substantially weakens the "bank depth cheaply overnight" hypothesis —
+  the depth may be low-risk but it is not low-capital.
+- **Every resting order is cancelled at the open.** On carried→live, *all*
+  resting orders and pending triggers on that vol market are cancelled and
+  must be re-quoted. This answers an open question: we cannot carry quotes
+  into the 488% hour even if we wanted to, and the venue is protecting
+  makers from exactly that.
+- **Two bands, not one.** `vol_oracle_band_pct` (default **5**) is the legal
+  placement band; `vol_aggressive_ring_pct` (default **2**) is the inner
+  ring. Outside the inner ring only *passive* rests are allowed (bids ≤
+  oracle, asks ≥ oracle). The ±2% figure that governs depth credit is the
+  same inner ring.
+- **Prices are decimal annualized IV** (`0.176` = 17.6%), must be within the
+  legal band of a *fresh* oracle, and a stale oracle returns HTTP **503**.
+
 ### Open questions
 
 - Is the 13:00Z spike a genuine open-effect or an artefact of the oracle
   restarting after 13 idle hours? Not resolvable from venue history —
   `/info/candles` accepts `tf` but **ignores it**, always returning hourly
-  bars.
-- Does a frozen oracle still count as "fresh" for liquidity-incentive
-  purposes? Decides whether overnight quoting is cheap credit or no credit.
+  bars. (Partly moot for quoting: all resting orders are cancelled at
+  carried→live anyway, so we cannot be holding stale quotes into it.)
+- Does a carried (frozen) oracle still count as "fresh" for depth credit?
+  Placement against a *stale* oracle returns HTTP 503, and carried is
+  evidently not the same as stale since carried placement is permitted at
+  8× IM — but whether carried ticks *accrue depth* is still undocumented,
+  and it decides whether the overnight window is worth the 8× capital.
 - How is the oracle actually computed? Permuto documents a BLS-signed
   price certificate, but `/info/price_certificate` returns
   `No price certificate available yet`, so no provenance is exposed.
