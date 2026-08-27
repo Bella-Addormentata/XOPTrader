@@ -126,6 +126,36 @@ pegged_assets:
   sustained_observations: 30
   prefer_market_cross: false
   enforce: true
+# The other two legacy wrappers.  No live pair quotes them today, but an
+# operator re-adding XCH/wUSDC or XCH/USDS without a declaration here gets a
+# factor of 0.0 -- NO valuation -- rather than the implicit $1 the old
+# hardcoded list gave them.  That is the intended behaviour (par is declared,
+# never assumed), so they are declared rather than left to surprise someone.
+#
+# ⚠ Engine and GUI can disagree after enforce:false.  The GUI's
+# pnl_usdc_expr (gui/services/database_service.py) still hardcodes $1.00 for
+# wUSDC.b/wUSDC, so retiring a peg here changes engine accounting while the
+# GUI keeps showing par.  Tracked as follow-up; do not read the two as
+# cross-checks of each other.
+- asset_id: bbb51b246fbec1da1305be31dcf17151ccd0b8231a1ec306d7ce9f5b8c742b9e
+  symbol: wUSDC
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  prefer_market_cross: false
+  enforce: true
+- asset_id: REPLACE_WITH_USDS_TAIL_HEX
+  symbol: USDS
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  prefer_market_cross: false
+  # Left unenforced because the tail above is a PLACEHOLDER -- fill in the
+  # real asset id before enabling, or the declaration keys on a string no
+  # asset will ever match.
+  enforce: false
 - asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   symbol: BYC
   peg_currency: USD

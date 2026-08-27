@@ -452,8 +452,10 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
                 "pegged_assets: incoherent entry for '"
                 + (item["symbol"] ? item["symbol"].as<std::string>()
                                   : std::string{"<no symbol>"})
-                + "' -- needs a non-empty asset_id and peg_currency, a "
-                  "positive peg_target, and bail_pct > warn_pct");
+                + "' -- needs a non-empty asset_id and peg_currency, "
+                  "finite values, bail_pct > warn_pct, and an asset_id not "
+                  "already declared above (a duplicate would silently "
+                  "replace the first entry's safety policy)");
         }
     }
     return reg;

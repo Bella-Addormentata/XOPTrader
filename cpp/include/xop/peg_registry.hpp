@@ -172,6 +172,15 @@ public:
         if (!asset.is_coherent()) {
             return false;
         }
+        // A duplicate declaration is a config error, not an update.  Last
+        // -write-wins would let a second entry silently replace the first
+        // asset's SAFETY POLICY -- its enforce flag, its bail threshold --
+        // and the operator would have no way to see which one was in
+        // effect.  Refuse; the parser turns this into a loud startup
+        // failure.
+        if (by_asset_id_.find(asset.asset_id) != by_asset_id_.end()) {
+            return false;
+        }
         const std::string key = asset.asset_id;
         by_asset_id_[key] = std::move(asset);
         return true;
@@ -281,8 +290,15 @@ public:
         const std::string& asset_id,
         std::optional<double> observed) const
     {
+        // Must agree with classify() on WHICH assets have a deviation at
+        // all: an unenforced peg classifies as NotPegged, so reporting a
+        // deviation for it would have the two functions disagreeing about
+        // whether the asset is pegged.  Non-finite observations are
+        // rejected here for the same reason they are in classify.
         const auto* a = find(asset_id);
-        if (a == nullptr || !observed.has_value() || !(*observed > 0.0)) {
+        if (a == nullptr || !a->enforce
+            || !observed.has_value() || !std::isfinite(*observed)
+            || !(*observed > 0.0)) {
             return std::nullopt;
         }
         return (*observed - a->peg_target) / a->peg_target * 100.0;

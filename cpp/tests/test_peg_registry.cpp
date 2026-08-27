@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <xop/peg_registry.hpp>
 
 using xop::PeggedAsset;
@@ -236,4 +238,55 @@ TEST(PegRegistry, AllReturnsAStableOrder) {
     EXPECT_EQ(all[0]->asset_id, "a_tail");
     EXPECT_EQ(all[1]->asset_id, "b_tail");
     EXPECT_EQ(all[2]->asset_id, "c_tail");
+}
+
+// ---------------------------------------------------------------------------
+// [2026-08-27] Review findings 2.3 / 2.4
+// ---------------------------------------------------------------------------
+
+TEST(PegRegistry, DuplicateDeclarationIsRefusedRatherThanOverwriting) {
+    // Last-write-wins would let a second entry silently replace the first
+    // asset's SAFETY POLICY -- its enforce flag, its bail threshold -- with
+    // no way for an operator to see which was in effect.
+    PeggedAsset first = usd_coin("dup", "FIRST");
+    first.bail_pct = 10.0;
+    first.enforce  = true;
+
+    PeggedAsset second = usd_coin("dup", "SECOND");
+    second.bail_pct = 99.0;
+    second.enforce  = false;
+
+    PegRegistry reg;
+    EXPECT_TRUE(reg.add(first));
+    EXPECT_FALSE(reg.add(second)) << "a duplicate is a config error, not an update";
+
+    const auto* kept = reg.find("dup");
+    ASSERT_NE(kept, nullptr);
+    EXPECT_EQ(kept->symbol, "FIRST") << "the first declaration must survive";
+    EXPECT_DOUBLE_EQ(kept->bail_pct, 10.0);
+    EXPECT_TRUE(kept->enforce);
+}
+
+TEST(PegRegistry, DeviationAgreesWithClassifyAboutWhatIsPegged) {
+    // If classify() says NotPegged, deviation_pct must not hand back a
+    // number as though the asset had a peg to deviate from.
+    PeggedAsset retired = usd_coin("gone", "GONE");
+    retired.enforce = false;
+    PegRegistry reg({retired});
+
+    EXPECT_EQ(reg.classify("gone", 0.74), PegStatus::NotPegged);
+    EXPECT_FALSE(reg.deviation_pct("gone", 0.74).has_value())
+        << "an unenforced peg has no deviation to report";
+}
+
+TEST(PegRegistry, DeviationRejectsNonFiniteObservationsLikeClassifyDoes) {
+    PegRegistry reg({usd_coin()});
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    EXPECT_EQ(reg.classify("wusdc_tail", inf), PegStatus::Unobserved);
+    EXPECT_FALSE(reg.deviation_pct("wusdc_tail", inf).has_value());
+
+    EXPECT_EQ(reg.classify("wusdc_tail", nan), PegStatus::Unobserved);
+    EXPECT_FALSE(reg.deviation_pct("wusdc_tail", nan).has_value());
 }
