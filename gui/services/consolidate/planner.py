@@ -38,6 +38,7 @@ from typing import Iterable, Optional, Sequence
 
 __all__ = [
     "Anchor",
+    "denomination",
     "ConsolidationPlan",
     "Leg",
     "OfferCandidate",
@@ -46,6 +47,18 @@ __all__ = [
     "effective_rate",
     "rate_deviation_frac",
 ]
+
+
+#: Raw units per display unit.  XCH is 10^12 mojos; every CAT is 10^3.  The
+#: same split the engine applies (``rec.asset_id == "xch" ? 1e12 : 1e3`` in
+#: compute_portfolio_equity_usd) and the config parser enforces.
+XCH_UNITS = 10 ** 12
+CAT_UNITS = 10 ** 3
+
+
+def denomination(asset_id: str) -> int:
+    """Raw units per display unit of ``asset_id``."""
+    return XCH_UNITS if asset_id.lower() == "xch" else CAT_UNITS
 
 
 class PlanError(ValueError):
@@ -83,9 +96,18 @@ class OfferCandidate:
 
     ``give_amount`` / ``receive_amount`` are in the raw integer units of
     their respective assets (mojos for XCH, CAT mojos otherwise), exactly as
-    the wallet reports them.  The planner never converts units; it only ever
-    forms ratios, so unit scaling cancels as long as a single offer's two
-    amounts are each in their own asset's units.
+    the wallet reports them.
+
+    An earlier version of this docstring claimed the planner could form
+    ratios directly because "unit scaling cancels".  **It does not cancel
+    across two different assets.**  XCH carries 10^12 raw units per display
+    unit and a CAT carries 10^3, so a 2 BYC-per-XCH offer expressed raw is
+    2000 / 10^12 = 2e-9 -- while a dexie or engine anchor for the same offer
+    is 2.0, a factor of 10^9 apart.  Depending on direction that makes every
+    offer pass the cap or every offer fail it, and neither failure looks
+    like a bug from the outside.  :func:`effective_rate` normalises both
+    sides by :func:`denomination` so rates are display-denominated and
+    directly comparable with the anchor.
     """
 
     offer_id: str
@@ -125,6 +147,16 @@ class ConsolidationPlan:
     skipped_malformed: int = 0
     skipped_too_large: int = 0
     unspent_source: int = 0
+    hop_residual: int = 0
+    """Hop-asset units the second leg could not spend.
+
+    A two-hop plan buys the intermediate asset with the FIRST take and sells
+    it with the second.  When the second leg cannot absorb everything the
+    first yields -- its offers are too large, too expensive, or too few --
+    the difference is left sitting in an asset the operator did not want and
+    did not ask to hold.  Silently, previously.  It is surfaced so the
+    confirmation dialog can state it before anything executes.
+    """
 
     @property
     def is_empty(self) -> bool:
@@ -151,7 +183,30 @@ def effective_rate(offer: OfferCandidate) -> float:
     """
     if offer.receive_amount <= 0 or offer.give_amount < 0:
         return float("inf")
-    return offer.give_amount / offer.receive_amount
+    # Normalise to DISPLAY units on both sides.  Raw ratios do not cancel
+    # across assets with different denominations -- see OfferCandidate.
+    give = offer.give_amount / denomination(offer.give_asset)
+    receive = offer.receive_amount / denomination(offer.receive_asset)
+    if receive <= 0.0:
+        return float("inf")
+    return give / receive
+
+
+#: The cap is documented as inclusive, but binary floats do not honour that
+#: at the boundary: give/receive = 7/100 against an anchor of 0.05 computes a
+#: deviation of 0.4000000000000001, so an offer sitting exactly ON a 0.4 cap
+#: is rejected.  A relative tolerance restores the documented behaviour.  The
+#: direction is deliberate -- at the boundary we ACCEPT, because rejecting an
+#: at-cap offer is the surprising half and the operator chose that number.
+_CAP_EPSILON = 1e-9
+
+
+def within_cap(deviation: float, max_slippage_frac: float) -> bool:
+    """Is ``deviation`` inside an inclusive cap, tolerant of float error?"""
+    if deviation != deviation:                      # NaN deviation
+        return False
+    tolerance = _CAP_EPSILON * (1.0 + abs(max_slippage_frac))
+    return deviation <= max_slippage_frac + tolerance
 
 
 def rate_deviation_frac(rate: float, anchor: Anchor) -> float:
@@ -174,6 +229,12 @@ def _usable(offer: OfferCandidate, give_asset: str, receive_asset: str) -> bool:
     a junk entry cannot reach the ranking at all -- it never gets the chance
     to look attractive.
     """
+    if not offer.offer_id:
+        # Compact dexie responses need this id to fetch the live offer
+        # payload before it can be taken, so an offer without one cannot be
+        # executed no matter how good its price.  Structural, not a price
+        # judgement -- it never reaches the ranking.
+        return False
     if offer.status != 0:
         return False
     if offer.give_asset != give_asset or offer.receive_asset != receive_asset:
@@ -219,7 +280,7 @@ def _plan_leg(
 
     for index, offer in enumerate(usable):
         rate = effective_rate(offer)
-        if rate_deviation_frac(rate, anchor) > max_slippage_frac:
+        if not within_cap(rate_deviation_frac(rate, anchor), max_slippage_frac):
             # The list is sorted best-first, so every remaining offer is at
             # least this bad.  Count the whole tail from here and stop,
             # rather than walking it to re-derive the same verdict.
@@ -249,6 +310,26 @@ def _plan_leg(
         offers=tuple(chosen),
         give_total=give_total,
         receive_total=receive_total,
+    )
+
+
+def _empty_plan(
+    source_asset: str, target_asset: str, budget: int, counters: dict[str, int]
+) -> "ConsolidationPlan":
+    """A plan that does nothing, carrying EVERY diagnostic counter.
+
+    Factored out because the three early returns each dropped a different
+    subset by hand, and the diagnostics are how an operator tells "nothing
+    was cheap enough" from "nothing was small enough".
+    """
+    return ConsolidationPlan(
+        source_asset=source_asset,
+        target_asset=target_asset,
+        legs=[],
+        skipped_worse_than_cap=counters.get("worse_than_cap", 0),
+        skipped_malformed=counters.get("malformed", 0),
+        skipped_too_large=counters.get("too_large", 0),
+        unspent_source=budget,
     )
 
 
@@ -290,6 +371,17 @@ def build_plan(
         raise PlanError("source and target are the same asset")
     if budget <= 0:
         raise PlanError(f"budget must be positive, got {budget}")
+    # NaN fails EVERY comparison, so `< 0.0` waves it through -- and then
+    # every `deviation > cap` test downstream is also false, silently
+    # disabling the cap entirely and selecting arbitrarily bad offers.
+    # Infinity removes the advertised finite bound the same way.  Both are
+    # rejected here rather than defended against at each comparison.
+    if max_slippage_frac != max_slippage_frac or max_slippage_frac in (
+        float("inf"), float("-inf")
+    ):
+        raise PlanError(
+            f"max slippage must be a finite number, got {max_slippage_frac!r}"
+        )
     if max_slippage_frac < 0.0:
         raise PlanError(f"max slippage must be non-negative, got {max_slippage_frac}")
 
@@ -317,14 +409,12 @@ def build_plan(
             )
 
     if hop_asset is None:
-        return ConsolidationPlan(
-            source_asset=source_asset,
-            target_asset=target_asset,
-            legs=[],
-            skipped_worse_than_cap=counters.get("worse_than_cap", 0),
-            skipped_malformed=counters.get("malformed", 0),
-            unspent_source=budget,
-        )
+        # skipped_too_large was omitted here and below, so a direct route
+        # that failed ONLY because every offer was bigger than the budget
+        # reported zero oversized offers -- telling the operator "nothing
+        # within your cap" when the truth was "nothing small enough".  Those
+        # are different problems with different fixes.
+        return _empty_plan(source_asset, target_asset, budget, counters)
 
     if first_hop_anchor is None or second_hop_anchor is None:
         raise PlanError("a two-hop plan needs an anchor for each hop")
@@ -339,14 +429,7 @@ def build_plan(
         counters=counters,
     )
     if not first.offers:
-        return ConsolidationPlan(
-            source_asset=source_asset,
-            target_asset=target_asset,
-            legs=[],
-            skipped_worse_than_cap=counters.get("worse_than_cap", 0),
-            skipped_malformed=counters.get("malformed", 0),
-            unspent_source=budget,
-        )
+        return _empty_plan(source_asset, target_asset, budget, counters)
 
     # The second hop can only spend what the first actually yields.  Budget
     # it from first.receive_total rather than from any projection: if hop
@@ -362,6 +445,14 @@ def build_plan(
         counters=counters,
     )
 
+    if not second.offers:
+        # The first hop would spend source to buy an intermediate asset the
+        # second hop cannot sell -- so the plan receives NO target at all
+        # while still costing the whole first leg.  is_empty was false in
+        # this state (the first leg has offers), so it would have executed.
+        # A route that cannot deliver the target is not a route.
+        return _empty_plan(source_asset, target_asset, budget, counters)
+
     return ConsolidationPlan(
         source_asset=source_asset,
         target_asset=target_asset,
@@ -370,4 +461,5 @@ def build_plan(
         skipped_malformed=counters.get("malformed", 0),
         skipped_too_large=counters.get("too_large", 0),
         unspent_source=budget - first.give_total,
+        hop_residual=first.receive_total - second.give_total,
     )
