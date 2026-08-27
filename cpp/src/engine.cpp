@@ -11370,6 +11370,18 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
             continue;
         }
         auto snap = state_->get_market(other.name);
+        // [PEG 2026-08-27] The mid is denominated in the CROSS
+        // wrapper, so it must be converted through that wrapper's
+        // declared par exactly as usd_per_xch does -- returning it
+        // raw reports wrapper units as dollars.  nullopt (a
+        // non-USD peg with no FX rate) means this cross cannot
+        // yield a USD factor, so skip it.  This guard MUST stay
+        // identical here and in quote_usd_factor or the two
+        // disagree about which snapshot supplies the value -- the
+        // inconsistency class S20 was burned by.
+        if (!declared_usd_par(other.quote_asset_id)) {
+            continue;
+        }
         if (snap.mid_price > 0
             && snap.spread_bps > 0.0
             && snap.spread_bps <= kMaxCrossSpreadBps) {
@@ -11490,11 +11502,26 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
             // two-sided book here, which is the same evidence grade would
             // ask for; adding grade would only fold in the CEX-availability
             // dependency described at usd_per_xch.
+            // [PEG 2026-08-27] The mid is denominated in the CROSS
+            // wrapper, so it must be converted through that wrapper's
+            // declared par exactly as usd_per_xch does -- returning it
+            // raw reports wrapper units as dollars.  nullopt (a
+            // non-USD peg with no FX rate) means this cross cannot
+            // yield a USD factor, so skip it.  This guard MUST stay
+            // identical here and in quote_usd_factor or the two
+            // disagree about which snapshot supplies the value -- the
+            // inconsistency class S20 was burned by.
+            if (!declared_usd_par(other.quote_asset_id)) {
+                continue;
+            }
             if (snap.mid_price > 0
                 && snap.spread_bps > 0.0
                 && snap.spread_bps <= kMaxCrossSpreadBps) {
+                const auto cross_par =
+                    declared_usd_par(other.quote_asset_id);
                 return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
+                     / static_cast<double>(kMojosPerXch)
+                     * (cross_par ? *cross_par : 0.0);
             }
         }
         // [PEG 2026-08-26] No eligible cross, so fall back to the DECLARED

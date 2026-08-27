@@ -97,11 +97,25 @@ dexie:
 #            the declared par is only the fallback when no tight cross
 #            exists.
 #
-# enforce: false keeps the declaration on record while stopping the asset
-# valuing anything -- for an issuer that has been compromised or is winding
-# down.  This is the switch that did not exist when warp.green and Circuit
-# DAO were both reported compromised in August 2026, and BYC kept marking
-# the whole book at par because the 1.0 was written in the code.
+# enforce: false RETIRES THE DECLARED PAR.  It is the switch that did not
+# exist when warp.green and Circuit DAO were both reported compromised in
+# August 2026 and BYC kept marking the whole book at $1 because the 1.0 was
+# written in the code.
+#
+# ⚠ It does NOT blind the asset.  Read this before reaching for it during an
+# incident.  With enforce:false the registry-gated branches stop answering,
+# but an asset that is the QUOTE of an XCH-base pair still gets a factor
+# derived from that pair's own mid (usd_per_xch / quote_per_xch, grade-gated
+# as usual).  So flipping it on BYC does not stop BYC being valued -- it
+# reroutes BYC's valuation from the declared peg to the market.
+#
+# That is deliberate, and for a compromised issuer it is arguably the more
+# honest number: the market's view of a wound-down asset beats the par it is
+# no longer holding.  It also avoids a nastier failure -- making the switch
+# absolute would zero equity the moment it is flipped on the only priced
+# asset, which is the S27 fail-open condition arriving by another route.
+#
+# If you need the asset to contribute NOTHING, disable its pairs as well.
 pegged_assets:
 - asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   symbol: wUSDC.b
