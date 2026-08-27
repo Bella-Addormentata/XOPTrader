@@ -520,6 +520,81 @@ Found while checking the above, and material to any strategy:
 - **Prices are decimal annualized IV** (`0.176` = 17.6%), must be within the
   legal band of a *fresh* oracle, and a stale oracle returns HTTP **503**.
 
+### Ideas taken from two external repositories
+
+Read for ideas, not copied. Recorded here with what each one is actually
+worth to us, because the useful parts were not the parts either repository
+advertises.
+
+#### `anthonymakarewicz/volatility-trading` (MIT, Python)
+
+Its headline strategies — VRP harvesting and skew mispricing — are
+delta-hedged **options** strategies and cannot run on a venue with no options
+chain. Same wall as the replication leg above. But two of its components are
+directly on our critical path.
+
+**1. Range-based realized-volatility estimators — the best idea in either
+repo.** `rv_forecasting/vol_estimators.py` implements a family beyond
+close-to-close: Parkinson, Garman–Klass, Rogers–Satchell and Yang–Zhang.
+These use the full OHLC bar rather than only the close, and the standard
+result is that they extract substantially more information from the same
+sample — Parkinson and Garman–Klass are several times more statistically
+efficient than close-to-close, and Yang–Zhang is built to survive
+overnight gaps.
+
+That matters here for a specific reason. **Permuto serves OHLC**
+(`/info/candles` returns `open`/`high`/`low`/`close`), and the venue's own
+oracle is a 60-second trailing estimate whose short-window noise is the
+central open question in `TODO-COMPETITION.md`. A range-based estimator
+computed from the same bars gives an *independent, better-conditioned*
+estimate of the same quantity — and **the difference between that estimate
+and the oracle is the estimator noise itself**, measured directly rather
+than inferred from variance ratios.
+
+This is a better instrument than the variance-ratio work above, which has
+already had to be walked back once as confounded by overlapping windows. It
+should go into the C-03 observer.
+
+**2. Explicit regular-trading-hours handling.** `rv_intraday(close,
+rth_start="09:30", rth_end="16:00")` and `overnight_return(...)` treat the
+session and the overnight gap as *separate objects* rather than smoothing
+across them. That is exactly the problem the measured session shape poses —
+thirteen dead hours a day, a 488% open, and a "carried" oracle state the
+venue names itself. Any estimator we calibrate on a blended day will
+misprice both halves, and this is the established way to avoid it.
+
+**3. HAR lag structure** (`RV_D`, `RV_W`, `RV_M` in
+`rv_forecasting/features.py`) is the standard decomposition for realized
+variance, reportedly ~30% out-of-sample R² in their write-up. Worth knowing,
+but **transfer is doubtful**: HAR is built on *daily* realized vol from
+intraday returns, whereas our oracle is a 60-second estimate refreshed every
+5s. The multi-timescale idea is right; the specific daily/weekly/monthly
+components are not obviously meaningful at our sampling rate. Treat as a
+direction, not a recipe.
+
+Its `options/risk/{sizing,margin,scenarios}.py` may be worth a look when
+C-04 (the perps position model) starts, since sizing under volatility
+uncertainty is the same problem in a different wrapper.
+
+#### `SidShah2953/Perpetuals-Research` (no licence declared, Python)
+
+**No licence means no grant of rights** — readable, not copyable. Nothing
+here is taken.
+
+Its analysis does not cover market making or basis/arbitrage, so the
+research content is of limited use to us. The useful idea is
+**architectural**: `dataCollection/` separates a per-venue client
+(`hyperliquid/`, `edgex/`, `dydx/`) from a shared `common/{http, types,
+classification}` layer, with each venue exposing the same
+`perpetuals/{markets, candles, funding}` surface.
+
+That is precisely the adapter boundary `TODO-COMPETITION.md` argues for —
+strategy and observation shared, venue mechanics isolated — and it is
+useful confirmation that someone else building against several perp venues
+converged on the same split. It also treats **funding as a first-class
+collected stream** rather than a derived quantity, which matches VOL markets
+settling every 60s.
+
 ### Open questions
 
 - Is the 13:00Z spike a genuine open-effect or an artefact of the oracle

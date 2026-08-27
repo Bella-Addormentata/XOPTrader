@@ -380,6 +380,13 @@ transfer and must not leak into shared code.
       carried ticks credit depth; per-market session statistics; would-be
       PnL of a candidate rule. Endpoints listed in
       `docs/permuto-api-reference.md` §7. **Do first, after C-00.**
+      **Use a range-based estimator, not variance ratios.** Permuto serves
+      OHLC, so Parkinson / Garman–Klass computed from the same bars gives an
+      independent and better-conditioned estimate of the same quantity — and
+      the *difference* from the oracle measures the estimator noise directly
+      instead of inferring it. See `docs/advanced-trading-methods.md` §4,
+      "Ideas taken from two external repositories". Separate the session from
+      the carried hours in the estimator rather than smoothing across them.
 - [ ] **C-04** Perps position model — positions, margin, funding,
       liquidation distance.
 - [ ] **C-05** Execution adapter — `order`/`modify`/`cancel`/
