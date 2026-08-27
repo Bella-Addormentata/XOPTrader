@@ -151,6 +151,14 @@ class IdentityInfo:
     registered: bool
     user_id: Optional[str] = None
     trading_address: Optional[str] = None
+    listing_verified: bool = False
+    """The venue's leaderboard has actually listed us.
+
+    Distinct from ``registered``, which only means the link call succeeded.
+    Without this the page would render green on any later refresh, because
+    the durable state cannot otherwise tell a confirmed listing from an
+    unconfirmed one -- and green is the whole point of the check.
+    """
 
 
 class PermutoIdentity:
@@ -232,6 +240,14 @@ class PermutoIdentity:
         with _io_transaction(self._io):
             secrets = self._io.read()
             section = self._section(secrets)
+            # Restoring a DIFFERENT phrase installs a different account.
+            # Registration metadata describes the old one: left in place it
+            # would disable the Register button and display someone else's
+            # user_id and address against the new key.
+            if section.get("bls_public_key") not in (None, pubkey):
+                for stale in ("registered", "user_id", "trading_address",
+                              "registered_at", "listing_verified"):
+                    section.pop(stale, None)
             section["bls_private_key_dpapi"] = keystore.protect_secret(
                 bytes(sk),
                 extra_entropy=_IDENTITY_ENTROPY,
@@ -293,14 +309,29 @@ class PermutoIdentity:
             self._section(secrets)["backup_confirmed"] = True
             self._io.write(secrets)
 
-    def mark_registered(self, *, user_id: str, trading_address: str) -> None:
+    def mark_registered(
+        self, *, user_id: str, trading_address: str,
+        listing_verified: bool = False,
+    ) -> None:
+        """Record the link. ``listing_verified`` only when the board shows us.
+
+        Never downgrades a verified listing: a later check that happens to
+        run while the board is rebuilding must not retract a confirmation we
+        already earned.
+        """
         with _io_transaction(self._io):
             secrets = self._io.read()
             section = self._section(secrets)
             section["registered"] = True
             section["user_id"] = user_id
             section["trading_address"] = trading_address
-            section["registered_at"] = datetime.now(timezone.utc).isoformat()
+            section.setdefault(
+                "registered_at", datetime.now(timezone.utc).isoformat()
+            )
+            if listing_verified:
+                section["listing_verified"] = True
+            else:
+                section.setdefault("listing_verified", False)
             self._io.write(secrets)
 
     def info(self) -> IdentityInfo:
@@ -314,4 +345,5 @@ class PermutoIdentity:
             registered=bool(section.get("registered")),
             user_id=section.get("user_id"),
             trading_address=section.get("trading_address"),
+            listing_verified=bool(section.get("listing_verified")),
         )

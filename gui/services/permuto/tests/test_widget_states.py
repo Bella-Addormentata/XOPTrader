@@ -67,11 +67,14 @@ def test_create_button_cannot_clobber_an_existing_identity(page):
     assert not widget._create_btn.isEnabled()
 
 
-def test_registered_state_shows_green_success(page):
+def test_green_requires_a_verified_listing(page):
+    """Green means the venue listed us, not that a call returned 200."""
     widget, ident = page
     ident.create()
     ident.mark_backup_confirmed()
-    ident.mark_registered(user_id="a" * 64, trading_address="xch1test")
+    ident.mark_registered(
+        user_id="a" * 64, trading_address="xch1test", listing_verified=True
+    )
     widget.refresh()
 
     from gui.theme import COLORS as C
@@ -79,6 +82,51 @@ def test_registered_state_shows_green_success(page):
     assert "Successfully registered" in widget._status.text()
     assert C.PROFIT_GREEN.lower() in widget._status.styleSheet().lower()
     assert not widget._register_btn.isEnabled()
+
+
+def test_an_unverified_registration_stays_amber_across_refresh(page):
+    """THE regression. mark_registered() runs even when the board has not
+    listed us yet; without a persisted verification flag the next refresh()
+    promoted that unverified account to green and it never went back."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(
+        user_id="a" * 64, trading_address="xch1test", listing_verified=False
+    )
+
+    from gui.theme import COLORS as C
+
+    for _ in range(3):                      # refresh repeatedly: still amber
+        widget.refresh()
+        assert C.PROFIT_GREEN.lower() not in widget._status.styleSheet().lower()
+        assert "not yet confirmed" in widget._status.text()
+
+
+def test_verification_is_never_downgraded(page):
+    """A check that lands mid-rebuild must not retract a confirmed listing."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="a" * 64, trading_address="x",
+                          listing_verified=True)
+    ident.mark_registered(user_id="a" * 64, trading_address="x",
+                          listing_verified=False)
+    assert ident.info().listing_verified is True
+
+
+def test_check_button_needs_a_user_id(page):
+    """Searching for "" finds nothing and rendered as 'Registered -- not on
+    the leaderboard yet', claiming a registration that never happened."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    widget.refresh()
+    assert not widget._check_btn.isEnabled()
+
+    ident.mark_registered(user_id="a" * 64, trading_address="x")
+    widget.refresh()
+    assert widget._check_btn.isEnabled()
 
 
 def test_success_colour_is_actually_green(page):

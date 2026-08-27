@@ -24,6 +24,7 @@ public result.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 from typing import Any, Optional
 
@@ -68,6 +69,7 @@ class _RecoveryPhraseDialog(QDialog):
         self.setWindowTitle("Permuto recovery phrase")
         self.setModal(True)
         self.setMinimumWidth(560)
+        self._copied_digest: Optional[bytes] = None
 
         layout = QVBoxLayout(self)
 
@@ -132,10 +134,37 @@ class _RecoveryPhraseDialog(QDialog):
         layout.addWidget(buttons)
 
     def _copy(self, phrase: str) -> None:
-        QApplication.clipboard().setText(phrase)
+        clipboard = QApplication.clipboard()
+        if clipboard is None:
+            return
+        # Digest rather than the phrase itself, so the dialog does not hold a
+        # second plaintext copy just to know what to clear.
+        self._copied_digest = hashlib.sha256(phrase.encode("utf-8")).digest()
+        clipboard.setText(phrase)
         self._copy_notice.setText(
-            "Copied -- paste it somewhere durable, then clear your clipboard."
+            "Copied. Cleared when this dialog closes -- but clipboard "
+            "HISTORY tools may still retain it."
         )
+
+    def done(self, result: int) -> None:
+        """Clear our own clipboard copy before releasing the dialog.
+
+        The mnemonic is a permanent account secret, so leaving it on the
+        clipboard outlives any warning we could print. Cleared only when the
+        clipboard still holds what we put there -- comparing digests so we
+        never wipe something the operator copied afterwards.
+
+        This does NOT defeat clipboard-history tools, and the notice says so
+        rather than implying the secret is gone.
+        """
+        clipboard = QApplication.clipboard()
+        if clipboard is not None and self._copied_digest is not None:
+            current = clipboard.text()
+            if hashlib.sha256(current.encode("utf-8")).digest() ==                     self._copied_digest:
+                clipboard.clear()
+            del current
+        self._copied_digest = None
+        super().done(result)
 
     @property
     def confirmed(self) -> bool:
@@ -366,14 +395,30 @@ class PermutoWidget(QWidget):
         self._backup_box.setChecked(info.backup_confirmed)
         self._create_btn.setEnabled(False)
         self._restore_btn.setEnabled(True)
-        self._check_btn.setEnabled(True)
+        # Nothing to look up without a user id: searching for "" finds
+        # nothing and would render as "Registered -- not on the leaderboard
+        # yet", claiming a registration that never happened.
+        self._check_btn.setEnabled(bool(info.registered and info.user_id))
 
         if info.registered:
             self._register_btn.setEnabled(False)
-            self._set_status(
-                "Successfully registered  --  user %s" % (info.user_id or "")[:16],
-                _C.PROFIT_GREEN,
-            )
+            # Green is reserved for a listing we actually saw. `registered`
+            # alone only means the link call returned; rendering that green
+            # on every later refresh would quietly promote an unverified
+            # account to confirmed, which is exactly what the leaderboard
+            # read-back exists to prevent.
+            if info.listing_verified:
+                self._set_status(
+                    "Successfully registered  --  user %s"
+                    % (info.user_id or "")[:16],
+                    _C.PROFIT_GREEN,
+                )
+            else:
+                self._set_status(
+                    "Registered  --  not yet confirmed on the leaderboard. "
+                    "Press Check leaderboard to verify.",
+                    _C.WARNING_YELLOW,
+                )
         else:
             # The gate: no registration until the words are written down.
             self._register_btn.setEnabled(info.backup_confirmed)
@@ -392,6 +437,20 @@ class PermutoWidget(QWidget):
             self._status.setStyleSheet(
                 "color: %s; font-size: 14px; font-weight: bold;" % colour
             )
+
+    def stop_background_work(self) -> None:
+        """Join the worker before teardown.
+
+        Qt aborts the process (qFatal) if a QThread is destroyed while still
+        running, and these requests take up to 30 seconds. MainWindow calls
+        this for every page that owns a thread.
+        """
+        thread, self._thread = self._thread, None
+        self._worker = None
+        if thread is not None:
+            thread.quit()
+            if not thread.wait(10000):
+                _log.warning("permuto: worker thread did not stop in time")
 
     # -- actions ------------------------------------------------------------ #
 
@@ -490,9 +549,21 @@ class PermutoWidget(QWidget):
                 self._identity_factory().mark_registered(
                     user_id=result["user_id"],
                     trading_address=result["trading_address"],
+                    listing_verified=bool(result.get("listed")),
                 )
-            except Exception:  # noqa: BLE001
+            except Exception as exc:  # noqa: BLE001
+                # A logged-and-continue here would show green while nothing
+                # was saved: after a restart the identity reads unregistered
+                # and the operator was told otherwise.
                 _log.exception("permuto: could not persist registration")
+                self.refresh()
+                self._set_status(
+                    "Linked with Permuto, but SAVING it failed: %s  "
+                    "Do not re-register -- the account exists. Fix the "
+                    "secrets file and press Check leaderboard." % exc,
+                    _C.LOSS_RED,
+                )
+                return
 
         self.refresh()
 

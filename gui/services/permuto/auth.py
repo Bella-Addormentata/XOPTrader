@@ -109,7 +109,7 @@ def leaderboard_entry(user_id: str) -> Optional[dict]:
     the standings by a factor of 35.
     """
     offset = 0
-    while offset <= 2000:
+    while True:
         page = _request(
             "GET", "/exchange/leaderboard?limit=100&offset=%d" % offset
         )
@@ -125,8 +125,11 @@ def leaderboard_entry(user_id: str) -> Optional[dict]:
         )
         if seen >= total:
             return None
+        # No fixed ceiling. An offset cap silently reports a registered
+        # account as unlisted once the field grows past it, which is the
+        # same class of error as reading only page one -- and it fails in
+        # the direction that looks like "you are not registered".
         offset += 100
-    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -206,9 +209,21 @@ def register(identity: Any) -> Registration:
     if not session:
         raise PermutoAuthError("auth response carried no session token: %r" % auth)
 
+    # Validate rather than coerce. Empty strings here would sail through the
+    # worker as an "ok" result, the UI would report Registered, and nothing
+    # would be saved -- a false durable success from a malformed 200.
+    user_id = resolved.get("wallet_user_id") or auth.get("user_id")
+    trading_address = resolved.get("wallet_address")
+    if not user_id or not trading_address:
+        raise PermutoAuthError(
+            "link succeeded but the venue did not return both identifiers "
+            "(user_id=%r, address=%r); refusing to record a registration we "
+            "cannot verify" % (user_id, trading_address)
+        )
+
     return Registration(
-        user_id=str(resolved.get("wallet_user_id") or auth.get("user_id") or ""),
-        trading_address=str(resolved.get("wallet_address") or ""),
+        user_id=str(user_id),
+        trading_address=str(trading_address),
         pubkey=pubkey,
         session_token=str(session),
     )

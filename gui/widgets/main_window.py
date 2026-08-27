@@ -172,7 +172,8 @@ _PAGE_WALLET: Final[int] = 5
 _PAGE_REPORTS: Final[int] = 6
 _PAGE_WARP: Final[int] = 7
 _PAGE_BASE_WALLET: Final[int] = 8
-_PAGE_SETTINGS: Final[int] = 9
+_PAGE_PERMUTO: Final[int] = 9
+_PAGE_SETTINGS: Final[int] = 10
 
 
 def _fmt_usd(value: float) -> str:
@@ -2416,7 +2417,8 @@ class MainWindow(QMainWindow):
         # process (qFatal) if a QThread is destroyed while still running, and
         # nothing else knows about these: EngineBridge.shutdown() owns the
         # services, not the pages' own threads.
-        for page in (self._wallet_balances, self._settings_widget):
+        for page in (self._wallet_balances, self._settings_widget,
+                     self._permuto_widget):
             widget = self._unwrap(page)
             if widget is not None and hasattr(widget, "stop_background_work"):
                 widget.stop_background_work()
