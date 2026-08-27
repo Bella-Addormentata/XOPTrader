@@ -239,6 +239,50 @@ Carried is evidently not the same as stale (stale placement returns HTTP
 503, carried placement is permitted at 8× IM), but whether the ~10s sampler
 credits carried ticks is undocumented.
 
+## Clarifications from the Chia Discord (#svPerps, 2026-08-27)
+
+⚠ **Informal.** These are statements in chat by Gene Hoffman (tagged *Chia
+Employees*), not amendments to the official rules page. Where they differ
+from the written rules, treat the written rules as binding and the chat as
+intent. Recorded because three of them change items in this document.
+
+**1. Pre-competition IS a warm-up, and real money comes later.** Asked
+directly whether the current market is a warm-up test phase, the answer was:
+
+> Barring any serious issues (which we don't expect) we would roll out real
+> money a few weeks after the end of the competition.
+
+So the present environment is explicitly for practice, and no real capital
+is at stake until weeks *after* the contest ends. That removes the main
+reason for hesitating to trade the pre-competition market.
+
+**2. The one-account rule binds during the contest, not before.** Asked
+whether multiple accounts are allowed given the rules forbid them:
+
+> In the competition, yes - now? meh.
+
+**3. A Trader account AND a Market Maker account appear to be fine.**
+Another entrant disclosed running both (separate binaries, separate AWS
+instances, no backchannel) and asked for a "cheating check". After review:
+
+> After reviewing it looks like an honest trade that happened to hit your MM
+> too but you were hitting the other MMs about equally
+
+This reconciles with the official rules, which allow one entrant to win in
+both categories. "Multiple accounts" evidently means multiple *within* a
+category, not one per category.
+
+**4. The self-trading bar is "not preferential", not "never".** Point 3 is
+the useful part: the same entrant's two bots *did* trade with each other,
+and that was judged acceptable because the flow was not directed at their own
+MM more than at others. That is a far more implementable spec than "never
+cross yourself" — and it matches their own reasoning that avoiding it
+entirely would require a backchannel between the bots, which would be worse.
+
+**5. There is a channel for pre-clearing.** An entrant can post their
+addresses and ask for a review before the contest. That is the venue for
+**C-0S** (gate-then-PnL vs combined scoring) — ask there rather than guess.
+
 ## Conduct rules that bind a two-sided quoter
 
 From the official rules, disqualifying conduct includes **wash trading,
@@ -369,9 +413,11 @@ transfer and must not leak into shared code.
       **31 Aug 17:00 ET** and no one may join after day one. This is the
       only hard deadline and it does not require any code. **Operator
       decision, and the first one.**
-- [ ] **C-0S** Clarify with the Sponsor whether MM rank is *gate-then-PnL*
-      (agent skill) or *PnL combined with liquidity score* (official rules).
-      They imply different strategies. Cheap to ask, expensive to guess.
+- [ ] **C-0S** Clarify whether MM rank is *gate-then-PnL* (agent skill) or
+      *PnL combined with liquidity score* (official rules). They imply
+      different strategies. **Venue: the #svPerps Discord**, where entrants
+      already post questions and get answers from Chia staff. Cheap to ask,
+      expensive to guess.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth, but **decaying**.
 - [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
@@ -396,10 +442,13 @@ transfer and must not leak into shared code.
 - [ ] **C-07** Session scheduler — stand down at 13:00Z; quote per-market
       on measured statistics, not by rule.
 - [ ] **C-08** Secure the qualifying fill early (untraded purge).
-- [ ] **C-10** **Self-trade guard.** A two-sided quoter can cross its own
-      bid and ask when the oracle moves through both; wash trading and
-      self-dealing are disqualifying. Must exist before the first quote,
-      not after.
+- [ ] **C-10** **Self-trade guard — re-scoped.** Still needed, but the bar
+      per Discord is *not preferential*, not *never*: incidental crossing
+      between one entrant's own Trader and MM accounts was reviewed and
+      accepted because the flow hit other MMs about equally. So the
+      requirement is to avoid systematically directing flow at our own
+      quotes, and to be able to SHOW that if asked — not to make crossing
+      impossible. Much cheaper than the original framing.
 - [ ] **C-09** Poll `CONTEST_START` / `untraded_purge_at` / `signup_closed`
       continuously; all three change the plan when they flip.
 
