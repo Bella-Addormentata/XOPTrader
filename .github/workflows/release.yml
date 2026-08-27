@@ -317,6 +317,7 @@ jobs:
           --paths ..
           --collect-submodules gui
           --exclude-module gui.services.warp.tests
+          --exclude-module gui.services.consolidate.tests
           --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
           --add-data "../scripts/offer_sizing.py:scripts"
           --add-data "../config.example.yaml:."
@@ -417,6 +418,7 @@ jobs:
             '--paths', '..',
             '--collect-submodules', 'gui',
             '--exclude-module', 'gui.services.warp.tests',
+            '--exclude-module', 'gui.services.consolidate.tests',
             # ';' separator to match the --add-binary calls below.
             '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
             '--add-data', '../scripts/offer_sizing.py;scripts',
