@@ -283,9 +283,11 @@ jobs:
       # the repo root on the search path so both resolve.
       #
       # --exclude-module: with the package importable, --collect-submodules
-      # would otherwise force-import the 10 warp test modules (~4,600 lines)
-      # into the bundle, every one of which imports pytest -- a dev-only
-      # dependency that is not installed here.
+      # would otherwise force-import the in-package test modules into the
+      # bundle, every one of which imports pytest -- a dev-only dependency
+      # that is not installed here.  EVERY new gui/services/<x>/tests package
+      # needs a line here or the release build breaks; there is no glob form
+      # of --exclude-module, so this list is maintained by hand.
       #
       # This combination logs ten lines of
       #   ERROR: Hidden import 'gui.services.warp.tests.test_*' not found
@@ -317,6 +319,7 @@ jobs:
           --paths ..
           --collect-submodules gui
           --exclude-module gui.services.warp.tests
+          --exclude-module gui.services.permuto.tests
           --add-data "services/warp/puzzles/*.clsp.hex:gui/services/warp/puzzles"
           --add-data "../scripts/offer_sizing.py:scripts"
           --add-data "../config.example.yaml:."
@@ -417,6 +420,7 @@ jobs:
             '--paths', '..',
             '--collect-submodules', 'gui',
             '--exclude-module', 'gui.services.warp.tests',
+            '--exclude-module', 'gui.services.permuto.tests',
             # ';' separator to match the --add-binary calls below.
             '--add-data', 'services/warp/puzzles/*.clsp.hex;gui/services/warp/puzzles',
             '--add-data', '../scripts/offer_sizing.py;scripts',
