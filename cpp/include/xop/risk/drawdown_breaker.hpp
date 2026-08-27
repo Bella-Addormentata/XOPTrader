@@ -56,6 +56,32 @@ namespace xop::risk {
 /// The caller compares against risk.max_drawdown_frac and applies the
 /// startup grace window; this function is just the unit-critical
 /// arithmetic.  NaN inputs fail every comparison and yield 0.0 (no trip).
+/// [S27 2026-08-27] Should the engine stop trading because it cannot value
+/// its own book?
+///
+/// Marking a cycle degraded freezes the peak, which is right when a peak
+/// already exists -- a suspect number must not ratchet the high-water mark.
+/// But on a FRESH PROCESS there is no peak to freeze, so the same mechanism
+/// pins it at zero, and `equity_drawdown_frac` returns 0.0 for a
+/// non-positive peak.  The breakers then cannot fire at all, no matter what
+/// happens, for as long as one held asset stays unpriced.
+///
+/// That is fail-OPEN, and it is the condition S27 exists to remove: the
+/// 2026-08-25 engine knew nothing was priced and traded anyway.  So when
+/// the startup grace has elapsed, valuation is degraded, and no peak has
+/// ever been established, the answer is to stop -- an engine that cannot
+/// measure its exposure has no business adding to it.
+///
+/// Deliberately NOT triggered when a valid peak exists: there the frozen
+/// peak is a real reference and the existing comparison still protects us.
+[[nodiscard]] constexpr bool unvaluable_book_must_fail_closed(
+    bool         grace_elapsed,
+    bool         valuation_degraded,
+    double       peak_equity_usd) noexcept
+{
+    return grace_elapsed && valuation_degraded && !(peak_equity_usd > 0.0);
+}
+
 [[nodiscard]] constexpr double equity_drawdown_frac(
     double peak_equity_usd, double equity_usd) noexcept
 {

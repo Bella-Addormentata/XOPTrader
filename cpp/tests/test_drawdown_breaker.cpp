@@ -29,6 +29,7 @@ using xop::risk::window_loss_threshold_usd;
 using xop::risk::portfolio_equity_usd;
 using xop::risk::effective_usd_per_unit;
 using xop::risk::AssetValuationInput;
+using xop::risk::unvaluable_book_must_fail_closed;
 using xop::risk::BreakerRealertGate;
 using xop::risk::kWindowAnchorFallbackUsd;
 
@@ -283,4 +284,48 @@ TEST(DrawdownBreakerTest, S27_UnvaluedAssetsSumToZeroEquity) {
     byc.live_usd_per_unit = 1.0;
     book.push_back(byc);
     EXPECT_NEAR(portfolio_equity_usd(book), 63.818, 1e-9);
+}
+
+// ===========================================================================
+// [S27 2026-08-27] Fail closed when the book cannot be valued
+//
+// Review finding 117-2: setting valuation_degraded_ makes the engine KNOW it
+// is blind, but freezing a peak that is already zero leaves the breakers
+// exactly as inert as before.  The first version of the S27 fix therefore
+// did not close its own stated hole.  These pin the decision that does.
+// ===========================================================================
+
+TEST(DrawdownBreakerTest, S27_FailsClosedWhenDegradedWithNoPeakEverEstablished) {
+    // The 2026-08-25 shape on a fresh process: nothing priced, so no peak
+    // was ever seeded and no drawdown can ever be measured.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*peak_equity_usd=*/0.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedWhileAValidPeakExists) {
+    // A frozen peak is still a real reference, and the ordinary comparison
+    // keeps protecting us.  Pausing here would be a false positive on a
+    // book that is measurably fine.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, true, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedDuringStartupGrace) {
+    // Valuations warm up over the first cycles; pausing before grace
+    // expires would stop every start.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(false, true, 0.0));
+}
+
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedOnACleanValuation) {
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, false, 0.0));
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, false, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_ANegativeOrNanPeakCountsAsNoPeak) {
+    // `!(peak > 0)` rather than `peak <= 0` so NaN -- which fails every
+    // comparison -- also reads as "no usable peak" instead of slipping
+    // through as if it were valid.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, -1.0));
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        true, true, std::numeric_limits<double>::quiet_NaN()));
 }

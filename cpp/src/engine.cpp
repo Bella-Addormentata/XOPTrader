@@ -11322,7 +11322,22 @@ double Engine::usd_per_xch() const
     // The note in the loop below is right that a CoinGecko outage must not
     // zero every USD figure in the bot, so this prefers the external feed
     // and falls back rather than failing.
-    {
+    // FRESHNESS IS NOT OPTIONAL HERE.  Step 1 deliberately RETAINS the old
+    // price map when a fetch fails and does not advance
+    // coingecko_last_fetch_, so reading the cache without an age check gives
+    // a stale value permanent priority and makes the DEX fallback below
+    // unreachable.  Worse: because the stale value is positive,
+    // asset_usd_pseudo_price keeps refreshing last_asset_live_block_ every
+    // heartbeat, so the carry never expires and a frozen feed reads as
+    // permanently healthy.  Reuse the existing revival gate, whose
+    // documentation already argues exactly this -- "a frozen feed would
+    // quote forever" -- and which treats a non-positive or non-finite
+    // threshold as stale rather than as "always fresh".
+    if (coingecko_feed_fresh_for_revival(
+            !coingecko_prices_.empty(),
+            coingecko_last_fetch_,
+            std::chrono::steady_clock::now(),
+            config_.market_data.cex_freshness_threshold_sec)) {
         auto it = coingecko_prices_.find("chia");
         if (it != coingecko_prices_.end() && std::isfinite(it->second)
             && it->second > 0.0) {
@@ -13716,6 +13731,41 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // member).  [S20] Only an authoritative valuation may move it.
     if (valuation_authoritative) {
         peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
+    }
+
+    // [S27 2026-08-27] FAIL CLOSED when the book cannot be valued at all.
+    //
+    // Freezing the peak is the right response to a degraded valuation when
+    // a peak already exists.  On a fresh process there is nothing to
+    // freeze, so the same mechanism pins the peak at zero -- and
+    // equity_drawdown_frac returns 0.0 for a non-positive peak, so the
+    // breakers cannot fire however bad things get.  Setting
+    // valuation_degraded_ (the fix above) makes the engine KNOW it is
+    // blind; without this it still trades anyway, which is exactly the
+    // 2026-08-25 condition.
+    //
+    // Not triggered when a valid peak exists: there the frozen peak is a
+    // real reference and the ordinary comparison still protects us.
+    if (risk::unvaluable_book_must_fail_closed(
+            drawdown_grace_remaining_ == 0,
+            valuation_degraded_,
+            peak_equity_hwm_usd_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        state_->set_status(BotStatus::Paused);
+        spdlog::error("[Engine] Step 13: [S27] NO VALUATION and no peak ever "
+                      "established -- equity ${:.2f} cannot be trusted and "
+                      "the drawdown breaker cannot fire against a zero peak. "
+                      "Engine PAUSED (fail-closed).  Manual intervention "
+                      "required: an asset is held that nothing can price.",
+                      equity_usd);
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                "valuation unavailable: no held asset could be priced and no "
+                "equity peak was ever established, so the drawdown breaker "
+                "cannot fire -- engine paused fail-closed");
+        }
     }
 
     bs.equity_usd      = equity_usd;
