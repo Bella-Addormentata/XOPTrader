@@ -82,6 +82,14 @@ instructive.**
 4. **"The gate costs 0.6% of capital" — WRONG.** Observed cost of reaching
    84% of the gate was **−$166,985** (a third of seed). Three MMs sit at
    exactly zero equity.
+5. **"The gate is meant to be cleared during the cash session" — WRONG.**
+   Inferred from Gene calibrating 300M as "≈$3,000 for about 28 hours
+   (roughly 80%+ of cash-session hours)", which I read as a statement about
+   *which* hours count. It was a statement about magnitude only. Carried
+   ticks do accrue (confirmed 2026-08-27), so the denominator is 102.5
+   hours, not 32.5 — and the depth needed falls from ~$2,564 to ~$813. The
+   lesson: a figure offered as a rough guide is not a rule, and I built an
+   argument on the phrasing of an aside.
 
 ---
 
@@ -196,12 +204,13 @@ wall-clock hours are cash session, and whether *carried* (out-of-hours)
 ticks credit is still unresolved. If they do not, the gate must be cleared
 inside those 32 hours.
 
-⚠ **The "before 31 Aug does not count" half is an assumption, not a rule.**
-A competitor put the opposite reading to the sponsor on 2026-08-26 — that
-because the contest is shorter than the 5-day window, pre-competition depth
-*would* carry in unless explicitly reset — and received no answer. See the
-Discord-archive section below; this is one of the two questions worth
-asking before Monday.
+✅ **Both halves settled 2026-08-27.** `depth_seconds` **is** reset for the
+contest — Gene Hoffman, "planning to do that already" — so nothing banked
+in the sandbox carries in. But **carried (out-of-hours) ticks do accrue**,
+so the usable window is the full **102.5 wall-clock hours**, not 32.5 cash
+hours. Held continuously that is only **~$813** of balanced depth, or
+**~$1,190** if we quote the four overnight sessions and stand down for the
+cash open. See the Discord-archive section below.
 
 Rules: one-sided quotes earn **zero** for that market (`min(bid, ask)`);
 pauses/restarts/stale oracle advance the window and add nothing.
@@ -237,14 +246,21 @@ Depth accrues on **resting size in-band**. In-band is trivially satisfied
 when the oracle is frozen — and it is frozen ~13 hours a day plus weekends.
 The 488% hour at the open is where a resting quote gets destroyed.
 
-So the shape that fits the evidence: **bank eligibility overnight and at
-weekends, quote the session only where statistics support it.** That would
+So the shape that fits the evidence: **bank eligibility in the carried
+hours, quote the session only where statistics support it.** That would
 also explain the leaderboard — accounts chasing `Σ_markets` depth during
 the session, in TSLA as hard as NVDA, getting run over.
 
-**This is a hypothesis, and it is now materially weaker than when first
-written.** Two venue rules found in the API skill on 2026-08-26 cut against
-it:
+✅ **Confirmed on the load-bearing point, 2026-08-27: carried ticks do
+accrue depth.** The gate can be banked out-of-hours. Quoting only the four
+overnight sessions of the contest needs ~$1,190 of balanced depth held
+throughout, against ~$2,564 to clear it inside the cash session — see the
+Discord-archive section. (There are no weekends *inside* the contest window,
+so the weekend half of the original phrasing is moot; and depth is reset at
+the start, so it cannot be pre-banked either.)
+
+**Two venue rules still cut against doing it naively**, and they are what
+turn "cheap" into "cheap but not free":
 
 - **Carried sessions cost 8× margin.** While the oracle is *carried* (the
   venue's own term for the frozen out-of-hours state), risk-increasing
@@ -387,51 +403,80 @@ a 98% threshold. Nobody could ever qualify, so the metric was replaced. That
 is also the answer to "is the leaderboard leftover data?" — it is live, but
 balances have been reset repeatedly (7/17, 7/20, 8/6, 8/21).
 
-### Still unresolved: do carried ticks accrue depth?
+### RESOLVED: carried ticks DO accrue depth (asked 2026-08-27 15:06)
 
-This remains the decisive open question, and the archive sharpens it rather
-than closing it.
+Jakub Hadamcik, **2026-08-27 15:10**, answering our question directly:
 
-**Against accrual** — the rule says "within ±2% of a **fresh** oracle", and
-Gene calibrates the gate as "≈$3,000 average balanced depth for about 28
-hours (roughly **80%+ of cash-session hours**)". A contest week holds ~32.5
-cash-session hours, and 28/32.5 ≈ 86%, which fits exactly. If carried ticks
-credited, the same $3,000 would clear the gate in 28 of ~102 available hours
-— a 27% duty cycle, which nobody would describe as "80%+ of cash-session
-hours". The calibration is written as though only the cash session counts.
+> And yes, when underlying markets are closed, you keep collecting depth
+> seconds
 
-**For accrual** — "carried" is demonstrably not "stale" in this venue's
-vocabulary. Gene, **2026-06-11**:
+⚠ **Entrant-sourced, not sponsor-sourced.** Jakub is a competitor, not
+Permuto staff. He is also the entrant who records every trade, book change
+and oracle print, has been consistently candid in the channel, and gains
+nothing by telling the field the gate is easier than it looks. Treat it as
+strong but verifiable — see "Verify it ourselves" below.
 
-> Closed equity hours stop fresh equity-price oracles, but vol perps keep a
-> **continuous carried IV oracle** so they can trade around the clock
+**This reverses the inference in the previous draft.** The argument against
+accrual was that Gene calibrates the gate as "≈$3,000 average balanced depth
+for about 28 hours (roughly 80%+ of cash-session hours)", which reads as
+though only the cash session counts. That was over-reading a figure offered
+as a rough magnitude. The evidence *for* accrual — Gene's own "vol perps
+keep a **continuous carried IV oracle** so they can trade around the clock"
+(2026-06-11) and the band being "±50% around the **live (or carried)**
+oracle IV" (2026-06-17) — was the better guide. Carried is a real oracle,
+and a real oracle is a fresh one.
 
-and **2026-06-17**, on the placement band: "±50% around the **live (or
-carried)** oracle IV". A carried oracle is a legitimate oracle for band
-purposes, so it may well count as fresh for the sampler too.
+**The arithmetic changes a lot.** The gate is 300,000,000 depth-seconds over
+a 102.5-hour contest window:
 
-Our own measurement (leader's depth flat through 30 minutes of frozen
-oracle) leans against accrual but is confounded by the 5-day window.
-**Ask.** This is now the top question for the channel, replacing C-0S.
+| Quote during | Seconds | Balanced depth needed, held throughout |
+| --- | ---: | ---: |
+| Whole contest window (102.5 h) | 369,000 | **~$813** |
+| Carried hours only (4 nights, 70 h) | 252,000 | **~$1,190** |
+| Cash session only (32.5 h) | 117,000 | ~$2,564 |
 
-### Unanswered by the sponsor, and it cuts our way
+Gene's own calibration checks out against this: $3,000 × 28 h × 3,600 =
+302,400,000. The 28 hours was never a claim about *which* hours.
+
+**So the "bank the gate in the quiet hours" shape is back on**, and it is
+now the cheapest route to eligibility by a factor of ~2 against quoting the
+cash session. Two things still argue against doing it naively:
+
+- **8× stressed initial margin** on risk-increasing places while carried.
+  Cheap in *depth* terms is not cheap in *capital* terms.
+- **It is the identified hunting ground.** See the adversarial-precedent
+  section below: entrants explicitly short resting MM size overnight when
+  the oracle is pinned high. Small, balanced, and reduce-only-biased is the
+  shape that survives; a fat overnight grid is what gets farmed.
+
+**Verify it ourselves before relying on it.** The leaderboard is public and
+unauthenticated. Sample `depth_5d` for two or three actively-quoting MMs
+just after a 16:00 ET close and again ~90 minutes later. A clear rise
+confirms accrual. Note the 5-day window cuts both ways — roll-off can mask
+a small gain — so prefer accounts with large recent accrual and use a long
+enough gap that accrual dominates.
+
+### RESOLVED: depth_seconds IS reset for the contest
 
 Jakub Hadamcik, **2026-08-26 15:45**, replying to the reset announcement:
 
 > Ideally reset also depth seconds because competition is less than 5 days
 > long, it would count pre-competition depth seconds as well
 
-**No reply.** If `depth_seconds` is the trailing-5-day window the leaderboard
-column implies, and it is *not* reset on Sunday, then depth banked Friday
-through Sunday is still inside the window at the Monday bell and counts
-toward the 300M gate. That directly contradicts this document's earlier
-assertion that "depth banked before 31 Aug does not count" — an assumption,
-never a confirmed rule, and a competitor has now put the opposite reading to
-the sponsor without being corrected.
+Gene Hoffman, **2026-08-26 15:45**:
 
-**This is worth real money to us.** Clearing a large fraction of the gate
-before the contest opens, in the sandbox, at leisure, would remove the
-single hardest constraint on competing. Ask alongside the carried question.
+> **planning to do that already**
+
+**So pre-competition depth does not carry in**, and this document's original
+assertion — "depth banked before 31 Aug does not count" — is correct after
+all. There is no weekend-banking shortcut. The full 300,000,000 has to be
+earned inside `[CONTEST_START, CONTEST_END]`.
+
+*How this was missed:* the answer is four words long and contains none of
+the terms worth searching for. It was found only by following the message
+link in Jakub's reply. Keyword search over a chat archive systematically
+misses short answers — check the replies to the *question*, not just the
+keyword.
 
 ### The reset schedule
 
@@ -519,15 +564,20 @@ carrying huge short which I wasn't able to release anywhere."
 
 Sophisticated entrants deliberately hunt resting MM size during carried hours
 and at the open. Combined with the 8× stressed initial margin off-hours,
-**quoting meaningful size overnight is the identified way to lose** — and the
-"bank the gate overnight" hypothesis above is weaker still, because it is
-precisely the behaviour these traders are farming.
+**quoting meaningful size overnight is the identified way to lose.**
 
-### Questions asked in `#svPerps` — posted 2026-08-27 15:06, awaiting answer
+This does *not* kill the bank-the-gate-overnight plan — carried ticks are
+confirmed to accrue, and the gate only needs ~$1,190 of balanced depth held
+across the four contest nights. It sets the *size*: the gate is cheap enough
+that we never need a fat overnight grid, and a fat overnight grid is exactly
+what gets farmed. Quote the minimum that clears the gate, biased reduce-only,
+and treat any overnight fill as information rather than inventory to defend.
 
-Both were unanswered by anyone, both change strategy materially, and the
-channel has a demonstrated record of answering this kind of question within
-hours. Posted as a single message:
+### Questions asked in `#svPerps` — posted 2026-08-27 15:06, both ANSWERED
+
+Both were unanswered by anyone and both changed strategy materially. Posted
+as a single message at 15:06; first reply at 15:09, both answered by 15:10.
+The channel answers this kind of question fast — use it. Posted:
 
 > Two questions on depth_seconds accounting, if I may. (1) Do carried
 > (out-of-hours) ticks accrue depth_seconds - is a carried IV oracle treated
@@ -538,15 +588,18 @@ hours. Posted as a single message:
 > otherwise carry into the 300,000,000 gate. Asking now because the two
 > answers imply quite different overnight sizing. Thanks!
 
-In full:
+**The answers:**
 
-1. **Do carried (out-of-hours) ticks accrue `depth_seconds`?** Is a carried
-   IV oracle "fresh" for the ~10 s depth sampler, given that placement
-   treats live and carried oracles alike?
-2. **Will `depth_seconds` be reset on Sunday along with balances?** If not,
-   does depth banked in the pre-competition sandbox count toward the
-   300,000,000 gate, since the contest is shorter than the 5-day window?
-   (Jakub raised this on 2026-08-26 and got no answer.)
+1. **Carried ticks DO accrue.** Jakub Hadamcik, 15:10 — "And yes, when
+   underlying markets are closed, you keep collecting depth seconds."
+   *Entrant, not staff* — verify (C-0S3).
+2. **`depth_seconds` IS reset.** Jakub pointed at Gene Hoffman's reply to
+   his own 2026-08-26 request — "planning to do that already". Sponsor,
+   authoritative. No pre-banking.
+
+Net: no shortcut before Monday, but the gate is roughly a third as expensive
+as the cash-session-only reading implied. Both revisions are worked through
+in the two sections above.
 
 ## Conduct rules that bind a two-sided quoter
 
@@ -682,15 +735,19 @@ transfer and must not leak into shared code.
       Discord, 2026-08-11: "depth_seconds does not change rank order and is
       not combined with PnL." The agent skill was right; the rules page
       phrasing is loose.
-- [~] **C-0S2** **Two questions that replace it — ASKED 2026-08-27 15:06,
-      awaiting answer.** (a) do *carried* out-of-hours ticks accrue
-      `depth_seconds`? (b) will `depth_seconds` be reset on Sunday along
-      with balances, or does sandbox depth carry into the contest through
-      the 5-day window? A competitor asked (b) on 2026-08-26 and got no
-      reply. **(b) may let us clear most of the gate before Monday** — if
-      the answer is "not reset", banking depth in the sandbox over the
-      weekend becomes the highest-value thing we can do, and it needs no
-      strategy code at all. Check back before the Sunday-evening pause.
+- [x] **C-0S2** **ANSWERED within four minutes of asking, 2026-08-27.**
+      (a) **Carried out-of-hours ticks DO accrue `depth_seconds`** — "when
+      underlying markets are closed, you keep collecting depth seconds"
+      (Jakub Hadamcik, an entrant, not staff — verify before betting on
+      it). (b) **`depth_seconds` IS reset** for the contest — Gene Hoffman,
+      "planning to do that already". So there is no weekend pre-banking,
+      but the usable window is the full 102.5 h, which drops the depth
+      needed from ~$2,564 to ~$813 held throughout.
+- [ ] **C-0S3** **Verify (a) ourselves from the public leaderboard.** Sample
+      `depth_5d` for two or three actively-quoting MMs just after a 16:00 ET
+      close and again ~90 min later; a clear rise confirms accrual. No auth
+      needed, no code beyond a fetch. Do this before sizing anything on it —
+      the whole eligibility plan now rests on one entrant's statement.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
       **not decaying** — the sponsor confirms the accumulator only rises;
       what falls is the 5-day display window.
