@@ -365,7 +365,20 @@ exposure this week.
 ### S29: peg identity is a repeated string comparison, not a property of the asset
 - **Files:** `cpp/include/xop/peg_registry.hpp` (new), `cpp/src/engine.cpp` (5 sites), `cpp/src/monitoring/pnl.cpp:1512`, `cpp/src/strategy/arbitrage.cpp:916`, `cpp/src/strategy/market_allocator.cpp:188`, `cpp/include/xop/feed_listings.hpp:47`
 - **Issue:** 15 sites each ask a variant of `quote == "wUSDC.b" || ... == "USDS"` and independently conclude "worth exactly $1". Two failures followed: BYC's depeg watch existed only because a *pair* carried `is_stablecoin`, so disabling BYC/wUSDC.b removed monitoring from the asset that had just become the book's dollar anchor; and `quote_usd_factor`'s BYC branch falls through to `return 1.0`, so BYC kept marking the portfolio at par after Circuit DAO announced the protocol would be sunset.
-- **Status:** `[~]` — Registry built on `feat/peg-registry` (f86d9b9): asset-keyed, declares the peg **currency** (so EUR/JPY pegs are expressible and a missing FX rate yields *no valuation* rather than a silent 1:1), separates `Unobserved` from `Holding`, and has an `enforce` flag for "declared but no longer trusted to value anything". 16 tests, sabotage-verified. **No call sites converted yet** — that is the next commit and is what actually fixes the live bug.
+- **Status:** `[~]` — Registry built and the VALUATION call sites converted
+  on `feat/peg-registry` (PR #115): `engine.cpp` now contains zero
+  comparisons against `"wUSDC.b"` / `"wUSDC"` / `"USDS"` / `"BYC"` and no
+  bare `return 1.0` in the USD-factor path. Asset-keyed, declares the peg
+  **currency** (so EUR/JPY pegs are expressible and a missing FX rate yields
+  *no valuation* rather than a silent 1:1), separates `Unobserved` from
+  `Holding`, and has an `enforce` flag. 20 registry tests plus 13 parser
+  tests, sabotage-verified.
+  **STILL OPEN — the observation half.** `PegRegistry::classify` has no
+  production caller; `DepegDetector` is registered and updated solely from
+  `PairConfig::is_stablecoin` and the pair loop, so disabling `BYC/wUSDC.b`
+  still removes BYC's only peg observation. Wiring an asset-level detector
+  independent of `pair.enabled` is the remaining work, and is what actually
+  closes S30.
 
 ### S30: both issuers of our quote assets were compromised within a day
 - **Files:** `config.yaml` (pairs), `TODO-COMPETITION.md`, memory `warp-green-bridge-compromise`
@@ -374,7 +387,7 @@ exposure this week.
 
 ### S31: no dead man's switch -- a wedged engine leaves live offers on the book
 - **Files:** `cpp/src/engine.cpp` (heartbeat), `cpp/src/execution/offer_manager.cpp`
-- **Issue:** On 2026-08-25 the engine spent ~4h unable to reach the full node while offers rested on dexie. When the node returned, six four-hour-old XCH/BYC bids filled in the same second and the rolling-window breaker tripped (-$12.71 over 3 blocks). Nothing cancels our book when the engine stops functioning -- the offers outlive the process that is supposed to be managing them. S28 compounds it: `pause.flag` is also unreadable in that state, so the operator cannot intervene either.
+- **Issue:** On 2026-08-25 the engine spent ~4h unable to reach the full node while offers rested on dexie. When the node returned, six four-hour-old XCH/BYC bids filled in the same second and the rolling-window breaker tripped (-$12.71 over 3 blocks). Nothing cancels our book when the engine stops functioning -- the offers outlive the process that is supposed to be managing them. S28 compounds it differently from how this item first claimed: `pause.flag` is not read *during* the outage, but it IS applied before Step 8 on recovery (see the correction in S28), so the operator can still stop the engine — what they cannot do is retract the already-live book, which is exactly why this item is separate from S28.
 - **Prior art:** Permuto exposes exactly this as a first-class endpoint (`POST /exchange/schedule_cancel`, Hyperliquid-style): arm a future cancel-all, extend it on every healthy loop, and the venue cancels for you if you stop. Policy there is `min_delay_ms` 5000, `max_triggers_per_day` 10 fresh arms, with rescheduling-while-armed unlimited -- so the pattern is *extend*, never disarm-and-rearm. See `docs/permuto-api-reference.md` §2.
 - **Design note:** dexie has no server-side equivalent, so ours must be local and must NOT depend on the heartbeat it is protecting against -- a watchdog inside the loop that wedges is worthless. Wallet RPC stayed healthy throughout the 2026-08-25 outage while the full node was unreachable, so a wallet-only cancel path is viable.
 - **Status:** `[ ]` — Identified 2026-08-26 while scoping Permuto; the capability is a straight transfer back to the dexie bot.

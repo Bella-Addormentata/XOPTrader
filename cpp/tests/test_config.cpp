@@ -1479,7 +1479,7 @@ TEST(ConfigParserTest, PeggedAssets_AbsentSectionIsLegalAndEmpty) {
 TEST(ConfigParserTest, PeggedAssets_AllFieldsRoundTrip) {
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: aabb
+- asset_id: aabb000000000000000000000000000000000000000000000000000000000000
   symbol: wTEST
   peg_currency: USD
   peg_target: 1.0
@@ -1490,7 +1490,7 @@ pegged_assets:
   enforce: true
 )"));
     auto cfg = xop::load_config(tmp.path());
-    const auto* a = cfg.pegged_assets.find("aabb");
+    const auto* a = cfg.pegged_assets.find("aabb000000000000000000000000000000000000000000000000000000000000");
     ASSERT_NE(a, nullptr);
     EXPECT_EQ(a->symbol, "wTEST");
     EXPECT_EQ(a->peg_currency, "USD");
@@ -1507,30 +1507,30 @@ TEST(ConfigParserTest, PeggedAssets_EnforceFalseSurvivesTheParser) {
     // parser dropped it, an operator would set it and nothing would change.
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: dead
+- asset_id: dead000000000000000000000000000000000000000000000000000000000000
   symbol: GONE
   peg_currency: USD
   peg_target: 1.0
   enforce: false
 )"));
     auto cfg = xop::load_config(tmp.path());
-    ASSERT_NE(cfg.pegged_assets.find("dead"), nullptr) << "declaration retained";
-    EXPECT_FALSE(cfg.pegged_assets.is_pegged("dead"));
-    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("dead").has_value())
+    ASSERT_NE(cfg.pegged_assets.find("dead000000000000000000000000000000000000000000000000000000000000"), nullptr) << "declaration retained";
+    EXPECT_FALSE(cfg.pegged_assets.is_pegged("dead000000000000000000000000000000000000000000000000000000000000"));
+    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("dead000000000000000000000000000000000000000000000000000000000000").has_value())
         << "an unenforced peg must not value anything";
 }
 
 TEST(ConfigParserTest, PeggedAssets_PreferMarketCrossSurvivesTheParser) {
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: cdp
+- asset_id: cd90000000000000000000000000000000000000000000000000000000000000
   symbol: CDP
   peg_currency: USD
   peg_target: 1.0
   prefer_market_cross: true
 )"));
     auto cfg = xop::load_config(tmp.path());
-    const auto* a = cfg.pegged_assets.find("cdp");
+    const auto* a = cfg.pegged_assets.find("cd90000000000000000000000000000000000000000000000000000000000000");
     ASSERT_NE(a, nullptr);
     EXPECT_TRUE(a->prefer_market_cross)
         << "wrapper-vs-CDP is what selects the valuation path";
@@ -1539,25 +1539,25 @@ pegged_assets:
 TEST(ConfigParserTest, PeggedAssets_NonUsdDeclarationParsesAndYieldsNoUsdValue) {
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: euro
+- asset_id: e040000000000000000000000000000000000000000000000000000000000000
   symbol: wEURC
   peg_currency: EUR
   peg_target: 1.0
 )"));
     auto cfg = xop::load_config(tmp.path());
-    const auto* a = cfg.pegged_assets.find("euro");
+    const auto* a = cfg.pegged_assets.find("e040000000000000000000000000000000000000000000000000000000000000");
     ASSERT_NE(a, nullptr);
     EXPECT_EQ(a->peg_currency, "EUR");
-    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("euro").has_value())
+    EXPECT_FALSE(cfg.pegged_assets.usd_par_value("e040000000000000000000000000000000000000000000000000000000000000").has_value())
         << "no FX rate supplied, so no USD value -- never a silent 1:1";
-    EXPECT_TRUE(cfg.pegged_assets.usd_par_value("euro", 1.09).has_value());
+    EXPECT_TRUE(cfg.pegged_assets.usd_par_value("e040000000000000000000000000000000000000000000000000000000000000", 1.09).has_value());
 }
 
 TEST(ConfigParserTest, PeggedAssets_IncoherentEntryThrows) {
     // Dropped silently, this is an asset everyone assumes is watched.
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: bad
+- asset_id: bad0000000000000000000000000000000000000000000000000000000000000
   symbol: BAD
   peg_currency: USD
   peg_target: 1.0
@@ -1581,7 +1581,7 @@ pegged_assets:
 TEST(ConfigParserTest, PeggedAssets_NonFiniteTargetThrows) {
     TempYaml tmp(with_pegs(R"(
 pegged_assets:
-- asset_id: inf
+- asset_id: 1f00000000000000000000000000000000000000000000000000000000000000
   symbol: INF
   peg_currency: USD
   peg_target: .inf
@@ -1597,6 +1597,62 @@ TEST(ConfigParserTest, PeggedAssets_MalformedSectionThrowsRatherThanDisablingEve
 pegged_assets:
   asset_id: oops
   symbol: OOPS
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_UppercaseAssetIdIsLowercased) {
+    // Chia tools emit uppercase hex.  Without canonicalization the
+    // declaration could never match a pair's lowercased asset id, so the
+    // peg would silently do nothing while looking configured.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: AABBCCDDEEFF00112233445566778899AABBCCDDEEFF00112233445566778899
+  symbol: UPPER
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_NE(cfg.pegged_assets.find(
+        "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899"),
+        nullptr);
+}
+
+TEST(ConfigParserTest, PeggedAssets_MalformedAssetIdThrows) {
+    // A placeholder or typo must fail at startup, not key on a string no
+    // asset can ever match.
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: REPLACE_WITH_REAL_TAIL
+  symbol: PLACEHOLDER
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, PeggedAssets_XchIsAValidAssetId) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: xch
+  symbol: XCH
+  peg_currency: USD
+  peg_target: 1.0
+)"));
+    EXPECT_NO_THROW(xop::load_config(tmp.path()));
+}
+
+TEST(ConfigParserTest, PeggedAssets_DuplicateAssetIdThrows) {
+    TempYaml tmp(with_pegs(R"(
+pegged_assets:
+- asset_id: aa11000000000000000000000000000000000000000000000000000000000000
+  symbol: ONE
+  peg_currency: USD
+  peg_target: 1.0
+- asset_id: aa11000000000000000000000000000000000000000000000000000000000000
+  symbol: TWO
+  peg_currency: USD
+  peg_target: 1.0
 )"));
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }

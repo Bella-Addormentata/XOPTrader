@@ -182,12 +182,10 @@ TEST(PegRegistry, UndeclaredAssetClassifiesAsNotPeggedNotUnobserved) {
 }
 
 TEST(PegRegistry, EachBandIsEnteredOnceItsThresholdIsPassed) {
-    // Deliberately NOT asserting on values sitting exactly on a threshold.
-    // 1.02 - 1.0 is 0.020000000000000018 in double, so "exactly 2%" is not
-    // a state the arithmetic can represent, and pinning it would pin the
-    // representation error rather than the contract.  A hair either side of
-    // a peg threshold is not a distinction worth defending; the bands
-    // themselves are.
+    // Bands, not exact boundaries: 1.02 - 1.0 is 0.020000000000000018 in
+    // double, so "exactly 2%" is not a state the arithmetic can represent
+    // and pinning it would pin the representation error.  What IS pinned
+    // (below) is that the comparison is INCLUSIVE, matching DepegDetector.
     PeggedAsset a = usd_coin();
     a.warn_pct = 2.0;
     a.bail_pct = 10.0;
@@ -289,4 +287,28 @@ TEST(PegRegistry, DeviationRejectsNonFiniteObservationsLikeClassifyDoes) {
 
     EXPECT_EQ(reg.classify("wusdc_tail", nan), PegStatus::Unobserved);
     EXPECT_FALSE(reg.deviation_pct("wusdc_tail", nan).has_value());
+}
+
+TEST(PegRegistry, ThresholdsAreInclusiveLikeDepegDetector) {
+    // depeg_detector.hpp:121,131 both use >=.  If classify used > instead,
+    // a deviation sitting on a configured limit would be Broken to one
+    // component and merely Warn to the other -- two views of the same
+    // number disagreeing about whether the limit was breached.
+    //
+    // Uses a target of 100.0 so the deviations land on exactly
+    // representable values (2.0 and 10.0 percent) and the assertion is
+    // about the operator, not about float representation.
+    PeggedAsset a;
+    a.asset_id     = "exact";
+    a.peg_currency = "USD";
+    a.peg_target   = 100.0;
+    a.warn_pct     = 2.0;
+    a.bail_pct     = 10.0;
+    PegRegistry reg({a});
+
+    EXPECT_EQ(reg.classify("exact", 102.0), PegStatus::Warn)
+        << "exactly at warn_pct must BE the warn band, not below it";
+    EXPECT_EQ(reg.classify("exact", 110.0), PegStatus::Broken)
+        << "exactly at bail_pct must BE broken, not merely warn";
+    EXPECT_EQ(reg.classify("exact", 101.0), PegStatus::Holding);
 }

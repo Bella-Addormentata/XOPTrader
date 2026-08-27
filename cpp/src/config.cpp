@@ -433,6 +433,31 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
         PeggedAsset a;
         a.asset_id = item["asset_id"] ? item["asset_id"].as<std::string>() : "";
         a.symbol   = item["symbol"]   ? item["symbol"].as<std::string>()   : "";
+
+        // [PEG 2026-08-27] Canonicalize and validate exactly as parse_pairs
+        // does (T3-29).  Without this an uppercase tail -- which Chia tools
+        // emit -- could never match the lowercased pair asset ids, and a
+        // malformed id would be accepted silently.  Either one removes the
+        // peg valuation the operator believes they declared, with no error
+        // to tell them.
+        std::transform(a.asset_id.begin(), a.asset_id.end(), a.asset_id.begin(),
+                       [](unsigned char c) {
+                           return static_cast<char>(std::tolower(c));
+                       });
+        if (a.asset_id != "xch") {
+            const bool well_formed =
+                a.asset_id.size() == 64
+                && a.asset_id.find_first_not_of("0123456789abcdef")
+                       == std::string::npos;
+            if (!well_formed) {
+                throw ConfigError(
+                    "pegged_assets: asset_id for '"
+                    + (a.symbol.empty() ? std::string{"<no symbol>"} : a.symbol)
+                    + "' must be \"xch\" or a 64-character hex CAT tail -- got '"
+                    + a.asset_id + "'.  A malformed id can never match a pair, "
+                      "so the declared peg would silently do nothing.");
+            }
+        }
         if (item["peg_currency"]) a.peg_currency = item["peg_currency"].as<std::string>();
         if (item["peg_target"])   a.peg_target   = item["peg_target"].as<double>();
         if (item["warn_pct"])     a.warn_pct     = item["warn_pct"].as<double>();

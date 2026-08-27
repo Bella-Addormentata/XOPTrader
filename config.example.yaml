@@ -145,17 +145,11 @@ pegged_assets:
   bail_pct: 10.0
   prefer_market_cross: false
   enforce: true
-- asset_id: REPLACE_WITH_USDS_TAIL_HEX
-  symbol: USDS
-  peg_currency: USD
-  peg_target: 1.0
-  warn_pct: 2.0
-  bail_pct: 10.0
-  prefer_market_cross: false
-  # Left unenforced because the tail above is a PLACEHOLDER -- fill in the
-  # real asset id before enabling, or the declaration keys on a string no
-  # asset will ever match.
-  enforce: false
+# USDS is deliberately NOT declared here.  A placeholder tail would now be
+# rejected at startup (asset_id must be "xch" or a 64-char hex tail), and a
+# placeholder that PARSED would be worse -- it would key on a string no asset
+# can match, so the declaration would sit in config looking like protection
+# while doing nothing.  Add a real entry when the tail is known.
 - asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   symbol: BYC
   peg_currency: USD

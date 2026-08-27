@@ -279,8 +279,14 @@ public:
         }
         const double dev_pct =
             std::abs(*observed - a->peg_target) / a->peg_target * 100.0;
-        if (dev_pct > a->bail_pct)  return PegStatus::Broken;
-        if (dev_pct > a->warn_pct)  return PegStatus::Warn;
+        // INCLUSIVE, matching DepegDetector (depeg_detector.hpp:121,131 both
+        // use >=) and the fields' own "deviation at which to warn/bail"
+        // contract.  With `>` a deviation sitting exactly on a configured
+        // limit lands in the lower band, so the two components would
+        // disagree about whether that limit had been breached -- precisely
+        // the inconsistency this registry exists to remove.
+        if (dev_pct >= a->bail_pct)  return PegStatus::Broken;
+        if (dev_pct >= a->warn_pct)  return PegStatus::Warn;
         return PegStatus::Holding;
     }
 
