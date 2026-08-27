@@ -416,8 +416,18 @@ DexieConfig parse_dexie(const YAML::Node& root)
 PegRegistry parse_pegged_assets(const YAML::Node& root)
 {
     PegRegistry reg;
-    if (!root["pegged_assets"] || !root["pegged_assets"].IsSequence()) {
-        return reg;
+    if (!root["pegged_assets"]) {
+        return reg;   // absent is legal: nothing is declared pegged
+    }
+    // Present but not a sequence -- a mapping produced by an indentation
+    // slip, say.  Treating that like absence would silently disable EVERY
+    // peg and zero all USD valuation on a typo, which is the opposite of
+    // the fail-loud contract this parser is meant to honour.
+    if (!root["pegged_assets"].IsSequence()) {
+        throw ConfigError(
+            "pegged_assets: expected a sequence of asset declarations, got "
+            "something else -- check the indentation.  Remove the section "
+            "entirely if no asset is pegged.");
     }
     for (const auto& item : root["pegged_assets"]) {
         PeggedAsset a;

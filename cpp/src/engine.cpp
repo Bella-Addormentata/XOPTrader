@@ -11307,7 +11307,6 @@ double Engine::usd_per_xch() const
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
         const auto slash = pair.name.find('/');
         if (slash == std::string::npos) continue;
-        const std::string quote = pair.name.substr(slash + 1);
         // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
         // registry, keyed on ASSET ID rather than the ticker parsed out of
         // the pair name -- symbols collide and get reused, asset ids do
@@ -11325,9 +11324,17 @@ double Engine::usd_per_xch() const
             // breaker's own anchor.  The published mid is already gated
             // against an independent anchor before it reaches State, which
             // is where junk is meant to be stopped.
-            if (snap.mid_price > 0) {
+            // [PEG 2026-08-27] Multiply by the quote's DECLARED par rather
+            // than assuming one unit is one dollar.  The mid here is
+            // denominated in the quote asset, so for a EUR-pegged wrapper
+            // -- or any non-unit target -- returning it raw would silently
+            // report EUR as USD.  An unavailable par (no FX rate, or the
+            // peg no longer enforced) means this pair cannot anchor XCH;
+            // continue to the next candidate rather than guessing.
+            const auto par = declared_usd_par(pair.quote_asset_id);
+            if (snap.mid_price > 0 && par) {
                 return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch);
+                     / static_cast<double>(kMojosPerXch) * *par;
             }
         }
     }
@@ -11359,9 +11366,6 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
     for (const auto& other : config_.pairs) {
         if (!other.enabled) continue;
         if (other.base_asset_id != pc.quote_asset_id) continue;
-        const auto oslash = other.name.find('/');
-        if (oslash == std::string::npos) continue;
-        const std::string oquote = other.name.substr(oslash + 1);
         if (!is_par_wrapper_quote(other)) {
             continue;
         }
@@ -11381,11 +11385,6 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
 // factor needs no snapshot (par) or none is available.
 std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
     if (quote_prefers_market_cross(pc)) {
         return byc_cross_source_pair(pc);
     }
@@ -11483,9 +11482,6 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
         for (const auto& other : config_.pairs) {
             if (!other.enabled) continue;
             if (other.base_asset_id != pc.quote_asset_id) continue;
-            const auto oslash = other.name.find('/');
-            if (oslash == std::string::npos) continue;
-            const std::string oquote = other.name.substr(oslash + 1);
             if (!is_par_wrapper_quote(other)) {
                 continue;
             }

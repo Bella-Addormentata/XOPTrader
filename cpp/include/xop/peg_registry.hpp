@@ -109,11 +109,16 @@ struct PeggedAsset {
     bool prefer_market_cross{false};
 
     [[nodiscard]] bool is_coherent() const noexcept {
+        // Finiteness is checked explicitly: +inf satisfies `> 0.0` and an
+        // infinite bail_pct satisfies `> warn_pct`, so a declaration built
+        // from a typo could otherwise return an infinite USD factor into
+        // llround.  Matches the finite check PairConfig::peg_target already
+        // gets in config.cpp.
         return !asset_id.empty()
             && !peg_currency.empty()
-            && peg_target > 0.0
-            && warn_pct >= 0.0
-            && bail_pct > warn_pct;
+            && std::isfinite(peg_target) && peg_target > 0.0
+            && std::isfinite(warn_pct)   && warn_pct >= 0.0
+            && std::isfinite(bail_pct)   && bail_pct > warn_pct;
     }
 };
 
@@ -231,10 +236,17 @@ public:
         if (a->peg_currency == "USD") {
             return a->peg_target;
         }
-        if (!fx_to_usd.has_value() || !(*fx_to_usd > 0.0)) {
+        if (!fx_to_usd.has_value() || !std::isfinite(*fx_to_usd)
+            || !(*fx_to_usd > 0.0)) {
             return std::nullopt;
         }
-        return a->peg_target * *fx_to_usd;
+        const double v = a->peg_target * *fx_to_usd;
+        // Two individually finite values can still overflow.  An infinite
+        // valuation is not a valuation.
+        if (!std::isfinite(v)) {
+            return std::nullopt;
+        }
+        return v;
     }
 
     /// Grade an observed rate against the declared peg.
@@ -252,7 +264,8 @@ public:
         if (a == nullptr || !a->enforce) {
             return PegStatus::NotPegged;
         }
-        if (!observed.has_value() || !(*observed > 0.0)) {
+        if (!observed.has_value() || !std::isfinite(*observed)
+            || !(*observed > 0.0)) {
             return PegStatus::Unobserved;
         }
         const double dev_pct =
