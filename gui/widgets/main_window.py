@@ -109,6 +109,11 @@ try:
 except ImportError:
     BaseWalletWidget = None  # type: ignore[assignment,misc]
 
+try:
+    from gui.widgets.permuto import PermutoWidget
+except ImportError:
+    PermutoWidget = None  # type: ignore[assignment,misc]
+
 # ---------------------------------------------------------------------------
 # Theme constants -- sourced from the canonical CHIA palette singleton.
 # ---------------------------------------------------------------------------
@@ -1828,8 +1833,12 @@ class MainWindow(QMainWindow):
             BaseWalletWidget, "Base Wallet"
         )
         self._stacked.addWidget(self._base_wallet_widget)
+        self._permuto_widget = self._create_page_widget(            # index 9
+            PermutoWidget, "Permuto"
+        )
+        self._stacked.addWidget(self._permuto_widget)
         self._settings_widget = self._create_page_widget(SettingsWidget, "Settings")
-        self._stacked.addWidget(self._settings_widget)              # index 9
+        self._stacked.addWidget(self._settings_widget)              # index 10
         self._splitter.addWidget(self._stacked)
 
         # Bottom area: tab widget (35 %)

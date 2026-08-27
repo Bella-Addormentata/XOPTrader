@@ -1,0 +1,130 @@
+"""Page state machine, with the backup gate as the load-bearing test.
+
+The gate is the whole safety argument of this page: registration is permanent
+and unchangeable, so an operator must not reach it before the recovery phrase
+exists somewhere off this machine. A test that only checks the happy path
+would pass with the gate deleted, so the disabled cases are asserted first.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+pytest.importorskip("PySide6")
+
+from gui.services.permuto.identity import PermutoIdentity  # noqa: E402
+from gui.services.permuto.tests.test_identity import (  # noqa: E402
+    FakeProtector,
+    FakeSecretsIO,
+)
+
+
+@pytest.fixture(scope="module")
+def qapp():
+    from PySide6.QtWidgets import QApplication
+
+    app = QApplication.instance() or QApplication([])
+    yield app
+
+
+@pytest.fixture()
+def page(qapp):
+    from gui.widgets.permuto import PermutoWidget
+
+    io = FakeSecretsIO()
+    ident = PermutoIdentity(io, protector=FakeProtector())
+    widget = PermutoWidget(lambda: ident)
+    return widget, ident
+
+
+def test_no_identity_offers_create_and_restore_only(page):
+    widget, _ = page
+    assert widget._create_btn.isEnabled()
+    assert widget._restore_btn.isEnabled()
+    assert not widget._register_btn.isEnabled()
+    assert not widget._check_btn.isEnabled()
+    assert "No Permuto identity" in widget._identity_lbl.text()
+
+
+def test_register_is_blocked_until_the_phrase_is_confirmed(page):
+    """THE gate. Delete it and this is the test that fails."""
+    widget, ident = page
+    ident.create()
+    widget.refresh()
+
+    assert not widget._register_btn.isEnabled()
+    assert "recovery phrase" in widget._status.text().lower()
+
+    ident.mark_backup_confirmed()
+    widget.refresh()
+    assert widget._register_btn.isEnabled()
+
+
+def test_create_button_cannot_clobber_an_existing_identity(page):
+    widget, ident = page
+    ident.create()
+    widget.refresh()
+    assert not widget._create_btn.isEnabled()
+
+
+def test_registered_state_shows_green_success(page):
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="a" * 64, trading_address="xch1test")
+    widget.refresh()
+
+    from gui.theme import COLORS as C
+
+    assert "Successfully registered" in widget._status.text()
+    assert C.PROFIT_GREEN.lower() in widget._status.styleSheet().lower()
+    assert not widget._register_btn.isEnabled()
+
+
+def test_success_colour_is_actually_green(page):
+    """LIGHT_GREEN in this theme is #FFB347 -- orange. Guard the mix-up."""
+    from gui.theme import COLORS as C
+
+    assert C.PROFIT_GREEN == "#00FF00"
+
+
+def test_registered_but_unlisted_is_not_reported_as_success(page):
+    """A rebuilt-leaderboard lag must not read as failure OR as confirmed."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    widget._on_finished(
+        {"ok": True, "user_id": "b" * 64, "trading_address": "xch1x",
+         "listed": False, "entry": None}
+    )
+    from gui.theme import COLORS as C
+
+    text = widget._status.text()
+    assert "not on the leaderboard yet" in text
+    assert C.PROFIT_GREEN.lower() not in widget._status.styleSheet().lower()
+
+
+def test_failure_is_shown_in_red_and_survives_refresh(page):
+    """refresh() rewrites the status line, so ordering matters -- the error
+    must be the last thing written or it vanishes."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    widget._on_finished({"ok": False, "error": "HTTP 403 signup closed"})
+
+    from gui.theme import COLORS as C
+
+    assert "403" in widget._status.text()
+    assert C.LOSS_RED.lower() in widget._status.styleSheet().lower()
+
+
+def test_public_key_is_shown_and_private_key_is_not(page):
+    widget, ident = page
+    pubkey, phrase = ident.create()
+    widget.refresh()
+
+    shown = widget._identity_lbl.text()
+    assert pubkey in shown
+    assert bytes(ident.private_key()).hex() not in shown
+    for word in phrase.split():
+        assert " %s " % word not in shown
