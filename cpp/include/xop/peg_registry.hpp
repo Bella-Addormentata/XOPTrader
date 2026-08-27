@@ -76,6 +76,11 @@ struct PeggedAsset {
     double peg_target{1.0};
 
     /// Deviation from peg_target at which to warn, as a percentage.
+    /// Must be strictly positive: the classify() comparison is inclusive
+    /// (to agree with DepegDetector), so a warn_pct of 0 would make an
+    /// observation sitting exactly ON the peg classify as Warn and no
+    /// healthy peg could ever reach Holding.  Matches the per-pair
+    /// validation in config.cpp.
     double warn_pct{2.0};
 
     /// Deviation at which the asset is considered broken rather than
@@ -117,7 +122,7 @@ struct PeggedAsset {
         return !asset_id.empty()
             && !peg_currency.empty()
             && std::isfinite(peg_target) && peg_target > 0.0
-            && std::isfinite(warn_pct)   && warn_pct >= 0.0
+            && std::isfinite(warn_pct)   && warn_pct > 0.0
             && std::isfinite(bail_pct)   && bail_pct > warn_pct;
     }
 };

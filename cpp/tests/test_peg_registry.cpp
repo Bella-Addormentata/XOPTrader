@@ -312,3 +312,21 @@ TEST(PegRegistry, ThresholdsAreInclusiveLikeDepegDetector) {
         << "exactly at bail_pct must BE broken, not merely warn";
     EXPECT_EQ(reg.classify("exact", 101.0), PegStatus::Holding);
 }
+
+TEST(PegRegistry, ZeroWarnPctIsRejectedBecauseTheBoundaryIsInclusive) {
+    // classify() uses >= so it agrees with DepegDetector.  With warn_pct
+    // of 0 that makes an observation sitting exactly ON the peg classify
+    // as Warn, and no healthy peg could ever reach Holding.  The per-pair
+    // parser already rejects this; the registry now matches.
+    PeggedAsset a = usd_coin();
+    a.warn_pct = 0.0;
+    PegRegistry reg;
+    EXPECT_FALSE(reg.add(a))
+        << "a zero warn band cannot coexist with an inclusive comparison";
+}
+
+TEST(PegRegistry, AnObservationExactlyOnPegIsHolding) {
+    // The property the rejection above protects.
+    PegRegistry reg({usd_coin()});
+    EXPECT_EQ(reg.classify("wusdc_tail", 1.0), PegStatus::Holding);
+}
