@@ -11748,8 +11748,11 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     bool degraded = false;
 
     std::vector<risk::AssetValuationInput> inputs;
+    std::size_t held_count = 0;
+    std::size_t live_count = 0;
     for (const auto& rec : inventory_->get_all_records()) {
         if (rec.total_quantity <= 0) continue;
+        ++held_count;
 
         const double mojos_per_unit =
             (rec.asset_id == "xch") ? 1e12 : 1e3;
@@ -11760,6 +11763,7 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         // Live USD price per display unit (pseudo-price is USD * 1e12).
         const Mojo pseudo = asset_usd_pseudo_price(rec.asset_id);
         if (pseudo > 0) {
+            ++live_count;
             in.live_usd_per_unit = static_cast<double>(pseudo)
                                  / static_cast<double>(kMojosPerXch);
             last_asset_usd_price_[rec.asset_id] = in.live_usd_per_unit;
@@ -11813,6 +11817,10 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
 
     if (current_block > 0) {
         valuation_degraded_ = degraded;
+        // Nothing live at all, while holding something.  Equity is then
+        // entirely carried fiction and no comparison against it is
+        // meaningful -- see unvaluable_book_must_fail_closed.
+        valuation_all_unpriced_ = (held_count > 0 && live_count == 0);
     }
     return risk::portfolio_equity_usd(inputs);
 }
@@ -13733,40 +13741,6 @@ void Engine::step_check_alerts(BlockHeight block_height)
         peak_equity_hwm_usd_ = std::max(peak_equity_hwm_usd_, equity_usd);
     }
 
-    // [S27 2026-08-27] FAIL CLOSED when the book cannot be valued at all.
-    //
-    // Freezing the peak is the right response to a degraded valuation when
-    // a peak already exists.  On a fresh process there is nothing to
-    // freeze, so the same mechanism pins the peak at zero -- and
-    // equity_drawdown_frac returns 0.0 for a non-positive peak, so the
-    // breakers cannot fire however bad things get.  Setting
-    // valuation_degraded_ (the fix above) makes the engine KNOW it is
-    // blind; without this it still trades anyway, which is exactly the
-    // 2026-08-25 condition.
-    //
-    // Not triggered when a valid peak exists: there the frozen peak is a
-    // real reference and the ordinary comparison still protects us.
-    if (risk::unvaluable_book_must_fail_closed(
-            drawdown_grace_remaining_ == 0,
-            valuation_degraded_,
-            peak_equity_hwm_usd_)
-        && !breaker_pause_active_) {
-        breaker_pause_active_ = true;
-        state_->set_status(BotStatus::Paused);
-        spdlog::error("[Engine] Step 13: [S27] NO VALUATION and no peak ever "
-                      "established -- equity ${:.2f} cannot be trusted and "
-                      "the drawdown breaker cannot fire against a zero peak. "
-                      "Engine PAUSED (fail-closed).  Manual intervention "
-                      "required: an asset is held that nothing can price.",
-                      equity_usd);
-        if (alerts_) {
-            alerts_->send_alert(
-                AlertRule::CircuitBreaker,
-                "valuation unavailable: no held asset could be priced and no "
-                "equity peak was ever established, so the drawdown breaker "
-                "cannot fire -- engine paused fail-closed");
-        }
-    }
 
     bs.equity_usd      = equity_usd;
     bs.peak_equity_usd = peak_equity_hwm_usd_;
@@ -13797,6 +13771,55 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // warm-up cannot trip the breaker.
     if (drawdown_grace_remaining_ > 0) {
         --drawdown_grace_remaining_;
+    }
+
+    // [S27 2026-08-27] FAIL CLOSED when the book cannot be valued.
+    //
+    // Placed AFTER the grace decrement so it uses the SAME boundary as the
+    // ordinary drawdown breaker below.  Checking before the decrement made
+    // this path wait one extra heartbeat when the counter entered Step 13
+    // at 1 -- allowing another trading round while the normal breaker
+    // already considered grace elapsed.
+    //
+    // Two states, both of which leave the breaker unable to fire: no peak
+    // was ever established (so it is frozen at zero), or nothing is live at
+    // all (so equity is carried fiction sitting at the value the peak was
+    // frozen at).  See the predicate for why the second one refutes the
+    // "a frozen peak still protects us" reasoning.
+    if (risk::unvaluable_book_must_fail_closed(
+            drawdown_grace_remaining_ == 0,
+            valuation_degraded_,
+            valuation_all_unpriced_,
+            peak_equity_hwm_usd_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        state_->set_status(BotStatus::Paused);
+        if (valuation_all_unpriced_) {
+            spdlog::error("[Engine] Step 13: [S27] NO held asset has a live "
+                          "price -- equity ${:.2f} is entirely carried from "
+                          "stale values, so the drawdown breaker is comparing "
+                          "a frozen equity against a frozen peak (${:.2f}) and "
+                          "cannot detect a loss.  Engine PAUSED (fail-closed). "
+                          "Manual intervention required.",
+                          equity_usd, peak_equity_hwm_usd_);
+        } else {
+            spdlog::error("[Engine] Step 13: [S27] valuation is INCOMPLETE and "
+                          "no equity peak was ever established, so the drawdown "
+                          "breaker cannot fire against a zero peak (equity "
+                          "${:.2f}).  Engine PAUSED (fail-closed).  Manual "
+                          "intervention required.", equity_usd);
+        }
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                valuation_all_unpriced_
+                    ? "valuation unavailable: no held asset has a live price, "
+                      "so equity is entirely carried and the drawdown breaker "
+                      "cannot detect a loss -- engine paused fail-closed"
+                    : "valuation incomplete and no equity peak was ever "
+                      "established, so the drawdown breaker cannot fire -- "
+                      "engine paused fail-closed");
+        }
     }
 
     // [S20 2026-08-24] The breaker COMPARISON is deliberately NOT gated on

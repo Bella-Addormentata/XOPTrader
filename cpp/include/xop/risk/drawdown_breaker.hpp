@@ -56,30 +56,54 @@ namespace xop::risk {
 /// The caller compares against risk.max_drawdown_frac and applies the
 /// startup grace window; this function is just the unit-critical
 /// arithmetic.  NaN inputs fail every comparison and yield 0.0 (no trip).
-/// [S27 2026-08-27] Should the engine stop trading because it cannot value
+// ---------------------------------------------------------------------------
+// [S27 2026-08-27] Fail-closed decision -- a SEPARATE documentation block.
+// Without this break the comment below continues the preceding
+// equity_drawdown_frac Doxygen block, so generated docs attach that
+// function's arithmetic and NaN-return prose to this bool-returning API.
+// ---------------------------------------------------------------------------
+
+/// Should the engine stop trading because it cannot value
 /// its own book?
 ///
-/// Marking a cycle degraded freezes the peak, which is right when a peak
-/// already exists -- a suspect number must not ratchet the high-water mark.
-/// But on a FRESH PROCESS there is no peak to freeze, so the same mechanism
-/// pins it at zero, and `equity_drawdown_frac` returns 0.0 for a
-/// non-positive peak.  The breakers then cannot fire at all, no matter what
-/// happens, for as long as one held asset stays unpriced.
+/// TWO DISTINCT FAIL-OPEN STATES, both of which leave the drawdown breaker
+/// unable to fire however bad things get.
 ///
-/// That is fail-OPEN, and it is the condition S27 exists to remove: the
-/// 2026-08-25 engine knew nothing was priced and traded anyway.  So when
-/// the startup grace has elapsed, valuation is degraded, and no peak has
-/// ever been established, the answer is to stop -- an engine that cannot
-/// measure its exposure has no business adding to it.
+/// 1. NO PEAK EVER ESTABLISHED.  Marking a cycle degraded freezes the peak,
+///    which is right when a peak exists -- a suspect number must not ratchet
+///    the high-water mark.  On a fresh process there is nothing to freeze,
+///    so the peak stays 0 and `equity_drawdown_frac` returns 0.0 for a
+///    non-positive peak.
 ///
-/// Deliberately NOT triggered when a valid peak exists: there the frozen
-/// peak is a real reference and the existing comparison still protects us.
+/// 2. EVERY HELD ASSET UNPRICED, EVEN WITH A PEAK.  This one refutes the
+///    first version of this helper, which assumed "a frozen peak is a real
+///    reference and the ordinary comparison still protects us".  It does
+///    not: `effective_usd_per_unit` carries the last known price with NO
+///    expiry check -- expiry only raises the degraded flag, it does not stop
+///    the carry being summed.  So when nothing is live, equity holds at its
+///    carried value, which is the same number the peak was frozen at, and
+///    the drawdown sits at 0 indefinitely.  Comparing a frozen equity to a
+///    frozen peak cannot detect anything.
+///
+/// Either way the answer is to stop: an engine that cannot measure its
+/// exposure has no business adding to it.
+///
+/// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
+/// there at least one asset is still live, equity still moves, and the
+/// ordinary comparison genuinely does work.
 [[nodiscard]] constexpr bool unvaluable_book_must_fail_closed(
-    bool         grace_elapsed,
-    bool         valuation_degraded,
-    double       peak_equity_usd) noexcept
+    bool   grace_elapsed,
+    bool   valuation_degraded,
+    bool   all_held_assets_unpriced,
+    double peak_equity_usd) noexcept
 {
-    return grace_elapsed && valuation_degraded && !(peak_equity_usd > 0.0);
+    if (!grace_elapsed) {
+        return false;
+    }
+    if (all_held_assets_unpriced) {
+        return true;
+    }
+    return valuation_degraded && !(peak_equity_usd > 0.0);
 }
 
 [[nodiscard]] constexpr double equity_drawdown_frac(

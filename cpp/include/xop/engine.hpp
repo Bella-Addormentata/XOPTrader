@@ -1074,6 +1074,14 @@ private:
     /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
 
+    /// [S27 2026-08-27] TRUE when every held asset lacked a live price this
+    /// cycle.  Distinct from valuation_degraded_, which means "at least one"
+    /// -- and the distinction decides whether the drawdown comparison means
+    /// anything.  With one asset still live, equity moves and the comparison
+    /// works.  With nothing live, equity is entirely carried fiction sitting
+    /// at the value the peak was frozen at, so the drawdown reads 0 forever.
+    bool valuation_all_unpriced_{false};
+
     /// [S20] Peak-update authority: the clean-streak debounce and the
     /// transition signals that drive the warn-once logging.  Pure logic in
     /// risk/valuation_authority.hpp so the semantics are test-pinned
