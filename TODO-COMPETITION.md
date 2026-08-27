@@ -4,18 +4,19 @@ Working document for whether and how XOPTrader competes at
 <https://perps.permuto.capital>. Separate from `TODO.md`, which tracks the
 live Chia bot.
 
-**Status: scoped, nothing built — and the contest starts in under 5 days.**
+**Status: scoped, nothing built — and the contest starts in 4 days.**
 Figures read from the live venue 2026-08-26 unless noted; contest terms from
-the official rules page.
+the official rules page, sharpened by the Discord archive read 2026-08-27.
 
 > ## ⏱ THE CLOCK
 >
 > | | |
 > | --- | --- |
 > | **Sign-up closes** | Mon **31 Aug 2026, 17:00 ET** (21:00 UTC) |
+> | **Balances reset** | Sun **30 Aug**, evening — venue paused until the open |
 > | **Contest runs** | Mon **31 Aug 09:30 ET** → Fri **4 Sep 16:00 ET** |
 > | Duration | 4.3 days, ~32 cash-session hours |
-> | As of 2026-08-26 23:06 UTC | **4.6 days to start, 4.9 to sign-up close** |
+> | As of 2026-08-27 | **~4 days to start, ~4.3 to sign-up close** |
 >
 > **New participants cannot join after the first day of competition.** If we
 > are entering at all, registration is the only thing that has a hard
@@ -62,11 +63,19 @@ instructive.**
    default `GET /exchange/leaderboard` fetch, which is **paginated at 20**
    while `market_makers_total` is 25+. The row called "the best" at 7.2M
    depth-seconds is sixth. The real leader sits at **84.3%** of the gate.
-2. **"Monotonic — banked score cannot be taken away" — WRONG.** The
-   OpenAPI text says monotonic; observation says otherwise. Two samples
-   240s apart, no intervention: leader went 252,758,105 → 252,695,155,
-   **−62,950**. Eligibility is a rolling window you must *hold through the
-   snapshot*, not a bank you fill once.
+2. **"Monotonic — banked score cannot be taken away" — WRONG, then right
+   again.** The OpenAPI text says monotonic; observation said otherwise.
+   Two samples 240s apart, no intervention: leader went 252,758,105 →
+   252,695,155, **−62,950**.
+   **Superseded 2026-08-27.** Gene Hoffman has since said it plainly, twice
+   — "The score only increases while quoting" and "Score only goes up;
+   stopping quoting only stops accrual". Both statements reconcile with the
+   observation once you notice the leaderboard column is `depth_5d`, a
+   **trailing 5-day window**: banked credit does not decay, it *ages out*.
+   The distinction matters, because the contest period (Mon 09:30 → Fri
+   16:00 ET, ~102.5 h) fits inside a 120 h window — so nothing banked
+   during the contest can age out before it ends. "Hold through the
+   snapshot" was the wrong lesson to draw.
 3. **"The oracle is synthetic" — WRONG.** Based on a bad test (continuous
    candle *series*, so I concluded no market hours). The *values* are
    frozen outside the cash session. It is clearly market-linked.
@@ -160,24 +169,39 @@ balanced_depth_usdc = min(bid_notional_in_band, ask_notional_in_band)
 depth_seconds += Σ_markets balanced_depth_usdc × 10
 ```
 
-Skill states the gate as ≈$3,000 balanced depth for ~28 hours. **But it
-decays** (correction 2), so it must be *held*, not banked and abandoned.
+Skill states the gate as ≈$3,000 balanced depth for ~28 hours, and the
+sponsor confirms that figure verbatim in Discord. It does **not** decay
+(correction 2): banked credit only rises, and the whole contest fits inside
+one 5-day window.
 
-⚠ **The official rules and the agent skill do not obviously agree.** The
-rules say market makers are ranked by profit "**combined with** liquidity
-scoring", while the skill is explicit that the two metrics are "**not**
-added into one score" — depth is an eligibility gate, then rank is by net
-PnL alone. The skill is the more specific document and is what the API
-actually exposes (`prize_eligible` is a boolean, separate from `total_pnl`),
-but this is worth clarifying with the Sponsor before optimising for either
-reading. They imply different strategies.
+✅ **C-0S RESOLVED 2026-08-27 — the skill is right.** The rules page says
+market makers are ranked by profit "combined with liquidity scoring", which
+read as a possible sum. The sponsor has settled it in Discord:
+
+> Among prize-eligible Market Makers, standing and prizes are determined
+> solely by net PnL (mark-to-market equity minus the finalized competition
+> seed). **depth_seconds does not change rank order and is not combined
+> with PnL.**
+> — Gene Hoffman, 2026-08-11
+
+Depth is a pure eligibility gate; rank is net PnL alone. That matches what
+the API exposes (`prize_eligible` a boolean, separate from `total_pnl`).
+Treat the gate as a constraint to *satisfy*, never as a score to maximise.
 
 **The contest window changes the arithmetic.** Eligibility integrates
-`[CONTEST_START, CONTEST_END]` once set, so **depth banked before 31 Aug
-does not count**. 300,000,000 over ~32 cash-session hours is ~$2,600 of
-balanced depth held continuously — but only ~32 of the 103 wall-clock hours
-are cash session, and whether *carried* (out-of-hours) ticks credit is still
-unresolved. If they do not, the gate must be cleared inside those 32 hours.
+`[CONTEST_START, CONTEST_END]` once set, so on the face of it **depth banked
+before 31 Aug does not count**. 300,000,000 over ~32 cash-session hours is
+~$2,600 of balanced depth held continuously — but only ~32 of the 103
+wall-clock hours are cash session, and whether *carried* (out-of-hours)
+ticks credit is still unresolved. If they do not, the gate must be cleared
+inside those 32 hours.
+
+⚠ **The "before 31 Aug does not count" half is an assumption, not a rule.**
+A competitor put the opposite reading to the sponsor on 2026-08-26 — that
+because the contest is shorter than the 5-day window, pre-competition depth
+*would* carry in unless explicitly reset — and received no answer. See the
+Discord-archive section below; this is one of the two questions worth
+asking before Monday.
 
 Rules: one-sided quotes earn **zero** for that market (`min(bid, ask)`);
 pauses/restarts/stale oracle advance the window and add nothing.
@@ -237,7 +261,15 @@ it:
 Still unresolved and decisive: **do carried ticks accrue depth at all?**
 Carried is evidently not the same as stale (stale placement returns HTTP
 503, carried placement is permitted at 8× IM), but whether the ~10s sampler
-credits carried ticks is undocumented.
+credits carried ticks is undocumented. The Discord archive adds evidence on
+both sides without closing it — see below — and the sponsor's own
+calibration of the gate against *cash-session hours* is the strongest hint
+that carried ticks do not count.
+
+A third strike against the hypothesis: the archive shows experienced
+entrants **deliberately hunting resting MM size during carried hours**,
+when the oracle is pinned high. Overnight depth is not quiet; it is where
+the predators are.
 
 ## Clarifications from the Chia Discord (#svPerps, 2026-08-27)
 
@@ -280,8 +312,230 @@ cross yourself" — and it matches their own reasoning that avoiding it
 entirely would require a backchannel between the bots, which would be worse.
 
 **5. There is a channel for pre-clearing.** An entrant can post their
-addresses and ask for a review before the contest. That is the venue for
-**C-0S** (gate-then-PnL vs combined scoring) — ask there rather than guess.
+addresses and ask for a review before the contest. It is also where scoring
+questions get answered — **C-0S has since been resolved there** (see the
+next section); two other questions have taken its place.
+
+## From the Discord archive (searched 2026-08-27)
+
+The `#svPerps` thread only renders the current day in the client, but
+**server-wide search reaches the whole history**. Searching `depth_seconds`,
+`oracle`, `carried`, `reset` and `overnight` surfaced the posts below. Same
+caveat as the section above — chat, not rules — except that several of these
+are the *only* place a rule is stated at all, and two of them **reverse**
+rules that were published earlier.
+
+### C-0S — ANSWERED. Depth is a pure gate; rank is net PnL alone.
+
+Gene Hoffman, **2026-08-11 16:14**, verbatim:
+
+> Slight update to how we're going to judge the MM prizes:
+>
+> Market Maker prizes. A Market Maker is prize-eligible only if, over the
+> Contest Period (Monday 9:30 a.m. ET through Friday 4:00 p.m. ET), their
+> banked depth_seconds is at least 300,000,000. Among prize-eligible Market
+> Makers, standing and prizes are determined solely by net PnL
+> (mark-to-market equity minus the finalized competition seed).
+> **depth_seconds does not change rank order and is not combined with PnL.**
+>
+> depth_seconds. Every ~10 seconds, for each volatility market, the Exchange
+> measures two-sided resting notional within ±2% of a fresh oracle as
+> min(bid, ask). Those market depths are summed and multiplied by 10
+> seconds. **The score only increases while quoting**; platform pause,
+> deploy gaps, and missing/stale oracle add zero. Guidance: 300,000,000 is
+> approximately $3,000 average balanced depth for about 28 hours (roughly
+> 80%+ of cash-session hours). Larger size for less time, or smaller size
+> for more time, both count.
+
+That settles gate-then-PnL vs combined in favour of the skill, in the
+sponsor's own words. **C-0S needs no Discord question.** It also pins the
+Contest Period definition and is the origin of the ≈$3,000-for-28-hours
+calibration the skill quotes.
+
+### The uptime era is over — and one rule was reversed
+
+Gene Hoffman, **2026-08-06 17:30**, announcing the change:
+
+> **Leaderboard liquidity score is depth_seconds (not uptime %)** […]
+> Score only goes up; stopping quoting only stops accrual. Operator pause /
+> deploy gaps / missing oracle: window advances with zero depth (no free
+> credit). **There is no 95% uptime gate and no scarce-side / sticky-spread
+> qualification.** Keep two-sided size inside ±2% after fills
+> (batch_upsert) so ticks keep earning depth.
+
+Compare his **2026-07-20 21:14** market-shape post, which said the opposite:
+
+> MM uptime: balanced quotes still ±2%/2%/$500; when |impact_premium| ≥
+> 0.5%, scarce-side only counts; win requires ≥95% uptime_5d.
+> **Pause / oracle gap / deploy still credit 100% up for MM uptime.**
+
+**Free credit during outages is gone.** Anything written against the old
+regime — 95% uptime, scarce-side qualification, sticky spread, the $500/side
+balanced-quote test — is dead. Two consequences for us:
+
+- The 300M must be earned in genuinely *live, oracle-fresh, quoting* time.
+  Venue-side outages shrink the usable window below the contest wall clock;
+  we cannot plan to the full ~32.5 cash-session hours.
+- **Our own downtime is pure loss against the gate.** A second, independent
+  argument for `S31` (dead man's switch), and for restart latency being a
+  first-class metric rather than an ops nicety.
+
+*Why the change happened*, from Drewski241 **2026-07-29**: he pulled the
+full 257-row MM leaderboard and found **zero accounts ≥95% on any uptime
+field** (best active MM ~83.6% `uptime_5d`); Round 1 had the same outcome at
+a 98% threshold. Nobody could ever qualify, so the metric was replaced. That
+is also the answer to "is the leaderboard leftover data?" — it is live, but
+balances have been reset repeatedly (7/17, 7/20, 8/6, 8/21).
+
+### Still unresolved: do carried ticks accrue depth?
+
+This remains the decisive open question, and the archive sharpens it rather
+than closing it.
+
+**Against accrual** — the rule says "within ±2% of a **fresh** oracle", and
+Gene calibrates the gate as "≈$3,000 average balanced depth for about 28
+hours (roughly **80%+ of cash-session hours**)". A contest week holds ~32.5
+cash-session hours, and 28/32.5 ≈ 86%, which fits exactly. If carried ticks
+credited, the same $3,000 would clear the gate in 28 of ~102 available hours
+— a 27% duty cycle, which nobody would describe as "80%+ of cash-session
+hours". The calibration is written as though only the cash session counts.
+
+**For accrual** — "carried" is demonstrably not "stale" in this venue's
+vocabulary. Gene, **2026-06-11**:
+
+> Closed equity hours stop fresh equity-price oracles, but vol perps keep a
+> **continuous carried IV oracle** so they can trade around the clock
+
+and **2026-06-17**, on the placement band: "±50% around the **live (or
+carried)** oracle IV". A carried oracle is a legitimate oracle for band
+purposes, so it may well count as fresh for the sampler too.
+
+Our own measurement (leader's depth flat through 30 minutes of frozen
+oracle) leans against accrual but is confounded by the 5-day window.
+**Ask.** This is now the top question for the channel, replacing C-0S.
+
+### Unanswered by the sponsor, and it cuts our way
+
+Jakub Hadamcik, **2026-08-26 15:45**, replying to the reset announcement:
+
+> Ideally reset also depth seconds because competition is less than 5 days
+> long, it would count pre-competition depth seconds as well
+
+**No reply.** If `depth_seconds` is the trailing-5-day window the leaderboard
+column implies, and it is *not* reset on Sunday, then depth banked Friday
+through Sunday is still inside the window at the Monday bell and counts
+toward the 300M gate. That directly contradicts this document's earlier
+assertion that "depth banked before 31 Aug does not count" — an assumption,
+never a confirmed rule, and a competitor has now put the opposite reading to
+the sponsor without being corrected.
+
+**This is worth real money to us.** Clearing a large fraction of the gate
+before the contest opens, in the sandbox, at leisure, would remove the
+single hardest constraint on competing. Ask alongside the carried question.
+
+### The reset schedule
+
+- Gene, **2026-08-26 15:37**: "We will reset balances Sunday evening during
+  a trading pause that will un-pause when the competition starts." So:
+  **paused from Sunday 30 Aug evening until Monday 31 Aug 09:30 ET.**
+- Gene, **2026-08-27 11:40**: "all accounts will be reset to their starting
+  balances shortly before the 2nd competition starts".
+- Gene, **2026-08-21 15:40**: "Balances reset, market open, everyone who
+  signed up since 8/6 is still in. **Taking new entrant sign ups through
+  Monday, August 31 at 5 PM ET**" — independently confirms the sign-up
+  deadline in THE CLOCK above.
+- Still unanswered (codingisart, **2026-08-27 01:26**): does the reset
+  *flatten positions* and cancel resting orders, or only zero balances and
+  PnL? Assume flat-at-the-bell; build nothing that depends on carrying
+  inventory through it.
+- Useful: the sponsor has granted **individual equity resets on request** in
+  the sandbox (Ethaneal, 2026-07-22, after going bust). Blowing up in
+  practice is recoverable — one more reason to trade the warm-up hard.
+
+### Venue mechanics stated only in chat
+
+Not in the rules page; these belong in `docs/permuto-api-reference.md` when
+that document is next revised.
+
+**Mark for uPnL** — Gene, **2026-08-26 18:16**:
+
+> uPnL is against oracle plus a small, rate-limited book-mid basis — not
+> last price, not raw mid, and not raw oracle unless the basis is at zero
+> (empty/out-of-band book)
+
+Since MM standing is *solely* net PnL and PnL is marked this way, the mark
+cannot be walked by posting a lopsided book: the basis is rate-limited and
+anchored to the oracle. That rules out the obvious mark-painting exploit —
+and it also means our equity curve moves on oracle prints we never traded.
+
+**Notional caps** — Gene, **2026-07-20 21:14**: risk-increasing exposure
+capped at **$500k/market and $1M portfolio** (position *plus* risk-increasing
+resting); reduce-only exempt. Place/modify/trigger/batch share the same
+LimitRest and notional gates — expect **HTTP 400** out of band or over cap.
+A grid sized for the gate has to fit under the portfolio cap across all
+markets at once.
+
+**Funding V3 (H=2)** — Gene, **2026-07-20 21:19**: hourly =
+`clamp(impact_premium / 2, ±10%)` with **no interest-rate clamp**; VOL
+markets settle every **60 s**, rate scaled to the interval. Funding tracks
+the skew we actually quote into, so a persistently one-sided book is charged
+for it every minute.
+
+**ADL** — after every forced-liquidation flat, auto-deleveraging closes
+opposite OI **at mark**, uPnL-ranked and pro-rata. Our winning positions can
+be closed by someone else's liquidation. Visible in trade history as mark
+fills even when insurance covers the cash.
+
+### The three bands, stated cleanly
+
+Drewski241, **2026-07-23 22:17**, the clearest summary anyone has written:
+
+> ±5% is where orders are allowed to live; ±2% ring controls whether you can
+> quote aggressively or must quote passively; ±2% proximity is what the MM
+> leaderboard counts […] **If your oracle is stale, you will place orders
+> that look fine to you but get cancelled or score zero against the host's
+> real-time oracle.**
+
+That last sentence is a design requirement, not a warning. Our quoting loop
+must be driven by **the venue's oracle over WS**, never by a locally
+resampled or cached copy — a stale local oracle produces orders we believe
+are scoring and that are in fact worth nothing. Aggressive rests outside the
+ring "reject at place and **purge on oracle move**", so a lagging oracle also
+silently empties our book.
+
+### Adversarial precedent: the off-hours squeeze is a known play
+
+Jakub Hadamcik, **2026-07-29 16:34**, describing it openly:
+
+> I just shorted whatever MMs provided me with since NVDA oracle is 41%.
+> This allows me to collect very profitable shorts and they have to (again)
+> choose between uptime or profit. […] Funding doesn't justify it for longs
+> because it stabilized at -0.014676% costing me about $3750/h
+
+Ethaneal, **2026-07-30**: "especially when it is a two minute oracle spike".
+Jakub again, **2026-08-05**: "I managed to not get liquidated today on market
+open just because I got super lucky on market pop being low enough. But I was
+carrying huge short which I wasn't able to release anywhere."
+
+Sophisticated entrants deliberately hunt resting MM size during carried hours
+and at the open. Combined with the 8× stressed initial margin off-hours,
+**quoting meaningful size overnight is the identified way to lose** — and the
+"bank the gate overnight" hypothesis above is weaker still, because it is
+precisely the behaviour these traders are farming.
+
+### Questions to ask in `#svPerps`
+
+Both are unanswered by anyone, both change strategy materially, and the
+channel has a demonstrated record of answering this kind of question within
+hours:
+
+1. **Do carried (out-of-hours) ticks accrue `depth_seconds`?** Is a carried
+   IV oracle "fresh" for the ~10 s depth sampler, given that placement
+   treats live and carried oracles alike?
+2. **Will `depth_seconds` be reset on Sunday along with balances?** If not,
+   does depth banked in the pre-competition sandbox count toward the
+   300,000,000 gate, since the contest is shorter than the 5-day window?
+   (Jakub raised this on 2026-08-26 and got no answer.)
 
 ## Conduct rules that bind a two-sided quoter
 
@@ -413,12 +667,21 @@ transfer and must not leak into shared code.
       **31 Aug 17:00 ET** and no one may join after day one. This is the
       only hard deadline and it does not require any code. **Operator
       decision, and the first one.**
-- [ ] **C-0S** Clarify whether MM rank is *gate-then-PnL* (agent skill) or
-      *PnL combined with liquidity score* (official rules). They imply
-      different strategies. **Venue: the #svPerps Discord**, where entrants
-      already post questions and get answers from Chia staff. Cheap to ask,
-      expensive to guess.
-- [x] **C-01** Gate quantified. ≈$3,000 balanced depth, but **decaying**.
+- [x] **C-0S** MM rank is *gate-then-PnL*. Answered in the #svPerps
+      Discord, 2026-08-11: "depth_seconds does not change rank order and is
+      not combined with PnL." The agent skill was right; the rules page
+      phrasing is loose.
+- [ ] **C-0S2** **Two questions that replace it — ask in #svPerps now.**
+      Both are unanswered by anyone and both move strategy: (a) do
+      *carried* out-of-hours ticks accrue `depth_seconds`? (b) will
+      `depth_seconds` be reset on Sunday along with balances, or does
+      sandbox depth carry into the contest through the 5-day window? A
+      competitor asked (b) on 2026-08-26 and got no reply. Cheap to ask,
+      expensive to guess — and (b) may let us clear most of the gate before
+      Monday.
+- [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
+      **not decaying** — the sponsor confirms the accumulator only rises;
+      what falls is the 5-day display window.
 - [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
       short-horizon jitter estimator noise or information** (the central
@@ -437,8 +700,18 @@ transfer and must not leak into shared code.
       liquidation distance.
 - [ ] **C-05** Execution adapter — `order`/`modify`/`cancel`/
       `batch_upsert`/`cancel_all`, place vs mutate tokens.
+      **Drive it from the venue's oracle over WS, never a local copy.** A
+      stale local oracle produces orders that look fine to us, get purged or
+      rejected by the host, and score zero — the failure is silent on our
+      side. Prefer `batch_upsert` for grid refresh, and re-quote on
+      carried→live because the sequencer cancels everything at the open.
 - [ ] **C-06** Risk layer — reuse breakers; add liquidation proximity and a
-      funding budget. Never let a position price at 0 in silence.
+      funding budget. Never let a position price at 0 in silence. Budget
+      funding at `clamp(impact_premium/2, ±10%)` per hour settling every
+      60 s, and model **ADL**: a forced-liquidation flat anywhere closes
+      opposite OI at mark, so our winners can be closed by someone else's
+      blow-up. Respect the $500k/market and $1M portfolio risk-increasing
+      caps or every place returns HTTP 400.
 - [ ] **C-07** Session scheduler — stand down at 13:00Z; quote per-market
       on measured statistics, not by rule.
 - [ ] **C-08** Secure the qualifying fill early (untraded purge).
@@ -476,3 +749,7 @@ transfer and must not leak into shared code.
 - `/.well-known/agent-skills/perps-market-maker-auth/SKILL.md` — auth, "How to win"
 - `/.well-known/agent-skills/perps-api/SKILL.md` — trading endpoints, limits
 - `GET /info/meta`, `/info/oracle`, `/info/candles`, `/exchange/leaderboard` — read 2026-08-26
+- Chia Network Discord, `#permuto-capital` › *svPerps* thread — live thread
+  read 2026-08-27; full history reached by server search on `depth_seconds`,
+  `oracle`, `carried`, `reset`, `overnight`. Statements by Gene Hoffman
+  (tagged *Chia Employees*) are treated as sponsor intent, not as rules.
