@@ -24,9 +24,9 @@ the official rules page, sharpened by the Discord archive read 2026-08-27.
 >
 > **Prizes** (each category, paid in XCH): 1st **$15,000**, 2nd **$5,000**,
 > 3rd **$2,500**. Traders and Market Makers are separate categories and one
-> entrant may win in both — $45,000 total pool. **This document has been wrong twice; corrections
-are recorded rather than quietly edited out, because the errors are
-instructive.**
+> entrant may win in both — $45,000 total pool. **This document has been
+> wrong twice; corrections are recorded rather than quietly edited out,
+> because the errors are instructive.**
 
 > ## C-00 — eligibility: the CONTEST is open to us, live trading is not
 >

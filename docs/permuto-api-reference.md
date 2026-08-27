@@ -98,7 +98,15 @@ signal. There is no options chain on this venue.
 ## 2  Trading — `/exchange/*`
 
 All require a session token: `Authorization: Bearer <token>` or
-`Cookie: perps_session=<token>`.
+`Cookie: perps_session=<token>` — **except `GET /exchange/leaderboard`**,
+which is public.
+
+⚠ **Send a browser `User-Agent`.** Verified 2026-08-27: the leaderboard
+returns full data with no credentials, but a bare `urllib`/default agent
+gets **HTTP 403**. The 403 is agent filtering, not an auth requirement, and
+reads as "we need a token" if you do not test it. This is what lets the
+depth-accrual probe (`scripts/permuto_depth_probe.py`) sample the field
+without an account.
 
 ### Order entry
 
