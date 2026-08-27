@@ -76,6 +76,11 @@ struct PeggedAsset {
     double peg_target{1.0};
 
     /// Deviation from peg_target at which to warn, as a percentage.
+    /// Must be strictly positive: the classify() comparison is inclusive
+    /// (to agree with DepegDetector), so a warn_pct of 0 would make an
+    /// observation sitting exactly ON the peg classify as Warn and no
+    /// healthy peg could ever reach Holding.  Matches the per-pair
+    /// validation in config.cpp.
     double warn_pct{2.0};
 
     /// Deviation at which the asset is considered broken rather than
@@ -117,7 +122,7 @@ struct PeggedAsset {
         return !asset_id.empty()
             && !peg_currency.empty()
             && std::isfinite(peg_target) && peg_target > 0.0
-            && std::isfinite(warn_pct)   && warn_pct >= 0.0
+            && std::isfinite(warn_pct)   && warn_pct > 0.0
             && std::isfinite(bail_pct)   && bail_pct > warn_pct;
     }
 };
@@ -170,6 +175,15 @@ public:
     /// than silently run with a half-declared peg.
     bool add(PeggedAsset asset) {
         if (!asset.is_coherent()) {
+            return false;
+        }
+        // A duplicate declaration is a config error, not an update.  Last
+        // -write-wins would let a second entry silently replace the first
+        // asset's SAFETY POLICY -- its enforce flag, its bail threshold --
+        // and the operator would have no way to see which one was in
+        // effect.  Refuse; the parser turns this into a loud startup
+        // failure.
+        if (by_asset_id_.find(asset.asset_id) != by_asset_id_.end()) {
             return false;
         }
         const std::string key = asset.asset_id;
@@ -270,8 +284,14 @@ public:
         }
         const double dev_pct =
             std::abs(*observed - a->peg_target) / a->peg_target * 100.0;
-        if (dev_pct > a->bail_pct)  return PegStatus::Broken;
-        if (dev_pct > a->warn_pct)  return PegStatus::Warn;
+        // INCLUSIVE, matching DepegDetector (depeg_detector.hpp:121,131 both
+        // use >=) and the fields' own "deviation at which to warn/bail"
+        // contract.  With `>` a deviation sitting exactly on a configured
+        // limit lands in the lower band, so the two components would
+        // disagree about whether that limit had been breached -- precisely
+        // the inconsistency this registry exists to remove.
+        if (dev_pct >= a->bail_pct)  return PegStatus::Broken;
+        if (dev_pct >= a->warn_pct)  return PegStatus::Warn;
         return PegStatus::Holding;
     }
 
@@ -281,8 +301,15 @@ public:
         const std::string& asset_id,
         std::optional<double> observed) const
     {
+        // Must agree with classify() on WHICH assets have a deviation at
+        // all: an unenforced peg classifies as NotPegged, so reporting a
+        // deviation for it would have the two functions disagreeing about
+        // whether the asset is pegged.  Non-finite observations are
+        // rejected here for the same reason they are in classify.
         const auto* a = find(asset_id);
-        if (a == nullptr || !observed.has_value() || !(*observed > 0.0)) {
+        if (a == nullptr || !a->enforce
+            || !observed.has_value() || !std::isfinite(*observed)
+            || !(*observed > 0.0)) {
             return std::nullopt;
         }
         return (*observed - a->peg_target) / a->peg_target * 100.0;

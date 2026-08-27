@@ -6,6 +6,8 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
+
 #include <xop/peg_registry.hpp>
 
 using xop::PeggedAsset;
@@ -180,12 +182,10 @@ TEST(PegRegistry, UndeclaredAssetClassifiesAsNotPeggedNotUnobserved) {
 }
 
 TEST(PegRegistry, EachBandIsEnteredOnceItsThresholdIsPassed) {
-    // Deliberately NOT asserting on values sitting exactly on a threshold.
-    // 1.02 - 1.0 is 0.020000000000000018 in double, so "exactly 2%" is not
-    // a state the arithmetic can represent, and pinning it would pin the
-    // representation error rather than the contract.  A hair either side of
-    // a peg threshold is not a distinction worth defending; the bands
-    // themselves are.
+    // Bands, not exact boundaries: 1.02 - 1.0 is 0.020000000000000018 in
+    // double, so "exactly 2%" is not a state the arithmetic can represent
+    // and pinning it would pin the representation error.  What IS pinned
+    // (below) is that the comparison is INCLUSIVE, matching DepegDetector.
     PeggedAsset a = usd_coin();
     a.warn_pct = 2.0;
     a.bail_pct = 10.0;
@@ -236,4 +236,97 @@ TEST(PegRegistry, AllReturnsAStableOrder) {
     EXPECT_EQ(all[0]->asset_id, "a_tail");
     EXPECT_EQ(all[1]->asset_id, "b_tail");
     EXPECT_EQ(all[2]->asset_id, "c_tail");
+}
+
+// ---------------------------------------------------------------------------
+// [2026-08-27] Review findings 2.3 / 2.4
+// ---------------------------------------------------------------------------
+
+TEST(PegRegistry, DuplicateDeclarationIsRefusedRatherThanOverwriting) {
+    // Last-write-wins would let a second entry silently replace the first
+    // asset's SAFETY POLICY -- its enforce flag, its bail threshold -- with
+    // no way for an operator to see which was in effect.
+    PeggedAsset first = usd_coin("dup", "FIRST");
+    first.bail_pct = 10.0;
+    first.enforce  = true;
+
+    PeggedAsset second = usd_coin("dup", "SECOND");
+    second.bail_pct = 99.0;
+    second.enforce  = false;
+
+    PegRegistry reg;
+    EXPECT_TRUE(reg.add(first));
+    EXPECT_FALSE(reg.add(second)) << "a duplicate is a config error, not an update";
+
+    const auto* kept = reg.find("dup");
+    ASSERT_NE(kept, nullptr);
+    EXPECT_EQ(kept->symbol, "FIRST") << "the first declaration must survive";
+    EXPECT_DOUBLE_EQ(kept->bail_pct, 10.0);
+    EXPECT_TRUE(kept->enforce);
+}
+
+TEST(PegRegistry, DeviationAgreesWithClassifyAboutWhatIsPegged) {
+    // If classify() says NotPegged, deviation_pct must not hand back a
+    // number as though the asset had a peg to deviate from.
+    PeggedAsset retired = usd_coin("gone", "GONE");
+    retired.enforce = false;
+    PegRegistry reg({retired});
+
+    EXPECT_EQ(reg.classify("gone", 0.74), PegStatus::NotPegged);
+    EXPECT_FALSE(reg.deviation_pct("gone", 0.74).has_value())
+        << "an unenforced peg has no deviation to report";
+}
+
+TEST(PegRegistry, DeviationRejectsNonFiniteObservationsLikeClassifyDoes) {
+    PegRegistry reg({usd_coin()});
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+
+    EXPECT_EQ(reg.classify("wusdc_tail", inf), PegStatus::Unobserved);
+    EXPECT_FALSE(reg.deviation_pct("wusdc_tail", inf).has_value());
+
+    EXPECT_EQ(reg.classify("wusdc_tail", nan), PegStatus::Unobserved);
+    EXPECT_FALSE(reg.deviation_pct("wusdc_tail", nan).has_value());
+}
+
+TEST(PegRegistry, ThresholdsAreInclusiveLikeDepegDetector) {
+    // depeg_detector.hpp:121,131 both use >=.  If classify used > instead,
+    // a deviation sitting on a configured limit would be Broken to one
+    // component and merely Warn to the other -- two views of the same
+    // number disagreeing about whether the limit was breached.
+    //
+    // Uses a target of 100.0 so the deviations land on exactly
+    // representable values (2.0 and 10.0 percent) and the assertion is
+    // about the operator, not about float representation.
+    PeggedAsset a;
+    a.asset_id     = "exact";
+    a.peg_currency = "USD";
+    a.peg_target   = 100.0;
+    a.warn_pct     = 2.0;
+    a.bail_pct     = 10.0;
+    PegRegistry reg({a});
+
+    EXPECT_EQ(reg.classify("exact", 102.0), PegStatus::Warn)
+        << "exactly at warn_pct must BE the warn band, not below it";
+    EXPECT_EQ(reg.classify("exact", 110.0), PegStatus::Broken)
+        << "exactly at bail_pct must BE broken, not merely warn";
+    EXPECT_EQ(reg.classify("exact", 101.0), PegStatus::Holding);
+}
+
+TEST(PegRegistry, ZeroWarnPctIsRejectedBecauseTheBoundaryIsInclusive) {
+    // classify() uses >= so it agrees with DepegDetector.  With warn_pct
+    // of 0 that makes an observation sitting exactly ON the peg classify
+    // as Warn, and no healthy peg could ever reach Holding.  The per-pair
+    // parser already rejects this; the registry now matches.
+    PeggedAsset a = usd_coin();
+    a.warn_pct = 0.0;
+    PegRegistry reg;
+    EXPECT_FALSE(reg.add(a))
+        << "a zero warn band cannot coexist with an inclusive comparison";
+}
+
+TEST(PegRegistry, AnObservationExactlyOnPegIsHolding) {
+    // The property the rejection above protects.
+    PegRegistry reg({usd_coin()});
+    EXPECT_EQ(reg.classify("wusdc_tail", 1.0), PegStatus::Holding);
 }

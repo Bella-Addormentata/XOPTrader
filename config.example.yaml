@@ -97,11 +97,25 @@ dexie:
 #            the declared par is only the fallback when no tight cross
 #            exists.
 #
-# enforce: false keeps the declaration on record while stopping the asset
-# valuing anything -- for an issuer that has been compromised or is winding
-# down.  This is the switch that did not exist when warp.green and Circuit
-# DAO were both reported compromised in August 2026, and BYC kept marking
-# the whole book at par because the 1.0 was written in the code.
+# enforce: false RETIRES THE DECLARED PAR.  It is the switch that did not
+# exist when warp.green and Circuit DAO were both reported compromised in
+# August 2026 and BYC kept marking the whole book at $1 because the 1.0 was
+# written in the code.
+#
+# ⚠ It does NOT blind the asset.  Read this before reaching for it during an
+# incident.  With enforce:false the registry-gated branches stop answering,
+# but an asset that is the QUOTE of an XCH-base pair still gets a factor
+# derived from that pair's own mid (usd_per_xch / quote_per_xch, grade-gated
+# as usual).  So flipping it on BYC does not stop BYC being valued -- it
+# reroutes BYC's valuation from the declared peg to the market.
+#
+# That is deliberate, and for a compromised issuer it is arguably the more
+# honest number: the market's view of a wound-down asset beats the par it is
+# no longer holding.  It also avoids a nastier failure -- making the switch
+# absolute would zero equity the moment it is flipped on the only priced
+# asset, which is the S27 fail-open condition arriving by another route.
+#
+# If you need the asset to contribute NOTHING, disable its pairs as well.
 pegged_assets:
 - asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   symbol: wUSDC.b
@@ -112,6 +126,30 @@ pegged_assets:
   sustained_observations: 30
   prefer_market_cross: false
   enforce: true
+# The other two legacy wrappers.  No live pair quotes them today, but an
+# operator re-adding XCH/wUSDC or XCH/USDS without a declaration here gets a
+# factor of 0.0 -- NO valuation -- rather than the implicit $1 the old
+# hardcoded list gave them.  That is the intended behaviour (par is declared,
+# never assumed), so they are declared rather than left to surprise someone.
+#
+# ⚠ Engine and GUI can disagree after enforce:false.  The GUI's
+# pnl_usdc_expr (gui/services/database_service.py) still hardcodes $1.00 for
+# wUSDC.b/wUSDC, so retiring a peg here changes engine accounting while the
+# GUI keeps showing par.  Tracked as follow-up; do not read the two as
+# cross-checks of each other.
+- asset_id: bbb51b246fbec1da1305be31dcf17151ccd0b8231a1ec306d7ce9f5b8c742b9e
+  symbol: wUSDC
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  prefer_market_cross: false
+  enforce: true
+# USDS is deliberately NOT declared here.  A placeholder tail would now be
+# rejected at startup (asset_id must be "xch" or a 64-char hex tail), and a
+# placeholder that PARSED would be worse -- it would key on a string no asset
+# can match, so the declaration would sit in config looking like protection
+# while doing nothing.  Add a real entry when the tail is known.
 - asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
   symbol: BYC
   peg_currency: USD
