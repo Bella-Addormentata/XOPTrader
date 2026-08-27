@@ -11664,6 +11664,26 @@ double Engine::compute_implied_cross_anchor(const PairConfig& pc) const
     return midgate::median_of(candidates);
 }
 
+bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
+{
+    // Mirrors exactly the two loops in asset_usd_pseudo_price below: an
+    // asset is priceable as the BASE of an enabled pair or as its QUOTE.
+    // If neither loop can even reach a candidate, no market event will ever
+    // produce a price and the asset is unpriceable BY CONFIGURATION.
+    //
+    // Deliberately ignores whether the pair currently HAS a usable mid, a
+    // trusted factor, or a valuation grade.  Those are transient and belong
+    // to the carry mechanism; folding them in here would let a junk book
+    // masquerade as "no path" and write a live asset off to zero.
+    for (const auto& pair : config_.pairs) {
+        if (!pair.enabled) continue;
+        if (pair.base_asset_id == asset_id || pair.quote_asset_id == asset_id) {
+            return true;
+        }
+    }
+    return false;
+}
+
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 {
     // Prefer pricing the asset as the BASE of an enabled pair (live mid).
@@ -11750,6 +11770,9 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     std::vector<risk::AssetValuationInput> inputs;
     std::size_t held_count = 0;
     std::size_t live_count = 0;
+    // [S32] Held but structurally unpriceable: counted separately so it can
+    // never be mistaken for a live price when deciding all-unpriced below.
+    std::size_t writtenoff_count = 0;
     for (const auto& rec : inventory_->get_all_records()) {
         if (rec.total_quantity <= 0) continue;
         ++held_count;
@@ -11793,12 +11816,50 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         // and 519 DBX were invisible to it.  Never-valued is the WORST
         // case, not an exempt one: there is not even a stale number to
         // carry, so it degrades unconditionally.
+        //
+        // [S32 2026-08-27] ...but only when a price was ever POSSIBLE.  The
+        // paragraph above is right that never-valued is the worst case when
+        // the engine is trying and failing to price something.  It is not
+        // the right reading when the operator has removed every route to a
+        // price, which is what disabling the last pair for an asset does.
+        // wUSDC.b is held (78.6 units) with both its pairs disabled after
+        // the warp.green compromise, and wmilliETH.b likewise: under the
+        // unconditional rule every cycle degrades from cycle 0, the
+        // authority gate never sees the 10 clean cycles it needs to re-arm,
+        // the peak never seeds, and the fail-closed check below pauses the
+        // engine on EVERY start.  The release meant to make it safe to
+        // resume would have made it impossible.
+        //
+        // So an asset with no configured pricing path is written off at $0
+        // and does not degrade the cycle.  It stays out of live_count, so
+        // it cannot disguise a book with no live prices at all.
         if (pseudo <= 0 && current_block > 0) {
-            if (!have_carry) {
+            if (risk::unpriced_asset_is_written_off(
+                    asset_has_pricing_path(rec.asset_id), have_carry)) {
+                ++writtenoff_count;
+                // in.live_usd_per_unit and in.last_usd_per_unit both stay
+                // 0.0, so the asset contributes exactly $0 to equity.
+                if (writeoff_logged_.insert(rec.asset_id).second) {
+                    spdlog::warn("[Engine] [S32] held asset {} has NO enabled "
+                                 "pair and therefore no pricing path -- "
+                                 "valuing {} units at $0.  This is a "
+                                 "configuration state, not a feed outage: it "
+                                 "will persist until a pair is re-enabled. "
+                                 "Equity EXCLUDES this holding.",
+                                 rec.asset_id.substr(0, 12), in.units);
+                }
+            } else if (!have_carry) {
                 degraded = true;
-                spdlog::debug("[Engine] [S20] held asset {} has NEVER been "
-                              "valued -- contributing $0; equity degraded "
-                              "this cycle", rec.asset_id);
+                // Warn, not debug: this is the signature of the 2026-08-25
+                // incident and it stayed invisible in the logs while the
+                // breakers sat inert.  Once per asset per process -- the
+                // condition repeats every heartbeat and would drown the log.
+                if (never_valued_logged_.insert(rec.asset_id).second) {
+                    spdlog::warn("[Engine] [S20] held asset {} has NEVER been "
+                                 "valued despite having an enabled pair -- "
+                                 "contributing $0; equity DEGRADED",
+                                 rec.asset_id.substr(0, 12));
+                }
             } else if (ttl > 0) {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()

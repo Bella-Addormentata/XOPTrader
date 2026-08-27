@@ -101,6 +101,51 @@ namespace xop::risk {
 /// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
 /// there at least one asset is still live, equity still moves, and the
 /// ordinary comparison genuinely does work.
+/// Whether a held asset with no live price should be WRITTEN OFF at $0
+/// rather than degrading the valuation cycle.
+///
+/// [S32 2026-08-27] "No price available" hides two conditions that must not
+/// share a response:
+///
+/// 1. NO PRICING PATH EXISTS.  No enabled pair names the asset, so nothing
+///    in the configuration can ever produce a price for it.  This is a
+///    permanent, deterministic property of the config, known at startup and
+///    unchanged by any market event.  wUSDC.b after the warp.green
+///    compromise is the live example: both its pairs are disabled, so it is
+///    structurally unpriceable and will stay so until the operator changes
+///    the config.  Treating this as a data gap is what makes the engine
+///    unable to resume at all -- every cycle degrades from cycle 0, the
+///    authority gate never re-arms, the peak never seeds, and the drawdown
+///    breaker sits inert against a $0 peak.  The honest reading is that the
+///    operator has declared this asset unpriceable, so value it at $0 and
+///    let the rest of the book carry the valuation.
+///
+/// 2. A PATH EXISTS BUT IS QUIET.  The feed is down, the book is junk this
+///    heartbeat, or the mid failed its valuation grade.  This is exactly
+///    the transient the carry mechanism exists to bridge, and marking it to
+///    zero would be catastrophic: a momentary CoinGecko outage would write
+///    the whole book to nothing, and on a fresh process -- before the first
+///    fetch lands -- it would seed the peak from a near-zero equity and
+///    leave the breaker under-protective for the rest of the run.
+///
+/// So the write-off is gated on the ABSENCE OF A CONFIGURED ROUTE, never on
+/// the absence of a quote. `has_carry` is required to be false as well:
+/// a carry can only exist if the asset was priced earlier in this run, so
+/// its presence contradicts "no path" and the carried value is the better
+/// number.
+///
+/// A written-off asset contributes $0 to equity and does NOT set the
+/// degraded flag -- there is nothing degraded about a number the operator
+/// has effectively declared. It is still excluded from the live count, so
+/// a book consisting ENTIRELY of written-off assets leaves no live price,
+/// no peak, and fails closed through the ordinary path below.
+[[nodiscard]] constexpr bool unpriced_asset_is_written_off(
+    bool has_pricing_path,
+    bool has_carry) noexcept
+{
+    return !has_pricing_path && !has_carry;
+}
+
 [[nodiscard]] constexpr bool unvaluable_book_must_fail_closed(
     bool   grace_elapsed,
     bool   valuation_degraded,

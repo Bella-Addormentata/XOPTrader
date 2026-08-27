@@ -30,6 +30,7 @@ using xop::risk::portfolio_equity_usd;
 using xop::risk::effective_usd_per_unit;
 using xop::risk::AssetValuationInput;
 using xop::risk::unvaluable_book_must_fail_closed;
+using xop::risk::unpriced_asset_is_written_off;
 using xop::risk::BreakerRealertGate;
 using xop::risk::kWindowAnchorFallbackUsd;
 
@@ -366,4 +367,58 @@ TEST(DrawdownBreakerTest, S27_ATransientAllUnpricedTickWithFreshCarriesDoesNotLa
 
     // Same tick, but the carries have now expired -> genuinely unvaluable.
     EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
+}
+
+// ---------------------------------------------------------------------------
+// S32: "no price" is two conditions, and they need opposite responses.
+// ---------------------------------------------------------------------------
+
+TEST(DrawdownBreakerTest, S32_NoConfiguredPathIsWrittenOff) {
+    // wUSDC.b after the warp.green compromise: held, both pairs disabled, so
+    // no market event can ever price it.  Writing it off at $0 is what keeps
+    // the rest of the book valuable and the breakers armed.
+    EXPECT_TRUE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/false, /*has_carry=*/false));
+}
+
+TEST(DrawdownBreakerTest, S32_AQuietFeedIsNeverWrittenOff) {
+    // THE dangerous case.  A configured pair that simply has no usable mid
+    // this heartbeat -- CoinGecko down, junk book, failed valuation grade --
+    // must ride its carry and degrade, never mark to zero.  On a fresh
+    // process this is also the pre-first-fetch state, so writing it off
+    // would seed the drawdown peak from a near-zero equity and leave the
+    // breaker under-protective for the rest of the run.
+    EXPECT_FALSE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/true, /*has_carry=*/false));
+    EXPECT_FALSE(unpriced_asset_is_written_off(true, true));
+}
+
+TEST(DrawdownBreakerTest, S32_ACarryOutranksTheWriteOff) {
+    // A carry can only exist if the asset was priced earlier this run, which
+    // contradicts "no path".  If the two ever disagree, the real number the
+    // engine once observed beats a synthetic zero.
+    EXPECT_FALSE(unpriced_asset_is_written_off(
+        /*has_pricing_path=*/false, /*has_carry=*/true));
+}
+
+TEST(DrawdownBreakerTest, S32_WriteOffsDoNotRescueATotallyUnpriceableBook) {
+    // Written-off assets stay out of live_count, so a book made up ENTIRELY
+    // of them still reports all-unpriced and still fails closed.  Equity is
+    // $0, no peak can seed, and the engine must not trade.  This is the
+    // guard against the write-off quietly becoming a way to disable the
+    // breaker for the whole portfolio.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/true, /*peak_equity_usd=*/0.0));
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, false, 0.0));
+}
+
+TEST(DrawdownBreakerTest, S32_ThePartialBookThatUnblocksResume) {
+    // The live 2026-08-27 shape: XCH, BYC and DBX price fine; wUSDC.b and
+    // wmilliETH.b are written off.  Nothing degrades, so the authority gate
+    // stays armed, the peak seeds from real equity, and the ordinary
+    // drawdown comparison protects the run.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/false,
+        /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/1234.56));
 }

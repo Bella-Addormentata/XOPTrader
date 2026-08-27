@@ -539,6 +539,16 @@ private:
     /// [S20] The base-of-pair branch only accepts valuation-grade mids.
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
 
+    /// [S32 2026-08-27] Whether the configuration provides ANY route to a
+    /// USD price for this asset -- that is, whether some ENABLED pair names
+    /// it as base or quote.  This is what distinguishes "we cannot price
+    /// this, ever, as configured" from "the price is unavailable right
+    /// now", and the two must not share a response: the first is written
+    /// off at $0, the second rides its carry.  Deliberately a pure function
+    /// of `config_.pairs` with no market state, so the answer is stable for
+    /// the life of the process and cannot flap with the feed.
+    [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
+
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
     /// every healthy pair of enabled sibling books (see the definition for
     /// leg-health rules).  0 when no healthy triangle exists.  Feeds
@@ -1081,6 +1091,14 @@ private:
     /// works.  With nothing live, equity is entirely carried fiction sitting
     /// at the value the peak was frozen at, so the drawdown reads 0 forever.
     bool valuation_all_unpriced_{false};
+
+    /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
+    /// every heartbeat and would otherwise emit a warn line per asset per
+    /// block; the operator needs to see each one ONCE, loudly. Not cleared
+    /// on recovery -- a written-off asset only becomes priceable again via
+    /// a config change, which means a restart.
+    std::set<AssetId> writeoff_logged_;
+    std::set<AssetId> never_valued_logged_;
 
     /// [S20] Peak-update authority: the clean-streak debounce and the
     /// transition signals that drive the warn-once logging.  Pure logic in
