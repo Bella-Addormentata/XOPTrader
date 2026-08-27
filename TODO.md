@@ -21,7 +21,7 @@ manage.** Ordered by whether resuming without it is defensible.
 | --- | --- |
 | **PR #115** (S29/S30) | peg identity becomes an asset property; `enforce: false` lets an operator switch off a compromised peg without a release. **In flight** |
 | **S27** | with only XCH/DBX enabled, equity is exactly $0 and `equity_drawdown_frac` returns 0.0 on a non-positive peak — **both breakers go inert rather than trip**. Resuming with no drawdown protection is worse than staying paused. **The blocker** |
-| **S28** | `check_pause_flag()` sits downstream of a successful block poll; 529 consecutive failures meant it was never read. Pause and Resume do not work during the incident that makes you reach for them |
+| **S28** | the engine cannot fall back to the wallet for block height, so it sat dead ~2.5h beside a healthy wallet RPC. (The pause-flag half was overstated; corrected in place — pause *is* applied before Step 8 on recovery) |
 | **S31** | nothing cancels the book when the engine stops. Cost $12.71 and a tripped breaker on 08-25, and was demonstrated again on 08-26 when a stray `--dry-run` killed the live process and left 10 offers unmanaged |
 | **S13** | "wallet needs to be fully synced" is **88% of all error lines** (~4,000 of 4,514). A silently failed cancel leaves a stale quote live — the same outcome as S31, by a different route |
 | **S14** (absorbs S26) | forced cancel retries with the same fee forever. Watched fail for 6+ hours on two offers this week; worst recorded case 158 warnings over 36h with coins locked throughout |
@@ -353,10 +353,14 @@ exposure this week.
 - **Consequence:** with only XCH/DBX enabled, equity is exactly $0. `equity_drawdown_frac` returns 0.0 when the peak is non-positive, so **both breakers go inert rather than trip** -- trading with no drawdown protection, and fills landing on `record_fill_unpriced`.
 - **Status:** `[ ]` — Fix has three parts: decouple price/peg **observation** from `pair.enabled` (a disabled pair should still be watched); make "never valued" set `degraded`; and let `usd_per_xch()` prefer the **external** CoinGecko XCH/USD already in `coingecko_prices_` (three call sites exist) with the DEX-derived mid as fallback. The last is the only anchor that survives both issuers being compromised.
 
-### S28: the GUI pause flag is unreachable during a node outage
-- **Files:** `cpp/src/engine.cpp:1597` (sole `check_pause_flag()` call site), `:1237`, `:13901-13929`
-- **Issue:** `check_pause_flag()` is called once, inside `on_new_block_coro`, reached only when `current_block > last_block_` -- which requires a successful `get_block_height()`. During the 2026-08-25 outage that call failed **529 consecutive times** over ~2.5h, so `pause.flag` was never *read*. Pause and Resume are dead controls in exactly the incident where an operator reaches for them. Separately, `wallet_only_mode_` is assigned only inside `open_connections()`, so the `mode: auto` fallback is one-shot at startup and the engine cannot switch to `wallet_->get_height_info()` mid-outage even though that path exists and the wallet RPC stayed healthy throughout.
-- **Status:** `[ ]` — Two small independent commits. Verified 2026-08-26.
+### S28: engine cannot fall back to the wallet for block height mid-outage
+- **Files:** `cpp/src/engine.cpp:1237` (height call), `:13901-13929` (`open_connections`), `:1597` (`check_pause_flag`)
+- **⚠ CORRECTED 2026-08-27.** Originally filed as "the GUI pause flag is unreachable during a node outage", claiming Pause and Resume are dead controls. **That was overstated.** `check_pause_flag()` runs at the TOP of `on_new_block_coro` (1597) while Step 8 posts at 1881, so on recovery the flag IS read before anything posts — and during the outage nothing is trading regardless. The flag genuinely is not read *while* the node is down, but the safety consequence asserted does not follow from that.
+- **What is actually wrong, in two parts of very different weight:**
+  1. **SUBSTANTIVE — no wallet fallback.** `wallet_only_mode_` is assigned only inside `open_connections()`, so the `mode: auto` decision is one-shot at startup. On 2026-08-25 the full node was unreachable for ~2.5h (529 consecutive `get_block_height` failures) **while the wallet RPC stayed healthy the whole time** — and `wallet_->get_height_info()` is already the height source in wallet-only mode. The engine sat dead beside a working alternative it could not switch to.
+  2. **MINOR — no pause feedback during an outage.** An operator who sets `pause.flag` while the node is down gets no log line and a stale GUI status, so cannot tell whether it registered. `check_pause_flag()` is pure filesystem and state with no RPC, so it can safely be called from the poll loop before the height call.
+- **Status:** `[ ]` — (2) is trivial and safe. (1) is the real item and needs care: switching height source mid-flight changes which RPC the heartbeat depends on, and `mode: auto` semantics need thought. Re-scoped, not descoped.
+
 
 ### S29: peg identity is a repeated string comparison, not a property of the asset
 - **Files:** `cpp/include/xop/peg_registry.hpp` (new), `cpp/src/engine.cpp` (5 sites), `cpp/src/monitoring/pnl.cpp:1512`, `cpp/src/strategy/arbitrage.cpp:916`, `cpp/src/strategy/market_allocator.cpp:188`, `cpp/include/xop/feed_listings.hpp:47`
