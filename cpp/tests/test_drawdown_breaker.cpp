@@ -351,3 +351,19 @@ TEST(DrawdownBreakerTest, S27_PartialDegradationWithARealPeakStillTrades) {
 TEST(DrawdownBreakerTest, S27_AllUnpricedStillRespectsStartupGrace) {
     EXPECT_FALSE(unvaluable_book_must_fail_closed(false, true, true, 500.0));
 }
+
+TEST(DrawdownBreakerTest, S27_ATransientAllUnpricedTickWithFreshCarriesDoesNotLatch) {
+    // Review: "all unpriced this heartbeat" is not "we cannot value the
+    // book".  A momentary feed gap with every carry still inside
+    // valuation_carry_ttl_blocks is exactly what the carry mechanism exists
+    // to bridge -- config.hpp: "a data gap must not read as a crash".
+    // Without requiring degradation, one bad tick would permanently latch
+    // the breaker, and a configured TTL of 0 ("never expire") would be
+    // ignored outright.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/false,
+        /*all_held_assets_unpriced=*/true, /*peak_equity_usd=*/500.0));
+
+    // Same tick, but the carries have now expired -> genuinely unvaluable.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
+}

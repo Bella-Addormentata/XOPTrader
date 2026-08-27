@@ -88,6 +88,16 @@ namespace xop::risk {
 /// Either way the answer is to stop: an engine that cannot measure its
 /// exposure has no business adding to it.
 ///
+/// BOTH cases additionally require `valuation_degraded`, and that guard is
+/// load-bearing rather than belt-and-braces.  "Every asset unpriced THIS
+/// HEARTBEAT" is not the same as "we cannot value the book": a momentary
+/// feed gap with every carry still inside `valuation_carry_ttl_blocks` is
+/// precisely the transient the carry mechanism exists to bridge, and
+/// config.hpp says so -- "a data gap must not read as a crash".  Without
+/// this guard a single bad tick would permanently latch the breaker, and a
+/// configured TTL of 0 ("never expire") would be ignored outright.
+/// Degradation is what distinguishes a gap from an outage.
+///
 /// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
 /// there at least one asset is still live, equity still moves, and the
 /// ordinary comparison genuinely does work.
@@ -97,13 +107,13 @@ namespace xop::risk {
     bool   all_held_assets_unpriced,
     double peak_equity_usd) noexcept
 {
-    if (!grace_elapsed) {
+    if (!grace_elapsed || !valuation_degraded) {
         return false;
     }
     if (all_held_assets_unpriced) {
         return true;
     }
-    return valuation_degraded && !(peak_equity_usd > 0.0);
+    return !(peak_equity_usd > 0.0);
 }
 
 [[nodiscard]] constexpr double equity_drawdown_frac(
