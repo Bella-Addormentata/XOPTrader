@@ -523,11 +523,22 @@ and at the open. Combined with the 8× stressed initial margin off-hours,
 "bank the gate overnight" hypothesis above is weaker still, because it is
 precisely the behaviour these traders are farming.
 
-### Questions to ask in `#svPerps`
+### Questions asked in `#svPerps` — posted 2026-08-27 15:06, awaiting answer
 
-Both are unanswered by anyone, both change strategy materially, and the
+Both were unanswered by anyone, both change strategy materially, and the
 channel has a demonstrated record of answering this kind of question within
-hours:
+hours. Posted as a single message:
+
+> Two questions on depth_seconds accounting, if I may. (1) Do carried
+> (out-of-hours) ticks accrue depth_seconds - is a carried IV oracle treated
+> as "fresh" by the ~10s sampler, given that placement seems to treat live
+> and carried alike? (2) Will depth_seconds be reset on Sunday along with
+> balances? That was raised on the 26th but I didn't see an answer - since
+> the contest is shorter than the 5-day window, pre-competition depth would
+> otherwise carry into the 300,000,000 gate. Asking now because the two
+> answers imply quite different overnight sizing. Thanks!
+
+In full:
 
 1. **Do carried (out-of-hours) ticks accrue `depth_seconds`?** Is a carried
    IV oracle "fresh" for the ~10 s depth sampler, given that placement
@@ -671,14 +682,15 @@ transfer and must not leak into shared code.
       Discord, 2026-08-11: "depth_seconds does not change rank order and is
       not combined with PnL." The agent skill was right; the rules page
       phrasing is loose.
-- [ ] **C-0S2** **Two questions that replace it — ask in #svPerps now.**
-      Both are unanswered by anyone and both move strategy: (a) do
-      *carried* out-of-hours ticks accrue `depth_seconds`? (b) will
-      `depth_seconds` be reset on Sunday along with balances, or does
-      sandbox depth carry into the contest through the 5-day window? A
-      competitor asked (b) on 2026-08-26 and got no reply. Cheap to ask,
-      expensive to guess — and (b) may let us clear most of the gate before
-      Monday.
+- [~] **C-0S2** **Two questions that replace it — ASKED 2026-08-27 15:06,
+      awaiting answer.** (a) do *carried* out-of-hours ticks accrue
+      `depth_seconds`? (b) will `depth_seconds` be reset on Sunday along
+      with balances, or does sandbox depth carry into the contest through
+      the 5-day window? A competitor asked (b) on 2026-08-26 and got no
+      reply. **(b) may let us clear most of the gate before Monday** — if
+      the answer is "not reset", banking depth in the sandbox over the
+      weekend becomes the highest-value thing we can do, and it needs no
+      strategy code at all. Check back before the Sunday-evening pause.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
       **not decaying** — the sponsor confirms the accumulator only rises;
       what falls is the 5-day display window.
