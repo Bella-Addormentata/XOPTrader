@@ -228,3 +228,59 @@ TEST(WindowLossThresholdUsdTest, DisabledAndDegenerateInputs) {
 }
 
 }  // namespace
+
+// ===========================================================================
+// [S27 2026-08-27] The inert-breaker hazard
+//
+// These do not test the engine-side fix (marking a never-valued asset as
+// degrading the cycle) -- that needs Engine plus an inventory tracker and is
+// blocked on the T4-07 harness.  They pin the PURE property that makes the
+// engine-side bug dangerous, so the hazard is documented where the maths
+// lives rather than only in a TODO.
+//
+// On 2026-08-25, disabling the wUSDC.b pairs left every held asset without
+// an enabled pricing pair.  Equity became exactly $0, the peak tracked to
+// $0 with it, and the breaker stopped being able to fire AT ALL -- not a
+// nuisance trip, silence.
+// ===========================================================================
+
+TEST(DrawdownBreakerTest, S27_ZeroPeakMakesTheBreakerInertNotTrigger) {
+    // The specific shape of the 2026-08-25 failure: nothing priced, so both
+    // equity and peak are 0.  A non-positive peak yields 0.0 drawdown, so
+    // no threshold can ever be crossed.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(0.0, 0.0), 0.0);
+
+    // And it stays inert however bad things get, because the peak never
+    // rose above zero to measure against.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(0.0, -5000.0), 0.0);
+}
+
+TEST(DrawdownBreakerTest, S27_APricedPeakStillProtectsAgainstACollapseToZero) {
+    // Contrast: once ANY real peak exists, a collapse to zero reads as a
+    // full 100% drawdown and trips everything.  The danger is not a wrong
+    // number -- it is having no number at all.
+    EXPECT_DOUBLE_EQ(equity_drawdown_frac(500.0, 0.0), 1.0);
+}
+
+TEST(DrawdownBreakerTest, S27_UnvaluedAssetsSumToZeroEquity) {
+    // Held units with neither a live nor a carried price contribute
+    // nothing, so a book full of them is indistinguishable from an empty
+    // one at this layer.  That is correct for the pure function -- which is
+    // exactly why the ENGINE must flag the condition instead of letting it
+    // pass as a healthy $0.
+    std::vector<AssetValuationInput> book;
+    AssetValuationInput xch;   xch.units = 70.0;    // no prices at all
+    AssetValuationInput dbx;   dbx.units = 519.0;
+    book.push_back(xch);
+    book.push_back(dbx);
+    EXPECT_DOUBLE_EQ(portfolio_equity_usd(book), 0.0);
+
+    // One priced asset is enough to make the total non-zero -- the $63.82
+    // equity observed live was exactly this: one asset counted, the rest
+    // silently absent.
+    AssetValuationInput byc;
+    byc.units = 63.818;
+    byc.live_usd_per_unit = 1.0;
+    book.push_back(byc);
+    EXPECT_NEAR(portfolio_equity_usd(book), 63.818, 1e-9);
+}

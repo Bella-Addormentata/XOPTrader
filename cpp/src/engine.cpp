@@ -11303,6 +11303,33 @@ std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
 
 double Engine::usd_per_xch() const
 {
+    // [S27 2026-08-27] EXTERNAL FEED FIRST.
+    //
+    // This used to derive XCH's dollar price solely from an enabled
+    // XCH/<par wrapper> pair.  That has the anchor backwards: XCH has a
+    // real, liquid, externally quoted USD price, and deriving it through a
+    // bridged stablecoin on a thin Chia book adds the wrapper issuer's risk
+    // to a number that never needed it.
+    //
+    // It also failed outright.  Only wUSDC.b / wUSDC / USDS qualified --
+    // BYC never did -- so when the wUSDC.b pairs were disabled on
+    // 2026-08-25 this returned 0, every asset priced at $0, equity became
+    // exactly $0, and equity_drawdown_frac returns 0.0 on a non-positive
+    // peak.  Both circuit breakers went INERT rather than tripping: the
+    // engine would have traded with no drawdown protection at all.
+    //
+    // The DEX-derived mid stays as the FALLBACK rather than being dropped.
+    // The note in the loop below is right that a CoinGecko outage must not
+    // zero every USD figure in the bot, so this prefers the external feed
+    // and falls back rather than failing.
+    {
+        auto it = coingecko_prices_.find("chia");
+        if (it != coingecko_prices_.end() && std::isfinite(it->second)
+            && it->second > 0.0) {
+            return it->second;
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
         const auto slash = pair.name.find('/');
@@ -11725,17 +11752,35 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                 last_asset_live_block_[rec.asset_id] = current_block;
             }
         }
-        if (auto it = last_asset_usd_price_.find(rec.asset_id);
-            it != last_asset_usd_price_.end()) {
-            in.last_usd_per_unit = it->second;
+        const auto carry_it = last_asset_usd_price_.find(rec.asset_id);
+        const bool have_carry = (carry_it != last_asset_usd_price_.end());
+        if (have_carry) {
+            in.last_usd_per_unit = carry_it->second;
+        }
 
-            // [S20] Expired carry on a HELD asset degrades the cycle.
-            // The subtraction is guarded because BlockHeight is unsigned:
-            // a peer serving a lower height (reorg, node swap) would
-            // otherwise underflow to a huge age and instantly declare
-            // every asset degraded.  A regressed height means "no elapsed
-            // time", not "infinite elapsed time".
-            if (pseudo <= 0 && current_block > 0 && ttl > 0) {
+        // [S20] Expired carry on a HELD asset degrades the cycle.
+        // The subtraction is guarded because BlockHeight is unsigned: a
+        // peer serving a lower height (reorg, node swap) would otherwise
+        // underflow to a huge age and instantly declare every asset
+        // degraded.  A regressed height means "no elapsed time", not
+        // "infinite elapsed time".
+        //
+        // [S27 2026-08-27] This check used to sit INSIDE the "carry entry
+        // found" branch, so an asset that had NEVER been priced skipped it
+        // entirely: it contributed $0 to equity in silence and left
+        // `degraded` false, so ValuationAuthorityGate never fired and the
+        // peak re-anchored to a partial book.  On 2026-08-25 that produced
+        // an equity of $63.82 -- exactly the BYC balance -- while ~70 XCH
+        // and 519 DBX were invisible to it.  Never-valued is the WORST
+        // case, not an exempt one: there is not even a stale number to
+        // carry, so it degrades unconditionally.
+        if (pseudo <= 0 && current_block > 0) {
+            if (!have_carry) {
+                degraded = true;
+                spdlog::debug("[Engine] [S20] held asset {} has NEVER been "
+                              "valued -- contributing $0; equity degraded "
+                              "this cycle", rec.asset_id);
+            } else if (ttl > 0) {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
                     || risk::carry_expired(current_block, lb->second, ttl)) {
@@ -11747,6 +11792,7 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                 }
             }
         }
+
         inputs.push_back(in);
     }
 
