@@ -11,6 +11,33 @@
 
 ---
 
+## Target scope: v0.9.23 -- make it safe to resume
+
+The engine has been paused since 2026-08-25 and every item here is about the
+same failure: **the bot continuing to stand behind quotes it can no longer
+manage.** Ordered by whether resuming without it is defensible.
+
+| item | why it gates a resume |
+| --- | --- |
+| **PR #115** (S29/S30) | peg identity becomes an asset property; `enforce: false` lets an operator switch off a compromised peg without a release. **In flight** |
+| **S27** | with only XCH/DBX enabled, equity is exactly $0 and `equity_drawdown_frac` returns 0.0 on a non-positive peak — **both breakers go inert rather than trip**. Resuming with no drawdown protection is worse than staying paused. **The blocker** |
+| **S28** | `check_pause_flag()` sits downstream of a successful block poll; 529 consecutive failures meant it was never read. Pause and Resume do not work during the incident that makes you reach for them |
+| **S31** | nothing cancels the book when the engine stops. Cost $12.71 and a tripped breaker on 08-25, and was demonstrated again on 08-26 when a stray `--dry-run` killed the live process and left 10 offers unmanaged |
+| **S13** | "wallet needs to be fully synced" is **88% of all error lines** (~4,000 of 4,514). A silently failed cancel leaves a stale quote live — the same outcome as S31, by a different route |
+| **S14** (absorbs S26) | forced cancel retries with the same fee forever. Watched fail for 6+ hours on two offers this week; worst recorded case 158 warnings over 36h with coins locked throughout |
+
+**Not in scope, deliberately.** S24 (reconciliation dominating the
+heartbeat) and S22 (pre-S20 DB junk, plus the S11 orphan backfill) are real
+but neither prevents a safe restart. S15 (11,798 spread warnings, 14% of all
+warnings, still firing while paused) is cheap noise reduction — include only
+if there is room.
+
+**Note on S13 and S14:** both are marked "touches live order handling: NOT
+to be fixed casually". They want care, not speed. But both directly caused
+exposure this week.
+
+---
+
 ## Open items (audited 2026-08-18)
 
 ### Correctness
@@ -159,7 +186,15 @@
 - **Issue:** Rows stay `status='pending'` indefinitely when an offer ends without the resolution being written back. Measured 2026-08-21: 23 of 57 pending rows are over a day old, the oldest dated 2026-08-08, against a chain 38k blocks ahead. Taking the best price across all pending rows reported a SELF-CROSSED book (bid 1.4857 above ask 1.4534) on XCH/BYC. The engine separately logs `verify_pending_offer_coins: offer ... has terminal wallet status 3 but still in State` 1,614 times, which looks like the same class of bookkeeping gap — though five sampled ids from those warnings do NOT appear among the stale rows, so the link is unconfirmed.
 - **Also affected:** `fetch_deployed_capital()` aggregates every pending row the same way, so the Balances tab's "Deployed %" is likely overstated by the same ghosts. Not yet quantified.
 - **The heuristic is wrong in BOTH directions.** Too wide and eight-day ghosts return; too narrow and genuinely resting offers disappear. Observed 2026-08-22 while the engine was paused by the drawdown breaker: no new offers were posted for hours, so every side aged out of the 6.25h window and the panel showed em dashes — yet those offers were still resting on chain and takeable, because a pause stops new posting without cancelling what is live. An operator reading the panel would think we had no book at all.
-- **Status:** `[ ]` — OPEN. The dashboard's per-pair table works around this with a TTL-derived recency window (PR #94), which is a display heuristic only: age cannot distinguish a ghost from a legitimately resting offer. The real fix is for reconciliation to retire rows authoritatively, or for consumers to query live offer state.
+- **Status:** `[x]` — LARGELY RESOLVED by S25 (PR #114, shipped v0.9.22).
+  The root cause was exactly what S25 fixed: terminal outcomes were detected
+  every cycle and never written down. Measured 2026-08-26, two days after
+  the release: **pending+unresolved is 10, down from 48**, and **61 terminal
+  outcomes were written in 48 hours**. Remaining work is not this bug: the
+  10 survivors are the orphan class PR #114 identified (the wallet no longer
+  knows them, so they can never self-heal) and need the bounded backfill
+  SQL from that PR description, run once by the operator against the live
+  DB. Tracked with S22.
 
 ### S12: One spurious print latches a GLOBAL offer halt for ~1000 blocks
 - **Files:** `cpp/src/risk/limits.cpp` (`check_flash_crash`), `cpp/src/engine.cpp` (flash-crash state machine)
@@ -177,6 +212,24 @@
 - **Files:** `cpp/src/engine.cpp:7109-7121`, `cpp/src/execution/offer_manager.cpp:3206`
 - **Issue:** The forced-cancel loop retries with the SAME fee indefinitely: worst case one offer re-warned 158 times over ~36 h (age 851 → 7,782 blocks), fee frozen at 5,000 mojos on every attempt. While stuck, coins stay locked (170 "entering XCH-buy-only mode" warnings) and the quote stays live. Mostly downstream of S13.
 - **Status:** `[ ]` — OPEN. Escalation ladder: retry with escalated fee → delete_unconfirmed_transactions + re-cancel → mark unrecoverable and alert ONCE. Rate-limit the per-offer warning. Touches live order handling.
+- **[2026-08-26] S26 folded in here.** A separate item was filed after
+  watching two wmilliETH.b/XCH bids (`0xa49d5c9edd`, `0xca4eed3a27`) be
+  reported stuck and "attempting forced cancel" on every cycle for 6+ hours,
+  age climbing 895 -> 1173 blocks (~3x the 400-block TTL), with no error
+  logged after the attempt. Same signature later on XCH/DBX ("3 stuck
+  offers ... attempting forced cancel"). That is not a new bug -- it is this
+  one observed live, and S14 already names the mechanism (same fee, retried
+  forever). Filing it twice was a duplicate on my part.
+- **Second call site:** the escalation ladder must also cover
+  `engine.cpp:7435` (`cancel_stale` in Step 8), not only 7109-7121.
+- **⚠ Do NOT route `engine.cpp:7439` through the S25 re-verify buffer.**
+  That write looks like the ones S25 fixed, but `cancel_stale` is
+  *self-initiated*: the wallet reports PENDING_CANCEL for a while, which
+  `recheck_terminal` reads as non-terminal and would discard -- breaking a
+  path that currently works.
+- **Diagnose before fixing:** either `cancel_stale` is not returning these
+  ids, or the cancel is issued and does not take. Different fixes.
+
 
 ### S15: Spread-cap warning fires every block, including while paused
 - **Files:** `cpp/src/engine.cpp:3456`
@@ -293,10 +346,6 @@
 - **Issue:** ~800s of every ~840s cycle spent in reconciliation, scanning blocks at ~12.5s each. Pre-existing but invisible while v0.9.20 was breaker-paused.
 - **Status:** `[ ]` — Suspected contributor to the 2026-08-25 full-node RPC wedge: sustained scan load against an I/O-strained node. Unproven, but the two facts sit close together.
 
-### S26: forced cancel does not clear stuck offers
-- **Files:** `cpp/src/engine.cpp:7435` (`cancel_stale` call site)
-- **Issue:** Two wmilliETH.b/XCH bids (`0xa49d5c9edd`, `0xca4eed3a27`) were reported stuck and "attempting forced cancel" every cycle for 6+ hours, age climbing 895 -> 1173 blocks (~3x the 400-block TTL), with no error logged after the attempt. Same signature later seen on XCH/DBX ("3 stuck offers ... attempting forced cancel").
-- **Status:** `[ ]` — Diagnose FIRST: either `cancel_stale` is not returning these ids, or the cancel is issued and does not take. Different fixes. NOTE: engine.cpp:7439 is a fourth immediate `update_offer_status("cancelled")` with the same silent catch S25 fixed elsewhere, but it must NOT be routed through the S25 re-verify buffer -- `cancel_stale` is self-initiated and the wallet reports PENDING_CANCEL for a while, which `recheck_terminal` would read as non-terminal and discard, breaking the working path.
 
 ### S27: assets with no enabled pair price at $0 -- silently, and the S20 gate cannot see it
 - **Files:** `cpp/src/engine.cpp:11582` (`asset_usd_pseudo_price`), `:11277` (`usd_per_xch`), `cpp/include/xop/risk/drawdown_breaker.hpp`
