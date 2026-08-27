@@ -176,3 +176,35 @@ def test_public_key_is_shown_and_private_key_is_not(page):
     assert bytes(ident.private_key()).hex() not in shown
     for word in phrase.split():
         assert " %s " % word not in shown
+
+
+def test_page_constants_match_the_sidebar_order(qapp):
+    """Inserting a page shifts every index after it.
+
+    _PAGE_SETTINGS stayed 9 when Permuto took index 9, so the Settings menu,
+    open_settings_page() and the first-run missing-config redirect all opened
+    Permuto -- a new user with no config landed on a key-generation page.
+    Nothing tied the constants to the sidebar, so nothing caught it. This does.
+    """
+    from gui.widgets import main_window as mw
+    from gui.widgets.sidebar import _NAV_ITEMS
+
+    expected = {
+        "Dashboard": mw._PAGE_DASHBOARD,
+        "Charts": mw._PAGE_CHARTS,
+        "Orders": mw._PAGE_ORDERS,
+        "Order Book": mw._PAGE_ORDER_BOOK,
+        "Analysis": mw._PAGE_ANALYSIS,
+        "Wallet": mw._PAGE_WALLET,
+        "Reports": mw._PAGE_REPORTS,
+        "Warp": mw._PAGE_WARP,
+        "Base": mw._PAGE_BASE_WALLET,
+        "Permuto": mw._PAGE_PERMUTO,
+        "Settings": mw._PAGE_SETTINGS,
+    }
+    labels = [label for label, _icon in _NAV_ITEMS]
+    assert len(labels) == len(expected), "a nav item has no page constant"
+    for label, index in expected.items():
+        assert labels[index] == label, (
+            "_PAGE_* constant for %s points at %s" % (label, labels[index])
+        )
