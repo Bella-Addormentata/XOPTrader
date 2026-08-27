@@ -371,7 +371,7 @@ exposure this week.
   bare `return 1.0` in the USD-factor path. Asset-keyed, declares the peg
   **currency** (so EUR/JPY pegs are expressible and a missing FX rate yields
   *no valuation* rather than a silent 1:1), separates `Unobserved` from
-  `Holding`, and has an `enforce` flag. 20 registry tests plus 13 parser
+  `Holding`, and has an `enforce` flag. 22 registry tests plus 14 parser
   tests, sabotage-verified.
   **STILL OPEN — the observation half.** `PegRegistry::classify` has no
   production caller; `DepegDetector` is registered and updated solely from

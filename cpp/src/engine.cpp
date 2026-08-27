@@ -11435,11 +11435,6 @@ bool Engine::quote_usd_factor_trusted(const PairConfig& pc) const
 
 bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
     if (is_par_wrapper_quote(pc)) {
         return true;
     }
@@ -11454,11 +11449,6 @@ bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
 
 double Engine::quote_usd_factor(const PairConfig& pc) const
 {
-    const auto slash = pc.name.find('/');
-    const std::string quote = (slash == std::string::npos)
-        ? std::string{}
-        : pc.name.substr(slash + 1);
-
     // Fiat-collateralised wrappers hold their peg tightly enough to treat
     // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
     // [PEG 2026-08-26] The 1.0 is no longer written here.  It comes from
