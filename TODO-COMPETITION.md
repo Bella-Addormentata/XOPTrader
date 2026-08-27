@@ -426,11 +426,9 @@ Jakub Hadamcik, **2026-08-27 15:10**, answering our question directly:
 > And yes, when underlying markets are closed, you keep collecting depth
 > seconds
 
-⚠ **Entrant-sourced, not sponsor-sourced.** Jakub is a competitor, not
-Permuto staff. He is also the entrant who records every trade, book change
-and oracle print, has been consistently candid in the channel, and gains
-nothing by telling the field the gate is easier than it looks. Treat it as
-strong but verifiable — see "Verify it ourselves" below.
+✅ **Independently confirmed by our own measurement, 2026-08-27.** The claim
+was entrant-sourced, not sponsor-sourced, so we measured it rather than
+trusting it. Result below under "C-0S3: measured". Jakub was right.
 
 **This reverses the inference in the previous draft.** The argument against
 accrual was that Gene calibrates the gate as "≈$3,000 average balanced depth
@@ -465,12 +463,49 @@ cash session. Two things still argue against doing it naively:
   the oracle is pinned high. Small, balanced, and reduce-only-biased is the
   shape that survives; a fat overnight grid is what gets farmed.
 
-**Verify it ourselves before relying on it.** The leaderboard is public and
-unauthenticated. Sample `depth_5d` for two or three actively-quoting MMs
-just after a 16:00 ET close and again ~90 minutes later. A clear rise
-confirms accrual. Note the 5-day window cuts both ways — roll-off can mask
-a small gain — so prefer accounts with large recent accrual and use a long
-enough gap that accrual dominates.
+### C-0S3: measured, and it holds
+
+`scripts/permuto_depth_probe.py`, 124 samples at 60 s over **122 minutes**
+from 20:26 to 22:29 UTC — entirely after the 16:00 ET close, with the oracle
+returning a **single distinct value across all 124 samples**, so the whole
+window is confirmed carried.
+
+| account | Δ depth_5d | implied balanced depth |
+| --- | ---: | ---: |
+| `7c81d1c9` | **+10,266,440** | ~$1,400 |
+| `23dfb630` | **+8,370,792** | ~$1,141 |
+| `9941a3ad` | −14,657,329 | — (stopped quoting) |
+| 9 others | 0 | — |
+
+Roll-off can only subtract, so a gain with the oracle frozen can only come
+from carried ticks accruing. **Confirmed.**
+
+**Backfill ruled out.** The obvious alternative was leaderboard lag — that
+post-close gains are delayed credit for pre-close ticks. That would drain and
+taper. It does not: bucketed into 20-minute windows the implied depth for
+`7c81d1c9` runs 823, 2000, 2000, 703, 777, 1983, 2000 — no downward trend,
+and still at maximum two hours after the close. The oscillation looks like
+bots actively re-quoting, not a settling residue.
+
+**This also calibrates sizing for free.** `d(depth)/dt` measured in
+depth-seconds per second **is** the resting balanced notional in dollars,
+because depth accrues at notional × elapsed time. So the probe reads other
+entrants' overnight size directly without placing a single order. At
+`7c81d1c9`'s ~$1,400, clearing 300,000,000 takes **59.5 hours** — against a
+102.5 h contest window, which needs ~$813 held throughout. The two figures
+are derived independently and agree.
+
+⚠ **Competitive signal worth noting.** Those two accounts are quoting
+overnight at $1,141–$1,400, which brackets the ~$1,190 that the
+carried-hours-only route needs. Other entrants have converged on
+approximately this shape already, so it is not an edge — it is the going
+rate, and the gate is unlikely to be what separates the field.
+
+**And it settles correction 2 from the other direction.** `9941a3ad` shed
+14.66M in the same two hours with equity at exactly $0 — a wiped account
+that has stopped quoting, watching its 5-day window roll off. Banked credit
+does not decay; a trailing window ages out. That is precisely the mechanism
+the corrected reading proposed, observed directly.
 
 ### RESOLVED: depth_seconds IS reset for the contest
 
@@ -759,11 +794,14 @@ transfer and must not leak into shared code.
       "planning to do that already". So there is no weekend pre-banking,
       but the usable window is the full 102.5 h, which drops the depth
       needed from ~$2,564 to ~$813 held throughout.
-- [ ] **C-0S3** **Verify (a) ourselves from the public leaderboard.** Sample
-      `depth_5d` for two or three actively-quoting MMs just after a 16:00 ET
-      close and again ~90 min later; a clear rise confirms accrual. No auth
-      needed, no code beyond a fetch. Do this before sizing anything on it —
-      the whole eligibility plan now rests on one entrant's statement.
+- [x] **C-0S3** **Measured and confirmed 2026-08-27.** 124 samples over 122
+      minutes of confirmed-carried session (oracle frozen at a single value
+      throughout): two accounts gained 10.27M and 8.37M depth-seconds, which
+      roll-off cannot produce. Backfill ruled out by the flat rate profile.
+      Also calibrated other entrants' overnight size at $1,141–$1,400 without
+      placing an order, and observed a wiped account shedding 14.66M to
+      window roll-off — the mechanism correction 2 proposed. See
+      `scripts/permuto_depth_probe.py`.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
       **not decaying** — the sponsor confirms the accumulator only rises;
       what falls is the 5-day display window.
