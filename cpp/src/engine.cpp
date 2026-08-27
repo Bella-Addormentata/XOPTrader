@@ -11790,6 +11790,10 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     // [S32] Held but structurally unpriceable: counted separately so it can
     // never be mistaken for a live price when deciding all-unpriced below.
     std::size_t writtenoff_count = 0;
+    // [S33] Is SOME held asset riding a carry that is still inside its TTL?
+    // That is the carry mechanism doing its job, and it is the difference
+    // between a gap the engine is bridging and an outage it cannot see past.
+    bool any_fresh_carry_bridging = false;
     for (const auto& rec : inventory_->get_all_records()) {
         if (rec.total_quantity <= 0) continue;
         ++held_count;
@@ -11877,7 +11881,12 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                                  "contributing $0; equity DEGRADED",
                                  rec.asset_id.substr(0, 12));
                 }
-            } else if (ttl > 0) {
+            } else if (ttl == 0) {
+                // TTL 0 means "never expire" (config.hpp). The operator has
+                // said a carry stays valid indefinitely, so this asset is
+                // bridged by definition and must not read as an outage.
+                any_fresh_carry_bridging = true;
+            } else {
                 auto lb = last_asset_live_block_.find(rec.asset_id);
                 if (lb == last_asset_live_block_.end()
                     || risk::carry_expired(current_block, lb->second, ttl)) {
@@ -11886,6 +11895,12 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                                   "{} blocks without a live print -- "
                                   "equity degraded this cycle",
                                   rec.asset_id, ttl);
+                } else {
+                    // [S33] Unpriced this tick but the carry is still inside
+                    // its TTL: this asset is being BRIDGED, not lost. That
+                    // distinction is what stops one quiet tick latching the
+                    // breaker -- see valuation_all_unpriced_ below.
+                    any_fresh_carry_bridging = true;
                 }
             }
         }
@@ -11894,11 +11909,36 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
     }
 
     if (current_block > 0) {
+        // [S33 2026-08-27] A book made ENTIRELY of written-off assets has no
+        // valuation basis at all: equity is $0 by declaration, no peak can
+        // seed, and there is nothing for a breaker to measure.  Written-off
+        // assets deliberately do not degrade the cycle on their own (that is
+        // the point of S32), so without this the whole-book case would report
+        // a clean valuation of $0 and trade unprotected.
+        if (writtenoff_count > 0 && writtenoff_count == held_count) {
+            degraded = true;
+        }
         valuation_degraded_ = degraded;
-        // Nothing live at all, while holding something.  Equity is then
-        // entirely carried fiction and no comparison against it is
-        // meaningful -- see unvaluable_book_must_fail_closed.
-        valuation_all_unpriced_ = (held_count > 0 && live_count == 0);
+
+        // Nothing live at all, while holding something, AND nothing being
+        // bridged by a still-valid carry.  Equity is then entirely FROZEN
+        // fiction and no comparison against it is meaningful -- see
+        // unvaluable_book_must_fail_closed.
+        //
+        // [S33 2026-08-27] The bridging term is load-bearing and its absence
+        // was a real defect.  `degraded` is an aggregate over every held
+        // asset, so it can be raised by asset A's long-expired carry while
+        // asset B is riding a perfectly fresh one.  Without this term, a
+        // single quiet tick on B -- the exact transient the carry mechanism
+        // exists to bridge -- combined with A's standing degradation gave
+        // (grace, degraded, all_unpriced) = (true, true, true) and latched
+        // the breaker permanently.  The guard that was supposed to tell a
+        // gap from an outage was being satisfied by a DIFFERENT asset than
+        // the one that had gone quiet.  Requiring that nothing at all is
+        // being bridged restores the documented policy: "a data gap must not
+        // read as a crash".
+        valuation_all_unpriced_ =
+            (held_count > 0 && live_count == 0 && !any_fresh_carry_bridging);
     }
     return risk::portfolio_equity_usd(inputs);
 }

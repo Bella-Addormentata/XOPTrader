@@ -101,6 +101,17 @@ namespace xop::risk {
 /// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
 /// there at least one asset is still live, equity still moves, and the
 /// ordinary comparison genuinely does work.
+///
+/// [S33 2026-08-27] `all_held_assets_unpriced` means "nothing live AND
+/// nothing being bridged by a still-valid carry", not merely "nothing live
+/// this tick". The weaker reading was a defect: `valuation_degraded` is an
+/// aggregate over every held asset, so it can be raised by one asset's
+/// long-expired carry while a second asset rides a perfectly fresh one. A
+/// single quiet tick on the second then produced (true, true, true) and
+/// latched the breaker permanently -- with the degradation guard satisfied
+/// by a DIFFERENT asset than the one that had gone quiet, which is exactly
+/// the confusion this parameter now exists to prevent. The caller computes
+/// it in compute_portfolio_equity_usd.
 /// Whether a held asset with no live price should be WRITTEN OFF at $0
 /// rather than degrading the valuation cycle.
 ///

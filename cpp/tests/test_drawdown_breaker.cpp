@@ -422,3 +422,23 @@ TEST(DrawdownBreakerTest, S32_ThePartialBookThatUnblocksResume) {
         /*grace_elapsed=*/true, /*valuation_degraded=*/false,
         /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/1234.56));
 }
+
+// ---------------------------------------------------------------------------
+// S33: the degradation guard must not be satisfied by a different asset than
+// the one that went quiet.
+// ---------------------------------------------------------------------------
+
+TEST(DrawdownBreakerTest, S33_AFreshCarryElsewhereStopsTheLatch) {
+    // The reported shape: asset A sits on a long-expired carry (so the
+    // aggregate degraded flag is permanently true) while asset B is live.
+    // B then misses ONE tick with its carry still fresh.  The caller must
+    // report all_held_assets_unpriced=false, because B is being bridged --
+    // otherwise these inputs latch the breaker on a transient.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        /*grace_elapsed=*/true, /*valuation_degraded=*/true,
+        /*all_held_assets_unpriced=*/false, /*peak_equity_usd=*/500.0));
+
+    // Once B's carry expires too, nothing is bridged and the book really is
+    // unvaluable.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(true, true, true, 500.0));
+}
