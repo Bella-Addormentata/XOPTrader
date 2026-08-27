@@ -11275,6 +11275,32 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 // DBX cross-derived, XCH from a live stable-quoted mid.
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-26] Peg identity helpers -- see engine.hpp for why these
+// exist and why they key on asset id rather than on a parsed ticker.
+// ---------------------------------------------------------------------------
+bool Engine::is_par_wrapper_quote(const PairConfig& pc) const
+{
+    const auto* a = config_.pegged_assets.find(pc.quote_asset_id);
+    return a != nullptr && a->enforce && !a->prefer_market_cross;
+}
+
+bool Engine::quote_prefers_market_cross(const PairConfig& pc) const
+{
+    const auto* a = config_.pegged_assets.find(pc.quote_asset_id);
+    return a != nullptr && a->enforce && a->prefer_market_cross;
+}
+
+std::optional<double> Engine::declared_usd_par(const AssetId& asset_id) const
+{
+    // No FX rate is supplied here, so a non-USD peg yields nullopt rather
+    // than a silent 1:1 substitution.  Wiring a live FX feed is the
+    // follow-up that makes EUR/JPY pegs usable; until then, declaring one
+    // produces "no valuation" and the caller falls through exactly as it
+    // does for a missing mid.
+    return config_.pegged_assets.usd_par_value(asset_id);
+}
+
 double Engine::usd_per_xch() const
 {
     for (const auto& pair : config_.pairs) {
@@ -11282,7 +11308,12 @@ double Engine::usd_per_xch() const
         const auto slash = pair.name.find('/');
         if (slash == std::string::npos) continue;
         const std::string quote = pair.name.substr(slash + 1);
-        if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+        // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
+        // registry, keyed on ASSET ID rather than the ticker parsed out of
+        // the pair name -- symbols collide and get reused, asset ids do
+        // not.  A wrapper is one that does NOT prefer a market cross: its
+        // par is a claim on a dollar, not an observation.
+        if (is_par_wrapper_quote(pair)) {
             auto snap = state_->get_market(pair.name);
             // [S20 2026-08-24] NOT gated on mid_valuation_grade.  Grade
             // requires a fresh two-sided FILTERED book or a fresh CEX leg,
@@ -11331,7 +11362,7 @@ std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
         const auto oslash = other.name.find('/');
         if (oslash == std::string::npos) continue;
         const std::string oquote = other.name.substr(oslash + 1);
-        if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
+        if (!is_par_wrapper_quote(other)) {
             continue;
         }
         auto snap = state_->get_market(other.name);
@@ -11355,7 +11386,7 @@ std::string Engine::quote_usd_factor_source_pair(const PairConfig& pc) const
         ? std::string{}
         : pc.name.substr(slash + 1);
 
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         return byc_cross_source_pair(pc);
     }
     if (pc.base_asset_id == "xch") {
@@ -11398,10 +11429,10 @@ bool Engine::quote_usd_factor_is_par(const PairConfig& pc) const
         ? std::string{}
         : pc.name.substr(slash + 1);
 
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
+    if (is_par_wrapper_quote(pc)) {
         return true;
     }
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         // Par exactly when no eligible cross exists -- the same question
         // byc_cross_source_pair answers, so the two cannot disagree about
         // which snapshot (if any) supplies the factor.
@@ -11419,8 +11450,15 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
 
     // Fiat-collateralised wrappers hold their peg tightly enough to treat
     // as exactly $1 for accounting (matches the GUI's pnl_usdc_expr).
-    if (quote == "wUSDC.b" || quote == "wUSDC" || quote == "USDS") {
-        return 1.0;
+    // [PEG 2026-08-26] The 1.0 is no longer written here.  It comes from
+    // whatever the operator declared for this asset, in the currency they
+    // declared it in -- so a EUR-pegged wrapper yields its EURUSD value and
+    // an asset whose peg is no longer enforced yields nothing at all.
+    if (is_par_wrapper_quote(pc)) {
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     // BYC is a Chia-native CDP stablecoin.  This branch used to prefer the
@@ -11440,7 +11478,7 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // (midpoint worst-case error ~150 bps, comparable to the peg's), and
     // fall back to par otherwise.  spread_bps is 0 for one-sided or crossed
     // books, which also (correctly) selects par.
-    if (quote == "BYC") {
+    if (quote_prefers_market_cross(pc)) {
         constexpr double kMaxCrossSpreadBps = 300.0;
         for (const auto& other : config_.pairs) {
             if (!other.enabled) continue;
@@ -11448,7 +11486,7 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
             const auto oslash = other.name.find('/');
             if (oslash == std::string::npos) continue;
             const std::string oquote = other.name.substr(oslash + 1);
-            if (oquote != "wUSDC.b" && oquote != "wUSDC" && oquote != "USDS") {
+            if (!is_par_wrapper_quote(other)) {
                 continue;
             }
             auto snap = state_->get_market(other.name);
@@ -11463,7 +11501,16 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
                      / static_cast<double>(kMojosPerXch);
             }
         }
-        return 1.0;
+        // [PEG 2026-08-26] No eligible cross, so fall back to the DECLARED
+        // par rather than a 1.0 written here.  This is the line that kept
+        // marking BYC at a dollar after its issuer announced the protocol
+        // would be sunset: with the value hardcoded there was nothing an
+        // operator could turn off.  Now clearing `enforce` in config stops
+        // it, and an undeclared asset yields no valuation at all.
+        if (auto par = declared_usd_par(pc.quote_asset_id)) {
+            return *par;
+        }
+        return 0.0;
     }
 
     if (pc.quote_asset_id == "xch") {

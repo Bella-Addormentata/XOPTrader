@@ -93,6 +93,21 @@ struct PeggedAsset {
     /// without letting it mark the book at par.
     bool enforce{true};
 
+    /// Prefer a live market cross over the declared par when one is
+    /// available.
+    ///
+    /// This is the economic difference between the two kinds of pegged
+    /// asset we hold.  A FIAT-COLLATERALISED WRAPPER (wUSDC.b, wUSDC,
+    /// USDS) is par by construction -- one unit is a claim on one dollar
+    /// held by the issuer -- so a market print that disagrees is evidence
+    /// about the ISSUER, not about the value of the claim, and should not
+    /// be used to mark the book.  A CDP STABLECOIN (BYC) has no such
+    /// claim: its dollar value is whatever the market says, and a live
+    /// cross is a better estimate than the target it aims at.
+    ///
+    /// Set false for wrappers, true for market-determined pegs.
+    bool prefer_market_cross{false};
+
     [[nodiscard]] bool is_coherent() const noexcept {
         return !asset_id.empty()
             && !peg_currency.empty()

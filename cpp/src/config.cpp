@@ -405,6 +405,50 @@ DexieConfig parse_dexie(const YAML::Node& root)
     return cfg;
 }
 
+// ---------------------------------------------------------------------------
+// [PEG 2026-08-26] parse_pegged_assets
+//
+// Optional section.  Absent or empty means no asset is declared pegged, and
+// every valuation lookup then returns "no value" rather than falling back to
+// a dollar -- which is the whole point: par is something the operator
+// asserts, not something the code assumes from a ticker symbol.
+// ---------------------------------------------------------------------------
+PegRegistry parse_pegged_assets(const YAML::Node& root)
+{
+    PegRegistry reg;
+    if (!root["pegged_assets"] || !root["pegged_assets"].IsSequence()) {
+        return reg;
+    }
+    for (const auto& item : root["pegged_assets"]) {
+        PeggedAsset a;
+        a.asset_id = item["asset_id"] ? item["asset_id"].as<std::string>() : "";
+        a.symbol   = item["symbol"]   ? item["symbol"].as<std::string>()   : "";
+        if (item["peg_currency"]) a.peg_currency = item["peg_currency"].as<std::string>();
+        if (item["peg_target"])   a.peg_target   = item["peg_target"].as<double>();
+        if (item["warn_pct"])     a.warn_pct     = item["warn_pct"].as<double>();
+        if (item["bail_pct"])     a.bail_pct     = item["bail_pct"].as<double>();
+        if (item["sustained_observations"]) {
+            a.sustained_observations =
+                item["sustained_observations"].as<std::uint32_t>();
+        }
+        if (item["enforce"]) a.enforce = item["enforce"].as<bool>();
+        if (item["prefer_market_cross"]) {
+            a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
+        }
+        if (!reg.add(std::move(a))) {
+            // Loud: a half-declared peg silently dropped is how an asset
+            // ends up unmonitored while everyone assumes it is watched.
+            throw ConfigError(
+                "pegged_assets: incoherent entry for '"
+                + (item["symbol"] ? item["symbol"].as<std::string>()
+                                  : std::string{"<no symbol>"})
+                + "' -- needs a non-empty asset_id and peg_currency, a "
+                  "positive peg_target, and bail_pct > warn_pct");
+        }
+    }
+    return reg;
+}
+
 std::vector<PairConfig> parse_pairs(const YAML::Node& root)
 {
     const std::string sec = "pairs";
@@ -3235,6 +3279,7 @@ AppConfig load_config(const std::string& path,
     cfg.chia       = parse_chia(root);
     cfg.dexie      = parse_dexie(root);
     cfg.pairs      = parse_pairs(root);
+    cfg.pegged_assets = parse_pegged_assets(root);
     cfg.strategy   = parse_strategy(root);
     cfg.risk       = parse_risk(root);
     cfg.volatility = parse_volatility(root);

@@ -73,6 +73,54 @@ dexie:
 # --- pairs: REQUIRED (at least one enabled pair) ----------------------------
 # Per-pair: base_asset_id, quote_asset_id, name are REQUIRED.
 # All other fields (enabled, *_override, is_stablecoin, depeg_*) are OPTIONAL.
+# [PEG 2026-08-26] Assets declared pegged, and to WHAT.
+#
+# Replaces fifteen hardcoded `quote == "wUSDC.b" || ...` comparisons that
+# each independently decided an asset was worth exactly one dollar.  Par is
+# now declared here, not inferred from a ticker symbol.  An asset ABSENT
+# from this list has no declared value -- which is the correct answer, not a
+# reason to fall back to $1.
+#
+# Keyed on asset_id, never on symbol: symbols collide and get reused.
+#
+# peg_currency lets a peg be denominated in something other than USD.
+# Converting a non-USD peg into USD needs an FX rate; until one is wired in,
+# a non-USD peg yields NO valuation rather than a silent 1:1 substitution.
+#
+# prefer_market_cross distinguishes the two kinds of pegged asset:
+#   false -- fiat-collateralised wrapper (wUSDC.b, wUSDC, USDS).  One unit
+#            is a claim on one dollar held by the issuer, so a market print
+#            that disagrees is evidence about the ISSUER and must not mark
+#            the book.
+#   true  -- CDP stablecoin (BYC).  No such claim; a live cross against a
+#            wrapper is a better estimate than the target it aims at, and
+#            the declared par is only the fallback when no tight cross
+#            exists.
+#
+# enforce: false keeps the declaration on record while stopping the asset
+# valuing anything -- for an issuer that has been compromised or is winding
+# down.  This is the switch that did not exist when warp.green and Circuit
+# DAO were both reported compromised in August 2026, and BYC kept marking
+# the whole book at par because the 1.0 was written in the code.
+pegged_assets:
+- asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
+  symbol: wUSDC.b
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  sustained_observations: 30
+  prefer_market_cross: false
+  enforce: true
+- asset_id: ae1536f56760e471ad85ead45f00d680ff9cca73b8cc3407be778f1c0c606eac
+  symbol: BYC
+  peg_currency: USD
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+  sustained_observations: 30
+  prefer_market_cross: true
+  enforce: true
 pairs:
   - base_asset_id: "xch"          # XCH native
     quote_asset_id: "fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d"  # wUSDC.b
