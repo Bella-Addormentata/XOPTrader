@@ -13808,7 +13808,24 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // is one that can persist for hours.  A frozen peak compared against a
     // degraded equity still detects a real loss; it merely cannot invent a
     // new peak to measure it from.
-    if (equity_usd > 0.0 && drawdown_grace_remaining_ == 0) {
+    // [S27 2026-08-27] Gate on the PEAK, not on current equity.
+    //
+    // Gating on `equity_usd > 0.0` made a total pricing failure skip the
+    // drawdown evaluation entirely -- the exact 2026-08-25 shape, where
+    // equity computes to $0 and the breaker therefore never even looks.
+    // This PR added a test pinning that a collapse to zero against a real
+    // peak is a 100% drawdown, and that property was UNREACHABLE in
+    // production because of this line: the test pinned the maths while the
+    // call site defeated it.
+    //
+    // Safe against false trips for a structural reason: portfolio_equity_usd
+    // carries last-known prices, so mid-run equity can only reach $0 when
+    // every currently-held asset has NEVER been valued this run (any prior
+    // valuation leaves a carry entry).  With a peak already established that
+    // state means "everything held is unpriced", which is precisely what
+    // must not keep trading.  Warm-up is unchanged: equity_drawdown_frac
+    // already returns 0.0 for a non-positive peak.
+    if (peak_equity_hwm_usd_ > 0.0 && drawdown_grace_remaining_ == 0) {
         const double drawdown_frac = risk::equity_drawdown_frac(
             peak_equity_hwm_usd_, equity_usd);
 
