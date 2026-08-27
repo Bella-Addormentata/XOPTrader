@@ -101,6 +101,19 @@ All require a session token: `Authorization: Bearer <token>` or
 `Cookie: perps_session=<token>` — **except `GET /exchange/leaderboard`**,
 which is public.
 
+⚠ **`tif` is `GTC`/`ALO`/`IOC` as published. FOK is unverified** — an
+earlier draft of `docs/advanced-trading-methods.md` listed it, sourced from
+nothing traceable. `/openapi.json` does not parse as JSON and `/llms.txt`
+mentions no TIF at all (checked 2026-08-27), so neither list could be
+confirmed against the venue. Treat the three above as the supported set and
+do not emit FOK without testing it against a live reject.
+
+⚠ **`market` takes the `symbol`, not the oracle ticker.** `/info/meta`
+carries both and they differ by suffix: `symbol` is `QQQ-VOL-PERP` (the
+tradeable market), while `base_asset` and `oracle_ticker` are `QQQ-VOL` (the
+volatility series being priced). Order routes want the former; oracle and
+candle lookups want the latter.
+
 ⚠ **Send a browser `User-Agent`.** Verified 2026-08-27: the leaderboard
 returns full data with no credentials, but a bare `urllib`/default agent
 gets **HTTP 403**. The 403 is agent filtering, not an auth requirement, and
@@ -112,7 +125,7 @@ without an account.
 
 | endpoint | use |
 | -------- | --- |
-| `POST /exchange/order` | single order. `market`, `side` (`buy`/`sell`), `size` required; `order_type` (`market`/`limit`), `price`, `tif` (`GTC`/`ALO`/`IOC`), `reduce_only` |
+| `POST /exchange/order` | single order. `market` (the **`symbol`**, e.g. `QQQ-VOL-PERP`, not the oracle ticker `QQQ-VOL`), `side` (`buy`/`sell`), `size` required; `order_type` (`market`/`limit`), `price`, `tif` (`GTC`/`ALO`/`IOC`), `reduce_only` |
 | `POST /exchange/batch_place` | up to 12 limit legs, one **place** token. Insert-only semantics |
 | `POST /exchange/batch_upsert` | up to 12 GTC/ALO quotes, one **mutate** token. Modify-or-place per `(market, side)`, at most one leg each |
 | `POST /exchange/batch_modify` | up to 12 resting orders by `order_id`, one mutate token |
@@ -224,7 +237,7 @@ before depositing anything real.
 | -------- | --- |
 | `WS /ws` | channels incl. `l2Book` (fixed 20 levels), `bbo`, `trades`, `oracle` |
 | `GET /health` | detailed; **503 when live mutations are blocked**. Pause alone still returns 200 |
-| `GET /ready` | k8s-style liveness |
+| `GET /ready` | k8s-style **readiness** — whether the instance should be sent traffic. Not liveness, which governs restarts |
 | `GET /metrics` | Prometheus text |
 | `GET,POST /mcp` | MCP transport + JSON-RPC tool catalog |
 

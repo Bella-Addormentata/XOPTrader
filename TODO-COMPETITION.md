@@ -82,7 +82,23 @@ the official rules page, sharpened by the Discord archive read 2026-08-27.
 4. **"The gate costs 0.6% of capital" — WRONG.** Observed cost of reaching
    84% of the gate was **−$166,985** (a third of seed). Three MMs sit at
    exactly zero equity.
-5. **"The gate is meant to be cleared during the cash session" — WRONG.**
+5. **"Any replication argument assuming a continuous price path is invalid
+   here" — OVERSTATED**, and so were two conclusions next to it. Corrected
+   in `docs/advanced-trading-methods.md` on 2026-08-27 after a third
+   independent review. The continuity assumption concerns the **underlying
+   equity** path; what I measured jumping was the **oracle**, and a 60s
+   trailing estimator resampled every 5s steps discontinuously whenever one
+   large return enters or leaves its window — an artifact of the estimator,
+   not evidence about QQQ/NVDA/TSLA. Alongside it: "unhedged by
+   construction" ignored that these names have deep listed options (the true
+   claim is narrower — no *on-venue* hedge, and an external one is out of
+   scope and carries basis, tenor, collateral and latency risk); and reading
+   the depth-vs-PnL correlation as "the signature of unhedgeable inventory,
+   not bad execution" claimed a cause the leaderboard cannot identify, since
+   it exposes nothing about leverage, quote placement or adverse selection.
+   All three are the same error — treating a suggestive measurement as
+   settling a question it does not address.
+6. **"The gate is meant to be cleared during the cash session" — WRONG.**
    Inferred from Gene calibrating 300M as "≈$3,000 for about 28 hours
    (roughly 80%+ of cash-session hours)", which I read as a statement about
    *which* hours count. It was a statement about magnitude only. Carried

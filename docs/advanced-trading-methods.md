@@ -391,11 +391,25 @@ it was motivated by the 2008–09 jumps that dried up the single-name variance
 swap market entirely. The *simple* variance swap is a different contract
 chosen to stay robust and hedgeable under jumps.
 
-That distinction is not pedantry for us. These oracles jump violently — a
-488% mean intrabar range at the open, 20.8% moves in two seconds. **Any
-replication argument that assumes a continuous price path is invalid in
-exactly our regime.** If we ever reason about fair value from replication,
-it must be the jump-robust formulation.
+That distinction matters to us, but the argument below was originally made
+too strongly and is corrected here.
+
+What we observed is violent movement in the **oracle** — 488% mean intrabar
+range at the open, 20.8% moves in two seconds. What the replication
+continuity assumption concerns is the path of the **underlying equity**.
+Those are not the same series, and one does not demonstrate the other: a
+60-second trailing realized-vol estimator resampled every 5s will step
+discontinuously whenever a single large return enters or leaves its window,
+which is a property of the estimator's construction rather than evidence of
+a jump in QQQ, NVDA or TSLA.
+
+So the honest statement is: **if** the underlying paths jump, the standard
+1/K² replication is the wrong tool and the jump-robust formulation is
+required — and the oracle's behaviour makes that worth testing rather than
+assuming. Settling it needs a jump test on the underlying source returns,
+not on the oracle. Until that runs, treat jump-robustness as the prudent
+default for any fair-value reasoning, not as an established fact about
+these names.
 
 **"Variance Swap Replication: Discrete or Continuous?"** (MDPI,
 *JRFM* 11(1), 11). *Unverified — 403 on fetch.* Cited for discretisation
@@ -413,17 +427,33 @@ portfolio. Permuto lists three vol perps and nothing else: no options, no
 spot vol instrument, and no venue on which the same exposure trades. There
 is also no cash-and-carry anchor, since nobody can hold realized variance.
 
-So a market maker there is **unhedged by construction**. Inventory can only
-be flattened by trading back on the same book, against the same flow that
-created it. Steps 1 and 2 are all that is available, and they control the
-*rate* of inventory accumulation without providing any way to offload it.
+So **Permuto offers no on-venue hedge**, and under XOPTrader's current scope
+the position is unhedged: inventory can only be flattened by trading back on
+the same book, against the same flow that created it. Steps 1 and 2 are all
+that is available, and they control the *rate* of inventory accumulation
+without providing any way to offload it.
 
-This is the most important practical conclusion in this section, and it is
-consistent with the live evidence: on the venue leaderboard, every market
-maker that accumulated meaningful two-sided depth is deeply negative, three
-are at exactly zero equity, and the only non-negative MM has essentially no
-depth. That is the signature of unhedgeable inventory in a jumping series,
-not of bad execution.
+⚠ **Not "unhedged by construction" — that was too strong.** QQQ, NVDA and
+TSLA have deep listed options markets, so a variance exposure in these names
+is hedgeable in principle by an external strip. What is true is narrower and
+still decisive for us: there is no hedge *on this venue*, we have no external
+options adapter and no plan to build one, and such a hedge would carry tenor
+mismatch, oracle-vs-market basis, separate collateral, latency across venues,
+and account access we do not have. The conclusion for our scope is unchanged;
+the reason is "out of scope and expensive", not "impossible".
+
+The live evidence is consistent with this: on the venue leaderboard, every
+market maker that accumulated meaningful two-sided depth is deeply negative,
+three are at exactly zero equity, and the only non-negative MM has
+essentially no depth.
+
+⚠ **That correlation does not identify a cause.** It is consistent with
+unhedgeable inventory, but it cannot separate inventory risk from leverage,
+quote placement, adverse selection or execution quality — the leaderboard
+exposes none of those. The earlier claim that this is "the signature of
+unhedgeable inventory, not of bad execution" asserted more than the data can
+carry. What survives is that depth and PnL move against each other on this
+venue, which is reason enough to treat inventory as the thing to control.
 
 Implication for any SVPerp strategy we build: **inventory limits are the
 primary risk control**, not spread. Spread governs how fast inventory
@@ -479,9 +509,11 @@ The method maps options IV, ATM straddles, and perp funding into a unified
 surface over synthetic tenors, then arbitrages the SVPerp against a
 replicating options strip.
 
-**Verified unavailable.** `/info/meta` lists exactly three markets —
-`QQQ-VOL`, `TSLA-VOL`, `NVDA-VOL` — with no option-like instrument and no
-second venue trading the same exposure. The method presumes a
+**Verified unavailable on-venue.** `/info/meta` lists exactly three markets
+— symbols `QQQ-VOL-PERP`, `TSLA-VOL-PERP`, `NVDA-VOL-PERP`, on oracle
+tickers `QQQ-VOL`, `TSLA-VOL`, `NVDA-VOL` — with no option-like instrument
+and nothing else on this venue trading the same exposure. (External listed
+options on the same names do exist; see the hedging correction above.) The method presumes a
 Deribit-plus-Hyperliquid world. This is the same wall as the replication
 leg: the arbitrage that would make the operation statistical rather than
 directional does not exist here.
@@ -491,8 +523,9 @@ directional does not exist here.
 **Verified: Permuto is a CLOB, not a vAMM.** Neither published skill
 contains any pool, vault, LP-token or deposit-share concept (zero matches),
 while the API is unambiguously order-driven: `/info/l2` snapshots,
-`POST /exchange/order` with GTC/IOC/FOK/ALO, `batch_upsert` to modify
-resting orders. There is no "deposit and act as the house" path — capital
+`POST /exchange/order` with GTC/ALO/IOC (see the note on FOK in
+`docs/permuto-api-reference.md` §2), `batch_upsert` to modify resting
+orders. There is no "deposit and act as the house" path — capital
 is committed as limit orders and liquidity is provided actively.
 
 ### Venue mechanics we had missed
