@@ -335,9 +335,11 @@ Two reasons for care:
    once closed, three accounts already at zero. Practising with the seed
    risks entering the real contest broke.
 
-**Recommended:** start observation immediately (free), and spend real money
+**Recommended:** start observation immediately (free), and spend *seed*
 early on exactly one thing — a single qualifying fill to survive the
-untraded purge.
+untraded purge. (Seed, not real money: the contest runs on simulated
+dollars with `withdrawals_enabled: false`. The cost of that fill is
+contest standing, not capital.)
 
 ## Why this is worth doing even if we never place a live perp order
 

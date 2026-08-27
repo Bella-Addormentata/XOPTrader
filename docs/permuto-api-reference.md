@@ -83,8 +83,15 @@ markets settle every **60s**. The top-level `funding_timing` (3600s) is only
 a platform fallback — reading the wrong one understates funding frequency
 by 60×.
 
-**Prices are decimal annualized IV** — `0.176` means 17.6%. A missing or
-stale oracle returns HTTP **503**.
+**Order prices are decimal annualized vol** — `0.176` means 17.6%. A missing
+or stale oracle returns HTTP **503**.
+
+⚠ The API skill calls this "IV", which conventionally means *implied*
+volatility from option prices. §0 establishes the ORACLE is a 60-second
+trailing **realized**-vol estimate. Both can be true — the traded mark is a
+forward-looking number the book agrees on, while the oracle it settles
+against prints realized — but do not read "IV" here as an options-derived
+signal. There is no options chain on this venue.
 
 ---
 

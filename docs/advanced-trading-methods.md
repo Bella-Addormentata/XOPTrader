@@ -292,9 +292,25 @@ TSLA trends, QQQ is neither.
 This is the practically important finding, and it cuts against the theory.
 Stochastic-volatility models (Heston and descendants) assume variance is
 mean-reverting — that is the defining property. **Only one of these three
-oracles behaves that way.** A maker who assumes reversion because the
-underlying is "volatility" will be right on NVDA and systematically run over
-on TSLA.
+oracles behaved that way IN THIS SAMPLE.**
+
+⚠ **This is one 7.5-minute window, and it does not support a durable
+classification of any market.** Two reasons to hold it loosely, both of
+which cut against the reading above:
+
+- **Overlapping windows confound the result.** The oracle is a 60-second
+  trailing estimate resampled every 5s, so consecutive prints share ~55/60
+  of their input and are autocorrelated *by construction*. The near-1
+  short-horizon VRs are partly that artefact, not a statement about the
+  underlying quantity.
+- **One sample, one session segment.** These are volatility oracles; their
+  character plausibly changes across the session, and the 13:00Z hour alone
+  carries a 488% mean intrabar range.
+
+So the honest statement is: **in this window NVDA reverted and TSLA
+trended**. Whether that persists is exactly what the C-03 observer exists to
+find out, and a maker should measure per market rather than inherit either
+conclusion from here.
 
 ### Implications for quoting
 
@@ -304,8 +320,10 @@ on TSLA.
    relevant σ is vol-of-vol — 12–26% here, far above what a price-based
    calibration would produce.
 2. **Reversion is an empirical question per market, not a property of the
-   asset class.** Measure the variance ratio per oracle, per session
-   segment; do not assume it from the fact that the underlying is variance.
+   asset class — and not settled by the sample above.** Measure the variance
+   ratio per oracle, per session segment, over a full day at minimum; do not
+   assume it from the fact that the underlying is variance, and do not
+   inherit it from a 7.5-minute window.
 3. **Session awareness is mandatory.** Thirteen dead hours a day is not
    noise to be smoothed — it is a different regime, and any estimator
    calibrated on a blended day will misprice both halves.
