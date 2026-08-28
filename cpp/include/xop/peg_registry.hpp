@@ -322,6 +322,91 @@ private:
     std::unordered_map<std::string, PeggedAsset> by_asset_id_;
 };
 
+// ---------------------------------------------------------------------------
+// Market-cross selection ([S29 review round 2, finding 115-3]).
+//
+// This decision used to live entirely inside Engine::market_cross_for, where
+// nothing could reach it: constructing an Engine builds every subsystem, so
+// no test invoked it, and the review was right that the cross-orientation and
+// declared-par fixes could regress with the whole suite green.
+//
+// Same treatment the rest of this project's risk logic already gets --
+// drawdown_breaker.hpp, valuation_authority.hpp, and the registry above are
+// pure headers precisely so the part that decides what money is worth can be
+// tested exhaustively without a running engine. The Engine keeps only the
+// adapter that reads config and snapshots.
+// ---------------------------------------------------------------------------
+
+/// One enabled pair, reduced to what cross selection needs.
+///
+/// `mid` is already in DISPLAY units (raw mid / mojos-per-unit), because the
+/// conversion is the caller's business and mixing it in here is how the
+/// denomination bugs elsewhere in this codebase happened.
+struct CrossCandidate {
+    std::string base_asset_id;
+    std::string quote_asset_id;
+    std::string pair_name;
+    double      mid{0.0};
+    double      spread_bps{0.0};
+};
+
+/// The chosen cross. Empty `pair_name` means none was eligible and the caller
+/// must fall back to the declared par.
+struct CrossSelection {
+    std::string pair_name;
+    double      usd_per_unit{0.0};
+};
+
+/// Pick the cross that prices `target`, and say what a unit is worth.
+///
+/// BOTH ORIENTATIONS. `<target>/<wrapper>` gives a mid denominated in the
+/// wrapper, so it multiplies by par; `<wrapper>/<target>` gives the
+/// reciprocal and divides. Accepting only the first meant an operator who
+/// configured the pair the other way round got no source, no warning, and a
+/// silent fall back to par -- on an asset flagged prefer_market_cross
+/// precisely because its peg was no longer trusted.
+///
+/// A cross must clear `max_spread_bps`: on these books a midpoint's
+/// worst-case location error is about half the spread, so a wide book is
+/// worse evidence than the declared par it would override. `spread_bps` of 0
+/// means one-sided or crossed and never qualifies.
+[[nodiscard]] inline CrossSelection select_market_cross(
+    const std::string& target,
+    const std::vector<CrossCandidate>& candidates,
+    const PegRegistry& registry,
+    double max_spread_bps) noexcept
+{
+    const auto is_par_wrapper = [&registry](const std::string& id) {
+        const auto* a = registry.find(id);
+        return a != nullptr && a->enforce && !a->prefer_market_cross;
+    };
+
+    for (const auto& c : candidates) {
+        const bool direct  = (c.base_asset_id == target)
+                          && is_par_wrapper(c.quote_asset_id);
+        const bool inverse = (c.quote_asset_id == target)
+                          && is_par_wrapper(c.base_asset_id);
+        if (!direct && !inverse) continue;
+
+        // The mid is denominated in the CROSS wrapper, so it must go through
+        // that wrapper's declared par -- returning it raw reports wrapper
+        // units as dollars. nullopt (a non-USD peg with no FX rate) means
+        // this cross cannot yield a USD figure at all.
+        const std::string& wrapper =
+            direct ? c.quote_asset_id : c.base_asset_id;
+        const auto par = registry.usd_par_value(wrapper);
+        if (!par) continue;
+
+        if (!(c.mid > 0.0) || !std::isfinite(c.mid)) continue;
+        if (!(c.spread_bps > 0.0) || c.spread_bps > max_spread_bps) continue;
+
+        const double usd = direct ? c.mid * *par : *par / c.mid;
+        if (!std::isfinite(usd) || !(usd > 0.0)) continue;
+        return CrossSelection{c.pair_name, usd};
+    }
+    return {};
+}
+
 }  // namespace xop
 
 #endif  // XOP_PEG_REGISTRY_HPP

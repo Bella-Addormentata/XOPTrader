@@ -11409,61 +11409,33 @@ double Engine::usd_per_xch() const
 // from this single answer so they cannot drift apart.
 Engine::CrossQuote Engine::market_cross_for(const PairConfig& pc) const
 {
-    // [PEG review round 5] ONE place decides which cross prices a
-    // market-cross asset AND what that cross is worth.  The eligibility test
-    // and the price used to live in two copies -- here and in the loop
-    // inside quote_usd_factor -- under a comment warning they must stay
-    // identical, which is a duplication that only holds while someone
-    // remembers.  Now the price is computed once and the source-pair query
-    // is a projection of it, so they cannot disagree by construction.
-    //
-    // BOTH ORIENTATIONS.  Both copies previously matched only
-    // <target>/<wrapper>.  The engine supports either direction (the example
-    // config ships wmilliETH.b/XCH), so an operator configuring
-    // <wrapper>/<target> got no source, no warning, and a silent fall back
-    // to declared par -- the "valued at par while impaired" outcome S30 was
-    // filed about, reachable through pair orientation alone.
+    // [review round 2, 115-3] The DECISION lives in peg_registry.hpp so it
+    // can be tested without constructing an Engine -- which builds every
+    // subsystem, which is why nothing tested this and why the orientation
+    // and declared-par fixes could have regressed with the suite green.
+    // What is left here is the adapter: read config and snapshots, convert
+    // mids to display units, hand over.
     constexpr double kMaxCrossSpreadBps = 300.0;
-    const AssetId& target = pc.quote_asset_id;
 
+    std::vector<CrossCandidate> candidates;
+    candidates.reserve(config_.pairs.size());
     for (const auto& other : config_.pairs) {
         if (!other.enabled) continue;
-
-        const bool direct  = (other.base_asset_id == target)
-                          && is_par_wrapper_asset(other.quote_asset_id);
-        const bool inverse = (other.quote_asset_id == target)
-                          && is_par_wrapper_asset(other.base_asset_id);
-        if (!direct && !inverse) continue;
-
-        // The mid is denominated in the CROSS wrapper, so it must be
-        // converted through that wrapper's declared par exactly as
-        // usd_per_xch does -- returning it raw reports wrapper units as
-        // dollars.  nullopt (a non-USD peg with no FX rate) means this cross
-        // cannot yield a USD factor, so skip it.
-        const AssetId& wrapper =
-            direct ? other.quote_asset_id : other.base_asset_id;
-        const auto par = declared_usd_par(wrapper);
-        if (!par) continue;
-
-        // [S20] The S17 tight-spread test already establishes a live
-        // two-sided book here, which is the same evidence grade would ask
-        // for; adding grade would only fold in the CEX-availability
-        // dependency described at usd_per_xch.  spread_bps is 0 for
-        // one-sided or crossed books, which also (correctly) selects par.
         auto snap = state_->get_market(other.name);
-        if (!(snap.mid_price > 0) || !(snap.spread_bps > 0.0)
-            || snap.spread_bps > kMaxCrossSpreadBps) {
-            continue;
-        }
-        const double mid = static_cast<double>(snap.mid_price)
-                         / static_cast<double>(kMojosPerXch);
-        if (!(mid > 0.0)) continue;
-
-        // direct : mid is WRAPPER per target -> multiply by par.
-        // inverse: mid is TARGET per wrapper -> divide.
-        return CrossQuote{other.name, direct ? mid * *par : *par / mid};
+        candidates.push_back(CrossCandidate{
+            other.base_asset_id,
+            other.quote_asset_id,
+            other.name,
+            static_cast<double>(snap.mid_price)
+                / static_cast<double>(kMojosPerXch),
+            snap.spread_bps,
+        });
     }
-    return {};
+
+    const auto sel = select_market_cross(
+        pc.quote_asset_id, candidates, config_.pegged_assets,
+        kMaxCrossSpreadBps);
+    return CrossQuote{sel.pair_name, sel.usd_per_unit};
 }
 
 std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
