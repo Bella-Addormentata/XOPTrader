@@ -144,15 +144,35 @@ namespace xop::risk {
     bool   grace_elapsed,
     bool   valuation_degraded,
     bool   all_held_assets_unpriced,
-    double peak_equity_usd) noexcept
+    double peak_equity_usd,
+    bool   holding_anything = true) noexcept
 {
-    if (!grace_elapsed || !valuation_degraded) {
+    if (!grace_elapsed) {
         return false;
     }
-    if (all_held_assets_unpriced) {
+
+    // [review] A ZERO PEAK IS UNPROTECTED WHATEVER THE VALUATION IS DOING,
+    // and this check used to sit under the `degraded` guard where a clean
+    // cycle could step past it.
+    //
+    // The gap: start degraded, become clean near the end of grace. Then
+    // `valuation_degraded` is false, but ValuationAuthorityGate still
+    // refuses peak updates for its debounce run of clean cycles -- so the
+    // peak stays at zero and equity_drawdown_frac() returns 0.0 against it
+    // for up to nine post-grace cycles. The breaker is not merely blunted,
+    // it cannot fire at all, which is the same inert state the whole S27
+    // work exists to end.
+    //
+    // Gated on holding something, because a genuinely empty book has a zero
+    // peak for the honest reason and there is nothing there to protect.
+    if (holding_anything && !(peak_equity_usd > 0.0)) {
         return true;
     }
-    return !(peak_equity_usd > 0.0);
+
+    if (!valuation_degraded) {
+        return false;
+    }
+    return all_held_assets_unpriced;
 }
 
 /// Equity drawdown fraction, USD in / dimensionless out:

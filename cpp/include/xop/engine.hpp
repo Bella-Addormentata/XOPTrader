@@ -1149,6 +1149,13 @@ private:
     /// value the peak was frozen at, so the drawdown reads 0 forever.
     bool valuation_all_unpriced_{false};
 
+    /// Whether the last valuation saw ANY held asset.
+    ///
+    /// Distinguishes a zero peak that is honest -- an empty book has nothing
+    /// to protect -- from a zero peak while holding, which leaves the
+    /// drawdown breaker unable to fire at all.
+    bool valuation_holds_anything_{false};
+
     /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
     /// every heartbeat and would otherwise emit a warn line per asset per
     /// block; the operator needs to see each one ONCE, loudly. Not cleared

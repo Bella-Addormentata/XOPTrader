@@ -1833,6 +1833,37 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
     }
 
+    // [S27 review] LATCH BEFORE TRADING, not in Step 13.
+    //
+    // unvaluable_book_must_fail_closed() was only evaluated in
+    // step_check_alerts(), which runs AFTER ladder generation, offer
+    // management, drift correction and arbitrage -- so the first cycle to
+    // discover an unvaluable book could post offers and execute takes before
+    // the flag that is supposed to stop it existed.
+    //
+    // The verdict this reads is the PREVIOUS cycle's, which is sufficient
+    // and is why it can run here at all: the predicate requires the drawdown
+    // grace to have elapsed, and the valuation flags have been recomputed
+    // every cycle throughout that grace. So by the cycle the condition first
+    // holds, the inputs are already true and the latch closes before this
+    // cycle trades rather than after.
+    //
+    // Idempotent -- Step 13 still evaluates it and owns the operator-facing
+    // logging and alert, which needs this cycle's equity figure.
+    if (risk::unvaluable_book_must_fail_closed(
+            drawdown_grace_remaining_ == 0,
+            valuation_degraded_,
+            valuation_all_unpriced_,
+            peak_equity_hwm_usd_,
+            valuation_holds_anything_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        state_->set_status(BotStatus::Paused);
+        spdlog::error("[Engine] [S27] the book cannot be valued and the "
+                      "grace has elapsed -- pausing BEFORE this cycle trades. "
+                      "Step 13 will report the detail.");
+    }
+
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
         spdlog::error("[Engine] Step 7 (ladder) failed: {}", e.what());
@@ -12051,6 +12082,10 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
         // read as a crash".
         valuation_all_unpriced_ =
             (held_count > 0 && live_count == 0 && !any_fresh_carry_bridging);
+        // Needed by the fail-closed predicate to tell "no peak because the
+        // book is empty" -- honest and harmless -- from "no peak while
+        // holding", which is the unprotected state.
+        valuation_holds_anything_ = (held_count > 0);
     }
     return risk::portfolio_equity_usd(inputs);
 }
@@ -14035,7 +14070,8 @@ void Engine::step_check_alerts(BlockHeight block_height)
             drawdown_grace_remaining_ == 0,
             valuation_degraded_,
             valuation_all_unpriced_,
-            peak_equity_hwm_usd_)
+            peak_equity_hwm_usd_,
+            valuation_holds_anything_)
         && !breaker_pause_active_) {
         breaker_pause_active_ = true;
         state_->set_status(BotStatus::Paused);

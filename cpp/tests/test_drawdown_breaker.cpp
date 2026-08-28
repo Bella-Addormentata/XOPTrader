@@ -317,9 +317,35 @@ TEST(DrawdownBreakerTest, S27_DoesNotFailClosedDuringStartupGrace) {
     EXPECT_FALSE(unvaluable_book_must_fail_closed(false, true, false, 0.0));
 }
 
-TEST(DrawdownBreakerTest, S27_DoesNotFailClosedOnACleanValuation) {
-    EXPECT_FALSE(unvaluable_book_must_fail_closed(true, false, false, 0.0));
+TEST(DrawdownBreakerTest, S27_DoesNotFailClosedOnACleanValuationWithAPeak) {
     EXPECT_FALSE(unvaluable_book_must_fail_closed(true, false, false, 500.0));
+}
+
+TEST(DrawdownBreakerTest, S27_ACleanValuationWithNoPeakStillFailsClosed) {
+    // [review] This asserted the opposite and was wrong.
+    //
+    // Start degraded, become clean near the end of grace: valuation_degraded
+    // is false, but ValuationAuthorityGate still refuses peak updates for its
+    // debounce run -- so the peak stays at zero and equity_drawdown_frac()
+    // returns 0.0 against it for up to nine post-grace cycles. The breaker is
+    // not blunted, it cannot fire at all, which is the inert state S27 exists
+    // to end.
+    EXPECT_TRUE(unvaluable_book_must_fail_closed(
+        true, false, false, 0.0, /*holding_anything=*/true));
+}
+
+TEST(DrawdownBreakerTest, S27_AnEmptyBookWithNoPeakIsNotAFault) {
+    // A zero peak is honest when there is nothing to protect, and pausing on
+    // it would make an idle engine unable to start.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        true, false, false, 0.0, /*holding_anything=*/false));
+    // Degraded but empty is still not a fault: degradation can be raised by
+    // an asset that has since been sold. all_held_assets_unpriced is NOT
+    // tested here because it is defined as "something held and nothing
+    // live", so it cannot be true of an empty book -- asserting on that
+    // combination would be asserting on a state the engine cannot produce.
+    EXPECT_FALSE(unvaluable_book_must_fail_closed(
+        true, true, false, 0.0, /*holding_anything=*/false));
 }
 
 TEST(DrawdownBreakerTest, S27_ANegativeOrNanPeakCountsAsNoPeak) {
