@@ -33,6 +33,7 @@ converting at the edges avoids the inverted-rate class of bug entirely.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Iterable, Optional, Sequence
 
@@ -419,10 +420,16 @@ def remaining_route_cap(route_cap: float, first_leg_deviation: float) -> float:
     watching in the dialog. No single hop goes further from its own reference
     than the number the operator typed.
     """
-    if not (1.0 + first_leg_deviation > 0.0):
-        # A non-positive or NaN realised rate cannot come from a leg that
-        # selected offers, but the division below would answer with nonsense
-        # rather than refuse, so fall back to the blind bound.
+    # [audit] The guard has to catch INFINITY, which is the one degenerate
+    # value that actually arrives. `Leg.realised_rate` never returns a
+    # non-positive number -- its sole degenerate result is float("inf"), when
+    # receive_total is zero -- and rate_deviation_frac then yields inf too.
+    # `1.0 + inf > 0.0` is True, so the old guard did not fire: control fell
+    # through to a division by infinity, producing -1.0, and the second leg
+    # was handed a NEGATIVE cap that refuses every offer. The fallback branch
+    # was dead for the exact case it was written for.
+    if not math.isfinite(first_leg_deviation) or not (
+            1.0 + first_leg_deviation > 0.0):
         return per_leg_cap(route_cap, 2)
     return min(route_cap, (1.0 + route_cap) / (1.0 + first_leg_deviation) - 1.0)
 
@@ -664,35 +671,28 @@ def build_plan(
     )
 
     # Direct wins ties and near-ties; the two-hop route has to be materially
-    # better to justify a second all-or-nothing take. "Materially" is coverage
-    # of the source budget -- but measured as source that actually REACHES THE
-    # TARGET, not source spent on the first hop.
+    # better to justify a second all-or-nothing take.
     #
-    # [review round 3] Comparing against first.give_total was wrong and could
-    # lose money: a first hop spending 1,000 units followed by a second hop
-    # absorbing only 1 of them "beat" a 999-unit direct fill, delivered almost
-    # no target, and stranded the rest as hop_residual in an asset the
-    # operator never asked to hold. Only the pro-rata share of the first leg
-    # whose output the second leg actually consumed counts as delivered.
+    # "Better" is TARGET RECEIVED, and getting to that took three attempts.
+    # Round 3 compared source SPENT on the first hop, so a hop spending 1,000
+    # units followed by a second absorbing 1 of them beat a 999-unit direct
+    # fill while delivering almost no target. Round 4 fixed that to source
+    # DELIVERED -- the pro-rata share whose output the second leg actually
+    # consumed -- which is closer but still the wrong quantity: an audit
+    # produced a counterexample where a permitted-but-expensive second hop
+    # wins on delivered source while handing the operator strictly LESS of
+    # the target than the direct fill would have.
     #
-    # [review round 4] Cross-multiplied rather than compared as floats.  The
-    # delivered share is give1 * give2 / receive1, and these are raw units: at
-    # 10^12 mojos per XCH, 2^53 is only ~9,007 XCH, so an ordinary position
-    # overflows exact float integers.  Rounding DOWN would be harmless here --
-    # the test is deliberately biased toward direct -- but it rounds up too,
-    # and then a two-hop route delivering a hair LESS than the direct fill
-    # wins a comparison it should have lost.  Python ints are arbitrary
-    # precision, so the cross-multiplied form is exact at any size.
-    # [review round 5] "Near-ties" was written into the contract above and
-    # never implemented: the test was `>=`, so a two-hop route covering ONE
-    # more mojo won, paying a second fee and a second all-or-nothing failure
-    # window for nothing. Direct now wins unless two hops deliver at least
-    # MIN_TWO_HOP_ADVANTAGE more, which is what "materially better" meant.
+    # The operator's outcome is the target in their wallet. Compare that
+    # directly and the whole class disappears -- both routes draw on the same
+    # budget, and slippage is already bounded per leg, so more target for
+    # that budget is simply better. Integers throughout, no rate arithmetic,
+    # nothing to overflow.
     if second.offers and direct_leg is not None and direct_leg.offers:
-        delivered = first.give_total * second.give_total
-        direct_scaled = direct_leg.give_total * first.receive_total
-        if (delivered * _ADVANTAGE_DEN
-                <= direct_scaled * _ADVANTAGE_NUM):  # noqa: E501
+        two_hop_target = second.receive_total
+        direct_target = direct_leg.receive_total
+        if (two_hop_target * _ADVANTAGE_DEN
+                <= direct_target * _ADVANTAGE_NUM):
             return _single_leg_plan(
                 source_asset, target_asset, direct_leg, budget, counters)
 

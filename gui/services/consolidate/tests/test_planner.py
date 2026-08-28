@@ -946,3 +946,60 @@ def test_the_package_facade_exports_denomination():
 
     assert hasattr(pkg, "denomination")
     assert "denomination" in pkg.__all__
+
+
+def test_a_two_hop_route_delivering_less_target_never_wins():
+    """[audit] The comparison used to score SOURCE delivered, not target.
+
+    So a permitted-but-expensive second hop could win while handing the
+    operator strictly less of the thing they asked for.
+    """
+    direct = offer("direct", 1_000, 900, give_asset=BYC, recv_asset=XCH)
+    hop1 = offer("h1", 1_000, 1_000, give_asset=BYC, recv_asset="usds")
+    # Consumes the whole first hop but returns far less target.
+    hop2 = offer("h2", 1_000, 400, give_asset="usds", recv_asset=XCH)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=1_000 * denomination(BYC),
+        direct_offers=[direct],
+        direct_anchor=Anchor(rate=1.111, source="test"),
+        first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
+        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=2.5, source="t"),
+        max_slippage_frac=0.10,
+    )
+    assert len(plan.legs) == 1
+    assert plan.receive_total == direct.receive_amount
+
+
+def test_a_two_hop_route_delivering_materially_more_target_wins():
+    direct = offer("direct", 1_000, 400, give_asset=BYC, recv_asset=XCH)
+    hop1 = offer("h1", 1_000, 1_000, give_asset=BYC, recv_asset="usds")
+    hop2 = offer("h2", 1_000, 900, give_asset="usds", recv_asset=XCH)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=1_000 * denomination(BYC),
+        direct_offers=[direct],
+        direct_anchor=Anchor(rate=2.5, source="test"),
+        first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
+        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=1.111, source="t"),
+        max_slippage_frac=0.10,
+    )
+    assert len(plan.legs) == 2
+    assert plan.receive_total > direct.receive_amount
+
+
+def test_an_infinite_first_leg_deviation_falls_back_rather_than_refusing_all():
+    """[audit] inf is the only degenerate value that reaches this.
+
+    realised_rate returns inf when receive_total is zero, so
+    `1.0 + inf > 0.0` was True and the guard never fired: the division by
+    infinity produced -1.0, a NEGATIVE cap that rejects every offer.
+    """
+    from gui.services.consolidate.planner import (
+        per_leg_cap,
+        remaining_route_cap,
+    )
+
+    assert remaining_route_cap(0.10, float("inf")) == per_leg_cap(0.10, 2)
+    assert remaining_route_cap(0.10, float("nan")) == per_leg_cap(0.10, 2)
+    assert remaining_route_cap(0.10, float("inf")) > 0.0
