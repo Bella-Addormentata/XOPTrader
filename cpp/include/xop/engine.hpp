@@ -425,6 +425,18 @@ private:
     std::atomic<std::int64_t> last_beat_ms_{0};
     std::atomic<bool>         watchdog_stop_{false};
 
+    /// Set once the switch has fired, and never cleared without a restart.
+    ///
+    /// Distinct from the Watchdog's own `fired_`, which re-arms on a newer
+    /// heartbeat -- correct for suppressing repeat cancel RPCs, wrong as a
+    /// trading gate.  A stalled cycle that finally completes stamps a fresh
+    /// beat, and without this flag the very next Step 8 would post a new
+    /// ladder on top of cancel spends that may not have confirmed yet.
+    /// Restart-only for the same reason `breaker_pause_active_` is: the
+    /// switch firing means the book state is unknown until a human looks.
+    std::atomic<bool>         watchdog_fired_{false};
+    bool                      watchdog_skip_warned_{false};
+
     void start_watchdog();
     void stop_watchdog();
     void watchdog_loop();

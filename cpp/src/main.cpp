@@ -395,17 +395,38 @@ int main(int argc, char* argv[]) {
 #endif
     );
 
+    if (cli.dry_run) {
+        spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
+    }
+
     // ------------------------------------------------------------------
     // 3a. Kill any old xop_trader instances still running.
     //
     //     This ensures only one engine is active at a time -- prevents
     //     double-posting offers, port conflicts on the Prometheus
     //     exporter, and wallet RPC contention.
+    //
+    //     [S31] NOT in dry run. This used to run before cli.dry_run was
+    //     ever inspected, which made a dry run the most dangerous thing in
+    //     the repository: it terminated the live engine -- on Windows via
+    //     TerminateProcess, with no graceful path and therefore no
+    //     cancel_all() -- and the replacement process then neither posts
+    //     nor cancels, because both the watchdog and shutdown()'s
+    //     cancellation are dry-run gated. Startup reconciliation is NOT
+    //     gated, so the dry run would even adopt the orphans it could not
+    //     cancel. That is the ten-orphaned-offers incident of 2026-08-26,
+    //     reachable by running an inspection command.
+    //
+    //     A dry run has no reason to want the live engine dead: it submits
+    //     nothing, so there is no double-posting to prevent. The residual
+    //     conflicts are the Prometheus port and wallet RPC contention,
+    //     which are inconveniences rather than money.
     // ------------------------------------------------------------------
-    kill_old_instances();
-
     if (cli.dry_run) {
-        spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
+        spdlog::warn("[S31] dry run -- NOT killing any running engine. A live "
+                     "instance keeps its book and its dead man's switch.");
+    } else {
+        kill_old_instances();
     }
 
     // ------------------------------------------------------------------

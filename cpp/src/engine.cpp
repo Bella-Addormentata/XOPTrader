@@ -621,7 +621,16 @@ void Engine::start_watchdog()
         return;
     }
     if (dry_run_) {
-        spdlog::info("[Engine] [S31] dry run -- watchdog not started");
+        // NOT silently. A dry run reaches this line having already killed
+        // the live engine -- main.cpp calls kill_old_instances() before it
+        // ever inspects cli.dry_run, and on Windows that is an immediate
+        // TerminateProcess with no graceful cancel. So the process most
+        // likely to be running while a real book rests unmanaged is exactly
+        // this one, and an info-level "not started" reads like a normal
+        // startup line in a log nobody is watching.
+        spdlog::warn("[Engine] [S31] dry run -- dead man's switch NOT armed. "
+                     "If a live engine was replaced by this process, its "
+                     "offers are resting with nothing watching them.");
         return;
     }
     watchdog_stop_.store(false, std::memory_order_relaxed);
@@ -649,6 +658,14 @@ void Engine::watchdog_loop()
     risk::Watchdog watchdog{
         static_cast<std::int64_t>(config_.risk.watchdog_stall_seconds) * 1000};
 
+    // Arm from NOW, which is what closes the startup hole. last_beat_ms_ is
+    // stamped only when a cycle COMPLETES, so it is 0 for the whole of
+    // startup -- and startup_reconcile() adopts already-resting offers into
+    // State well before the first cycle finishes. Without an arm time a
+    // wedge in open_connections() or the first poll left those adopted
+    // offers live with the switch permanently silent.
+    watchdog.arm(now_ms());
+
     // Its OWN io_context and its OWN wallet client.  Reusing the engine's
     // would defeat the entire point.
     while (!watchdog_stop_.load(std::memory_order_relaxed)) {
@@ -658,6 +675,16 @@ void Engine::watchdog_loop()
         const auto action = watchdog.tick(
             last_beat_ms_.load(std::memory_order_relaxed), now_ms());
         if (action != risk::WatchdogAction::Fire) continue;
+
+        // Latch BEFORE the cancel, and never clear it here. The Watchdog's
+        // own fired_ re-arms on a newer heartbeat, which is right for
+        // suppressing repeat RPCs but wrong as a trading gate: the wedged
+        // cycle eventually completes, stamps a fresh beat, and the next
+        // Step 8 would post a new ladder straight into the unconfirmed
+        // cancel spends. This flag is restart-only, the same contract
+        // breaker_pause_active_ already carries, because "the switch fired"
+        // means the book state is unknown until someone looks.
+        watchdog_fired_.store(true, std::memory_order_release);
 
         const auto stale_ms =
             now_ms() - last_beat_ms_.load(std::memory_order_relaxed);
@@ -2017,7 +2044,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // trades, and a pause that stops passive posting while active taking
     // continues is not a pause -- the audit found the latch gated Step 8
     // alone while every taker path kept trading.
-    if (!wallet_circuit_open_ && !breaker_pause_active_) {
+    if (!wallet_circuit_open_ && !breaker_pause_active_
+            && !watchdog_fired_.load(std::memory_order_acquire)) {
         try { co_await step_run_drift_corrector(block_height); }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 9f (drift corrector) failed: {}", e.what());
@@ -2027,7 +2055,21 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // [T1-03] Step 8 is a coroutine (co_awaits cancel_stale + post_quotes).
     // [T3-10] Gate Step 8 during Crash/Recovery states.
     // Also gated by the wallet circuit breaker and GUI pause flag.
-    if (wallet_circuit_open_) {
+    if (watchdog_fired_.load(std::memory_order_acquire)) {
+        // [S31] First, ahead of every other reason to skip. The switch
+        // cancelled the book on a secure cancel, which settles on chain and
+        // not on the RPC returning -- so at this moment we do not know which
+        // offers are gone, which are still spendable, and which a
+        // counterparty is taking right now. Posting a fresh ladder into that
+        // is how the same coins get committed twice.
+        if (!watchdog_skip_warned_) {
+            spdlog::warn("[Engine] Step 8 SKIPPED: the dead man's switch has "
+                         "fired -- no new offers until restart");
+            watchdog_skip_warned_ = true;
+        } else {
+            spdlog::debug("[Engine] Step 8 SKIPPED: dead man's switch fired");
+        }
+    } else if (wallet_circuit_open_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: wallet circuit breaker open");
     } else if (gui_pause_active_) {
         spdlog::debug("[Engine] Step 8 SKIPPED: trading paused by GUI");
@@ -2075,7 +2117,8 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     } // end of !xch_recovery_mode_ block
 
-    if (!breaker_pause_active_) {
+    if (!breaker_pause_active_
+            && !watchdog_fired_.load(std::memory_order_acquire)) {
         try { co_await step_check_arbitrage(block_height); }
         catch (const std::exception& e) {
             spdlog::error("[Engine] Step 9 (arbitrage) failed: {}", e.what());

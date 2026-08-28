@@ -86,6 +86,35 @@ struct WatchdogInput {
     std::int64_t threshold_ms{0};
     /// Whether the switch has already fired for the current stall.
     bool already_fired{false};
+
+    /// When the watchdog was armed.  0 means "not armed", which preserves
+    /// the original never-fire-before-the-first-heartbeat behaviour.
+    ///
+    /// This exists because the startup window was the one place the switch
+    /// could not reach.  `last_beat_ms` is stamped only at the END of a
+    /// completed cycle, so before the first cycle finishes it is 0 -- and
+    /// treating 0 as "not started, stay quiet" left the engine unprotected
+    /// during exactly the phase that ADOPTS live offers: startup
+    /// reconciliation restores resting offers into State before any
+    /// heartbeat has ever landed.  A wedge in connection setup or the first
+    /// poll therefore left a live book with the watchdog permanently silent,
+    /// which is the incident this whole switch exists to prevent.
+    std::int64_t armed_at_ms{0};
+
+    /// How long startup may take before an absent first heartbeat counts as
+    /// a stall.  0 falls back to `threshold_ms`.
+    ///
+    /// Separate from `threshold_ms` because startup is legitimately slower
+    /// than a steady-state cycle -- it opens connections and reconciles from
+    /// scratch.  Measured basis for defaulting it to `threshold_ms`
+    /// nonetheless: 2,419 completed cycles across the current engine's logs
+    /// run p50 3.1 s, p90 11.1 s, max 35.9 s, and the slowest cycle in the
+    /// older v0.7.x logs is 531 s.  The 600 s default therefore sits above
+    /// every cycle this engine has ever recorded, with ~17x headroom on
+    /// current behaviour, while the wedge it exists to catch ran
+    /// 14,241,482 ms.  An operator whose startup is genuinely slower should
+    /// raise it rather than lose the protection.
+    std::int64_t startup_grace_ms{0};
 };
 
 /// Decide what to do this tick.
@@ -100,7 +129,22 @@ struct WatchdogInput {
         return WatchdogAction::Healthy;   // disabled
     }
     if (in.last_beat_ms <= 0) {
-        return WatchdogAction::NotStartedYet;
+        // Never beaten.  Unarmed callers keep the old behaviour; an armed
+        // watchdog gives startup a grace period and then treats a missing
+        // first heartbeat exactly like a stalled one, because from the
+        // book's point of view they are the same thing: offers are resting
+        // and nothing is managing them.
+        if (in.armed_at_ms <= 0) {
+            return WatchdogAction::NotStartedYet;
+        }
+        const std::int64_t grace = in.startup_grace_ms > 0
+                                 ? in.startup_grace_ms : in.threshold_ms;
+        const std::int64_t since_arm = in.now_ms - in.armed_at_ms;
+        if (since_arm < grace) {
+            return WatchdogAction::NotStartedYet;
+        }
+        return in.already_fired ? WatchdogAction::AlreadyFired
+                                : WatchdogAction::Fire;
     }
 
     // A clock that has gone BACKWARDS yields a negative age.  Treat that as
@@ -126,6 +170,18 @@ public:
     explicit constexpr Watchdog(std::int64_t threshold_ms) noexcept
         : threshold_ms_(threshold_ms) {}
 
+    /// Arm at `now_ms`, starting the startup grace period.
+    ///
+    /// A separate call rather than a constructor argument so that an
+    /// un-armed Watchdog keeps the original semantics: existing callers and
+    /// tests that never arm can still never fire before a first heartbeat.
+    constexpr void arm(std::int64_t now_ms,
+                       std::int64_t startup_grace_ms = 0) noexcept
+    {
+        armed_at_ms_      = now_ms;
+        startup_grace_ms_ = startup_grace_ms;
+    }
+
     /// Evaluate one tick and update internal state.
     [[nodiscard]] constexpr WatchdogAction tick(
         std::int64_t last_beat_ms, std::int64_t now_ms) noexcept
@@ -138,7 +194,8 @@ public:
         }
 
         const WatchdogAction a = watchdog_decide(
-            WatchdogInput{last_beat_ms, now_ms, threshold_ms_, fired_});
+            WatchdogInput{last_beat_ms, now_ms, threshold_ms_, fired_,
+                          armed_at_ms_, startup_grace_ms_});
 
         if (a == WatchdogAction::Fire) {
             fired_ = true;
@@ -156,6 +213,8 @@ private:
     std::int64_t threshold_ms_{0};
     bool         fired_{false};
     std::int64_t fired_on_beat_ms_{0};
+    std::int64_t armed_at_ms_{0};
+    std::int64_t startup_grace_ms_{0};
 };
 
 }  // namespace xop::risk

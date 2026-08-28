@@ -141,3 +141,83 @@ TEST(Watchdog, NormalCycleDurationsDoNotTripIt) {
         beat = now;
     }
 }
+
+// ---------------------------------------------------------------------------
+// [S31] The startup window.  last_beat_ms is stamped only when a cycle
+// COMPLETES, so it is 0 for the whole of startup -- and startup_reconcile()
+// adopts already-resting offers into State before the first cycle finishes.
+// An unarmed watchdog answers NotStartedYet forever, which left exactly that
+// window unprotected.
+// ---------------------------------------------------------------------------
+
+TEST(Watchdog, UnarmedKeepsTheOriginalNeverFireBeforeFirstBeat) {
+    // Callers that never arm must not change behaviour.
+    Watchdog wd(10 * kMin);
+    EXPECT_EQ(wd.tick(0, 1'000 * kMin), WatchdogAction::NotStartedYet);
+}
+
+TEST(Watchdog, ArmedStaysQuietWhileStartupIsStillPlausible) {
+    Watchdog wd(10 * kMin);
+    wd.arm(1);
+    EXPECT_EQ(wd.tick(0, 1 + 1 * kMin), WatchdogAction::NotStartedYet);
+    EXPECT_EQ(wd.tick(0, 1 + 9 * kMin), WatchdogAction::NotStartedYet);
+}
+
+TEST(Watchdog, ArmedFiresWhenTheFirstHeartbeatNeverArrives) {
+    // The gap this closes: a wedge in open_connections() or the first poll,
+    // with offers already adopted by startup reconciliation.
+    Watchdog wd(10 * kMin);
+    wd.arm(1);
+    EXPECT_EQ(wd.tick(0, 1 + 10 * kMin), WatchdogAction::Fire);
+    // Exactly once -- a wedged engine must not be sprayed with cancel RPCs.
+    EXPECT_EQ(wd.tick(0, 1 + 11 * kMin), WatchdogAction::AlreadyFired);
+    EXPECT_EQ(wd.tick(0, 1 + 90 * kMin), WatchdogAction::AlreadyFired);
+}
+
+TEST(Watchdog, AFirstHeartbeatInsideTheGraceRestoresNormalSemantics) {
+    Watchdog wd(10 * kMin);
+    wd.arm(1);
+    const std::int64_t beat = 1 + 5 * kMin;
+    EXPECT_EQ(wd.tick(beat, beat),             WatchdogAction::Healthy);
+    EXPECT_EQ(wd.tick(beat, beat + 9 * kMin),  WatchdogAction::Healthy);
+    EXPECT_EQ(wd.tick(beat, beat + 10 * kMin), WatchdogAction::Fire);
+}
+
+TEST(Watchdog, AHeartbeatAfterAStartupFireClearsTheLatch) {
+    // The engine came alive late.  The watchdog's own latch re-arms so it can
+    // fire again on a LATER stall; the engine-side watchdog_fired_ flag is the
+    // one that stays set until restart.
+    Watchdog wd(10 * kMin);
+    wd.arm(1);
+    ASSERT_EQ(wd.tick(0, 1 + 10 * kMin), WatchdogAction::Fire);
+    const std::int64_t beat = 1 + 11 * kMin;
+    EXPECT_EQ(wd.tick(beat, beat), WatchdogAction::Healthy);
+    EXPECT_FALSE(wd.fired());
+    EXPECT_EQ(wd.tick(beat, beat + 10 * kMin), WatchdogAction::Fire);
+}
+
+TEST(Watchdog, AnExplicitStartupGraceOverridesTheThreshold) {
+    // An operator whose startup is genuinely slow raises the grace rather
+    // than losing the protection.
+    Watchdog wd(10 * kMin);
+    wd.arm(1, 30 * kMin);
+    EXPECT_EQ(wd.tick(0, 1 + 20 * kMin), WatchdogAction::NotStartedYet);
+    EXPECT_EQ(wd.tick(0, 1 + 30 * kMin), WatchdogAction::Fire);
+}
+
+TEST(Watchdog, ArmingDoesNotResurrectADisabledWatchdog) {
+    // threshold 0 means the operator turned it off; arming must not override.
+    Watchdog wd(0);
+    wd.arm(1);
+    EXPECT_EQ(wd.tick(0, 1 + 1'000 * kMin), WatchdogAction::Healthy);
+}
+
+TEST(Watchdog, StartupGraceIsMeasuredFromArmNotFromZero) {
+    // A process armed late on a monotonic clock that is already large must
+    // still get its full grace, not fire instantly because now_ms is big.
+    Watchdog wd(10 * kMin);
+    const std::int64_t armed = 5'000'000;
+    wd.arm(armed);
+    EXPECT_EQ(wd.tick(0, armed + 1 * kMin), WatchdogAction::NotStartedYet);
+    EXPECT_EQ(wd.tick(0, armed + 10 * kMin), WatchdogAction::Fire);
+}
