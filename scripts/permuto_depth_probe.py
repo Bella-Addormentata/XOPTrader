@@ -53,7 +53,16 @@ def get(path, timeout=20):
 
 def sample():
     """One observation. Returns a dict; never raises."""
-    row = {"ts": datetime.now(timezone.utc).isoformat()}
+    # [review] BRACKET the capture, do not stamp it once at the top.
+    #
+    # The oracle is fetched after every paginated leaderboard page, so around
+    # the cash close a row could pair a leaderboard read taken while the
+    # market was still live with an oracle read already showing the frozen
+    # carried value -- and the analyzer would then count live accrual as
+    # carried. One timestamp cannot express that; two can, and the analyzer
+    # rejects any row whose bracket straddles an oracle transition.
+    t_start = datetime.now(timezone.utc)
+    row = {"ts": t_start.isoformat(), "t_leaderboard_start": t_start.isoformat()}
     try:
         # Page. The default page size is 20 and this asked for 100 without
         # checking the total -- so a field larger than 100 was silently
@@ -89,6 +98,7 @@ def sample():
     except Exception as e:  # noqa: BLE001 - a bad sample must not end the run
         row["lb_error"] = "%s: %s" % (type(e).__name__, e)
     try:
+        row["t_oracle"] = datetime.now(timezone.utc).isoformat()
         row["oracle"] = get("/info/oracle").get("prices")
     except Exception as e:  # noqa: BLE001
         row["oracle_error"] = "%s: %s" % (type(e).__name__, e)

@@ -861,7 +861,17 @@ transfer and must not leak into shared code.
       "planning to do that already". So there is no weekend pre-banking,
       but the usable window is the full 102.5 h, which drops the depth
       needed from ~$2,564 to ~$813 held throughout.
-- [x] **C-0S3** **Measured and confirmed 2026-08-27.** 124 samples over 122
+- [~] **C-0S3** **Measured 2026-08-27; STRONG EVIDENCE, not confirmed.**
+      **Downgraded 2026-08-28 after review.** The flat rate profile rules out
+      backfill that *arrives once and stops*, which is what the original
+      reasoning addressed. It does not rule out **incremental** backfill -- a
+      delayed counter draining a little into each bucket rises in every
+      sub-window too, and is observationally identical to carried accrual at
+      this sampling rate. Neither the API contract nor these samples bound
+      the publication lag. Separating them needs a control account known to
+      be flat through the close, or a documented lag bound. The $813 sizing
+      therefore rests on evidence, not on a measurement, and the analyzer now
+      says so rather than printing CONFIRMED. Original record: 124 samples over 122
       minutes of confirmed-carried session (oracle frozen at a single value
       throughout): two accounts gained 10.27M and 8.37M depth-seconds, which
       roll-off cannot produce. Backfill ruled out by the flat rate profile.

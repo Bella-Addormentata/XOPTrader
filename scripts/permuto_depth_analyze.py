@@ -85,6 +85,21 @@ def load_sessions(path):
     return sessions, malformed
 
 
+def _brackets_a_transition(row, prev_oracle, oracle_of):
+    """True when this row's leaderboard and oracle reads may disagree.
+
+    Rows written before the probe recorded `t_oracle` carry no bracket, so
+    they cannot be checked and are kept -- flagging them would retroactively
+    invalidate every historical session, which is a different claim from the
+    one this guard makes.
+    """
+    if "t_oracle" not in row or "t_leaderboard_start" not in row:
+        return False
+    if prev_oracle is None:
+        return False
+    return oracle_of(row) != prev_oracle
+
+
 def frozen_window(rows, interval_s, carried_since=None):
     """Trailing run of consecutive samples with ONE oracle value and no gaps.
 
@@ -362,11 +377,28 @@ def main():
 
     if strong:
         rate = max(o[0] / span_s * 3600 for o in corroborated)
-        print("VERDICT: CONFIRMED. %d of %d accounts gained depth in every "
-              "sub-window" % (len(corroborated), len(out)))
+        print("VERDICT: STRONG EVIDENCE. %d of %d accounts gained depth in "
+              "every sub-window" % (len(corroborated), len(out)))
         print("         of an operator-asserted carried session. Roll-off can only")
-        print("         subtract, so a sustained gain there can only come from")
-        print("         carried ticks accruing.")
+        print("         subtract, so a sustained gain there cannot come from")
+        print("         window decay.")
+        # [review] NOT "confirmed", and the reason is a hypothesis this data
+        # cannot exclude. A delayed counter published INCREMENTALLY -- a
+        # backlog draining a little into each bucket -- rises in every
+        # sub-window too, and is observationally identical to carried
+        # accrual at this sampling rate. The earlier reasoning ruled out
+        # backfill that "arrives once and stops", which the flat rate profile
+        # does exclude; it never addressed the incremental case, and neither
+        # the API contract nor these samples bound the publication lag.
+        #
+        # Separating them needs a control: an account known to be flat
+        # through the close, or a documented lag bound. Until one exists this
+        # is the strongest honest label, and the sizing that depends on it
+        # should be read as resting on evidence rather than on a measurement.
+        print("         NOT CONFIRMED: incremental backfill -- a delayed counter")
+        print("         draining a little into each bucket -- is observationally")
+        print("         identical here. Excluding it needs a flat-account control")
+        print("         or a published lag bound; neither exists yet.")
         print("         Top corroborated rate: %.0f depth-seconds/hour, i.e. about"
               % rate)
         print("         $%.0f of balanced depth resting inside the 2%% ring."

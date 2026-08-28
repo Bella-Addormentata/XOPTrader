@@ -245,7 +245,7 @@ def test_a_flat_tail_alone_cannot_certify_a_carried_session(tmp_path, monkeypatc
     path = _write(tmp_path, _header(-120), *rows)
 
     out = _run(monkeypatch, capsys, path).out
-    assert "CONFIRMED" not in out
+    assert "STRONG EVIDENCE" not in out
     assert "NOT CERTIFIED" in out
     # And it must say how to certify, rather than only that it will not.
     assert "--carried-since" in out
@@ -260,7 +260,10 @@ def test_an_asserted_boundary_still_certifies_a_genuine_carried_run(
     path = _write(tmp_path, _header(-120), *rows)
 
     out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(-90)}").out
-    assert "VERDICT: CONFIRMED" in out
+    assert "VERDICT: STRONG EVIDENCE" in out
+    # [review] And it must NOT overclaim: incremental backfill is
+    # observationally identical at this sampling rate.
+    assert "NOT CONFIRMED" in out
     assert "ASSERTED" in out
 
 
@@ -280,7 +283,7 @@ def test_live_accrual_outside_the_window_cannot_corroborate_a_carried_gain(
     path = _write(tmp_path, _header(0), *rows)
 
     out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(36)}").out
-    assert "CONFIRMED" not in out
+    assert "STRONG EVIDENCE" not in out
     assert "EVIDENCE, NOT CONFIRMATION" in out
 
 
@@ -299,7 +302,7 @@ def test_corroboration_is_bucketed_over_the_window_not_the_session(
     path = _write(tmp_path, _header(0), *rows)
 
     out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(60)}").out
-    assert "CONFIRMED" not in out
+    assert "STRONG EVIDENCE" not in out
     assert "EVIDENCE, NOT CONFIRMATION" in out
 
 
