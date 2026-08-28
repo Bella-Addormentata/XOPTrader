@@ -61,6 +61,18 @@ def denomination(asset_id: str) -> int:
     return XCH_UNITS if asset_id.lower() == "xch" else CAT_UNITS
 
 
+def canonical_asset(asset_id: str) -> str:
+    """Fold an asset id for comparison.
+
+    Asset ids reach this module from two directions and do not agree on case:
+    the wallet lowercases them while settings can carry uppercase (see
+    gui/services/engine_bridge.py). Exact matching therefore classified a
+    perfectly good offer as malformed and returned an empty plan -- and
+    "nothing was cheap enough" is what the operator would have read.
+    """
+    return asset_id.strip().lower()
+
+
 class PlanError(ValueError):
     """Raised when a plan cannot be built at all (as opposed to being empty)."""
 
@@ -246,7 +258,7 @@ def _usable(offer: OfferCandidate, give_asset: str, receive_asset: str) -> bool:
     a junk entry cannot reach the ranking at all -- it never gets the chance
     to look attractive.
     """
-    if not offer.offer_id:
+    if not offer.offer_id.strip():
         # Compact dexie responses need this id to fetch the live offer
         # payload before it can be taken, so an offer without one cannot be
         # executed no matter how good its price.  Structural, not a price
@@ -254,7 +266,7 @@ def _usable(offer: OfferCandidate, give_asset: str, receive_asset: str) -> bool:
         return False
     if offer.status != 0:
         return False
-    if offer.give_asset != give_asset or offer.receive_asset != receive_asset:
+    if canonical_asset(offer.give_asset) != canonical_asset(give_asset)             or canonical_asset(offer.receive_asset) != canonical_asset(receive_asset):
         return False
     if offer.give_amount <= 0 or offer.receive_amount <= 0:
         return False
@@ -431,7 +443,7 @@ def build_plan(
         empty plan -- nothing was cheap enough -- is NOT an error; it is a
         valid answer that the dialog reports as "no offers within your cap".
     """
-    if source_asset == target_asset:
+    if canonical_asset(source_asset) == canonical_asset(target_asset):
         raise PlanError("source and target are the same asset")
     if budget <= 0:
         raise PlanError(f"budget must be positive, got {budget}")
@@ -491,6 +503,14 @@ def build_plan(
 
     if first_hop_anchor is None or second_hop_anchor is None:
         raise PlanError("a two-hop plan needs an anchor for each hop")
+    # A hop that IS one of the endpoints is a self-conversion leg, not a
+    # route. Only the anchors were checked, so this produced a degenerate
+    # plan instead of rejecting an incoherent request.
+    if canonical_asset(hop_asset) in (canonical_asset(source_asset),
+                                      canonical_asset(target_asset)):
+        raise PlanError(
+            "hop asset %r is the source or the target; a hop must be a "
+            "third asset" % hop_asset)
 
     # Both hops share the operator's ROUTE cap, split so the composite
     # honours it -- see per_leg_cap.

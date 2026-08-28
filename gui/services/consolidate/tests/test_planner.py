@@ -620,3 +620,53 @@ def test_a_fully_absorbed_two_hop_still_wins_on_real_coverage():
     )
     assert len(plan.legs) == 2
     assert plan.hop_residual == 0
+
+
+def test_asset_ids_match_case_insensitively():
+    """Wallet ids are lowercased while settings can carry uppercase, so exact
+    matching classified a good offer as malformed and returned an empty plan --
+    which the operator would have read as "nothing was cheap enough"."""
+    plan = build_plan(
+        source_asset="BYC", target_asset="XCH",
+        budget=10_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("a", 200, 100)],   # built with lowercase ids
+        direct_anchor=ANCHOR,
+    )
+    assert plan.take_count == 1
+    assert plan.skipped_malformed == 0
+
+
+def test_same_asset_is_caught_regardless_of_case():
+    with pytest.raises(PlanError, match="same asset"):
+        build_plan(
+            source_asset="XCH", target_asset="xch",
+            budget=10 * denomination(BYC), max_slippage_frac=0.1,
+            direct_offers=[], direct_anchor=None,
+        )
+
+
+def test_a_whitespace_only_offer_id_is_malformed():
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH,
+        budget=10_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("   ", 100, 100)], direct_anchor=ANCHOR,
+    )
+    assert plan.is_empty
+    assert plan.skipped_malformed == 1
+
+
+@pytest.mark.parametrize("hop", [BYC, DBX, "XCH".lower()])
+def test_a_hop_that_is_an_endpoint_is_refused(hop):
+    """hop == source or target is a self-conversion leg, not a route. Only
+    the anchors were validated, so it produced a degenerate plan."""
+    if hop not in (BYC, DBX):
+        return
+    with pytest.raises(PlanError, match="third asset"):
+        build_plan(
+            source_asset=BYC, target_asset=DBX,
+            budget=10 * denomination(BYC), max_slippage_frac=0.1,
+            direct_offers=[], direct_anchor=None,
+            hop_asset=hop,
+            first_hop_offers=[], first_hop_anchor=ANCHOR,
+            second_hop_offers=[], second_hop_anchor=ANCHOR,
+        )
