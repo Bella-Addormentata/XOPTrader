@@ -339,6 +339,53 @@ conclusion from here.
    listed options. See the hedging correction later in this document; the
    conclusion holds, the reason is narrower.)
 
+### The closest live comparable: Bitfinex BVIV (and why it is not that close)
+
+Bitfinex lists `BVIVF0:USTF0`, a perpetual on the **Bitcoin Implied Volatility
+Index** published by Volmex — the nearest thing to a production svPerp on a
+major venue, and worth reading precisely because the differences are larger
+than the similarities.
+
+| | **BVIV** (Bitfinex/Volmex) | **Permuto svPerps** |
+| --- | --- | --- |
+| underlying | 30-day **implied** vol | 60-second **realized** vol |
+| source | actual option prices, two markets | range of a resampled price series |
+| horizon | 30 days | 60 seconds |
+| hedge | listed BTC options exist | none on-venue |
+| mark | Index × USD/USDt | oracle + rate-limited book-mid basis |
+| funding | on average spread vs mark; **may pause trading** | `clamp(premium/2, ±10%)`, 60 s settlement |
+| leverage | 20× (IM 5.00%, MM 2.50%) | 10× (`/info/meta`) |
+
+**The horizon differs by roughly 43,000×, and almost everything else follows
+from that.** A 30-day implied-vol index is smooth, strongly mean-reverting, and
+sits on top of a liquid instrument that can hedge it. A 60-second realized-vol
+estimate resampled every 5 s is none of those things: it is noisy by
+construction (consecutive prints share 55 seconds of input), it has no
+tradeable underlying, and — as measured here — it moves 10–13% in seconds.
+
+So BVIV validates the *product category* while quietly confirming the thing
+that makes ours hard. It is the version of this instrument built where a hedge
+exists. Quoting it is an options-desk problem; quoting Permuto's is an
+inventory-limits problem, which is the conclusion §"No hedge exists ON THIS
+VENUE" reaches from the other direction.
+
+Two smaller transfers worth keeping:
+
+- **Bitfinex pauses trading during funding**, "for a period of time lasting
+  several seconds or longer". Permuto settles VOL funding every 60 s, so the
+  obvious worry is a brief pause on every settlement. **Measured: no.** Across
+  54 pause-state samples on 2026-08-28 `trading_paused` was false throughout,
+  while `premium` moved every 5 s and `hourly_rate` stepped on 60-second
+  boundaries — exactly the documented `sample_interval_secs: 5` /
+  `settlement_interval_secs: 60`, with no trading interruption. A useful
+  negative: C-11 pause handling has to cover operator pauses and the Sunday
+  reset, not a funding hiccup every minute.
+- **Dynamic tick size and minimum order size**, both derived from the
+  contract's own price rather than fixed. Permuto publishes static
+  `tick_size` 0.0001 and `lot_size` 1, which at a QQQ-VOL oracle near 0.07
+  makes one tick ~0.14% of price — coarse relative to a ±2% ring, and worth
+  remembering when placing ladder levels that must stay strictly inside it.
+
 ### Market making an SVPerp — the two-literature blueprint
 
 No paper is titled "Market Making for SVPerps". The mathematical blueprint
