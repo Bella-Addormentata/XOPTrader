@@ -924,21 +924,38 @@ def test_the_sort_key_puts_unusable_offers_last():
 def test_a_marginally_better_two_hop_route_loses_to_direct():
     """A second leg is a second fee and a second all-or-nothing window.
 
-    The comparison used `>=`, so a route covering one more mojo won.
+    [round 3] The first version of this test gave both routes identical
+    source coverage, so it passed under the OLD source-scored comparison too
+    and pinned nothing about materiality. The two-hop route here delivers
+    strictly MORE target -- 1,010 against 1,000 -- but only 1%, under the 2%
+    bar, so direct must still win.
     """
-    direct = offer("direct", 1_000, 500, give_asset=BYC, recv_asset=XCH)
+    direct = offer("direct", 1_000, 1_000, give_asset=BYC, recv_asset=XCH)
     hop1 = offer("h1", 1_000, 1_000, give_asset=BYC, recv_asset="usds")
-    hop2 = offer("h2", 1_000, 501, give_asset="usds", recv_asset=XCH)
+    hop2 = offer("h2", 1_000, 1_010, give_asset="usds", recv_asset=XCH)
     plan = build_plan(
         source_asset=BYC, target_asset=XCH, hop_asset="usds",
         budget=1_000 * denomination(BYC),
         direct_offers=[direct],
-        direct_anchor=Anchor(rate=2.0, source="test"),
+        direct_anchor=Anchor(rate=1.0, source="test"),
         first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
-        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=2.0, source="t"),
+        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=1.0, source="t"),
         max_slippage_frac=0.10,
     )
-    assert len(plan.legs) == 1, "a hair more coverage is not materially better"
+    assert len(plan.legs) == 1, "1% more target is not materially better"
+    # And the two-hop route really did offer more, so the bar is what refused
+    # it rather than the route being worse.
+    assert hop2.receive_amount > direct.receive_amount
+
+
+def test_the_materiality_bar_is_driven_by_its_named_constant():
+    """[round 3] The comparison used a hand-written 102/100 beside a named
+    MIN_TWO_HOP_ADVANTAGE, so changing the constant moved nothing."""
+    from gui.services.consolidate import planner as P
+
+    assert P._ADVANTAGE_NUM / P._ADVANTAGE_DEN == pytest.approx(
+        1.0 + P.MIN_TWO_HOP_ADVANTAGE
+    )
 
 
 def test_the_package_facade_exports_denomination():

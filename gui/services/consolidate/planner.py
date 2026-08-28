@@ -479,9 +479,11 @@ def _empty_plan(
 #: genuinely better routes and large enough that noise does not choose one.
 MIN_TWO_HOP_ADVANTAGE = 0.02
 
-#: The same figure as an exact rational, so the comparison never leaves ints.
-_ADVANTAGE_NUM = 102
-_ADVANTAGE_DEN = 100
+#: The same figure as an exact rational, derived FROM the constant above so
+#: the two cannot drift. A hand-written 102/100 beside a named
+#: MIN_TWO_HOP_ADVANTAGE is a policy knob that does not move the policy.
+_ADVANTAGE_DEN = 10_000
+_ADVANTAGE_NUM = _ADVANTAGE_DEN + round(MIN_TWO_HOP_ADVANTAGE * _ADVANTAGE_DEN)
 
 
 class _exact_rate_key:
@@ -623,7 +625,9 @@ def build_plan(
             "third asset" % hop_asset)
 
     # The first hop is priced blind -- nothing is known about the second when
-    # its offers are chosen -- so it takes the conservative equal split.
+    # its offers are chosen. It is planned against the FULL route cap; the
+    # bound is enforced by the second hop, whose allowance is derived from
+    # what this one actually cost (see remaining_route_cap).
     first = _plan_leg(
         give_asset=source_asset,
         receive_asset=hop_asset,
