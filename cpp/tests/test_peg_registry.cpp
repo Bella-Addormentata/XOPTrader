@@ -579,9 +579,53 @@ TEST(PeggedAssetCoherence, ThePracticalRangeIsStillAccepted) {
     }
 }
 
-TEST(PeggedAssetCoherence, TheBoundLeavesHeadroomUnderLlround) {
-    // The product that must survive: par * mojos-per-XCH.
+TEST(PeggedAssetCoherence, TheBoundAloneDoesNotProtectLlround) {
+    // [review] The test that used to live here checked exactly the one case
+    // that passes -- kMaxPegTarget * 1e12 -- and concluded the declaration
+    // bound was sufficient. It is not. A pseudo-price is a 1e12-SCALED RATE,
+    // so the real product is par * price, and a 20-XCH price at the maximum
+    // par is 2e19: past long long, whatever the declaration was bounded to.
     constexpr double kMojos = 1e12;
-    const double worst = xop::PeggedAsset::kMaxPegTarget * kMojos;
-    EXPECT_LT(worst, 9.0e18) << "the bound does not actually protect llround";
+    const double at_one_xch = xop::PeggedAsset::kMaxPegTarget * kMojos;
+    EXPECT_LT(at_one_xch, 9.0e18);
+
+    const double at_twenty_xch = xop::PeggedAsset::kMaxPegTarget * 20.0 * kMojos;
+    EXPECT_GT(at_twenty_xch, 9.3e18)
+        << "if this no longer overflows, the boundary guard below is why";
+}
+
+// ---------------------------------------------------------------------------
+// to_mojo_checked -- the guard that actually protects the conversion.
+// ---------------------------------------------------------------------------
+
+TEST(ToMojoChecked, AnOrdinaryValueConverts) {
+    const auto m = xop::to_mojo_checked(2.5e12);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(*m, 2'500'000'000'000LL);
+}
+
+TEST(ToMojoChecked, TheProductTheOldBoundMissedIsRefused) {
+    // par 1e6 against a 20-XCH price: finite, declarable, and 2e19.
+    EXPECT_FALSE(xop::to_mojo_checked(1e6 * 20.0 * 1e12));
+}
+
+TEST(ToMojoChecked, ADivisionByATinyFactorIsRefused) {
+    // from_usd_pseudo's mirror case: a small positive factor passes
+    // coherence and produces an enormous quotient.
+    EXPECT_FALSE(xop::to_mojo_checked(1e12 / 1e-9));
+}
+
+TEST(ToMojoChecked, NonFiniteAndNegativeAreRefused) {
+    EXPECT_FALSE(xop::to_mojo_checked(std::numeric_limits<double>::infinity()));
+    EXPECT_FALSE(xop::to_mojo_checked(
+        std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(xop::to_mojo_checked(-1.0));
+}
+
+TEST(ToMojoChecked, TheBoundaryItselfIsRefusedRatherThanWrapped) {
+    // llround on an out-of-range double raises the invalid-operation
+    // condition and returns an unspecified value; it does not report an
+    // error, which is why the guard runs BEFORE the call.
+    EXPECT_FALSE(xop::to_mojo_checked(9.3e18));
+    EXPECT_TRUE(xop::to_mojo_checked(9.0e18));
 }

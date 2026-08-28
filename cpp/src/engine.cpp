@@ -11548,8 +11548,16 @@ Mojo Engine::to_usd_pseudo(Mojo pair_price, const PairConfig& pc) const
     if (pair_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(pair_price) * f));
+    // Checked, not cast. The product is a 1e12-scaled rate times a factor,
+    // and neither operand alone tells you whether it lands inside Mojo --
+    // bounding the declaration was not enough. 0 is the established "no USD
+    // valuation" answer here, and every caller already handles it.
+    if (const auto m = to_mojo_checked(static_cast<double>(pair_price) * f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] to_usd_pseudo({}) overflowed for {} at factor {}; "
+                 "reporting no valuation", pair_price, pc.name, f);
+    return 0;
 }
 
 Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
@@ -11557,8 +11565,14 @@ Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
     if (usd_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(usd_price) / f));
+    // Division has the mirror problem: an arbitrarily SMALL positive factor
+    // passes coherence and produces an enormous quotient.
+    if (const auto m = to_mojo_checked(static_cast<double>(usd_price) / f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] from_usd_pseudo({}) overflowed for {} at factor "
+                 "{}; reporting no valuation", usd_price, pc.name, f);
+    return 0;
 }
 
 // [S20 2026-08-24] Triangulated implied cross for the published-mid gate.
@@ -11683,8 +11697,11 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                f * static_cast<double>(kMojosPerXch)));
+            if (const auto m = to_mojo_checked(
+                    f * static_cast<double>(kMojosPerXch))) {
+                return *m;
+            }
+            continue;
         }
     }
     return 0;

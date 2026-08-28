@@ -452,6 +452,33 @@ struct CrossSelection {
     return usd;
 }
 
+/// A double converted to Mojo, or nullopt when the result is not one.
+///
+/// [review] THE BOUND ON peg_target WAS NOT ENOUGH, and the test I wrote to
+/// prove otherwise checked the one case that passes. A pseudo-price is a
+/// 1e12-SCALED RATE, not a value capped at 1e12 -- so a par of 1e6 against a
+/// 20-XCH price is 2e19 and overflows long long inside std::llround
+/// regardless of what the declaration was bounded to. Division has the
+/// mirror problem: an arbitrarily small positive factor passes coherence and
+/// blows up from_usd_pseudo().
+///
+/// So the check belongs at the boundary, where the actual product is known,
+/// and not only at the declaration. llround on an out-of-range double raises
+/// the invalid-operation condition and returns an unspecified value -- it
+/// does not report an error -- so the guard has to be BEFORE the call.
+[[nodiscard]] inline std::optional<std::int64_t>
+to_mojo_checked(double value) noexcept
+{
+    if (!std::isfinite(value)) return std::nullopt;
+    if (value < 0.0) return std::nullopt;
+    // Compared against the double nearest to the Mojo maximum, and strictly
+    // less than: 9.223372036854775807e18 is not representable, and the
+    // nearest double is above it.
+    constexpr double kMax = 9.2233720368547748e18;
+    if (value >= kMax) return std::nullopt;
+    return static_cast<std::int64_t>(std::llround(value));
+}
+
 }  // namespace xop
 
 #endif  // XOP_PEG_REGISTRY_HPP
