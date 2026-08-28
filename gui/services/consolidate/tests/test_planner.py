@@ -577,3 +577,46 @@ def test_whitespace_provenance_is_refused():
     """It passes `not source` and shows the operator nothing at all."""
     with pytest.raises(PlanError, match="provenance"):
         Anchor(rate=1.0, source="   ")
+
+
+def test_an_underfilled_second_hop_does_not_beat_a_good_direct_fill():
+    """[round 3] Comparing against first.give_total counted source SPENT on
+    hop one, not source DELIVERED to the target. A first hop spending 1,000
+    followed by a second absorbing only 1 of them beat a 999-unit direct
+    fill -- delivering almost nothing and stranding the rest in an asset the
+    operator never asked to hold."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=1_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("d", 999, 999, give_asset=BYC, recv_asset=DBX)],
+        direct_anchor=Anchor(rate=1.0, source="test"),
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 1_000, 1_000)],   # spends all 1,000 BYC
+        first_hop_anchor=Anchor(rate=1.0, source="test"),
+        second_hop_offers=[                            # ...but sells 1 XCH
+            offer("s", 1, 1, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 1
+    assert [o.offer_id for o in plan.legs[0].offers] == ["d"]
+
+
+def test_a_fully_absorbed_two_hop_still_wins_on_real_coverage():
+    """The counterpart: when the second hop actually absorbs the first, the
+    two-hop route delivers more and should still be chosen."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=1_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("d", 100, 100, give_asset=BYC, recv_asset=DBX)],
+        direct_anchor=Anchor(rate=1.0, source="test"),
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 1_000, 1_000)],
+        first_hop_anchor=Anchor(rate=1.0, source="test"),
+        second_hop_offers=[
+            offer("s", 1_000, 1_000, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 2
+    assert plan.hop_residual == 0

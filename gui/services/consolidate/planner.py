@@ -529,9 +529,22 @@ def build_plan(
 
     # Direct wins ties and near-ties; the two-hop route has to be materially
     # better to justify a second all-or-nothing take. "Materially" is coverage
-    # of the source budget, because that is what the operator asked for.
+    # of the source budget -- but measured as source that actually REACHES THE
+    # TARGET, not source spent on the first hop.
+    #
+    # [review round 3] Comparing against first.give_total was wrong and could
+    # lose money: a first hop spending 1,000 units followed by a second hop
+    # absorbing only 1 of them "beat" a 999-unit direct fill, delivered almost
+    # no target, and stranded the rest as hop_residual in an asset the
+    # operator never asked to hold. Only the pro-rata share of the first leg
+    # whose output the second leg actually consumed counts as delivered.
     if second.offers and direct_leg is not None and direct_leg.offers:
-        if direct_leg.give_total >= first.give_total:
+        delivered_source = 0.0
+        if first.receive_total > 0:
+            delivered_source = (
+                first.give_total * (second.give_total / first.receive_total)
+            )
+        if direct_leg.give_total >= delivered_source:
             return _single_leg_plan(
                 source_asset, target_asset, direct_leg, budget, counters)
 
