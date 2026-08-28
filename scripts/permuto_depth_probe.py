@@ -85,7 +85,12 @@ def main():
     stop_at = sys.argv[2]  # ISO8601 UTC, e.g. 2026-08-27T22:30:00+00:00
     stop = datetime.fromisoformat(stop_at)
 
-    os.makedirs(os.path.dirname(out_path), exist_ok=True)
+    # A bare filename has no dirname, and makedirs("") raises
+    # FileNotFoundError -- so the probe would die before its first sample
+    # over an argument that is perfectly reasonable.
+    out_dir = os.path.dirname(out_path)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
     with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps({"probe_start": datetime.now(timezone.utc).isoformat(),
                              "interval_s": INTERVAL_S,

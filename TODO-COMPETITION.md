@@ -290,18 +290,21 @@ turn "cheap" into "cheap but not free":
   accident. The venue already protects makers from the thing C-07 was
   written to avoid.
 
-Still unresolved and decisive: **do carried ticks accrue depth at all?**
-Carried is evidently not the same as stale (stale placement returns HTTP
-503, carried placement is permitted at 8× IM), but whether the ~10s sampler
-credits carried ticks is undocumented. The Discord archive adds evidence on
-both sides without closing it — see below — and the sponsor's own
-calibration of the gate against *cash-session hours* is the strongest hint
-that carried ticks do not count.
+✅ **Carried ticks DO accrue depth — settled 2026-08-27.** This paragraph
+used to say the question was open and lean towards "they do not", which
+contradicted both the Discord answer and our own measurement further down.
+Confirmed twice: an entrant said so directly, and C-0S3 measured two accounts
+gaining 10.27M and 8.37M depth-seconds across 122 minutes of frozen oracle,
+with backfill ruled out by a flat rate profile. So the load-bearing mechanic
+of this hypothesis holds.
 
-A third strike against the hypothesis: the archive shows experienced
-entrants **deliberately hunting resting MM size during carried hours**,
-when the oracle is pinned high. Overnight depth is not quiet; it is where
-the predators are.
+**What survives against it is capital, not mechanics.** Carried placement
+costs 8× stressed initial margin, and the archive shows experienced entrants
+**deliberately hunting resting MM size during carried hours** when the oracle
+is pinned high. Overnight depth is not quiet; it is where the predators are.
+That sets the SIZE rather than ruling out the plan — the gate needs only
+~$1,190 held across the four contest nights, so a fat overnight grid is never
+necessary, and a fat overnight grid is exactly what gets farmed.
 
 ## Clarifications from the Chia Discord (#svPerps, 2026-08-27)
 

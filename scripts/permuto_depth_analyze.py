@@ -43,8 +43,8 @@ def load(path):
 
 def main():
     path = sys.argv[1]
-    header, rows = load(path)
-    rows = [r for r in rows if r.get("mms")]
+    header, all_rows = load(path)
+    rows = [r for r in all_rows if r.get("mms")]
     if len(rows) < 2:
         print("not enough samples yet (%d)" % len(rows))
         return
@@ -52,16 +52,35 @@ def main():
     t0, t1 = rows[0], rows[-1]
     span_s = (datetime.fromisoformat(t1["ts"]) - datetime.fromisoformat(t0["ts"])).total_seconds()
 
-    # Was the oracle frozen for the whole window? That is what makes this a
-    # carried-session measurement rather than a mixed one.
-    oracles = [json.dumps(r.get("oracle"), sort_keys=True) for r in rows if r.get("oracle")]
-    frozen = len(set(oracles)) == 1
+    # Was the oracle frozen for the WHOLE window? That is what makes this a
+    # carried-session measurement rather than a mixed one, and it is the only
+    # reason a depth gain proves anything.
+    #
+    # Two ways this check could lie by omission, both fixed here. It ran over
+    # `rows`, which has already dropped every sample whose LEADERBOARD fetch
+    # failed -- even though such a sample may carry a perfectly good, MOVING
+    # oracle. And it then skipped samples with no oracle at all. So a window
+    # that actually contained oracle movement could present one distinct
+    # value and read as frozen. Missing coverage is now a disqualifier rather
+    # than something to quietly filter away: an incomplete window cannot
+    # confirm anything.
+    oracle_samples = [r.get("oracle") for r in all_rows if "oracle" in r or "oracle_error" in r]
+    missing = sum(1 for o in oracle_samples if not o)
+    distinct = {json.dumps(o, sort_keys=True) for o in oracle_samples if o}
+    frozen = (len(distinct) == 1 and missing == 0)
 
     print("samples      : %d over %.0f min" % (len(rows), span_s / 60))
     print("window       : %s -> %s UTC" % (t0["ts"][11:19], t1["ts"][11:19]))
-    print("oracle       : %s" % ("FROZEN throughout (carried)" if frozen
-                                 else "MOVED (%d distinct values) - window is NOT purely carried"
-                                      % len(set(oracles))))
+    if frozen:
+        oracle_note = "FROZEN throughout (carried), %d samples" % len(oracle_samples)
+    elif missing:
+        oracle_note = ("INCOMPLETE - %d of %d samples have no oracle reading; "
+                       "cannot certify the window as carried"
+                       % (missing, len(oracle_samples)))
+    else:
+        oracle_note = ("MOVED (%d distinct values) - window is NOT purely carried"
+                       % len(distinct))
+    print("oracle       : %s" % oracle_note)
     print()
 
     a = {m["u"]: m for m in t0["mms"]}

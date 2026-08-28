@@ -291,11 +291,13 @@ Collected from the API skill; each has bitten someone already.
 
 ## 8  Open questions
 
-- **Do carried (frozen-oracle) ticks accrue depth-seconds?** Carried is not
-  the same as stale — stale placement returns 503 while carried placement is
-  allowed at 8× IM — but whether the ~10s sampler *credits* carried ticks is
-  undocumented, and it decides whether the overnight window is worth the
-  capital.
+- ~~Do carried (frozen-oracle) ticks accrue depth-seconds?~~ **ANSWERED
+  2026-08-27: yes.** Confirmed by the sponsor's channel and then measured
+  directly — two accounts gained 10.27M and 8.37M depth-seconds over 122
+  minutes with the oracle frozen at a single value, which roll-off cannot
+  produce. See `TODO-COMPETITION.md` C-0S3 and
+  `scripts/permuto_depth_probe.py`. The overnight window is therefore worth
+  the capital on mechanics; what constrains it is the 8× carried margin.
 - **Is the oracle's short-horizon jitter estimator noise or information?**
   §0 argues it is substantially the former. Decides whether this is a
   quotable market at all.
