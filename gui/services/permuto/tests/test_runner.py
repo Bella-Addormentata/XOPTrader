@@ -1,0 +1,329 @@
+"""The sequencer. Fake client, real policy modules underneath."""
+
+from __future__ import annotations
+
+import pytest
+
+from gui.services.permuto.auth import PermutoAuthError
+from gui.services.permuto.batch import BatchError
+from gui.services.permuto.client import PermutoNotLinked
+from gui.services.permuto.quoting import RestingQuote
+from gui.services.permuto.runner import QuoteRunner, _margin_state
+from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
+from gui.services.permuto.session import RenewAction
+
+_MKT = "QQQ-VOL-PERP"
+_ORACLE = {_MKT: 0.07}
+
+
+class _Client:
+    def __init__(self, **kw):
+        self.calls = []
+        self.session_action = kw.get("session", RenewAction.OK)
+        self.account_payload = kw.get("account", {
+            "equity_usd": 100_000.0, "used_margin_usd": 0.0, "positions": {},
+        })
+        self.open_payload = kw.get("open_orders", {"orders": []})
+        self.fail_on = kw.get("fail_on")
+
+    def _maybe_fail(self, name):
+        if self.fail_on == name:
+            raise PermutoAuthError("%s exploded" % name)
+
+    def ensure_session(self, now_s):
+        self.calls.append("ensure_session")
+        self._maybe_fail("ensure_session")
+        return self.session_action
+
+    def open_orders(self, now_s):
+        self.calls.append("open_orders")
+        self._maybe_fail("open_orders")
+        return self.open_payload
+
+    def account(self, now_s):
+        self.calls.append("account")
+        self._maybe_fail("account")
+        return self.account_payload
+
+    def batch_upsert(self, legs, now_s):
+        self.calls.append("batch_upsert")
+        self.last_batch = legs
+        self._maybe_fail("batch_upsert")
+        return {}
+
+    def cancel_all(self, now_s, markets=None):
+        self.calls.append("cancel_all")
+        self._maybe_fail("cancel_all")
+        return {}
+
+
+def _runner(client, **kw):
+    return QuoteRunner(client, [_MKT], **kw)
+
+
+# --------------------------------------------------------------------------- #
+# C-11: pause, un-pause, and the belief that must not outlive the orders
+# --------------------------------------------------------------------------- #
+def test_a_pause_withdraws_and_forgets_the_book():
+    c = _Client()
+    r = _runner(c)
+    r._resting[_MKT] = RestingQuote(0.069, 0.071)
+
+    result = r.tick(1.0, _ORACLE, {"trading_paused": True})
+
+    assert result.action == "withdraw"
+    assert "cancel_all" in c.calls
+    assert r._resting[_MKT].empty, "belief must not outlive the cancel"
+
+
+def test_a_pause_does_not_spend_a_session_renewal():
+    """Nothing can be placed while paused; renewing is a wasted round trip."""
+    c = _Client()
+    _runner(c).tick(1.0, _ORACLE, {"trading_paused": True})
+    assert "ensure_session" not in c.calls
+
+
+def test_the_tick_after_an_unpause_rebuilds_rather_than_holds():
+    """The venue cancels every resting order at the open, silently."""
+    c = _Client()
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {"trading_paused": True})
+    r._resting[_MKT] = RestingQuote(0.069, 0.071)  # a belief that is now false
+
+    result = r.tick(2.0, _ORACLE, {"trading_paused": False})
+    assert result.action == "quote"
+    assert "batch_upsert" in c.calls
+
+
+def test_the_reopen_debt_survives_a_failed_tick():
+    """A latch, not a flag consumed by whichever tick happens to see it."""
+    c = _Client(fail_on="account")
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {"trading_paused": True})
+    assert not r.tick(2.0, _ORACLE, {"trading_paused": False}).ok
+    assert r._reopen_pending, "the rebuild we owe the book was dropped"
+
+    c.fail_on = None
+    assert r.tick(3.0, _ORACLE, {"trading_paused": False}).action == "quote"
+
+
+def test_a_second_pause_clears_a_pending_reopen():
+    c = _Client()
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {"trading_paused": True})
+    r.tick(2.0, _ORACLE, {"trading_paused": False})   # reopen latched+consumed
+    r.tick(3.0, _ORACLE, {"trading_paused": True})    # paused again
+    assert r._reopen_pending is False
+
+
+def test_a_steady_pause_is_not_a_reopen_every_tick():
+    c = _Client()
+    r = _runner(c)
+    for t in range(1, 5):
+        r.tick(float(t), _ORACLE, {"trading_paused": True})
+    assert r._reopen_pending is False
+
+
+# --------------------------------------------------------------------------- #
+# Reconciliation
+# --------------------------------------------------------------------------- #
+def test_reconcile_overwrites_rather_than_merges():
+    """The entries the venue omits are the ones that must be dropped."""
+    r = _runner(_Client())
+    r._resting[_MKT] = RestingQuote(0.069, 0.071)
+    r.reconcile({"orders": [{"market": _MKT, "side": "BUY", "price": 0.069}]})
+    assert r._resting[_MKT].bid_price == 0.069
+    assert r._resting[_MKT].ask_price is None
+
+
+def test_reconcile_ignores_markets_we_do_not_quote():
+    r = _runner(_Client())
+    r.reconcile({"orders": [
+        {"market": "TSLA-VOL-PERP", "side": "BUY", "price": 0.5},
+    ]})
+    assert r._resting[_MKT].empty
+
+
+@pytest.mark.parametrize("junk", [
+    {"orders": [{"market": _MKT, "side": "BUY", "price": None}]},
+    {"orders": [{"market": _MKT, "side": "BUY", "price": "abc"}]},
+    {"orders": ["not a dict"]},
+    {"orders": None},
+    {},
+    [],
+])
+def test_reconcile_survives_a_malformed_payload(junk):
+    r = _runner(_Client())
+    r.reconcile(junk)
+    assert r._resting[_MKT].empty
+
+
+def test_a_one_sided_book_is_requoted_because_min_bid_ask_is_zero():
+    c = _Client(open_orders={
+        "orders": [{"market": _MKT, "side": "BUY", "price": 0.0698}],
+    })
+    r = _runner(c)
+    r._resting[_MKT] = RestingQuote(0.0698, None)
+    assert r.tick(1.0, _ORACLE, {}).action == "quote"
+
+
+# --------------------------------------------------------------------------- #
+# Risk wiring
+# --------------------------------------------------------------------------- #
+def test_a_flattening_account_places_nothing():
+    c = _Client(account={
+        "equity_usd": 1_000.0,
+        "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+        "positions": {},
+    })
+    r = _runner(c)
+    result = r.tick(1.0, _ORACLE, {})
+    assert result.action == "hold"
+    assert "batch_upsert" not in c.calls
+
+
+def test_reduce_only_keeps_only_the_shrinking_side():
+    c = _Client(account={
+        "equity_usd": 100_000.0, "used_margin_usd": 0.0,
+        "positions": {_MKT: 100.0},
+    })
+    r = _runner(c, max_position=100.0)
+    assert r.tick(1.0, _ORACLE, {}).action == "quote"
+    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+    assert all(leg["reduce_only"] for leg in c.last_batch)
+
+
+def test_a_long_book_is_quoted_below_the_oracle():
+    """Price skew, not size skew -- both legs move, sizes stay equal."""
+    flat = _Client()
+    _runner(flat).tick(1.0, _ORACLE, {})
+    long_book = _Client(account={
+        "equity_usd": 100_000.0, "used_margin_usd": 0.0,
+        "positions": {_MKT: 50.0},
+    })
+    _runner(long_book, max_position=100.0).tick(1.0, _ORACLE, {})
+
+    def _leg(client, side):
+        return [x for x in client.last_batch if x["side"] == side][0]
+
+    # The pair slid down...
+    assert _leg(long_book, "buy")["price"] < _leg(flat, "buy")["price"]
+    assert _leg(long_book, "sell")["price"] < _leg(flat, "sell")["price"]
+    def _notional(client, side):
+        leg = _leg(client, side)
+        return leg["price"] * leg["size"]
+
+    # ...with the two sides carrying equal NOTIONAL, which is the unit depth
+    # credit is measured in, so min(bid_usd, ask_usd) is not truncated. The
+    # ladder equalises notional rather than contract count, and notional is
+    # the one that has to match.
+    assert _notional(long_book, "buy") == pytest.approx(
+        _notional(long_book, "sell"), rel=0.001
+    )
+    # ...and the skew cost nothing in standing notional.
+    assert _notional(long_book, "buy") == pytest.approx(
+        _notional(flat, "buy"), rel=0.001
+    )
+
+
+def test_a_carried_session_actually_quotes_the_smaller_size():
+    """risk.assess() computes an eighth; the ladder must use it."""
+    live, carried = _Client(), _Client()
+    _runner(live).tick(1.0, _ORACLE, {})
+    _runner(carried).tick(1.0, _ORACLE, {"carried": True})
+
+    def _size(client):
+        return [x for x in client.last_batch if x["side"] == "buy"][0]["size"]
+
+    assert _size(carried) == pytest.approx(_size(live) / 8.0, rel=0.01)
+
+
+def test_a_missing_oracle_places_nothing_for_that_market():
+    c = _Client()
+    result = _runner(c).tick(1.0, {}, {})
+    assert result.action == "withdraw"
+
+
+def test_a_stale_oracle_withdraws():
+    c = _Client()
+    result = _runner(c).tick(1.0, _ORACLE, {"oracle_age_s": 60.0})
+    assert result.action == "withdraw"
+    assert "cancel_all" in c.calls
+
+
+# --------------------------------------------------------------------------- #
+# Session
+# --------------------------------------------------------------------------- #
+def test_a_backing_off_session_waits_rather_than_withdrawing():
+    """The book may still be legitimately resting."""
+    c = _Client(session=RenewAction.WAIT)
+    result = _runner(c).tick(1.0, _ORACLE, {})
+    assert result.action == "wait"
+    assert "cancel_all" not in c.calls
+
+
+def test_no_session_at_all_withdraws():
+    c = _Client(session=RenewAction.NO_SESSION)
+    assert _runner(c).tick(1.0, _ORACLE, {}).action == "withdraw"
+
+
+# --------------------------------------------------------------------------- #
+# The loop outlives its failures
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "where", ["ensure_session", "open_orders", "account", "batch_upsert"]
+)
+def test_a_failure_anywhere_returns_rather_than_raises(where):
+    c = _Client(fail_on=where)
+    result = _runner(c).tick(1.0, _ORACLE, {})
+    assert not result.ok
+    assert "exploded" in result.error
+
+
+def test_an_unexpected_exception_is_still_caught():
+    class _Broken(_Client):
+        def ensure_session(self, now_s):
+            raise ZeroDivisionError("bug")
+
+    result = _runner(_Broken()).tick(1.0, _ORACLE, {})
+    assert not result.ok
+    assert "ZeroDivisionError" in result.error
+
+
+def test_never_linked_is_reported_as_blocked_not_a_transient_error():
+    class _Unlinked(_Client):
+        def ensure_session(self, now_s):
+            raise PermutoNotLinked("no session held")
+
+    result = _runner(_Unlinked()).tick(1.0, _ORACLE, {})
+    assert result.action == "blocked"
+
+
+def test_a_rejected_batch_does_not_update_the_belief():
+    """Believe only what the venue accepted."""
+    c = _Client(fail_on="batch_upsert")
+    r = _runner(c)
+    assert not r.tick(1.0, _ORACLE, {}).ok
+    assert r._resting[_MKT].empty
+
+
+# --------------------------------------------------------------------------- #
+# Account parsing
+# --------------------------------------------------------------------------- #
+def test_a_malformed_account_reads_as_fully_utilised_not_empty():
+    """0 equity means "stop adding risk", which is the safe reading."""
+    assert _margin_state(None, False).utilisation() == 1.0
+    assert _margin_state({}, False).utilisation() == 1.0
+
+
+def test_positions_parse_from_a_dict_or_a_list():
+    as_dict = _margin_state({"positions": {_MKT: 5.0}}, False)
+    as_list = _margin_state(
+        {"positions": [{"market": _MKT, "size": 5.0}]}, False
+    )
+    assert as_dict.positions[_MKT] == as_list.positions[_MKT] == 5.0
+
+
+def test_numeric_strings_are_accepted_and_booleans_are_not():
+    assert _margin_state({"equity_usd": "1500.5"}, False).equity_usd == 1500.5
+    assert _margin_state({"equity_usd": True}, False).equity_usd == 0.0
