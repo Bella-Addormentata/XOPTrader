@@ -85,8 +85,23 @@ def signup_open() -> tuple[bool, dict]:
     A new identity is refused at the challenge step with HTTP 403 when signup
     is closed, so there is no point deriving a signature we cannot use.
     """
-    flags = (_request("GET", "/info/meta") or {}).get("flags") or {}
-    return (not flags.get("signup_closed", False)), flags
+    meta = _request("GET", "/info/meta") or {}
+    flags = meta.get("flags")
+    # FAIL CLOSED on an unknown shape. `{}`, a missing `flags`, or a
+    # non-boolean all used to read as "signup is open" -- and the very next
+    # thing this gates is a PERMANENT link. Only an explicit boolean says the
+    # door is open.
+    if not isinstance(flags, dict) or "signup_closed" not in flags:
+        raise PermutoAuthError(
+            "/info/meta did not report signup_closed; refusing to link an "
+            "identity against an unknown venue state"
+        )
+    closed = flags["signup_closed"]
+    if not isinstance(closed, bool):
+        raise PermutoAuthError(
+            "signup_closed was %r, not a boolean; refusing to guess" % (closed,)
+        )
+    return (not closed), flags
 
 
 def resolve_trading_address(pubkey_hex: str) -> dict:

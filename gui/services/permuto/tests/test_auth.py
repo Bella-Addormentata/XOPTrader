@@ -277,3 +277,18 @@ def test_non_string_identifiers_are_refused(monkeypatch, bad_id, bad_addr):
     _routes(monkeypatch, table)
     with pytest.raises(PermutoAuthError, match="identifiers"):
         auth.register(FakeIdentity())
+
+
+@pytest.mark.parametrize("meta", [
+    {}, {"flags": {}}, {"flags": None},
+    {"flags": {"signup_closed": "false"}},
+    {"flags": {"signup_closed": 0}},
+])
+def test_an_unknown_signup_state_fails_closed(monkeypatch, meta):
+    """The gate used to read {} and a missing/non-boolean flag as "open", and
+    the very next call performs a PERMANENT link."""
+    ident = FakeIdentity()
+    _routes(monkeypatch, {("GET", "/info/meta"): meta})
+    with pytest.raises(PermutoAuthError):
+        auth.register(ident)
+    assert ident.signed == []

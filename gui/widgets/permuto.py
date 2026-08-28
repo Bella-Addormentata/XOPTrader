@@ -215,6 +215,12 @@ class _RestoreDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+    def scrub(self) -> None:
+        """Drop the typed phrase. exec() hides this dialog, it does not
+        destroy it, so the editor keeps the secret alive as a child of the
+        page until the window closes."""
+        self._edit.clear()
+
     @property
     def phrase(self) -> str:
         return self._edit.toPlainText().strip()
@@ -512,8 +518,13 @@ class PermutoWidget(QWidget):
             return
 
         dialog = _RecoveryPhraseDialog(phrase, self)
-        dialog.exec()
-        confirmed = dialog.confirmed
+        accepted = bool(dialog.exec())
+        # BOTH, and the dialog result is the half that was missing. Ticking
+        # the box and then pressing Escape left `confirmed` true, so the
+        # identity was marked backed up instead of rolled back -- turning the
+        # rollback branch below into dead code in precisely the case it was
+        # written for, and leaving an unrecoverable key marked as safe.
+        confirmed = accepted and dialog.confirmed
         # exec() only HIDES a parented dialog. Its QTextEdit and the copy
         # lambda keep the full phrase alive as children of this page, so the
         # earlier claim that it "goes out of scope" was wrong. Scrub, then
@@ -557,14 +568,24 @@ class PermutoWidget(QWidget):
     @Slot()
     def _on_restore(self) -> None:
         dialog = _RestoreDialog(self)
-        if not dialog.exec():
+        accepted = bool(dialog.exec())
+        # Capture, then scrub, on BOTH paths. exec() only hides a parented
+        # dialog, so its editor would otherwise hold the recovery phrase as a
+        # child of this page for the lifetime of the window -- the same
+        # retention the creation dialog was already fixed for.
+        phrase = dialog.phrase if accepted else ""
+        dialog.scrub()
+        dialog.deleteLater()
+        if not accepted:
             return
         identity = self._identity_factory()
         try:
-            identity.restore(dialog.phrase)
+            identity.restore(phrase)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Could not restore identity", str(exc))
             return
+        finally:
+            phrase = ""
         self.refresh()
 
     @Slot(bool)
