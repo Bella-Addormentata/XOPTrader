@@ -551,3 +551,37 @@ TEST(UsdPerBaseFromMid, AnOverflowingProductIsRejectedNotReturned) {
     const double huge = std::numeric_limits<double>::max();
     EXPECT_FALSE(xop::usd_per_base_from_mid(huge, 1.0, huge));
 }
+
+// ---------------------------------------------------------------------------
+// [review] Finite is not enough. A finite-but-enormous par reaches llround.
+// ---------------------------------------------------------------------------
+
+TEST(PeggedAssetCoherence, AnAstronomicalParIsRejected) {
+    // 1e308 is finite and positive. Multiplied by a Mojo -- up to 1e12 for
+    // XCH -- it overflows long long inside std::llround, which raises the
+    // invalid-operation condition and returns an unusable value rather than
+    // an error.
+    xop::PeggedAsset a;
+    a.asset_id = "wusdc.b";
+    a.peg_currency = "USD";
+    a.peg_target = 1e308;
+    EXPECT_FALSE(a.is_coherent());
+}
+
+TEST(PeggedAssetCoherence, ThePracticalRangeIsStillAccepted) {
+    xop::PeggedAsset a;
+    a.asset_id = "wusdc.b";
+    a.peg_currency = "USD";
+    for (const double par : {0.000001, 0.5, 1.0, 3.75, 1000.0,
+                             xop::PeggedAsset::kMaxPegTarget}) {
+        a.peg_target = par;
+        EXPECT_TRUE(a.is_coherent()) << "rejected a legitimate par " << par;
+    }
+}
+
+TEST(PeggedAssetCoherence, TheBoundLeavesHeadroomUnderLlround) {
+    // The product that must survive: par * mojos-per-XCH.
+    constexpr double kMojos = 1e12;
+    const double worst = xop::PeggedAsset::kMaxPegTarget * kMojos;
+    EXPECT_LT(worst, 9.0e18) << "the bound does not actually protect llround";
+}

@@ -3373,10 +3373,21 @@ void validate_usd_anchor(const AppConfig& cfg)
 
     // The only route is an enabled pair whose quote asset carries a
     // declared, enforced USD par.
+    // [review] MIRROR BOTH RUNTIME PREDICATES, or this certifies an anchor
+    // usd_per_xch() will not use. That function accepts only an enabled
+    // pair whose BASE is XCH and whose quote is a par WRAPPER -- which
+    // excludes prefer_market_cross assets, since those are valued through
+    // their market rather than their par. Checking any base and ignoring
+    // prefer_market_cross meant a config of only BYC/wUSDC.b, or only
+    // XCH/BYC with BYC cross-preferring, suppressed the warning while
+    // usd_per_xch() returned 0 and every XCH-quoted conversion stayed
+    // unavailable.
     for (const auto& pair : cfg.pairs) {
         if (!pair.enabled) continue;
+        if (pair.base_asset_id != "xch") continue;
         const auto* a = cfg.pegged_assets.find(pair.quote_asset_id);
-        if (a != nullptr && a->enforce && a->peg_currency == "USD") {
+        if (a != nullptr && a->enforce && !a->prefer_market_cross
+                && a->peg_currency == "USD") {
             return;
         }
     }

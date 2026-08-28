@@ -75,6 +75,16 @@ struct PeggedAsset {
     /// Almost always 1.0, but a coin pegged to 100 JPY is expressible.
     double peg_target{1.0};
 
+    /// Largest declarable USD par per unit.
+    ///
+    /// Not a taste judgement: the product of this and a Mojo has to survive
+    /// llround. XCH carries 1e12 mojos per unit, so a par of 1e6 leaves
+    /// eighteen orders of magnitude of headroom under the ~9.2e18 that
+    /// long long can represent, while still admitting anything an actual
+    /// pegged asset could be worth -- the most valuable currency unit in
+    /// circulation is under 4 USD.
+    static constexpr double kMaxPegTarget = 1e6;
+
     /// Deviation from peg_target at which to warn, as a percentage.
     /// Must be strictly positive: the classify() comparison is inclusive
     /// (to agree with DepegDetector), so a warn_pct of 0 would make an
@@ -119,9 +129,19 @@ struct PeggedAsset {
         // from a typo could otherwise return an infinite USD factor into
         // llround.  Matches the finite check PairConfig::peg_target already
         // gets in config.cpp.
+        //
+        // [review] Finite is NOT enough for peg_target. 1e308 is finite and
+        // positive, and the factor it produces is multiplied by a Mojo --
+        // up to 1e12 for XCH -- and handed to std::llround at every
+        // double-to-Mojo boundary. That overflows long long, raises the
+        // invalid-operation condition, and yields an unusable Mojo rather
+        // than an error. Bounding the DECLARATION is the cheap place to stop
+        // it: one check at startup instead of a range test at every
+        // conversion, and it fails loudly where an operator can read it.
         return !asset_id.empty()
             && !peg_currency.empty()
             && std::isfinite(peg_target) && peg_target > 0.0
+            && peg_target <= kMaxPegTarget
             && std::isfinite(warn_pct)   && warn_pct > 0.0
             && std::isfinite(bail_pct)   && bail_pct > warn_pct;
     }
