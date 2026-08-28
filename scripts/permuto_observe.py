@@ -65,6 +65,40 @@ def safe(path):
         return {"__error__": "%s: %s" % (type(exc).__name__, exc)}
 
 
+def _ring_depth(bids, asks, oracle, ring_pct=2.0):
+    """Balanced notional inside the depth-credit ring, per the venue's rule.
+
+    Depth accrues on ``min(bid, ask)`` within +/-2% of a fresh oracle, so the
+    minimum -- not either side, and not the sum -- is what a market earns.
+    Recorded per tick because the ladder it is derived from is not kept.
+    """
+    if not oracle or not (oracle > 0.0):
+        return None
+
+    def side(levels):
+        total, n = 0.0, 0
+        for lvl in levels:
+            try:
+                price = float(lvl["price"])
+                size = float(lvl["size"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if abs(price - oracle) / oracle * 100.0 <= ring_pct:
+                total += price * size
+                n += 1
+        return total, n
+
+    bid_usd, bid_n = side(bids)
+    ask_usd, ask_n = side(asks)
+    return {
+        "bid_usd": round(bid_usd, 4),
+        "ask_usd": round(ask_usd, 4),
+        "credit_usd": round(min(bid_usd, ask_usd), 4),
+        "bid_levels": bid_n,
+        "ask_levels": ask_n,
+    }
+
+
 def main():
     out_path = sys.argv[1]
     stop = datetime.fromisoformat(sys.argv[2])
@@ -91,13 +125,25 @@ def main():
             row["oracle"] = safe("/info/oracle").get("prices")
 
             books, funding = {}, {}
+            oracle_by_ticker = row.get("oracle") or {}
             for m in MARKETS:
-                l2 = safe("/info/l2/" + m)
-                # Store only the top of book plus the aggregate; the full
-                # ladder would balloon the file and the ring is what matters.
+                l2 = safe("/info/l2/" + m + "?levels=500")
+                bids = l2.get("bids") or []
+                asks = l2.get("asks") or []
+                # THE AGGREGATE IS THE POINT, and an earlier version stored
+                # only eight levels while its own comment claimed otherwise.
+                # The +/-2% ring can hold more than eight, so a truncated
+                # ladder cannot reconstruct balanced in-ring depth -- the one
+                # question this recorder exists to answer. Computed here,
+                # against the oracle from this same tick, because it cannot
+                # be recovered later from a ladder we did not keep.
+                ora = oracle_by_ticker.get(m.replace("-PERP", ""))
                 books[m] = {
-                    "bids": (l2.get("bids") or [])[:8],
-                    "asks": (l2.get("asks") or [])[:8],
+                    "bids": bids[:8],
+                    "asks": asks[:8],
+                    "n_bid_levels": len(bids),
+                    "n_ask_levels": len(asks),
+                    "ring": _ring_depth(bids, asks, ora),
                     "err": l2.get("__error__"),
                 }
                 f = safe("/info/funding/" + m)
