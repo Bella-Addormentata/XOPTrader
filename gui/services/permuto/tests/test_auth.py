@@ -257,3 +257,23 @@ def test_a_short_page_ends_the_search(monkeypatch):
     monkeypatch.setattr(auth, "_request", fake)
     assert auth.leaderboard_entry("absent") is None
     assert len(calls) == 1
+
+
+@pytest.mark.parametrize("bad_id,bad_addr", [
+    (12345, "xch1example"),
+    ("c" * 64, 99),
+    ("", "xch1example"),
+    ("   ", "xch1example"),
+])
+def test_non_string_identifiers_are_refused(monkeypatch, bad_id, bad_addr):
+    """Truthiness alone accepted a numeric id, str()'d it, and persisted it as
+    a successful PERMANENT registration. Registration declares strings and the
+    venue has always sent strings, so anything else is a changed contract to
+    refuse rather than coerce."""
+    table = _happy()
+    table[("GET", "/info/wallet_bls_trading_address")] = {
+        "wallet_user_id": bad_id, "wallet_address": bad_addr,
+    }
+    _routes(monkeypatch, table)
+    with pytest.raises(PermutoAuthError, match="identifiers"):
+        auth.register(FakeIdentity())

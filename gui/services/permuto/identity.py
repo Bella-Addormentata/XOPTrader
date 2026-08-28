@@ -26,8 +26,16 @@ Two layers, deliberately not alternatives:
 
 * **The mnemonic** protects against losing the machine. Paper or metal, off
   this box, written down once at creation.
-* **DPAPI (or a passphrase off Windows)** protects the copy at rest, so a
-  stolen ``secrets.yaml`` is not a stolen account.
+* **DPAPI protects the copy at rest** on Windows, so a stolen
+  ``secrets.yaml`` is not a stolen account.
+
+  ⚠ An earlier version of this text promised "or a passphrase off Windows".
+  **That path does not exist.** ``keystore.default_protector()`` supports
+  Windows DPAPI and raises everywhere else, so on Linux and macOS there is no
+  at-rest protection to fall back on: creating, restoring or signing raises,
+  and only INSPECTION of the public identity works. Promising a protector we
+  do not implement is worse than admitting the gap, because an operator would
+  reasonably assume their key was wrapped.
 
 The wordlist ships inside ``eth_account``, already a declared dependency, so
 this adds no package and downloads nothing. Its BIP-39 implementation is

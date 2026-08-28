@@ -611,6 +611,13 @@ class PermutoWidget(QWidget):
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_finished)
+        # Clearing the Python attributes does not remove a stopped QThread
+        # from this page's QObject children, so repeated leaderboard checks
+        # accumulated thread and worker objects until the window closed.
+        # Same wiring the other worker-owning pages use.
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._thread.finished.connect(self._thread.deleteLater)
         self._thread.start()
 
     @Slot(dict)

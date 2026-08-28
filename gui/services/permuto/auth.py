@@ -225,7 +225,12 @@ def register(identity: Any) -> Registration:
     # would be saved -- a false durable success from a malformed 200.
     user_id = resolved.get("wallet_user_id") or auth.get("user_id")
     trading_address = resolved.get("wallet_address")
-    if not user_id or not trading_address:
+    # Type as well as truthiness. A numeric id is truthy, would be str()'d
+    # below, and would then be persisted as a successful PERMANENT
+    # registration -- Registration declares these as strings and the venue
+    # has always sent strings, so anything else is a changed contract we
+    # should refuse rather than coerce.
+    if not isinstance(user_id, str) or not isinstance(trading_address, str)             or not user_id.strip() or not trading_address.strip():
         raise PermutoAuthError(
             "link succeeded but the venue did not return both identifiers "
             "(user_id=%r, address=%r); refusing to record a registration we "
