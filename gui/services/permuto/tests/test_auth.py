@@ -426,18 +426,37 @@ def test_a_malformed_200_leaves_the_attempt_marked(monkeypatch):
 # Reconciliation -- read the venue back WITHOUT linking anything
 # --------------------------------------------------------------------------- #
 
-def test_reconcile_reports_an_already_linked_key(monkeypatch):
+def test_reconcile_confirms_a_key_that_is_on_the_leaderboard(monkeypatch):
     calls = _routes(monkeypatch, {
         ("GET", "/info/wallet_bls_trading_address"): RESOLVED,
+        ("GET", "/exchange/leaderboard"): {
+            "market_makers": [{"user_id": "c" * 64}], "traders": [],
+        },
     })
     assert auth.reconcile_registration(FakeIdentity()) == (
         "c" * 64, "xch1example"
     )
-    # The route it uses is the documented side-effect-free one, and it is the
-    # ONLY call: reconciling must never be a way of linking by accident.
-    assert [c[1].split("?")[0] for c in calls] == [
-        "/info/wallet_bls_trading_address"
-    ]
+    paths = [c[1].split("?")[0] for c in calls]
+    # Both routes are reads. Reconciling must never be a way of linking.
+    assert paths == ["/info/wallet_bls_trading_address",
+                     "/exchange/leaderboard"]
+
+
+def test_a_derived_user_id_alone_is_not_proof_of_a_link(monkeypatch):
+    """MEASURED 2026-08-28, and it is the whole reason this is two calls.
+
+    /info/wallet_bls_trading_address DERIVES wallet_user_id from the pubkey
+    rather than looking up a registration: a freshly generated key that has
+    never been sent to the venue comes back with a populated wallet_user_id
+    and wallet_address. Treating that as "already linked" reports EVERY valid
+    key as registered -- and the caller then records a registration that
+    never happened and disables Register for an account that does not exist.
+    """
+    _routes(monkeypatch, {
+        ("GET", "/info/wallet_bls_trading_address"): RESOLVED,
+        ("GET", "/exchange/leaderboard"): {"market_makers": [], "traders": []},
+    })
+    assert auth.reconcile_registration(FakeIdentity()) is None
 
 
 def test_reconcile_says_none_rather_than_inventing_a_registration(monkeypatch):

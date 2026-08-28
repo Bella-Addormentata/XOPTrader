@@ -292,15 +292,28 @@ class PermutoIdentity:
             # still pass the BIP-39 checksum and derive a perfectly valid
             # stranger's key. Overwriting on that keystroke abandons a live
             # venue identity with no way back.
-            if different_key and section.get("registered"):
+            # [audit] `link_attempted_at` is the OTHER "this key may be the
+            # account" state, and restore sweeps it two lines below -- so
+            # guarding only on `registered` protected one of the pair and
+            # actively destroyed the evidence for its sibling. An operator
+            # whose link timed out is exactly the one most likely to reach
+            # for Restore, and the key they would abandon may already own a
+            # live account.
+            unresolved_attempt = bool(section.get("link_attempted_at"))
+            if different_key and (section.get("registered")
+                                  or unresolved_attempt):
                 raise PermutoIdentityError(
-                    "refusing to restore a DIFFERENT key over a REGISTERED "
-                    "identity -- the key is the account, and this would "
-                    "abandon it permanently. These words derive %s..., but "
-                    "the registered account is %s.... Restore the phrase "
+                    "refusing to restore a DIFFERENT key over %s -- the key "
+                    "is the account, and this would abandon it permanently. "
+                    "These words derive %s..., but the account here is "
+                    "%s.... Restore the phrase "
                     "for THAT key, or remove the 'permuto' section from "
                     "secrets.yaml deliberately if the account really is "
-                    "being given up." % (pubkey[:16], str(stored)[:16])
+                    "being given up."
+                    % ("a REGISTERED identity" if section.get("registered")
+                       else "an UNRESOLVED link attempt (this key may "
+                            "already own an account)",
+                       pubkey[:16], str(stored)[:16])
                 )
             # Restoring a DIFFERENT phrase installs a different account.
             # Registration metadata describes the old one: left in place it

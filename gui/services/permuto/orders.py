@@ -250,13 +250,20 @@ def quote_ladder(
     credit, and it is logged at WARNING so a config typo does not silently
     idle the book for a whole contest week.
     """
+    # [audit] Log EVERY rejection, not just the offsets. The docstring
+    # promised that and only the offset branch delivered it, so a sign typo
+    # in target_depth_usd -- a QuoteRunner constructor argument -- idled the
+    # book in silence for as long as nobody looked.
     if not (_finite(oracle) and oracle > 0.0):
+        _log.warning("quote_ladder: refusing to build against oracle %r", oracle)
         return []
     if not (_finite(target_depth_usd) and target_depth_usd > 0.0):
+        _log.warning("quote_ladder: target_depth_usd is %r; quoting nothing",
+                     target_depth_usd)
         return []
     if levels < 1:
         return []
-    if not (_finite(first_offset_pct) and first_offset_pct >= 0.0
+    if not (_finite(first_offset_pct) and first_offset_pct > 0.0
             and _finite(level_step_pct) and level_step_pct >= 0.0
             and _finite(ring_pct) and 0.0 < ring_pct <= 100.0):
         _log.warning(

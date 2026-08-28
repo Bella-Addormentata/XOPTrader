@@ -423,3 +423,36 @@ def test_a_registered_identity_is_never_discarded(ident):
     with pytest.raises(PermutoIdentityError, match="REGISTERED"):
         ident.discard_unregistered()
     assert ident.exists()
+
+
+def test_restore_also_refuses_over_an_unresolved_link_attempt():
+    """The other "this key may be the account" state.
+
+    An operator whose link timed out is the one most likely to reach for
+    Restore -- and restore sweeps link_attempted_at, so guarding only on
+    `registered` protected one of the pair while destroying the evidence for
+    its sibling.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    other = generate_mnemonic()
+    with pytest.raises(PermutoIdentityError, match="UNRESOLVED link attempt"):
+        ident.restore(other)
+
+    # And the marker survives the refusal.
+    assert ident.info().link_attempted is True
+
+
+def test_restore_still_allows_the_same_key_over_an_attempt():
+    """The machine-move path must keep working."""
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    before = ident.public_key()
+    ident.mark_link_attempt()
+
+    ident.restore(phrase)
+    assert ident.public_key() == before

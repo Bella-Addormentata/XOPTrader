@@ -257,30 +257,49 @@ def _clear_link_attempt(identity: Any) -> None:
 
 
 def reconcile_registration(identity: Any) -> Optional[tuple[str, str]]:
-    """``(user_id, trading_address)`` if the venue already knows this key.
+    """``(user_id, trading_address)`` if the venue CONFIRMS this key is linked.
 
-    The read-back for an indeterminate link. ``/info/wallet_bls_trading_
-    address`` is documented as having **no link side effects**, which is the
-    whole reason it can be used here: asking "am I already linked?" must not
-    be a way of accidentally linking.
+    The read-back for an indeterminate link, and the hard part is not fetching
+    anything -- it is finding a signal that actually means "linked".
 
-    Returns ``None`` when the venue does not report a ``wallet_user_id`` for
-    this key. That is read as "not linked" -- deliberately the conservative
-    direction, because the alternative is recording a registration that never
-    happened and permanently disabling the Register button for an account
-    that does not exist. ``register()`` itself falls back to the auth
-    response for ``user_id``, which is what says this field is not populated
-    for an unlinked key.
+    WHAT DOES NOT WORK, MEASURED.  The obvious candidate is
+    ``/info/wallet_bls_trading_address``, which returns a ``wallet_user_id``
+    and is documented as having no link side effects. It is useless as a
+    linkage test: that route DERIVES the id from the pubkey rather than
+    looking up a registration. Probed on 2026-08-28 with a freshly generated
+    key that has never been sent to the venue::
+
+        wallet_user_id = '7232a2d5...'
+        wallet_address = 'xch1wge294flzk0tuyf6c4l3c6nzt7llhtel2kq2'
+
+    So keying off that field reports EVERY valid key as already linked -- and
+    the caller then records a registration that never happened and disables
+    Register for an account that does not exist. That is precisely the failure
+    this function exists to avoid, arriving through the function itself.
+
+    WHAT DOES WORK, PARTLY.  The leaderboard lists real accounts, so finding
+    our derived id there is positive proof of a link. Not finding it proves
+    nothing -- a linked account that has not traded may not be listed yet.
+
+    Hence three outcomes, not two, and the caller must not collapse them:
+    a tuple means CONFIRMED linked; ``None`` means UNCONFIRMED, which is not
+    the same as unlinked and must not re-enable Register on its own.
     """
     pubkey = identity.public_key()
     resolved = resolve_trading_address(pubkey) or {}
     if resolved.get("error"):
         raise PermutoAuthError("venue rejected our pubkey: %s" % resolved["error"])
+
+    # Derived, not looked up -- see above. Useful only as the KEY for the
+    # leaderboard search, never as the answer.
     user_id = resolved.get("wallet_user_id")
     address = resolved.get("wallet_address")
     if not isinstance(user_id, str) or not user_id.strip():
         return None
     if not isinstance(address, str) or not address.strip():
+        return None
+
+    if leaderboard_entry(user_id) is None:
         return None
     return user_id, address
 
