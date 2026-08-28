@@ -458,7 +458,27 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
                       "so the declared peg would silently do nothing.");
             }
         }
-        if (item["peg_currency"]) a.peg_currency = item["peg_currency"].as<std::string>();
+        if (item["peg_currency"]) {
+            // Canonicalise to trimmed upper case.  usd_par_value() matches
+            // "USD" exactly, while the parser accepted any non-empty string --
+            // so `peg_currency: usd` was ACCEPTED and then behaved like an
+            // unsupported foreign currency, silently removing the par the
+            // operator believed they had declared.  Same class as the asset-id
+            // canonicalisation above: a declaration that looks like protection
+            // and does nothing.
+            std::string cur = item["peg_currency"].as<std::string>();
+            const std::string ws = " \t\r\n";
+            const auto first = cur.find_first_not_of(ws);
+            const auto last  = cur.find_last_not_of(ws);
+            cur = (first == std::string::npos)
+                ? std::string{}
+                : cur.substr(first, last - first + 1);
+            std::transform(cur.begin(), cur.end(), cur.begin(),
+                           [](unsigned char c) {
+                               return static_cast<char>(std::toupper(c));
+                           });
+            a.peg_currency = cur;
+        }
         if (item["peg_target"])   a.peg_target   = item["peg_target"].as<double>();
         if (item["warn_pct"])     a.warn_pct     = item["warn_pct"].as<double>();
         if (item["bail_pct"])     a.bail_pct     = item["bail_pct"].as<double>();

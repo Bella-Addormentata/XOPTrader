@@ -1656,3 +1656,30 @@ pegged_assets:
 )"));
     EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
 }
+
+TEST(ConfigParserTest, PeggedAssets_PegCurrencyIsCanonicalised) {
+    // usd_par_value() matches "USD" exactly. The parser accepted any
+    // non-empty string, so `peg_currency: usd` was accepted and then behaved
+    // like an unsupported foreign currency -- silently removing the par the
+    // operator believed they had declared.
+    for (const char* written : {"usd", " USD ", "Usd", "\tuSd\n"}) {
+        TempYaml tmp(with_pegs(std::string(R"(
+pegged_assets:
+- asset_id: "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233"
+  symbol: TEST
+  peg_currency: ")") + written + R"("
+  peg_target: 1.0
+  warn_pct: 2.0
+  bail_pct: 10.0
+)"));
+        auto cfg = xop::load_config(tmp.path());
+        const auto* a = cfg.pegged_assets.find(
+            "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233");
+        ASSERT_NE(a, nullptr) << "written as: " << written;
+        EXPECT_EQ(a->peg_currency, "USD") << "written as: " << written;
+        EXPECT_TRUE(cfg.pegged_assets.usd_par_value(
+            "aa11bb22cc33dd44ee55ff6600112233445566778899aabbccddeeff00112233")
+                        .has_value())
+            << "a canonicalised USD peg must still yield a par: " << written;
+    }
+}
