@@ -126,11 +126,17 @@ pegged_assets:
   sustained_observations: 30
   prefer_market_cross: false
   enforce: true
-# The other two legacy wrappers.  No live pair quotes them today, but an
-# operator re-adding XCH/wUSDC or XCH/USDS without a declaration here gets a
-# factor of 0.0 -- NO valuation -- rather than the implicit $1 the old
-# hardcoded list gave them.  That is the intended behaviour (par is declared,
-# never assumed), so they are declared rather than left to surprise someone.
+# The other two legacy wrappers.  No live pair quotes them today.  Declaring
+# them here is what gives them a PAR of exactly $1; the old hardcoded list
+# gave them that implicitly, and par is now declared, never assumed.
+#
+# ⚠ Undeclared does NOT mean unvalued.  An operator re-adding XCH/wUSDC or
+# XCH/USDS without a declaration here still gets a MARKET-DERIVED factor
+# (usd_per_xch / quote_per_xch, the same generic XCH-base branch DBX uses) --
+# what they lose is the $1 par, not the valuation.  Same distinction as
+# enforce:false above: retiring or omitting a declaration reroutes valuation
+# to the market, it does not stop it.  To make an asset contribute nothing,
+# disable its pairs.
 #
 # ⚠ Engine and GUI can disagree after enforce:false.  The GUI's
 # pnl_usdc_expr (gui/services/database_service.py) still hardcodes $1.00 for
