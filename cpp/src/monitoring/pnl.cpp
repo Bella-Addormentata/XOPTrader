@@ -1489,11 +1489,31 @@ double PnLTracker::quote_mojos_to_usd_locked(const std::string& pair_name,
     const double quote_mojos = static_cast<double>(quote_mojos_int);
 
     auto it = pair_conv_.find(pair_name);
-    if (it != pair_conv_.end()
-        && it->second.usd_per_quote_unit > 0.0
-        && it->second.quote_mojos_per_unit > 0.0) {
-        return quote_mojos / it->second.quote_mojos_per_unit
-                           * it->second.usd_per_quote_unit;
+    if (it != pair_conv_.end()) {
+        if (it->second.usd_per_quote_unit > 0.0
+            && it->second.quote_mojos_per_unit > 0.0) {
+            return quote_mojos / it->second.quote_mojos_per_unit
+                               * it->second.usd_per_quote_unit;
+        }
+        // [PEG 2026-08-28] REGISTERED BUT UNPRICEABLE IS NOT THE SAME AS
+        // UNKNOWN, and conflating them undid the entire peg registry.
+        //
+        // The engine registers a conversion for every configured pair each
+        // cycle. When the quote asset's declared par is unavailable --
+        // enforce:false, or a non-USD peg with no FX rate -- quote_usd_factor
+        // deliberately yields 0.0, which peg_registry.hpp documents as "no
+        // valuation available ... NOT substitute 1.0". Falling through to the
+        // symbol list below did exactly that: it read the pair NAME, matched
+        // wUSDC.b, and returned precisely $1.00 per unit with no registry
+        // lookup, no peg_target and no FX.
+        //
+        // So setting enforce:false on wUSDC.b -- the operator action this
+        // whole PR exists to support, and the response to the warp.green
+        // compromise -- silently restored the $1.00 belief it was meant to
+        // remove, in the P&L totals rather than in equity, where nobody was
+        // looking. A registered pair whose par we cannot obtain contributes
+        // nothing, and says so.
+        return 0.0;
     }
 
     // Retired-pair fallback: rehydration resurrects pairs that are no longer
