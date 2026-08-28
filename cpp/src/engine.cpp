@@ -11279,10 +11279,15 @@ void Engine::step_run_hedging([[maybe_unused]] BlockHeight block_height)
 // [PEG 2026-08-26] Peg identity helpers -- see engine.hpp for why these
 // exist and why they key on asset id rather than on a parsed ticker.
 // ---------------------------------------------------------------------------
+bool Engine::is_par_wrapper_asset(const AssetId& asset_id) const
+{
+    const auto* a = config_.pegged_assets.find(asset_id);
+    return a != nullptr && a->enforce && !a->prefer_market_cross;
+}
+
 bool Engine::is_par_wrapper_quote(const PairConfig& pc) const
 {
-    const auto* a = config_.pegged_assets.find(pc.quote_asset_id);
-    return a != nullptr && a->enforce && !a->prefer_market_cross;
+    return is_par_wrapper_asset(pc.quote_asset_id);
 }
 
 bool Engine::quote_prefers_market_cross(const PairConfig& pc) const
@@ -11402,35 +11407,68 @@ double Engine::usd_per_xch() const
 // one snapshot's grade while consuming another snapshot's price -- passing
 // an ungraded factor or rejecting a graded one.  Both callers below derive
 // from this single answer so they cannot drift apart.
-std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+Engine::CrossQuote Engine::market_cross_for(const PairConfig& pc) const
 {
+    // [PEG review round 5] ONE place decides which cross prices a
+    // market-cross asset AND what that cross is worth.  The eligibility test
+    // and the price used to live in two copies -- here and in the loop
+    // inside quote_usd_factor -- under a comment warning they must stay
+    // identical, which is a duplication that only holds while someone
+    // remembers.  Now the price is computed once and the source-pair query
+    // is a projection of it, so they cannot disagree by construction.
+    //
+    // BOTH ORIENTATIONS.  Both copies previously matched only
+    // <target>/<wrapper>.  The engine supports either direction (the example
+    // config ships wmilliETH.b/XCH), so an operator configuring
+    // <wrapper>/<target> got no source, no warning, and a silent fall back
+    // to declared par -- the "valued at par while impaired" outcome S30 was
+    // filed about, reachable through pair orientation alone.
     constexpr double kMaxCrossSpreadBps = 300.0;
+    const AssetId& target = pc.quote_asset_id;
+
     for (const auto& other : config_.pairs) {
         if (!other.enabled) continue;
-        if (other.base_asset_id != pc.quote_asset_id) continue;
-        if (!is_par_wrapper_quote(other)) {
-            continue;
-        }
+
+        const bool direct  = (other.base_asset_id == target)
+                          && is_par_wrapper_asset(other.quote_asset_id);
+        const bool inverse = (other.quote_asset_id == target)
+                          && is_par_wrapper_asset(other.base_asset_id);
+        if (!direct && !inverse) continue;
+
+        // The mid is denominated in the CROSS wrapper, so it must be
+        // converted through that wrapper's declared par exactly as
+        // usd_per_xch does -- returning it raw reports wrapper units as
+        // dollars.  nullopt (a non-USD peg with no FX rate) means this cross
+        // cannot yield a USD factor, so skip it.
+        const AssetId& wrapper =
+            direct ? other.quote_asset_id : other.base_asset_id;
+        const auto par = declared_usd_par(wrapper);
+        if (!par) continue;
+
+        // [S20] The S17 tight-spread test already establishes a live
+        // two-sided book here, which is the same evidence grade would ask
+        // for; adding grade would only fold in the CEX-availability
+        // dependency described at usd_per_xch.  spread_bps is 0 for
+        // one-sided or crossed books, which also (correctly) selects par.
         auto snap = state_->get_market(other.name);
-        // [PEG 2026-08-27] The mid is denominated in the CROSS
-        // wrapper, so it must be converted through that wrapper's
-        // declared par exactly as usd_per_xch does -- returning it
-        // raw reports wrapper units as dollars.  nullopt (a
-        // non-USD peg with no FX rate) means this cross cannot
-        // yield a USD factor, so skip it.  This guard MUST stay
-        // identical here and in quote_usd_factor or the two
-        // disagree about which snapshot supplies the value -- the
-        // inconsistency class S20 was burned by.
-        if (!declared_usd_par(other.quote_asset_id)) {
+        if (!(snap.mid_price > 0) || !(snap.spread_bps > 0.0)
+            || snap.spread_bps > kMaxCrossSpreadBps) {
             continue;
         }
-        if (snap.mid_price > 0
-            && snap.spread_bps > 0.0
-            && snap.spread_bps <= kMaxCrossSpreadBps) {
-            return other.name;
-        }
+        const double mid = static_cast<double>(snap.mid_price)
+                         / static_cast<double>(kMojosPerXch);
+        if (!(mid > 0.0)) continue;
+
+        // direct : mid is WRAPPER per target -> multiply by par.
+        // inverse: mid is TARGET per wrapper -> divide.
+        return CrossQuote{other.name, direct ? mid * *par : *par / mid};
     }
     return {};
+}
+
+std::string Engine::byc_cross_source_pair(const PairConfig& pc) const
+{
+    return market_cross_for(pc).pair_name;
 }
 
 // [S20 2026-08-24] Which pair's published snapshot quote_usd_factor()
@@ -11522,39 +11560,12 @@ double Engine::quote_usd_factor(const PairConfig& pc) const
     // fall back to par otherwise.  spread_bps is 0 for one-sided or crossed
     // books, which also (correctly) selects par.
     if (quote_prefers_market_cross(pc)) {
-        constexpr double kMaxCrossSpreadBps = 300.0;
-        for (const auto& other : config_.pairs) {
-            if (!other.enabled) continue;
-            if (other.base_asset_id != pc.quote_asset_id) continue;
-            if (!is_par_wrapper_quote(other)) {
-                continue;
-            }
-            auto snap = state_->get_market(other.name);
-            // [S20] The S17 tight-spread test already establishes a live
-            // two-sided book here, which is the same evidence grade would
-            // ask for; adding grade would only fold in the CEX-availability
-            // dependency described at usd_per_xch.
-            // [PEG 2026-08-27] The mid is denominated in the CROSS
-            // wrapper, so it must be converted through that wrapper's
-            // declared par exactly as usd_per_xch does -- returning it
-            // raw reports wrapper units as dollars.  nullopt (a
-            // non-USD peg with no FX rate) means this cross cannot
-            // yield a USD factor, so skip it.  This guard MUST stay
-            // identical here and in quote_usd_factor or the two
-            // disagree about which snapshot supplies the value -- the
-            // inconsistency class S20 was burned by.
-            if (!declared_usd_par(other.quote_asset_id)) {
-                continue;
-            }
-            if (snap.mid_price > 0
-                && snap.spread_bps > 0.0
-                && snap.spread_bps <= kMaxCrossSpreadBps) {
-                const auto cross_par =
-                    declared_usd_par(other.quote_asset_id);
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch)
-                     * (cross_par ? *cross_par : 0.0);
-            }
+        // Same resolver byc_cross_source_pair() projects, so the snapshot
+        // whose grade is checked is always the snapshot whose price is
+        // consumed -- the inconsistency class S20 was burned by.
+        const auto cross = market_cross_for(pc);
+        if (!cross.pair_name.empty()) {
+            return cross.usd_per_unit;
         }
         // [PEG 2026-08-26] No eligible cross, so fall back to the DECLARED
         // par rather than a 1.0 written here.  This is the line that kept

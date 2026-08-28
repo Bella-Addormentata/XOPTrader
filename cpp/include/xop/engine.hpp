@@ -521,6 +521,21 @@ private:
     /// blip), otherwise it requires the supplying snapshot to be grade.
     /// Single classifier for all three consumers: both branches of
     /// asset_usd_pseudo_price and the P&L conversion refresh.
+    /// [PEG round 5] Asset-keyed form of is_par_wrapper_quote, so a cross
+    /// can be tested from EITHER side of a pair.
+    [[nodiscard]] bool is_par_wrapper_asset(const AssetId& asset_id) const;
+
+    /// One eligible market cross for a prefer_market_cross asset: which pair
+    /// supplies it and what a unit is worth in USD.  Both orientations are
+    /// accepted (<target>/<wrapper> and <wrapper>/<target>, the latter
+    /// inverted).  Empty pair_name means no eligible cross, and the caller
+    /// falls back to declared par.
+    struct CrossQuote {
+        std::string pair_name;
+        double      usd_per_unit{0.0};
+    };
+    [[nodiscard]] CrossQuote market_cross_for(const PairConfig& pc) const;
+
     [[nodiscard]] bool quote_usd_factor_trusted(const PairConfig& pc) const;
 
     /// Convert a pair-quote pseudo-price to a USD-normalized pseudo-price.
