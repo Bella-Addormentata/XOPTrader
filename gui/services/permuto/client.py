@@ -123,8 +123,7 @@ class PermutoClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
-                raw = resp.read().decode()
-                return json.loads(raw) if raw.strip() else {}
+                return _decode(resp.read().decode(), method, path)
         except urllib.error.HTTPError as exc:
             detail = ""
             try:
@@ -244,6 +243,16 @@ class PermutoClient:
             "POST", "/exchange/batch_upsert", {"orders": list(legs)}, now_s
         )
 
+    def account(self, now_s: float) -> Any:
+        """Equity, used margin and positions, for :mod:`risk`."""
+        return self._retry_once_on_401("POST", "/exchange/account", {}, now_s)
+
+    def open_orders(self, now_s: float) -> Any:
+        """What is actually resting, as opposed to what we believe rests."""
+        return self._retry_once_on_401(
+            "POST", "/exchange/open_orders", {}, now_s
+        )
+
     def cancel_all(
         self, now_s: float, markets: Optional[Sequence[str]] = None
     ) -> Any:
@@ -272,6 +281,33 @@ class PermutoClient:
             )
             self.reauth(now_s)
             return self._request(method, path, payload)
+
+
+def _decode(raw: str, method: str, path: str) -> Any:
+    """Parse a response body, or say clearly why it is not one.
+
+    The venue serves its single-page app on any unrecognised path, with HTTP
+    200 and an HTML body -- so a mistyped route does not 404, it succeeds and
+    hands back a document. Left to json.loads that surfaces as a bare
+    JSONDecodeError from inside the transport, bypassing every PermutoAuthError
+    the callers are written to handle, and reading like malformed data rather
+    than a wrong address.
+    """
+    if not raw.strip():
+        return {}
+    try:
+        return json.loads(raw)
+    except ValueError as exc:
+        head = raw.lstrip()[:40].lower()
+        if head.startswith("<!doctype") or head.startswith("<html"):
+            raise PermutoAuthError(
+                "%s %s returned the web app, not JSON -- that path is not an "
+                "API route (unknown paths fall through to the SPA with a 200)"
+                % (method, path)
+            ) from exc
+        raise PermutoAuthError(
+            "%s %s returned unparseable JSON: %.120r" % (method, path, raw)
+        ) from exc
 
 
 def _expiry_from(auth: dict, now_s: float) -> float:

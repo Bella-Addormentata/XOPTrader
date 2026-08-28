@@ -228,6 +228,50 @@ def test_empty_response_body_is_not_a_json_error(monkeypatch):
     assert c.cancel_all(0.0) == {}
 
 
+def test_spa_fallback_reads_as_a_wrong_path_not_bad_json(monkeypatch):
+    """Unknown paths return HTTP 200 and an HTML document.
+
+    Probed live: /exchange/positions, /exchange/balances and /info/account all
+    answer 200 with the web app. Only 405-on-GET proves an API route exists.
+    """
+    class _Html(_Fake):
+        def __call__(self, req, timeout=None):
+            self.calls.append((req.method, "x", {}))
+            return _Resp(b'<!doctype html> <html lang="en"><head>')
+
+    monkeypatch.setattr(client_mod.urllib.request, "urlopen", _Html({}))
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1e12)
+    with pytest.raises(PermutoAuthError, match="not an API route"):
+        c.account(0.0)
+
+
+def test_unparseable_json_is_still_a_permuto_error(monkeypatch):
+    class _Junk(_Fake):
+        def __call__(self, req, timeout=None):
+            self.calls.append((req.method, "x", {}))
+            return _Resp(b"{not json")
+
+    monkeypatch.setattr(client_mod.urllib.request, "urlopen", _Junk({}))
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1e12)
+    with pytest.raises(PermutoAuthError, match="unparseable"):
+        c.account(0.0)
+
+
+def test_account_and_open_orders_post_to_confirmed_routes(monkeypatch):
+    """Both answer 405 to GET, which is how we know they exist as POST."""
+    fake = _wire(monkeypatch, {
+        "/exchange/account": {"equity_usd": 1000.0},
+        "/exchange/open_orders": {"orders": []},
+    })
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1e12)
+    assert c.account(0.0) == {"equity_usd": 1000.0}
+    assert c.open_orders(0.0) == {"orders": []}
+    assert [(m, p) for m, p, _ in fake.calls] == [
+        ("POST", "/exchange/account"),
+        ("POST", "/exchange/open_orders"),
+    ]
+
+
 # --------------------------------------------------------------------------- #
 # ensure_session
 # --------------------------------------------------------------------------- #
