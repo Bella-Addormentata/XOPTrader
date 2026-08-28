@@ -104,11 +104,14 @@ class MarginState:
         """
         if not (self.equity_usd > 0.0) or not math.isfinite(self.equity_usd):
             return 1.0
-        if not math.isfinite(self.used_margin_usd):
-            # [review] NaN would make BOTH threshold comparisons below false,
-            # so assess() would return NORMAL and keep adding risk against an
-            # account whose margin we cannot read. Every unreadable number
-            # here has to mean "no room", never "lots of room".
+        if not math.isfinite(self.used_margin_usd) or self.used_margin_usd < 0.0:
+            # [review] NaN makes BOTH threshold comparisons below false, so
+            # assess() returns NORMAL and keeps adding risk against an
+            # account whose margin we cannot read. A NEGATIVE margin is
+            # worse, because it is finite and passes an isfinite check: the
+            # division yields negative utilisation, which is BELOW every
+            # threshold and reads as unlimited headroom. Every unreadable
+            # number here has to mean "no room", never "lots of room".
             return 1.0
         return self.used_margin_usd / self.equity_usd
 
@@ -173,6 +176,17 @@ def assess(
     that merely resize it -- the same ordering discipline as quoting.decide().
     """
     position = float(state.positions.get(market, 0.0) or 0.0)
+    if not math.isfinite(position):
+        # [review] A NaN position fails the limit comparison below and is
+        # then CLAMPED by skew_frac into a finite extreme skew, so assess()
+        # returned NORMAL and added risk on inventory it could not read.
+        # Unreadable inventory is the strongest reason to stop, not a
+        # reason to continue.
+        return RiskDecision(
+            RiskAction.FLATTEN, 0.0, 0.0,
+            "position for %s is not a readable number (%r)"
+            % (market, state.positions.get(market)),
+        )
     utilisation = state.utilisation()
 
     if utilisation >= FLATTEN_MARGIN_UTILISATION:

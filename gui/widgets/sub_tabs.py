@@ -21,6 +21,8 @@ appears and disappears without moving anything.
 Keyboard navigation is implemented rather than inherited: QTabWidget gives
 Ctrl+Tab and arrow keys for free and a plain button row does not, so losing
 them would have been a real regression for anyone who does not use a mouse.
+Arrows clamp at the ends; Ctrl+Tab and Ctrl+Shift+Tab wrap, matching what
+QTabWidget does with each.
 """
 
 from __future__ import annotations
@@ -229,6 +231,20 @@ class SubTabBar(QWidget):
         plain button row does not, so omitting it would lock out anyone
         navigating without a mouse.
         """
+        ctrl = bool(event.modifiers() & Qt.ControlModifier)
+        shift = bool(event.modifiers() & Qt.ShiftModifier)
+
+        # [review] Ctrl+Tab and Ctrl+Shift+Tab, not just arrows. The module
+        # docstring promised QTabWidget's keyboard behaviour was preserved
+        # and delivered half of it -- Ctrl+Tab is the standard shortcut, and
+        # dropping it silently is worse than never having claimed it.
+        if ctrl and event.key() in (Qt.Key_Tab, Qt.Key_Backtab):
+            step = -1 if (shift or event.key() == Qt.Key_Backtab) else 1
+            # Wraps, because that is what QTabWidget does with Ctrl+Tab.
+            self.set_current((self._current + step) % max(1, self.count()))
+            event.accept()
+            return
+
         if event.key() in (Qt.Key_Left, Qt.Key_Up):
             self.set_current(max(0, self._current - 1))
             event.accept()

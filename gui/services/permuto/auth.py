@@ -381,6 +381,18 @@ def register(identity: Any) -> Registration:
             "anything." % exc
         ) from exc
 
+    # [review] The response to the IRREVERSIBLE POST need not be an object.
+    # A null or an array made .get raise AttributeError -- after the venue
+    # may already have committed -- which escaped the indeterminate handling
+    # entirely and was reported as an ordinary failure, re-enabling Register
+    # for a key that may now be an account. A parseable 200 of the wrong
+    # SHAPE is exactly the "the venue answered, we cannot tell what it did"
+    # case, so it is indeterminate.
+    if not isinstance(auth, dict):
+        raise PermutoLinkIndeterminate(
+            "wallet_auth returned %s, not an object -- the venue answered "
+            "but the answer cannot be read, so this key may now be linked"
+            % type(auth).__name__)
     session = auth.get("session_token") or auth.get("token")
     # As strictly as the identifiers below. A numeric or whitespace-only
     # token is truthy, would be str()'d, and would record a PERMANENT link as

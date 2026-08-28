@@ -363,11 +363,25 @@ class _RegistrationWorker(QObject):
         """
         found = auth.reconcile_registration(self._identity)
         if found is None:
-            # The venue does not know this key, so the attempt really did
-            # fail. Drop the marker or the operator is stranded: Register
-            # stays disabled forever for an account that does not exist.
-            self._identity.clear_link_attempt()
-            return {"ok": True, "reconciled": True, "linked": False}
+            # [review] KEEP the marker. This branch used to clear it, on the
+            # reasoning that the venue not knowing the key proves the attempt
+            # failed -- and that reasoning died when reconcile_registration
+            # was corrected: the leaderboard is a POSITIVE-only oracle, so
+            # absence means UNCONFIRMED, not unlinked. A linked account that
+            # has not traded may simply not be listed yet.
+            #
+            # Clearing here re-enabled Register for a key the venue may
+            # already own, which is the one action with no undo. The
+            # operator is not stranded: the marker leaves the page in the
+            # unfinished-link state, they can reconcile again later, and if
+            # they conclude the account really does not exist they can
+            # discard the identity deliberately -- discard_unregistered()
+            # still permits that, because a link attempt is not a
+            # registration.
+            return {
+                "ok": True, "reconciled": True, "linked": False,
+                "unresolved": True,
+            }
 
         user_id, trading_address = found
         self._identity.mark_registered(
@@ -468,6 +482,31 @@ def _scrolled(inner: QWidget) -> QScrollArea:
     return area
 
 
+class _MarketWorker(QObject):
+    """One read of the public routes, off the GUI thread.
+
+    [review] This used to run inline in the QTimer callback, and the default
+    reader makes two sequential requests with a 30-second timeout each -- so
+    a slow venue froze the entire application for up to a minute on every
+    poll, on a 5-second timer. The rest of this page already puts network
+    work on a worker; the Markets section had quietly not.
+    """
+
+    done = Signal(object)     # dict on success
+    failed = Signal(str)
+
+    def __init__(self, reader: Any) -> None:
+        super().__init__()
+        self._reader = reader
+
+    @Slot()
+    def run(self) -> None:
+        try:
+            self.done.emit(self._reader())
+        except Exception as exc:  # noqa: BLE001 - reported, never raised
+            self.failed.emit(str(exc))
+
+
 class PermutoWidget(QWidget):
     """Identity + registration surface for the Permuto perps venue."""
 
@@ -493,6 +532,8 @@ class PermutoWidget(QWidget):
         # Injectable so tests exercise the Markets section without a socket.
         self._market_reader = market_reader or _default_market_reader
         self._markets_timer: Optional[QTimer] = None
+        self._markets_thread: Optional[QThread] = None
+        self._markets_worker: Optional[Any] = None
         self._target_depth_usd = 1_200.0
         self._max_position = 100.0
         self._build()
@@ -739,13 +780,43 @@ class PermutoWidget(QWidget):
         self._poll_markets()
 
     def _poll_markets(self) -> None:
-        """One read of the public routes. Never raises into the event loop."""
-        try:
-            snapshot = self._market_reader()
-        except Exception as exc:  # noqa: BLE001 - a poll must not kill the UI
-            self._markets_lbl.setText("unavailable")
-            self._markets_note.setText("Last poll failed: %s" % exc)
-            self._log_activity("markets: poll failed -- %s" % exc)
+        """Kick off one read, on a worker thread.
+
+        Overlapping polls are refused rather than queued: the timer fires
+        every 5s and a request may take 30, so queuing would build an
+        unbounded backlog of stale reads against a venue we compete on.
+        """
+        if self._markets_thread is not None:
+            return
+
+        thread = QThread(self)
+        worker = _MarketWorker(self._market_reader)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_markets_result)
+        worker.failed.connect(self._on_markets_failed)
+        for sig in (worker.done, worker.failed):
+            sig.connect(thread.quit)
+        thread.finished.connect(self._on_markets_thread_finished)
+        self._markets_thread = thread
+        self._markets_worker = worker
+        thread.start()
+
+    def _on_markets_thread_finished(self) -> None:
+        thread, self._markets_thread = self._markets_thread, None
+        self._markets_worker = None
+        if thread is not None:
+            thread.deleteLater()
+
+    def _on_markets_failed(self, message: str) -> None:
+        self._markets_lbl.setText("unavailable")
+        self._markets_note.setText("Last poll failed: %s" % message)
+        self._log_activity("markets: poll failed -- %s" % message)
+
+    def _on_markets_result(self, snapshot: Any) -> None:
+        if not isinstance(snapshot, dict):
+            self._on_markets_failed(
+                "venue returned %s, not an object" % type(snapshot).__name__)
             return
 
         prices = snapshot.get("prices") or {}
@@ -918,31 +989,46 @@ class PermutoWidget(QWidget):
             )
 
     def stop_background_work(self) -> None:
-        """Join the worker before teardown.
+        """Join EVERY worker before teardown.
 
         Qt aborts the process (qFatal) if a QThread is destroyed while still
         running, and these requests take up to 30 seconds. MainWindow calls
         this for every page that owns a thread.
+
+        Both threads, not just the registration one: moving the market poll
+        off the GUI thread created a second, and a page that joins one of two
+        is a page that still aborts -- just less often, which is worse.
         """
-        thread = self._thread
-        if thread is None:
-            return
-        # quit() only asks the event loop to stop, and the worker is blocked
-        # in a socket read for up to 30 seconds -- so waiting politely can
-        # expire with the thread still running, and returning here would let
-        # closeEvent() destroy the widget underneath it. That is the exact
-        # "QThread: Destroyed while thread is still running" abort this
-        # method exists to prevent. Same terminate-and-wait fallback the
-        # other page-owned workers use (settings.py, wallet_balances.py).
-        thread.quit()
-        if not thread.wait(10000):
-            _log.warning("permuto: worker thread did not stop; terminating")
-            thread.terminate()
-            thread.wait(1000)
-        # Cleared only AFTER the thread is actually down, so nothing can
-        # observe a half-torn-down state.
+        # Stop the timer first, or a fire during teardown starts a thread we
+        # have already decided to join.
+        if self._markets_timer is not None:
+            self._markets_timer.stop()
+
+        self._join(self._thread, "registration")
         self._thread = None
         self._worker = None
+
+        self._join(self._markets_thread, "market poll")
+        self._markets_thread = None
+        self._markets_worker = None
+
+    @staticmethod
+    def _join(thread: Optional[QThread], what: str) -> None:
+        """Stop one worker, terminating it if it will not go quietly."""
+        if thread is None:
+            return
+        # quit() only asks the event loop to stop, and the worker may be
+        # blocked in a socket read for up to 30 seconds -- so waiting
+        # politely can expire with the thread still running, and returning
+        # would let closeEvent() destroy the widget underneath it. That is
+        # the exact "QThread: Destroyed while thread is still running" abort
+        # this exists to prevent. Same terminate-and-wait fallback the other
+        # page-owned workers use (settings.py, wallet_balances.py).
+        thread.quit()
+        if not thread.wait(10000):
+            _log.warning("permuto: %s thread did not stop; terminating", what)
+            thread.terminate()
+            thread.wait(1000)
 
     # -- actions ------------------------------------------------------------ #
 
@@ -1169,9 +1255,18 @@ class PermutoWidget(QWidget):
         if result.get("reconciled") and not result.get("linked"):
             self._pending_registration = None
             self.refresh()
+            # NOT "you can register again". The leaderboard is a
+            # positive-only oracle, so a key it does not list may still be
+            # linked -- and registering a second time is the one action with
+            # no undo. refresh() keeps Register shut because the attempt
+            # marker survives.
             self._set_status(
-                "Permuto does not show this key as linked, so the earlier "
-                "attempt did not reach the venue. You can register again.",
+                "Permuto does not LIST this key, which is not proof it was "
+                "never linked -- an account that has not traded may not "
+                "appear yet. The attempt is still recorded and Register "
+                "stays closed. Reconcile again later; if you are satisfied "
+                "no account exists, discard this identity deliberately and "
+                "create a new one.",
                 _C.WARNING_YELLOW,
             )
             return

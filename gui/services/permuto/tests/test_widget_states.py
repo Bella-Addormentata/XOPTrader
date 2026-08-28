@@ -292,9 +292,19 @@ def test_an_indeterminate_link_is_not_reported_as_an_ordinary_failure(
     assert ident.info().link_attempted is True
 
 
-def test_reconciling_an_unlinked_key_hands_register_back(page, monkeypatch):
-    """The venue says no such link, so the attempt really did fail and the
-    operator must not be stranded."""
+def test_an_unlisted_key_keeps_register_shut(page, monkeypatch):
+    """[review] This asserted the opposite until the meaning of None changed.
+
+    reconcile_registration() returns None for UNCONFIRMED, not for "never
+    linked" -- the leaderboard is a positive-only oracle and an account that
+    has not traded may not be listed. Clearing the marker here re-enabled
+    Register for a key the venue may already own, and a second permanent
+    link is the one action with no undo.
+
+    The operator is not stranded: they can reconcile again later, or discard
+    the identity deliberately, which is still permitted because a link
+    ATTEMPT is not a registration.
+    """
     from gui.services.permuto import auth as auth_mod
 
     widget, ident = page
@@ -305,9 +315,20 @@ def test_reconciling_an_unlinked_key_hands_register_back(page, monkeypatch):
     monkeypatch.setattr(auth_mod, "reconcile_registration", lambda i: None)
     widget._on_finished(_worker(ident, "reconcile"))
 
-    assert ident.info().link_attempted is False
-    assert widget._register_btn.isEnabled()
-    assert widget._recover_btn.isHidden()
+    assert ident.info().link_attempted is True, "the attempt marker was lost"
+    assert not widget._register_btn.isEnabled()
+    assert "not proof" in widget._status.text()
+
+
+def test_an_unresolved_attempt_can_still_be_discarded_deliberately(page):
+    """The escape hatch, so keeping the marker is not a trap."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    ident.discard_unregistered()          # must not raise
+    assert not ident.exists()
 
 
 def test_reconciling_an_already_linked_key_records_it_without_re_linking(
@@ -479,6 +500,21 @@ def test_page_constants_match_the_sidebar_order(qapp):
 # new surfaces which touch the network or the account are gated.
 # --------------------------------------------------------------------------- #
 
+def _await_poll(widget, qapp, timeout_ms: int = 5000) -> None:
+    """Drive the event loop until the market worker has reported.
+
+    The poll is on a worker thread now, so a test that asserts immediately
+    after enabling it is racing the socket -- which is the whole point of the
+    change.
+    """
+    from PySide6.QtCore import QDeadlineTimer
+
+    deadline = QDeadlineTimer(timeout_ms)
+    while widget._markets_thread is not None and not deadline.hasExpired():
+        qapp.processEvents()
+    qapp.processEvents()
+
+
 def _fake_market_page(qapp, reader):
     from gui.widgets.permuto import PermutoWidget
 
@@ -527,6 +563,7 @@ def test_markets_polls_only_while_its_section_is_open(qapp):
     widget, _ = _fake_market_page(qapp, reader)
     widget._sections.set_current(1)
     widget._markets_btn.setChecked(True)
+    _await_poll(widget, qapp)
     assert calls, "polling did not start"
 
     # Navigating away must stop it: a background poll feeding a widget nobody
@@ -542,6 +579,7 @@ def test_a_failing_poll_does_not_raise_into_the_event_loop(qapp):
     widget, _ = _fake_market_page(qapp, boom)
     widget._sections.set_current(1)
     widget._markets_btn.setChecked(True)          # must not raise
+    _await_poll(widget, qapp)
     assert "unavailable" in widget._markets_lbl.text()
     assert "venue down" in widget._markets_note.text()
 
@@ -553,6 +591,7 @@ def test_a_venue_pause_is_stated_plainly(qapp):
     )
     widget._sections.set_current(1)
     widget._markets_btn.setChecked(True)
+    _await_poll(widget, qapp)
     assert "PAUSED" in widget._markets_note.text()
 
 
@@ -589,3 +628,46 @@ def test_the_quoting_summary_states_the_ring_and_the_risk_lines(page):
     assert "2.00%" in text          # the ring depth credit is measured in
     assert "5.00%" in text          # the legal band
     assert "utilisation" in text
+
+
+def test_the_market_poll_does_not_run_on_the_gui_thread(qapp):
+    """A slow venue must not freeze the application.
+
+    The default reader makes two requests at 30s timeouts on a 5s timer, so
+    running it inline froze the whole UI for up to a minute per poll.
+    """
+    import threading
+
+    seen = {}
+
+    def reader():
+        seen["thread"] = threading.current_thread().name
+        return {"prices": {"QQQ-VOL-PERP": 0.07}, "trading_paused": False}
+
+    widget, _ = _fake_market_page(qapp, reader)
+    widget._sections.set_current(1)
+    widget._markets_btn.setChecked(True)
+    _await_poll(widget, qapp)
+    assert seen.get("thread") != threading.main_thread().name
+
+
+def test_overlapping_polls_are_refused_rather_than_queued(qapp):
+    """The timer fires every 5s and a request may take 30."""
+    widget, _ = _fake_market_page(
+        qapp, lambda: {"prices": {"Q": 1.0}, "trading_paused": False})
+    widget._sections.set_current(1)
+    widget._poll_markets()
+    first = widget._markets_thread
+    widget._poll_markets()                 # must not start a second
+    assert widget._markets_thread is first
+    _await_poll(widget, qapp)
+
+
+def test_teardown_joins_the_market_thread_too(qapp):
+    """A page that joins one of two threads still aborts, just less often."""
+    widget, _ = _fake_market_page(
+        qapp, lambda: {"prices": {"Q": 1.0}, "trading_paused": False})
+    widget._sections.set_current(1)
+    widget._markets_btn.setChecked(True)
+    widget.stop_background_work()
+    assert widget._markets_thread is None

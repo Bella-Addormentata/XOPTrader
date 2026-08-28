@@ -232,3 +232,23 @@ def test_non_finite_margin_reads_as_fully_utilised(bad):
 @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
 def test_non_finite_equity_reads_as_fully_utilised(bad):
     assert MarginState(equity_usd=bad, used_margin_usd=0.0).utilisation() == 1.0
+
+
+def test_a_negative_used_margin_reads_as_fully_utilised():
+    """Finite, so it passes an isfinite check -- and then the division gives
+    NEGATIVE utilisation, which is below every threshold and reads as
+    unlimited headroom."""
+    st = MarginState(equity_usd=1_000.0, used_margin_usd=-500.0)
+    assert st.utilisation() == 1.0
+    d = assess(st, _MKT, base_size=10.0, max_position=100.0)
+    assert d.action is RiskAction.FLATTEN
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_an_unreadable_position_flattens_rather_than_skewing(bad):
+    """NaN fails the limit comparison and is then clamped into a finite
+    extreme skew, so assess() returned NORMAL on inventory it could not
+    read."""
+    d = assess(_state(positions={_MKT: bad}), _MKT,
+               base_size=10.0, max_position=100.0)
+    assert d.action is RiskAction.FLATTEN

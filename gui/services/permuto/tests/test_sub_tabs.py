@@ -171,3 +171,54 @@ def test_the_title_survives_a_dirty_round_trip(pages):
     pages.set_dirty(2, False)
     assert pages.bar._buttons[2].text() == "Quoting"
     assert pages.bar.title(2) == "Quoting"
+
+
+# --------------------------------------------------------------------------- #
+# [review] The docstring promised QTabWidget's keyboard behaviour and the
+# first implementation delivered arrows only. Ctrl+Tab is the standard
+# shortcut; dropping it silently is worse than never claiming it.
+# --------------------------------------------------------------------------- #
+
+def _key(pages, key, mods):
+    from PySide6.QtCore import QEvent
+    from PySide6.QtGui import QKeyEvent
+
+    pages.bar.keyPressEvent(QKeyEvent(QEvent.KeyPress, key, mods))
+
+
+def test_ctrl_tab_moves_forward(pages):
+    from PySide6.QtCore import Qt
+
+    pages.set_current(0)
+    _key(pages, Qt.Key_Tab, Qt.ControlModifier)
+    assert pages.current_index() == 1
+
+
+def test_ctrl_shift_tab_moves_back(pages):
+    from PySide6.QtCore import Qt
+
+    pages.set_current(2)
+    _key(pages, Qt.Key_Backtab, Qt.ControlModifier | Qt.ShiftModifier)
+    assert pages.current_index() == 1
+
+
+def test_ctrl_tab_wraps_the_way_qtabwidget_does(pages):
+    from PySide6.QtCore import Qt
+
+    last = pages.bar.count() - 1
+    pages.set_current(last)
+    _key(pages, Qt.Key_Tab, Qt.ControlModifier)
+    assert pages.current_index() == 0
+
+    _key(pages, Qt.Key_Backtab, Qt.ControlModifier | Qt.ShiftModifier)
+    assert pages.current_index() == last
+
+
+def test_a_bare_tab_is_left_to_qt_for_focus_movement(pages):
+    """Ctrl is what makes it section navigation; plain Tab must still move
+    focus between controls."""
+    from PySide6.QtCore import Qt
+
+    pages.set_current(1)
+    _key(pages, Qt.Key_Tab, Qt.NoModifier)
+    assert pages.current_index() == 1
