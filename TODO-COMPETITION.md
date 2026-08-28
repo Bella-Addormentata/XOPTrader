@@ -655,6 +655,51 @@ Net: no shortcut before Monday, but the gate is roughly a third as expensive
 as the cash-session-only reading implied. Both revisions are worked through
 in the two sections above.
 
+## Discord, 2026-08-27/28 — the one thing the sponsor asked bots to handle
+
+Asked whether anything needs doing on the bot's end before the contest, or
+whether a bot left running on Friday will just pick up when the reset comes,
+Gene Hoffman answered with exactly one requirement:
+
+> Make sure your bot can recognize a market pause and un-pause and you should
+> be ok
+> — 2026-08-27 17:20
+
+**That is a work item we did not have.** The reset happens Sunday evening
+*during a trading pause that un-pauses when the competition starts*, so the
+transition is not an edge case — it is how every entrant enters the contest.
+`GET /info/meta` already exposes what is needed: `flags.trading_paused`,
+`pause_message`, `pause_reason`, `pause_updated_at`, `pause_resume_at`. A bot
+that quotes through a pause gets rejects; one that does not notice the
+un-pause starts late, on a metric that only accrues while quoting.
+
+Jakub Hadamcik added the practical version, and it is the same shape as our
+own S28/S31 work:
+
+> If you already handle re-auth and state refreshes based on what exchange
+> tells you (normal operation), you are good to go
+
+— with the caveat that he resets internal counters by hand, which is his own
+bot's business rather than the venue's.
+
+**Still unanswered** (codingisart, 2026-08-28 06:17): whether code changes may
+be deployed while the contest is running. Worth knowing before we plan any
+mid-contest iteration.
+
+### C-0S3 corroborated by two more entrants
+
+Independently of our measurement, on 2026-08-28:
+
+> **doge5minutes:** Do MM get depth-seconds for providing liquidity when the
+> markets are closed, but trading is open?
+> **Gigabarney:** If you're talking about when the oracle is frozen, yes they
+> do get depth seconds
+> **doge5minutes:** That's what I was observing
+
+So carried accrual now rests on four independent sources — Jakub's statement,
+our own frozen-oracle measurement, and two entrants observing it separately.
+It is as settled as anything in this document.
+
 ## Conduct rules that bind a two-sided quoter
 
 From the official rules, disqualifying conduct includes **wash trading,
@@ -850,6 +895,15 @@ transfer and must not leak into shared code.
       impossible. Much cheaper than the original framing.
 - [ ] **C-09** Poll `CONTEST_START` / `untraded_purge_at` / `signup_closed`
       continuously; all three change the plan when they flip.
+- [ ] **C-11** **Handle market pause and un-pause.** The only thing the
+      sponsor named when asked what bots must do before the contest, and not
+      an edge case: the Sunday-evening reset happens *inside* a pause that
+      un-pauses at the start, so every entrant enters through this
+      transition. Quoting through a pause earns rejects; missing the un-pause
+      starts us late on a metric that only accrues while quoting. Everything
+      needed is already on `GET /info/meta` — `flags.trading_paused`,
+      `pause_reason`, `pause_resume_at`. Pairs naturally with C-05's WS-driven
+      loop.
 
 ## Operator decisions
 
