@@ -440,6 +440,9 @@ private:
     void start_watchdog();
     void stop_watchdog();
     void watchdog_loop();
+    /// Cancel every resting offer through a private wallet RPC.
+    /// `why` is the operator-facing reason, already formatted.
+    void watchdog_cancel_book(const std::string& why);
 
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order

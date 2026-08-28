@@ -621,16 +621,16 @@ void Engine::start_watchdog()
         return;
     }
     if (dry_run_) {
-        // NOT silently. A dry run reaches this line having already killed
-        // the live engine -- main.cpp calls kill_old_instances() before it
-        // ever inspects cli.dry_run, and on Windows that is an immediate
-        // TerminateProcess with no graceful cancel. So the process most
-        // likely to be running while a real book rests unmanaged is exactly
-        // this one, and an info-level "not started" reads like a normal
-        // startup line in a log nobody is watching.
+        // Still warn, but no longer for the original reason: main.cpp now
+        // skips kill_old_instances() in dry run, so this process has NOT
+        // replaced a live engine and any real book is still watched by the
+        // instance that owns it. What remains true is narrower -- this
+        // process adopts resting offers during startup reconciliation, which
+        // is not dry-run gated, and cannot cancel them.
         spdlog::warn("[Engine] [S31] dry run -- dead man's switch NOT armed. "
-                     "If a live engine was replaced by this process, its "
-                     "offers are resting with nothing watching them.");
+                     "A live engine, if any, keeps its own switch; this "
+                     "process will adopt resting offers during startup "
+                     "reconciliation but can neither post nor cancel.");
         return;
     }
     watchdog_stop_.store(false, std::memory_order_relaxed);
@@ -644,6 +644,90 @@ void Engine::stop_watchdog()
     watchdog_stop_.store(true, std::memory_order_relaxed);
     if (watchdog_thread_.joinable()) {
         watchdog_thread_.join();
+    }
+}
+
+// [S31] Cancel every resting offer through the wallet RPC, on our own
+// io_context and our own client.
+//
+// Extracted so the abnormal-exit path in run() can reuse it: ioc_.run()
+// returning without a shutdown request means the engine DIED rather than
+// stopped, and stop_watchdog() is about to remove the only other route to a
+// cancel. `why` is the operator-facing reason, already formatted.
+void Engine::watchdog_cancel_book(const std::string& why)
+{
+    try {
+        asio::io_context wioc;
+        rpc::ChiaRPCConfig wal_cfg;
+        wal_cfg.host = config_.chia.wallet_host;
+        wal_cfg.port = config_.chia.wallet_port;
+        wal_cfg.tls.cert_path    = config_.chia.wallet_cert_path;
+        wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
+        wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
+        wal_cfg.verify_ssl       = config_.chia.verify_ssl;
+        auto wallet = std::make_shared<rpc::ChiaWalletRPC>(wioc, wal_cfg);
+
+        std::string failure;
+        asio::co_spawn(wioc, [&]() -> asio::awaitable<void> {
+            try {
+                co_await wallet->open();
+                // Arguments come from risk::watchdog_cancel() so the
+                // two values that have each been wrong in production
+                // once are a named, tested constant rather than
+                // literals buried three scopes deep. The reasoning for
+                // both lives with them in watchdog.hpp.
+                constexpr auto req = risk::watchdog_cancel();
+                co_await wallet->cancel_offers(req.fee_mojos, req.secure);
+            } catch (const std::exception& ex) {
+                failure = ex.what();
+            }
+            co_return;
+        }, asio::detached);
+        wioc.run();
+
+        if (failure.empty()) {
+            spdlog::error("[Engine] [S31] cancel_offers SUBMITTED. A "
+                          "secure cancel spends the offer coins on-chain, "
+                          "so the book is not empty until those spends "
+                          "CONFIRM -- do not read this as proof the "
+                          "offers are gone. The engine is still wedged "
+                          "and needs manual attention.");
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::CircuitBreaker,
+                    "DEAD MAN'S SWITCH FIRED: no heartbeat for " +
+                    why + ". A secure cancel "
+                    "of every resting offer has been SUBMITTED -- the "
+                    "spends must still confirm on-chain, so verify the "
+                    "book is empty rather than assuming it. The engine "
+                    "is wedged and requires manual intervention.");
+            }
+        } else {
+            spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
+                             "STILL LIVE on a wedged engine -- cancel them "
+                             "by hand NOW.", failure);
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::CircuitBreaker,
+                    "DEAD MAN'S SWITCH COULD NOT CANCEL: " + failure +
+                    ". Offers are still live and unmanaged.");
+            }
+        }
+    } catch (const std::exception& ex) {
+        // Alert, not just log. Wallet construction, co_spawn or
+        // wioc.run() throwing leaves the offers exactly as live as an
+        // RPC refusal does, and that path alerts -- staying silent here
+        // made the worst failure the quietest one.
+        spdlog::critical("[Engine] [S31] watchdog cancel path threw: {} "
+                         "-- offers are STILL LIVE on a wedged engine.",
+                         ex.what());
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                std::string("DEAD MAN'S SWITCH FAILED BEFORE IT COULD "
+                            "CANCEL: ") + ex.what() +
+                ". Offers are still live and unmanaged.");
+        }
     }
 }
 
@@ -664,7 +748,8 @@ void Engine::watchdog_loop()
     // State well before the first cycle finishes. Without an arm time a
     // wedge in open_connections() or the first poll left those adopted
     // offers live with the switch permanently silent.
-    watchdog.arm(now_ms());
+    const auto armed_at_ms = now_ms();
+    watchdog.arm(armed_at_ms);
 
     // Its OWN io_context and its OWN wallet client.  Reusing the engine's
     // would defeat the entire point.
@@ -686,74 +771,34 @@ void Engine::watchdog_loop()
         // means the book state is unknown until someone looks.
         watchdog_fired_.store(true, std::memory_order_release);
 
-        const auto stale_ms =
-            now_ms() - last_beat_ms_.load(std::memory_order_relaxed);
-        spdlog::error("[Engine] [S31] DEAD MAN'S SWITCH FIRING -- no heartbeat "
-                      "completed for {} ms (threshold {} ms). Cancelling every "
-                      "resting offer through the wallet RPC.",
-                      stale_ms, watchdog.threshold_ms());
-
-        try {
-            asio::io_context wioc;
-            rpc::ChiaRPCConfig wal_cfg;
-            wal_cfg.host = config_.chia.wallet_host;
-            wal_cfg.port = config_.chia.wallet_port;
-            wal_cfg.tls.cert_path    = config_.chia.wallet_cert_path;
-            wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
-            wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
-            wal_cfg.verify_ssl       = config_.chia.verify_ssl;
-            auto wallet = std::make_shared<rpc::ChiaWalletRPC>(wioc, wal_cfg);
-
-            std::string failure;
-            asio::co_spawn(wioc, [&]() -> asio::awaitable<void> {
-                try {
-                    co_await wallet->open();
-                    // Arguments come from risk::watchdog_cancel() so the
-                    // two values that have each been wrong in production
-                    // once are a named, tested constant rather than
-                    // literals buried three scopes deep. The reasoning for
-                    // both lives with them in watchdog.hpp.
-                    constexpr auto req = risk::watchdog_cancel();
-                    co_await wallet->cancel_offers(req.fee_mojos, req.secure);
-                } catch (const std::exception& ex) {
-                    failure = ex.what();
-                }
-                co_return;
-            }, asio::detached);
-            wioc.run();
-
-            if (failure.empty()) {
-                spdlog::error("[Engine] [S31] cancel_offers SUBMITTED. A "
-                              "secure cancel spends the offer coins on-chain, "
-                              "so the book is not empty until those spends "
-                              "CONFIRM -- do not read this as proof the "
-                              "offers are gone. The engine is still wedged "
-                              "and needs manual attention.");
-                if (alerts_) {
-                    alerts_->send_alert(
-                        AlertRule::CircuitBreaker,
-                        "DEAD MAN'S SWITCH FIRED: no heartbeat for " +
-                        std::to_string(stale_ms / 1000) + "s. A secure cancel "
-                        "of every resting offer has been SUBMITTED -- the "
-                        "spends must still confirm on-chain, so verify the "
-                        "book is empty rather than assuming it. The engine "
-                        "is wedged and requires manual intervention.");
-                }
-            } else {
-                spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
-                                 "STILL LIVE on a wedged engine -- cancel them "
-                                 "by hand NOW.", failure);
-                if (alerts_) {
-                    alerts_->send_alert(
-                        AlertRule::CircuitBreaker,
-                        "DEAD MAN'S SWITCH COULD NOT CANCEL: " + failure +
-                        ". Offers are still live and unmanaged.");
-                }
-            }
-        } catch (const std::exception& ex) {
-            spdlog::critical("[Engine] [S31] watchdog cancel path threw: {}",
-                             ex.what());
+        // Measure from the ARM time when no heartbeat has ever landed.
+        // last_beat_ms_ is 0 for the whole of startup, so `now - 0` is time
+        // since the steady clock's epoch -- typically system uptime -- and a
+        // 10-minute startup timeout would have reported days of staleness in
+        // both the log and the operator alert.
+        const auto beat = last_beat_ms_.load(std::memory_order_relaxed);
+        const bool ever_beat = (beat > 0);
+        const auto stale_ms = now_ms() - (ever_beat ? beat : armed_at_ms);
+        if (ever_beat) {
+            spdlog::error("[Engine] [S31] DEAD MAN'S SWITCH FIRING -- no "
+                          "heartbeat completed for {} ms (threshold {} ms). "
+                          "Cancelling every resting offer through the wallet "
+                          "RPC.", stale_ms, watchdog.threshold_ms());
+        } else {
+            spdlog::error("[Engine] [S31] DEAD MAN'S SWITCH FIRING -- the "
+                          "engine never completed a single heartbeat in the "
+                          "{} ms since startup (threshold {} ms). Startup "
+                          "reconciliation may already have adopted live "
+                          "offers. Cancelling every resting offer through the "
+                          "wallet RPC.", stale_ms, watchdog.threshold_ms());
         }
+
+        const std::string reason =
+            ever_beat
+                ? ("no heartbeat for " + std::to_string(stale_ms / 1000) + "s")
+                : ("no heartbeat EVER, " + std::to_string(stale_ms / 1000) +
+                   "s after startup");
+        watchdog_cancel_book(reason);
     }
 }
 
@@ -828,11 +873,35 @@ void Engine::run()
     // Block until shutdown() posts a stop or all work completes.
     ioc_.run();
 
-    // [S31] ioc_.run() has returned, so the engine is shutting down and will
-    // not manage anything further.  Join before the destructor runs: the
-    // thread captures `this`, and outliving the Engine it reads would be a
-    // use-after-free in the one component whose job is to still work when
-    // everything else has stopped.
+    // [S31] ioc_.run() has returned, so the engine will not manage anything
+    // further.  Join before the destructor runs: the thread captures `this`,
+    // and outliving the Engine it reads would be a use-after-free in the one
+    // component whose job is to still work when everything else has stopped.
+    //
+    // But returning is NOT proof of a graceful shutdown. poll_loop_coro() is
+    // detached, so an exception out of open_connections() ends it and the
+    // context simply runs out of work with stop_requested_ still false --
+    // and we would then disable the only independent cancellation path
+    // without anyone having asked for a shutdown. Cancel explicitly on that
+    // path rather than hoping the watchdog wins a race it is about to be
+    // taken out of.
+    if (!stop_requested_.load(std::memory_order_acquire)) {
+        spdlog::critical("[Engine] [S31] the io_context ran out of work "
+                         "without a shutdown request -- the engine died "
+                         "rather than stopped. Cancelling the book before "
+                         "standing down.");
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::CircuitBreaker,
+                "ENGINE EXITED WITHOUT A SHUTDOWN REQUEST: the event loop ran "
+                "out of work. Cancelling every resting offer; verify the book "
+                "is empty and check the log for the originating failure.");
+        }
+        if (!dry_run_) {
+            watchdog_cancel_book("the event loop ran out of work "
+                                 "without a shutdown request");
+        }
+    }
     stop_watchdog();
 
     spdlog::info("[Engine] Main loop exited");
