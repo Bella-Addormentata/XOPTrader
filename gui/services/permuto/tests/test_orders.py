@@ -1,0 +1,150 @@
+"""Order-legality tests.
+
+Every failure mode here is silent from our side: an order rejected at place, or
+accepted and then purged on an oracle move, looks the same locally as one
+resting and earning. So these assert the venue's rules rather than our
+intentions.
+"""
+
+from __future__ import annotations
+
+import pytest
+
+from gui.services.permuto.orders import (
+    OrderIntent,
+    Placement,
+    Side,
+    classify_placement,
+    depth_credit_usd,
+    notional_usd,
+    quote_ladder,
+)
+
+ORACLE = 0.10
+
+
+# --------------------------------------------------------------------------- #
+# The three bands
+# --------------------------------------------------------------------------- #
+
+def test_a_bid_below_the_oracle_is_passive_and_always_legal():
+    assert classify_placement(Side.BUY, 0.099, ORACLE) is Placement.PASSIVE
+    assert classify_placement(Side.SELL, 0.101, ORACLE) is Placement.PASSIVE
+
+
+def test_aggressive_inside_the_ring_is_allowed():
+    # A bid ABOVE the oracle is aggressive; inside 2% that is fine.
+    assert classify_placement(Side.BUY, 0.101, ORACLE) is Placement.AGGRESSIVE
+    assert classify_placement(Side.SELL, 0.099, ORACLE) is Placement.AGGRESSIVE
+
+
+def test_aggressive_outside_the_ring_is_purge_risk_not_merely_rejected():
+    """THE trap. Outside the ring an aggressive rest is refused at place --
+    and if one ever rests, an oracle move purges it. The book empties without
+    us doing anything, and nothing local says so."""
+    assert classify_placement(Side.BUY, 0.103, ORACLE) is Placement.PURGE_RISK
+    assert classify_placement(Side.SELL, 0.097, ORACLE) is Placement.PURGE_RISK
+
+
+def test_outside_the_legal_band_is_illegal_on_either_side():
+    assert classify_placement(Side.BUY, 0.94 * ORACLE, ORACLE) is Placement.ILLEGAL
+    assert classify_placement(Side.SELL, 1.06 * ORACLE, ORACLE) is Placement.ILLEGAL
+
+
+def test_the_boundaries_are_inclusive():
+    """The venue expresses these as "within N%"; rejecting an order sitting
+    exactly on a limit is the surprising direction."""
+    assert classify_placement(Side.BUY, ORACLE * 1.02, ORACLE) is Placement.AGGRESSIVE
+    assert classify_placement(Side.BUY, ORACLE * 0.95, ORACLE) is Placement.PASSIVE
+    assert classify_placement(Side.BUY, ORACLE * 1.0201, ORACLE) is Placement.PURGE_RISK
+
+
+def test_no_fresh_oracle_means_no_opinion():
+    """A stale or missing oracle must not be treated as permission. Orders
+    placed against one look fine locally and score nothing."""
+    for bad in (0.0, -1.0, float("nan")):
+        assert classify_placement(Side.BUY, 0.1, bad) is Placement.ILLEGAL
+
+
+# --------------------------------------------------------------------------- #
+# Depth credit is min(bid, ask) -- the property the whole strategy rests on
+# --------------------------------------------------------------------------- #
+
+def test_depth_is_the_minimum_of_the_two_sides_not_the_sum():
+    bids = [OrderIntent("QQQ-VOL-PERP", Side.BUY, 0.0995, 10_000)]   # ~$995
+    asks = [OrderIntent("QQQ-VOL-PERP", Side.SELL, 0.1005, 5_000)]   # ~$502
+    credit = depth_credit_usd(bids, asks, ORACLE)
+    assert credit == pytest.approx(502.5, rel=1e-3)
+
+
+def test_a_lifted_side_earns_nothing_for_the_whole_market():
+    """Not 'less' -- nothing. A filled bid stops accrual even though the ask
+    is untouched, which is why restoring a side is urgent rather than tidy."""
+    asks = [OrderIntent("QQQ-VOL-PERP", Side.SELL, 0.1005, 50_000)]
+    assert depth_credit_usd([], asks, ORACLE) == 0.0
+
+
+def test_legs_outside_the_ring_earn_nothing():
+    """They may be perfectly legal placements and still score zero -- the
+    band and the credit ring are different numbers."""
+    bids = [OrderIntent("QQQ-VOL-PERP", Side.BUY, ORACLE * 0.97, 10_000)]
+    asks = [OrderIntent("QQQ-VOL-PERP", Side.SELL, ORACLE * 1.03, 10_000)]
+    assert classify_placement(Side.BUY, ORACLE * 0.97, ORACLE) is Placement.PASSIVE
+    assert depth_credit_usd(bids, asks, ORACLE) == 0.0
+
+
+def test_reduce_only_legs_do_not_count_as_liquidity():
+    """They shed inventory; counting them would flatter a retreating book."""
+    bids = [OrderIntent("QQQ-VOL-PERP", Side.BUY, 0.0995, 10_000, reduce_only=True)]
+    asks = [OrderIntent("QQQ-VOL-PERP", Side.SELL, 0.1005, 10_000)]
+    assert depth_credit_usd(bids, asks, ORACLE) == 0.0
+
+
+# --------------------------------------------------------------------------- #
+# The ladder
+# --------------------------------------------------------------------------- #
+
+def test_the_ladder_earns_what_it_was_asked_for():
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, target_depth_usd=1000.0)
+    bids = [o for o in legs if o.side is Side.BUY]
+    asks = [o for o in legs if o.side is Side.SELL]
+    assert depth_credit_usd(bids, asks, ORACLE) == pytest.approx(1000.0, rel=1e-6)
+
+
+def test_the_ladder_is_symmetric_because_the_minimum_is_what_scores():
+    """Any asymmetry is capital at risk on the heavier side earning nothing."""
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0)
+    bid_notional = sum(o.notional for o in legs if o.side is Side.BUY)
+    ask_notional = sum(o.notional for o in legs if o.side is Side.SELL)
+    assert bid_notional == pytest.approx(ask_notional, rel=1e-9)
+
+
+def test_every_ladder_leg_is_strictly_inside_the_ring():
+    """A leg outside earns nothing AND can be purged on an oracle move, so
+    asking for more levels than the ring holds must tighten the ladder rather
+    than emit invisible legs."""
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0, levels=12,
+                        level_step_pct=1.0)
+    for leg in legs:
+        assert classify_placement(leg.side, leg.price, ORACLE) in (
+            Placement.PASSIVE, Placement.AGGRESSIVE)
+        assert abs(leg.price - ORACLE) / ORACLE * 100.0 <= 2.0
+
+
+def test_a_degenerate_request_yields_no_orders_rather_than_bad_ones():
+    assert quote_ladder("QQQ-VOL-PERP", 0.0, 1000.0) == []
+    assert quote_ladder("QQQ-VOL-PERP", ORACLE, 0.0) == []
+    assert quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0, levels=0) == []
+
+
+def test_notional_rejects_non_finite_so_a_bad_quote_cannot_pass_a_cap():
+    assert notional_usd(float("nan"), 100) == 0.0
+    assert notional_usd(float("inf"), 100) == 0.0
+    assert notional_usd(0.1, -5) == 0.0
+
+
+def test_the_market_field_is_the_symbol_not_the_oracle_ticker():
+    """/info/meta carries both and they differ by suffix; order routes want
+    QQQ-VOL-PERP. Getting this wrong is an HTTP 400 on every single order."""
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 100.0, levels=1)
+    assert legs and all(o.market.endswith("-PERP") for o in legs)
