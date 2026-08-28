@@ -16,6 +16,21 @@ using xop::PegStatus;
 
 namespace {
 
+// [review round 4] Replaces the PegRegistry(std::vector<...>) constructor,
+// which was removed because it called add() and threw the result away -- so a
+// duplicate or incoherent declaration silently produced a half-built registry.
+// This helper ASSERTS every add, which is strictly better for a fixture: a
+// test that accidentally declares an asset the registry refuses now fails
+// loudly instead of quietly exercising an emptier registry than it looks.
+PegRegistry registry_of(std::initializer_list<PeggedAsset> assets) {
+    PegRegistry reg;
+    for (const auto& a : assets) {
+        EXPECT_TRUE(reg.add(a))
+            << "fixture declared an asset the registry refused: " << a.asset_id;
+    }
+    return reg;
+}
+
 PeggedAsset usd_coin(std::string id = "wusdc_tail", std::string sym = "wUSDC.b") {
     PeggedAsset a;
     a.asset_id = std::move(id);
@@ -71,7 +86,7 @@ TEST(PegRegistry, LooksUpByAssetIdNotSymbol) {
     // Symbols collide and get reused -- CoinMarketCap serves two coins
     // called XCH, one of them dead since 2016.  Valuation must key on the
     // identity that cannot be renamed.
-    PegRegistry reg({usd_coin("tail_a", "SAME"), usd_coin("tail_b", "SAME")});
+    PegRegistry reg = registry_of({usd_coin("tail_a", "SAME"), usd_coin("tail_b", "SAME")});
     EXPECT_EQ(reg.size(), 2u);
     EXPECT_NE(reg.find("tail_a"), nullptr);
     EXPECT_NE(reg.find("tail_b"), nullptr);
@@ -83,14 +98,14 @@ TEST(PegRegistry, LooksUpByAssetIdNotSymbol) {
 // ---------------------------------------------------------------------------
 
 TEST(PegRegistry, UsdPeggedAssetNeedsNoFxRate) {
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     auto v = reg.usd_par_value("wusdc_tail");
     ASSERT_TRUE(v.has_value());
     EXPECT_DOUBLE_EQ(*v, 1.0);
 }
 
 TEST(PegRegistry, NonUsdPegConvertsThroughTheSuppliedRate) {
-    PegRegistry reg({euro_coin()});
+    PegRegistry reg = registry_of({euro_coin()});
     auto v = reg.usd_par_value("eur_tail", 1.09);
     ASSERT_TRUE(v.has_value());
     EXPECT_DOUBLE_EQ(*v, 1.09);
@@ -101,7 +116,7 @@ TEST(PegRegistry, NonUsdPegWithoutAnFxRateIsUnvalued) {
     // have been marked at $1.00 because "pegged" was hardcoded to mean
     // "a dollar".  A missing rate must produce no valuation, never a 1:1
     // substitution.
-    PegRegistry reg({euro_coin()});
+    PegRegistry reg = registry_of({euro_coin()});
     EXPECT_FALSE(reg.usd_par_value("eur_tail").has_value());
     EXPECT_FALSE(reg.usd_par_value("eur_tail", 0.0).has_value());
     EXPECT_FALSE(reg.usd_par_value("eur_tail", -1.0).has_value());
@@ -112,14 +127,14 @@ TEST(PegRegistry, NonUnitTargetScales) {
     yen100.asset_id = "jpy_tail";
     yen100.peg_currency = "JPY";
     yen100.peg_target = 100.0;
-    PegRegistry reg({yen100});
+    PegRegistry reg = registry_of({yen100});
     auto v = reg.usd_par_value("jpy_tail", 0.0064);  // JPY->USD
     ASSERT_TRUE(v.has_value());
     EXPECT_DOUBLE_EQ(*v, 0.64);
 }
 
 TEST(PegRegistry, UndeclaredAssetIsUnvalued) {
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_FALSE(reg.usd_par_value("something_else").has_value());
 }
 
@@ -130,7 +145,7 @@ TEST(PegRegistry, AnUnenforcedPegDoesNotMarkTheBookAtPar) {
     // returning 1.0 and marked the whole portfolio.
     PeggedAsset winding_down = usd_coin("byc_tail", "BYC");
     winding_down.enforce = false;
-    PegRegistry reg({winding_down});
+    PegRegistry reg = registry_of({winding_down});
 
     EXPECT_NE(reg.find("byc_tail"), nullptr) << "declaration is retained";
     EXPECT_FALSE(reg.is_pegged("byc_tail"));
@@ -143,7 +158,7 @@ TEST(PegRegistry, AnUnenforcedPegDoesNotMarkTheBookAtPar) {
 // ---------------------------------------------------------------------------
 
 TEST(PegRegistry, ClassifiesAgainstTheDeclaredThresholds) {
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("wusdc_tail", 1.00), PegStatus::Holding);
     EXPECT_EQ(reg.classify("wusdc_tail", 1.01), PegStatus::Holding);
     EXPECT_EQ(reg.classify("wusdc_tail", 1.05), PegStatus::Warn);
@@ -152,7 +167,7 @@ TEST(PegRegistry, ClassifiesAgainstTheDeclaredThresholds) {
 }
 
 TEST(PegRegistry, DeviationIsSignedSoBelowPegIsDistinguishable) {
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     auto below = reg.deviation_pct("wusdc_tail", 0.74);
     ASSERT_TRUE(below.has_value());
     EXPECT_LT(*below, 0.0) << "trading below par must be visibly negative";
@@ -168,7 +183,7 @@ TEST(PegRegistry, MissingObservationIsUnobservedNotHolding) {
     // pairs stopped the ticker ingest that fed the peg monitor, and 144
     // readings became 0.  If absence had been reported as health, nothing
     // would ever have said so.
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("wusdc_tail", std::nullopt), PegStatus::Unobserved);
     EXPECT_EQ(reg.classify("wusdc_tail", 0.0), PegStatus::Unobserved);
     EXPECT_NE(reg.classify("wusdc_tail", std::nullopt), PegStatus::Holding);
@@ -176,7 +191,7 @@ TEST(PegRegistry, MissingObservationIsUnobservedNotHolding) {
 
 TEST(PegRegistry, UndeclaredAssetClassifiesAsNotPeggedNotUnobserved) {
     // An asset nobody claimed is pegged is not a monitoring gap.
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("xch", 1.42), PegStatus::NotPegged);
     EXPECT_EQ(reg.classify("xch", std::nullopt), PegStatus::NotPegged);
 }
@@ -189,7 +204,7 @@ TEST(PegRegistry, EachBandIsEnteredOnceItsThresholdIsPassed) {
     PeggedAsset a = usd_coin();
     a.warn_pct = 2.0;
     a.bail_pct = 10.0;
-    PegRegistry reg({a});
+    PegRegistry reg = registry_of({a});
 
     EXPECT_EQ(reg.classify("wusdc_tail", 1.015), PegStatus::Holding);
     EXPECT_EQ(reg.classify("wusdc_tail", 0.985), PegStatus::Holding);
@@ -206,7 +221,7 @@ TEST(PegRegistry, BandsAreSymmetricAboveAndBelowPar) {
     // implementation that forgot the absolute value would pass every
     // above-par case and silently ignore the below-par ones -- which is
     // the direction that actually happened.
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     for (double delta : {0.03, 0.05, 0.09}) {
         EXPECT_EQ(reg.classify("wusdc_tail", 1.0 + delta),
                   reg.classify("wusdc_tail", 1.0 - delta))
@@ -222,7 +237,7 @@ TEST(PegRegistry, TheLiveWusdcReadingClassifiesAsBroken) {
     // Implied wUSDC.b sat at $0.737-$0.746 for hours on 2026-08-25 while
     // accounting valued it at exactly $1.00.  With a declaration in place
     // that reading is Broken, not a curiosity in a log line.
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("wusdc_tail", 0.737140), PegStatus::Broken);
     auto dev = reg.deviation_pct("wusdc_tail", 0.737140);
     ASSERT_TRUE(dev.has_value());
@@ -230,7 +245,7 @@ TEST(PegRegistry, TheLiveWusdcReadingClassifiesAsBroken) {
 }
 
 TEST(PegRegistry, AllReturnsAStableOrder) {
-    PegRegistry reg({usd_coin("c_tail"), usd_coin("a_tail"), usd_coin("b_tail")});
+    PegRegistry reg = registry_of({usd_coin("c_tail"), usd_coin("a_tail"), usd_coin("b_tail")});
     auto all = reg.all();
     ASSERT_EQ(all.size(), 3u);
     EXPECT_EQ(all[0]->asset_id, "a_tail");
@@ -270,7 +285,7 @@ TEST(PegRegistry, DeviationAgreesWithClassifyAboutWhatIsPegged) {
     // number as though the asset had a peg to deviate from.
     PeggedAsset retired = usd_coin("gone", "GONE");
     retired.enforce = false;
-    PegRegistry reg({retired});
+    PegRegistry reg = registry_of({retired});
 
     EXPECT_EQ(reg.classify("gone", 0.74), PegStatus::NotPegged);
     EXPECT_FALSE(reg.deviation_pct("gone", 0.74).has_value())
@@ -278,7 +293,7 @@ TEST(PegRegistry, DeviationAgreesWithClassifyAboutWhatIsPegged) {
 }
 
 TEST(PegRegistry, DeviationRejectsNonFiniteObservationsLikeClassifyDoes) {
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     const double inf = std::numeric_limits<double>::infinity();
     const double nan = std::numeric_limits<double>::quiet_NaN();
 
@@ -304,7 +319,7 @@ TEST(PegRegistry, ThresholdsAreInclusiveLikeDepegDetector) {
     a.peg_target   = 100.0;
     a.warn_pct     = 2.0;
     a.bail_pct     = 10.0;
-    PegRegistry reg({a});
+    PegRegistry reg = registry_of({a});
 
     EXPECT_EQ(reg.classify("exact", 102.0), PegStatus::Warn)
         << "exactly at warn_pct must BE the warn band, not below it";
@@ -327,6 +342,6 @@ TEST(PegRegistry, ZeroWarnPctIsRejectedBecauseTheBoundaryIsInclusive) {
 
 TEST(PegRegistry, AnObservationExactlyOnPegIsHolding) {
     // The property the rejection above protects.
-    PegRegistry reg({usd_coin()});
+    PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("wusdc_tail", 1.0), PegStatus::Holding);
 }

@@ -33,7 +33,7 @@
 //
 // Converting a non-USD peg into USD needs an FX rate, which is a market
 // observation like any other and therefore may be missing.  This header
-// deliberately does NOT fetch it.  usd_value() takes the rate as an
+// deliberately does NOT fetch it.  usd_par_value() takes the rate as an
 // argument and returns nullopt when it is absent, so a missing EURUSD
 // produces "no valuation" rather than a silent 1:1 substitution -- the
 // same discipline the engine already applies to a missing mid.
@@ -164,11 +164,14 @@ class PegRegistry {
 public:
     PegRegistry() = default;
 
-    explicit PegRegistry(std::vector<PeggedAsset> assets) {
-        for (auto& a : assets) {
-            add(std::move(a));
-        }
-    }
+    // [review round 4] There WAS an explicit PegRegistry(std::vector<...>)
+    // convenience constructor.  It called add() and ignored the result, so a
+    // duplicate or incoherent declaration produced a PARTIALLY POPULATED
+    // registry while the very same declarations are a hard startup error
+    // through the parser -- two construction paths disagreeing about whether
+    // a bad peg is fatal.  It had no callers in the engine or the tests, so
+    // it is removed rather than taught to throw: the parser is the real
+    // path, and it already checks every add().
 
     /// Register a declaration.  Returns false (and changes nothing) if it
     /// is incoherent -- a caller loading config should surface that rather
@@ -196,15 +199,15 @@ public:
         return it == by_asset_id_.end() ? nullptr : &it->second;
     }
 
-    /// Symbol lookup, for logs and UI.  Linear and case-sensitive: symbols
-    /// are not unique and must never drive valuation, so this is
-    /// deliberately not the fast path.
-    [[nodiscard]] const PeggedAsset* find_by_symbol(const std::string& symbol) const {
-        for (const auto& [_, a] : by_asset_id_) {
-            if (a.symbol == symbol) return &a;
-        }
-        return nullptr;
-    }
+    // [review round 4] find_by_symbol() is gone.  It returned whichever
+    // matching entry an unordered_map happened to yield first, so its answer
+    // was nondeterministic for EXACTLY the duplicate-symbol case its own
+    // comment said it existed to tolerate -- and two assets sharing a symbol
+    // is the situation this registry was built for (wUSDC.b and wUSDC both
+    // read as "USDC" to a human).  It had no callers.  Reintroducing a
+    // symbol-keyed lookup into the header whose entire purpose is retiring
+    // symbol-keyed logic would be the wrong direction; call sites have an
+    // asset id and should use find().
 
     /// True only for an asset that is declared AND enforced.  Call sites
     /// that used to ask `quote == "wUSDC.b"` should ask this instead.
