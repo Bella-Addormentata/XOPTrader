@@ -172,7 +172,16 @@ class PermutoClient:
                 "challenge response missing challenge_token/nonce: %r"
                 % (challenge,)
             )
-        nonce = bytes.fromhex(nonce_hex)
+        # bytes.fromhex raises ValueError (or TypeError on a non-string)
+        # for a malformed nonce. Left raw those escape the PermutoAuthError
+        # contract: ensure_session() records backoff only for that type, so
+        # a bad response shape would bypass renewal accounting entirely and
+        # be retried on every tick as an unexpected error.
+        try:
+            nonce = bytes.fromhex(nonce_hex)
+        except (TypeError, ValueError) as exc:
+            raise PermutoAuthError(
+                "challenge nonce is not hex: %r" % (nonce_hex,)) from exc
         if len(nonce) != 32:
             raise PermutoAuthError(
                 "expected a 32-byte nonce, got %d -- refusing to sign an "

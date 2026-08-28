@@ -174,3 +174,31 @@ def test_three_markets_two_sides_fits_in_one_batch():
         legs.append(OrderIntent(m, Side.BUY, 0.0995, 100))
         legs.append(OrderIntent(m, Side.SELL, 0.1005, 100))
     assert len(build_upsert_batch(legs, oracles)) == 6 <= MAX_LEGS
+
+
+# --------------------------------------------------------------------------- #
+# [review] +inf passes `> 0` and equals itself, and json.dumps writes it as
+# the non-standard token `Infinity` -- so a batch this function has just
+# certified reaches the venue malformed.
+# --------------------------------------------------------------------------- #
+def test_an_infinite_size_is_rejected_not_serialised():
+    import json as _json
+    import math as _math
+
+    with pytest.raises(BatchError, match="non-finite"):
+        build_upsert_batch(
+            [OrderIntent("QQQ-VOL-PERP", Side.BUY, 0.0698, _math.inf)],
+            {"QQQ-VOL-PERP": 0.07},
+        )
+    # Why it matters: this is what would have gone out.
+    assert "Infinity" in _json.dumps({"size": _math.inf})
+
+
+def test_an_infinite_price_is_rejected():
+    import math as _math
+
+    with pytest.raises(BatchError):
+        build_upsert_batch(
+            [OrderIntent("QQQ-VOL-PERP", Side.BUY, _math.inf, 10.0)],
+            {"QQQ-VOL-PERP": 0.07},
+        )

@@ -25,6 +25,7 @@ class _Client:
         })
         self.open_payload = kw.get("open_orders", {"orders": []})
         self.fail_on = kw.get("fail_on")
+        self.cancelled = []
 
     def _maybe_fail(self, name):
         if self.fail_on == name:
@@ -53,6 +54,7 @@ class _Client:
 
     def cancel_all(self, now_s, markets=None):
         self.calls.append("cancel_all")
+        self.cancelled.append(list(markets) if markets else None)
         self._maybe_fail("cancel_all")
         return {}
 
@@ -327,3 +329,117 @@ def test_positions_parse_from_a_dict_or_a_list():
 def test_numeric_strings_are_accepted_and_booleans_are_not():
     assert _margin_state({"equity_usd": "1500.5"}, False).equity_usd == 1500.5
     assert _margin_state({"equity_usd": True}, False).equity_usd == 0.0
+
+
+_MKT2 = "NVDA-VOL-PERP"
+_BOTH = {_MKT: 0.07, _MKT2: 0.09}
+
+
+def _runner2(client, **kw):
+    return QuoteRunner(client, [_MKT, _MKT2], **kw)
+
+
+# --------------------------------------------------------------------------- #
+# [review] A market that must leave has to leave, whatever its neighbours do
+# --------------------------------------------------------------------------- #
+def test_one_markets_withdrawal_is_not_skipped_because_another_quotes():
+    """The guard used to be `withdrawing and not any_quoted`.
+
+    A stale oracle on QQQ while NVDA merely needed a refresh skipped the
+    cancel entirely: QQQ's unsafe orders stayed live and the batch touched
+    only NVDA.
+    """
+    c = _Client()
+    r = _runner2(c)
+    r._resting[_MKT] = RestingQuote(0.069, 0.071)
+
+    # QQQ has no oracle -> WITHDRAW. NVDA has one and nothing resting -> QUOTE.
+    result = r.tick(1.0, {_MKT2: 0.09}, {})
+
+    assert "cancel_all" in c.calls, "the withdrawing market was left live"
+    assert c.cancelled[0] == [_MKT], "cancel must be scoped, not global"
+    assert result.action == "quote"
+    assert {leg["market"] for leg in c.last_batch} == {_MKT2}
+
+
+def test_every_market_withdrawing_still_cancels_globally():
+    c = _Client()
+    r = _runner2(c)
+    r.tick(1.0, _BOTH, {"trading_paused": True})
+    assert c.cancelled[-1] is None, "a full withdrawal should not be scoped"
+
+
+# --------------------------------------------------------------------------- #
+# [review] HOLD must not stop the runner looking at the venue
+# --------------------------------------------------------------------------- #
+def test_holding_still_polls_orders_and_account():
+    """Once _resting looked two-sided the loop stopped asking.
+
+    A filled side was never discovered -- and depth credit is min(bid, ask),
+    so that market earns zero -- while margin could cross the reduce and
+    flatten lines with the old quotes still live.
+    """
+    c = _Client(open_orders={"orders": [
+        {"market": _MKT, "side": "buy", "price": 0.0698},
+        {"market": _MKT, "side": "sell", "price": 0.0702},
+    ]})
+    r = _runner(c)
+    assert r.tick(1.0, _ORACLE, {}).action == "hold"
+    assert "open_orders" in c.calls
+    assert "account" in c.calls
+
+
+def test_a_fill_discovered_while_holding_triggers_a_requote():
+    # The venue says one side is gone; belief says two-sided.
+    c = _Client(open_orders={"orders": [
+        {"market": _MKT, "side": "buy", "price": 0.0698},
+    ]})
+    r = _runner(c)
+    r._resting[_MKT] = RestingQuote(0.0698, 0.0702)
+    assert r.tick(1.0, _ORACLE, {}).action == "quote"
+
+
+# --------------------------------------------------------------------------- #
+# [review] FLATTEN and REDUCE_ONLY have to retract what is resting
+# --------------------------------------------------------------------------- #
+def test_flatten_cancels_rather_than_only_relabelling():
+    c = _Client(account={
+        "equity_usd": 1_000.0,
+        "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+        "positions": {},
+    })
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {})
+    assert "cancel_all" in c.calls, "flatten left the two-sided quote live"
+    assert c.cancelled[-1] == [_MKT]
+
+
+def test_reduce_only_cancels_the_market_before_upserting_one_side():
+    """batch_upsert is keyed on (market, side).
+
+    Omitting the risk-increasing side does not remove it, so the old quote
+    would stay live beside the new reduce-only one.
+    """
+    c = _Client(account={
+        "equity_usd": 100_000.0, "used_margin_usd": 0.0,
+        "positions": {_MKT: 100.0},
+    })
+    r = _runner(c, max_position=100.0)
+    r.tick(1.0, _ORACLE, {})
+    assert c.calls.index("cancel_all") < c.calls.index("batch_upsert")
+    assert [leg["side"] for leg in c.last_batch] == ["sell"]
+
+
+# --------------------------------------------------------------------------- #
+# [review] A partly-readable account must fail CLOSED
+# --------------------------------------------------------------------------- #
+def test_equity_without_margin_reads_as_fully_utilised():
+    """0.0 read as maximum headroom, so the runner added risk against an
+    account it could not actually read."""
+    st = _margin_state({"equity_usd": 1_000.0}, False)
+    assert st.utilisation() == 1.0
+
+
+def test_a_readable_zero_margin_is_still_zero():
+    st = _margin_state({"equity_usd": 1_000.0, "used_margin_usd": 0.0}, False)
+    assert st.utilisation() == 0.0

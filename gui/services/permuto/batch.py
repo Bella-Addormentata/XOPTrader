@@ -26,6 +26,8 @@ at prices we have already decided are wrong.
 
 from __future__ import annotations
 
+import math
+
 from dataclasses import dataclass
 from typing import Iterable, Sequence
 
@@ -140,8 +142,15 @@ def build_upsert_batch(
                 % (leg.market, leg.side.value, leg.price, ring_pct, oracle)
             )
 
-        if not (leg.size > 0.0) or leg.size != leg.size:
+        # math.isfinite, not a NaN self-comparison: +inf passes `> 0` and
+        # equals itself, and json.dumps serialises it as the non-standard
+        # token `Infinity` -- so a batch this function has just certified
+        # reaches the venue malformed.
+        if not (leg.size > 0.0) or not math.isfinite(leg.size):
             raise BatchError("%s %s has non-positive or non-finite size"
+                             % (leg.market, leg.side.value))
+        if not math.isfinite(leg.price):
+            raise BatchError("%s %s has a non-finite price"
                              % (leg.market, leg.side.value))
 
         out.append({

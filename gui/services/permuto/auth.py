@@ -317,7 +317,15 @@ def register(identity: Any) -> Registration:
             "challenge response missing challenge_token/nonce: %r" % challenge
         )
 
-    nonce = bytes.fromhex(nonce_hex)
+    # bytes.fromhex raises ValueError (or TypeError on a non-string). Left
+    # raw that escapes this module's operator-facing error contract and
+    # surfaces an implementation exception for a venue response that should
+    # simply be refused.
+    try:
+        nonce = bytes.fromhex(nonce_hex)
+    except (TypeError, ValueError) as exc:
+        raise PermutoAuthError(
+            "challenge nonce is not hex: %r" % (nonce_hex,)) from exc
     if len(nonce) != 32:
         raise PermutoAuthError(
             "expected a 32-byte nonce, got %d bytes -- refusing to sign an "

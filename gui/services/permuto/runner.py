@@ -172,6 +172,22 @@ class QuoteRunner:
             session_waiting = action is RenewAction.WAIT
             session_ok = action in (RenewAction.OK, RenewAction.RENEW)
 
+        # [review] Poll the venue BEFORE deciding, not after deciding to
+        # quote. The first version reconciled only on the way to a batch, so
+        # once _resting looked two-sided the loop answered HOLD and stopped
+        # asking: a filled side was never discovered, the market earned zero
+        # -- depth credit is min(bid, ask) -- and margin could cross the
+        # reduce and flatten lines with the old quotes still live. This
+        # module's own docstring says prediction is the failure mode; the
+        # implementation predicted anyway.
+        #
+        # Two requests per tick is the price of not being wrong about the
+        # book. Skipped while paused or session-less, where both would fail.
+        state = MarginState(carried=carried)
+        if session_ok and not paused:
+            self.reconcile(self._client.open_orders(now_s))
+            state = _margin_state(self._client.account(now_s), carried)
+
         results: dict = {}
         any_quoted = False
         for market in self._markets:
@@ -196,14 +212,31 @@ class QuoteRunner:
 
         want = LoopAction.WITHDRAW.value
         withdrawing = [m for m, (a, _) in results.items() if a == want]
-        if withdrawing and not any_quoted:
+        if withdrawing:
+            # [review] Unconditionally, NOT only when nothing else wants to
+            # quote. The first version guarded this on `not any_quoted`, so a
+            # stale oracle on QQQ while NVDA merely needed a refresh skipped
+            # the cancel entirely -- QQQ's unsafe orders stayed live and the
+            # batch below touched only NVDA. A market that must leave has to
+            # leave whatever its neighbours are doing.
+            #
+            # Scoped to the withdrawing markets rather than cancel_all, so one
+            # bad oracle does not empty a book that is earning depth
+            # elsewhere. Falls back to a full cancel when every market is
+            # withdrawing, which is also the pause and dead-session case.
             reason = results[withdrawing[0]][1]
-            self._client.cancel_all(now_s)
-            # Clear on withdrawal, not on next observation: between the two
-            # sits a belief in orders we just cancelled.
-            self._forget_book()
+            if len(withdrawing) == len(self._markets):
+                self._client.cancel_all(now_s)
+                self._forget_book()
+            else:
+                self._client.cancel_all(now_s, withdrawing)
+                # Clear on withdrawal, not on next observation: between the
+                # two sits a belief in orders we just cancelled.
+                for market in withdrawing:
+                    self._resting[market] = RestingQuote()
             self._reopen_pending = False
-            return TickResult("withdraw", reason, results)
+            if not any_quoted:
+                return TickResult("withdraw", reason, results)
 
         if not any_quoted:
             wait = LoopAction.WAIT.value
@@ -213,14 +246,8 @@ class QuoteRunner:
             return TickResult("hold", "all markets two-sided and in ring",
                               results)
 
-        # Anything about to be re-quoted must be priced against what is really
-        # resting, not what we remember.
-        self.reconcile(self._client.open_orders(now_s))
-
-        account = self._client.account(now_s)
-        state = _margin_state(account, carried)
-
         legs = []
+        to_cancel: list = []
         for market, (action, _) in results.items():
             if action != LoopAction.QUOTE.value:
                 continue
@@ -234,7 +261,14 @@ class QuoteRunner:
                 half_spread_pct=self._half_spread_pct,
             )
             if risk.action is RiskAction.FLATTEN:
+                # [review] FLATTEN used to change the label and drop the
+                # legs, which left the existing two-sided quote live and sent
+                # nothing to reduce -- so at the 75% line the runner did
+                # neither of the things the action names. Retract the book
+                # for this market at minimum; closing the position itself is
+                # a taker order and stays an operator decision.
                 results[market] = ("flatten", risk.reason)
+                to_cancel.append(market)
                 continue
 
             reference = skewed_reference(oracle, risk.skew)
@@ -261,6 +295,14 @@ class QuoteRunner:
                 levels=1, first_offset_pct=self._half_spread_pct,
                 ring_pct=self._ring_pct,
             )
+            if risk.action is RiskAction.REDUCE_ONLY:
+                # [review] batch_upsert is keyed on (market, side), so
+                # omitting the risk-increasing side does not remove it -- the
+                # old quote stays live beside the new reduce-only one, which
+                # is the opposite of reducing. Cancel the market first, then
+                # place the single shrinking leg.
+                to_cancel.append(market)
+
             for leg in ladder:
                 if risk.action is RiskAction.REDUCE_ONLY:
                     # Keep only the side that shrinks the book, and mark it
@@ -275,6 +317,13 @@ class QuoteRunner:
                     leg = type(leg)(leg.market, leg.side, leg.price,
                                     leg.size, True)
                 legs.append(leg)
+
+        if to_cancel:
+            # Before the upsert, so the reduce-only leg is not racing the
+            # risk-increasing one it replaces.
+            self._client.cancel_all(now_s, to_cancel)
+            for market in to_cancel:
+                self._resting[market] = RestingQuote()
 
         if not legs:
             return TickResult("hold", "risk left nothing to place", results)
@@ -311,6 +360,19 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
     if not isinstance(account, dict):
         return MarginState(carried=carried)
 
+    def _num_present(src, *keys):
+        """Value plus whether any of `keys` yielded a usable number."""
+        for key in keys:
+            value = src.get(key)
+            if isinstance(value, (int, float)) and not isinstance(value, bool):
+                return float(value), True
+            if isinstance(value, str):
+                try:
+                    return float(value), True
+                except ValueError:
+                    continue
+        return 0.0, False
+
     def _num(*keys):
         for key in keys:
             value = account.get(key)
@@ -343,9 +405,20 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
             except (TypeError, ValueError):
                 continue
 
+    equity = _num("equity_usd", "equity", "account_value")
+    used, used_present = _num_present(
+        account, "used_margin_usd", "used_margin", "margin_used")
+    if equity > 0.0 and not used_present:
+        # [review] Fail CLOSED on a partly-readable payload. Defaulting the
+        # missing field to 0.0 made utilisation() report 0% -- maximum
+        # headroom -- so the runner went on adding risk against an account it
+        # could not actually read, which is the opposite of what the
+        # docstring promises. Treat unknown margin as fully used.
+        used = equity
+
     return MarginState(
-        equity_usd=_num("equity_usd", "equity", "account_value"),
-        used_margin_usd=_num("used_margin_usd", "used_margin", "margin_used"),
+        equity_usd=equity,
+        used_margin_usd=used,
         positions=positions,
         carried=carried,
     )

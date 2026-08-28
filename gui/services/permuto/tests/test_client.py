@@ -328,3 +328,31 @@ def test_a_boolean_is_not_an_expiry():
     assert _expiry_from({"expires_at": True}, 100.0) == (
         100.0 + DEFAULT_SESSION_TTL_S
     )
+
+
+def test_a_non_hex_nonce_is_a_permuto_error_not_a_raw_valueerror(monkeypatch):
+    """ensure_session() records backoff only for PermutoAuthError.
+
+    A raw ValueError from bytes.fromhex bypassed renewal accounting entirely
+    and came back every tick as an unexpected runner error.
+    """
+    _wire(monkeypatch, {
+        "/exchange/wallet_link_challenge": {
+            "challenge_token": "ct", "nonce": "zzzz",
+        },
+    })
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1_000.0)
+    with pytest.raises(PermutoAuthError, match="not hex"):
+        c.reauth(0.0)
+
+
+def test_a_bad_nonce_during_renewal_still_records_the_backoff(monkeypatch):
+    _wire(monkeypatch, {
+        "/exchange/wallet_link_challenge": {
+            "challenge_token": "ct", "nonce": None,
+        },
+    })
+    c = PermutoClient(_Identity(), session_token="tok", expires_at_s=1_000.0)
+    with pytest.raises(PermutoAuthError):
+        c.ensure_session(900.0)
+    assert c.session.consecutive_failures == 1
