@@ -148,3 +148,93 @@ def test_the_market_field_is_the_symbol_not_the_oracle_ticker():
     QQQ-VOL-PERP. Getting this wrong is an HTTP 400 on every single order."""
     legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 100.0, levels=1)
     assert legs and all(o.market.endswith("-PERP") for o in legs)
+
+
+# --------------------------------------------------------------------------- #
+# Credit is measured per side, so the LEG decides -- not the bucket
+# --------------------------------------------------------------------------- #
+
+def test_a_sell_intent_in_the_bid_book_is_refused_rather_than_scored():
+    """119-7. Classification came from the iterable a leg was handed in
+    through, never from ``leg.side``. A SELL priced above the oracle, passed
+    as a bid, was therefore scored under the BUY rule -- aggressive, inside
+    the ring -- and counted as bid liquidity that does not exist."""
+    stray = OrderIntent("QQQ-VOL-PERP", Side.SELL, ORACLE * 1.005, 10_000)
+    asks = [OrderIntent("QQQ-VOL-PERP", Side.SELL, ORACLE * 1.005, 10_000)]
+    with pytest.raises(ValueError, match="sell"):
+        depth_credit_usd([stray], asks, ORACLE)
+
+
+def test_two_sell_sides_can_never_produce_balanced_depth():
+    """THE consequence. min(bid, ask) is the entire scoring model, so a
+    one-sided book that reads as two-sided overstates the one number this
+    module exists to keep honest."""
+    sells = [OrderIntent("QQQ-VOL-PERP", Side.SELL, ORACLE * 1.005, 10_000)]
+    with pytest.raises(ValueError):
+        depth_credit_usd(sells, list(sells), ORACLE)
+
+
+def test_a_wrong_sided_reduce_only_leg_is_still_a_caller_bug():
+    """Skipping it quietly would hide the mis-bucketing that produced it."""
+    stray = OrderIntent("QQQ-VOL-PERP", Side.BUY, ORACLE * 0.995, 10.0,
+                        reduce_only=True)
+    with pytest.raises(ValueError):
+        depth_credit_usd([], [stray], ORACLE)
+
+
+# --------------------------------------------------------------------------- #
+# Ladder inputs -- every tuning knob, not the three that happened to be checked
+# --------------------------------------------------------------------------- #
+
+def _no_leg_is_malformed(legs):
+    for leg in legs:
+        assert leg.price == leg.price and leg.price > 0.0
+        assert leg.price not in (float("inf"), float("-inf"))
+        assert leg.size == leg.size and leg.size > 0.0
+        assert leg.size not in (float("inf"), float("-inf"))
+
+
+def test_a_negative_offset_cannot_invert_the_ladder():
+    """119-8. A negative first offset put the BUY above the oracle and the
+    SELL below it. Nothing downstream catches that: both legs stay inside the
+    band and the ring, so batch.py classifies them as legal and the crossed
+    pair is sent -- and ``first_offset_pct`` reaches here from configuration
+    (runner.py's ``_half_spread_pct``), not from a literal."""
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0, first_offset_pct=-0.25)
+    _no_leg_is_malformed(legs)
+    bids = [o.price for o in legs if o.side is Side.BUY]
+    asks = [o.price for o in legs if o.side is Side.SELL]
+    assert not any(b > a for b in bids for a in asks)
+
+
+@pytest.mark.parametrize("kwargs", [
+    {"first_offset_pct": float("nan")},
+    {"level_step_pct": float("nan")},
+    {"first_offset_pct": float("inf")},
+    {"level_step_pct": float("-inf")},
+    {"first_offset_pct": -0.25},
+    {"level_step_pct": -0.5},
+    {"ring_pct": float("nan")},
+    {"ring_pct": 0.0},
+    {"ring_pct": -2.0},
+    {"ring_pct": 250.0},
+])
+def test_out_of_domain_tuning_quotes_nothing(kwargs):
+    """``min(nan, x)`` is nan in Python -- the ``x < nan`` comparison is False
+    -- so a NaN offset survived the ring clamp and landed in both prices. A
+    ring above 100% lifts that clamp past the oracle and makes the bid price
+    negative."""
+    legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0, **kwargs)
+    assert legs == []
+
+
+@pytest.mark.parametrize("oracle,target", [
+    (float("inf"), 1000.0),
+    (float("nan"), 1000.0),
+    (ORACLE, float("inf")),
+    (ORACLE, float("nan")),
+])
+def test_non_finite_oracle_or_target_quotes_nothing(oracle, target):
+    """``inf > 0.0`` passes a bare positivity check, and every leg built from
+    one is infinite in price and zero in size, or infinite in size."""
+    assert quote_ladder("QQQ-VOL-PERP", oracle, target) == []

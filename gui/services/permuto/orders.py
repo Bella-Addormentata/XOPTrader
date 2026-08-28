@@ -31,9 +31,13 @@ number rather than a cached one.
 
 from __future__ import annotations
 
+import logging
+import math
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Optional
+
+_log = logging.getLogger(__name__)
 
 __all__ = [
     "OrderIntent",
@@ -110,6 +114,19 @@ def _within(deviation: float, limit: float) -> bool:
     return deviation <= limit + _EDGE_EPSILON * (1.0 + abs(limit))
 
 
+def _finite(value: float) -> bool:
+    """A real number, not NaN and not an infinity.
+
+    ``x > 0.0`` is not a sufficient guard: ``inf`` passes it, and every price
+    or size derived from an infinite input is then either infinite or zero
+    while still looking like an ordinary float.
+    """
+    try:
+        return math.isfinite(value)
+    except TypeError:          # not a number at all
+        return False
+
+
 def classify_placement(
     side: Side,
     price: float,
@@ -162,14 +179,31 @@ def depth_credit_usd(
     Reduce-only legs are excluded — they exist to shed inventory, not to
     provide liquidity, and counting them would flatter a book that is
     actually retreating.
+
+    Raises ``ValueError`` when a leg's own ``side`` disagrees with the book it
+    was handed in through. That is a caller bug, and the quiet version of it
+    is the worst outcome available here: two sell-side legs split across the
+    two arguments would score as a balanced book and report depth that cannot
+    exist. Refusing is the only answer that cannot overstate the number.
     """
     def in_ring(legs: Iterable[OrderIntent], side: Side) -> float:
         total = 0.0
         for leg in legs:
+            # Side() normalises, so a plain "buy" string is accepted as
+            # Side.BUY rather than silently scored as a sell -- the intent
+            # dataclass is not frozen against a caller passing the raw value.
+            leg_side = Side(leg.side)
+            if leg_side is not side:
+                raise ValueError(
+                    "a %s intent was passed in the %s book for %s. Depth "
+                    "credit is measured per side, so scoring it under the "
+                    "wrong rule would report balanced depth for a one-sided "
+                    "book" % (leg_side.value, side.value, leg.market)
+                )
             if leg.reduce_only:
                 continue
             placement = classify_placement(
-                side, leg.price, oracle, ring_pct=ring_pct,
+                leg_side, leg.price, oracle, ring_pct=ring_pct,
                 band_pct=max(ring_pct, 5.0),
             )
             if placement in (Placement.PASSIVE, Placement.AGGRESSIVE):
@@ -204,8 +238,32 @@ def quote_ladder(
     clamped rather than allowed to drift out, so asking for more levels than
     the ring can hold degrades into a tighter ladder instead of a book with
     invisible legs.
+
+    EVERY tuning input is checked, and an out-of-domain one quotes NOTHING
+    rather than raising. ``first_offset_pct`` and ``ring_pct`` arrive from
+    configuration (``QuotingRunner``'s constructor), and the failure modes are
+    not merely ugly: a negative offset inverts the ladder into a crossed pair
+    that batch.py happily accepts because both legs are inside the band, NaN
+    survives the ring clamp (``min(nan, x)`` is nan) and poisons both prices,
+    and a ring above 100% lifts the clamp past the oracle and makes the bid
+    price negative. Quoting nothing is the safe direction — it costs depth
+    credit, and it is logged at WARNING so a config typo does not silently
+    idle the book for a whole contest week.
     """
-    if not (oracle > 0.0) or not (target_depth_usd > 0.0) or levels < 1:
+    if not (_finite(oracle) and oracle > 0.0):
+        return []
+    if not (_finite(target_depth_usd) and target_depth_usd > 0.0):
+        return []
+    if levels < 1:
+        return []
+    if not (_finite(first_offset_pct) and first_offset_pct >= 0.0
+            and _finite(level_step_pct) and level_step_pct >= 0.0
+            and _finite(ring_pct) and 0.0 < ring_pct <= 100.0):
+        _log.warning(
+            "permuto: refusing to quote %s -- out-of-domain ladder tuning "
+            "(first_offset_pct=%r, level_step_pct=%r, ring_pct=%r)",
+            market, first_offset_pct, level_step_pct, ring_pct,
+        )
         return []
 
     per_level = target_depth_usd / levels
