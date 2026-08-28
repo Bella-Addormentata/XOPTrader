@@ -12,10 +12,10 @@ Compliant with:
 
 from __future__ import annotations
 
-from collections import deque
-from datetime import datetime
 import logging
 import time
+from collections import deque
+from datetime import datetime
 from typing import Any, Final, Optional
 
 from PySide6.QtCore import QSettings, QSize, Qt, QTimer
@@ -39,8 +39,10 @@ from PySide6.QtWidgets import (
 )
 
 # -- Local widgets ----------------------------------------------------------
+from gui.services.venue_control import SwitchInputs
 from gui.widgets.sidebar import Sidebar
 from gui.widgets.status_bar import StatusBar
+from gui.widgets.venue_switch import VenueSwitch
 
 # -- Placeholder imports for widgets that will be created later -------------
 # Each of these will live in gui/widgets/<name>.py once implemented.
@@ -307,6 +309,11 @@ class MainWindow(QMainWindow):
         self._connected: bool = False
         self._bot_running: bool = False
         self._bot_paused: bool = False
+        # Per-venue INTENT, distinct from what is happening. The switch shows
+        # the difference: intent ON plus a gate is BLOCKED, not ON.
+        self._dexie_desired_on: bool = False
+        self._permuto_desired_on: bool = False
+        self._permuto_book_is_empty: bool = True
         # True when the current Paused status is owned by the GUI flag (the
         # pause Resume can clear), False when a risk breaker holds it.
         self._gui_pause_owns_it: bool = True
@@ -583,6 +590,10 @@ class MainWindow(QMainWindow):
         # Ownership of a pause can change without a status transition;
         # keep the Resume control truthful on every tick.
         self._refresh_pause_ownership()
+        # Same reasoning for the venue switches: a breaker can trip, the dead
+        # man's switch can fire, and the resting-offer count can fall to zero
+        # -- none of which is a status-string transition.
+        self._refresh_venue_switches()
         pnl = data.get("pnl", {})
         health = data.get("health", {})
 
@@ -1462,11 +1473,11 @@ class MainWindow(QMainWindow):
 
         file_menu.addSeparator()
 
-        self._act_start_trading = QAction("&Start Trading", self)
+        self._act_start_trading = QAction("&Start Engine", self)
         self._act_start_trading.triggered.connect(self._on_start_stop)
         file_menu.addAction(self._act_start_trading)
 
-        self._act_stop_trading = QAction("S&top Trading", self)
+        self._act_stop_trading = QAction("S&hut Down Engine", self)
         self._act_stop_trading.setEnabled(False)
         self._act_stop_trading.triggered.connect(self._on_start_stop)
         file_menu.addAction(self._act_stop_trading)
@@ -1606,14 +1617,27 @@ class MainWindow(QMainWindow):
 
         toolbar.addSeparator()
 
-        # Start / Stop button
-        self._start_stop_btn = QPushButton("Start Trading")
-        self._start_stop_btn.setFixedSize(130, 36)
-        self._start_stop_btn.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._start_stop_btn.setToolTip("Start or stop live trading on the CHIA DEX")
-        self._start_stop_btn.clicked.connect(self._on_start_stop)
-        self._style_start_stop_button()
-        toolbar.addWidget(self._start_stop_btn)
+        # Per-venue trading switches.
+        #
+        # These replaced a single "Start Trading" button, which conflated two
+        # separate questions: is the engine process alive, and is each venue
+        # trading. They are genuinely independent -- dexie is 24/7 and
+        # currently idle with both stablecoin issuers compromised, while
+        # Permuto runs a fixed contest window -- so the operator needs both,
+        # either, or neither, and the old control could not express that.
+        #
+        # Process lifecycle moved to the File menu. Killing the engine is
+        # rare and destructive, and it does not belong under the same click
+        # as "stop quoting on one venue".
+        self._dexie_switch = VenueSwitch("dexie", self._gather_dexie)
+        self._dexie_switch.toggleRequested.connect(self._on_dexie_toggle)
+        self._dexie_switch.refused.connect(self._on_switch_refused)
+        toolbar.addWidget(self._dexie_switch)
+
+        self._permuto_switch = VenueSwitch("permuto", self._gather_permuto)
+        self._permuto_switch.toggleRequested.connect(self._on_permuto_toggle)
+        self._permuto_switch.refused.connect(self._on_switch_refused)
+        toolbar.addWidget(self._permuto_switch)
 
         # Pause / Resume button
         self._pause_resume_btn = QPushButton("Pause Trading")
@@ -1628,43 +1652,17 @@ class MainWindow(QMainWindow):
         toolbar.addWidget(self._pause_resume_btn)
 
     def _style_start_stop_button(self) -> None:
-        """Apply the correct colour to the start/stop button."""
-        if self._bot_running:
-            self._start_stop_btn.setText("Stop Trading")
-            self._start_stop_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background-color: {LOSS_RED};
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    padding: 8px 16px;
-                }}
-                QPushButton:hover {{ background-color: #F06060; }}
-                """
-            )
-        else:
-            self._start_stop_btn.setText("Start Trading")
-            self._start_stop_btn.setStyleSheet(
-                f"""
-                QPushButton {{
-                    background-color: {PRIMARY_GREEN};
-                    color: white;
-                    border: none;
-                    border-radius: 8px;
-                    font-weight: bold;
-                    font-size: 13px;
-                    padding: 8px 16px;
-                }}
-                QPushButton:hover {{ background-color: {LIGHT_GREEN}; }}
-                """
-            )
+        """Keep the File-menu process actions in step with engine state.
 
-        # Keep File menu items in sync with the toolbar button.
+        The toolbar button this used to paint is gone -- trading is now two
+        per-venue switches, and starting or killing the engine PROCESS is a
+        different question that lives in the File menu. The menu items still
+        need syncing, and the venue switches need repainting because
+        `engine_down` is one of their gates.
+        """
         self._act_start_trading.setEnabled(not self._bot_running)
         self._act_stop_trading.setEnabled(self._bot_running)
+        self._refresh_venue_switches()
 
     def _refresh_pause_ownership(self) -> None:
         """Recompute who owns the current pause, and re-arm the controls.
@@ -2127,6 +2125,134 @@ class MainWindow(QMainWindow):
         self._conn_label.setText("Disconnected")
         self._act_connect.setEnabled(True)
         self._act_disconnect.setEnabled(False)
+
+    # ------------------------------------------------------------------
+    # Per-venue trading switches
+    # ------------------------------------------------------------------
+
+    def _gather_dexie(self) -> SwitchInputs:
+        """What the dexie switch is allowed to claim right now.
+
+        Gates come from the engine's OWN posting-gate family rather than
+        being recomputed here, so the switch reports the gate the engine is
+        actually applying. `gui` is excluded because that IS this switch --
+        treating our own pause as a protection gate would make the switch
+        permanently unable to turn itself back on. `dry_run` is excluded
+        because it is a mode, not a fault.
+        """
+        gates: set[str] = set()
+        if not self._bot_running:
+            gates.add("engine_down")
+        else:
+            try:
+                if self._bridge is not None:
+                    gates |= (self._bridge.metrics_service
+                              .posting_gate_reasons() - {"gui", "dry_run"})
+            except Exception:  # noqa: BLE001 - a stale read must not arm it
+                # Fail CLOSED: if the gate state cannot be read we do not
+                # know whether a breaker holds, and guessing "clear" is how
+                # a switch turns trading on over a tripped one.
+                gates.add("breaker")
+
+        return SwitchInputs(
+            desired_on=self._dexie_desired_on,
+            gates=frozenset(gates),
+            book_is_empty=self._dexie_book_is_empty(),
+        )
+
+    def _dexie_book_is_empty(self) -> bool:
+        """Whether anything of ours is still resting on dexie.
+
+        Unknown counts as NOT empty. A secure cancel settles on chain, so the
+        honest default while we cannot see the book is that an offer may
+        still be takeable -- which shows STOPPING rather than a false OFF.
+        """
+        if self._bridge is None:
+            # Nothing connected, so nothing of ours can be resting.
+            return True
+        try:
+            pending = self._bridge.metrics_service.get_offers_summary()
+            return float(pending.get("pending", 0.0)) <= 0.0
+        except Exception:  # noqa: BLE001
+            # Unknown counts as NOT empty. A secure cancel settles on chain,
+            # so while we cannot see the book the honest reading is that an
+            # offer may still be takeable -- which shows STOPPING rather than
+            # a false OFF.
+            return False
+
+    def _gather_permuto(self) -> SwitchInputs:
+        gates: set[str] = set()
+        try:
+            from gui.widgets.permuto import _default_identity_factory
+
+            info = _default_identity_factory().info()
+            if not info.registered:
+                gates.add("not_registered")
+        except Exception:  # noqa: BLE001 - no identity is a normal state
+            gates.add("not_registered")
+
+        return SwitchInputs(
+            desired_on=self._permuto_desired_on,
+            gates=frozenset(gates),
+            book_is_empty=self._permuto_book_is_empty,
+        )
+
+    def _on_switch_refused(self, reason: str) -> None:
+        """Say why, in the status bar and in the log.
+
+        A switch that snaps back without explanation teaches the operator
+        that the control is unreliable rather than that something is holding
+        it.
+        """
+        self.statusBar().showMessage("Refused: %s" % reason, 8000)
+        _log.warning("[GUI] venue switch refused: %s", reason)
+
+    def _on_dexie_toggle(self, want_on: bool) -> None:
+        if want_on:
+            if self._bridge is not None and not self._bot_running:
+                self._bridge.start_engine()
+            if self._bridge is not None:
+                self._bridge.resume_trading()
+            self._dexie_desired_on = True
+        else:
+            # OFF means flat, not "stopped posting". Pause first so nothing
+            # new is placed while the cancels go out, THEN cancel -- the
+            # other order races a fresh ladder against its own cancellation.
+            if self._bridge is not None:
+                self._bridge.pause_trading()
+                # Capability, not hasattr. cancel_all_offers() EXISTS on the
+                # Phase 1 bridge and does nothing but log -- so probing for
+                # the method would have this switch go quiet about a book it
+                # never retracted, which is the failure the OFF-means-flat
+                # rule was chosen to avoid.
+                if getattr(self._bridge, "SUPPORTS_DIRECT_CONTROL", False):
+                    self._bridge.cancel_all_offers()
+                else:
+                    self._on_switch_refused(
+                        "posting stopped, but this build cannot cancel from "
+                        "the GUI -- offers already resting stay takeable "
+                        "until they expire or the engine shuts down")
+            self._dexie_desired_on = False
+        self._refresh_venue_switches()
+
+    def _on_permuto_toggle(self, want_on: bool) -> None:
+        self._permuto_desired_on = bool(want_on)
+        if not want_on:
+            self._permuto_book_is_empty = True
+        self._refresh_venue_switches()
+
+    def _refresh_venue_switches(self) -> None:
+        """Repaint both switches. Cheap, and called on every data tick.
+
+        Polling rather than reacting to transitions: the gate set can change
+        while the status STRING stays the same -- a breaker tripping under an
+        existing pause is the documented case -- so a transition-only refresh
+        goes stale in both directions.
+        """
+        for switch in (getattr(self, "_dexie_switch", None),
+                       getattr(self, "_permuto_switch", None)):
+            if switch is not None:
+                switch.refresh()
 
     def _on_start_stop(self) -> None:
         """Toggle bot running state after user confirmation.
