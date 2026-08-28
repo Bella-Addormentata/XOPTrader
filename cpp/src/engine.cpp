@@ -1252,7 +1252,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
             std::int64_t height = -1;
             bool node_ok = false;
 
-            if (wallet_only_mode_
+            // [review] Ask height_source_, not wallet_only_mode_. The
+            // latter is assigned only in open_connections() and never
+            // cleared, so an auto-mode startup fallback pinned this branch
+            // forever: even after the probe walked the source back to the
+            // node, every poll still took the wallet path and waited on both
+            // RPCs. wallet_only_CONFIGURED is the genuinely permanent one.
+            if (wallet_only_configured_
                 || height_source_.current == risk::HeightSource::Wallet) {
                 // The wallet call gets its own guard. Unprotected, a wallet
                 // throw unwound the whole poll before the recovery probe
@@ -1275,7 +1281,19 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 // Guarded on wallet_only_CONFIGURED, not wallet_only_mode_:
                 // an auto-mode startup failure sets the latter, and guarding
                 // on it disabled recovery precisely when recovery mattered.
-                if (!wallet_only_configured_ && mode_is_auto) {
+                // [review] THROTTLED. get_block_height() retries four
+                // times at up to 30s each plus backoff, and this is awaited
+                // inline -- so during an outage every poll paused roughly two
+                // minutes before the wallet height it had ALREADY fetched
+                // could reach the heartbeat. The probe exists to notice a
+                // recovery, which is a minutes-scale event; paying two
+                // minutes of heartbeat latency every poll to detect it sooner
+                // is the wrong trade, and it delays the cancels and breaker
+                // evaluations the heartbeat carries.
+                const bool probe_due =
+                    (++node_probe_skips_ >= kNodeProbeEveryNPolls);
+                if (!wallet_only_configured_ && mode_is_auto && probe_due) {
+                    node_probe_skips_ = 0;
                     try {
                         // A startup fallback closed the node client, so
                         // re-open before probing. open() is idempotent but
@@ -1313,6 +1331,9 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     if (next_height_source(height_source_, node_ok,
                                            mode_is_auto)
                             != before) {
+                        // Clear the runtime fallback too, so the rest of the
+                        // engine stops behaving as though there were no node.
+                        wallet_only_mode_ = false;
                         spdlog::warn("[Engine] [S28] full node is answering "
                                      "again -- block height back on the node");
                     }
@@ -1480,7 +1501,13 @@ asio::awaitable<void> Engine::run_startup_analysis()
             if (!wallet_only_mode_) {
                 try {
                     height = co_await wallet_->get_height_info();
-                    recovered = (height > 0);
+                    // Same bound the main poll applies. Accepting any
+                    // positive int64 here and narrowing to BlockHeight below
+                    // would fabricate an analysis height out of a malformed
+                    // value above UINT32_MAX -- the exact wrap the helper
+                    // was added to prevent, reintroduced one function away.
+                    recovered = risk::height_is_usable(
+                        height, last_block_.load(std::memory_order_relaxed));
                 } catch (const std::exception&) {
                     recovered = false;
                 }

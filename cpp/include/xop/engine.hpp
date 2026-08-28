@@ -419,6 +419,14 @@ private:
     /// was never noticed and the engine stayed on the wallet forever.
     bool wallet_only_configured_{false};
 
+    /// Polls between full-node recovery probes while on the wallet.
+    ///
+    /// The probe is awaited inline and get_block_height() retries four times
+    /// at up to 30s each, so probing every poll paid ~2 minutes of heartbeat
+    /// latency during an outage to detect a minutes-scale event sooner.
+    static constexpr int kNodeProbeEveryNPolls = 10;
+    int                  node_probe_skips_{kNodeProbeEveryNPolls};
+
     /// True when running without the full node (wallet-only mode).
     /// Set during open_connections() based on config_.chia.mode and
     /// full-node reachability (auto-detect).
