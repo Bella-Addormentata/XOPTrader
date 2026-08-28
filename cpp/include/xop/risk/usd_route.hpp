@@ -88,7 +88,12 @@ struct ParLookups {
     ParLookup anchors_xch;
 };
 
-/// Can XCH reach USD at all?
+/// Can XCH reach USD at all, for a DOWNSTREAM asset's conversion?
+///
+/// Narrow on purpose: this answers "will usd_per_xch() return a rate", which
+/// is what an asset priced through XCH actually depends on, and that function
+/// accepts only par WRAPPERS. Use :func:`xch_is_valuable` for the different
+/// question of whether XCH itself can be priced.
 [[nodiscard]] inline bool xch_is_anchored(
     const ExternalXchFeed& feed,
     const std::vector<RoutePair>& enabled_pairs,
@@ -97,6 +102,29 @@ struct ParLookups {
     if (feed.usable()) return true;
     for (const auto& p : enabled_pairs) {
         if (p.base_asset_id == "xch" && pars.anchors_xch(p.quote_asset_id)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Can XCH ITSELF be priced?
+///
+/// [review] Broader than :func:`xch_is_anchored`, because the runtime is.
+/// asset_usd_pseudo_price("xch") walks XCH's own base pairs and calls
+/// quote_usd_factor(), which values a BYC quote through its market cross --
+/// so an XCH/BYC pair CAN price XCH even though BYC, preferring its market,
+/// is not accepted as usd_per_xch()'s par anchor. Using the narrow test here
+/// classified XCH as having no route before that snapshot arrived, wrote it
+/// off at $0, and let a partial book seed the drawdown high-water mark.
+[[nodiscard]] inline bool xch_is_valuable(
+    const ExternalXchFeed& feed,
+    const std::vector<RoutePair>& enabled_pairs,
+    const ParLookups& pars)
+{
+    if (feed.usable()) return true;
+    for (const auto& p : enabled_pairs) {
+        if (p.base_asset_id == "xch" && pars.has_par(p.quote_asset_id)) {
             return true;
         }
     }
@@ -115,7 +143,7 @@ struct ParLookups {
     const ParLookups& pars)
 {
     if (asset_id == "xch") {
-        return xch_is_anchored(feed, enabled_pairs, pars);
+        return xch_is_valuable(feed, enabled_pairs, pars);
     }
     if (pars.has_par(asset_id)) {
         return true;   // priceable with no market at all
@@ -132,7 +160,13 @@ struct ParLookups {
 
         const std::string& other = is_base ? p.quote_asset_id
                                            : p.base_asset_id;
-        if (pars.has_par(other)) return true;
+        // [review] Only when the asset is the BASE. quote_usd_factor() gives
+        // USD per unit of the QUOTE, which prices the base through the mid.
+        // The mirror image does not exist: it cannot invert an arbitrary
+        // par-valued base to price the quote, so WRAP/CAT_A returned "route"
+        // for CAT_A while the runtime returned 0 -- and CAT_A then degraded
+        // permanently rather than taking the write-off.
+        if (is_base && pars.has_par(other)) return true;
         if (other == "xch") {
             if (!xch_checked) {
                 xch_ok      = xch_is_anchored(feed, enabled_pairs, pars);

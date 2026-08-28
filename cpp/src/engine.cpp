@@ -11837,6 +11837,23 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
                 f * static_cast<double>(kMojosPerXch)));
         }
     }
+
+    // [review] OWN DECLARED PAR, last.
+    //
+    // usd_route.hpp advertises "the asset's own enforced par" as a route,
+    // and until now no runtime path delivered it: an asset holding an
+    // enforced par whose pairs were all disabled produced no pseudo-price,
+    // was classified as routable, and therefore degraded forever instead of
+    // taking the structural write-off -- pausing the engine on every start,
+    // which is the condition S32 exists to prevent.
+    //
+    // Placed AFTER both market loops on purpose. A prefer_market_cross asset
+    // must still be valued through its market when one is available; this is
+    // the fallback for when none is, not a shortcut past them.
+    if (const auto par = declared_usd_par(asset_id)) {
+        return static_cast<Mojo>(std::llround(
+            *par * static_cast<double>(kMojosPerXch)));
+    }
     return 0;
 }
 

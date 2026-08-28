@@ -570,11 +570,17 @@ private:
     /// of CONFIGURATION with no market state, so the answer is stable for the
     /// life of the process and cannot flap with the feed.
     ///
-    /// Two routes count, not one: an enabled pair naming the asset, OR -- for
-    /// XCH only -- an enabled CoinGecko feed listing "chia". Callers use this
-    /// answer to choose between degrading and a permanent $0 write-off, so
-    /// omitting the external route from the description is exactly the kind
-    /// of gap that gets XCH written off while a live feed is quoting it.
+    /// [review] NOT "an enabled pair naming the asset" -- that was the
+    /// rejected first implementation and this paragraph outlived its
+    /// deletion above. An enabled pair counts only when its other leg
+    /// reaches an enforced par or an anchored XCH; an enabled CAT/CAT pair
+    /// with neither is a dead end that yields 0.0 forever. Conversely an
+    /// asset's own enforced par is a route with no pair at all.
+    ///
+    /// Callers use this answer to choose between degrading and a permanent
+    /// $0 write-off, and both errors are expensive: a false route degrades
+    /// forever on a condition that cannot resolve, a missing one writes off
+    /// a holding a live feed is quoting.
     [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
 
     /// Whether XCH can reach USD at all: the external CoinGecko quote, or an

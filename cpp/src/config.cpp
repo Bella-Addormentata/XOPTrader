@@ -3452,7 +3452,16 @@ AppConfig load_config(const std::string& path,
     // peak -- so the next successful CoinGecko refresh reads as a drawdown
     // the market never produced. Nothing about that looks like a
     // misconfiguration in the logs, which is why it is called out here.
-    if (cfg.coingecko.enabled && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+    // [review] The same "chia" membership test validate_usd_anchor() uses.
+    // Without it this warned about "the external XCH anchor" alternating
+    // with the DEX for any enabled CoinGecko config -- a Bitcoin-only feed
+    // with a long interval got a diagnostic about an XCH anchor that does
+    // not exist, which is how operators learn to ignore warnings.
+    const auto& cg_ids = cfg.coingecko.coin_ids;
+    const bool cg_quotes_chia =
+        std::find(cg_ids.begin(), cg_ids.end(), "chia") != cg_ids.end();
+    if (cfg.coingecko.enabled && cg_quotes_chia
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
         const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
         // Strictly greater, not >=. The freshness check accepts
         // age <= threshold, and a fetch is completed and timestamped BEFORE

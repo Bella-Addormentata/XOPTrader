@@ -23,6 +23,7 @@ using xop::risk::RoutePair;
 using xop::risk::ParLookups;
 using xop::risk::asset_is_routable_to_usd;
 using xop::risk::xch_is_anchored;
+using xop::risk::xch_is_valuable;
 
 namespace {
 
@@ -58,10 +59,11 @@ TEST(ExternalXchFeedUsable, AConfiguredAndFreshFeedIsAnAnchor) {
 }
 
 TEST(ExternalXchFeedUsable, AZeroThresholdIsNotAnAnchor) {
-    // Legal, silent, and anchorless: usd_per_xch() gates the cached price
-    // through a freshness check that treats a non-positive threshold as
-    // permanently stale, so every tick rejects the value while startup
-    // validation reported a healthy anchor.
+    // usd_per_xch() gates the cached price through a freshness check that
+    // treats a non-positive threshold as permanently stale, so every tick
+    // rejects the value. Startup validation used to certify that config as
+    // anchored; it now declines the CoinGecko exemption and warns, which is
+    // the agreement this constant exists to keep.
     ExternalXchFeed f = live_feed();
     f.freshness_threshold_sec = 0.0;
     EXPECT_FALSE(f.usable());
@@ -145,9 +147,19 @@ TEST(AssetRoute, AnAssetWithItsOwnParNeedsNoMarket) {
                                          pars({"byc"})));
 }
 
-TEST(AssetRoute, AssetWorksAsEitherLegOfThePair) {
+TEST(AssetRoute, APricedBaseDoesNotMakeItsQuoteRoutable) {
+    // [review] This asserted the opposite and was wrong. quote_usd_factor()
+    // yields USD per unit of the QUOTE, which prices the BASE through the
+    // mid; the mirror image does not exist, because it cannot invert an
+    // arbitrary par-valued base to price the quote. So WRAP/CAT_A reported a
+    // route for CAT_A while the runtime returned 0 -- and CAT_A degraded
+    // permanently instead of taking the structural write-off, which is the
+    // failure this predicate exists to prevent.
     const std::vector<RoutePair> p{{"wusdc.b", "cat_a"}};
-    EXPECT_TRUE(asset_is_routable_to_usd("cat_a", ExternalXchFeed{}, p,
+    EXPECT_FALSE(asset_is_routable_to_usd("cat_a", ExternalXchFeed{}, p,
+                                          pars({"wusdc.b"})));
+    // The base of that same pair IS routable -- that direction works.
+    EXPECT_TRUE(asset_is_routable_to_usd("wusdc.b", ExternalXchFeed{}, p,
                                          pars({"wusdc.b"})));
 }
 
@@ -197,11 +209,24 @@ TEST(AssetRoute, TheZeroThresholdHoleReachesEveryXchRoutedAsset) {
 
 TEST(XchIsAnchored, APreferMarketCrossAssetDoesNotAnchorXch) {
     const std::vector<RoutePair> p{{"xch", "byc"}};
-    // Declared par: yes. Accepted by usd_per_xch as an anchor: no.
+    // Declared par: yes. Accepted by usd_per_xch() as an anchor: no.
     const auto pars_byc = pars({"byc"}, /*anchors=*/{}, /*anchors_given=*/true);
     EXPECT_FALSE(xch_is_anchored(ExternalXchFeed{}, p, pars_byc));
-    EXPECT_FALSE(asset_is_routable_to_usd("xch", ExternalXchFeed{}, p,
-                                          pars_byc));
+}
+
+TEST(XchIsValuable, APreferMarketCrossQuoteCanStillPriceXch) {
+    // [review] The two questions differ, and conflating them wrote XCH off.
+    // asset_usd_pseudo_price("xch") walks XCH's base pairs and calls
+    // quote_usd_factor(), which values a BYC quote through its MARKET CROSS
+    // -- so XCH/BYC prices XCH even though BYC is not an acceptable par
+    // anchor for usd_per_xch(). Using the narrow test here classified XCH as
+    // routeless before that snapshot arrived, valued it at $0, and let a
+    // partial book seed the drawdown high-water mark.
+    const std::vector<RoutePair> p{{"xch", "byc"}};
+    const auto pars_byc = pars({"byc"}, /*anchors=*/{}, /*anchors_given=*/true);
+    EXPECT_TRUE(xch_is_valuable(ExternalXchFeed{}, p, pars_byc));
+    EXPECT_TRUE(asset_is_routable_to_usd("xch", ExternalXchFeed{}, p,
+                                         pars_byc));
 }
 
 TEST(AssetRoute, APreferMarketCrossQuoteStillPricesTheBaseDirectly) {
