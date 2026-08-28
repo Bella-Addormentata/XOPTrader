@@ -24,6 +24,22 @@ Two details that are easy to get wrong and expensive to debug:
 
 A browser ``User-Agent`` is required. Without one the venue answers 403 even
 on public routes, which reads exactly like an auth failure and is not one.
+
+THE COMMIT BOUNDARY, AND WHY "FAILED" IS THE WRONG DEFAULT.  The last POST is
+irreversible: once the venue commits, this key IS that account, forever, with
+no change-my-key flow. But the transport cannot tell us whether it committed
+-- a socket timeout arriving *after* the write raises the identical
+``URLError`` as a connection refused *before* it. Collapsing that into an
+ordinary failure is what invites a second permanent link, so the unknown case
+gets :class:`PermutoLinkIndeterminate` and the caller must reconcile rather
+than retry. Two supports make that workable:
+
+* the attempt is recorded through the identity BEFORE the request, which is
+  also the write test that refuses to link at all when the record could not be
+  kept; and
+* :func:`reconcile_registration` answers "am I already linked?" over
+  ``/info/wallet_bls_trading_address``, the route documented as having no link
+  side effects -- so asking the question can never be the act.
 """
 
 from __future__ import annotations
@@ -52,6 +68,41 @@ _TIMEOUT = 30
 
 class PermutoAuthError(RuntimeError):
     """Operator-facing failure during link, auth or standing lookup."""
+
+
+class PermutoLinkIndeterminate(PermutoAuthError):
+    """The committing request failed in a way that does not say what happened.
+
+    ``POST /exchange/wallet_auth`` is the irreversible boundary: once the
+    venue commits, this key is that account forever. A socket timeout, a
+    connection reset or a 5xx after the commit raises exactly the same
+    ``URLError``/``HTTPError`` as a refusal before it, so the transport gives
+    us no way to tell "never linked" from "linked, answer lost".
+
+    Collapsing that into an ordinary failure is what re-enables Register for a
+    key the venue may already own -- and a second link attempt on an already
+    linked key is the one action with no undo. So the unknown case gets its
+    own type, and the caller must treat it as *possibly linked*: reconcile
+    with :func:`reconcile_registration`, which reads the venue back through a
+    route documented as having no link side effects.
+    """
+
+
+def _venue_answered_and_refused(exc: BaseException) -> bool:
+    """True when the venue replied to the commit call and turned it down.
+
+    A 4xx is an ANSWER: the request arrived, was understood and was rejected,
+    so nothing was committed. Everything else -- a timeout, a reset, a 5xx, a
+    200 whose body will not parse -- leaves the outcome unknown. The
+    asymmetry is deliberate: a false "indeterminate" costs the operator one
+    extra read-back click, while a false "not linked" invites a second
+    permanent link.
+    """
+    cause = exc.__cause__
+    return (
+        isinstance(cause, urllib.error.HTTPError)
+        and 400 <= cause.code < 500
+    )
 
 
 def _request(method: str, path: str, payload: Optional[dict] = None) -> Any:
@@ -181,6 +232,59 @@ class Registration:
     __str__ = __repr__
 
 
+def _note_link_attempt(identity: Any) -> None:
+    """Durably record that the commit call is about to be issued.
+
+    Any exception propagates on purpose -- see the call site. ``getattr``
+    rather than a hard call because ``identity`` is duck-typed here (the
+    protocol tests hand in a signing stub with no storage at all); a stub that
+    cannot record an attempt also cannot lose one.
+    """
+    mark = getattr(identity, "mark_link_attempt", None)
+    if callable(mark):
+        mark()
+
+
+def _clear_link_attempt(identity: Any) -> None:
+    """Drop the marker after an answer that rules a link out."""
+    clear = getattr(identity, "clear_link_attempt", None)
+    if not callable(clear):
+        return
+    try:
+        clear()
+    except Exception as exc:  # noqa: BLE001 - never mask the real failure
+        _log.warning("permuto: could not clear the link-attempt marker: %s", exc)
+
+
+def reconcile_registration(identity: Any) -> Optional[tuple[str, str]]:
+    """``(user_id, trading_address)`` if the venue already knows this key.
+
+    The read-back for an indeterminate link. ``/info/wallet_bls_trading_
+    address`` is documented as having **no link side effects**, which is the
+    whole reason it can be used here: asking "am I already linked?" must not
+    be a way of accidentally linking.
+
+    Returns ``None`` when the venue does not report a ``wallet_user_id`` for
+    this key. That is read as "not linked" -- deliberately the conservative
+    direction, because the alternative is recording a registration that never
+    happened and permanently disabling the Register button for an account
+    that does not exist. ``register()`` itself falls back to the auth
+    response for ``user_id``, which is what says this field is not populated
+    for an unlinked key.
+    """
+    pubkey = identity.public_key()
+    resolved = resolve_trading_address(pubkey) or {}
+    if resolved.get("error"):
+        raise PermutoAuthError("venue rejected our pubkey: %s" % resolved["error"])
+    user_id = resolved.get("wallet_user_id")
+    address = resolved.get("wallet_address")
+    if not isinstance(user_id, str) or not user_id.strip():
+        return None
+    if not isinstance(address, str) or not address.strip():
+        return None
+    return user_id, address
+
+
 def register(identity: Any) -> Registration:
     """Link ``identity`` to Permuto and return the session.
 
@@ -222,15 +326,34 @@ def register(identity: Any) -> Registration:
 
     signature = identity.sign(nonce)
 
-    auth = _request(
-        "POST",
-        "/exchange/wallet_auth",
-        {
-            "challenge_token": token,
-            "wallet_pubkey": pubkey,
-            "signature": signature.hex(),
-        },
-    )
+    # Everything above this line is reversible. The call below is not, so the
+    # attempt is recorded FIRST -- and recording it is also the write test
+    # that decides whether linking is safe at all. If secrets.yaml cannot be
+    # written, the link would succeed and the record of it would not, which
+    # is the single outcome with no recovery path: a permanently linked key
+    # the app believes is free. Failing here turns that into "not linked".
+    _note_link_attempt(identity)
+    try:
+        auth = _request(
+            "POST",
+            "/exchange/wallet_auth",
+            {
+                "challenge_token": token,
+                "wallet_pubkey": pubkey,
+                "signature": signature.hex(),
+            },
+        )
+    except Exception as exc:  # noqa: BLE001 - re-raised, classified
+        if isinstance(exc, PermutoAuthError) and _venue_answered_and_refused(exc):
+            _clear_link_attempt(identity)
+            raise
+        raise PermutoLinkIndeterminate(
+            "the Permuto link request did not complete cleanly (%s). The key "
+            "MAY already be linked -- do NOT register again. Use Recover "
+            "registration, which reads the venue back without linking "
+            "anything." % exc
+        ) from exc
+
     session = auth.get("session_token") or auth.get("token")
     # As strictly as the identifiers below. A numeric or whitespace-only
     # token is truthy, would be str()'d, and would record a PERMANENT link as
@@ -250,7 +373,8 @@ def register(identity: Any) -> Registration:
     # registration -- Registration declares these as strings and the venue
     # has always sent strings, so anything else is a changed contract we
     # should refuse rather than coerce.
-    if not isinstance(user_id, str) or not isinstance(trading_address, str)             or not user_id.strip() or not trading_address.strip():
+    if (not isinstance(user_id, str) or not isinstance(trading_address, str)
+            or not user_id.strip() or not trading_address.strip()):
         raise PermutoAuthError(
             "link succeeded but the venue did not return both identifiers "
             "(user_id=%r, address=%r); refusing to record a registration we "

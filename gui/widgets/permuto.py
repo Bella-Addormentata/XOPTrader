@@ -1,13 +1,18 @@
 """Permuto page: create the trading identity, back it up, register, verify.
 
-Four states, and the page shows exactly one:
+Five states, and the page shows exactly one:
 
 1. **No identity** -- offer to create it, or restore from 24 words.
 2. **Identity, backup not confirmed** -- refuse to register. The words are the
    only thing standing between the operator and a lost account, and the moment
    after creation is the only moment they can be written down.
 3. **Backed up, not registered** -- the Register button is live.
-4. **Registered** -- green confirmation, with standing read back from the
+4. **Link unfinished** -- a registration started and its outcome was not
+   recorded, either because the venue's answer was lost or because the local
+   write failed. Register is shut and the only button offered is the one that
+   RECOVERS: the key may already be the account, and a second permanent link
+   is the one action with no undo.
+5. **Registered** -- green confirmation, with standing read back from the
    leaderboard rather than merely asserted.
 
 WHY REGISTRATION IS GATED ON THE BACKUP CHECKBOX.  Registering binds this key
@@ -108,6 +113,19 @@ class _RecoveryPhraseDialog(QDialog):
             f"border: 1px solid {_C.BORDER}; font-family: monospace;"
         )
         grid.setFixedHeight(160)
+        # ALL copying must go through _copy(), because done() can only clear a
+        # copy it knows the digest of. setReadOnly leaves
+        # TextSelectableByMouse|ByKeyboard and the standard Select All / Copy
+        # menu in place, so Ctrl+C on the grid -- the natural gesture when
+        # pasting into a password manager -- put the whole mnemonic on the
+        # clipboard without entering _copy(), the digest guard short-circuited,
+        # and the notice's promise that it is "cleared when this dialog closes"
+        # became false. Mouse selection is the worse half on X11 and Wayland:
+        # it fills the PRIMARY buffer, which clipboard.clear() does not touch
+        # at all. Same closure base_wallet.py applies to its key field.
+        grid.setContextMenuPolicy(Qt.ContextMenuPolicy.NoContextMenu)
+        grid.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        grid.setTextInteractionFlags(Qt.TextInteractionFlag.NoTextInteraction)
         layout.addWidget(grid)
 
         copy_row = QHBoxLayout()
@@ -160,7 +178,8 @@ class _RecoveryPhraseDialog(QDialog):
         clipboard = QApplication.clipboard()
         if clipboard is not None and self._copied_digest is not None:
             current = clipboard.text()
-            if hashlib.sha256(current.encode("utf-8")).digest() ==                     self._copied_digest:
+            digest = hashlib.sha256(current.encode("utf-8")).digest()
+            if digest == self._copied_digest:
                 clipboard.clear()
             del current
         self._copied_digest = None
@@ -246,45 +265,126 @@ class _RegistrationWorker(QObject):
 
         try:
             if self._action == "register":
-                reg = auth.register(self._identity)
-                # THE LINK IS NOW PERMANENT AND CANNOT BE REDONE.  Everything
-                # after this point is verification, and verification failing
-                # must never present as "registration failed" -- a single
-                # outer except used to swallow the whole thing, so a
-                # leaderboard timeout emitted {ok: false}, persisted nothing,
-                # and re-enabled a Register button for an account that
-                # already existed.
-                result = {
-                    "ok": True,
-                    "user_id": reg.user_id,
-                    "trading_address": reg.trading_address,
-                    "listed": False,
-                    "entry": None,
-                }
-                try:
-                    entry = auth.leaderboard_entry(reg.user_id)
-                    result["listed"] = entry is not None
-                    result["entry"] = entry
-                except Exception as exc:  # noqa: BLE001
-                    _log.warning(
-                        "permuto: linked, but the leaderboard read-back "
-                        "failed: %s", exc
-                    )
-                    result["verify_error"] = str(exc)
-                self.finished.emit(result)
+                result = self._register(auth)
+            elif self._action == "reconcile":
+                result = self._reconcile(auth)
             else:
-                info = self._identity.info()
-                entry = (
-                    auth.leaderboard_entry(info.user_id) if info.user_id else None
-                )
-                self.finished.emit(
-                    {"ok": True, "listed": entry is not None, "entry": entry,
-                     "user_id": info.user_id or "",
-                     "trading_address": info.trading_address or ""}
-                )
+                result = self._check(auth)
+        except auth.PermutoLinkIndeterminate as exc:
+            # NOT an ordinary failure. The venue may already own this key
+            # permanently, and the durable marker written before the request
+            # is what stops the page offering to link it a second time.
+            _log.exception("permuto: the link outcome is unknown")
+            self.finished.emit(
+                {"ok": False, "indeterminate": True, "error": str(exc)}
+            )
         except Exception as exc:  # noqa: BLE001 - surfaced to the operator
             _log.exception("permuto: %s failed", self._action)
             self.finished.emit({"ok": False, "error": str(exc)})
+        else:
+            self.finished.emit(result)
+
+    def _register(self, auth) -> dict:
+        reg = auth.register(self._identity)
+        # THE LINK IS NOW PERMANENT AND CANNOT BE REDONE, so the durable
+        # write happens HERE, at the side-effect boundary, before anything
+        # that can block. It used to happen in _on_finished, on the UI thread,
+        # AFTER a paginated leaderboard read whose every page carries a
+        # 30-second socket timeout -- and stop_background_work() terminates
+        # this thread 10 seconds into a close. Shutting the window shortly
+        # after a successful link therefore destroyed the only record of a
+        # permanently linked account, leaving a live Register button pointing
+        # at a key the venue already owned.
+        try:
+            self._identity.mark_registered(
+                user_id=reg.user_id,
+                trading_address=reg.trading_address,
+                listing_verified=False,
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("permuto: linked, but the registration would not save")
+            return {
+                "ok": False,
+                "linked": True,
+                "user_id": reg.user_id,
+                "trading_address": reg.trading_address,
+                "error": str(exc),
+            }
+
+        result = {
+            "ok": True,
+            "user_id": reg.user_id,
+            "trading_address": reg.trading_address,
+            "listed": False,
+            "entry": None,
+        }
+        self._verify(auth, reg.user_id, result)
+        return result
+
+    def _check(self, auth) -> dict:
+        info = self._identity.info()
+        result = {
+            "ok": True,
+            "listed": False,
+            "entry": None,
+            "user_id": info.user_id or "",
+            "trading_address": info.trading_address or "",
+        }
+        self._verify(auth, info.user_id or "", result)
+        return result
+
+    def _reconcile(self, auth) -> dict:
+        """Ask the venue whether this key is already linked. Links nothing.
+
+        The answer to an indeterminate link. ``reconcile_registration`` reads
+        the route documented as having no link side effects, so the question
+        cannot become the act.
+        """
+        found = auth.reconcile_registration(self._identity)
+        if found is None:
+            # The venue does not know this key, so the attempt really did
+            # fail. Drop the marker or the operator is stranded: Register
+            # stays disabled forever for an account that does not exist.
+            self._identity.clear_link_attempt()
+            return {"ok": True, "reconciled": True, "linked": False}
+
+        user_id, trading_address = found
+        self._identity.mark_registered(
+            user_id=user_id, trading_address=trading_address,
+            listing_verified=False,
+        )
+        result = {
+            "ok": True,
+            "reconciled": True,
+            "linked": True,
+            "user_id": user_id,
+            "trading_address": trading_address,
+            "listed": False,
+            "entry": None,
+        }
+        self._verify(auth, user_id, result)
+        return result
+
+    def _verify(self, auth, user_id: str, result: dict) -> None:
+        """Leaderboard read-back. Never fatal, on ANY branch.
+
+        The register branch always demoted a read-back failure to
+        ``verify_error``; the check branch did not, so the identical
+        PermutoAuthError from a 503 mid-rebuild came back as ``ok: False`` and
+        the red "Failed" wiped a green listing that was already earned and
+        persisted -- for an operator who pressed the button the amber messages
+        told them to press. One helper now, so the two cannot drift again.
+        """
+        if not user_id:
+            return
+        try:
+            entry = auth.leaderboard_entry(user_id)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("permuto: the leaderboard read-back failed: %s", exc)
+            result["verify_error"] = str(exc)
+            return
+        result["listed"] = entry is not None
+        result["entry"] = entry
 
 
 # --------------------------------------------------------------------------- #
@@ -339,6 +439,11 @@ class PermutoWidget(QWidget):
         self._thread: Optional[QThread] = None
         self._worker: Optional[_RegistrationWorker] = None
         self._worker_identity: Any = None
+        # Identifiers from a link that succeeded and could not be written.
+        # Held so refresh() can keep Register shut and offer to save them
+        # again; the old handler discarded them and then re-enabled Register
+        # under a message telling the operator not to press it.
+        self._pending_registration: Optional[dict] = None
         self._build()
         self.refresh()
 
@@ -401,6 +506,15 @@ class PermutoWidget(QWidget):
         self._check_btn.clicked.connect(self._on_check)
         row.addWidget(self._check_btn)
 
+        # Shown only when a link did not finish cleanly. Deliberately the ONLY
+        # affordance offered in that state: every other route out of it either
+        # links a second time or leaves the operator with a disabled button
+        # and an instruction to press it.
+        self._recover_btn = QPushButton("Recover registration")
+        self._recover_btn.clicked.connect(self._on_recover)
+        self._recover_btn.setVisible(False)
+        row.addWidget(self._recover_btn)
+
         row.addStretch(1)
         layout.addLayout(row)
 
@@ -426,6 +540,7 @@ class PermutoWidget(QWidget):
             self._restore_btn.setEnabled(True)
             self._register_btn.setEnabled(False)
             self._check_btn.setEnabled(False)
+            self._recover_btn.setVisible(False)
             self._set_status("", "")
             return
 
@@ -441,6 +556,25 @@ class PermutoWidget(QWidget):
         # nothing and would render as "Registered -- not on the leaderboard
         # yet", claiming a registration that never happened.
         self._check_btn.setEnabled(bool(info.registered and info.user_id))
+
+        if info.registered:
+            self._pending_registration = None
+
+        # A link that started and did not visibly finish, in either of the two
+        # ways it can fail: the venue's answer was lost (durable marker), or
+        # the answer arrived and the local write did not (pending identifiers).
+        # Both mean this key may ALREADY be the account, so Register stays
+        # shut -- refresh() re-enabling it on backup_confirmed alone is what
+        # made "Do not re-register" a message printed above a live button.
+        unfinished = not info.registered and (
+            self._pending_registration is not None or info.link_attempted
+        )
+        self._recover_btn.setVisible(unfinished)
+        self._recover_btn.setEnabled(unfinished)
+        self._recover_btn.setText(
+            "Save registration" if self._pending_registration
+            else "Recover registration"
+        )
 
         if info.registered:
             self._register_btn.setEnabled(False)
@@ -460,6 +594,24 @@ class PermutoWidget(QWidget):
                     "Registered  --  not yet confirmed on the leaderboard. "
                     "Press Check leaderboard to verify.",
                     _C.WARNING_YELLOW,
+                )
+        elif unfinished:
+            self._register_btn.setEnabled(False)
+            if self._pending_registration:
+                self._set_status(
+                    "Linked with Permuto, but the registration is NOT saved "
+                    "on this machine. Do NOT register again -- the account "
+                    "exists. Make secrets.yaml writable, then press Save "
+                    "registration.",
+                    _C.LOSS_RED,
+                )
+            else:
+                self._set_status(
+                    "A registration attempt did not complete, so this key MAY "
+                    "already be linked to a Permuto account. Linking again is "
+                    "neither possible nor safe. Press Recover registration -- "
+                    "it asks the venue and links nothing.",
+                    _C.LOSS_RED,
                 )
         else:
             # The gate: no registration until the words are written down.
@@ -621,11 +773,54 @@ class PermutoWidget(QWidget):
     def _on_check(self) -> None:
         self._run("check", "Checking leaderboard...")
 
+    @Slot()
+    def _on_recover(self) -> None:
+        """Finish a link that did not finish. Never links anything new.
+
+        Two shapes, one button, because to the operator they are one problem:
+        we hold identifiers that would not save (write them again), or we hold
+        nothing and do not know whether the venue committed (ask it).
+        """
+        pending = self._pending_registration
+        if not pending:
+            self._run(
+                "reconcile",
+                "Asking Permuto whether this key is already linked...",
+            )
+            return
+
+        # The WORKER's identity for the same reason _on_finished uses it: this
+        # records a PERMANENT link, and the factory would rebuild from a
+        # config directory that may have changed since the link was made.
+        identity = self._worker_identity or self._identity_factory()
+        try:
+            identity.mark_registered(
+                user_id=pending["user_id"],
+                trading_address=pending["trading_address"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("permuto: the registration save failed again")
+            self.refresh()
+            self._set_status(
+                "Still could not save the registration: %s  The account "
+                "exists either way -- do NOT register again." % exc,
+                _C.LOSS_RED,
+            )
+            return
+        self._pending_registration = None
+        self.refresh()
+        self._set_status(
+            "Registration saved. Press Check leaderboard to confirm the "
+            "listing.",
+            _C.INFO_BLUE,
+        )
+
     def _run(self, action: str, pending: str) -> None:
         if self._thread is not None:
             return  # already busy
         self._set_status(pending, _C.INFO_BLUE)
-        for btn in (self._register_btn, self._check_btn, self._restore_btn):
+        for btn in (self._register_btn, self._check_btn, self._restore_btn,
+                    self._recover_btn):
             btn.setEnabled(False)
 
         self._thread = QThread(self)
@@ -654,10 +849,46 @@ class PermutoWidget(QWidget):
             thread.wait(5000)
 
         if not result.get("ok"):
+            if result.get("linked"):
+                # The link is real and the save is not. Hold the identifiers
+                # so refresh() can keep Register shut and offer to write them
+                # again; discarding them is what left the page telling the
+                # operator to press a button it had just disabled.
+                self._pending_registration = {
+                    "user_id": result.get("user_id", ""),
+                    "trading_address": result.get("trading_address", ""),
+                }
             # refresh() first (it restores button state), then set the message,
             # because refresh() overwrites the status line.
             self.refresh()
+            # "Failed:" is the wrong word for both of these -- the account may
+            # well exist, and the operator's next move is recovery, not retry.
+            if result.get("linked"):
+                self._set_status(
+                    "Linked with Permuto, but SAVING the registration "
+                    "failed: %s  Do NOT register again -- the account "
+                    "exists. Make secrets.yaml writable, then press Save "
+                    "registration." % result.get("error", ""),
+                    _C.LOSS_RED,
+                )
+                return
+            if result.get("indeterminate"):
+                # PermutoLinkIndeterminate carries the whole instruction, and
+                # the marker it left on disk is what keeps Register shut
+                # across a restart.
+                self._set_status(result.get("error", ""), _C.LOSS_RED)
+                return
             self._set_status("Failed: %s" % result.get("error", ""), _C.LOSS_RED)
+            return
+
+        if result.get("reconciled") and not result.get("linked"):
+            self._pending_registration = None
+            self.refresh()
+            self._set_status(
+                "Permuto does not show this key as linked, so the earlier "
+                "attempt did not reach the venue. You can register again.",
+                _C.WARNING_YELLOW,
+            )
             return
 
         if result.get("user_id") and result.get("trading_address"):
@@ -673,19 +904,24 @@ class PermutoWidget(QWidget):
                     listing_verified=bool(result.get("listed")),
                 )
             except Exception as exc:  # noqa: BLE001
-                # A logged-and-continue here would show green while nothing
-                # was saved: after a restart the identity reads unregistered
-                # and the operator was told otherwise.
-                _log.exception("permuto: could not persist registration")
+                # The link itself is already durable -- the worker writes it
+                # the moment it becomes permanent. What can still fail here is
+                # the PROMOTION of listing_verified, so say that. The old
+                # "nothing was saved, do not re-register" alarm would now send
+                # an operator hunting a problem they do not have.
+                _log.exception(
+                    "permuto: could not persist the leaderboard verification"
+                )
                 self.refresh()
                 self._set_status(
-                    "Linked with Permuto, but SAVING it failed: %s  "
-                    "Do not re-register -- the account exists. Fix the "
-                    "secrets file and press Check leaderboard." % exc,
-                    _C.LOSS_RED,
+                    "Registered and saved, but recording the leaderboard "
+                    "confirmation failed: %s  Press Check leaderboard again "
+                    "once the secrets file is writable." % exc,
+                    _C.WARNING_YELLOW,
                 )
                 return
 
+        self._pending_registration = None
         self.refresh()
 
         # 119-5: a lookup that misses while the board rebuilds must not
@@ -706,11 +942,16 @@ class PermutoWidget(QWidget):
             return
 
         if result.get("listed") or durable_verified:
+            # `entry` is None whenever the green comes from the DURABLE flag
+            # rather than this lookup, so the category is unknown -- printing
+            # it unconditionally rendered "as <id> ()".
             entry = result.get("entry") or {}
+            category = entry.get("category") or ""
             self._set_status(
                 "Successfully registered  --  listed on the Permuto "
-                "leaderboard as %s (%s)"
-                % (result["user_id"][:16], entry.get("category", "")),
+                "leaderboard as %s%s"
+                % (result["user_id"][:16],
+                   " (%s)" % category if category else ""),
                 _C.PROFIT_GREEN,
             )
         else:

@@ -168,6 +168,16 @@ class IdentityInfo:
     unconfirmed one -- and green is the whole point of the check.
     """
 
+    link_attempted: bool = False
+    """A link was issued whose outcome we never learned.
+
+    Set BEFORE the committing request and cleared once the answer is known,
+    so a timeout -- or a crash, or the worker being terminated at shutdown --
+    leaves a durable "this key may already be an account" marker. Without it
+    the next launch sees an unregistered identity and offers to link a key
+    the venue may already own permanently.
+    """
+
 
 class PermutoIdentity:
     """Create, load and back up the persistent Permuto signing identity.
@@ -252,9 +262,17 @@ class PermutoIdentity:
     def restore(self, phrase: str) -> str:
         """Re-derive the identity from its recovery phrase. Returns pubkey hex.
 
-        Overwrites whatever is stored, because the caller is asserting these
-        words are the account. The checksum in :func:`derive_bls_key` is what
-        stops a typo installing a stranger's key here.
+        Overwrites an UNREGISTERED identity, because the caller is asserting
+        these words are the account and an unlinked key is worth nothing. The
+        checksum in :func:`derive_bls_key` is what stops a typo installing a
+        stranger's key here.
+
+        REFUSES to install a DIFFERENT key over a registered one, for the same
+        reason :meth:`discard_unregistered` refuses to delete it: after the
+        link the key IS the account, there is no change-my-key flow on this
+        venue, and this write replaces the only copy of it. Re-deriving the
+        SAME key is always allowed -- that is the machine-move path the
+        mnemonic exists for, and it leaves the registration untouched.
         """
         from ..warp import keystore
 
@@ -264,13 +282,34 @@ class PermutoIdentity:
         with _io_transaction(self._io):
             secrets = self._io.read()
             section = self._section(secrets)
+            stored = section.get("bls_public_key")
+            different_key = stored not in (None, pubkey)
+            # The guard discard_unregistered() has, applied to the other way
+            # of destroying the same key. Restore is the more dangerous of
+            # the two because it looks like recovery: the operator typing a
+            # phrase believes they are RE-installing their account, and the
+            # words that are one letter wrong, or from a different wallet,
+            # still pass the BIP-39 checksum and derive a perfectly valid
+            # stranger's key. Overwriting on that keystroke abandons a live
+            # venue identity with no way back.
+            if different_key and section.get("registered"):
+                raise PermutoIdentityError(
+                    "refusing to restore a DIFFERENT key over a REGISTERED "
+                    "identity -- the key is the account, and this would "
+                    "abandon it permanently. These words derive %s..., but "
+                    "the registered account is %s.... Restore the phrase "
+                    "for THAT key, or remove the 'permuto' section from "
+                    "secrets.yaml deliberately if the account really is "
+                    "being given up." % (pubkey[:16], str(stored)[:16])
+                )
             # Restoring a DIFFERENT phrase installs a different account.
             # Registration metadata describes the old one: left in place it
             # would disable the Register button and display someone else's
             # user_id and address against the new key.
-            if section.get("bls_public_key") not in (None, pubkey):
+            if different_key:
                 for stale in ("registered", "user_id", "trading_address",
-                              "registered_at", "listing_verified"):
+                              "registered_at", "listing_verified",
+                              "link_attempted_at"):
                     section.pop(stale, None)
             section["bls_private_key_dpapi"] = keystore.protect_secret(
                 bytes(sk),
@@ -358,6 +397,41 @@ class PermutoIdentity:
             self._section(secrets)["backup_confirmed"] = True
             self._io.write(secrets)
 
+    # -- the indeterminate window around the permanent link ----------------- #
+
+    def mark_link_attempt(self) -> None:
+        """Record that a PERMANENT link is about to be issued.
+
+        Two jobs, and both matter more than the timestamp itself.
+
+        First, it is a durable trace of an attempt whose outcome we may never
+        learn. A socket timeout on ``POST /exchange/wallet_auth`` is
+        indistinguishable from a connection refused, but the venue may
+        already have committed -- and without this marker the app comes back
+        believing the key is unlinked and offers to link it again.
+
+        Second, it is a WRITE TEST taken before the irreversible step. If
+        ``secrets.yaml`` cannot be written, then linking would succeed and
+        the record of it would not, which is the one outcome with no recovery
+        path at all. Letting this raise turns "linked but unsaveable" into
+        "not linked", which is strictly better.
+        """
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            self._section(secrets)["link_attempted_at"] = (
+                datetime.now(timezone.utc).isoformat()
+            )
+            self._io.write(secrets)
+
+    def clear_link_attempt(self) -> None:
+        """Drop the marker once the outcome is known, either way."""
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            section = secrets.get(_SECTION) or {}
+            if section.pop("link_attempted_at", None) is None:
+                return
+            self._io.write(secrets)
+
     def mark_registered(
         self, *, user_id: str, trading_address: str,
         listing_verified: bool = False,
@@ -381,6 +455,10 @@ class PermutoIdentity:
                 section["listing_verified"] = True
             else:
                 section.setdefault("listing_verified", False)
+            # The outcome is known now, so the "may already be linked" marker
+            # has done its job. Leaving it would keep the page in recovery
+            # mode forever.
+            section.pop("link_attempted_at", None)
             self._io.write(secrets)
 
     def info(self) -> IdentityInfo:
@@ -395,4 +473,5 @@ class PermutoIdentity:
             user_id=section.get("user_id"),
             trading_address=section.get("trading_address"),
             listing_verified=bool(section.get("listing_verified")),
+            link_attempted=bool(section.get("link_attempted_at")),
         )

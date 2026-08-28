@@ -11,10 +11,12 @@ network and must never register anything.
 
 from __future__ import annotations
 
+import urllib.error
+
 import pytest
 
 from gui.services.permuto import auth
-from gui.services.permuto.auth import PermutoAuthError
+from gui.services.permuto.auth import PermutoAuthError, PermutoLinkIndeterminate
 
 
 class FakeIdentity:
@@ -30,6 +32,37 @@ class FakeIdentity:
     def sign(self, message: bytes) -> bytes:
         self.signed.append(message)
         return b"\x11" * 96
+
+
+class RecordingIdentity(FakeIdentity):
+    """Adds the durable link-attempt marker the real identity carries."""
+
+    def __init__(self, pubkey="ab" * 48, mark_raises=None):
+        super().__init__(pubkey)
+        self.link_attempted = False
+        self.marks = 0
+        self._mark_raises = mark_raises
+
+    def mark_link_attempt(self):
+        self.marks += 1
+        if self._mark_raises is not None:
+            raise self._mark_raises
+        self.link_attempted = True
+
+    def clear_link_attempt(self):
+        self.link_attempted = False
+
+
+def _transport_failure(message, cause):
+    """A PermutoAuthError shaped exactly as ``_request`` raises one.
+
+    ``_request`` uses ``raise ... from exc``, so the transport error survives
+    on ``__cause__`` -- which is the only thing that distinguishes "the venue
+    answered and said no" from "we never found out".
+    """
+    err = PermutoAuthError(message)
+    err.__cause__ = cause
+    return err
 
 
 def _routes(monkeypatch, table):
@@ -292,6 +325,131 @@ def test_an_unknown_signup_state_fails_closed(monkeypatch, meta):
     with pytest.raises(PermutoAuthError):
         auth.register(ident)
     assert ident.signed == []
+
+
+# --------------------------------------------------------------------------- #
+# The commit boundary -- "we do not know" is not the same as "it did not happen"
+# --------------------------------------------------------------------------- #
+
+def test_a_timeout_on_the_commit_call_is_not_reported_as_not_linked(monkeypatch):
+    """119-4. A socket timeout AFTER the venue committed raises the identical
+    exception as a connection refused BEFORE it. Reported as an ordinary
+    failure, the page re-enabled Register for a key that may already be an
+    account -- and a second permanent link is the one action with no undo."""
+    table = _happy()
+    table[("POST", "/exchange/wallet_auth")] = _transport_failure(
+        "POST /exchange/wallet_auth unreachable: timed out",
+        urllib.error.URLError("timed out"),
+    )
+    _routes(monkeypatch, table)
+    ident = RecordingIdentity()
+    with pytest.raises(PermutoLinkIndeterminate, match="MAY already be linked"):
+        auth.register(ident)
+    # The marker outlives the process, which is the point: a crash here must
+    # not leave the next launch believing the key is free.
+    assert ident.link_attempted is True
+
+
+def test_a_5xx_on_the_commit_call_is_indeterminate_too(monkeypatch):
+    """A 500 can be raised after the write. Only a 4xx is an answer."""
+    table = _happy()
+    table[("POST", "/exchange/wallet_auth")] = _transport_failure(
+        "POST /exchange/wallet_auth -> HTTP 502",
+        urllib.error.HTTPError("u", 502, "bad gateway", {}, None),
+    )
+    _routes(monkeypatch, table)
+    ident = RecordingIdentity()
+    with pytest.raises(PermutoLinkIndeterminate):
+        auth.register(ident)
+    assert ident.link_attempted is True
+
+
+def test_a_4xx_refusal_stays_an_ordinary_failure(monkeypatch):
+    """The venue understood the request and turned it down, so nothing was
+    linked and the marker must not strand the page in recovery mode."""
+    table = _happy()
+    table[("POST", "/exchange/wallet_auth")] = _transport_failure(
+        "POST /exchange/wallet_auth -> HTTP 403 signature rejected",
+        urllib.error.HTTPError("u", 403, "forbidden", {}, None),
+    )
+    _routes(monkeypatch, table)
+    ident = RecordingIdentity()
+    with pytest.raises(PermutoAuthError) as caught:
+        auth.register(ident)
+    assert not isinstance(caught.value, PermutoLinkIndeterminate)
+    assert ident.link_attempted is False
+
+
+def test_the_attempt_is_recorded_before_the_commit_call(monkeypatch):
+    """Recorded after would leave exactly the window this marker closes."""
+    calls = _routes(monkeypatch, _happy())
+
+    class Ordered(RecordingIdentity):
+        marked_after = None
+
+        def mark_link_attempt(self):
+            self.marked_after = list(calls)
+            super().mark_link_attempt()
+
+    ident = Ordered()
+    auth.register(ident)
+    assert ident.marks == 1
+    assert not any(c[1].startswith("/exchange/wallet_auth")
+                   for c in ident.marked_after)
+    assert any(c[1].startswith("/exchange/wallet_auth") for c in calls)
+
+
+def test_an_unwritable_secrets_file_stops_the_link_before_it_commits(monkeypatch):
+    """Fail closed. Linking succeeds and saving it does not is the one
+    outcome with no recovery path, so the write is tested BEFORE the
+    irreversible request rather than after it."""
+    calls = _routes(monkeypatch, _happy())
+    ident = RecordingIdentity(mark_raises=OSError("secrets.yaml is read-only"))
+    with pytest.raises(OSError):
+        auth.register(ident)
+    assert not any(c[1].startswith("/exchange/wallet_auth") for c in calls)
+
+
+def test_a_malformed_200_leaves_the_attempt_marked(monkeypatch):
+    """A 200 means the venue committed. If its body is then unusable we have
+    a linked key and no identifiers -- the marker is all that says so."""
+    table = _happy()
+    table[("POST", "/exchange/wallet_auth")] = {"session_token": ""}
+    _routes(monkeypatch, table)
+    ident = RecordingIdentity()
+    with pytest.raises(PermutoAuthError, match="session token"):
+        auth.register(ident)
+    assert ident.link_attempted is True
+
+
+# --------------------------------------------------------------------------- #
+# Reconciliation -- read the venue back WITHOUT linking anything
+# --------------------------------------------------------------------------- #
+
+def test_reconcile_reports_an_already_linked_key(monkeypatch):
+    calls = _routes(monkeypatch, {
+        ("GET", "/info/wallet_bls_trading_address"): RESOLVED,
+    })
+    assert auth.reconcile_registration(FakeIdentity()) == (
+        "c" * 64, "xch1example"
+    )
+    # The route it uses is the documented side-effect-free one, and it is the
+    # ONLY call: reconciling must never be a way of linking by accident.
+    assert [c[1].split("?")[0] for c in calls] == [
+        "/info/wallet_bls_trading_address"
+    ]
+
+
+def test_reconcile_says_none_rather_than_inventing_a_registration(monkeypatch):
+    """Recording a link that never happened would permanently disable
+    Register for an account that does not exist, so the unknown answer is
+    'not linked'."""
+    _routes(monkeypatch, {
+        ("GET", "/info/wallet_bls_trading_address"): {
+            "wallet_address": "xch1example", "wallet_pubkey": "ab" * 48,
+        },
+    })
+    assert auth.reconcile_registration(FakeIdentity()) is None
 
 
 @pytest.mark.parametrize("tok", [12345, "", "   ", None, {"t": 1}])

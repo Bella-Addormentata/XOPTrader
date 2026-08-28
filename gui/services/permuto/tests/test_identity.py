@@ -214,6 +214,56 @@ def test_restore_marks_backup_confirmed(ident):
     assert fresh.info().backup_confirmed is True
 
 
+def test_restore_refuses_to_swap_the_key_of_a_registered_identity(ident):
+    """119-1. discard_unregistered() already refuses to delete a registered
+    key because the key IS the account -- but Restore destroyed it just as
+    completely, overwriting the wrapped blob and sweeping away the user_id
+    and address that were the only local record of the linked account. There
+    is no change-my-key flow on this venue, so the abandoned account is
+    unreachable forever."""
+    pubkey, _phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1live")
+    before = ident._io.read()["permuto"]["bls_private_key_dpapi"]
+
+    stranger = generate_mnemonic()
+    with pytest.raises(PermutoIdentityError, match="REGISTERED"):
+        ident.restore(stranger)
+
+    section = ident._io.read()["permuto"]
+    assert section["bls_private_key_dpapi"] == before
+    assert section["bls_public_key"] == pubkey
+    assert section["user_id"] == "u" * 64
+    assert section["trading_address"] == "xch1live"
+    assert section["registered"] is True
+
+
+def test_restoring_the_same_phrase_over_a_registration_still_works(ident):
+    """The recovery path must survive the guard. Re-deriving the SAME key --
+    after a machine move, or to re-wrap it under a new DPAPI context -- is
+    not a key swap and must keep the registration intact."""
+    pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1live",
+                          listing_verified=True)
+
+    assert ident.restore(phrase) == pubkey
+    info = ident.info()
+    assert info.registered is True
+    assert info.user_id == "u" * 64
+    assert info.trading_address == "xch1live"
+    assert info.listing_verified is True
+
+
+def test_restore_still_replaces_an_unregistered_identity(ident):
+    """The guard is about the ACCOUNT, not about the key. An unregistered key
+    is worth nothing, so replacing it stays free."""
+    ident.create()
+    stranger = generate_mnemonic()
+    new_pubkey = ident.restore(stranger)
+    assert ident.info().pubkey == new_pubkey
+
+
 def test_identity_blob_is_bound_to_its_own_entropy(ident):
     """A warp blob must not unwrap as a Permuto blob on the same machine."""
     ident.create()
@@ -320,6 +370,38 @@ def test_split_and_save_keeps_identity_out_of_public_config(tmp_path):
     # destroyed -- the warp block was given this rule after exactly that.
     assert "ON_DISK_SECRET" in sec.read_text(encoding="utf-8")
     assert "STALE_SNAPSHOT_BLOB" not in sec.read_text(encoding="utf-8")
+
+
+def test_every_field_the_identity_writes_is_listed_as_a_secret():
+    """Derived from behaviour, not from a copy of the list.
+
+    Both key sets are hand-maintained, and the section they describe grows:
+    `link_attempted_at` was added for the indeterminate-link marker. A field
+    missing from SECRET_KEYS is written straight into git-tracked config.yaml
+    on the next Settings save, and one missing from WALLET_MANAGED_KEYS is
+    round-tripped back from a stale in-memory snapshot over the live file.
+    Enumerating the section the identity actually produces catches the next
+    field too.
+    """
+    from gui.services.config_split import SECRET_KEYS, WALLET_MANAGED_KEYS
+
+    ident_ = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    ident_.create()
+    ident_.mark_backup_confirmed()
+    ident_.mark_link_attempt()
+    ident_.mark_registered(user_id="u" * 64, trading_address="xch1x",
+                           listing_verified=True)
+    ident_.mark_link_attempt()          # the marker can outlive a registration
+
+    written = set(ident_._io.read()["permuto"])
+    assert written <= SECRET_KEYS["permuto"], (
+        "unlisted identity fields leak to config.yaml: %s"
+        % sorted(written - SECRET_KEYS["permuto"])
+    )
+    assert written <= WALLET_MANAGED_KEYS["permuto"], (
+        "unlisted identity fields can be clobbered by a stale snapshot: %s"
+        % sorted(written - WALLET_MANAGED_KEYS["permuto"])
+    )
 
 
 def test_an_unconfirmed_identity_can_be_discarded(ident):

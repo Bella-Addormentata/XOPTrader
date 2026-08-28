@@ -166,6 +166,267 @@ def test_failure_is_shown_in_red_and_survives_refresh(page):
     assert C.LOSS_RED.lower() in widget._status.styleSheet().lower()
 
 
+# --------------------------------------------------------------------------- #
+# The permanent link, and the three windows in which it could be lost
+# --------------------------------------------------------------------------- #
+
+class _Reg:
+    user_id = "d" * 64
+    trading_address = "xch1linked"
+
+
+def _worker(ident, action):
+    from gui.widgets.permuto import _RegistrationWorker
+
+    worker = _RegistrationWorker(ident, action)
+    seen: list = []
+    worker.finished.connect(seen.append)
+    worker.run()
+    assert seen, "the worker emitted nothing"
+    return seen[0]
+
+
+def test_the_link_is_persisted_before_the_leaderboard_read_back(qapp, monkeypatch):
+    """119-2. auth.register() performs the PERMANENT link, but the venue
+    identifiers were only written in _on_finished -- after a second request
+    that blocks for up to 30 seconds per page. Closing the window in that
+    window terminates the worker (stop_background_work) and the only durable
+    record of a permanently linked account is gone."""
+    from gui.services.permuto import auth as auth_mod
+
+    io = FakeSecretsIO()
+    ident = PermutoIdentity(io, protector=FakeProtector())
+    ident.create()
+    ident.mark_backup_confirmed()
+
+    saved_when_called = {}
+
+    def _read_back(user_id):
+        saved_when_called["registered"] = ident.info().registered
+        saved_when_called["user_id"] = ident.info().user_id
+        raise RuntimeError("worker terminated mid-read-back")
+
+    monkeypatch.setattr(auth_mod, "register", lambda identity: _Reg())
+    monkeypatch.setattr(auth_mod, "leaderboard_entry", _read_back)
+
+    result = _worker(ident, "register")
+
+    assert saved_when_called["registered"] is True
+    assert saved_when_called["user_id"] == "d" * 64
+    assert result["ok"] is True          # verification is phase two, not fatal
+    assert ident.info().trading_address == "xch1linked"
+
+
+def test_a_link_that_cannot_be_saved_never_re_enables_register(page, monkeypatch):
+    """119-3. The old handler said 'Do not re-register' and then called
+    refresh(), which read an unregistered identity off disk and switched
+    Register back on -- while pointing the operator at Check leaderboard,
+    which the same refresh() had just disabled."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+
+    widget._on_finished({
+        "ok": False, "linked": True,
+        "user_id": "d" * 64, "trading_address": "xch1linked",
+        "error": "secrets.yaml is read-only",
+    })
+
+    from gui.theme import COLORS as C
+
+    assert not widget._register_btn.isEnabled()
+    assert widget._recover_btn.isEnabled()
+    assert C.LOSS_RED.lower() in widget._status.styleSheet().lower()
+
+    # ...and the affordance it names actually completes the job.
+    widget._on_recover()
+    info = ident.info()
+    assert info.registered and info.user_id == "d" * 64
+    assert not widget._register_btn.isEnabled()
+    assert widget._recover_btn.isHidden()
+
+
+def test_an_unfinished_link_survives_a_restart_and_blocks_register(page):
+    """119-4. A timeout on the commit call leaves the outcome unknown. The
+    marker is durable precisely so the NEXT launch -- a fresh widget reading
+    only secrets.yaml -- still refuses to link a key the venue may own."""
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    widget.refresh()
+    assert not widget._register_btn.isEnabled()
+    assert not widget._recover_btn.isHidden()
+    assert "MAY" in widget._status.text() or "may" in widget._status.text()
+
+
+def test_an_indeterminate_link_is_not_reported_as_an_ordinary_failure(
+    page, monkeypatch
+):
+    """119-4, end to end. A timeout on the commit call used to arrive as
+    {ok: False} and the failure branch called refresh(), which re-enabled
+    Register on backup_confirmed alone -- offering a second permanent link on
+    a key the venue may already own."""
+    from gui.services.permuto import auth as auth_mod
+    from gui.theme import COLORS as C
+
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+
+    def _timed_out(identity):
+        identity.mark_link_attempt()       # what auth.register() does first
+        raise auth_mod.PermutoLinkIndeterminate(
+            "did not complete cleanly (timed out). The key MAY already be "
+            "linked -- do NOT register again."
+        )
+
+    monkeypatch.setattr(auth_mod, "register", _timed_out)
+    widget._on_finished(_worker(ident, "register"))
+
+    assert not widget._register_btn.isEnabled()
+    assert not widget._recover_btn.isHidden()
+    assert C.LOSS_RED.lower() in widget._status.styleSheet().lower()
+    assert "Failed:" not in widget._status.text()
+    assert ident.info().link_attempted is True
+
+
+def test_reconciling_an_unlinked_key_hands_register_back(page, monkeypatch):
+    """The venue says no such link, so the attempt really did fail and the
+    operator must not be stranded."""
+    from gui.services.permuto import auth as auth_mod
+
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    monkeypatch.setattr(auth_mod, "reconcile_registration", lambda i: None)
+    widget._on_finished(_worker(ident, "reconcile"))
+
+    assert ident.info().link_attempted is False
+    assert widget._register_btn.isEnabled()
+    assert widget._recover_btn.isHidden()
+
+
+def test_reconciling_an_already_linked_key_records_it_without_re_linking(
+    page, monkeypatch
+):
+    from gui.services.permuto import auth as auth_mod
+
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_link_attempt()
+
+    monkeypatch.setattr(auth_mod, "reconcile_registration",
+                        lambda i: ("d" * 64, "xch1linked"))
+    monkeypatch.setattr(auth_mod, "leaderboard_entry", lambda uid: None)
+    widget._on_finished(_worker(ident, "reconcile"))
+
+    info = ident.info()
+    assert info.registered and info.user_id == "d" * 64
+    assert info.link_attempted is False
+    assert not widget._register_btn.isEnabled()
+
+
+def test_a_transient_leaderboard_error_never_retracts_a_confirmed_listing(
+    page, monkeypatch
+):
+    """119-6. The register branch demoted a leaderboard failure to
+    verify_error; the check branch did not, so the same PermutoAuthError came
+    back as ok=False and the red 'Failed: HTTP 503' overwrote the green that
+    refresh() had just painted from the persisted flag. Check is enabled for
+    a verified operator and every amber message tells them to press it."""
+    from gui.services.permuto import auth as auth_mod
+    from gui.services.permuto.auth import PermutoAuthError
+    from gui.theme import COLORS as C
+
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="d" * 64, trading_address="xch1linked",
+                          listing_verified=True)
+
+    def _rebuilding(user_id):
+        raise PermutoAuthError("GET /exchange/leaderboard -> HTTP 503")
+
+    monkeypatch.setattr(auth_mod, "leaderboard_entry", _rebuilding)
+    widget._on_finished(_worker(ident, "check"))
+
+    assert C.LOSS_RED.lower() not in widget._status.styleSheet().lower()
+    assert C.PROFIT_GREEN.lower() in widget._status.styleSheet().lower()
+    assert ident.info().listing_verified is True
+    # The empty-category parenthetical: entry is None on this path, so the
+    # green line used to end "as dddddddddddddddd ()".
+    assert "()" not in widget._status.text()
+
+
+def test_a_genuine_check_failure_is_still_reported(page, monkeypatch):
+    """Demoting the read-back must not swallow a real problem."""
+    from gui.theme import COLORS as C
+
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+
+    class Broken:
+        def info(self):
+            raise RuntimeError("secrets.yaml is corrupt")
+
+    widget._on_finished(_worker(Broken(), "check"))
+    assert C.LOSS_RED.lower() in widget._status.styleSheet().lower()
+    assert "corrupt" in widget._status.text()
+
+
+# --------------------------------------------------------------------------- #
+# The recovery-phrase modal
+# --------------------------------------------------------------------------- #
+
+def test_the_word_grid_cannot_make_an_untracked_clipboard_copy(qapp):
+    """119-5. The dialog clears the clipboard on close, but only for copies
+    it made itself -- it compares digests so it never wipes something the
+    operator copied afterwards. A read-only QTextEdit still offers Select All
+    / Copy and mouse selection, so Ctrl+C on the grid put the full mnemonic on
+    the clipboard without ever entering _copy(); the digest guard then
+    short-circuited and the promise on screen ('Cleared when this dialog
+    closes') became false. base_wallet.py closes exactly this hole."""
+    from PySide6.QtCore import Qt
+
+    from gui.widgets.permuto import _RecoveryPhraseDialog
+
+    phrase = " ".join(["abandon"] * 23 + ["art"])
+    dialog = _RecoveryPhraseDialog(phrase)
+    try:
+        assert dialog._grid.contextMenuPolicy() == \
+            Qt.ContextMenuPolicy.NoContextMenu
+        assert dialog._grid.focusPolicy() == Qt.FocusPolicy.NoFocus
+        # Mouse selection is what populates the X11/Wayland PRIMARY buffer,
+        # which clipboard.clear() does not touch at all.
+        assert dialog._grid.textInteractionFlags() == \
+            Qt.TextInteractionFlag.NoTextInteraction
+    finally:
+        dialog.deleteLater()
+
+
+def test_a_tracked_copy_is_still_cleared_when_the_dialog_closes(qapp):
+    from PySide6.QtWidgets import QApplication
+
+    from gui.widgets.permuto import _RecoveryPhraseDialog
+
+    phrase = " ".join(["abandon"] * 23 + ["art"])
+    dialog = _RecoveryPhraseDialog(phrase)
+    try:
+        dialog._copy(phrase)
+        clipboard = QApplication.clipboard()
+        assert clipboard.text() == phrase
+        dialog.reject()                      # Escape and the X take this path
+        assert clipboard.text() == ""
+    finally:
+        dialog.deleteLater()
+
+
 def test_public_key_is_shown_and_private_key_is_not(page):
     widget, ident = page
     pubkey, phrase = ident.create()
