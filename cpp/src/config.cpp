@@ -3443,7 +3443,13 @@ AppConfig load_config(const std::string& path,
     // misconfiguration in the logs, which is why it is called out here.
     if (cfg.coingecko.enabled && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
         const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
-        if (poll_s >= cfg.market_data.cex_freshness_threshold_sec) {
+        // Strictly greater, not >=. The freshness check accepts
+        // age <= threshold, and a fetch is completed and timestamped BEFORE
+        // valuation reads it -- so poll_s == threshold never produces a
+        // stale cycle during healthy polling. Warning on equality would cry
+        // wolf on a perfectly good configuration, and a warning that fires
+        // when nothing is wrong is how operators learn to ignore warnings.
+        if (poll_s > cfg.market_data.cex_freshness_threshold_sec) {
             spdlog::warn(
                 "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
                 "shorter than market_data.cex_freshness_threshold_sec "
