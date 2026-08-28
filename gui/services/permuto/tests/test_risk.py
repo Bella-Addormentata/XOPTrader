@@ -214,3 +214,21 @@ def test_a_skew_that_would_invert_the_price_yields_nothing():
 def test_an_unskewed_reference_is_the_oracle():
     assert skewed_reference(0.07, 0.0) == pytest.approx(0.07)
     assert math.isfinite(skewed_reference(0.07, 0.0))
+
+
+# --------------------------------------------------------------------------- #
+# [review] Every unreadable number must mean "no room", never "lots of room"
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_non_finite_margin_reads_as_fully_utilised(bad):
+    """NaN makes BOTH threshold comparisons false, so assess() returned
+    NORMAL and kept adding risk against an unreadable account."""
+    st = MarginState(equity_usd=1_000.0, used_margin_usd=bad)
+    assert st.utilisation() == 1.0
+    d = assess(st, _MKT, base_size=10.0, max_position=100.0)
+    assert d.action is RiskAction.FLATTEN
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+def test_non_finite_equity_reads_as_fully_utilised(bad):
+    assert MarginState(equity_usd=bad, used_margin_usd=0.0).utilisation() == 1.0

@@ -158,3 +158,19 @@ def test_every_withdrawal_says_why():
         d = decide(v, GOOD)
         assert d.action in (LoopAction.WITHDRAW, LoopAction.WAIT)
         assert d.reason and len(d.reason) > 10
+
+
+def test_an_infinite_oracle_withdraws_rather_than_holding():
+    """+inf passes `> 0`, and the drift check then computes inf/inf = NaN.
+
+    Every comparison against NaN is false, so the loop reported HOLD and left
+    stale orders resting against a price that does not exist.
+    """
+    view = VenueView(oracle=float("inf"))
+    resting = RestingQuote(0.069, 0.071)
+    assert decide(view, resting).action is LoopAction.WITHDRAW
+
+
+def test_a_nan_oracle_withdraws():
+    assert decide(VenueView(oracle=float("nan")),
+                  RestingQuote(0.069, 0.071)).action is LoopAction.WITHDRAW

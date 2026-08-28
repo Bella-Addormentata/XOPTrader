@@ -165,6 +165,14 @@ class PermutoClient:
             {"wallet_pubkey": pubkey},
             authed=False,
         )
+        # _decode returns whatever JSON the venue sent, which need not be an
+        # object. A null or an array made this raise AttributeError, and
+        # ensure_session() records backoff only for PermutoAuthError -- so a
+        # response-shape failure bypassed renewal accounting entirely.
+        if not isinstance(challenge, dict):
+            raise PermutoAuthError(
+                "challenge response was %s, not an object"
+                % type(challenge).__name__)
         token = challenge.get("challenge_token")
         nonce_hex = challenge.get("nonce")
         if not token or not nonce_hex:
@@ -198,6 +206,9 @@ class PermutoClient:
             },
             authed=False,
         )
+        if not isinstance(auth, dict):
+            raise PermutoAuthError(
+                "auth response was %s, not an object" % type(auth).__name__)
         session = auth.get("session_token") or auth.get("token")
         if not isinstance(session, str) or not session.strip():
             raise PermutoAuthError(

@@ -34,6 +34,7 @@ equity terms. Being flat and eligible beats being liquidated and ranked.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -101,7 +102,13 @@ class MarginState:
         room, and returning 0.0 would read as healthy to every threshold
         below.
         """
-        if not (self.equity_usd > 0.0):
+        if not (self.equity_usd > 0.0) or not math.isfinite(self.equity_usd):
+            return 1.0
+        if not math.isfinite(self.used_margin_usd):
+            # [review] NaN would make BOTH threshold comparisons below false,
+            # so assess() would return NORMAL and keep adding risk against an
+            # account whose margin we cannot read. Every unreadable number
+            # here has to mean "no room", never "lots of room".
             return 1.0
         return self.used_margin_usd / self.equity_usd
 

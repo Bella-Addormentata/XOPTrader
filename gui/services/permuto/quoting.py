@@ -26,6 +26,7 @@ one call rather than a cancel/place pair.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
@@ -140,7 +141,12 @@ def decide(
             return QuoteDecision(LoopAction.WAIT, "session renewal backing off")
         return QuoteDecision(LoopAction.WITHDRAW, "no usable trading session")
 
-    if view.oracle is None or not (view.oracle > 0.0):
+    # math.isfinite as well as `> 0`: +inf passes the positivity test, and
+    # the drift calculation further down then computes inf/inf = NaN, whose
+    # comparisons are all false -- so the loop reports HOLD and leaves stale
+    # orders resting against a price that does not exist.
+    if (view.oracle is None or not (view.oracle > 0.0)
+            or not math.isfinite(view.oracle)):
         return QuoteDecision(LoopAction.WITHDRAW, "no oracle price available")
 
     if view.oracle_age_s > MAX_ORACLE_AGE_S:

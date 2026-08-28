@@ -443,3 +443,19 @@ def test_equity_without_margin_reads_as_fully_utilised():
 def test_a_readable_zero_margin_is_still_zero():
     st = _margin_state({"equity_usd": 1_000.0, "used_margin_usd": 0.0}, False)
     assert st.utilisation() == 0.0
+
+
+@pytest.mark.parametrize("bad", ["nan", "inf", "-inf"])
+def test_a_non_finite_resting_price_is_not_a_present_side(bad):
+    """float("nan") converts happily and would count as a live quote.
+
+    RestingQuote.two_sided would then be true while every drift comparison
+    against it is false -- the loop HOLDs on a book it cannot evaluate.
+    """
+    r = _runner(_Client())
+    r.reconcile({"orders": [
+        {"market": _MKT, "side": "buy", "price": bad},
+        {"market": _MKT, "side": "sell", "price": 0.0702},
+    ]})
+    assert r._resting[_MKT].bid_price is None
+    assert not r._resting[_MKT].two_sided

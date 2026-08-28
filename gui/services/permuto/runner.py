@@ -34,6 +34,7 @@ on the first transient 500 has failed at the only thing it had to do.
 from __future__ import annotations
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -122,6 +123,12 @@ class QuoteRunner:
             try:
                 price = float(row.get("price"))
             except (TypeError, ValueError):
+                continue
+            # float("nan") converts happily and would be recorded as a
+            # present side, making RestingQuote.two_sided true while every
+            # later drift comparison against it is false -- the loop HOLDs on
+            # a book it cannot actually evaluate.
+            if not math.isfinite(price):
                 continue
             if side in ("BUY", "BID", "B"):
                 seen[market]["bid"] = price
