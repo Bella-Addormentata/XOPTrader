@@ -232,8 +232,13 @@ def register(identity: Any) -> Registration:
         },
     )
     session = auth.get("session_token") or auth.get("token")
-    if not session:
-        raise PermutoAuthError("auth response carried no session token: %r" % auth)
+    # As strictly as the identifiers below. A numeric or whitespace-only
+    # token is truthy, would be str()'d, and would record a PERMANENT link as
+    # successful while holding nothing that can actually authenticate.
+    if not isinstance(session, str) or not session.strip():
+        raise PermutoAuthError(
+            "auth response carried no usable session token (got %r)"
+            % (session,))
 
     # Validate rather than coerce. Empty strings here would sail through the
     # worker as an "ok" result, the UI would report Registered, and nothing

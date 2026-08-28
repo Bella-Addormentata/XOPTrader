@@ -292,3 +292,15 @@ def test_an_unknown_signup_state_fails_closed(monkeypatch, meta):
     with pytest.raises(PermutoAuthError):
         auth.register(ident)
     assert ident.signed == []
+
+
+@pytest.mark.parametrize("tok", [12345, "", "   ", None, {"t": 1}])
+def test_an_unusable_session_token_is_refused(monkeypatch, tok):
+    """A numeric or blank token is truthy, would be str()'d, and would record
+    a PERMANENT link as successful while holding nothing that can
+    authenticate. Same strictness as the identifiers."""
+    table = _happy()
+    table[("POST", "/exchange/wallet_auth")] = {"session_token": tok}
+    _routes(monkeypatch, table)
+    with pytest.raises(PermutoAuthError, match="session token"):
+        auth.register(FakeIdentity())

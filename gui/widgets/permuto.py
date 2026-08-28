@@ -338,6 +338,7 @@ class PermutoWidget(QWidget):
         self._identity_factory = identity_factory or _default_identity_factory
         self._thread: Optional[QThread] = None
         self._worker: Optional[_RegistrationWorker] = None
+        self._worker_identity: Any = None
         self._build()
         self.refresh()
 
@@ -628,7 +629,10 @@ class PermutoWidget(QWidget):
             btn.setEnabled(False)
 
         self._thread = QThread(self)
-        self._worker = _RegistrationWorker(self._identity_factory(), action)
+        # Hold the exact identity handed to the worker so the result is
+        # recorded against the key that actually signed.
+        self._worker_identity = self._identity_factory()
+        self._worker = _RegistrationWorker(self._worker_identity, action)
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.run)
         self._worker.finished.connect(self._on_finished)
@@ -658,7 +662,12 @@ class PermutoWidget(QWidget):
 
         if result.get("user_id") and result.get("trading_address"):
             try:
-                self._identity_factory().mark_registered(
+                # The WORKER's identity, not a freshly resolved one. The
+                # factory rebuilds from the config directory, so resolving it
+                # again here can attach key A's registration to key B if that
+                # directory changed while the request was in flight -- and
+                # the thing being recorded is a PERMANENT link.
+                (self._worker_identity or self._identity_factory()).mark_registered(
                     user_id=result["user_id"],
                     trading_address=result["trading_address"],
                     listing_verified=bool(result.get("listed")),
