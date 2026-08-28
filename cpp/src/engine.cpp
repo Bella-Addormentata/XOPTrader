@@ -713,16 +713,21 @@ void Engine::watchdog_loop()
             wioc.run();
 
             if (failure.empty()) {
-                spdlog::error("[Engine] [S31] cancel_offers issued. The book "
-                              "should now be empty; the engine is still "
-                              "wedged and needs manual attention.");
+                spdlog::error("[Engine] [S31] cancel_offers SUBMITTED. A "
+                              "secure cancel spends the offer coins on-chain, "
+                              "so the book is not empty until those spends "
+                              "CONFIRM -- do not read this as proof the "
+                              "offers are gone. The engine is still wedged "
+                              "and needs manual attention.");
                 if (alerts_) {
                     alerts_->send_alert(
                         AlertRule::CircuitBreaker,
                         "DEAD MAN'S SWITCH FIRED: no heartbeat for " +
-                        std::to_string(stale_ms / 1000) + "s. Every resting "
-                        "offer has been cancelled. The engine is wedged and "
-                        "requires manual intervention.");
+                        std::to_string(stale_ms / 1000) + "s. A secure cancel "
+                        "of every resting offer has been SUBMITTED -- the "
+                        "spends must still confirm on-chain, so verify the "
+                        "book is empty rather than assuming it. The engine "
+                        "is wedged and requires manual intervention.");
                 }
             } else {
                 spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
