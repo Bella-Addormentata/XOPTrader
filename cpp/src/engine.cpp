@@ -700,7 +700,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
                           "and needs manual attention.");
             if (alerts_) {
                 alerts_->send_alert(
-                    AlertRule::CircuitBreaker,
+                    AlertRule::DeadMansSwitch,
                     // `why` is already a complete phrase -- prepending
                     // produced "no heartbeat for no heartbeat for 600s",
                     // and the abnormal-exit caller is not about heartbeats
@@ -732,7 +732,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
                          ex.what());
         if (alerts_) {
             alerts_->send_alert(
-                AlertRule::CircuitBreaker,
+                AlertRule::DeadMansSwitch,
                 std::string("DEAD MAN'S SWITCH FAILED BEFORE IT COULD "
                             "CANCEL: ") + ex.what() +
                 ". Offers are still live and unmanaged.");
