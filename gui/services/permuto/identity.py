@@ -334,6 +334,24 @@ class PermutoIdentity:
                                datetime.now(timezone.utc).isoformat())
             # Restoring proves the phrase is written down somewhere.
             section["backup_confirmed"] = True
+            # [review] A RESTORED KEY MAY ALREADY BE AN ACCOUNT.
+            #
+            # This is the advertised machine-move path, so the common case is
+            # a phrase that was registered on the machine it came from -- and
+            # a fresh install has none of that metadata. Left as-is, refresh()
+            # sees registered=False with backup_confirmed=True and offers the
+            # PERMANENT Register action for a key the venue may already own,
+            # which is the one action with no undo.
+            #
+            # Marking the attempt puts the page into the unfinished-link
+            # state instead: Register stays shut and Recover is offered, which
+            # reads the venue back over a route with no link side effects. If
+            # the key is unknown there, the operator can discard deliberately
+            # and create a new one. Only for a DIFFERENT key -- restoring the
+            # same phrase over its own registration must not disturb it.
+            if different_key and not section.get("registered"):
+                section["link_attempted_at"] = (
+                    datetime.now(timezone.utc).isoformat())
             self._io.write(secrets)
 
         _log.info("permuto: identity restored, pubkey %s...", pubkey[:16])

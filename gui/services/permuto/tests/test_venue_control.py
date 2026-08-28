@@ -184,11 +184,30 @@ def test_dexie_refuses_while_the_engine_is_down(window):
     assert window._dexie_switch.text() == "DEXIE OFF"
 
 
-def test_permuto_refuses_until_registered(window):
+def test_permuto_refuses_while_no_runner_is_owned(window):
+    """[review] The switch could have reported PERMUTO ON with nothing behind
+    it -- no session, no loop, no orders.
+
+    `not_wired` outranks `not_registered` because it is the more fundamental
+    obstacle: registering would not make this switch do anything.
+    """
     seen = []
     window._permuto_switch.refused.connect(seen.append)
     window._permuto_switch.click()
-    assert seen == ["this identity is not registered with the venue"]
+    assert seen == ["the quoting loop is not connected to this switch yet"]
+    assert window._permuto_switch.text() == "PERMUTO OFF"
+
+
+def test_permuto_still_refuses_on_registration_alone(window):
+    """With a runner present but no registration, the other gate applies."""
+    window._permuto_runner = object()
+    try:
+        seen = []
+        window._permuto_switch.refused.connect(seen.append)
+        window._permuto_switch.click()
+        assert seen == ["this identity is not registered with the venue"]
+    finally:
+        window._permuto_runner = None
 
 
 def test_an_unreadable_gate_state_fails_closed(window, monkeypatch):
@@ -222,6 +241,10 @@ def test_an_unreadable_book_reports_not_empty(window, monkeypatch):
 def test_a_resting_book_shows_stopping_rather_than_off(window, monkeypatch):
     class _Svc:
         @staticmethod
+        def has_data():
+            return True
+
+        @staticmethod
         def get_offers_summary():
             return {"pending": 3.0}
 
@@ -233,6 +256,7 @@ def test_a_resting_book_shows_stopping_rather_than_off(window, monkeypatch):
         metrics_service = _Svc()
 
     monkeypatch.setattr(window, "_bridge", _Bridge())
+    window._dexie_intent_synced = True      # do not adopt engine state here
     window._dexie_desired_on = False
     window._dexie_switch.refresh()
     assert window._dexie_switch.text() == "DEXIE STOPPING"
@@ -248,6 +272,10 @@ def test_the_gui_pause_is_not_treated_as_a_protection_gate(window, monkeypatch):
     unable to turn itself back on."""
     class _Svc:
         @staticmethod
+        def has_data():
+            return True
+
+        @staticmethod
         def get_offers_summary():
             return {"pending": 0.0}
 
@@ -262,3 +290,86 @@ def test_the_gui_pause_is_not_treated_as_a_protection_gate(window, monkeypatch):
     window._bot_running = True
     assert window._gather_dexie().gates == frozenset()
     window._bot_running = False
+
+
+def test_a_disconnected_metrics_service_is_not_an_empty_book(window, monkeypatch):
+    """[review] Every gauge defaults to 0.0 when nothing has been scraped, so
+    pending==0 rendered as DEXIE OFF over a book that may still be takeable --
+    contradicting the unknown-is-not-empty contract in the same method."""
+    class _Svc:
+        @staticmethod
+        def has_data():
+            return False
+
+        @staticmethod
+        def get_offers_summary():
+            return {"pending": 0.0}       # the default, not an observation
+
+        @staticmethod
+        def posting_gate_reasons():
+            return set()
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+    monkeypatch.setattr(window, "_bridge", _Bridge())
+    assert window._dexie_book_is_empty() is False
+
+
+def test_a_pause_button_pause_is_not_hidden_by_the_switch(window, monkeypatch):
+    """`gui` is only OUR pause while the switch is OFF.
+
+    With intent ON, a gui gate means the Pause/Resume button did it -- and
+    dropping it unconditionally showed DEXIE ON over a paused Step 8.
+    """
+    class _Svc:
+        @staticmethod
+        def has_data():
+            return True
+
+        @staticmethod
+        def get_offers_summary():
+            return {"pending": 0.0}
+
+        @staticmethod
+        def posting_gate_reasons():
+            return {"gui"}
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+    monkeypatch.setattr(window, "_bridge", _Bridge())
+    window._bot_running = True
+    window._dexie_intent_synced = True
+    window._dexie_desired_on = True
+    assert "gui" in window._gather_dexie().gates
+    window._dexie_switch.refresh()
+    assert window._dexie_switch.text() == "DEXIE BLOCKED"
+    window._bot_running = False
+
+
+def test_the_switch_adopts_an_already_trading_engine(window, monkeypatch):
+    """EngineBridge auto-starts the engine without creating pause.flag, so a
+    fresh GUI attaches to one that is already trading -- and the intent
+    defaulted to False, showing DEXIE OFF over a live book."""
+    class _Svc:
+        @staticmethod
+        def has_data():
+            return True
+
+        @staticmethod
+        def get_offers_summary():
+            return {"pending": 0.0}
+
+        @staticmethod
+        def posting_gate_reasons():
+            return set()          # ungated: it IS posting
+
+    class _Bridge:
+        metrics_service = _Svc()
+
+    monkeypatch.setattr(window, "_bridge", _Bridge())
+    window._dexie_intent_synced = False
+    window._dexie_desired_on = False
+    window._sync_dexie_intent_from_engine()
+    assert window._dexie_desired_on is True

@@ -312,7 +312,11 @@ class MainWindow(QMainWindow):
         # Per-venue INTENT, distinct from what is happening. The switch shows
         # the difference: intent ON plus a gate is BLOCKED, not ON.
         self._dexie_desired_on: bool = False
+        self._dexie_intent_synced: bool = False
         self._permuto_desired_on: bool = False
+        # Set when a QuoteRunner is owned by this window. Until then the
+        # Permuto switch refuses to turn on -- see _gather_permuto.
+        self._permuto_runner = None
         self._permuto_book_is_empty: bool = True
         # True when the current Paused status is owned by the GUI flag (the
         # pause Resume can clear), False when a risk breaker holds it.
@@ -2130,6 +2134,28 @@ class MainWindow(QMainWindow):
     # Per-venue trading switches
     # ------------------------------------------------------------------
 
+    def _sync_dexie_intent_from_engine(self) -> None:
+        """Adopt the engine's actual posting state as our initial intent.
+
+        [review] EngineBridge.initialise() auto-starts the C++ engine without
+        creating pause.flag, so a freshly opened GUI attaches to an engine
+        that is already trading -- while this intent defaulted to False and
+        the switch read DEXIE OFF. A control that says OFF over a live book
+        is the failure this design was chosen to avoid, arriving through its
+        own initial value.
+
+        Runs once, on the first tick that can see the engine.
+        """
+        if self._dexie_intent_synced or self._bridge is None:
+            return
+        try:
+            reasons = self._bridge.metrics_service.posting_gate_reasons()
+        except Exception:  # noqa: BLE001 - try again on the next tick
+            return
+        self._dexie_intent_synced = True
+        # Posting ungated means it IS trading, whatever we assumed.
+        self._dexie_desired_on = not (reasons - {"dry_run"})
+
     def _gather_dexie(self) -> SwitchInputs:
         """What the dexie switch is allowed to claim right now.
 
@@ -2146,8 +2172,16 @@ class MainWindow(QMainWindow):
         else:
             try:
                 if self._bridge is not None:
-                    gates |= (self._bridge.metrics_service
-                              .posting_gate_reasons() - {"gui", "dry_run"})
+                    reasons = (self._bridge.metrics_service
+                               .posting_gate_reasons() - {"dry_run"})
+                    # [review] `gui` is only OUR pause while this switch is
+                    # OFF. With intent ON, a gui gate means something ELSE
+                    # paused posting -- the Pause/Resume button, which still
+                    # exists -- and dropping it unconditionally left the
+                    # switch showing DEXIE ON over a paused Step 8.
+                    if not self._dexie_desired_on:
+                        reasons -= {"gui"}
+                    gates |= reasons
             except Exception:  # noqa: BLE001 - a stale read must not arm it
                 # Fail CLOSED: if the gate state cannot be read we do not
                 # know whether a breaker holds, and guessing "clear" is how
@@ -2171,7 +2205,15 @@ class MainWindow(QMainWindow):
             # Nothing connected, so nothing of ours can be resting.
             return True
         try:
-            pending = self._bridge.metrics_service.get_offers_summary()
+            svc = self._bridge.metrics_service
+            # [review] A DISCONNECTED metrics service does not raise: every
+            # gauge defaults to 0.0, so pending==0 rendered as DEXIE OFF over
+            # a book that may still be takeable -- contradicting the
+            # unknown-is-not-empty contract three lines below. Connectivity
+            # has to be established before zero means anything.
+            if not svc.has_data():
+                return False
+            pending = svc.get_offers_summary()
             return float(pending.get("pending", 0.0)) <= 0.0
         except Exception:  # noqa: BLE001
             # Unknown counts as NOT empty. A secure cancel settles on chain,
@@ -2182,6 +2224,17 @@ class MainWindow(QMainWindow):
 
     def _gather_permuto(self) -> SwitchInputs:
         gates: set[str] = set()
+        # [review] The switch could report PERMUTO ON with nothing behind it.
+        # QuoteRunner and PermutoClient are not instantiated outside tests,
+        # and the Permuto page deliberately keeps "Start quoting" disabled --
+        # so a registered operator could flip this and get a live-trading
+        # indication over no session, no loop and no orders. A control that
+        # claims to be trading when it is not is worse than one that refuses.
+        #
+        # This gate comes off in the change that owns a runner, and not
+        # before.
+        if self._permuto_runner is None:
+            gates.add("not_wired")
         try:
             from gui.widgets.permuto import _default_identity_factory
 
@@ -2249,6 +2302,7 @@ class MainWindow(QMainWindow):
         existing pause is the documented case -- so a transition-only refresh
         goes stale in both directions.
         """
+        self._sync_dexie_intent_from_engine()
         for switch in (getattr(self, "_dexie_switch", None),
                        getattr(self, "_permuto_switch", None)):
             if switch is not None:

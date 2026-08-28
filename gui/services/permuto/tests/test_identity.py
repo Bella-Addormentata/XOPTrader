@@ -456,3 +456,33 @@ def test_restore_still_allows_the_same_key_over_an_attempt():
 
     ident.restore(phrase)
     assert ident.public_key() == before
+
+
+def test_a_restored_key_must_be_reconciled_before_registering():
+    """[review] The machine-move path is the COMMON case for restore.
+
+    A phrase registered on another machine arrives here with none of its
+    metadata, so refresh() saw registered=False plus backup_confirmed=True and
+    offered the permanent Register action for a key the venue may already own.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, _phrase = ident.create()
+    other = generate_mnemonic()
+
+    ident.restore(other)
+    info = ident.info()
+    assert info.link_attempted is True, "restore did not gate registration"
+    assert info.backup_confirmed is True
+    assert info.registered is False
+
+
+def test_restoring_the_same_phrase_does_not_disturb_its_registration():
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    _pubkey, phrase = ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1example")
+
+    ident.restore(phrase)
+    info = ident.info()
+    assert info.registered is True
+    assert info.link_attempted is False

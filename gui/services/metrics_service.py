@@ -489,6 +489,19 @@ class MetricsService(QObject):
             "wallet_connected": _labelled(m, "xop_node", "metric", "wallet_connected"),
         }
 
+    def has_data(self) -> bool:
+        """Whether ANY metrics scrape has landed.
+
+        Every getter here returns 0.0 for a metric it has not seen, which is
+        indistinguishable from a real zero -- so a consumer that treats zero
+        as authoritative reports a disconnected engine as an idle one. The
+        venue switch needs the difference: "no offers resting" and "we cannot
+        see whether offers are resting" are opposite answers to the only
+        question it asks.
+        """
+        with QMutexLocker(self._mutex):
+            return bool(self._latest)
+
     def get_offers_summary(self) -> dict[str, float]:
         """Return aggregated offer counters.
 

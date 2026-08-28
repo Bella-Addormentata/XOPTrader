@@ -77,6 +77,7 @@ GATE_LABELS: dict[str, str] = {
     "not_registered": "this identity is not registered with the venue",
     "not_configured": "the venue is not configured",
     "cancels_pending": "the previous stop is still confirming on chain",
+    "not_wired": "the quoting loop is not connected to this switch yet",
 }
 
 
@@ -136,6 +137,7 @@ _GATE_ORDER = (
     "wallet_circuit",
     "engine_down",
     "not_configured",
+    "not_wired",
     "not_registered",
     "cancels_pending",
 )
