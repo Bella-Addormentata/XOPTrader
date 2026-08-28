@@ -13,6 +13,9 @@
 using xop::PeggedAsset;
 using xop::PegRegistry;
 using xop::PegStatus;
+using xop::CrossCandidate;
+using xop::CrossSelection;
+using xop::select_market_cross;
 
 namespace {
 
@@ -344,4 +347,143 @@ TEST(PegRegistry, AnObservationExactlyOnPegIsHolding) {
     // The property the rejection above protects.
     PegRegistry reg = registry_of({usd_coin()});
     EXPECT_EQ(reg.classify("wusdc_tail", 1.0), PegStatus::Holding);
+}
+
+// ---------------------------------------------------------------------------
+// Market-cross selection (review round 2, finding 115-3).
+//
+// None of this was reachable while it lived inside Engine::market_cross_for:
+// constructing an Engine builds every subsystem, so the cross-orientation and
+// declared-par fixes could have regressed with the whole suite green.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+PeggedAsset wrapper(std::string id, double target = 1.0,
+                    std::string currency = "USD") {
+    PeggedAsset a;
+    a.asset_id     = std::move(id);
+    a.symbol       = "WRAP";
+    a.peg_currency = std::move(currency);
+    a.peg_target   = target;
+    a.warn_pct     = 2.0;
+    a.bail_pct     = 10.0;
+    a.enforce      = true;
+    a.prefer_market_cross = false;      // a par wrapper
+    return a;
+}
+
+CrossCandidate cand(std::string base, std::string quote, std::string name,
+                    double mid, double spread_bps = 50.0) {
+    return CrossCandidate{std::move(base), std::move(quote), std::move(name),
+                          mid, spread_bps};
+}
+
+}  // namespace
+
+TEST(MarketCross, DirectOrientationMultipliesByPar) {
+    // BYC/WRAP: the mid is WRAP per BYC, so par converts it to dollars.
+    auto reg = registry_of({wrapper("wrap_tail")});
+    const auto sel = select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "BYC/WRAP", 1.05)},
+        reg, 300.0);
+    EXPECT_EQ(sel.pair_name, "BYC/WRAP");
+    EXPECT_NEAR(sel.usd_per_unit, 1.05, 1e-12);
+}
+
+TEST(MarketCross, InverseOrientationDividesByTheMid) {
+    // WRAP/BYC: the mid is BYC per WRAP, so a unit of BYC is par / mid.
+    // Accepting only the direct form was the bug -- it produced no source, no
+    // warning, and a silent fall back to par on an asset flagged
+    // prefer_market_cross precisely because its peg was not trusted.
+    auto reg = registry_of({wrapper("wrap_tail")});
+    const auto sel = select_market_cross(
+        "byc_tail", {cand("wrap_tail", "byc_tail", "WRAP/BYC", 1.25)},
+        reg, 300.0);
+    EXPECT_EQ(sel.pair_name, "WRAP/BYC");
+    EXPECT_NEAR(sel.usd_per_unit, 0.8, 1e-12);   // 1.00 / 1.25
+}
+
+TEST(MarketCross, BothOrientationsAgreeOnValue) {
+    auto reg = registry_of({wrapper("wrap_tail")});
+    const auto direct = select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "D", 0.8)}, reg, 300.0);
+    const auto inverse = select_market_cross(
+        "byc_tail", {cand("wrap_tail", "byc_tail", "I", 1.25)}, reg, 300.0);
+    EXPECT_NEAR(direct.usd_per_unit, inverse.usd_per_unit, 1e-12);
+}
+
+TEST(MarketCross, NonUnitParScalesTheResult) {
+    // A wrapper pegged at 100 units of currency, not 1 -- returning the mid
+    // raw would report wrapper units as dollars.
+    auto reg = registry_of({wrapper("wrap_tail", 100.0)});
+    const auto sel = select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "P", 2.0)}, reg, 300.0);
+    EXPECT_NEAR(sel.usd_per_unit, 200.0, 1e-12);
+}
+
+TEST(MarketCross, AMissingFxRateYieldsNoCrossRatherThanOneToOne) {
+    // A EUR-pegged wrapper has no USD value without an FX rate. "No
+    // valuation" is the answer; a silent 1:1 is the failure this registry
+    // exists to prevent.
+    auto reg = registry_of({wrapper("wrap_tail", 1.0, "EUR")});
+    const auto sel = select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "E", 1.05)}, reg, 300.0);
+    EXPECT_TRUE(sel.pair_name.empty());
+}
+
+TEST(MarketCross, AnUnenforcedWrapperIsNotAParAnchor) {
+    PeggedAsset retired = wrapper("wrap_tail");
+    retired.enforce = false;
+    auto reg = registry_of({retired});
+    const auto sel = select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "R", 1.05)}, reg, 300.0);
+    EXPECT_TRUE(sel.pair_name.empty())
+        << "clearing enforce retires the par, so it cannot anchor a cross";
+}
+
+TEST(MarketCross, AWideBookIsWorseEvidenceThanTheDeclaredPar) {
+    auto reg = registry_of({wrapper("wrap_tail")});
+    EXPECT_TRUE(select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "W", 1.05, 301.0)},
+        reg, 300.0).pair_name.empty());
+    EXPECT_FALSE(select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "W", 1.05, 300.0)},
+        reg, 300.0).pair_name.empty()) << "the bound is inclusive";
+}
+
+TEST(MarketCross, AOneSidedBookNeverQualifies) {
+    auto reg = registry_of({wrapper("wrap_tail")});
+    EXPECT_TRUE(select_market_cross(
+        "byc_tail", {cand("byc_tail", "wrap_tail", "O", 1.05, 0.0)},
+        reg, 300.0).pair_name.empty())
+        << "spread_bps 0 means one-sided or crossed, not infinitely tight";
+}
+
+TEST(MarketCross, ANonPositiveOrNonFiniteMidIsSkipped) {
+    auto reg = registry_of({wrapper("wrap_tail")});
+    const double inf = std::numeric_limits<double>::infinity();
+    for (double mid : {0.0, -1.0, inf}) {
+        EXPECT_TRUE(select_market_cross(
+            "byc_tail", {cand("byc_tail", "wrap_tail", "N", mid)},
+            reg, 300.0).pair_name.empty()) << "mid=" << mid;
+    }
+}
+
+TEST(MarketCross, TheFirstELIGIBLECandidateWinsNotTheFirstCandidate) {
+    // A wide book earlier in the list must not shadow a tight one behind it.
+    auto reg = registry_of({wrapper("wrap_tail")});
+    const auto sel = select_market_cross("byc_tail", {
+        cand("byc_tail", "unknown_tail", "NOT_A_WRAPPER", 1.01),
+        cand("byc_tail", "wrap_tail", "TOO_WIDE", 1.02, 900.0),
+        cand("byc_tail", "wrap_tail", "GOOD", 1.03, 20.0),
+    }, reg, 300.0);
+    EXPECT_EQ(sel.pair_name, "GOOD");
+    EXPECT_NEAR(sel.usd_per_unit, 1.03, 1e-12);
+}
+
+TEST(MarketCross, NoCandidatesYieldsNoCross) {
+    auto reg = registry_of({wrapper("wrap_tail")});
+    EXPECT_TRUE(select_market_cross("byc_tail", {}, reg, 300.0)
+                    .pair_name.empty());
 }
