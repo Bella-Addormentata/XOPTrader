@@ -762,7 +762,7 @@ things Permuto forces on us are gaps XOPTrader already has.
 
 | capability | why Permuto forces it | value back on dexie |
 | --- | --- | --- |
-| **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31** in `TODO.md` |
+| **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31**, which reaches `TODO.md` with PR #115 -- so this pointer dangles on `main` if #116 merges first (see the merge order in Sequenced work) |
 | **Paper / observer mode** | history is hourly only, so a rule must be scored on live data before risking capital | XOPTrader has **no paper mode**; every strategy change ships straight to a live book |
 | **Jump-aware estimation** | the oracle is a jump process and continuous-path models are misspecified | Dexie CATs jump too — the 100× outlier at `price=0.013810` is the same shape. Feeds S20 |
 | **Estimator noise vs information** | the oracle is a 60s RV estimate, so much of its jitter is sampling error | The same question S20 asks: junk print, or real repricing? |
