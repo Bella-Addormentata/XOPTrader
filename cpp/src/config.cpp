@@ -3339,7 +3339,18 @@ void validate_usd_anchor(const AppConfig& cfg)
     // An external XCH/USD feed is an anchor in its own right and needs no
     // declaration at all (S27).  With one configured, every XCH-based
     // conversion has a route and there is nothing to complain about.
-    if (cfg.coingecko.enabled) {
+    //
+    // But only if the RUNTIME will actually accept it. usd_per_xch() gates
+    // the cached CoinGecko price through coingecko_feed_fresh_for_revival(),
+    // which treats a non-positive or non-finite threshold as permanently
+    // stale -- deliberately, so a frozen feed cannot quote forever. A config
+    // with cex_freshness_threshold_sec: 0 is therefore legal, silent, and
+    // anchorless: this check passed on the declaration while every tick
+    // rejected the value. Requiring a usable threshold here keeps the
+    // startup verdict and the runtime behaviour in agreement.
+    if (cfg.coingecko.enabled
+            && std::isfinite(cfg.market_data.cex_freshness_threshold_sec)
+            && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
         const auto& ids = cfg.coingecko.coin_ids;
         if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
             return;

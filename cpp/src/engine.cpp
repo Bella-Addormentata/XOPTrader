@@ -25,6 +25,7 @@
 #include "xop/execution/fair_value_solver.hpp"
 #include "xop/execution/mid_gate.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 
 #include "xop/accounting/bridge_ingest.hpp"
 #include "xop/accounting/reward_ingest.hpp"
@@ -11681,20 +11682,58 @@ bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
     // the feed is fresh RIGHT NOW is a runtime availability question and
     // belongs to the carry mechanism, exactly like a quiet book -- what
     // matters here is that a route exists at all.
-    if (asset_id == "xch" && config_.coingecko.enabled) {
-        const auto& ids = config_.coingecko.coin_ids;
-        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
-            return true;
-        }
-    }
+    // [review] Pair membership is NOT proof of a USD route. An enabled
+    // CAT_A/CAT_B pair where neither leg is XCH and CAT_B has no enforced
+    // par gives quote_usd_factor() nothing to work with -- it returns 0.0
+    // for every tick, forever. Counting that as "has a path" is not a safe
+    // over-approximation: it withholds the write-off, so the asset degrades
+    // instead, and because the cause is CONFIGURATION rather than a feed
+    // outage the degradation never lifts. The engine would sit permanently
+    // paused on a state that will not resolve, which is precisely what the
+    // write-off exists to avoid. So follow the route to an anchor.
+    return risk::asset_is_routable_to_usd(
+        asset_id, external_xch_feed(), enabled_route_pairs(),
+        [this](const std::string& id) {
+            return declared_usd_par(id).has_value();
+        });
+}
 
+/// Does XCH have any USD anchor at all?
+///
+/// Split out because it is asked twice: once for XCH itself, and once for
+/// every asset that can only reach USD by going through XCH. Mirrors what
+/// usd_per_xch() will actually accept -- the external CoinGecko quote, or an
+/// enabled XCH pair against a wrapper with a declared, enforced par.
+bool Engine::xch_has_usd_anchor() const
+{
+    return risk::xch_is_anchored(external_xch_feed(), enabled_route_pairs(),
+                                 [this](const std::string& id) {
+                                     return declared_usd_par(id).has_value();
+                                 });
+}
+
+/// The two config shapes the pure route logic needs, gathered in one place.
+std::vector<risk::RoutePair> Engine::enabled_route_pairs() const
+{
+    std::vector<risk::RoutePair> out;
+    out.reserve(config_.pairs.size());
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
-        if (pair.base_asset_id == asset_id || pair.quote_asset_id == asset_id) {
-            return true;
-        }
+        out.push_back({pair.base_asset_id, pair.quote_asset_id});
     }
-    return false;
+    return out;
+}
+
+risk::ExternalXchFeed Engine::external_xch_feed() const
+{
+    risk::ExternalXchFeed feed;
+    feed.enabled = config_.coingecko.enabled;
+    const auto& ids = config_.coingecko.coin_ids;
+    feed.quotes_chia =
+        std::find(ids.begin(), ids.end(), "chia") != ids.end();
+    feed.freshness_threshold_sec =
+        config_.market_data.cex_freshness_threshold_sec;
+    return feed;
 }
 
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const

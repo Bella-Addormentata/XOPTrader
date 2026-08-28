@@ -65,6 +65,7 @@
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
 #include "xop/risk/valuation_authority.hpp"
+#include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
 #include "xop/risk/hedging.hpp"
@@ -569,6 +570,16 @@ private:
     /// omitting the external route from the description is exactly the kind
     /// of gap that gets XCH written off while a live feed is quoting it.
     [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
+
+    /// Whether XCH can reach USD at all: the external CoinGecko quote, or an
+    /// enabled XCH pair against a wrapper with a declared, enforced par.
+    /// Asked twice -- for XCH itself, and for every asset whose only route to
+    /// USD runs through XCH, where an unanchored XCH makes the chain 0 * mid.
+    [[nodiscard]] bool xch_has_usd_anchor() const;
+
+    /// Config reduced to what the pure route logic in usd_route.hpp needs.
+    [[nodiscard]] std::vector<risk::RoutePair> enabled_route_pairs() const;
+    [[nodiscard]] risk::ExternalXchFeed        external_xch_feed() const;
 
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
     /// every healthy pair of enabled sibling books (see the definition for
@@ -1105,12 +1116,24 @@ private:
     /// risk control fail open for a condition that can persist hours.
     bool valuation_degraded_{false};
 
-    /// [S27 2026-08-27] TRUE when every held asset lacked a live price this
-    /// cycle.  Distinct from valuation_degraded_, which means "at least one"
-    /// -- and the distinction decides whether the drawdown comparison means
-    /// anything.  With one asset still live, equity moves and the comparison
-    /// works.  With nothing live, equity is entirely carried fiction sitting
-    /// at the value the peak was frozen at, so the drawdown reads 0 forever.
+    /// [S27 2026-08-27, tightened by S33] TRUE only when something is held,
+    /// NOTHING was priced live this cycle, AND nothing is being bridged by a
+    /// still-valid carry.
+    ///
+    /// The third clause is not a detail. Without it a single quiet tick on a
+    /// healthy asset -- exactly the transient the carry mechanism exists to
+    /// bridge -- combined with some other asset's standing degradation gave
+    /// (grace, degraded, all_unpriced) = (true, true, true) and latched the
+    /// breaker permanently. The guard meant to tell a data gap from an
+    /// outage was being satisfied by a DIFFERENT asset than the one that had
+    /// gone quiet.
+    ///
+    /// Distinct from valuation_degraded_, which means "at least one", and
+    /// the distinction decides whether the drawdown comparison means
+    /// anything. With one asset still live or still bridged, equity moves
+    /// and the comparison works. With nothing live and nothing bridged,
+    /// equity is a mix of carried fiction and S32 write-offs sitting at the
+    /// value the peak was frozen at, so the drawdown reads 0 forever.
     bool valuation_all_unpriced_{false};
 
     /// [S32 2026-08-27] One-shot log guards. Both conditions re-evaluate
