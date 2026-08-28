@@ -685,7 +685,13 @@ void Engine::watchdog_cancel_book(const std::string& why)
         }, asio::detached);
         wioc.run();
 
-        if (failure.empty()) {
+        // Through risk::watchdog_outcome() so the tested value and the
+        // production wording cannot diverge. Review's point: the helper had
+        // no production caller, so the test pinning "SUBMITTED, not
+        // cancelled" would have stayed green while this branch regressed to
+        // a false all-clear.
+        const auto outcome = risk::watchdog_outcome(!failure.empty());
+        if (outcome == risk::WatchdogOutcome::Submitted) {
             spdlog::error("[Engine] [S31] cancel_offers SUBMITTED. A "
                           "secure cancel spends the offer coins on-chain, "
                           "so the book is not empty until those spends "
@@ -895,7 +901,7 @@ void Engine::run()
                          "standing down.");
         if (alerts_) {
             alerts_->send_alert(
-                AlertRule::CircuitBreaker,
+                AlertRule::DeadMansSwitch,
                 "ENGINE EXITED WITHOUT A SHUTDOWN REQUEST: the event loop ran "
                 "out of work. Cancelling every resting offer; verify the book "
                 "is empty and check the log for the originating failure.");
@@ -2041,7 +2047,17 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // arm is bounded by its own recovery thresholds.  If a future audit
     // wants takes stopped here too, that is a policy change to make
     // explicitly, not a gate to add by symmetry.
-    if (!wallet_circuit_open_) {
+    // [S31 review] ...but the WATCHDOG latch is different from the breaker,
+    // and the distinction is why this gate is added while the breaker one
+    // still is not. A tripped breaker leaves a healthy engine that may still
+    // need to buy XCH to wind down. The dead man's switch firing means the
+    // engine is WEDGED and its book has been cancelled with spends that have
+    // not settled -- and this path calls take_offer(), so leaving it open
+    // contradicts "no trading until restart" outright. The switch's own
+    // cancel uses fee=0 precisely so it never depends on having XCH, so
+    // gating this cannot strand the wind-down.
+    if (!wallet_circuit_open_
+            && !watchdog_fired_.load(std::memory_order_acquire)) {
         try {
             co_await step_xch_recovery(block_height);
         } catch (const std::exception& e) {
@@ -9496,6 +9512,19 @@ asio::awaitable<void> Engine::step_manage_offers(BlockHeight block_height)
         const double fee_override = xch_buy_only_mode
             ? config_.strategy.fee_reserve_xch
             : 0.0;
+        // [S31 review] Re-read the latch HERE, not only at the Step 8 gate.
+        // Step 8 is a coroutine: it can be suspended in get_sync_status(),
+        // in cancellation, or in a wallet call when the switch fires, and it
+        // then resumes and posts without ever looking again -- placing a
+        // fresh book on top of cancel spends that have not settled. The
+        // outer gate stops the NEXT cycle; this stops the one already in
+        // flight.
+        if (watchdog_fired_.load(std::memory_order_acquire)) {
+            spdlog::error("[Engine] [S31] abandoning an in-flight post for "
+                          "{}: the dead man's switch fired mid-cycle",
+                          pair_cfg->name);
+            co_return;
+        }
         int posted = co_await offer_mgr_->post_quotes(
             *pair_cfg, fee_filtered_tiers, block_height, fee_override);
 
