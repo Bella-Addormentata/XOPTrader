@@ -751,6 +751,18 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
          || dry_run || watchdog) ? 1.0 : 0.0);
 }
 
+void MetricsExporter::update_watchdog_gate(bool fired)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+    gate_watchdog_->Set(fired ? 1.0 : 0.0);
+    if (fired) {
+        // The aggregate has to move with it, or a consumer watching only
+        // xop_posting_gated sees nothing while posting is gated.
+        posting_gated_gauge_->Set(1.0);
+    }
+}
+
 void MetricsExporter::update_bot_paused(bool is_paused)
 {
     std::unique_lock lock(mtx_);

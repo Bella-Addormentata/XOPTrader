@@ -255,6 +255,13 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     // the Dexie aggregator for cross-platform visibility.
     offer_mgr_ = std::make_unique<execution::OfferManager>(
         ioc_, wallet_, dexie_, state_, config_);
+    // [S31] Let the switch stop a post already in flight.
+    // post_quotes() creates and publishes several tiers with
+    // awaits between them, so the Step 8 gate only stops the next
+    // cycle -- this stops the one running.
+    offer_mgr_->set_abort_predicate([this] {
+        return watchdog_fired_.load(std::memory_order_acquire);
+    });
 
     // Market data feed: construct with a MarketDataConfig populated from
     // the YAML `market_data:` section (T4-05).
@@ -779,6 +786,17 @@ void Engine::watchdog_loop()
         // breaker_pause_active_ already carries, because "the switch fired"
         // means the book state is unknown until someone looks.
         watchdog_fired_.store(true, std::memory_order_release);
+        // [review] PUBLISH FROM HERE, not from Step 12. The gauge was
+        // refreshed only by step_export_metrics() on the engine's event-loop
+        // thread -- the thread that, in the failure this switch exists for,
+        // never returns. So Prometheus and the GUI would have gone on
+        // reporting watchdog=0 indefinitely while the latch was set, which
+        // defeats the entire point of publishing it. This runs on the
+        // watchdog's own thread; update_watchdog_gate() takes the same mutex
+        // every other updater does.
+        if (metrics_) {
+            metrics_->update_watchdog_gate(true);
+        }
 
         // Measure from the ARM time when no heartbeat has ever landed.
         // last_beat_ms_ is 0 for the whole of startup, so `now - 0` is time
@@ -899,16 +917,22 @@ void Engine::run()
                          "without a shutdown request -- the engine died "
                          "rather than stopped. Cancelling the book before "
                          "standing down.");
-        if (alerts_) {
+        // [review] NO separate alert here. AlertManager rate-limits per
+        // rule for 60 seconds, so this preliminary notice consumed the
+        // DeadMansSwitch cooldown and suppressed the message immediately
+        // after it -- the one carrying the OUTCOME, which is the only part
+        // an operator can act on. One alert, and it is the outcome-bearing
+        // one; the reason travels in `why`.
+        if (!dry_run_) {
+            watchdog_cancel_book("the engine exited without a shutdown "
+                                 "request -- the event loop ran out of work");
+        } else if (alerts_) {
+            // Dry run cancels nothing, so there is no outcome alert to
+            // preserve and this is the only chance to say anything.
             alerts_->send_alert(
                 AlertRule::DeadMansSwitch,
-                "ENGINE EXITED WITHOUT A SHUTDOWN REQUEST: the event loop ran "
-                "out of work. Cancelling every resting offer; verify the book "
-                "is empty and check the log for the originating failure.");
-        }
-        if (!dry_run_) {
-            watchdog_cancel_book("the event loop ran out of work "
-                                 "without a shutdown request");
+                "ENGINE EXITED WITHOUT A SHUTDOWN REQUEST (dry run): the "
+                "event loop ran out of work. Nothing was cancelled.");
         }
     }
     stop_watchdog();
@@ -1099,8 +1123,29 @@ asio::awaitable<void> Engine::poll_loop_coro()
             spdlog::info("[Engine] Startup reconcile: {} pending offers in DB",
                          known_ids.size());
 
-            auto orphans = co_await offer_mgr_->startup_reconcile(
-                known_ids, startup_block);
+            // [S31 review] NOT IN DRY RUN. Skipping kill_old_instances()
+            // was not enough to make a dry run non-mutating:
+            // startup_reconcile() issues SECURE cancel_offer for anything it
+            // judges an orphan, and a concurrently running engine can have a
+            // freshly created offer visible in the wallet before Step 8 has
+            // persisted it to the DB. This process would then classify that
+            // live offer as an orphan and cancel it -- a dry run spending
+            // the real engine's coins.
+            //
+            // Skipped rather than made read-only because everything
+            // reconciliation produces here is adoption into State, and a dry
+            // run neither posts nor cancels, so there is nothing for the
+            // adopted state to be used by.
+            std::vector<std::string> orphans;
+            if (dry_run_) {
+                spdlog::warn("[Engine] [S31] dry run -- SKIPPING startup "
+                             "reconciliation. It cancels offers it judges "
+                             "orphaned, and another engine's newly created "
+                             "offer can look exactly like one.");
+            } else {
+                orphans = co_await offer_mgr_->startup_reconcile(
+                    known_ids, startup_block);
+            }
 
             // Mark cancelled orphans in the DB.  Adopted orphans were
             // already upserted into State by startup_reconcile; persist
@@ -9979,6 +10024,18 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                          edge_bps, take_size, fee);
 
             // Take the offer via wallet RPC (atomic swap).
+            // [S31 review] The latch is read HERE, immediately before the
+            // take, and not only at the step gate. Every one of these sits after
+            // an await -- a book fetch, a balance read, a sync check -- so a
+            // coroutine already in flight when the switch fires would otherwise
+            // resume and trade after the engine has been declared wedged and its
+            // book cancelled. An entry gate stops the next cycle; only this
+            // stops the one already running.
+            if (watchdog_fired_.load(std::memory_order_acquire)) {
+                spdlog::error("[Engine] [S31] abandoning a take in flight: the "
+                              "dead man's switch fired");
+                co_return;
+            }
             auto result = co_await wallet_->take_offer(
                 offer_status.offer.offer_bech32, fee);
 
@@ -10323,6 +10380,18 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                             best_ask_a_id.substr(0, 12),
                             net_edge_bps, take_size, fee);
 
+                        // [S31 review] The latch is read HERE, immediately before the
+                        // take, and not only at the step gate. Every one of these sits after
+                        // an await -- a book fetch, a balance read, a sync check -- so a
+                        // coroutine already in flight when the switch fires would otherwise
+                        // resume and trade after the engine has been declared wedged and its
+                        // book cancelled. An entry gate stops the next cycle; only this
+                        // stops the one already running.
+                        if (watchdog_fired_.load(std::memory_order_acquire)) {
+                            spdlog::error("[Engine] [S31] abandoning a take in flight: the "
+                                          "dead man's switch fired");
+                            co_return;
+                        }
                         auto result = co_await wallet_->take_offer(
                             offer_status.offer.offer_bech32, fee);
 
@@ -10572,6 +10641,18 @@ asio::awaitable<void> Engine::step_check_arbitrage(
                              c.id.substr(0, 12), c.edge_bps,
                              take_sz, fee);
 
+                // [S31 review] The latch is read HERE, immediately before the
+                // take, and not only at the step gate. Every one of these sits after
+                // an await -- a book fetch, a balance read, a sync check -- so a
+                // coroutine already in flight when the switch fires would otherwise
+                // resume and trade after the engine has been declared wedged and its
+                // book cancelled. An entry gate stops the next cycle; only this
+                // stops the one already running.
+                if (watchdog_fired_.load(std::memory_order_acquire)) {
+                    spdlog::error("[Engine] [S31] abandoning a take in flight: the "
+                                  "dead man's switch fired");
+                    co_return;
+                }
                 auto result = co_await wallet_->take_offer(
                     os.offer.offer_bech32, fee);
 
@@ -11098,6 +11179,18 @@ asio::awaitable<void> Engine::step_run_drift_corrector(BlockHeight block_height)
                      chosen->id.substr(0, 12), chosen->premium_bps,
                      take_sz, fee);
 
+        // [S31 review] The latch is read HERE, immediately before the
+        // take, and not only at the step gate. Every one of these sits after
+        // an await -- a book fetch, a balance read, a sync check -- so a
+        // coroutine already in flight when the switch fires would otherwise
+        // resume and trade after the engine has been declared wedged and its
+        // book cancelled. An entry gate stops the next cycle; only this
+        // stops the one already running.
+        if (watchdog_fired_.load(std::memory_order_acquire)) {
+            spdlog::error("[Engine] [S31] abandoning a take in flight: the "
+                          "dead man's switch fired");
+            co_return;
+        }
         auto result = co_await wallet_->take_offer(
             os.offer.offer_bech32, fee);
 
@@ -11420,6 +11513,18 @@ asio::awaitable<void> Engine::step_xch_recovery(BlockHeight block_height)
                              pair.name, cand.offer_id.substr(0, 12),
                              price_d, premium_bps, fee);
 
+                // [S31 review] The latch is read HERE, immediately before the
+                // take, and not only at the step gate. Every one of these sits after
+                // an await -- a book fetch, a balance read, a sync check -- so a
+                // coroutine already in flight when the switch fires would otherwise
+                // resume and trade after the engine has been declared wedged and its
+                // book cancelled. An entry gate stops the next cycle; only this
+                // stops the one already running.
+                if (watchdog_fired_.load(std::memory_order_acquire)) {
+                    spdlog::error("[Engine] [S31] abandoning a take in flight: the "
+                                  "dead man's switch fired");
+                    co_return;
+                }
                 auto result = co_await wallet_->take_offer(
                     offer_status.offer.offer_bech32, fee);
 

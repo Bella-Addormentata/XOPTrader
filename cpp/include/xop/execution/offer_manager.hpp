@@ -523,6 +523,19 @@ public:
     /// @param fee_mojos  Fee in mojos.  Must be > 0.
     void set_dynamic_fee(std::uint64_t fee_mojos) noexcept;
 
+    /// [S31] A predicate consulted before every offer-CREATING side effect.
+    ///
+    /// Returning true means stop: do not create, do not publish, abandon the
+    /// rest of this call. It exists because post_quotes() is a coroutine
+    /// that creates and publishes SEVERAL offers with awaits between them,
+    /// so a check at the engine's step gate only stops the next cycle. If
+    /// the dead man's switch fires midway through, the remaining tiers must
+    /// not be posted on top of a book that has just been cancelled.
+    ///
+    /// Unset means "never abort", so nothing changes for callers that do not
+    /// wire it.
+    void set_abort_predicate(std::function<bool()> predicate);
+
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
 
@@ -908,6 +921,7 @@ private:
     /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
+    std::function<bool()> abort_predicate_;
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()

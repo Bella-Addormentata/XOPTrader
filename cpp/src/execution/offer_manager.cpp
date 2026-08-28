@@ -489,6 +489,17 @@ asio::awaitable<int> OfferManager::post_quotes(
             continue;
         }
 
+        // [S31] Consulted before every create, not once at entry. This
+        // coroutine creates and publishes several tiers with awaits between
+        // them, so a gate at the engine's step boundary stops the NEXT cycle
+        // while this one goes on posting -- onto a book the dead man's
+        // switch may have just cancelled, with spends still unconfirmed.
+        if (abort_predicate_ && abort_predicate_()) {
+            logger_->error("aborting offer creation for {} mid-flight: the "
+                           "engine asked us to stop", pair.name);
+            break;
+        }
+
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         json result;
         try {
@@ -1452,6 +1463,11 @@ std::size_t OfferManager::pending_count() const
 void OfferManager::set_dynamic_fee(std::uint64_t fee_mojos) noexcept
 {
     current_fee_mojos_ = fee_mojos;
+}
+
+void OfferManager::set_abort_predicate(std::function<bool()> predicate)
+{
+    abort_predicate_ = std::move(predicate);
 }
 
 std::uint64_t OfferManager::current_fee() const noexcept
@@ -3053,6 +3069,14 @@ asio::awaitable<int> OfferManager::post_merged_side(
     }
 
     if (merged_dict.empty()) co_return 0;
+
+    // [S31] Same check on the batch path. One merged offer is still an offer,
+    // and this function is reached after several awaits.
+    if (abort_predicate_ && abort_predicate_()) {
+        logger_->error("aborting merged batch creation for {}: the engine "
+                       "asked us to stop", pair.name);
+        co_return 0;
+    }
 
     // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
     // leg is the sum of every tier's, so the ledger charge is exact.

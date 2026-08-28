@@ -293,6 +293,14 @@ public:
                               bool flash_crash, bool xch_recovery,
                               bool dry_run, bool watchdog);
 
+    /// [S31] Set the watchdog gate alone, from the watchdog's own thread.
+    ///
+    /// Separate from update_posting_gates() because that is called from
+    /// Step 12 on the engine's event loop -- the thread that has stopped in
+    /// the failure this gate reports. A latch nobody can observe is not a
+    /// signal.  Thread-safe by the same mutex as every other updater.
+    void update_watchdog_gate(bool fired);
+
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
 
