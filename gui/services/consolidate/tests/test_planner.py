@@ -878,3 +878,71 @@ def test_a_blank_endpoint_is_refused():
             budget=10 * denomination(BYC), max_slippage_frac=0.1,
             direct_offers=[], direct_anchor=ANCHOR,
         )
+
+
+# ---------------------------------------------------------------------------
+# [review round 5] Ordering must be exact, and "materially better" must mean
+# something.
+# ---------------------------------------------------------------------------
+
+def test_the_sort_key_separates_rates_that_collide_as_floats():
+    """2**53 + 1 is not representable as a double, so it equals 2**53.
+
+    XCH carries 10^12 raw units per display unit, which puts ~9,007 XCH at
+    that boundary -- an ordinary position, not a pathological one. Two
+    distinct prices then sort as a tie, input order decides, and if only one
+    offer fits the planner takes the worse of them.
+    """
+    from gui.services.consolidate.planner import _exact_rate_key
+
+    recv = 2 ** 52
+    better = OfferCandidate(offer_id="better", give_asset=XCH,
+                            receive_asset=BYC,
+                            give_amount=2 ** 53, receive_amount=recv)
+    worse = OfferCandidate(offer_id="worse", give_asset=XCH,
+                           receive_asset=BYC,
+                           give_amount=2 ** 53 + 1, receive_amount=recv)
+
+    # Indistinguishable in floating point...
+    assert float(worse.give_amount) == float(better.give_amount)
+    # ...and correctly ordered exactly.
+    assert _exact_rate_key(better) < _exact_rate_key(worse)
+    assert not _exact_rate_key(worse) < _exact_rate_key(better)
+
+
+def test_the_sort_key_puts_unusable_offers_last():
+    from gui.services.consolidate.planner import _exact_rate_key
+
+    good = OfferCandidate(offer_id="g", give_asset=XCH, receive_asset=BYC,
+                          give_amount=100, receive_amount=50)
+    dud = OfferCandidate(offer_id="d", give_asset=XCH, receive_asset=BYC,
+                         give_amount=100, receive_amount=0)
+    assert _exact_rate_key(good) < _exact_rate_key(dud)
+    assert not _exact_rate_key(dud) < _exact_rate_key(good)
+
+
+def test_a_marginally_better_two_hop_route_loses_to_direct():
+    """A second leg is a second fee and a second all-or-nothing window.
+
+    The comparison used `>=`, so a route covering one more mojo won.
+    """
+    direct = offer("direct", 1_000, 500, give_asset=BYC, recv_asset=XCH)
+    hop1 = offer("h1", 1_000, 1_000, give_asset=BYC, recv_asset="usds")
+    hop2 = offer("h2", 1_000, 501, give_asset="usds", recv_asset=XCH)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=1_000 * denomination(BYC),
+        direct_offers=[direct],
+        direct_anchor=Anchor(rate=2.0, source="test"),
+        first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
+        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=2.0, source="t"),
+        max_slippage_frac=0.10,
+    )
+    assert len(plan.legs) == 1, "a hair more coverage is not materially better"
+
+
+def test_the_package_facade_exports_denomination():
+    import gui.services.consolidate as pkg
+
+    assert hasattr(pkg, "denomination")
+    assert "denomination" in pkg.__all__

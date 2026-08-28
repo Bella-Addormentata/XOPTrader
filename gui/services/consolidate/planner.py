@@ -321,7 +321,14 @@ def _plan_leg(
         seen_ids.add(offer.offer_id)
         usable.append(offer)
 
-    usable.sort(key=effective_rate)
+    # [review] Exact, not float. `effective_rate` returns a float, and XCH
+    # carries 10^12 raw units per display unit, so distinct prices collapse
+    # to the same float once the integers pass 2^53 -- about 9,007 XCH, an
+    # ordinary position. Ties then fall back to input order and can put a
+    # worse offer first; if only one fits, that is the best-price-first
+    # guarantee quietly broken. Ordering on the exact ratio give/receive by
+    # cross-multiplication keeps it in Python ints, which are unbounded.
+    usable.sort(key=_exact_rate_key)
 
     chosen: list[OfferCandidate] = []
     give_total = 0
@@ -457,6 +464,38 @@ def _empty_plan(
     )
 
 
+#: How much more of the budget two hops must deliver to be worth taking.
+#:
+#: A second leg is a second fee and a second all-or-nothing failure window,
+#: and it strands anything the second hop cannot absorb in an intermediate
+#: asset the operator never asked to hold. 2% is small enough not to reject
+#: genuinely better routes and large enough that noise does not choose one.
+MIN_TWO_HOP_ADVANTAGE = 0.02
+
+#: The same figure as an exact rational, so the comparison never leaves ints.
+_ADVANTAGE_NUM = 102
+_ADVANTAGE_DEN = 100
+
+
+class _exact_rate_key:
+    """Total order on give/receive as an EXACT rational, no float involved."""
+
+    __slots__ = ("give", "receive")
+
+    def __init__(self, offer: "OfferCandidate") -> None:
+        self.give = offer.give_amount
+        self.receive = offer.receive_amount
+
+    def __lt__(self, other: "_exact_rate_key") -> bool:
+        # a/b < c/d  <=>  a*d < c*b, for positive b and d. Non-positive
+        # receive sorts last: those offers are unusable and must not win.
+        if self.receive <= 0:
+            return False
+        if other.receive <= 0:
+            return True
+        return self.give * other.receive < other.give * self.receive
+
+
 def build_plan(
     *,
     source_asset: str,
@@ -584,7 +623,15 @@ def build_plan(
         budget=budget,
         offers=first_hop_offers,
         anchor=first_hop_anchor,
-        max_slippage_frac=per_leg_cap(max_slippage_frac, 2),
+        # [review round 5] The FULL route cap, not the nth-root split. The
+        # split is sufficient for the route bound but not equivalent to it,
+        # and the gap costs availability: a +9% first hop followed by a -10%
+        # second is about -1.9% composite, comfortably inside a 10% route
+        # cap, yet the first hop was discarded at 4.88%. The route bound is
+        # still enforced -- remaining_route_cap() derives the second hop's
+        # allowance from what the first ACTUALLY cost, so a first hop that
+        # spends the whole cap leaves the second with nothing to spend.
+        max_slippage_frac=max_slippage_frac,
         counters=counters,
         seen_ids=seen_ids,
     )
@@ -636,9 +683,16 @@ def build_plan(
     # and then a two-hop route delivering a hair LESS than the direct fill
     # wins a comparison it should have lost.  Python ints are arbitrary
     # precision, so the cross-multiplied form is exact at any size.
+    # [review round 5] "Near-ties" was written into the contract above and
+    # never implemented: the test was `>=`, so a two-hop route covering ONE
+    # more mojo won, paying a second fee and a second all-or-nothing failure
+    # window for nothing. Direct now wins unless two hops deliver at least
+    # MIN_TWO_HOP_ADVANTAGE more, which is what "materially better" meant.
     if second.offers and direct_leg is not None and direct_leg.offers:
-        if (direct_leg.give_total * first.receive_total
-                >= first.give_total * second.give_total):
+        delivered = first.give_total * second.give_total
+        direct_scaled = direct_leg.give_total * first.receive_total
+        if (delivered * _ADVANTAGE_DEN
+                <= direct_scaled * _ADVANTAGE_NUM):  # noqa: E501
             return _single_leg_plan(
                 source_asset, target_asset, direct_leg, budget, counters)
 

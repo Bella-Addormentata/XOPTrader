@@ -17,12 +17,14 @@ from gui.services.consolidate.planner import (
     OfferCandidate,
     PlanError,
     build_plan,
+    denomination,
     effective_rate,
     rate_deviation_frac,
 )
 
 __all__ = [
     "Anchor",
+    "denomination",
     "ConsolidationPlan",
     "Leg",
     "OfferCandidate",
