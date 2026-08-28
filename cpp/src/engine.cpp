@@ -11710,10 +11710,29 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
     // structurally unpriceable.  The S27 incident, arriving back through the
     // fix for it.  Ask the anchor first.
     if (asset_id == "xch") {
-        const double usd = usd_per_xch();
-        if (std::isfinite(usd) && usd > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                usd * static_cast<double>(kMojosPerXch)));
+        // THE EXTERNAL QUOTE ONLY -- not usd_per_xch().
+        //
+        // usd_per_xch() falls back to an ungraded DEX mid when the feed is
+        // stale, and returning that here would bypass the
+        // mid_valuation_grade check in the base-pair loop below: a
+        // last-trade-only wrapper book could then refresh XCH's live-price
+        // timestamp forever, so the carry TTL never fires and a junk print
+        // marks equity. That is the S20 contract (types.hpp), and the fast
+        // path added for S27 quietly stepped around it.
+        //
+        // The fast path exists only so a live EXTERNAL price is not hidden
+        // behind disabled pairs. The DEX fallback still happens -- through
+        // the graded loop below, where it belongs.
+        if (coingecko_feed_fresh_for_revival(
+                !coingecko_prices_.empty(), coingecko_last_fetch_,
+                std::chrono::steady_clock::now(),
+                config_.market_data.cex_freshness_threshold_sec)) {
+            auto it = coingecko_prices_.find("chia");
+            if (it != coingecko_prices_.end() && std::isfinite(it->second)
+                && it->second > 0.0) {
+                return static_cast<Mojo>(std::llround(
+                    it->second * static_cast<double>(kMojosPerXch)));
+            }
         }
     }
 

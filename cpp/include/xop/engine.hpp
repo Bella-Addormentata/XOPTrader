@@ -560,8 +560,14 @@ private:
     /// this, ever, as configured" from "the price is unavailable right
     /// now", and the two must not share a response: the first is written
     /// off at $0, the second rides its carry.  Deliberately a pure function
-    /// of `config_.pairs` with no market state, so the answer is stable for
-    /// the life of the process and cannot flap with the feed.
+    /// of CONFIGURATION with no market state, so the answer is stable for the
+    /// life of the process and cannot flap with the feed.
+    ///
+    /// Two routes count, not one: an enabled pair naming the asset, OR -- for
+    /// XCH only -- an enabled CoinGecko feed listing "chia". Callers use this
+    /// answer to choose between degrading and a permanent $0 write-off, so
+    /// omitting the external route from the description is exactly the kind
+    /// of gap that gets XCH written off while a live feed is quoting it.
     [[nodiscard]] bool asset_has_pricing_path(const AssetId& asset_id) const;
 
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
