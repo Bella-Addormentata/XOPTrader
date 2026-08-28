@@ -89,8 +89,14 @@ def frozen_window(rows, interval_s, carried_since=None):
     best, run = [], []
 
     def flush():
+        # The MOST RECENT completed run, not the longest. The comment above
+        # says "suffix after the last transition" and the code kept the
+        # longest instead -- so a quiet stretch of live trading longer than
+        # the post-close run became `best`, and the is_suffix check below then
+        # rejected an otherwise perfectly usable carried window. The selector
+        # and its own description disagreed.
         nonlocal best
-        if len(run) > len(best):
+        if run:
             best = list(run)
 
     prev_ts = None
@@ -138,6 +144,31 @@ def frozen_window(rows, interval_s, carried_since=None):
     if not (followed_a_transition and is_suffix):
         return []
     return best
+
+
+def _sustained_risers(rows, buckets):
+    """Accounts that gained in EVERY sub-window, not just end to end.
+
+    Backfill arrives once and stops; genuine accrual keeps arriving. Splitting
+    the window and requiring a gain in each bucket is the cheap version of the
+    rate-profile check that was done by hand for the recorded experiment.
+    """
+    usable = [r for r in rows if r.get("mms")]
+    if len(usable) < buckets + 1:
+        return set()
+    step = len(usable) // buckets
+    edges = [usable[i * step] for i in range(buckets)] + [usable[-1]]
+
+    def d5(row):
+        return {(m.get("user_id") or m["u"]): m.get("d5") for m in row["mms"]}
+
+    always = None
+    for a, b in zip(edges, edges[1:]):
+        da, db = d5(a), d5(b)
+        gained = {u for u, v in db.items()
+                  if v is not None and da.get(u) is not None and v > da[u]}
+        always = gained if always is None else (always & gained)
+    return always or set()
 
 
 def main():
@@ -237,7 +268,17 @@ def main():
     implied_hr = [(o[0] / span_s * 3600) for o in risers]
 
     print()
-    if risers and frozen:
+    # A single positive endpoint delta is EVIDENCE, not confirmation. The
+    # docstring asks for a sustained increase, and delayed leaderboard
+    # backfill is a documented alternative source of a one-off gain -- the
+    # recorded experiment ruled it out with a multi-bucket flat rate profile,
+    # which this generic path does not perform. So the verdict is graded by
+    # how much of the window actually supports it.
+    buckets = max(1, min(6, len(rows) // 10))
+    sustained = _sustained_risers(rows, buckets) if buckets > 1 else set()
+    strong = risers and frozen and len(sustained) > 0
+
+    if strong:
         print("VERDICT: CONFIRMED. %d of %d accounts gained depth while the oracle"
               % (len(risers), len(out)))
         print("         was frozen. Roll-off can only subtract, so a gain during a")
@@ -250,6 +291,15 @@ def main():
         print("         At that rate 300,000,000 takes %.1f hours; the contest"
               % (300e6 / max(implied_hr)))
         print("         window is 102.5 h, which needs ~$813 held throughout.")
+    elif risers and frozen:
+        print("VERDICT: EVIDENCE, NOT CONFIRMATION. %d of %d accounts show a "
+              "positive" % (len(risers), len(out)))
+        print("         endpoint delta with the oracle frozen, but no account "
+              "gained in")
+        print("         every sub-window -- so delayed leaderboard backfill "
+              "is not excluded.")
+        print("         Re-run over a longer carried window before relying on "
+              "this.")
     elif risers and not frozen:
         print("INCONCLUSIVE: accounts gained depth, but the oracle moved during the")
         print("         window, so some of the gain may be from live ticks.")
