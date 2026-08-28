@@ -1612,8 +1612,13 @@ RiskConfig parse_risk(const YAML::Node& root)
     if (node["watchdog_stall_seconds"]
             && node["watchdog_stall_seconds"].IsDefined()
             && !node["watchdog_stall_seconds"].IsNull()) {
+        // read_uint32 range-checks through int64. Parsing straight to
+        // uint32 let YAML `-1` wrap to UINT32_MAX -- arming the switch with a
+        // ~136-year threshold, which reads as "configured" and behaves as
+        // "disabled". The one value that must survive is 0, which this
+        // helper accepts.
         cfg.watchdog_stall_seconds =
-            node["watchdog_stall_seconds"].as<std::uint32_t>();
+            read_uint32(node, "watchdog_stall_seconds", "risk");
     }
 
     // [S20 2026-08-24] valuation_carry_ttl_blocks: heartbeats an asset's

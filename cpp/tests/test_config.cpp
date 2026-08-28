@@ -1450,3 +1450,18 @@ TEST(ConfigParserTest, S20NonFinitePegTargetRejected) {
         EXPECT_DOUBLE_EQ(cfg.pairs[0].peg_target, 1.0);
     });
 }
+
+TEST(ConfigParserTest, S31_NegativeWatchdogThresholdIsRejectedNotWrapped) {
+    // Parsing straight to uint32 let -1 wrap to UINT32_MAX: a ~136-year
+    // threshold that reads as "configured" and behaves as "disabled" -- the
+    // worst outcome for a safety switch.
+    TempYaml tmp(with_risk_extra("watchdog_stall_seconds: -1"));
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}
+
+TEST(ConfigParserTest, S31_ZeroWatchdogThresholdStaysLegal) {
+    // 0 is the documented way to disable it and must survive the range check.
+    TempYaml tmp(with_risk_extra("watchdog_stall_seconds: 0"));
+    auto cfg = xop::load_config(tmp.path());
+    EXPECT_EQ(cfg.risk.watchdog_stall_seconds, 0u);
+}
