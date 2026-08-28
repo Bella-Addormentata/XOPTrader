@@ -525,10 +525,15 @@ def build_plan(
     whatsoever: each hop is a separate all-or-nothing take with its own fee,
     its own slippage, and its own window in which the book can move, so two
     hops are strictly more dangerous than one. Direct therefore wins ties and
-    near-ties -- but a two-hop route that actually DELIVERS more source to the
-    target wins, because a dust direct fill silently stranding the position is
-    the failure this feature exists to avoid. Coverage is measured as source
-    reaching the target, not source spent on the first hop.
+    near-ties -- but a two-hop route that delivers materially more TARGET
+    wins, because a dust direct fill silently stranding the position is the
+    failure this feature exists to avoid.
+
+    "Materially" is :data:`MIN_TWO_HOP_ADVANTAGE`, and the quantity compared
+    is target RECEIVED. Earlier revisions compared source spent on the first
+    hop, then source delivered through both, and both let a route win while
+    handing the operator less of the thing they asked for. The operator's
+    outcome is the target in their wallet, so that is what is measured.
 
     The two-hop path exists because not every holding has a direct pair --
     with XCH as the target every asset does, but consolidating into DBX

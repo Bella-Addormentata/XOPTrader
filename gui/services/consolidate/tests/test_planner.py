@@ -663,12 +663,17 @@ def test_a_whitespace_only_offer_id_is_malformed():
     assert plan.skipped_malformed == 1
 
 
-@pytest.mark.parametrize("hop", [BYC, DBX, "XCH".lower()])
+@pytest.mark.parametrize("hop", [BYC, DBX, " byc ", "DBX"])
 def test_a_hop_that_is_an_endpoint_is_refused(hop):
     """hop == source or target is a self-conversion leg, not a route. Only
-    the anchors were validated, so it produced a degenerate plan."""
-    if hop not in (BYC, DBX):
-        return
+    the anchors were validated, so it produced a degenerate plan.
+
+    [review] The third case used to be "XCH".lower(), which is not an
+    endpoint of this BYC-to-DBX request, guarded by an early return -- so
+    that parameter ran no assertion at all. Replaced with case and whitespace
+    variants of the real endpoints, which is what the guard was standing in
+    for, and the guard is gone so every case now exercises the refusal.
+    """
     with pytest.raises(PlanError, match="third asset"):
         build_plan(
             source_asset=BYC, target_asset=DBX,
