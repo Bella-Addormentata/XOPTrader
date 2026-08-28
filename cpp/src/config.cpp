@@ -3413,11 +3413,22 @@ void validate_usd_anchor(const AppConfig& cfg)
     // that does not exist is worse than the missing anchor: an operator who
     // reads it has been told the fault is contained.
     spdlog::warn(
-        "[Config] NO USD ANCHOR IS REACHABLE. Every asset will value at $0 "
-        "and BOTH DRAWDOWN BREAKERS WILL SIT INERT -- they cannot fire "
-        "against a zero peak. This is the 2026-08-25 incident exactly, and "
-        "on this build nothing pauses automatically. Enabled pairs: {}. Fix "
-        "by declaring the quote asset's peg under `pegged_assets:` (see "
+        // [review] Scoped to what actually follows. The earlier wording
+        // said every asset values at $0 and both breakers sit inert, which
+        // is false for some configurations this matches: with only XCH/BYC
+        // and BYC cross-preferring, quote_usd_factor() falls back to the
+        // declared par and asset_usd_pseudo_price() can still value both, so
+        // equity need not be zero. Overstating a warning is how it gets
+        // dismissed the time it is right.
+        "[Config] NO usd_per_xch() ANCHOR IS REACHABLE. Nothing priced "
+        "THROUGH XCH can be valued -- usd_per_xch() returns 0, so every "
+        "XCH-quoted conversion is unavailable. Assets with their own "
+        "enforced par may still value. IF that leaves equity at or near zero, "
+        "both drawdown breakers sit inert, because they cannot fire against a "
+        "zero peak -- which is the 2026-08-25 incident, and on this build "
+        "nothing pauses automatically. Enabled pairs: {}. Fix by declaring an "
+        "enabled XCH pair's quote asset under `pegged_assets:` with "
+        "enforce: true and prefer_market_cross: false (see "
         "config.example.yaml; a config written before that section existed "
         "declares nothing, and the old built-in $1 assumptions are gone).",
         enabled_names);
