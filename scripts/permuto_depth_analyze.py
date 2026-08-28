@@ -11,14 +11,22 @@ The test is deliberately one-sided. Both `depth_seconds_5d` and
 The second term is never negative, so it can only drag the observed delta
 *down*. Therefore:
 
-  - Any sustained INCREASE while the oracle is frozen proves accrual. It
-    cannot be produced by roll-off, and it cannot be produced by a sampler
-    that credits nothing.
+  - Any sustained INCREASE while the oracle is frozen cannot be produced by
+    roll-off, and cannot be produced by a sampler that credits nothing.
   - A flat or falling reading proves nothing either way, because zero accrual
     and (accrual - equal roll-off) look identical.
 
-So a positive result is conclusive and a negative result is merely
-uninformative. Report it that way rather than claiming symmetry.
+  - **But an increase is not conclusive either.** A delayed counter published
+    INCREMENTALLY -- a pre-close backlog draining a little into each bucket --
+    rises in every sub-window too, and at this sampling rate is
+    indistinguishable from carried accrual. The flat rate profile excludes a
+    one-time delayed update; it says nothing about a draining one, and
+    neither the API contract nor these samples bound the publication lag.
+
+So a positive result is STRONG EVIDENCE, a negative result is uninformative,
+and neither is proof. Separating accrual from incremental backfill needs a
+control account known to be flat through the close, or a documented lag
+bound. The verdict this tool prints says so.
 """
 
 import json
@@ -157,8 +165,24 @@ def frozen_window(rows, interval_s, carried_since=None):
             continue
         key = json.dumps(oracle, sort_keys=True)
         gapped = prev_ts is not None and (ts - prev_ts).total_seconds() > max_gap
-        if run and (key != prev_oracle or gapped):
-            flush(); run = []
+        transition = bool(run) and key != prev_oracle
+        if transition or gapped:
+            if run:
+                flush(); run = []
+        # [review] DROP the transition row itself when its capture is
+        # bracketed. The probe reads the leaderboard first and the oracle
+        # after, so around the close a single row can pair a leaderboard
+        # snapshot taken while the market was live with an oracle already
+        # showing the frozen value -- and that row would then open the frozen
+        # run and contribute live accrual to a carried verdict.
+        #
+        # Only rows the probe bracketed can be judged; older sessions carry
+        # no timestamps and are kept, because treating "unknown" as
+        # "straddling" would retroactively void every historical sample.
+        if transition and _brackets_a_transition(row, prev_oracle,
+                                                 lambda r: key):
+            prev_ts, prev_oracle = ts, key
+            continue
         run.append(row)
         prev_ts, prev_oracle = ts, key
     flush()

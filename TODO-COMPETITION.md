@@ -271,7 +271,8 @@ hours, quote the session only where statistics support it.** That would
 also explain the leaderboard — accounts chasing `Σ_markets` depth during
 the session, in TSLA as hard as NVDA, getting run over.
 
-✅ **Confirmed on the load-bearing point, 2026-08-27: carried ticks do
+✅ **STRONG EVIDENCE on the load-bearing point, 2026-08-27: carried ticks
+appear to
 accrue depth.** The gate can be banked out-of-hours. Quoting only the four
 overnight sessions of the contest needs ~$1,190 of balanced depth held
 throughout, against ~$2,564 to clear it inside the cash session — see the
@@ -297,9 +298,11 @@ turn "cheap" into "cheap but not free":
 ✅ **Carried ticks DO accrue depth — settled 2026-08-27.** This paragraph
 used to say the question was open and lean towards "they do not", which
 contradicted both the Discord answer and our own measurement further down.
-Confirmed twice: an entrant said so directly, and C-0S3 measured two accounts
+**Downgraded 2026-08-28 (see C-0S3):** incremental backfill -- a delayed counter draining a little into each bucket -- is observationally identical to carried accrual at this sampling rate and is NOT excluded by the flat profile, which rules out only a one-time delayed update. Read the below as strong evidence, not confirmation.
+
+Corroborated twice: an entrant said so directly, and C-0S3 measured two accounts
 gaining 10.27M and 8.37M depth-seconds across 122 minutes of frozen oracle,
-with backfill ruled out by a flat rate profile. So the load-bearing mechanic
+with ONE-TIME backfill ruled out by a flat rate profile. So the load-bearing mechanic
 of this hypothesis holds.
 
 **What survives against it is capital, not mechanics.** Carried placement
@@ -434,7 +437,8 @@ Jakub Hadamcik, **2026-08-27 15:10**, answering our question directly:
 > And yes, when underlying markets are closed, you keep collecting depth
 > seconds
 
-✅ **Independently confirmed by our own measurement, 2026-08-27.** The claim
+✅ **Corroborated by our own measurement, 2026-08-27 -- strong evidence,
+not independent confirmation (see C-0S3).** The claim
 was entrant-sourced, not sponsor-sourced, so we measured it rather than
 trusting it. Result below under "C-0S3: measured". Jakub was right.
 
@@ -484,7 +488,7 @@ the verdict.
 124 samples at 60 s over **122 minutes** from 20:26 to 22:29 UTC —
 entirely after the 16:00 ET close, with the oracle
 returning a **single distinct value across all 124 samples**, so the whole
-window is confirmed carried.
+window is an operator-ASSERTED carried session.
 
 | account | Δ depth_5d | implied balanced depth (lower bound) |
 | --- | ---: | ---: |
@@ -494,9 +498,11 @@ window is confirmed carried.
 | 9 others | 0 | — |
 
 Roll-off can only subtract, so a gain with the oracle frozen can only come
-from carried ticks accruing. **Confirmed.**
+from window decay. **Strong evidence, not confirmation:** an incrementally
+draining backlog produces the same profile.
 
-**Backfill ruled out.** The obvious alternative was leaderboard lag — that
+**One-time backfill ruled out; INCREMENTAL backfill is not.** The obvious
+alternative was leaderboard lag — that
 post-close gains are delayed credit for pre-close ticks. That would drain and
 taper. It does not: bucketed into 20-minute windows the implied depth for
 `7c81d1c9` runs 823, 2000, 2000, 703, 777, 1983, 2000 — no downward trend,
@@ -637,7 +643,8 @@ and at the open. Combined with the 8× stressed initial margin off-hours,
 **quoting meaningful size overnight is the identified way to lose.**
 
 This does *not* kill the bank-the-gate-overnight plan — carried ticks are
-confirmed to accrue, and the gate only needs ~$1,190 of balanced depth held
+evidenced to accrue (not confirmed — see C-0S3), and the gate needs ~$1,190
+of balanced depth held
 across the four contest nights. It sets the *size*: the gate is cheap enough
 that we never need a fat overnight grid, and a fat overnight grid is exactly
 what gets farmed. Quote the minimum that clears the gate, biased reduce-only,

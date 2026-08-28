@@ -317,3 +317,56 @@ def test_accounts_sharing_a_display_prefix_get_independent_deltas(
     assert out.count("abcdefgh") == 2
     assert "+3000" in out
     assert "+21000" in out
+
+
+def test_a_bracketed_transition_row_is_excluded_from_the_frozen_window(tmp_path):
+    """[review] The guard existed and had no callers.
+
+    The probe reads the leaderboard first and the oracle after, so around the
+    close one row can pair a LIVE leaderboard snapshot with an oracle already
+    showing the frozen value. That row opened the frozen run and contributed
+    live accrual to a carried verdict -- the exact false attribution the
+    capture brackets were added to prevent.
+    """
+    mod = _load_analyzer()
+    rows = []
+    # Three live samples, then the straddling row, then the frozen tail.
+    for i in range(3):
+        rows.append({"ts": "2026-08-27T19:5%d:00+00:00" % i,
+                     "oracle": {"QQQ-VOL": 0.07 + i * 0.001},
+                     "t_leaderboard_start": "2026-08-27T19:5%d:00+00:00" % i,
+                     "t_oracle": "2026-08-27T19:5%d:03+00:00" % i,
+                     "leaderboard": []})
+    straddle = {"ts": "2026-08-27T19:59:59+00:00",
+                "oracle": {"QQQ-VOL": 0.09},
+                "t_leaderboard_start": "2026-08-27T19:59:58+00:00",
+                "t_oracle": "2026-08-27T20:00:02+00:00",
+                "leaderboard": []}
+    rows.append(straddle)
+    for i in range(4):
+        rows.append({"ts": "2026-08-27T20:0%d:00+00:00" % i,
+                     "oracle": {"QQQ-VOL": 0.09},
+                     "t_leaderboard_start": "2026-08-27T20:0%d:00+00:00" % i,
+                     "t_oracle": "2026-08-27T20:0%d:03+00:00" % i,
+                     "leaderboard": []})
+
+    window, _prov = mod.frozen_window(rows, 60)
+    assert window, "no frozen window was found at all"
+    assert straddle not in window, "the straddling row entered the window"
+    assert all(r["ts"] >= "2026-08-27T20:00:00+00:00" for r in window)
+
+
+def test_an_unbracketed_transition_row_is_still_kept(tmp_path):
+    """Older sessions carry no capture timestamps.
+
+    Treating "unknown" as "straddling" would retroactively void every
+    historical sample, which is a stronger claim than the evidence supports.
+    """
+    mod = _load_analyzer()
+    rows = [{"ts": "2026-08-27T19:59:00+00:00", "oracle": {"Q": 0.07},
+             "leaderboard": []}]
+    rows += [{"ts": "2026-08-27T20:0%d:00+00:00" % i, "oracle": {"Q": 0.09},
+              "leaderboard": []} for i in range(4)]
+
+    window, _prov = mod.frozen_window(rows, 60)
+    assert len(window) == 4

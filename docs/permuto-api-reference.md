@@ -298,13 +298,18 @@ Collected from the API skill; each has bitten someone already.
 
 ## 8  Open questions
 
-- ~~Do carried (frozen-oracle) ticks accrue depth-seconds?~~ **ANSWERED
-  2026-08-27: yes.** Confirmed by the sponsor's channel and then measured
-  directly — two accounts gained 10.27M and 8.37M depth-seconds over 122
-  minutes with the oracle frozen at a single value, which roll-off cannot
-  produce. See `TODO-COMPETITION.md` C-0S3 and
-  `scripts/permuto_depth_probe.py`. The overnight window is therefore worth
-  the capital on mechanics; what constrains it is the 8× carried margin.
+- **Do carried (frozen-oracle) ticks accrue depth-seconds? STRONG EVIDENCE
+  that they do, 2026-08-27 — not confirmation.** Stated in the sponsor's
+  channel by an entrant, and measured: two accounts gained 10.27M and 8.37M
+  depth-seconds over 122 minutes with the oracle frozen at a single value,
+  which roll-off cannot produce. **What that does not exclude** is
+  incremental backfill — a delayed counter draining a little into each
+  bucket produces the same profile, and nothing here bounds the publication
+  lag. So the overnight window looks worth the capital on mechanics, but the
+  $813/$1,190 sizing rests on evidence rather than on an experimentally
+  proven premise. See `TODO-COMPETITION.md` C-0S3 and
+  `scripts/permuto_depth_probe.py`; what constrains it either way is the 8×
+  carried margin.
 - **Is the oracle's short-horizon jitter estimator noise or information?**
   §0 argues it is substantially the former. Decides whether this is a
   quotable market at all.

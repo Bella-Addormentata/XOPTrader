@@ -108,6 +108,21 @@ def main():
 
     seen_trades = {m: set() for m in MARKETS}
 
+    # [review] Same unterminated-line repair the depth probe already does.
+    # A run killed mid-write leaves no trailing newline, and appending the
+    # next session's header straight onto it produces ONE unreadable line
+    # carrying both the partial sample and the session boundary -- so the
+    # analyzer cannot tell the runs apart and counts downtime it never
+    # observed as continuous evidence. One seek is cheaper than
+    # reconstructing that later.
+    if os.path.exists(out_path) and os.path.getsize(out_path):
+        with open(out_path, "rb") as probe_fh:
+            probe_fh.seek(-1, os.SEEK_END)
+            unterminated = probe_fh.read(1) != b"\n"
+        if unterminated:
+            with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n")
+
     with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps({
             "observe_start": datetime.now(timezone.utc).isoformat(),
@@ -126,6 +141,19 @@ def main():
             books, funding = {}, {}
             oracle_by_ticker = row.get("oracle") or {}
             for m in MARKETS:
+                # [review] RE-READ THE ORACLE PER BOOK. It used to be fetched
+                # once at the top of the tick, and each of the seven requests
+                # below carries an 8-second timeout -- so the last book could
+                # be classified against an oracle several 5-second resamples
+                # old, and the +/-2% ring aggregate computed from it is then
+                # simply wrong. The aggregate is the one number this recorder
+                # exists to produce, and it cannot be recomputed later.
+                #
+                # The extra call is cheap next to the L2 fetch it accompanies,
+                # and the value used is stored beside the ring so a reader can
+                # see which oracle each book was measured against rather than
+                # having to assume.
+                per_book_oracle = safe("/info/oracle").get("prices") or {}
                 l2 = safe("/info/l2/" + m + "?levels=500")
                 bids = l2.get("bids") or []
                 asks = l2.get("asks") or []
@@ -136,13 +164,18 @@ def main():
                 # question this recorder exists to answer. Computed here,
                 # against the oracle from this same tick, because it cannot
                 # be recovered later from a ladder we did not keep.
-                ora = oracle_by_ticker.get(m.replace("-PERP", ""))
+                ticker = m.replace("-PERP", "")
+                ora = per_book_oracle.get(ticker,
+                                          oracle_by_ticker.get(ticker))
                 books[m] = {
                     "bids": bids[:8],
                     "asks": asks[:8],
                     "n_bid_levels": len(bids),
                     "n_ask_levels": len(asks),
                     "ring": _ring_depth(bids, asks, ora),
+                    # Which oracle this book was measured against, so a
+                    # reader never has to assume it was the tick's.
+                    "ring_oracle": ora,
                     "err": l2.get("__error__"),
                 }
                 f = safe("/info/funding/" + m)

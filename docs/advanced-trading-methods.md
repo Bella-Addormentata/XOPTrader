@@ -713,13 +713,20 @@ settling every 60s.
   `/info/candles` accepts `tf` but **ignores it**, always returning hourly
   bars. (Partly moot for quoting: all resting orders are cancelled at
   carried→live anyway, so we cannot be holding stale quotes into it.)
-- ~~Does a carried (frozen) oracle count as "fresh" for depth credit?~~
-  **ANSWERED 2026-08-27: yes.** Confirmed in the sponsor's channel and then
-  measured — two accounts gained 10.27M and 8.37M depth-seconds across 122
-  minutes with the oracle frozen at a single value, which roll-off cannot
-  produce. See `TODO-COMPETITION.md` C-0S3. What constrains the overnight
-  window is the 8× carried margin and the entrants hunting resting size
-  there, not the mechanics.
+- **Does a carried (frozen) oracle count as "fresh" for depth credit?
+  STRONG EVIDENCE that it does, 2026-08-27 — not confirmation.** Stated in
+  the sponsor's channel and then measured: two accounts gained 10.27M and
+  8.37M depth-seconds across 122 minutes with the oracle frozen at a single
+  value, which roll-off cannot produce.
+
+  The measurement excludes a ONE-TIME delayed credit, which is what the flat
+  rate profile rules out. It does not exclude incremental backfill — a
+  pre-close backlog draining a little into each bucket rises in every
+  sub-window too and is indistinguishable at this sampling rate. Separating
+  them needs a control account known to be flat through the close, or a
+  documented lag bound; neither exists. See `TODO-COMPETITION.md` C-0S3.
+  What constrains the overnight window either way is the 8× carried margin
+  and the entrants hunting resting size there.
 - How is the oracle actually computed? Permuto documents a BLS-signed
   price certificate, but `/info/price_certificate` returns
   `No price certificate available yet`, so no provenance is exposed.

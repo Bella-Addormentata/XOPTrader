@@ -22,6 +22,17 @@ So we do not need to disentangle the window: we only need the shape of the
 change at the boundary. Sampling every 60s from before the close to well
 after it makes that shape visible.
 
+**A THIRD EXPLANATION THIS CANNOT SEPARATE, added 2026-08-28.** Delayed
+pre-close credit published INCREMENTALLY -- a backlog draining a little into
+each bucket -- also rises smoothly across the boundary and is
+indistinguishable from carried accrual here. The two fingerprints above
+distinguish accrual from a SHARP stop and from roll-off; they do not
+distinguish it from a slow drain, and nothing in the API contract bounds the
+publication lag. So this probe settles the question only in the negative
+direction. Confirming it needs a control account known to be flat through
+the close, or a documented lag bound -- see `TODO-COMPETITION.md` C-0S3,
+which is why the verdict was downgraded to strong evidence.
+
 The oracle is sampled alongside, because the frozen-price transition marks
 the carried boundary far more precisely than the wall clock does.
 
