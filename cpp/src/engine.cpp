@@ -13263,7 +13263,23 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // its history either.
     for (const auto& pair : config_.pairs) {
         double     factor  = quote_usd_factor(pair);
-        const bool trusted = pair.enabled && quote_usd_factor_trusted(pair);
+
+        // [review] Suppress a fresh factor only when its SOURCE is the
+        // disabled pair itself. Gating on pair.enabled alone discarded
+        // factors that never came from this pair's market -- a declared par
+        // needs no market at all, and an XCH-quoted pair's factor is
+        // usd_per_xch(), which is independent of whether this market is
+        // switched on. After a restart the carry map is empty, so those
+        // pairs registered with factor 0 and their historical USD P&L
+        // vanished from the totals.
+        //
+        // quote_usd_factor_source_pair() returns empty when there is no
+        // market source, and this pair's own name when there is one.
+        const std::string factor_src = quote_usd_factor_source_pair(pair);
+        const bool source_is_this_disabled_pair =
+            !pair.enabled && factor_src == pair.name;
+        const bool trusted = !source_is_this_disabled_pair
+                          && quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;
