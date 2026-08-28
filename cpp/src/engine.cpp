@@ -13224,11 +13224,23 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // discontinuity this guard exists to avoid.  0 is used only before any
     // trusted factor has ever been seen, where there is no mark to
     // preserve.
+    // [review 2026-08-28] EVERY CONFIGURED PAIR, enabled or not.
+    //
+    // Skipping disabled pairs here kept them out of pair_conv_ entirely, and
+    // PnLTracker treats "not registered" as licence to fall back to a
+    // hardcoded symbol list worth exactly $1.00 per unit. So the documented
+    // response to the 2026-08-25 incident -- enforce:false on wUSDC.b AND
+    // disabling its pairs -- still marked every historical wUSDC.b and BYC
+    // position at par, which is the belief this whole change exists to
+    // remove. Registering a disabled pair costs one map write and turns it
+    // into "registered but unpriceable", which now contributes nothing.
+    //
+    // A pair that was enabled earlier keeps its last trusted factor through
+    // the carry below, so disabling a market does not discontinuously rewrite
+    // its history either.
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
-
         double     factor  = quote_usd_factor(pair);
-        const bool trusted = quote_usd_factor_trusted(pair);
+        const bool trusted = pair.enabled && quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;

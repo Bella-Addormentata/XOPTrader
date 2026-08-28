@@ -116,6 +116,17 @@ dexie:
 # asset, which is the S27 fail-open condition arriving by another route.
 #
 # If you need the asset to contribute NOTHING, disable its pairs as well.
+#
+# ONE CAVEAT, and it is the one that bit on 2026-08-25.  The rerouting above
+# only holds while SOME OTHER enabled XCH pair can still anchor USD.  If the
+# asset you unenforce is the only par wrapper the book has -- wUSDC.b was
+# exactly that -- then usd_per_xch() has nothing left to anchor on and
+# returns 0, the market-derived path returns 0 with it, and the asset is
+# blinded rather than repriced.  That is the S27 zero-equity condition, not
+# a graceful degradation.  Before flipping `enforce` on your only anchor,
+# give the book a second one: either declare a par on another enabled quote
+# asset, or enable the CoinGecko feed with "chia" in coingecko.coin_ids.
+# `validate_usd_anchor()` warns at startup when no anchor is reachable.
 pegged_assets:
 - asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   symbol: wUSDC.b
