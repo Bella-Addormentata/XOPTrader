@@ -470,3 +470,18 @@ def test_an_underfilled_second_hop_reports_the_stranded_residual():
     )
     assert plan.take_count == 2
     assert plan.hop_residual == 40 * denomination(XCH)
+
+
+def test_realised_rate_is_denominated_like_effective_rate():
+    """The blended leg rate had the same 10^9 error as the per-offer rate,
+    and survived the first fix.  It is shown beside the operator's anchor in
+    the confirmation dialog, so a mismatch invites a meaningless comparison."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH,
+        budget=10_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("a", 200, 100), offer("b", 220, 100)],
+        direct_anchor=ANCHOR,
+    )
+    leg = plan.legs[0]
+    # 420 BYC given for 200 XCH received -> 2.1, not 2.1e-9.
+    assert leg.realised_rate == pytest.approx(2.1)

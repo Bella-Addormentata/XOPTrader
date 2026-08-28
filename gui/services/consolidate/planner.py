@@ -131,9 +131,21 @@ class Leg:
 
     @property
     def realised_rate(self) -> float:
+        """Blended give-per-receive for the whole leg, in DISPLAY units.
+
+        Same denomination trap as effective_rate, and it survived the fix
+        there: dividing the raw totals reports a 2-BYC-per-XCH leg as 2e-9.
+        This is the number a confirmation dialog shows next to the anchor the
+        operator chose, so the two must be in the same units or the comparison
+        it invites is meaningless.
+        """
         if self.receive_total <= 0:
             return float("inf")
-        return self.give_total / self.receive_total
+        give = self.give_total / denomination(self.give_asset)
+        receive = self.receive_total / denomination(self.receive_asset)
+        if receive <= 0.0:
+            return float("inf")
+        return give / receive
 
 
 @dataclass
