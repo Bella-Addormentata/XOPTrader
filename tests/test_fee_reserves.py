@@ -88,8 +88,25 @@ def _written(path: Path) -> dict:
 # --------------------------------------------------------------------------- #
 
 def test_the_tab_is_named_for_both_halves(panel):
-    """One tab answers 'what may I spend' and 'what must I keep'."""
-    assert panel._tabs.tabText(_FEES_TAB) == "Fees & Reserves"
+    """One section answers 'what may I spend' and 'what must I keep'.
+
+    Reads the section bar rather than QTabWidget.tabText(): Settings now uses
+    the wrapping SubTabPages switcher, which is deliberately NOT a QTabWidget
+    drop-in -- its titles are the operator-facing labels and its dirty marker
+    is separate state, where tabText() conflated the two.
+    """
+    assert panel._tabs.bar.title(_FEES_TAB) == "Fees & Reserves"
+
+
+def test_the_section_title_survives_a_dirty_marker(panel):
+    """The old tabText() would have returned the title WITH the marker.
+
+    Settings appended " *" to the tab label, so any caller reading it back
+    got a different string once the section had unsaved edits.
+    """
+    panel._tabs.set_dirty(_FEES_TAB, True)
+    assert panel._tabs.bar.title(_FEES_TAB) == "Fees & Reserves"
+    panel._tabs.clear_dirty()
 
 
 def test_every_floor_has_exactly_one_widget(panel):
