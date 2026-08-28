@@ -311,10 +311,14 @@ def test_anchor_must_be_finite_positive_and_carry_provenance():
 @pytest.mark.parametrize(
     "kwargs",
     [
-        dict(source_asset=XCH, target_asset=XCH, budget=10 * denomination(BYC), max_slippage_frac=0.1),
-        dict(source_asset=BYC, target_asset=XCH, budget=0 * denomination(BYC), max_slippage_frac=0.1),
-        dict(source_asset=BYC, target_asset=XCH, budget=-5 * denomination(BYC), max_slippage_frac=0.1),
-        dict(source_asset=BYC, target_asset=XCH, budget=10 * denomination(BYC), max_slippage_frac=-0.1),
+        dict(source_asset=XCH, target_asset=XCH,
+             budget=10 * denomination(BYC), max_slippage_frac=0.1),
+        dict(source_asset=BYC, target_asset=XCH,
+             budget=0 * denomination(BYC), max_slippage_frac=0.1),
+        dict(source_asset=BYC, target_asset=XCH,
+             budget=-5 * denomination(BYC), max_slippage_frac=0.1),
+        dict(source_asset=BYC, target_asset=XCH,
+             budget=10 * denomination(BYC), max_slippage_frac=-0.1),
     ],
 )
 def test_incoherent_requests_raise_rather_than_returning_an_empty_plan(kwargs):
@@ -667,6 +671,20 @@ def test_a_hop_that_is_an_endpoint_is_refused(hop):
             budget=10 * denomination(BYC), max_slippage_frac=0.1,
             direct_offers=[], direct_anchor=None,
             hop_asset=hop,
+            first_hop_offers=[], first_hop_anchor=ANCHOR,
+            second_hop_offers=[], second_hop_anchor=ANCHOR,
+        )
+
+
+def test_a_blank_hop_asset_is_refused():
+    """"   " folds to empty and passed the endpoint check, letting the planner
+    build legs through an unnamed asset."""
+    with pytest.raises(PlanError, match="blank"):
+        build_plan(
+            source_asset=BYC, target_asset=DBX,
+            budget=10 * denomination(BYC), max_slippage_frac=0.1,
+            direct_offers=[], direct_anchor=None,
+            hop_asset="   ",
             first_hop_offers=[], first_hop_anchor=ANCHOR,
             second_hop_offers=[], second_hop_anchor=ANCHOR,
         )

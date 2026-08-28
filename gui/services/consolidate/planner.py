@@ -266,7 +266,9 @@ def _usable(offer: OfferCandidate, give_asset: str, receive_asset: str) -> bool:
         return False
     if offer.status != 0:
         return False
-    if canonical_asset(offer.give_asset) != canonical_asset(give_asset)             or canonical_asset(offer.receive_asset) != canonical_asset(receive_asset):
+    if (canonical_asset(offer.give_asset) != canonical_asset(give_asset)
+            or canonical_asset(offer.receive_asset)
+            != canonical_asset(receive_asset)):
         return False
     if offer.give_amount <= 0 or offer.receive_amount <= 0:
         return False
@@ -425,11 +427,14 @@ def build_plan(
 ) -> ConsolidationPlan:
     """Build a one- or two-hop consolidation plan.
 
-    A direct route is preferred whenever one exists and produces any fill:
-    each hop is a separate all-or-nothing take with its own fee, its own
-    slippage, and its own window in which the book can move, so two hops are
-    strictly more dangerous than one and are only worth it when there is no
-    direct book at all.
+    A direct route is PREFERRED but no longer preferred at any coverage
+    whatsoever: each hop is a separate all-or-nothing take with its own fee,
+    its own slippage, and its own window in which the book can move, so two
+    hops are strictly more dangerous than one. Direct therefore wins ties and
+    near-ties -- but a two-hop route that actually DELIVERS more source to the
+    target wins, because a dust direct fill silently stranding the position is
+    the failure this feature exists to avoid. Coverage is measured as source
+    reaching the target, not source spent on the first hop.
 
     The two-hop path exists because not every holding has a direct pair --
     with XCH as the target every asset does, but consolidating into DBX
@@ -506,8 +511,12 @@ def build_plan(
     # A hop that IS one of the endpoints is a self-conversion leg, not a
     # route. Only the anchors were checked, so this produced a degenerate
     # plan instead of rejecting an incoherent request.
-    if canonical_asset(hop_asset) in (canonical_asset(source_asset),
-                                      canonical_asset(target_asset)):
+    hop = canonical_asset(hop_asset)
+    if not hop:
+        # "   " folds to empty and would otherwise pass the endpoint test,
+        # letting the planner build legs through an unnamed asset.
+        raise PlanError("hop asset is blank")
+    if hop in (canonical_asset(source_asset), canonical_asset(target_asset)):
         raise PlanError(
             "hop asset %r is the source or the target; a hop must be a "
             "third asset" % hop_asset)
