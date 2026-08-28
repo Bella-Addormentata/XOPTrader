@@ -423,6 +423,12 @@ private:
     /// not trading -- the exact inversion the breaker gate was split out to
     /// prevent.
     prometheus::Gauge* gate_watchdog_{nullptr};
+    /// [S31] Latched copy of the watchdog gate, guarded by mtx_.
+    ///
+    /// Two threads publish this gauge and one of them samples its input
+    /// before taking the lock, so without a sticky copy an older snapshot
+    /// can clear a signal that is meant to survive until restart.
+    bool               watchdog_sticky_{false};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------

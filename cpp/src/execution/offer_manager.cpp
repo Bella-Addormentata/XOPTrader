@@ -527,6 +527,38 @@ asio::awaitable<int> OfferManager::post_quotes(
             continue;
         }
 
+        // [review] CHECK AGAIN, AFTER the create. The pre-call check cannot
+        // stop a create already in flight: if the switch's bulk cancel
+        // enumerates the book before this trade registers, the coroutine
+        // resumes here holding an offer the cancel never saw, and publishing
+        // it would leave a live offer behind a fired dead man's switch.
+        //
+        // The offer exists now, so refusing to publish is not enough -- the
+        // coins are locked either way. Cancel the trade we just created.
+        if (abort_predicate_ && abort_predicate_()) {
+            std::string late_id;
+            if (result.contains("trade_record")
+                && result["trade_record"].contains("trade_id")) {
+                late_id = result["trade_record"]["trade_id"]
+                              .get<std::string>();
+            }
+            logger_->error("create for {} tier {} landed AFTER the engine "
+                           "asked us to stop; cancelling trade {} rather "
+                           "than publishing it", pair.name, tier.tier_index,
+                           late_id.empty() ? "<unknown>" : late_id);
+            if (!late_id.empty()) {
+                try {
+                    co_await cancel_offer_charged(
+                        late_id, current_fee_mojos_, /*secure=*/true);
+                } catch (const std::exception& e) {
+                    logger_->critical("could not cancel the late offer {}: "
+                                      "{} -- it is LIVE and unmanaged",
+                                      late_id, e.what());
+                }
+            }
+            break;
+        }
+
         // Step 3: Extract the bech32m offer text.
         if (!result.contains("offer") || !result["offer"].is_string()) {
             logger_->error("create_offer response missing 'offer' field "
@@ -3122,6 +3154,16 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                    "batch fallback")) {
                 continue;
             }
+            // [review] The fallback loop issued creates without ever
+            // consulting the predicate -- so a watchdog fire during the
+            // failed merged request, or between fallback tiers, went on
+            // rebuilding the book one tier at a time. Checked before each.
+            if (abort_predicate_ && abort_predicate_()) {
+                logger_->error("abandoning batch fallback for {} after tier "
+                               "{}: the engine asked us to stop",
+                               pair.name, tier.tier_index);
+                break;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
@@ -3131,6 +3173,32 @@ asio::awaitable<int> OfferManager::post_merged_side(
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
+            }
+            // And again after it lands, for the same reason as the primary
+            // path: a create that completes after the bulk cancel has
+            // enumerated the book leaves a live offer nobody cancelled.
+            if (!tier_failed && abort_predicate_ && abort_predicate_()) {
+                std::string late_id;
+                if (sr.contains("trade_record")
+                    && sr["trade_record"].contains("trade_id")) {
+                    late_id = sr["trade_record"]["trade_id"]
+                                  .get<std::string>();
+                }
+                logger_->error("fallback create for {} tier {} landed AFTER "
+                               "the stop; cancelling trade {}", pair.name,
+                               tier.tier_index,
+                               late_id.empty() ? "<unknown>" : late_id);
+                if (!late_id.empty()) {
+                    try {
+                        co_await cancel_offer_charged(
+                            late_id, current_fee_mojos_, /*secure=*/true);
+                    } catch (const std::exception& e2) {
+                        logger_->critical("could not cancel late offer {}: "
+                                          "{} -- LIVE and unmanaged",
+                                          late_id, e2.what());
+                    }
+                }
+                break;
             }
             if (tier_failed) {
                 logger_->error("Fallback create_offer failed for {} tier {}: {}",
