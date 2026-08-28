@@ -1,0 +1,289 @@
+"""The authenticated transport. Thin, because the policy lives elsewhere.
+
+`session.py` decides WHEN to renew, `batch.py` decides WHAT a legal batch
+looks like, `quoting.py` decides whether to be in the market at all. This
+module does none of that. It holds a socket, a token, and the small amount of
+state that has to survive between calls.
+
+THE TRAP THIS MODULE EXISTS TO AVOID. Renewal is not registration. The obvious
+implementation of "renew the session" is to call `register()` again -- it does
+challenge, sign, auth, and returns a token, which is exactly what renewal
+needs. But `register()` opens with a `signup_open()` gate and refuses when the
+venue reports sign-up closed. **Registration closes Monday 31 Aug at 17:00 ET,
+several hours into a contest that runs until Friday.** A renewal path built on
+`register()` would work in every test, work on Monday morning, and then fail
+on every attempt from Monday evening onwards -- the book would drain and stay
+drained for four days, with the logs showing a sign-up error that has nothing
+to do with the actual problem. So `reauth()` below deliberately repeats the
+challenge/sign/auth sequence WITHOUT the gate: an existing identity proving it
+still holds its key is a different operation from a new account asking to be
+let in, and only the second one is closed.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import urllib.error
+import urllib.request
+from typing import Any, Optional, Sequence
+
+from .auth import BASE_URL, PermutoAuthError, _HEADERS, _TIMEOUT
+from .session import RenewAction, SessionState, renew_action
+
+_log = logging.getLogger(__name__)
+
+__all__ = [
+    "DEFAULT_SESSION_TTL_S",
+    "PermutoClient",
+    "PermutoNotLinked",
+    "PermutoSessionExpired",
+]
+
+#: Assumed session lifetime when the venue does not state one.
+#:
+#: The policy in session.py maps "unknown expiry" to RENEW, which is the right
+#: POLICY -- an unknown deadline that turns out to be imminent is worse than a
+#: spare request. But the loop ticks every few seconds, so taking that
+#: literally would mint a new session on every tick and hammer the auth route
+#: for the whole contest. The transport is the right place to fix that: adopt
+#: a conservative deadline so renewals happen on a sane cadence. 40 minutes
+#: matches the documented agent-session cadence, and RENEW_MARGIN_S still
+#: pulls the actual renewal 5 minutes earlier.
+DEFAULT_SESSION_TTL_S = 2400.0
+
+
+class PermutoSessionExpired(PermutoAuthError):
+    """HTTP 401/403. The session is dead regardless of what our clock says.
+
+    Retryable exactly once, after a fresh token.
+    """
+
+
+class PermutoNotLinked(PermutoAuthError):
+    """No session is held LOCALLY. Deliberately not a SessionExpired.
+
+    These look alike and must not be treated alike. A 401 means we had a
+    session and the venue refused it, so minting a new one and retrying is
+    right. Holding no token at all means the loop has not linked yet -- and
+    `quoting.decide()` maps that to WITHDRAW. If the retry path caught this
+    too, the transport would quietly authenticate and place orders behind a
+    policy that had just decided not to be in the market. The transport does
+    not get a vote on that.
+    """
+
+
+class PermutoClient:
+    """One identity's authenticated connection to the venue.
+
+    Not thread-safe: one loop owns one client. The session token mutates on
+    renewal, and two threads renewing concurrently would race to install
+    different tokens and invalidate each other's.
+    """
+
+    def __init__(
+        self,
+        identity: Any,
+        *,
+        session_token: str = "",
+        expires_at_s: float = 0.0,
+        base_url: str = BASE_URL,
+        timeout: float = _TIMEOUT,
+    ) -> None:
+        self._identity = identity
+        self._base_url = base_url.rstrip("/")
+        self._timeout = timeout
+        self.session = SessionState(
+            token=session_token, expires_at_s=expires_at_s
+        )
+
+    # ------------------------------------------------------------------ #
+    # Transport
+    # ------------------------------------------------------------------ #
+    def _request(
+        self,
+        method: str,
+        path: str,
+        payload: Optional[dict] = None,
+        *,
+        authed: bool = True,
+    ) -> Any:
+        headers = dict(_HEADERS)
+        if authed:
+            if not self.session.token:
+                raise PermutoNotLinked(
+                    "%s %s needs a session and none is held; call "
+                    "ensure_session() first" % (method, path)
+                )
+            headers["Authorization"] = "Bearer " + self.session.token
+
+        body = json.dumps(payload).encode() if payload is not None else None
+        req = urllib.request.Request(
+            self._base_url + path, data=body, headers=headers, method=method
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                raw = resp.read().decode()
+                return json.loads(raw) if raw.strip() else {}
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode()[:400]
+            except Exception:  # noqa: BLE001
+                pass
+            if exc.code in (401, 403) and authed:
+                # Believe the server over our own clock. Leaving `forced`
+                # unset here would let renew_action() keep answering OK from
+                # a stale expiry while every request is rejected.
+                self.session.forced = True
+                raise PermutoSessionExpired(
+                    "%s %s -> HTTP %s (session rejected) %s"
+                    % (method, path, exc.code, detail)
+                ) from exc
+            raise PermutoAuthError(
+                "%s %s -> HTTP %s %s" % (method, path, exc.code, detail)
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise PermutoAuthError(
+                "%s %s unreachable: %s" % (method, path, exc)
+            ) from exc
+
+    # ------------------------------------------------------------------ #
+    # Session
+    # ------------------------------------------------------------------ #
+    def reauth(self, now_s: float) -> None:
+        """Prove we still hold the key, and take a fresh token.
+
+        Deliberately NOT `auth.register()` -- see the module docstring. This
+        is the same challenge/sign/auth sequence without the sign-up gate,
+        because a registered identity must be able to renew for four days
+        after registration closes.
+        """
+        pubkey = self._identity.public_key()
+        challenge = self._request(
+            "POST",
+            "/exchange/wallet_link_challenge",
+            {"wallet_pubkey": pubkey},
+            authed=False,
+        )
+        token = challenge.get("challenge_token")
+        nonce_hex = challenge.get("nonce")
+        if not token or not nonce_hex:
+            raise PermutoAuthError(
+                "challenge response missing challenge_token/nonce: %r"
+                % (challenge,)
+            )
+        nonce = bytes.fromhex(nonce_hex)
+        if len(nonce) != 32:
+            raise PermutoAuthError(
+                "expected a 32-byte nonce, got %d -- refusing to sign an "
+                "unexpected message" % len(nonce)
+            )
+
+        auth = self._request(
+            "POST",
+            "/exchange/wallet_auth",
+            {
+                "challenge_token": token,
+                "wallet_pubkey": pubkey,
+                "signature": self._identity.sign(nonce).hex(),
+            },
+            authed=False,
+        )
+        session = auth.get("session_token") or auth.get("token")
+        if not isinstance(session, str) or not session.strip():
+            raise PermutoAuthError(
+                "renewal returned no usable session token (got %r)"
+                % (session,)
+            )
+
+        self.session.token = session
+        self.session.expires_at_s = _expiry_from(auth, now_s)
+        self.session.consecutive_failures = 0
+        self.session.forced = False
+        self.session.last_attempt_s = now_s
+
+    def ensure_session(self, now_s: float) -> RenewAction:
+        """Bring the session up to date. Returns what the policy decided.
+
+        A WAIT result is returned rather than slept on: the caller owns the
+        loop clock, and blocking here would stall the quote loop inside a
+        function whose job is bookkeeping.
+        """
+        action = renew_action(self.session, now_s)
+        if action is not RenewAction.RENEW:
+            return action
+        try:
+            self.reauth(now_s)
+        except PermutoAuthError as exc:
+            self.session.consecutive_failures += 1
+            self.session.last_attempt_s = now_s
+            _log.warning(
+                "permuto: session renewal failed (attempt %d): %s",
+                self.session.consecutive_failures, exc,
+            )
+            raise
+        return RenewAction.RENEW
+
+    # ------------------------------------------------------------------ #
+    # Trading
+    # ------------------------------------------------------------------ #
+    def batch_upsert(self, legs: Sequence[dict], now_s: float) -> Any:
+        """POST a batch built by :func:`batch.build_upsert_batch`.
+
+        Legs are NOT re-validated here. They were validated against the oracle
+        they were priced from, and re-checking against a newer oracle would
+        reject a batch the venue would have accepted.
+        """
+        if not legs:
+            # An empty batch is not a cancel -- on an upsert route it is a
+            # no-op that still spends a request and can read, in logs, like a
+            # withdrawal that never happened.
+            return {}
+        return self._retry_once_on_401(
+            "POST", "/exchange/batch_upsert", {"orders": list(legs)}, now_s
+        )
+
+    def cancel_all(
+        self, now_s: float, markets: Optional[Sequence[str]] = None
+    ) -> Any:
+        """Withdraw. Must work when everything else is sick."""
+        payload: dict = {}
+        if markets:
+            payload["markets"] = list(markets)
+        return self._retry_once_on_401(
+            "POST", "/exchange/cancel_all", payload, now_s
+        )
+
+    def _retry_once_on_401(
+        self, method: str, path: str, payload: dict, now_s: float
+    ) -> Any:
+        """One automatic re-auth and retry, then give up.
+
+        Once, not a loop: a 401 that survives a fresh token is not a session
+        problem, and retrying it in a tight loop against an auth route is how
+        a bot gets rate-limited out of its own contest.
+        """
+        try:
+            return self._request(method, path, payload)
+        except PermutoSessionExpired:
+            _log.info(
+                "permuto: %s rejected the session, re-authing once", path
+            )
+            self.reauth(now_s)
+            return self._request(method, path, payload)
+
+
+def _expiry_from(auth: dict, now_s: float) -> float:
+    """Absolute expiry on the caller's clock, however the venue phrases it."""
+    for key in ("expires_at", "expires_at_s", "expiry"):
+        value = auth.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value > 0:
+                return float(value)
+    for key in ("expires_in", "expires_in_s", "ttl"):
+        value = auth.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            if value > 0:
+                return now_s + float(value)
+    return now_s + DEFAULT_SESSION_TTL_S
