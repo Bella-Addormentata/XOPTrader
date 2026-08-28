@@ -98,9 +98,33 @@ def _ring_depth(bids, asks, oracle, ring_pct=2.0):
     }
 
 
+def _aware_utc(text, what):
+    """Parse an ISO timestamp that MUST carry an offset.
+
+    [review] datetime.fromisoformat() happily accepts a naive value, and the
+    rows this is compared against are timezone-aware UTC -- so a
+    perfectly reasonable-looking argument parsed fine and then raised
+    TypeError deep in the comparison, in the observer's case AFTER the output
+    file had already been created. Reject it here, where the message can say
+    what to type.
+    """
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SystemExit("%s: %r is not an ISO-8601 timestamp (%s)"
+                         % (what, text, exc))
+    if value.tzinfo is None:
+        raise SystemExit(
+            "%s: %r has no UTC offset. Timestamps here are compared against "
+            "timezone-aware UTC samples, so a naive value cannot be ordered "
+            "against them. Use e.g. %sZ or %s+00:00."
+            % (what, text, text, text))
+    return value.astimezone(timezone.utc)
+
+
 def main():
     out_path = sys.argv[1]
-    stop = datetime.fromisoformat(sys.argv[2])
+    stop = _aware_utc(sys.argv[2], "stop time")
 
     out_dir = os.path.dirname(out_path)
     if out_dir:
@@ -153,7 +177,8 @@ def main():
                 # and the value used is stored beside the ring so a reader can
                 # see which oracle each book was measured against rather than
                 # having to assume.
-                per_book_oracle = safe("/info/oracle").get("prices") or {}
+                per_book_raw = safe("/info/oracle")
+                per_book_oracle = per_book_raw.get("prices") or {}
                 l2 = safe("/info/l2/" + m + "?levels=500")
                 bids = l2.get("bids") or []
                 asks = l2.get("asks") or []
@@ -165,8 +190,16 @@ def main():
                 # against the oracle from this same tick, because it cannot
                 # be recovered later from a ladder we did not keep.
                 ticker = m.replace("-PERP", "")
-                ora = per_book_oracle.get(ticker,
-                                          oracle_by_ticker.get(ticker))
+                # [review] NO FALLBACK to the tick-start oracle. Doing that
+                # computed a non-null ring against a value possibly several
+                # 5-second resamples old -- silently recreating the exact
+                # stale-oracle misclassification this per-book fetch was
+                # added to prevent, and producing a number a reader would
+                # trust. When the adjacent read fails the ring is simply
+                # unavailable, and the error is recorded so the gap is
+                # visible rather than filled in.
+                oracle_err = per_book_raw.get("__error__")
+                ora = per_book_oracle.get(ticker) if not oracle_err else None
                 books[m] = {
                     "bids": bids[:8],
                     "asks": asks[:8],
@@ -174,8 +207,11 @@ def main():
                     "n_ask_levels": len(asks),
                     "ring": _ring_depth(bids, asks, ora),
                     # Which oracle this book was measured against, so a
-                    # reader never has to assume it was the tick's.
+                    # reader never has to assume it was the tick's -- and the
+                    # error when there was none, so a null ring can be told
+                    # apart from a book with no depth.
                     "ring_oracle": ora,
+                    "ring_oracle_err": oracle_err,
                     "err": l2.get("__error__"),
                 }
                 f = safe("/info/funding/" + m)

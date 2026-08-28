@@ -31,7 +31,7 @@ bound. The verdict this tool prints says so.
 
 import json
 import sys
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def load_sessions(path):
@@ -259,12 +259,37 @@ def _sustained_risers(rows, buckets):
     return always or set()
 
 
+def _aware_utc(text, what):
+    """Parse an ISO timestamp that MUST carry an offset.
+
+    [review] datetime.fromisoformat() happily accepts a naive value, and the
+    rows this is compared against are timezone-aware UTC -- so a
+    perfectly reasonable-looking argument parsed fine and then raised
+    TypeError deep in the comparison, in the observer's case AFTER the output
+    file had already been created. Reject it here, where the message can say
+    what to type.
+    """
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SystemExit("%s: %r is not an ISO-8601 timestamp (%s)"
+                         % (what, text, exc))
+    if value.tzinfo is None:
+        raise SystemExit(
+            "%s: %r has no UTC offset. Timestamps here are compared against "
+            "timezone-aware UTC samples, so a naive value cannot be ordered "
+            "against them. Use e.g. %sZ or %s+00:00."
+            % (what, text, text, text))
+    return value.astimezone(timezone.utc)
+
+
 def main():
     path = sys.argv[1]
     carried_since = None
     for arg in sys.argv[2:]:
         if arg.startswith("--carried-since="):
-            carried_since = datetime.fromisoformat(arg.split("=", 1)[1])
+            carried_since = _aware_utc(arg.split("=", 1)[1],
+                                       "--carried-since")
     sessions, malformed = load_sessions(path)
     if not sessions:
         print("no samples in %s" % path)
@@ -356,10 +381,17 @@ def main():
         if not ma or ma.get("d5") is None or mb.get("d5") is None:
             continue
         d5 = mb["d5"] - ma["d5"]
-        d24 = (mb.get("d24") or 0) - (ma.get("d24") or 0)
+        # [review] PRESERVE None. Coercing each endpoint to 0 independently
+        # turns one unavailable reading into a fabricated 24-hour swing the
+        # size of the other endpoint -- printed with a sign, next to real
+        # numbers. The d5 path already refuses incomplete endpoints; this one
+        # silently invented them.
+        a24, b24 = ma.get("d24"), mb.get("d24")
+        d24 = None if (a24 is None or b24 is None) else (b24 - a24)
         out.append((d5, d24, u, mb))
 
-    out.sort(reverse=True)
+    # None is not orderable against a number, and d24 may now be None.
+    out.sort(key=lambda row: row[0], reverse=True)
     # depth_seconds accrues at (balanced notional) x (elapsed seconds), so
     # d(depth)/dt read in depth-seconds per second IS the resting balanced
     # notional in dollars. That is the conversion we need for sizing, and it
@@ -368,8 +400,10 @@ def main():
           % ("account", "d(depth_5d)", "d(depth_24h)", "depth_5d now",
              "impl. $depth", "equity"))
     for d5, d24, u, mb in out[:12]:
-        print("%-10s %+16.0f %+16.0f %14.0f %12s %10.0f"
-              % (u, d5, d24, mb["d5"],
+        print("%-10s %+16.0f %16s %14.0f %12s %10.0f"
+              % (u, d5,
+                 ("%+.0f" % d24) if d24 is not None else "unavailable",
+                 mb["d5"],
                  ("$%.0f" % (d5 / span_s)) if d5 > 0 else "-", mb["eq"]))
 
     risers = [o for o in out if o[0] > 0]

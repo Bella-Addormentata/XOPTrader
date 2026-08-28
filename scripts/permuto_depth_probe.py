@@ -116,10 +116,34 @@ def sample():
     return row
 
 
+def _aware_utc(text, what):
+    """Parse an ISO timestamp that MUST carry an offset.
+
+    [review] datetime.fromisoformat() happily accepts a naive value, and the
+    rows this is compared against are timezone-aware UTC -- so a
+    perfectly reasonable-looking argument parsed fine and then raised
+    TypeError deep in the comparison, in the observer's case AFTER the output
+    file had already been created. Reject it here, where the message can say
+    what to type.
+    """
+    try:
+        value = datetime.fromisoformat(text)
+    except ValueError as exc:
+        raise SystemExit("%s: %r is not an ISO-8601 timestamp (%s)"
+                         % (what, text, exc))
+    if value.tzinfo is None:
+        raise SystemExit(
+            "%s: %r has no UTC offset. Timestamps here are compared against "
+            "timezone-aware UTC samples, so a naive value cannot be ordered "
+            "against them. Use e.g. %sZ or %s+00:00."
+            % (what, text, text, text))
+    return value.astimezone(timezone.utc)
+
+
 def main():
     out_path = sys.argv[1]
     stop_at = sys.argv[2]  # ISO8601 UTC, e.g. 2026-08-27T22:30:00+00:00
-    stop = datetime.fromisoformat(stop_at)
+    stop = _aware_utc(stop_at, "stop time")
 
     # A bare filename has no dirname, and makedirs("") raises
     # FileNotFoundError -- so the probe would die before its first sample
