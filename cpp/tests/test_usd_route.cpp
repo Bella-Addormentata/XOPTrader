@@ -20,17 +20,25 @@
 
 using xop::risk::ExternalXchFeed;
 using xop::risk::RoutePair;
+using xop::risk::ParLookups;
 using xop::risk::asset_is_routable_to_usd;
 using xop::risk::xch_is_anchored;
 
 namespace {
 
-/// Par lookup over a fixed set, matching the engine's
-/// declared_usd_par().has_value().
-xop::risk::ParLookup pars(std::set<std::string> declared) {
-    return [d = std::move(declared)](const std::string& id) {
-        return d.count(id) > 0;
+/// Par lookups over fixed sets. `declared` is what carries a par at all;
+/// `anchors` is the narrower set usd_per_xch() will accept as an XCH anchor,
+/// defaulting to the same thing when the distinction does not matter.
+xop::risk::ParLookups pars(std::set<std::string> declared,
+                           std::set<std::string> anchors = {},
+                           bool anchors_given = false) {
+    auto in = [](std::set<std::string> s) {
+        return [t = std::move(s)](const std::string& id) {
+            return t.count(id) > 0;
+        };
     };
+    return xop::risk::ParLookups{
+        in(declared), in(anchors_given ? anchors : declared)};
 }
 
 ExternalXchFeed live_feed() {
@@ -174,4 +182,33 @@ TEST(AssetRoute, TheZeroThresholdHoleReachesEveryXchRoutedAsset) {
     const std::vector<RoutePair> p{{"dbx", "xch"}};
     EXPECT_FALSE(asset_is_routable_to_usd("dbx", f, p, kNoPars));
     EXPECT_FALSE(asset_is_routable_to_usd("xch", f, p, kNoPars));
+}
+
+
+// ---------------------------------------------------------------------------
+// [review] "has a par" and "can anchor XCH" are different questions.
+//
+// BYC declares an ENFORCED par and also prefers its market cross, so
+// declared_usd_par("byc") returns a value while is_par_wrapper_quote()
+// rejects it. Using one lookup for both made an XCH/BYC pair report XCH --
+// and therefore every XCH-routed asset -- as routable, when usd_per_xch()
+// would have skipped that pair and returned 0.
+// ---------------------------------------------------------------------------
+
+TEST(XchIsAnchored, APreferMarketCrossAssetDoesNotAnchorXch) {
+    const std::vector<RoutePair> p{{"xch", "byc"}};
+    // Declared par: yes. Accepted by usd_per_xch as an anchor: no.
+    const auto pars_byc = pars({"byc"}, /*anchors=*/{}, /*anchors_given=*/true);
+    EXPECT_FALSE(xch_is_anchored(ExternalXchFeed{}, p, pars_byc));
+    EXPECT_FALSE(asset_is_routable_to_usd("xch", ExternalXchFeed{}, p,
+                                          pars_byc));
+}
+
+TEST(AssetRoute, APreferMarketCrossQuoteStillPricesTheBaseDirectly) {
+    // The narrower lookup applies only to the XCH-ANCHOR question. A pair
+    // quoted in BYC can still price its own base against BYC's declared par.
+    const std::vector<RoutePair> p{{"cat_a", "byc"}};
+    const auto pars_byc = pars({"byc"}, /*anchors=*/{}, /*anchors_given=*/true);
+    EXPECT_TRUE(asset_is_routable_to_usd("cat_a", ExternalXchFeed{}, p,
+                                         pars_byc));
 }

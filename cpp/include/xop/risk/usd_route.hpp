@@ -73,15 +73,30 @@ struct ExternalXchFeed {
 /// A callback so this header need not know about PegRegistry.
 using ParLookup = std::function<bool(const std::string&)>;
 
+/// The two questions, which are NOT the same question.
+///
+/// `has_par` is "can this asset be valued at its declared par". `anchors_xch`
+/// is the narrower "will usd_per_xch() accept a pair quoted in this asset as
+/// its anchor", which additionally excludes `prefer_market_cross` assets:
+/// BYC declares an enforced par AND prefers its market cross, so
+/// `declared_usd_par("byc")` returns a value while `is_par_wrapper_quote()`
+/// rejects it. Using one lookup for both made an `XCH/BYC` pair report XCH --
+/// and therefore every XCH-routed asset -- as routable when usd_per_xch()
+/// would have skipped that pair and returned 0.
+struct ParLookups {
+    ParLookup has_par;
+    ParLookup anchors_xch;
+};
+
 /// Can XCH reach USD at all?
 [[nodiscard]] inline bool xch_is_anchored(
     const ExternalXchFeed& feed,
     const std::vector<RoutePair>& enabled_pairs,
-    const ParLookup& has_par)
+    const ParLookups& pars)
 {
     if (feed.usable()) return true;
     for (const auto& p : enabled_pairs) {
-        if (p.base_asset_id == "xch" && has_par(p.quote_asset_id)) {
+        if (p.base_asset_id == "xch" && pars.anchors_xch(p.quote_asset_id)) {
             return true;
         }
     }
@@ -97,12 +112,12 @@ using ParLookup = std::function<bool(const std::string&)>;
     const std::string& asset_id,
     const ExternalXchFeed& feed,
     const std::vector<RoutePair>& enabled_pairs,
-    const ParLookup& has_par)
+    const ParLookups& pars)
 {
     if (asset_id == "xch") {
-        return xch_is_anchored(feed, enabled_pairs, has_par);
+        return xch_is_anchored(feed, enabled_pairs, pars);
     }
-    if (has_par(asset_id)) {
+    if (pars.has_par(asset_id)) {
         return true;   // priceable with no market at all
     }
 
@@ -117,10 +132,10 @@ using ParLookup = std::function<bool(const std::string&)>;
 
         const std::string& other = is_base ? p.quote_asset_id
                                            : p.base_asset_id;
-        if (has_par(other)) return true;
+        if (pars.has_par(other)) return true;
         if (other == "xch") {
             if (!xch_checked) {
-                xch_ok      = xch_is_anchored(feed, enabled_pairs, has_par);
+                xch_ok      = xch_is_anchored(feed, enabled_pairs, pars);
                 xch_checked = true;
             }
             if (xch_ok) return true;

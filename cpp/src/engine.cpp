@@ -11692,10 +11692,7 @@ bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
     // paused on a state that will not resolve, which is precisely what the
     // write-off exists to avoid. So follow the route to an anchor.
     return risk::asset_is_routable_to_usd(
-        asset_id, external_xch_feed(), enabled_route_pairs(),
-        [this](const std::string& id) {
-            return declared_usd_par(id).has_value();
-        });
+        asset_id, external_xch_feed(), enabled_route_pairs(), par_lookups());
 }
 
 /// Does XCH have any USD anchor at all?
@@ -11707,9 +11704,7 @@ bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
 bool Engine::xch_has_usd_anchor() const
 {
     return risk::xch_is_anchored(external_xch_feed(), enabled_route_pairs(),
-                                 [this](const std::string& id) {
-                                     return declared_usd_par(id).has_value();
-                                 });
+                                 par_lookups());
 }
 
 /// The two config shapes the pure route logic needs, gathered in one place.
@@ -11722,6 +11717,19 @@ std::vector<risk::RoutePair> Engine::enabled_route_pairs() const
         out.push_back({pair.base_asset_id, pair.quote_asset_id});
     }
     return out;
+}
+
+risk::ParLookups Engine::par_lookups() const
+{
+    return risk::ParLookups{
+        [this](const std::string& id) {
+            return declared_usd_par(id).has_value();
+        },
+        // Narrower on purpose -- mirrors what usd_per_xch() will accept.
+        [this](const std::string& id) {
+            return is_par_wrapper_asset(id) && declared_usd_par(id).has_value();
+        },
+    };
 }
 
 risk::ExternalXchFeed Engine::external_xch_feed() const
@@ -11933,12 +11941,22 @@ double Engine::compute_portfolio_equity_usd(BlockHeight current_block)
                 // in.live_usd_per_unit and in.last_usd_per_unit both stay
                 // 0.0, so the asset contributes exactly $0 to equity.
                 if (writeoff_logged_.insert(rec.asset_id).second) {
-                    spdlog::warn("[Engine] [S32] held asset {} has NO enabled "
-                                 "pair and therefore no pricing path -- "
-                                 "valuing {} units at $0.  This is a "
-                                 "configuration state, not a feed outage: it "
-                                 "will persist until a pair is re-enabled. "
-                                 "Equity EXCLUDES this holding.",
+                    // [review] Not "no enabled pair" -- the predicate now
+                    // follows the route, so this also fires for an asset
+                    // that IS in an enabled pair which cannot reach USD
+                    // (CAT_A/CAT_B with no XCH leg and no enforced par).
+                    // Telling that operator to re-enable a pair sends them
+                    // to check something already true.
+                    spdlog::warn("[Engine] [S32] held asset {} has NO "
+                                 "configured route to a USD anchor -- valuing "
+                                 "{} units at $0.  This is a configuration "
+                                 "state, not a feed outage: it persists until "
+                                 "the asset can reach USD, by enabling a pair "
+                                 "against a quote asset with an enforced par, "
+                                 "or against XCH while XCH itself is anchored "
+                                 "(CoinGecko \"chia\", or an XCH pair against "
+                                 "a declared par).  Equity EXCLUDES this "
+                                 "holding.",
                                  rec.asset_id.substr(0, 12), in.units);
                 }
             } else if (!have_carry) {

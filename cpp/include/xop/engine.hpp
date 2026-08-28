@@ -580,6 +580,7 @@ private:
     /// Config reduced to what the pure route logic in usd_route.hpp needs.
     [[nodiscard]] std::vector<risk::RoutePair> enabled_route_pairs() const;
     [[nodiscard]] risk::ExternalXchFeed        external_xch_feed() const;
+    [[nodiscard]] risk::ParLookups             par_lookups() const;
 
     /// [S20 2026-08-24] Median implied price of `pc` triangulated through
     /// every healthy pair of enabled sibling books (see the definition for
