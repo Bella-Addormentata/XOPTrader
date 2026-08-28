@@ -319,6 +319,31 @@ class PermutoIdentity:
 
     # -- backup bookkeeping ------------------------------------------------- #
 
+    def discard_unregistered(self) -> None:
+        """Remove an identity that was created but never confirmed or linked.
+
+        Only ever called when the operator dismissed the recovery phrase
+        without confirming it: the key then has no backup anywhere, and
+        keeping it strands an account nobody can recover while blocking
+        Create. Nothing is registered at that point, so the key is worth
+        exactly nothing and removing it is free.
+
+        REFUSES once registered. After linking, the key IS the account --
+        deleting it would abandon a live venue identity (and, once Permuto
+        moves off simulated capital, a balance) with no way back.
+        """
+        with _io_transaction(self._io):
+            secrets = self._io.read()
+            section = secrets.get(_SECTION) or {}
+            if section.get("registered"):
+                raise PermutoIdentityError(
+                    "refusing to discard a REGISTERED identity -- the key is "
+                    "the account. Restore from its phrase instead."
+                )
+            secrets.pop(_SECTION, None)
+            self._io.write(secrets)
+        _log.warning("permuto: unconfirmed identity discarded (no backup taken)")
+
     def mark_backup_confirmed(self) -> None:
         with _io_transaction(self._io):
             secrets = self._io.read()

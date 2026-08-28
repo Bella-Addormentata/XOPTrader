@@ -117,13 +117,24 @@ def leaderboard_entry(user_id: str) -> Optional[dict]:
             for row in page.get(bucket, []):
                 if row.get("user_id") == user_id:
                     return {"category": bucket, **row}
-        seen = offset + max(
+        rows_this_page = max(
             len(page.get("market_makers", [])), len(page.get("traders", []))
         )
-        total = max(
-            page.get("market_makers_total", 0), page.get("traders_total", 0)
-        )
-        if seen >= total:
+        seen = offset + rows_this_page
+
+        # `.get(key, 0)` returns None when the key EXISTS with a JSON null,
+        # and max(None, 50) raises TypeError -- crashing the lookup and
+        # reporting "Failed" for an account that is registered. Coerce, then
+        # do not trust the result: totals of 0 from a null response would
+        # make `seen >= total` true immediately and silently truncate the
+        # search to page one, which fails in the direction that reads as
+        # "you are not registered". A short page is the reliable end signal.
+        def _count(key):
+            value = page.get(key)
+            return value if isinstance(value, int) and value >= 0 else 0
+
+        total = max(_count("market_makers_total"), _count("traders_total"))
+        if rows_this_page == 0 or (total > 0 and seen >= total):
             return None
         # No fixed ceiling. An offset cap silently reports a registered
         # account as unlisted once the field grows past it, which is the

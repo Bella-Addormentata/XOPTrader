@@ -91,7 +91,7 @@ class _RecoveryPhraseDialog(QDialog):
         layout.addWidget(warning)
 
         words = phrase.split()
-        grid = QTextEdit()
+        grid = self._grid = QTextEdit()
         grid.setReadOnly(True)
         grid.setPlainText(
             "\n".join(
@@ -111,7 +111,7 @@ class _RecoveryPhraseDialog(QDialog):
         layout.addWidget(grid)
 
         copy_row = QHBoxLayout()
-        copy_btn = QPushButton("Copy to clipboard")
+        copy_btn = self._copy_btn = QPushButton("Copy to clipboard")
         copy_btn.clicked.connect(lambda: self._copy(phrase))
         copy_row.addWidget(copy_btn)
         self._copy_notice = QLabel("")
@@ -165,6 +165,20 @@ class _RecoveryPhraseDialog(QDialog):
             del current
         self._copied_digest = None
         super().done(result)
+
+    def scrub(self) -> None:
+        """Drop every retained copy of the phrase held by this dialog.
+
+        exec() hides a parented dialog, it does not destroy it -- so without
+        this the word grid and the copy-button closure keep the mnemonic
+        alive as children of the page for the life of the window.
+        """
+        self._grid.clear()
+        try:
+            self._copy_btn.clicked.disconnect()
+        except (RuntimeError, TypeError):  # already disconnected
+            pass
+        self._copy_notice.clear()
 
     @property
     def confirmed(self) -> bool:
@@ -227,18 +241,31 @@ class _RegistrationWorker(QObject):
         try:
             if self._action == "register":
                 reg = auth.register(self._identity)
-                # Verify against the leaderboard rather than trusting the auth
-                # response: "registered" should mean "the venue lists us".
-                entry = auth.leaderboard_entry(reg.user_id)
-                self.finished.emit(
-                    {
-                        "ok": True,
-                        "user_id": reg.user_id,
-                        "trading_address": reg.trading_address,
-                        "listed": entry is not None,
-                        "entry": entry,
-                    }
-                )
+                # THE LINK IS NOW PERMANENT AND CANNOT BE REDONE.  Everything
+                # after this point is verification, and verification failing
+                # must never present as "registration failed" -- a single
+                # outer except used to swallow the whole thing, so a
+                # leaderboard timeout emitted {ok: false}, persisted nothing,
+                # and re-enabled a Register button for an account that
+                # already existed.
+                result = {
+                    "ok": True,
+                    "user_id": reg.user_id,
+                    "trading_address": reg.trading_address,
+                    "listed": False,
+                    "entry": None,
+                }
+                try:
+                    entry = auth.leaderboard_entry(reg.user_id)
+                    result["listed"] = entry is not None
+                    result["entry"] = entry
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning(
+                        "permuto: linked, but the leaderboard read-back "
+                        "failed: %s", exc
+                    )
+                    result["verify_error"] = str(exc)
+                self.finished.emit(result)
             else:
                 info = self._identity.info()
                 entry = (
@@ -486,9 +513,45 @@ class PermutoWidget(QWidget):
 
         dialog = _RecoveryPhraseDialog(phrase, self)
         dialog.exec()
-        if dialog.confirmed:
+        confirmed = dialog.confirmed
+        # exec() only HIDES a parented dialog. Its QTextEdit and the copy
+        # lambda keep the full phrase alive as children of this page, so the
+        # earlier claim that it "goes out of scope" was wrong. Scrub, then
+        # schedule destruction.
+        dialog.scrub()
+        dialog.deleteLater()
+
+        if confirmed:
             identity.mark_backup_confirmed()
-        # The phrase goes out of scope here and is never written anywhere.
+            self.refresh()
+            return
+
+        # ROLLED BACK, and this is the whole point of the branch.  Disabling
+        # OK does not disable Escape or the title-bar close; either returns
+        # Rejected.  The identity was already persisted before the modal
+        # opened, so leaving it would strand an account whose ONLY recovery
+        # phrase had just been discarded -- with Create disabled because a key
+        # exists, and the page checkbox able to mark the unrecoverable key as
+        # backed up.  Nothing is registered yet, so the key is worth nothing
+        # and discarding it is free; keeping it is what costs.
+        try:
+            identity.discard_unregistered()
+        except Exception as exc:  # noqa: BLE001
+            _log.exception("permuto: could not roll back the new identity")
+            QMessageBox.critical(
+                self, "Identity not rolled back",
+                "The recovery phrase was dismissed without confirmation, but "
+                "the new key could not be removed: %s  Do NOT register it "
+                "-- it has no backup. Remove the 'permuto' section from "
+                "secrets.yaml and start again." % exc,
+            )
+        else:
+            QMessageBox.information(
+                self, "Identity discarded",
+                "The recovery phrase was not confirmed, so the new key was "
+                "discarded rather than left without a backup. Press Create "
+                "identity to start again.",
+            )
         self.refresh()
 
     @Slot()
@@ -588,7 +651,24 @@ class PermutoWidget(QWidget):
 
         self.refresh()
 
-        if result.get("listed"):
+        # 119-5: a lookup that misses while the board rebuilds must not
+        # retract a verification we already earned and persisted.
+        durable_verified = False
+        try:
+            durable_verified = self._identity_factory().info().listing_verified
+        except Exception:  # noqa: BLE001
+            pass
+
+        if result.get("verify_error") and not durable_verified:
+            self._set_status(
+                "Registered with Permuto and saved. The leaderboard check "
+                "could not run (%s) -- press Check leaderboard to confirm."
+                % result["verify_error"],
+                _C.WARNING_YELLOW,
+            )
+            return
+
+        if result.get("listed") or durable_verified:
             entry = result.get("entry") or {}
             self._set_status(
                 "Successfully registered  --  listed on the Permuto "

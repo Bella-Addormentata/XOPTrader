@@ -222,3 +222,38 @@ def test_leaderboard_absent_returns_none(monkeypatch):
 
     monkeypatch.setattr(auth, "_request", fake)
     assert auth.leaderboard_entry("missing") is None
+
+
+def test_null_totals_do_not_crash_or_truncate(monkeypatch):
+    """`.get(key, 0)` returns None for a key present with a JSON null, and
+    max(None, 50) raises TypeError -- reporting "Failed" for a registered
+    account. Coercing to 0 alone is not enough either: total==0 would end the
+    search after page one, failing as "not registered"."""
+    target = {"user_id": "n" * 64}
+
+    def fake(method, path, payload=None):
+        offset = int(path.split("offset=")[1])
+        rows = [{"user_id": "%064d" % (offset + i)} for i in range(100)]
+        if offset == 200:
+            rows[3] = target
+        if offset >= 300:
+            rows = []
+        return {"market_makers": rows, "traders": [],
+                "market_makers_total": None, "traders_total": None}
+
+    monkeypatch.setattr(auth, "_request", fake)
+    assert auth.leaderboard_entry("n" * 64) is not None
+
+
+def test_a_short_page_ends_the_search(monkeypatch):
+    """Without a usable total, a page shorter than the batch is the end."""
+    calls = []
+
+    def fake(method, path, payload=None):
+        calls.append(path)
+        return {"market_makers": [], "traders": [],
+                "market_makers_total": None, "traders_total": None}
+
+    monkeypatch.setattr(auth, "_request", fake)
+    assert auth.leaderboard_entry("absent") is None
+    assert len(calls) == 1

@@ -269,3 +269,75 @@ def test_the_protector_is_resolved_only_when_key_material_is_touched():
     with pytest.raises(RuntimeError, match="secure store"):
         ident.create()
     assert calls == ["protect"]
+
+
+# --------------------------------------------------------------------------- #
+# The identity must never reach git-tracked config.yaml
+# --------------------------------------------------------------------------- #
+
+def test_split_and_save_keeps_identity_out_of_public_config(tmp_path):
+    """Reproduces the leak before it was fixed.
+
+    Settings loads config.yaml and secrets.yaml MERGED, then writes every
+    section it does not recognise as public configuration -- and config.yaml
+    is tracked. With `permuto` absent from SECRET_KEYS, one Save wrote the
+    wrapped BLS key into the repository. The warp block carries the same
+    warning verbatim, which is why the rule is a list and not a convention.
+    """
+    from gui.services.config_split import (
+        SECRET_KEYS,
+        WALLET_MANAGED_KEYS,
+        split_and_save,
+    )
+
+    assert "permuto" in SECRET_KEYS
+    assert "permuto" in WALLET_MANAGED_KEYS
+
+    cfg = tmp_path / "config.yaml"
+    sec = tmp_path / "secrets.yaml"
+    cfg.write_text("pairs: []\n", encoding="utf-8")
+    sec.write_text(
+        "permuto:\n  bls_private_key_dpapi: ON_DISK_SECRET\n", encoding="utf-8"
+    )
+
+    split_and_save(cfg, {
+        "pairs": [],
+        "permuto": {
+            "bls_private_key_dpapi": "STALE_SNAPSHOT_BLOB",
+            "bls_public_key": "PUB",
+            "registered": True,
+            "user_id": "u" * 64,
+        },
+    })
+
+    public = cfg.read_text(encoding="utf-8")
+    for leaked in ("STALE_SNAPSHOT_BLOB", "ON_DISK_SECRET", "bls_private_key_dpapi"):
+        assert leaked not in public, "identity material reached tracked config"
+    assert "permuto" not in public
+
+    # WALLET_MANAGED: the on-disk secret is authoritative, so a stale cached
+    # snapshot must not round-trip over it. That is how a rotated key gets
+    # destroyed -- the warp block was given this rule after exactly that.
+    assert "ON_DISK_SECRET" in sec.read_text(encoding="utf-8")
+    assert "STALE_SNAPSHOT_BLOB" not in sec.read_text(encoding="utf-8")
+
+
+def test_an_unconfirmed_identity_can_be_discarded(ident):
+    """Escape and the title-bar close both reject the phrase dialog, and the
+    key is persisted BEFORE it opens.  Without rollback that strands an
+    account whose only recovery phrase was just discarded, with Create
+    disabled because a key exists."""
+    ident.create()
+    assert ident.exists()
+    ident.discard_unregistered()
+    assert not ident.exists()
+    ident.create()          # and Create works again
+
+
+def test_a_registered_identity_is_never_discarded(ident):
+    """After linking, the key IS the account."""
+    ident.create()
+    ident.mark_registered(user_id="a" * 64, trading_address="xch1x")
+    with pytest.raises(PermutoIdentityError, match="REGISTERED"):
+        ident.discard_unregistered()
+    assert ident.exists()
