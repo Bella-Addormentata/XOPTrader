@@ -3432,6 +3432,29 @@ AppConfig load_config(const std::string& path,
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
     validate_usd_anchor(cfg);
+
+    // [S27 review round 3] Since usd_per_xch() now prefers the external
+    // CoinGecko price, a polling interval LONGER than the freshness window
+    // makes that anchor stale for part of every cycle by construction: the
+    // gate rejects the cached value, valuation silently falls through to the
+    // DEX mid, and if the DEX anchor sits higher it can ratchet the equity
+    // peak -- so the next successful CoinGecko refresh reads as a drawdown
+    // the market never produced. Nothing about that looks like a
+    // misconfiguration in the logs, which is why it is called out here.
+    if (cfg.coingecko.enabled && cfg.market_data.cex_freshness_threshold_sec > 0.0) {
+        const double poll_s = cfg.coingecko.polling_interval_ms / 1000.0;
+        if (poll_s >= cfg.market_data.cex_freshness_threshold_sec) {
+            spdlog::warn(
+                "[Config] coingecko.polling_interval_ms ({:.0f}s) is not "
+                "shorter than market_data.cex_freshness_threshold_sec "
+                "({:.0f}s), so the external XCH anchor is STALE for part of "
+                "every poll cycle and valuation alternates between CoinGecko "
+                "and the DEX mid. That can ratchet the equity peak and make "
+                "the next refresh look like a drawdown. Set the polling "
+                "interval well inside the freshness window.",
+                poll_s, cfg.market_data.cex_freshness_threshold_sec);
+        }
+    }
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);

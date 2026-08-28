@@ -13927,12 +13927,13 @@ void Engine::step_check_alerts(BlockHeight block_height)
         breaker_pause_active_ = true;
         state_->set_status(BotStatus::Paused);
         if (valuation_all_unpriced_) {
-            spdlog::error("[Engine] Step 13: [S27] NO held asset has a live "
-                          "price -- equity ${:.2f} is entirely carried from "
-                          "stale values, so the drawdown breaker is comparing "
-                          "a frozen equity against a frozen peak (${:.2f}) and "
-                          "cannot detect a loss.  Engine PAUSED (fail-closed). "
-                          "Manual intervention required.",
+            spdlog::error("[Engine] Step 13: [S27] NO held asset has a "
+                          "usable live valuation -- equity ${:.2f} is either "
+                          "carried from stale values or written off to $0 "
+                          "(S32), so the drawdown breaker is comparing an "
+                          "unmoving equity against a frozen peak (${:.2f}) "
+                          "and cannot detect a loss.  Engine PAUSED "
+                          "(fail-closed).  Manual intervention required.",
                           equity_usd, peak_equity_hwm_usd_);
         } else {
             spdlog::error("[Engine] Step 13: [S27] valuation is INCOMPLETE and "
@@ -13945,9 +13946,11 @@ void Engine::step_check_alerts(BlockHeight block_height)
             alerts_->send_alert(
                 AlertRule::CircuitBreaker,
                 valuation_all_unpriced_
-                    ? "valuation unavailable: no held asset has a live price, "
-                      "so equity is entirely carried and the drawdown breaker "
-                      "cannot detect a loss -- engine paused fail-closed"
+                    ? "valuation unavailable: no held asset has a usable "
+                      "live valuation -- equity is carried from stale values "
+                      "or written off to $0, so it cannot move and the "
+                      "drawdown breaker cannot detect a loss. Engine paused "
+                      "fail-closed"
                     : "valuation incomplete and no equity peak was ever "
                       "established, so the drawdown breaker cannot fire -- "
                       "engine paused fail-closed");
