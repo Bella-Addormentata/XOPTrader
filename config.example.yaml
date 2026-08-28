@@ -124,9 +124,13 @@ dexie:
 # returns 0, the market-derived path returns 0 with it, and the asset is
 # blinded rather than repriced.  That is the S27 zero-equity condition, not
 # a graceful degradation.  Before flipping `enforce` on your only anchor,
-# give the book a second one: either declare a par on another enabled quote
-# asset, or enable the CoinGecko feed with "chia" in coingecko.coin_ids.
-# `validate_usd_anchor()` warns at startup when no anchor is reachable.
+# give the book a second one by declaring a par on another enabled quote
+# asset. `validate_usd_anchor()` warns at startup when none is reachable.
+#
+# NOT CoinGecko, on this build: `usd_per_xch()` scans enabled XCH/par-wrapper
+# pairs and does not read the external feed at all, so enabling it satisfies
+# nobody. Teaching the anchor to prefer the external quote is S27's work
+# (PR #117); until that lands, a declared par is the only anchor there is.
 pegged_assets:
 - asset_id: fa4a180ac326e67ea289b869e3448256f6af05721f7cf934cb9901baa6b7a99d
   symbol: wUSDC.b

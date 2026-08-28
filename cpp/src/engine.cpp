@@ -11310,8 +11310,14 @@ double Engine::usd_per_xch() const
 {
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
-        const auto slash = pair.name.find('/');
-        if (slash == std::string::npos) continue;
+        // [review] No slash check. It is left over from when this matched on
+        // the display NAME; the lookup below is entirely by canonical asset
+        // id, and parse_pairs() accepts names without a slash (only
+        // revive_market imposes one). So a legitimately-configured pair whose
+        // name happens to lack "/" was silently skipped as an anchor, while
+        // validate_usd_anchor() -- which never looks at the name -- reported
+        // the config as anchored. Startup said fine and the runtime returned
+        // 0.
         // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
         // registry, keyed on ASSET ID rather than the ticker parsed out of
         // the pair name -- symbols collide and get reused, asset ids do
