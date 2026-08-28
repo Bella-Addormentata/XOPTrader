@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
@@ -412,6 +413,12 @@ private:
     /// Set during open_connections() based on config_.chia.mode and
     /// full-node reachability (auto-detect).
     bool wallet_only_mode_{false};
+
+    /// [S28] Which RPC answers "what block is it?", re-decided every poll.
+    /// wallet_only_mode_ above is the STARTUP decision and stays as it was;
+    /// this is the mid-flight one, which is what was missing when the node
+    /// died for 2.5h beside a healthy wallet.
+    risk::HeightSourceState height_source_{};
 
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order

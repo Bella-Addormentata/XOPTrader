@@ -1233,10 +1233,84 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 }
             }
 
-            // co_await the block height -- use wallet RPC in wallet-only mode.
-            std::int64_t height = wallet_only_mode_
-                ? co_await wallet_->get_height_info()
-                : co_await full_node_->get_block_height();
+            // [S28] The pause flag is pure filesystem and state -- no RPC --
+            // so it is readable even while the node is unreachable. Read it
+            // HERE, before the height call that may be about to fail, so an
+            // operator who pauses during an outage gets a log line and a GUI
+            // status instead of silence.
+            check_pause_flag();
+
+            // [S28] Height source is decided EVERY poll, not once at startup.
+            // wallet_only_mode_ used to be assigned only in
+            // open_connections(), so `mode: auto` auto-detected once and then
+            // never again: on 2026-08-25 that meant 529 consecutive failures
+            // over ~2.5h against a dead node while the wallet RPC answered
+            // fine the whole time. No height means no heartbeat -- no quote
+            // refresh, no cancel, no breaker evaluation -- with offers resting
+            // on dexie throughout.
+            const bool mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+            std::int64_t height = -1;
+            bool node_ok = false;
+
+            if (wallet_only_mode_
+                || height_source_.current == risk::HeightSource::Wallet) {
+                height = co_await wallet_->get_height_info();
+                // A wallet poll is evidence about the WALLET, not the node.
+                // Probe the node separately so a recovery can be noticed --
+                // otherwise the fallback would be permanent.
+                if (!wallet_only_mode_ && mode_is_auto) {
+                    try {
+                        const std::int64_t probe =
+                            co_await full_node_->get_block_height();
+                        node_ok = (probe >= 0);
+                        if (node_ok) height = std::max(height, probe);
+                    } catch (const std::exception&) {
+                        node_ok = false;
+                    }
+                    const auto before = height_source_.current;
+                    if (next_height_source(height_source_, node_ok,
+                                           mode_is_auto)
+                            != before) {
+                        spdlog::warn("[Engine] [S28] full node is answering "
+                                     "again -- block height back on the node");
+                    }
+                }
+            } else {
+                try {
+                    height = co_await full_node_->get_block_height();
+                    node_ok = (height >= 0);
+                } catch (const std::exception& ex) {
+                    node_ok = false;
+                    spdlog::warn("[Engine] [S28] full node height failed: {}",
+                                 ex.what());
+                }
+                const auto before = height_source_.current;
+                if (next_height_source(height_source_, node_ok, mode_is_auto)
+                        != before) {
+                    spdlog::error(
+                        "[Engine] [S28] full node has failed {} consecutive "
+                        "height polls -- falling back to the WALLET RPC for "
+                        "block height so the heartbeat keeps running. The "
+                        "engine is not blind and its offers are still managed.",
+                        risk::kNodeFailuresBeforeWalletFallback);
+                }
+                if (!node_ok) {
+                    // Nothing usable this cycle; the switch (if any) takes
+                    // effect on the next poll.
+                    continue;
+                }
+            }
+
+            if (!risk::height_is_usable(
+                    height, last_block_.load(std::memory_order_relaxed))) {
+                // A wallet tip BEHIND the node's would read as a reorg to
+                // every downstream consumer, so it is skipped rather than
+                // applied. Negative heights are a malfunctioning RPC.
+                spdlog::debug("[Engine] [S28] height {} not usable against "
+                              "last seen {}; skipping this poll",
+                              height, last_block_.load());
+                continue;
+            }
 
             // [MEDIUM-4] Guard against negative block heights returned by a
             // malfunctioning or unreachable full node.  The RPC returns
