@@ -469,3 +469,123 @@ def test_page_constants_match_the_sidebar_order(qapp):
         assert labels[index] == label, (
             "_PAGE_* constant for %s points at %s" % (label, labels[index])
         )
+
+
+# --------------------------------------------------------------------------- #
+# Sections
+#
+# The page grew a sub-menu that opens inside the tab. The load-bearing checks
+# are that nothing about the identity state machine moved, and that the two
+# new surfaces which touch the network or the account are gated.
+# --------------------------------------------------------------------------- #
+
+def _fake_market_page(qapp, reader):
+    from gui.widgets.permuto import PermutoWidget
+
+    io = FakeSecretsIO()
+    ident = PermutoIdentity(io, protector=FakeProtector())
+    return PermutoWidget(lambda: ident, market_reader=reader), ident
+
+
+def test_the_page_opens_on_identity(page):
+    widget, _ = page
+    assert widget._sections.current_index() == 0
+    assert widget._sections.bar.title(0) == "Identity"
+
+
+def test_every_section_is_reachable(page):
+    widget, _ = page
+    titles = [widget._sections.bar.title(i)
+              for i in range(widget._sections.bar.count())]
+    assert titles == ["Identity", "Markets", "Quoting", "Activity"]
+    for i in range(len(titles)):
+        widget._sections.set_current(i)
+        assert widget._sections.stack.currentIndex() == i
+
+
+def test_the_status_line_is_outside_the_sections(page):
+    """It reports link attempts, which an operator must not miss.
+
+    Burying it in one section would hide the most important line on the page
+    behind a click.
+    """
+    widget, _ = page
+    for i in range(widget._sections.bar.count()):
+        widget._sections.set_current(i)
+        assert widget._status.parentWidget() is widget
+
+
+# -- Markets: read-only, and it stops when you look away --------------------- #
+
+def test_markets_polls_only_while_its_section_is_open(qapp):
+    calls = []
+
+    def reader():
+        calls.append(1)
+        return {"prices": {"QQQ-VOL-PERP": 0.07}, "trading_paused": False}
+
+    widget, _ = _fake_market_page(qapp, reader)
+    widget._sections.set_current(1)
+    widget._markets_btn.setChecked(True)
+    assert calls, "polling did not start"
+
+    # Navigating away must stop it: a background poll feeding a widget nobody
+    # is looking at is a request every 5s against a venue we compete on.
+    widget._sections.set_current(0)
+    assert not widget._markets_btn.isChecked()
+
+
+def test_a_failing_poll_does_not_raise_into_the_event_loop(qapp):
+    def boom():
+        raise RuntimeError("venue down")
+
+    widget, _ = _fake_market_page(qapp, boom)
+    widget._sections.set_current(1)
+    widget._markets_btn.setChecked(True)          # must not raise
+    assert "unavailable" in widget._markets_lbl.text()
+    assert "venue down" in widget._markets_note.text()
+
+
+def test_a_venue_pause_is_stated_plainly(qapp):
+    widget, _ = _fake_market_page(
+        qapp,
+        lambda: {"prices": {"QQQ-VOL-PERP": 0.07}, "trading_paused": True},
+    )
+    widget._sections.set_current(1)
+    widget._markets_btn.setChecked(True)
+    assert "PAUSED" in widget._markets_note.text()
+
+
+# -- Quoting: never armed by accident ---------------------------------------- #
+
+def test_quoting_is_not_armed_without_a_registration(page):
+    widget, _ = page
+    widget._sections.set_current(2)
+    assert not widget._arm_btn.isEnabled()
+    assert "not registered" in widget._arm_note.text()
+
+
+def test_quoting_stays_unarmed_even_once_registered(page):
+    """Arming places REAL orders with real collateral.
+
+    That is a deliberate decision, not a side effect of opening a tab, so the
+    button stays disabled and the page says why rather than implying it with
+    a grey rectangle.
+    """
+    widget, ident = page
+    ident.create()
+    ident.mark_backup_confirmed()
+    ident.mark_registered(user_id="u" * 64, trading_address="xch1example")
+
+    widget._sections.set_current(2)
+    assert not widget._arm_btn.isEnabled()
+    assert "deliberate" in widget._arm_note.text()
+
+
+def test_the_quoting_summary_states_the_ring_and_the_risk_lines(page):
+    widget, _ = page
+    widget._sections.set_current(2)
+    text = widget._quoting_lbl.text()
+    assert "2.00%" in text          # the ring depth credit is measured in
+    assert "5.00%" in text          # the legal band
+    assert "utilisation" in text

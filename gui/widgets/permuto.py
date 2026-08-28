@@ -31,9 +31,10 @@ from __future__ import annotations
 
 import hashlib
 import logging
+from datetime import datetime
 from typing import Any, Optional
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal, Slot
+from PySide6.QtCore import QObject, Qt, QThread, QTimer, Signal, Slot
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -42,19 +43,39 @@ from PySide6.QtWidgets import (
     QFrame,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMessageBox,
+    QPlainTextEdit,
     QPushButton,
+    QScrollArea,
     QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from gui.theme import COLORS as _C
+from gui.widgets.sub_tabs import SubTabPages
 
 _log = logging.getLogger(__name__)
 
 PERMUTO_URL = "https://perps.permuto.capital"
+
+#: Lines kept in the Activity section. Bounded because this is a diagnostic
+#: view, not a log: an unbounded QPlainTextEdit on a 5s poll grows without
+#: limit over a 102-hour contest.
+_ACTIVITY_LINES = 500
+
+#: How often the Markets section re-reads the venue.
+#:
+#: Matches the oracle's own resample interval. Faster would show the same
+#: number twice; slower would show a figure the venue has already replaced,
+#: on a series measured moving 10-13% in seconds.
+_MARKETS_POLL_MS = 5000
+
+#: Section indices, in the order they are added.
+_SECTION_IDENTITY = 0
+_SECTION_MARKETS = 1
+_SECTION_QUOTING = 2
+_SECTION_ACTIVITY = 3
 
 
 # --------------------------------------------------------------------------- #
@@ -423,6 +444,30 @@ def _default_identity_factory():
     return PermutoIdentity(_SecretsFileIO(base / "secrets.yaml"))
 
 
+def _default_market_reader() -> dict:
+    """Oracle prices and the pause flag, from the public routes.
+
+    Deliberately the ONLY network call this page makes without a session:
+    both routes are unauthenticated reads, so opening the Markets section can
+    never be an action against the account.
+    """
+    from gui.services.permuto.auth import _request
+
+    prices = (_request("GET", "/info/oracle") or {}).get("prices") or {}
+    flags = (_request("GET", "/info/meta") or {}).get("flags") or {}
+    return {"prices": prices, "trading_paused": bool(flags.get("trading_paused"))}
+
+
+def _scrolled(inner: QWidget) -> QScrollArea:
+    """Wrap a section so a narrow window scrolls it instead of clipping it."""
+    area = QScrollArea()
+    area.setWidgetResizable(True)
+    area.setWidget(inner)
+    area.setStyleSheet(
+        "QScrollArea { border: none; background: transparent; }")
+    return area
+
+
 class PermutoWidget(QWidget):
     """Identity + registration surface for the Permuto perps venue."""
 
@@ -430,6 +475,7 @@ class PermutoWidget(QWidget):
         self,
         identity_factory: Any = None,
         parent: Optional[QWidget] = None,
+        market_reader: Any = None,
     ) -> None:
         super().__init__(parent)
         # Default factory so the page can be built by _create_page_widget like
@@ -444,35 +490,71 @@ class PermutoWidget(QWidget):
         # again; the old handler discarded them and then re-enabled Register
         # under a message telling the operator not to press it.
         self._pending_registration: Optional[dict] = None
+        # Injectable so tests exercise the Markets section without a socket.
+        self._market_reader = market_reader or _default_market_reader
+        self._markets_timer: Optional[QTimer] = None
+        self._target_depth_usd = 1_200.0
+        self._max_position = 100.0
         self._build()
         self.refresh()
 
     # -- construction ------------------------------------------------------- #
 
     def _build(self) -> None:
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(14)
+        root = QVBoxLayout(self)
+        root.setContentsMargins(24, 24, 24, 16)
+        root.setSpacing(10)
 
         title = QLabel("Permuto Capital -- volatility perps")
         title.setStyleSheet(
             f"color: {_C.TEXT_PRIMARY}; font-size: 18px; font-weight: bold;"
         )
-        layout.addWidget(title)
+        root.addWidget(title)
 
         subtitle = QLabel(
             "Market-maker prizes require the BLS wallet identity, not OAuth. "
-            "The key below is generated and held locally -- no third-party "
-            "wallet, no WalletConnect."
+            "The key is generated and held locally -- no third-party wallet, "
+            "no WalletConnect."
         )
         subtitle.setWordWrap(True)
         subtitle.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
-        layout.addWidget(subtitle)
+        root.addWidget(subtitle)
 
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet(f"color: {_C.BORDER};")
-        layout.addWidget(line)
+        root.addWidget(line)
+
+        # Sections open INSIDE this page rather than as siblings in the
+        # sidebar: they share one identity and one venue session, and a
+        # sidebar entry per section would imply four independent pages.
+        self._sections = SubTabPages()
+        for label, builder in (
+            ("Identity", self._build_identity_page),
+            ("Markets", self._build_markets_page),
+            ("Quoting", self._build_quoting_page),
+            ("Activity", self._build_activity_page),
+        ):
+            self._sections.add_page(label, _scrolled(builder()))
+        self._sections.currentChanged.connect(self._on_section_changed)
+        root.addWidget(self._sections, stretch=1)
+
+        # Status lives OUTSIDE the sections, deliberately. It reports on the
+        # identity and on link attempts, which are the states an operator
+        # must not miss, and burying it in one section would hide the most
+        # important line on the page behind a click.
+        self._status = QLabel("")
+        self._status.setWordWrap(True)
+        self._status.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        root.addWidget(self._status)
+
+    # -- sections ----------------------------------------------------------- #
+
+    def _build_identity_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(14)
 
         self._identity_lbl = QLabel("")
         self._identity_lbl.setWordWrap(True)
@@ -517,13 +599,216 @@ class PermutoWidget(QWidget):
 
         row.addStretch(1)
         layout.addLayout(row)
+        layout.addStretch(1)
+        return page
 
-        self._status = QLabel("")
-        self._status.setWordWrap(True)
-        self._status.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        layout.addWidget(self._status)
+    def _build_markets_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(12)
+
+        blurb = QLabel(
+            "Read-only. These are the venue's own numbers, polled from the "
+            "public /info routes -- no key and no orders are involved. The "
+            "oracle is a 60-second trailing realized-vol estimate resampled "
+            "every 5s, so it moves faster than any equity book."
+        )
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(blurb)
+
+        self._markets_lbl = QLabel("Not polling.")
+        self._markets_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._markets_lbl.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-family: monospace;"
+        )
+        layout.addWidget(self._markets_lbl)
+
+        row = QHBoxLayout()
+        self._markets_btn = QPushButton("Start polling")
+        self._markets_btn.setCheckable(True)
+        self._markets_btn.toggled.connect(self._on_markets_toggled)
+        row.addWidget(self._markets_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._markets_note = QLabel("")
+        self._markets_note.setWordWrap(True)
+        self._markets_note.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(self._markets_note)
 
         layout.addStretch(1)
+        return page
+
+    def _build_quoting_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(12)
+
+        blurb = QLabel(
+            "The parameters the quoting loop would run with. Depth credit is "
+            "min(bid, ask), so the two sides are always sized equally and "
+            "inventory is steered by moving BOTH quotes in price -- shrinking "
+            "a side would truncate the minimum and cost eligibility."
+        )
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(blurb)
+
+        self._quoting_lbl = QLabel("")
+        self._quoting_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self._quoting_lbl.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-family: monospace;"
+        )
+        layout.addWidget(self._quoting_lbl)
+
+        row = QHBoxLayout()
+        self._arm_btn = QPushButton("Start quoting")
+        self._arm_btn.setEnabled(False)
+        row.addWidget(self._arm_btn)
+        row.addStretch(1)
+        layout.addLayout(row)
+
+        self._arm_note = QLabel("")
+        self._arm_note.setWordWrap(True)
+        self._arm_note.setStyleSheet(f"color: {_C.WARNING_YELLOW};")
+        layout.addWidget(self._arm_note)
+
+        layout.addStretch(1)
+        return page
+
+    def _build_activity_page(self) -> QWidget:
+        page = QWidget()
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(0, 4, 0, 0)
+        layout.setSpacing(10)
+
+        blurb = QLabel(
+            "Everything this page has done, newest last. Kept in memory only "
+            "-- the engine's own log is the durable record."
+        )
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet(f"color: {_C.TEXT_SECONDARY};")
+        layout.addWidget(blurb)
+
+        self._activity = QPlainTextEdit()
+        self._activity.setReadOnly(True)
+        self._activity.setMaximumBlockCount(_ACTIVITY_LINES)
+        self._activity.setStyleSheet(
+            f"color: {_C.TEXT_PRIMARY}; font-family: monospace;"
+        )
+        layout.addWidget(self._activity, stretch=1)
+        return page
+
+    # -- section behaviour -------------------------------------------------- #
+
+    def _on_section_changed(self, index: int) -> None:
+        """Stop polling when the operator navigates away from Markets.
+
+        A background poll feeding a widget nobody is looking at is a request
+        per 5s against a venue we are also a competitor on, for no benefit.
+        """
+        if index != _SECTION_MARKETS and self._markets_btn.isChecked():
+            self._markets_btn.setChecked(False)
+        if index == _SECTION_QUOTING:
+            self._refresh_quoting()
+
+    def _log_activity(self, message: str) -> None:
+        stamp = datetime.now().strftime("%H:%M:%S")
+        self._activity.appendPlainText("%s  %s" % (stamp, message))
+
+    # -- markets ------------------------------------------------------------ #
+
+    def _on_markets_toggled(self, on: bool) -> None:
+        self._markets_btn.setText("Stop polling" if on else "Start polling")
+        if not on:
+            if self._markets_timer is not None:
+                self._markets_timer.stop()
+            self._markets_note.setText("")
+            self._log_activity("markets: polling stopped")
+            return
+
+        if self._markets_timer is None:
+            self._markets_timer = QTimer(self)
+            self._markets_timer.timeout.connect(self._poll_markets)
+        self._markets_timer.start(_MARKETS_POLL_MS)
+        self._log_activity("markets: polling every %.0fs"
+                           % (_MARKETS_POLL_MS / 1000.0))
+        self._poll_markets()
+
+    def _poll_markets(self) -> None:
+        """One read of the public routes. Never raises into the event loop."""
+        try:
+            snapshot = self._market_reader()
+        except Exception as exc:  # noqa: BLE001 - a poll must not kill the UI
+            self._markets_lbl.setText("unavailable")
+            self._markets_note.setText("Last poll failed: %s" % exc)
+            self._log_activity("markets: poll failed -- %s" % exc)
+            return
+
+        prices = snapshot.get("prices") or {}
+        if not prices:
+            self._markets_lbl.setText("venue returned no oracle prices")
+            return
+
+        lines = ["%-18s %12s" % ("MARKET", "ORACLE")]
+        for name in sorted(prices):
+            lines.append("%-18s %12s" % (name, prices[name]))
+        self._markets_lbl.setText(chr(10).join(lines))
+
+        paused = snapshot.get("trading_paused")
+        if paused:
+            self._markets_note.setText(
+                "TRADING IS PAUSED at the venue. Quotes are rejected while "
+                "this holds, and the Sunday reset happens inside a pause.")
+        else:
+            self._markets_note.setText("Trading is open.")
+
+    # -- quoting ------------------------------------------------------------ #
+
+    def _refresh_quoting(self) -> None:
+        """Show the parameters, and say plainly why quoting is not armed."""
+        from gui.services.permuto import risk as _risk
+
+        rows = [
+            ("target depth per side", "$%.0f" % self._target_depth_usd),
+            ("max position", "%.0f contracts" % self._max_position),
+            ("aggressive ring", "+/-2.00%  (depth credit + purge boundary)"),
+            ("legal band", "+/-5.00%  (outside is HTTP 400)"),
+            ("stop adding risk at", "%.0f%% margin utilisation"
+                % (_risk.MAX_MARGIN_UTILISATION * 100)),
+            ("shed risk at", "%.0f%% margin utilisation"
+                % (_risk.FLATTEN_MARGIN_UTILISATION * 100)),
+            ("carried sizing", "1/%.0f of live size (8x stressed IM)"
+                % _risk.CARRIED_IM_MULTIPLIER),
+        ]
+        width = max(len(k) for k, _ in rows)
+        self._quoting_lbl.setText(
+            chr(10).join("%-*s  %s" % (width, k, v) for k, v in rows))
+
+        try:
+            info = self._identity_factory().info()
+            registered = bool(info.registered)
+        except Exception:  # noqa: BLE001 - no identity is a normal state
+            registered = False
+
+        # The button stays disabled, and the reason is spelled out rather
+        # than implied by a grey rectangle. Arming this places REAL orders
+        # with real collateral, so it is an explicit decision and not a
+        # side effect of opening a tab.
+        if not registered:
+            self._arm_note.setText(
+                "Not armed: this identity is not registered with Permuto. "
+                "Register on the Identity section first.")
+        else:
+            self._arm_note.setText(
+                "Not armed: the quoting loop is built and tested but has "
+                "never placed a live order. Arming it is a separate, "
+                "deliberate step -- it commits real collateral, and an "
+                "unhedgeable position on a 60-second realized-vol oracle is "
+                "not something to start by clicking a button you found.")
 
     # -- state -------------------------------------------------------------- #
 
