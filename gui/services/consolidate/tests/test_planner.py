@@ -1025,3 +1025,46 @@ def test_an_infinite_first_leg_deviation_falls_back_rather_than_refusing_all():
     assert remaining_route_cap(0.10, float("inf")) == per_leg_cap(0.10, 2)
     assert remaining_route_cap(0.10, float("nan")) == per_leg_cap(0.10, 2)
     assert remaining_route_cap(0.10, float("inf")) > 0.0
+
+
+def test_a_dear_first_hop_is_accepted_when_the_second_pays_for_it():
+    """[review] Nothing pinned the full-cap first hop.
+
+    Reverting that line to per_leg_cap(cap, 2) left every test green: the
+    existing cases are empty under both rules, or have a NEGATIVE first
+    deviation that passes either cap. This one needs the full cap — a +9%
+    first hop is refused by the 4.88% split — and a second hop cheap enough
+    that the composite stays inside 10%.
+    """
+    hop1 = offer("h1", 1_090, 1_000, give_asset=BYC, recv_asset="usds")
+    hop2 = offer("h2", 1_000, 1_000, give_asset="usds", recv_asset=XCH)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=1_090 * denomination(BYC),
+        direct_offers=[], direct_anchor=None,
+        first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
+        second_hop_offers=[hop2], second_hop_anchor=Anchor(rate=1.0, source="t"),
+        max_slippage_frac=0.10,
+    )
+    assert len(plan.legs) == 2, "the +9% first hop was refused"
+    first = plan.legs[0]
+    assert rate_deviation_frac(
+        first.realised_rate, Anchor(rate=1.0, source="t")
+    ) == pytest.approx(0.09, abs=0.005)
+
+
+def test_the_composite_bound_still_holds_for_that_route():
+    """The full cap on hop one is only safe because hop two absorbs what is
+    left; a +9% first hop must not be followed by another dear one."""
+    hop1 = offer("h1", 1_090, 1_000, give_asset=BYC, recv_asset="usds")
+    dear2 = offer("h2", 1_060, 1_000, give_asset="usds", recv_asset=XCH)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH, hop_asset="usds",
+        budget=1_090 * denomination(BYC),
+        direct_offers=[], direct_anchor=None,
+        first_hop_offers=[hop1], first_hop_anchor=Anchor(rate=1.0, source="t"),
+        second_hop_offers=[dear2], second_hop_anchor=Anchor(rate=1.0, source="t"),
+        max_slippage_frac=0.10,
+    )
+    # 1.09 * 1.06 = 1.155, past the 10% route cap.
+    assert plan.is_empty

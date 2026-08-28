@@ -408,9 +408,14 @@ def remaining_route_cap(route_cap: float, first_leg_deviation: float) -> float:
 
     Once the first leg is priced its deviation d1 is a fact, so the second
     leg's allowance follows from the route cap directly: (1+s)/(1+d1) - 1,
-    which multiplies back out to (1+d1)*(1+d2) <= 1+s. This is never tighter
-    than the split it replaces -- d1 is itself within the split, so the
-    quotient is at least (1+s)^(1/2) - 1.
+    which multiplies back out to (1+d1)*(1+d2) <= 1+s.
+
+    [review] It is NOT "never tighter than the split it replaces" -- that
+    claim was true only while the first hop was itself capped at the split.
+    The first hop now gets the full route cap, so a +9% first leg against a
+    10% route cap leaves about 0.917% here, well inside the 4.88% equal
+    split. That is the point rather than a regression: the composite bound is
+    what matters, and a first hop that spends most of it must leave the rest.
 
     The result is clamped at ``route_cap``. Strictly, a large enough bargain
     on hop one buys more headroom than that, but the bargain is measured
