@@ -267,7 +267,6 @@ def _default_identity_factory():
     from pathlib import Path
 
     from gui.services.permuto.identity import PermutoIdentity
-    from gui.services.warp.keystore import default_protector
     from gui.services.warp.service import _SecretsFileIO
 
     try:
@@ -277,9 +276,18 @@ def _default_identity_factory():
     except Exception:  # noqa: BLE001 - fall back to the working directory
         base = Path.cwd()
 
-    return PermutoIdentity(
-        _SecretsFileIO(base / "secrets.yaml"), protector=default_protector()
-    )
+    # default_protector() RAISES on every non-Windows platform. Calling it
+    # eagerly here meant _create_page_widget caught the exception during
+    # construction (refresh() runs the factory) and replaced the whole page
+    # with "Permuto (not yet implemented)" on Linux and macOS -- for a
+    # project that is open source and used worldwide, that silently removes
+    # the feature for most of its users.
+    #
+    # Reading and displaying PUBLIC identity state needs no protector at
+    # all, so it is resolved lazily: PermutoIdentity only asks for one when
+    # it actually has to wrap or unwrap the key, and the error surfaces then,
+    # attached to the operation that needs it.
+    return PermutoIdentity(_SecretsFileIO(base / "secrets.yaml"))
 
 
 class PermutoWidget(QWidget):
@@ -445,12 +453,25 @@ class PermutoWidget(QWidget):
         running, and these requests take up to 30 seconds. MainWindow calls
         this for every page that owns a thread.
         """
-        thread, self._thread = self._thread, None
+        thread = self._thread
+        if thread is None:
+            return
+        # quit() only asks the event loop to stop, and the worker is blocked
+        # in a socket read for up to 30 seconds -- so waiting politely can
+        # expire with the thread still running, and returning here would let
+        # closeEvent() destroy the widget underneath it. That is the exact
+        # "QThread: Destroyed while thread is still running" abort this
+        # method exists to prevent. Same terminate-and-wait fallback the
+        # other page-owned workers use (settings.py, wallet_balances.py).
+        thread.quit()
+        if not thread.wait(10000):
+            _log.warning("permuto: worker thread did not stop; terminating")
+            thread.terminate()
+            thread.wait(1000)
+        # Cleared only AFTER the thread is actually down, so nothing can
+        # observe a half-torn-down state.
+        self._thread = None
         self._worker = None
-        if thread is not None:
-            thread.quit()
-            if not thread.wait(10000):
-                _log.warning("permuto: worker thread did not stop in time")
 
     # -- actions ------------------------------------------------------------ #
 

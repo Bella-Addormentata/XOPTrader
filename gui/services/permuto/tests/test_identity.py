@@ -223,3 +223,49 @@ def test_identity_blob_is_bound_to_its_own_entropy(ident):
             __import__("base64").b64decode(section["bls_private_key_dpapi"]),
             b"XOPTrader/warp/keystore/v1",
         )
+
+
+# --------------------------------------------------------------------------- #
+# Platform reach -- the page must not vanish where DPAPI does not exist
+# --------------------------------------------------------------------------- #
+
+def test_inspection_needs_no_protector_at_all():
+    """default_protector() raises off Windows, and resolving it eagerly took
+    the whole Permuto page down on Linux and macOS -- for a project that is
+    open source and used worldwide. Reading PUBLIC state must not need one."""
+    io_ = FakeSecretsIO({
+        "permuto": {
+            "bls_public_key": "ab" * 48,
+            "bls_private_key_dpapi": "irrelevant",
+            "registered": True,
+            "user_id": "c" * 64,
+            "trading_address": "xch1x",
+            "listing_verified": True,
+        }
+    })
+    ident = PermutoIdentity(io_)          # no protector supplied
+    info = ident.info()                   # must not raise
+    assert info.pubkey == "ab" * 48
+    assert info.registered and info.listing_verified
+    assert ident.public_key() == "ab" * 48
+    assert ident.exists() is True
+
+
+def test_the_protector_is_resolved_only_when_key_material_is_touched():
+    """And when it IS needed, the platform error arrives attached to the
+    operation that requires it rather than to page construction."""
+    calls = []
+
+    class Boom:
+        def protect(self, data, entropy=b""):
+            calls.append("protect")
+            raise RuntimeError("no secure store on this platform")
+
+        def unprotect(self, blob, entropy=b""):
+            raise RuntimeError("no secure store on this platform")
+
+    ident = PermutoIdentity(FakeSecretsIO(), protector=Boom())
+    assert calls == []                    # construction touched nothing
+    with pytest.raises(RuntimeError, match="secure store"):
+        ident.create()
+    assert calls == ["protect"]

@@ -173,6 +173,22 @@ class PermutoIdentity:
         self._io = secrets_io
         self._protector = protector
 
+    def _wrapper(self):
+        """The at-rest protector, resolved on first ACTUAL use.
+
+        Resolving eagerly meant constructing an identity raised on every
+        non-Windows platform, which took the whole page down with it -- even
+        though reading the public key, the address and the registration state
+        needs no protector at all. Deferring it keeps inspection working
+        everywhere and puts the platform error on the operation that genuinely
+        requires a secure store.
+        """
+        if self._protector is None:
+            from ..warp.keystore import default_protector
+
+            self._protector = default_protector()
+        return self._protector
+
     # -- internals ---------------------------------------------------------- #
 
     def _section(self, secrets: dict) -> dict:
@@ -214,7 +230,7 @@ class PermutoIdentity:
             section["bls_private_key_dpapi"] = keystore.protect_secret(
                 bytes(sk),
                 extra_entropy=_IDENTITY_ENTROPY,
-                protector=self._protector,
+                protector=self._wrapper(),
             )
             section["bls_public_key"] = pubkey
             section["created_at"] = datetime.now(timezone.utc).isoformat()
@@ -251,7 +267,7 @@ class PermutoIdentity:
             section["bls_private_key_dpapi"] = keystore.protect_secret(
                 bytes(sk),
                 extra_entropy=_IDENTITY_ENTROPY,
-                protector=self._protector,
+                protector=self._wrapper(),
             )
             section["bls_public_key"] = pubkey
             section.setdefault("created_at",
@@ -278,7 +294,7 @@ class PermutoIdentity:
                 "restore it from its 24-word recovery phrase"
             )
         raw = keystore.unprotect_secret(
-            blob, extra_entropy=_IDENTITY_ENTROPY, protector=self._protector
+            blob, extra_entropy=_IDENTITY_ENTROPY, protector=self._wrapper()
         )
         return chia_rs.PrivateKey.from_bytes(raw)
 
