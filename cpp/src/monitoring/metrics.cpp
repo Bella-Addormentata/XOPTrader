@@ -345,6 +345,7 @@ void MetricsExporter::register_metrics()
     gate_flash_crash_    = &posting_gate_family_->Add({{"reason", "flash_crash"}});
     gate_xch_recovery_   = &posting_gate_family_->Add({{"reason", "xch_recovery"}});
     gate_dry_run_        = &posting_gate_family_->Add({{"reason", "dry_run"}});
+    gate_watchdog_       = &posting_gate_family_->Add({{"reason", "watchdog"}});
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
@@ -729,7 +730,8 @@ void MetricsExporter::update_stuck_offers(int count)
 void MetricsExporter::update_posting_gates(bool gui, bool breaker,
                                            bool wallet_circuit,
                                            bool flash_crash,
-                                           bool xch_recovery, bool dry_run)
+                                           bool xch_recovery, bool dry_run,
+                                           bool watchdog)
 {
     // Same locked lifecycle check as every neighbouring updater: shutdown()
     // resets registry_ under this mutex, destroying the gauges, so an
@@ -743,9 +745,10 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
     gate_flash_crash_->Set(flash_crash ? 1.0 : 0.0);
     gate_xch_recovery_->Set(xch_recovery ? 1.0 : 0.0);
     gate_dry_run_->Set(dry_run ? 1.0 : 0.0);
+    gate_watchdog_->Set(watchdog ? 1.0 : 0.0);
     posting_gated_gauge_->Set(
         (gui || breaker || wallet_circuit || flash_crash || xch_recovery
-         || dry_run) ? 1.0 : 0.0);
+         || dry_run || watchdog) ? 1.0 : 0.0);
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

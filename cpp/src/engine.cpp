@@ -13824,7 +13824,8 @@ void Engine::step_export_metrics(BlockHeight block_height)
     metrics_->update_posting_gates(
         gui_pause_active_, breaker_pause_active_, wallet_circuit_open_,
         flash_crash_state_ != FlashCrashState::Normal,
-        xch_recovery_mode_, dry_run_);
+        xch_recovery_mode_, dry_run_,
+        watchdog_fired_.load(std::memory_order_acquire));
 
     // Dashboard 8: Rolling 24-hour blockchain fees
     if (fee_tracker_ && fee_tracker_->enabled()) {
