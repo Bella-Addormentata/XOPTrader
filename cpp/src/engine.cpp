@@ -13867,13 +13867,28 @@ void Engine::step_check_alerts(BlockHeight block_height)
     // alternating junk/honest cycles cannot ratchet the peak.
     const auto authority = valuation_authority_.step(valuation_degraded_);
     if (authority.entered_degraded) {
-        spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
-                     "(carry TTL exceeded on a held asset) -- peak frozen "
-                     "at ${:.2f} until {} consecutive clean cycles.  Both "
-                     "breakers REMAIN ARMED and keep comparing against "
-                     "that frozen peak",
-                     peak_equity_hwm_usd_,
-                     risk::ValuationAuthorityGate::kRearmCleanCycles);
+        // [S33] The cause matters, because the consequences differ. A carry
+        // that outlived its TTL leaves a real frozen peak and armed breakers.
+        // A book written off entirely (S32) has NO carry and NO peak, so
+        // saying "peak frozen at $0.00, both breakers remain armed" would be
+        // false on both counts -- and it is the FIRST thing an operator sees,
+        // ahead of the fail-closed latch that follows.
+        if (peak_equity_hwm_usd_ > 0.0) {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "(carry TTL exceeded on a held asset) -- peak frozen "
+                         "at ${:.2f} until {} consecutive clean cycles.  Both "
+                         "breakers REMAIN ARMED and keep comparing against "
+                         "that frozen peak",
+                         peak_equity_hwm_usd_,
+                         risk::ValuationAuthorityGate::kRearmCleanCycles);
+        } else {
+            spdlog::warn("[Engine] Step 13: [S20] equity valuation DEGRADED "
+                         "with NO equity peak ever established -- there is "
+                         "nothing to freeze and the drawdown breaker cannot "
+                         "fire against a zero peak.  This is the write-off / "
+                         "never-valued path, not an expired carry; the "
+                         "fail-closed check below decides whether to pause.");
+        }
     }
     if (authority.recovered) {
         spdlog::info("[Engine] Step 13: [S20] equity valuation clean for "

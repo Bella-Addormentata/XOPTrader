@@ -43,26 +43,6 @@
 
 namespace xop::risk {
 
-/// Equity drawdown fraction, USD in / dimensionless out:
-///
-///     peak > 0 :  (peak - equity) / peak
-///     peak <= 0:  0.0 -- equity is a sum of holdings x non-negative
-///                 prices, so a non-positive peak means nothing has been
-///                 valued yet and there is no measurable drawdown.  (This
-///                 differs from the retired P&L variant, whose "losing
-///                 from a never-profitable baseline" branch existed
-///                 because P&L can be genuinely negative.)
-///
-/// The caller compares against risk.max_drawdown_frac and applies the
-/// startup grace window; this function is just the unit-critical
-/// arithmetic.  NaN inputs fail every comparison and yield 0.0 (no trip).
-// ---------------------------------------------------------------------------
-// [S27 2026-08-27] Fail-closed decision -- a SEPARATE documentation block.
-// Without this break the comment below continues the preceding
-// equity_drawdown_frac Doxygen block, so generated docs attach that
-// function's arithmetic and NaN-return prose to this bool-returning API.
-// ---------------------------------------------------------------------------
-
 /// Whether a held asset with no live price should be WRITTEN OFF at $0
 /// rather than degrading the valuation cycle.
 ///
@@ -172,6 +152,19 @@ namespace xop::risk {
     return !(peak_equity_usd > 0.0);
 }
 
+/// Equity drawdown fraction, USD in / dimensionless out:
+///
+///     peak > 0 :  (peak - equity) / peak
+///     peak <= 0:  0.0 -- equity is a sum of holdings x non-negative
+///                 prices, so a non-positive peak means nothing has been
+///                 valued yet and there is no measurable drawdown.  (This
+///                 differs from the retired P&L variant, whose "losing
+///                 from a never-profitable baseline" branch existed
+///                 because P&L can be genuinely negative.)
+///
+/// The caller compares against risk.max_drawdown_frac and applies the
+/// startup grace window; this function is just the unit-critical
+/// arithmetic.  NaN inputs fail every comparison and yield 0.0 (no trip).
 [[nodiscard]] constexpr double equity_drawdown_frac(
     double peak_equity_usd, double equity_usd) noexcept
 {
