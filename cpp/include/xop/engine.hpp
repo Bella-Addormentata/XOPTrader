@@ -425,7 +425,13 @@ private:
     /// at up to 30s each, so probing every poll paid ~2 minutes of heartbeat
     /// latency during an outage to detect a minutes-scale event sooner.
     static constexpr int kNodeProbeEveryNPolls = 10;
-    int                  node_probe_skips_{kNodeProbeEveryNPolls};
+    ///
+    /// Starts at 0, not at the threshold. Seeding it full made the FIRST
+    /// wallet-sourced poll probe immediately -- so the very heartbeat that
+    /// the fallback exists to deliver, right after six failed node polls,
+    /// still waited through a four-attempt node probe. The node has just
+    /// failed six times; there is nothing to learn by asking again at once.
+    int                  node_probe_skips_{0};
 
     /// True when running without the full node (wallet-only mode).
     /// Set during open_connections() based on config_.chia.mode and
