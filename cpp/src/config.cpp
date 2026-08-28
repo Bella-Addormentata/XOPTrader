@@ -1608,6 +1608,14 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
     }
 
+    // [S31] The dead man's switch threshold.  0 disables it.
+    if (node["watchdog_stall_seconds"]
+            && node["watchdog_stall_seconds"].IsDefined()
+            && !node["watchdog_stall_seconds"].IsNull()) {
+        cfg.watchdog_stall_seconds =
+            node["watchdog_stall_seconds"].as<std::uint32_t>();
+    }
+
     // [S20 2026-08-24] valuation_carry_ttl_blocks: heartbeats an asset's
     // carried USD price keeps PEAK-UPDATE authority without a fresh
     // valuation-grade print.  Expiry freezes the drawdown peak; it does

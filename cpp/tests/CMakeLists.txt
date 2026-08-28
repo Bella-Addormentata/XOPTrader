@@ -77,6 +77,7 @@ add_executable(xop_tests
     test_bridge_ingest.cpp
     test_reward_ingest.cpp
     test_drawdown_breaker.cpp
+    test_watchdog.cpp
     test_settled_fill.cpp
     test_wallet_poll_throttle.cpp
 )

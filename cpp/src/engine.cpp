@@ -589,8 +589,146 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     spdlog::info("[Engine] All subsystems initialized successfully");
 }
 
+// ===========================================================================
+// S31 -- dead man's switch
+// ===========================================================================
+//
+// Offers outlive the process that is supposed to manage them.  On 2026-08-25
+// the node was unreachable ~4h while offers rested on dexie; when it returned,
+// six four-hour-old bids filled in the same second and tripped the
+// rolling-window breaker.  On 2026-08-26 a stray --dry-run terminated the live
+// process and left ten offers unmanaged.  Same failure twice.
+//
+// WHY ITS OWN THREAD AND ITS OWN io_context.  The engine runs a single
+// ioc_.run() (see run()), so poll loop, heartbeat and every RPC share one
+// thread.  A watchdog posted to that context is starved by precisely the stall
+// it exists to detect -- the 08-25 log contains a cycle recorded as "processed
+// in 14241482 ms", 3.96 hours during which nothing else on that thread ran.
+// A watchdog that can be blocked by what it watches is not a watchdog, so this
+// one shares nothing with the engine except two atomics.
+//
+// WHY THE WALLET RPC.  Cancellation needs only the wallet, and the wallet
+// stayed healthy throughout the 08-25 outage while the full node was
+// unreachable -- which is exactly the scenario this fires in.
+
+void Engine::start_watchdog()
+{
+    const std::uint32_t secs = config_.risk.watchdog_stall_seconds;
+    if (secs == 0) {
+        spdlog::warn("[Engine] [S31] dead man's switch DISABLED "
+                     "(risk.watchdog_stall_seconds = 0). Offers will outlive "
+                     "a wedged engine, which has cost money twice.");
+        return;
+    }
+    if (dry_run_) {
+        spdlog::info("[Engine] [S31] dry run -- watchdog not started");
+        return;
+    }
+    watchdog_stop_.store(false, std::memory_order_relaxed);
+    watchdog_thread_ = std::thread([this] { watchdog_loop(); });
+    spdlog::info("[Engine] [S31] dead man's switch armed: the book is "
+                 "cancelled if no heartbeat completes for {}s", secs);
+}
+
+void Engine::stop_watchdog()
+{
+    watchdog_stop_.store(true, std::memory_order_relaxed);
+    if (watchdog_thread_.joinable()) {
+        watchdog_thread_.join();
+    }
+}
+
+void Engine::watchdog_loop()
+{
+    using clock = std::chrono::steady_clock;
+    const auto now_ms = [] {
+        return std::chrono::duration_cast<std::chrono::milliseconds>(
+            clock::now().time_since_epoch()).count();
+    };
+
+    risk::Watchdog watchdog{
+        static_cast<std::int64_t>(config_.risk.watchdog_stall_seconds) * 1000};
+
+    // Its OWN io_context and its OWN wallet client.  Reusing the engine's
+    // would defeat the entire point.
+    while (!watchdog_stop_.load(std::memory_order_relaxed)) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        if (watchdog_stop_.load(std::memory_order_relaxed)) break;
+
+        const auto action = watchdog.tick(
+            last_beat_ms_.load(std::memory_order_relaxed), now_ms());
+        if (action != risk::WatchdogAction::Fire) continue;
+
+        const auto stale_ms =
+            now_ms() - last_beat_ms_.load(std::memory_order_relaxed);
+        spdlog::error("[Engine] [S31] DEAD MAN'S SWITCH FIRING -- no heartbeat "
+                      "completed for {} ms (threshold {} ms). Cancelling every "
+                      "resting offer through the wallet RPC.",
+                      stale_ms, watchdog.threshold_ms());
+
+        try {
+            asio::io_context wioc;
+            rpc::ChiaRPCConfig wal_cfg;
+            wal_cfg.host = config_.chia.wallet_host;
+            wal_cfg.port = config_.chia.wallet_port;
+            wal_cfg.tls.cert_path    = config_.chia.wallet_cert_path;
+            wal_cfg.tls.key_path     = config_.chia.wallet_key_path;
+            wal_cfg.tls.ca_cert_path = config_.chia.ca_cert_path;
+            wal_cfg.verify_ssl       = config_.chia.verify_ssl;
+            auto wallet = std::make_shared<rpc::ChiaWalletRPC>(wioc, wal_cfg);
+
+            std::string failure;
+            asio::co_spawn(wioc, [&]() -> asio::awaitable<void> {
+                try {
+                    co_await wallet->open();
+                    // Local-only cancellation: an on-chain secure cancel needs
+                    // a fee and a working node, and the node is very often the
+                    // thing that is broken when this fires.  Local removal
+                    // stops OUR wallet honouring the offer, which is what
+                    // takes the quote off dexie.
+                    co_await wallet->cancel_offers(/*fee=*/0, /*secure=*/false);
+                } catch (const std::exception& ex) {
+                    failure = ex.what();
+                }
+                co_return;
+            }, asio::detached);
+            wioc.run();
+
+            if (failure.empty()) {
+                spdlog::error("[Engine] [S31] cancel_offers issued. The book "
+                              "should now be empty; the engine is still "
+                              "wedged and needs manual attention.");
+                if (alerts_) {
+                    alerts_->send_alert(
+                        AlertRule::CircuitBreaker,
+                        "DEAD MAN'S SWITCH FIRED: no heartbeat for " +
+                        std::to_string(stale_ms / 1000) + "s. Every resting "
+                        "offer has been cancelled. The engine is wedged and "
+                        "requires manual intervention.");
+                }
+            } else {
+                spdlog::critical("[Engine] [S31] cancel FAILED: {}. Offers are "
+                                 "STILL LIVE on a wedged engine -- cancel them "
+                                 "by hand NOW.", failure);
+                if (alerts_) {
+                    alerts_->send_alert(
+                        AlertRule::CircuitBreaker,
+                        "DEAD MAN'S SWITCH COULD NOT CANCEL: " + failure +
+                        ". Offers are still live and unmanaged.");
+                }
+            }
+        } catch (const std::exception& ex) {
+            spdlog::critical("[Engine] [S31] watchdog cancel path threw: {}",
+                             ex.what());
+        }
+    }
+}
+
 Engine::~Engine()
 {
+    // [S31] Defensive: run() joins the watchdog, but a path that destroys the
+    // Engine without reaching that join would leave a thread holding `this`.
+    stop_watchdog();
     // Ensure clean shutdown if the caller did not invoke shutdown() explicitly.
     // Guard also covers BotStatus::Analyzing so that destroying the engine
     // during the startup analysis phase correctly cancels the timer and tears
@@ -635,6 +773,12 @@ void Engine::run()
                     asset_ids.end());
     metrics_->init(config_.monitoring.prometheus_port, asset_ids);
 
+    // [S31] Arm the dead man's switch before any offer can exist.  Started
+    // here rather than in the constructor so a config-error abort never
+    // leaves a thread behind, and before trading rather than after so there
+    // is no window in which offers are live and unwatched.
+    start_watchdog();
+
     // Transition to Analyzing (if startup analysis is enabled) or Running.
     if (market_analyzer_) {
         state_->set_status(BotStatus::Analyzing);
@@ -650,6 +794,13 @@ void Engine::run()
 
     // Block until shutdown() posts a stop or all work completes.
     ioc_.run();
+
+    // [S31] ioc_.run() has returned, so the engine is shutting down and will
+    // not manage anything further.  Join before the destructor runs: the
+    // thread captures `this`, and outliving the Engine it reads would be a
+    // use-after-free in the one component whose job is to still work when
+    // everything else has stopped.
+    stop_watchdog();
 
     spdlog::info("[Engine] Main loop exited");
 }
@@ -1970,6 +2121,15 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     auto elapsed = std::chrono::steady_clock::now() - cycle_start;
     auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed);
     spdlog::info("[Engine] Block {} processed in {} ms", block_height, ms.count());
+
+    // [S31] Stamp the heartbeat for the dead man's switch.  Written HERE, at
+    // the end of a cycle that actually completed -- stamping at the start
+    // would mean the 3.96-hour cycle logged on 2026-08-25 looked healthy for
+    // its entire duration, which is precisely the stall being watched for.
+    last_beat_ms_.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count(),
+        std::memory_order_relaxed);
 
     co_return;
 }

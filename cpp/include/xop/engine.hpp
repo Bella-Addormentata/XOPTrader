@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/watchdog.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
@@ -97,6 +98,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
+#include <thread>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -412,6 +414,20 @@ private:
     /// Set during open_connections() based on config_.chia.mode and
     /// full-node reachability (auto-detect).
     bool wallet_only_mode_{false};
+
+    /// [S31] Dead man's switch.  Its own thread and its own io_context by
+    /// necessity, not preference: the engine runs a SINGLE ioc_.run(), so a
+    /// watchdog posted to that context is starved by exactly the stall it
+    /// exists to detect.  The 2026-08-25 log contains one cycle recorded as
+    /// "processed in 14241482 ms" -- 3.96 hours during which nothing else on
+    /// that thread ran.
+    std::thread               watchdog_thread_;
+    std::atomic<std::int64_t> last_beat_ms_{0};
+    std::atomic<bool>         watchdog_stop_{false};
+
+    void start_watchdog();
+    void stop_watchdog();
+    void watchdog_loop();
 
     // -- Pair config lookup ---------------------------------------------------
     // [M11] Declared after config_ so that C++ member initialization order

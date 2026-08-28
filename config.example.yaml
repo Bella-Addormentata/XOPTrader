@@ -315,6 +315,21 @@ strategy:
 # --- risk: REQUIRED ----------------------------------------------------------
 # First 5 fields are REQUIRED; circuit breaker fields are OPTIONAL.
 risk:
+  # [S31] Dead man's switch: cancel every resting offer if no heartbeat cycle
+  # completes for this many seconds.  0 disables it.
+  #
+  # Offers outlive the process meant to manage them, and that has now cost
+  # money twice -- six four-hour-old bids filling in one second when the node
+  # came back (2026-08-25), and ten offers orphaned by a stray --dry-run
+  # (2026-08-26).  The watchdog runs on its own thread with its own wallet
+  # connection, because the engine is single-threaded and a watchdog sharing
+  # that thread is starved by exactly the stall it watches for.
+  #
+  # 600 is deliberate, not round: observed cycles run 3.2-13.9s against a
+  # pathological 3.96 HOURS, so ten minutes sits three orders of magnitude
+  # above normal and far below pathological.
+  watchdog_stall_seconds: 600
+
   # Inventory limits
   soft_limit_pct: 0.60   # [REQUIRED] Begin aggressive skewing
   hard_limit_pct: 0.80   # [REQUIRED] Pull quotes on overweight side (must > soft_limit_pct)
