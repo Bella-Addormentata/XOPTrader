@@ -487,3 +487,67 @@ TEST(MarketCross, NoCandidatesYieldsNoCross) {
     EXPECT_TRUE(select_market_cross("byc_tail", {}, reg, 300.0)
                     .pair_name.empty());
 }
+
+// ---------------------------------------------------------------------------
+// [review] usd_per_base_from_mid -- the multiplication that had no coverage.
+//
+// Review's point: nothing in the suite invoked usd_per_xch(),
+// quote_usd_factor() or asset_usd_pseudo_price(), because no test constructs
+// an Engine. So the single multiplication that keeps a EUR-pegged wrapper
+// from being reported as dollars could have regressed with the suite green.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr double kScale = 1e12;   // kMojosPerXch
+}
+
+TEST(UsdPerBaseFromMid, AUnitParIsJustTheMid) {
+    // 25 quote units per XCH, par $1.00 -> $25.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 1.0);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 25.0);
+}
+
+TEST(UsdPerBaseFromMid, ANonUnitParIsAppliedRatherThanAssumedAway) {
+    // The whole reason the par exists. A EUR wrapper at 1.08 USD/EUR must
+    // not report its EUR mid as dollars.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 1.08);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 27.0);
+    EXPECT_GT(*usd, 25.0) << "the FX rate was dropped";
+}
+
+TEST(UsdPerBaseFromMid, ASubUnitParReducesTheValuation) {
+    // A wrapper trading below its peg target must value BELOW the raw mid.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 0.74);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 18.5);
+}
+
+TEST(UsdPerBaseFromMid, NoParMeansNoValuationNotOneDollar) {
+    // peg_registry's contract: absent must never become 1.0.
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, 0.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, -1.0));
+}
+
+TEST(UsdPerBaseFromMid, AQuietOrJunkBookYieldsNothing) {
+    EXPECT_FALSE(xop::usd_per_base_from_mid(0.0, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(-1.0, kScale, 1.0));
+}
+
+TEST(UsdPerBaseFromMid, NonFiniteInputsYieldNothing) {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::usd_per_base_from_mid(inf, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(nan, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, inf));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, nan));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, 0.0, 1.0));
+}
+
+TEST(UsdPerBaseFromMid, AnOverflowingProductIsRejectedNotReturned) {
+    // Two individually finite values whose product is not. Returning
+    // infinity here reaches llround downstream.
+    const double huge = std::numeric_limits<double>::max();
+    EXPECT_FALSE(xop::usd_per_base_from_mid(huge, 1.0, huge));
+}

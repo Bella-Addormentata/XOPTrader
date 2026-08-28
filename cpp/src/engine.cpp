@@ -11337,9 +11337,12 @@ double Engine::usd_per_xch() const
             // peg no longer enforced) means this pair cannot anchor XCH;
             // continue to the next candidate rather than guessing.
             const auto par = declared_usd_par(pair.quote_asset_id);
-            if (snap.mid_price > 0 && par) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch) * *par;
+            if (par) {
+                if (auto usd = usd_per_base_from_mid(
+                        static_cast<double>(snap.mid_price),
+                        static_cast<double>(kMojosPerXch), *par)) {
+                    return *usd;
+                }
             }
         }
     }

@@ -407,6 +407,31 @@ struct CrossSelection {
     return {};
 }
 
+
+/// USD per BASE unit, from a scaled quote-denominated mid and the quote
+/// asset's declared par.
+///
+/// Extracted because review pointed out that nothing invoked usd_per_xch(),
+/// quote_usd_factor() or asset_usd_pseudo_price() -- no test constructs an
+/// Engine -- so the one multiplication that stops a EUR-pegged wrapper being
+/// reported as dollars had no coverage at all. The declared-par fixes could
+/// have regressed with the whole suite green.
+///
+/// `scaled_mid` is `Snapshot::mid_price`, which carries quote units per base
+/// unit multiplied by `scale` (kMojosPerXch). Returns nullopt rather than a
+/// number for every degenerate input, because the caller's contract is that
+/// an absent value means "no valuation available" and must never become 1.0.
+[[nodiscard]] inline std::optional<double> usd_per_base_from_mid(
+    double scaled_mid, double scale, double par) noexcept
+{
+    if (!(scaled_mid > 0.0) || !std::isfinite(scaled_mid)) return std::nullopt;
+    if (!(scale      > 0.0) || !std::isfinite(scale))      return std::nullopt;
+    if (!(par        > 0.0) || !std::isfinite(par))        return std::nullopt;
+    const double usd = scaled_mid / scale * par;
+    if (!std::isfinite(usd) || !(usd > 0.0)) return std::nullopt;
+    return usd;
+}
+
 }  // namespace xop
 
 #endif  // XOP_PEG_REGISTRY_HPP

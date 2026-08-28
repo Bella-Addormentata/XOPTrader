@@ -490,6 +490,24 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
         if (item["prefer_market_cross"]) {
             a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
         }
+        // [review] These three are PARSED AND STORED, but nothing consumes
+        // them yet: PegRegistry::classify() has no production caller, and
+        // DepegDetector is still built and fed solely from
+        // PairConfig::is_stablecoin and the pair loop. An operator who sets
+        // them is configuring a monitor that does not run -- which is the
+        // exact shape of the S30 failure, where BYC's only peg watch lived
+        // on a pair that had been disabled. Say so rather than accept them
+        // silently; wiring an asset-level detector is what closes S29.
+        if (item["warn_pct"] || item["bail_pct"]
+                || item["sustained_observations"]) {
+            spdlog::warn(
+                "[Config] pegged_assets.{}: warn_pct / bail_pct / "
+                "sustained_observations are recorded but NOT YET WIRED to a "
+                "detector. Peg monitoring still comes only from pairs marked "
+                "`is_stablecoin`, so declaring thresholds here does not by "
+                "itself watch this asset.", a.asset_id);
+        }
+
         if (!reg.add(std::move(a))) {
             // Loud: a half-declared peg silently dropped is how an asset
             // ends up unmonitored while everyone assumes it is watched.
@@ -3336,18 +3354,25 @@ static void deep_merge(YAML::Node dst, const YAML::Node& src)
 // operator hits it.
 void validate_usd_anchor(const AppConfig& cfg)
 {
-    // An external XCH/USD feed is an anchor in its own right and needs no
-    // declaration at all (S27).  With one configured, every XCH-based
-    // conversion has a route and there is nothing to complain about.
-    if (cfg.coingecko.enabled) {
-        const auto& ids = cfg.coingecko.coin_ids;
-        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
-            return;
-        }
-    }
+    // [review] NO CoinGecko EXEMPTION HERE, deliberately.
+    //
+    // An external XCH/USD feed WOULD be an anchor in its own right -- but on
+    // this branch Engine::usd_per_xch() never reads coingecko_prices_. It
+    // walks enabled pairs and asks declared_usd_par(), and returns 0.0 if no
+    // pair yields one. So exempting a CoinGecko-enabled config here silenced
+    // this warning in precisely the deployment it was added to catch: one
+    // upgrading into the registry with no `pegged_assets:` section, whose
+    // valuation is about to go to zero. The check must describe what the
+    // engine does, not what a sibling branch does.
+    //
+    // Teaching usd_per_xch() to prefer the external quote is S27's work
+    // (PR #117), which re-introduces this exemption together with the code
+    // that earns it -- and gated on cex_freshness_threshold_sec, since a
+    // non-positive threshold makes the runtime reject the cached price on
+    // every tick.
 
-    // Otherwise the only remaining route is an enabled pair whose quote asset
-    // carries a declared, enforced USD par.
+    // The only route is an enabled pair whose quote asset carries a
+    // declared, enforced USD par.
     for (const auto& pair : cfg.pairs) {
         if (!pair.enabled) continue;
         const auto* a = cfg.pegged_assets.find(pair.quote_asset_id);
@@ -3368,16 +3393,23 @@ void validate_usd_anchor(const AppConfig& cfg)
         return;
     }
 
+    // The wording is deliberately narrower than an earlier draft, which
+    // promised the engine "will pause fail-closed rather than trade blind".
+    // That behaviour is S27's (PR #117); on this branch a never-valued asset
+    // does not set `degraded`, so nothing pauses -- equity simply reads $0,
+    // and equity_drawdown_frac returns 0.0 against a non-positive peak, so
+    // both breakers sit INERT rather than tripping. Promising protection
+    // that does not exist is worse than the missing anchor: an operator who
+    // reads it has been told the fault is contained.
     spdlog::warn(
-        "[Config] NO USD ANCHOR IS REACHABLE. Every asset would value at $0 "
-        "and both drawdown breakers would sit inert -- this is the "
-        "2026-08-25 incident. Enabled pairs: {}. Fix by EITHER declaring the "
-        "quote asset's peg under `pegged_assets:` (see config.example.yaml; "
-        "a config written before that section existed declares nothing, and "
-        "the old built-in $1 assumptions are gone), OR enabling the "
-        "CoinGecko feed with \"chia\" in coingecko.coin_ids. If you hold "
-        "anything, the engine will pause fail-closed rather than trade "
-        "blind.", enabled_names);
+        "[Config] NO USD ANCHOR IS REACHABLE. Every asset will value at $0 "
+        "and BOTH DRAWDOWN BREAKERS WILL SIT INERT -- they cannot fire "
+        "against a zero peak. This is the 2026-08-25 incident exactly, and "
+        "on this build nothing pauses automatically. Enabled pairs: {}. Fix "
+        "by declaring the quote asset's peg under `pegged_assets:` (see "
+        "config.example.yaml; a config written before that section existed "
+        "declares nothing, and the old built-in $1 assumptions are gone).",
+        enabled_names);
 }
 
 AppConfig load_config(const std::string& path,

@@ -373,6 +373,15 @@ exposure this week.
   *no valuation* rather than a silent 1:1), separates `Unobserved` from
   `Holding`, and has an `enforce` flag. 22 registry tests plus 14 parser
   tests, sabotage-verified.
+  **`pnl.cpp:1512` is now handled too, and it was the dangerous one.** Its
+  retired-pair fallback triggered whenever `usd_per_quote_unit <= 0`, which
+  is exactly what `quote_usd_factor` returns when a declared par is
+  UNAVAILABLE — so `enforce:false` on wUSDC.b, the whole point of this work,
+  silently routed back to a hardcoded $1.00 per unit in the P&L totals.
+  Registered-but-unpriceable now contributes 0.0; only never-registered
+  pairs keep the symbol fallback, which rehydration genuinely needs.
+  **Still carrying the $1 assumption:** `arbitrage.cpp:916`,
+  `market_allocator.cpp:188`, `feed_listings.hpp:47`.
   **STILL OPEN — the observation half.** `PegRegistry::classify` has no
   production caller; `DepegDetector` is registered and updated solely from
   `PairConfig::is_stablecoin` and the pair loop, so disabling `BYC/wUSDC.b`
