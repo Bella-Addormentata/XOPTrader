@@ -433,9 +433,21 @@ private:
     /// failed six times; there is nothing to learn by asking again at once.
     int                  node_probe_skips_{0};
 
-    /// True when running without the full node (wallet-only mode).
-    /// Set during open_connections() based on config_.chia.mode and
-    /// full-node reachability (auto-detect).
+    /// Consecutive full-node polls that answered without advancing.
+    ///
+    /// height_is_usable() accepts height == last_block_, so a frozen node
+    /// resets the failure streak forever and the wallet fallback is never
+    /// reached. A node that says yes and never moves is a dead node.
+    std::uint32_t        node_no_progress_polls_{0};
+
+    /// The RUNTIME latch disabling full-node-dependent behaviour.
+    ///
+    /// [review] No longer only a startup decision. It is set by
+    /// open_connections() from config_.chia.mode and reachability, AND at
+    /// runtime when the height source falls back to the wallet -- and
+    /// cleared again when the node recovers. Anything that must not await a
+    /// dead node (the adaptive-fee path, for one) reads this;
+    /// height_source_ is what drives the source transitions themselves.
     bool wallet_only_mode_{false};
 
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.

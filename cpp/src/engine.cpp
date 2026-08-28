@@ -1359,8 +1359,38 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     // The engine then stops seeing blocks indefinitely
                     // beside a healthy wallet, which is the outage S28
                     // exists to end.
-                    node_ok = risk::height_is_usable(
-                        height, last_block_.load(std::memory_order_relaxed));
+                    // [review] USABLE IS NOT THE SAME AS PROGRESSING.
+                    // height_is_usable() deliberately accepts
+                    // height == last_block_, so a node that keeps returning
+                    // the last processed height answers every poll, resets
+                    // the failure streak forever, and the fallback is never
+                    // reached -- while a healthy wallet advances beside it
+                    // and no new-block heartbeat runs. A frozen node is a
+                    // dead node that says yes.
+                    //
+                    // Counted as healthy only while it is not stuck: the
+                    // streak of no-progress polls is bounded the same way
+                    // outright failures are.
+                    const auto seen = last_block_.load(
+                        std::memory_order_relaxed);
+                    const bool usable = risk::height_is_usable(height, seen);
+                    const bool progressing =
+                        usable && static_cast<std::uint64_t>(height) > seen;
+                    if (progressing) {
+                        node_no_progress_polls_ = 0;
+                    } else if (usable) {
+                        ++node_no_progress_polls_;
+                    }
+                    node_ok = usable
+                           && node_no_progress_polls_
+                                  < risk::kNodeFailuresBeforeWalletFallback;
+                    if (usable && !node_ok) {
+                        spdlog::error("[Engine] [S28] the full node has "
+                                      "answered {} times without advancing "
+                                      "past block {} -- treating it as failed "
+                                      "so the wallet fallback can run",
+                                      node_no_progress_polls_, seen);
+                    }
                 } catch (const std::exception& ex) {
                     node_ok = false;
                     spdlog::warn("[Engine] [S28] full node height failed: {}",
