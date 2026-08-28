@@ -10,11 +10,11 @@ from __future__ import annotations
 import pytest
 
 from gui.services.consolidate.planner import (
-    denomination,
     Anchor,
     OfferCandidate,
     PlanError,
     build_plan,
+    denomination,
     effective_rate,
     rate_deviation_frac,
 )
@@ -319,6 +319,10 @@ def test_anchor_must_be_finite_positive_and_carry_provenance():
              budget=-5 * denomination(BYC), max_slippage_frac=0.1),
         dict(source_asset=BYC, target_asset=XCH,
              budget=10 * denomination(BYC), max_slippage_frac=-0.1),
+        dict(source_asset="   ", target_asset=XCH,
+             budget=10 * denomination(BYC), max_slippage_frac=0.1),
+        dict(source_asset=BYC, target_asset="",
+             budget=10 * denomination(BYC), max_slippage_frac=0.1),
     ],
 )
 def test_incoherent_requests_raise_rather_than_returning_an_empty_plan(kwargs):
@@ -687,4 +691,190 @@ def test_a_blank_hop_asset_is_refused():
             hop_asset="   ",
             first_hop_offers=[], first_hop_anchor=ANCHOR,
             second_hop_offers=[], second_hop_anchor=ANCHOR,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Review round 4
+# ---------------------------------------------------------------------------
+
+def test_a_padded_asset_id_is_still_denominated_as_xch():
+    """`denomination` lowercased where everything else strips AND lowercases.
+
+    `" XCH ".lower()` is `" xch "`, which is not `"xch"`, so an id that
+    `_usable` had just accepted as XCH fell through to the CAT branch -- the
+    10^9 error again, from the one place left folding ids differently.
+
+    Asserted against the chain's own numbers rather than against this
+    module's constants: the tests in this file have already once agreed with
+    a denomination bug by deriving their expectations from the code.
+    """
+    assert denomination(" XCH ") == 10 ** 12
+    assert denomination("\tXCH\n") == 10 ** 12
+    assert denomination(" byc ") == 10 ** 3
+
+
+def test_a_padded_asset_id_does_not_skew_an_offers_rate():
+    """Built by hand rather than through `offer()`: that helper scales with
+    `denomination` too, so it would have cancelled the very bug this pins."""
+    padded = OfferCandidate(
+        offer_id="p", give_asset=" XCH ", receive_asset=BYC,
+        give_amount=100 * 10 ** 12,     # 100 XCH, in mojos
+        receive_amount=200 * 10 ** 3,   # 200 BYC, in CAT mojos
+    )
+    assert effective_rate(padded) == pytest.approx(0.5)
+
+
+def test_a_padded_source_asset_does_not_skew_the_realised_rate():
+    """`Leg.give_asset` is the caller's raw settings string, untrimmed, and
+    the realised rate built from it is what the confirmation dialog shows
+    beside the operator's anchor."""
+    plan = build_plan(
+        source_asset=" XCH ", target_asset=BYC,
+        budget=100 * (10 ** 12), max_slippage_frac=0.1,
+        direct_offers=[offer("a", 100, 200, give_asset=XCH, recv_asset=BYC)],
+        direct_anchor=Anchor(rate=0.5, source="test"),
+    )
+    assert plan.take_count == 1
+    # 100 XCH given for 200 BYC received -> 0.5, not 0.5e9.
+    assert plan.legs[0].realised_rate == pytest.approx(0.5)
+
+
+def test_a_bargain_first_hop_pays_for_a_dearer_second_hop():
+    """The equal nth-root split is sufficient for the route cap, not
+    equivalent to it.
+
+    A first hop 10% BETTER than its anchor and a second 10% worse composite
+    to -1%, inside a 10% ROUTE cap by any reading -- and the static 4.88%
+    per-leg number threw the route away, in exactly the thin-book case this
+    feature exists for.
+    """
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=3_600 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 3_600, 2_000)],      # 1.8 vs 2.0 = -10%
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[                               # 1.1 vs 1.0 = +10%
+            offer("s", 1_100, 1_000, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 2
+    first, second = plan.legs
+    # From first principles: what a ROUTE cap bounds is the composite, and
+    # this route's is -1%.  Derived from the anchors the plan carries, not
+    # from any number the planner reports about its own cap arithmetic.
+    composite = (
+        (first.realised_rate / first.anchor.rate)
+        * (second.realised_rate / second.anchor.rate)
+    ) - 1.0
+    assert composite == pytest.approx(-0.01)
+    assert composite <= 0.10
+
+
+def test_a_slightly_dear_first_hop_still_leaves_the_second_its_headroom():
+    """+1% then +5.5% composites to +6.55%, well inside a 10% route cap, yet
+    the flat 4.88% split refused the second leg."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=2_020 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 2_020, 1_000)],      # 2.02 vs 2.0 = +1%
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[                            # 1.055 vs 1.0 = +5.5%
+            offer("s", 844, 800, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 2
+    assert (1.01 * 1.055) - 1.0 == pytest.approx(0.06555)   # inside 10%
+
+
+def test_a_dear_first_hop_shrinks_what_the_second_may_spend():
+    """The other half of the same rule.  +4% then +6% composites to +10.24%,
+    which is OUTSIDE the operator's 10%, so widening the second leg to the
+    full route cap would be just as wrong as pinning it at 4.88%."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=2_080 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 2_080, 1_000)],      # 2.08 vs 2.0 = +4%
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[                               # 1.06 vs 1.0 = +6%
+            offer("s", 530, 500, give_asset=XCH, recv_asset=DBX),
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert (1.04 * 1.06) - 1.0 > 0.10       # first principles: past the cap
+    assert plan.is_empty
+
+
+def test_the_second_hop_allowance_multiplies_back_out_to_the_route_cap():
+    from gui.services.consolidate.planner import per_leg_cap, remaining_route_cap
+
+    for d1 in (0.0, 0.005, 0.01, 0.02, 0.0488):
+        allowance = remaining_route_cap(0.10, d1)
+        assert (1.0 + d1) * (1.0 + allowance) - 1.0 == pytest.approx(0.10)
+    # A first hop better than its anchor buys headroom, but never more than
+    # the headline number: the "bargain" is itself only an anchor estimate,
+    # and no single take should be executed further from its own reference
+    # than the operator asked for.
+    assert remaining_route_cap(0.10, -0.10) == pytest.approx(0.10)
+    assert remaining_route_cap(0.10, -0.90) == pytest.approx(0.10)
+    # A degenerate deviation must not divide by zero; fall back to the split.
+    assert remaining_route_cap(0.10, -1.0) == pytest.approx(per_leg_cap(0.10, 2))
+
+
+def test_route_coverage_is_compared_exactly_above_two_to_the_fifty_third():
+    """Coverage was `first.give_total * (second.give_total /
+    first.receive_total)` in binary floats.  XCH carries 10^12 mojos per
+    display unit, so 2^53 mojos is only ~9,007 XCH -- an ordinary position,
+    not a pathological one.
+
+    Here the two-hop route delivers EXACTLY the direct fill (10,010 * 9/11 =
+    8,190 XCH), a tie direct is documented to win because a second
+    all-or-nothing take is strictly more dangerous.  In floats the product
+    lands one mojo high and the riskier route is chosen instead.
+    """
+    g1, r1, g2 = 10_010 * 10 ** 12, 11 * 10 ** 3, 9 * 10 ** 3
+    assert g1 > 2 ** 53
+    assert g1 * g2 % r1 == 0                        # exact: a dead tie...
+    assert g1 * g2 // r1 == 8_190 * 10 ** 12
+    assert g1 * (g2 / r1) > 8_190 * 10 ** 12        # ...that floats lose
+
+    plan = build_plan(
+        source_asset=XCH, target_asset=DBX,
+        budget=10_010 * denomination(XCH), max_slippage_frac=0.10,
+        direct_offers=[offer("d", 8_190, 8_190, give_asset=XCH, recv_asset=DBX)],
+        direct_anchor=Anchor(rate=1.0, source="test"),
+        hop_asset=BYC,
+        first_hop_offers=[offer("f", 10_010, 11, give_asset=XCH, recv_asset=BYC)],
+        first_hop_anchor=Anchor(rate=910.0, source="test"),
+        second_hop_offers=[offer("s", 9, 9, give_asset=BYC, recv_asset=DBX)],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 1
+    assert [o.offer_id for o in plan.legs[0].offers] == ["d"]
+
+
+def test_a_blank_endpoint_is_refused():
+    """A blank source folds to "" -- not equal to the target, so planning
+    went ahead: `_usable` then matched any offer whose own give_asset was
+    blank, and `denomination("   ")` quietly called it a CAT.  The same guard
+    already existed for the hop and was never applied to the endpoints."""
+    with pytest.raises(PlanError, match="must be named"):
+        build_plan(
+            source_asset="   ", target_asset=XCH,
+            budget=10 * denomination(BYC), max_slippage_frac=0.1,
+            direct_offers=[], direct_anchor=ANCHOR,
+        )
+    with pytest.raises(PlanError, match="must be named"):
+        build_plan(
+            source_asset=BYC, target_asset="",
+            budget=10 * denomination(BYC), max_slippage_frac=0.1,
+            direct_offers=[], direct_anchor=ANCHOR,
         )

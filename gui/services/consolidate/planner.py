@@ -56,11 +56,6 @@ XCH_UNITS = 10 ** 12
 CAT_UNITS = 10 ** 3
 
 
-def denomination(asset_id: str) -> int:
-    """Raw units per display unit of ``asset_id``."""
-    return XCH_UNITS if asset_id.lower() == "xch" else CAT_UNITS
-
-
 def canonical_asset(asset_id: str) -> str:
     """Fold an asset id for comparison.
 
@@ -71,6 +66,20 @@ def canonical_asset(asset_id: str) -> str:
     "nothing was cheap enough" is what the operator would have read.
     """
     return asset_id.strip().lower()
+
+
+def denomination(asset_id: str) -> int:
+    """Raw units per display unit of ``asset_id``.
+
+    [review round 4] This folded with a bare ``.lower()`` while every id
+    COMPARISON in the module folds with :func:`canonical_asset`, which also
+    strips. Settings ids arrive untrimmed, so ``" XCH "`` was accepted as XCH
+    by ``_usable`` and then scaled here as a CAT -- 10^3 instead of 10^12, the
+    same 10^9 error described in :class:`OfferCandidate`, reintroduced by the
+    one place left folding differently. Any id the module is willing to MATCH
+    as XCH must also be DENOMINATED as XCH, so both use one function.
+    """
+    return XCH_UNITS if canonical_asset(asset_id) == "xch" else CAT_UNITS
 
 
 class PlanError(ValueError):
@@ -365,13 +374,50 @@ def per_leg_cap(route_cap: float, hops: int) -> float:
 
     Inverting that gives each leg (1+s)^(1/n) - 1, so the COMPOSITE honours
     the number the operator actually chose. A 10% route cap becomes ~4.88%
-    per leg over two hops. That is tighter and will sometimes find nothing --
-    which is the correct answer to "keep me within 10%", and far better than
-    quietly spending 21%.
+    per leg over two hops -- far better than quietly spending 21%.
+
+    [review round 4] This is the bound for a leg priced BLIND. It is
+    sufficient for the route cap but not equivalent to it, so applying it to
+    every leg threw away routes that were comfortably inside the cap (see
+    :func:`remaining_route_cap`). Only the first hop is priced blind; by the
+    time the second is chosen the first is a known quantity.
     """
     if hops <= 1:
         return route_cap
     return (1.0 + route_cap) ** (1.0 / hops) - 1.0
+
+
+def remaining_route_cap(route_cap: float, first_leg_deviation: float) -> float:
+    """What the SECOND hop may deviate, given what the first one achieved.
+
+    [review round 4] ``per_leg_cap`` on both legs is sufficient but not
+    equivalent: a first hop 10% BETTER than its anchor and a second 10% worse
+    composite to -1%, which is inside a 10% route cap by any reading -- and
+    was refused anyway, because the second leg was judged against the static
+    4.88% split. Erring conservative never overspends, but "found nothing" is
+    the wrong answer in precisely the dust/thin-book situation this feature
+    exists for.
+
+    Once the first leg is priced its deviation d1 is a fact, so the second
+    leg's allowance follows from the route cap directly: (1+s)/(1+d1) - 1,
+    which multiplies back out to (1+d1)*(1+d2) <= 1+s. This is never tighter
+    than the split it replaces -- d1 is itself within the split, so the
+    quotient is at least (1+s)^(1/2) - 1.
+
+    The result is clamped at ``route_cap``. Strictly, a large enough bargain
+    on hop one buys more headroom than that, but the bargain is measured
+    against an anchor and anchors are the acknowledged weak link here (see the
+    module docstring). A stale first-hop reference would turn a phantom "-50%"
+    into a licence to pay +120% on the second take, on a book the operator is
+    watching in the dialog. No single hop goes further from its own reference
+    than the number the operator typed.
+    """
+    if not (1.0 + first_leg_deviation > 0.0):
+        # A non-positive or NaN realised rate cannot come from a leg that
+        # selected offers, but the division below would answer with nonsense
+        # rather than refuse, so fall back to the blind bound.
+        return per_leg_cap(route_cap, 2)
+    return min(route_cap, (1.0 + route_cap) / (1.0 + first_leg_deviation) - 1.0)
 
 
 def _single_leg_plan(
@@ -448,7 +494,16 @@ def build_plan(
         empty plan -- nothing was cheap enough -- is NOT an error; it is a
         valid answer that the dialog reports as "no offers within your cap".
     """
-    if canonical_asset(source_asset) == canonical_asset(target_asset):
+    # A blank endpoint folds to "" and is not equal to the other one, so it
+    # sailed past the sameness test. Planning then proceeded against an
+    # unnamed asset: `_usable` matched any offer whose own give_asset was
+    # blank, and `denomination("")` quietly called it a CAT. The hop already
+    # had this guard; the endpoints reach the same code and never did.
+    src = canonical_asset(source_asset)
+    tgt = canonical_asset(target_asset)
+    if not src or not tgt:
+        raise PlanError("source and target assets must be named")
+    if src == tgt:
         raise PlanError("source and target are the same asset")
     if budget <= 0:
         raise PlanError(f"budget must be positive, got {budget}")
@@ -516,22 +571,20 @@ def build_plan(
         # "   " folds to empty and would otherwise pass the endpoint test,
         # letting the planner build legs through an unnamed asset.
         raise PlanError("hop asset is blank")
-    if hop in (canonical_asset(source_asset), canonical_asset(target_asset)):
+    if hop in (src, tgt):
         raise PlanError(
             "hop asset %r is the source or the target; a hop must be a "
             "third asset" % hop_asset)
 
-    # Both hops share the operator's ROUTE cap, split so the composite
-    # honours it -- see per_leg_cap.
-    leg_cap = per_leg_cap(max_slippage_frac, 2)
-
+    # The first hop is priced blind -- nothing is known about the second when
+    # its offers are chosen -- so it takes the conservative equal split.
     first = _plan_leg(
         give_asset=source_asset,
         receive_asset=hop_asset,
         budget=budget,
         offers=first_hop_offers,
         anchor=first_hop_anchor,
-        max_slippage_frac=leg_cap,
+        max_slippage_frac=per_leg_cap(max_slippage_frac, 2),
         counters=counters,
         seen_ids=seen_ids,
     )
@@ -545,13 +598,20 @@ def build_plan(
     # it from first.receive_total rather than from any projection: if hop
     # one underfills, hop two must shrink with it or the plan promises a
     # quantity that will not exist when it runs.
+    #
+    # Its slippage allowance is likewise derived from what the first hop
+    # actually cost, not guessed in advance -- the route cap binds the
+    # COMPOSITE, so the blind split is the wrong yardstick once d1 is known.
     second = _plan_leg(
         give_asset=hop_asset,
         receive_asset=target_asset,
         budget=first.receive_total,
         offers=second_hop_offers,
         anchor=second_hop_anchor,
-        max_slippage_frac=leg_cap,
+        max_slippage_frac=remaining_route_cap(
+            max_slippage_frac,
+            rate_deviation_frac(first.realised_rate, first_hop_anchor),
+        ),
         counters=counters,
         seen_ids=seen_ids,
     )
@@ -567,13 +627,18 @@ def build_plan(
     # no target, and stranded the rest as hop_residual in an asset the
     # operator never asked to hold. Only the pro-rata share of the first leg
     # whose output the second leg actually consumed counts as delivered.
+    #
+    # [review round 4] Cross-multiplied rather than compared as floats.  The
+    # delivered share is give1 * give2 / receive1, and these are raw units: at
+    # 10^12 mojos per XCH, 2^53 is only ~9,007 XCH, so an ordinary position
+    # overflows exact float integers.  Rounding DOWN would be harmless here --
+    # the test is deliberately biased toward direct -- but it rounds up too,
+    # and then a two-hop route delivering a hair LESS than the direct fill
+    # wins a comparison it should have lost.  Python ints are arbitrary
+    # precision, so the cross-multiplied form is exact at any size.
     if second.offers and direct_leg is not None and direct_leg.offers:
-        delivered_source = 0.0
-        if first.receive_total > 0:
-            delivered_source = (
-                first.give_total * (second.give_total / first.receive_total)
-            )
-        if direct_leg.give_total >= delivered_source:
+        if (direct_leg.give_total * first.receive_total
+                >= first.give_total * second.give_total):
             return _single_leg_plan(
                 source_asset, target_asset, direct_leg, budget, counters)
 
