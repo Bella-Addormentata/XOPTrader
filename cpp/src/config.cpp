@@ -3279,6 +3279,87 @@ static void deep_merge(YAML::Node dst, const YAML::Node& src)
 // Public API
 // ---------------------------------------------------------------------------
 
+// [S29 review round 2] AN EMPTY REGISTRY MUST NOT BOOT INTO A ZERO BOOK.
+//
+// Before the registry, "wUSDC.b is a dollar" was compiled into fifteen call
+// sites.  Retiring that is the point of this work -- but it also means a
+// config written before `pegged_assets` existed now declares NOTHING, and
+// all fifteen implicit anchors are simply gone.  usd_per_xch() then finds no
+// par wrapper among the enabled pairs and returns 0.0, every asset prices at
+// $0, and equity collapses: precisely the S27 incident, arriving through the
+// upgrade meant to make valuation safer.
+//
+// The tempting fix is to ship a default declaration so the registry is never
+// empty.  That is the wrong shape twice over.  It re-introduces exactly the
+// hardcoded "this symbol is worth a dollar" belief the registry exists to
+// delete, only centralised -- and the only plausible candidate is wUSDC.b,
+// whose issuer was compromised on 2026-08-25 and whose implied peg ran
+// $0.73-$0.75 for hours.  A built-in default would ship the specific belief
+// that caused the loss, and would still not rescue an operator whose enabled
+// pairs quote in something else.
+//
+// So: no default, and no silent zero either -- a loud, specific warning
+// naming the pairs and both ways to fix it.
+//
+// WHY A WARNING AND NOT A HARD FAILURE.  Refusing to start was the first
+// attempt and it rejected 35 existing configurations, including this
+// project's own kMinimalValidYaml -- which is anchorless by design, and
+// which PeggedAssets_AbsentSectionIsLegalAndEmpty deliberately asserts is
+// legal.  Parse time cannot tell a real deployment about to price a live
+// book from a fixture that will never hold anything, because it does not
+// know what is in the wallet.
+//
+// The runtime guard does know, and it already exists: S27's
+// unvaluable_book_must_fail_closed() pauses the engine when the book cannot
+// be valued, with actual holdings in hand.  So the enforcement lives there
+// and this is the early, actionable heads-up that names the fix before the
+// operator hits it.
+void validate_usd_anchor(const AppConfig& cfg)
+{
+    // An external XCH/USD feed is an anchor in its own right and needs no
+    // declaration at all (S27).  With one configured, every XCH-based
+    // conversion has a route and there is nothing to complain about.
+    if (cfg.coingecko.enabled) {
+        const auto& ids = cfg.coingecko.coin_ids;
+        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
+            return;
+        }
+    }
+
+    // Otherwise the only remaining route is an enabled pair whose quote asset
+    // carries a declared, enforced USD par.
+    for (const auto& pair : cfg.pairs) {
+        if (!pair.enabled) continue;
+        const auto* a = cfg.pegged_assets.find(pair.quote_asset_id);
+        if (a != nullptr && a->enforce && a->peg_currency == "USD") {
+            return;
+        }
+    }
+
+    std::string enabled_names;
+    for (const auto& pair : cfg.pairs) {
+        if (!pair.enabled) continue;
+        if (!enabled_names.empty()) enabled_names += ", ";
+        enabled_names += pair.name;
+    }
+    // Nothing enabled means nothing to value and nothing to protect, so an
+    // anchorless config is a legitimate (if idle) state rather than a fault.
+    if (enabled_names.empty()) {
+        return;
+    }
+
+    spdlog::warn(
+        "[Config] NO USD ANCHOR IS REACHABLE. Every asset would value at $0 "
+        "and both drawdown breakers would sit inert -- this is the "
+        "2026-08-25 incident. Enabled pairs: {}. Fix by EITHER declaring the "
+        "quote asset's peg under `pegged_assets:` (see config.example.yaml; "
+        "a config written before that section existed declares nothing, and "
+        "the old built-in $1 assumptions are gone), OR enabling the "
+        "CoinGecko feed with \"chia\" in coingecko.coin_ids. If you hold "
+        "anything, the engine will pause fail-closed rather than trade "
+        "blind.", enabled_names);
+}
+
 AppConfig load_config(const std::string& path,
                       const std::string& secrets_path)
 {
@@ -3330,6 +3411,7 @@ AppConfig load_config(const std::string& path,
     cfg.inventory_aging = parse_inventory_aging(root);
     cfg.accounting = parse_accounting(root);
     cfg.market_data = parse_market_data(root);
+    validate_usd_anchor(cfg);
     cfg.adverse_selection = parse_adverse_selection(root);
     cfg.market_allocator = parse_market_allocator(root);
     cfg.recovery   = parse_recovery(root);
