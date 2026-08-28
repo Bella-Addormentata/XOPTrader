@@ -1341,7 +1341,16 @@ asio::awaitable<void> Engine::poll_loop_coro()
             } else {
                 try {
                     height = co_await full_node_->get_block_height();
-                    node_ok = (height >= 0);
+                    // [review] USABLE, not merely non-negative. A stale or
+                    // malformed node answers every poll with a height that
+                    // is rejected below -- but counting it as a success
+                    // resets the failure counter, so the run of six that
+                    // triggers the wallet fallback can never accumulate.
+                    // The engine then stops seeing blocks indefinitely
+                    // beside a healthy wallet, which is the outage S28
+                    // exists to end.
+                    node_ok = risk::height_is_usable(
+                        height, last_block_.load(std::memory_order_relaxed));
                 } catch (const std::exception& ex) {
                     node_ok = false;
                     spdlog::warn("[Engine] [S28] full node height failed: {}",
@@ -1350,6 +1359,13 @@ asio::awaitable<void> Engine::poll_loop_coro()
                 const auto before = height_source_.current;
                 if (next_height_source(height_source_, node_ok, mode_is_auto)
                         != before) {
+                    // [review] Set the runtime latch too. Without it every
+                    // wallet-driven heartbeat still enters the adaptive-fee
+                    // path and awaits get_fee_estimate() on the dead node,
+                    // retries and all -- stalling the very heartbeat this
+                    // fallback exists to preserve. The recovery path already
+                    // clears it.
+                    wallet_only_mode_ = true;
                     spdlog::error(
                         "[Engine] [S28] full node has failed {} consecutive "
                         "height polls -- falling back to the WALLET RPC for "
@@ -1533,7 +1549,12 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (metrics_->is_running()) {
             SystemHealthSnapshot health;
             health.block_height     = current_block;
-            health.node_synced      = true;   // We just got a block -> node OK.
+            // [review] Not unconditionally true. This block is reached
+            // after the wallet fallback rescues a poll the NODE just failed,
+            // so publishing node_synced here reported the unavailable node
+            // as healthy -- to monitoring and to the GUI -- for as long as
+            // analysis ran. Derive it from which source actually answered.
+            health.node_synced      = height_error.empty();
             health.wallet_connected = wallet_->is_open();
             metrics_->update_system_health(health);
         }
@@ -14098,6 +14119,16 @@ asio::awaitable<void> Engine::open_connections()
                 spdlog::warn("[Engine] Full node unreachable ({}); "
                              "falling back to wallet-only mode", ex.what());
                 wallet_only_mode_ = true;
+                // [review] Move the height SOURCE too, not just the mode
+                // latch. height_source_ still said FullNode, and the poll
+                // loop selects its branch from that -- so a startup that had
+                // already given up on the node went on polling the closed
+                // client for the six failures it takes to fall back,
+                // recreating at startup the exact heartbeat gap S28 exists
+                // to close.
+                height_source_.current = risk::HeightSource::Wallet;
+                height_source_.consecutive_node_failures =
+                    risk::kNodeFailuresBeforeWalletFallback;
                 full_node_->close();
             } else {
                 // FullNode mode: failure is fatal.
