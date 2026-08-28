@@ -33,8 +33,14 @@
 // that is easy to miss: usd_per_xch() gates the cached price through a
 // freshness check that treats a non-positive or non-finite threshold as
 // permanently stale -- deliberately, so a frozen feed cannot quote forever.
-// A config with `cex_freshness_threshold_sec: 0` is therefore legal, silent,
-// and anchorless.  The threshold is part of whether the anchor exists.
+// A config with `cex_freshness_threshold_sec: 0` is therefore legal and
+// anchorless.  The threshold is part of whether the anchor exists.
+//
+// [review] No longer SILENT, though it was when this was written:
+// validate_usd_anchor() now declines the CoinGecko exemption for a
+// non-positive threshold and warns at startup when enabled pairs have no
+// other anchor. Describing the old behaviour as current is how a defect gets
+// re-introduced by someone tidying up a warning they think is spurious.
 // ---------------------------------------------------------------------------
 
 #ifndef XOP_RISK_USD_ROUTE_HPP

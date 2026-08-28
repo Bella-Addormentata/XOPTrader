@@ -11353,8 +11353,13 @@ double Engine::usd_per_xch() const
 
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
-        const auto slash = pair.name.find('/');
-        if (slash == std::string::npos) continue;
+        // [review] No slash check. It is vestigial -- from when this matched
+        // on the display NAME -- and the lookup below is entirely by
+        // canonical asset id. parse_pairs() accepts names without a slash,
+        // so a legal XCH/<par> configuration whose name happens to lack one
+        // was skipped here while the route predicate reported it priceable,
+        // leaving every XCH-routed holding in permanent degradation. The two
+        // must agree, and the asset-id lookup is the one that is right.
         // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
         // registry, keyed on ASSET ID rather than the ticker parsed out of
         // the pair name -- symbols collide and get reused, asset ids do
