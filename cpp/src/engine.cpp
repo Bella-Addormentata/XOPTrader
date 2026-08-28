@@ -1311,8 +1311,18 @@ asio::awaitable<void> Engine::poll_loop_coro()
                         // backwards and the engine stopped seeing blocks at
                         // all. Require the node to be at least level with
                         // both the wallet and the last height we acted on.
+                        // [review] Compare against the wallet only when
+                        // the wallet's own reading is usable. A wallet value
+                        // above UINT32_MAX makes every real node tip compare
+                        // lower, so a healthy node could never accumulate
+                        // recovery successes and would be locked out
+                        // permanently by a number that is itself rejected
+                        // downstream.
+                        const bool wallet_usable = risk::height_is_usable(
+                            wallet_height,
+                            last_block_.load(std::memory_order_relaxed));
                         node_ok = (probe >= 0)
-                               && (probe >= wallet_height)
+                               && (!wallet_usable || probe >= wallet_height)
                                && risk::height_is_usable(
                                       probe,
                                       last_block_.load(
@@ -1554,7 +1564,14 @@ asio::awaitable<void> Engine::run_startup_analysis()
             // so publishing node_synced here reported the unavailable node
             // as healthy -- to monitoring and to the GUI -- for as long as
             // analysis ran. Derive it from which source actually answered.
-            health.node_synced      = height_error.empty();
+            // [review] The node is synced only if the NODE answered. In
+            // explicit wallet-only mode, and after an auto-mode startup
+            // fallback, height_error is empty because the WALLET succeeded --
+            // so this reported a node that is unavailable, or does not
+            // exist, as healthy.
+            health.node_synced      = height_error.empty()
+                                   && !wallet_only_mode_
+                                   && !wallet_only_configured_;
             health.wallet_connected = wallet_->is_open();
             metrics_->update_system_health(health);
         }
@@ -13700,7 +13717,13 @@ void Engine::step_export_metrics(BlockHeight block_height)
     // Dashboard 4: System health
     SystemHealthSnapshot health;
     health.block_height    = block_height;
-    health.node_synced     = true;  // Phase 2: check full node sync status.
+    // [review] Derived, not asserted. Every wallet-driven heartbeat reached
+    // here and published the FAILED node as synced, masking the outage in
+    // monitoring and in the GUI for its whole duration -- which is the one
+    // period anyone would be looking.
+    health.node_synced     = !wallet_only_configured_
+                          && !wallet_only_mode_
+                          && height_source_.current == risk::HeightSource::FullNode;
     health.wallet_connected = wallet_->is_open();
     metrics_->update_system_health(health);
 

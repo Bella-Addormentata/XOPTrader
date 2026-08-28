@@ -54,8 +54,23 @@ struct HeightSourceState {
 /// Not 1: a single failed poll is a transient, and flapping the height source
 /// between two RPCs that disagree about the tip by a block or two would make
 /// the engine reprocess or skip heights. Not 529 either, which is what
-/// "never" cost on 2026-08-25. At the default ~5s poll cadence this is well
-/// under a minute of blindness before the engine helps itself.
+/// "never" cost on 2026-08-25.
+///
+/// [review] THE LATENCY IS NOT WHAT THE POLL CADENCE SUGGESTS. This counts
+/// COMPLETED get_block_height() calls, and each one is four attempts at up
+/// to a 30-second request timeout plus backoff -- so against a node that
+/// accepts connections and never answers, six failures is roughly twelve
+/// minutes, not the "well under a minute" an earlier version of this comment
+/// claimed from the 5s cadence. A node that REFUSES connections fails fast
+/// and does reach the fallback in seconds, which is the common case and the
+/// one that was measured.
+///
+/// Closing the gap properly needs a short-deadline health poll for source
+/// selection, separate from the retrying request the heartbeat uses. That is
+/// a change to the RPC layer rather than to this constant, and it is filed
+/// rather than papered over by lowering the count -- fewer failures would
+/// trade a real transient-flap risk for a partial improvement to the slow
+/// case.
 inline constexpr std::uint32_t kNodeFailuresBeforeWalletFallback = 6;
 
 /// Consecutive node successes required to go back.
