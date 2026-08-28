@@ -642,11 +642,13 @@ settling every 60s.
   `/info/candles` accepts `tf` but **ignores it**, always returning hourly
   bars. (Partly moot for quoting: all resting orders are cancelled at
   carried→live anyway, so we cannot be holding stale quotes into it.)
-- Does a carried (frozen) oracle still count as "fresh" for depth credit?
-  Placement against a *stale* oracle returns HTTP 503, and carried is
-  evidently not the same as stale since carried placement is permitted at
-  8× IM — but whether carried ticks *accrue depth* is still undocumented,
-  and it decides whether the overnight window is worth the 8× capital.
+- ~~Does a carried (frozen) oracle count as "fresh" for depth credit?~~
+  **ANSWERED 2026-08-27: yes.** Confirmed in the sponsor's channel and then
+  measured — two accounts gained 10.27M and 8.37M depth-seconds across 122
+  minutes with the oracle frozen at a single value, which roll-off cannot
+  produce. See `TODO-COMPETITION.md` C-0S3. What constrains the overnight
+  window is the 8× carried margin and the entrants hunting resting size
+  there, not the mechanics.
 - How is the oracle actually computed? Permuto documents a BLS-signed
   price certificate, but `/info/price_certificate` returns
   `No price certificate available yet`, so no provenance is exposed.
