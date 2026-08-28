@@ -79,6 +79,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::ArbitrageDetected:    return "ArbitrageDetected";
         case AlertRule::LedgerDivergence:     return "LedgerDivergence";
         case AlertRule::StablecoinDepeg:      return "StablecoinDepeg";
+        case AlertRule::DeadMansSwitch:       return "DeadMansSwitch";
     }
     return "UNKNOWN";
 }
@@ -109,6 +110,12 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // A quote stablecoin leaving its peg mis-values the entire book and
         // every USD figure derived from it -- treat as critical.
         case AlertRule::StablecoinDepeg:
+            return AlertTier::CRITICAL;
+
+        // [S31] The book was just cancelled by a process that has given up
+        // managing it, and the spends are not confirmed. Nothing this engine
+        // sends matters more.
+        case AlertRule::DeadMansSwitch:
             return AlertTier::CRITICAL;
 
         // INFO (rules 12-15).

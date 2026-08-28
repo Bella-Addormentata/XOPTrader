@@ -695,8 +695,11 @@ void Engine::watchdog_cancel_book(const std::string& why)
             if (alerts_) {
                 alerts_->send_alert(
                     AlertRule::CircuitBreaker,
-                    "DEAD MAN'S SWITCH FIRED: no heartbeat for " +
-                    why + ". A secure cancel "
+                    // `why` is already a complete phrase -- prepending
+                    // produced "no heartbeat for no heartbeat for 600s",
+                    // and the abnormal-exit caller is not about heartbeats
+                    // at all.
+                    "DEAD MAN'S SWITCH FIRED: " + why + ". A secure cancel "
                     "of every resting offer has been SUBMITTED -- the "
                     "spends must still confirm on-chain, so verify the "
                     "book is empty rather than assuming it. The engine "
@@ -708,7 +711,7 @@ void Engine::watchdog_cancel_book(const std::string& why)
                              "by hand NOW.", failure);
             if (alerts_) {
                 alerts_->send_alert(
-                    AlertRule::CircuitBreaker,
+                    AlertRule::DeadMansSwitch,
                     "DEAD MAN'S SWITCH COULD NOT CANCEL: " + failure +
                     ". Offers are still live and unmanaged.");
             }
