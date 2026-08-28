@@ -403,11 +403,16 @@ def test_a_fill_discovered_while_holding_triggers_a_requote():
 # [review] FLATTEN and REDUCE_ONLY have to retract what is resting
 # --------------------------------------------------------------------------- #
 def test_flatten_cancels_rather_than_only_relabelling():
-    c = _Client(account={
-        "equity_usd": 1_000.0,
-        "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
-        "positions": {},
-    })
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+        ]},
+        account={
+            "equity_usd": 1_000.0,
+            "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+            "positions": {},
+        },
+    )
     r = _runner(c)
     r.tick(1.0, _ORACLE, {})
     assert "cancel_all" in c.calls, "flatten left the two-sided quote live"
@@ -418,12 +423,18 @@ def test_reduce_only_cancels_the_market_before_upserting_one_side():
     """batch_upsert is keyed on (market, side).
 
     Omitting the risk-increasing side does not remove it, so the old quote
-    would stay live beside the new reduce-only one.
+    would stay live beside the new reduce-only one. Needs something resting
+    for there to be anything to retract.
     """
-    c = _Client(account={
-        "equity_usd": 100_000.0, "used_margin_usd": 0.0,
-        "positions": {_MKT: 100.0},
-    })
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+        ]},
+        account={
+            "equity_usd": 100_000.0, "used_margin_usd": 0.0,
+            "positions": {_MKT: 100.0},
+        },
+    )
     r = _runner(c, max_position=100.0)
     r.tick(1.0, _ORACLE, {})
     assert c.calls.index("cancel_all") < c.calls.index("batch_upsert")
@@ -459,3 +470,75 @@ def test_a_non_finite_resting_price_is_not_a_present_side(bad):
     ]})
     assert r._resting[_MKT].bid_price is None
     assert not r._resting[_MKT].two_sided
+
+
+# --------------------------------------------------------------------------- #
+# [review] Risk must be evaluated for every LIVE market, not only for the ones
+# already deciding to quote.
+# --------------------------------------------------------------------------- #
+
+def test_a_held_two_sided_book_is_retracted_when_margin_crosses_the_line():
+    """The state decide() is happiest about is the one this missed.
+
+    A two-sided in-ring book returns HOLD, so any_quoted stayed false and
+    assess() was never called -- leaving the quote live while the account
+    crossed the flatten line. FLATTEN was unreachable in exactly the
+    situation it exists for.
+    """
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+            {"market": _MKT, "side": "sell", "price": 0.0702},
+        ]},
+        account={
+            "equity_usd": 1_000.0,
+            "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+            "positions": {},
+        },
+    )
+    r = _runner(c)
+    result = r.tick(1.0, _ORACLE, {})
+
+    assert result.action == "withdraw", "the book was left live"
+    assert "cancel_all" in c.calls
+    assert c.cancelled[-1] == [_MKT]
+    assert r._resting[_MKT].empty
+
+
+def test_a_held_book_at_the_position_limit_is_also_acted_on():
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+            {"market": _MKT, "side": "sell", "price": 0.0702},
+        ]},
+        account={
+            "equity_usd": 100_000.0, "used_margin_usd": 0.0,
+            "positions": {_MKT: 100.0},
+        },
+    )
+    r = _runner(c, max_position=100.0)
+    assert r.tick(1.0, _ORACLE, {}).action == "withdraw"
+    assert "cancel_all" in c.calls
+
+
+def test_a_healthy_held_book_is_still_left_alone():
+    """The guard must not turn every HOLD into a cancel."""
+    c = _Client(open_orders={"orders": [
+        {"market": _MKT, "side": "buy", "price": 0.0698},
+        {"market": _MKT, "side": "sell", "price": 0.0702},
+    ]})
+    r = _runner(c)
+    assert r.tick(1.0, _ORACLE, {}).action == "hold"
+    assert "cancel_all" not in c.calls
+
+
+def test_nothing_resting_means_nothing_to_retract():
+    """A flatten-level account with no live quote needs no cancel."""
+    c = _Client(account={
+        "equity_usd": 1_000.0,
+        "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+        "positions": {},
+    })
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {})
+    assert "cancel_all" not in c.calls

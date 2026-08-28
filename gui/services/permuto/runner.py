@@ -245,6 +245,43 @@ class QuoteRunner:
             if not any_quoted:
                 return TickResult("withdraw", reason, results)
 
+        # [review] RISK IS EVALUATED FOR EVERY LIVE MARKET, not only for the
+        # ones already deciding to quote.
+        #
+        # The early HOLD below used to return before assess() ran at all, so
+        # a two-sided in-ring book -- the state decide() is happiest about --
+        # stayed live while the freshly fetched account crossed the position
+        # limit or the 75% flatten line. FLATTEN and REDUCE_ONLY were
+        # unreachable in exactly the situation they exist for: the loop was
+        # content because the QUOTES were fine, and never asked whether the
+        # POSITION was.
+        risk_by_market: dict = {}
+        for market in self._markets:
+            oracle = oracles.get(market)
+            base_size = self._base_size(oracle)
+            risk_by_market[market] = assess(
+                state, market,
+                base_size=base_size,
+                max_position=self._max_position,
+                ring_pct=self._ring_pct,
+                half_spread_pct=self._half_spread_pct,
+            )
+
+        # A market holding a live quote that risk wants shrunk or gone must
+        # act now, whatever decide() thought of the quote itself.
+        risk_forced = [
+            m for m, r in risk_by_market.items()
+            if r.action is not RiskAction.NORMAL
+            and not self._resting.get(m, RestingQuote()).empty
+        ]
+        if risk_forced and not any_quoted:
+            worst = risk_by_market[risk_forced[0]]
+            self._client.cancel_all(now_s, risk_forced)
+            for market in risk_forced:
+                self._resting[market] = RestingQuote()
+                results[market] = (worst.action.value, worst.reason)
+            return TickResult("withdraw", worst.reason, results)
+
         if not any_quoted:
             wait = LoopAction.WAIT.value
             waiting = [m for m, (a, _) in results.items() if a == wait]
@@ -260,13 +297,7 @@ class QuoteRunner:
                 continue
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
-            risk = assess(
-                state, market,
-                base_size=base_size,
-                max_position=self._max_position,
-                ring_pct=self._ring_pct,
-                half_spread_pct=self._half_spread_pct,
-            )
+            risk = risk_by_market[market]
             if risk.action is RiskAction.FLATTEN:
                 # [review] FLATTEN used to change the label and drop the
                 # legs, which left the existing two-sided quote live and sent
@@ -275,7 +306,12 @@ class QuoteRunner:
                 # for this market at minimum; closing the position itself is
                 # a taker order and stays an operator decision.
                 results[market] = ("flatten", risk.reason)
-                to_cancel.append(market)
+                # Only if something is actually resting. _resting was
+                # reconciled from the venue at the top of this tick, so an
+                # empty entry means there is nothing to retract and a cancel
+                # would be a request that changes nothing.
+                if not self._resting.get(market, RestingQuote()).empty:
+                    to_cancel.append(market)
                 continue
 
             reference = skewed_reference(oracle, risk.skew)
@@ -308,7 +344,8 @@ class QuoteRunner:
                 # old quote stays live beside the new reduce-only one, which
                 # is the opposite of reducing. Cancel the market first, then
                 # place the single shrinking leg.
-                to_cancel.append(market)
+                if not self._resting.get(market, RestingQuote()).empty:
+                    to_cancel.append(market)
 
             for leg in ladder:
                 if risk.action is RiskAction.REDUCE_ONLY:
