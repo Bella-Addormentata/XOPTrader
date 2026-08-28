@@ -855,7 +855,10 @@ transfer and must not leak into shared code.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
       **not decaying** — the sponsor confirms the accumulator only rises;
       what falls is the 5-day display window.
-- [ ] **C-02** Auth path + BLS key handling. **Operator decision.**
+- [x] **C-02** **BUILT** (PR #119). `gui/services/permuto/identity.py` holds a
+      mnemonic-derived BLS identity wrapped by DPAPI, never in git-tracked
+      config; `auth.py` does challenge -> sign 32 decoded nonce bytes ->
+      wallet_auth. Registration itself stays an **operator decision** (C-0R).
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
       short-horizon jitter estimator noise or information** (the central
       question, given the 60s/5s overlapping-window construction); do
@@ -869,16 +872,48 @@ transfer and must not leak into shared code.
       instead of inferring it. See `docs/advanced-trading-methods.md` §4,
       "Ideas taken from two external repositories". Separate the session from
       the carried hours in the estimator rather than smoothing across them.
-- [ ] **C-04** Perps position model — positions, margin, funding,
-      liquidation distance.
-- [ ] **C-05** Execution adapter — `order`/`modify`/`cancel`/
+- [x] **C-04** **BUILT.** `risk.py` + `runner._margin_state()`: signed
+      positions per market, margin utilisation, position limits, and the
+      carried 8x initial-margin multiplier. Thresholds are deliberately far
+      inside the venue's — stop adding risk at 50% utilisation, shed at 75%
+      — because liquidation cannot be traded out of and PnL is the whole
+      rank. **Funding budget and liquidation distance are NOT in it**; those
+      stay with C-06.
+      The finding that shaped it: depth credit is `min(bid, ask)`, so
+      controlling inventory by SHRINKING a side truncates the minimum and
+      pays for risk control in the currency the gate is denominated in.
+      Inventory is steered by sliding BOTH quotes in price with sizes equal,
+      which leaves `min(bid, ask)` untouched and pays in expected edge
+      instead. The skew ceiling is arithmetic, not preference:
+      `ring - half_spread`, or the trailing leg falls out of the ring.
+- [~] **C-05** **BUILT, with one deviation.** `client.py` (transport),
+      `batch.py` (payload), `orders.py` (placement), `runner.py`
+      (sequencer). Confirmed live that `/exchange/batch_upsert`,
+      `/exchange/cancel_all`, `/exchange/account` and
+      `/exchange/open_orders` exist as POST routes — they answer 405 to a
+      GET, which is the only reliable probe, because **unknown paths return
+      HTTP 200 with the single-page app**, so a mistyped route succeeds and
+      hands back HTML.
+      **Deviation: polling, not WS.** The runner takes `oracles` and `flags`
+      as tick arguments, so the freshness requirement is real but moved to
+      the caller — `quoting.decide()` withdraws past `MAX_ORACLE_AGE_S`
+      (15 s, three resample periods). A WS feed would still be better.
+      Renewal is deliberately NOT `register()`: that call gates on
+      `signup_open()`, and sign-up closes Mon 17:00 ET while the contest
+      runs to Friday, so a renewal path built on it would work all Monday
+      morning and then fail for four days. Original notes:
+      - Execution adapter — `order`/`modify`/`cancel`/
       `batch_upsert`/`cancel_all`, place vs mutate tokens.
       **Drive it from the venue's oracle over WS, never a local copy.** A
       stale local oracle produces orders that look fine to us, get purged or
       rejected by the host, and score zero — the failure is silent on our
       side. Prefer `batch_upsert` for grid refresh, and re-quote on
       carried→live because the sequencer cancels everything at the open.
-- [ ] **C-06** Risk layer — reuse breakers; add liquidation proximity and a
+- [~] **C-06** **PARTIAL.** Margin utilisation, position limits, reduce-only
+      and flatten are built (C-04). Still missing: **funding budget**,
+      **liquidation distance**, **ADL modelling**, and the $500k/market /
+      $1M portfolio risk-increasing caps. Original notes:
+      - Risk layer — reuse breakers; add liquidation proximity and a
       funding budget. Never let a position price at 0 in silence. Budget
       funding at `clamp(impact_premium/2, ±10%)` per hour settling every
       60 s, and model **ADL**: a forced-liquidation flat anywhere closes
@@ -897,7 +932,19 @@ transfer and must not leak into shared code.
       impossible. Much cheaper than the original framing.
 - [ ] **C-09** Poll `CONTEST_START` / `untraded_purge_at` / `signup_closed`
       continuously; all three change the plan when they flip.
-- [ ] **C-11** **Handle market pause and un-pause.** The only thing the
+- [x] **C-11** **BUILT** in `runner.py`, plus one measurement. Bitfinex's
+      BVIV perpetual warns that funding "may require a pause in trading...
+      several seconds or longer", and Permuto settles VOL funding every
+      60 s — so a brief pause every minute would have been a real hazard
+      here. Measured on 2026-08-28: across 54 pause-state samples
+      `trading_paused` was false throughout while `premium` moved every 5 s
+      and `hourly_rate` stepped on 60-second boundaries. So pause handling
+      covers operator pauses and the Sunday reset, not a funding hiccup.
+      The reopen edge is computed from the pause transition (the venue does
+      not announce it) and **latched**, not consumed — the tick that spots
+      the reopen may still fail on session or oracle, and the rebuild it
+      owes the book must not die with it. Original notes:
+      - **Handle market pause and un-pause.** The only thing the
       sponsor named when asked what bots must do before the contest, and not
       an edge case: the Sunday-evening reset happens *inside* a pause that
       un-pauses at the start, so every entrant enters through this
