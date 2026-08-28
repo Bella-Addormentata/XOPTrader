@@ -159,6 +159,52 @@ struct WatchdogInput {
                             : WatchdogAction::Fire;
 }
 
+/// The cancel the switch issues, as data rather than as two literals buried
+/// in a lambda inside a coroutine inside a thread.
+///
+/// It is here because both values have been wrong in production once each,
+/// and neither error was catchable by any test that existed:
+///
+///  - `secure` shipped as false, on the reasoning that an on-chain cancel
+///    costs a fee and needs a working node. That made the whole switch
+///    decorative. `chia_rpc.hpp` states that a local-only cancel leaves an
+///    offer that "could still be taken by a counterparty who already has the
+///    offer file" -- and dexie IS a counterparty holding the file. Forgetting
+///    an offer locally does not stop anyone taking it; only spending the
+///    locked coins does. The six four-hour-old bids that filled on
+///    2026-08-25 would have filled anyway.
+///
+///  - `fee_mojos` must stay 0. A zero-fee spend is valid on Chia -- lower
+///    mempool priority, still processed, and the recovery path already
+///    relies on it -- and the switch must not fail because XCH is short at
+///    exactly the moment everything else has gone wrong.
+struct WatchdogCancel {
+    std::uint64_t fee_mojos{0};
+    bool          secure{true};
+};
+
+[[nodiscard]] constexpr WatchdogCancel watchdog_cancel() noexcept {
+    return WatchdogCancel{};
+}
+
+/// What the engine may honestly say after issuing the cancel.
+enum class WatchdogOutcome {
+    /// The RPC accepted the request.  NOT "cancelled": a secure cancel
+    /// spends the offer coins on-chain, so the book is not empty until
+    /// those spends CONFIRM.  Reporting this as done was a real defect --
+    /// it told an operator the exposure was over while it was still open.
+    Submitted,
+    /// The RPC refused or threw.  Offers are still live on a wedged engine.
+    Failed,
+};
+
+[[nodiscard]] constexpr WatchdogOutcome watchdog_outcome(
+    bool rpc_reported_failure) noexcept
+{
+    return rpc_reported_failure ? WatchdogOutcome::Failed
+                                : WatchdogOutcome::Submitted;
+}
+
 /// Tracks fired-state across ticks so the caller does not have to.
 ///
 /// One stall produces exactly one Fire.  The latch clears only when a

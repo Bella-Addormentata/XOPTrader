@@ -708,30 +708,13 @@ void Engine::watchdog_loop()
             asio::co_spawn(wioc, [&]() -> asio::awaitable<void> {
                 try {
                     co_await wallet->open();
-                    // SECURE cancellation -- this must spend the coins.
-                    //
-                    // The first version of this used secure=false, reasoning
-                    // that an on-chain cancel costs a fee and needs a working
-                    // node. That reasoning was wrong and it made the whole
-                    // switch decorative: chia_rpc.hpp says outright that a
-                    // local-only cancel leaves an offer that "could still be
-                    // taken by a counterparty who already has the offer
-                    // file", and dexie IS a counterparty holding the file.
-                    // Forgetting an offer locally does not stop anyone taking
-                    // it -- only spending the locked coins does. The six
-                    // four-hour-old bids that filled on 2026-08-25 would have
-                    // filled anyway.
-                    //
-                    // fee=0 is deliberate: a zero-fee spend is valid on Chia
-                    // (lower mempool priority, still processed -- the engine
-                    // already relies on this in the recovery path) and the
-                    // switch must not fail because XCH is short at exactly
-                    // the moment everything else has gone wrong.
-                    //
-                    // This broadcasts through the WALLET's own peer
-                    // connections, not our full node, which is why it still
-                    // works in the scenario this fires in.
-                    co_await wallet->cancel_offers(/*fee=*/0, /*secure=*/true);
+                    // Arguments come from risk::watchdog_cancel() so the
+                    // two values that have each been wrong in production
+                    // once are a named, tested constant rather than
+                    // literals buried three scopes deep. The reasoning for
+                    // both lives with them in watchdog.hpp.
+                    constexpr auto req = risk::watchdog_cancel();
+                    co_await wallet->cancel_offers(req.fee_mojos, req.secure);
                 } catch (const std::exception& ex) {
                     failure = ex.what();
                 }

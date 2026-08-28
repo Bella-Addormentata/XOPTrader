@@ -221,3 +221,38 @@ TEST(Watchdog, StartupGraceIsMeasuredFromArmNotFromZero) {
     EXPECT_EQ(wd.tick(0, armed + 1 * kMin), WatchdogAction::NotStartedYet);
     EXPECT_EQ(wd.tick(0, armed + 10 * kMin), WatchdogAction::Fire);
 }
+
+// ---------------------------------------------------------------------------
+// [S31] The cancel arguments and the honesty of the outcome wording.
+//
+// These are constants, and testing a constant is usually pointless.  Not here:
+// BOTH of these values have been wrong in production, each caught only by
+// human review, and neither was reachable by any test because they were
+// literals inside a lambda inside a coroutine inside a worker thread.
+// ---------------------------------------------------------------------------
+
+TEST(WatchdogCancelArgs, SecureIsMandatoryBecauseDexieHoldsTheOfferFile) {
+    // Shipped once as secure=false, which made the switch decorative: a
+    // local-only cancel does not stop a counterparty who already holds the
+    // offer file from taking it. Only spending the locked coins does.
+    EXPECT_TRUE(xop::risk::watchdog_cancel().secure);
+}
+
+TEST(WatchdogCancelArgs, FeeIsZeroSoAShortWalletCannotDisarmTheSwitch) {
+    // A zero-fee spend is valid on Chia. The switch must not fail because
+    // XCH is short at exactly the moment everything else has gone wrong.
+    EXPECT_EQ(xop::risk::watchdog_cancel().fee_mojos, 0u);
+}
+
+TEST(WatchdogOutcomeWording, AnAcceptedRpcIsSubmittedAndNotCancelled) {
+    // A secure cancel spends coins on-chain; the book is not empty until
+    // those spends confirm. Calling this "cancelled" told an operator the
+    // exposure was over while it was still open.
+    EXPECT_EQ(xop::risk::watchdog_outcome(/*rpc_reported_failure=*/false),
+              xop::risk::WatchdogOutcome::Submitted);
+}
+
+TEST(WatchdogOutcomeWording, AFailedRpcIsFailed) {
+    EXPECT_EQ(xop::risk::watchdog_outcome(/*rpc_reported_failure=*/true),
+              xop::risk::WatchdogOutcome::Failed);
+}
