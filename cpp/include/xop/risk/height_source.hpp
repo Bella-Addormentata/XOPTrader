@@ -29,6 +29,7 @@
 #define XOP_RISK_HEIGHT_SOURCE_HPP
 
 #include <cstdint>
+#include <limits>
 
 namespace xop::risk {
 
@@ -130,6 +131,15 @@ constexpr HeightSource next_height_source(HeightSourceState& state,
                                               std::uint32_t last_seen) noexcept
 {
     if (height < 0) return false;                       // malfunctioning RPC
+    // The caller narrows to BlockHeight (uint32_t) immediately after this
+    // returns true, so anything above that range is not a large height, it
+    // is a wraparound. INT64_MAX would arrive downstream as 4,294,967,295 --
+    // a phantom tip millions of blocks ahead that every later real height
+    // then fails to beat, wedging the engine on a number no chain produced.
+    if (height > static_cast<std::int64_t>(
+            std::numeric_limits<std::uint32_t>::max())) {
+        return false;
+    }
     return static_cast<std::uint64_t>(height) >= last_seen;
 }
 

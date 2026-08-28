@@ -5,6 +5,9 @@
 
 #include "xop/risk/height_source.hpp"
 
+#include <cstdint>
+#include <limits>
+
 using xop::risk::HeightSource;
 using xop::risk::HeightSourceState;
 using xop::risk::height_fallback_allowed;
@@ -136,4 +139,34 @@ TEST(HeightSource, CountersDoNotOverflowUnderALongOutage) {
     run(s, false, 5000);
     EXPECT_EQ(s.current, HeightSource::Wallet);
     EXPECT_LE(s.consecutive_node_failures, kNodeFailuresBeforeWalletFallback);
+}
+
+// ---------------------------------------------------------------------------
+// [S28] The caller narrows to BlockHeight (uint32_t) the moment this returns
+// true, so "usable" has to mean "survives that narrowing", not merely
+// "non-negative and not going backwards".
+// ---------------------------------------------------------------------------
+
+TEST(HeightIsUsable, RejectsHeightsAboveTheBlockHeightRange) {
+    // INT64_MAX would arrive downstream as 4,294,967,295 -- a phantom tip
+    // millions of blocks ahead that no real height can ever beat, wedging
+    // the engine on a number no chain produced.
+    EXPECT_FALSE(height_is_usable(std::numeric_limits<std::int64_t>::max(), 0));
+    EXPECT_FALSE(height_is_usable(
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()) + 1,
+        0));
+}
+
+TEST(HeightIsUsable, AcceptsTheTopOfTheBlockHeightRange) {
+    // The boundary itself is representable and must still be accepted.
+    EXPECT_TRUE(height_is_usable(
+        static_cast<std::int64_t>(std::numeric_limits<std::uint32_t>::max()),
+        0));
+}
+
+TEST(HeightIsUsable, StillRejectsNegativeAndBackwards) {
+    EXPECT_FALSE(height_is_usable(-1, 0));
+    EXPECT_FALSE(height_is_usable(99, 100));
+    EXPECT_TRUE(height_is_usable(100, 100));
+    EXPECT_TRUE(height_is_usable(101, 100));
 }

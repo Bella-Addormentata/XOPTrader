@@ -409,6 +409,16 @@ private:
     /// Dry-run mode flag.
     bool dry_run_;
 
+    /// True only when the OPERATOR configured wallet-only.
+    ///
+    /// Distinct from `wallet_only_mode_`, which also becomes true when
+    /// `mode: auto` fails to reach the node AT STARTUP. Conflating the two
+    /// made the S28 recovery probe unreachable in exactly the case it was
+    /// written for: a startup node failure set wallet_only_mode_, and the
+    /// probe was guarded on that same flag, so a node that came back later
+    /// was never noticed and the engine stayed on the wallet forever.
+    bool wallet_only_configured_{false};
+
     /// True when running without the full node (wallet-only mode).
     /// Set during open_connections() based on config_.chia.mode and
     /// full-node reachability (auto-detect).

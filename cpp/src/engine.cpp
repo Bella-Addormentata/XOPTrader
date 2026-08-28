@@ -1254,16 +1254,58 @@ asio::awaitable<void> Engine::poll_loop_coro()
 
             if (wallet_only_mode_
                 || height_source_.current == risk::HeightSource::Wallet) {
-                height = co_await wallet_->get_height_info();
+                // The wallet call gets its own guard. Unprotected, a wallet
+                // throw unwound the whole poll before the recovery probe
+                // below could run -- so the one failure that makes the
+                // wallet a bad height source was also the one that
+                // guaranteed we never looked for a way off it.
+                std::int64_t wallet_height = -1;
+                try {
+                    wallet_height = co_await wallet_->get_height_info();
+                    height = wallet_height;
+                } catch (const std::exception& ex) {
+                    spdlog::warn("[Engine] [S28] wallet height failed: {} -- "
+                                 "still probing the node for recovery",
+                                 ex.what());
+                }
                 // A wallet poll is evidence about the WALLET, not the node.
                 // Probe the node separately so a recovery can be noticed --
                 // otherwise the fallback would be permanent.
-                if (!wallet_only_mode_ && mode_is_auto) {
+                //
+                // Guarded on wallet_only_CONFIGURED, not wallet_only_mode_:
+                // an auto-mode startup failure sets the latter, and guarding
+                // on it disabled recovery precisely when recovery mattered.
+                if (!wallet_only_configured_ && mode_is_auto) {
                     try {
+                        // A startup fallback closed the node client, so
+                        // re-open before probing. open() is idempotent but
+                        // tears down a live session, hence the is_open test.
+                        if (!full_node_->is_open()) {
+                            co_await full_node_->open();
+                        }
                         const std::int64_t probe =
                             co_await full_node_->get_block_height();
-                        node_ok = (probe >= 0);
+                        // Answering is not the same as being usable. A node
+                        // resyncing from genesis answers every poll with a
+                        // height far BELOW the wallet's; counting those as
+                        // successes walked the source back onto it, after
+                        // which height_is_usable rejected every reading as
+                        // backwards and the engine stopped seeing blocks at
+                        // all. Require the node to be at least level with
+                        // both the wallet and the last height we acted on.
+                        node_ok = (probe >= 0)
+                               && (probe >= wallet_height)
+                               && risk::height_is_usable(
+                                      probe,
+                                      last_block_.load(
+                                          std::memory_order_relaxed));
                         if (node_ok) height = std::max(height, probe);
+                        else if (probe >= 0) {
+                            spdlog::debug("[Engine] [S28] node answered {} but "
+                                          "is behind wallet {} -- not counting "
+                                          "it as recovered", probe,
+                                          wallet_height);
+                        }
                     } catch (const std::exception&) {
                         node_ok = false;
                     }
@@ -1416,13 +1458,40 @@ asio::awaitable<void> Engine::run_startup_analysis()
 
         // Fetch current block height.
         std::int64_t height{0};
+        std::string  height_error;
         try {
             height = wallet_only_mode_
                 ? co_await wallet_->get_height_info()
                 : co_await full_node_->get_block_height();
         } catch (const std::exception& ex) {
-            spdlog::warn("[Engine] Analysis: block height poll failed: {}", ex.what());
-            continue;
+            height_error = ex.what();
+            height = -1;
+        }
+
+        // [S28] The main loop's fallback does not exist yet -- this phase runs
+        // before it. open_connections() covers a node that is already down at
+        // startup, but a node that dies DURING analysis left this loop failing
+        // and `continue`ing forever, so the engine never reached the loop
+        // where the fallback lives. Try the wallet rather than spinning.
+        //
+        // Outside the catch, not inside it: co_await is illegal in a handler.
+        if (!height_error.empty()) {
+            bool recovered = false;
+            if (!wallet_only_mode_) {
+                try {
+                    height = co_await wallet_->get_height_info();
+                    recovered = (height > 0);
+                } catch (const std::exception&) {
+                    recovered = false;
+                }
+            }
+            if (!recovered) {
+                spdlog::warn("[Engine] Analysis: block height poll failed: {}",
+                             height_error);
+                continue;
+            }
+            spdlog::warn("[Engine] [S28] Analysis: node height failed ({}) -- "
+                         "used the WALLET for this poll", height_error);
         }
 
         if (height <= 0) continue;
@@ -13972,7 +14041,8 @@ asio::awaitable<void> Engine::open_connections()
 {
     // Determine operating mode: full_node, wallet_only, or auto-detect.
     if (config_.chia.mode == ChiaMode::WalletOnly) {
-        wallet_only_mode_ = true;
+        wallet_only_mode_       = true;
+        wallet_only_configured_ = true;
         spdlog::info("[Engine] Configured for wallet-only mode "
                      "(no full node required)");
     } else if (config_.chia.mode == ChiaMode::FullNode) {
