@@ -485,3 +485,95 @@ def test_realised_rate_is_denominated_like_effective_rate():
     leg = plan.legs[0]
     # 420 BYC given for 200 XCH received -> 2.1, not 2.1e-9.
     assert leg.realised_rate == pytest.approx(2.1)
+
+
+# ---------------------------------------------------------------------------
+# Review round 2
+# ---------------------------------------------------------------------------
+
+def test_a_dust_direct_fill_no_longer_hides_a_complete_two_hop_route():
+    """Returning on ANY direct offer let 1 unit of dust liquidity strand 999
+    of 1,000 source units while a complete two-hop route sat unused."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=1_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("dust", 1, 1, give_asset=BYC, recv_asset=DBX)],
+        direct_anchor=Anchor(rate=1.0, source="test"),
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 1_000, 500)],
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[
+            offer("s", 500, 500, give_asset=XCH, recv_asset=DBX)
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 2
+    assert plan.give_total == 1_000 * denomination(BYC)
+
+
+def test_direct_still_wins_when_its_coverage_matches():
+    """Each extra hop is another all-or-nothing take with its own fee and its
+    own window for the book to move, so direct keeps ties."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=1_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[offer("d", 1_000, 1_000, give_asset=BYC, recv_asset=DBX)],
+        direct_anchor=Anchor(rate=1.0, source="test"),
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 1_000, 500)],
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[offer("s", 500, 500, give_asset=XCH, recv_asset=DBX)],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert len(plan.legs) == 1
+    assert [o.offer_id for o in plan.legs[0].offers] == ["d"]
+
+
+def test_the_route_cap_is_not_applied_twice():
+    """Applying the same cap per leg let two 10% hops deliver a composite 21%
+    worse than the anchors -- while the operator's limit said 10%."""
+    from gui.services.consolidate.planner import per_leg_cap
+
+    assert per_leg_cap(0.10, 1) == pytest.approx(0.10)
+    leg = per_leg_cap(0.10, 2)
+    assert leg == pytest.approx(0.0488, abs=1e-4)
+    # The whole point: compounding the per-leg bound reproduces the route cap.
+    assert (1 + leg) ** 2 - 1 == pytest.approx(0.10)
+
+
+def test_two_near_cap_legs_are_refused_by_the_route_cap():
+    """Both legs sit at ~9%, inside the old per-leg reading and outside the
+    operator's actual 10% route cap."""
+    plan = build_plan(
+        source_asset=BYC, target_asset=DBX,
+        budget=10_000 * denomination(BYC), max_slippage_frac=0.10,
+        direct_offers=[], direct_anchor=None,
+        hop_asset=XCH,
+        first_hop_offers=[offer("f", 218, 100)],          # 2.18 vs 2.0 = +9%
+        first_hop_anchor=ANCHOR,
+        second_hop_offers=[
+            offer("s", 109, 100, give_asset=XCH, recv_asset=DBX)  # +9%
+        ],
+        second_hop_anchor=Anchor(rate=1.0, source="test"),
+    )
+    assert plan.is_empty
+
+
+def test_a_repeated_offer_id_is_planned_once():
+    """The first take consumes the offer and the second fails -- after the
+    plan has already partially executed."""
+    dupe = offer("same", 200, 100)
+    plan = build_plan(
+        source_asset=BYC, target_asset=XCH,
+        budget=10_000 * denomination(BYC), max_slippage_frac=10.0,
+        direct_offers=[dupe, offer("same", 210, 100), dupe],
+        direct_anchor=ANCHOR,
+    )
+    assert plan.take_count == 1
+    assert plan.skipped_duplicate == 2
+
+
+def test_whitespace_provenance_is_refused():
+    """It passes `not source` and shows the operator nothing at all."""
+    with pytest.raises(PlanError, match="provenance"):
+        Anchor(rate=1.0, source="   ")

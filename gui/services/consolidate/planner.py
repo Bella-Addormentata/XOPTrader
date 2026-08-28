@@ -86,7 +86,11 @@ class Anchor:
     def __post_init__(self) -> None:
         if not (self.rate > 0.0) or self.rate != self.rate or self.rate == float("inf"):
             raise PlanError(f"anchor rate must be finite and positive, got {self.rate!r}")
-        if not self.source:
+        if not self.source.strip():
+            # The operator is the last line of defence against a bad
+            # reference and can only exercise that if the dialog shows them
+            # something. "   " passes `not self.source` and displays as
+            # nothing at all.
             raise PlanError("anchor must carry its provenance")
 
 
@@ -158,6 +162,7 @@ class ConsolidationPlan:
     skipped_worse_than_cap: int = 0
     skipped_malformed: int = 0
     skipped_too_large: int = 0
+    skipped_duplicate: int = 0
     unspent_source: int = 0
     hop_residual: int = 0
     """Hop-asset units the second leg could not spend.
@@ -265,6 +270,7 @@ def _plan_leg(
     anchor: Anchor,
     max_slippage_frac: float,
     counters: dict[str, int],
+    seen_ids: set[str],
 ) -> Leg:
     """Select offers for one hop, best price first, until the budget is spent.
 
@@ -278,10 +284,19 @@ def _plan_leg(
     """
     usable: list[OfferCandidate] = []
     for offer in offers:
-        if _usable(offer, give_asset, receive_asset):
-            usable.append(offer)
-        else:
+        if not _usable(offer, give_asset, receive_asset):
             counters["malformed"] = counters.get("malformed", 0) + 1
+            continue
+        # A repeated id is the SAME on-chain offer arriving twice. Planning
+        # it twice means the first take consumes it and the second fails --
+        # after the plan has already partially executed, which is the worst
+        # moment to discover it. Deduped across the whole plan, not just
+        # this leg, because the same offer can appear in both hops' books.
+        if offer.offer_id in seen_ids:
+            counters["duplicate"] = counters.get("duplicate", 0) + 1
+            continue
+        seen_ids.add(offer.offer_id)
+        usable.append(offer)
 
     usable.sort(key=effective_rate)
 
@@ -325,6 +340,42 @@ def _plan_leg(
     )
 
 
+def per_leg_cap(route_cap: float, hops: int) -> float:
+    """Split an operator's ROUTE slippage cap across ``hops`` legs.
+
+    [review round 2] The same cap used to be applied independently to each
+    hop, so a two-hop plan could accept 10% on the first leg and 10% on the
+    second and deliver a composite 21% worse than the product of the anchors
+    -- while telling the operator their limit was 10%. The bound on a route
+    of n equally-capped legs is (1+s)^n - 1, not s.
+
+    Inverting that gives each leg (1+s)^(1/n) - 1, so the COMPOSITE honours
+    the number the operator actually chose. A 10% route cap becomes ~4.88%
+    per leg over two hops. That is tighter and will sometimes find nothing --
+    which is the correct answer to "keep me within 10%", and far better than
+    quietly spending 21%.
+    """
+    if hops <= 1:
+        return route_cap
+    return (1.0 + route_cap) ** (1.0 / hops) - 1.0
+
+
+def _single_leg_plan(
+    source_asset: str, target_asset: str, leg: "Leg", budget: int,
+    counters: dict[str, int]
+) -> "ConsolidationPlan":
+    return ConsolidationPlan(
+        source_asset=source_asset,
+        target_asset=target_asset,
+        legs=[leg],
+        skipped_worse_than_cap=counters.get("worse_than_cap", 0),
+        skipped_malformed=counters.get("malformed", 0),
+        skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
+        unspent_source=budget - leg.give_total,
+    )
+
+
 def _empty_plan(
     source_asset: str, target_asset: str, budget: int, counters: dict[str, int]
 ) -> "ConsolidationPlan":
@@ -341,6 +392,7 @@ def _empty_plan(
         skipped_worse_than_cap=counters.get("worse_than_cap", 0),
         skipped_malformed=counters.get("malformed", 0),
         skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
         unspent_source=budget,
     )
 
@@ -398,9 +450,11 @@ def build_plan(
         raise PlanError(f"max slippage must be non-negative, got {max_slippage_frac}")
 
     counters: dict[str, int] = {}
+    seen_ids: set[str] = set()
 
+    direct_leg = None
     if direct_anchor is not None:
-        leg = _plan_leg(
+        direct_leg = _plan_leg(
             give_asset=source_asset,
             receive_asset=target_asset,
             budget=budget,
@@ -408,17 +462,24 @@ def build_plan(
             anchor=direct_anchor,
             max_slippage_frac=max_slippage_frac,
             counters=counters,
+            seen_ids=seen_ids,
         )
-        if leg.offers:
-            return ConsolidationPlan(
-                source_asset=source_asset,
-                target_asset=target_asset,
-                legs=[leg],
-                skipped_worse_than_cap=counters.get("worse_than_cap", 0),
-                skipped_malformed=counters.get("malformed", 0),
-                skipped_too_large=counters.get("too_large", 0),
-                unspent_source=budget - leg.give_total,
-            )
+        # [review round 2] This used to return the moment the direct route
+        # selected ANY offer. A reproduced case took a single 1-unit direct
+        # offer and left 999 of 1,000 source units untouched while a complete
+        # two-hop route sat unused -- dust liquidity making the only viable
+        # consolidation unreachable, in a tool whose whole promise is moving
+        # as much as possible. Direct is still PREFERRED, because each extra
+        # hop is another all-or-nothing take with its own fee and its own
+        # window for the book to move; it is just no longer preferred at any
+        # coverage whatsoever.
+        if direct_leg.offers and hop_asset is None:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+
+    if hop_asset is None and direct_leg is not None and direct_leg.offers:
+        return _single_leg_plan(
+            source_asset, target_asset, direct_leg, budget, counters)
 
     if hop_asset is None:
         # skipped_too_large was omitted here and below, so a direct route
@@ -431,16 +492,24 @@ def build_plan(
     if first_hop_anchor is None or second_hop_anchor is None:
         raise PlanError("a two-hop plan needs an anchor for each hop")
 
+    # Both hops share the operator's ROUTE cap, split so the composite
+    # honours it -- see per_leg_cap.
+    leg_cap = per_leg_cap(max_slippage_frac, 2)
+
     first = _plan_leg(
         give_asset=source_asset,
         receive_asset=hop_asset,
         budget=budget,
         offers=first_hop_offers,
         anchor=first_hop_anchor,
-        max_slippage_frac=max_slippage_frac,
+        max_slippage_frac=leg_cap,
         counters=counters,
+        seen_ids=seen_ids,
     )
     if not first.offers:
+        if direct_leg is not None and direct_leg.offers:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
         return _empty_plan(source_asset, target_asset, budget, counters)
 
     # The second hop can only spend what the first actually yields.  Budget
@@ -453,11 +522,24 @@ def build_plan(
         budget=first.receive_total,
         offers=second_hop_offers,
         anchor=second_hop_anchor,
-        max_slippage_frac=max_slippage_frac,
+        max_slippage_frac=leg_cap,
         counters=counters,
+        seen_ids=seen_ids,
     )
 
+    # Direct wins ties and near-ties; the two-hop route has to be materially
+    # better to justify a second all-or-nothing take. "Materially" is coverage
+    # of the source budget, because that is what the operator asked for.
+    if second.offers and direct_leg is not None and direct_leg.offers:
+        if direct_leg.give_total >= first.give_total:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
+
     if not second.offers:
+        # A partial direct fill beats a two-hop route that cannot complete.
+        if direct_leg is not None and direct_leg.offers:
+            return _single_leg_plan(
+                source_asset, target_asset, direct_leg, budget, counters)
         # The first hop would spend source to buy an intermediate asset the
         # second hop cannot sell -- so the plan receives NO target at all
         # while still costing the whole first leg.  is_empty was false in
@@ -472,6 +554,7 @@ def build_plan(
         skipped_worse_than_cap=counters.get("worse_than_cap", 0),
         skipped_malformed=counters.get("malformed", 0),
         skipped_too_large=counters.get("too_large", 0),
+        skipped_duplicate=counters.get("duplicate", 0),
         unspent_source=budget - first.give_total,
         hop_residual=first.receive_total - second.give_total,
     )
