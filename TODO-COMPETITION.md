@@ -468,7 +468,9 @@ cash session. Two things still argue against doing it naively:
 
 ### C-0S3: measured, and it holds
 
-`scripts/permuto_depth_probe.py`, 124 samples at 60 s over **122 minutes**
+`scripts/permuto_depth_probe.py`, re-verified with
+`--carried-since=2026-08-27T20:00:00+00:00` (the cash close). 124 samples
+at 60 s over **122 minutes**
 from 20:26 to 22:29 UTC — entirely after the 16:00 ET close, with the oracle
 returning a **single distinct value across all 124 samples**, so the whole
 window is confirmed carried.

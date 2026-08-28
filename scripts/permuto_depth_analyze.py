@@ -41,7 +41,14 @@ def load_sessions(path):
             line = line.strip()
             if not line:
                 continue
-            d = json.loads(line)
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError:
+                # A probe killed mid-write leaves a partial final record.
+                # Aborting the parse would throw away every valid sample
+                # before it, which is the whole run.
+                sys.stderr.write("skipping malformed JSONL record\n")
+                continue
             if "probe_start" in d:
                 sessions.append({"header": d, "rows": []})
             elif sessions:
@@ -51,7 +58,7 @@ def load_sessions(path):
     return sessions
 
 
-def frozen_window(rows, interval_s):
+def frozen_window(rows, interval_s, carried_since=None):
     """Longest run of consecutive samples with ONE oracle value and no gaps.
 
     Two separate problems, one answer.
@@ -68,6 +75,16 @@ def frozen_window(rows, interval_s):
     equal, and no adjacent pair further apart than a small multiple of the
     sampling interval. Depth endpoints are then taken from inside that window.
     """
+    # SUFFIX AFTER THE LAST TRANSITION, not merely the longest flat run.
+    #
+    # [review round 3] Picking the longest equal-oracle run does not establish
+    # that the run is CARRIED. A quiet stretch during live trading can easily
+    # be longer than the post-close suffix, and the verdict was then reported
+    # as CONFIRMED anyway -- the third time this tool could have certified
+    # something it had not actually observed. The carried window is by
+    # definition the one the oracle froze INTO most recently, so take the
+    # suffix that follows the final oracle change and require it to be a
+    # genuine freeze (i.e. something different came before it).
     max_gap = max(interval_s * 3, 30)
     best, run = [], []
 
@@ -91,11 +108,44 @@ def frozen_window(rows, interval_s):
         run.append(row)
         prev_ts, prev_oracle = ts, key
     flush()
+
+    # `best` is the longest run; now insist it is the LAST one, and that it
+    # was preceded by a different oracle value. A file that never changes
+    # value has not observed a freeze happening and cannot certify one.
+    if not best:
+        return []
+    tail_start = rows.index(best[0])
+    seen_before = {
+        json.dumps(r.get("oracle"), sort_keys=True)
+        for r in rows[:tail_start] if r.get("oracle")
+    }
+    this_value = json.dumps(best[0].get("oracle"), sort_keys=True)
+    followed_a_transition = bool(seen_before - {this_value})
+    is_suffix = (best[-1] is rows[-1])
+
+    # An OPERATOR-SUPPLIED boundary is the other way to know. A probe started
+    # after the close never sees the freeze happen, so it cannot certify the
+    # window from its own data however obviously carried it is -- and the
+    # venue exposes no is_carried flag to ask (still unanswered in the
+    # channel). Rather than let the tool assume, it accepts the fact it
+    # cannot observe: --carried-since <ISO8601>, recorded in the output so
+    # the claim always travels with its provenance.
+    if carried_since is not None:
+        inside = [r for r in best
+                  if datetime.fromisoformat(r["ts"]) >= carried_since]
+        return inside if len(inside) >= 2 else []
+
+    if not (followed_a_transition and is_suffix):
+        return []
     return best
 
 
 def main():
     path = sys.argv[1]
+    carried_since = None
+    for arg in sys.argv[2:]:
+        if arg.startswith("--carried-since="):
+            carried_since = datetime.fromisoformat(arg.split("=", 1)[1])
     sessions = load_sessions(path)
     if not sessions:
         print("no samples in %s" % path)
@@ -122,7 +172,7 @@ def main():
     # pre-close movement is expected and must narrow the window rather than
     # invalidate the run -- while the depth endpoints must come from inside
     # the frozen part, or they silently include live-session accrual.
-    window = frozen_window(session["rows"], interval_s)
+    window = frozen_window(session["rows"], interval_s, carried_since)
     window = [r for r in window if r.get("mms")]
 
     print("session      : %s" % (header.get("probe_start", "?")[:19] or "?"))
@@ -130,8 +180,12 @@ def main():
           % (len(rows), len(window)))
 
     if len(window) < 2:
-        print("oracle       : NO usable frozen window (need >=2 consecutive "
-              "samples with one oracle value and no gaps)")
+        print("oracle       : NO usable frozen window. Need >=2 consecutive "
+              "samples with one oracle value and no gaps, AND either an "
+              "observed transition into that value or an explicit "
+              "--carried-since=<ISO8601>. A run that merely happens to be "
+              "flat is not evidence of a carried session -- a quiet stretch "
+              "of LIVE trading looks identical.")
         print("\nINCONCLUSIVE: nothing to measure. Re-run the probe entirely "
               "inside a carried session.")
         return
@@ -144,11 +198,18 @@ def main():
     print("window       : %s -> %s UTC (%.0f min)"
           % (t0["ts"][11:19], t1["ts"][11:19], span_s / 60))
     print("oracle       : FROZEN across the selected window, complete "
-          "coverage, no gaps > %.0fs" % max(interval_s * 3, 30))
+          "coverage, no gaps > %.0fs%s"
+          % (max(interval_s * 3, 30),
+             "" if carried_since is None
+             else " (carried boundary asserted: %s)" % carried_since.isoformat()))
     print()
 
-    a = {m["u"]: m for m in t0["mms"]}
-    b = {m["u"]: m for m in t1["mms"]}
+    # Join on the FULL id. The 8-char form is for display: two accounts
+    # sharing a prefix would overwrite each other and produce a delta between
+    # two different accounts, which is worse than no answer.
+    key = lambda m: m.get("user_id") or m["u"]
+    a = {key(m): m for m in t0["mms"]}
+    b = {key(m): m for m in t1["mms"]}
 
     out = []
     for u, mb in b.items():
