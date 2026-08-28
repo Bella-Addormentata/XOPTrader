@@ -5,11 +5,10 @@ from __future__ import annotations
 import pytest
 
 from gui.services.permuto.auth import PermutoAuthError
-from gui.services.permuto.batch import BatchError
 from gui.services.permuto.client import PermutoNotLinked
 from gui.services.permuto.quoting import RestingQuote
-from gui.services.permuto.runner import QuoteRunner, _margin_state
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
+from gui.services.permuto.runner import QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
 
 _MKT = "QQQ-VOL-PERP"
