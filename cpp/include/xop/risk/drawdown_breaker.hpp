@@ -63,55 +63,6 @@ namespace xop::risk {
 // function's arithmetic and NaN-return prose to this bool-returning API.
 // ---------------------------------------------------------------------------
 
-/// Should the engine stop trading because it cannot value
-/// its own book?
-///
-/// TWO DISTINCT FAIL-OPEN STATES, both of which leave the drawdown breaker
-/// unable to fire however bad things get.
-///
-/// 1. NO PEAK EVER ESTABLISHED.  Marking a cycle degraded freezes the peak,
-///    which is right when a peak exists -- a suspect number must not ratchet
-///    the high-water mark.  On a fresh process there is nothing to freeze,
-///    so the peak stays 0 and `equity_drawdown_frac` returns 0.0 for a
-///    non-positive peak.
-///
-/// 2. EVERY HELD ASSET UNPRICED, EVEN WITH A PEAK.  This one refutes the
-///    first version of this helper, which assumed "a frozen peak is a real
-///    reference and the ordinary comparison still protects us".  It does
-///    not: `effective_usd_per_unit` carries the last known price with NO
-///    expiry check -- expiry only raises the degraded flag, it does not stop
-///    the carry being summed.  So when nothing is live, equity holds at its
-///    carried value, which is the same number the peak was frozen at, and
-///    the drawdown sits at 0 indefinitely.  Comparing a frozen equity to a
-///    frozen peak cannot detect anything.
-///
-/// Either way the answer is to stop: an engine that cannot measure its
-/// exposure has no business adding to it.
-///
-/// BOTH cases additionally require `valuation_degraded`, and that guard is
-/// load-bearing rather than belt-and-braces.  "Every asset unpriced THIS
-/// HEARTBEAT" is not the same as "we cannot value the book": a momentary
-/// feed gap with every carry still inside `valuation_carry_ttl_blocks` is
-/// precisely the transient the carry mechanism exists to bridge, and
-/// config.hpp says so -- "a data gap must not read as a crash".  Without
-/// this guard a single bad tick would permanently latch the breaker, and a
-/// configured TTL of 0 ("never expire") would be ignored outright.
-/// Degradation is what distinguishes a gap from an outage.
-///
-/// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
-/// there at least one asset is still live, equity still moves, and the
-/// ordinary comparison genuinely does work.
-///
-/// [S33 2026-08-27] `all_held_assets_unpriced` means "nothing live AND
-/// nothing being bridged by a still-valid carry", not merely "nothing live
-/// this tick". The weaker reading was a defect: `valuation_degraded` is an
-/// aggregate over every held asset, so it can be raised by one asset's
-/// long-expired carry while a second asset rides a perfectly fresh one. A
-/// single quiet tick on the second then produced (true, true, true) and
-/// latched the breaker permanently -- with the degradation guard satisfied
-/// by a DIFFERENT asset than the one that had gone quiet, which is exactly
-/// the confusion this parameter now exists to prevent. The caller computes
-/// it in compute_portfolio_equity_usd.
 /// Whether a held asset with no live price should be WRITTEN OFF at $0
 /// rather than degrading the valuation cycle.
 ///
@@ -157,6 +108,55 @@ namespace xop::risk {
     return !has_pricing_path && !has_carry;
 }
 
+/// Should the engine stop trading because it cannot value
+/// its own book?
+///
+/// TWO DISTINCT FAIL-OPEN STATES, both of which leave the drawdown breaker
+/// unable to fire however bad things get.
+///
+/// 1. NO PEAK EVER ESTABLISHED.  Marking a cycle degraded freezes the peak,
+///    which is right when a peak exists -- a suspect number must not ratchet
+///    the high-water mark.  On a fresh process there is nothing to freeze,
+///    so the peak stays 0 and `equity_drawdown_frac` returns 0.0 for a
+///    non-positive peak.
+///
+/// 2. EVERY HELD ASSET UNPRICED, EVEN WITH A PEAK.  This one refutes the
+///    first version of this helper, which assumed "a frozen peak is a real
+///    reference and the ordinary comparison still protects us".  It does
+///    not: `effective_usd_per_unit` carries the last known price with NO
+///    expiry check -- expiry only raises the degraded flag, it does not stop
+///    the carry being summed.  So when nothing is live, equity holds at its
+///    carried value, which is the same number the peak was frozen at, and
+///    the drawdown sits at 0 indefinitely.  Comparing a frozen equity to a
+///    frozen peak cannot detect anything.
+///
+/// Either way the answer is to stop: an engine that cannot measure its
+/// exposure has no business adding to it.
+///
+/// BOTH cases additionally require `valuation_degraded`, and that guard is
+/// load-bearing rather than belt-and-braces.  "Every asset unpriced THIS
+/// HEARTBEAT" is not the same as "we cannot value the book": a momentary
+/// feed gap with every carry still inside `valuation_carry_ttl_blocks` is
+/// precisely the transient the carry mechanism exists to bridge, and
+/// config.hpp says so -- "a data gap must not read as a crash".  Without
+/// this guard a single bad tick would permanently latch the breaker, and a
+/// configured TTL of 0 ("never expire") would be ignored outright.
+/// Degradation is what distinguishes a gap from an outage.
+///
+/// PARTIAL degradation with a valid peak is deliberately NOT a trigger --
+/// there is at least one asset still live, equity still moves, and the
+/// ordinary comparison genuinely does work.
+///
+/// [S33 2026-08-27] `all_held_assets_unpriced` means "nothing live AND
+/// nothing being bridged by a still-valid carry", not merely "nothing live
+/// this tick". The weaker reading was a defect: `valuation_degraded` is an
+/// aggregate over every held asset, so it can be raised by one asset's
+/// long-expired carry while a second asset rides a perfectly fresh one. A
+/// single quiet tick on the second then produced (true, true, true) and
+/// latched the breaker permanently -- with the degradation guard satisfied
+/// by a DIFFERENT asset than the one that had gone quiet, which is exactly
+/// the confusion this parameter now exists to prevent. The caller computes
+/// it in compute_portfolio_equity_usd.
 [[nodiscard]] constexpr bool unvaluable_book_must_fail_closed(
     bool   grace_elapsed,
     bool   valuation_degraded,
