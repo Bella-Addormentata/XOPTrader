@@ -337,7 +337,10 @@ void MetricsExporter::register_metrics()
         .Name("xop_posting_gate")
         .Help("1 while the named standing gate disables offer posting; "
               "reason label is one of gui, breaker, wallet_circuit, "
-              "flash_crash, xch_recovery, dry_run")
+              "flash_crash, xch_recovery, dry_run, watchdog. The watchdog "
+              "gate is restart-only: once set it stays set, because the "
+              "dead man's switch firing means the book was cancelled by a "
+              "process that has stopped managing it.")
         .Register(*registry_);
     gate_gui_            = &posting_gate_family_->Add({{"reason", "gui"}});
     gate_breaker_        = &posting_gate_family_->Add({{"reason", "breaker"}});

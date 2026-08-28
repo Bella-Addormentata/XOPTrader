@@ -23,6 +23,7 @@
 #include <xop/execution/offer_manager.hpp>
 
 #include <xop/execution/wallet_poll_throttle.hpp>
+#include <xop/risk/watchdog.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -549,11 +550,20 @@ asio::awaitable<int> OfferManager::post_quotes(
             if (!late_id.empty()) {
                 try {
                     co_await cancel_offer_charged(
-                        late_id, current_fee_mojos_, /*secure=*/true);
+                        late_id, xop::risk::watchdog_cancel().fee_mojos,
+                        xop::risk::watchdog_cancel().secure);
                 } catch (const std::exception& e) {
                     logger_->critical("could not cancel the late offer {}: "
                                       "{} -- it is LIVE and unmanaged",
                                       late_id, e.what());
+                    if (escalate_) {
+                        escalate_("an offer created after the stop could NOT "
+                                  "be cancelled and is LIVE: trade " + late_id
+                                  + " (" + e.what() + "). The bulk cancel "
+                                  "never saw it, so any earlier "
+                                  "cancellation-submitted message does not "
+                                  "cover this one.");
+                    }
                 }
             }
             break;
@@ -1500,6 +1510,12 @@ void OfferManager::set_dynamic_fee(std::uint64_t fee_mojos) noexcept
 void OfferManager::set_abort_predicate(std::function<bool()> predicate)
 {
     abort_predicate_ = std::move(predicate);
+}
+
+void OfferManager::set_escalation(
+    std::function<void(const std::string&)> escalate)
+{
+    escalate_ = std::move(escalate);
 }
 
 std::uint64_t OfferManager::current_fee() const noexcept
@@ -3191,11 +3207,18 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 if (!late_id.empty()) {
                     try {
                         co_await cancel_offer_charged(
-                            late_id, current_fee_mojos_, /*secure=*/true);
+                            late_id, xop::risk::watchdog_cancel().fee_mojos,
+                        xop::risk::watchdog_cancel().secure);
                     } catch (const std::exception& e2) {
                         logger_->critical("could not cancel late offer {}: "
                                           "{} -- LIVE and unmanaged",
                                           late_id, e2.what());
+                        if (escalate_) {
+                            escalate_("a fallback offer created after the "
+                                      "stop could NOT be cancelled and is "
+                                      "LIVE: trade " + late_id + " ("
+                                      + e2.what() + ").");
+                        }
                     }
                 }
                 break;

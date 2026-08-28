@@ -262,6 +262,17 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     offer_mgr_->set_abort_predicate([this] {
         return watchdog_fired_.load(std::memory_order_acquire);
     });
+    // A late offer that could not be cancelled has to reach the operator.
+    // The watchdog's own alert says a cancel of every resting offer was
+    // SUBMITTED -- and this trade was created after that request enumerated
+    // the book, so it was never in it.
+    offer_mgr_->set_escalation([this](const std::string& detail) {
+        spdlog::critical("[Engine] [S31] {}", detail);
+        if (alerts_) {
+            alerts_->send_alert(AlertRule::DeadMansSwitch,
+                                "DEAD MAN'S SWITCH INCOMPLETE: " + detail);
+        }
+    });
 
     // Market data feed: construct with a MarketDataConfig populated from
     // the YAML `market_data:` section (T4-05).

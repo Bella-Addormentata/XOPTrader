@@ -536,6 +536,17 @@ public:
     /// wire it.
     void set_abort_predicate(std::function<bool()> predicate);
 
+    /// [S31] Called when an offer created after the abort could not be
+    /// cancelled again, with an operator-facing description.
+    ///
+    /// This exists because a local log is not enough here. The watchdog may
+    /// already have alerted that a cancel of every resting offer was
+    /// SUBMITTED -- and this trade was created after that bulk request
+    /// enumerated the book, so it was never in it. Leaving the failure in a
+    /// log file turns that alert into a false all-clear about the one thing
+    /// it is for.
+    void set_escalation(std::function<void(const std::string&)> escalate);
+
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
 
@@ -922,6 +933,7 @@ private:
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
     std::function<bool()> abort_predicate_;
+    std::function<void(const std::string&)> escalate_;
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()
