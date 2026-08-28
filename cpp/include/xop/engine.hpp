@@ -556,8 +556,14 @@ private:
     [[nodiscard]] Mojo asset_usd_pseudo_price(const AssetId& asset_id) const;
 
     /// [S32 2026-08-27] Whether the configuration provides ANY route to a
-    /// USD price for this asset -- that is, whether some ENABLED pair names
-    /// it as base or quote.  This is what distinguishes "we cannot price
+    /// USD price for this asset -- meaning a route that reaches an ANCHOR,
+    /// not merely membership of an enabled pair.  Three qualify: the asset's
+    /// own declared and still-enforced par; an enabled pair against a quote
+    /// asset that has one; or an enabled pair against XCH while XCH is
+    /// itself anchored (CoinGecko "chia" with a usable freshness threshold,
+    /// or an enabled XCH pair against a par wrapper).  An enabled CAT/CAT
+    /// pair with no XCH leg and no enforced par is NOT a route -- it yields
+    /// 0.0 forever.  This is what distinguishes "we cannot price
     /// this, ever, as configured" from "the price is unavailable right
     /// now", and the two must not share a response: the first is written
     /// off at $0, the second rides its carry.  Deliberately a pure function

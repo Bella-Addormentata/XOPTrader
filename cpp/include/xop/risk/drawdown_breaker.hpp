@@ -49,8 +49,11 @@ namespace xop::risk {
 /// [S32 2026-08-27] "No price available" hides two conditions that must not
 /// share a response:
 ///
-/// 1. NO PRICING PATH EXISTS.  No enabled pair names the asset, so nothing
-///    in the configuration can ever produce a price for it.  This is a
+/// 1. NO PRICING PATH EXISTS.  The configuration provides no route from this
+///    asset to a USD anchor, so nothing in it can ever produce a price.
+///    Note that this is NOT "no enabled pair names the asset": a declared
+///    par needs no pair at all, and an enabled CAT/CAT pair with no XCH leg
+///    and no enforced par is a dead end that yields 0.0 forever.  This is a
 ///    permanent, deterministic property of the config, known at startup and
 ///    unchanged by any market event.  wUSDC.b after the warp.green
 ///    compromise is the live example: both its pairs are disabled, so it is
