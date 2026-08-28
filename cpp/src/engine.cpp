@@ -11703,6 +11703,19 @@ bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
     // trusted factor, or a valuation grade.  Those are transient and belong
     // to the carry mechanism; folding them in here would let a junk book
     // masquerade as "no path" and write a live asset off to zero.
+    // XCH is configured with an EXTERNAL route that no pair mediates, so
+    // judging it by pairs alone declares the one asset with an independent
+    // anchor unpriceable the moment its markets are switched off.  Whether
+    // the feed is fresh RIGHT NOW is a runtime availability question and
+    // belongs to the carry mechanism, exactly like a quiet book -- what
+    // matters here is that a route exists at all.
+    if (asset_id == "xch" && config_.coingecko.enabled) {
+        const auto& ids = config_.coingecko.coin_ids;
+        if (std::find(ids.begin(), ids.end(), "chia") != ids.end()) {
+            return true;
+        }
+    }
+
     for (const auto& pair : config_.pairs) {
         if (!pair.enabled) continue;
         if (pair.base_asset_id == asset_id || pair.quote_asset_id == asset_id) {
@@ -11714,6 +11727,24 @@ bool Engine::asset_has_pricing_path(const AssetId& asset_id) const
 
 Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
 {
+    // [S27 follow-up] XCH HAS ITS OWN ANCHOR, INDEPENDENT OF EVERY PAIR.
+    //
+    // usd_per_xch() prefers a freshness-gated external CoinGecko price
+    // precisely so a disabled or compromised quote-asset market cannot zero
+    // the book -- but this function only ever reached that logic while
+    // ITERATING AN ENABLED PAIR.  So with every XCH pair disabled (exactly
+    // what an operator did on 2026-08-25) XCH priced at $0 despite a
+    // perfectly good external quote, and S32 then wrote it off as
+    // structurally unpriceable.  The S27 incident, arriving back through the
+    // fix for it.  Ask the anchor first.
+    if (asset_id == "xch") {
+        const double usd = usd_per_xch();
+        if (std::isfinite(usd) && usd > 0.0) {
+            return static_cast<Mojo>(std::llround(
+                usd * static_cast<double>(kMojosPerXch)));
+        }
+    }
+
     // Prefer pricing the asset as the BASE of an enabled pair (live mid).
     //
     // [S20 2026-08-24] Valuation-grade mids only.  This branch was the main
