@@ -253,7 +253,9 @@ arbitrage to anchor the contract.** A conventional perp is disciplined by
 arbitrageurs who can hold the underlying. Nobody can hold "QQQ 30-day
 realized vol". The oracle and the funding rate are the *only* things holding
 mark to fair value, so a maker on an SVPerp is quoting against a reference
-they cannot hedge in the underlying.
+with **no hedge on this venue** — and, under XOPTrader's current scope, no
+hedge at all. (Not "no hedge exists in the underlying": these names have
+deep listed options. See the hedging correction later in this document.)
 
 ### What we measured on a live SVPerp venue
 
@@ -633,14 +635,36 @@ That matters here for a specific reason. **Permuto serves OHLC**
 (`/info/candles` returns `open`/`high`/`low`/`close`), and the venue's own
 oracle is a 60-second trailing estimate whose short-window noise is the
 central open question in `TODO-COMPETITION.md`. A range-based estimator
-computed from the same bars gives an *independent, better-conditioned*
-estimate of the same quantity — and **the difference between that estimate
-and the oracle is the estimator noise itself**, measured directly rather
-than inferred from variance ratios.
+computed from those bars is *independent and better-conditioned*, and it is
+the best instrument this venue actually serves.
 
-This is a better instrument than the variance-ratio work above, which has
+⚠ **It is not the same quantity, so the difference is a bound, not an
+identification.** Three mismatches, none of which the difference can
+separate from the noise it is supposed to be measuring:
+
+- **Horizon.** `tf` is accepted and ignored; `/info/candles` returns 3600s
+  bars whatever you ask for (`docs/permuto-api-reference.md` §1). The oracle
+  is a 60s trailing estimate. An hourly range and a 60-second RV are not
+  comparable magnitudes.
+- **Input series.** `base_asset`/`oracle_ticker` is `QQQ-VOL`, so the bars
+  are bars *of the volatility series*. A range estimator over them measures
+  variation of the vol series — vol-of-vol — not the underlying equity's
+  realized volatility.
+- **Model.** Parkinson and Garman–Klass assume driftless GBM over the bar,
+  which the oracle's construction does not satisfy.
+
+So the difference between the two series **bounds** the oracle's estimator
+noise and confounds it with horizon, input and model mismatch; it does not
+measure it. Identifying the estimator noise needs matching-frequency returns
+of QQQ/NVDA/TSLA themselves, which this venue does not serve. C-03 must
+therefore either source those externally, or record the range estimator for
+what it is — an hourly vol-of-vol proxy, useful as a regime signal and as an
+upper bound, not as a noise measurement.
+
+It is still better conditioned than the variance-ratio work above, which has
 already had to be walked back once as confounded by overlapping windows. It
-should go into the C-03 observer.
+should go into the C-03 observer — as a proxy carrying the three mismatches
+above, not as the answer to the noise question.
 
 **2. Explicit regular-trading-hours handling.** `rv_intraday(close,
 rth_start="09:30", rth_end="16:00")` and `overnight_return(...)` treat the

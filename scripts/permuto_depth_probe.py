@@ -32,7 +32,6 @@ import json
 import os
 import sys
 import time
-import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
@@ -107,6 +106,21 @@ def main():
     out_dir = os.path.dirname(out_path)
     if out_dir:
         os.makedirs(out_dir, exist_ok=True)
+    # Terminate a previous run's last line before appending our header. A
+    # probe killed mid-write leaves the file without a trailing newline, and
+    # appending the header straight onto it produces ONE unreadable line
+    # carrying both the partial sample and the session boundary -- the
+    # analyzer then cannot tell the two runs apart, so hours of downtime it
+    # never observed get counted as continuous evidence. One seek is cheaper
+    # than reconstructing that afterwards.
+    if os.path.exists(out_path) and os.path.getsize(out_path):
+        with open(out_path, "rb") as probe_fh:
+            probe_fh.seek(-1, os.SEEK_END)
+            unterminated = probe_fh.read(1) != b"\n"
+        if unterminated:
+            with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
+                fh.write("\n")
+
     with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps({"probe_start": datetime.now(timezone.utc).isoformat(),
                              "interval_s": INTERVAL_S,

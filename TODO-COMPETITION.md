@@ -4,7 +4,10 @@ Working document for whether and how XOPTrader competes at
 <https://perps.permuto.capital>. Separate from `TODO.md`, which tracks the
 live Chia bot.
 
-**Status: scoped, nothing built — and the contest starts in 4 days.**
+**Status: scoped; the read-only research tooling and the order path are
+built — C-02, C-04, C-05 and C-11, C-06 partial, plus the three read-only
+scripts this PR adds. No live trading integration and no registration, and
+the contest starts in 3 days.**
 Figures read from the live venue 2026-08-26 unless noted; contest terms from
 the official rules page, sharpened by the Discord archive read 2026-08-27.
 
@@ -16,7 +19,7 @@ the official rules page, sharpened by the Discord archive read 2026-08-27.
 > | **Balances reset** | Sun **30 Aug**, evening — venue paused until the open |
 > | **Contest runs** | Mon **31 Aug 09:30 ET** → Fri **4 Sep 16:00 ET** |
 > | Duration | 4.3 days, ~32 cash-session hours |
-> | As of 2026-08-27 | **~4 days to start, ~4.3 to sign-up close** |
+> | As of 2026-08-28 | **~3 days to start, ~3.3 to sign-up close** |
 >
 > **New participants cannot join after the first day of competition.** If we
 > are entering at all, registration is the only thing that has a hard
@@ -213,12 +216,13 @@ the API exposes (`prize_eligible` a boolean, separate from `total_pnl`).
 Treat the gate as a constraint to *satisfy*, never as a score to maximise.
 
 **The contest window changes the arithmetic.** Eligibility integrates
-`[CONTEST_START, CONTEST_END]` once set, so on the face of it **depth banked
-before 31 Aug does not count**. 300,000,000 over ~32 cash-session hours is
-~$2,600 of balanced depth held continuously — but only ~32 of the 103
-wall-clock hours are cash session, and whether *carried* (out-of-hours)
-ticks credit is still unresolved. If they do not, the gate must be cleared
-inside those 32 hours.
+`[CONTEST_START, CONTEST_END]` once set, so **depth banked before 31 Aug
+does not count** — and because *carried* (out-of-hours) ticks **do** credit,
+the denominator is the full ~102.5 wall-clock hours rather than the ~32
+cash-session hours. 300,000,000 over 102.5 h is **~$813** of balanced depth
+held continuously. This paragraph used to size on the 32-hour window at
+~$2,600 and describe the carried question as unresolved; that is correction
+6 above, kept there rather than left standing here as operational guidance.
 
 ✅ **Both halves settled 2026-08-27.** `depth_seconds` **is** reset for the
 contest — Gene Hoffman, "planning to do that already" — so nothing banked
@@ -412,7 +416,8 @@ balanced-quote test — is dead. Two consequences for us:
   Venue-side outages shrink the usable window below the contest wall clock;
   we cannot plan to the full ~32.5 cash-session hours.
 - **Our own downtime is pure loss against the gate.** A second, independent
-  argument for `S31` (dead man's switch), and for restart latency being a
+  argument for `S31` (dead man's switch, arriving in `TODO.md` with PR
+  #115 — it is not there yet), and for restart latency being a
   first-class metric rather than an ops nicety.
 
 *Why the change happened*, from Drewski241 **2026-07-29**: he pulled the
@@ -468,14 +473,20 @@ cash session. Two things still argue against doing it naively:
 
 ### C-0S3: measured, and it holds
 
-`scripts/permuto_depth_probe.py`, re-verified with
-`--carried-since=2026-08-27T20:00:00+00:00` (the cash close). 124 samples
-at 60 s over **122 minutes**
-from 20:26 to 22:29 UTC — entirely after the 16:00 ET close, with the oracle
+`scripts/permuto_depth_probe.py`, read by `scripts/permuto_depth_analyze.py`
+and re-verified with `--carried-since=2026-08-27T20:00:00+00:00` (the cash
+close). That flag is required, not decorative: a frozen oracle is a property
+of the *estimator* and a quiet stretch of live trading reads identically, so
+the analyzer will not certify a carried session whose boundary it did not
+observe — the operator asserts it, and the assertion is printed alongside
+the verdict.
+
+124 samples at 60 s over **122 minutes** from 20:26 to 22:29 UTC —
+entirely after the 16:00 ET close, with the oracle
 returning a **single distinct value across all 124 samples**, so the whole
 window is confirmed carried.
 
-| account | Δ depth_5d | implied balanced depth |
+| account | Δ depth_5d | implied balanced depth (lower bound) |
 | --- | ---: | ---: |
 | `7c81d1c9` | **+10,266,440** | ~$1,400 |
 | `23dfb630` | **+8,370,792** | ~$1,141 |
@@ -494,17 +505,20 @@ bots actively re-quoting, not a settling residue.
 
 **This also calibrates sizing for free.** `d(depth)/dt` measured in
 depth-seconds per second **is** the resting balanced notional in dollars,
-because depth accrues at notional × elapsed time. So the probe reads other
-entrants' overnight size directly without placing a single order. At
-`7c81d1c9`'s ~$1,400, clearing 300,000,000 takes **59.5 hours** — against a
+because depth accrues at notional × elapsed time. So the probe places a
+**lower bound** on other entrants' overnight size without placing a single
+order — the observed slope is accrual *minus* 5-day roll-off, and roll-off
+can only subtract, so the true size is at least this. At `7c81d1c9`'s
+~$1,400, clearing 300,000,000 takes **at most 59.5 hours** — against a
 102.5 h contest window, which needs ~$813 held throughout. The two figures
 are derived independently and agree.
 
 ⚠ **Competitive signal worth noting.** Those two accounts are quoting
-overnight at $1,141–$1,400, which brackets the ~$1,190 that the
-carried-hours-only route needs. Other entrants have converged on
-approximately this shape already, so it is not an edge — it is the going
-rate, and the gate is unlikely to be what separates the field.
+overnight at **at least** $1,141–$1,400 (lower bounds, per above), so they
+are already at or above the ~$1,190 that the carried-hours-only route needs.
+Other entrants have converged on approximately this shape already, so it is
+not an edge — it is at minimum the going rate, and the gate is unlikely to
+be what separates the field.
 
 **And it settles correction 2 from the other direction.** `9941a3ad` shed
 14.66M in the same two hours with equity at exactly $0 — a wiped account
@@ -676,7 +690,8 @@ that quotes through a pause gets rejects; one that does not notice the
 un-pause starts late, on a metric that only accrues while quoting.
 
 Jakub Hadamcik added the practical version, and it is the same shape as our
-own S28/S31 work:
+own S28/S31 work (neither is in `TODO.md` on `main` yet — it stops at S21;
+S31 arrives with PR #115):
 
 > If you already handle re-auth and state refreshes based on what exchange
 > tells you (normal operation), you are good to go
@@ -791,9 +806,11 @@ Possible: `signup_closed: false`, trading live, competition mode already on.
 
 Two reasons for care:
 
-1. **Pre-contest depth probably does not count.** Eligibility uses the
-   rolling 5d bank *only while `CONTEST_START` is unset*; once set it
-   integrates the contest window.
+1. **Pre-contest depth does not count.** `depth_seconds` is reset for the
+   contest (sponsor-confirmed 2026-08-26 — see "RESOLVED: depth_seconds IS
+   reset for the contest"), and eligibility uses the rolling 5d bank *only
+   while `CONTEST_START` is unset*; once set it integrates
+   `[CONTEST_START, CONTEST_END]`.
 2. **The seed is one-shot.** `withdrawals_enabled: false`, re-signup blocked
    once closed, three accounts already at zero. Practising with the seed
    risks entering the real contest broke.
@@ -814,7 +831,7 @@ things Permuto forces on us are gaps XOPTrader already has.
 | --- | --- | --- |
 | **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31**, which reaches `TODO.md` with PR #115 -- so this pointer dangles on `main` if #116 merges first (see the merge order in Sequenced work) |
 | **Paper / observer mode** | history is hourly only, so a rule must be scored on live data before risking capital | XOPTrader has **no paper mode**; every strategy change ships straight to a live book |
-| **Jump-aware estimation** | the oracle is a jump process and continuous-path models are misspecified | Dexie CATs jump too — the 100× outlier at `price=0.013810` is the same shape. Feeds S20 |
+| **Jump-aware estimation** | the *oracle* steps discontinuously by construction (60s estimator, 5s resample); whether the underlying paths jump is untested, so jump-robustness is the prudent default rather than an established fact — see correction 5 | Dexie CATs jump too — the 100× outlier at `price=0.013810` is the same shape. Feeds S20 |
 | **Estimator noise vs information** | the oracle is a 60s RV estimate, so much of its jitter is sampling error | The same question S20 asks: junk print, or real repricing? |
 | **Balanced two-sided depth** | `min(bid, ask)` — a lifted side earns zero | We do not track whether our dexie book is two-sided; one-sided quoting is invisible today |
 | **Batch quote maintenance** | `batch_upsert` restores a lifted side in one call | Step 8's cancel-and-repost is two operations with a window between |
@@ -848,7 +865,8 @@ transfer and must not leak into shared code.
       minutes of confirmed-carried session (oracle frozen at a single value
       throughout): two accounts gained 10.27M and 8.37M depth-seconds, which
       roll-off cannot produce. Backfill ruled out by the flat rate profile.
-      Also calibrated other entrants' overnight size at $1,141–$1,400 without
+      Also lower-bounded other entrants' overnight size at $1,141–$1,400
+      (the observed slope is accrual minus roll-off) without
       placing an order, and observed a wiped account shedding 14.66M to
       window roll-off — the mechanism correction 2 proposed. See
       `scripts/permuto_depth_probe.py`.
@@ -861,15 +879,23 @@ transfer and must not leak into shared code.
       wallet_auth. Registration itself stays an **operator decision** (C-0R).
 - [ ] **C-03** Analysis-mode observer (read-only, no key). Settles: **is the
       short-horizon jitter estimator noise or information** (the central
-      question, given the 60s/5s overlapping-window construction); do
-      carried ticks credit depth; per-market session statistics; would-be
-      PnL of a candidate rule. Endpoints listed in
+      question, given the 60s/5s overlapping-window construction);
+      per-market session statistics; would-be PnL of a candidate rule. It
+      also re-confirms carried accrual as a passive by-product, but that is
+      **already settled by C-0S3** and is not something C-03 decides.
+      Endpoints listed in
       `docs/permuto-api-reference.md` §7. **Do first, after C-00.**
       **Use a range-based estimator, not variance ratios.** Permuto serves
-      OHLC, so Parkinson / Garman–Klass computed from the same bars gives an
-      independent and better-conditioned estimate of the same quantity — and
-      the *difference* from the oracle measures the estimator noise directly
-      instead of inferring it. See `docs/advanced-trading-methods.md` §4,
+      OHLC, so Parkinson / Garman–Klass computed from those bars is
+      independent and better-conditioned. But it is **not the same
+      quantity**: `/info/candles` ignores `tf` and returns 3600s bars, and
+      the bars are bars of the `QQQ-VOL` series, so the estimator measures
+      hourly **vol-of-vol**, not the underlying's 60s realized vol. Its
+      difference from the oracle therefore *bounds* the estimator noise and
+      confounds it with horizon, input and model mismatch — identifying that
+      noise needs matching-frequency returns of QQQ/NVDA/TSLA, which this
+      venue does not serve. Record the range estimator as a proxy, or source
+      the underlying externally. See `docs/advanced-trading-methods.md` §4,
       "Ideas taken from two external repositories". Separate the session from
       the carried hours in the estimator rather than smoothing across them.
 - [x] **C-04** **BUILT.** `risk.py` + `runner._margin_state()`: signed

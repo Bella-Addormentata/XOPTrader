@@ -2,8 +2,10 @@
 
 Working reference for the Permuto Capital perps API, `https://perps.permuto.capital`.
 Every fact here was read from the live venue, its OpenAPI 3.1 spec, its
-published agent skills, or the product page, on **2026-08-26**. Where
-something is inferred rather than documented it is marked.
+published agent skills, or the product page, on **2026-08-26**, with
+additions and re-verifications on **2026-08-27** — those are dated
+individually where they appear. Where something is inferred rather than
+documented it is marked.
 
 Companion documents: `TODO-COMPETITION.md` (whether to compete and what it
 would cost) and `advanced-trading-methods.md` §4 (the SVPerp literature and
@@ -98,8 +100,13 @@ signal. There is no options chain on this venue.
 ## 2  Trading — `/exchange/*`
 
 All require a session token: `Authorization: Bearer <token>` or
-`Cookie: perps_session=<token>` — **except `GET /exchange/leaderboard`**,
-which is public.
+`Cookie: perps_session=<token>` — **except `GET /exchange/leaderboard`** and
+**`GET /exchange/session`**, both of which were read with no credentials
+(see `TODO-COMPETITION.md`, "Connecting: API, not an embedded browser").
+Only *reachability* was verified for `/exchange/session` — nothing here
+records what it returns to an anonymous caller, so do not assume the
+`linked_wallet_*` / `trading_*` fields described in §3 are visible without
+a token.
 
 ⚠ **`tif` is `GTC`/`ALO`/`IOC` as published. FOK is unverified** — an
 earlier draft of `docs/advanced-trading-methods.md` listed it, sourced from

@@ -34,8 +34,16 @@ def load_sessions(path):
     time: two one-row sessions an hour apart, the same oracle either side, and
     the unobserved gap between them counted as continuous evidence. Sessions
     are separated here and only one is analysed.
+
+    Returns ``(sessions, malformed_count)``.
     """
     sessions = []
+    malformed = 0
+    # A session boundary may be hiding inside a record we cannot read, so the
+    # break is remembered and applied to the NEXT row rather than opening an
+    # empty session immediately -- a probe killed on its last write must not
+    # leave a phantom trailing session for main() to analyse.
+    pending_break = False
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -47,19 +55,44 @@ def load_sessions(path):
                 # A probe killed mid-write leaves a partial final record.
                 # Aborting the parse would throw away every valid sample
                 # before it, which is the whole run.
+                #
+                # But skipping it and carrying on is not enough either. The
+                # probe opens the file in append mode and writes its header
+                # first, so restarting a killed probe -- the normal response
+                # to a kill -- concatenates the unterminated tail with the
+                # next run's header into ONE unreadable line. Dropping that
+                # line silently swallows the session boundary, rejoins two
+                # runs, and hands the hours of unobserved downtime between
+                # them to the analysis as continuous evidence. That is the
+                # exact failure this function exists to prevent, so any
+                # unreadable record is treated as a discontinuity.
+                malformed += 1
+                pending_break = True
                 sys.stderr.write("skipping malformed JSONL record\n")
                 continue
             if "probe_start" in d:
-                sessions.append({"header": d, "rows": []})
-            elif sessions:
+                sessions.append({"header": d, "rows": [], "truncated": False})
+                pending_break = False
+            elif pending_break or not sessions:
+                # Either a hand-edited file with rows before any header, or a
+                # header that went down with the record we could not read.
+                sessions.append(
+                    {"header": None, "rows": [d], "truncated": pending_break}
+                )
+                pending_break = False
+            else:
                 sessions[-1]["rows"].append(d)
-            else:  # rows before any header (hand-edited file)
-                sessions.append({"header": None, "rows": [d]})
-    return sessions
+    return sessions, malformed
 
 
 def frozen_window(rows, interval_s, carried_since=None):
-    """Longest run of consecutive samples with ONE oracle value and no gaps.
+    """Trailing run of consecutive samples with ONE oracle value and no gaps.
+
+    Returns ``(window, provenance)``. ``provenance`` is ``"asserted"`` when the
+    operator supplied the carried boundary, ``"inferred"`` when the run merely
+    looks like a freeze this file watched happen, and ``None`` when nothing
+    qualifies. Only an asserted boundary may certify carried accrual -- see the
+    note on `followed_a_transition` below.
 
     Two separate problems, one answer.
 
@@ -70,7 +103,7 @@ def frozen_window(rows, interval_s, carried_since=None):
     accrual. And observed equality either side of a missing stretch never proved
     the oracle held still inside it.
 
-    So rather than judging the file, find the longest stretch that actually
+    So rather than judging the file, find the trailing stretch that actually
     qualifies: consecutive samples, every one carrying an oracle reading, all
     equal, and no adjacent pair further apart than a small multiple of the
     sampling interval. Depth endpoints are then taken from inside that window.
@@ -115,11 +148,24 @@ def frozen_window(rows, interval_s, carried_since=None):
         prev_ts, prev_oracle = ts, key
     flush()
 
-    # `best` is the longest run; now insist it is the LAST one, and that it
-    # was preceded by a different oracle value. A file that never changes
-    # value has not observed a freeze happening and cannot certify one.
+    # `best` is the trailing run; now insist it was preceded by a different
+    # oracle value and that it really does close the file. A file that never
+    # changes value has not observed a freeze happening at all.
+    #
+    # [review round 4] This pair is necessary and NOT sufficient, and the
+    # tool used to treat it as sufficient. "Something different came before
+    # it" is satisfied by ordinary intraday movement, and "it closes the
+    # file" is satisfied by stopping the probe. So a session sampled entirely
+    # inside the cash day, with the oracle merely quiet for its last half
+    # hour, met both -- and a live plateau supplied both endpoints for a
+    # CONFIRMED carried verdict, dollar sizing included. A frozen oracle is a
+    # property of the ESTIMATOR; carriedness is a property of the CLOCK, and
+    # the venue exposes no flag joining the two. Nothing in this file can
+    # close that gap, so the window is still returned -- an inferred freeze
+    # is worth measuring -- but it is labelled, and main() refuses to
+    # certify anything the operator has not asserted with --carried-since.
     if not best:
-        return []
+        return [], None
     tail_start = rows.index(best[0])
     seen_before = {
         json.dumps(r.get("oracle"), sort_keys=True)
@@ -129,7 +175,7 @@ def frozen_window(rows, interval_s, carried_since=None):
     followed_a_transition = bool(seen_before - {this_value})
     is_suffix = (best[-1] is rows[-1])
 
-    # An OPERATOR-SUPPLIED boundary is the other way to know. A probe started
+    # An OPERATOR-SUPPLIED boundary is the ONLY way to know. A probe started
     # after the close never sees the freeze happen, so it cannot certify the
     # window from its own data however obviously carried it is -- and the
     # venue exposes no is_carried flag to ask (still unanswered in the
@@ -139,11 +185,11 @@ def frozen_window(rows, interval_s, carried_since=None):
     if carried_since is not None:
         inside = [r for r in best
                   if datetime.fromisoformat(r["ts"]) >= carried_since]
-        return inside if len(inside) >= 2 else []
+        return (inside, "asserted") if len(inside) >= 2 else ([], None)
 
     if not (followed_a_transition and is_suffix):
-        return []
-    return best
+        return [], None
+    return best, "inferred"
 
 
 def _sustained_risers(rows, buckets):
@@ -152,6 +198,9 @@ def _sustained_risers(rows, buckets):
     Backfill arrives once and stops; genuine accrual keeps arriving. Splitting
     the window and requiring a gain in each bucket is the cheap version of the
     rate-profile check that was done by hand for the recorded experiment.
+
+    `rows` must be the FROZEN WINDOW. Handed the whole session this answers a
+    question nobody asked -- whether the account rose during live trading.
     """
     usable = [r for r in rows if r.get("mms")]
     if len(usable) < buckets + 1:
@@ -177,10 +226,19 @@ def main():
     for arg in sys.argv[2:]:
         if arg.startswith("--carried-since="):
             carried_since = datetime.fromisoformat(arg.split("=", 1)[1])
-    sessions = load_sessions(path)
+    sessions, malformed = load_sessions(path)
     if not sessions:
         print("no samples in %s" % path)
         return
+
+    # On stdout, not just stderr: whoever reads the verdict is not reading the
+    # terminal's error stream, and an unreadable record is a hole in the
+    # observation the verdict rests on.
+    if malformed:
+        print("WARNING: %d unreadable record(s) skipped. Each is treated as a "
+              "session break -- a probe killed mid-write leaves its partial "
+              "line welded to the next run's header, and joining those two "
+              "runs would count the unobserved gap as evidence.\n" % malformed)
 
     # One session only. Analysing across a restart counts process downtime as
     # observed carried time -- reproduced with two one-row sessions an hour
@@ -198,15 +256,19 @@ def main():
         print("not enough samples in this session (%d)" % len(rows))
         return
 
-    # Select the longest genuinely-carried stretch rather than judging the
+    # Select the trailing genuinely-frozen stretch rather than judging the
     # whole file. The probe is documented to run ACROSS the close, so normal
     # pre-close movement is expected and must narrow the window rather than
     # invalidate the run -- while the depth endpoints must come from inside
     # the frozen part, or they silently include live-session accrual.
-    window = frozen_window(session["rows"], interval_s, carried_since)
+    window, provenance = frozen_window(session["rows"], interval_s, carried_since)
     window = [r for r in window if r.get("mms")]
+    certified = provenance == "asserted"
 
-    print("session      : %s" % (header.get("probe_start", "?")[:19] or "?"))
+    print("session      : %s%s"
+          % (header.get("probe_start", "?")[:19] or "?",
+             "  (starts after a truncated record; its own header was "
+             "unreadable)" if session.get("truncated") else ""))
     print("samples      : %d in session, %d in the frozen window"
           % (len(rows), len(window)))
 
@@ -224,15 +286,22 @@ def main():
     t0, t1 = window[0], window[-1]
     span_s = (datetime.fromisoformat(t1["ts"])
               - datetime.fromisoformat(t0["ts"])).total_seconds()
-    frozen = True
 
     print("window       : %s -> %s UTC (%.0f min)"
           % (t0["ts"][11:19], t1["ts"][11:19], span_s / 60))
     print("oracle       : FROZEN across the selected window, complete "
-          "coverage, no gaps > %.0fs%s"
-          % (max(interval_s * 3, 30),
-             "" if carried_since is None
-             else " (carried boundary asserted: %s)" % carried_since.isoformat()))
+          "coverage, no gaps > %.0fs" % max(interval_s * 3, 30))
+    # The reader of a verdict cannot see which of these two the tool did, and
+    # they are not the same claim, so say it on the same screen as the answer.
+    if certified:
+        print("carried      : ASSERTED by the operator, "
+              "--carried-since=%s" % carried_since.isoformat())
+    else:
+        print("carried      : NOT ESTABLISHED. The oracle is flat and "
+              "something different preceded it -- which is also exactly what "
+              "a quiet stretch of LIVE trading looks like. Pass "
+              "--carried-since=<ISO8601> to assert the boundary the venue "
+              "does not expose.")
     print()
 
     # Join on the FULL id. The 8-char form is for display: two accounts
@@ -265,7 +334,6 @@ def main():
                  ("$%.0f" % (d5 / span_s)) if d5 > 0 else "-", mb["eq"]))
 
     risers = [o for o in out if o[0] > 0]
-    implied_hr = [(o[0] / span_s * 3600) for o in risers]
 
     print()
     # A single positive endpoint delta is EVIDENCE, not confirmation. The
@@ -274,35 +342,56 @@ def main():
     # recorded experiment ruled it out with a multi-bucket flat rate profile,
     # which this generic path does not perform. So the verdict is graded by
     # how much of the window actually supports it.
-    buckets = max(1, min(6, len(rows) // 10))
-    sustained = _sustained_risers(rows, buckets) if buckets > 1 else set()
-    strong = risers and frozen and len(sustained) > 0
+    #
+    # [review round 4] Bucketed over the WINDOW, never the session. This was
+    # fed `rows` -- the whole across-close file -- so the one check standing
+    # between "an account gained" and "carried ticks accrue" was evaluated
+    # over live trading. It cut both ways: a genuine carried gain was
+    # downgraded because the account did not also rise in the live buckets,
+    # and a live riser plus one backfill credit inside a two-minute frozen
+    # window was upgraded to CONFIRMED. The corroboration has to come from
+    # the same samples as the claim.
+    buckets = max(1, min(6, len(window) // 10))
+    sustained = _sustained_risers(window, buckets) if buckets > 1 else set()
+    # And from the same ACCOUNTS. `sustained` and `risers` were only tested
+    # for non-emptiness, so one account rising steadily vouched for a
+    # different account's single jump, and the headline rate below was then
+    # quoted from a riser nothing had rate-checked.
+    corroborated = [o for o in risers if o[2] in sustained]
+    strong = certified and bool(corroborated)
 
     if strong:
-        print("VERDICT: CONFIRMED. %d of %d accounts gained depth while the oracle"
-              % (len(risers), len(out)))
-        print("         was frozen. Roll-off can only subtract, so a gain during a")
-        print("         carried session can only come from carried ticks accruing.")
-        print("         Top accrual rate: %.0f depth-seconds/hour, i.e. about"
-              % max(implied_hr))
+        rate = max(o[0] / span_s * 3600 for o in corroborated)
+        print("VERDICT: CONFIRMED. %d of %d accounts gained depth in every "
+              "sub-window" % (len(corroborated), len(out)))
+        print("         of an operator-asserted carried session. Roll-off can only")
+        print("         subtract, so a sustained gain there can only come from")
+        print("         carried ticks accruing.")
+        print("         Top corroborated rate: %.0f depth-seconds/hour, i.e. about"
+              % rate)
         print("         $%.0f of balanced depth resting inside the 2%% ring."
-              % (max(implied_hr) / 3600))
+              % (rate / 3600))
         print()
         print("         At that rate 300,000,000 takes %.1f hours; the contest"
-              % (300e6 / max(implied_hr)))
+              % (300e6 / rate))
         print("         window is 102.5 h, which needs ~$813 held throughout.")
-    elif risers and frozen:
+    elif risers and not certified:
+        print("VERDICT: NOT CERTIFIED. %d of %d accounts gained depth across a "
+              "flat-oracle" % (len(risers), len(out)))
+        print("         window, but nothing here establishes that window as CARRIED.")
+        print("         A quiet stretch of live trading reads identically, and live")
+        print("         accrual would explain the same gain. Re-run with")
+        print("         --carried-since=<ISO8601> to assert the boundary, or probe")
+        print("         across a close you actually observe.")
+    elif risers:
         print("VERDICT: EVIDENCE, NOT CONFIRMATION. %d of %d accounts show a "
               "positive" % (len(risers), len(out)))
         print("         endpoint delta with the oracle frozen, but no account "
               "gained in")
-        print("         every sub-window -- so delayed leaderboard backfill "
-              "is not excluded.")
+        print("         every sub-window OF THAT WINDOW -- so delayed leaderboard")
+        print("         backfill is not excluded.")
         print("         Re-run over a longer carried window before relying on "
               "this.")
-    elif risers and not frozen:
-        print("INCONCLUSIVE: accounts gained depth, but the oracle moved during the")
-        print("         window, so some of the gain may be from live ticks.")
     else:
         print("INCONCLUSIVE: no account gained depth. This does NOT disprove accrual —")
         print("         zero accrual and accrual-cancelled-by-roll-off are")
