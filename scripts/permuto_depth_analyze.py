@@ -26,8 +26,16 @@ import sys
 from datetime import datetime
 
 
-def load(path):
-    header, rows = None, []
+def load_sessions(path):
+    """Split the file into probe SESSIONS, one per header.
+
+    The probe appends, writing a fresh ``probe_start`` header each run. Keeping
+    every row across headers made process downtime look like observed carried
+    time: two one-row sessions an hour apart, the same oracle either side, and
+    the unobserved gap between them counted as continuous evidence. Sessions
+    are separated here and only one is analysed.
+    """
+    sessions = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
             line = line.strip()
@@ -35,52 +43,108 @@ def load(path):
                 continue
             d = json.loads(line)
             if "probe_start" in d:
-                header = d
-            else:
-                rows.append(d)
-    return header, rows
+                sessions.append({"header": d, "rows": []})
+            elif sessions:
+                sessions[-1]["rows"].append(d)
+            else:  # rows before any header (hand-edited file)
+                sessions.append({"header": None, "rows": [d]})
+    return sessions
+
+
+def frozen_window(rows, interval_s):
+    """Longest run of consecutive samples with ONE oracle value and no gaps.
+
+    Two separate problems, one answer.
+
+    The probe's own instructions say to sample from before the close until well
+    after it -- but the analyzer demanded a single oracle value across the WHOLE
+    file, so any normal pre-close movement made it report "not purely carried"
+    while the first-to-last depth delta still quietly included live-session
+    accrual. And observed equality either side of a missing stretch never proved
+    the oracle held still inside it.
+
+    So rather than judging the file, find the longest stretch that actually
+    qualifies: consecutive samples, every one carrying an oracle reading, all
+    equal, and no adjacent pair further apart than a small multiple of the
+    sampling interval. Depth endpoints are then taken from inside that window.
+    """
+    max_gap = max(interval_s * 3, 30)
+    best, run = [], []
+
+    def flush():
+        nonlocal best
+        if len(run) > len(best):
+            best = list(run)
+
+    prev_ts = None
+    prev_oracle = None
+    for row in rows:
+        oracle = row.get("oracle")
+        ts = datetime.fromisoformat(row["ts"]) if row.get("ts") else None
+        if not oracle or ts is None:
+            flush(); run = []; prev_ts = prev_oracle = None
+            continue
+        key = json.dumps(oracle, sort_keys=True)
+        gapped = prev_ts is not None and (ts - prev_ts).total_seconds() > max_gap
+        if run and (key != prev_oracle or gapped):
+            flush(); run = []
+        run.append(row)
+        prev_ts, prev_oracle = ts, key
+    flush()
+    return best
 
 
 def main():
     path = sys.argv[1]
-    header, all_rows = load(path)
-    rows = [r for r in all_rows if r.get("mms")]
-    if len(rows) < 2:
-        print("not enough samples yet (%d)" % len(rows))
+    sessions = load_sessions(path)
+    if not sessions:
+        print("no samples in %s" % path)
         return
 
-    t0, t1 = rows[0], rows[-1]
-    span_s = (datetime.fromisoformat(t1["ts"]) - datetime.fromisoformat(t0["ts"])).total_seconds()
+    # One session only. Analysing across a restart counts process downtime as
+    # observed carried time -- reproduced with two one-row sessions an hour
+    # apart, which the old code reported as CONFIRMED.
+    if len(sessions) > 1:
+        print("NOTE: %d probe sessions in this file; analysing the LAST one. "
+              "Rows from earlier sessions are ignored -- the gaps between "
+              "runs are not observed time.\n" % len(sessions))
+    session = sessions[-1]
+    header = session["header"] or {}
+    interval_s = float(header.get("interval_s") or 60)
 
-    # Was the oracle frozen for the WHOLE window? That is what makes this a
-    # carried-session measurement rather than a mixed one, and it is the only
-    # reason a depth gain proves anything.
-    #
-    # Two ways this check could lie by omission, both fixed here. It ran over
-    # `rows`, which has already dropped every sample whose LEADERBOARD fetch
-    # failed -- even though such a sample may carry a perfectly good, MOVING
-    # oracle. And it then skipped samples with no oracle at all. So a window
-    # that actually contained oracle movement could present one distinct
-    # value and read as frozen. Missing coverage is now a disqualifier rather
-    # than something to quietly filter away: an incomplete window cannot
-    # confirm anything.
-    oracle_samples = [r.get("oracle") for r in all_rows if "oracle" in r or "oracle_error" in r]
-    missing = sum(1 for o in oracle_samples if not o)
-    distinct = {json.dumps(o, sort_keys=True) for o in oracle_samples if o}
-    frozen = (len(distinct) == 1 and missing == 0)
+    rows = [r for r in session["rows"] if r.get("mms")]
+    if len(rows) < 2:
+        print("not enough samples in this session (%d)" % len(rows))
+        return
 
-    print("samples      : %d over %.0f min" % (len(rows), span_s / 60))
-    print("window       : %s -> %s UTC" % (t0["ts"][11:19], t1["ts"][11:19]))
-    if frozen:
-        oracle_note = "FROZEN throughout (carried), %d samples" % len(oracle_samples)
-    elif missing:
-        oracle_note = ("INCOMPLETE - %d of %d samples have no oracle reading; "
-                       "cannot certify the window as carried"
-                       % (missing, len(oracle_samples)))
-    else:
-        oracle_note = ("MOVED (%d distinct values) - window is NOT purely carried"
-                       % len(distinct))
-    print("oracle       : %s" % oracle_note)
+    # Select the longest genuinely-carried stretch rather than judging the
+    # whole file. The probe is documented to run ACROSS the close, so normal
+    # pre-close movement is expected and must narrow the window rather than
+    # invalidate the run -- while the depth endpoints must come from inside
+    # the frozen part, or they silently include live-session accrual.
+    window = frozen_window(session["rows"], interval_s)
+    window = [r for r in window if r.get("mms")]
+
+    print("session      : %s" % (header.get("probe_start", "?")[:19] or "?"))
+    print("samples      : %d in session, %d in the frozen window"
+          % (len(rows), len(window)))
+
+    if len(window) < 2:
+        print("oracle       : NO usable frozen window (need >=2 consecutive "
+              "samples with one oracle value and no gaps)")
+        print("\nINCONCLUSIVE: nothing to measure. Re-run the probe entirely "
+              "inside a carried session.")
+        return
+
+    t0, t1 = window[0], window[-1]
+    span_s = (datetime.fromisoformat(t1["ts"])
+              - datetime.fromisoformat(t0["ts"])).total_seconds()
+    frozen = True
+
+    print("window       : %s -> %s UTC (%.0f min)"
+          % (t0["ts"][11:19], t1["ts"][11:19], span_s / 60))
+    print("oracle       : FROZEN across the selected window, complete "
+          "coverage, no gaps > %.0fs" % max(interval_s * 3, 30))
     print()
 
     a = {m["u"]: m for m in t0["mms"]}

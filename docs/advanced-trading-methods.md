@@ -332,9 +332,12 @@ conclusion from here.
    particular timescale; it closes only as fast as funding makes it
    expensive. Sizing a mean-reversion trade on basis needs the funding
    cadence as an explicit input.
-5. **No hedge exists in the underlying.** Inventory acquired on an SVPerp
-   can only be flattened on the same venue, so inventory risk is closer to
-   a single-venue CAT than to a hedgeable perp.
+5. **No hedge exists ON THIS VENUE.** Inventory acquired on an SVPerp can
+   only be flattened on Permuto under XOPTrader's current scope, so
+   inventory risk behaves more like a single-venue CAT than a hedgeable
+   perp. (Not "no hedge exists in the underlying" -- these names have deep
+   listed options. See the hedging correction later in this document; the
+   conclusion holds, the reason is narrower.)
 
 ### Market making an SVPerp — the two-literature blueprint
 
@@ -475,10 +478,14 @@ instead: they spike when liquidations cascade. The proposal is a jump-aware
 Realized GARCH with autoregressive jump intensity, widening the ask and
 leaning short-vol ahead of a predicted upward jump.
 
-Directly relevant. Our own measurements show a 488% mean intrabar range at
-the equity open and 20.8% two-second moves — this is a jump process, and
-any continuous-path model is misspecified in exactly our regime (see the
-Martin note above for the same point from the replication side).
+Directly relevant — with the same caveat the Martin note above carries, and
+for the same reason. Our measurements show a 488% mean intrabar range at the
+equity open and 20.8% two-second moves **in the ORACLE**, and a 60-second
+trailing estimator resampled every 5s steps discontinuously by construction
+whenever one large return enters or leaves its window. That is not evidence
+of jumps in QQQ, NVDA or TSLA. Treat jump-awareness as the prudent default
+for quoting this series, not as an established property of the underlying;
+settling it needs a jump test on the underlying returns.
 
 One caveat on the proposed *signal*: it assumes on-chain flow and liquidation
 observability. Permuto runs an off-chain sequencer with a CLOB, so there is

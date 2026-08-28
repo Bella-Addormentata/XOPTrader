@@ -56,11 +56,27 @@ def sample():
     """One observation. Returns a dict; never raises."""
     row = {"ts": datetime.now(timezone.utc).isoformat()}
     try:
-        lb = get("/exchange/leaderboard?limit=100")
+        # Page. The default page size is 20 and this asked for 100 without
+        # checking the total -- so a field larger than 100 was silently
+        # truncated, which is the same mistake as reading page one, just
+        # further along. Nothing warns; the missing accounts simply are not
+        # in the sample.
+        mms, offset = [], 0
+        lb = {}
+        while True:
+            lb = get("/exchange/leaderboard?limit=100&offset=%d" % offset)
+            page = lb.get("market_makers", [])
+            mms.extend(page)
+            total = lb.get("market_makers_total")
+            if not page or not isinstance(total, int) or len(mms) >= total:
+                break
+            offset += 100
         row["mm_total"] = lb.get("market_makers_total")
         row["finalized"] = lb.get("finalized")
         row["mms"] = [
             {
+                # Full id for joins; the 8-char form is for display only.
+                "user_id": m["user_id"],
                 "u": m["user_id"][:8],
                 "d5": m.get("depth_seconds_5d"),
                 "d24": m.get("depth_seconds_24h"),
@@ -69,7 +85,7 @@ def sample():
                 "elig": m.get("prize_eligible"),
                 "trades": m.get("trade_count"),
             }
-            for m in lb.get("market_makers", [])
+            for m in mms
         ]
     except Exception as e:  # noqa: BLE001 - a bad sample must not end the run
         row["lb_error"] = "%s: %s" % (type(e).__name__, e)
