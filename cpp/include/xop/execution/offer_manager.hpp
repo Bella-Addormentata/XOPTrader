@@ -803,6 +803,22 @@ private:
     /// so without this the ledger overstates the free pool).  Charged
     /// before the RPC: a failed cancel over-counts, which is the
     /// conservative direction.
+    /// The trade id of an offer that landed AFTER the stop, or empty.
+    ///
+    /// Empty is not a logging inconvenience: it is a created offer that
+    /// cannot be individually cancelled, resting in a book the bulk cancel
+    /// has already enumerated. So this ESCALATES on the way out rather than
+    /// returning a quiet empty string -- operationally it is the same
+    /// incident as a cancel that failed, and the only difference is that we
+    /// never got far enough to attempt one.
+    ///
+    /// It also type-checks before converting. `get<std::string>()` on a
+    /// non-string throws nlohmann::type_error, and every call site tested
+    /// only that the KEY was present.
+    ///
+    /// `what` names the path ("fallback", "merged") for the operator.
+    std::string late_trade_id(const json& result, const std::string& what);
+
     asio::awaitable<json> cancel_offer_charged(const std::string& trade_id,
                                                std::uint64_t      fee,
                                                bool               secure);

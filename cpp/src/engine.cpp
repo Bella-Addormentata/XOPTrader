@@ -679,6 +679,9 @@ void Engine::stop_watchdog()
 // cancel. `why` is the operator-facing reason, already formatted.
 void Engine::watchdog_cancel_book(const std::string& why)
 {
+    // One cancel at a time, so one authoritative outcome. See the mutex's
+    // declaration for why concurrent entry is worse than a slow one.
+    const std::lock_guard<std::mutex> cancel_lock(watchdog_cancel_mtx_);
     try {
         asio::io_context wioc;
         rpc::ChiaRPCConfig wal_cfg;
@@ -928,6 +931,15 @@ void Engine::run()
     // without anyone having asked for a shutdown. Cancel explicitly on that
     // path rather than hoping the watchdog wins a race it is about to be
     // taken out of.
+    // [review] Stop the watchdog BEFORE deciding, not after. Cancelling
+    // while it is still running raced it: both threads could enter
+    // watchdog_cancel_book() at once, and the cancel below was issued on the
+    // assumption that stop_watchdog() had already removed the other route --
+    // which it had not, because it ran afterwards. join() here means that by
+    // the time we decide, the watchdog thread is gone and any cancel it had
+    // in flight has finished.
+    stop_watchdog();
+
     if (!stop_requested_.load(std::memory_order_acquire)) {
         spdlog::critical("[Engine] [S31] the io_context ran out of work "
                          "without a shutdown request -- the engine died "
@@ -939,7 +951,15 @@ void Engine::run()
         // after it -- the one carrying the OUTCOME, which is the only part
         // an operator can act on. One alert, and it is the outcome-bearing
         // one; the reason travels in `why`.
-        if (!dry_run_) {
+        if (watchdog_fired_.load(std::memory_order_acquire)) {
+            // The watchdog got there first and its outcome is the record.
+            // Re-cancelling would spend again for a book it has already
+            // dealt with, and the second alert would be the one suppressed
+            // by the cooldown -- so the operator would be left holding the
+            // less informative of the two.
+            spdlog::critical("[Engine] [S31] the switch had already fired; "
+                             "its cancel stands and no second one is sent");
+        } else if (!dry_run_) {
             watchdog_cancel_book("the engine exited without a shutdown "
                                  "request -- the event loop ran out of work");
         } else if (alerts_) {
@@ -951,7 +971,6 @@ void Engine::run()
                 "event loop ran out of work. Nothing was cancelled.");
         }
     }
-    stop_watchdog();
 
     spdlog::info("[Engine] Main loop exited");
 }
@@ -1679,6 +1698,27 @@ asio::awaitable<void> Engine::run_startup_analysis()
         if (current_block <= last_analysis_block) continue;
         last_analysis_block = current_block;
         ++total_polls;
+
+        // [S31] Analysis is PROGRESS, so it beats. The switch was armed in
+        // start_watchdog() before this phase begins, and last_beat_ms_ is
+        // stamped only at the end of a completed trading cycle -- which
+        // means the whole analysis phase counted as one unbroken absence of
+        // a heartbeat. With the 20-block configuration the example config
+        // documents, 331 of 2,398 real 20-block windows in this engine's
+        // own logs (13.8%, worst 895 s) run past the 600 s default, so a
+        // perfectly healthy startup cancelled its book and latched trading
+        // off permanently about one start in seven.
+        //
+        // Stamping on each ADVANCE rather than each tick keeps the
+        // protection: a wedged analysis observes no new block, stamps
+        // nothing, and still fires. What it stops being is a timer on a
+        // phase whose legitimate duration the threshold was never sized
+        // for. The gap this leaves is one block interval -- max 181 s over
+        // 2,418 measured -- against 600 s.
+        last_beat_ms_.store(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count(),
+            std::memory_order_relaxed);
 
         // Publish system health during analysis so the GUI shows
         // wallet/node connectivity immediately, not only after
@@ -14485,6 +14525,28 @@ void Engine::check_pause_flag()
 
 asio::awaitable<void> Engine::step_maintain_coin_pool(BlockHeight block_height)
 {
+    // [review] A dry run does not split coins. Skipping startup
+    // reconciliation was not enough to make an inspection run
+    // non-mutating: ensure_split() self-sends through the wallet's
+    // send_transaction RPC, which is a real spend paying a real fee, and
+    // BOTH call sites -- startup and the periodic step -- reached it with
+    // no dry-run guard at all.
+    //
+    // The contention is the worse half. A dry run is normally started
+    // BESIDE a live engine, to look at what it would do; splitting locks
+    // the very coins that engine is trying to fund offers with, so the
+    // inspection makes the real engine fail to post for reasons that have
+    // nothing to do with the market.
+    //
+    // Guarded here rather than at the two call sites so a third one cannot
+    // reintroduce it -- which is exactly how this survived the last fix.
+    if (dry_run_) {
+        spdlog::info("[Engine] [dry-run] skipping coin pool maintenance "
+                     "(splitting is a real spend and would contend for the "
+                     "live engine's coins)");
+        co_return;
+    }
+
     // -----------------------------------------------------------------------
     // Phase 1: XCH coin pool (wallet_id 1)
     // -----------------------------------------------------------------------

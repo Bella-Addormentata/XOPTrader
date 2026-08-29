@@ -98,6 +98,7 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
+#include <mutex>
 #include <thread>
 #include <chrono>
 #include <cstdint>
@@ -436,6 +437,23 @@ private:
     /// switch firing means the book state is unknown until a human looks.
     std::atomic<bool>         watchdog_fired_{false};
     bool                      watchdog_skip_warned_{false};
+
+    /// Serialises watchdog_cancel_book() so there is ONE authoritative
+    /// outcome per cancel.
+    ///
+    /// Two threads can reach it: the watchdog thread when the switch fires,
+    /// and run() on the abnormal-exit path.  Concurrently they would issue
+    /// duplicate SECURE spends -- real fees, and two attempts contending for
+    /// the same coins, which is how one of them fails for a reason that has
+    /// nothing to do with the book -- and report contradictory outcomes,
+    /// with the 60-second per-rule cooldown suppressing whichever alert
+    /// arrived second.  The operator would then be told the opposite of what
+    /// happened, or told nothing.
+    ///
+    /// A mutex rather than a one-shot claim flag: the watchdog may
+    /// legitimately fire again on a LATER stall, and a retry after a failed
+    /// cancel is exactly what should still be allowed to happen.
+    std::mutex                watchdog_cancel_mtx_;
 
     void start_watchdog();
     void stop_watchdog();

@@ -537,12 +537,7 @@ asio::awaitable<int> OfferManager::post_quotes(
         // The offer exists now, so refusing to publish is not enough -- the
         // coins are locked either way. Cancel the trade we just created.
         if (abort_predicate_ && abort_predicate_()) {
-            std::string late_id;
-            if (result.contains("trade_record")
-                && result["trade_record"].contains("trade_id")) {
-                late_id = result["trade_record"]["trade_id"]
-                              .get<std::string>();
-            }
+            const std::string late_id = late_trade_id(result, "tier");
             logger_->error("create for {} tier {} landed AFTER the engine "
                            "asked us to stop; cancelling trade {} rather "
                            "than publishing it", pair.name, tier.tier_index,
@@ -2958,6 +2953,29 @@ asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
     }
 }
 
+std::string OfferManager::late_trade_id(const json& result,
+                                       const std::string& what)
+{
+    if (result.contains("trade_record")
+        && result["trade_record"].contains("trade_id")
+        && result["trade_record"]["trade_id"].is_string()) {
+        auto id = result["trade_record"]["trade_id"].get<std::string>();
+        if (!id.empty()) return id;
+    }
+    logger_->critical("a {} offer was created after the stop and its trade "
+                      "id is missing or not a string -- it cannot be "
+                      "cancelled individually and is LIVE and unmanaged",
+                      what);
+    if (escalate_) {
+        escalate_("an offer created after the stop (" + what + ") is LIVE "
+                  "and CANNOT be cancelled: the wallet returned no usable "
+                  "trade id. The bulk cancel never saw it, so any earlier "
+                  "cancellation-submitted message does not cover this one. "
+                  "The book must be inspected by hand.");
+    }
+    return {};
+}
+
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
@@ -3194,12 +3212,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
             // path: a create that completes after the bulk cancel has
             // enumerated the book leaves a live offer nobody cancelled.
             if (!tier_failed && abort_predicate_ && abort_predicate_()) {
-                std::string late_id;
-                if (sr.contains("trade_record")
-                    && sr["trade_record"].contains("trade_id")) {
-                    late_id = sr["trade_record"]["trade_id"]
-                                  .get<std::string>();
-                }
+                const std::string late_id = late_trade_id(sr, "fallback");
                 logger_->error("fallback create for {} tier {} landed AFTER "
                                "the stop; cancelling trade {}", pair.name,
                                tier.tier_index,
@@ -3289,11 +3302,7 @@ asio::awaitable<int> OfferManager::post_merged_side(
     // the switch fires while create_offer() is suspended here, the merged
     // offer is submitted to a book the bulk cancel has already enumerated.
     if (abort_predicate_ && abort_predicate_()) {
-        std::string late_id;
-        if (result.contains("trade_record")
-            && result["trade_record"].contains("trade_id")) {
-            late_id = result["trade_record"]["trade_id"].get<std::string>();
-        }
+        const std::string late_id = late_trade_id(result, "merged");
         logger_->error("merged create for {} landed AFTER the stop; "
                        "cancelling trade {} rather than publishing it",
                        pair.name, late_id.empty() ? "<unknown>" : late_id);

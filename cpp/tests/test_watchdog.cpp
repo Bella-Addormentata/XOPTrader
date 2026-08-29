@@ -256,3 +256,56 @@ TEST(WatchdogOutcomeWording, AFailedRpcIsFailed) {
     EXPECT_EQ(xop::risk::watchdog_outcome(/*rpc_reported_failure=*/true),
               xop::risk::WatchdogOutcome::Failed);
 }
+
+// ---------------------------------------------------------------------------
+// The startup-analysis false positive
+// ---------------------------------------------------------------------------
+
+TEST(Watchdog, AnAnalysisPhaseThatNeverBeatsIsIndistinguishableFromAWedge)
+{
+    // This is the decision that made a healthy startup cancel its own book.
+    //
+    // start_watchdog() arms before run_startup_analysis(), and last_beat_ms_
+    // was stamped only at the end of a completed TRADING cycle -- so the
+    // whole analysis phase presented here as one unbroken absence of a
+    // heartbeat, which watchdog_decide() rightly cannot tell apart from a
+    // wedge. 331 of 2,398 real 20-block windows in this engine's own logs
+    // (13.8%) run past the 600 s default, worst 895 s.
+    //
+    // The decision is CORRECT and stays as it is; the engine's answer is to
+    // stamp on each observed block, so what reaches here is a per-block gap
+    // (max 181 s measured) rather than a whole-phase one. Both halves are
+    // asserted, because fixing it by loosening the threshold instead would
+    // have given back the startup protection that arming exists to provide.
+    constexpr std::int64_t kThreshold = 600'000;
+    constexpr std::int64_t kArmed     = 1'000'000;
+
+    xop::risk::WatchdogInput unstamped{};
+    unstamped.threshold_ms = kThreshold;
+    unstamped.armed_at_ms  = kArmed;
+    unstamped.last_beat_ms = 0;                       // analysis never beat
+    unstamped.now_ms       = kArmed + 895'000;        // worst real window
+    EXPECT_EQ(watchdog_decide(unstamped), xop::risk::WatchdogAction::Fire);
+
+    xop::risk::WatchdogInput stamped{};
+    stamped.threshold_ms = kThreshold;
+    stamped.armed_at_ms  = kArmed;
+    stamped.last_beat_ms = kArmed + 714'000;          // a block, mid-phase
+    stamped.now_ms       = kArmed + 895'000;          // 181 s later: the max
+    EXPECT_EQ(watchdog_decide(stamped), xop::risk::WatchdogAction::Healthy);
+}
+
+TEST(Watchdog, StampingPerBlockStillCatchesAWedgedAnalysis)
+{
+    // The stamp is on ADVANCE, not on tick, so it is a progress signal
+    // rather than an "I exist" signal. An analysis phase that observes no
+    // new block stamps nothing and still fires -- which is the protection
+    // the fix had to keep while removing the false positive above.
+    xop::risk::WatchdogInput wedged{};
+    wedged.threshold_ms = 600'000;
+    wedged.armed_at_ms  = 1'000'000;
+    wedged.last_beat_ms = 1'100'000;      // last block it ever saw
+    wedged.now_ms       = 1'100'000 + 600'001;
+    EXPECT_EQ(watchdog_decide(wedged), xop::risk::WatchdogAction::Fire);
+}
+
