@@ -529,6 +529,9 @@ class PermutoWidget(QWidget):
         # again; the old handler discarded them and then re-enabled Register
         # under a message telling the operator not to press it.
         self._pending_registration: Optional[dict] = None
+        #: True once a reconcile has asked the venue and could not resolve
+        #: the link. Gates the discard escape hatch -- see _on_discard.
+        self._reconcile_unresolved: bool = False
         # Injectable so tests exercise the Markets section without a socket.
         self._market_reader = market_reader or _default_market_reader
         self._markets_timer: Optional[QTimer] = None
@@ -637,6 +640,22 @@ class PermutoWidget(QWidget):
         self._recover_btn.clicked.connect(self._on_recover)
         self._recover_btn.setVisible(False)
         row.addWidget(self._recover_btn)
+
+        # [review] THE WAY OUT of an unfinished link.
+        #
+        # restore() sets the attempt marker unconditionally, so restoring a
+        # never-registered phrase on a fresh machine opens in the unfinished
+        # state: Register shut, Create shut, only Recover offered -- and
+        # Recover asks a positive-only oracle that can never answer "no".
+        # The status text already told the operator to "discard this identity
+        # deliberately" and nothing in the page could do it, so the only
+        # escape was hand-editing secrets.yaml. With registration closing
+        # Monday 17:00 ET that is an entry-blocking trap, not an
+        # inconvenience.
+        self._discard_btn = QPushButton("Discard this identity")
+        self._discard_btn.clicked.connect(self._on_discard)
+        self._discard_btn.setVisible(False)
+        row.addWidget(self._discard_btn)
 
         row.addStretch(1)
         layout.addLayout(row)
@@ -933,6 +952,15 @@ class PermutoWidget(QWidget):
         )
         self._recover_btn.setVisible(unfinished)
         self._recover_btn.setEnabled(unfinished)
+
+        # Offered only after the venue has actually been asked and could not
+        # resolve it. Throwing a key away is not a first move, and the
+        # operator must have consulted the leaderboard before being allowed
+        # to. discard_unregistered() refuses outright once `registered` is
+        # set, which is the backstop underneath this.
+        may_discard = unfinished and self._reconcile_unresolved
+        self._discard_btn.setVisible(may_discard)
+        self._discard_btn.setEnabled(may_discard)
         self._recover_btn.setText(
             "Save registration" if self._pending_registration
             else "Recover registration"
@@ -1151,6 +1179,48 @@ class PermutoWidget(QWidget):
         self._run("check", "Checking leaderboard...")
 
     @Slot()
+    def _on_discard(self) -> None:
+        """Throw away an identity the venue could not resolve.
+
+        Guarded three ways, because the destructive case -- discarding a key
+        that IS linked -- abandons the account permanently and only the 24
+        words can bring it back:
+
+          1. discard_unregistered() refuses outright once `registered` is set.
+          2. The button appears only after a reconcile has asked the venue
+             and come back unresolved.
+          3. The operator types the word, rather than clicking Yes. A
+             Yes/No box is answered reflexively; this one cannot be.
+        """
+        from PySide6.QtWidgets import QInputDialog
+
+        typed, ok = QInputDialog.getText(
+            self, "Discard this identity",
+            "This deletes the only copy of this key on this machine."
+            "\n\n"
+            "If the key IS linked at Permuto, the account is abandoned "
+            "permanently and ONLY your 24 words can bring it back. Keep "
+            "the phrase before continuing."
+            "\n\n"
+            "Type DISCARD to confirm:")
+        if not ok or typed.strip() != "DISCARD":
+            self._set_status("Discard cancelled -- nothing was removed.",
+                             _C.TEXT_SECONDARY)
+            return
+
+        try:
+            self._identity_factory().discard_unregistered()
+        except Exception as exc:  # noqa: BLE001
+            self._set_status("Could not discard: %s" % exc, _C.LOSS_RED)
+            return
+
+        self._pending_registration = None
+        self._reconcile_unresolved = False
+        self.refresh()
+        self._set_status(
+            "Identity discarded. Create a new one, or restore the phrase of "
+            "the account you meant to use.", _C.WARNING_YELLOW)
+
     def _on_recover(self) -> None:
         """Finish a link that did not finish. Never links anything new.
 
@@ -1260,6 +1330,10 @@ class PermutoWidget(QWidget):
 
         if result.get("reconciled") and not result.get("linked"):
             self._pending_registration = None
+            # The venue has now been asked and could not resolve it, which is
+            # what unlocks the discard escape hatch. Set BEFORE refresh(),
+            # which is what reads it.
+            self._reconcile_unresolved = True
             self.refresh()
             # NOT "you can register again". The leaderboard is a
             # positive-only oracle, so a key it does not list may still be

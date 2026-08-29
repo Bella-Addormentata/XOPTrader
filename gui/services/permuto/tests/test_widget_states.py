@@ -674,3 +674,101 @@ def test_teardown_joins_the_market_thread_too(qapp):
     widget._markets_btn.setChecked(True)
     widget.stop_background_work()
     assert widget._markets_thread is None
+
+
+# --------------------------------------------------------------------------- #
+# [review] The way out of an unfinished link
+# --------------------------------------------------------------------------- #
+
+def _restored(page):
+    """Reproduce the trap: a never-registered phrase restored on a FRESH
+    machine.
+
+    The phrase comes from a throwaway identity so the test needs no wordlist
+    dependency, and it is restored into a brand-new store -- which is exactly
+    the "moved to a new install" case. restore() sets the attempt marker
+    unconditionally, so the page opens with Register shut, Create shut and
+    only Recover offered, and Recover asks a positive-only oracle that can
+    never answer "no".
+    """
+    from gui.widgets.permuto import PermutoWidget
+
+    _, source = page
+    _pub, phrase = source.create()
+
+    fresh = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    fresh.restore(phrase)
+    widget = PermutoWidget(lambda: fresh)
+    widget.refresh()
+    return widget, fresh
+
+
+def test_a_restored_never_registered_phrase_lands_in_the_unfinished_state(page):
+    widget, ident = _restored(page)
+    info = ident.info()
+    assert not info.registered
+    assert info.link_attempted, "the marker that shuts Register"
+    assert not widget._register_btn.isEnabled()
+
+
+def test_discard_is_hidden_until_the_venue_has_been_asked(page):
+    """Throwing a key away is not a first move: the operator must have
+    consulted the leaderboard before being allowed to."""
+    widget, _ = _restored(page)
+    assert not widget._discard_btn.isEnabled()
+
+
+def test_discard_appears_once_a_reconcile_could_not_resolve_the_link(page):
+    """Without this the operator is trapped -- Register shut, Create shut,
+    Recover unable to answer -- with registration closing Monday 17:00 ET.
+    The status text already said "discard this identity deliberately" and
+    nothing in the page could do it."""
+    widget, _ = _restored(page)
+    widget._reconcile_unresolved = True
+    widget.refresh()
+    assert widget._discard_btn.isEnabled()
+
+
+def test_discard_refuses_without_the_typed_word(page, monkeypatch):
+    """A Yes/No box is answered reflexively, and discarding a key that IS
+    linked abandons the account permanently."""
+    from PySide6.QtWidgets import QInputDialog
+    widget, ident = _restored(page)
+    before = ident.info().pubkey
+
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: ("yes", True)))
+    widget._on_discard()
+    assert ident.info().pubkey == before, "discarded without the word"
+
+
+def test_discard_removes_the_identity_when_confirmed(page, monkeypatch):
+    from PySide6.QtWidgets import QInputDialog
+
+    from gui.services.permuto.identity import PermutoIdentityError
+
+    widget, ident = _restored(page)
+    assert ident.info().pubkey
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: ("DISCARD", True)))
+    widget._on_discard()
+
+    # "No identity" is an absence, not an empty record -- info() says so.
+    with pytest.raises(PermutoIdentityError):
+        ident.info()
+    # And the page recovers into the create/restore state rather than raising.
+    assert widget._create_btn.isEnabled()
+
+
+def test_discard_still_refuses_a_registered_identity(page, monkeypatch):
+    """The backstop underneath the two UI guards: after linking, the key IS
+    the account, and only the 24 words could bring it back."""
+    from PySide6.QtWidgets import QInputDialog
+    widget, ident = _restored(page)
+    ident.mark_registered(user_id="u1", trading_address="xch1abc")
+    before = ident.info().pubkey
+
+    monkeypatch.setattr(QInputDialog, "getText",
+                        staticmethod(lambda *a, **k: ("DISCARD", True)))
+    widget._on_discard()
+    assert ident.info().pubkey == before, "a registered identity was discarded"
