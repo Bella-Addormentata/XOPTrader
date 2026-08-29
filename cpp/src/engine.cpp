@@ -1500,6 +1500,11 @@ asio::awaitable<void> Engine::run_startup_analysis()
     const uint32_t target = market_analyzer_->analysis_blocks();
     spdlog::info("[Engine] Starting market analysis phase ({} blocks)", target);
 
+    // The same mode the main poll loop uses. Hoisted once: only `auto` may
+    // move the height source off the node, during this phase as much as any
+    // other.
+    const bool analysis_mode_is_auto = (config_.chia.mode == ChiaMode::Auto);
+
     asio::steady_timer timer(ioc_);
     BlockHeight last_analysis_block{0};
 
@@ -1571,7 +1576,22 @@ asio::awaitable<void> Engine::run_startup_analysis()
         // Outside the catch, not inside it: co_await is illegal in a handler.
         if (!height_error.empty()) {
             bool recovered = false;
-            if (!wallet_only_mode_) {
+            // [review] The CONFIGURED PIN applies during analysis too.
+            //
+            // This branch gated on !wallet_only_mode_, which is false in
+            // explicit ChiaMode::FullNode -- so a single node error silently
+            // used the wallet in the one mode whose entire meaning is "do
+            // not". height_fallback_allowed() is the predicate the main
+            // poll loop consults for exactly this, and analysis was the only
+            // place that decided for itself.
+            //
+            // The per-poll rescue is kept rather than folded into
+            // height_source_'s hysteresis: analysis runs before the main
+            // loop exists, it is bounded, and a streak counter that has to
+            // reach six before it helps would spend the whole phase failing.
+            // What it must not do is override a pin the operator set.
+            if (!wallet_only_mode_
+                    && risk::height_fallback_allowed(analysis_mode_is_auto)) {
                 try {
                     height = co_await wallet_->get_height_info();
                     // Same bound the main poll applies. Accepting any
@@ -1590,6 +1610,7 @@ asio::awaitable<void> Engine::run_startup_analysis()
                              height_error);
                 continue;
             }
+
             spdlog::warn("[Engine] [S28] Analysis: node height failed ({}) -- "
                          "used the WALLET for this poll", height_error);
         }
