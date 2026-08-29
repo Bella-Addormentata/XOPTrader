@@ -269,7 +269,12 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     offer_mgr_->set_escalation([this](const std::string& detail) {
         spdlog::critical("[Engine] [S31] {}", detail);
         if (alerts_) {
-            alerts_->send_alert(AlertRule::DeadMansSwitch,
+            // [sweep] NOT DeadMansSwitch. That rule carries the outcome
+            // alert ("a cancel of every resting offer was SUBMITTED"), and
+            // AlertManager rate-limits per rule for 60 seconds -- so this
+            // correction, which says one offer was never in that request,
+            // could be dropped by the cooldown of the message it corrects.
+            alerts_->send_alert(AlertRule::DeadMansSwitchLive,
                                 "DEAD MAN'S SWITCH INCOMPLETE: " + detail);
         }
     });
