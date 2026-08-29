@@ -1086,8 +1086,34 @@ void Engine::shutdown()
             } claim_guard{&graceful_cancel_active_};
 
             try {
+                const auto pending_before =
+                    state_->get_all_offers().size();
                 auto shutdown_cancelled = co_await offer_mgr_->cancel_all();
-                spdlog::info("[Engine] All outstanding offers cancelled");
+                // [review round 11] VERIFIED, not assumed. cancel_all()
+                // swallows per-offer RPC failures and returns only the ids
+                // it succeeded on -- and this coroutine then stops the
+                // io_context, after which run() joins the watchdog before
+                // its fresh shutdown heartbeat can age out. A partial
+                // cancellation therefore exited the process with live
+                // offers and NO fallback and NO outcome alert: the graceful
+                // path swallowed exactly the failure the switch exists to
+                // announce. When the count comes up short, the independent
+                // zero-fee secure fallback runs from here -- same mutex,
+                // same alert machinery, one authoritative outcome -- while
+                // the claim is still held so the watchdog cannot race it.
+                if (shutdown_cancelled.size() < pending_before) {
+                    spdlog::critical(
+                        "[Engine] [S31] graceful cancellation got {}/{} -- "
+                        "invoking the independent fallback for the rest",
+                        shutdown_cancelled.size(), pending_before);
+                    watchdog_cancel_book(
+                        "graceful shutdown cancelled "
+                        + std::to_string(shutdown_cancelled.size()) + "/"
+                        + std::to_string(pending_before)
+                        + " offers; the fallback covers the remainder");
+                } else {
+                    spdlog::info("[Engine] All outstanding offers cancelled");
+                }
                 // [T5-02] Persist cancellation status to database with retry.
                 // Shutdown is our last chance to update the audit trail; stale
                 // "pending" records cause ghost offers on next startup.  Retry
