@@ -483,3 +483,64 @@ def test_the_placement_fence_refuses_batches_but_not_cancels(monkeypatch):
     assert sent and sent[-1][1] == "/exchange/cancel_all", (
         "the fence must not block the cancel it exists to protect")
 
+
+def test_cold_start_bootstrap_promotes_no_session_to_a_real_reauth(monkeypatch):
+    """[release review] The ONE line between the shipped GUI path (PermutoLive
+    built with session_token="") and the documented never-places-an-order
+    failure is the NO_SESSION -> RENEW promotion. Every other ensure_session
+    test constructs a client with a token; nothing pinned the cold start."""
+    from gui.services.permuto.client import PermutoClient
+    from gui.services.permuto.session import RenewAction
+
+    c = PermutoClient(_Identity(), session_token="")
+    reauths = []
+    monkeypatch.setattr(c, "reauth", lambda now_s: reauths.append(now_s))
+    action = c.ensure_session(1.0)
+    assert reauths, "an empty token was treated as terminal again"
+    assert action is RenewAction.RENEW
+
+
+def test_the_fence_also_blocks_the_401_retry_resend(monkeypatch):
+    """[review round 10] The fence was checked before the FIRST request only,
+    so a shutdown beginning while that request was in flight let the retry
+    reauthenticate and place AFTER the last-resort cancel."""
+    from gui.services.permuto.batch import BatchError
+    from gui.services.permuto.client import (PermutoClient,
+                                             PermutoSessionExpired)
+
+    c = PermutoClient(_Identity(), session_token="tok")
+    c.session.expires_at_s = 1e12
+    sent = []
+
+    def responder(method, path, payload=None, **kw):
+        sent.append(path)
+        # First send 401s; the shutdown lands while it is in flight.
+        c.halt_placements()
+        raise PermutoSessionExpired("401")
+
+    monkeypatch.setattr(c, "_request", responder)
+    monkeypatch.setattr(c, "reauth", lambda now_s: None)
+    with pytest.raises(BatchError):
+        c.batch_upsert([{"market": "X"}], 1.0)
+    assert sent.count("/exchange/batch_upsert") == 1, (
+        "the retry re-placed through the fence")
+
+
+def test_schedule_cancel_extends_and_clear_omits_time(monkeypatch):
+    """Extend-never-rearm: a fresh arm spends one of ten daily triggers,
+    re-scheduling while armed is free, and clearing omits `time` per the
+    API reference."""
+    from gui.services.permuto.client import PermutoClient
+
+    c = PermutoClient(_Identity(), session_token="tok")
+    c.session.expires_at_s = 1e12
+    sent = []
+    monkeypatch.setattr(
+        c, "_request",
+        lambda m, p, payload=None, **kw: sent.append((p, payload)) or {})
+
+    c.schedule_cancel(1.0, 123_456_000)
+    c.clear_schedule_cancel(2.0)
+    assert sent[0] == ("/exchange/schedule_cancel", {"time": 123_456_000})
+    assert sent[1] == ("/exchange/schedule_cancel", {})
+

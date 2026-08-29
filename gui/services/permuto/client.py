@@ -29,7 +29,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Optional, Sequence
 
-from .auth import BASE_URL, PermutoAuthError, _HEADERS, _TIMEOUT
+from .auth import _HEADERS, _TIMEOUT, BASE_URL, PermutoAuthError
 from .batch import BatchError
 from .session import RenewAction, SessionState, renew_action
 
@@ -315,6 +315,30 @@ class PermutoClient:
     # ------------------------------------------------------------------ #
     # Trading
     # ------------------------------------------------------------------ #
+    def schedule_cancel(self, now_s: float, deadline_utc_ms: int) -> Any:
+        """Arm or extend the venue-side dead man's switch.
+
+        [release review] POST /exchange/schedule_cancel {time: <utc_ms>} arms
+        a future cancel-all the VENUE executes if we stop extending -- the
+        one retraction path that survives a crash, a reboot, or a power loss,
+        none of which any in-process cancel can cover. Budget per the API
+        reference: a FRESH arm counts against 10/day; re-scheduling while
+        armed is free. So extend, never disarm-and-rearm.
+        """
+        return self._retry_once_on_401(
+            "POST", "/exchange/schedule_cancel",
+            {"time": int(deadline_utc_ms)}, now_s)
+
+    def clear_schedule_cancel(self, now_s: float) -> Any:
+        """Disarm the scheduled cancel (omit `time` per the reference).
+
+        Only called after our OWN cancel has been sent on a graceful stop --
+        a scheduled cancel firing over an already-empty book is harmless but
+        spends one of the ten daily triggers.
+        """
+        return self._retry_once_on_401(
+            "POST", "/exchange/schedule_cancel", {}, now_s)
+
     def halt_placements(self) -> None:
         """No further batch_upsert will be issued. Cancels still work."""
         self._halt_placements.set()
@@ -380,6 +404,15 @@ class PermutoClient:
             # Counted, not direct -- see _reauth_counted().
             prior = self.session.consecutive_failures
             self._reauth_counted(now_s)
+            # [review round 10] Re-check the fence before the RESEND. The
+            # batch checks it before the first request, but a shutdown that
+            # begins while that request is in flight would otherwise let
+            # this retry reauthenticate and place AFTER the last-resort
+            # cancel -- the fence exists precisely for requests already past
+            # the first check.
+            if (path.endswith("/batch_upsert")
+                    and self._halt_placements.is_set()):
+                raise BatchError("placements halted for shutdown")
             try:
                 return self._request(method, path, payload)
             except PermutoSessionExpired:

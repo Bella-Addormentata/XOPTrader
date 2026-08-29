@@ -108,7 +108,12 @@ def test_the_ladder_earns_what_it_was_asked_for():
     legs = quote_ladder("QQQ-VOL-PERP", ORACLE, target_depth_usd=1000.0)
     bids = [o for o in legs if o.side is Side.BUY]
     asks = [o for o in legs if o.side is Side.SELL]
-    assert depth_credit_usd(bids, asks, ORACLE) == pytest.approx(1000.0, rel=1e-6)
+    # Within one lot per leg of the target, and never ABOVE it: sizes floor
+    # to the venue's lot grid, so quantisation may shave a few cents but must
+    # not promise notional that was never priced.
+    credit = depth_credit_usd(bids, asks, ORACLE)
+    assert credit <= 1000.0 + 1e-9
+    assert credit == pytest.approx(1000.0, abs=1.0)
 
 
 def test_the_ladder_is_symmetric_because_the_minimum_is_what_scores():
@@ -116,7 +121,10 @@ def test_the_ladder_is_symmetric_because_the_minimum_is_what_scores():
     legs = quote_ladder("QQQ-VOL-PERP", ORACLE, 1000.0)
     bid_notional = sum(o.notional for o in legs if o.side is Side.BUY)
     ask_notional = sum(o.notional for o in legs if o.side is Side.SELL)
-    assert bid_notional == pytest.approx(ask_notional, rel=1e-9)
+    # Symmetric to within one lot per level -- tick/lot quantisation rounds
+    # each side on its own grid, so exact equality is no longer the invariant;
+    # bounded asymmetry is.
+    assert bid_notional == pytest.approx(ask_notional, abs=1.0)
 
 
 def test_every_ladder_leg_is_strictly_inside_the_ring():
@@ -238,3 +246,47 @@ def test_non_finite_oracle_or_target_quotes_nothing(oracle, target):
     """``inf > 0.0`` passes a bare positivity check, and every leg built from
     one is infinite in price and zero in size, or infinite in size."""
     assert quote_ladder("QQQ-VOL-PERP", oracle, target) == []
+
+
+def test_prices_land_on_the_tick_grid_and_sizes_on_the_lot_grid():
+    """[release review] The live venue declares tick_size 0.0001 and
+    lot_size 1, and nothing honoured either -- 16-decimal prices and
+    fractional sizes. A strict validator rejects the whole batch: zero
+    orders for 102 hours."""
+    legs = quote_ladder("QQQ-VOL-PERP", 0.1544391445921985, 1000.0,
+                        tick_size=0.0001, lot_size=1.0)
+    assert legs
+    for leg in legs:
+        ticks = leg.price / 0.0001
+        assert abs(ticks - round(ticks)) < 1e-6, leg.price
+        assert leg.size == int(leg.size), leg.size
+        assert leg.size >= 1
+
+
+def test_quantisation_rounds_away_from_the_oracle():
+    """Never sharper than the price risk approved: bid floors DOWN, ask
+    ceils UP."""
+    oracle = 0.1544391445921985
+    legs = quote_ladder("QQQ-VOL-PERP", oracle, 1000.0, levels=1,
+                        tick_size=0.0001, lot_size=1.0)
+    bid = next(o for o in legs if o.side is Side.BUY)
+    ask = next(o for o in legs if o.side is Side.SELL)
+    assert bid.price <= oracle * (1.0 - 0.25 / 100.0) + 1e-12
+    assert ask.price >= oracle * (1.0 + 0.25 / 100.0) - 1e-12
+
+
+def test_a_degenerate_quantised_pair_is_skipped_not_sent():
+    """A tick wider than the spread crosses or zeroes the pair; the level is
+    dropped rather than shipped."""
+    assert quote_ladder("X", 0.0002, 1000.0, levels=1,
+                        tick_size=0.01, lot_size=1.0) == []
+
+
+def test_an_unusable_tick_or_lot_falls_back_to_the_documented_default():
+    legs = quote_ladder("QQQ-VOL-PERP", 0.15, 1000.0,
+                        tick_size=float("nan"), lot_size=0.0)
+    assert legs
+    for leg in legs:
+        ticks = leg.price / 0.0001
+        assert abs(ticks - round(ticks)) < 1e-6
+

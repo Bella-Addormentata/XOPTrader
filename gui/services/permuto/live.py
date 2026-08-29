@@ -35,6 +35,7 @@ from typing import Any, Callable, Optional
 from PySide6.QtCore import QObject, QThread, Signal, Slot
 
 from gui.services.permuto.client import PermutoClient
+from gui.services.permuto.quoting import MAX_ORACLE_AGE_S as _GRACE_S
 from gui.services.permuto.runner import QuoteRunner
 
 _log = logging.getLogger(__name__)
@@ -148,16 +149,31 @@ def _default_venue_state() -> dict:
     markets = meta.get("markets")
     wanted = {m.replace("-PERP", "") for m in MARKETS}
     active = set()
+    # [release review] Per-market tick/lot specs, for the ladder's
+    # quantisation. Missing or malformed values fall back to the documented
+    # defaults inside quote_ladder, so a partial payload degrades to the
+    # published grid rather than to raw floats.
+    specs: dict = {}
     if isinstance(markets, list):
         for entry in markets:
             if not isinstance(entry, dict):
                 continue
+            names = {entry.get("symbol"), entry.get("base_asset")}
+            hit = names & wanted
+            if hit:
+                spec = {}
+                for field, key in (("tick_size", "tick_size"),
+                                   ("lot_size", "lot_size")):
+                    try:
+                        spec[field] = float(entry.get(key))
+                    except (TypeError, ValueError):
+                        pass
+                for name in hit:
+                    specs[name + "-PERP"] = spec
             if entry.get("status") != "active":
                 continue
-            for key in ("symbol", "base_asset"):
-                name = entry.get(key)
-                if name in wanted:
-                    active.add(name)
+            for name in hit:
+                active.add(name)
     carried = active != wanted
 
     return {
@@ -165,6 +181,7 @@ def _default_venue_state() -> dict:
         "flags": {
             "trading_paused": bool(flags.get("trading_paused")),
             "carried": carried,
+            "specs": specs,
         },
     }
 
@@ -186,6 +203,9 @@ class _Worker(QObject):
         # When we last held a venue reading we would be willing to quote on.
         # Seeded at construction so the first tick is not born stale.
         self._fresh_at = time.monotonic()
+        #: The last successfully parsed (oracles, flags), for riding a
+        #: transient venue blip inside the oracle grace.
+        self._last_good: Optional[tuple] = None
 
     def request_stop(self) -> None:
         self._stop = True
@@ -219,10 +239,29 @@ class _Worker(QObject):
                         flags = dict(state.get("flags") or {})
                         if oracles:
                             self._fresh_at = time.monotonic()
+                            self._last_good = (oracles, flags)
                     except Exception as exc:  # noqa: BLE001
-                        _log.warning("permuto: venue state unreadable: %s", exc)
-                        oracles, flags = {}, {"trading_paused": True,
-                                              "carried": False}
+                        # [release review] One failed GET used to cancel the
+                        # WHOLE book immediately -- the 15s oracle grace that
+                        # MAX_ORACLE_AGE_S exists for was unreachable,
+                        # because a fabricated empty-oracle state withdraws
+                        # without consulting age at all. Inside the grace the
+                        # last good reading is used with its REAL age, so
+                        # decide() holds through a blip and still withdraws
+                        # the moment the reading is genuinely stale.
+                        age = time.monotonic() - self._fresh_at
+                        if self._last_good is not None and age <= _GRACE_S:
+                            _log.warning(
+                                "permuto: venue state unreadable (%s) -- "
+                                "riding the %.1fs-old reading inside the "
+                                "%.0fs grace", exc, age, _GRACE_S)
+                            oracles, flags = (dict(self._last_good[0]),
+                                              dict(self._last_good[1]))
+                        else:
+                            _log.warning(
+                                "permuto: venue state unreadable: %s", exc)
+                            oracles, flags = {}, {"trading_paused": True,
+                                                  "carried": False}
 
                     # [review] A REAL oracle age. decide() withdraws above
                     # MAX_ORACLE_AGE_S, and nothing in the process had ever
@@ -254,6 +293,14 @@ class _Worker(QObject):
             # happened above -- including an exception that escaped the loop.
             try:
                 self._client.cancel_all(time.time())
+                # Disarm the venue-side switch AFTER our own cancel: the book
+                # is empty now, and a scheduled cancel firing later would
+                # spend one of the ten daily triggers on nothing. Best
+                # effort -- if it stays armed it fires harmlessly.
+                try:
+                    self._client.clear_schedule_cancel(time.time())
+                except Exception:  # noqa: BLE001
+                    pass
                 self.book_state.emit(True)
                 reason = "stopped; a cancel of every resting order was sent"
             except Exception as exc:  # noqa: BLE001
@@ -277,7 +324,7 @@ class PermutoLive(QObject):
         session_token: str = "",
         markets: Optional[list] = None,
         target_depth_usd: float = 1_200.0,
-        max_position: float = 100.0,
+        max_position_usd: float = 1_200.0,
         venue_state: Optional[Callable[[], dict]] = None,
         client: Any = None,
     ) -> None:
@@ -290,7 +337,7 @@ class PermutoLive(QObject):
         self._runner = QuoteRunner(
             self._client, self._markets,
             target_depth_usd=target_depth_usd,
-            max_position=max_position,
+            max_position_usd=max_position_usd,
         )
         self._venue_state = venue_state or _default_venue_state
         self._thread: Optional[QThread] = None

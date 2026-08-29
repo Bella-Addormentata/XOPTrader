@@ -51,6 +51,11 @@ from .session import RenewAction
 #: a fourteen-hour pause into ten thousand identical requests.
 RECANCEL_INTERVAL_S = 60.0
 
+#: How far ahead the venue-side scheduled cancel-all is pushed each tick.
+#: 24 missed ticks of headroom -- generous against transients, small against
+#: the hours an unnoticed crash would otherwise leave quotes resting.
+DMS_EXTEND_S = 120.0
+
 _log = logging.getLogger(__name__)
 
 __all__ = ["QuoteRunner", "TickResult"]
@@ -80,7 +85,7 @@ class QuoteRunner:
         markets: list,
         *,
         target_depth_usd: float = 1_200.0,
-        max_position: float = 100.0,
+        max_position_usd: float = 1_200.0,
         ring_pct: float = 2.0,
         half_spread_pct: float = 0.25,
         quote_when_carried: bool = True,
@@ -88,7 +93,14 @@ class QuoteRunner:
         self._client = client
         self._markets = list(markets)
         self._target_depth_usd = target_depth_usd
-        self._max_position = max_position
+        # [release review] USD, not contracts. The old default of 100
+        # CONTRACTS was ~$15-32 of notional at live oracles (0.15-0.32)
+        # against $1,200 quote legs -- so the first routine fill of ~1.5% of
+        # one quote pinned the market REDUCE_ONLY, zeroed its min(bid, ask)
+        # depth credit, and the gate margin is only ~1.78x at full health. A
+        # dollar limit survives an oracle that moves 10-13% in seconds; a
+        # contract limit does not.
+        self._max_position_usd = max_position_usd
         self._ring_pct = ring_pct
         self._half_spread_pct = half_spread_pct
         self._quote_when_carried = quote_when_carried
@@ -99,6 +111,9 @@ class QuoteRunner:
         #: When the last full cancel_all went out, for the re-assert below.
         #: Negative infinity so the first withdraw always cancels.
         self._last_full_cancel_s = float("-inf")
+        #: Whether the venue-side dead man's switch reported armed, for
+        #: log-once state transitions rather than a message per tick.
+        self._dms_ok: Optional[bool] = None
 
     # ------------------------------------------------------------------ #
     # Belief
@@ -237,6 +252,32 @@ class QuoteRunner:
         # never fetched an account is indistinguishable from one that fetched
         # an unreadable one, and the risk pass below would act on the
         # fully-utilised default.
+        # [release review] EXTEND THE VENUE-SIDE DEAD MAN'S SWITCH before
+        # anything else that needs a session. schedule_cancel is the one
+        # retraction that survives a crash, reboot or power loss -- the
+        # in-process cancels all need this process alive, and the contest is
+        # ~102 unattended hours. Extended every session-holding tick to
+        # now + 120s (24 missed ticks of headroom); a fresh arm costs one of
+        # ten daily triggers, re-extending is free, so extend-never-rearm.
+        # A failure here must not affect the tick -- the switch is a net
+        # under the loop, not a gate in it.
+        if session_ok:
+            try:
+                self._client.schedule_cancel(
+                    now_s, int((now_s + DMS_EXTEND_S) * 1000.0))
+                if self._dms_ok is not True:
+                    _log.info("permuto: venue-side dead man's switch armed "
+                              "(+%.0fs, extended every tick)", DMS_EXTEND_S)
+                    self._dms_ok = True
+            except AttributeError:
+                pass    # a test fake without the method
+            except Exception as exc:  # noqa: BLE001
+                if self._dms_ok is not False:
+                    _log.warning("permuto: could not arm/extend the venue "
+                                 "dead man's switch: %s -- a crash would "
+                                 "leave the book resting", exc)
+                    self._dms_ok = False
+
         state = MarginState(carried=carried)
         account_seen = False
         if session_ok and not paused:
@@ -312,8 +353,13 @@ class QuoteRunner:
                 due = (now_s - self._last_full_cancel_s
                        >= RECANCEL_INTERVAL_S)
                 if not believed_empty or due:
-                    self._client.cancel_all(now_s)
+                    # Stamped BEFORE the attempt: a cancel that throws during
+                    # a venue outage must not retry every 5s tick for the
+                    # whole outage -- that is the auth-route hammer again,
+                    # through the cancel door. The next attempt waits out the
+                    # re-assert interval like any other.
                     self._last_full_cancel_s = now_s
+                    self._client.cancel_all(now_s)
                 self._forget_book()
                 # A full withdrawal discharges the reopen debt, because
                 # _forget_book() is what the debt was FOR: the latch exists
@@ -332,8 +378,14 @@ class QuoteRunner:
                 # discharged the rebuild owed to the others -- whose beliefs
                 # this branch deliberately leaves intact, and which are
                 # exactly the ones that can still be stale after a reopen.
-            if not any_quoted:
-                return TickResult("withdraw", reason, results)
+            # [review round 10] NO early return here. Returning when nothing
+            # wanted to quote skipped the risk pass below entirely, so a
+            # market HOLDing a two-sided book past its position limit kept it
+            # for as long as a NEIGHBOUR was withdrawing -- and a venue pause
+            # withdraws every tick. The withdraw result is reported after
+            # risk has had its say; the risk_forced branch already returns
+            # the same shape when it acts.
+            withdraw_reason = reason
 
         # [review] RISK IS EVALUATED FOR EVERY LIVE MARKET, not only for the
         # ones already deciding to quote.
@@ -360,10 +412,16 @@ class QuoteRunner:
         for market in (self._markets if account_seen else []):
             oracle = oracles.get(market)
             base_size = self._base_size(oracle)
+            # Contracts equivalent of the dollar limit at THIS oracle. Zero
+            # oracle means zero base_size too, and assess() treats a
+            # non-positive limit as "no limit" -- but base_size 0 places
+            # nothing, so nothing is sized off the degenerate value.
+            max_position = (self._max_position_usd / oracle
+                            if oracle and oracle > 0.0 else 0.0)
             risk_by_market[market] = assess(
                 state, market,
                 base_size=base_size,
-                max_position=self._max_position,
+                max_position=max_position,
                 ring_pct=self._ring_pct,
                 half_spread_pct=self._half_spread_pct,
             )
@@ -396,6 +454,8 @@ class QuoteRunner:
                 return TickResult("withdraw", worst.reason, results)
 
         if not any_quoted:
+            if withdrawing:
+                return TickResult("withdraw", withdraw_reason, results)
             wait = LoopAction.WAIT.value
             waiting = [m for m, (a, _) in results.items() if a == wait]
             if waiting:
@@ -457,10 +517,15 @@ class QuoteRunner:
             depth_usd = self._target_depth_usd * (
                 risk.size / base_size if base_size > 0.0 else 0.0
             )
+            raw_specs = flags.get("specs")
+            spec = (raw_specs.get(market, {})
+                    if isinstance(raw_specs, dict) else {})
             ladder = quote_ladder(
                 market, reference, depth_usd,
                 levels=1, first_offset_pct=self._half_spread_pct,
                 ring_pct=self._ring_pct,
+                tick_size=spec.get("tick_size", 0.0001),
+                lot_size=spec.get("lot_size", 1.0),
             )
             if risk.action is RiskAction.REDUCE_ONLY:
                 # [review] batch_upsert is keyed on (market, side), so
@@ -494,10 +559,38 @@ class QuoteRunner:
                 self._resting[market] = RestingQuote()
 
         if not legs:
-            return TickResult("hold", "risk left nothing to place", results)
+            # [review round 10] NOT "hold". hold means "the book is resting
+            # and correct"; here risk refused every leg, and after a
+            # reduce-only cancel the book may be EMPTY. MainWindow treats
+            # quote/hold as proof the loop trades, so reporting hold cleared
+            # the not_quoting gate and painted PERMUTO ON over nothing
+            # resting. risk_blocked gates the switch like any other
+            # non-trading outcome.
+            return TickResult("risk_blocked",
+                              "risk left nothing to place", results)
 
         payload = build_upsert_batch(legs, oracles, ring_pct=self._ring_pct)
-        self._client.batch_upsert(payload, now_s)
+        response = self._client.batch_upsert(payload, now_s)
+
+        # [release review] "partial" IS HTTP success on this venue, and the
+        # response was thrown away -- a per-leg ALO refusal (a competitor's
+        # aggressive in-ring rest crossing our leg) was invisible: the loop
+        # believed both sides rested and re-sent the same crossing price on
+        # the next drift check while min(bid, ask) earned zero. The
+        # authenticated response SHAPE is not yet pinned by a live capture,
+        # so this is deliberately conservative: any status other than a
+        # clean acceptance is surfaced loudly and reported in the result,
+        # and reconcile() heals the belief from open_orders next tick.
+        batch_note = ""
+        if isinstance(response, dict):
+            status = str(response.get("status", "")).lower()
+            if status and status not in ("ok", "success", "accepted"):
+                batch_note = (" -- batch status %r; some legs may "
+                              "not rest" % status)
+                _log.warning(
+                    "permuto: batch_upsert returned status %r (body %r); "
+                    "believing open_orders over our own send",
+                    status, str(response)[:400])
 
         # Believe only what we just sent, and only after it was accepted.
         for leg in legs:
@@ -509,7 +602,8 @@ class QuoteRunner:
             self._resting[leg.market] = current
 
         self._reopen_pending = False
-        return TickResult("quote", "%d legs" % len(legs), results)
+        return TickResult("quote", "%d legs%s" % (len(legs), batch_note),
+                          results)
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""

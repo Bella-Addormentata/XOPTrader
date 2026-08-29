@@ -136,11 +136,15 @@ def decide(
         # so every entrant passes through this state on the way in.
         return QuoteDecision(LoopAction.WITHDRAW, "venue reports trading paused")
 
-    if not view.session_ok:
-        if view.session_waiting:
-            return QuoteDecision(LoopAction.WAIT, "session renewal backing off")
-        return QuoteDecision(LoopAction.WITHDRAW, "no usable trading session")
-
+    # [review round 10] ORACLE VALIDITY BEFORE THE SESSION BACKOFF. WAIT
+    # used to be answered first, so a session outage that coincided with a
+    # dead or stale oracle held the previous book resting at an unsafe price
+    # for the whole backoff -- the exact inversion of this function's own
+    # ordering rule, since a stale price is UNSAFE and a pending renewal is
+    # merely inconvenient. The withdraw the caller issues may itself fail
+    # without a session; attempting it is still right, and the runner charges
+    # that failure to the same backoff.
+    #
     # math.isfinite as well as `> 0`: +inf passes the positivity test, and
     # the drift calculation further down then computes inf/inf = NaN, whose
     # comparisons are all false -- so the loop reports HOLD and leaves stale
@@ -156,6 +160,11 @@ def decide(
             "would be rejected or purged and would score nothing"
             % (view.oracle_age_s, MAX_ORACLE_AGE_S),
         )
+
+    if not view.session_ok:
+        if view.session_waiting:
+            return QuoteDecision(LoopAction.WAIT, "session renewal backing off")
+        return QuoteDecision(LoopAction.WITHDRAW, "no usable trading session")
 
     if view.carried and not quote_when_carried:
         return QuoteDecision(

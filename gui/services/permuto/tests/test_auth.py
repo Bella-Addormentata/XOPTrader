@@ -163,12 +163,17 @@ def test_missing_session_token_is_refused(monkeypatch):
 
 def test_missing_identifiers_are_refused_rather_than_emptied(monkeypatch):
     """A 200 without identifiers previously became user_id="" and an ok
-    result, so the UI said Registered and saved nothing."""
+    result, so the UI said Registered and saved nothing.
+
+    [review round 10] With the address now validated in the PREFLIGHT, a
+    resolver answer that carries no address at all is refused before the
+    link -- which is strictly better than the post-auth refusal this test
+    originally pinned. The assertion moved with the behaviour."""
     table = _happy()
     table[("GET", "/info/wallet_bls_trading_address")] = {"wallet_pubkey": "ab" * 48}
     table[("POST", "/exchange/wallet_auth")] = {"session_token": "sess"}
     _routes(monkeypatch, table)
-    with pytest.raises(PermutoAuthError, match="identifiers"):
+    with pytest.raises(PermutoAuthError, match="wallet_address"):
         auth.register(FakeIdentity())
 
 
@@ -292,24 +297,52 @@ def test_a_short_page_ends_the_search(monkeypatch):
     assert len(calls) == 1
 
 
-@pytest.mark.parametrize("bad_id,bad_addr", [
-    (12345, "xch1example"),
-    ("c" * 64, 99),
-    ("", "xch1example"),
-    ("   ", "xch1example"),
-])
-def test_non_string_identifiers_are_refused(monkeypatch, bad_id, bad_addr):
+@pytest.mark.parametrize("bad_id", [12345, "", "   "])
+def test_non_string_identifiers_are_refused(monkeypatch, bad_id):
     """Truthiness alone accepted a numeric id, str()'d it, and persisted it as
     a successful PERMANENT registration. Registration declares strings and the
     venue has always sent strings, so anything else is a changed contract to
     refuse rather than coerce."""
     table = _happy()
     table[("GET", "/info/wallet_bls_trading_address")] = {
-        "wallet_user_id": bad_id, "wallet_address": bad_addr,
+        "wallet_user_id": bad_id, "wallet_address": "xch1example",
     }
     _routes(monkeypatch, table)
     with pytest.raises(PermutoAuthError, match="identifiers"):
         auth.register(FakeIdentity())
+
+
+@pytest.mark.parametrize("bad_addr", [99, None, "", "   "])
+def test_a_bad_resolver_address_is_refused_BEFORE_the_link(monkeypatch,
+                                                           bad_addr):
+    """[review round 10] The preflight used to check only the `error` field,
+    so a resolver answer with no usable address was discovered AFTER
+    wallet_auth -- the irreversible call -- leaving the key permanently in
+    recovery for a failure that was knowable up front. Refusing here costs a
+    retry; refusing after costs the key. The challenge must never be
+    requested."""
+    calls = []
+    table = _happy()
+    table[("GET", "/info/wallet_bls_trading_address")] = {
+        "wallet_user_id": "c" * 64, "wallet_address": bad_addr,
+    }
+
+    real = table
+
+    def fake(method, path, payload=None, **kw):
+        calls.append((method, path.split("?")[0]))
+        for (m, p), resp in real.items():
+            if m == method and path.startswith(p):
+                return resp
+        raise AssertionError("unexpected route %s %s" % (method, path))
+
+    import gui.services.permuto.auth as auth_mod
+    monkeypatch.setattr(auth_mod, "_request", fake)
+    with pytest.raises(PermutoAuthError, match="wallet_address"):
+        auth.register(FakeIdentity())
+    assert ("POST", "/exchange/wallet_link_challenge") not in calls, (
+        "the challenge was requested past a failed preflight")
+    assert ("POST", "/exchange/wallet_auth") not in calls
 
 
 @pytest.mark.parametrize("meta", [

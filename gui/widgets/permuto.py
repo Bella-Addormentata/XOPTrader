@@ -538,7 +538,7 @@ class PermutoWidget(QWidget):
         self._markets_thread: Optional[QThread] = None
         self._markets_worker: Optional[Any] = None
         self._target_depth_usd = 1_200.0
-        self._max_position = 100.0
+        self._max_position_usd = 1_200.0
         self._build()
         self.refresh()
 
@@ -864,7 +864,7 @@ class PermutoWidget(QWidget):
 
         rows = [
             ("target depth per side", "$%.0f" % self._target_depth_usd),
-            ("max position", "%.0f contracts" % self._max_position),
+            ("max position", "$%.0f of notional" % self._max_position_usd),
             ("aggressive ring", "+/-2.00%  (depth credit + purge boundary)"),
             ("legal band", "+/-5.00%  (outside is HTTP 400)"),
             ("stop adding risk at", "%.0f%% margin utilisation"

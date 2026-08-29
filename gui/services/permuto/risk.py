@@ -40,6 +40,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Optional
 
+from .quoting import REQUOTE_AT_RING_FRACTION as _REQUOTE_AT_RING_FRACTION
+
 __all__ = [
     "FLATTEN_MARGIN_UTILISATION",
     "MAX_MARGIN_UTILISATION",
@@ -145,8 +147,19 @@ def max_price_skew_frac(ring_pct: float, half_spread_pct: float) -> float:
     Never negative: a spread wider than the ring has no legal two-sided
     placement at all, and reporting a negative allowance would invert the
     skew and push the leading leg out instead.
+
+    [release review] ALSO capped below the re-quote trigger. The ring-edge
+    ceiling ((ring - half_spread)/100 = 1.75% at defaults) sits ABOVE the
+    drift trigger (ring * REQUOTE_AT_RING_FRACTION = 1.2%), so a heavily
+    skewed quote was born already past the trigger -- decide() re-quoted it
+    every tick, an endless cancel/replace churn that consumed the mutate
+    budget and never rested long enough to earn depth. The skew ceiling now
+    stops at 80% of the trigger, so even a fully skewed pair rests until the
+    ORACLE moves, which is what the trigger is for.
     """
-    return max(0.0, (ring_pct - half_spread_pct) / 100.0)
+    ring_edge = (ring_pct - half_spread_pct) / 100.0
+    trigger = ring_pct * _REQUOTE_AT_RING_FRACTION / 100.0
+    return max(0.0, min(ring_edge, trigger * 0.8))
 
 
 def skew_frac(

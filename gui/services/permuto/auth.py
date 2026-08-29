@@ -324,9 +324,26 @@ def register(identity: Any) -> Registration:
 
     # Pre-flight: does the venue derive the same address we expect? Cheap,
     # side-effect-free, and it fails loudly here rather than mid-link.
+    #
+    # [review round 10] The full answer is validated, not just the absence
+    # of an `error` field. wallet_auth is the irreversible call -- a key that
+    # links and then turns out unusable is permanently in recovery -- and a
+    # resolver response missing its address was knowable BEFORE the
+    # commitment. Refusing here costs a retry; refusing after costs the key.
     resolved = resolve_trading_address(pubkey)
+    if not isinstance(resolved, dict):
+        raise PermutoAuthError(
+            "address resolver returned %s, not an object -- refusing to "
+            "link an identity the venue cannot describe"
+            % type(resolved).__name__)
     if resolved.get("error"):
         raise PermutoAuthError("venue rejected our pubkey: %s" % resolved["error"])
+    _addr = resolved.get("wallet_address")
+    if not isinstance(_addr, str) or not _addr.strip():
+        raise PermutoAuthError(
+            "address resolver returned no usable wallet_address (%r) -- "
+            "refusing the irreversible link for a key the venue cannot "
+            "derive an address for" % (_addr,))
 
     challenge = _request(
         "POST", "/exchange/wallet_link_challenge", {"wallet_pubkey": pubkey}

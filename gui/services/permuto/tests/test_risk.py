@@ -93,10 +93,25 @@ def test_skew_is_clamped_at_the_limit_not_extrapolated():
 def test_the_ceiling_keeps_the_trailing_leg_inside_the_ring():
     ring, half_spread = 2.0, 0.25
     ceiling = max_price_skew_frac(ring, half_spread)
-    assert ceiling == pytest.approx((2.0 - 0.25) / 100.0)
     # Worst case: full skew, trailing leg a half-spread behind.
     trailing_pct = (ceiling * 100.0) + half_spread
     assert trailing_pct <= ring + 1e-9
+
+
+def test_the_ceiling_stays_below_the_requote_trigger():
+    """[release review] The ring-edge ceiling (1.75% at defaults) sat ABOVE
+    the drift trigger (ring * REQUOTE_AT_RING_FRACTION = 1.2%), so a fully
+    skewed quote was born already past the trigger -- re-quoted every tick,
+    an endless cancel/replace churn that never rested long enough to earn
+    depth. The skew must leave the trigger headroom, so a skewed pair rests
+    until the ORACLE moves."""
+    from gui.services.permuto.quoting import REQUOTE_AT_RING_FRACTION
+    ring, half_spread = 2.0, 0.25
+    ceiling = max_price_skew_frac(ring, half_spread)
+    trigger = ring * REQUOTE_AT_RING_FRACTION / 100.0
+    assert ceiling < trigger, "a full skew is instantly past its own trigger"
+    # And a spread so wide the ring edge is the binding cap still wins.
+    assert max_price_skew_frac(2.0, 1.9) == pytest.approx(0.1 / 100.0)
 
 
 def test_a_spread_wider_than_the_ring_allows_no_skew_rather_than_a_negative():

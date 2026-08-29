@@ -225,6 +225,8 @@ def quote_ladder(
     first_offset_pct: float = 0.25,
     level_step_pct: float = 0.5,
     ring_pct: float = 2.0,
+    tick_size: float = 0.0001,
+    lot_size: float = 1.0,
 ) -> list[OrderIntent]:
     """A balanced ladder sized to earn ``target_depth_usd`` of depth credit.
 
@@ -273,6 +275,20 @@ def quote_ladder(
         )
         return []
 
+    # [release review] Quantise to the venue's published grid. The live
+    # /info/meta declares tick_size 0.0001 and lot_size 1 per market, and
+    # nothing here honoured either -- prices went out with 16 decimals and
+    # fractional sizes. If the venue enforces (a validator that rejects a
+    # whole batch outright is a strict one), the first batch on Monday would
+    # be a 400 and so would every retry for 102 hours. Directions are chosen
+    # to stay maker-safe and inside the ring: bid rounds DOWN, ask rounds UP
+    # (both AWAY from the oracle -- never sharper than approved), size floors
+    # to the lot so we never promise notional we did not price.
+    if not (_finite(tick_size) and tick_size > 0.0):
+        tick_size = 0.0001
+    if not (_finite(lot_size) and lot_size > 0.0):
+        lot_size = 1.0
+
     per_level = target_depth_usd / levels
     out: list[OrderIntent] = []
     for i in range(levels):
@@ -282,6 +298,23 @@ def quote_ladder(
         offset = min(offset, ring_pct * 0.9)
         bid_price = oracle * (1.0 - offset / 100.0)
         ask_price = oracle * (1.0 + offset / 100.0)
-        out.append(OrderIntent(market, Side.BUY, bid_price, per_level / bid_price))
-        out.append(OrderIntent(market, Side.SELL, ask_price, per_level / ask_price))
+        # floor/ceil on the tick grid, then guard the degenerate results: a
+        # bid floored to zero, or a pair the rounding has crossed.
+        bid_price = math.floor(bid_price / tick_size) * tick_size
+        ask_price = math.ceil(ask_price / tick_size) * tick_size
+        if not (bid_price > 0.0 and ask_price > bid_price):
+            _log.warning(
+                "quote_ladder: %s level %d quantised to a degenerate pair "
+                "(bid=%r ask=%r, tick=%r); skipping the level",
+                market, i, bid_price, ask_price, tick_size)
+            continue
+        bid_size = math.floor((per_level / bid_price) / lot_size) * lot_size
+        ask_size = math.floor((per_level / ask_price) / lot_size) * lot_size
+        if bid_size <= 0.0 or ask_size <= 0.0:
+            _log.warning(
+                "quote_ladder: %s level %d sizes to zero lots "
+                "(per_level=$%.2f); skipping the level", market, i, per_level)
+            continue
+        out.append(OrderIntent(market, Side.BUY, bid_price, bid_size))
+        out.append(OrderIntent(market, Side.SELL, ask_price, ask_size))
     return out

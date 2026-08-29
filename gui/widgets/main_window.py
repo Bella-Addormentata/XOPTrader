@@ -2357,7 +2357,18 @@ class MainWindow(QMainWindow):
         from gui.widgets.permuto import _default_identity_factory
 
         identity = _default_identity_factory()
-        return PermutoLive(identity)
+        # [release review] The page's displayed parameters are the ones the
+        # session runs with. They used to agree only because both were the
+        # same hard-coded defaults -- a GUI that shows one sizing while the
+        # loop trades another is how an operator misreads their own risk.
+        page = self._unwrap(self._permuto_widget)
+        kwargs = {}
+        if page is not None:
+            kwargs = {
+                "target_depth_usd": page._target_depth_usd,
+                "max_position_usd": page._max_position_usd,
+            }
+        return PermutoLive(identity, **kwargs)
 
     def _on_permuto_tick(self, result) -> None:
         action = getattr(result, "action", "?")

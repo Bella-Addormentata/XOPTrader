@@ -178,7 +178,9 @@ def test_a_partial_withdrawal_does_not_discharge_the_rebuild_debt():
     # _MKT loses its oracle -> 1 of 2 withdraws -> the PARTIAL branch.
     result = r.tick(2.0, {_MKT2: 0.07}, {"trading_paused": False})
 
-    assert result.action == "hold"
+    # risk_blocked, not hold: risk refused every leg and the book may be
+    # empty -- reporting hold painted the switch ON over nothing resting.
+    assert result.action == "risk_blocked"
     assert "batch_upsert" not in c.calls, "nothing was rebuilt"
     assert r._reopen_pending, (
         "withdrawing one market discharged the rebuild owed to the other")
@@ -268,7 +270,9 @@ def test_a_flattening_account_places_nothing():
     })
     r = _runner(c)
     result = r.tick(1.0, _ORACLE, {})
-    assert result.action == "hold"
+    # risk_blocked, not hold: the flatten line left nothing to place, and
+    # hold reads to the switch as "trading normally".
+    assert result.action == "risk_blocked"
     assert "batch_upsert" not in c.calls
 
 
@@ -277,7 +281,7 @@ def test_reduce_only_keeps_only_the_shrinking_side():
         "equity_usd": 100_000.0, "used_margin_usd": 0.0,
         "positions": {_MKT: 100.0},
     })
-    r = _runner(c, max_position=100.0)
+    r = _runner(c, max_position_usd=7.0)
     assert r.tick(1.0, _ORACLE, {}).action == "quote"
     assert [leg["side"] for leg in c.last_batch] == ["sell"]
     assert all(leg["reduce_only"] for leg in c.last_batch)
@@ -291,7 +295,7 @@ def test_a_long_book_is_quoted_below_the_oracle():
         "equity_usd": 100_000.0, "used_margin_usd": 0.0,
         "positions": {_MKT: 50.0},
     })
-    _runner(long_book, max_position=100.0).tick(1.0, _ORACLE, {})
+    _runner(long_book, max_position_usd=7.0).tick(1.0, _ORACLE, {})
 
     def _leg(client, side):
         return [x for x in client.last_batch if x["side"] == side][0]
@@ -553,7 +557,7 @@ def test_reduce_only_cancels_the_market_before_upserting_one_side():
             "positions": {_MKT: 100.0},
         },
     )
-    r = _runner(c, max_position=100.0)
+    r = _runner(c, max_position_usd=7.0)
     r.tick(1.0, _ORACLE, {})
     assert c.calls.index("cancel_all") < c.calls.index("batch_upsert")
     assert [leg["side"] for leg in c.last_batch] == ["sell"]
@@ -634,7 +638,7 @@ def test_a_held_book_at_the_position_limit_is_also_acted_on():
             "positions": {_MKT: 100.0},
         },
     )
-    r = _runner(c, max_position=100.0)
+    r = _runner(c, max_position_usd=7.0)
     assert r.tick(1.0, _ORACLE, {}).action == "withdraw"
     assert "cancel_all" in c.calls
 
@@ -725,7 +729,7 @@ def test_one_markets_risk_retraction_is_not_skipped_because_another_quotes():
     result = r.tick(1.0, _BOTH, {})
     assert "cancel_all" in c.calls, "the at-risk market was left live"
     assert _MKT in (c.cancelled[0] or [])
-    assert result.action in ("withdraw", "hold", "quote")
+    assert result.action in ("withdraw", "hold", "quote", "risk_blocked")
     assert r._resting[_MKT].empty
 
 
@@ -759,4 +763,56 @@ def test_an_unreadable_position_stops_the_market_adding_risk():
     d = assess(st, _MKT, base_size=100.0, max_position=100.0,
                ring_pct=2.0, half_spread_pct=0.5)
     assert d.action is not RiskAction.NORMAL
+
+
+def test_every_session_holding_tick_extends_the_venue_dead_mans_switch():
+    """[release review] The one retraction that survives a crash, a reboot
+    or a power loss -- everything in-process needs this process alive, and
+    the contest is ~102 unattended hours."""
+    class _DMS(_Client):
+        def __init__(self, **kw):
+            super().__init__(**kw)
+            self.armed = []
+
+        def schedule_cancel(self, now_s, deadline_ms):
+            self.armed.append(deadline_ms)
+            return {}
+
+    c = _DMS()
+    _runner(c).tick(100.0, _ORACLE, {})
+    assert c.armed, "no venue-side dead man's switch was armed"
+    assert c.armed[0] >= int(100.0 * 1000), "deadline is not in the future"
+
+
+def test_a_failing_dead_mans_switch_does_not_affect_the_tick():
+    """A net under the loop, not a gate in it."""
+    class _DMSBroken(_Client):
+        def schedule_cancel(self, now_s, deadline_ms):
+            raise RuntimeError("dms route down")
+
+    result = _runner(_DMSBroken()).tick(1.0, _ORACLE, {})
+    assert result.action == "quote", result.reason
+
+
+def test_a_market_past_its_limit_is_retracted_even_while_a_pause_withdraws():
+    """[review round 10] The early return after a withdraw skipped the risk
+    pass, so a market HOLDing a two-sided book past its position limit kept
+    it for as long as a neighbour was withdrawing -- and a venue pause
+    withdraws every tick."""
+    c = _Client(account={"equity_usd": 1_000.0,
+                         "used_margin_usd": 900.0,      # past the 75% line
+                         "positions": {}})
+    r = _runner2(c)
+    r._resting[_MKT] = RestingQuote(0.0698, 0.0702)   # a live book
+    r._resting[_MKT2] = RestingQuote()
+
+    # _MKT2 has no oracle -> withdraws; _MKT would HOLD but is past risk.
+    result = r.tick(1.0, {_MKT: 0.07}, {})
+    # risk_blocked, because risk had the last word -- what matters is that
+    # the tick did NOT return early on the neighbour's withdraw and the
+    # at-risk book came down.
+    assert result.action in ("withdraw", "risk_blocked")
+    assert "cancel_all" in c.calls
+    assert r._resting[_MKT].empty, (
+        "the at-risk book survived because a neighbour was withdrawing")
 
