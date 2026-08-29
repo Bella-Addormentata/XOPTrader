@@ -869,17 +869,23 @@ class PermutoWidget(QWidget):
         # than implied by a grey rectangle. Arming this places REAL orders
         # with real collateral, so it is an explicit decision and not a
         # side effect of opening a tab.
+        # The loop is armed from the PERMUTO switch in the toolbar, beside
+        # the dexie one, because starting and stopping a venue is the same
+        # decision on both and belongs in one place. This section describes
+        # what it would do; it does not duplicate the control.
         if not registered:
             self._arm_note.setText(
-                "Not armed: this identity is not registered with Permuto. "
-                "Register on the Identity section first.")
+                "The PERMUTO switch in the toolbar refuses to turn on: this "
+                "identity is not registered with the venue. Register on the "
+                "Identity section first.")
         else:
             self._arm_note.setText(
-                "Not armed: the quoting loop is built and tested but has "
-                "never placed a live order. Arming it is a separate, "
-                "deliberate step -- it commits real collateral, and an "
-                "unhedgeable position on a 60-second realized-vol oracle is "
-                "not something to start by clicking a button you found.")
+                "Armed from the PERMUTO switch in the toolbar. Turning it ON "
+                "starts quoting with the parameters above and commits real "
+                "collateral; turning it OFF cancels every resting order and "
+                "shows STOPPING until that cancel is acknowledged. This is an "
+                "unhedgeable position on a 60-second realized-vol oracle -- "
+                "watch the first session rather than leaving it.")
 
     # -- state -------------------------------------------------------------- #
 

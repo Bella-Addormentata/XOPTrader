@@ -602,6 +602,7 @@ def test_quoting_is_not_armed_without_a_registration(page):
     widget._sections.set_current(2)
     assert not widget._arm_btn.isEnabled()
     assert "not registered" in widget._arm_note.text()
+    assert "toolbar" in widget._arm_note.text()
 
 
 def test_quoting_stays_unarmed_even_once_registered(page):
@@ -617,8 +618,10 @@ def test_quoting_stays_unarmed_even_once_registered(page):
     ident.mark_registered(user_id="u" * 64, trading_address="xch1example")
 
     widget._sections.set_current(2)
+    # The page describes; the toolbar switch arms. One control, not two.
     assert not widget._arm_btn.isEnabled()
-    assert "deliberate" in widget._arm_note.text()
+    assert "PERMUTO switch" in widget._arm_note.text()
+    assert "cancels every resting order" in widget._arm_note.text()
 
 
 def test_the_quoting_summary_states_the_ring_and_the_risk_lines(page):
