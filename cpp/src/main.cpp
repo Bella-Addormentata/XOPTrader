@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,8 @@
 #endif
 
 // Third-party
+#include <sqlite3.h>
+
 #include <boost/program_options.hpp>
 #include <curl/curl.h>
 #include <spdlog/spdlog.h>
@@ -504,18 +507,43 @@ int main(int argc, char* argv[]) {
 
             std::error_code ec;
             fs::remove(scratch, ec);
+            fs::remove(fs::path{scratch.string() + "-wal"}, ec);
+            fs::remove(fs::path{scratch.string() + "-shm"}, ec);
+            // [review round 9] SQLite's backup API, not a file copy.
+            //
+            // Sequentially copying main + -wal + -shm of a database another
+            // process is WRITING is not a snapshot of anything: a checkpoint
+            // landing between the two copies moves committed frames into the
+            // live main file after we copied it, so the scratch DB silently
+            // loses committed rows -- and a half-copied WAL is not stale, it
+            // is CORRUPT. sqlite3_backup_step(-1) runs under a single WAL
+            // read snapshot, sees every committed frame, and is neither
+            // blocked by nor blocks the live writer.
             if (fs::exists(live)) {
-                fs::copy_file(live, scratch,
-                              fs::copy_options::overwrite_existing);
-                // The WAL may hold committed pages the main file does not.
-                for (const char* suffix : {"-wal", "-shm"}) {
-                    const fs::path from{live.string() + suffix};
-                    if (fs::exists(from)) {
-                        fs::copy_file(from,
-                                      fs::path{scratch.string() + suffix},
-                                      fs::copy_options::overwrite_existing,
-                                      ec);
-                    }
+                sqlite3* src = nullptr;
+                sqlite3* dst = nullptr;
+                int rc = sqlite3_open_v2(live.string().c_str(), &src,
+                                         SQLITE_OPEN_READONLY, nullptr);
+                if (rc == SQLITE_OK) {
+                    rc = sqlite3_open(scratch.string().c_str(), &dst);
+                }
+                if (rc == SQLITE_OK) {
+                    sqlite3_busy_timeout(src, 5000);
+                    sqlite3_busy_timeout(dst, 5000);
+                    sqlite3_backup* bk =
+                        sqlite3_backup_init(dst, "main", src, "main");
+                    rc = bk ? sqlite3_backup_step(bk, -1) : SQLITE_ERROR;
+                    if (bk) sqlite3_backup_finish(bk);
+                }
+                const std::string err =
+                    (rc == SQLITE_DONE || rc == SQLITE_OK)
+                        ? std::string{}
+                        : (src ? sqlite3_errmsg(src) : "open failed");
+                if (src) sqlite3_close(src);
+                if (dst) sqlite3_close(dst);
+                if (!err.empty()) {
+                    throw std::runtime_error(
+                        "sqlite backup failed: " + err);
                 }
             }
             spdlog::warn("[S31] dry run -- database redirected to {} so this "

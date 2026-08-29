@@ -650,10 +650,13 @@ void Engine::start_watchdog()
         // instance that owns it. What remains true is narrower -- this
         // process adopts resting offers during startup reconciliation, which
         // is not dry-run gated, and cannot cancel them.
+        // [review round 9] Reconciliation is dry-run gated now, so this no
+        // longer adopts anything -- saying it did told the operator this
+        // process was tracking offers it never sees.
         spdlog::warn("[Engine] [S31] dry run -- dead man's switch NOT armed. "
-                     "A live engine, if any, keeps its own switch; this "
-                     "process will adopt resting offers during startup "
-                     "reconciliation but can neither post nor cancel.");
+                     "A live engine, if any, keeps its own switch. This "
+                     "process neither reconciles, posts, cancels nor owns "
+                     "any part of the live book.");
         return;
     }
     watchdog_stop_.store(false, std::memory_order_relaxed);
@@ -792,9 +795,43 @@ void Engine::watchdog_loop()
         std::this_thread::sleep_for(std::chrono::seconds(1));
         if (watchdog_stop_.load(std::memory_order_relaxed)) break;
 
+        // [review round 9] DEFER BEFORE TICKING, not after.
+        //
+        // tick() latches its internal fired_ inside the same call that
+        // returns Fire, and the only reset is a NEWER heartbeat -- which a
+        // hung shutdown can never produce, because the poll timer is
+        // cancelled and shutdown()'s own stamp is once-only. So deferring
+        // AFTER the tick consumed the one Fire this stall would ever
+        // deliver: every later tick answered AlreadyFired, and the
+        // advertised "past its grace, fire anyway" branch was unreachable.
+        // One deferral permanently muzzled the switch over a live book --
+        // intermittently, decided by coroutine dispatch latency against the
+        // 1-second tick grid, which is the worst kind of hole because it
+        // passes casual testing.
+        //
+        // Peeking here means no tick runs during the grace, so nothing
+        // latches; when the grace expires (or the claim clears on a
+        // completed cancel), ticking resumes and the first stalled tick
+        // returns a GENUINE Fire. Normal-operation suppression of repeat
+        // cancel RPCs is untouched -- tick() still latches on the tick that
+        // proceeds to the cancel.
+        if (graceful_cancel_active_.load(std::memory_order_acquire)) {
+            const auto started =
+                graceful_cancel_started_ms_.load(std::memory_order_acquire);
+            if (now_ms() - started < static_cast<std::int64_t>(
+                    config_.risk.watchdog_stall_seconds) * 1000) {
+                continue;   // quiet: this fires once a second during shutdown
+            }
+        }
+
         const auto action = watchdog.tick(
             last_beat_ms_.load(std::memory_order_relaxed), now_ms());
         if (action != risk::WatchdogAction::Fire) continue;
+
+        if (graceful_cancel_active_.load(std::memory_order_acquire)) {
+            spdlog::critical("[Engine] [S31] the graceful cancel has run past "
+                             "its grace; firing anyway");
+        }
 
         // Latch BEFORE the cancel, and never clear it here. The Watchdog's
         // own fired_ re-arms on a newer heartbeat, which is right for
@@ -804,27 +841,6 @@ void Engine::watchdog_loop()
         // cancel spends. This flag is restart-only, the same contract
         // breaker_pause_active_ already carries, because "the switch fired"
         // means the book state is unknown until someone looks.
-        // [review] Defer to a graceful cancel that is already in flight --
-        // for a bounded time only. Two secure bulk cancels racing over the
-        // same coins produce duplicate spends and contradictory outcomes,
-        // with the 60s per-rule cooldown suppressing whichever alert lands
-        // second. Past the grace the graceful path is presumed wedged and
-        // this fires anyway, which is the half that keeps a hung shutdown
-        // from silencing the switch entirely.
-        if (graceful_cancel_active_.load(std::memory_order_acquire)) {
-            const auto started =
-                graceful_cancel_started_ms_.load(std::memory_order_acquire);
-            if (now_ms() - started < static_cast<std::int64_t>(
-                    config_.risk.watchdog_stall_seconds) * 1000) {
-                spdlog::warn("[Engine] [S31] stall detected, but a graceful "
-                             "cancel is in flight -- deferring rather than "
-                             "spending the same coins twice");
-                continue;
-            }
-            spdlog::critical("[Engine] [S31] the graceful cancel has run past "
-                             "its grace; firing anyway");
-        }
-
         watchdog_fired_.store(true, std::memory_order_release);
         // [review] PUBLISH FROM HERE, not from Step 12. The gauge was
         // refreshed only by step_export_metrics() on the engine's event-loop
