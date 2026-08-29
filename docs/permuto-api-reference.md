@@ -99,14 +99,25 @@ signal. There is no options chain on this venue.
 
 ## 2  Trading — `/exchange/*`
 
-All require a session token: `Authorization: Bearer <token>` or
-`Cookie: perps_session=<token>` — **except `GET /exchange/leaderboard`** and
-**`GET /exchange/session`**, both of which were read with no credentials
-(see `TODO-COMPETITION.md`, "Connecting: API, not an embedded browser").
-Only *reachability* was verified for `/exchange/session` — nothing here
-records what it returns to an anonymous caller, so do not assume the
-`linked_wallet_*` / `trading_*` fields described in §3 are visible without
-a token.
+**Every route tabulated in this section** requires a session token:
+`Authorization: Bearer <token>` or `Cookie: perps_session=<token>` — with
+two `/exchange/*` reads outside these tables that need no credentials at
+all, **`GET /exchange/leaderboard`** and **`GET /exchange/session`**, both
+read anonymously (see `TODO-COMPETITION.md`, "Connecting: API, not an
+embedded browser"). Only *reachability* was verified for
+`/exchange/session` — nothing here records what it returns to an anonymous
+caller, so do not assume the `linked_wallet_*` / `trading_*` fields
+described in §3 are visible without a token.
+
+⚠ **Do not read that as "all of `/exchange/*`".** The bootstrap family is in
+the same namespace and is pre-session by construction — a session token
+cannot exist yet when it is called: `wallet_link_challenge` and
+`wallet_auth`, the deprecated `link_wallet` / `wallet_challenge` pair, and
+the `cloud_wallet_*` OAuth callbacks. They carry their own sequence in §3.
+One route in that family also reuses this header with a **different
+credential class**: `POST /exchange/agent_session` takes
+`Authorization: Bearer perps_agent_…`, the API key, and returns the session
+token you then trade with. The header is the same; the secret is not.
 
 ⚠ **`tif` is `GTC`/`ALO`/`IOC` as published. FOK is unverified** — an
 earlier draft of `docs/advanced-trading-methods.md` listed it, sourced from

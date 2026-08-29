@@ -36,7 +36,10 @@ which is why the verdict was downgraded to strong evidence.
 The oracle is sampled alongside, because the frozen-price transition marks
 the carried boundary far more precisely than the wall clock does.
 
-Read-only: two unauthenticated GETs per minute.
+Read-only, unauthenticated: one leaderboard GET per 100 market makers plus
+one oracle read, each minute. That is two GETs per minute at the present
+field size (26) and grows a page at a time -- it is not a fixed two, and
+this line used to say it was.
 """
 
 import json
@@ -66,12 +69,12 @@ def sample():
     """One observation. Returns a dict; never raises."""
     # [review] BRACKET the capture, do not stamp it once at the top.
     #
-    # The oracle is fetched after every paginated leaderboard page, so around
-    # the cash close a row could pair a leaderboard read taken while the
-    # market was still live with an oracle read already showing the frozen
-    # carried value -- and the analyzer would then count live accrual as
-    # carried. One timestamp cannot express that; two can, and the analyzer
-    # rejects any row whose bracket straddles an oracle transition.
+    # The oracle is fetched after the last paginated leaderboard page, so
+    # around the cash close a row could pair a leaderboard read taken while
+    # the market was still live with an oracle read already showing the
+    # frozen carried value -- and the analyzer would then count live accrual
+    # as carried. One timestamp cannot express that; two can, and the
+    # analyzer rejects any row whose bracket straddles an oracle transition.
     t_start = datetime.now(timezone.utc)
     row = {"ts": t_start.isoformat(), "t_leaderboard_start": t_start.isoformat()}
     try:

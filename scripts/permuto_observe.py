@@ -49,6 +49,11 @@ TICK_S = 5.0
 TRADES_EVERY = 3      # ticks
 META_EVERY = 12       # ticks
 
+# The documented DEFAULT of vol_aggressive_ring_pct, used only when
+# /info/meta cannot be read. It is a venue parameter, not a constant -- see
+# _ring_pct_from_meta.
+DEFAULT_RING_PCT = 2.0
+
 
 def get(path, timeout=8):
     req = urllib.request.Request(BASE + path, headers=HEADERS)
@@ -64,10 +69,41 @@ def safe(path):
         return {"__error__": "%s: %s" % (type(exc).__name__, exc)}
 
 
-def _ring_depth(bids, asks, oracle, ring_pct=2.0):
+def _ring_pct_from_meta(meta):
+    """`vol_aggressive_ring_pct` out of a /info/meta payload, or None.
+
+    [review] The ring percentage was hard-coded at 2.0 here while the venue
+    PUBLISHES it and the reference documents 2 as a *default*, not a
+    constant. If the sponsor retunes it for the contest, every credit_usd in
+    the recording is computed against the wrong band and cannot be
+    recomputed afterwards -- only eight levels of each ladder are kept, and
+    the ring can hold more.
+
+    Searched by key name rather than by path: the nesting of the band
+    parameters inside /info/meta is not recorded anywhere we can check
+    offline, and a guessed path that misses would fall silently back to the
+    default -- which is exactly the failure this lookup exists to catch.
+    """
+    stack = [meta]
+    while stack:
+        node = stack.pop()
+        if isinstance(node, dict):
+            if "vol_aggressive_ring_pct" in node:
+                try:
+                    return float(node["vol_aggressive_ring_pct"])
+                except (TypeError, ValueError):
+                    return None
+            stack.extend(node.values())
+        elif isinstance(node, list):
+            stack.extend(node)
+    return None
+
+
+def _ring_depth(bids, asks, oracle, ring_pct=DEFAULT_RING_PCT):
     """Balanced notional inside the depth-credit ring, per the venue's rule.
 
-    Depth accrues on ``min(bid, ask)`` within +/-2% of a fresh oracle, so the
+    Depth accrues on ``min(bid, ask)`` within +/-``ring_pct`` of a fresh
+    oracle (the venue's `vol_aggressive_ring_pct`, 2 by default), so the
     minimum -- not either side, and not the sum -- is what a market earns.
     Recorded per tick because the ladder it is derived from is not kept.
     """
@@ -147,10 +183,22 @@ def main():
             with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write("\n")
 
+    # Read the ring BEFORE the first sample, not on the first META_EVERY
+    # tick: rows written before that would otherwise be measured against an
+    # assumed band. A failed read does not blank the session -- the
+    # documented default is used and SAID SO in the header and on every row,
+    # so a reader can discount the aggregate instead of finding nothing at
+    # all where a measurement should be.
+    ring_pct = _ring_pct_from_meta(safe("/info/meta"))
+    ring_pct_src = "meta" if ring_pct is not None else "default"
+    if ring_pct is None:
+        ring_pct = DEFAULT_RING_PCT
+
     with open(out_path, "a", encoding="utf-8", newline="\n") as fh:
         fh.write(json.dumps({
             "observe_start": datetime.now(timezone.utc).isoformat(),
             "tick_s": TICK_S, "markets": MARKETS, "stop_at": sys.argv[2],
+            "ring_pct": ring_pct, "ring_pct_src": ring_pct_src,
             "note": "read-only; oracle+L2 every tick, trades every %d, meta every %d"
                     % (TRADES_EVERY, META_EVERY),
         }) + "\n")
@@ -163,7 +211,6 @@ def main():
             row["oracle"] = safe("/info/oracle").get("prices")
 
             books, funding = {}, {}
-            oracle_by_ticker = row.get("oracle") or {}
             for m in MARKETS:
                 # [review] RE-READ THE ORACLE PER BOOK. It used to be fetched
                 # once at the top of the tick, and each of the seven requests
@@ -180,6 +227,7 @@ def main():
                 per_book_raw = safe("/info/oracle")
                 per_book_oracle = per_book_raw.get("prices") or {}
                 l2 = safe("/info/l2/" + m + "?levels=500")
+                l2_err = l2.get("__error__")
                 bids = l2.get("bids") or []
                 asks = l2.get("asks") or []
                 # THE AGGREGATE IS THE POINT, and an earlier version stored
@@ -200,26 +248,50 @@ def main():
                 # visible rather than filled in.
                 oracle_err = per_book_raw.get("__error__")
                 ora = per_book_oracle.get(ticker) if not oracle_err else None
+                # [review] AN UNREAD BOOK IS NOT AN EMPTY BOOK. A failed L2
+                # fetch leaves bids/asks as [], and _ring_depth then happily
+                # returns credit_usd 0.0 with zero levels -- a
+                # valid-looking measurement of a market we never saw, which
+                # any aggregation that does not join on `err` averages in as
+                # a real zero. The oracle side already got this right (a bad
+                # oracle read yields no ring at all); the book side did not.
+                # Same rule both ways: we looked and there was nothing, or
+                # we did not look.
                 books[m] = {
-                    "bids": bids[:8],
-                    "asks": asks[:8],
-                    "n_bid_levels": len(bids),
-                    "n_ask_levels": len(asks),
-                    "ring": _ring_depth(bids, asks, ora),
+                    "bids": bids[:8] if not l2_err else None,
+                    "asks": asks[:8] if not l2_err else None,
+                    "n_bid_levels": len(bids) if not l2_err else None,
+                    "n_ask_levels": len(asks) if not l2_err else None,
+                    "ring": None if l2_err else _ring_depth(bids, asks, ora,
+                                                            ring_pct),
                     # Which oracle this book was measured against, so a
                     # reader never has to assume it was the tick's -- and the
                     # error when there was none, so a null ring can be told
                     # apart from a book with no depth.
                     "ring_oracle": ora,
                     "ring_oracle_err": oracle_err,
-                    "err": l2.get("__error__"),
+                    "err": l2_err,
                 }
+                # [review] The per-market route, not /info/funding/predicted.
+                # The reference labels this one "historical funding", which
+                # reads as though `premium` and `hourly_rate` would come back
+                # empty here -- they do not. The C-11 measurement recorded in
+                # TODO-COMPETITION came out of this exact call: `premium`
+                # moved every 5s and `hourly_rate` stepped on 60-second
+                # boundaries across a 54-minute run. `predicted_rate` may
+                # well be absent; a missing key lands as None, which is
+                # visible, and switching routes would cost the fields that
+                # are actually arriving.
                 f = safe("/info/funding/" + m)
                 funding[m] = {k: f.get(k) for k in
                               ("hourly_rate", "premium", "oracle_price",
                                "predicted_rate")}
             row["l2"] = books
             row["funding"] = funding
+            # Per row, not only in the header: a run that spans a mid-session
+            # retune must not present two different bands as one number.
+            row["ring_pct"] = ring_pct
+            row["ring_pct_src"] = ring_pct_src
 
             if n % TRADES_EVERY == 0:
                 fresh = {}
@@ -237,11 +309,22 @@ def main():
                     row["trades"] = fresh
 
             if n % META_EVERY == 0:
-                flags = safe("/info/meta").get("flags") or {}
+                meta = safe("/info/meta")
+                flags = meta.get("flags") or {}
                 row["meta"] = {k: flags.get(k) for k in
                                ("trading_paused", "pause_reason",
                                 "pause_resume_at", "signup_closed",
                                 "untraded_purge_at")}
+                # Same call, so refreshing the band is free: a change during
+                # the run is caught within a minute rather than at the end.
+                # This row keeps the OLD value -- it is what its books were
+                # measured against -- and carries the change alongside, so
+                # the boundary is visible instead of implied.
+                fresh_ring = _ring_pct_from_meta(meta)
+                if fresh_ring is not None and fresh_ring != ring_pct:
+                    row["ring_pct_changed"] = {"from": ring_pct,
+                                               "to": fresh_ring}
+                    ring_pct, ring_pct_src = fresh_ring, "meta"
 
             fh.write(json.dumps(row) + "\n")
             fh.flush()

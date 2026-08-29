@@ -27,6 +27,8 @@ import sys
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # 16:00 ET on 2026-08-27, the cash close the recorded experiment straddled.
@@ -125,6 +127,11 @@ def test_each_header_starts_a_session_and_only_the_last_is_analysed(
     out = _run(monkeypatch, capsys, path).out
     assert "2 probe sessions" in out
     assert "samples      : 2 in session" in out
+    # Both sessions have two rows, so the counts above cannot tell which one
+    # was analysed. The printed session header can, and it is the only thing
+    # naming the samples the verdict was computed from.
+    assert f"session      : {_ts(180)[:19]}" in out
+    assert _ts(0)[:19] not in out
 
 
 def test_a_truncated_final_record_does_not_discard_the_samples_before_it(tmp_path):
@@ -193,6 +200,23 @@ def test_frozen_window_refuses_a_file_whose_oracle_never_moves():
     assert provenance is None
 
 
+def test_an_earlier_longer_flat_run_does_not_beat_the_trailing_one():
+    """A quiet stretch of LIVE trading is routinely longer than the post-close run.
+
+    The selector's own comment says "the most recent completed run, not the
+    longest", and every fixture until now happened to have the trailing run
+    be the longest as well -- so picking the longest passed the suite while
+    handing back a window that is not the freeze the oracle most recently
+    entered.
+    """
+    rows = [_row(i, ORACLE_Y) for i in range(10)]
+    rows += [_row(10 + i, ORACLE_X) for i in range(4)]
+
+    window, provenance = analyze.frozen_window(rows, 60)
+    assert [r["ts"] for r in window] == [_ts(10), _ts(11), _ts(12), _ts(13)]
+    assert provenance == "inferred"
+
+
 def test_frozen_window_takes_the_run_after_the_last_transition():
     rows = [_row(i, ORACLE_Y) for i in range(3)] + [_row(3 + i, ORACLE_X) for i in range(4)]
     window, provenance = analyze.frozen_window(rows, 60)
@@ -227,6 +251,62 @@ def test_carried_since_past_the_data_yields_no_window():
     window, provenance = analyze.frozen_window(rows, 60, CLOSE + timedelta(minutes=6))
     assert window == []
     assert provenance is None
+
+
+def test_an_oracle_move_inside_the_asserted_window_refutes_the_assertion():
+    """The assertion and the data disagree, and only the operator can settle it.
+
+    Filtering the already-selected trailing run by the boundary made an
+    oracle transition AFTER the boundary silently narrow the window to the
+    island on the far side of it -- so the samples showing the operator was
+    wrong were the ones discarded, and the tool certified what was left and
+    printed sizing off it.
+    """
+    rows = [_row(-1, ORACLE_Y)]
+    rows += [_row(i, ORACLE_X) for i in range(0, 5)]
+    rows += [_row(i, ORACLE_Z) for i in range(5, 10)]
+
+    window, provenance = analyze.frozen_window(rows, 60, CLOSE)
+    assert window == []
+    assert provenance.startswith("contradicted")
+    assert "MOVED" in provenance
+    assert _ts(5) in provenance
+
+
+def test_a_gap_inside_the_asserted_window_refutes_the_assertion():
+    """Equality either side of a hole never proved the oracle held still."""
+    rows = [_row(-1, ORACLE_Y)] + [_row(i, ORACLE_X) for i in (0, 1, 2, 20, 21)]
+
+    window, provenance = analyze.frozen_window(rows, 60, CLOSE)
+    assert window == []
+    assert provenance.startswith("contradicted")
+    assert "missing coverage" in provenance
+
+
+def test_a_missing_oracle_inside_the_asserted_window_refutes_the_assertion():
+    rows = [_row(-1, ORACLE_Y), _row(0, ORACLE_X), _row(1), _row(2, ORACLE_X)]
+
+    window, provenance = analyze.frozen_window(rows, 60, CLOSE)
+    assert window == []
+    assert provenance.startswith("contradicted")
+    assert "no oracle reading" in provenance
+
+
+def test_a_refuted_assertion_is_reported_as_such_not_as_inconclusive(
+    tmp_path, monkeypatch, capsys
+):
+    """"Nothing qualified" and "your assertion is wrong" are different answers."""
+    rows = [_row(-1, ORACLE_Y, {A: 0})]
+    rows += [_row(i, ORACLE_X, {A: 1_000 * i}) for i in range(0, 5)]
+    rows += [_row(i, ORACLE_Z, {A: 1_000 * i}) for i in range(5, 10)]
+    path = _write(tmp_path, _header(-1), *rows)
+
+    out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(0)}").out
+    assert "REFUTED" in out
+    assert "moved" in out.lower()
+    assert "STRONG EVIDENCE" not in out
+    # And it must not report a window it built out of the surviving island.
+    assert "impl. $depth" not in out
 
 
 # --- what the verdict is allowed to claim --------------------------------
@@ -304,6 +384,66 @@ def test_corroboration_is_bucketed_over_the_window_not_the_session(
     out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(60)}").out
     assert "STRONG EVIDENCE" not in out
     assert "EVIDENCE, NOT CONFIRMATION" in out
+
+
+def test_one_accounts_steady_rise_cannot_vouch_for_anothers_single_jump(
+    tmp_path, monkeypatch, capsys
+):
+    """Corroboration has to come from the same ACCOUNT, not just the same window.
+
+    `sustained` and `risers` were once only tested for non-emptiness, so a
+    small steady riser unlocked STRONG EVIDENCE for a different account whose
+    entire gain arrived in one step -- the leaderboard-backfill fingerprint --
+    and the headline dollar figure was then quoted from that unchecked jump.
+    """
+    rows = [_row(-1, ORACLE_Y, {P1: 0, P2: 0})]
+    # P1 rises in every sub-window; P2 is flat but for one 500,000 step.
+    for i in range(30):
+        rows.append(_row(i, ORACLE_X,
+                         {P1: 1_000 * i, P2: 0 if i < 15 else 500_000}))
+    path = _write(tmp_path, _header(-1), *rows)
+
+    out = _run(monkeypatch, capsys, path, f"--carried-since={_ts(0)}").out
+    assert "VERDICT: STRONG EVIDENCE" in out
+    assert "1 of 2 accounts gained depth in every sub-window" in out
+    # 29,000 depth-seconds over 1,740 s is ~$17 of resting depth. P2's
+    # single 500,000 step over the same span reads as ~$287 in the per-account
+    # table, and must not become the corroborated headline rate.
+    assert "$17 of balanced depth" in out
+    assert "$287 of balanced depth" not in out
+
+
+def test_a_naive_carried_since_is_refused_before_the_run_starts(
+    tmp_path, monkeypatch, capsys
+):
+    """A perfectly reasonable-looking argument used to fail deep in a compare.
+
+    The rows are timezone-aware UTC, so a naive boundary raised TypeError
+    inside the window scan -- in the observer's case after the output file
+    already existed. It has to be rejected where the message can say what to
+    type.
+    """
+    path = _write(tmp_path, _header(0),
+                  _row(1, ORACLE_X, {A: 1_000}), _row(2, ORACLE_X, {A: 2_000}))
+
+    with pytest.raises(SystemExit) as caught:
+        _run(monkeypatch, capsys, path, "--carried-since=2026-08-27T20:00:00")
+    assert "no UTC offset" in str(caught.value)
+
+
+def test_an_unavailable_24h_reading_is_not_reported_as_a_swing(
+    tmp_path, monkeypatch, capsys
+):
+    """Coercing a missing endpoint to 0 invents a delta the size of the other."""
+    rows = [_row(0, ORACLE_Y, {A: 1_000}), _row(1, ORACLE_X, {A: 2_000}),
+            _row(2, ORACLE_X, {A: 3_000})]
+    for row in rows:
+        row["mms"][0]["d24"] = None
+    path = _write(tmp_path, _header(0), *rows)
+
+    out = _run(monkeypatch, capsys, path).out
+    assert "unavailable" in out
+    assert "-3000" not in out and "+3000 " not in out
 
 
 def test_accounts_sharing_a_display_prefix_get_independent_deltas(

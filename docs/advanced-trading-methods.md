@@ -291,6 +291,13 @@ Variance ratio < 1 is mean-reverting, ~1 a random walk, > 1 trending. All
 three are a random walk at 2s and **diverge with horizon**: NVDA reverts,
 TSLA trends, QQQ is neither.
 
+⚠ **`sd` has no recorded basis and is not a σ.** It was tabulated without
+stating whether it is the dispersion of oracle *levels* over the 7.5-minute
+window or of the 2-second *increments*, and it carries no normalisation to a
+unit of time in either reading. The 200 raw samples were not kept, so the
+basis cannot be recovered. Treat the column as evidence that vol-of-vol is
+**large**, and as nothing that can be substituted into a model.
+
 This is the practically important finding, and it cuts against the theory.
 Stochastic-volatility models (Heston and descendants) assume variance is
 mean-reverting — that is the defining property. **Only one of these three
@@ -318,9 +325,14 @@ conclusion from here.
 
 1. **Reservation spread must cover vol-of-vol, not vol.** In
    Avellaneda–Stoikov the inventory penalty scales with σ of the *quoted
-   instrument*. Here the quoted instrument is itself a volatility, so the
-   relevant σ is vol-of-vol — 12–26% here, far above what a price-based
-   calibration would produce.
+   instrument*, and σ there is a diffusion coefficient — price units per
+   √time. Here the quoted instrument is itself a volatility, so the relevant
+   σ is vol-of-vol, and the measurement above says only that vol-of-vol is
+   **large**. It cannot be dropped into the model as it stands: the `sd`
+   column records no basis and no time base (see the warning under the
+   table), so **re-estimate σ from increments at the quoting horizon before
+   using it**. The conclusion that survives is directional — a price-based
+   calibration will understate the penalty here, probably by a lot.
 2. **Reversion is an empirical question per market, not a property of the
    asset class — and not settled by the sample above.** Measure the variance
    ratio per oracle, per session segment, over a full day at minimum; do not
@@ -476,8 +488,10 @@ strip — **cannot be completed on Permuto.**
 
 Step 3 requires an options chain on the underlying to build the replicating
 portfolio. Permuto lists three vol perps and nothing else: no options, no
-spot vol instrument, and no venue on which the same exposure trades. There
-is also no cash-and-carry anchor, since nobody can hold realized variance.
+spot vol instrument, and nothing else *on this venue* trading the same
+exposure. (Listed options on QQQ, NVDA and TSLA do exist off-venue; see the
+hedging correction below.) There is also no cash-and-carry anchor, since
+nobody can hold realized variance.
 
 So **Permuto offers no on-venue hedge**, and under XOPTrader's current scope
 the position is unhedged: inventory can only be flattened by trading back on
@@ -547,13 +561,20 @@ The proposal: a PPO/DDPG agent on
 `ΔPnL − λ₁·InventoryRisk + λ₂·FundingEarned`, learning to accumulate large
 directional inventory purely to farm funding paid by leveraged speculators.
 
-⚠ **On Permuto this is the strategy that has already bankrupted people.**
-Farming funding means holding large unhedged inventory, and per the section
-above there is no hedge available on this venue — no options, no second
-market, no cash-and-carry. Three MMs currently sit at exactly zero equity.
-The reward function above prices inventory risk with a tunable λ₁; the
-venue prices it with a liquidation. Any funding-farming term must sit behind
-a hard inventory cap, not a soft penalty.
+⚠ **On Permuto this strategy holds the exposure the venue punishes hardest,
+and three MMs are already at exactly zero equity.** Farming funding means
+holding large unhedged inventory, and per the section above there is no
+hedge available on this venue — no options, no second market, no
+cash-and-carry. An earlier draft said this "is the strategy that has already
+bankrupted people": the leaderboard does not support that, and the same
+claim was withdrawn in the hedging section above for the same reason. It
+shows depth, PnL and equity and nothing about which strategy any account
+ran, its leverage, or its execution — so the three wipeouts are a warning
+about carrying unhedged inventory on this venue, not an attribution to
+funding farming. What is structural rather than inferred: the reward
+function above prices inventory risk with a tunable λ₁, and the venue prices
+it with a liquidation. Any funding-farming term must sit behind a hard
+inventory cap, not a soft penalty.
 
 Note also the funding cadence: `markets[].funding_timing` is authoritative
 and VOL markets settle every **60s**, not the 3600s in the top-level
@@ -635,12 +656,14 @@ That matters here for a specific reason. **Permuto serves OHLC**
 (`/info/candles` returns `open`/`high`/`low`/`close`), and the venue's own
 oracle is a 60-second trailing estimate whose short-window noise is the
 central open question in `TODO-COMPETITION.md`. A range-based estimator
-computed from those bars is *independent and better-conditioned*, and it is
-the best instrument this venue actually serves.
+computed from those bars is *better-conditioned* than close-to-close, and it
+is the best instrument this venue actually serves.
 
-⚠ **It is not the same quantity, so the difference is a bound, not an
-identification.** Three mismatches, none of which the difference can
-separate from the noise it is supposed to be measuring:
+⚠ **It is neither the same quantity nor an independent one.** This paragraph
+called it "independent and better-conditioned" and then took the difference
+from the oracle as a bound on the oracle's estimator noise. The second half
+does not follow, and the first half is wrong. Four mismatches, none of which
+the difference can separate from the noise it is supposed to be measuring:
 
 - **Horizon.** `tf` is accepted and ignored; `/info/candles` returns 3600s
   bars whatever you ask for (`docs/permuto-api-reference.md` §1). The oracle
@@ -650,20 +673,30 @@ separate from the noise it is supposed to be measuring:
   are bars *of the volatility series*. A range estimator over them measures
   variation of the vol series — vol-of-vol — not the underlying equity's
   realized volatility.
+- **Shared input, which is the one that voids the bound.** Candle lookups
+  key on the oracle ticker (`docs/permuto-api-reference.md` §2), so those
+  bars are built from the oracle's own published prints. The range estimator
+  is therefore a second functional of the same numbers, not an outside
+  measurement of them: the hourly high and low are inflated by exactly the
+  noise excursions the statistic is supposed to bound, and the error term
+  sits inside both sides of the difference. The 0.0% intrabar range across
+  every 00:00–12:00 UTC hour is the same tell — that is the frozen oracle,
+  not a quiet market.
 - **Model.** Parkinson and Garman–Klass assume driftless GBM over the bar,
   which the oracle's construction does not satisfy.
 
-So the difference between the two series **bounds** the oracle's estimator
-noise and confounds it with horizon, input and model mismatch; it does not
-measure it. Identifying the estimator noise needs matching-frequency returns
-of QQQ/NVDA/TSLA themselves, which this venue does not serve. C-03 must
-therefore either source those externally, or record the range estimator for
-what it is — an hourly vol-of-vol proxy, useful as a regime signal and as an
-upper bound, not as a noise measurement.
+So the difference between the two series is **not** a bound on the oracle's
+estimator noise; it is a comparison of two statistics of one series,
+confounded on top of that by horizon and model mismatch. Identifying the
+estimator noise needs matching-frequency returns of QQQ/NVDA/TSLA
+themselves, which this venue does not serve. C-03 must therefore either
+source those externally, or record the range estimator for what it is — an
+hourly vol-of-vol regime proxy, not a noise measurement and not a bound on
+one.
 
 It is still better conditioned than the variance-ratio work above, which has
 already had to be walked back once as confounded by overlapping windows. It
-should go into the C-03 observer — as a proxy carrying the three mismatches
+should go into the C-03 observer — as a proxy carrying the four mismatches
 above, not as the answer to the noise question.
 
 **2. Explicit regular-trading-hours handling.** `rv_intraday(close,

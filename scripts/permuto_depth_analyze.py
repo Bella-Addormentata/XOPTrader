@@ -100,6 +100,15 @@ def _brackets_a_transition(row, prev_oracle, oracle_of):
     they cannot be checked and are kept -- flagging them would retroactively
     invalidate every historical session, which is a different claim from the
     one this guard makes.
+
+    [review] Note what this does NOT do: it never compares `t_leaderboard_start`
+    and `t_oracle` against the instant the oracle changed, because that instant
+    is not observable -- it lies somewhere between two samples, and the probe
+    records neither end of it. At the one call site the value comparison is
+    already decided by the caller, so in practice this reduces to "is the row
+    bracketed at all", and every bracketed transition row is dropped. That is
+    deliberately conservative: it can discard a clean row, and it cannot admit
+    a straddling one. Wrong in the cheap direction.
     """
     if "t_oracle" not in row or "t_leaderboard_start" not in row:
         return False
@@ -108,14 +117,93 @@ def _brackets_a_transition(row, prev_oracle, oracle_of):
     return oracle_of(row) != prev_oracle
 
 
+def _asserted_window(rows, carried_since, max_gap):
+    """Validate the WHOLE tail from an asserted boundary, not the last run.
+
+    Returns ``(window, provenance)`` like `frozen_window`. On rejection the
+    provenance is a ``"contradicted: ..."`` string rather than None, because
+    the operator needs to know their assertion and the data disagree -- that
+    is a different message from "nothing qualified".
+
+    [review] Filtering the ALREADY-SELECTED run by the boundary asks the
+    wrong question. `best` is the trailing run, so an oracle transition
+    occurring AFTER the asserted boundary splits the tail and leaves `best`
+    as the island on the far side of it. The tool then certified that island
+    and printed dollar sizing off it, while the samples showing the oracle
+    moving inside the asserted carried session -- direct evidence the
+    assertion is wrong -- were dropped without a word.
+
+    An oracle that moves inside an asserted carried window is not a reason to
+    narrow the window. It is the assertion and the data contradicting each
+    other, and only the operator can settle which one is wrong. So the whole
+    tail has to hold together: every sample carrying an oracle, all equal, in
+    order, with no gap wide enough to hide a move.
+    """
+    stamped = [i for i, r in enumerate(rows)
+               if r.get("ts") and datetime.fromisoformat(r["ts"]) >= carried_since]
+    if not stamped:
+        return [], None
+    start = stamped[0]
+
+    # Same bracket rule as the inferred path. If the first sample after the
+    # boundary is the one that changed value and its capture straddles the
+    # change, its leaderboard half may still be live -- so drop it rather
+    # than let live accrual open a carried window.
+    if start > 0 and rows[start].get("oracle") and rows[start - 1].get("oracle"):
+        prev_key = json.dumps(rows[start - 1]["oracle"], sort_keys=True)
+        first_key = json.dumps(rows[start]["oracle"], sort_keys=True)
+        if first_key != prev_key and _brackets_a_transition(
+                rows[start], prev_key, lambda r: first_key):
+            start += 1
+
+    tail = rows[start:]
+    if len(tail) < 2:
+        return [], None
+
+    expected = None
+    prev_ts = None
+    for row in tail:
+        ts_text = row.get("ts")
+        if not ts_text:
+            return [], ("contradicted: a sample after the asserted boundary "
+                        "carries no timestamp, so its place in the run cannot "
+                        "be checked")
+        if not row.get("oracle"):
+            return [], (f"contradicted: no oracle reading at {ts_text}, after "
+                        "the asserted carried boundary -- an unread oracle "
+                        "cannot show the value held still")
+        key = json.dumps(row["oracle"], sort_keys=True)
+        if expected is None:
+            expected = key
+        elif key != expected:
+            return [], (f"contradicted: the oracle MOVED at {ts_text}, after "
+                        "the asserted carried boundary. The assertion and the "
+                        "data disagree; move --carried-since past the "
+                        "transition, or the session was not carried")
+        ts = datetime.fromisoformat(ts_text)
+        if prev_ts is not None:
+            gap = (ts - prev_ts).total_seconds()
+            if gap < 0:
+                return [], (f"contradicted: timestamps go backwards at "
+                            f"{ts_text}, so the tail is not one ordered run")
+            if gap > max_gap:
+                return [], (f"contradicted: {gap:.0f}s of missing coverage "
+                            f"before {ts_text}, inside the asserted carried "
+                            "session -- the oracle could have moved and "
+                            "returned unseen")
+        prev_ts = ts
+    return tail, "asserted"
+
+
 def frozen_window(rows, interval_s, carried_since=None):
     """Trailing run of consecutive samples with ONE oracle value and no gaps.
 
     Returns ``(window, provenance)``. ``provenance`` is ``"asserted"`` when the
     operator supplied the carried boundary, ``"inferred"`` when the run merely
-    looks like a freeze this file watched happen, and ``None`` when nothing
-    qualifies. Only an asserted boundary may certify carried accrual -- see the
-    note on `followed_a_transition` below.
+    looks like a freeze this file watched happen, ``"contradicted: ..."`` when
+    an asserted boundary is refuted by the samples inside it, and ``None`` when
+    nothing qualifies. Only an asserted boundary may certify carried accrual --
+    see the note on `followed_a_transition` below.
 
     Two separate problems, one answer.
 
@@ -142,6 +230,14 @@ def frozen_window(rows, interval_s, carried_since=None):
     # suffix that follows the final oracle change and require it to be a
     # genuine freeze (i.e. something different came before it).
     max_gap = max(interval_s * 3, 30)
+
+    # The asserted path does NOT go through the run scan below. It used to,
+    # and reusing `best` there meant an oracle transition after the boundary
+    # narrowed the window instead of refuting the assertion -- see
+    # `_asserted_window`.
+    if carried_since is not None:
+        return _asserted_window(rows, carried_since, max_gap)
+
     best, run = [], []
 
     def flush():
@@ -214,18 +310,13 @@ def frozen_window(rows, interval_s, carried_since=None):
     followed_a_transition = bool(seen_before - {this_value})
     is_suffix = (best[-1] is rows[-1])
 
-    # An OPERATOR-SUPPLIED boundary is the ONLY way to know. A probe started
-    # after the close never sees the freeze happen, so it cannot certify the
-    # window from its own data however obviously carried it is -- and the
-    # venue exposes no is_carried flag to ask (still unanswered in the
-    # channel). Rather than let the tool assume, it accepts the fact it
-    # cannot observe: --carried-since <ISO8601>, recorded in the output so
-    # the claim always travels with its provenance.
-    if carried_since is not None:
-        inside = [r for r in best
-                  if datetime.fromisoformat(r["ts"]) >= carried_since]
-        return (inside, "asserted") if len(inside) >= 2 else ([], None)
-
+    # An OPERATOR-SUPPLIED boundary is the ONLY way to know, and it is handled
+    # at the top of this function. A probe started after the close never sees
+    # the freeze happen, so it cannot certify the window from its own data
+    # however obviously carried it is -- and the venue exposes no is_carried
+    # flag to ask (still unanswered in the channel). Rather than let the tool
+    # assume, it accepts the fact it cannot observe: --carried-since
+    # <ISO8601>, recorded in the output so the claim travels with provenance.
     if not (followed_a_transition and is_suffix):
         return [], None
     return best, "inferred"
@@ -337,6 +428,16 @@ def main():
           % (len(rows), len(window)))
 
     if len(window) < 2:
+        # A refuted assertion is not the same answer as "nothing qualified",
+        # and the operator is the only one who can resolve it -- so say which
+        # sample disagrees rather than reporting a bare INCONCLUSIVE.
+        if isinstance(provenance, str) and provenance.startswith("contradicted"):
+            print("carried      : ASSERTION REFUTED BY THE SAMPLES -- "
+                  f"{provenance.split(': ', 1)[1]}")
+            print("\nINCONCLUSIVE: the asserted carried session is not "
+                  "supported by its own samples. Nothing is measured from a "
+                  "window the data contradicts.")
+            return
         print("oracle       : NO usable frozen window. Need >=2 consecutive "
               "samples with one oracle value and no gaps, AND either an "
               "observed transition into that value or an explicit "

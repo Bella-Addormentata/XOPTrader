@@ -104,11 +104,12 @@ the official rules page, sharpened by the Discord archive read 2026-08-27.
 6. **"The gate is meant to be cleared during the cash session" — WRONG.**
    Inferred from Gene calibrating 300M as "≈$3,000 for about 28 hours
    (roughly 80%+ of cash-session hours)", which I read as a statement about
-   *which* hours count. It was a statement about magnitude only. Carried
-   ticks do accrue (confirmed 2026-08-27), so the denominator is 102.5
-   hours, not 32.5 — and the depth needed falls from ~$2,564 to ~$813. The
-   lesson: a figure offered as a rough guide is not a rule, and I built an
-   argument on the phrasing of an aside.
+   *which* hours count. Carried ticks accrue on strong evidence (measured
+   2026-08-27; the word "confirmed" stood here until 2026-08-28, when C-0S3
+   was downgraded — see that entry), so the denominator is 102.5 hours, not
+   32.5 — and the depth needed falls from ~$2,564 to ~$813. The lesson: a
+   figure offered as a rough guide is not a rule, and I built an argument on
+   the phrasing of an aside.
 
 ---
 
@@ -175,6 +176,16 @@ Random walk at 2s across all three. They diverge with horizon: **NVDA
 mean-reverts** (maker-friendly), **TSLA trends** (hostile), QQQ is a coin
 flip. *One 7.5-minute sample, one regime — treat as indicative only.*
 
+⚠ **`sd` here has no recorded basis, so do not calibrate on it.** The column
+was written down without saying whether it is the dispersion of oracle
+*levels* across the 7.5-minute window or of the 2-second *increments*, and
+it carries no per-unit-time normalisation either way. The raw 200 samples
+were not kept, so it cannot be recomputed from what we have — it is a
+magnitude, not a parameter. Anything that needs a σ (the
+Avellaneda–Stoikov inventory penalty, in particular) must re-estimate it
+from increments at the quoting horizon; the C-03 observer records the oracle
+on a known 5s grid precisely so that this can be done properly.
+
 `/info/price_certificate` (documented as the BLS-signed oracle snapshot)
 returns `No price certificate available yet`, so there is **no signed
 provenance** to inspect. Source of the feed is undocumented.
@@ -197,9 +208,12 @@ depth_seconds += Σ_markets balanced_depth_usdc × 10
 ```
 
 Skill states the gate as ≈$3,000 balanced depth for ~28 hours, and the
-sponsor confirms that figure verbatim in Discord. It does **not** decay
-(correction 2): banked credit only rises, and the whole contest fits inside
-one 5-day window.
+sponsor confirms that figure verbatim in Discord. That is the **same
+integral** as the ~$813 figure below, not a competing one: $3,000 × 28 h and
+$813 × 102.5 h both land on ~300,000,000 depth-seconds, and the difference is
+only how many hours you assume count. Worked through under "The arithmetic
+changes a lot". It does **not** decay (correction 2): banked credit only
+rises, and the whole contest fits inside one 5-day window.
 
 ✅ **C-0S RESOLVED 2026-08-27 — the skill is right.** The rules page says
 market makers are ranked by profit "combined with liquidity scoring", which
@@ -217,19 +231,29 @@ Treat the gate as a constraint to *satisfy*, never as a score to maximise.
 
 **The contest window changes the arithmetic.** Eligibility integrates
 `[CONTEST_START, CONTEST_END]` once set, so **depth banked before 31 Aug
-does not count** — and because *carried* (out-of-hours) ticks **do** credit,
-the denominator is the full ~102.5 wall-clock hours rather than the ~32
-cash-session hours. 300,000,000 over 102.5 h is **~$813** of balanced depth
-held continuously. This paragraph used to size on the 32-hour window at
-~$2,600 and describe the carried question as unresolved; that is correction
-6 above, kept there rather than left standing here as operational guidance.
+does not count** — and *carried* (out-of-hours) ticks credit too on the
+evidence below, so the denominator is the full ~102.5 wall-clock hours
+rather than the ~32 cash-session hours. 300,000,000 over 102.5 h is **~$813**
+of balanced depth held continuously. This paragraph used to size on the
+32.5-hour window at ~$2,564 and describe the carried question as unresolved;
+that reading is recorded as correction 6 above rather than left standing
+here as operational guidance.
 
-✅ **Both halves settled 2026-08-27.** `depth_seconds` **is** reset for the
-contest — Gene Hoffman, "planning to do that already" — so nothing banked
-in the sandbox carries in. But **carried (out-of-hours) ticks do accrue**,
-so the usable window is the full **102.5 wall-clock hours**, not 32.5 cash
-hours. Held continuously that is only **~$813** of balanced depth, or
-**~$1,190** if we quote the four overnight sessions and stand down for the
+⚠ **Read the ~$813 as the evidenced figure, not the measured one.** The
+carried half of this arithmetic is **strong evidence, not confirmation** —
+incremental backfill is not excluded, see C-0S3 and the downgrade note
+below. If it turns out carried ticks do not credit, the same gate costs
+~$2,564 inside the cash session; size with that factor of ~3 in view rather
+than treating ~$813 as a floor that has been observed.
+
+**One half is settled, the other is evidenced.** `depth_seconds` **is** reset
+for the contest — Gene Hoffman, "planning to do that already", sponsor and
+authoritative — so nothing banked in the sandbox carries in. **Carried
+(out-of-hours) ticks appear to accrue** on an entrant's statement plus our
+own measurement, which is strong evidence rather than a settled fact. Taking
+that reading, the usable window is the full **102.5 wall-clock hours**, not
+32.5 cash hours: held continuously that is only **~$813** of balanced depth,
+or **~$1,190** if we quote the four overnight sessions and stand down for the
 cash open. See the Discord-archive section below.
 
 Rules: one-sided quotes earn **zero** for that market (`min(bid, ask)`);
@@ -271,9 +295,9 @@ hours, quote the session only where statistics support it.** That would
 also explain the leaderboard — accounts chasing `Σ_markets` depth during
 the session, in TSLA as hard as NVDA, getting run over.
 
-✅ **STRONG EVIDENCE on the load-bearing point, 2026-08-27: carried ticks
-appear to
-accrue depth.** The gate can be banked out-of-hours. Quoting only the four
+⚠ **STRONG EVIDENCE on the load-bearing point, 2026-08-27: carried ticks
+appear to accrue depth** — measured, not confirmed; see C-0S3. If that
+holds, the gate can be banked out-of-hours. Quoting only the four
 overnight sessions of the contest needs ~$1,190 of balanced depth held
 throughout, against ~$2,564 to clear it inside the cash session — see the
 Discord-archive section. (There are no weekends *inside* the contest window,
@@ -295,15 +319,21 @@ turn "cheap" into "cheap but not free":
   accident. The venue already protects makers from the thing C-07 was
   written to avoid.
 
-✅ **Carried ticks DO accrue depth — settled 2026-08-27.** This paragraph
-used to say the question was open and lean towards "they do not", which
-contradicted both the Discord answer and our own measurement further down.
-**Downgraded 2026-08-28 (see C-0S3):** incremental backfill -- a delayed counter draining a little into each bucket -- is observationally identical to carried accrual at this sampling rate and is NOT excluded by the flat profile, which rules out only a one-time delayed update. Read the below as strong evidence, not confirmation.
+⚠ **Carried ticks DO accrue depth — strong evidence, 2026-08-27; NOT
+confirmation.** This paragraph twice said more than the data carried. It
+first said the question was open and leaned towards "they do not", which
+contradicted both the Discord answer and our own measurement further down;
+it was then rewritten to "settled 2026-08-27", which overshot in the other
+direction. **Downgraded 2026-08-28 (see C-0S3):** incremental backfill — a
+delayed counter draining a little into each bucket — is observationally
+identical to carried accrual at this sampling rate and is NOT excluded by
+the flat profile, which rules out only a one-time delayed update.
 
-Corroborated twice: an entrant said so directly, and C-0S3 measured two accounts
+Evidenced twice: an entrant said so directly, and C-0S3 measured two accounts
 gaining 10.27M and 8.37M depth-seconds across 122 minutes of frozen oracle,
-with ONE-TIME backfill ruled out by a flat rate profile. So the load-bearing mechanic
-of this hypothesis holds.
+with ONE-TIME backfill ruled out by a flat rate profile. So the load-bearing
+mechanic of this hypothesis is well supported and unrefuted — which is not
+the same as observed, and the plan below should be read as conditional on it.
 
 **What survives against it is capital, not mechanics.** Carried placement
 costs 8× stressed initial margin, and the archive shows experienced entrants
@@ -430,17 +460,19 @@ a 98% threshold. Nobody could ever qualify, so the metric was replaced. That
 is also the answer to "is the leaderboard leftover data?" — it is live, but
 balances have been reset repeatedly (7/17, 7/20, 8/6, 8/21).
 
-### RESOLVED: carried ticks DO accrue depth (asked 2026-08-27 15:06)
+### STRONG EVIDENCE: carried ticks DO accrue depth (asked 2026-08-27 15:06)
 
 Jakub Hadamcik, **2026-08-27 15:10**, answering our question directly:
 
 > And yes, when underlying markets are closed, you keep collecting depth
 > seconds
 
-✅ **Corroborated by our own measurement, 2026-08-27 -- strong evidence,
-not independent confirmation (see C-0S3).** The claim
-was entrant-sourced, not sponsor-sourced, so we measured it rather than
-trusting it. Result below under "C-0S3: measured". Jakub was right.
+⚠ **Corroborated by our own measurement, 2026-08-27 — strong evidence, not
+independent confirmation (see C-0S3).** The claim was entrant-sourced, not
+sponsor-sourced, so we measured it rather than trusting it. Result below
+under "C-0S3: measured". Nothing we recorded contradicts Jakub, and the one
+alternative still standing — a delayed counter draining incrementally — is
+indistinguishable from him being right at the rate we sampled.
 
 **This reverses the inference in the previous draft.** The argument against
 accrual was that Gene calibrates the gate as "≈$3,000 average balanced depth
@@ -475,7 +507,7 @@ cash session. Two things still argue against doing it naively:
   the oracle is pinned high. Small, balanced, and reduce-only-biased is the
   shape that survives; a fat overnight grid is what gets farmed.
 
-### C-0S3: measured, and it holds
+### C-0S3: measured — strong evidence, not confirmation
 
 `scripts/permuto_depth_probe.py`, read by `scripts/permuto_depth_analyze.py`
 and re-verified with `--carried-since=2026-08-27T20:00:00+00:00` (the cash
@@ -484,6 +516,14 @@ of the *estimator* and a quiet stretch of live trading reads identically, so
 the analyzer will not certify a carried session whose boundary it did not
 observe — the operator asserts it, and the assertion is printed alongside
 the verdict.
+
+The analyzer has since been tightened on that path (2026-08-28): it used to
+take the asserted boundary as a filter over the trailing flat run, so an
+oracle move *after* the boundary quietly narrowed the window to whatever
+came next instead of reporting that the assertion and the samples disagree.
+It now validates the whole tail and refuses rather than narrowing. The
+figures below come from the older, looser run; re-run the recorded JSONL
+through the current tool before quoting them again.
 
 124 samples at 60 s over **122 minutes** from 20:26 to 22:29 UTC —
 entirely after the 16:00 ET close, with the oracle
@@ -720,9 +760,19 @@ Independently of our measurement, on 2026-08-28:
 > do get depth seconds
 > **doge5minutes:** That's what I was observing
 
-So carried accrual now rests on four independent sources — Jakub's statement,
-our own frozen-oracle measurement, and two entrants observing it separately.
-It is as settled as anything in this document.
+So four separate parties now say the same thing — Jakub, us, doge5minutes
+and Gigabarney.
+
+⚠ **Four sources, one observation.** This paragraph used to close "it is as
+settled as anything in this document", and that does not survive the
+2026-08-28 downgrade. What doge5minutes and Gigabarney report is the same
+thing we measured: depth-seconds rising while the oracle is frozen. A
+delayed counter draining incrementally into each bucket produces exactly
+that for every observer, so watching more people see it adds agreement but
+no discriminating power against the hypothesis C-0S3 leaves open. Four
+independent *observers*, one non-independent *observation*. Separating the
+two still needs what C-0S3 asks for: a control account known to be flat
+through the close, or a documented publication-lag bound.
 
 ## Conduct rules that bind a two-sided quoter
 
@@ -730,12 +780,25 @@ From the official rules, disqualifying conduct includes **wash trading,
 self-dealing, collusion**, operating **multiple accounts**, false
 information, and tampering with Exchange operations.
 
-⚠ **Self-trading is a live risk for us specifically.** A two-sided quoter
-with a bid and an ask on the same market *can* cross itself when the oracle
-moves through both — and the API skill references "opposite-side self-trade
-refresh" as a real scenario in the `batch_place` docs. That is exactly the
-shape of accidental self-dealing. Any quoting loop needs an explicit
-self-trade guard before it goes near this contest, not after.
+⚠ **Self-trading is a live risk for us specifically, and the mechanism is
+the refresh, not the drift.** An earlier draft said a two-sided quoter "can
+cross itself when the oracle moves through both", which is wrong: a resting
+bid and a resting ask never match each other, whatever the oracle does. A
+CLOB matches on **order entry**, and this venue's answer to a regime change
+is cancellation, not re-matching (at carried→live everything resting is
+pulled). The real case is **repricing**: when the oracle moves and we
+re-quote, a newly submitted bid can cross our own still-resting ask, or the
+new ask cross the resting bid, in the window before the old leg is gone. The
+API skill names exactly that scenario — "opposite-side self-trade refresh" —
+in the `batch_place` docs, and `batch_place` is insert-only, so it is the
+call that can produce it.
+
+The guard therefore belongs on the **submit path**, not on a drift monitor:
+check every outgoing leg against our own resting book on the opposite side
+before sending, and prefer `batch_upsert` (modify-or-place per
+`(market, side)`, `docs/permuto-api-reference.md` §2) over a place-then-cancel
+pair so there is no window in which both legs are live. See C-10 for the bar
+this has to meet — not-preferential rather than never.
 
 **One account only.** No hedging our own entry with a second identity, and
 no separate "test" account running alongside.
@@ -836,7 +899,7 @@ things Permuto forces on us are gaps XOPTrader already has.
 
 | capability | why Permuto forces it | value back on dexie |
 | --- | --- | --- |
-| **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31**, which reaches `TODO.md` with PR #115 -- so this pointer dangles on `main` if #116 merges first (see the merge order in Sequenced work) |
+| **Dead man's switch** | `schedule_cancel` is first-class; quoting without one is reckless | **The clearest win.** On 2026-08-25 the engine sat wedged ~4h with live offers, then six stale bids were picked off the moment the node returned. "No completed cycle in N minutes ⇒ cancel everything" would have prevented it outright. Filed as **S31**, which reaches `TODO.md` with PR #115 -- so **#115 must merge before #116**, or this pointer dangles on `main` |
 | **Paper / observer mode** | history is hourly only, so a rule must be scored on live data before risking capital | XOPTrader has **no paper mode**; every strategy change ships straight to a live book |
 | **Jump-aware estimation** | the *oracle* steps discontinuously by construction (60s estimator, 5s resample); whether the underlying paths jump is untested, so jump-robustness is the prudent default rather than an established fact — see correction 5 | Dexie CATs jump too — the 100× outlier at `price=0.013810` is the same shape. Feeds S20 |
 | **Estimator noise vs information** | the oracle is a 60s RV estimate, so much of its jitter is sampling error | The same question S20 asks: junk print, or real repricing? |
@@ -860,14 +923,18 @@ transfer and must not leak into shared code.
       Discord, 2026-08-11: "depth_seconds does not change rank order and is
       not combined with PnL." The agent skill was right; the rules page
       phrasing is loose.
-- [x] **C-0S2** **ANSWERED within four minutes of asking, 2026-08-27.**
+- [~] **C-0S2** **ANSWERED within four minutes of asking, 2026-08-27 — one
+      half settled, one half only evidenced.**
       (a) **Carried out-of-hours ticks DO accrue `depth_seconds`** — "when
       underlying markets are closed, you keep collecting depth seconds"
-      (Jakub Hadamcik, an entrant, not staff — verify before betting on
-      it). (b) **`depth_seconds` IS reset** for the contest — Gene Hoffman,
-      "planning to do that already". So there is no weekend pre-banking,
-      but the usable window is the full 102.5 h, which drops the depth
-      needed from ~$2,564 to ~$813 held throughout.
+      (Jakub Hadamcik, an entrant, not staff). We did measure it (C-0S3),
+      and that measurement is **strong evidence, not confirmation**: it
+      does not exclude incremental backfill. Still open in that sense.
+      (b) **`depth_seconds` IS reset** for the contest — Gene Hoffman,
+      "planning to do that already". Sponsor-sourced and settled. So there
+      is no weekend pre-banking, and *if* (a) holds the usable window is the
+      full 102.5 h, which drops the depth needed from ~$2,564 to ~$813 held
+      throughout.
 - [~] **C-0S3** **Measured 2026-08-27; STRONG EVIDENCE, not confirmed.**
       **Downgraded 2026-08-28 after review.** The flat rate profile rules out
       backfill that *arrives once and stops*, which is what the original
@@ -879,9 +946,11 @@ transfer and must not leak into shared code.
       be flat through the close, or a documented lag bound. The $813 sizing
       therefore rests on evidence, not on a measurement, and the analyzer now
       says so rather than printing CONFIRMED. Original record: 124 samples over 122
-      minutes of confirmed-carried session (oracle frozen at a single value
-      throughout): two accounts gained 10.27M and 8.37M depth-seconds, which
-      roll-off cannot produce. Backfill ruled out by the flat rate profile.
+      minutes of operator-ASSERTED carried session (oracle frozen at a single
+      value throughout): two accounts gained 10.27M and 8.37M depth-seconds,
+      which roll-off cannot produce. One-time backfill ruled out by the flat
+      rate profile; incremental backfill is not — that is the downgrade above,
+      and the sentence here used to claim the stronger version.
       Also lower-bounded other entrants' overnight size at $1,141–$1,400
       (the observed slope is accrual minus roll-off) without
       placing an order, and observed a wiped account shedding 14.66M to
@@ -889,7 +958,9 @@ transfer and must not leak into shared code.
       `scripts/permuto_depth_probe.py`.
 - [x] **C-01** Gate quantified. ≈$3,000 balanced depth for ~28 hours,
       **not decaying** — the sponsor confirms the accumulator only rises;
-      what falls is the 5-day display window.
+      what falls is the 5-day display window. Same integral as the ~$813
+      over 102.5 h used elsewhere in this document; the two figures differ
+      only in how many hours are assumed to count, not in the gate.
 - [x] **C-02** **BUILT** (PR #119). `gui/services/permuto/identity.py` holds a
       mnemonic-derived BLS identity wrapped by DPAPI, never in git-tracked
       config; `auth.py` does challenge -> sign 32 decoded nonce bytes ->
@@ -898,20 +969,26 @@ transfer and must not leak into shared code.
       short-horizon jitter estimator noise or information** (the central
       question, given the 60s/5s overlapping-window construction);
       per-market session statistics; would-be PnL of a candidate rule. It
-      also re-confirms carried accrual as a passive by-product, but that is
-      **already settled by C-0S3** and is not something C-03 decides.
-      Endpoints listed in
+      also re-observes carried accrual as a passive by-product, but C-0S3
+      **already answers that to strong-evidence level** and C-03 as scoped
+      does not decide it either: the observer reads `/info/*` only, so it
+      never sees `depth_seconds`, and what would close C-0S3 is a leaderboard
+      control account known to be flat through the close, or a documented
+      publication-lag bound. Neither the probe nor this observer supplies
+      one today. Endpoints listed in
       `docs/permuto-api-reference.md` §7. **Do first, after C-00.**
       **Use a range-based estimator, not variance ratios.** Permuto serves
       OHLC, so Parkinson / Garman–Klass computed from those bars is
-      independent and better-conditioned. But it is **not the same
-      quantity**: `/info/candles` ignores `tf` and returns 3600s bars, and
-      the bars are bars of the `QQQ-VOL` series, so the estimator measures
-      hourly **vol-of-vol**, not the underlying's 60s realized vol. Its
-      difference from the oracle therefore *bounds* the estimator noise and
-      confounds it with horizon, input and model mismatch — identifying that
-      noise needs matching-frequency returns of QQQ/NVDA/TSLA, which this
-      venue does not serve. Record the range estimator as a proxy, or source
+      better-conditioned than close-to-close. But it is **not the same
+      quantity and not an independent one**: `/info/candles` ignores `tf` and
+      returns 3600s bars, and candle lookups key on `QQQ-VOL`, so the bars
+      are bars *of the oracle's own output series*. The estimator therefore
+      measures hourly **vol-of-vol**, not the underlying's 60s realized vol,
+      and it is a second functional of the very prints whose noise we want to
+      measure — so its difference from the oracle is not an outside check on
+      that noise and does not bound it. Identifying the estimator noise needs
+      matching-frequency returns of QQQ/NVDA/TSLA, which this venue does not
+      serve. Record the range estimator as an hourly regime proxy, or source
       the underlying externally. See `docs/advanced-trading-methods.md` §4,
       "Ideas taken from two external repositories". Separate the session from
       the carried hours in the estimator rather than smoothing across them.
