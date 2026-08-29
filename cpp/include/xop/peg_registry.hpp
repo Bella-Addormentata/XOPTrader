@@ -75,6 +75,16 @@ struct PeggedAsset {
     /// Almost always 1.0, but a coin pegged to 100 JPY is expressible.
     double peg_target{1.0};
 
+    /// Largest declarable USD par per unit.
+    ///
+    /// Not a taste judgement: the product of this and a Mojo has to survive
+    /// llround. XCH carries 1e12 mojos per unit, so a par of 1e6 leaves
+    /// eighteen orders of magnitude of headroom under the ~9.2e18 that
+    /// long long can represent, while still admitting anything an actual
+    /// pegged asset could be worth -- the most valuable currency unit in
+    /// circulation is under 4 USD.
+    static constexpr double kMaxPegTarget = 1e6;
+
     /// Deviation from peg_target at which to warn, as a percentage.
     /// Must be strictly positive: the classify() comparison is inclusive
     /// (to agree with DepegDetector), so a warn_pct of 0 would make an
@@ -119,9 +129,19 @@ struct PeggedAsset {
         // from a typo could otherwise return an infinite USD factor into
         // llround.  Matches the finite check PairConfig::peg_target already
         // gets in config.cpp.
+        //
+        // [review] Finite is NOT enough for peg_target. 1e308 is finite and
+        // positive, and the factor it produces is multiplied by a Mojo --
+        // up to 1e12 for XCH -- and handed to std::llround at every
+        // double-to-Mojo boundary. That overflows long long, raises the
+        // invalid-operation condition, and yields an unusable Mojo rather
+        // than an error. Bounding the DECLARATION is the cheap place to stop
+        // it: one check at startup instead of a range test at every
+        // conversion, and it fails loudly where an operator can read it.
         return !asset_id.empty()
             && !peg_currency.empty()
             && std::isfinite(peg_target) && peg_target > 0.0
+            && peg_target <= kMaxPegTarget
             && std::isfinite(warn_pct)   && warn_pct > 0.0
             && std::isfinite(bail_pct)   && bail_pct > warn_pct;
     }
@@ -405,6 +425,58 @@ struct CrossSelection {
         return CrossSelection{c.pair_name, usd};
     }
     return {};
+}
+
+
+/// USD per BASE unit, from a scaled quote-denominated mid and the quote
+/// asset's declared par.
+///
+/// Extracted because review pointed out that nothing invoked usd_per_xch(),
+/// quote_usd_factor() or asset_usd_pseudo_price() -- no test constructs an
+/// Engine -- so the one multiplication that stops a EUR-pegged wrapper being
+/// reported as dollars had no coverage at all. The declared-par fixes could
+/// have regressed with the whole suite green.
+///
+/// `scaled_mid` is `Snapshot::mid_price`, which carries quote units per base
+/// unit multiplied by `scale` (kMojosPerXch). Returns nullopt rather than a
+/// number for every degenerate input, because the caller's contract is that
+/// an absent value means "no valuation available" and must never become 1.0.
+[[nodiscard]] inline std::optional<double> usd_per_base_from_mid(
+    double scaled_mid, double scale, double par) noexcept
+{
+    if (!(scaled_mid > 0.0) || !std::isfinite(scaled_mid)) return std::nullopt;
+    if (!(scale      > 0.0) || !std::isfinite(scale))      return std::nullopt;
+    if (!(par        > 0.0) || !std::isfinite(par))        return std::nullopt;
+    const double usd = scaled_mid / scale * par;
+    if (!std::isfinite(usd) || !(usd > 0.0)) return std::nullopt;
+    return usd;
+}
+
+/// A double converted to Mojo, or nullopt when the result is not one.
+///
+/// [review] THE BOUND ON peg_target WAS NOT ENOUGH, and the test I wrote to
+/// prove otherwise checked the one case that passes. A pseudo-price is a
+/// 1e12-SCALED RATE, not a value capped at 1e12 -- so a par of 1e6 against a
+/// 20-XCH price is 2e19 and overflows long long inside std::llround
+/// regardless of what the declaration was bounded to. Division has the
+/// mirror problem: an arbitrarily small positive factor passes coherence and
+/// blows up from_usd_pseudo().
+///
+/// So the check belongs at the boundary, where the actual product is known,
+/// and not only at the declaration. llround on an out-of-range double raises
+/// the invalid-operation condition and returns an unspecified value -- it
+/// does not report an error -- so the guard has to be BEFORE the call.
+[[nodiscard]] inline std::optional<std::int64_t>
+to_mojo_checked(double value) noexcept
+{
+    if (!std::isfinite(value)) return std::nullopt;
+    if (value < 0.0) return std::nullopt;
+    // Compared against the double nearest to the Mojo maximum, and strictly
+    // less than: 9.223372036854775807e18 is not representable, and the
+    // nearest double is above it.
+    constexpr double kMax = 9.2233720368547748e18;
+    if (value >= kMax) return std::nullopt;
+    return static_cast<std::int64_t>(std::llround(value));
 }
 
 }  // namespace xop

@@ -490,6 +490,24 @@ PegRegistry parse_pegged_assets(const YAML::Node& root)
         if (item["prefer_market_cross"]) {
             a.prefer_market_cross = item["prefer_market_cross"].as<bool>();
         }
+        // [review] These three are PARSED AND STORED, but nothing consumes
+        // them yet: PegRegistry::classify() has no production caller, and
+        // DepegDetector is still built and fed solely from
+        // PairConfig::is_stablecoin and the pair loop. An operator who sets
+        // them is configuring a monitor that does not run -- which is the
+        // exact shape of the S30 failure, where BYC's only peg watch lived
+        // on a pair that had been disabled. Say so rather than accept them
+        // silently; wiring an asset-level detector is what closes S29.
+        if (item["warn_pct"] || item["bail_pct"]
+                || item["sustained_observations"]) {
+            spdlog::warn(
+                "[Config] pegged_assets.{}: warn_pct / bail_pct / "
+                "sustained_observations are recorded but NOT YET WIRED to a "
+                "detector. Peg monitoring still comes only from pairs marked "
+                "`is_stablecoin`, so declaring thresholds here does not by "
+                "itself watch this asset.", a.asset_id);
+        }
+
         if (!reg.add(std::move(a))) {
             // Loud: a half-declared peg silently dropped is how an asset
             // ends up unmonitored while everyone assumes it is watched.
@@ -3357,12 +3375,23 @@ void validate_usd_anchor(const AppConfig& cfg)
         }
     }
 
-    // Otherwise the only remaining route is an enabled pair whose quote asset
-    // carries a declared, enforced USD par.
+    // The only route is an enabled pair whose quote asset carries a
+    // declared, enforced USD par.
+    // [review] MIRROR BOTH RUNTIME PREDICATES, or this certifies an anchor
+    // usd_per_xch() will not use. That function accepts only an enabled
+    // pair whose BASE is XCH and whose quote is a par WRAPPER -- which
+    // excludes prefer_market_cross assets, since those are valued through
+    // their market rather than their par. Checking any base and ignoring
+    // prefer_market_cross meant a config of only BYC/wUSDC.b, or only
+    // XCH/BYC with BYC cross-preferring, suppressed the warning while
+    // usd_per_xch() returned 0 and every XCH-quoted conversion stayed
+    // unavailable.
     for (const auto& pair : cfg.pairs) {
         if (!pair.enabled) continue;
+        if (pair.base_asset_id != "xch") continue;
         const auto* a = cfg.pegged_assets.find(pair.quote_asset_id);
-        if (a != nullptr && a->enforce && a->peg_currency == "USD") {
+        if (a != nullptr && a->enforce && !a->prefer_market_cross
+                && a->peg_currency == "USD") {
             return;
         }
     }
@@ -3379,16 +3408,34 @@ void validate_usd_anchor(const AppConfig& cfg)
         return;
     }
 
+    // The wording is deliberately narrower than an earlier draft, which
+    // promised the engine "will pause fail-closed rather than trade blind".
+    // That behaviour is S27's (PR #117); on this branch a never-valued asset
+    // does not set `degraded`, so nothing pauses -- equity simply reads $0,
+    // and equity_drawdown_frac returns 0.0 against a non-positive peak, so
+    // both breakers sit INERT rather than tripping. Promising protection
+    // that does not exist is worse than the missing anchor: an operator who
+    // reads it has been told the fault is contained.
     spdlog::warn(
-        "[Config] NO USD ANCHOR IS REACHABLE. Every asset would value at $0 "
-        "and both drawdown breakers would sit inert -- this is the "
-        "2026-08-25 incident. Enabled pairs: {}. Fix by EITHER declaring the "
-        "quote asset's peg under `pegged_assets:` (see config.example.yaml; "
-        "a config written before that section existed declares nothing, and "
-        "the old built-in $1 assumptions are gone), OR enabling the "
-        "CoinGecko feed with \"chia\" in coingecko.coin_ids. If you hold "
-        "anything, the engine will pause fail-closed rather than trade "
-        "blind.", enabled_names);
+        // [review] Scoped to what actually follows. The earlier wording
+        // said every asset values at $0 and both breakers sit inert, which
+        // is false for some configurations this matches: with only XCH/BYC
+        // and BYC cross-preferring, quote_usd_factor() falls back to the
+        // declared par and asset_usd_pseudo_price() can still value both, so
+        // equity need not be zero. Overstating a warning is how it gets
+        // dismissed the time it is right.
+        "[Config] NO usd_per_xch() ANCHOR IS REACHABLE. Nothing priced "
+        "THROUGH XCH can be valued -- usd_per_xch() returns 0, so every "
+        "XCH-quoted conversion is unavailable. Assets with their own "
+        "enforced par may still value. IF that leaves equity at or near zero, "
+        "both drawdown breakers sit inert, because they cannot fire against a "
+        "zero peak -- which is the 2026-08-25 incident, and on this build "
+        "nothing pauses automatically. Enabled pairs: {}. Fix by declaring an "
+        "enabled XCH pair's quote asset under `pegged_assets:` with "
+        "enforce: true and prefer_market_cross: false (see "
+        "config.example.yaml; a config written before that section existed "
+        "declares nothing, and the old built-in $1 assumptions are gone).",
+        enabled_names);
 }
 
 AppConfig load_config(const std::string& path,

@@ -487,3 +487,145 @@ TEST(MarketCross, NoCandidatesYieldsNoCross) {
     EXPECT_TRUE(select_market_cross("byc_tail", {}, reg, 300.0)
                     .pair_name.empty());
 }
+
+// ---------------------------------------------------------------------------
+// [review] usd_per_base_from_mid -- the multiplication that had no coverage.
+//
+// Review's point: nothing in the suite invoked usd_per_xch(),
+// quote_usd_factor() or asset_usd_pseudo_price(), because no test constructs
+// an Engine. So the single multiplication that keeps a EUR-pegged wrapper
+// from being reported as dollars could have regressed with the suite green.
+// ---------------------------------------------------------------------------
+
+namespace {
+constexpr double kScale = 1e12;   // kMojosPerXch
+}
+
+TEST(UsdPerBaseFromMid, AUnitParIsJustTheMid) {
+    // 25 quote units per XCH, par $1.00 -> $25.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 1.0);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 25.0);
+}
+
+TEST(UsdPerBaseFromMid, ANonUnitParIsAppliedRatherThanAssumedAway) {
+    // The whole reason the par exists. A EUR wrapper at 1.08 USD/EUR must
+    // not report its EUR mid as dollars.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 1.08);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 27.0);
+    EXPECT_GT(*usd, 25.0) << "the FX rate was dropped";
+}
+
+TEST(UsdPerBaseFromMid, ASubUnitParReducesTheValuation) {
+    // A wrapper trading below its peg target must value BELOW the raw mid.
+    const auto usd = xop::usd_per_base_from_mid(25.0 * kScale, kScale, 0.74);
+    ASSERT_TRUE(usd.has_value());
+    EXPECT_DOUBLE_EQ(*usd, 18.5);
+}
+
+TEST(UsdPerBaseFromMid, NoParMeansNoValuationNotOneDollar) {
+    // peg_registry's contract: absent must never become 1.0.
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, 0.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, -1.0));
+}
+
+TEST(UsdPerBaseFromMid, AQuietOrJunkBookYieldsNothing) {
+    EXPECT_FALSE(xop::usd_per_base_from_mid(0.0, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(-1.0, kScale, 1.0));
+}
+
+TEST(UsdPerBaseFromMid, NonFiniteInputsYieldNothing) {
+    const double inf = std::numeric_limits<double>::infinity();
+    const double nan = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(xop::usd_per_base_from_mid(inf, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(nan, kScale, 1.0));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, inf));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, kScale, nan));
+    EXPECT_FALSE(xop::usd_per_base_from_mid(25.0 * kScale, 0.0, 1.0));
+}
+
+TEST(UsdPerBaseFromMid, AnOverflowingProductIsRejectedNotReturned) {
+    // Two individually finite values whose product is not. Returning
+    // infinity here reaches llround downstream.
+    const double huge = std::numeric_limits<double>::max();
+    EXPECT_FALSE(xop::usd_per_base_from_mid(huge, 1.0, huge));
+}
+
+// ---------------------------------------------------------------------------
+// [review] Finite is not enough. A finite-but-enormous par reaches llround.
+// ---------------------------------------------------------------------------
+
+TEST(PeggedAssetCoherence, AnAstronomicalParIsRejected) {
+    // 1e308 is finite and positive. Multiplied by a Mojo -- up to 1e12 for
+    // XCH -- it overflows long long inside std::llround, which raises the
+    // invalid-operation condition and returns an unusable value rather than
+    // an error.
+    xop::PeggedAsset a;
+    a.asset_id = "wusdc.b";
+    a.peg_currency = "USD";
+    a.peg_target = 1e308;
+    EXPECT_FALSE(a.is_coherent());
+}
+
+TEST(PeggedAssetCoherence, ThePracticalRangeIsStillAccepted) {
+    xop::PeggedAsset a;
+    a.asset_id = "wusdc.b";
+    a.peg_currency = "USD";
+    for (const double par : {0.000001, 0.5, 1.0, 3.75, 1000.0,
+                             xop::PeggedAsset::kMaxPegTarget}) {
+        a.peg_target = par;
+        EXPECT_TRUE(a.is_coherent()) << "rejected a legitimate par " << par;
+    }
+}
+
+TEST(PeggedAssetCoherence, TheBoundAloneDoesNotProtectLlround) {
+    // [review] The test that used to live here checked exactly the one case
+    // that passes -- kMaxPegTarget * 1e12 -- and concluded the declaration
+    // bound was sufficient. It is not. A pseudo-price is a 1e12-SCALED RATE,
+    // so the real product is par * price, and a 20-XCH price at the maximum
+    // par is 2e19: past long long, whatever the declaration was bounded to.
+    constexpr double kMojos = 1e12;
+    const double at_one_xch = xop::PeggedAsset::kMaxPegTarget * kMojos;
+    EXPECT_LT(at_one_xch, 9.0e18);
+
+    const double at_twenty_xch = xop::PeggedAsset::kMaxPegTarget * 20.0 * kMojos;
+    EXPECT_GT(at_twenty_xch, 9.3e18)
+        << "if this no longer overflows, the boundary guard below is why";
+}
+
+// ---------------------------------------------------------------------------
+// to_mojo_checked -- the guard that actually protects the conversion.
+// ---------------------------------------------------------------------------
+
+TEST(ToMojoChecked, AnOrdinaryValueConverts) {
+    const auto m = xop::to_mojo_checked(2.5e12);
+    ASSERT_TRUE(m.has_value());
+    EXPECT_EQ(*m, 2'500'000'000'000LL);
+}
+
+TEST(ToMojoChecked, TheProductTheOldBoundMissedIsRefused) {
+    // par 1e6 against a 20-XCH price: finite, declarable, and 2e19.
+    EXPECT_FALSE(xop::to_mojo_checked(1e6 * 20.0 * 1e12));
+}
+
+TEST(ToMojoChecked, ADivisionByATinyFactorIsRefused) {
+    // from_usd_pseudo's mirror case: a small positive factor passes
+    // coherence and produces an enormous quotient.
+    EXPECT_FALSE(xop::to_mojo_checked(1e12 / 1e-9));
+}
+
+TEST(ToMojoChecked, NonFiniteAndNegativeAreRefused) {
+    EXPECT_FALSE(xop::to_mojo_checked(std::numeric_limits<double>::infinity()));
+    EXPECT_FALSE(xop::to_mojo_checked(
+        std::numeric_limits<double>::quiet_NaN()));
+    EXPECT_FALSE(xop::to_mojo_checked(-1.0));
+}
+
+TEST(ToMojoChecked, TheBoundaryItselfIsRefusedRatherThanWrapped) {
+    // llround on an out-of-range double raises the invalid-operation
+    // condition and returns an unspecified value; it does not report an
+    // error, which is why the guard runs BEFORE the call.
+    EXPECT_FALSE(xop::to_mojo_checked(9.3e18));
+    EXPECT_TRUE(xop::to_mojo_checked(9.0e18));
+}

@@ -11391,11 +11391,18 @@ double Engine::usd_per_xch() const
         if (!pair.enabled || pair.base_asset_id != "xch") continue;
         // [review] No slash check. It is vestigial -- from when this matched
         // on the display NAME -- and the lookup below is entirely by
-        // canonical asset id. parse_pairs() accepts names without a slash,
-        // so a legal XCH/<par> configuration whose name happens to lack one
-        // was skipped here while the route predicate reported it priceable,
-        // leaving every XCH-routed holding in permanent degradation. The two
-        // must agree, and the asset-id lookup is the one that is right.
+        // canonical asset id. parse_pairs() accepts names without a slash
+        // (only revive_market imposes one), so a legal XCH/<par>
+        // configuration whose name happens to lack one was skipped here as
+        // an anchor while validate_usd_anchor() -- which never looks at the
+        // name -- reported the config anchored, and the route predicate
+        // reported every XCH-routed holding priceable. Startup said fine and
+        // the runtime returned 0, which resolves as permanent degradation.
+        // The two must agree, and the asset-id lookup is the one that is
+        // right.
+        //
+        // Fixed independently on both branches, since neither contained the
+        // other; this is the merge of the two comments.
         // [PEG 2026-08-26] Was a hardcoded symbol list.  Now asks the
         // registry, keyed on ASSET ID rather than the ticker parsed out of
         // the pair name -- symbols collide and get reused, asset ids do
@@ -11421,9 +11428,12 @@ double Engine::usd_per_xch() const
             // peg no longer enforced) means this pair cannot anchor XCH;
             // continue to the next candidate rather than guessing.
             const auto par = declared_usd_par(pair.quote_asset_id);
-            if (snap.mid_price > 0 && par) {
-                return static_cast<double>(snap.mid_price)
-                     / static_cast<double>(kMojosPerXch) * *par;
+            if (par) {
+                if (auto usd = usd_per_base_from_mid(
+                        static_cast<double>(snap.mid_price),
+                        static_cast<double>(kMojosPerXch), *par)) {
+                    return *usd;
+                }
             }
         }
     }
@@ -11623,8 +11633,16 @@ Mojo Engine::to_usd_pseudo(Mojo pair_price, const PairConfig& pc) const
     if (pair_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(pair_price) * f));
+    // Checked, not cast. The product is a 1e12-scaled rate times a factor,
+    // and neither operand alone tells you whether it lands inside Mojo --
+    // bounding the declaration was not enough. 0 is the established "no USD
+    // valuation" answer here, and every caller already handles it.
+    if (const auto m = to_mojo_checked(static_cast<double>(pair_price) * f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] to_usd_pseudo({}) overflowed for {} at factor {}; "
+                 "reporting no valuation", pair_price, pc.name, f);
+    return 0;
 }
 
 Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
@@ -11632,8 +11650,14 @@ Mojo Engine::from_usd_pseudo(Mojo usd_price, const PairConfig& pc) const
     if (usd_price <= 0) return 0;
     const double f = quote_usd_factor(pc);
     if (f <= 0.0) return 0;
-    return static_cast<Mojo>(std::llround(
-        static_cast<double>(usd_price) / f));
+    // Division has the mirror problem: an arbitrarily SMALL positive factor
+    // passes coherence and produces an enormous quotient.
+    if (const auto m = to_mojo_checked(static_cast<double>(usd_price) / f)) {
+        return *m;
+    }
+    spdlog::warn("[Engine] from_usd_pseudo({}) overflowed for {} at factor "
+                 "{}; reporting no valuation", usd_price, pc.name, f);
+    return 0;
 }
 
 // [S20 2026-08-24] Triangulated implied cross for the published-mid gate.
@@ -11847,8 +11871,21 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (snap.mid_price > 0 && snap.mid_valuation_grade && f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                static_cast<double>(snap.mid_price) * f));
+            // [sweep] Checked, like the quote branch below. This one was
+            // missed when the guard went in, and it is the branch the
+            // overflow actually reaches: mid_price is 1e12-scaled, so a
+            // 20-unit mid against the maximum declarable par is 2e19 -- the
+            // exact product test_peg_registry.cpp asserts to be out of range.
+            // `continue` rather than 0, because another enabled pair may
+            // still price this asset as base.
+            if (const auto m = to_mojo_checked(
+                    static_cast<double>(snap.mid_price) * f)) {
+                return *m;
+            }
+            spdlog::warn("[Engine] asset_usd_pseudo_price({}) overflowed via "
+                         "{} at factor {}; trying the next pair",
+                         asset_id.substr(0, 12), pair.name, f);
+            continue;
         }
     }
     // Otherwise price it as the QUOTE of an enabled pair (per-unit value).
@@ -11874,8 +11911,11 @@ Mojo Engine::asset_usd_pseudo_price(const AssetId& asset_id) const
         }
         const double f = quote_usd_factor(pair);
         if (f > 0.0) {
-            return static_cast<Mojo>(std::llround(
-                f * static_cast<double>(kMojosPerXch)));
+            if (const auto m = to_mojo_checked(
+                    f * static_cast<double>(kMojosPerXch))) {
+                return *m;
+            }
+            continue;
         }
     }
 
@@ -13560,11 +13600,39 @@ void Engine::step_update_pnl(BlockHeight block_height)
     // discontinuity this guard exists to avoid.  0 is used only before any
     // trusted factor has ever been seen, where there is no mark to
     // preserve.
+    // [review 2026-08-28] EVERY CONFIGURED PAIR, enabled or not.
+    //
+    // Skipping disabled pairs here kept them out of pair_conv_ entirely, and
+    // PnLTracker treats "not registered" as licence to fall back to a
+    // hardcoded symbol list worth exactly $1.00 per unit. So the documented
+    // response to the 2026-08-25 incident -- enforce:false on wUSDC.b AND
+    // disabling its pairs -- still marked every historical wUSDC.b and BYC
+    // position at par, which is the belief this whole change exists to
+    // remove. Registering a disabled pair costs one map write and turns it
+    // into "registered but unpriceable", which now contributes nothing.
+    //
+    // A pair that was enabled earlier keeps its last trusted factor through
+    // the carry below, so disabling a market does not discontinuously rewrite
+    // its history either.
     for (const auto& pair : config_.pairs) {
-        if (!pair.enabled) continue;
-
         double     factor  = quote_usd_factor(pair);
-        const bool trusted = quote_usd_factor_trusted(pair);
+
+        // [review] Suppress a fresh factor only when its SOURCE is the
+        // disabled pair itself. Gating on pair.enabled alone discarded
+        // factors that never came from this pair's market -- a declared par
+        // needs no market at all, and an XCH-quoted pair's factor is
+        // usd_per_xch(), which is independent of whether this market is
+        // switched on. After a restart the carry map is empty, so those
+        // pairs registered with factor 0 and their historical USD P&L
+        // vanished from the totals.
+        //
+        // quote_usd_factor_source_pair() returns empty when there is no
+        // market source, and this pair's own name when there is one.
+        const std::string factor_src = quote_usd_factor_source_pair(pair);
+        const bool source_is_this_disabled_pair =
+            !pair.enabled && factor_src == pair.name;
+        const bool trusted = !source_is_this_disabled_pair
+                          && quote_usd_factor_trusted(pair);
 
         if (trusted && factor > 0.0) {
             last_trusted_quote_usd_factor_[pair.name] = factor;
