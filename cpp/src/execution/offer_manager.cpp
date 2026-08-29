@@ -3307,6 +3307,30 @@ asio::awaitable<int> OfferManager::post_merged_side(
                        "cancelling trade {} rather than publishing it",
                        pair.name, late_id.empty() ? "<unknown>" : late_id);
         if (!late_id.empty()) {
+            // [review round 10] TRACK IT EITHER WAY. A successful secure
+            // cancel is an UNCONFIRMED spend -- a counterparty holding the
+            // offer file can still win the race to the coins. Returning
+            // without adopting the trade meant a fill in that window hit an
+            // offer neither State nor the DB had ever heard of: fill
+            // detection could not see it, and the next startup could not
+            // reconcile it. The trade is adopted under its real id (no
+            // dexie id -- it was never published) so the ordinary fill and
+            // status machinery carries it to a terminal state, whichever
+            // way the race resolves.
+            for (const auto& tier : tiers) {
+                PendingOffer pending;
+                pending.offer_id         = late_id;
+                pending.pair_name        = pair.name;
+                pending.side             = tier.side;
+                pending.price            = tier.price;
+                pending.size             = tier.size;
+                pending.tier             = tier.tier_index;
+                pending.created_at_block = block_height;
+                pending.created_at_ts    = std::chrono::system_clock::now();
+                pending.fee_mojos        = current_fee_mojos_;
+                pending.post_spread_bps  = tier.spread_bps;
+                state_->upsert_offer(pending);
+            }
             try {
                 co_await cancel_offer_charged(
                     late_id, xop::risk::watchdog_cancel().fee_mojos,
@@ -3318,7 +3342,9 @@ asio::awaitable<int> OfferManager::post_merged_side(
                 if (escalate_) {
                     escalate_("a merged offer created after the stop could "
                               "NOT be cancelled and is LIVE: trade "
-                              + late_id + " (" + e.what() + ").");
+                              + late_id + " (" + e.what() + "). It IS "
+                              "tracked in State, so fills on it will be "
+                              "seen.");
                 }
             }
         }

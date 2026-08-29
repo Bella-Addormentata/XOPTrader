@@ -490,9 +490,22 @@ int main(int argc, char* argv[]) {
     //     the path covers all three. accounting.bridge_jobs_db_path needs
     //     no change: it is already opened SQLITE_OPEN_READONLY.
     // ------------------------------------------------------------------
+    // Removed at exit by the guard below -- and stale copies from EARLIER
+    // dry runs (a crash skips any exit path) are swept here, so repeated
+    // inspections cannot accumulate accounting snapshots in the temp
+    // directory until it fills.
+    std::filesystem::path dryrun_scratch;
     if (cli.dry_run) {
         namespace fs = std::filesystem;
         try {
+            std::error_code sweep_ec;
+            for (const auto& entry : fs::directory_iterator(
+                     fs::temp_directory_path(), sweep_ec)) {
+                const auto name = entry.path().filename().string();
+                if (name.rfind("xop_dryrun_", 0) == 0) {
+                    fs::remove(entry.path(), sweep_ec);
+                }
+            }
             const fs::path live{app_config.database.path};
             const auto stamp = std::to_string(static_cast<long long>(
 #ifdef _WIN32
@@ -550,6 +563,7 @@ int main(int argc, char* argv[]) {
                          "inspection cannot write to the live engine's "
                          "accounting state", scratch.string());
             app_config.database.path = scratch.string();
+            dryrun_scratch = scratch;
         } catch (const std::exception& e) {
             spdlog::critical("[S31] dry run -- could NOT isolate the database "
                              "({}). Refusing to start: running against the "
@@ -560,6 +574,22 @@ int main(int argc, char* argv[]) {
             return EXIT_FAILURE;
         }
     }
+
+    // [review round 10] The copy is deleted when this scope unwinds --
+    // normal exit, config error, or engine-constructor throw alike. The
+    // sweep above catches what a hard crash leaves behind.
+    struct ScratchGuard {
+        std::filesystem::path path;
+        ~ScratchGuard() {
+            if (path.empty()) return;
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(
+                std::filesystem::path{path.string() + "-wal"}, ec);
+            std::filesystem::remove(
+                std::filesystem::path{path.string() + "-shm"}, ec);
+        }
+    } scratch_guard{dryrun_scratch};
 
     // Count enabled trading pairs for the startup banner.
     std::size_t enabled_pairs = 0;
