@@ -451,3 +451,21 @@ def test_a_trading_tick_clears_the_gate(window):
         gates = window._gather_permuto().gates
         assert not (gates & {"blocked", "not_quoting"}), action
 
+
+def test_stopping_clears_the_blocked_latch_so_the_switch_can_rearm(window):
+    """[release review] The latch is written only by the tick handler, so a
+    stop during a blocked spell -- the Sunday pause is the guaranteed one --
+    froze it True with no ticks left to clear it. Every later arm attempt
+    was refused with stale text until the GUI restarted: an off->on cycle
+    during the pause locked the operator out of the contest open."""
+    window._on_permuto_tick(
+        type("R", (), {"action": "withdraw", "ok": True, "error": ""})())
+    assert window._gather_permuto().gates & {"blocked", "not_quoting"}
+
+    window._permuto_desired_on = True
+    window._on_permuto_toggle(False)     # operator turns it OFF
+
+    gates = window._gather_permuto().gates
+    assert not (gates & {"blocked", "not_quoting"}), (
+        "a stale latch from the stopped session still gates the next one")
+

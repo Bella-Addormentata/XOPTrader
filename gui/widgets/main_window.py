@@ -2339,6 +2339,14 @@ class MainWindow(QMainWindow):
             # cancel is acknowledged -- off means flat, and the acknowledgement
             # is what makes that true rather than merely intended.
             self._permuto_desired_on = False
+            # [release review] Clear the blocked latch on an operator stop.
+            # It is written ONLY by the tick handler, so a stop during a
+            # blocked spell -- the Sunday pause being the guaranteed one --
+            # froze it True with no ticks left to clear it, and every later
+            # arm attempt was refused until the GUI restarted. The next
+            # session re-derives it from its own first tick.
+            self._permuto_last_blocked = False
+            self._permuto_last_action = ""
             if self._permuto_runner is not None:
                 self._permuto_runner.stop()
         self._refresh_venue_switches()
