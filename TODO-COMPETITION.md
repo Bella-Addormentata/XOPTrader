@@ -746,9 +746,63 @@ S31 arrives with PR #115):
 — with the caveat that he resets internal counters by hand, which is his own
 bot's business rather than the venue's.
 
-**Still unanswered** (codingisart, 2026-08-28 06:17): whether code changes may
-be deployed while the contest is running. Worth knowing before we plan any
-mid-contest iteration.
+**ANSWERED 2026-08-28 08:47** (was recorded here as unanswered). codingisart
+asked at 06:17 whether code changes may be deployed while the contest runs.
+SemaphoreSlim (*Mods*):
+
+> There is no rule against participants making code changes to their MM bots
+> during the contest.
+
+So mid-contest iteration is permitted. That materially changes the risk of
+entering with a conservative configuration: we can start small on Monday and
+tune during the week rather than having to get sizing right before the open.
+
+### The venue cancels OUR resting orders on an oracle move
+
+doge5minutes, **2026-08-28 12:14**, asking whether the trader-side
+cancellation applies to market makers too — "But the MM orders I hope doesn't
+disappear if oracle moves?" Jakub Hadamcik, **12:55**:
+
+> It all disappears (if it gets sufficiently out of band)
+
+*Entrant, not staff.* But it is consistent with the documented carried->live
+behaviour, and it means the venue is a second author of our book: resting
+orders can vanish with no fill and no action by us.
+
+**Already handled, and it is why `reconcile()` overwrites rather than
+merges** (`runner.py`) — a merge preserves exactly the entries the venue no
+longer lists, which are the beliefs that cause a silent HOLD on an empty
+book. Each tick replaces belief with the venue's `open_orders`, and an empty
+belief re-quotes. Our own re-quote trigger (outside `vol_aggressive_ring_pct`,
+2%) is tighter than the band that triggers the venue's cancel, so in the
+normal case we refresh before it fires.
+
+### ⚠ Unresolved: which band earns depth credit
+
+Jakub Hadamcik, **2026-08-28 16:28**, on collecting depth at a high oracle:
+
+> Because depth seconds are based on notional value so at 2.5% even if
+> nobody wanted to buy, you would need to offer massive sell to collect any
+> meaningful depth seconds
+>
+> But you get depth seconds if you have two sided offers **within oracle
+> band**. It's just not much.
+
+The notional half agrees with our model (`credit_usd = price * size`). The
+band half does **not**: this document measures depth credit inside
+`vol_aggressive_ring_pct` (2%), while "oracle band" is the wider
+`vol_oracle_band_pct` (5%) placement band.
+
+If Jakub is right, we may quote far wider for the same credit — which is a
+large reduction in pick-off risk for the same gate progress, and would change
+overnight sizing again. If he is loose with the term, quoting at 5% earns
+nothing and we would miss the gate entirely.
+
+**Do not act on this without settling it.** It is an entrant's phrasing
+against our own measurement, and the two failure directions are asymmetric.
+The probe records `ring_pct` per row and can answer it directly: place
+two-sided inside 5% but outside 2% and watch whether `depth_seconds` moves.
+That is a cheap experiment and should be run before Monday.
 
 ### C-0S3 corroborated by two more entrants
 
