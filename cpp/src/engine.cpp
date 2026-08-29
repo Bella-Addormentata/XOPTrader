@@ -1829,9 +1829,28 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
     // are idempotent within a block, so evaluating it twice per cycle (here
     // and in Step 13, which still owns the operator-facing report with this
     // cycle's equity figure) is two map walks, not two effects.
-    // The equity figure itself is Step 13's to report; only the flag side
-    // effects are wanted here.
-    static_cast<void>(compute_portfolio_equity_usd(block_height));
+    // The equity figure feeds one thing here besides the flags: seeding the
+    // FIRST peak when the authority gate is fully armed.
+    //
+    // [review round 10] Without this, a legal `drawdown_grace_blocks: 0`
+    // paused every non-empty healthy startup: this latch runs BEFORE Step 13
+    // has ever seeded peak_equity_hwm_usd_, so a clean valuation reached the
+    // zero-peak branch of unvaluable_book_must_fail_closed() -- written for
+    // the post-degradation debounce window, not for a peak that has simply
+    // not been seeded yet -- and latched over nothing. Seeding mirrors Step
+    // 13's monotonic max, gated on the same authority (read-only: the gate
+    // is NOT stepped here, or each cycle would count its clean streak
+    // twice), so a degraded startup still cannot seed and the zero-peak
+    // protection still holds where it was aimed.
+    const double pre_trade_equity =
+        compute_portfolio_equity_usd(block_height);
+    if (pre_trade_equity > 0.0
+            && valuation_authority_.clean_streak()
+                   >= risk::ValuationAuthorityGate::kRearmCleanCycles
+            && !valuation_degraded_) {
+        peak_equity_hwm_usd_ =
+            std::max(peak_equity_hwm_usd_, pre_trade_equity);
+    }
     if (risk::unvaluable_book_must_fail_closed(
             drawdown_grace_remaining_ == 0,
             valuation_degraded_,
