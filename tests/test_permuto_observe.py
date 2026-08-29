@@ -342,3 +342,16 @@ def test_a_usable_ring_pct_is_still_read(obs):
     assert obs._ring_pct_from_meta(
         {"a": {"b": {"vol_aggressive_ring_pct": "3"}}}) == 3.0
 
+
+def test_a_non_finite_oracle_yields_no_ring_not_a_zero_one(obs):
+    """[review round 9] Infinity passed `oracle > 0.0`, made every in-ring
+    comparison False, and recorded a valid-looking ZERO-depth ring -- a
+    measured absence of depth that never happened. A numeric string raised
+    TypeError out of the recorder instead."""
+    good = [{"price": "0.070", "size": "100"}]
+    for bad in (float("inf"), float("nan")):
+        assert obs._ring_depth(good, good, bad) is None, bad
+    # A numeric STRING is normalised rather than fatal.
+    out = obs._ring_depth(good, good, "0.07")
+    assert out is not None and out["credit_usd"] > 0
+

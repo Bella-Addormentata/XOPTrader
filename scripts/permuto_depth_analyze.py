@@ -183,8 +183,13 @@ def _asserted_window(rows, carried_since, max_gap):
         ts = datetime.fromisoformat(ts_text)
         if prev_ts is not None:
             gap = (ts - prev_ts).total_seconds()
-            if gap < 0:
-                return [], (f"contradicted: timestamps go backwards at "
+            # [review round 9] `<= 0`, not `< 0`. A duplicated timestamp gave
+            # the asserted window span_s == 0, and main() divides depth
+            # deltas by it -- so one repeated row crashed the analyzer with a
+            # ZeroDivisionError instead of an explanation. Equal is as
+            # non-increasing as backwards.
+            if gap <= 0:
+                return [], (f"contradicted: timestamps do not increase at "
                             f"{ts_text}, so the tail is not one ordered run")
             if gap > max_gap:
                 return [], (f"contradicted: {gap:.0f}s of missing coverage "
@@ -260,7 +265,13 @@ def frozen_window(rows, interval_s, carried_since=None):
             flush(); run = []; prev_ts = prev_oracle = None
             continue
         key = json.dumps(oracle, sort_keys=True)
-        gapped = prev_ts is not None and (ts - prev_ts).total_seconds() > max_gap
+        # [review round 9] Non-positive deltas break the run too. The scanner
+        # only split on OVERSIZED gaps, so a duplicate timestamp stayed inside
+        # one inferred window (division by zero downstream) and a backwards
+        # one produced a negative span and a negative rate presented as real.
+        delta = ((ts - prev_ts).total_seconds()
+                 if prev_ts is not None else None)
+        gapped = delta is not None and (delta > max_gap or delta <= 0)
         transition = bool(run) and key != prev_oracle
         if transition or gapped:
             if run:

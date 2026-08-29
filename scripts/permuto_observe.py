@@ -120,7 +120,16 @@ def _ring_depth(bids, asks, oracle, ring_pct=DEFAULT_RING_PCT):
     minimum -- not either side, and not the sum -- is what a market earns.
     Recorded per tick because the ladder it is derived from is not kept.
     """
-    if not oracle or not (oracle > 0.0):
+    # [review round 9] The oracle gets the same finiteness bar as the levels
+    # and the ring. A JSON `Infinity` passes `oracle > 0.0`, makes every
+    # in-ring comparison False, and records a valid-looking ZERO-depth ring;
+    # a numeric string raises TypeError out of the recorder. Normalise, then
+    # require finite and positive.
+    try:
+        oracle = float(oracle) if oracle is not None else None
+    except (TypeError, ValueError):
+        return None
+    if oracle is None or not math.isfinite(oracle) or not (oracle > 0.0):
         return None
 
     def side(levels):

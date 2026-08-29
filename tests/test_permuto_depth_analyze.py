@@ -283,6 +283,20 @@ def test_a_gap_inside_the_asserted_window_refutes_the_assertion():
     assert "missing coverage" in provenance
 
 
+def test_a_duplicate_timestamp_refutes_rather_than_divides_by_zero():
+    """[review round 9] A repeated row gave the asserted window span_s == 0,
+    and main() divides depth deltas by it -- one duplicated timestamp crashed
+    the analyzer with ZeroDivisionError instead of an explanation. Equal is
+    as non-increasing as backwards."""
+    rows = [_row(-1, ORACLE_Y), _row(0, ORACLE_X),
+            _row(1, ORACLE_X), _row(1, ORACLE_X)]
+
+    window, provenance = analyze.frozen_window(rows, 60, CLOSE)
+    assert window == []
+    assert provenance.startswith("contradicted")
+    assert "do not increase" in provenance
+
+
 def test_a_missing_oracle_inside_the_asserted_window_refutes_the_assertion():
     rows = [_row(-1, ORACLE_Y), _row(0, ORACLE_X), _row(1), _row(2, ORACLE_X)]
 
