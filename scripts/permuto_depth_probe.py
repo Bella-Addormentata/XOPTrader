@@ -85,14 +85,29 @@ def sample():
         # in the sample.
         mms, offset = [], 0
         lb = {}
+        lb_truncated = None
         while True:
             lb = get("/exchange/leaderboard?limit=100&offset=%d" % offset)
             page = lb.get("market_makers", [])
             mms.extend(page)
             total = lb.get("market_makers_total")
-            if not page or not isinstance(total, int) or len(mms) >= total:
+            # [review round 11] An unverifiable total is RECORDED, not
+            # trusted. Breaking on a missing/wrong-typed total treated the
+            # first page as a complete sample -- silently reintroducing the
+            # truncation this loop exists to prevent, with no lb_error to
+            # warn the analyzer. And advancing by the REQUESTED limit could
+            # skip entries when a page came back short; advance by what
+            # actually arrived.
+            if not isinstance(total, int):
+                if page:
+                    lb_truncated = ("market_makers_total was %r -- the "
+                                    "sample may be incomplete" % (total,))
                 break
-            offset += 100
+            if not page or len(mms) >= total:
+                break
+            offset += len(page)
+        if lb_truncated:
+            row["lb_truncated"] = lb_truncated
         row["mm_total"] = lb.get("market_makers_total")
         row["finalized"] = lb.get("finalized")
         row["mms"] = [

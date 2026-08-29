@@ -293,11 +293,15 @@ Collected from the API skill; each has bitten someone already.
 
 ## 7  Endpoints we would exercise, in order
 
-1. **C-03 observer, read-only, no key, no capital.** `/info/meta`,
-   `/info/oracle`, `/info/l2/{market}`, `/info/trades/{market}`,
-   `/info/funding/predicted`, plus `WS /ws`. Records the oracle at 1–2s and
-   computes what depth-seconds and PnL a candidate rule *would* have earned.
-   This is the only way to get sub-hourly history, since `tf` is ignored.
+1. **C-03 observer, read-only, no key, no capital.** The SHIPPED collector
+   (`scripts/permuto_observe.py`) polls `/info/meta`, `/info/oracle`,
+   `/info/l2/{market}`, `/info/trades/{market}` and `/info/funding/{market}`
+   at a 5s cadence and records observed depth, trades and flags to JSONL.
+   The FULLER design -- `WS /ws`, 1-2s oracle capture, and simulating what
+   depth-seconds and PnL a candidate rule *would* have earned -- is planned
+   C-03 analysis work and is NOT implemented; do not expect those fields in
+   the recording. Sub-hourly history has no other source, since `tf` is
+   ignored.
 2. **Auth.** `wallet_link_challenge` → sign → `wallet_auth`, gated on
    `signup_closed`.
 3. **State.** `/exchange/account`, `/exchange/open_orders`.
