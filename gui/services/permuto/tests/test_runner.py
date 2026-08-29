@@ -8,7 +8,7 @@ from gui.services.permuto.auth import PermutoAuthError
 from gui.services.permuto.client import PermutoNotLinked
 from gui.services.permuto.quoting import RestingQuote
 from gui.services.permuto.risk import FLATTEN_MARGIN_UTILISATION
-from gui.services.permuto.runner import QuoteRunner, _margin_state
+from gui.services.permuto.runner import RECANCEL_INTERVAL_S, QuoteRunner, _margin_state
 from gui.services.permuto.session import RenewAction
 
 _MKT = "QQQ-VOL-PERP"
@@ -77,11 +77,52 @@ def test_a_pause_withdraws_and_forgets_the_book():
     assert r._resting[_MKT].empty, "belief must not outlive the cancel"
 
 
-def test_a_pause_does_not_spend_a_session_renewal():
-    """Nothing can be placed while paused; renewing is a wasted round trip."""
+def test_a_pause_KEEPS_the_session_warm():
+    """[discord 2026-08-27] This asserted the opposite, and the contest
+    begins with the case that breaks it.
+
+    The old reasoning was "nothing can be placed while paused, so renewing is
+    a wasted round trip". But the sponsor resets balances on Sunday evening
+    during a trading pause that un-pauses at the 09:30 ET open -- fourteen-odd
+    hours. Letting the session lapse through that means the first tick after
+    the open spends a full challenge/sign/auth round trip before it can place
+    anything, at the moment every entrant reconnects at once, on a metric
+    that only accrues while quoting. A failed reauth there backs off through
+    the open.
+
+    It is not even a per-tick cost: ensure_session() is a policy check that
+    only reaches the network when a renewal is actually due.
+    """
     c = _Client()
     _runner(c).tick(1.0, _ORACLE, {"trading_paused": True})
-    assert "ensure_session" not in c.calls
+    assert "ensure_session" in c.calls
+
+
+def test_a_sustained_pause_does_not_hammer_cancel_all():
+    """A pause is a SUSTAINED withdraw. At a 5s tick the Sunday pause is
+    ~10,000 identical authenticated cancels against a venue that is paused --
+    a good way to be rate-limited at the open."""
+    c = _Client()
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {"trading_paused": True})
+    first = c.calls.count("cancel_all")
+    assert first == 1, "the first withdraw must always cancel"
+
+    # Ten more ticks inside the re-assert window.
+    for i in range(10):
+        r.tick(2.0 + i, _ORACLE, {"trading_paused": True})
+    assert c.calls.count("cancel_all") == first, "re-cancelled a known-empty book"
+
+
+def test_a_sustained_pause_still_re_asserts_the_cancel_periodically():
+    """Belief can be stale -- the venue cancels everything at carried->live
+    and reconcile() does not run while paused -- so an empty belief must
+    still re-send, just not every tick."""
+    c = _Client()
+    r = _runner(c)
+    r.tick(1.0, _ORACLE, {"trading_paused": True})
+    r.tick(1.0 + RECANCEL_INTERVAL_S + 1, _ORACLE, {"trading_paused": True})
+    assert c.calls.count("cancel_all") == 2
 
 
 def test_the_tick_after_an_unpause_rebuilds_rather_than_holds():

@@ -46,6 +46,11 @@ from .quoting import LoopAction, RestingQuote, VenueView, decide
 from .risk import MarginState, RiskAction, assess, skewed_reference
 from .session import RenewAction
 
+#: How often a SUSTAINED full withdrawal re-asserts the cancel when we
+#: already believe the book is empty. Covers a stale belief without turning
+#: a fourteen-hour pause into ten thousand identical requests.
+RECANCEL_INTERVAL_S = 60.0
+
 _log = logging.getLogger(__name__)
 
 __all__ = ["QuoteRunner", "TickResult"]
@@ -91,6 +96,9 @@ class QuoteRunner:
         self._resting: dict = {m: RestingQuote() for m in self._markets}
         self._was_paused = False
         self._reopen_pending = False
+        #: When the last full cancel_all went out, for the re-assert below.
+        #: Negative infinity so the first withdraw always cancels.
+        self._last_full_cancel_s = float("-inf")
 
     # ------------------------------------------------------------------ #
     # Belief
@@ -174,27 +182,45 @@ class QuoteRunner:
         self._was_paused = paused
 
         session_ok, session_waiting = True, False
-        if not paused:
-            # [review] A raise here used to abort the tick BEFORE the
-            # withdraw path, so the one branch written for a dead session --
-            # decide()'s `if not view.session_ok: WITHDRAW "no usable trading
-            # session"` -- was unreachable by exception. session_ok is only
-            # ever set from a RETURNED action, and an auth failure returns
-            # nothing. The book stayed resting for the whole outage while the
-            # code that exists to retract it sat one frame up the stack.
-            #
-            # Caught and folded into session_ok instead: a session we could
-            # not establish is a session we do not have, which is exactly
-            # what decide() already knows how to answer.
-            try:
-                action = self._client.ensure_session(now_s)
-                session_waiting = action is RenewAction.WAIT
-                session_ok = action in (RenewAction.OK, RenewAction.RENEW)
-            except PermutoNotLinked:
-                raise
-            except PermutoAuthError as exc:
-                _log.warning("permuto: session unavailable this tick: %s", exc)
-                session_ok, session_waiting = False, False
+        # [discord 2026-08-27] RENEWED THROUGH A PAUSE, deliberately.
+        #
+        # This used to be `if not paused`, and the contest begins with
+        # exactly the case that breaks: the sponsor resets balances on
+        # Sunday evening during a trading pause that un-pauses at the
+        # 09:30 ET open -- fourteen-odd hours in which the session would
+        # have expired unrenewed. The first tick after the open would
+        # then spend a full challenge/sign/auth round trip before it
+        # could place anything, at the exact moment every entrant
+        # reconnects at once, on a metric that only accrues while
+        # quoting. If that reauth failed we would be backing off through
+        # the open.
+        #
+        # Authentication is not a trading route, so it works while
+        # trading is paused. The result changes nothing while paused --
+        # decide() tests trading_paused first and withdraws regardless --
+        # it just means we come out of the pause already holding a
+        # usable session.
+        #
+        # [review] A raise here used to abort the tick BEFORE the
+        # withdraw path, so the one branch written for a dead session --
+        # decide()'s `if not view.session_ok: WITHDRAW "no usable trading
+        # session"` -- was unreachable by exception. session_ok is only
+        # ever set from a RETURNED action, and an auth failure returns
+        # nothing. The book stayed resting for the whole outage while the
+        # code that exists to retract it sat one frame up the stack.
+        #
+        # Caught and folded into session_ok instead: a session we could
+        # not establish is a session we do not have, which is exactly
+        # what decide() already knows how to answer.
+        try:
+            action = self._client.ensure_session(now_s)
+            session_waiting = action is RenewAction.WAIT
+            session_ok = action in (RenewAction.OK, RenewAction.RENEW)
+        except PermutoNotLinked:
+            raise
+        except PermutoAuthError as exc:
+            _log.warning("permuto: session unavailable this tick: %s", exc)
+            session_ok, session_waiting = False, False
 
         # [review] Poll the venue BEFORE deciding, not after deciding to
         # quote. The first version reconciled only on the way to a batch, so
@@ -268,7 +294,26 @@ class QuoteRunner:
             # withdrawing, which is also the pause and dead-session case.
             reason = results[withdrawing[0]][1]
             if len(withdrawing) == len(self._markets):
-                self._client.cancel_all(now_s)
+                # [discord 2026-08-27] Do not re-cancel a book we have just
+                # emptied. A pause is a SUSTAINED withdraw, and the Sunday
+                # one runs from the evening to the 09:30 ET open -- at a 5s
+                # tick that is ~10,000 authenticated cancel_all calls against
+                # a venue that is paused, which is a good way to be
+                # rate-limited at the open.
+                #
+                # Re-asserted rather than skipped outright: belief can be
+                # stale (the venue cancels everything at carried->live), and
+                # during a pause reconcile() does not run to correct it. So
+                # an empty belief still re-sends every kRecancelS, which
+                # self-corrects a drifted belief within a minute while
+                # cutting the pause traffic by ~98%.
+                believed_empty = all(
+                    q.empty for q in self._resting.values())
+                due = (now_s - self._last_full_cancel_s
+                       >= RECANCEL_INTERVAL_S)
+                if not believed_empty or due:
+                    self._client.cancel_all(now_s)
+                    self._last_full_cancel_s = now_s
                 self._forget_book()
                 # A full withdrawal discharges the reopen debt, because
                 # _forget_book() is what the debt was FOR: the latch exists
