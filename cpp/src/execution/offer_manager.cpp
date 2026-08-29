@@ -3283,6 +3283,39 @@ asio::awaitable<int> OfferManager::post_merged_side(
         co_return fallback_count;
     }
 
+    // [sweep] The SUCCESSFUL merged create had no post-create recheck. The
+    // pre-create gate and the fallback tiers both got one; this path -- the
+    // one that actually publishes to dexie on the happy day -- did not. If
+    // the switch fires while create_offer() is suspended here, the merged
+    // offer is submitted to a book the bulk cancel has already enumerated.
+    if (abort_predicate_ && abort_predicate_()) {
+        std::string late_id;
+        if (result.contains("trade_record")
+            && result["trade_record"].contains("trade_id")) {
+            late_id = result["trade_record"]["trade_id"].get<std::string>();
+        }
+        logger_->error("merged create for {} landed AFTER the stop; "
+                       "cancelling trade {} rather than publishing it",
+                       pair.name, late_id.empty() ? "<unknown>" : late_id);
+        if (!late_id.empty()) {
+            try {
+                co_await cancel_offer_charged(
+                    late_id, xop::risk::watchdog_cancel().fee_mojos,
+                    xop::risk::watchdog_cancel().secure);
+            } catch (const std::exception& e) {
+                logger_->critical("could not cancel the late merged offer "
+                                  "{}: {} -- LIVE and unmanaged",
+                                  late_id, e.what());
+                if (escalate_) {
+                    escalate_("a merged offer created after the stop could "
+                              "NOT be cancelled and is LIVE: trade "
+                              + late_id + " (" + e.what() + ").");
+                }
+            }
+        }
+        co_return 0;
+    }
+
     // Extract trade_id and offer text.
     if (!result.contains("offer") || !result["offer"].is_string()
         || !result.contains("trade_record")
