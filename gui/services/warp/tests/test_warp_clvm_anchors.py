@@ -231,9 +231,13 @@ def test_millieth_pin_matches_the_enabled_trading_pair():
 
     cfg_path = Path(__file__).resolve().parents[4] / "config.yaml"
     cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8"))
+    # [v0.10.4] The pair's PRESENCE and id are the invariant; enabled-ness
+    # is an operational choice -- the operator disabled both wrapped-ETH
+    # pairs after the 2026-08-25 warp.green compromise, and a test that
+    # demands enabled=true turns a sound risk decision into a red suite.
     pairs = [p for p in (cfg.get("pairs") or [])
-             if p.get("name") == "wmilliETH.b/XCH" and p.get("enabled")]
-    assert pairs, "the ENABLED wmilliETH.b/XCH pair is missing from config.yaml"
+             if p.get("name") == "wmilliETH.b/XCH"]
+    assert pairs, "the wmilliETH.b/XCH pair is missing from config.yaml"
     assert pairs[0]["base_asset_id"] == (
         C.MAINNET.asset("milliETH").expected_asset_id)
 
