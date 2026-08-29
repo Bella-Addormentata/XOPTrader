@@ -327,3 +327,18 @@ def test_a_zero_priced_level_is_skipped(obs):
     out = obs._ring_depth(good + [{"price": "0", "size": "100"}], good, 0.07)
     assert out["bid_levels"] == 1
 
+
+def test_an_unusable_ring_pct_falls_back_to_the_default(obs):
+    """A NaN ring makes every in-ring test False, so both sides total zero and
+    credit_usd is a well-formed 0.0 stamped as metadata-derived -- a recording
+    that reads as a measured absence of depth rather than a broken band."""
+    for bad in (float("nan"), float("inf"), -2.0, 0.0):
+        assert obs._ring_pct_from_meta(
+            {"vol_aggressive_ring_pct": bad}) is None, bad
+
+
+def test_a_usable_ring_pct_is_still_read(obs):
+    assert obs._ring_pct_from_meta({"vol_aggressive_ring_pct": 2.5}) == 2.5
+    assert obs._ring_pct_from_meta(
+        {"a": {"b": {"vol_aggressive_ring_pct": "3"}}}) == 3.0
+

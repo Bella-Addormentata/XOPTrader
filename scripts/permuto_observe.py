@@ -91,9 +91,21 @@ def _ring_pct_from_meta(meta):
         if isinstance(node, dict):
             if "vol_aggressive_ring_pct" in node:
                 try:
-                    return float(node["vol_aggressive_ring_pct"])
+                    value = float(node["vol_aggressive_ring_pct"])
                 except (TypeError, ValueError):
                     return None
+                # [review] float() accepts NaN, the infinities and negatives.
+                # A NaN here is the worst of them and it is SILENT: every
+                # in-ring test `abs(price - oracle) / oracle * 100.0 <= nan`
+                # is False, so both sides total zero, credit_usd is a
+                # perfectly well-formed 0.0, and ring_pct_src is stamped
+                # "meta" -- a recording that looks like a measured absence of
+                # depth rather than a broken band, for as long as the venue
+                # serves that value. Falling back to the documented default
+                # is the honest reading of an unusable one.
+                if not (math.isfinite(value) and value > 0.0):
+                    return None
+                return value
             stack.extend(node.values())
         elif isinstance(node, list):
             stack.extend(node)
@@ -223,7 +235,13 @@ def main():
         while datetime.now(timezone.utc) < stop:
             n += 1
             row = {"ts": datetime.now(timezone.utc).isoformat(), "n": n}
-            row["oracle"] = safe("/info/oracle").get("prices")
+            oracle_doc = safe("/info/oracle")
+            row["oracle"] = oracle_doc.get("prices")
+            # [review] Keep the failure. This is the tick-level series the
+            # jitter and trade analysis runs on, and discarding __error__ made
+            # an outage indistinguishable from a success carrying no prices.
+            if "__error__" in oracle_doc:
+                row["oracle_err"] = oracle_doc["__error__"]
 
             books, funding = {}, {}
             for m in MARKETS:
@@ -347,6 +365,11 @@ def main():
             if n % META_EVERY == 0:
                 meta = safe("/info/meta")
                 flags = meta.get("flags") or {}
+                # [review] Same again, and this poll is the observer's only
+                # PAUSE-STATE evidence -- an all-null flag object with no
+                # error reads as a venue that answered and was not paused.
+                if "__error__" in meta:
+                    row["meta_err"] = meta["__error__"]
                 row["meta"] = {k: flags.get(k) for k in
                                ("trading_paused", "pause_reason",
                                 "pause_resume_at", "signup_closed",
@@ -357,9 +380,16 @@ def main():
                 # measured against -- and carries the change alongside, so
                 # the boundary is visible instead of implied.
                 fresh_ring = _ring_pct_from_meta(meta)
-                if fresh_ring is not None and fresh_ring != ring_pct:
-                    row["ring_pct_changed"] = {"from": ring_pct,
-                                               "to": fresh_ring}
+                if fresh_ring is not None:
+                    # [review] Provenance updates on every successful read;
+                    # only the VALUE change is an event. Tying both to
+                    # `fresh_ring != ring_pct` meant a startup failure
+                    # followed by a refresh reporting the default left
+                    # ring_pct_src stuck on "default" forever -- reading as a
+                    # guess when metadata had in fact confirmed it.
+                    if fresh_ring != ring_pct:
+                        row["ring_pct_changed"] = {"from": ring_pct,
+                                                   "to": fresh_ring}
                     ring_pct, ring_pct_src = fresh_ring, "meta"
 
             fh.write(json.dumps(row) + "\n")
