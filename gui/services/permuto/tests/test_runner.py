@@ -816,3 +816,31 @@ def test_a_market_past_its_limit_is_retracted_even_while_a_pause_withdraws():
     assert r._resting[_MKT].empty, (
         "the at-risk book survived because a neighbour was withdrawing")
 
+
+def test_a_missing_positions_payload_is_not_a_flat_account():
+    """[review round 11] {} and [] are genuinely flat; a MISSING key or a
+    wrong-typed value is inventory we cannot see, and both used to collapse
+    into the same {} -- so valid equity with no readable positions let every
+    market add risk against unknown inventory."""
+    from gui.services.permuto.risk import RiskAction, assess
+
+    for bad in ({"equity_usd": 100_000.0, "used_margin_usd": 0.0},
+                {"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                 "positions": "nonsense"}):
+        st = _margin_state(bad, False)
+        assert not st.positions_readable
+        d = assess(st, _MKT, base_size=100.0, max_position=1_000.0,
+                   ring_pct=2.0, half_spread_pct=0.5)
+        assert d.action is RiskAction.FLATTEN, bad
+
+    # And the genuinely flat shapes still quote.
+    for flat in ({"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                  "positions": {}},
+                 {"equity_usd": 100_000.0, "used_margin_usd": 0.0,
+                  "positions": []}):
+        st = _margin_state(flat, False)
+        assert st.positions_readable
+        d = assess(st, _MKT, base_size=100.0, max_position=1_000.0,
+                   ring_pct=2.0, half_spread_pct=0.5)
+        assert d.action is RiskAction.NORMAL, flat
+

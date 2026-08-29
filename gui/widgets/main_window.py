@@ -2211,8 +2211,13 @@ class MainWindow(QMainWindow):
         still be takeable -- which shows STOPPING rather than a false OFF.
         """
         if self._bridge is None:
-            # Nothing connected, so nothing of ours can be resting.
-            return True
+            # [review round 11] Unknown, NOT empty. Dexie offers rest on
+            # chain and survive this process, so "no bridge yet" is an
+            # absence of evidence -- exactly what the docstring above says
+            # must not read as an empty book. In production this is a
+            # startup transient (set_bridge() lands right after
+            # construction); while it lasts, STOPPING is the honest state.
+            return False
         try:
             svc = self._bridge.metrics_service
             # [review] A DISCONNECTED metrics service does not raise: every

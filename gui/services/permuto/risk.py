@@ -106,6 +106,17 @@ class MarginState:
     equity_usd: float = 0.0
     used_margin_usd: float = 0.0
     positions: dict = field(default_factory=dict)
+
+    positions_readable: bool = True
+    """Whether the positions field was PRESENT and well-typed.
+
+    [review round 11] An empty dict is a genuinely flat account; a missing
+    or wrong-typed positions payload is an account we cannot read -- and
+    the two used to collapse into the same {}, so a payload with valid
+    equity but no readable positions let every market quote risk-increasing
+    size against unknown inventory. assess() forces FLATTEN when this is
+    False.
+    """
     carried: bool = False
 
     def utilisation(self) -> float:
@@ -199,6 +210,12 @@ def assess(
     Ordered so that the checks which make quoting UNSAFE come before the ones
     that merely resize it -- the same ordering discipline as quoting.decide().
     """
+    if not state.positions_readable:
+        return RiskDecision(
+            RiskAction.FLATTEN, 0.0, 0.0,
+            "the account's positions could not be read -- unknown inventory "
+            "is the strongest reason to stop, not a flat book",
+        )
     position = float(state.positions.get(market, 0.0) or 0.0)
     if not math.isfinite(position):
         # [review] A NaN position fails the limit comparison below and is

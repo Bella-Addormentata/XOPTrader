@@ -128,13 +128,13 @@ def may_turn_on(inputs: SwitchInputs) -> tuple[bool, str]:
     Only the FIRST gate is named. An operator acts on one thing at a time,
     and a switch that recites four reasons teaches people to stop reading it.
     """
-    if not inputs.book_is_empty and not inputs.desired_on:
-        # Turning on over an unconfirmed stop would post a fresh book on top
-        # of cancel spends that have not settled -- the same coins committed
-        # twice, which is what the watchdog latch exists to prevent on the
-        # engine side.
-        return False, GATE_LABELS["cancels_pending"]
-
+    # [review round 11] Named gates FIRST. The unknown-book refusal used to
+    # outrank them, so a fresh GUI with no engine connection -- where the
+    # book is unknown because nothing has looked -- refused with "the
+    # previous stop is still confirming", which is neither true nor
+    # actionable. "The engine is not running" is what the operator can fix.
+    # The book check still blocks when it is the ONLY obstacle, which is the
+    # case it was written for.
     for key in _GATE_ORDER:
         if key in inputs.gates:
             return False, GATE_LABELS.get(key, key)
@@ -142,6 +142,13 @@ def may_turn_on(inputs: SwitchInputs) -> tuple[bool, str]:
         # An unknown gate still blocks. Failing open on a reason we do not
         # recognise would make every future gate a silent no-op here.
         return False, sorted(inputs.gates)[0]
+
+    if not inputs.book_is_empty and not inputs.desired_on:
+        # Turning on over an unconfirmed stop would post a fresh book on top
+        # of cancel spends that have not settled -- the same coins committed
+        # twice, which is what the watchdog latch exists to prevent on the
+        # engine side.
+        return False, GATE_LABELS["cancels_pending"]
     return True, ""
 
 

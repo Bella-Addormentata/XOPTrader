@@ -660,6 +660,12 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
     # sentinel simply never reached it.
     positions = {}
     raw = account.get("positions")
+    # [review round 11] Present-and-well-typed is a separate fact from
+    # empty. {} and [] are genuinely flat accounts; a MISSING key or a
+    # wrong-typed value is an account whose inventory we cannot see, and
+    # collapsing both into {} let assess() read unknown inventory as flat
+    # and add risk against it.
+    positions_readable = isinstance(raw, (dict, list))
     if isinstance(raw, dict):
         for market, value in raw.items():
             try:
@@ -695,5 +701,6 @@ def _margin_state(account: Any, carried: bool) -> MarginState:
         equity_usd=equity,
         used_margin_usd=used,
         positions=positions,
+        positions_readable=positions_readable,
         carried=carried,
     )

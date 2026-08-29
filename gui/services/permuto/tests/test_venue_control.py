@@ -171,8 +171,13 @@ def window():
     return MainWindow()
 
 
-def test_both_switches_start_off(window):
-    assert window._dexie_switch.text() == "DEXIE OFF"
+def test_both_switches_start_honestly(window):
+    """[review round 11] Dexie starts STOPPING, not OFF: with no bridge the
+    book is UNKNOWN, and dexie offers rest on chain and survive this
+    process -- "off and nothing is resting" is a claim nothing has checked.
+    Permuto starts OFF because its unverified book is deliberately reported
+    empty (arming is what reconciles it; see _gather_permuto)."""
+    assert window._dexie_switch.text() == "DEXIE STOPPING"
     assert window._permuto_switch.text() == "PERMUTO OFF"
 
 
@@ -180,8 +185,11 @@ def test_dexie_refuses_while_the_engine_is_down(window):
     seen = []
     window._dexie_switch.refused.connect(seen.append)
     window._dexie_switch.click()
+    # Gates-first ordering: with the engine down AND an unknown book, "the
+    # engine is not running" is the refusal the operator can act on --
+    # "previous stop still confirming" would be neither true nor fixable.
     assert seen == ["the engine is not running"]
-    assert window._dexie_switch.text() == "DEXIE OFF"
+    assert window._dexie_switch.text() == "DEXIE STOPPING"
 
 
 def test_permuto_refuses_until_registered(window):
