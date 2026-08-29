@@ -129,11 +129,28 @@ class QuoteRunner:
         ones -- which are precisely the beliefs that cause a silent HOLD on an
         empty book.
         """
-        rows = []
+        # [review round 11] A MALFORMED payload keeps the old belief; only a
+        # well-formed one may declare the book empty. Normalising garbage to
+        # [] overwrote the belief with "empty", and an empty belief SKIPS the
+        # safety cancel on the withdraw and flatten paths -- so a venue
+        # hiccup that mangled one open_orders response could leave live
+        # orders resting precisely when risk wanted them gone. Keeping the
+        # stale belief errs the other way: at worst a cancel is sent for
+        # orders already gone, which changes nothing.
         if isinstance(open_orders, dict):
-            rows = open_orders.get("orders") or open_orders.get("open") or []
+            rows = open_orders.get("orders", open_orders.get("open"))
+            if not isinstance(rows, list):
+                _log.warning("permuto: open_orders carried no order list "
+                             "(%r) -- keeping the previous belief",
+                             str(open_orders)[:200])
+                return
         elif isinstance(open_orders, list):
             rows = open_orders
+        else:
+            _log.warning("permuto: open_orders was %s, not an object -- "
+                         "keeping the previous belief",
+                         type(open_orders).__name__)
+            return
 
         seen: dict = {m: {"bid": None, "ask": None} for m in self._markets}
         for row in rows:
@@ -581,16 +598,25 @@ class QuoteRunner:
         # so this is deliberately conservative: any status other than a
         # clean acceptance is surfaced loudly and reported in the result,
         # and reconcile() heals the belief from open_orders next tick.
-        batch_note = ""
         if isinstance(response, dict):
             status = str(response.get("status", "")).lower()
             if status and status not in ("ok", "success", "accepted"):
-                batch_note = (" -- batch status %r; some legs may "
-                              "not rest" % status)
+                # [review round 11] A non-clean status is a FAILED tick, not
+                # an annotated success. Recording every requested leg as
+                # resting and returning ok meant a venue answering "partial"
+                # forever kept the toolbar ON while one side never rested.
+                # _resting is left untouched; the next open_orders
+                # reconciliation establishes what was actually accepted.
                 _log.warning(
                     "permuto: batch_upsert returned status %r (body %r); "
                     "believing open_orders over our own send",
                     status, str(response)[:400])
+                return TickResult(
+                    "error",
+                    "batch status %r -- legs not recorded as resting; "
+                    "reconciling from open_orders next tick" % status,
+                    results,
+                    error="batch status %r" % status)
 
         # Believe only what we just sent, and only after it was accepted.
         for leg in legs:
@@ -602,8 +628,7 @@ class QuoteRunner:
             self._resting[leg.market] = current
 
         self._reopen_pending = False
-        return TickResult("quote", "%d legs%s" % (len(legs), batch_note),
-                          results)
+        return TickResult("quote", "%d legs" % len(legs), results)
 
     def _base_size(self, oracle: Optional[float]) -> float:
         """Contracts that carry ``target_depth_usd`` of notional per side."""

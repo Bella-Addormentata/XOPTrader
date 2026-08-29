@@ -844,3 +844,36 @@ def test_a_missing_positions_payload_is_not_a_flat_account():
                    ring_pct=2.0, half_spread_pct=0.5)
         assert d.action is RiskAction.NORMAL, flat
 
+
+def test_a_malformed_open_orders_payload_keeps_the_previous_belief():
+    """[review round 11] Normalising garbage to [] declared the book empty,
+    and an empty belief SKIPS the safety cancel on the withdraw and flatten
+    paths -- one mangled response could leave live orders resting precisely
+    when risk wanted them gone."""
+    r = _runner(_Client())
+    r._resting[_MKT] = RestingQuote(0.0698, 0.0702)
+
+    for garbage in ({"unexpected": "shape"}, "nonsense", None, 42):
+        r.reconcile(garbage)
+        assert not r._resting[_MKT].empty, garbage
+
+    # A WELL-FORMED empty list is still authoritative.
+    r.reconcile({"orders": []})
+    assert r._resting[_MKT].empty
+
+
+def test_a_non_clean_batch_status_is_a_failed_tick_not_a_quote():
+    """[review round 11] Recording every leg as resting and returning ok on
+    "partial" kept the toolbar ON while one side never rested."""
+    class _Partial(_Client):
+        def batch_upsert(self, legs, now_s):
+            self.calls.append("batch_upsert")
+            return {"status": "partial", "results": []}
+
+    r = _runner(_Partial())
+    result = r.tick(1.0, _ORACLE, {})
+    assert not result.ok
+    assert "partial" in (result.error or "")
+    assert r._resting[_MKT].empty, (
+        "legs were recorded as resting off a non-clean status")
+
