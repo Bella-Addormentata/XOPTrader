@@ -105,13 +105,15 @@ def _venue_answered_and_refused(exc: BaseException) -> bool:
     )
 
 
-def _request(method: str, path: str, payload: Optional[dict] = None) -> Any:
+def _request(method: str, path: str, payload: Optional[dict] = None,
+             timeout: Optional[float] = None) -> Any:
     body = json.dumps(payload).encode() if payload is not None else None
     req = urllib.request.Request(
         BASE_URL + path, data=body, headers=_HEADERS, method=method
     )
     try:
-        with urllib.request.urlopen(req, timeout=_TIMEOUT) as resp:
+        with urllib.request.urlopen(
+                req, timeout=_TIMEOUT if timeout is None else timeout) as resp:
             return json.loads(resp.read().decode())
     except urllib.error.HTTPError as exc:
         detail = ""

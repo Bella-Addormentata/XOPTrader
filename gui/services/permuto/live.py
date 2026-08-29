@@ -39,11 +39,27 @@ from gui.services.permuto.runner import QuoteRunner
 
 _log = logging.getLogger(__name__)
 
+#: Threads that outlived their join budget. Held only so Qt never destroys a
+#: QThread that is still running; nothing ever reads this.
+_ABANDONED: list = []
+
 __all__ = ["MARKETS", "PermutoLive"]
 
 #: The three vol markets. Symbols, not oracle tickers -- order routes reject
 #: the ticker form with HTTP 400 on every leg.
 MARKETS = ["QQQ-VOL-PERP", "NVDA-VOL-PERP", "TSLA-VOL-PERP"]
+
+#: Per-request timeout inside the quoting loop.
+#:
+#: [review] Deliberately far below auth._TIMEOUT (30s). A 30s ceiling inside
+#: a 5s tick is wrong on its own terms -- one slow request stalls six ticks'
+#: worth of quoting -- and it is what made window close dangerous: the worker
+#: only checks the stop flag between ticks, so an in-flight tick against a
+#: degraded venue could outlast the whole shutdown budget and be killed
+#: before its cancel ran. Bounding the I/O is what makes a bounded shutdown
+#: honest. A request that has not answered in this long has already missed
+#: the tick it belonged to.
+REQUEST_TIMEOUT_S = 4.0
 
 #: Seconds between ticks. The oracle resamples every 5s and depth is measured
 #: against a FRESH one, so a slower loop quotes against a value the venue has
@@ -66,8 +82,10 @@ def _default_venue_state() -> dict:
     from gui.services.permuto.auth import _request
 
     try:
-        oracle_doc = _request("GET", "/info/oracle") or {}
-        meta = _request("GET", "/info/meta") or {}
+        oracle_doc = _request("GET", "/info/oracle",
+                              timeout=REQUEST_TIMEOUT_S) or {}
+        meta = _request("GET", "/info/meta",
+                        timeout=REQUEST_TIMEOUT_S) or {}
     except Exception as exc:  # noqa: BLE001
         raise VenueStateUnreadable("public routes failed: %s" % exc) from exc
 
@@ -262,7 +280,8 @@ class PermutoLive(QObject):
         self._identity = identity
         self._markets = list(markets or MARKETS)
         self._client = client or PermutoClient(
-            identity, session_token=session_token)
+            identity, session_token=session_token,
+            timeout=REQUEST_TIMEOUT_S)
         self._runner = QuoteRunner(
             self._client, self._markets,
             target_depth_usd=target_depth_usd,
@@ -336,9 +355,50 @@ class PermutoLive(QObject):
         # cannot do.
         thread.quit()
         if not thread.wait(timeout_ms):
-            _log.warning("permuto: live thread did not stop; terminating")
-            thread.terminate()
-            thread.wait(2_000)
+            # [review] CANCEL BEFORE TERMINATING. terminate() is
+            # TerminateThread on Windows: the frame is destroyed without
+            # unwinding, so the worker's `finally` -- the thing that owns the
+            # cancel -- never runs. The old code went straight there, which
+            # meant a slow venue turned window close into "OFF over a live
+            # book", the one outcome this class exists to prevent.
+            #
+            # So the cancel is issued from HERE first, on our own thread,
+            # bounded by the same short request timeout the loop uses. It may
+            # duplicate the worker's if that is what is hanging; a duplicate
+            # cancel is harmless and an uncancelled book is not.
+            _log.critical("permuto: the live thread did not stop in %dms -- "
+                          "cancelling from the GUI thread before terminating",
+                          timeout_ms)
+            try:
+                self._client.cancel_all(time.time())
+                self._book_empty = True
+                _log.critical("permuto: last-resort cancel SENT")
+            except Exception as exc:  # noqa: BLE001
+                self._book_empty = False
+                _log.critical("permuto: last-resort cancel FAILED (%s) -- "
+                              "orders may still be resting at the venue; "
+                              "check the book by hand", exc)
+            # DO NOT TERMINATE. terminate() is TerminateThread on Windows,
+            # and if it lands while the worker holds the GIL -- which it does
+            # whenever it is running Python rather than blocked in a socket
+            # -- the wait() after it can never reacquire the interpreter and
+            # closeEvent hangs FOREVER. That is strictly worse than the slow
+            # exit it was meant to bound, and a test written for this path
+            # hung on exactly it.
+            #
+            # The book has just been retracted above, which is the part that
+            # matters. The thread is abandoned to the process teardown, and
+            # its objects are parked in a module-level list so the QThread is
+            # never garbage-collected while still running -- that would be
+            # the "destroyed while thread is still running" abort this file
+            # already carries a comment about.
+            _ABANDONED.append((thread, self._worker))
+            _log.critical("permuto: the live thread is abandoned to process "
+                          "exit rather than terminated (terminating it can "
+                          "deadlock the GUI)")
+            self._thread = None
+            self._worker = None
+            return
         self._thread = None
         self._worker = None
 

@@ -7,6 +7,7 @@ that throws does not end a session meant to run for 102 unattended hours.
 
 from __future__ import annotations
 
+import threading
 import time
 
 import pytest
@@ -214,7 +215,7 @@ def _venue_state(meta, oracle=None):
         m.replace("-PERP", ""): 0.07 for m in MARKETS}
     real = auth_mod._request
 
-    def fake(method, path, payload=None):
+    def fake(method, path, payload=None, **kw):
         return {"prices": prices} if path == "/info/oracle" else meta
 
     auth_mod._request = fake
@@ -259,3 +260,36 @@ def test_an_explicitly_non_active_market_is_carried():
                         for i, m in enumerate(_ACTIVE["markets"])]}
     assert _venue_state(meta)["flags"]["carried"] is True
 
+
+def test_a_thread_that_will_not_stop_is_still_flattened(qapp):
+    """[review] terminate() is TerminateThread on Windows: the frame dies
+    without unwinding, so the worker's `finally` -- which owns the cancel --
+    never runs. Going straight there turned a slow venue into "OFF over a
+    live book" on window close, which is the one outcome this class exists
+    to prevent. The cancel is issued from the joining thread first.
+    """
+    live = _live(qapp)
+
+    entered = threading.Event()
+    release = threading.Event()
+
+    class _Stuck:
+        """Blocks INSIDE the tick, which is the only place the worker cannot
+        observe the stop flag -- exactly the in-flight request case."""
+        def tick(self, now_s, oracles, flags):
+            entered.set()
+            release.wait(20)          # released in the finally below
+
+    live._runner = _Stuck()
+    live.start()
+    try:
+        assert entered.wait(5), "the worker never reached the tick"
+
+        live.join(timeout_ms=300)     # far too short, on purpose
+
+        assert live._client.cancels, "terminated without retracting the book"
+        assert live.book_is_empty(), "the switch would have read OFF"
+        assert not live.is_running()
+    finally:
+        release.set()
+        qapp.processEvents()
