@@ -24,11 +24,13 @@ from __future__ import annotations
 
 import json
 import logging
+import threading
 import urllib.error
 import urllib.request
 from typing import Any, Optional, Sequence
 
 from .auth import BASE_URL, PermutoAuthError, _HEADERS, _TIMEOUT
+from .batch import BatchError
 from .session import RenewAction, SessionState, renew_action
 
 _log = logging.getLogger(__name__)
@@ -93,6 +95,14 @@ class PermutoClient:
         self._identity = identity
         self._base_url = base_url.rstrip("/")
         self._timeout = timeout
+        # [review round 9] The placement fence. Set from the joining thread
+        # when the session is being torn down: a worker tick already in
+        # flight cannot see _stop until it returns, so without this it could
+        # resume AFTER join()'s last-resort cancel and place a fresh batch --
+        # orders left live at the venue while the process exits claiming an
+        # empty book. Only placements are fenced; cancels must keep working
+        # during shutdown, which is the whole point of shutting down.
+        self._halt_placements = threading.Event()
         self.session = SessionState(
             token=session_token, expires_at_s=expires_at_s
         )
@@ -305,6 +315,10 @@ class PermutoClient:
     # ------------------------------------------------------------------ #
     # Trading
     # ------------------------------------------------------------------ #
+    def halt_placements(self) -> None:
+        """No further batch_upsert will be issued. Cancels still work."""
+        self._halt_placements.set()
+
     def batch_upsert(self, legs: Sequence[dict], now_s: float) -> Any:
         """POST a batch built by :func:`batch.build_upsert_batch`.
 
@@ -317,6 +331,12 @@ class PermutoClient:
             # no-op that still spends a request and can read, in logs, like a
             # withdrawal that never happened.
             return {}
+        # Re-read IMMEDIATELY before the request, the same discipline the
+        # engine applies to watchdog_fired_ before take_offer: the fence
+        # exists for a tick that was already past every earlier check when
+        # the shutdown began.
+        if self._halt_placements.is_set():
+            raise BatchError("placements halted for shutdown")
         return self._retry_once_on_401(
             "POST", "/exchange/batch_upsert", {"orders": list(legs)}, now_s
         )

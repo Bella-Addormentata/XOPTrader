@@ -345,6 +345,17 @@ class PermutoLive(QObject):
         if thread is None:
             return
         self.stop()
+        # [review round 9] Fence placements BEFORE anything else. A tick
+        # already in flight cannot observe the stop flag until it returns, so
+        # it could otherwise resume after the last-resort cancel below and
+        # place a fresh batch -- the book left live while the process exits
+        # claiming it is empty. Once a stop is requested, off means flat, and
+        # a placement that slips past the fence onto the wire is covered by
+        # the cancels that follow it on both paths.
+        try:
+            self._client.halt_placements()
+        except Exception:  # noqa: BLE001 - a fake client without the method
+            pass
         # [review] quit() DIRECTLY, not through worker.stopped -> thread.quit.
         #
         # That connection is auto, and the QThread OBJECT lives in the GUI

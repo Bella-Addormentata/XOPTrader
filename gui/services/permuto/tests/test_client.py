@@ -457,3 +457,29 @@ def test_a_timeout_during_the_body_read_is_still_an_auth_error(monkeypatch):
     with pytest.raises(PermutoAuthError):
         c.open_orders(1.0)
 
+
+def test_the_placement_fence_refuses_batches_but_not_cancels(monkeypatch):
+    """[review round 9] A tick in flight cannot see the stop flag until it
+    returns, so it could resume AFTER join()'s last-resort cancel and place a
+    fresh batch -- orders left live while the process exits claiming an empty
+    book. The fence sits at the placement chokepoint both threads share, and
+    cancels stay open because shutting down IS cancelling."""
+    from gui.services.permuto.batch import BatchError
+    from gui.services.permuto.client import PermutoClient
+
+    sent = []
+    c = PermutoClient(_Identity(), session_token="tok")
+    c.session.expires_at_s = 1e12
+    monkeypatch.setattr(
+        c, "_request",
+        lambda m, p, payload=None, **kw: sent.append((m, p)) or {})
+
+    c.halt_placements()
+    with pytest.raises(BatchError):
+        c.batch_upsert([{"market": "X"}], 1.0)
+    assert not sent, "the halted batch still reached the wire"
+
+    c.cancel_all(2.0)
+    assert sent and sent[-1][1] == "/exchange/cancel_all", (
+        "the fence must not block the cancel it exists to protect")
+

@@ -307,6 +307,7 @@ def test_a_non_boolean_pause_flag_is_unreadable_not_unpaused(bad):
 
 
 def test_a_real_boolean_pause_flag_is_read():
-    meta = dict(_ACTIVE); meta["flags"] = {"trading_paused": True}
+    meta = dict(_ACTIVE)
+    meta["flags"] = {"trading_paused": True}
     assert _venue_state(meta)["flags"]["trading_paused"] is True
 
