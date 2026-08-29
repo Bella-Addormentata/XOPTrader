@@ -1398,13 +1398,15 @@ asio::awaitable<void> Engine::poll_loop_coro()
                     }
                     node_ok = usable
                            && node_no_progress_polls_
-                                  < risk::kNodeFailuresBeforeWalletFallback;
+                                  < risk::kNodePollsWithoutProgress;
                     if (usable && !node_ok) {
                         spdlog::error("[Engine] [S28] the full node has "
-                                      "answered {} times without advancing "
-                                      "past block {} -- treating it as failed "
-                                      "so the wallet fallback can run",
-                                      node_no_progress_polls_, seen);
+                                      "answered {} times ({}s) without "
+                                      "advancing past block {} -- treating it "
+                                      "as frozen so the wallet fallback runs",
+                                      node_no_progress_polls_,
+                                      risk::kNodePollsWithoutProgress * 5,
+                                      seen);
                     }
                 } catch (const std::exception& ex) {
                     node_ok = false;

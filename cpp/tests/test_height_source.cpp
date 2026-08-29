@@ -13,6 +13,7 @@ using xop::risk::HeightSourceState;
 using xop::risk::height_fallback_allowed;
 using xop::risk::height_is_usable;
 using xop::risk::kNodeFailuresBeforeWalletFallback;
+using xop::risk::kNodePollsWithoutProgress;
 using xop::risk::kNodeSuccessesBeforeReturn;
 using xop::risk::next_height_source;
 
@@ -169,4 +170,38 @@ TEST(HeightIsUsable, StillRejectsNegativeAndBackwards) {
     EXPECT_FALSE(height_is_usable(99, 100));
     EXPECT_TRUE(height_is_usable(100, 100));
     EXPECT_TRUE(height_is_usable(101, 100));
+}
+
+// ---------------------------------------------------------------------------
+// [sweep] The no-progress bound must clear a REAL block interval.
+//
+// The first version reused kNodeFailuresBeforeWalletFallback, which counts
+// failed CALLS -- a different event with a different scale. Six polls at the
+// ~5s cadence is 30 seconds, and 28% of the 1,934 block intervals recorded in
+// logs/ are longer than that, so it would have declared a healthy node frozen
+// several times an hour.
+// ---------------------------------------------------------------------------
+
+TEST(NodeProgressBound, ClearsTheLongestObservedBlockInterval) {
+    // p50 17s, p90 57s, p99 106s, max 181s over 1,934 intervals.
+    constexpr int kPollSeconds = 5;
+    constexpr int kLongestObserved = 181;
+    const int bound_seconds =
+        static_cast<int>(kNodePollsWithoutProgress) * kPollSeconds;
+    EXPECT_GT(bound_seconds, kLongestObserved)
+        << "the bound fires inside a normal block interval";
+    // And with real headroom, not a hair.
+    EXPECT_GT(bound_seconds, kLongestObserved * 3 / 2);
+}
+
+TEST(NodeProgressBound, IsNotTheFailureThreshold) {
+    // Different events, different scales. Sharing one constant is what made
+    // the first version fire against healthy nodes.
+    EXPECT_NE(kNodePollsWithoutProgress, kNodeFailuresBeforeWalletFallback);
+    EXPECT_GT(kNodePollsWithoutProgress, kNodeFailuresBeforeWalletFallback);
+}
+
+TEST(NodeProgressBound, StillCatchesAGenuinelyFrozenNodeInMinutes) {
+    // A node that never advances must not be tolerated indefinitely.
+    EXPECT_LE(static_cast<int>(kNodePollsWithoutProgress) * 5, 600);
 }

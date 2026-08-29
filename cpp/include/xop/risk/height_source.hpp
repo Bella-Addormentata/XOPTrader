@@ -73,6 +73,26 @@ struct HeightSourceState {
 /// case.
 inline constexpr std::uint32_t kNodeFailuresBeforeWalletFallback = 6;
 
+/// Consecutive polls a node may answer WITHOUT advancing before it counts as
+/// frozen.
+///
+/// Deliberately not the failure threshold above, which counts failed CALLS --
+/// a different event with a different natural scale. An unchanged tip is the
+/// NORMAL state between blocks, so this bound has to clear the real block
+/// interval by a wide margin or it fires against a healthy node.
+///
+/// MEASURED, because the first version of this reused the failure threshold
+/// and was catastrophically wrong: 6 polls at the ~5s cadence is 30 seconds,
+/// and 28% of real block intervals are longer than that. It would have
+/// declared a healthy node frozen several times an hour and moved the source
+/// to the wallet each time.
+///
+/// 1,934 intervals between processed blocks in `logs/`: p50 17s, p90 57s,
+/// p99 106s, max 181s. At 60 polls (300s) not one real interval reaches the
+/// bound, with 65% headroom over the longest ever observed -- while a
+/// genuinely frozen node is still caught in five minutes rather than never.
+inline constexpr std::uint32_t kNodePollsWithoutProgress = 60;
+
 /// Consecutive node successes required to go back.
 ///
 /// Higher than the fallback threshold ON PURPOSE. A node that is flapping --
