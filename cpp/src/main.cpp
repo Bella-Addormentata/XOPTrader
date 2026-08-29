@@ -498,11 +498,41 @@ int main(int argc, char* argv[]) {
     if (cli.dry_run) {
         namespace fs = std::filesystem;
         try {
+            // [review round 11] Reap only ORPHANED copies. Multiple dry
+            // runs are legal now (kill_old_instances is skipped), and on
+            // POSIX unlinking another live run's open database succeeds --
+            // its next connection at that path would find a fresh empty
+            // file instead of the snapshot it was reading. The pid is in
+            // the filename; a copy is swept only when that process is
+            // provably gone.
+            auto pid_alive = [](long long pid) -> bool {
+                if (pid <= 0) return false;
+#ifdef _WIN32
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, static_cast<DWORD>(pid));
+                if (!h) return false;
+                DWORD code = 0;
+                const bool alive = GetExitCodeProcess(h, &code)
+                                   && code == STILL_ACTIVE;
+                CloseHandle(h);
+                return alive;
+#else
+                return ::kill(static_cast<pid_t>(pid), 0) == 0
+                       || errno == EPERM;
+#endif
+            };
             std::error_code sweep_ec;
             for (const auto& entry : fs::directory_iterator(
                      fs::temp_directory_path(), sweep_ec)) {
                 const auto name = entry.path().filename().string();
-                if (name.rfind("xop_dryrun_", 0) == 0) {
+                if (name.rfind("xop_dryrun_", 0) != 0) continue;
+                long long owner = 0;
+                try {
+                    owner = std::stoll(name.substr(11));
+                } catch (const std::exception&) {
+                    owner = 0;   // unparseable -> treat as orphaned
+                }
+                if (!pid_alive(owner)) {
                     fs::remove(entry.path(), sweep_ec);
                 }
             }
