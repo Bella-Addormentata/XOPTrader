@@ -580,3 +580,31 @@ def test_an_unreadable_account_still_flattens():
     r = _runner(c)
     assert r.tick(1.0, _ORACLE, {}).action == "withdraw"
     assert "cancel_all" in c.calls
+
+
+def test_one_markets_risk_retraction_is_not_skipped_because_another_quotes():
+    """[sweep] The same mistake as the withdraw path, one commit later.
+
+    A market past its position limit was left holding a live two-sided book
+    because a NEIGHBOUR merely needed a refresh. Risk is per-market and so is
+    the retraction.
+    """
+    c = _Client(
+        open_orders={"orders": [
+            {"market": _MKT, "side": "buy", "price": 0.0698},
+            {"market": _MKT, "side": "sell", "price": 0.0702},
+        ]},
+        account={
+            "equity_usd": 1_000.0,
+            "used_margin_usd": 1_000.0 * FLATTEN_MARGIN_UTILISATION,
+            "positions": {},
+        },
+    )
+    r = _runner2(c)                     # QQQ holds a book; NVDA has none
+    r._resting[_MKT] = RestingQuote(0.0698, 0.0702)
+
+    result = r.tick(1.0, _BOTH, {})
+    assert "cancel_all" in c.calls, "the at-risk market was left live"
+    assert _MKT in (c.cancelled[0] or [])
+    assert result.action in ("withdraw", "hold", "quote")
+    assert r._resting[_MKT].empty

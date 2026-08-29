@@ -349,7 +349,14 @@ class PermutoIdentity:
             # the key is unknown there, the operator can discard deliberately
             # and create a new one. Only for a DIFFERENT key -- restoring the
             # same phrase over its own registration must not disturb it.
-            if different_key and not section.get("registered"):
+            # [sweep] `different_key` is FALSE on a genuinely fresh install,
+            # because `stored` is None -- so the guard added for the
+            # machine-move path did not fire in the machine-move case, which
+            # is the whole scenario it was written for. Restoring onto a
+            # clean machine showed the identity as ready to Register even
+            # though the phrase may already own an account.
+            same_key = (stored is not None and stored == pubkey)
+            if not same_key and not section.get("registered"):
                 section["link_attempted_at"] = (
                     datetime.now(timezone.utc).isoformat())
             self._io.write(secrets)

@@ -486,3 +486,21 @@ def test_restoring_the_same_phrase_does_not_disturb_its_registration():
     info = ident.info()
     assert info.registered is True
     assert info.link_attempted is False
+
+
+def test_restoring_onto_a_clean_machine_needs_reconciliation_too():
+    """[sweep] The guard did not fire in the case it was written for.
+
+    `different_key` compares against a STORED key, and a fresh install has
+    none -- so restoring a phrase onto a clean machine, which is the entire
+    advertised machine-move path, showed the identity as ready to Register
+    even though it may already own an account.
+    """
+    ident = PermutoIdentity(FakeSecretsIO(), protector=FakeProtector())
+    phrase = generate_mnemonic()
+
+    ident.restore(phrase)
+    info = ident.info()
+    assert info.link_attempted is True, "a clean-machine restore was not gated"
+    assert info.registered is False
+    assert info.backup_confirmed is True

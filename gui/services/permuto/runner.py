@@ -286,18 +286,30 @@ class QuoteRunner:
 
         # A market holding a live quote that risk wants shrunk or gone must
         # act now, whatever decide() thought of the quote itself.
+        # Only markets the quoting loop below will NOT reach. One that is
+        # re-quoting already handles its own risk action there -- cancel then
+        # place the shrinking side -- and pre-empting it here would cancel
+        # the book and then skip the replacement, leaving the market flat
+        # when it should have been reduced.
         risk_forced = [
             m for m, r in risk_by_market.items()
             if r.action is not RiskAction.NORMAL
             and not self._resting.get(m, RestingQuote()).empty
+            and results.get(m, ("", ""))[0] != LoopAction.QUOTE.value
         ]
-        if risk_forced and not any_quoted:
+        # [sweep] Unconditional, NOT `and not any_quoted`. This is the same
+        # mistake as the withdraw path two commits ago: a market past its
+        # position or margin limit was left holding a live two-sided book
+        # because a NEIGHBOUR happened to need a refresh. Risk is per-market
+        # and so is the retraction.
+        if risk_forced:
             worst = risk_by_market[risk_forced[0]]
             self._client.cancel_all(now_s, risk_forced)
             for market in risk_forced:
                 self._resting[market] = RestingQuote()
                 results[market] = (worst.action.value, worst.reason)
-            return TickResult("withdraw", worst.reason, results)
+            if not any_quoted:
+                return TickResult("withdraw", worst.reason, results)
 
         if not any_quoted:
             wait = LoopAction.WAIT.value
