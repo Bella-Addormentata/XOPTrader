@@ -1794,6 +1794,52 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
     }
 
+    // [review] HOISTED OUT of the recovery-mode branch.
+    //
+    // This latch used to sit inside the `else` of `if (xch_recovery_mode_)`,
+    // so it was skipped entirely whenever recovery was active -- while Step 9
+    // arbitrage, which TAKES offers, still runs in that mode. A book that
+    // cannot be valued could therefore be traded against for one cycle before
+    // Step 13 discovered it.
+    //
+    // Hoisting does not stop recovery from restoring XCH: step_xch_recovery
+    // runs above this point, and this only sets breaker_pause_active_, which
+    // gates Steps 7-8 and the taker paths -- not recovery itself.
+    // [S27 review] LATCH BEFORE TRADING, not in Step 13.
+    //
+    // unvaluable_book_must_fail_closed() was only evaluated in
+    // step_check_alerts(), which runs AFTER ladder generation, offer
+    // management, drift correction and arbitrage -- so the first cycle to
+    // discover an unvaluable book could post offers and execute takes before
+    // the flag that is supposed to stop it existed.
+    //
+    // The verdict this reads is the PREVIOUS cycle's, which is sufficient
+    // and is why it can run here at all: the predicate requires the drawdown
+    // grace to have elapsed, and the valuation flags have been recomputed
+    // every cycle throughout that grace. So by the cycle the condition first
+    // holds, the inputs are already true and the latch closes before this
+    // cycle trades rather than after.
+    // Idempotent -- Step 13 still evaluates it and owns the operator-facing
+    // logging and alert, which needs this cycle's equity figure.
+    if (risk::unvaluable_book_must_fail_closed(
+            drawdown_grace_remaining_ == 0,
+            valuation_degraded_,
+            valuation_all_unpriced_,
+            peak_equity_hwm_usd_,
+            valuation_holds_anything_)
+        && !breaker_pause_active_) {
+        breaker_pause_active_ = true;
+        // [review] Step 13's branch is gated on !breaker_pause_active_, so
+        // latching here silently SUPPRESSED the detailed log and the
+        // operator alert -- the exact report the comment promised. Record
+        // that the report is still owed; Step 13 clears it once sent.
+        unvaluable_report_pending_ = true;
+        state_->set_status(BotStatus::Paused);
+        spdlog::error("[Engine] [S27] the book cannot be valued and the "
+                      "grace has elapsed -- pausing BEFORE this cycle trades. "
+                      "Step 13 reports the detail.");
+    }
+
     // -- Dynamic market allocator: re-score pairs periodically. ------------
     // Must run before Step 7 (ladder generation) so that allocation fractions
     // are up-to-date when capital is distributed across pairs.
@@ -1833,41 +1879,6 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
         }
     }
 
-    // [S27 review] LATCH BEFORE TRADING, not in Step 13.
-    //
-    // unvaluable_book_must_fail_closed() was only evaluated in
-    // step_check_alerts(), which runs AFTER ladder generation, offer
-    // management, drift correction and arbitrage -- so the first cycle to
-    // discover an unvaluable book could post offers and execute takes before
-    // the flag that is supposed to stop it existed.
-    //
-    // The verdict this reads is the PREVIOUS cycle's, which is sufficient
-    // and is why it can run here at all: the predicate requires the drawdown
-    // grace to have elapsed, and the valuation flags have been recomputed
-    // every cycle throughout that grace. So by the cycle the condition first
-    // holds, the inputs are already true and the latch closes before this
-    // cycle trades rather than after.
-    //
-    // Idempotent -- Step 13 still evaluates it and owns the operator-facing
-    // logging and alert, which needs this cycle's equity figure.
-    if (risk::unvaluable_book_must_fail_closed(
-            drawdown_grace_remaining_ == 0,
-            valuation_degraded_,
-            valuation_all_unpriced_,
-            peak_equity_hwm_usd_,
-            valuation_holds_anything_)
-        && !breaker_pause_active_) {
-        breaker_pause_active_ = true;
-        // [review] Step 13's branch is gated on !breaker_pause_active_, so
-        // latching here silently SUPPRESSED the detailed log and the
-        // operator alert -- the exact report the comment promised. Record
-        // that the report is still owed; Step 13 clears it once sent.
-        unvaluable_report_pending_ = true;
-        state_->set_status(BotStatus::Paused);
-        spdlog::error("[Engine] [S27] the book cannot be valued and the "
-                      "grace has elapsed -- pausing BEFORE this cycle trades. "
-                      "Step 13 reports the detail.");
-    }
 
     try { step_generate_ladder(block_height); }
     catch (const std::exception& e) {
