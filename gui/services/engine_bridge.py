@@ -564,6 +564,45 @@ class EngineBridge(QObject):
             _log.error("Failed to create pause flag: %s", exc)
             self.error.emit(f"Could not pause trading: {exc}")
 
+    @property
+    def launched_config_path(self):
+        """[RELOAD] The --config this bridge launched the engine with, or
+        None when no engine was launched by this GUI (attached engines
+        included). Lets the Save path be honest about whether a reload can
+        reach the running process."""
+        return getattr(self, "_launched_config_path", None)
+
+    @property
+    def engine_running_locally(self) -> bool:
+        """True while a GUI-launched engine subprocess is alive."""
+        proc = getattr(self, "_engine_process", None)
+        return proc is not None and proc.poll() is None
+
+    def request_config_reload(self) -> None:
+        """[RELOAD] Ask the running engine to re-read config.yaml.
+
+        Same channel as the pause and the peg re-enable: a flag file beside
+        the database, consumed and deleted by the engine on its next
+        heartbeat. The engine applies pair DISABLES live (and cancels their
+        resting offers); everything else it logs as restart-required. With
+        no engine running the flag is consumed harmlessly at the next
+        startup, when the file is the config being loaded anyway.
+        """
+        flag_path = self._db_path.parent / "config_reload.flag"
+        try:
+            flag_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(flag_path, "w", encoding="utf-8") as fh:
+                fh.write("reload" + chr(10))
+            _log.info("Config reload requested via %s", flag_path)
+        except OSError as exc:
+            _log.error("Could not write config reload flag %s: %s",
+                       flag_path, exc)
+            # A silent failure here would leave the Settings label promising
+            # live application that cannot happen.
+            self.error.emit(
+                "Could not signal the engine to reload config -- the "
+                "running engine will NOT pick up this save. See gui.log.")
+
     def reenable_peg(self, asset_id: str) -> None:
         """[PEGSUSPEND] Ask the engine to re-enable a suspended peg.
 
@@ -1029,6 +1068,11 @@ class EngineBridge(QObject):
                     self._engine_process.pid,
                     cmd,
                     log_path,
+                )
+                # [RELOAD] Remember which config THIS engine actually
+                # runs, so a later Save can tell whether it reaches it.
+                self._launched_config_path = (
+                    self._config_path if self._config_path.is_file() else None
                 )
                 QTimer.singleShot(3_000, self._check_engine_startup_result)
                 return True

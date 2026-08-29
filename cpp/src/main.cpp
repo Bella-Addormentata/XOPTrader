@@ -654,6 +654,9 @@ int main(int argc, char* argv[]) {
         curl_global_cleanup();
         return EXIT_FAILURE;
     }
+    // [RELOAD] The engine needs its own config file locations to honour a
+    // GUI-initiated hot reload (pair disables applied live).
+    engine->set_config_paths(cli.config_path, cli.secrets_path);
 
     // ------------------------------------------------------------------
     // 6. Install signal handlers (SIGINT, SIGTERM) via std::signal.

@@ -21,6 +21,7 @@ import copy
 import logging
 import os
 import tempfile
+import time
 import threading
 from contextlib import contextmanager
 from pathlib import Path
@@ -101,7 +102,18 @@ def _atomic_write_text(path: Path, text: str, *, newline: str) -> None:
                 fh.write(text)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(tmp, path)
+            # [RELOAD] The engine re-reads config.yaml within a heartbeat
+            # of every save; on Windows its open read handle makes this
+            # os.replace raise PermissionError. The read lasts
+            # milliseconds -- absorb it instead of failing the save.
+            for _attempt in range(3):
+                try:
+                    os.replace(tmp, path)
+                    break
+                except PermissionError:
+                    if _attempt == 2:
+                        raise
+                    time.sleep(0.1)
         finally:
             try:
                 if tmp.exists():
@@ -279,7 +291,7 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
 
         buf = io.StringIO()
         yaml_rt.dump(template, buf)
-        _atomic_write_text(path, buf.getvalue(), newline=newline)
+        text = buf.getvalue()
     except Exception as exc:  # noqa: BLE001 - a save must never be lost
         _log.warning(
             "Comment-preserving write of %s failed (%s); falling back to "
@@ -287,6 +299,15 @@ def dump_preserving(path: Path, data: dict[str, Any]) -> None:
             path, exc,
         )
         _dump_plain(path, data)
+        return
+
+    # [RELOAD] The DISK write happens outside the fallback try/except: a
+    # transient OSError (e.g. os.replace losing a sharing-violation race
+    # against the engine's reload re-read of this same file) must surface
+    # as a Save Error with comments intact -- not silently downgrade to the
+    # comment-destroying plain dumper. The fallback above is reserved for
+    # genuine round-trip (ruamel) failures.
+    _atomic_write_text(path, text, newline=newline)
 
 
 def _dump_plain(path: Path, data: dict[str, Any]) -> None:

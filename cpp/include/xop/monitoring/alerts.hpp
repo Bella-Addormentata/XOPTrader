@@ -119,6 +119,13 @@ enum class AlertRule : std::uint8_t {
                                // breaker alert moments earlier would swallow
                                // the one message saying the book was just
                                // cancelled by a process that has given up.
+    ConfigReload         = 20, // [RELOAD] A GUI config save was applied (or
+                               // rejected) on the RUNNING engine. Its own
+                               // rule: a reload outcome must never be
+                               // rate-limited away by unrelated warnings --
+                               // the operator just clicked Save and is
+                               // watching for exactly this message.
+
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,

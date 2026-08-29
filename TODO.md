@@ -1,7 +1,9 @@
 # XOPTrader Master TODO List
 
 **Created:** 2026-03-24
-**Last audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
+**Last audited: 2026-08-29 (v0.10.5)** -- post-release operator-experience round: config hot-reload (a Settings save now applies pair DISABLES to the running engine live, cancelling their resting offers; enables and every other field are honestly reported as restart-required -- the 2026-08-25 "disable landed on disk but the engine kept quoting" hole), and allocation zeroing (a disabled pair's asset is applied as a 0% target while hidden from Target Portfolio Allocation; its saved percent returns when the pair does).
+
+**Previously audited: 2026-08-29 (v0.10.0)** -- the seven-PR review cycle merged:
 #115 (peg registry, S29/S30), #117 (S27+S32), #120 (S28), #121 (S31), #118
 (emergency consolidation), #116 (Permuto research + probes), and #119 (the
 complete Permuto trading stack: identity, auth, quoting, risk, the live

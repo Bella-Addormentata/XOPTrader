@@ -29,6 +29,7 @@
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <unordered_set>
 
 namespace xop {
 namespace {
@@ -555,6 +556,12 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
     std::vector<PairConfig> pairs;
     pairs.reserve(root[sec].size());
 
+    // [RELOAD] Pair names must be unique: pair_config_map_ is name-keyed
+    // (a duplicate would be shadowed last-writer-wins), and a live reload
+    // disables pairs BY NAME -- with duplicates it could flip one entry,
+    // cancel the book, alert success, and leave the twin quoting.
+    std::unordered_set<std::string> seen_names;
+
     for (std::size_t i = 0; i < root[sec].size(); ++i) {
         const YAML::Node& item = root[sec][i];
         const std::string idx  = sec + "[" + std::to_string(i) + "]";
@@ -563,6 +570,10 @@ std::vector<PairConfig> parse_pairs(const YAML::Node& root)
         p.base_asset_id  = read_string(item, "base_asset_id", idx);
         p.quote_asset_id = read_string(item, "quote_asset_id", idx);
         p.name           = read_string(item, "name", idx);
+        if (!seen_names.insert(p.name).second) {
+            throw ConfigError(idx + ".name: duplicate pair name '" + p.name
+                              + "' -- pair names must be unique");
+        }
 
         // T3-29: Normalize asset IDs to lowercase before validation.
         // Chia tools may emit uppercase hex (e.g. "A1B2..."); coerce to

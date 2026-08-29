@@ -68,6 +68,7 @@
 #include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/peg_suspension.hpp"
+#include "xop/config_reload.hpp"
 #include "xop/risk/usd_route.hpp"
 #include "xop/risk/inventory.hpp"
 #include "xop/risk/limits.hpp"
@@ -109,9 +110,11 @@
 #include <filesystem>
 #include <map>
 #include <memory>
+#include <optional>
 #include <string>
 #include <set>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -185,6 +188,11 @@ public:
     ///
     /// @throws std::runtime_error if any subsystem fails to initialise.
     Engine(const AppConfig& config, bool dry_run);
+
+    /// [RELOAD] Tell the engine which files its config was loaded from so
+    /// a GUI save can be re-read live. Optional: never calling it simply
+    /// leaves the reload flag ignored (tests, embedded use).
+    void set_config_paths(std::string config_path, std::string secrets_path);
 
     /// Destructor.  Calls shutdown() if the engine is still running.
     ~Engine();
@@ -533,6 +541,34 @@ private:
     // not a healed bridge.
     std::unordered_map<std::string, risk::PegRuntime> asset_peg_rt_;
     std::filesystem::path peg_reenable_flag_path_;
+
+    // -- [RELOAD] Config hot-reload: live pair disable ---------------------
+    //
+    // A GUI Save writes config.yaml and touches data/config_reload.flag;
+    // the engine consumes the flag each heartbeat, re-parses the file, and
+    // applies exactly one kind of change live: a pair going enabled ->
+    // disabled (flag flipped in place, resting offers cancelled). Enabling
+    // a pair, adding/removing pairs, and every other field are reported as
+    // restart-required -- their subsystems are built at construction. See
+    // config_reload.hpp for the full rationale.
+    std::filesystem::path config_reload_flag_path_;
+    std::string config_file_path_;    ///< empty => hot-reload disabled
+    std::string secrets_file_path_;
+
+    /// Pairs disabled by a live reload whose resting offers have NOT yet
+    /// been cleanly submitted for cancel. Swept every heartbeat until
+    /// empty -- OFF MEANS FLAT is an invariant, not an attempt.
+    std::unordered_set<std::string> reload_pending_cancel_;
+    /// True while the operator has been told the cancel failed; cleared
+    /// (with a follow-up alert) when a retry finally succeeds.
+    bool reload_cancel_alert_pending_ = false;
+    /// mtime of a flag file that could not be DELETED (AV lock, perms):
+    /// skip re-processing until the file changes, instead of re-parsing
+    /// the config and spamming the log every heartbeat.
+    std::optional<std::filesystem::file_time_type> reload_flag_stuck_mtime_;
+
+    asio::awaitable<void> check_config_reload_flag();
+    asio::awaitable<bool> sweep_reload_disabled_offers();
 
     [[nodiscard]] bool asset_peg_suspended(const std::string& asset_id) const;
     [[nodiscard]] bool pair_peg_suspended(const PairConfig& pc) const;

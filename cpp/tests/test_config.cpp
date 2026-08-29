@@ -1735,3 +1735,22 @@ pegged_assets:
             << "a canonicalised USD peg must still yield a par: " << written;
     }
 }
+
+
+// [RELOAD] Duplicate pair names would make a live disable flip one entry,
+// cancel the book, alert success, and leave the twin quoting. Rejected at
+// parse time so neither boot nor reload can ever see them.
+TEST(ConfigParserTest, DuplicatePairNames_Throw) {
+    std::string yaml = kMinimalValidYaml;
+    const std::string anchor = "    enabled: true\n";
+    auto pos = yaml.find(anchor);
+    ASSERT_NE(pos, std::string::npos);
+    yaml.insert(pos + anchor.size(),
+        "  - base_asset_id: \"xch\"\n"
+        "    quote_asset_id: \"fedcba9876543210fedcba9876543210"
+        "fedcba9876543210fedcba9876543210\"\n"
+        "    name: \"XCH/TEST\"\n"
+        "    enabled: true\n");
+    TempYaml tmp(yaml.c_str());
+    EXPECT_THROW(xop::load_config(tmp.path()), xop::ConfigError);
+}

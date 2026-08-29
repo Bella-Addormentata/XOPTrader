@@ -969,10 +969,10 @@ transfer and must not leak into shared code.
       residents of the 50 US states, DC and territories. The non-U.S.
       restriction applies to **live trading**, not the contest. Do not cross
       that boundary without settling it separately.
-- [ ] **C-0R** **REGISTER, or decide not to enter.** Sign-up closes Mon
-      **31 Aug 17:00 ET** and no one may join after day one. This is the
-      only hard deadline and it does not require any code. **Operator
-      decision, and the first one.**
+- [x] **C-0R** **DONE 2026-08-29** -- registered from the in-GUI identity
+      (v0.10.x Permuto tab) and visible on the leaderboard. The deadline
+      that mattered is behind us; everything below is now about being
+      GOOD on Monday, not eligible.
 - [x] **C-0S** MM rank is *gate-then-PnL*. Answered in the #svPerps
       Discord, 2026-08-11: "depth_seconds does not change rank order and is
       not combined with PnL." The agent skill was right; the rules page

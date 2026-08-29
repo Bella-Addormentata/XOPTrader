@@ -936,6 +936,33 @@ class WalletBalancesWidget(QWidget):
                 return candidate
         return None
 
+    def _enabled_pair_assets(self) -> set[str]:
+        """Upper-cased symbols participating in at least one ENABLED pair.
+
+        Empty when pairs config hasn't arrived yet -- callers treat that
+        as "unknown", not as "nothing is enabled".
+        """
+        assets: set[str] = set()
+        for pair_cfg in self._last_pairs_cfg:
+            if not pair_cfg.get("enabled", True):
+                continue
+            pair_name = str(pair_cfg.get("name", ""))
+            if not pair_name:
+                continue
+            base_asset, quote_asset = _split_pair(pair_name)
+            if base_asset:
+                assets.add(base_asset.upper())
+            if quote_asset:
+                assets.add(quote_asset.upper())
+        return assets
+
+    def _enabled_pair_names(self) -> set[str]:
+        """Names of pairs currently enabled in config.  Empty = unknown."""
+        return {
+            str(p.get("name", "")) for p in self._last_pairs_cfg
+            if p.get("enabled", True) and p.get("name")
+        }
+
     def _refresh_allocation_table(self) -> None:
         asset_prices = self._asset_prices_usdc()
         current_values: dict[str, float] = {}
@@ -951,25 +978,13 @@ class WalletBalancesWidget(QWidget):
         # whenever its price graph hadn't resolved.
         all_assets: set[str] = set()
 
-        # Build the set of assets that participate in at least one
-        # enabled trading pair.  Assets only present in disabled pairs
-        # (or in wallets not traded at all) are hidden from the
-        # allocation table so the user only manages targets for assets
-        # the bot is actually trading.  When pairs config hasn't
-        # arrived yet (empty set), fall through to the legacy
-        # "show everything" behaviour so startup isn't blank.
-        enabled_assets: set[str] = set()
-        for pair_cfg in self._last_pairs_cfg:
-            if not pair_cfg.get("enabled", True):
-                continue
-            pair_name = str(pair_cfg.get("name", ""))
-            if not pair_name:
-                continue
-            base_asset, quote_asset = _split_pair(pair_name)
-            if base_asset:
-                enabled_assets.add(base_asset.upper())
-            if quote_asset:
-                enabled_assets.add(quote_asset.upper())
+        # Assets that participate in at least one enabled trading pair.
+        # Assets only present in disabled pairs (or in wallets not traded
+        # at all) are hidden from the allocation table so the user only
+        # manages targets for assets the bot is actually trading.  When
+        # pairs config hasn't arrived yet (empty set), fall through to the
+        # legacy "show everything" behaviour so startup isn't blank.
+        enabled_assets = self._enabled_pair_assets()
 
         asset_id_map = self._asset_id_symbol_map()
 
@@ -1337,8 +1352,28 @@ class WalletBalancesWidget(QWidget):
         self._refresh_allocation_table()
 
     def _update_allocation_sum_status(self) -> None:
-        target_sum = sum(self._target_allocations.values())
-        self._alloc_sum_label.setText(f"Target sum: {target_sum:.2f}%")
+        # [ALLOCZERO] Validate the sum Apply would actually WRITE, not the
+        # saved dict: hidden (disabled-pair) percents are omitted at apply
+        # time, and a green "balanced" over numbers that will not be
+        # applied is a lie in both directions.  The hidden remainder is
+        # disclosed on this label because it survives the ~5s refresh that
+        # overwrites the hint label.
+        hidden_total = 0.0
+        if self._last_pairs_cfg:
+            enabled_assets = self._enabled_pair_assets()
+            target_sum = sum(
+                v for k, v in self._target_allocations.items()
+                if k in enabled_assets)
+            hidden_total = sum(
+                v for k, v in self._target_allocations.items()
+                if k not in enabled_assets and v > 0.0)
+        else:
+            target_sum = sum(self._target_allocations.values())
+        hidden_note = (
+            f"  (+{hidden_total:.2f}% saved on disabled pairs, not applied)"
+            if hidden_total > 0.0 else "")
+        self._alloc_sum_label.setText(
+            f"Target sum: {target_sum:.2f}%{hidden_note}")
         if abs(target_sum - 100.0) <= 0.5:
             self._alloc_sum_label.setStyleSheet(
                 f"color: {PROFIT_GREEN}; font-size: 11px; font-weight: bold;"
@@ -1374,7 +1409,13 @@ class WalletBalancesWidget(QWidget):
 
     def _pair_ratio_targets_from_allocations(self) -> dict[str, float]:
         pair_targets: dict[str, float] = {}
+        # [ALLOCZERO] A disabled pair gets no ratio target: the engine
+        # ignores it anyway, and writing one into config.yaml would present
+        # a stale number as live intent.
+        enabled_pairs = self._enabled_pair_names()
         for pair_name in self._last_market_data:
+            if self._last_pairs_cfg and pair_name not in enabled_pairs:
+                continue
             base_asset, quote_asset = _split_pair(pair_name)
             base_key = base_asset.upper()
             quote_key = quote_asset.upper()
@@ -1398,7 +1439,10 @@ class WalletBalancesWidget(QWidget):
         so the C++ side accepts it as a valid enter band.
         """
         bands: dict[str, float] = {}
+        enabled_pairs = self._enabled_pair_names()
         for pair_name in self._last_market_data:
+            if self._last_pairs_cfg and pair_name not in enabled_pairs:
+                continue
             base_asset, quote_asset = _split_pair(pair_name)
             base_key = base_asset.upper()
             quote_key = quote_asset.upper()
@@ -1442,6 +1486,25 @@ class WalletBalancesWidget(QWidget):
             key: float(value) / 100.0
             for key, value in self._target_allocations.items()
         }
+        # [ALLOCZERO 2026-08-29] An asset whose every pair is disabled is
+        # hidden from the table, but its SAVED percent used to ride along
+        # into config.yaml -- the engine kept steering the portfolio toward
+        # a target the bot could not trade.  OMIT it while disabled: absence
+        # is the engine's neutral semantic (no acquisition taper, no drift
+        # classification), whereas an explicit 0.0 would make a later
+        # re-enable + restart actively SELL the asset toward 0% until the
+        # operator remembered a second Apply.  The saved percent itself is
+        # untouched (QSettings keeps it), so re-enabling the pair brings the
+        # old target back on the next Apply.  An empty _last_pairs_cfg means
+        # pairs config hasn't arrived (unknown -- omit nothing); a KNOWN
+        # config whose every pair is disabled omits everything.
+        omitted: list[str] = []
+        if self._last_pairs_cfg:
+            enabled_assets = self._enabled_pair_assets()
+            for key in [k for k, v in asset_targets.items()
+                        if k not in enabled_assets and v > 0.0]:
+                del asset_targets[key]
+                omitted.append(key)
         pair_targets = self._pair_ratio_targets_from_allocations()
         asset_tolerances = {
             key: float(value) / 100.0
@@ -1452,10 +1515,14 @@ class WalletBalancesWidget(QWidget):
         self.allocation_targets_applied.emit(
             asset_targets, pair_targets, asset_tolerances, pair_band_enters
         )
+        omitted_note = (
+            "; omitted " + ", ".join(sorted(omitted)) + " (pairs disabled)"
+            if omitted else ""
+        )
         self._alloc_hint_label.setText(
             f"Applied {len(asset_targets)} asset target(s), "
             f"{len(pair_targets)} pair ratio target(s), "
-            f"{len(pair_band_enters)} pair band override(s)"
+            f"{len(pair_band_enters)} pair band override(s)" + omitted_note
         )
         self._alloc_hint_label.setStyleSheet(
             f"color: {INFO}; font-size: 11px;"

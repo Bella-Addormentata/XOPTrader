@@ -81,6 +81,7 @@ const char* to_string(AlertRule rule) noexcept
         case AlertRule::StablecoinDepeg:      return "StablecoinDepeg";
         case AlertRule::DeadMansSwitch:       return "DeadMansSwitch";
         case AlertRule::DeadMansSwitchLive:   return "DeadMansSwitchLive";
+        case AlertRule::ConfigReload:         return "ConfigReload";
     }
     return "UNKNOWN";
 }
@@ -106,6 +107,9 @@ AlertTier tier_for_rule(AlertRule rule) noexcept
         // Accounting divergence is a WARNING: it needs investigation but,
         // with auto-adjust on, it does not by itself endanger capital.
         case AlertRule::LedgerDivergence:
+        // [RELOAD] A reload outcome is operator feedback on an action they
+        // just took -- important, never capital-critical by itself.
+        case AlertRule::ConfigReload:
             return AlertTier::WARNING;
 
         // A quote stablecoin leaving its peg mis-values the entire book and
@@ -329,7 +333,12 @@ void AlertManager::send_alert(AlertRule rule, const std::string& message)
     }
 
     // CRITICAL / WARNING: check per-rule rate limit.
-    if (!check_rate_limit(rule)) {
+    // [RELOAD] ConfigReload is exempt: it fires at most once per consumed
+    // flag file and only on an explicit operator Save, and the NORMAL
+    // emergency sequence -- a rejected save corrected within the 300s
+    // WARNING window -- must deliver BOTH outcomes to an operator who is
+    // watching for exactly this message.
+    if (rule != AlertRule::ConfigReload && !check_rate_limit(rule)) {
         return;
     }
 

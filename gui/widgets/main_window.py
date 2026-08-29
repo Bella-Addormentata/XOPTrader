@@ -531,6 +531,14 @@ class MainWindow(QMainWindow):
             self._settings_widget.config_saved.connect(
                 lambda *_: self._push_sizing_paths()
             )
+            # [RELOAD] Every successful Save nudges the running engine to
+            # re-read the file, and the Settings label is told the TRUTH
+            # about whether the save can reach it (same config? engine
+            # running at all?). Guarded: an older bridge means saves stay
+            # restart-only and the label says so.
+            self._settings_widget.config_saved.connect(
+                self._nudge_engine_config_reload
+            )
         wallet_widget = self._unwrap(self._wallet_balances)
         if (wallet_widget is not None
             and hasattr(wallet_widget, "allocation_targets_applied")
@@ -1916,6 +1924,52 @@ class MainWindow(QMainWindow):
         self._splitter.setStretchFactor(1, 35)
 
         outer_layout.addWidget(self._splitter)
+
+    def _nudge_engine_config_reload(self, saved_path: str) -> None:
+        """[RELOAD] After a Save: write the reload flag and label honestly.
+
+        Three truths the label can tell: the save reaches the running
+        engine live (same config file, engine launched by this GUI); the
+        engine runs a DIFFERENT config and the save does not reach it; or
+        no engine is running and the file simply waits for the next start.
+        """
+        from pathlib import Path
+
+        settings = self._settings_widget
+        bridge = self._bridge
+
+        def _note(text: str) -> None:
+            if settings is not None and hasattr(settings, "note_reload_state"):
+                settings.note_reload_state(text)
+
+        if bridge is None or not hasattr(bridge, "request_config_reload"):
+            _note("engine restart required to apply")
+            return
+
+        bridge.request_config_reload()
+
+        launched = getattr(bridge, "launched_config_path", None)
+        running = bool(getattr(bridge, "engine_running_locally", False))
+        if not running or launched is None:
+            _note("no engine launched by this GUI -- an engine sharing this "
+                  "config picks the save up live; otherwise it applies at "
+                  "the next engine start")
+            return
+        try:
+            same = Path(saved_path).resolve() == Path(launched).resolve()
+        except OSError:
+            same = False
+        if same:
+            _note("pair disables apply live; other changes need an engine "
+                  "restart")
+        else:
+            log.warning(
+                "[RELOAD] save went to %s but the engine was launched with "
+                "%s -- the save does NOT reach the running engine",
+                saved_path, launched)
+            _note(f"engine is running a DIFFERENT config ({launched}) -- "
+                  "this save does NOT reach it; restart the engine on this "
+                  "file")
 
     def _push_sizing_paths(self) -> None:
         """Hand the advisory calculator the bridge's CURRENT paths.

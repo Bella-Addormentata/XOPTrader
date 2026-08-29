@@ -3748,6 +3748,9 @@ class SettingsWidget(QWidget):
         self._clean_snapshot = copy.deepcopy(cfg)
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         self._last_saved_time = now
+        # [RELOAD] The truthful "does this reach the running engine?"
+        # suffix is appended by MainWindow via note_reload_state() -- only
+        # it knows which config the engine was launched with.
         self._last_saved_label.setText(f"Last saved: {now}")
         self._config_path_label.setText(f"Config: {resolved}")
         self._clear_dirty()
@@ -3755,6 +3758,16 @@ class SettingsWidget(QWidget):
         self.config_saved.emit(str(resolved))
         log.info("Settings saved to %s", resolved)
         return True
+
+    def note_reload_state(self, text: str) -> None:
+        """[RELOAD] Append MainWindow's verdict on what the save reached.
+
+        The label alone cannot know whether a live engine runs this config
+        file; claiming "applies live" unconditionally is how an operator
+        ends up watching a disabled pair keep quoting (2026-08-25).
+        """
+        self._last_saved_label.setText(
+            f"Last saved: {self._last_saved_time} -- {text}")
 
     # ===================================================================
     # Button slots

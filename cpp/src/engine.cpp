@@ -592,8 +592,10 @@ Engine::Engine(const AppConfig& config, bool dry_run)
     // -- Pair config lookup map -----------------------------------------------
     // Build the O(1) pair_config_map_ from config_.pairs so that every step
     // can resolve a pair name to its PairConfig without a linear scan.
-    // ISO/IEC 5055: pointers remain valid because config_ is an immutable
-    // value member and its pairs vector is never reallocated after construction.
+    // ISO/IEC 5055: pointers remain valid because the pairs vector is
+    // never reallocated after construction. The ONE post-construction
+    // mutation is [RELOAD] flipping a pair's `enabled` bool in place,
+    // which moves nothing.
     for (const auto& pc : config_.pairs) {
         pair_config_map_[pc.name] = &pc;
     }
@@ -611,6 +613,8 @@ Engine::Engine(const AppConfig& config, bool dry_run)
         // button writes asset ids here, one per line, and the engine
         // consumes the file on its next cycle.
         peg_reenable_flag_path_ = db_dir / "peg_reenable.flag";
+        // [RELOAD] Touched by the GUI after every successful Save.
+        config_reload_flag_path_ = db_dir / "config_reload.flag";
     }
 
     state_->set_status(BotStatus::Initializing);
@@ -2569,6 +2573,14 @@ asio::awaitable<void> Engine::on_new_block_coro(BlockHeight block_height)
 
     // Check GUI-initiated pause flag each heartbeat.
     check_pause_flag();
+
+    // [RELOAD] A GUI Save may have disabled pairs -- honour it THIS cycle,
+    // before quoting, so a disable never has to wait behind a full
+    // heartbeat of posting on the old config.
+    try { co_await check_config_reload_flag(); }
+    catch (const std::exception& e) {
+        spdlog::error("[Engine] [RELOAD] config reload failed: {}", e.what());
+    }
 
     // Execute all 13 steps in strict sequence.
     // Each step is wrapped in a try/catch so that a failure in one step
@@ -15799,6 +15811,217 @@ void Engine::close_connections()
 // ---------------------------------------------------------------------------
 // check_pause_flag -- GUI-initiated pause via signal file.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// [RELOAD] Config hot-reload: live pair disable
+// ---------------------------------------------------------------------------
+
+void Engine::set_config_paths(std::string config_path, std::string secrets_path)
+{
+    config_file_path_  = std::move(config_path);
+    secrets_file_path_ = std::move(secrets_path);
+}
+
+// Cancel every resting offer on the pairs in reload_pending_cancel_.
+// Returns true when the sweep is CLEAN: nothing was resting, or every
+// cancel was submitted. On partial failure or an exception the set is
+// kept and the caller retries next heartbeat -- OFF MEANS FLAT is an
+// invariant, not an attempt (a live-disabled pair leaves the per-pair
+// cycle loop, so no other sweep will ever reach its offers again).
+asio::awaitable<bool> Engine::sweep_reload_disabled_offers()
+{
+    if (reload_pending_cancel_.empty()) co_return true;
+
+    std::vector<std::string> to_cancel;
+    for (const auto& po : state_->get_all_offers()) {
+        if (reload_pending_cancel_.count(po.pair_name) > 0) {
+            to_cancel.push_back(po.offer_id);
+        }
+    }
+    if (to_cancel.empty() || !offer_mgr_ || dry_run_) {
+        reload_pending_cancel_.clear();
+        co_return true;
+    }
+    try {
+        auto done = co_await offer_mgr_->selective_cancel(to_cancel);
+        if (done.size() >= to_cancel.size()) {
+            spdlog::warn("[Engine] [RELOAD] cancelled {}/{} resting offers "
+                         "on live-disabled pairs",
+                         done.size(), to_cancel.size());
+            reload_pending_cancel_.clear();
+            co_return true;
+        }
+        spdlog::critical("[Engine] [RELOAD] only {}/{} resting offers on "
+                         "live-disabled pairs could be cancelled -- the "
+                         "rest are STILL LIVE; retrying next heartbeat",
+                         done.size(), to_cancel.size());
+        co_return false;
+    } catch (const std::exception& e) {
+        spdlog::critical("[Engine] [RELOAD] could not cancel the book on "
+                         "live-disabled pairs: {} -- offers are STILL LIVE; "
+                         "retrying next heartbeat", e.what());
+        co_return false;
+    }
+}
+
+// Consume data/config_reload.flag: re-parse config.yaml with FULL
+// validation and apply the one change that is safe on a running engine --
+// a pair going enabled -> disabled. Everything else is reported as
+// restart-required rather than silently ignored. A file that fails to
+// parse changes nothing: the engine keeps the config it booted with and
+// says so loudly. Every outcome alert names the file that was re-read, so
+// a save that landed in a DIFFERENT config universe is diagnosable from
+// the phone rather than silently ignored.
+asio::awaitable<void> Engine::check_config_reload_flag()
+{
+    namespace fs = std::filesystem;
+    if (config_reload_flag_path_.empty()) co_return;
+
+    // Retry leg: offers that survived a previous disable's failed cancel.
+    if (!reload_pending_cancel_.empty()) {
+        const bool clean = co_await sweep_reload_disabled_offers();
+        if (clean && reload_cancel_alert_pending_) {
+            reload_cancel_alert_pending_ = false;
+            if (alerts_) {
+                alerts_->send_alert(
+                    AlertRule::ConfigReload,
+                    "Retry succeeded: the resting offers on live-disabled "
+                    "pairs are now cancelled.");
+            }
+        }
+    }
+
+    std::error_code ec;
+    if (!fs::exists(config_reload_flag_path_, ec)) co_return;
+
+    // A flag that could not be DELETED must not re-trigger a parse and a
+    // log line every heartbeat: skip until the file changes (= new save).
+    auto flag_mtime = fs::last_write_time(config_reload_flag_path_, ec);
+    const bool have_mtime = !ec;
+    if (reload_flag_stuck_mtime_ && have_mtime
+        && flag_mtime == *reload_flag_stuck_mtime_) {
+        co_return;
+    }
+    reload_flag_stuck_mtime_.reset();
+
+    // Consume FIRST: a poison config must trigger one loud failure, not a
+    // failure every heartbeat until someone deletes a file by hand.
+    std::error_code rm_ec;
+    fs::remove(config_reload_flag_path_, rm_ec);
+    if (rm_ec) {
+        spdlog::warn("[Engine] [RELOAD] could not delete {} ({}) -- this "
+                     "reload still runs; further heartbeats skip the stuck "
+                     "flag until the file changes",
+                     config_reload_flag_path_.string(), rm_ec.message());
+        if (have_mtime) reload_flag_stuck_mtime_ = flag_mtime;
+    }
+
+    if (config_file_path_.empty()) {
+        spdlog::warn("[Engine] [RELOAD] reload requested but this engine was "
+                     "never told its config path -- restart to apply changes");
+        co_return;
+    }
+
+    AppConfig fresh;
+    try {
+        fresh = load_config(config_file_path_, secrets_file_path_);
+    } catch (const std::exception& e) {
+        spdlog::error("[Engine] [RELOAD] saved config was rejected: {} -- "
+                      "the engine keeps running on its previous settings",
+                      e.what());
+        if (alerts_) {
+            alerts_->send_alert(
+                AlertRule::ConfigReload,
+                "Re-read " + config_file_path_ + ": REJECTED ("
+                + std::string(e.what())
+                + "). The engine keeps running on its previous settings.");
+        }
+        co_return;
+    }
+
+    auto diff = diff_pair_enables(config_.pairs, fresh.pairs);
+    // Duplicate names in a damaged running config would list a pair once
+    // per occurrence; flip and report each NAME once.
+    std::sort(diff.to_disable.begin(), diff.to_disable.end());
+    diff.to_disable.erase(
+        std::unique(diff.to_disable.begin(), diff.to_disable.end()),
+        diff.to_disable.end());
+
+    // Live-apply the disables: flip EVERY entry with the name in place
+    // (pair_config_map_ pointers stay valid, nothing is moved), then take
+    // the pairs' resting offers down. OFF MEANS FLAT.
+    std::string disabled_list;
+    for (const auto& name : diff.to_disable) {
+        for (auto& pair : config_.pairs) {
+            if (pair.name == name) pair.enabled = false;
+        }
+        disabled_list += (disabled_list.empty() ? "" : ", ") + name;
+        // Into the pending set BEFORE the cancel attempt, so an exception
+        // anywhere between flip and cancel still leaves the retry leg
+        // owning these offers.
+        reload_pending_cancel_.insert(name);
+        spdlog::warn("[Engine] [RELOAD] pair {} DISABLED live from the "
+                     "saved config -- quoting stops this cycle and its "
+                     "resting offers are being cancelled", name);
+    }
+
+    bool cancel_clean = true;
+    if (!diff.to_disable.empty()) {
+        cancel_clean = co_await sweep_reload_disabled_offers();
+        if (!cancel_clean) reload_cancel_alert_pending_ = true;
+    }
+
+    // Honesty about everything the reload did NOT do.
+    for (const auto& name : diff.to_enable) {
+        spdlog::warn("[Engine] [RELOAD] pair {} was ENABLED in the saved "
+                     "config, but its strategy state does not exist in this "
+                     "process -- restart the engine to start quoting it",
+                     name);
+    }
+    for (const auto& name : diff.structural) {
+        spdlog::warn("[Engine] [RELOAD] pair {} was added or removed in the "
+                     "saved config -- structural changes require an engine "
+                     "restart", name);
+    }
+    spdlog::info("[Engine] [RELOAD] processed {}: {} pair(s) disabled live; "
+                 "any other edited settings take effect on the next engine "
+                 "restart", config_file_path_, diff.to_disable.size());
+
+    // ONE outcome alert per consumed flag, stating what actually happened
+    // -- including "nothing", which is what an operator whose save landed
+    // in a different file needs to hear to catch the mismatch.
+    if (alerts_) {
+        std::string msg = "Re-read " + config_file_path_ + ": ";
+        if (!disabled_list.empty()) {
+            msg += "disabled live: " + disabled_list + " -- ";
+            msg += cancel_clean
+                ? "resting offers cancelled. "
+                : "WARNING: some resting offers could NOT be cancelled and "
+                  "are STILL LIVE; the engine retries each heartbeat. ";
+        }
+        auto join = [](const std::vector<std::string>& v) {
+            std::string out;
+            for (const auto& n : v) out += (out.empty() ? "" : ", ") + n;
+            return out;
+        };
+        if (!diff.to_enable.empty()) {
+            msg += "Enabled in the file but RESTART-REQUIRED: "
+                 + join(diff.to_enable) + ". ";
+        }
+        if (!diff.structural.empty()) {
+            msg += "Pairs added/removed (restart-required): "
+                 + join(diff.structural) + ". ";
+        }
+        if (disabled_list.empty() && diff.to_enable.empty()
+            && diff.structural.empty()) {
+            msg += "no pair enable changes; ";
+        }
+        msg += "Other edited settings take effect on the next engine "
+               "restart.";
+        alerts_->send_alert(AlertRule::ConfigReload, msg);
+    }
+    co_return;
+}
+
 // ---------------------------------------------------------------------------
 // [PEGSUSPEND] Asset-level peg suspension
 // ---------------------------------------------------------------------------
