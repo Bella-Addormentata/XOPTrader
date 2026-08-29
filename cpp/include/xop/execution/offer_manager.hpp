@@ -523,6 +523,30 @@ public:
     /// @param fee_mojos  Fee in mojos.  Must be > 0.
     void set_dynamic_fee(std::uint64_t fee_mojos) noexcept;
 
+    /// [S31] A predicate consulted before every offer-CREATING side effect.
+    ///
+    /// Returning true means stop: do not create, do not publish, abandon the
+    /// rest of this call. It exists because post_quotes() is a coroutine
+    /// that creates and publishes SEVERAL offers with awaits between them,
+    /// so a check at the engine's step gate only stops the next cycle. If
+    /// the dead man's switch fires midway through, the remaining tiers must
+    /// not be posted on top of a book that has just been cancelled.
+    ///
+    /// Unset means "never abort", so nothing changes for callers that do not
+    /// wire it.
+    void set_abort_predicate(std::function<bool()> predicate);
+
+    /// [S31] Called when an offer created after the abort could not be
+    /// cancelled again, with an operator-facing description.
+    ///
+    /// This exists because a local log is not enough here. The watchdog may
+    /// already have alerted that a cancel of every resting offer was
+    /// SUBMITTED -- and this trade was created after that bulk request
+    /// enumerated the book, so it was never in it. Leaving the failure in a
+    /// log file turns that alert into a false all-clear about the one thing
+    /// it is for.
+    void set_escalation(std::function<void(const std::string&)> escalate);
+
     /// Return the fee currently in effect (dynamic or static fallback).
     [[nodiscard]] std::uint64_t current_fee() const noexcept;
 
@@ -779,6 +803,22 @@ private:
     /// so without this the ledger overstates the free pool).  Charged
     /// before the RPC: a failed cancel over-counts, which is the
     /// conservative direction.
+    /// The trade id of an offer that landed AFTER the stop, or empty.
+    ///
+    /// Empty is not a logging inconvenience: it is a created offer that
+    /// cannot be individually cancelled, resting in a book the bulk cancel
+    /// has already enumerated. So this ESCALATES on the way out rather than
+    /// returning a quiet empty string -- operationally it is the same
+    /// incident as a cancel that failed, and the only difference is that we
+    /// never got far enough to attempt one.
+    ///
+    /// It also type-checks before converting. `get<std::string>()` on a
+    /// non-string throws nlohmann::type_error, and every call site tested
+    /// only that the KEY was present.
+    ///
+    /// `what` names the path ("fallback", "merged") for the operator.
+    std::string late_trade_id(const json& result, const std::string& what);
+
     asio::awaitable<json> cancel_offer_charged(const std::string& trade_id,
                                                std::uint64_t      fee,
                                                bool               secure);
@@ -908,6 +948,8 @@ private:
     /// Dynamic fee override.  Initialised from strategy_cfg_.offer_fee_mojos;
     /// updated at runtime by set_dynamic_fee() from the engine's FeeTracker.
     std::uint64_t current_fee_mojos_;
+    std::function<bool()> abort_predicate_;
+    std::function<void(const std::string&)> escalate_;
 
     /// O(1) lookup: pair_name -> PairConfig.  Populated once in the
     /// constructor from AppConfig::pairs so that evaluate_rebalance()

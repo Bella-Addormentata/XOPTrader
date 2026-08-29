@@ -337,7 +337,10 @@ void MetricsExporter::register_metrics()
         .Name("xop_posting_gate")
         .Help("1 while the named standing gate disables offer posting; "
               "reason label is one of gui, breaker, wallet_circuit, "
-              "flash_crash, xch_recovery, dry_run")
+              "flash_crash, xch_recovery, dry_run, watchdog. The watchdog "
+              "gate is restart-only: once set it stays set, because the "
+              "dead man's switch firing means the book was cancelled by a "
+              "process that has stopped managing it.")
         .Register(*registry_);
     gate_gui_            = &posting_gate_family_->Add({{"reason", "gui"}});
     gate_breaker_        = &posting_gate_family_->Add({{"reason", "breaker"}});
@@ -345,6 +348,7 @@ void MetricsExporter::register_metrics()
     gate_flash_crash_    = &posting_gate_family_->Add({{"reason", "flash_crash"}});
     gate_xch_recovery_   = &posting_gate_family_->Add({{"reason", "xch_recovery"}});
     gate_dry_run_        = &posting_gate_family_->Add({{"reason", "dry_run"}});
+    gate_watchdog_       = &posting_gate_family_->Add({{"reason", "watchdog"}});
 
     posting_gated_gauge_ = &prometheus::BuildGauge()
         .Name("xop_posting_gated")
@@ -729,7 +733,8 @@ void MetricsExporter::update_stuck_offers(int count)
 void MetricsExporter::update_posting_gates(bool gui, bool breaker,
                                            bool wallet_circuit,
                                            bool flash_crash,
-                                           bool xch_recovery, bool dry_run)
+                                           bool xch_recovery, bool dry_run,
+                                           bool watchdog)
 {
     // Same locked lifecycle check as every neighbouring updater: shutdown()
     // resets registry_ under this mutex, destroying the gauges, so an
@@ -743,9 +748,33 @@ void MetricsExporter::update_posting_gates(bool gui, bool breaker,
     gate_flash_crash_->Set(flash_crash ? 1.0 : 0.0);
     gate_xch_recovery_->Set(xch_recovery ? 1.0 : 0.0);
     gate_dry_run_->Set(dry_run ? 1.0 : 0.0);
+    // OR in the sticky flag: a Step 12 snapshot older than the watchdog's
+    // own write must not clear it. Restart-only means restart-only.
+    if (watchdog) watchdog_sticky_ = true;
+    const bool wd = watchdog_sticky_;
+    gate_watchdog_->Set(wd ? 1.0 : 0.0);
     posting_gated_gauge_->Set(
         (gui || breaker || wallet_circuit || flash_crash || xch_recovery
-         || dry_run) ? 1.0 : 0.0);
+         || dry_run || wd) ? 1.0 : 0.0);
+}
+
+void MetricsExporter::update_watchdog_gate(bool fired)
+{
+    std::unique_lock lock(mtx_);
+    if (!running_) return;
+    // [review] STICKY, under the mutex. Two threads publish this: the
+    // watchdog, here, and Step 12 through update_posting_gates(). Step 12
+    // reads watchdog_fired_ BEFORE taking this lock, so a snapshot taken as
+    // false can arrive after the watchdog has set true and reset both gauges
+    // from a stale argument -- clearing a restart-only signal. Remembering it
+    // here makes the later writer unable to lose it.
+    if (fired) watchdog_sticky_ = true;
+    gate_watchdog_->Set(watchdog_sticky_ ? 1.0 : 0.0);
+    if (watchdog_sticky_) {
+        // The aggregate has to move with it, or a consumer watching only
+        // xop_posting_gated sees nothing while posting is gated.
+        posting_gated_gauge_->Set(1.0);
+    }
 }
 
 void MetricsExporter::update_bot_paused(bool is_paused)

@@ -1250,6 +1250,20 @@ struct StrategyConfig {
 //                           while paused on 2026-08-04).
 // ---------------------------------------------------------------------------
 struct RiskConfig {
+    /// [S31] Heartbeat staleness, in seconds, before the dead man's switch
+    /// cancels the whole book.  0 disables it.
+    ///
+    /// Default 600.  Observed live, normal cycles run 3.2-13.9s against a
+    /// pathological 3.96h, so ten minutes sits three orders of magnitude
+    /// above normal and far below pathological -- the margin is not a
+    /// judgement call.  ON by default, deliberately: the failure it prevents
+    /// has now happened twice with real money (six four-hour-old bids filling
+    /// in one second on 08-25; ten offers orphaned by a stray --dry-run on
+    /// 08-26), while the failure it can CAUSE is cancelling a book the engine
+    /// has demonstrably not touched for ten minutes -- which is the outcome
+    /// an operator would ask for anyway.
+    std::uint32_t watchdog_stall_seconds{600};
+
     double   soft_limit_pct{0.60};
     double   hard_limit_pct{0.80};
     double   single_cat_cap_pct{0.12};

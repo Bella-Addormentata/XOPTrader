@@ -1745,6 +1745,19 @@ RiskConfig parse_risk(const YAML::Node& root)
         cfg.breaker_realert_minutes = static_cast<uint32_t>(v);
     }
 
+    // [S31] The dead man's switch threshold.  0 disables it.
+    if (node["watchdog_stall_seconds"]
+            && node["watchdog_stall_seconds"].IsDefined()
+            && !node["watchdog_stall_seconds"].IsNull()) {
+        // read_uint32 range-checks through int64. Parsing straight to
+        // uint32 let YAML `-1` wrap to UINT32_MAX -- arming the switch with a
+        // ~136-year threshold, which reads as "configured" and behaves as
+        // "disabled". The one value that must survive is 0, which this
+        // helper accepts.
+        cfg.watchdog_stall_seconds =
+            read_uint32(node, "watchdog_stall_seconds", "risk");
+    }
+
     // [S20 2026-08-24] valuation_carry_ttl_blocks: heartbeats an asset's
     // carried USD price keeps PEAK-UPDATE authority without a fresh
     // valuation-grade print.  Expiry freezes the drawdown peak; it does

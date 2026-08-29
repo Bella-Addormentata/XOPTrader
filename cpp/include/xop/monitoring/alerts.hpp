@@ -100,6 +100,25 @@ enum class AlertRule : std::uint8_t {
 
     // Accounting (rule 16)
     StablecoinDepeg      = 17, // A quote stablecoin has left its peg.
+    DeadMansSwitchLive   = 19, // [S31] An offer created after the stop could
+                               // NOT be cancelled and is still live.
+                               //
+                               // Its OWN rule, separate from the one below,
+                               // because it would otherwise share that 60s
+                               // cooldown with the very message it corrects:
+                               // the outcome alert says a cancel of every
+                               // resting offer was SUBMITTED, and this says
+                               // one offer was never in that request. Losing
+                               // the correction to the rate limit of the
+                               // thing it corrects is the worst possible
+                               // ordering.
+    DeadMansSwitch       = 18, // [S31] The watchdog cancelled the book.
+                               // Its OWN rule, not CircuitBreaker: alerts are
+                               // rate-limited per rule for 60s, the drawdown
+                               // breakers already hold that key, and a
+                               // breaker alert moments earlier would swallow
+                               // the one message saying the book was just
+                               // cancelled by a process that has given up.
     LedgerDivergence     = 16  // Books and wallet disagree beyond tolerance.
                                // Its own rule so accounting noise can never
                                // rate-limit or masquerade as ExposureBreach,

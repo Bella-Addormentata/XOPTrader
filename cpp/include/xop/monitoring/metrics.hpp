@@ -291,7 +291,15 @@ public:
     /// aborts (e.g. wallet not yet synced) are outside this contract.
     void update_posting_gates(bool gui, bool breaker, bool wallet_circuit,
                               bool flash_crash, bool xch_recovery,
-                              bool dry_run);
+                              bool dry_run, bool watchdog);
+
+    /// [S31] Set the watchdog gate alone, from the watchdog's own thread.
+    ///
+    /// Separate from update_posting_gates() because that is called from
+    /// Step 12 on the engine's event loop -- the thread that has stopped in
+    /// the failure this gate reports. A latch nobody can observe is not a
+    /// signal.  Thread-safe by the same mutex as every other updater.
+    void update_watchdog_gate(bool fired);
 
     /// Update the rolling 24-hour blockchain fees gauge (mojos).
     void update_fees_paid_24h(std::uint64_t total_mojos);
@@ -409,6 +417,18 @@ private:
     prometheus::Gauge* gate_flash_crash_{nullptr};
     prometheus::Gauge* gate_xch_recovery_{nullptr};
     prometheus::Gauge* gate_dry_run_{nullptr};
+    /// [S31] The dead man's switch has fired. Published because it gates
+    /// Step 8 FIRST and is restart-only: without it the GUI sees no standing
+    /// gate, offers an enabled Resume, and reports a trading engine that is
+    /// not trading -- the exact inversion the breaker gate was split out to
+    /// prevent.
+    prometheus::Gauge* gate_watchdog_{nullptr};
+    /// [S31] Latched copy of the watchdog gate, guarded by mtx_.
+    ///
+    /// Two threads publish this gauge and one of them samples its input
+    /// before taking the lock, so without a sticky copy an older snapshot
+    /// can clear a signal that is meant to survive until restart.
+    bool               watchdog_sticky_{false};
     prometheus::Gauge* fees_paid_24h_gauge_{nullptr};
 
     // -- Trade decision-tree counters ---------------------------------------

@@ -23,6 +23,7 @@
 #include <xop/execution/offer_manager.hpp>
 
 #include <xop/execution/wallet_poll_throttle.hpp>
+#include <xop/risk/watchdog.hpp>
 
 #include <algorithm>
 #include <cctype>
@@ -489,6 +490,17 @@ asio::awaitable<int> OfferManager::post_quotes(
             continue;
         }
 
+        // [S31] Consulted before every create, not once at entry. This
+        // coroutine creates and publishes several tiers with awaits between
+        // them, so a gate at the engine's step boundary stops the NEXT cycle
+        // while this one goes on posting -- onto a book the dead man's
+        // switch may have just cancelled, with spends still unconfirmed.
+        if (abort_predicate_ && abort_predicate_()) {
+            logger_->error("aborting offer creation for {} mid-flight: the "
+                           "engine asked us to stop", pair.name);
+            break;
+        }
+
         // Step 2: Call wallet.create_offer() to produce the spend bundle.
         json result;
         try {
@@ -514,6 +526,61 @@ asio::awaitable<int> OfferManager::post_quotes(
                 }
             }
             continue;
+        }
+
+        // [review] CHECK AGAIN, AFTER the create. The pre-call check cannot
+        // stop a create already in flight: if the switch's bulk cancel
+        // enumerates the book before this trade registers, the coroutine
+        // resumes here holding an offer the cancel never saw, and publishing
+        // it would leave a live offer behind a fired dead man's switch.
+        //
+        // The offer exists now, so refusing to publish is not enough -- the
+        // coins are locked either way. Cancel the trade we just created.
+        if (abort_predicate_ && abort_predicate_()) {
+            const std::string late_id = late_trade_id(result, "tier");
+            logger_->error("create for {} tier {} landed AFTER the engine "
+                           "asked us to stop; cancelling trade {} rather "
+                           "than publishing it", pair.name, tier.tier_index,
+                           late_id.empty() ? "<unknown>" : late_id);
+            if (!late_id.empty()) {
+                // [review round 11] Adopt BEFORE cancelling, as the
+                // merged path does: a secure cancel is an unconfirmed
+                // spend, and a counterparty can still win the race -- a
+                // fill on an unadopted trade is invisible to detection and
+                // to the next startup.
+                {
+                    PendingOffer pending;
+                    pending.offer_id         = late_id;
+                    pending.pair_name        = pair.name;
+                    pending.side             = tier.side;
+                    pending.price            = tier.price;
+                    pending.size             = tier.size;
+                    pending.tier             = tier.tier_index;
+                    pending.created_at_block = block_height;
+                    pending.created_at_ts    = std::chrono::system_clock::now();
+                    pending.fee_mojos        = current_fee_mojos_;
+                    pending.post_spread_bps  = tier.spread_bps;
+                    state_->upsert_offer(pending);
+                }
+                try {
+                    co_await cancel_offer_charged(
+                        late_id, xop::risk::watchdog_cancel().fee_mojos,
+                        xop::risk::watchdog_cancel().secure);
+                } catch (const std::exception& e) {
+                    logger_->critical("could not cancel the late offer {}: "
+                                      "{} -- it is LIVE and unmanaged",
+                                      late_id, e.what());
+                    if (escalate_) {
+                        escalate_("an offer created after the stop could NOT "
+                                  "be cancelled and is LIVE: trade " + late_id
+                                  + " (" + e.what() + "). The bulk cancel "
+                                  "never saw it, so any earlier "
+                                  "cancellation-submitted message does not "
+                                  "cover this one.");
+                    }
+                }
+            }
+            break;
         }
 
         // Step 3: Extract the bech32m offer text.
@@ -1452,6 +1519,17 @@ std::size_t OfferManager::pending_count() const
 void OfferManager::set_dynamic_fee(std::uint64_t fee_mojos) noexcept
 {
     current_fee_mojos_ = fee_mojos;
+}
+
+void OfferManager::set_abort_predicate(std::function<bool()> predicate)
+{
+    abort_predicate_ = std::move(predicate);
+}
+
+void OfferManager::set_escalation(
+    std::function<void(const std::string&)> escalate)
+{
+    escalate_ = std::move(escalate);
 }
 
 std::uint64_t OfferManager::current_fee() const noexcept
@@ -2894,6 +2972,29 @@ asio::awaitable<void> OfferManager::begin_xch_lock_cycle()
     }
 }
 
+std::string OfferManager::late_trade_id(const json& result,
+                                       const std::string& what)
+{
+    if (result.contains("trade_record")
+        && result["trade_record"].contains("trade_id")
+        && result["trade_record"]["trade_id"].is_string()) {
+        auto id = result["trade_record"]["trade_id"].get<std::string>();
+        if (!id.empty()) return id;
+    }
+    logger_->critical("a {} offer was created after the stop and its trade "
+                      "id is missing or not a string -- it cannot be "
+                      "cancelled individually and is LIVE and unmanaged",
+                      what);
+    if (escalate_) {
+        escalate_("an offer created after the stop (" + what + ") is LIVE "
+                  "and CANNOT be cancelled: the wallet returned no usable "
+                  "trade id. The bulk cancel never saw it, so any earlier "
+                  "cancellation-submitted message does not cover this one. "
+                  "The book must be inspected by hand.");
+    }
+    return {};
+}
+
 asio::awaitable<json> OfferManager::cancel_offer_charged(
     const std::string& trade_id, std::uint64_t fee, bool secure)
 {
@@ -3054,6 +3155,14 @@ asio::awaitable<int> OfferManager::post_merged_side(
 
     if (merged_dict.empty()) co_return 0;
 
+    // [S31] Same check on the batch path. One merged offer is still an offer,
+    // and this function is reached after several awaits.
+    if (abort_predicate_ && abort_predicate_()) {
+        logger_->error("aborting merged batch creation for {}: the engine "
+                       "asked us to stop", pair.name);
+        co_return 0;
+    }
+
     // [XCH-LOCK-LEDGER] One merged offer, one lock: the merged dict's XCH
     // leg is the sum of every tier's, so the ledger charge is exact.
     if (!xch_ledger_admits(merged_dict, pair, tiers.front().side,
@@ -3098,6 +3207,16 @@ asio::awaitable<int> OfferManager::post_merged_side(
                                    "batch fallback")) {
                 continue;
             }
+            // [review] The fallback loop issued creates without ever
+            // consulting the predicate -- so a watchdog fire during the
+            // failed merged request, or between fallback tiers, went on
+            // rebuilding the book one tier at a time. Checked before each.
+            if (abort_predicate_ && abort_predicate_()) {
+                logger_->error("abandoning batch fallback for {} after tier "
+                               "{}: the engine asked us to stop",
+                               pair.name, tier.tier_index);
+                break;
+            }
             bool tier_failed = false;
             std::string tier_err;
             json sr;
@@ -3107,6 +3226,53 @@ asio::awaitable<int> OfferManager::post_merged_side(
             } catch (const rpc::ChiaRPCError& e2) {
                 tier_failed = true;
                 tier_err = e2.what();
+            }
+            // And again after it lands, for the same reason as the primary
+            // path: a create that completes after the bulk cancel has
+            // enumerated the book leaves a live offer nobody cancelled.
+            if (!tier_failed && abort_predicate_ && abort_predicate_()) {
+                const std::string late_id = late_trade_id(sr, "fallback");
+                logger_->error("fallback create for {} tier {} landed AFTER "
+                               "the stop; cancelling trade {}", pair.name,
+                               tier.tier_index,
+                               late_id.empty() ? "<unknown>" : late_id);
+                if (!late_id.empty()) {
+                    // [review round 11] Adopt BEFORE cancelling, as the
+                    // merged path does: a secure cancel is an unconfirmed
+                    // spend, and a counterparty can still win the race -- a
+                    // fill on an unadopted trade is invisible to detection and
+                    // to the next startup.
+                    {
+                        PendingOffer pending;
+                        pending.offer_id         = late_id;
+                        pending.pair_name        = pair.name;
+                        pending.side             = tier.side;
+                        pending.price            = tier.price;
+                        pending.size             = tier.size;
+                        pending.tier             = tier.tier_index;
+                        pending.created_at_block = block_height;
+                        pending.created_at_ts    = std::chrono::system_clock::now();
+                        pending.fee_mojos        = current_fee_mojos_;
+                        pending.post_spread_bps  = tier.spread_bps;
+                        state_->upsert_offer(pending);
+                    }
+                    try {
+                        co_await cancel_offer_charged(
+                            late_id, xop::risk::watchdog_cancel().fee_mojos,
+                        xop::risk::watchdog_cancel().secure);
+                    } catch (const std::exception& e2) {
+                        logger_->critical("could not cancel late offer {}: "
+                                          "{} -- LIVE and unmanaged",
+                                          late_id, e2.what());
+                        if (escalate_) {
+                            escalate_("a fallback offer created after the "
+                                      "stop could NOT be cancelled and is "
+                                      "LIVE: trade " + late_id + " ("
+                                      + e2.what() + ").");
+                        }
+                    }
+                }
+                break;
             }
             if (tier_failed) {
                 logger_->error("Fallback create_offer failed for {} tier {}: {}",
@@ -3166,6 +3332,77 @@ asio::awaitable<int> OfferManager::post_merged_side(
             }
         }
         co_return fallback_count;
+    }
+
+    // [sweep] The SUCCESSFUL merged create had no post-create recheck. The
+    // pre-create gate and the fallback tiers both got one; this path -- the
+    // one that actually publishes to dexie on the happy day -- did not. If
+    // the switch fires while create_offer() is suspended here, the merged
+    // offer is submitted to a book the bulk cancel has already enumerated.
+    if (abort_predicate_ && abort_predicate_()) {
+        const std::string late_id = late_trade_id(result, "merged");
+        logger_->error("merged create for {} landed AFTER the stop; "
+                       "cancelling trade {} rather than publishing it",
+                       pair.name, late_id.empty() ? "<unknown>" : late_id);
+        if (!late_id.empty()) {
+            // [review round 10] TRACK IT EITHER WAY. A successful secure
+            // cancel is an UNCONFIRMED spend -- a counterparty holding the
+            // offer file can still win the race to the coins. Returning
+            // without adopting the trade meant a fill in that window hit an
+            // offer neither State nor the DB had ever heard of: fill
+            // detection could not see it, and the next startup could not
+            // reconcile it. The trade is adopted under its real id (no
+            // dexie id -- it was never published) so the ordinary fill and
+            // status machinery carries it to a terminal state, whichever
+            // way the race resolves.
+            // [review round 11] ONE aggregate record, not a loop.
+            // State::upsert_offer is keyed by offer_id alone, so a per-tier
+            // loop under one trade id overwrote itself and retained only
+            // the LAST tier -- the "all constituents tracked" claim was
+            // false for every merged batch of more than one. The merged
+            // trade is one wallet trade; it is represented as one pending
+            // record carrying the total size, priced at the most
+            // conservative (worst-for-us) tier so fill accounting cannot
+            // overstate what the race can win.
+            {
+                PendingOffer pending;
+                pending.offer_id         = late_id;
+                pending.pair_name        = pair.name;
+                pending.side             = tiers.front().side;
+                pending.price            = tiers.front().price;
+                pending.size             = 0;
+                for (const auto& tier : tiers) {
+                    pending.size += tier.size;
+                    const bool worse = (tier.side == Side::Bid)
+                        ? tier.price > pending.price
+                        : tier.price < pending.price;
+                    if (worse) pending.price = tier.price;
+                }
+                pending.tier             = tiers.front().tier_index;
+                pending.created_at_block = block_height;
+                pending.created_at_ts    = std::chrono::system_clock::now();
+                pending.fee_mojos        = current_fee_mojos_;
+                pending.post_spread_bps  = tiers.front().spread_bps;
+                state_->upsert_offer(pending);
+            }
+            try {
+                co_await cancel_offer_charged(
+                    late_id, xop::risk::watchdog_cancel().fee_mojos,
+                    xop::risk::watchdog_cancel().secure);
+            } catch (const std::exception& e) {
+                logger_->critical("could not cancel the late merged offer "
+                                  "{}: {} -- LIVE and unmanaged",
+                                  late_id, e.what());
+                if (escalate_) {
+                    escalate_("a merged offer created after the stop could "
+                              "NOT be cancelled and is LIVE: trade "
+                              + late_id + " (" + e.what() + "). It IS "
+                              "tracked in State, so fills on it will be "
+                              "seen.");
+                }
+            }
+        }
+        co_return 0;
     }
 
     // Extract trade_id and offer text.

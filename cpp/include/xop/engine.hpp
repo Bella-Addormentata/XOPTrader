@@ -64,6 +64,7 @@
 
 // Risk layer
 #include "xop/risk/drawdown_breaker.hpp"
+#include "xop/risk/watchdog.hpp"
 #include "xop/risk/height_source.hpp"
 #include "xop/risk/valuation_authority.hpp"
 #include "xop/risk/usd_route.hpp"
@@ -99,6 +100,8 @@
 #include <boost/asio/steady_timer.hpp>
 
 #include <atomic>
+#include <mutex>
+#include <thread>
 #include <chrono>
 #include <cstdint>
 #include <deque>
@@ -451,6 +454,76 @@ private:
     /// height_source_ is what drives the source transitions themselves.
     bool wallet_only_mode_{false};
 
+    /// [S31] Dead man's switch.  Its own thread and its own io_context by
+    /// necessity, not preference: the engine runs a SINGLE ioc_.run(), so a
+    /// watchdog posted to that context is starved by exactly the stall it
+    /// exists to detect.  The 2026-08-25 log contains one cycle recorded as
+    /// "processed in 14241482 ms" -- 3.96 hours during which nothing else on
+    /// that thread ran.
+    std::thread               watchdog_thread_;
+    std::atomic<std::int64_t> last_beat_ms_{0};
+    std::atomic<bool>         watchdog_stop_{false};
+
+    /// Set once the switch has fired, and never cleared without a restart.
+    ///
+    /// Distinct from the Watchdog's own `fired_`, which re-arms on a newer
+    /// heartbeat -- correct for suppressing repeat cancel RPCs, wrong as a
+    /// trading gate.  A stalled cycle that finally completes stamps a fresh
+    /// beat, and without this flag the very next Step 8 would post a new
+    /// ladder on top of cancel spends that may not have confirmed yet.
+    /// Restart-only for the same reason `breaker_pause_active_` is: the
+    /// switch firing means the book state is unknown until a human looks.
+    std::atomic<bool>         watchdog_fired_{false};
+    bool                      watchdog_skip_warned_{false};
+
+    /// Serialises watchdog_cancel_book() so there is ONE authoritative
+    /// outcome per cancel.
+    ///
+    /// Two threads can reach it: the watchdog thread when the switch fires,
+    /// and run() on the abnormal-exit path.  Concurrently they would issue
+    /// duplicate SECURE spends -- real fees, and two attempts contending for
+    /// the same coins, which is how one of them fails for a reason that has
+    /// nothing to do with the book -- and report contradictory outcomes,
+    /// with the 60-second per-rule cooldown suppressing whichever alert
+    /// arrived second.  The operator would then be told the opposite of what
+    /// happened, or told nothing.
+    ///
+    /// A mutex rather than a one-shot claim flag: the watchdog may
+    /// legitimately fire again on a LATER stall, and a retry after a failed
+    /// cancel is exactly what should still be allowed to happen.
+    std::mutex                watchdog_cancel_mtx_;
+
+    /// A graceful shutdown has claimed the cancellation, and when it started.
+    ///
+    /// [review] The watchdog stays ARMED through the graceful cancel, and it
+    /// must: stop_watchdog() runs after ioc_.run() returns, so a cancel_all()
+    /// that never comes back means ioc_.stop() is never reached and the
+    /// watchdog is the only thing left that can retract the book. Disarming
+    /// it at the top of shutdown() -- the obvious fix -- would convert the
+    /// wedged-shutdown case into total silence over a live book, which is the
+    /// incident the switch was built for.
+    ///
+    /// So the two paths hand off rather than exclude. While this claim is
+    /// held the watchdog SKIPS its duplicate RPC (no second secure spend
+    /// against coins the graceful path is already spending, and no
+    /// contradictory outcome with the cooldown suppressing whichever alert
+    /// arrives second) -- but only for a bounded grace. Past that the
+    /// graceful cancel is presumed failed and the watchdog fires anyway, so
+    /// a cancel that hangs forever cannot muzzle it.
+    ///
+    /// An atomic rather than holding watchdog_cancel_mtx_ across the
+    /// co_await: a lock_guard spanning a suspension point is legal here only
+    /// because ioc_ is single-threaded today, and becomes undefined the
+    /// moment it is not.
+    std::atomic<bool>         graceful_cancel_active_{false};
+    std::atomic<std::int64_t> graceful_cancel_started_ms_{0};
+
+    void start_watchdog();
+    void stop_watchdog();
+    void watchdog_loop();
+    /// Cancel every resting offer through a private wallet RPC.
+    /// `why` is the operator-facing reason, already formatted.
+    void watchdog_cancel_book(const std::string& why);
     /// [S28] Which RPC answers "what block is it?", re-decided every poll.
     ///
     /// This is the TRANSITION STATE: the streak counters and the hysteresis

@@ -43,6 +43,7 @@
 #include <filesystem>
 #include <iostream>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -59,6 +60,8 @@
 #endif
 
 // Third-party
+#include <sqlite3.h>
+
 #include <boost/program_options.hpp>
 #include <curl/curl.h>
 #include <spdlog/spdlog.h>
@@ -395,17 +398,38 @@ int main(int argc, char* argv[]) {
 #endif
     );
 
+    if (cli.dry_run) {
+        spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
+    }
+
     // ------------------------------------------------------------------
     // 3a. Kill any old xop_trader instances still running.
     //
     //     This ensures only one engine is active at a time -- prevents
     //     double-posting offers, port conflicts on the Prometheus
     //     exporter, and wallet RPC contention.
+    //
+    //     [S31] NOT in dry run. This used to run before cli.dry_run was
+    //     ever inspected, which made a dry run the most dangerous thing in
+    //     the repository: it terminated the live engine -- on Windows via
+    //     TerminateProcess, with no graceful path and therefore no
+    //     cancel_all() -- and the replacement process then neither posts
+    //     nor cancels, because both the watchdog and shutdown()'s
+    //     cancellation are dry-run gated. Startup reconciliation is NOT
+    //     gated, so the dry run would even adopt the orphans it could not
+    //     cancel. That is the ten-orphaned-offers incident of 2026-08-26,
+    //     reachable by running an inspection command.
+    //
+    //     A dry run has no reason to want the live engine dead: it submits
+    //     nothing, so there is no double-posting to prevent. The residual
+    //     conflicts are the Prometheus port and wallet RPC contention,
+    //     which are inconveniences rather than money.
     // ------------------------------------------------------------------
-    kill_old_instances();
-
     if (cli.dry_run) {
-        spdlog::warn("*** DRY-RUN MODE -- no offers will be submitted ***");
+        spdlog::warn("[S31] dry run -- NOT killing any running engine. A live "
+                     "instance keeps its book and its dead man's switch.");
+    } else {
+        kill_old_instances();
     }
 
     // ------------------------------------------------------------------
@@ -424,6 +448,178 @@ int main(int argc, char* argv[]) {
         curl_global_cleanup();
         return EXIT_FAILURE;
     }
+
+    // ------------------------------------------------------------------
+    // 4a. [review] A DRY RUN GETS ITS OWN DATABASE.
+    //
+    //     Skipping kill_old_instances() above is right -- a dry run submits
+    //     nothing, so there is no double-posting to prevent -- but it also
+    //     removed the mutual exclusion that every DB write in the engine
+    //     silently depended on. Until this branch, exactly one process ever
+    //     held that file.
+    //
+    //     Dry run is NOT read-only there. It restores the live engine's
+    //     pending offers into State, so step_process_fills() then observes
+    //     the live engine's fills and writes them: offer status, trade log,
+    //     ledger entries, and persist_inventory_state() -- which rewrites
+    //     EVERY inventory row from a snapshot that stopped tracking reality
+    //     at startup. inventory_state.total_cost is the table whose loss
+    //     produced the P&L failure this project already spent a month on.
+    //     step_update_pnl() adds snapshot and strategy_quotes rows every
+    //     block, and the reward/bridge ingest branches on the ledger insert
+    //     COUNT -- so whichever process books a reward first makes the other
+    //     silently drop that income from its own running state.
+    //
+    //     Fixed at the persistence boundary rather than by guarding each
+    //     step. There are a dozen reachable write sites across six
+    //     functions, and this is the fourth round on dry-run isolation --
+    //     each previous one gated the sites it was shown and missed the
+    //     rest. A copy cannot be missed by a new step.
+    //
+    //     Copied rather than opened read-only, deliberately: writes would
+    //     then throw, and several callers convert a write failure into a
+    //     LATCHED degradation -- post_ledger_fill and the reward/bridge
+    //     ingest set ledger_incomplete_ and raise an ExposureBreach alert.
+    //     A read-only dry run would spend its life alarming about a database
+    //     that is fine. The copy also keeps every read the run needs
+    //     truthful: pending offers, inventory cost basis, and the snapshot
+    //     history the warm start replays.
+    //
+    //     PnLTracker opens its own second handle on this same path and
+    //     derives its trade_history CSV directory from it, so redirecting
+    //     the path covers all three. accounting.bridge_jobs_db_path needs
+    //     no change: it is already opened SQLITE_OPEN_READONLY.
+    // ------------------------------------------------------------------
+    // Removed at exit by the guard below -- and stale copies from EARLIER
+    // dry runs (a crash skips any exit path) are swept here, so repeated
+    // inspections cannot accumulate accounting snapshots in the temp
+    // directory until it fills.
+    std::filesystem::path dryrun_scratch;
+    if (cli.dry_run) {
+        namespace fs = std::filesystem;
+        try {
+            // [review round 11] Reap only ORPHANED copies. Multiple dry
+            // runs are legal now (kill_old_instances is skipped), and on
+            // POSIX unlinking another live run's open database succeeds --
+            // its next connection at that path would find a fresh empty
+            // file instead of the snapshot it was reading. The pid is in
+            // the filename; a copy is swept only when that process is
+            // provably gone.
+            auto pid_alive = [](long long pid) -> bool {
+                if (pid <= 0) return false;
+#ifdef _WIN32
+                HANDLE h = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION,
+                                       FALSE, static_cast<DWORD>(pid));
+                if (!h) return false;
+                DWORD code = 0;
+                const bool alive = GetExitCodeProcess(h, &code)
+                                   && code == STILL_ACTIVE;
+                CloseHandle(h);
+                return alive;
+#else
+                return ::kill(static_cast<pid_t>(pid), 0) == 0
+                       || errno == EPERM;
+#endif
+            };
+            std::error_code sweep_ec;
+            for (const auto& entry : fs::directory_iterator(
+                     fs::temp_directory_path(), sweep_ec)) {
+                const auto name = entry.path().filename().string();
+                if (name.rfind("xop_dryrun_", 0) != 0) continue;
+                long long owner = 0;
+                try {
+                    owner = std::stoll(name.substr(11));
+                } catch (const std::exception&) {
+                    owner = 0;   // unparseable -> treat as orphaned
+                }
+                if (!pid_alive(owner)) {
+                    fs::remove(entry.path(), sweep_ec);
+                }
+            }
+            const fs::path live{app_config.database.path};
+            const auto stamp = std::to_string(static_cast<long long>(
+#ifdef _WIN32
+                GetCurrentProcessId()
+#else
+                getpid()
+#endif
+            ));
+            const fs::path scratch =
+                fs::temp_directory_path()
+                / ("xop_dryrun_" + stamp + ".sqlite");
+
+            std::error_code ec;
+            fs::remove(scratch, ec);
+            fs::remove(fs::path{scratch.string() + "-wal"}, ec);
+            fs::remove(fs::path{scratch.string() + "-shm"}, ec);
+            // [review round 9] SQLite's backup API, not a file copy.
+            //
+            // Sequentially copying main + -wal + -shm of a database another
+            // process is WRITING is not a snapshot of anything: a checkpoint
+            // landing between the two copies moves committed frames into the
+            // live main file after we copied it, so the scratch DB silently
+            // loses committed rows -- and a half-copied WAL is not stale, it
+            // is CORRUPT. sqlite3_backup_step(-1) runs under a single WAL
+            // read snapshot, sees every committed frame, and is neither
+            // blocked by nor blocks the live writer.
+            if (fs::exists(live)) {
+                sqlite3* src = nullptr;
+                sqlite3* dst = nullptr;
+                int rc = sqlite3_open_v2(live.string().c_str(), &src,
+                                         SQLITE_OPEN_READONLY, nullptr);
+                if (rc == SQLITE_OK) {
+                    rc = sqlite3_open(scratch.string().c_str(), &dst);
+                }
+                if (rc == SQLITE_OK) {
+                    sqlite3_busy_timeout(src, 5000);
+                    sqlite3_busy_timeout(dst, 5000);
+                    sqlite3_backup* bk =
+                        sqlite3_backup_init(dst, "main", src, "main");
+                    rc = bk ? sqlite3_backup_step(bk, -1) : SQLITE_ERROR;
+                    if (bk) sqlite3_backup_finish(bk);
+                }
+                const std::string err =
+                    (rc == SQLITE_DONE || rc == SQLITE_OK)
+                        ? std::string{}
+                        : (src ? sqlite3_errmsg(src) : "open failed");
+                if (src) sqlite3_close(src);
+                if (dst) sqlite3_close(dst);
+                if (!err.empty()) {
+                    throw std::runtime_error(
+                        "sqlite backup failed: " + err);
+                }
+            }
+            spdlog::warn("[S31] dry run -- database redirected to {} so this "
+                         "inspection cannot write to the live engine's "
+                         "accounting state", scratch.string());
+            app_config.database.path = scratch.string();
+            dryrun_scratch = scratch;
+        } catch (const std::exception& e) {
+            spdlog::critical("[S31] dry run -- could NOT isolate the database "
+                             "({}). Refusing to start: running against the "
+                             "live file would corrupt its accounting.",
+                             e.what());
+            spdlog::shutdown();
+            curl_global_cleanup();
+            return EXIT_FAILURE;
+        }
+    }
+
+    // [review round 10] The copy is deleted when this scope unwinds --
+    // normal exit, config error, or engine-constructor throw alike. The
+    // sweep above catches what a hard crash leaves behind.
+    struct ScratchGuard {
+        std::filesystem::path path;
+        ~ScratchGuard() {
+            if (path.empty()) return;
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+            std::filesystem::remove(
+                std::filesystem::path{path.string() + "-wal"}, ec);
+            std::filesystem::remove(
+                std::filesystem::path{path.string() + "-shm"}, ec);
+        }
+    } scratch_guard{dryrun_scratch};
 
     // Count enabled trading pairs for the startup banner.
     std::size_t enabled_pairs = 0;
